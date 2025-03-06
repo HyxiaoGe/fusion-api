@@ -44,12 +44,12 @@ class LLMManager:
                 logger.error(f"文心一言模型初始化失败: {e}")
 
         # 通义千问
-        if settings.QIANWEN_API_KEY:
+        if settings.QWEN_API_KEY:
             try:
                 from langchain_community.chat_models.tongyi import ChatTongyi
-                self.models["qianwen"] = ChatTongyi(
+                self.models["qwen"] = ChatTongyi(
                     model="qwen-max-0125",
-                    api_key=settings.QIANWEN_API_KEY
+                    api_key=settings.QWEN_API_KEY
                 )
                 logger.info("通义千问模型初始化成功")
             except Exception as e:

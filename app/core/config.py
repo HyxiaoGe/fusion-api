@@ -10,13 +10,13 @@ class Settings(BaseSettings):
     # API密钥配置
     WENXIN_API_KEY: Optional[str] = None
     WENXIN_SECRET_KEY: Optional[str] = None
-    QIANWEN_API_KEY: Optional[str] = None
+    QWEN_API_KEY: Optional[str] = None
     # CLAUDE_API_KEY: Optional[str] = None
     DEEPSEEK_API_KEY: Optional[str] = None
     OPENAI_API_KEY: Optional[str] = None
 
     # 模型配置
-    DEFAULT_MODEL: str = "qianwen"  # 默认使用的模型
+    DEFAULT_MODEL: str = "qwen"  # 默认使用的模型
 
     # 数据库配置
     DATABASE_URL: str = "sqlite:///./chat_app.db"

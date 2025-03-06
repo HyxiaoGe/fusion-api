@@ -27,7 +27,7 @@ def get_model_info(model_name: str):
                 "capabilities": ["文本生成", "多轮对话", "创意写作", "代码生成"],
                 "max_tokens": 8000
             },
-            "qianwen": {
+            "qwen": {
                 "name": "通义千问",
                 "version": "Qianfan-Chinese-Llama-2-7B",
                 "capabilities": ["文本生成", "多轮对话", "知识问答"],
