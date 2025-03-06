@@ -5,7 +5,7 @@ from app.ai.vectorstores.chroma_store import ChromaDocStore
 
 
 class CustomAgent:
-    def __init__(self, model_name="claude"):
+    def __init__(self, model_name="deepseek"):
         self.llm = llm_manager.get_model(model_name)
         self.doc_store = ChromaDocStore()
 

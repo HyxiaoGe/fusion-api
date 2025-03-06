@@ -3,8 +3,6 @@ from typing import Union
 
 from langchain.chat_models.base import BaseChatModel
 from langchain.llms.base import LLM
-from langchain_anthropic import ChatAnthropic
-from langchain_openai import ChatOpenAI
 
 from app.core.config import settings
 
@@ -50,23 +48,25 @@ class LLMManager:
             try:
                 from langchain_community.chat_models.tongyi import ChatTongyi
                 self.models["qianwen"] = ChatTongyi(
-                    model="Qianfan-Chinese-Llama-2-7B",
+                    model="qwen-max-0125",
                     api_key=settings.QIANWEN_API_KEY
                 )
                 logger.info("通义千问模型初始化成功")
             except Exception as e:
                 logger.error(f"通义千问模型初始化失败: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
 
         # Claude
-        if settings.CLAUDE_API_KEY:
-            try:
-                self.models["claude"] = ChatAnthropic(
-                    anthropic_api_key=settings.CLAUDE_API_KEY,
-                    model="claude-3-sonnet-20240229"
-                )
-                logger.info("Claude模型初始化成功")
-            except Exception as e:
-                logger.error(f"Claude模型初始化失败: {e}")
+        # if settings.CLAUDE_API_KEY:
+        #     try:
+        #         self.models["claude"] = ChatAnthropic(
+        #             anthropic_api_key=settings.CLAUDE_API_KEY,
+        #             model="claude-3-sonnet-20240229"
+        #         )
+        #         logger.info("Claude模型初始化成功")
+        #     except Exception as e:
+        #         logger.error(f"Claude模型初始化失败: {e}")
 
         # Deepseek
         if settings.DEEPSEEK_API_KEY:
@@ -82,6 +82,7 @@ class LLMManager:
 
     def get_model(self, model_name: str = None) -> Union[LLM, BaseChatModel]:
         """获取指定的LLM模型实例"""
+        logger.info(f"获取模型: {model_name}")
         if not model_name:
             model_name = settings.DEFAULT_MODEL
 

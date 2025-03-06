@@ -33,12 +33,12 @@ def get_model_info(model_name: str):
                 "capabilities": ["文本生成", "多轮对话", "知识问答"],
                 "max_tokens": 4000
             },
-            "claude": {
-                "name": "Claude",
-                "version": "claude-3-sonnet-20240229",
-                "capabilities": ["文本生成", "多轮对话", "创意写作", "代码生成", "推理"],
-                "max_tokens": 32000
-            },
+            # "claude": {
+            #     "name": "Claude",
+            #     "version": "claude-3-sonnet-20240229",
+            #     "capabilities": ["文本生成", "多轮对话", "创意写作", "代码生成", "推理"],
+            #     "max_tokens": 32000
+            # },
             "deepseek": {
                 "name": "Deepseek",
                 "version": "deepseek-chat",
