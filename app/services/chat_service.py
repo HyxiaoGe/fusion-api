@@ -1,14 +1,16 @@
+import asyncio
 import json
+import logging
+import uuid
+from datetime import datetime
+from typing import List, Optional, Dict, Any
+
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
 
 from app.ai.llm_manager import llm_manager
 from app.schemas.chat import ChatResponse, Message, Conversation
 from app.services.memory_service import MemoryService
-from sqlalchemy.orm import Session
-from typing import List, Optional, Dict, Any
-import uuid
-from datetime import datetime
-from fastapi.responses import StreamingResponse
-import asyncio
 
 
 class ChatService:
@@ -23,7 +25,7 @@ class ChatService:
             conversation_id: Optional[str] = None,
             stream: bool = False,
             options: Optional[Dict[str, Any]] = None
-    ) -> ChatResponse:
+    ) -> StreamingResponse | ChatResponse:
         """处理用户消息并获取AI响应"""
         # 获取或创建会话
         conversation = None
@@ -46,21 +48,24 @@ class ChatService:
         )
         conversation.messages.append(user_message)
 
-        # 获取AI模型并生成响应
-        llm = llm_manager.get_model(model)
-
         # 准备聊天历史
         chat_history = []
         for msg in conversation.messages:
             chat_history.append({"role": msg.role, "content": msg.content})
 
-        # 生成响应
-        ai_response = ""
+        # 从聊天历史中提取过去的消息
+        messages = self._prepare_chat_messages(chat_history)
+
+        # 根据是否为流式响应分别处理
         if stream:
-            ai_response = await self.generate_stream_response(model, self._prepare_chat_messages(chat_history))
+            # 保存会话（先保存用户消息）
+            conversation.updated_at = datetime.now()
+            self.memory_service.save_conversation(conversation)
+
+            return await self.generate_stream_response(model, messages, conversation_id)
         else:
-            # 从聊天历史中提取过去的消息
-            messages = self._prepare_chat_messages(chat_history)
+            # 获取AI模型并生成响应
+            llm = llm_manager.get_model(model)
 
             # 调用LLM获取响应
             response = llm.invoke(messages)
@@ -88,26 +93,53 @@ class ChatService:
             conversation_id=conversation_id
         )
 
-    async def generate_stream_response(self, model, messages):
+    async def generate_stream_response(self, model, messages, conversation_id):
         """生成流式响应"""
         llm = llm_manager.get_model(model)
+        full_response = ""
 
         async def stream_generator():
+            nonlocal full_response
+
             for chunk in llm.stream(messages):
+                content = ""
                 if hasattr(chunk, 'content'):
                     content = chunk.content
                 else:
                     content = chunk
 
                 if content:
-                    yield f"data: {json.dumps({'content': content})}\n\n"
+                    full_response += content
+                    yield f"data: {json.dumps({'content': content, 'conversation_id': conversation_id})}\n\n"
+
                 await asyncio.sleep(0.01)
-            yield f"data: [DONE]\n\n"
+
+            # 流结束后，将完整响应保存到对话历史
+            await self._save_stream_response(model, conversation_id, full_response)
+            yield f"data: {json.dumps({'content': '[DONE]', 'conversation_id': conversation_id})}\n\n"
 
         return StreamingResponse(
             stream_generator(),
             media_type="text/event-stream"
         )
+
+    async def _save_stream_response(self, model, conversation_id, response_text):
+        """保存流式响应到对话历史"""
+        try:
+            conversation = self.memory_service.get_conversation(conversation_id)
+            if conversation:
+                # 创建并添加AI响应消息
+                ai_message = Message(
+                    role="assistant",
+                    content=response_text
+                )
+                conversation.messages.append(ai_message)
+                conversation.updated_at = datetime.now()
+
+                # 保存到数据库
+                self.memory_service.save_conversation(conversation)
+        except Exception as e:
+            logging.error(f"保存流式响应失败: {str(e)}")
 
     def _prepare_chat_messages(self, chat_history):
         """准备发送给LLM的消息格式"""

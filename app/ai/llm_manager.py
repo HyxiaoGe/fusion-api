@@ -19,16 +19,20 @@ class LLMManager:
     def _initialize_models(self):
         """初始化所有配置的模型"""
 
-        if settings.OPENAI_API_KEY:
+        # 通义千问
+        if settings.QWEN_API_KEY:
             try:
-                from langchain_openai import ChatOpenAI
-                self.models["openai"] = ChatOpenAI(
-                    api_key=settings.OPENAI_API_KEY,
-                    model="gpt-3.5-turbo"
+                from langchain_community.chat_models.tongyi import ChatTongyi
+                self.models["qwen"] = ChatTongyi(
+                    model="qwen-max-0125",
+                    api_key=settings.QWEN_API_KEY,
+                    streaming=True,
                 )
-                logger.info("OpenAI模型初始化成功")
+                logger.info("通义千问模型初始化成功")
             except Exception as e:
-                logger.error(f"OpenAI模型初始化失败: {e}")
+                logger.error(f"通义千问模型初始化失败: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
 
         # 文心一言
         if settings.WENXIN_API_KEY and settings.WENXIN_SECRET_KEY:
@@ -37,25 +41,39 @@ class LLMManager:
                 self.models["wenxin"] = QianfanChatEndpoint(
                     api_key=settings.WENXIN_API_KEY,
                     secret_key=settings.WENXIN_SECRET_KEY,
-                    model_name="ERNIE-Bot-4"
+                    model_name="ERNIE-Bot-4",
+                    streaming=True,
                 )
                 logger.info("文心一言模型初始化成功")
             except Exception as e:
                 logger.error(f"文心一言模型初始化失败: {e}")
 
-        # 通义千问
-        if settings.QWEN_API_KEY:
+        if settings.OPENAI_API_KEY:
             try:
-                from langchain_community.chat_models.tongyi import ChatTongyi
-                self.models["qwen"] = ChatTongyi(
-                    model="qwen-max-0125",
-                    api_key=settings.QWEN_API_KEY
+                from langchain_openai import ChatOpenAI
+                self.models["openai"] = ChatOpenAI(
+                    api_key=settings.OPENAI_API_KEY,
+                    model="gpt-3.5-turbo",
+                    temperature=0.7,
+                    streaming=True,
                 )
-                logger.info("通义千问模型初始化成功")
+                logger.info("OpenAI模型初始化成功")
             except Exception as e:
-                logger.error(f"通义千问模型初始化失败: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
+                logger.error(f"OpenAI模型初始化失败: {e}")
+
+        # Deepseek
+        if settings.DEEPSEEK_API_KEY:
+            try:
+                self.models["deepseek"] = ChatOpenAI(
+                    api_key=settings.DEEPSEEK_API_KEY,
+                    base_url="https://api.deepseek.com/v1",
+                    model="deepseek-chat",
+                    temperature=0.7,
+                    streaming=True,
+                )
+                logger.info("Deepseek模型初始化成功")
+            except Exception as e:
+                logger.error(f"Deepseek模型初始化失败: {e}")
 
         # Claude
         # if settings.CLAUDE_API_KEY:
@@ -67,18 +85,6 @@ class LLMManager:
         #         logger.info("Claude模型初始化成功")
         #     except Exception as e:
         #         logger.error(f"Claude模型初始化失败: {e}")
-
-        # Deepseek
-        if settings.DEEPSEEK_API_KEY:
-            try:
-                self.models["deepseek"] = ChatOpenAI(
-                    api_key=settings.DEEPSEEK_API_KEY,
-                    base_url="https://api.deepseek.com/v1",
-                    model="deepseek-chat"
-                )
-                logger.info("Deepseek模型初始化成功")
-            except Exception as e:
-                logger.error(f"Deepseek模型初始化失败: {e}")
 
     def get_model(self, model_name: str = None) -> Union[LLM, BaseChatModel]:
         """获取指定的LLM模型实例"""

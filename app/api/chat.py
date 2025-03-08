@@ -7,7 +7,7 @@ from app.db.database import get_db
 
 router = APIRouter()
 
-@router.post("/send", response_model=ChatResponse)
+@router.post("/send")
 async def send_message(request: ChatRequest, db: Session = Depends(get_db)):
     """发送消息到指定的AI模型并获取响应"""
     chat_service = ChatService(db)
