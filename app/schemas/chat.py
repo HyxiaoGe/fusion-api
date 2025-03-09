@@ -40,3 +40,15 @@ class Conversation(BaseModel):
 
     class Config:
         from_attributes = True
+
+# 添加到现有文件末尾
+class TitleGenerationRequest(BaseModel):
+    model: str
+    message: Optional[str] = None
+    conversation_id: Optional[str] = None
+    options: Optional[Dict[str, Any]] = None
+
+
+class TitleGenerationResponse(BaseModel):
+    title: str
+    conversation_id: Optional[str] = None

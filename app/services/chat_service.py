@@ -29,11 +29,12 @@ class ChatService:
         """处理用户消息并获取AI响应"""
         # 获取或创建会话
         conversation = None
+        print(f"conversation_id={conversation_id}")
         if conversation_id:
             conversation = self.memory_service.get_conversation(conversation_id)
 
         if not conversation:
-            conversation_id = str(uuid.uuid4())
+            print(f"创建新会话................................")
             conversation = Conversation(
                 id=conversation_id,
                 title=message[:30] + "..." if len(message) > 30 else message,
@@ -167,3 +168,85 @@ class ChatService:
     def delete_conversation(self, conversation_id: str) -> bool:
         """删除特定对话"""
         return self.memory_service.delete_conversation(conversation_id)
+
+    async def generate_title(
+            self,
+            model: str,
+            message: Optional[str] = None,
+            conversation_id: Optional[str] = None,
+            options: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """生成与消息或会话相关的标题"""
+
+        # 如果提供了会话ID，获取会话
+        conversation = None
+        if conversation_id:
+            conversation = self.memory_service.get_conversation(conversation_id)
+            if not conversation:
+                raise ValueError(f"找不到会话ID: {conversation_id}")
+
+            # 使用会话的消息作为输入
+            if not message and conversation.messages:
+                # 获取前3条用户消息，提供更好的上下文
+                user_messages = []
+                for msg in conversation.messages:
+                    if msg.role == "user":
+                        user_messages.append(msg.content)
+                        if len(user_messages) >= 3:
+                            break
+
+                if user_messages:
+                    message = "\n".join(user_messages)
+
+        if not message:
+            raise ValueError("必须提供消息内容或有效的会话ID")
+
+        # 准备给LLM的提示
+        prompt = f"""请为以下对话内容生成一个简短、具体且有描述性的标题。
+        要求：
+        1. 不超过15个字
+        2. 直接给出标题，不要包含引号或其他解释性文字
+        3. 避免使用"关于"、"讨论"等过于宽泛的词语
+        4. 标题应该明确反映对话的核心主题
+
+        对话内容：
+        {message}"""
+
+        try:
+            # 获取AI模型并生成标题
+            llm = llm_manager.get_model(model)
+            from langchain.schema import HumanMessage
+            response = llm.invoke([HumanMessage(content=prompt)])
+
+            if hasattr(response, 'content'):  # ChatModel返回的响应
+                title = response.content
+            else:  # 普通LLM返回的响应
+                title = response
+
+            # 清理标题（去除多余的引号、空白和解释性文字）
+            title = title.strip().strip('"\'')
+
+            # 如果标题中包含"标题："等前缀，去除
+            prefixes = ["标题：", "标题:", "主题：", "主题:"]
+            for prefix in prefixes:
+                if title.startswith(prefix):
+                    title = title[len(prefix):].strip()
+
+            # 限制标题长度
+            if len(title) > 30:
+                title = title[:30] + "..."
+
+            # 如果提供了会话ID，更新会话标题
+            if conversation_id and conversation:
+                conversation.title = title
+                conversation.updated_at = datetime.now()
+                self.memory_service.save_conversation(conversation)
+
+            return title
+        except Exception as e:
+            logging.error(f"生成标题时发生错误: {str(e)}")
+            # 如果生成失败，返回一个默认标题
+            if conversation_id:
+                return f"对话 {conversation_id[:8]}..."
+            else:
+                return "新对话"

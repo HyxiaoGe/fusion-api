@@ -1,12 +1,12 @@
-import logging
 from typing import Union
 
 from langchain.chat_models.base import BaseChatModel
 from langchain.llms.base import LLM
 
 from app.core.config import settings
+from app.core.logger import llm_logger
 
-logger = logging.getLogger(__name__)
+logger = llm_logger
 
 
 class LLMManager:
@@ -18,6 +18,7 @@ class LLMManager:
 
     def _initialize_models(self):
         """初始化所有配置的模型"""
+        logger.info("开始初始化配置的模型")
 
         # 通义千问
         if settings.QWEN_API_KEY:
@@ -74,6 +75,8 @@ class LLMManager:
                 logger.info("Deepseek模型初始化成功")
             except Exception as e:
                 logger.error(f"Deepseek模型初始化失败: {e}")
+
+        logger.info(f"模型初始化完成，可用模型: {self.list_available_models()}")
 
         # Claude
         # if settings.CLAUDE_API_KEY:
