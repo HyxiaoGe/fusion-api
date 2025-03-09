@@ -6,6 +6,7 @@ python-multipart>=0.0.6
 
 # 数据库
 sqlalchemy>=2.0.22
+psycopg2-binary>=2.9.5
 
 # AI/LLM相关
 langchain>=0.0.310

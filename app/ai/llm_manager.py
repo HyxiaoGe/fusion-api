@@ -8,7 +8,6 @@ from app.core.logger import llm_logger
 
 logger = llm_logger
 
-
 class LLMManager:
     """管理不同LLM模型的工厂类"""
 
@@ -112,3 +111,14 @@ class LLMManager:
 
 # 创建一个全局的LLM管理器实例
 llm_manager = LLMManager()
+
+MODEL_DISPLAY_NAMES = {
+    "qwen": "通义千问",
+    "wenxin": "文心一言",
+    "claude": "Claude",
+    "deepseek": "Deepseek",
+    "openai": "OpenAI"
+}
+
+def get_model_display_name(model_code):
+    return MODEL_DISPLAY_NAMES.get(model_code, model_code)

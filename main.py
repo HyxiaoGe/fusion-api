@@ -1,8 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
-from app.api import chat, models, settings as settings_api
+from app.api import chat, models, settings as settings_api, prompts
 from app.core.logger import app_logger
+from app.db.init_db import init_db
 
 app = FastAPI(title=settings.APP_NAME, version=settings.APP_VERSION)
 
@@ -18,10 +19,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("startup")
+def startup_event():
+    try:
+        app_logger.info("应用启动中...")
+        init_db()
+        app_logger.info("数据库初始化完成")
+    except Exception as e:
+        app_logger.error(f"应用启动失败: {e}")
+
 # 注册路由
 app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 app.include_router(models.router, prefix="/api/models", tags=["models"])
 app.include_router(settings_api.router, prefix="/api/settings", tags=["settings"])
+app.include_router(prompts.router, prefix="/api/prompts", tags=["prompts"])
 
 app_logger.info("所有路由已注册")
 

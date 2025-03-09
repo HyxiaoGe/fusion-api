@@ -19,7 +19,10 @@ class Settings(BaseSettings):
     DEFAULT_MODEL: str = "qwen"  # 默认使用的模型
 
     # 数据库配置
-    DATABASE_URL: str = "sqlite:///./chat_app.db"
+    DATABASE_URL: str = os.getenv(
+        "DATABASE_URL",
+        "postgresql://fusion:fusion123!!@localhost:5432/fusion"
+    )
 
     # Redis配置（可选）
     REDIS_HOST: Optional[str] = None
