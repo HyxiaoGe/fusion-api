@@ -11,12 +11,17 @@ from sqlalchemy.orm import Session
 from app.ai.llm_manager import llm_manager
 from app.schemas.chat import ChatResponse, Message, Conversation
 from app.services.memory_service import MemoryService
+from app.services.vector_service import VectorService
+from app.services.context_service import ContextEnhancer
 
 
 class ChatService:
     def __init__(self, db: Session):
         self.db = db
         self.memory_service = MemoryService(db)
+        # 初始化向量服务和上下文增强器
+        self.vector_service = VectorService.get_instance(db)
+        self.context_enhancer = ContextEnhancer(db)
 
     async def process_message(
             self,
@@ -29,12 +34,10 @@ class ChatService:
         """处理用户消息并获取AI响应"""
         # 获取或创建会话
         conversation = None
-        print(f"conversation_id={conversation_id}")
         if conversation_id:
             conversation = self.memory_service.get_conversation(conversation_id)
 
         if not conversation:
-            print(f"创建新会话................................")
             conversation = Conversation(
                 id=conversation_id,
                 title=message[:30] + "..." if len(message) > 30 else message,
@@ -57,11 +60,29 @@ class ChatService:
         # 从聊天历史中提取过去的消息
         messages = self._prepare_chat_messages(chat_history)
 
+        # 应用上下文增强
+        # 判断是否需要使用上下文增强
+        use_enhancement = options.get("use_enhancement", True) if options else True
+
+        if use_enhancement:
+            # 获取增强提示
+            enhancement = self.context_enhancer.enhance_prompt(
+                query=message,
+                conversation_id=conversation_id
+            )
+
+            if enhancement["has_enhancement"]:
+                # 如果有增强，用增强后的提示替换最后一条用户消息
+                messages[-1].content = enhancement["enhanced_prompt"]
+
         # 根据是否为流式响应分别处理
         if stream:
             # 保存会话（先保存用户消息）
             conversation.updated_at = datetime.now()
             self.memory_service.save_conversation(conversation)
+
+            # 异步向量化用户消息
+            asyncio.create_task(self._vectorize_message_async(user_message, conversation_id))
 
             return await self.generate_stream_response(model, messages, conversation_id)
         else:
@@ -85,6 +106,13 @@ class ChatService:
 
         # 保存到数据库
         self.memory_service.save_conversation(conversation)
+
+        # 异步向量化消息
+        asyncio.create_task(self._vectorize_messages_async(
+            [user_message, ai_message],
+            conversation_id,
+            conversation
+        ))
 
         # 构建并返回响应
         return ChatResponse(
@@ -167,7 +195,14 @@ class ChatService:
 
     def delete_conversation(self, conversation_id: str) -> bool:
         """删除特定对话"""
-        return self.memory_service.delete_conversation(conversation_id)
+        try:
+            # 首先删除向量数据
+            self.vector_service.delete_conversation_vectors(conversation_id)
+            # 然后删除数据库记录
+            return self.memory_service.delete_conversation(conversation_id)
+        except Exception as e:
+            logging.error(f"删除对话失败: {e}")
+            return False
 
     async def generate_title(
             self,
@@ -250,3 +285,22 @@ class ChatService:
                 return f"对话 {conversation_id[:8]}..."
             else:
                 return "新对话"
+
+    async def _vectorize_message_async(self, message: Message, conversation_id: str):
+        """异步向量化单条消息"""
+        try:
+            self.vector_service.vectorize_message(message, conversation_id)
+        except Exception as e:
+            logging.error(f"异步向量化消息失败: {e}")
+
+    async def _vectorize_messages_async(self, messages: List[Message], conversation_id: str,
+                                        conversation: Optional[Conversation] = None):
+        """异步向量化多条消息和对话"""
+        try:
+            for message in messages:
+                self.vector_service.vectorize_message(message, conversation_id)
+
+            if conversation:
+                self.vector_service.vectorize_conversation(conversation)
+        except Exception as e:
+            logging.error(f"异步向量化失败: {e}")
