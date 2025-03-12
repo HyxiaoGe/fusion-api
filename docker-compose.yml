@@ -19,7 +19,8 @@ services:
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     deploy:
       resources:
         limits:
@@ -45,6 +46,11 @@ services:
         limits:
           cpus: '0.5'
           memory: 400M
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U fusion" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   nginx:
     image: nginx:latest
