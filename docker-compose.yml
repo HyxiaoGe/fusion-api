@@ -1,6 +1,31 @@
 version: '3.8'
 
 services:
+  app:
+    build: .
+    container_name: fusion-api
+    restart: always
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./logs:/app/logs
+      - ./chroma_db:/app/chroma_db
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      - DATABASE_URL=postgresql://fusion:fusion123!!@postgres:5432/fusion
+      - WENXIN_API_KEY=${WENXIN_API_KEY:-}
+      - WENXIN_SECRET_KEY=${WENXIN_SECRET_KEY:-}
+      - QWEN_API_KEY=${QWEN_API_KEY:-}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    depends_on:
+      - postgres
+    deploy:
+      resources:
+        limits:
+          cpus: '0.8'
+          memory: 512M
+
   postgres:
     image: postgres:15
     container_name: fusion_postgres
@@ -12,7 +37,31 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./postgres-config/postgresql.conf:/etc/postgresql/postgresql.conf
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 400M
+
+  nginx:
+    image: nginx:latest
+    container_name: nginx_proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf
+    depends_on:
+      - app
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.2'
+          memory: 128M
 
 volumes:
   postgres_data:
