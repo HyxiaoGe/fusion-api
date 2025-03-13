@@ -41,7 +41,7 @@ def setup_logger(name, log_file, level=logging.INFO):
 def setup_root_logger():
     root_logger = logging.getLogger()
     # 设置为 DEBUG 级别，确保捕获所有级别的日志
-    root_logger.setLevel(logging.DEBUG)
+    root_logger.setLevel(logging.INFO)
 
     # 清空现有处理器
     if root_logger.handlers:
@@ -49,7 +49,7 @@ def setup_root_logger():
 
     # 添加控制台处理器
     console = logging.StreamHandler()
-    console.setLevel(logging.DEBUG)
+    console.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     console.setFormatter(formatter)
     root_logger.addHandler(console)

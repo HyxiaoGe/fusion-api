@@ -24,12 +24,6 @@ class Settings(BaseSettings):
         "postgresql://fusion:fusion123!!@localhost:5432/fusion"
     )
 
-    # Redis配置（可选）
-    REDIS_HOST: Optional[str] = None
-    REDIS_PORT: int = 6379
-    REDIS_PASSWORD: Optional[str] = None
-    REDIS_USE_SSL: bool = False
-
     class Config:
         env_file = ".env"
         extra = "ignore"

@@ -45,7 +45,5 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,
-        log_level="debug",  # 设置为debug级别以查看更多日志
-        access_log=False     # 确保访问日志开启
+        reload=True
     )
