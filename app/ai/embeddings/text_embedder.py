@@ -1,7 +1,9 @@
 import logging
+import torch
+import threading
 from typing import List
 
-from langchain.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 
 logger = logging.getLogger(__name__)
 
@@ -10,18 +12,33 @@ class TextEmbedder:
     """文本嵌入服务，用于将文本转换为向量表示"""
 
     _instance = None
+    _lock = threading.Lock()
+    _initialized = False
 
     @classmethod
     def get_instance(cls):
-        """单例模式获取文本嵌入器实例"""
         if cls._instance is None:
-            cls._instance = TextEmbedder()
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = TextEmbedder()
+                    cls._initialized = True
         return cls._instance
 
     def __init__(self):
+        if self._initialized:
+            return
         try:
+
+            # 检查GPU是否可用
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            if device == "cuda":
+                logger.info(f"使用GPU进行文本嵌入: {torch.cuda.get_device_name(0)}")
+            else:
+                logger.info("未检测到可用GPU，使用CPU进行文本嵌入")
+
             self.embeddings = HuggingFaceEmbeddings(
-                model_name="shibing624/text2vec-base-chinese"
+                model_name="shibing624/text2vec-base-chinese",
+                model_kwargs={"device": device}
             )
             logger.info("文本嵌入模型初始化成功")
         except Exception as e:

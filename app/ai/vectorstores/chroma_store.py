@@ -1,7 +1,7 @@
 import os
 from typing import List, Dict, Any, Optional
 
-from langchain.vectorstores import Chroma
+from langchain_chroma import Chroma
 
 from app.ai.embeddings.text_embedder import TextEmbedder
 from app.core.logger import app_logger as logger
@@ -104,7 +104,7 @@ class ChromaVectorStore:
 
     def search_messages(self, query: str, limit: int = 5,
                         conversation_id: Optional[str] = None,
-                        threshold: float = 0.6) -> List[Dict[str, Any]]:
+                        threshold: float = 0.3) -> List[Dict[str, Any]]:
         """搜索相关消息"""
         try:
             filter_dict = {}
@@ -140,7 +140,7 @@ class ChromaVectorStore:
             return []
 
     def search_conversations(self, query: str, limit: int = 5,
-                             threshold: float = 0.6) -> List[Dict[str, Any]]:
+                             threshold: float = 0.3) -> List[Dict[str, Any]]:
         """搜索相关对话"""
         try:
             results = self.conversation_store.similarity_search_with_score(
@@ -171,20 +171,28 @@ class ChromaVectorStore:
             return []
 
     def get_related_context(self, query: str, conversation_id: Optional[str] = None,
-                            limit: int = 3, threshold: float = 0.7) -> List[Dict[str, Any]]:
+                            limit: int = 3, threshold: float = 0.5) -> List[Dict[str, Any]]:
         """获取与查询相关的上下文信息，用于增强提示"""
         try:
+            logger.info(f"开始获取相关上下文: query='{query}', conversation_id='{conversation_id}'")
+
             # 搜索相关消息
-            related_messages = self.search_messages(
+            results = self.search_messages(
                 query=query,
                 limit=limit,
                 conversation_id=conversation_id,
                 threshold=threshold
             )
 
-            return related_messages
+            logger.info(f"搜索结果数量: {len(results)}")
+            if results:
+                logger.info(f"最高相似度: {results[0]['similarity']:.4f}")
+
+            return results
         except Exception as e:
             logger.error(f"获取相关上下文失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return []
 
     def delete_conversation_data(self, conversation_id: str) -> bool:

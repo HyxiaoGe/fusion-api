@@ -23,11 +23,15 @@ class ContextEnhancer:
             包含原始查询和增强提示的字典
         """
         try:
+            logger.info(f"开始增强提示: query='{query}', conversation_id='{conversation_id}'")
+
             # 1. 获取相关上下文
             related_context = self.vector_service.get_relevant_context(
                 query=query,
                 conversation_id=conversation_id
             )
+
+            logger.info(f"获取到相关上下文: {len(related_context)} 条")
 
             # 2. 如果没有找到相关上下文，返回原始查询
             if not related_context:
@@ -40,6 +44,7 @@ class ContextEnhancer:
 
             # 3. 构建增强提示
             context_text = self._format_context(related_context)
+            logger.info(f"格式化上下文完成，长度: {len(context_text)}")
 
             # 优化系统提示词
             enhanced_prompt = f"""我将回答一个问题，但需要考虑以下相关的历史信息：
@@ -48,17 +53,21 @@ class ContextEnhancer:
 
 考虑上述历史信息，但不要明确提及它是来自历史信息，请回答用户的问题: {query}
 """
-
+            logger.info("提示增强成功")
             # 4. 准备返回结果
-            return {
+            result = {
                 "original_query": query,
                 "enhanced_prompt": enhanced_prompt,
                 "has_enhancement": True,
                 "context_used": related_context
             }
+            logger.info(f"返回增强结果: has_enhancement={result['has_enhancement']}")
+            return result
 
         except Exception as e:
             logger.error(f"构建增强提示失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             # 出错时返回原始查询
             return {
                 "original_query": query,

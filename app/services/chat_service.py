@@ -13,7 +13,7 @@ from app.schemas.chat import ChatResponse, Message, Conversation
 from app.services.memory_service import MemoryService
 from app.services.vector_service import VectorService
 from app.services.context_service import ContextEnhancer
-
+from app.core.logger import app_logger as logger
 
 class ChatService:
     def __init__(self, db: Session):
@@ -64,6 +64,8 @@ class ChatService:
         # 判断是否需要使用上下文增强
         use_enhancement = options.get("use_enhancement", True) if options else True
 
+        logger.info(f"是否使用上下文增强: {use_enhancement}")
+
         if use_enhancement:
             # 获取增强提示
             enhancement = self.context_enhancer.enhance_prompt(
@@ -71,9 +73,12 @@ class ChatService:
                 conversation_id=conversation_id
             )
 
+            logger.info(f"增强结果: has_enhancement={enhancement['has_enhancement']}")
+
             if enhancement["has_enhancement"]:
                 # 如果有增强，用增强后的提示替换最后一条用户消息
                 messages[-1].content = enhancement["enhanced_prompt"]
+                logger.info("已应用增强提示")
 
         # 根据是否为流式响应分别处理
         if stream:
