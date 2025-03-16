@@ -8,7 +8,9 @@ from typing import List, Optional, Dict, Any
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
+from app.ai.adapters.file_adapters import get_file_adapter
 from app.ai.llm_manager import llm_manager
+from app.db.repositories import FileRepository
 from app.schemas.chat import ChatResponse, Message, Conversation
 from app.services.memory_service import MemoryService
 from app.services.vector_service import VectorService
@@ -22,6 +24,7 @@ class ChatService:
         # 初始化向量服务和上下文增强器
         self.vector_service = VectorService.get_instance(db)
         self.context_enhancer = ContextEnhancer(db)
+        self.file_repo = FileRepository(db)
 
     async def process_message(
             self,
@@ -29,7 +32,8 @@ class ChatService:
             message: str,
             conversation_id: Optional[str] = None,
             stream: bool = False,
-            options: Optional[Dict[str, Any]] = None
+            options: Optional[Dict[str, Any]] = None,
+            file_ids: Optional[List[str]] = None
     ) -> StreamingResponse | ChatResponse:
         """处理用户消息并获取AI响应"""
         # 获取或创建会话
@@ -38,6 +42,7 @@ class ChatService:
             conversation = self.memory_service.get_conversation(conversation_id)
 
         if not conversation:
+            # 创建新对话
             conversation = Conversation(
                 id=conversation_id,
                 title=message[:30] + "..." if len(message) > 30 else message,
@@ -80,6 +85,13 @@ class ChatService:
                 messages[-1].content = enhancement["enhanced_prompt"]
                 logger.info("已应用增强提示")
 
+        file_paths = []
+        if file_ids and len(file_ids) > 0:
+            file_paths = self.file_repo.get_file_paths(file_ids)
+            logger.info(f"处理带文件的请求, 文件数量: {len(file_paths)}")
+
+        file_adapter = get_file_adapter(model)
+
         # 根据是否为流式响应分别处理
         if stream:
             # 保存会话（先保存用户消息）
@@ -89,17 +101,30 @@ class ChatService:
             # 异步向量化用户消息
             asyncio.create_task(self._vectorize_message_async(user_message, conversation_id))
 
-            return await self.generate_stream_response(model, messages, conversation_id)
+            return await self.generate_stream_response(model, messages, conversation_id, file_paths)
         else:
-            # 获取AI模型并生成响应
+            # 获取AI模型
             llm = llm_manager.get_model(model)
 
-            # 调用LLM获取响应
-            response = llm.invoke(messages)
-            if hasattr(response, 'content'):  # ChatModel返回的响应
-                ai_response = response.content
-            else:  # 普通LLM返回的响应
-                ai_response = response
+            # 如果有文件，使用文件适配器准备请求
+            if file_paths:
+                try:
+                    # 准备带文件的请求
+                    file_request = file_adapter.prepare_file_for_request(file_paths, message)
+
+                    # 调用LLM获取响应
+                    response = await self._call_model_with_files(model, file_request)
+                    ai_response = response.get("content", "无法处理文件请求")
+                except Exception as e:
+                    logger.error(f"处理文件请求失败: {e}")
+                    ai_response = f"处理文件时出错: {str(e)}"
+            else:
+                # 常规调用LLM获取响应
+                response = llm.invoke(messages)
+                if hasattr(response, 'content'):  # ChatModel返回的响应
+                    ai_response = response.content
+                else:  # 普通LLM返回的响应
+                    ai_response = response
 
         # 记录AI响应消息
         ai_message = Message(
@@ -127,13 +152,46 @@ class ChatService:
             conversation_id=conversation_id
         )
 
-    async def generate_stream_response(self, model, messages, conversation_id):
+    async def generate_stream_response(self, model, messages, conversation_id, file_paths=None):
         """生成流式响应"""
         llm = llm_manager.get_model(model)
         full_response = ""
 
         async def stream_generator():
             nonlocal full_response
+
+            # 如果有文件，使用文件适配器处理
+            if file_paths and len(file_paths) > 0:
+                try:
+                    # 获取文件适配器
+                    file_adapter = get_file_adapter(model)
+                    # 准备带文件的请求
+                    file_request = file_adapter.prepare_file_for_request(
+                        file_paths,
+                        messages[-1].content if messages else ""
+                    )
+
+                    # 调用带文件的API
+                    response = await self._call_model_with_files(model, file_request)
+                    content = response.get("content", "")
+
+                    # 返回完整响应
+                    full_response = content
+                    yield f"data: {json.dumps({'content': content, 'conversation_id': conversation_id})}\n\n"
+                    yield f"data: {json.dumps({'content': '[DONE]', 'conversation_id': conversation_id})}\n\n"
+
+                    # 流结束后，将完整响应保存到对话历史
+                    await self._save_stream_response(model, conversation_id, full_response)
+                    return
+                except Exception as e:
+                    logger.error(f"处理文件流式响应失败: {e}")
+                    error_msg = f"处理文件时出错: {str(e)}"
+                    yield f"data: {json.dumps({'content': error_msg, 'conversation_id': conversation_id})}\n\n"
+                    yield f"data: {json.dumps({'content': '[DONE]', 'conversation_id': conversation_id})}\n\n"
+
+                    # 保存错误信息到对话历史
+                    await self._save_stream_response(model, conversation_id, error_msg)
+                    return
 
             for chunk in llm.stream(messages):
                 content = ""
@@ -156,6 +214,35 @@ class ChatService:
             stream_generator(),
             media_type="text/event-stream"
         )
+
+    async def _call_model_with_files(self, model: str, file_request: Dict[str, Any]) -> Dict[str, Any]:
+        """调用支持文件的模型API"""
+        # 这里需要根据不同模型实现具体的API调用
+        # 以下是一个示例实现框架
+        try:
+            if model == "wenxin":
+                # 调用文心一言API
+                return await self._call_wenxin_with_files(file_request)
+            elif model == "qwen":
+                # 调用通义千问API
+                return await self._call_qwen_with_files(file_request)
+            else:
+                # 不支持文件的模型
+                raise ValueError(f"模型 {model} 不支持文件处理")
+        except Exception as e:
+            logger.error(f"调用带文件的模型API失败: {e}")
+            raise
+
+    # 具体的模型API调用实现
+    async def _call_wenxin_with_files(self, file_request: Dict[str, Any]) -> Dict[str, Any]:
+        """调用文心一言的文件API"""
+        # 实际实现需要根据文心一言的API文档
+        pass
+
+    async def _call_qwen_with_files(self, file_request: Dict[str, Any]) -> Dict[str, Any]:
+        """调用通义千问的文件API"""
+        # 实际实现需要根据通义千问的API文档
+        pass
 
     async def _save_stream_response(self, model, conversation_id, response_text):
         """保存流式响应到对话历史"""

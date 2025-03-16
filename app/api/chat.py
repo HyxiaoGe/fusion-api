@@ -21,7 +21,8 @@ async def send_message(request: ChatRequest, db: Session = Depends(get_db)):
             message=request.message,
             conversation_id=request.conversation_id,
             stream=request.stream,
-            options=request.options
+            options=request.options,
+            file_ids=request.file_ids
         )
         print(f"请求处理完成，返回响应")
         return response
