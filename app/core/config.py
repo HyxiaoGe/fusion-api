@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     DEEPSEEK_API_KEY: Optional[str] = None
     OPENAI_API_KEY: Optional[str] = None
 
+    CHROMA_URL: str = os.getenv("CHROMA_URL", "http://localhost:8001")
+
     # 模型配置
     DEFAULT_MODEL: str = "qwen"  # 默认使用的模型
 
