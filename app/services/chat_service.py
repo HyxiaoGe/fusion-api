@@ -117,7 +117,7 @@ class ChatService:
                     ai_response = response.get("content", "无法处理文件请求")
                 except Exception as e:
                     logger.error(f"处理文件请求失败: {e}")
-                    ai_response = f"处理文件时出错: {str(e)}"
+                    ai_response = f"[process_message] 处理文件时出错: {str(e)}"
             else:
                 # 常规调用LLM获取响应
                 response = llm.invoke(messages)
@@ -184,7 +184,7 @@ class ChatService:
                     await self._save_stream_response(model, conversation_id, full_response)
                     return
                 except Exception as e:
-                    logger.error(f"处理文件流式响应失败: {e}")
+                    logger.error(f"[generate_stream_response] 处理文件流式响应失败: {e}")
                     error_msg = f"处理文件时出错: {str(e)}"
                     yield f"data: {json.dumps({'content': error_msg, 'conversation_id': conversation_id})}\n\n"
                     yield f"data: {json.dumps({'content': '[DONE]', 'conversation_id': conversation_id})}\n\n"

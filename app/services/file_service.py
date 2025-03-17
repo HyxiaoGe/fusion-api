@@ -1,14 +1,16 @@
+from datetime import datetime
 import os
 import uuid
+from typing import List, Dict, Any
+
 import aiofiles
 from fastapi import UploadFile
 from sqlalchemy.orm import Session
-from typing import List, Dict, Any, Optional
-import shutil
 
 from app.core.config import settings
 from app.core.logger import app_logger as logger
-from app.db.repositories import FileRepository
+from app.db.repositories import FileRepository, ConversationRepository
+from app.schemas.chat import Conversation
 
 
 class FileService:
@@ -39,6 +41,20 @@ class FileService:
     async def upload_files(self, files: List[UploadFile], conversation_id: str) -> List[str]:
         """处理文件上传并关联到对话"""
         file_ids = []
+
+        conv_repo = ConversationRepository(self.db)
+        conversation = conv_repo.get_by_id(conversation_id)
+
+        if not conversation:
+            temp_conversation = Conversation(
+                id=conversation_id,
+                title="新会话",
+                messages=[],
+                model=settings.DEFAULT_MODEL,
+                created_at=datetime.now(),
+                updated_at=datetime.now()
+            )
+            conv_repo.create(temp_conversation)
 
         # 检查对话关联的文件数量限制
         existing_count = self.file_repo.count_conversation_files(conversation_id)
