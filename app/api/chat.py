@@ -17,6 +17,7 @@ async def send_message(request: ChatRequest, db: Session = Depends(get_db)):
     chat_service = ChatService(db)
     try:
         response = await chat_service.process_message(
+            provider=request.provider,
             model=request.model,
             message=request.message,
             conversation_id=request.conversation_id,
@@ -64,7 +65,6 @@ async def generate_title(request: TitleGenerationRequest, db: Session = Depends(
     chat_service = ChatService(db)
     try:
         title = await chat_service.generate_title(
-            model=request.model,
             message=request.message,
             conversation_id=request.conversation_id,
             options=request.options

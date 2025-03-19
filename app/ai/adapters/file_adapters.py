@@ -72,11 +72,11 @@ class DefaultFileAdapter(FileDialogAdapter):
         return {"message": message}
 
 
-def get_file_adapter(model_name: str) -> FileDialogAdapter:
+def get_file_adapter(provider: str) -> FileDialogAdapter:
     """获取指定模型的文件适配器"""
     adapters = {
         "wenxin": WenxinFileAdapter(),
         "qwen": QwenFileAdapter(),
         "deepseek": DefaultFileAdapter()
     }
-    return adapters.get(model_name, DefaultFileAdapter())
+    return adapters.get(provider, DefaultFileAdapter())

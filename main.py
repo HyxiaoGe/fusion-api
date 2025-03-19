@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
-from app.api import chat, models, settings as settings_api, prompts, search, files
+from app.api import chat, settings as settings_api, prompts, search, files
 from app.core.logger import app_logger
 from app.db.init_db import init_db
 
@@ -31,7 +31,6 @@ def startup_event():
 # 注册路由
 app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 app.include_router(files.router, prefix="/api/files", tags=["files"])
-app.include_router(models.router, prefix="/api/models", tags=["models"])
 app.include_router(settings_api.router, prefix="/api/settings", tags=["settings"])
 app.include_router(prompts.router, prefix="/api/prompts", tags=["prompts"])
 app.include_router(search.router, prefix="/api/search", tags=["search"])

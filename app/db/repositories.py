@@ -25,6 +25,7 @@ class ConversationRepository:
             db_conversation = ConversationModel(
                 id=conversation.id,
                 title=conversation.title,
+                provider=conversation.provider,
                 model=conversation.model,
                 created_at=conversation.created_at,
                 updated_at=conversation.updated_at
@@ -150,7 +151,8 @@ class ConversationRepository:
         return Conversation(
             id=db_conversation.id,
             title=db_conversation.title,
-            model=get_model_display_name(db_conversation.model),
+            provider=get_model_display_name(db_conversation.model),
+            model=db_conversation.model,
             messages=messages,
             created_at=db_conversation.created_at,
             updated_at=db_conversation.updated_at

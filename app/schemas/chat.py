@@ -15,6 +15,7 @@ class Message(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    provider: str
     model: str
     message: str
     conversation_id: Optional[str] = None
@@ -25,6 +26,7 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
+    provider: str
     model: str
     message: Message
     conversation_id: str
@@ -33,9 +35,10 @@ class ChatResponse(BaseModel):
 
 class Conversation(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
+    provider: str
+    model: str
     title: str
     messages: List[Message] = []
-    model: str
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
 
@@ -44,7 +47,6 @@ class Conversation(BaseModel):
 
 # 添加到现有文件末尾
 class TitleGenerationRequest(BaseModel):
-    model: str
     message: Optional[str] = None
     conversation_id: Optional[str] = None
     options: Optional[Dict[str, Any]] = None
