@@ -37,6 +37,7 @@ class LLMManager:
                         secret_key=settings.WENXIN_SECRET_KEY,
                         model=model,
                         streaming=True,
+                        timeout=60,
                     )
                 elif provider == "openai":
                     from langchain_openai import ChatOpenAI

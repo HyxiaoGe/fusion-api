@@ -31,6 +31,7 @@ class ChatResponse(BaseModel):
     message: Message
     conversation_id: str
     created_at: datetime = Field(default_factory=datetime.now)
+    reasoning: Optional[str] = None
 
 
 class Conversation(BaseModel):
