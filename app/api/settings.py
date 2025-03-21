@@ -1,11 +1,14 @@
+from typing import Dict, Any
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from typing import Dict, Any
-from app.db.database import get_db
+
 from app.core.config import settings
+from app.db.database import get_db
 from app.db.repositories import SettingRepository
 
 router = APIRouter()
+
 
 @router.get("/")
 def get_settings(db: Session = Depends(get_db)):

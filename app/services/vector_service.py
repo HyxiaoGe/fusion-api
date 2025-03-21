@@ -1,9 +1,11 @@
-from sqlalchemy.orm import Session
+import threading
 from typing import List, Dict, Any, Optional
-from app.schemas.chat import Conversation, Message
+
+from sqlalchemy.orm import Session
+
 from app.ai.vectorstores.chroma_store import ChromaVectorStore
 from app.core.logger import app_logger as logger
-import threading
+from app.schemas.chat import Conversation, Message
 
 
 class VectorService:

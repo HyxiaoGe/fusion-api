@@ -1,5 +1,6 @@
-from langchain.agents import initialize_agent, Tool
 from langchain.agents import AgentType
+from langchain.agents import initialize_agent, Tool
+
 from app.ai.llm_manager import llm_manager
 from app.ai.vectorstores.chroma_store import ChromaDocStore
 

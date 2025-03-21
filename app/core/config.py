@@ -1,6 +1,7 @@
-from pydantic_settings import BaseSettings
 import os
 from typing import Dict, List, Optional, Any
+
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
@@ -35,26 +36,6 @@ class Settings(BaseSettings):
         "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "text/plain", "text/markdown", "text/csv"
     ]
-
-    # 模型文件支持配置
-    MODEL_FILE_SUPPORT: Dict[str, Dict[str, Any]] = {
-        "wenxin": {
-            "supported_files": ["image/jpeg", "image/png", "image/gif", "image/bmp", "application/pdf"],
-            "max_files": 5
-        },
-        "qwen": {
-            "supported_files": ["image/jpeg", "image/png", "image/gif", "image/bmp", "image/webp"],
-            "max_files": 5
-        },
-        "claude": {
-            "supported_files": ["image/jpeg", "image/png", "image/gif", "image/webp"],
-            "max_files": 5
-        },
-        "deepseek": {
-            "supported_files": [],
-            "max_files": 0
-        }
-    }
 
     class Config:
         env_file = ".env"

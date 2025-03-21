@@ -1,8 +1,8 @@
 import logging
-import torch
 import threading
 from typing import List
 
+import torch
 from langchain_huggingface import HuggingFaceEmbeddings
 
 logger = logging.getLogger(__name__)

@@ -1,15 +1,17 @@
+import logging
 import uuid
+from datetime import datetime
 from typing import List, Optional, Dict, Any
+
 from sqlalchemy.orm import Session, joinedload
+
+from app.ai.llm_manager import get_model_display_name
 from app.db.models import Conversation as ConversationModel, get_china_time, File, ConversationFile
 from app.db.models import Message as MessageModel
 from app.db.models import PromptTemplate as PromptTemplateModel
 from app.db.models import Setting as SettingModel
 from app.schemas.chat import Conversation, Message
 from app.schemas.prompts import PromptTemplate
-from datetime import datetime
-import logging
-from app.ai.llm_manager import get_model_display_name
 
 logger = logging.getLogger(__name__)
 
@@ -257,6 +259,7 @@ class FileRepository:
             self.db.rollback()
             logger.error(f"删除文件失败: {e}")
             return False
+
 
 class PromptTemplateRepository:
     def __init__(self, db: Session):

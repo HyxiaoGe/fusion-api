@@ -1,7 +1,8 @@
-from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
 from datetime import datetime
-from uuid import uuid4, UUID
+from typing import List, Optional, Dict, Any
+from uuid import uuid4
+
+from pydantic import BaseModel, Field
 
 
 class Message(BaseModel):
@@ -45,6 +46,7 @@ class Conversation(BaseModel):
 
     class Config:
         from_attributes = True
+
 
 # 添加到现有文件末尾
 class TitleGenerationRequest(BaseModel):

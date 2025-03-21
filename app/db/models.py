@@ -54,6 +54,7 @@ class ConversationFile(Base):
 
 Conversation.files = relationship("ConversationFile", back_populates="conversation", cascade="all, delete-orphan")
 
+
 class Message(Base):
     __tablename__ = "messages"
 

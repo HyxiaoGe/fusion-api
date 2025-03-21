@@ -81,7 +81,6 @@ class LLMManager:
             except Exception as e:
                 logger.error(f"默认通义千问模型初始化失败: {e}")
 
-
         # 如果所有模型都不可用，抛出异常
         raise ValueError("无法创建默认模型。请检查API密钥配置。")
 

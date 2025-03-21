@@ -1,6 +1,7 @@
 from typing import List, Dict, Any, Optional
-from app.services.vector_service import VectorService
+
 from app.core.logger import app_logger as logger
+from app.services.vector_service import VectorService
 
 
 class ContextEnhancer:

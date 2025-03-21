@@ -1,10 +1,13 @@
-from sqlalchemy.orm import Session
-from typing import List, Optional, Dict
-from app.schemas.chat import Conversation
-from app.db.repositories import ConversationRepository
 import logging
+from typing import List, Optional
+
+from sqlalchemy.orm import Session
+
+from app.db.repositories import ConversationRepository
+from app.schemas.chat import Conversation
 
 logger = logging.getLogger(__name__)
+
 
 class MemoryService:
     """
