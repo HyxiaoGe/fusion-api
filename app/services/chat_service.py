@@ -3,9 +3,10 @@ import json
 import logging
 import uuid
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 
 from fastapi.responses import StreamingResponse
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from sqlalchemy.orm import Session
 
 from app.ai.adapters.file_adapters import get_file_adapter
@@ -36,7 +37,7 @@ class ChatService:
             stream: bool = False,
             options: Optional[Dict[str, Any]] = None,
             file_ids: Optional[List[str]] = None,
-    ) -> StreamingResponse | ChatResponse:
+    ) -> Union[StreamingResponse, ChatResponse]:
         """处理用户消息并获取AI响应"""
         # 获取或创建会话
         conversation = None
@@ -46,7 +47,7 @@ class ChatService:
         if not conversation:
             # 创建新对话
             conversation = Conversation(
-                id=conversation_id,
+                id=conversation_id or str(uuid.uuid4()),
                 title=message[:30] + "..." if len(message) > 30 else message,
                 provider=provider,
                 model=model,
@@ -69,7 +70,7 @@ class ChatService:
         messages = self._prepare_chat_messages(chat_history)
 
         # 判断是否启用推理模式
-        use_reasoning = options.get("use_reasoning", False) if options else False
+        use_reasoning = options.get("use_reasoning", True) if options else True
         logger.info(f"是否使用推理模式: {use_reasoning}")
 
         # 应用上下文增强
@@ -95,229 +96,269 @@ class ChatService:
             file_paths = self.file_repo.get_file_paths(file_ids)
             logger.info(f"处理带文件的请求, 文件数量: {len(file_paths)}")
 
-        file_adapter = get_file_adapter(provider)
+        # 保存会话（先保存用户消息）
+        conversation.updated_at = datetime.now()
+        self.memory_service.save_conversation(conversation)
+
+        # 异步向量化用户消息
+        asyncio.create_task(self._vectorize_message_async(user_message, conversation_id))
 
         # 根据是否为流式响应分别处理
         if stream:
-            # 保存会话（先保存用户消息）
-            conversation.updated_at = datetime.now()
-            self.memory_service.save_conversation(conversation)
-
-            # 异步向量化用户消息
-            asyncio.create_task(self._vectorize_message_async(user_message, conversation_id))
-
-            return await self.generate_stream_response(provider, model, messages, conversation_id, file_paths,
-                                                       use_reasoning)
+            # 如果启用推理模式，使用二阶段流式推理
+            if use_reasoning:
+                return StreamingResponse(
+                    self.generate_stream_with_reasoning(
+                        provider=provider,
+                        model=model,
+                        message=message,
+                        conversation_id=conversation.id,
+                        options=options
+                    ),
+                    media_type="text/event-stream"
+                )
+            else:
+                # 使用常规流式响应（无文件版）
+                return StreamingResponse(
+                    self._generate_normal_stream(provider, model, messages, conversation.id),
+                    media_type="text/event-stream"
+                )
         else:
-            # 获取AI模型
-            llm = llm_manager.get_model(provider=provider, model=model)
-
-            # 如果有文件，使用文件适配器准备请求
+            # 非流式响应处理
+            # 如果有文件
             if file_paths:
                 try:
                     # 准备带文件的请求
+                    file_adapter = get_file_adapter(provider)
                     file_request = file_adapter.prepare_file_for_request(file_paths, message)
 
                     # 调用LLM获取响应
-                    response = await self._call_provider_with_files(provider, file_request)
-                    ai_response = response.get("content", "无法处理文件请求")
+                    response = await self._call_provider_with_files(provider, model, file_request)
+                    ai_content = response.get("content", "无法处理文件请求")
                 except Exception as e:
                     logger.error(f"处理文件请求失败: {e}")
-                    ai_response = f"[process_message] 处理文件时出错: {str(e)}"
-            else:
-                # 启用推理模式
-                reasoning_response = None
-                if use_reasoning:
-                    try:
-                        reasoning_response = await self._call_with_reasoning(llm, messages)
-                        ai_response = reasoning_response["answer"]
-                    except Exception as e:
-                        logger.error(f"使用推理模式失败: {e}")
-                        reasoning_response = None
+                    ai_content = f"处理文件时出错: {str(e)}"
 
-                # 如果推理模式失败或未启用，使用正常调用
-                if reasoning_response is None:
-                    response = llm.invoke(messages)
-                    if hasattr(response, 'content'):  # ChatModel返回的响应
-                        ai_response = response.content
-                    else:  # 普通LLM返回的响应
-                        ai_response = response
-
-            # 记录AI响应消息
-            ai_message = Message(
-                role="assistant",
-                content=ai_response
-            )
-
-            # 如果有推理过程，记录下来
-            if use_reasoning and reasoning_response and "reasoning" in reasoning_response:
-                # 创建推理记录
-                reasoning_message = Message(
-                    role="reasoning",
-                    content=reasoning_response["reasoning"]
+                # 创建AI响应消息
+                ai_message = Message(
+                    role="assistant",
+                    content=ai_content
                 )
-                conversation.messages.append(reasoning_message)
+                conversation.messages.append(ai_message)
 
-            conversation.messages.append(ai_message)
-            conversation.updated_at = datetime.now()
+                # 更新并保存会话
+                conversation.updated_at = datetime.now()
+                self.memory_service.save_conversation(conversation)
 
-            # 保存到数据库
-            self.memory_service.save_conversation(conversation)
+                # 向量化消息
+                asyncio.create_task(self._vectorize_message_async(ai_message, conversation.id))
 
-            # 异步向量化消息
-            asyncio.create_task(self._vectorize_messages_async(
-                [user_message, ai_message],
-                conversation_id,
-                conversation
-            ))
+                # 返回响应
+                return ChatResponse(
+                    id=str(uuid.uuid4()),
+                    provider=provider,
+                    model=model,
+                    message=ai_message,
+                    conversation_id=conversation.id
+                )
 
-            # 构建并返回响应
-            response_data = ChatResponse(
-                id=str(uuid.uuid4()),
-                provider=provider,
-                model=model,
-                message=ai_message,
-                conversation_id=conversation.id
-            )
-
-            # 如果有推理过程，添加到响应中
-            if use_reasoning and reasoning_response and "reasoning" in reasoning_response:
-                response_data.reasoning = reasoning_response["reasoning"]
-
-            return response_data
-
-    async def generate_stream_response(self, provider, model, messages, conversation_id, file_paths=None,
-                                       use_reasoning=False):
-        """生成流式响应"""
-        llm = llm_manager.get_model(provider=provider, model=model)
-        full_response = ""
-        reasoning = ""
-        in_reasoning = False
-
-        async def stream_generator():
-            nonlocal full_response, reasoning, in_reasoning
-
-            # 如果有文件，使用文件适配器处理
-            if file_paths and len(file_paths) > 0:
+            # 如果启用推理模式
+            elif use_reasoning:
                 try:
-                    # 获取文件适配器
-                    file_adapter = get_file_adapter(provider)
-                    # 准备带文件的请求
-                    file_request = file_adapter.prepare_file_for_request(
-                        file_paths,
-                        messages[-1].content if messages else ""
+                    # 使用二阶段推理处理
+                    reasoning_result = await self.process_message_with_reasoning(
+                        provider=provider,
+                        model=model,
+                        message=message,
+                        conversation_id=conversation.id
                     )
 
-                    # 调用带文件的API
-                    response = await self._call_provider_with_files(provider, file_request)
-                    content = response.get("content", "")
+                    # 记录推理过程
+                    reasoning_message = Message(
+                        role="reasoning",
+                        content=reasoning_result["reasoning"]
+                    )
 
-                    # 返回完整响应
-                    full_response = content
-                    yield f"data: {json.dumps({'content': content, 'conversation_id': conversation_id})}\n\n"
-                    yield f"data: {json.dumps({'content': '[DONE]', 'conversation_id': conversation_id})}\n\n"
+                    # 记录最终答案
+                    ai_message = Message(
+                        role="assistant",
+                        content=reasoning_result["answer"]
+                    )
 
-                    # 流结束后，将完整响应保存到对话历史
-                    await self._save_stream_response(conversation_id, full_response)
-                    return
+                    # 添加到会话
+                    conversation.messages.append(reasoning_message)
+                    conversation.messages.append(ai_message)
+
+                    # 更新并保存会话
+                    conversation.updated_at = datetime.now()
+                    self.memory_service.save_conversation(conversation)
+
+                    # 向量化消息
+                    asyncio.create_task(self._vectorize_message_async(reasoning_message, conversation.id))
+                    asyncio.create_task(self._vectorize_message_async(ai_message, conversation.id))
+
+                    # 返回响应
+                    return ChatResponse(
+                        id=str(uuid.uuid4()),
+                        provider=provider,
+                        model=model,
+                        message=ai_message,
+                        conversation_id=conversation.id,
+                        reasoning=reasoning_result["reasoning"]
+                    )
+
                 except Exception as e:
-                    logger.error(f"[generate_stream_response] 处理文件流式响应失败: {e}")
-                    error_msg = f"处理文件时出错: {str(e)}"
-                    yield f"data: {json.dumps({'content': error_msg, 'conversation_id': conversation_id})}\n\n"
-                    yield f"data: {json.dumps({'content': '[DONE]', 'conversation_id': conversation_id})}\n\n"
+                    logger.error(f"推理模式处理失败: {e}")
+                    # 推理失败时继续使用常规模式
+                    use_reasoning = False
 
-                    # 保存错误信息到对话历史
-                    await self._save_stream_response(conversation_id, error_msg)
-                    return
+            # 常规模式（无推理，无文件）
+            if not use_reasoning:
+                try:
+                    # 获取AI模型
+                    llm = llm_manager.get_model(provider=provider, model=model)
 
-            # 如果启用推理模式，添加系统提示
-            if use_reasoning:
-                from langchain.schema import SystemMessage
-                reasoning_prompt = """请先进行思考，然后再回答问题。
+                    # 调用模型
+                    response = llm.invoke(messages)
+                    ai_content = response.content if hasattr(response, 'content') else response
 
-                步骤：
-                1. 首先理解问题
-                2. 分析可能的思路
-                3. 考虑不同角度
-                4. 得出结论
+                    # 创建AI响应消息
+                    ai_message = Message(
+                        role="assistant",
+                        content=ai_content
+                    )
 
-                先用【thinking】和【/thinking】标签包裹你的思考过程，然后用【answering】和【/answering】标签包裹你的最终答案。
-                """
-                full_messages = [SystemMessage(content=reasoning_prompt)] + messages
-            else:
-                full_messages = messages
+                    # 添加到会话
+                    conversation.messages.append(ai_message)
 
-            # 流式响应处理
-            for chunk in llm.stream(full_messages):
-                content = ""
-                if hasattr(chunk, 'content'):
-                    content = chunk.content
-                else:
-                    content = chunk
+                    # 更新并保存会话
+                    conversation.updated_at = datetime.now()
+                    self.memory_service.save_conversation(conversation)
 
-                if content:
-                    full_response += content
+                    # 向量化消息
+                    asyncio.create_task(self._vectorize_message_async(ai_message, conversation.id))
 
-                    # 处理推理内容
-                    if use_reasoning:
-                        # 检测是否处于推理部分
-                        if "【thinking】" in content and not in_reasoning:
-                            in_reasoning = True
-                            yield f"data: {json.dumps({'reasoning_start': True, 'conversation_id': conversation_id})}\n\n"
+                    # 返回响应
+                    return ChatResponse(
+                        id=str(uuid.uuid4()),
+                        provider=provider,
+                        model=model,
+                        message=ai_message,
+                        conversation_id=conversation.id
+                    )
 
-                        if in_reasoning:
-                            if "【/thinking】" in content:
-                                in_reasoning = False
-                                # 提取完整推理内容
-                                import re
-                                reasoning_match = re.search(r'【thinking】(.*?)【/thinking】', full_response, re.DOTALL)
-                                if reasoning_match:
-                                    reasoning = reasoning_match.group(1).strip()
-                                    yield f"data: {json.dumps({'reasoning': reasoning, 'reasoning_end': True, 'conversation_id': conversation_id})}\n\n"
-                            else:
-                                # 如果仍在推理中，发送推理内容
-                                yield f"data: {json.dumps({'reasoning_content': content, 'conversation_id': conversation_id})}\n\n"
-                        else:
-                            # 非推理内容发送正常响应
-                            # 检查是否有回答标签
-                            if "【answering】" in content:
-                                content = content.replace("【answering】", "")
-                            if "【/answering】" in content:
-                                content = content.replace("【/answering】", "")
-                            yield f"data: {json.dumps({'content': content, 'conversation_id': conversation_id})}\n\n"
-                    else:
-                        # 无推理模式，直接发送内容
-                        yield f"data: {json.dumps({'content': content, 'conversation_id': conversation_id})}\n\n"
+                except Exception as e:
+                    logger.error(f"常规模式处理失败: {e}")
+                    raise
 
-                    await asyncio.sleep(0.01)
+    async def process_message_with_reasoning(self, provider, model, message, conversation_id, options=None):
+        """使用双调用方式处理模型推理的消息"""
+        # 第一步：获取模型推理的过程 - 明确要求只返回推理的过程
+        reasoning_prompt = f"""请针对以下问题进行深入思考和分析，详细说明你的思考过程。仅提供思考过程，不要给出最终答案。
 
-            # 流结束后，将完整响应保存到对话历史
-            # 如果使用推理模式，需要处理推理内容和最终回答
-            if use_reasoning:
-                # 提取最终回答
-                import re
-                answer_match = re.search(r'【answering】(.*?)【/answering】', full_response, re.DOTALL)
-                if answer_match:
-                    final_answer = answer_match.group(1).strip()
-                else:
-                    # 如果没有明确的回答标记，尝试获取非推理部分
-                    content_without_reasoning = re.sub(r'【thinking】.*?【/thinking】', '', full_response, flags=re.DOTALL)
-                    final_answer = content_without_reasoning.strip()
-                    # 移除可能的回答标签
-                    final_answer = final_answer.replace("【answering】", "").replace("【/answering】", "").strip()
+        用户问题: {message}
 
-                # 保存推理和回答
-                await self._save_stream_response_with_reasoning(conversation_id, final_answer, reasoning)
-            else:
-                # 常规保存
-                await self._save_stream_response(conversation_id, full_response)
+        请详细分析这个问题，考虑各种角度和可能性。"""
 
-            yield f"data: {json.dumps({'content': '[DONE]', 'conversation_id': conversation_id})}\n\n"
+        # 推理调用
+        reasoning_llm = llm_manager.get_model(provider=provider, model=model)
+        reasoning_response = reasoning_llm.invoke([HumanMessage(content=reasoning_prompt)])
+        reasoning_content = reasoning_response.content if hasattr(reasoning_response, 'content') else reasoning_response
 
-        return StreamingResponse(
-            stream_generator(),
-            media_type="text/event-stream"
+        # 第二步：获取最终答案 - 使用推理结果作为上下文，但要求只返回答案
+        answer_prompt = f"""根据以下思考过程，请直接回答原始问题。仅提供答案，不要重复思考过程。
+
+        原始问题: {message}
+
+        思考过程: {reasoning_content}
+
+        基于以上思考，你的答案是:"""
+
+        # 答案调用
+        answer_llm = llm_manager.get_model(provider=provider, model=model)
+        answer_response = answer_llm.invoke([HumanMessage(content=answer_prompt)])
+        answer_content = answer_response.content if hasattr(answer_response, 'content') else answer_response
+
+        return {
+            "reasoning": reasoning_content.strip(),
+            "answer": answer_content.strip(),
+            "conversation_id": conversation_id
+        }
+
+    async def _generate_normal_stream(self, provider, model, messages, conversation_id):
+        """生成常规流式响应（无推理模式）"""
+        llm = llm_manager.get_model(provider=provider, model=model)
+        full_response = ""
+
+        # 流式响应处理
+        for chunk in llm.stream(messages):
+            content = chunk.content if hasattr(chunk, 'content') else chunk
+
+            if content:
+                full_response += content
+                yield f"data: {json.dumps({'content': content, 'conversation_id': conversation_id})}\n\n"
+                await asyncio.sleep(0.01)
+
+        # 流结束后，将完整响应保存到对话历史
+        await self._save_stream_response(conversation_id, full_response)
+        yield f"data: {json.dumps({'content': '[DONE]', 'conversation_id': conversation_id})}\n\n"
+
+    async def generate_stream_with_reasoning(self, provider, model, message, conversation_id, options=None):
+        """使用双阶段流式处理推理和回答"""
+
+        # 构造发送事件的辅助函数
+        async def send_event(event_type, content=None):
+            data = {"type": event_type, "conversation_id": conversation_id}
+            if content is not None:
+                data["content"] = content
+            return f"data: {json.dumps(data)}\n\n"
+
+        # 阶段1：先获取并流式输出推理过程
+        yield await send_event("reasoning_start")
+
+        reasoning_prompt = f"""请针对以下问题进行深入思考和分析，详细说明你的思考过程。仅提供思考过程，不要给出最终答案。
+        用户问题: {message}"""
+
+        reasoning_llm = llm_manager.get_model(provider=provider, model=model)
+        reasoning_result = ""
+
+        # 流式获取推理过程
+        for chunk in reasoning_llm.stream([HumanMessage(content=reasoning_prompt)]):
+            content = chunk.content if hasattr(chunk, 'content') else chunk
+            reasoning_result += content
+            yield await send_event("reasoning_content", content)
+
+        yield await send_event("reasoning_complete")
+
+        # 阶段2：再获取并流式输出最终答案
+        yield await send_event("answering_start")
+
+        answer_prompt = f"""根据以下思考过程，请直接回答原始问题。仅提供答案，不要重复思考过程。
+        原始问题: {message}
+        思考过程: {reasoning_result}
+        基于以上思考，你的答案是:"""
+
+        answer_llm = llm_manager.get_model(provider=provider, model=model)
+        answer_result = ""
+
+        # 流式获取最终答案
+        for chunk in answer_llm.stream([HumanMessage(content=answer_prompt)]):
+            content = chunk.content if hasattr(chunk, 'content') else chunk
+            answer_result += content
+            yield await send_event("answering_content", content)
+
+        # 完成所有处理
+        yield await send_event("answering_complete")
+
+        # 保存到数据库的最终结果
+        await self._save_stream_response_with_reasoning(
+            conversation_id=conversation_id,
+            response_text=answer_result,
+            reasoning_text=reasoning_result
         )
+
+        # 完成标志
+        yield await send_event("done")
 
     async def _save_stream_response_with_reasoning(self, conversation_id, response_text, reasoning_text):
         """保存流式响应和推理过程到对话历史"""
@@ -354,70 +395,9 @@ class ChatService:
         except Exception as e:
             logging.error(f"保存推理流式响应失败: {str(e)}")
 
-    async def _call_with_reasoning(self, llm, messages):
-        """使用推理模式调用模型获取思考过程和回答"""
-        try:
-            # 构建推理提示
-            reasoning_prompt = """请先进行思考，然后再回答问题。
-
-            步骤：
-            1. 首先理解问题
-            2. 分析可能的思路
-            3. 考虑不同角度
-            4. 得出结论
-
-            先用【thinking】和【/thinking】标签包裹你的思考过程，然后用【answering】和【/answering】标签包裹你的最终答案。
-            """
-
-            # 添加系统提示到消息列表开头
-            from langchain.schema import SystemMessage
-            system_message = SystemMessage(content=reasoning_prompt)
-            full_messages = [system_message] + messages
-
-            # 调用模型
-            response = llm.invoke(full_messages)
-            content = response.content if hasattr(response, 'content') else response
-
-            # 解析响应中的思考过程和回答
-            reasoning, answer = self._extract_reasoning_and_answer(content)
-
-            return {
-                "reasoning": reasoning,
-                "answer": answer
-            }
-        except Exception as e:
-            logger.error(f"推理模式调用失败: {e}")
-            raise
-
-    def _extract_reasoning_and_answer(self, content):
-        """从响应内容中提取思考过程和回答"""
-        import re
-
-        # 默认值，以防提取失败
-        reasoning = ""
-        answer = content
-
-        # 尝试提取思考部分
-        reasoning_match = re.search(r'【thinking】(.*?)【/thinking】', content, re.DOTALL)
-        if reasoning_match:
-            reasoning = reasoning_match.group(1).strip()
-
-        # 尝试提取回答部分
-        answer_match = re.search(r'【answering】(.*?)【/answering】', content, re.DOTALL)
-        if answer_match:
-            answer = answer_match.group(1).strip()
-        elif reasoning:
-            # 如果有思考但没有明确的回答标记，将非思考部分作为回答
-            content_without_reasoning = re.sub(r'【thinking】.*?【/thinking】', '', content, flags=re.DOTALL)
-            answer = content_without_reasoning.strip()
-
-        return reasoning, answer
-
     async def _call_provider_with_files(self, provider: str, model: str, file_request: Dict[str, Any]) -> Dict[
         str, Any]:
         """调用支持文件的模型API"""
-        # 这里需要根据不同模型实现具体的API调用
-        # 以下是一个示例实现框架
         try:
             if provider == "wenxin":
                 # 调用文心一言API
@@ -458,13 +438,14 @@ class ChatService:
 
                 # 保存到数据库
                 self.memory_service.save_conversation(conversation)
+
+                # 异步向量化消息
+                asyncio.create_task(self._vectorize_message_async(ai_message, conversation_id))
         except Exception as e:
             logging.error(f"保存流式响应失败: {str(e)}")
 
     def _prepare_chat_messages(self, chat_history):
         """准备发送给LLM的消息格式"""
-        from langchain.schema import HumanMessage, AIMessage, SystemMessage
-
         messages = []
         for msg in chat_history:
             if msg["role"] == "user":
@@ -475,6 +456,21 @@ class ChatService:
                 messages.append(SystemMessage(content=msg["content"]))
 
         return messages
+
+    async def _vectorize_message_async(self, message: Message, conversation_id: str):
+        """异步向量化单条消息"""
+        try:
+            self.vector_service.vectorize_message(message, conversation_id)
+        except Exception as e:
+            logging.error(f"异步向量化消息失败: {e}")
+
+    async def _vectorize_messages_async(self, messages: List[Message], conversation_id: str):
+        """异步向量化多条消息"""
+        try:
+            for message in messages:
+                await self._vectorize_message_async(message, conversation_id)
+        except Exception as e:
+            logging.error(f"异步向量化多条消息失败: {e}")
 
     def get_all_conversations(self) -> List[Conversation]:
         """获取所有对话"""
@@ -502,7 +498,6 @@ class ChatService:
             options: Optional[Dict[str, Any]] = None
     ) -> str:
         """生成与消息或会话相关的标题"""
-
         # 如果提供了会话ID，获取会话
         conversation = None
         if conversation_id:
@@ -540,7 +535,6 @@ class ChatService:
         try:
             # 获取AI模型并生成标题
             llm = llm_manager.get_default_model()
-            from langchain.schema import HumanMessage
             response = llm.invoke([HumanMessage(content=prompt)])
 
             if hasattr(response, 'content'):  # ChatModel返回的响应
@@ -575,22 +569,3 @@ class ChatService:
                 return f"对话 {conversation_id[:8]}..."
             else:
                 return "新对话"
-
-    async def _vectorize_message_async(self, message: Message, conversation_id: str):
-        """异步向量化单条消息"""
-        try:
-            self.vector_service.vectorize_message(message, conversation_id)
-        except Exception as e:
-            logging.error(f"异步向量化消息失败: {e}")
-
-    async def _vectorize_messages_async(self, messages: List[Message], conversation_id: str,
-                                        conversation: Optional[Conversation] = None):
-        """异步向量化多条消息和对话"""
-        try:
-            for message in messages:
-                self.vector_service.vectorize_message(message, conversation_id)
-
-            if conversation:
-                self.vector_service.vectorize_conversation(conversation)
-        except Exception as e:
-            logging.error(f"异步向量化失败: {e}")
