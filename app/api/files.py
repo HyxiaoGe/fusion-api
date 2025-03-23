@@ -11,6 +11,8 @@ router = APIRouter()
 
 @router.post("/upload")
 async def upload_files(
+        provider: str = Form(...),
+        model: str = Form(...),
         conversation_id: str = Form(...),
         files: List[UploadFile] = File(...),
         db: Session = Depends(get_db)
@@ -18,7 +20,7 @@ async def upload_files(
     """上传文件到指定对话"""
     try:
         file_service = FileService(db)
-        file_ids = await file_service.upload_files(files, conversation_id)
+        file_ids = await file_service.upload_files(files, conversation_id, provider, model)
         return {"status": "success", "file_ids": file_ids}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

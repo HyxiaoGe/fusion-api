@@ -118,7 +118,6 @@ class ChatService:
                     media_type="text/event-stream"
                 )
             else:
-                # 使用常规流式响应（无文件版）
                 return StreamingResponse(
                     self._generate_normal_stream(provider, model, messages, conversation.id),
                     media_type="text/event-stream"

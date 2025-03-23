@@ -38,7 +38,7 @@ class FileService:
         safe_filename = "".join(c for c in filename if c.isalnum() or c in "._- ")
         return safe_filename
 
-    async def upload_files(self, files: List[UploadFile], conversation_id: str) -> List[str]:
+    async def upload_files(self, files: List[UploadFile], conversation_id: str, provider: str, model: str) -> List[str]:
         """处理文件上传并关联到对话"""
         file_ids = []
 
@@ -50,7 +50,8 @@ class FileService:
                 id=conversation_id,
                 title="新会话",
                 messages=[],
-                model=settings.DEFAULT_MODEL,
+                provider=provider,
+                model=model,
                 created_at=datetime.now(),
                 updated_at=datetime.now()
             )
