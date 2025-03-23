@@ -460,7 +460,9 @@ class ChatService:
     async def _vectorize_message_async(self, message: Message, conversation_id: str):
         """异步向量化单条消息"""
         try:
-            self.vector_service.vectorize_message(message, conversation_id)
+            # 线程池执行CPU密集型向量化操作
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self.vector_service.vectorize_message, message, conversation_id)
         except Exception as e:
             logging.error(f"异步向量化消息失败: {e}")
 
