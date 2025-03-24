@@ -103,6 +103,54 @@ class ChatService:
         # 异步向量化用户消息
         asyncio.create_task(self._vectorize_message_async(user_message, conversation_id))
 
+        file_contents = {}
+        if file_ids and len(file_ids) > 0:
+            # 获取文件解析结果
+            file_contents = self.file_repo.get_parsed_file_content(file_ids)
+
+            # 检查是否所有文件都已解析
+            all_files_processed = True
+            for file_id in file_ids:
+                if file_id not in file_contents:
+                    all_files_processed = False
+                    file = self.file_repo.get_file_by_id(file_id)
+                    if file and file.status == "parsing":
+                        # 文件仍在解析中
+                        return ChatResponse(
+                            id=str(uuid.uuid4()),
+                            provider=provider,
+                            model=model,
+                            message=Message(
+                                role="assistant",
+                                content="文件正在解析中，请稍后再试..."
+                            ),
+                            conversation_id=conversation.id
+                        )
+                    elif file and file.status == "error":
+                        # 文件解析出错
+                        return ChatResponse(
+                            id=str(uuid.uuid4()),
+                            provider=provider,
+                            model=model,
+                            message=Message(
+                                role="assistant",
+                                content=f"文件处理出错: {file.processing_result.get('message', '未知错误')}"
+                            ),
+                            conversation_id=conversation.id
+                        )
+
+            # 如果有文件解析结果，增强用户消息
+            if file_contents:
+                # 将文件内容添加到消息中
+                file_content_text = "\n\n".join([
+                    f"文件内容 ({i + 1}):\n{content}"
+                    for i, content in enumerate(file_contents.values())
+                ])
+
+                enhanced_message = f"""用户问题: {message}\n\n参考以下文件内容:\n{file_content_text}"""
+                # 替换最后一条消息内容
+                messages[-1] = HumanMessage(content=enhanced_message)
+
         # 根据是否为流式响应分别处理
         if stream:
             # 如果启用推理模式，使用二阶段流式推理
@@ -112,6 +160,7 @@ class ChatService:
                         provider=provider,
                         model=model,
                         message=message,
+                        file_contents=file_contents,
                         conversation_id=conversation.id,
                         options=options
                     ),
@@ -250,14 +299,35 @@ class ChatService:
                     logger.error(f"常规模式处理失败: {e}")
                     raise
 
-    async def process_message_with_reasoning(self, provider, model, message, conversation_id, options=None):
-        """使用双调用方式处理模型推理的消息"""
-        # 第一步：获取模型推理的过程 - 明确要求只返回推理的过程
-        reasoning_prompt = f"""请针对以下问题进行深入思考和分析，详细说明你的思考过程。仅提供思考过程，不要给出最终答案。
+    async def process_message_with_reasoning(
+            self, provider, model, message, conversation_id,
+            options=None, file_contents=None
+    ):
+        """使用双调用方式处理模型推理的消息，支持文件内容"""
+        # 准备推理提示，如果有文件内容则包含文件内容
+        reasoning_base_prompt = "请针对以下问题进行深入思考和分析，详细说明你的思考过程。仅提供思考过程，不要给出最终答案。"
 
-        用户问题: {message}
+        if file_contents and len(file_contents) > 0:
+            # 整合文件内容
+            file_content_text = "\n\n".join([
+                f"文件内容 ({i + 1}):\n{content}"
+                for i, content in enumerate(file_contents.values())
+            ])
 
-        请详细分析这个问题，考虑各种角度和可能性。"""
+            reasoning_prompt = f"""{reasoning_base_prompt}
+
+            用户问题: {message}
+
+            参考以下文件内容:
+            {file_content_text}
+
+            请基于文件内容和用户问题，详细分析这个问题，考虑各种角度和可能性。"""
+        else:
+            reasoning_prompt = f"""{reasoning_base_prompt}
+
+            用户问题: {message}
+
+            请详细分析这个问题，考虑各种角度和可能性。"""
 
         # 推理调用
         reasoning_llm = llm_manager.get_model(provider=provider, model=model)
@@ -265,13 +335,26 @@ class ChatService:
         reasoning_content = reasoning_response.content if hasattr(reasoning_response, 'content') else reasoning_response
 
         # 第二步：获取最终答案 - 使用推理结果作为上下文，但要求只返回答案
-        answer_prompt = f"""根据以下思考过程，请直接回答原始问题。仅提供答案，不要重复思考过程。
+        answer_base_prompt = "根据以下思考过程，请直接回答原始问题。仅提供答案，不要重复思考过程。"
 
-        原始问题: {message}
+        if file_contents and len(file_contents) > 0:
+            answer_prompt = f"""{answer_base_prompt}
 
-        思考过程: {reasoning_content}
+            原始问题: {message}
 
-        基于以上思考，你的答案是:"""
+            参考文件内容: {file_content_text}
+
+            思考过程: {reasoning_content}
+
+            基于以上思考和文件内容，你的答案是:"""
+        else:
+            answer_prompt = f"""{answer_base_prompt}
+
+            原始问题: {message}
+
+            思考过程: {reasoning_content}
+
+            基于以上思考，你的答案是:"""
 
         # 答案调用
         answer_llm = llm_manager.get_model(provider=provider, model=model)
@@ -302,8 +385,11 @@ class ChatService:
         await self._save_stream_response(conversation_id, full_response)
         yield f"data: {json.dumps({'content': '[DONE]', 'conversation_id': conversation_id})}\n\n"
 
-    async def generate_stream_with_reasoning(self, provider, model, message, conversation_id, options=None):
-        """使用双阶段流式处理推理和回答"""
+    async def generate_stream_with_reasoning(
+            self, provider, model, message, conversation_id,
+            options=None, file_contents=None
+    ):
+        """使用双阶段流式处理推理和回答，支持文件内容"""
 
         # 构造发送事件的辅助函数
         async def send_event(event_type, content=None):
@@ -315,8 +401,21 @@ class ChatService:
         # 阶段1：先获取并流式输出推理过程
         yield await send_event("reasoning_start")
 
-        reasoning_prompt = f"""请针对以下问题进行深入思考和分析，详细说明你的思考过程。仅提供思考过程，不要给出最终答案。
-        用户问题: {message}"""
+        # 准备推理提示，加入文件内容
+        if file_contents and len(file_contents) > 0:
+            file_content_text = "\n\n".join([
+                f"文件内容 ({i + 1}):\n{content}"
+                for i, content in enumerate(file_contents.values())
+            ])
+
+            reasoning_prompt = f"""请针对以下问题进行深入思考和分析，详细说明你的思考过程。仅提供思考过程，不要给出最终答案。
+                用户问题: {message}
+
+                参考以下文件内容:
+                {file_content_text}"""
+        else:
+            reasoning_prompt = f"""请针对以下问题进行深入思考和分析，详细说明你的思考过程。仅提供思考过程，不要给出最终答案。
+                用户问题: {message}"""
 
         reasoning_llm = llm_manager.get_model(provider=provider, model=model)
         reasoning_result = ""
@@ -332,10 +431,28 @@ class ChatService:
         # 阶段2：再获取并流式输出最终答案
         yield await send_event("answering_start")
 
-        answer_prompt = f"""根据以下思考过程，请直接回答原始问题。仅提供答案，不要重复思考过程。
-        原始问题: {message}
-        思考过程: {reasoning_result}
-        基于以上思考，你的答案是:"""
+        # 准备回答提示，加入文件内容
+        if file_contents and len(file_contents) > 0:
+            file_content_text = "\n\n".join([
+                f"文件内容 ({i + 1}):\n{content}"
+                for i, content in enumerate(file_contents.values())
+            ])
+
+            answer_prompt = f"""根据以下思考过程，请直接回答原始问题。仅提供答案，不要重复思考过程。
+            原始问题: {message}
+
+            参考文件内容: {file_content_text}
+
+            思考过程: {reasoning_result}
+
+            基于以上思考和文件内容，你的答案是:"""
+        else:
+            answer_prompt = f"""根据以下思考过程，请直接回答原始问题。仅提供答案，不要重复思考过程。
+            原始问题: {message}
+
+            思考过程: {reasoning_result}
+
+            基于以上思考，你的答案是:"""
 
         answer_llm = llm_manager.get_model(provider=provider, model=model)
         answer_result = ""

@@ -36,6 +36,7 @@ class File(Base):
     path = Column(String, nullable=False)  # 存储路径
     status = Column(String, nullable=False, default="pending")  # 状态
     processing_result = Column(JSON, nullable=True)  # 处理结果
+    parsed_content = Column(Text, nullable=True)  # 解析后的内容
     created_at = Column(DateTime, default=get_china_time)
     updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
 

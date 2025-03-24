@@ -38,6 +38,17 @@ def get_conversation_files(
     files = file_service.get_conversation_files(conversation_id)
     return {"files": files}
 
+@router.get("/{file_id}/status")
+def get_file_status(
+        file_id: str,
+        db: Session = Depends(get_db)
+):
+    """获取文件处理状态"""
+    file_service = FileService(db)
+    file = file_service.get_file_status(file_id)
+    if not file:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return file
 
 @router.delete("/{file_id}")
 def delete_file(

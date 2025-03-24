@@ -1,3 +1,4 @@
+import asyncio
 import os
 import uuid
 from datetime import datetime
@@ -7,6 +8,7 @@ import aiofiles
 from fastapi import UploadFile
 from sqlalchemy.orm import Session
 
+from app.ai.adapters.file_adapters import get_file_adapter
 from app.core.config import settings
 from app.core.logger import app_logger as logger
 from app.db.repositories import FileRepository, ConversationRepository
@@ -46,6 +48,7 @@ class FileService:
         conversation = conv_repo.get_by_id(conversation_id)
 
         if not conversation:
+            model = model or settings.DEFAULT_MODEL
             temp_conversation = Conversation(
                 id=conversation_id,
                 title="新会话",
@@ -98,7 +101,7 @@ class FileService:
                     "mimetype": file.content_type,
                     "size": len(content),
                     "path": file_path,
-                    "status": "processed"
+                    "status": "parsing"  # 文件解析状态
                 }
 
                 # 保存到数据库
@@ -106,6 +109,17 @@ class FileService:
                 self.file_repo.link_file_to_conversation(conversation_id, file_id)
 
                 file_ids.append(file_id)
+
+                # 异步解析文件内容
+                asyncio.create_task(
+                    self._parse_file_with_llm(
+                        file_id=file_id,
+                        file_path=file_path,
+                        provider=provider,
+                        model=model
+                    )
+                )
+
                 logger.info(f"文件上传成功: {file_id}, 原始文件名: {file.filename}")
 
             except Exception as e:
@@ -116,6 +130,104 @@ class FileService:
                 raise
 
         return file_ids
+
+    async def _parse_file_with_llm(self, file_id: str, file_path: str, provider: str, model: str) -> None:
+        """使用LLM模型解析文件内容"""
+        try:
+            # 获取文件信息
+            file = self.file_repo.get_file_by_id(file_id)
+            if not file:
+                logger.warning(f"要解析的文件不存在: {file_id}")
+                return
+
+            # 根据文件类型准备提示词
+            prompt = self._get_file_parsing_prompt(file.mimetype, file.original_filename)
+
+            # 获取文件适配器
+            file_adapter = get_file_adapter(provider=provider)
+
+            # 准备文件解析请求
+            file_request = file_adapter.prepare_file_for_request([file_path], prompt)
+
+            # 调用LLM模型解析文件
+            from app.ai.llm_manager import llm_manager
+            response = await self._call_llm_with_file(provider, model, file_request)
+
+            # 获取解析结果
+            parsed_content = response.get("content", "无法解析文件内容")
+
+            # 更新文件状态和解析将结果
+            self.file_repo.update_file(
+                file_id = file_id,
+                update={
+                    "status": "processed",
+                    "parsed_content": parsed_content,
+                    "processing_result": {"status": "success", "timestamp": datetime.now().isoformat()}
+                }
+            )
+
+            logger.info(f"文件 {file_id} 解析成功")
+
+        except Exception as e:
+            logger.error(f"文件解析失败 {file_id}: {e}")
+            # 更新文件状态为错误
+            self.file_repo.update_file(
+                file_id=file_id,
+                updates={
+                    "status": "error",
+                    "processing_result": {"status": "error", "message": str(e)}
+                }
+            )
+
+    def _get_file_parsing_prompt(self, mimetype: str, filename: str) -> str:
+        """根据文件类型生成解析提示词"""
+        if mimetype.startswith("image/"):
+            return f"请详细描述这张图片的内容。图片文件名: {filename}"
+        elif mimetype == "application/pdf":
+            return f"请分析这个PDF文档(文件名:{filename})的内容并提供详细摘要。"
+        elif mimetype.startswith("text/"):
+            return f"请分析这个文本文件(文件名:{filename})的内容并提供详细摘要。"
+        else:
+            return f"请分析这个文件(文件名:{filename})的内容并提供详细摘要。"
+
+    async def _call_llm_with_file(self, provider: str, model: str, file_request: Dict[str, Any]) -> Dict[str, Any]:
+        """调用支持文件的模型API"""
+        # 这部分可以复用现有的文件处理API调用逻辑
+        # 或者直接调用ChatService的相关方法
+        from app.services.chat_service import ChatService
+        chat_service = ChatService(self.db)
+        return await chat_service._call_provider_with_files(provider, model, file_request)
+
+    def get_file_status(self, file_id: str) -> Dict[str, Any]:
+        """获取文件处理状态信息"""
+        try:
+            file = self.file_repo.get_file_by_id(file_id)
+            if not file:
+                return None
+
+            # 构建状态响应
+            return {
+                "id": file.id,
+                "status": file.status,  # pending, parsing, processed, error
+                "original_filename": file.original_filename,
+                "mimetype": file.mimetype,
+                "size": file.size,
+                "processing_result": file.processing_result,
+                "created_at": file.created_at.isoformat() if file.created_at else None,
+                "updated_at": file.updated_at.isoformat() if file.updated_at else None
+            }
+        except Exception as e:
+            logger.error(f"获取文件状态失败: {e}")
+            return None
+
+    def get_parsed_file_content(self, file_ids: List[str]) -> Dict[str, str]:
+        """获取文件的解析内容，用于后续对话"""
+        result = {}
+        for file_id in file_ids:
+            file = self.file_repo.get_file_by_id(file_id)
+            if file and file.status == "processed" and file.parsed_content:
+                result[file_id] = file.parsed_content
+        return result
 
     def get_conversation_files(self, conversation_id: str) -> List[Dict[str, Any]]:
         """获取对话关联的所有文件信息"""

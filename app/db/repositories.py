@@ -249,6 +249,17 @@ class FileRepository:
             logger.error(f"获取文件路径失败: {e}")
             return []
 
+    def update_file(self, file_id: str, updates: Dict[str, Any]) -> bool:
+        """更新文件信息"""
+        try:
+            result = self.db.query(File).filter(File.id == file_id).update(updates)
+            self.db.commit()
+            return result > 0
+        except Exception as e:
+            self.db.rollback()
+            logger.error(f"更新文件失败: {e}")
+            return False
+
     def delete_file(self, file_id: str) -> bool:
         """删除文件记录"""
         try:
