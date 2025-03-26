@@ -55,7 +55,7 @@ class QwenFileAdapter(FileDialogAdapter):
                 image_content = f.read()
                 # 通义千问支持base64编码的图片
                 base64_image = base64.b64encode(image_content).decode("utf-8")
-                images.append(base64_image)
+                images.append({"url": f"data:image/jpeg;base64,{base64_image}"})
 
         return {
             "message": message,

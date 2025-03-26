@@ -212,6 +212,29 @@ class FileRepository:
             logger.error(f"关联文件到对话失败: {e}")
             return False
 
+    def get_parsed_file_content(self, file_ids: List[str]) -> Dict[str, str]:
+        """获取多个文件的解析内容"""
+        try:
+            result = {}
+            if not file_ids:
+                return result
+
+            # 查询指定ID的所有已处理文件
+            files = self.db.query(File).filter(
+                File.id.in_(file_ids),
+                File.status == "processed"
+            ).all()
+
+            # 构建ID到内容的映射
+            for file in files:
+                if file.parsed_content:
+                    result[file.id] = file.parsed_content
+
+            return result
+        except Exception as e:
+            logger.error(f"获取文件解析内容失败: {e}")
+            return {}
+
     def get_conversation_files(self, conversation_id: str) -> List[ConversationFile]:
         """获取对话关联的所有文件"""
         try:
@@ -239,6 +262,14 @@ class FileRepository:
         except Exception as e:
             logger.error(f"获取文件失败: {e}")
             return None
+
+    def get_files_info(self, file_ids: List[str]) -> List[File]:
+        """获取多个文件的信息"""
+        try:
+            return self.db.query(File).filter(File.id.in_(file_ids)).all()
+        except Exception as e:
+            logger.error(f"获取文件信息失败: {e}")
+            return []
 
     def get_file_paths(self, file_ids: List[str]) -> List[str]:
         """获取多个文件的路径"""

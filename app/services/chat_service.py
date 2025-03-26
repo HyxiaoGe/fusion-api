@@ -9,10 +9,10 @@ from fastapi.responses import StreamingResponse
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from sqlalchemy.orm import Session
 
-from app.ai.adapters.file_adapters import get_file_adapter
 from app.ai.llm_manager import llm_manager
 from app.core.logger import app_logger as logger
 from app.db.repositories import FileRepository
+from app.processor.file_processor import FileProcessor
 from app.schemas.chat import ChatResponse, Message, Conversation
 from app.services.context_service import ContextEnhancer
 from app.services.memory_service import MemoryService
@@ -27,6 +27,7 @@ class ChatService:
         self.vector_service = VectorService.get_instance(db)
         self.context_enhancer = ContextEnhancer(db)
         self.file_repo = FileRepository(db)
+        self.file_processor = FileProcessor()
 
     async def process_message(
             self,
@@ -92,8 +93,14 @@ class ChatService:
                 logger.info("已应用增强提示")
 
         file_paths = []
+        file_mimetypes = []
         if file_ids and len(file_ids) > 0:
-            file_paths = self.file_repo.get_file_paths(file_ids)
+            # 获取文件信息
+            files_info = self.file_repo.get_files_info(file_ids)
+            for file_info in files_info:
+                if file_info and file_info.path:
+                    file_paths.append(file_info.path)
+                    file_mimetypes.append(file_info.mimetype)
             logger.info(f"处理带文件的请求, 文件数量: {len(file_paths)}")
 
         # 保存会话（先保存用户消息）
@@ -176,13 +183,14 @@ class ChatService:
             # 如果有文件
             if file_paths:
                 try:
-                    # 准备带文件的请求
-                    file_adapter = get_file_adapter(provider)
-                    file_request = file_adapter.prepare_file_for_request(file_paths, message)
+                    # 使用统一的文件处理器处理文件
+                    file_response = await self.file_processor.process_files(
+                        file_paths=file_paths,
+                        query=message,
+                        mimetypes=file_mimetypes
+                    )
 
-                    # 调用LLM获取响应
-                    response = await self._call_provider_with_files(provider, model, file_request)
-                    ai_content = response.get("content", "无法处理文件请求")
+                    ai_content = file_response.get("content", "无法处理文件请求")
                 except Exception as e:
                     logger.error(f"处理文件请求失败: {e}")
                     ai_content = f"处理文件时出错: {str(e)}"
@@ -510,34 +518,6 @@ class ChatService:
                 ))
         except Exception as e:
             logging.error(f"保存推理流式响应失败: {str(e)}")
-
-    async def _call_provider_with_files(self, provider: str, model: str, file_request: Dict[str, Any]) -> Dict[
-        str, Any]:
-        """调用支持文件的模型API"""
-        try:
-            if provider == "wenxin":
-                # 调用文心一言API
-                return await self._call_wenxin_with_files(file_request, model)
-            elif provider == "qwen":
-                # 调用通义千问API
-                return await self._call_qwen_with_files(file_request, model)
-            else:
-                # 不支持文件的模型
-                raise ValueError(f"模型 {provider} 不支持文件处理")
-        except Exception as e:
-            logger.error(f"调用带文件的模型API失败: {e}")
-            raise
-
-    # 具体的模型API调用实现
-    async def _call_wenxin_with_files(self, file_request: Dict[str, Any], model: str) -> Dict[str, Any]:
-        """调用文心一言的文件API"""
-        # 实际实现需要根据文心一言的API文档
-        pass
-
-    async def _call_qwen_with_files(self, file_request: Dict[str, Any], model: str) -> Dict[str, Any]:
-        """调用通义千问的文件API"""
-        # 实际实现需要根据通义千问的API文档
-        pass
 
     async def _save_stream_response(self, conversation_id, response_text):
         """保存流式响应到对话历史"""

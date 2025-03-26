@@ -8,10 +8,10 @@ import aiofiles
 from fastapi import UploadFile
 from sqlalchemy.orm import Session
 
-from app.ai.adapters.file_adapters import get_file_adapter
 from app.core.config import settings
 from app.core.logger import app_logger as logger
 from app.db.repositories import FileRepository, ConversationRepository
+from app.processor.file_processor import FileProcessor
 from app.schemas.chat import Conversation
 
 
@@ -24,6 +24,8 @@ class FileService:
         self.base_path = settings.FILE_STORAGE_PATH
         # 确保存储目录存在
         os.makedirs(self.base_path, exist_ok=True)
+        # 初始化文件处理器
+        self.file_processor = FileProcessor()
 
     def _validate_file(self, file: UploadFile) -> None:
         """验证文件类型和大小"""
@@ -101,7 +103,8 @@ class FileService:
                     "mimetype": file.content_type,
                     "size": len(content),
                     "path": file_path,
-                    "status": "parsing"  # 文件解析状态
+                    "status": "parsing",
+                    "processing_result": None
                 }
 
                 # 保存到数据库
@@ -114,9 +117,7 @@ class FileService:
                 asyncio.create_task(
                     self._parse_file_with_llm(
                         file_id=file_id,
-                        file_path=file_path,
-                        provider=provider,
-                        model=model
+                        file_path=file_path
                     )
                 )
 
@@ -131,7 +132,7 @@ class FileService:
 
         return file_ids
 
-    async def _parse_file_with_llm(self, file_id: str, file_path: str, provider: str, model: str) -> None:
+    async def _parse_file_with_llm(self, file_id: str, file_path: str) -> None:
         """使用LLM模型解析文件内容"""
         try:
             # 获取文件信息
@@ -140,26 +141,29 @@ class FileService:
                 logger.warning(f"要解析的文件不存在: {file_id}")
                 return
 
-            # 根据文件类型准备提示词
-            prompt = self._get_file_parsing_prompt(file.mimetype, file.original_filename)
+            # 更新文件状态为解析中
+            self.file_repo.update_file(
+                file_id=file_id,
+                updates={
+                    "status": "processed",
+                    "processing_result": {"status": "success", "timestamp": datetime.now().isoformat()}
+                }
+            )
 
-            # 获取文件适配器
-            file_adapter = get_file_adapter(provider=provider)
-
-            # 准备文件解析请求
-            file_request = file_adapter.prepare_file_for_request([file_path], prompt)
-
-            # 调用LLM模型解析文件
-            from app.ai.llm_manager import llm_manager
-            response = await self._call_llm_with_file(provider, model, file_request)
+            # 使用文件处理器解析文件
+            response = await self.file_processor.process_files(
+                file_paths=[file_path],
+                query=self._get_file_parsing_prompt(file.mimetype, file.original_filename),
+                mime_types=[file.mimetype]
+            )
 
             # 获取解析结果
             parsed_content = response.get("content", "无法解析文件内容")
 
-            # 更新文件状态和解析将结果
+            # 更新文件状态和解析结果
             self.file_repo.update_file(
-                file_id = file_id,
-                update={
+                file_id=file_id,
+                updates={
                     "status": "processed",
                     "parsed_content": parsed_content,
                     "processing_result": {"status": "success", "timestamp": datetime.now().isoformat()}
@@ -189,14 +193,6 @@ class FileService:
             return f"请分析这个文本文件(文件名:{filename})的内容并提供详细摘要。"
         else:
             return f"请分析这个文件(文件名:{filename})的内容并提供详细摘要。"
-
-    async def _call_llm_with_file(self, provider: str, model: str, file_request: Dict[str, Any]) -> Dict[str, Any]:
-        """调用支持文件的模型API"""
-        # 这部分可以复用现有的文件处理API调用逻辑
-        # 或者直接调用ChatService的相关方法
-        from app.services.chat_service import ChatService
-        chat_service = ChatService(self.db)
-        return await chat_service._call_provider_with_files(provider, model, file_request)
 
     def get_file_status(self, file_id: str) -> Dict[str, Any]:
         """获取文件处理状态信息"""
