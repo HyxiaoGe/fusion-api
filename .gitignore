@@ -9,3 +9,5 @@ logs
 chroma_db
 
 storage
+
+__pycache__
