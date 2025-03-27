@@ -12,6 +12,14 @@ class ChromaVectorStore:
     """增强版向量存储，使用Chroma服务并采用余弦相似度进行语义搜索"""
 
     def __init__(self):
+        if not settings.ENABLE_VECTOR_EMBEDDINGS:
+            logger.info("向量存储功能已禁用")
+            self.embedder = None
+            self.client = None
+            self.message_collection = None
+            self.conversation_collection = None
+            return
+
         self.embedder = TextEmbedder.get_instance()
 
         # 使用配置的Chroma服务URL

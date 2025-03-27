@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     DEEPSEEK_API_KEY: Optional[str] = None
     OPENAI_API_KEY: Optional[str] = None
 
+    ENABLE_VECTOR_EMBEDDINGS: bool = False
+
     CHROMA_URL: str = os.getenv("CHROMA_URL", "http://localhost:8001")
 
     # 模型配置

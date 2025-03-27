@@ -5,6 +5,8 @@ from typing import List
 import torch
 from langchain_huggingface import HuggingFaceEmbeddings
 
+from app.core.config import settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -27,6 +29,12 @@ class TextEmbedder:
     def __init__(self):
         if self._initialized:
             return
+
+        if not settings.ENABLE_VECTOR_EMBEDDINGS:
+            logger.info("向量嵌入功能已禁用")
+            self.embeddings = None
+            return
+
         try:
 
             # 检查GPU是否可用
@@ -47,6 +55,9 @@ class TextEmbedder:
 
     def embed_text(self, text: str) -> List[float]:
         """将单个文本转换为向量"""
+        if self.embeddings is None:
+            return []
+
         try:
             if not text or text.strip() == "":
                 logger.warning("尝试嵌入空文本")
