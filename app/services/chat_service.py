@@ -75,7 +75,8 @@ class ChatService:
         logger.info(f"是否使用推理模式: {use_reasoning}")
 
         # 应用上下文增强
-        use_enhancement = options.get("use_enhancement", True) if options else True
+        use_enhancement = False
+        # use_enhancement = options.get("use_enhancement", True) if options else True
         logger.info(f"是否使用上下文增强: {use_enhancement}")
 
         if use_enhancement:
@@ -555,12 +556,14 @@ class ChatService:
 
     async def _vectorize_message_async(self, message: Message, conversation_id: str):
         """异步向量化单条消息"""
-        try:
-            # 线程池执行CPU密集型向量化操作
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self.vector_service.vectorize_message, message, conversation_id)
-        except Exception as e:
-            logging.error(f"异步向量化消息失败: {e}")
+        # 为了提高回复速度，暂时关闭
+        return
+        # try:
+        #     # 线程池执行CPU密集型向量化操作
+        #     loop = asyncio.get_event_loop()
+        #     await loop.run_in_executor(None, self.vector_service.vectorize_message, message, conversation_id)
+        # except Exception as e:
+        #     logging.error(f"异步向量化消息失败: {e}")
 
     async def _vectorize_messages_async(self, messages: List[Message], conversation_id: str):
         """异步向量化多条消息"""
