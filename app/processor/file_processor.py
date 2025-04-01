@@ -1,10 +1,8 @@
+import asyncio
 import base64
-import os
 import io
+import os
 from typing import List, Optional, Any, Dict
-
-from langchain_community.chat_models import ChatTongyi
-from langchain_core.messages import HumanMessage
 
 from app.core.config import settings
 from app.core.logger import app_logger as logger
@@ -14,16 +12,17 @@ class FileProcessor:
     """文件处理器，统一使用千问视觉大模型来处理文件"""
 
     def __init__(self):
-        self.model = "qwen-vl-max-latest"
+        self.model = "qwen-omni-turbo"
 
-        # 初始化模型
         try:
-            self.llm = ChatTongyi(
-                model=self.model,
+            from openai import OpenAI
+            self.client = OpenAI(
                 api_key=settings.QWEN_API_KEY,
-                streaming=False
+                base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
             )
+            logger.info(f"通义千问视觉模型初始化成功: {self.model}")
         except Exception as e:
+            logger.error(f"初始化通义千问视觉模型失败: {e}")
             raise e
 
     async def process_files(
@@ -57,6 +56,7 @@ class FileProcessor:
             prompt = self._build_prompt(query, files_data)
             # 调用模型
             response = await self._call_model(prompt, files_data)
+            logger.info(f"处理文件成功: {response}")
 
             return {
                 "content": response,
@@ -117,7 +117,7 @@ class FileProcessor:
 
             elif mime_type in ["application/vnd.ms-excel",
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"] or file_path.endswith(
-                    (".xls", ".xlsx")):
+                (".xls", ".xlsx")):
                 # Excel文件
                 try:
                     import pandas as pd
@@ -147,7 +147,7 @@ class FileProcessor:
 
             elif mime_type in ["application/msword",
                                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"] or file_path.endswith(
-                    (".doc", ".docx", ".dot")):
+                (".doc", ".docx", ".dot")):
                 # Word文档
                 try:
                     import docx
@@ -215,30 +215,78 @@ class FileProcessor:
         return prompt
 
     async def _call_model(self, prompt: str, files_data: List[Dict[str, Any]]) -> str:
-        """调用千问视觉模型处理文件"""
+        """使用通义千问视觉模型处理文件"""
         try:
-            message_content = [{"type": "text", "text": prompt}]
+            # 构建消息内容
+            messages = [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": "你是一个专业的图像分析助手，请详细分析图片内容。"}]
+                }
+            ]
 
+            # 构建用户消息
+            user_content = []
+
+            # 添加图片
             for file in files_data:
-                # 只为图片类型的文件添加图片数据
                 if file["mime_type"].startswith("image/"):
-                    message_content.append({
+                    user_content.append({
                         "type": "image_url",
-                        "image_url": {"url": f"data:{file['mime_type']};base64,{file['content']}"}
+                        "image_url": {
+                            "url": f"data:{file['mime_type']};base64,{file['content']}"
+                        }
                     })
 
-            # 如果消息内容只有一个元素，直接使用文本内容
-            if len(message_content) == 1:
-                message = HumanMessage(content=prompt)
-            else:
-                # 否则只使用文本请求
-                message = HumanMessage(content=message_content)
+            # 添加文本提示
+            user_content.append({"type": "text", "text": prompt})
 
-            # 调用模型
+            # 添加完整的用户消息
+            messages.append({
+                "role": "user",
+                "content": user_content
+            })
+
             logger.info(f"正在调用千问视觉模型处理文件，提示长度: {len(prompt)}")
-            response = self.llm.invoke([message])
 
-            return response.content if hasattr(response, "content") else str(response)
+            # 调用API
+            stream_response = await asyncio.to_thread(
+                self.client.chat.completions.create,
+                model=self.model,
+                messages=messages,
+                stream=True,
+                stream_options={"include_usage": True},
+                modalities=["text"]  # 只需要文本输出
+            )
+
+            # 收集流式响应
+            full_response = ""
+
+            async def process_stream():
+                nonlocal full_response
+                try:
+                    # 迭代处理每个响应块
+                    for chunk in stream_response:
+                        if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
+                            delta = chunk.choices[0].delta
+                            if hasattr(delta, 'content') and delta.content:
+                                full_response += delta.content
+                except Exception as e:
+                    logger.error(f"处理流式响应时出错: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+
+            # 处理流式响应
+            await process_stream()
+
+            # 返回完整响应
+            if full_response:
+                logger.info(f"full_response: {full_response}")
+                return full_response
+            else:
+                logger.warning("流式API响应中没有找到有效内容")
+                return "无法处理图片，API返回为空"
+
         except Exception as e:
             logger.error(f"调用千问视觉模型失败: {e}")
             import traceback

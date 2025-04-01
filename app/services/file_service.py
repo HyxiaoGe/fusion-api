@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import uuid
 from datetime import datetime
@@ -159,6 +160,9 @@ class FileService:
 
             # 获取解析结果
             parsed_content = response.get("content", "无法解析文件内容")
+
+            if isinstance(parsed_content, (dict, list)):
+                parsed_content = json.dumps(parsed_content, ensure_ascii=False)
 
             # 更新文件状态和解析结果
             self.file_repo.update_file(
