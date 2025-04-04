@@ -74,6 +74,10 @@ class ChatService:
         use_reasoning = options.get("use_reasoning", True) if options else True
         logger.info(f"是否使用推理模式: {use_reasoning}")
 
+        # 判断是否为 Deepseek 的 deepseek-reasoner 模型
+        is_deepseek_reasoner = provider == "deepseek" and model == "deepseek-reasoner"
+        logger.info(f"是否为 Deepseek Reasoner 模型: {is_deepseek_reasoner}")
+
         # 应用上下文增强
         use_enhancement = False
         # use_enhancement = options.get("use_enhancement", True) if options else True
@@ -161,8 +165,14 @@ class ChatService:
 
         # 根据是否为流式响应分别处理
         if stream:
+            # 如果是 Deepseek Reasoner 模型，直接使用其内置的流式返回
+            if is_deepseek_reasoner:
+                return StreamingResponse(
+                    self._generate_deepseek_stream(provider, model, messages, conversation.id),
+                    media_type="text/event-stream"
+                )
             # 如果启用推理模式，使用二阶段流式推理
-            if use_reasoning:
+            elif use_reasoning:
                 return StreamingResponse(
                     self.generate_stream_with_reasoning(
                         provider=provider,
@@ -181,8 +191,58 @@ class ChatService:
                 )
         else:
             # 非流式响应处理
+            # 如果是 Deepseek Reasoner 模型，直接使用其内置的推理
+            if is_deepseek_reasoner:
+                try:
+                    # 获取AI模型
+                    llm = llm_manager.get_model(provider=provider, model=model)
+
+                    # 调用模型
+                    response = llm.invoke(messages)
+                    
+                    # 从响应中提取 reasoning_content 和 content
+                    reasoning_content = getattr(response, 'reasoning_content', '')
+                    ai_content = response.content if hasattr(response, 'content') else response
+
+                    # 记录推理过程
+                    reasoning_message = Message(
+                        role="reasoning",
+                        content=reasoning_content
+                    )
+
+                    # 记录最终答案
+                    ai_message = Message(
+                        role="assistant",
+                        content=ai_content
+                    )
+
+                    # 添加到会话
+                    conversation.messages.append(reasoning_message)
+                    conversation.messages.append(ai_message)
+
+                    # 更新并保存会话
+                    conversation.updated_at = datetime.now()
+                    self.memory_service.save_conversation(conversation)
+
+                    # 向量化消息
+                    asyncio.create_task(self._vectorize_message_async(reasoning_message, conversation.id))
+                    asyncio.create_task(self._vectorize_message_async(ai_message, conversation.id))
+
+                    # 返回响应
+                    return ChatResponse(
+                        id=str(uuid.uuid4()),
+                        provider=provider,
+                        model=model,
+                        message=ai_message,
+                        conversation_id=conversation.id,
+                        reasoning=reasoning_content
+                    )
+                except Exception as e:
+                    logger.error(f"Deepseek Reasoner 处理失败: {e}")
+                    raise
+
             # 如果有文件
-            if file_paths:
+            elif file_paths:
                 try:
                     # 使用统一的文件处理器处理文件
                     file_response = await self.file_processor.process_files(
@@ -544,13 +604,34 @@ class ChatService:
     def _prepare_chat_messages(self, chat_history):
         """准备发送给LLM的消息格式"""
         messages = []
+        last_role = None
+        
         for msg in chat_history:
-            if msg["role"] == "user":
+            current_role = msg["role"]
+            
+            # 如果是 Deepseek Reasoner 模型，跳过 reasoning 角色的消息
+            if current_role == "reasoning":
+                continue
+                
+            # 检查是否有连续的角色
+            if last_role and last_role == current_role:
+                # 如果是连续的用户消息，合并内容
+                if current_role == "user":
+                    messages[-1].content += "\n" + msg["content"]
+                    continue
+                # 如果是连续的助手消息，跳过
+                elif current_role == "assistant":
+                    continue
+            
+            # 添加消息
+            if current_role == "user":
                 messages.append(HumanMessage(content=msg["content"]))
-            elif msg["role"] == "assistant":
+            elif current_role == "assistant":
                 messages.append(AIMessage(content=msg["content"]))
-            elif msg["role"] == "system":
+            elif current_role == "system":
                 messages.append(SystemMessage(content=msg["content"]))
+            
+            last_role = current_role
 
         return messages
 
@@ -670,3 +751,54 @@ class ChatService:
                 return f"对话 {conversation_id[:8]}..."
             else:
                 return "新对话"
+
+    async def _generate_deepseek_stream(self, provider, model, messages, conversation_id):
+        """生成 Deepseek 的流式响应，直接使用其内置的推理和回答"""
+        logger.info(f"开始生成 Deepseek 流式响应: conversation_id={conversation_id}")
+        
+        # 构造发送事件的辅助函数
+        async def send_event(event_type, content=None):
+            data = {"type": event_type, "conversation_id": conversation_id}
+            if content is not None:
+                data["content"] = content
+            return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+        yield await send_event("reasoning_start")
+        
+        # 获取模型
+        llm = llm_manager.get_model(provider=provider, model=model)
+        reasoning_result = ""
+        answer_result = ""
+
+        # 流式获取响应，设置 reasoning_effort 为 "medium"
+        for chunk in llm.stream(messages, reasoning_effort="medium"):
+            # 打印调试信息
+            logger.info(f"收到chunk: {chunk}")
+            
+            # 处理思考过程
+            if hasattr(chunk, 'additional_kwargs') and 'reasoning_content' in chunk.additional_kwargs:
+                reasoning_content = chunk.additional_kwargs['reasoning_content']
+                if reasoning_content and reasoning_content.strip():
+                    reasoning_result += reasoning_content
+                    yield await send_event("reasoning_content", reasoning_content)
+                    logger.info(f"发送思考过程: {reasoning_content}")
+            
+            # 处理最终答案
+            content = chunk.content if hasattr(chunk, 'content') else chunk
+            if content and content.strip() and content != reasoning_result:
+                answer_result += content
+                yield await send_event("answering_content", content)
+                logger.info(f"发送最终答案: {content}")
+
+        yield await send_event("reasoning_complete")
+        yield await send_event("answering_complete")
+
+        # 保存到数据库的最终结果
+        await self._save_stream_response_with_reasoning(
+            conversation_id=conversation_id,
+            response_text=answer_result,
+            reasoning_text=reasoning_result
+        )
+
+        # 完成标志
+        yield await send_event("done")

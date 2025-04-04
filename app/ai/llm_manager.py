@@ -48,13 +48,14 @@ class LLMManager:
                         streaming=True,
                     )
                 elif provider == "deepseek":
-                    from langchain_openai import ChatOpenAI
-                    return ChatOpenAI(
-                        api_key=settings.DEEPSEEK_API_KEY,
-                        base_url="https://api.deepseek.com/v1",
+                    from langchain_deepseek import ChatDeepSeek
+                    return ChatDeepSeek(
                         model=model,
                         temperature=0.7,
-                        streaming=True,
+                        max_tokens=None,
+                        timeout=None,
+                        max_retries=2,
+                        streaming=True
                     )
 
             except Exception as e:
