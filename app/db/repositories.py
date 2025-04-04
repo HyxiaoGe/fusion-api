@@ -3,6 +3,7 @@ import uuid
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 
+from sqlalchemy import desc, func
 from sqlalchemy.orm import Session, joinedload
 
 from app.ai.llm_manager import get_model_display_name
@@ -10,6 +11,8 @@ from app.db.models import Conversation as ConversationModel, get_china_time, Fil
 from app.db.models import Message as MessageModel
 from app.db.models import PromptTemplate as PromptTemplateModel
 from app.db.models import Setting as SettingModel
+from app.db.models import HotTopic as HotTopicModel
+from app.db.models import ScheduledTask as ScheduledTaskModel
 from app.schemas.chat import Conversation, Message
 from app.schemas.prompts import PromptTemplate
 
@@ -301,6 +304,151 @@ class FileRepository:
             self.db.rollback()
             logger.error(f"删除文件失败: {e}")
             return False
+
+
+class HotTopicRepository:
+    """热点话题数据仓库"""
+    
+    def __init__(self, db: Session):
+        self.db = db
+        
+    def create(self, hot_topic: HotTopicModel) -> HotTopicModel:
+        """创建新的热点话题"""
+        try:
+            self.db.add(hot_topic)
+            self.db.commit()
+            self.db.refresh(hot_topic)
+            return hot_topic
+        except Exception as e:
+            self.db.rollback()
+            raise e
+            
+    def exists_by_url(self, url: str) -> bool:
+        """检查指定URL的热点是否已存在"""
+        if not url:
+            return False
+        return self.db.query(HotTopicModel).filter(HotTopicModel.url == url).first() is not None
+        
+    def get_hot_topics(self, category: Optional[str] = None, limit: int = 10) -> List[HotTopicModel]:
+        """获取热点话题列表，可按分类筛选"""
+        query = self.db.query(HotTopicModel)
+        
+        if category:
+            query = query.filter(HotTopicModel.category == category)
+            
+        # 先按浏览次数排序，再按发布时间排序
+        return query.order_by(desc(HotTopicModel.view_count), desc(HotTopicModel.published_at)).limit(limit).all()
+        
+    def get_topic_by_id(self, topic_id: str) -> Optional[HotTopicModel]:
+        """根据ID获取热点话题"""
+        return self.db.query(HotTopicModel).filter(HotTopicModel.id == topic_id).first()
+        
+    def delete_before_date(self, date: datetime) -> int:
+        """删除指定日期之前的热点话题"""
+        try:
+            result = self.db.query(HotTopicModel).filter(HotTopicModel.published_at < date).delete()
+            self.db.commit()
+            return result
+        except Exception as e:
+            self.db.rollback()
+            raise e
+            
+    def increment_view_count(self, topic_id: str) -> bool:
+        """增加热点的浏览计数"""
+        try:
+            topic = self.db.query(HotTopicModel).filter(HotTopicModel.id == topic_id).first()
+            if not topic:
+                return False
+                
+            topic.view_count += 1
+            self.db.commit()
+            return True
+        except Exception as e:
+            self.db.rollback()
+            return False
+
+
+class ScheduledTaskRepository:
+    """定时任务数据仓库"""
+    
+    def __init__(self, db: Session):
+        self.db = db
+        
+    def get_task_by_name(self, name: str) -> Optional[ScheduledTaskModel]:
+        """根据名称获取任务"""
+        return self.db.query(ScheduledTaskModel).filter(ScheduledTaskModel.name == name).first()
+        
+    def get_all_active_tasks(self) -> List[ScheduledTaskModel]:
+        """获取所有活跃的任务"""
+        return self.db.query(ScheduledTaskModel).filter(ScheduledTaskModel.status == "active").all()
+        
+    def create_task(self, task_data: Dict[str, Any]) -> ScheduledTaskModel:
+        """创建新任务"""
+        try:
+            task = ScheduledTaskModel(**task_data)
+            self.db.add(task)
+            self.db.commit()
+            self.db.refresh(task)
+            return task
+        except Exception as e:
+            self.db.rollback()
+            logger.error(f"创建定时任务失败: {e}")
+            raise
+            
+    def update_task(self, name: str, update_data: Dict[str, Any]) -> bool:
+        """更新任务信息"""
+        try:
+            task = self.get_task_by_name(name)
+            if not task:
+                return False
+                
+            for key, value in update_data.items():
+                if hasattr(task, key):
+                    setattr(task, key, value)
+                    
+            self.db.commit()
+            return True
+        except Exception as e:
+            self.db.rollback()
+            logger.error(f"更新定时任务失败: {e}")
+            return False
+            
+    def update_last_run(self, name: str, new_task_data: Optional[Dict] = None) -> bool:
+        """更新任务的最后执行时间和下次执行时间"""
+        try:
+            task = self.get_task_by_name(name)
+            if not task:
+                return False
+                
+            now = datetime.now()
+            task.last_run_at = now
+            
+            # 计算下次执行时间
+            if task.interval:
+                from datetime import timedelta
+                task.next_run_at = now + timedelta(seconds=task.interval)
+                
+            # 更新任务数据
+            if new_task_data is not None:
+                task.task_data = new_task_data
+                
+            self.db.commit()
+            return True
+        except Exception as e:
+            self.db.rollback()
+            logger.error(f"更新任务执行时间失败: {e}")
+            return False
+    
+    def should_run_task(self, name: str) -> bool:
+        """检查任务是否应该执行"""
+        task = self.get_task_by_name(name)
+        if not task or task.status != "active":
+            return False
+            
+        if not task.next_run_at:
+            return True
+            
+        return datetime.now() >= task.next_run_at
 
 
 class PromptTemplateRepository:

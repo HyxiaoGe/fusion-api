@@ -69,6 +69,39 @@ class Message(Base):
     conversation = relationship("Conversation", back_populates="messages")
 
 
+class HotTopic(Base):
+    __tablename__ = "hot_topics"
+    
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    title = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    source = Column(String, nullable=False)  # 来源，如"36氪"
+    category = Column(String, nullable=True)  # 分类，如"科技"、"财经"
+    url = Column(String, nullable=True)  # 原文链接
+    published_at = Column(DateTime, nullable=True)  # 发布时间
+    created_at = Column(DateTime, default=get_china_time)
+    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
+    view_count = Column(Integer, default=0)  # 浏览次数，用于排序
+
+
+class ScheduledTask(Base):
+    __tablename__ = "scheduled_tasks"
+    
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    name = Column(String, nullable=False, unique=True)  # 任务名称，如"rss_hot_topics_update"
+    description = Column(Text, nullable=True)  # 任务描述
+    status = Column(String, nullable=False, default="active")  # 任务状态：active, paused
+    interval = Column(Integer, nullable=False)  # 间隔时间（秒）
+    last_run_at = Column(DateTime, nullable=True)  # 上次执行时间
+    next_run_at = Column(DateTime, nullable=True)  # 下次执行时间
+    params = Column(JSON, nullable=True)  # 任务参数，以JSON格式存储
+    created_at = Column(DateTime, default=get_china_time)
+    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
+    
+    # 额外字段用于存储任务特定数据
+    task_data = Column(JSON, nullable=True)  # 如已处理的URL等
+
+
 class PromptTemplate(Base):
     __tablename__ = "prompt_templates"
 

@@ -1,11 +1,28 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 from app.core.config import settings
-from app.api import chat, settings as settings_api, prompts, search, files
+from app.api import chat, settings as settings_api, prompts, search, files, hot_topics, scheduled_tasks
 from app.core.logger import app_logger
 from app.db.init_db import init_db
 
-app = FastAPI(title=settings.APP_NAME, version=settings.APP_VERSION)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        app_logger.info("应用启动中...")
+        init_db()
+        app_logger.info("数据库初始化完成")
+
+        # 启动调度器
+        from app.services.scheduler_service import SchedulerService
+        scheduler = SchedulerService()
+        scheduler.start()
+        app_logger.info("调度器启动完成")
+        yield
+    except Exception as e:
+        app_logger.error(f"应用启动失败: {e}")
+
+app = FastAPI(title=settings.APP_NAME, version=settings.APP_VERSION, lifespan=lifespan)
 
 # 输出启动日志
 app_logger.info(f"正在启动 {settings.APP_NAME} v{settings.APP_VERSION}")
@@ -19,25 +36,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.on_event("startup")
-def startup_event():
-    try:
-        app_logger.info("应用启动中...")
-        init_db()
-        app_logger.info("数据库初始化完成")
-    except Exception as e:
-        app_logger.error(f"应用启动失败: {e}")
-
 # 注册路由
 app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 app.include_router(files.router, prefix="/api/files", tags=["files"])
 app.include_router(settings_api.router, prefix="/api/settings", tags=["settings"])
 app.include_router(prompts.router, prefix="/api/prompts", tags=["prompts"])
 app.include_router(search.router, prefix="/api/search", tags=["search"])
+app.include_router(hot_topics.router, prefix="/api/topics", tags=["topics"])
+app.include_router(scheduled_tasks.router, prefix="/api/scheduled-tasks", tags=["scheduled-tasks"])
 
 app_logger.info("所有路由已注册")
 
-# main.py 的 if __name__ == "__main__" 部分
 if __name__ == "__main__":
     import uvicorn
     app_logger.info("使用 uvicorn 启动服务器")

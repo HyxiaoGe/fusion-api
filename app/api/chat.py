@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -6,7 +6,6 @@ from sqlalchemy.orm import Session
 from app.db.database import get_db
 from app.schemas.chat import ChatRequest, Conversation, TitleGenerationRequest, TitleGenerationResponse
 from app.services.chat_service import ChatService
-
 router = APIRouter()
 
 
@@ -14,6 +13,21 @@ router = APIRouter()
 async def send_message(request: ChatRequest, db: Session = Depends(get_db)):
     """发送消息到指定的AI模型并获取响应"""
     print(f"收到聊天请求: conversation_id={request.conversation_id}")
+
+    if request.topic_id:
+        from app.services.hot_topic_service import HotTopicService
+        hot_topic_service = HotTopicService(db)
+        topic = hot_topic_service.get_topic_by_id(request.topic_id)
+        if topic:
+            # 构建包含话题信息的提示词
+            enhanced_message = f"请分析以下热点新闻:\n\n标题: {topic.title}\n\n"
+            if topic.description:
+                enhanced_message += f"简介: {topic.description}\n\n"
+            request.message = enhanced_message
+            print(f"增强的消息: {request.message}")
+            # 增加浏览计数
+            hot_topic_service.increment_view_count(request.topic_id)
+
     chat_service = ChatService(db)
     try:
         response = await chat_service.process_message(

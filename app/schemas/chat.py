@@ -20,6 +20,7 @@ class ChatRequest(BaseModel):
     model: str
     message: str
     conversation_id: Optional[str] = None
+    topic_id: Optional[str] = None
     stream: bool = False
     options: Optional[Dict[str, Any]] = None
     file_ids: Optional[List[str]] = None

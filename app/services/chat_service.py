@@ -710,6 +710,7 @@ class ChatService:
         2. 直接给出标题，不要包含引号或其他解释性文字
         3. 避免使用"关于"、"讨论"等过于宽泛的词语
         4. 标题应该明确反映对话的核心主题
+        5. 如果对话内容没有实质性内容，则直接返回原文
 
         对话内容：
         {message}"""
@@ -754,7 +755,6 @@ class ChatService:
 
     async def _generate_deepseek_stream(self, provider, model, messages, conversation_id):
         """生成 Deepseek 的流式响应，直接使用其内置的推理和回答"""
-        logger.info(f"开始生成 Deepseek 流式响应: conversation_id={conversation_id}")
         
         # 构造发送事件的辅助函数
         async def send_event(event_type, content=None):
@@ -772,8 +772,6 @@ class ChatService:
 
         # 流式获取响应，设置 reasoning_effort 为 "medium"
         for chunk in llm.stream(messages, reasoning_effort="medium"):
-            # 打印调试信息
-            logger.info(f"收到chunk: {chunk}")
             
             # 处理思考过程
             if hasattr(chunk, 'additional_kwargs') and 'reasoning_content' in chunk.additional_kwargs:
@@ -781,14 +779,12 @@ class ChatService:
                 if reasoning_content and reasoning_content.strip():
                     reasoning_result += reasoning_content
                     yield await send_event("reasoning_content", reasoning_content)
-                    logger.info(f"发送思考过程: {reasoning_content}")
             
             # 处理最终答案
             content = chunk.content if hasattr(chunk, 'content') else chunk
             if content and content.strip() and content != reasoning_result:
                 answer_result += content
                 yield await send_event("answering_content", content)
-                logger.info(f"发送最终答案: {content}")
 
         yield await send_event("reasoning_complete")
         yield await send_event("answering_complete")
