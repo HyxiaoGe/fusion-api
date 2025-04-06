@@ -7,7 +7,7 @@ class HotTopicResponse(BaseModel):
     title: str
     description: Optional[str] = None
     source: str
-    # category: Optional[str] = None
+    category: Optional[str] = None
     url: Optional[str] = None
     published_at: Optional[datetime] = None
     created_at: datetime

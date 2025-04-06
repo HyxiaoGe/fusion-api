@@ -79,7 +79,7 @@ class SchedulerService:
             import traceback
             logger.error(traceback.format_exc())
 
-async def _run_hot_topic_task(self, db: Session):
-    """执行热点话题更新任务"""
-    service = HotTopicService(db)
-    await service.update_hot_topics()
+    async def _run_hot_topic_task(self, db: Session):
+        """执行热点话题更新任务"""
+        service = HotTopicService(db)
+        await service.update_hot_topics(True)

@@ -128,7 +128,7 @@ class HotTopicService:
         self.task_repo.update_last_run(self.TASK_NAME, task_data)
                 
         # 清理过期数据
-        self._clean_expired_topics()
+        # self._clean_expired_topics()
         logger.info(f"热点话题数据更新完成，新增 {len(new_processed_urls)} 条")
 
         return len(new_processed_urls)
