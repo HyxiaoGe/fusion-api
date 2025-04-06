@@ -46,6 +46,7 @@ class LLMManager:
                         model=model,
                         temperature=0.7,
                         streaming=True,
+                        base_url=settings.OPENAI_PROXY_URL
                     )
                 elif provider == "deepseek":
                     from langchain_deepseek import ChatDeepSeek

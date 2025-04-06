@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     # CLAUDE_API_KEY: Optional[str] = None
     DEEPSEEK_API_KEY: Optional[str] = None
     OPENAI_API_KEY: Optional[str] = None
+    OPENAI_PROXY_URL: Optional[str] = None
 
     ENABLE_VECTOR_EMBEDDINGS: bool = False
 
