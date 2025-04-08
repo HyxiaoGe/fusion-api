@@ -17,7 +17,7 @@ from app.schemas.chat import ChatResponse, Message, Conversation
 from app.services.context_service import ContextEnhancer
 from app.services.memory_service import MemoryService
 from app.services.vector_service import VectorService
-
+from app.services.web_search_service import WebSearchService
 
 class ChatService:
     def __init__(self, db: Session):
@@ -72,11 +72,7 @@ class ChatService:
 
         # 判断是否启用推理模式
         use_reasoning = options.get("use_reasoning", True) if options else True
-        logger.info(f"是否使用推理模式: {use_reasoning}")
 
-        # 判断是否为 Deepseek 的 deepseek-reasoner 模型
-        is_deepseek_reasoner = provider == "deepseek" and model == "deepseek-reasoner"
-        logger.info(f"是否为 Deepseek Reasoner 模型: {is_deepseek_reasoner}")
 
         # 应用上下文增强
         use_enhancement = False
@@ -166,7 +162,7 @@ class ChatService:
         # 根据是否为流式响应分别处理
         if stream:
             # 如果是 Deepseek Reasoner 模型，直接使用其内置的流式返回
-            if is_deepseek_reasoner:
+            if provider == "deepseek" and model == "deepseek-reasoner":
                 return StreamingResponse(
                     self._generate_deepseek_stream(provider, model, messages, conversation.id),
                     media_type="text/event-stream"
@@ -192,7 +188,7 @@ class ChatService:
         else:
             # 非流式响应处理
             # 如果是 Deepseek Reasoner 模型，直接使用其内置的推理
-            if is_deepseek_reasoner:
+            if provider == "deepseek" and model == "deepseek-reasoner":
                 try:
                     # 获取AI模型
                     llm = llm_manager.get_model(provider=provider, model=model)
@@ -798,3 +794,60 @@ class ChatService:
 
         # 完成标志
         yield await send_event("done")
+
+    async def handle_function_calls(self, provider: str, model: str, message: str, conversation_id: str):
+        """处理函数调用"""
+
+        functions = [
+            {
+                "name": "web_search",
+                "description": "在互联网上搜索最新信息",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "搜索查询文本"},
+                        "limit": {"type": "integer", "description": "返回结果数量", "default": 5}
+                    },
+                    "required": ["query"]
+                }
+            }
+        ]
+
+        # 获取AI模型
+        llm = llm_manager.get_model(provider=provider, model=model)
+
+        # 调用模型，让其觉得是否需要调用函数
+        response = llm.invoke(
+            [HumanMessage(content=message)],
+            functions=functions
+        )
+
+        # 检查是否需要调用函数
+        function_call = response.additional_kwargs.get("function_call", None)
+
+        if function_call:
+            # 解析函数调用参数
+            function_name = function_call.get("name")
+            function_args = json.loads(function_call.get("arguments", "{}"))
+
+            # 处理web_search函数调用
+            if function_name == "web_search":
+                # 调用web_search服务
+                search_service = WebSearchService()
+                search_results = await search_service.search(
+                    function_args.get("query"),
+                    function_args.get("limit", 5)
+                )
+
+                # 将搜索结果返回给模型，让它生成最终回答
+                search_result_response = llm.invoke([
+                    HumanMessage(content=message),
+                    AIMessage(content=response.content),
+                    {"role": "function", "name": "web_search", "content": json.dumps(search_results)}
+                ])
+
+                return search_result_response.content
+
+        return response.content
+                
+            

@@ -337,7 +337,7 @@ class HotTopicRepository:
             query = query.filter(HotTopicModel.category == category)
             
         # 先按浏览次数排序，再按发布时间排序
-        return query.order_by(desc(HotTopicModel.view_count), desc(HotTopicModel.published_at)).limit(limit).all()
+        return query.order_by(desc(HotTopicModel.published_at)).limit(limit).all()
         
     def get_topic_by_id(self, topic_id: str) -> Optional[HotTopicModel]:
         """根据ID获取热点话题"""
