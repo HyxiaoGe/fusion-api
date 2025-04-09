@@ -483,6 +483,11 @@ class ChatService:
         llm = llm_manager.get_model(provider=provider, model=model)
         reasoning_result = ""
         answer_result = ""
+        
+        # 状态跟踪
+        in_reasoning_phase = True
+        reasoning_completed = False
+        answering_started = False
 
         # 根据不同模型准备参数
         stream_kwargs = {}
@@ -491,6 +496,8 @@ class ChatService:
         
         # 流式获取响应
         for chunk in llm.stream(messages, **stream_kwargs):
+            has_reasoning = False
+            has_answer = False
             
             # 处理思考过程
             if hasattr(chunk, 'additional_kwargs') and 'reasoning_content' in chunk.additional_kwargs:
@@ -498,6 +505,7 @@ class ChatService:
                 if reasoning_content and reasoning_content.strip():
                     reasoning_result += reasoning_content
                     yield await send_event("reasoning_content", reasoning_content)
+                    has_reasoning = True
             
             # 处理最终答案
             content = chunk.content if hasattr(chunk, 'content') else chunk
@@ -505,14 +513,42 @@ class ChatService:
             # Deepseek模型需要额外检查content不等于reasoning_result
             if provider == "deepseek" and model == "deepseek-reasoner":
                 if content and content.strip() and content != reasoning_result:
+                    # 如果推理阶段结束但还没发送完成信号
+                    if in_reasoning_phase and not reasoning_completed and not has_reasoning:
+                        in_reasoning_phase = False
+                        reasoning_completed = True
+                        yield await send_event("reasoning_complete")
+                    
+                    if not answering_started:
+                        answering_started = True
+                        yield await send_event("answering_start")
+                    
                     answer_result += content
                     yield await send_event("answering_content", content)
+                    has_answer = True
             else:
                 if content and content.strip():
+                    # 如果开始接收到答案内容，但还没有结束推理阶段
+                    if in_reasoning_phase and not reasoning_completed and not has_reasoning:
+                        in_reasoning_phase = False
+                        reasoning_completed = True
+                        yield await send_event("reasoning_complete")
+                    
+                    if not answering_started:
+                        answering_started = True
+                        yield await send_event("answering_start")
+                    
                     answer_result += content
                     yield await send_event("answering_content", content)
-
-        yield await send_event("reasoning_complete")
+                    has_answer = True
+        
+        # 确保所有阶段正确结束
+        if in_reasoning_phase and not reasoning_completed:
+            yield await send_event("reasoning_complete")
+        
+        if not answering_started:
+            yield await send_event("answering_start")
+        
         yield await send_event("answering_complete")
 
         # 保存到数据库的最终结果
