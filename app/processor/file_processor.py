@@ -17,7 +17,7 @@ class FileProcessor:
         try:
             from openai import OpenAI
             self.client = OpenAI(
-                api_key=settings.QWEN_API_KEY,
+                api_key=settings.DASHSCOPE_API_KEY,
                 base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
             )
             logger.info(f"通义千问视觉模型初始化成功: {self.model}")

@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     # API密钥配置
     WENXIN_API_KEY: Optional[str] = None
     WENXIN_SECRET_KEY: Optional[str] = None
-    QWEN_API_KEY: Optional[str] = None
+    DASHSCOPE_API_KEY: Optional[str] = None
     # CLAUDE_API_KEY: Optional[str] = None
     DEEPSEEK_API_KEY: Optional[str] = None
     OPENAI_API_KEY: Optional[str] = None

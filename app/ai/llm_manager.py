@@ -24,12 +24,22 @@ class LLMManager:
         if provider and model:
             try:
                 if provider == "qwen":
-                    from langchain_community.chat_models.tongyi import ChatTongyi
-                    return ChatTongyi(
-                        model=model,
-                        api_key=settings.QWEN_API_KEY,
-                        streaming=True,
-                    )
+                    if "qwq" in model.lower():
+                        from langchain_qwq import ChatQwQ
+                        return ChatQwQ(
+                            model=model,
+                            max_tokens=3_000,
+                            timeout=None,
+                            max_retries=2,
+                            streaming=True,
+                            api_base="https://dashscope.aliyuncs.com/compatible-mode/v1"
+                        )
+                    else:
+                        from langchain_community.chat_models.tongyi import ChatTongyi
+                        return ChatTongyi(
+                            model=model,
+                            streaming=True,
+                        )
                 elif provider == "wenxin":
                     from langchain_community.chat_models import QianfanChatEndpoint
                     return QianfanChatEndpoint(
@@ -71,12 +81,12 @@ class LLMManager:
         if self._default_model is not None:
             return self._default_model
 
-        if settings.QWEN_API_KEY:
+        if settings.DASHSCOPE_API_KEY:
             try:
                 from langchain_community.chat_models.tongyi import ChatTongyi
                 self._default_model = ChatTongyi(
                     model="qwen-max-0125",
-                    api_key=settings.QWEN_API_KEY,
+                    api_key=settings.DASHSCOPE_API_KEY,
                     streaming=True,
                 )
                 return self._default_model

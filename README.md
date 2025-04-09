@@ -49,7 +49,7 @@ DATABASE_URL=postgresql://fusion:fusion123!!@postgres:5432/fusion
 # API密钥
 WENXIN_API_KEY=你的文心一言API密钥
 WENXIN_SECRET_KEY=你的文心一言密钥
-QWEN_API_KEY=你的通义千问API密钥
+DASHSCOPE_API_KEY=你的通义千问API密钥
 DEEPSEEK_API_KEY=你的DeepSeek API密钥
 OPENAI_API_KEY=你的OpenAI API密钥
 
