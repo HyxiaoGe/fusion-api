@@ -45,10 +45,10 @@ class TextEmbedder:
                 logger.info("未检测到可用GPU，使用CPU进行文本嵌入")
 
             self.embeddings = HuggingFaceEmbeddings(
-                model_name="shibing624/text2vec-base-chinese",
+                model_name="sentence-transformers/multi-qa-MiniLM-L6-cos-v1",
                 model_kwargs={"device": device}
             )
-            logger.info("文本嵌入模型初始化成功")
+            logger.info("问答优化的文本嵌入模型初始化成功")
         except Exception as e:
             logger.error(f"文本嵌入模型初始化失败: {e}")
             raise

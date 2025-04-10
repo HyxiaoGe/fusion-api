@@ -3,7 +3,7 @@ from typing import List, Dict, Any, Optional
 
 from sqlalchemy.orm import Session
 
-from app.ai.vectorstores.chroma_store import ChromaVectorStore
+from app.ai.vectorstores.weaviate_store import WeaviateVectorStore
 from app.core.logger import app_logger as logger
 from app.schemas.chat import Conversation, Message
 
@@ -26,7 +26,7 @@ class VectorService:
 
     def __init__(self, db: Optional[Session] = None):
         self.db = db
-        self.vector_store = ChromaVectorStore()
+        self.vector_store = WeaviateVectorStore()
 
     def vectorize_message(self, message: Message, conversation_id: str) -> bool:
         """向量化单条消息"""
