@@ -79,12 +79,7 @@ class GeminiFactory:
     def create_model(self, model: str) -> Union[LLM, BaseChatModel]:
         from langchain_google_genai import ChatGoogleGenerativeAI
         return ChatGoogleGenerativeAI(
-            model=model,
-            temperature=0.7,
-            max_tokens=None,
-            timeout=None,
-            max_retries=2,
-            streaming=True
+            model=model
         )
 
 class AnthropicFactory:
@@ -99,20 +94,20 @@ class AnthropicFactory:
             api_key=settings.ANTHROPIC_API_KEY,
             base_url="https://api.anthropic.com/v1",
         )
-
-class GroqFactory:
+        
+class XFactory:
     def create_model(self, model: str) -> Union[LLM, BaseChatModel]:
-        from langchain_groq import ChatGroq
-        return ChatGroq(
-            model=model,
-            temperature=0.7,
+        from langchain_xai import ChatXAI
+
+        llm = ChatXAI(
+            model="grok-beta",
+            temperature=0,
             max_tokens=None,
-            timeout=None,
             max_retries=2,
-            streaming=True,
-            api_key=settings.GROQ_API_KEY,
-            base_url="https://api.groq.com/openai/v1",
+            xai_api_base=settings.XAI_API_BASE
         )
+
+
 
 class LLMManager:
     """管理不同LLM模型的工厂类"""
@@ -127,8 +122,7 @@ class LLMManager:
             "deepseek": DeepseekFactory(),
             "ollama": OllamaFactory(),
             "gemini": GeminiFactory(),
-            "anthropic": AnthropicFactory(),
-            "groq": GroqFactory(),
+            "anthropic": AnthropicFactory()
         }
 
     def get_model(self, provider: str = None, model: str = None) -> Union[LLM, BaseChatModel]:

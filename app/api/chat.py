@@ -24,7 +24,6 @@ async def send_message(request: ChatRequest, db: Session = Depends(get_db)):
             if topic.description:
                 enhanced_message += f"简介: {topic.description}\n\n"
             request.message = enhanced_message
-            print(f"增强的消息: {request.message}")
             # 增加浏览计数
             hot_topic_service.increment_view_count(request.topic_id)
 
