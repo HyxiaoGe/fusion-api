@@ -95,19 +95,17 @@ class AnthropicFactory:
             base_url="https://api.anthropic.com/v1",
         )
         
-class XFactory:
+class XAIFactory:
     def create_model(self, model: str) -> Union[LLM, BaseChatModel]:
         from langchain_xai import ChatXAI
 
-        llm = ChatXAI(
+        return ChatXAI(
             model="grok-beta",
             temperature=0,
             max_tokens=None,
             max_retries=2,
             xai_api_base=settings.XAI_API_BASE
         )
-
-
 
 class LLMManager:
     """管理不同LLM模型的工厂类"""
@@ -118,11 +116,10 @@ class LLMManager:
         self._factories: Dict[str, ModelFactory] = {
             "qwen": QwenFactory(),
             "wenxin": WenxinFactory(),
-            "openai": OpenAIFactory(),
             "deepseek": DeepseekFactory(),
-            "ollama": OllamaFactory(),
+            "openai": OpenAIFactory(),
             "gemini": GeminiFactory(),
-            "anthropic": AnthropicFactory()
+            "xai": XAIFactory()
         }
 
     def get_model(self, provider: str = None, model: str = None) -> Union[LLM, BaseChatModel]:
@@ -167,9 +164,10 @@ llm_manager = LLMManager()
 MODEL_DISPLAY_NAMES = {
     "qwen": "通义千问",
     "weixin": "文心一言",
-    "claude": "Claude",
     "deepseek": "Deepseek",
-    "openai": "OpenAI"
+    "openai": "OpenAI",
+    "gemini": "Gemini",
+    "xai": "XAI"
 }
 
 def get_model_display_name(model_code):
