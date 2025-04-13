@@ -1,5 +1,6 @@
 from typing import Union, Dict, Type, Protocol
 from abc import ABC, abstractmethod
+import os
 
 from langchain.chat_models.base import BaseChatModel
 from langchain.llms.base import LLM
@@ -15,6 +16,60 @@ class ModelFactory(Protocol):
     def create_model(self, model: str) -> Union[LLM, BaseChatModel]:
         """创建模型实例"""
         pass
+
+class AnthropicFactory:
+    def create_model(self, model: str) -> Union[LLM, BaseChatModel]:
+        from langchain_anthropic import ChatAnthropic
+        return ChatAnthropic(
+            model=model,
+            temperature=0,
+            max_tokens=1024,
+            timeout=None,
+            max_retries=2,
+            base_url=os.getenv("ANTHROPIC_API_BASE"),
+        )
+
+class DeepseekFactory:
+    def create_model(self, model: str) -> Union[LLM, BaseChatModel]:
+        from langchain_deepseek import ChatDeepSeek
+        return ChatDeepSeek(
+            model=model,
+            temperature=0.7,
+            max_tokens=None,
+            timeout=None,
+            max_retries=2,
+            streaming=True
+        )
+
+class GoogleFactory:
+    def create_model(self, model: str) -> Union[LLM, BaseChatModel]:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        return ChatGoogleGenerativeAI(
+            model=model,
+            temperature=0.7,
+            max_tokens=None,
+            timeout=None,
+            max_retries=2,
+            streaming=True
+        )
+
+class HunyuanFactory:
+    def create_model(self, model: str) -> Union[LLM, BaseChatModel]:
+        from langchain_community.chat_models.hunyuan import ChatHunyuan
+        return ChatHunyuan(
+            model=model,
+            streaming=True
+        )
+
+class OpenAIFactory:
+    def create_model(self, model: str) -> Union[LLM, BaseChatModel]:
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model=model,
+            temperature=0.7,
+            streaming=True,
+            base_url=os.getenv("OPENAI_BASE_URL")
+        ) 
 
 class QwenFactory:
     def create_model(self, model: str) -> Union[LLM, BaseChatModel]:
@@ -35,6 +90,20 @@ class QwenFactory:
                 streaming=True,
             )
 
+class VolcengineFactory:
+    def create_model(self, model: str) -> Union[LLM, BaseChatModel]:
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model=model,
+            temperature=0.7,
+            max_tokens=4000,
+            timeout=30,
+            max_retries=2,
+            streaming=True,
+            api_key=os.getenv("VOLCENGINE_API_KEY"),
+            base_url=os.getenv("VOLCENGINE_API_BASE")
+        )
+
 class WenxinFactory:
     def create_model(self, model: str) -> Union[LLM, BaseChatModel]:
         from langchain_community.chat_models import QianfanChatEndpoint
@@ -43,58 +112,7 @@ class WenxinFactory:
             streaming=True,
             timeout=60,
         )
-
-class OpenAIFactory:
-    def create_model(self, model: str) -> Union[LLM, BaseChatModel]:
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
-            model=model,
-            temperature=0.7,
-            streaming=True,
-            base_url=settings.OPENAI_PROXY_URL
-        )
-
-class DeepseekFactory:
-    def create_model(self, model: str) -> Union[LLM, BaseChatModel]:
-        from langchain_deepseek import ChatDeepSeek
-        return ChatDeepSeek(
-            model=model,
-            temperature=0.7,
-            max_tokens=None,
-            timeout=None,
-            max_retries=2,
-            streaming=True
-        )
-
-class OllamaFactory:
-    def create_model(self, model: str) -> Union[LLM, BaseChatModel]:
-        from langchain_ollama import ChatOllama
-        return ChatOllama(
-            model=model,
-            temperature=0.8,
-            num_predict=256,
-        )
-
-class GeminiFactory:
-    def create_model(self, model: str) -> Union[LLM, BaseChatModel]:
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        return ChatGoogleGenerativeAI(
-            model=model
-        )
-
-class AnthropicFactory:
-    def create_model(self, model: str) -> Union[LLM, BaseChatModel]:
-        from langchain_anthropic import ChatAnthropic
-        return ChatAnthropic(
-            model="claude-3-sonnet-20240229",
-            temperature=0,
-            max_tokens=1024,
-            timeout=None,
-            max_retries=2,
-            api_key=settings.ANTHROPIC_API_KEY,
-            base_url="https://api.anthropic.com/v1",
-        )
-        
+ 
 class XAIFactory:
     def create_model(self, model: str) -> Union[LLM, BaseChatModel]:
         from langchain_xai import ChatXAI
@@ -104,7 +122,7 @@ class XAIFactory:
             temperature=0,
             max_tokens=None,
             max_retries=2,
-            xai_api_base=settings.XAI_API_BASE
+            xai_api_base=os.getenv("XAI_API_BASE")
         )
 
 class LLMManager:
@@ -114,12 +132,15 @@ class LLMManager:
         self.models = {}
         self._default_model = None
         self._factories: Dict[str, ModelFactory] = {
-            "qwen": QwenFactory(),
-            "wenxin": WenxinFactory(),
+            "anthropic": AnthropicFactory(),
             "deepseek": DeepseekFactory(),
+            "google": GoogleFactory(),
+            "hunyuan": HunyuanFactory(),
             "openai": OpenAIFactory(),
-            "gemini": GeminiFactory(),
-            "xai": XAIFactory()
+            "qwen": QwenFactory(),
+            "volcengine": VolcengineFactory(),
+            "wenxin": WenxinFactory(),
+            "xai": XAIFactory(),
         }
 
     def get_model(self, provider: str = None, model: str = None) -> Union[LLM, BaseChatModel]:
@@ -144,17 +165,15 @@ class LLMManager:
         if self._default_model is not None:
             return self._default_model
 
-        if settings.DASHSCOPE_API_KEY:
-            try:
-                from langchain_community.chat_models.tongyi import ChatTongyi
-                self._default_model = ChatTongyi(
-                    model="qwen-max-0125",
-                    api_key=settings.DASHSCOPE_API_KEY,
-                    streaming=True,
-                )
-                return self._default_model
-            except Exception as e:
-                logger.error(f"默认通义千问模型初始化失败: {e}")
+        try:
+            from langchain_community.chat_models.tongyi import ChatTongyi
+            self._default_model = ChatTongyi(
+                model="qwen-max-0125",
+                streaming=True,
+            )
+            return self._default_model
+        except Exception as e:
+            logger.error(f"默认通义千问模型初始化失败: {e}")
 
         raise ValueError("无法创建默认模型。请检查API密钥配置。")
 
@@ -162,11 +181,14 @@ class LLMManager:
 llm_manager = LLMManager()
 
 MODEL_DISPLAY_NAMES = {
-    "qwen": "通义千问",
-    "weixin": "文心一言",
+    "anthropic": "Anthropic",
     "deepseek": "Deepseek",
+    "google": "Google",
+    "hunyuan": "混元",
     "openai": "OpenAI",
-    "gemini": "Gemini",
+    "qwen": "通义千问",
+    "volcengine": "火山引擎",
+    "weixin": "文心一言",
     "xai": "XAI"
 }
 

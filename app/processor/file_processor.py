@@ -4,7 +4,6 @@ import io
 import os
 from typing import List, Optional, Any, Dict
 
-from app.core.config import settings
 from app.core.logger import app_logger as logger
 
 
@@ -17,7 +16,7 @@ class FileProcessor:
         try:
             from openai import OpenAI
             self.client = OpenAI(
-                api_key=settings.DASHSCOPE_API_KEY,
+                api_key=os.getenv("DASHSCOPE_API_KEY"),
                 base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
             )
             logger.info(f"通义千问视觉模型初始化成功: {self.model}")
