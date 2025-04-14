@@ -5,13 +5,10 @@ from typing import List, Dict, Any, Optional
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
 from app.schemas.chat import Message, Conversation
-from app.services.vector_service import VectorService
-
 
 class MessageProcessor:
     def __init__(self, db):
         self.db = db
-        self.vector_service = VectorService.get_instance(db)
 
     def prepare_chat_messages(self, chat_history):
         """准备发送给LLM的消息格式"""
@@ -63,22 +60,3 @@ class MessageProcessor:
         messages[-1] = HumanMessage(content=enhanced_message)
         
         return messages
-
-    async def vectorize_message_async(self, message: Message, conversation_id: str):
-        """异步向量化单条消息"""
-        # 为了提高回复速度，暂时关闭
-        return
-        # try:
-        #     # 线程池执行CPU密集型向量化操作
-        #     loop = asyncio.get_event_loop()
-        #     await loop.run_in_executor(None, self.vector_service.vectorize_message, message, conversation_id)
-        # except Exception as e:
-        #     logging.error(f"异步向量化消息失败: {e}")
-
-    async def vectorize_messages_async(self, messages: List[Message], conversation_id: str):
-        """异步向量化多条消息"""
-        try:
-            for message in messages:
-                await self.vectorize_message_async(message, conversation_id)
-        except Exception as e:
-            logging.error(f"异步向量化多条消息失败: {e}") 

@@ -14,13 +14,11 @@ from app.core.logger import app_logger as logger
 from app.db.repositories import FileRepository
 from app.processor.file_processor import FileProcessor
 from app.schemas.chat import ChatResponse, Message, Conversation
-from app.services.context_service import ContextEnhancer
 from app.services.file_content_service import FileContentService
 from app.services.memory_service import MemoryService
 from app.services.message_processor import MessageProcessor
 from app.services.model_strategies import ModelStrategyFactory
 from app.services.stream_handler import StreamHandler
-from app.services.vector_service import VectorService
 from app.services.web_search_service import WebSearchService
 
 class ChatService:
@@ -28,8 +26,6 @@ class ChatService:
         self.db = db
         # 初始化各种服务
         self.memory_service = MemoryService(db)
-        self.vector_service = VectorService.get_instance(db)
-        self.context_enhancer = ContextEnhancer(db)
         self.file_processor = FileProcessor()
         
         self.message_processor = MessageProcessor(db)
@@ -62,15 +58,9 @@ class ChatService:
         # 从聊天历史中提取消息
         messages = self.message_processor.prepare_chat_messages(chat_history)
 
-        # 应用上下文增强
-        messages = await self._apply_context_enhancement(messages, message, conversation_id)
-
         # 保存会话（先保存用户消息）
         conversation.updated_at = datetime.now()
         self.memory_service.save_conversation(conversation)
-
-        # 异步向量化用户消息
-        asyncio.create_task(self.message_processor.vectorize_message_async(user_message, conversation_id))
 
         # 处理文件内容
         if file_ids and len(file_ids) > 0:
@@ -108,27 +98,6 @@ class ChatService:
             
         return conversation
 
-    async def _apply_context_enhancement(self, messages, message, conversation_id):
-        """应用上下文增强"""
-        use_enhancement = False
-        logger.info(f"是否使用上下文增强: {use_enhancement}")
-
-        if use_enhancement:
-            # 获取增强提示
-            enhancement = self.context_enhancer.enhance_prompt(
-                query=message,
-                conversation_id=conversation_id
-            )
-
-            logger.info(f"增强结果: has_enhancement={enhancement['has_enhancement']}")
-
-            if enhancement["has_enhancement"]:
-                # 如果有增强，用增强后的提示替换最后一条用户消息
-                messages[-1].content = enhancement["enhanced_prompt"]
-                logger.info("已应用增强提示")
-                
-        return messages
-
     async def _handle_stream_response(self, provider, model, messages, conversation_id):
         """处理流式响应"""
         # 使用支持推理的模型
@@ -159,8 +128,6 @@ class ChatService:
             # 如果有推理内容，添加到会话
             if reasoning_message:
                 conversation.messages.append(reasoning_message)
-                # 异步向量化推理消息
-                asyncio.create_task(self.message_processor.vectorize_message_async(reasoning_message, conversation.id))
             
             # 添加AI响应到会话
             conversation.messages.append(ai_message)
@@ -168,9 +135,6 @@ class ChatService:
             # 更新并保存会话
             conversation.updated_at = datetime.now()
             self.memory_service.save_conversation(conversation)
-            
-            # 异步向量化AI消息
-            asyncio.create_task(self.message_processor.vectorize_message_async(ai_message, conversation.id))
             
             # 返回响应
             reasoning_content = reasoning_message.content if reasoning_message else ""
@@ -197,8 +161,6 @@ class ChatService:
     def delete_conversation(self, conversation_id: str) -> bool:
         """删除特定对话"""
         try:
-            # 首先删除向量数据
-            self.vector_service.delete_conversation_vectors(conversation_id)
             # 然后删除数据库记录
             return self.memory_service.delete_conversation(conversation_id)
         except Exception as e:

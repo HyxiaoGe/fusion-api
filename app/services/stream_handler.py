@@ -48,9 +48,6 @@ class StreamHandler:
 
                 # 保存到数据库
                 self.memory_service.save_conversation(conversation)
-
-                # 异步向量化消息
-                asyncio.create_task(self.message_processor.vectorize_message_async(ai_message, conversation_id))
         except Exception as e:
             logging.error(f"保存流式响应失败: {str(e)}")
 
@@ -171,14 +168,5 @@ class StreamHandler:
 
                 # 保存到数据库
                 self.memory_service.save_conversation(conversation)
-
-                # 异步向量化消息
-                if reasoning_text:
-                    asyncio.create_task(self.message_processor.vectorize_message_async(
-                        reasoning_message, conversation_id
-                    ))
-                asyncio.create_task(self.message_processor.vectorize_message_async(
-                    ai_message, conversation_id
-                ))
         except Exception as e:
             logging.error(f"保存推理流式响应失败: {str(e)}") 
