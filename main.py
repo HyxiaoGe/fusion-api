@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.core.config import settings
-from app.api import chat, settings as settings_api, prompts, files, hot_topics, scheduled_tasks, web_search
+from app.api import chat, settings as settings_api, prompts, files, hot_topics, scheduled_tasks, web_search, models
 from app.core.logger import app_logger
 from app.db.init_db import init_db
 
@@ -44,6 +44,7 @@ app.include_router(prompts.router, prefix="/api/prompts", tags=["prompts"])
 app.include_router(hot_topics.router, prefix="/api/topics", tags=["topics"])
 app.include_router(scheduled_tasks.router, prefix="/api/scheduled-tasks", tags=["scheduled-tasks"])
 app.include_router(web_search.router, prefix="/api/web_search", tags=["web_search"])
+app.include_router(models.router, prefix="/api/models", tags=["models"])
 
 if __name__ == "__main__":
     import uvicorn

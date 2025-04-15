@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone, timedelta
 
-from sqlalchemy import Column, String, Integer, Text, ForeignKey, DateTime, JSON
+from sqlalchemy import Column, String, Integer, Text, ForeignKey, DateTime, JSON, Boolean, Float
 from sqlalchemy.orm import relationship
 
 from app.db.database import Base
@@ -118,4 +118,25 @@ class Setting(Base):
 
     key = Column(String, primary_key=True)
     value = Column(JSON, nullable=False)
+    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
+
+
+class ModelSource(Base):
+    """模型数据源表"""
+    __tablename__ = "model_sources"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    model_id = Column(String, unique=True, index=True, nullable=False)
+    name = Column(String, nullable=False)
+    provider = Column(String, nullable=False)
+    knowledge_cutoff = Column(String, nullable=True)
+    
+    # 存储为JSON字段
+    capabilities = Column(JSON, nullable=False, default={})
+    pricing = Column(JSON, nullable=False, default={})
+    
+    enabled = Column(Boolean, default=True)
+    description = Column(String, nullable=True)
+    
+    created_at = Column(DateTime, default=get_china_time)
     updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)

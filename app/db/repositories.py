@@ -13,8 +13,10 @@ from app.db.models import PromptTemplate as PromptTemplateModel
 from app.db.models import Setting as SettingModel
 from app.db.models import HotTopic as HotTopicModel
 from app.db.models import ScheduledTask as ScheduledTaskModel
+from app.db.models import ModelSource
 from app.schemas.chat import Conversation, Message
 from app.schemas.prompts import PromptTemplate
+from app.schemas.models import ModelInfo, ModelCapabilities, ModelPricing
 
 logger = logging.getLogger(__name__)
 
@@ -547,3 +549,97 @@ class SettingRepository:
             self.db.rollback()
             logger.error(f"设置值失败: {e}")
             return False
+
+
+class ModelSourceRepository:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def get_all(self) -> List[ModelSource]:
+        """获取所有模型数据源"""
+        return self.db.query(ModelSource).all()
+    
+    def get_by_id(self, model_id: str) -> Optional[ModelSource]:
+        """根据模型ID获取模型数据源"""
+        return self.db.query(ModelSource).filter(ModelSource.model_id == model_id).first()
+    
+    def get_by_provider(self, provider: str) -> List[ModelSource]:
+        """根据提供商获取模型数据源"""
+        return self.db.query(ModelSource).filter(ModelSource.provider == provider).all()
+    
+    def create(self, model_info: ModelInfo) -> ModelSource:
+        """创建新的模型数据源"""
+        now = get_china_time()
+        
+        # 将Pydantic模型转换为数据库模型
+        model_source = ModelSource(
+            model_id=model_info.modelId,
+            name=model_info.name,
+            provider=model_info.provider,
+            knowledge_cutoff=model_info.knowledgeCutoff,
+            capabilities=model_info.capabilities.dict(),
+            pricing=model_info.pricing.dict(),
+            enabled=model_info.enabled,
+            description=model_info.description,
+            created_at=now,
+            updated_at=now
+        )
+        
+        self.db.add(model_source)
+        self.db.commit()
+        self.db.refresh(model_source)
+        return model_source
+    
+    def update(self, model_id: str, model_info: Dict[str, Any]) -> Optional[ModelSource]:
+        """更新模型数据源"""
+        model_source = self.get_by_id(model_id)
+        if not model_source:
+            return None
+        
+        # 更新数据库模型的字段
+        if "name" in model_info:
+            model_source.name = model_info["name"]
+        if "provider" in model_info:
+            model_source.provider = model_info["provider"]
+        if "knowledgeCutoff" in model_info:
+            model_source.knowledge_cutoff = model_info["knowledgeCutoff"]
+        if "capabilities" in model_info:
+            model_source.capabilities = model_info["capabilities"]
+        if "pricing" in model_info:
+            model_source.pricing = model_info["pricing"]
+        if "enabled" in model_info:
+            model_source.enabled = model_info["enabled"]
+        if "description" in model_info:
+            model_source.description = model_info["description"]
+            
+        model_source.updated_at = get_china_time()
+        
+        self.db.commit()
+        self.db.refresh(model_source)
+        return model_source
+    
+    def delete(self, model_id: str) -> bool:
+        """删除模型数据源"""
+        model_source = self.get_by_id(model_id)
+        if not model_source:
+            return False
+        
+        self.db.delete(model_source)
+        self.db.commit()
+        return True
+    
+    def to_schema(self, model_source: ModelSource) -> ModelInfo:
+        """将数据库模型转换为Pydantic模型"""
+        capabilities = ModelCapabilities(**model_source.capabilities)
+        pricing = ModelPricing(**model_source.pricing)
+        
+        return ModelInfo(
+            modelId=model_source.model_id,
+            name=model_source.name,
+            provider=model_source.provider,
+            knowledgeCutoff=model_source.knowledge_cutoff,
+            capabilities=capabilities,
+            pricing=pricing,
+            enabled=model_source.enabled,
+            description=model_source.description
+        )
