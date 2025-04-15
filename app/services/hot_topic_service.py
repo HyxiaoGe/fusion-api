@@ -31,7 +31,17 @@ class HotTopicService:
                 "url": "https://rsshub.rssforever.com/36kr/motif/327686782977",
                 "name": "36氪创投",
                 "category": "AI"
-            }
+            },
+            {
+                "url": "https://feeds.feedburner.com/ruanyifeng",
+                "name": "科技爱好者周刊",
+                "category": "weekly"
+            },
+            {
+                "url": "https://www.ithome.com/rss/",
+                "name": "IT之家",
+                "category": "科技"
+            },
         ]
 
 

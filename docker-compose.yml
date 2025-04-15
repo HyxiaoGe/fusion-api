@@ -12,7 +12,8 @@ services:
       - ./logs:/app/logs
       - ~/.cache/huggingface:/root/.cache/huggingface
     environment:
-      - DATABASE_URL=postgresql://fusion:fusion123!!@39.108.189.204:5432/fusion?client_encoding=utf8
+      - DATABASE_URL=postgresql://fusion:fusion123!!@localhost:5432/fusion?client_encoding=utf8
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-}
       - SEARCH_API_KEY=${SEARCH_API_KEY:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - ANTHROPIC_API_BASE=${ANTHROPIC_API_BASE:-}
@@ -36,3 +37,20 @@ services:
         limits:
           cpus: '1'
           memory: 1024M
+
+  nginx:
+    image: nginx:latest
+    container_name: nginx_proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf
+    depends_on:
+      - app
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.3'
+          memory: 256M
