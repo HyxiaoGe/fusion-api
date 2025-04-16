@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone, timedelta
 
-from sqlalchemy import Column, String, Integer, Text, ForeignKey, DateTime, JSON, Boolean, Float
+from sqlalchemy import Column, String, Integer, Text, ForeignKey, DateTime, JSON, Boolean, Float, UniqueConstraint
 from sqlalchemy.orm import relationship
 
 from app.db.database import Base
@@ -131,12 +131,35 @@ class ModelSource(Base):
     provider = Column(String, nullable=False)
     knowledge_cutoff = Column(String, nullable=True)
     
-    # 存储为JSON字段
-    capabilities = Column(JSON, nullable=False, default={})
-    pricing = Column(JSON, nullable=False, default={})
+    capabilities = Column(JSON, nullable=False, default={}) # 模型能力配置
+    pricing = Column(JSON, nullable=False, default={}) # 模型定价信息
+    
+    auth_config = Column(JSON, nullable=False, default={})  # 认证配置模板
+    model_configuration = Column(JSON, nullable=False, default={})  # 模型默认参数配置
     
     enabled = Column(Boolean, default=True)
     description = Column(String, nullable=True)
     
     created_at = Column(DateTime, default=get_china_time)
     updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
+
+    credentials = relationship("ModelCredential", back_populates="model_source", cascade="all, delete-orphan")
+
+class ModelCredential(Base):
+    __tablename__ = "model_credentials"
+    
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    model_id = Column(String, ForeignKey("model_sources.model_id", ondelete="CASCADE"), nullable=False)
+    name = Column(String, nullable=False)  # 凭证名称，如"默认"、"测试环境"等
+    is_default = Column(Boolean, default=False)  # 是否为默认凭证
+    credentials = Column(JSON, nullable=False)  # 存储实际的认证信息
+    created_at = Column(DateTime, default=get_china_time)
+    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
+    
+    # 关联关系
+    model_source = relationship("ModelSource", back_populates="credentials")
+    
+    # 联合唯一约束
+    __table_args__ = (
+        UniqueConstraint('model_id', 'name', name='uix_model_credential_name'),
+    )

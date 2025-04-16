@@ -13,10 +13,10 @@ from app.db.models import PromptTemplate as PromptTemplateModel
 from app.db.models import Setting as SettingModel
 from app.db.models import HotTopic as HotTopicModel
 from app.db.models import ScheduledTask as ScheduledTaskModel
-from app.db.models import ModelSource
+from app.db.models import ModelSource, ModelCredential
 from app.schemas.chat import Conversation, Message
 from app.schemas.prompts import PromptTemplate
-from app.schemas.models import ModelInfo, ModelCapabilities, ModelPricing
+from app.schemas.models import ModelInfo, ModelCapabilities, ModelPricing, AuthConfig, ModelConfiguration, ModelConfigParam, ModelBasicInfo, AuthConfigField, ModelCredentialInfo
 
 logger = logging.getLogger(__name__)
 
@@ -555,32 +555,46 @@ class ModelSourceRepository:
     def __init__(self, db: Session):
         self.db = db
 
-    def get_all(self) -> List[ModelSource]:
-        """获取所有模型数据源"""
-        return self.db.query(ModelSource).all()
+    def get_all(self, 
+                provider: Optional[str] = None, 
+                enabled: Optional[bool] = None,
+                capability: Optional[str] = None) -> List[ModelSource]:
+        """获取所有模型数据源，支持筛选"""
+        query = self.db.query(ModelSource)
+        
+        # 应用筛选条件
+        if provider:
+            query = query.filter(ModelSource.provider == provider)
+        
+        if enabled is not None:
+            query = query.filter(ModelSource.enabled == enabled)
+            
+        if capability:
+            # JSON查询，需根据具体数据库类型调整
+            query = query.filter(ModelSource.capabilities[capability].as_boolean() == True)
+            
+        return query.all()
     
     def get_by_id(self, model_id: str) -> Optional[ModelSource]:
         """根据模型ID获取模型数据源"""
         return self.db.query(ModelSource).filter(ModelSource.model_id == model_id).first()
     
-    def get_by_provider(self, provider: str) -> List[ModelSource]:
-        """根据提供商获取模型数据源"""
-        return self.db.query(ModelSource).filter(ModelSource.provider == provider).all()
-    
-    def create(self, model_info: ModelInfo) -> ModelSource:
+    def create(self, model_data: Dict[str, Any]) -> ModelSource:
         """创建新的模型数据源"""
         now = get_china_time()
         
         # 将Pydantic模型转换为数据库模型
         model_source = ModelSource(
-            model_id=model_info.modelId,
-            name=model_info.name,
-            provider=model_info.provider,
-            knowledge_cutoff=model_info.knowledgeCutoff,
-            capabilities=model_info.capabilities.dict(),
-            pricing=model_info.pricing.dict(),
-            enabled=model_info.enabled,
-            description=model_info.description,
+            model_id=model_data.get("modelId"),
+            name=model_data.get("name"),
+            provider=model_data.get("provider"),
+            knowledge_cutoff=model_data.get("knowledgeCutoff"),
+            capabilities=model_data.get("capabilities"),
+            pricing=model_data.get("pricing"),
+            auth_config=model_data.get("auth_config"),
+            model_configuration=model_data.get("model_configuration"),
+            enabled=model_data.get("enabled", True),
+            description=model_data.get("description", ""),
             created_at=now,
             updated_at=now
         )
@@ -590,30 +604,30 @@ class ModelSourceRepository:
         self.db.refresh(model_source)
         return model_source
     
-    def update(self, model_id: str, model_info: Dict[str, Any]) -> Optional[ModelSource]:
+    def update(self, model_id: str, update_data: Dict[str, Any]) -> Optional[ModelSource]:
         """更新模型数据源"""
         model_source = self.get_by_id(model_id)
         if not model_source:
             return None
         
-        # 更新数据库模型的字段
-        if "name" in model_info:
-            model_source.name = model_info["name"]
-        if "provider" in model_info:
-            model_source.provider = model_info["provider"]
-        if "knowledgeCutoff" in model_info:
-            model_source.knowledge_cutoff = model_info["knowledgeCutoff"]
-        if "capabilities" in model_info:
-            model_source.capabilities = model_info["capabilities"]
-        if "pricing" in model_info:
-            model_source.pricing = model_info["pricing"]
-        if "enabled" in model_info:
-            model_source.enabled = model_info["enabled"]
-        if "description" in model_info:
-            model_source.description = model_info["description"]
-            
-        model_source.updated_at = get_china_time()
+        # 更新属性
+        for key, value in update_data.items():
+            # 转换键名格式
+            field_name = key
+            if key == "modelId":
+                field_name = "model_id"
+            elif key == "knowledgeCutoff":
+                field_name = "knowledge_cutoff"
+            elif key == "auth_config":
+                field_name = "auth_config"
+            elif key == "model_configuration":
+                field_name = "model_configuration"
+                
+            # 设置值
+            if hasattr(model_source, field_name):
+                setattr(model_source, field_name, value)
         
+        model_source.updated_at = get_china_time()
         self.db.commit()
         self.db.refresh(model_source)
         return model_source
@@ -628,10 +642,43 @@ class ModelSourceRepository:
         self.db.commit()
         return True
     
-    def to_schema(self, model_source: ModelSource) -> ModelInfo:
-        """将数据库模型转换为Pydantic模型"""
+    def to_basic_schema(self, model_source: ModelSource) -> ModelBasicInfo:
+        """将数据库模型转换为基础Pydantic模型"""
+        capabilities = ModelCapabilities(**model_source.capabilities)
+        
+        return ModelBasicInfo(
+            modelId=model_source.model_id,
+            name=model_source.name,
+            provider=model_source.provider,
+            knowledgeCutoff=model_source.knowledge_cutoff,
+            capabilities=capabilities,
+            enabled=model_source.enabled,
+            description=model_source.description
+        )
+        
+    def to_full_schema(self, model_source: ModelSource) -> ModelInfo:
+        """将数据库模型转换为完整Pydantic模型"""
         capabilities = ModelCapabilities(**model_source.capabilities)
         pricing = ModelPricing(**model_source.pricing)
+        
+        auth_config = None
+        if model_source.auth_config:
+            fields = []
+            for field_data in model_source.auth_config.get("fields", []):
+                fields.append(AuthConfigField(**field_data))
+            
+            auth_config = AuthConfig(
+                fields=fields,
+                auth_type=model_source.auth_config.get("auth_type", "api_key")
+            )
+        
+        model_configuration = None
+        if model_source.model_configuration:
+            params = []
+            for param_data in model_source.model_configuration.get("params", []):
+                params.append(ModelConfigParam(**param_data))
+            
+            model_configuration = ModelConfiguration(params=params)
         
         return ModelInfo(
             modelId=model_source.model_id,
@@ -640,6 +687,138 @@ class ModelSourceRepository:
             knowledgeCutoff=model_source.knowledge_cutoff,
             capabilities=capabilities,
             pricing=pricing,
+            auth_config=auth_config,
+            model_configuration=model_configuration,
             enabled=model_source.enabled,
             description=model_source.description
+        )
+    
+    def to_schema(self, model_source: ModelSource) -> ModelInfo:
+        """将数据库模型转换为Pydantic模型"""
+        capabilities = ModelCapabilities(**model_source.capabilities)
+        pricing = ModelPricing(**model_source.pricing)
+        
+        auth_config = None
+        if model_source.auth_config:
+            auth_config = AuthConfig(**model_source.auth_config)
+            
+        model_configuration = None
+        if model_source.model_configuration:
+            model_configuration = ModelConfiguration(**model_source.model_configuration)
+        
+        return ModelInfo(
+            modelId=model_source.model_id,
+            name=model_source.name,
+            provider=model_source.provider,
+            knowledgeCutoff=model_source.knowledge_cutoff,
+            capabilities=capabilities,
+            pricing=pricing,
+            auth_config=auth_config,
+            model_configuration=model_configuration,
+            enabled=model_source.enabled,
+            description=model_source.description
+        )
+
+class ModelCredentialRepository:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def get_all(self, model_id: Optional[str] = None) -> List[ModelCredential]:
+        """获取所有凭证或指定模型的凭证"""
+        query = self.db.query(ModelCredential)
+        if model_id:
+            query = query.filter(ModelCredential.model_id == model_id)
+        return query.all()
+    
+    def get_by_id(self, credential_id: int) -> Optional[ModelCredential]:
+        """根据ID获取凭证"""
+        return self.db.query(ModelCredential).filter(ModelCredential.id == credential_id).first()
+    
+    def get_default(self, model_id: str) -> Optional[ModelCredential]:
+        """获取模型的默认凭证"""
+        return self.db.query(ModelCredential).filter(
+            ModelCredential.model_id == model_id,
+            ModelCredential.is_default == True
+        ).first()
+    
+    def create(self, credential_data: Dict[str, Any]) -> ModelCredential:
+        """创建新的凭证"""
+        # 如果设置为默认凭证，先取消其他默认凭证
+        if credential_data.get('is_default', False):
+            self._reset_default_status(credential_data['model_id'])
+            
+        credential = ModelCredential(**credential_data)
+        self.db.add(credential)
+        self.db.commit()
+        self.db.refresh(credential)
+        return credential
+    
+    def update(self, credential_id: int, update_data: Dict[str, Any]) -> Optional[ModelCredential]:
+        """更新凭证"""
+        credential = self.get_by_id(credential_id)
+        if not credential:
+            return None
+            
+        # 如果设置为默认凭证，先取消其他默认凭证
+        if update_data.get('is_default', False) and not credential.is_default:
+            self._reset_default_status(credential.model_id)
+            
+        # 更新字段
+        for key, value in update_data.items():
+            if hasattr(credential, key):
+                setattr(credential, key, value)
+                
+        credential.updated_at = get_china_time()
+        self.db.commit()
+        self.db.refresh(credential)
+        return credential
+    
+    def delete(self, credential_id: int) -> bool:
+        """删除凭证"""
+        credential = self.get_by_id(credential_id)
+        if not credential:
+            return False
+            
+        # 如果是默认凭证，可能需要设置另一个凭证为默认
+        was_default = credential.is_default
+        model_id = credential.model_id
+        
+        self.db.delete(credential)
+        self.db.commit()
+        
+        # 如果删除的是默认凭证，尝试设置另一个为默认
+        if was_default:
+            self._set_new_default(model_id)
+            
+        return True
+    
+    def _reset_default_status(self, model_id: str) -> None:
+        """重置指定模型的所有凭证的默认状态"""
+        self.db.query(ModelCredential).filter(
+            ModelCredential.model_id == model_id,
+            ModelCredential.is_default == True
+        ).update({'is_default': False})
+        self.db.commit()
+    
+    def _set_new_default(self, model_id: str) -> None:
+        """设置一个新的默认凭证"""
+        # 获取第一个可用的凭证并设置为默认
+        credential = self.db.query(ModelCredential).filter(
+            ModelCredential.model_id == model_id
+        ).first()
+        
+        if credential:
+            credential.is_default = True
+            self.db.commit()
+    
+    def to_schema(self, credential: ModelCredential) -> ModelCredentialInfo:
+        """将数据库模型转换为Pydantic模型"""
+        return ModelCredentialInfo(
+            id=credential.id,
+            model_id=credential.model_id,
+            name=credential.name,
+            is_default=credential.is_default,
+            credentials=credential.credentials,
+            created_at=credential.created_at,
+            updated_at=credential.updated_at
         )
