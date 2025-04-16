@@ -52,6 +52,7 @@ class ModelBasicInfo(BaseModel):
     provider: str
     knowledgeCutoff: Optional[str] = None
     capabilities: ModelCapabilities
+    priority: int = 100  # 添加优先级字段，默认为100
     enabled: bool = True
     description: str = ""
 
@@ -80,6 +81,7 @@ class ModelUpdate(BaseModel):
     pricing: Optional[ModelPricing] = None
     auth_config: Optional[AuthConfig] = None
     model_configuration: Optional[ModelConfiguration] = None
+    priority: Optional[int] = None
     enabled: Optional[bool] = None
     description: Optional[str] = None
 

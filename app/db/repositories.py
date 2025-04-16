@@ -573,6 +573,9 @@ class ModelSourceRepository:
             # JSON查询，需根据具体数据库类型调整
             query = query.filter(ModelSource.capabilities[capability].as_boolean() == True)
             
+        # 按优先级排序，数字小的排前面
+        query = query.order_by(ModelSource.priority, ModelSource.name)
+            
         return query.all()
     
     def get_by_id(self, model_id: str) -> Optional[ModelSource]:
@@ -652,6 +655,7 @@ class ModelSourceRepository:
             provider=model_source.provider,
             knowledgeCutoff=model_source.knowledge_cutoff,
             capabilities=capabilities,
+            priority=model_source.priority,
             enabled=model_source.enabled,
             description=model_source.description
         )
@@ -689,6 +693,7 @@ class ModelSourceRepository:
             pricing=pricing,
             auth_config=auth_config,
             model_configuration=model_configuration,
+            priority=model_source.priority,
             enabled=model_source.enabled,
             description=model_source.description
         )

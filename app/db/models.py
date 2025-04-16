@@ -136,6 +136,7 @@ class ModelSource(Base):
     
     auth_config = Column(JSON, nullable=False, default={})  # 认证配置模板
     model_configuration = Column(JSON, nullable=False, default={})  # 模型默认参数配置
+    priority = Column(Integer, default=100)  # 优先级，默认100，数字越小优先级越高
     
     enabled = Column(Boolean, default=True)
     description = Column(String, nullable=True)
