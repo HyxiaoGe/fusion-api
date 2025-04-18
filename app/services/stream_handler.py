@@ -31,7 +31,9 @@ class StreamHandler:
 
         # 流结束后，将完整响应保存到对话历史
         await self.save_stream_response(conversation_id, full_response)
+        # 发送结束信号
         yield f"data: {json.dumps({'content': '[DONE]', 'conversation_id': conversation_id})}\n\n"
+        
 
     async def save_stream_response(self, conversation_id, response_text):
         """保存流式响应到对话历史"""

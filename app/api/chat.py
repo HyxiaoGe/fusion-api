@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
-from app.schemas.chat import ChatRequest, Conversation, TitleGenerationRequest, TitleGenerationResponse
+from app.schemas.chat import ChatRequest, Conversation, TitleGenerationRequest, TitleGenerationResponse, SuggestedQuestionsRequest, SuggestedQuestionsResponse
 from app.services.chat_service import ChatService
 router = APIRouter()
 
@@ -83,6 +83,22 @@ async def generate_title(request: TitleGenerationRequest, db: Session = Depends(
             options=request.options
         )
         return TitleGenerationResponse(title=title, conversation_id=request.conversation_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/suggest-questions", response_model=SuggestedQuestionsResponse)
+async def suggest_questions(request: SuggestedQuestionsRequest, db: Session = Depends(get_db)):
+    """基于对话内容生成推荐问题"""
+    chat_service = ChatService(db)
+    try:
+        questions = await chat_service.generate_suggested_questions(
+            conversation_id=request.conversation_id,
+            options=request.options
+        )
+        return SuggestedQuestionsResponse(questions=questions, conversation_id=request.conversation_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

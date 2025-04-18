@@ -34,7 +34,15 @@ class ChatResponse(BaseModel):
     conversation_id: str
     created_at: datetime = Field(default_factory=datetime.now)
     reasoning: Optional[str] = None
+    suggested_questions: Optional[List[str]] = None
 
+class SuggestedQuestionsRequest(BaseModel):
+    conversation_id: str
+    options: Optional[Dict[str, Any]] = None
+
+class SuggestedQuestionsResponse(BaseModel):
+    questions: List[str]
+    conversation_id: str
 
 class Conversation(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))

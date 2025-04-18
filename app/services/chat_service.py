@@ -271,7 +271,111 @@ class ChatService:
                 return f"对话 {conversation_id[:8]}..."
             else:
                 return "新对话"
-                
+
+    async def generate_suggested_questions(
+        self,
+        conversation_id: str,
+        latest_only: bool = True,
+        options: Optional[Dict[str, Any]] = None
+    ) -> List[str]:
+        """生成与当前对话轮次相关的推荐问题"""
+        # 获取会话
+        conversation = self.memory_service.get_conversation(conversation_id)
+        if not conversation:
+            raise ValueError(f"找不到会话ID: {conversation_id}")
+
+        # 准备对话内容 - 只取最近一轮对话(最新的用户问题和AI回答)
+        latest_user_msg = None
+        latest_ai_msg = None
+        
+        # 从后向前查找最近的用户消息和AI回答
+        for i in range(len(conversation.messages) - 1, -1, -1):
+            msg = conversation.messages[i]
+            if not latest_ai_msg and msg.role == "assistant":
+                latest_ai_msg = msg.content
+            elif not latest_user_msg and msg.role == "user":
+                latest_user_msg = msg.content
+            if latest_user_msg and latest_ai_msg:
+                break
+        
+        # 组合最近一轮对话
+        dialog_content = ""
+        if latest_user_msg:
+            dialog_content += f"用户: {latest_user_msg}\n"
+        if latest_ai_msg:
+            dialog_content += f"助手: {latest_ai_msg}"
+        
+        if not dialog_content:
+            # 如果没有对话内容，返回默认问题
+            return [
+                "有什么我可以帮您解答的问题吗？",
+                "您想了解更多哪方面的信息？",
+                "还有其他我能帮助您的事情吗？"
+            ]
+
+        # 准备给LLM的提示
+        prompt = f"""根据以下最近一轮对话内容，生成三个用户可能想问的后续问题，这些问题应该能够帮助用户进一步探索话题或获取更多相关信息。
+        要求：
+        1. 问题应该简洁、明确且与对话内容直接相关
+        2. 问题应该多样化，覆盖不同的相关方面
+        3. 问题应该格式清晰，以数字列表形式给出
+        4. 直接给出问题列表，不需要任何额外说明
+        5. 确保问题有实际价值，能够产生有意义的回答
+        6. 问题应该使用中文，语言自然流畅
+
+        对话内容：
+        {dialog_content}
+
+        请给出三个推荐问题（直接给出问题列表，无需其他解释）："""
+
+        try:
+            # 获取AI模型并生成问题
+            llm = llm_manager.get_default_model()
+            response = llm.invoke([HumanMessage(content=prompt)])
+
+            if hasattr(response, 'content'):  # ChatModel返回的响应
+                response_text = response.content
+            else:  # 普通LLM返回的响应
+                response_text = response
+
+            # 解析响应文本，提取问题
+            questions = self._parse_questions(response_text)
+            
+            return questions[:3]  # 确保只返回3个问题
+        except Exception as e:
+            logger.error(f"生成推荐问题时发生错误: {str(e)}")
+            # 如果生成失败，返回默认问题
+            return [
+                "您对这个主题还有其他问题吗？",
+                "您想了解更多相关信息吗？",
+                "您想要探讨这个话题的哪些方面？"
+            ]
+
+    def _parse_questions(self, response_text: str) -> List[str]:
+        """从响应文本中解析出问题列表"""
+        questions = []
+        
+        # 尝试不同的解析方法
+        # 1. 尝试按数字列表解析
+        import re
+        numbered_questions = re.findall(r'\d+[\.\)]\s*(.*?)(?=\n\d+[\.\)]|\n*$)', response_text, re.DOTALL)
+        if numbered_questions and len(numbered_questions) >= 3:
+            return [q.strip() for q in numbered_questions]
+        
+        # 2. 按行分割
+        lines = [line.strip() for line in response_text.split('\n') if line.strip()]
+        for line in lines:
+            # 移除行首的数字、点、括号等
+            cleaned_line = re.sub(r'^\d+[\.\)]\s*', '', line).strip()
+            if cleaned_line:
+                questions.append(cleaned_line)
+        
+        # 如果没有找到足够的问题，返回原始文本分成的前三行
+        if len(questions) < 3:
+            questions = lines[:3] if len(lines) >= 3 else lines
+        
+        return questions
+        
     async def handle_function_calls(self, provider: str, model: str, message: str, conversation_id: str):
         """处理函数调用"""
 

@@ -1,5 +1,3 @@
-# 创建新文件 app/api/credentials.py
-
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
