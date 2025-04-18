@@ -14,12 +14,13 @@ class FileProcessor:
         self.model = "qwen-omni-turbo"
 
         try:
-            from openai import OpenAI
-            self.client = OpenAI(
-                api_key=os.getenv("DASHSCOPE_API_KEY"),
-                base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
-            )
-            logger.info(f"通义千问视觉模型初始化成功: {self.model}")
+            pass
+            # from openai import OpenAI
+            # self.client = OpenAI(
+            #     api_key=os.getenv("DASHSCOPE_API_KEY"),
+            #     base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
+            # )
+            # logger.info(f"通义千问视觉模型初始化成功: {self.model}")
         except Exception as e:
             logger.error(f"初始化通义千问视觉模型失败: {e}")
             raise e

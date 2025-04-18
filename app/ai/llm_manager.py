@@ -195,9 +195,6 @@ class LLMManager:
     
     def _get_model_credentials(self, provider: str, model: str) -> Dict[str, Any]:
         """从数据库获取模型凭证"""
-        if not self.db:
-            # 如果未设置数据库，返回环境变量中的凭证（向后兼容）
-            return self._get_env_credentials(provider)
             
         try:
             # 从数据库获取凭证
@@ -206,42 +203,15 @@ class LLMManager:
             # 获取模型信息
             model_repo = ModelSourceRepository(self.db)
             model_source = model_repo.get_by_id(model)
-            
-            if not model_source:
-                # 模型不存在，返回环境变量中的凭证
-                return self._get_env_credentials(provider)
                 
             # 获取模型凭证
             cred_repo = ModelCredentialRepository(self.db)
             credential = cred_repo.get_default(model)
-            
-            if not credential:
-                # 凭证不存在，返回环境变量中的凭证
-                return self._get_env_credentials(provider)
                 
             return credential.credentials
         except Exception as e:
             logger.error(f"获取模型凭证失败: {e}")
-            # 出错时返回环境变量中的凭证
-            return self._get_env_credentials(provider)
-
-    def _get_env_credentials(self, provider: str) -> Dict[str, Any]:
-        """从环境变量获取凭证（向后兼容）"""
-        credentials = {}
-        
-        if provider == "anthropic":
-            credentials = {
-                "api_key": os.getenv("ANTHROPIC_API_KEY"),
-                "base_url": os.getenv("ANTHROPIC_API_BASE")
-            }
-        elif provider == "openai":
-            credentials = {
-                "api_key": os.getenv("OPENAI_API_KEY"),
-                "base_url": os.getenv("OPENAI_BASE_URL")
-            }
-        # ... 其他模型提供商的凭证
-            
-        return credentials
+            raise
 
     async def test_credentials(self, provider: str, credentials: Dict[str, Any]) -> bool:
         """测试凭证是否有效"""

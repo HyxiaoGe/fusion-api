@@ -181,18 +181,42 @@ class ChatService:
             if not conversation:
                 raise ValueError(f"找不到会话ID: {conversation_id}")
 
-            # 使用会话的消息作为输入
+            # 使用会话的最后一次对话（用户和助手的消息）作为输入
             if not message and conversation.messages:
-                # 获取前3条用户消息，提供更好的上下文
-                user_messages = []
-                for msg in conversation.messages:
-                    if msg.role == "user":
-                        user_messages.append(msg.content)
-                        if len(user_messages) >= 3:
-                            break
-
-                if user_messages:
-                    message = "\n".join(user_messages)
+                # 获取会话中最后的用户和助手消息
+                user_message = None
+                assistant_message = None
+                
+                # 从后向前查找最近的一组对话
+                for i in range(len(conversation.messages) - 1, -1, -1):
+                    msg = conversation.messages[i]
+                    if not assistant_message and msg.role == "assistant":
+                        assistant_message = msg.content
+                    if not user_message and msg.role == "user":
+                        user_message = msg.content
+                    if user_message and assistant_message:
+                        break
+                
+                # 组合用户和助手的消息
+                dialog_messages = []
+                if user_message:
+                    dialog_messages.append(f"用户: {user_message}")
+                if assistant_message:
+                    dialog_messages.append(f"助手: {assistant_message}")
+                
+                if dialog_messages:
+                    message = "\n".join(dialog_messages)
+                else:
+                    # 如果没有找到对话，回退到之前的逻辑
+                    user_messages = []
+                    for msg in conversation.messages:
+                        if msg.role == "user":
+                            user_messages.append(msg.content)
+                            if len(user_messages) >= 3:
+                                break
+                    
+                    if user_messages:
+                        message = "\n".join(user_messages)
 
         if not message:
             raise ValueError("必须提供消息内容或有效的会话ID")

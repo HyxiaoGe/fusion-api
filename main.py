@@ -5,6 +5,8 @@ from app.core.config import settings
 from app.api import chat, settings as settings_api, prompts, files, hot_topics, scheduled_tasks, web_search, models, credentials
 from app.core.logger import app_logger
 from app.db.init_db import init_db
+from app.db.database import SessionLocal
+from app.ai.llm_manager import llm_manager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -13,12 +15,20 @@ async def lifespan(app: FastAPI):
         init_db()
         app_logger.info("数据库初始化完成")
 
+        # 初始化LLM管理器的数据库连接
+        db = SessionLocal()
+        llm_manager.db = db
+        app_logger.info("LLM管理器数据库初始化完成")
+
         # 启动调度器
         from app.services.scheduler_service import SchedulerService
         scheduler = SchedulerService()
         scheduler.start()
         app_logger.info("调度器启动完成")
         yield
+        # 应用关闭时，关闭数据库连接
+        if llm_manager.db:
+            llm_manager.db.close()
     except Exception as e:
         app_logger.error(f"应用启动失败: {e}")
 
