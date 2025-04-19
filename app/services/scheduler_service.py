@@ -66,6 +66,7 @@ class SchedulerService:
             # 使用任务名称关联到相应的服务和方法
             task_handlers = {
                 HotTopicService.TASK_NAME: self._run_hot_topic_task,
+                HotTopicService.LOCAL_DOCS_TASK_NAME: self._run_local_docs_task,
             }
 
             # 查找对应的处理器
@@ -83,3 +84,8 @@ class SchedulerService:
         """执行热点话题更新任务"""
         service = HotTopicService(db)
         await service.update_hot_topics(True)
+
+    async def _run_local_docs_task(self, db: Session):
+        """执行本地文档更新任务"""
+        service = HotTopicService(db)
+        await service.update_local_docs(True)
