@@ -1,5 +1,6 @@
 import feedparser
 import asyncio
+import re
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Set
@@ -40,7 +41,10 @@ class HotTopicService:
             {
                 "url": "https://www.ithome.com/rss/",
                 "name": "IT之家",
-                "category": "科技"
+                "category": "科技",
+                "filter_apply": "title",
+                "filter_type": "include",
+                "filter_rule": "OpenAI|ChatGPT|Claude|GPT|Sora|AI|微软|谷歌|字节|千问|DeepSeek|腾讯|阿里|xAI|马斯克|Gemini|Anthropic|豆包|文心一言"
             },
         ]
 
@@ -65,6 +69,67 @@ class HotTopicService:
         except Exception as e:
             logger.error(f"初始化定时任务失败: {e}")
 
+    def _filter_entry(self, entry, filter_apply, filter_type, filter_rule):
+        """
+        根据筛选条件过滤RSS条目
+        
+        参数:
+            entry: RSS条目
+            filter_apply: 应用过滤的字段（title, description 或 link）
+            filter_type: 过滤类型（include, exclude, regex match, regex not match）
+            filter_rule: 过滤规则（关键词或正则表达式）
+            
+        返回:
+            bool: 条目是否通过过滤
+        """
+        if not filter_apply or not filter_type or not filter_rule:
+            return True
+            
+        # 根据filter_apply获取要筛选的文本
+        if filter_apply == 'title':
+            text = entry.title if hasattr(entry, "title") else ""
+        elif filter_apply == 'description':
+            if hasattr(entry, "description"):
+                text = entry.description
+            elif hasattr(entry, "summary"):
+                text = entry.summary
+            else:
+                text = ""
+        elif filter_apply == 'link':
+            text = entry.link if hasattr(entry, "link") else ""
+        elif filter_apply == 'article':
+            # 尝试获取文章内容
+            if hasattr(entry, "content") and entry.content:
+                if isinstance(entry.content, list) and entry.content:
+                    text = entry.content[0].value
+                else:
+                    text = str(entry.content)
+            elif hasattr(entry, "summary"):
+                text = entry.summary
+            elif hasattr(entry, "description"):
+                text = entry.description
+            else:
+                text = ""
+        else:
+            logger.warning(f"不支持的filter_apply类型: {filter_apply}")
+            return True
+            
+        # 根据filter_type进行过滤
+        try:
+            if filter_type == 'include':
+                return bool(re.search(filter_rule, text))
+            elif filter_type == 'exclude':
+                return not bool(re.search(filter_rule, text))
+            elif filter_type == 'regex match':
+                return bool(re.search(filter_rule, text))
+            elif filter_type == 'regex not match':
+                return not bool(re.search(filter_rule, text))
+            else:
+                logger.warning(f"不支持的filter_type类型: {filter_type}")
+                return True
+        except Exception as e:
+            logger.error(f"应用过滤规则时出错: {e}")
+            return True
 
     async def update_hot_topics(self, force: bool):
         """
@@ -180,6 +245,19 @@ class HotTopicService:
                 if self.repo.exists_by_url(link):
                     new_processed_urls.add(link)  # 标记为已处理
                     continue
+                
+                # 应用过滤规则
+                filter_apply = source.get("filter_apply")
+                filter_type = source.get("filter_type") 
+                filter_rule = source.get("filter_rule")
+                
+                if filter_apply and filter_type and filter_rule:
+                    if not self._filter_entry(entry, filter_apply, filter_type, filter_rule):
+                        logger.info(f"条目被过滤: {title}")
+                        new_processed_urls.add(link)  # 标记为已处理，避免重复处理
+                        continue
+                    else:
+                        logger.info(f"条目通过过滤: {title}")
                     
                 # 提取发布时间
                 published = None
