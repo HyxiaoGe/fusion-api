@@ -44,6 +44,10 @@ class ChatService:
             file_ids: Optional[List[str]] = None,
     ) -> Union[StreamingResponse, ChatResponse]:
         """处理用户消息并获取AI响应"""
+        # 初始化options
+        if options is None:
+            options = {}
+        
         # 获取或创建会话
         conversation = self._get_or_create_conversation(conversation_id, provider, model, message)
 
@@ -77,9 +81,9 @@ class ChatService:
 
         # 根据是否为流式响应分别处理
         if stream:
-            return await self._handle_stream_response(provider, model, messages, conversation.id)
+            return await self._handle_stream_response(provider, model, messages, conversation.id, options)
         else:
-            return await self._handle_normal_response(provider, model, messages, conversation.id)
+            return await self._handle_normal_response(provider, model, messages, conversation.id, options)
 
     def _get_or_create_conversation(self, conversation_id, provider, model, message):
         """获取或创建会话"""
@@ -99,14 +103,34 @@ class ChatService:
             
         return conversation
 
-    async def _handle_stream_response(self, provider, model, messages, conversation_id):
+    async def _handle_stream_response(self, provider, model, messages, conversation_id, options=None):
         """处理流式响应"""
-        # 使用支持推理的模型
-        if (provider == "deepseek" and model == "deepseek-reasoner") or (provider == "qwen" and "qwq" in model.lower()):
+        # 默认options
+        if options is None:
+            options = {}
+            
+        # 判断是否使用推理模式
+        use_reasoning = options.get("use_reasoning", False)
+        
+        # 火山引擎特殊处理 - 直接使用OpenAI客户端访问API
+        if provider == "volcengine":
+            return StreamingResponse(
+                self.stream_handler.direct_reasoning_stream(provider, model, messages, conversation_id),
+                media_type="text/event-stream"
+            )
+            # 根据模型名称判断使用推理模式（向后兼容）
+        elif provider in ("deepseek", "qwen") and use_reasoning:
             return StreamingResponse(
                 self.stream_handler.generate_reasoning_stream(provider, model, messages, conversation_id),
                 media_type="text/event-stream"
             )
+        # 根据options判断使用推理模式
+        elif use_reasoning:
+            return StreamingResponse(
+                self.stream_handler.generate_reasoning_stream(provider, model, messages, conversation_id),
+                media_type="text/event-stream"
+            )
+        
         # 默认使用常规流式响应
         else:
             return StreamingResponse(
@@ -114,14 +138,18 @@ class ChatService:
                 media_type="text/event-stream"
             )
 
-    async def _handle_normal_response(self, provider, model, messages, conversation_id):
+    async def _handle_normal_response(self, provider, model, messages, conversation_id, options=None):
         """处理非流式响应"""
+        # 默认options
+        if options is None:
+            options = {}
+        
         # 获取适合的模型处理策略
-        strategy = ModelStrategyFactory.get_strategy(provider, model)
+        strategy = ModelStrategyFactory.get_strategy(provider, model, options)
         
         try:
             # 使用策略处理请求
-            ai_message, reasoning_message = await strategy.process(provider, model, messages, conversation_id, self.memory_service)
+            ai_message, reasoning_message = await strategy.process(provider, model, messages, conversation_id, self.memory_service, options)
             
             # 获取会话
             conversation = self.memory_service.get_conversation(conversation_id)

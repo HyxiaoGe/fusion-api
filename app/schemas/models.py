@@ -4,9 +4,11 @@ from datetime import datetime
 
 class ModelCapabilities(BaseModel):
     """模型能力配置"""
-    vision: bool = False
+    imageGen: bool = False
     deepThinking: bool = False
     fileSupport: bool = False
+    functionCalling: bool = False
+    webSearch: bool = False
 
 
 class ModelPricing(BaseModel):

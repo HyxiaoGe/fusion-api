@@ -9,7 +9,7 @@ class ModelStrategy(ABC):
     """模型处理策略的抽象基类"""
     
     @abstractmethod
-    async def process(self, provider, model, messages, conversation_id, memory_service):
+    async def process(self, provider, model, messages, conversation_id, memory_service, options=None):
         """处理请求并返回响应"""
         pass
 
@@ -17,7 +17,10 @@ class ModelStrategy(ABC):
 class NormalModelStrategy(ModelStrategy):
     """普通模型处理策略"""
     
-    async def process(self, provider, model, messages, conversation_id, memory_service):
+    async def process(self, provider, model, messages, conversation_id, memory_service, options=None):
+        if options is None:
+            options = {}
+            
         try:
             # 获取AI模型
             llm = llm_manager.get_model(provider=provider, model=model)
@@ -43,7 +46,10 @@ class NormalModelStrategy(ModelStrategy):
 class ReasoningModelStrategy(ModelStrategy):
     """推理模型处理策略"""
     
-    async def process(self, provider, model, messages, conversation_id, memory_service):
+    async def process(self, provider, model, messages, conversation_id, memory_service, options=None):
+        if options is None:
+            options = {}
+            
         try:
             # 获取AI模型
             llm = llm_manager.get_model(provider=provider, model=model)
@@ -85,8 +91,32 @@ class ModelStrategyFactory:
     """策略工厂，用于创建适合特定模型的处理策略"""
     
     @staticmethod
-    def get_strategy(provider, model):
-        """根据提供商和模型选择合适的策略"""
+    def get_strategy(provider, model, options=None):
+        """根据提供商、模型和选项选择合适的策略
+        
+        Args:
+            provider (str): 模型提供商
+            model (str): 模型名称
+            options (dict, optional): 其他选项，包含use_reasoning表示是否使用推理
+            
+        Returns:
+            ModelStrategy: 合适的模型处理策略
+        """
+        if options is None:
+            options = {}
+            
+        # 获取是否使用推理模式的标志
+        use_reasoning = options.get("use_reasoning", False)
+        
+        # 优先根据options中的use_reasoning判断
+        if use_reasoning:
+            return ReasoningModelStrategy()
+        
+        # 火山引擎模型特殊处理
+        if provider == "volcengine" and ("thinking" in model.lower() or "deepseek-r1" in model.lower()):
+            return ReasoningModelStrategy()
+            
+        # 根据模型名称判断（兼容旧代码）
         if provider == "deepseek" and model == "deepseek-reasoner":
             return ReasoningModelStrategy()
         elif provider == "qwen" and "qwq" in model.lower():
