@@ -10,6 +10,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from sqlalchemy.orm import Session
 
 from app.ai.llm_manager import llm_manager
+from app.ai.prompts import prompt_manager
 from app.core.logger import app_logger as logger
 from app.db.repositories import FileRepository
 from app.processor.file_processor import FileProcessor
@@ -221,18 +222,8 @@ class ChatService:
         if not message:
             raise ValueError("必须提供消息内容或有效的会话ID")
 
-        # 准备给LLM的提示
-        prompt = f"""请为以下对话内容生成一个简短、具体且有描述性的标题。
-        要求：
-        1. 返回的内容不允许超过15个字
-        2. 直接给出标题，不要包含引号或其他解释性文字
-        3. 避免使用"关于"、"讨论"等过于宽泛的词语
-        4. 标题应该明确反映对话的核心主题
-        5. 如果对话内容没有实质性内容，则直接返"新会话"
-        6. 禁止返回个人介绍，或者有关你本身的信息
-
-        对话内容：
-        {message}"""
+        # 使用提示词管理器获取并格式化提示词
+        prompt = prompt_manager.format_prompt("generate_title", content=message)
 
         try:
             # 获取AI模型并生成标题
@@ -313,20 +304,8 @@ class ChatService:
                 "还有其他我能帮助您的事情吗？"
             ]
 
-        # 准备给LLM的提示
-        prompt = f"""根据以下最近一轮对话内容，生成三个用户可能想问的后续问题，这些问题应该能够帮助用户进一步探索话题或获取更多相关信息。
-        要求：
-        1. 问题应该简洁、明确且与对话内容直接相关
-        2. 问题应该多样化，覆盖不同的相关方面
-        3. 问题应该格式清晰，以数字列表形式给出
-        4. 直接给出问题列表，不需要任何额外说明
-        5. 确保问题有实际价值，能够产生有意义的回答
-        6. 问题应该使用中文，语言自然流畅
-
-        对话内容：
-        {dialog_content}
-
-        请给出三个推荐问题（直接给出问题列表，无需其他解释）："""
+        # 使用提示词管理器获取并格式化提示词
+        prompt = prompt_manager.format_prompt("generate_suggested_questions", content=dialog_content)
 
         try:
             # 获取AI模型并生成问题

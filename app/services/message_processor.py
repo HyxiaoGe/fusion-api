@@ -4,6 +4,7 @@ from typing import List, Dict, Any, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
+from app.ai.prompts import prompt_manager
 from app.schemas.chat import Message, Conversation
 
 class MessageProcessor:
@@ -55,7 +56,13 @@ class MessageProcessor:
             for i, content in enumerate(file_contents.values())
         ])
 
-        enhanced_message = f"""用户问题: {message}\n\n参考以下文件内容:\n{file_content_text}"""
+        # 使用提示词管理器构建增强消息
+        enhanced_message = prompt_manager.format_prompt(
+            "file_content_enhancement", 
+            query=message, 
+            file_content=file_content_text
+        )
+        
         # 替换最后一条消息内容
         messages[-1] = HumanMessage(content=enhanced_message)
         

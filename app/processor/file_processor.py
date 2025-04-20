@@ -5,6 +5,7 @@ import os
 from typing import List, Optional, Any, Dict
 
 from app.core.logger import app_logger as logger
+from app.ai.prompts import prompt_manager
 
 
 class FileProcessor:
@@ -193,15 +194,10 @@ class FileProcessor:
 
     def _build_prompt(self, query: str, files_data: List[Dict[str, Any]]) -> str:
         """构建模型提示"""
-        # 基础提示
-        prompt = f"""请分析以下文件并回答问题。
-
-        问题: {query}
-        
-        """
-        # 添加文件信息
+        # 准备文件内容
+        file_content_text = ""
         for i, file in enumerate(files_data):
-            prompt += f"文件 {i + 1}: {file['file_name']} (类型: {file['mime_type']})\n"
+            file_content_text += f"文件 {i + 1}: {file['file_name']} (类型: {file['mime_type']})\n"
 
             # 如果有提取的文本内容，添加到提示中
             if file.get('extracted_text'):
@@ -210,9 +206,12 @@ class FileProcessor:
                 if len(text) > 3000:  # 限制每个文件提取的文本长度
                     text = text[:3000] + "...(内容过长已截断)"
 
-                prompt += f"文件内容:\n{text}\n\n"
+                file_content_text += f"文件内容:\n{text}\n\n"
 
-        return prompt
+        # 使用提示词管理器构建提示
+        return prompt_manager.format_prompt("file_analysis", 
+                                           query=query, 
+                                           file_content=file_content_text)
 
     async def _call_model(self, prompt: str, files_data: List[Dict[str, Any]]) -> str:
         """使用通义千问视觉模型处理文件"""

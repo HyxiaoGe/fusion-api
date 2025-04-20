@@ -505,6 +505,96 @@ class PromptTemplateRepository:
         except Exception as e:
             logger.error(f"获取所有提示词模板失败: {e}")
             return []
+            
+    def update(self, prompt_id: str, prompt_data: Dict) -> Optional[PromptTemplate]:
+        """更新提示词模板"""
+        try:
+            db_prompt = self.db.query(PromptTemplateModel).filter(
+                PromptTemplateModel.id == prompt_id
+            ).first()
+            
+            if not db_prompt:
+                return None
+                
+            # 更新字段
+            for key, value in prompt_data.items():
+                if hasattr(db_prompt, key):
+                    setattr(db_prompt, key, value)
+            
+            db_prompt.updated_at = datetime.now()
+            self.db.commit()
+            self.db.refresh(db_prompt)
+            
+            return PromptTemplate(
+                id=db_prompt.id,
+                title=db_prompt.title,
+                content=db_prompt.content,
+                tags=db_prompt.tags,
+                created_at=db_prompt.created_at,
+                updated_at=db_prompt.updated_at
+            )
+        except Exception as e:
+            self.db.rollback()
+            logger.error(f"更新提示词模板失败: {e}")
+            return None
+            
+    def delete(self, prompt_id: str) -> bool:
+        """删除提示词模板"""
+        try:
+            db_prompt = self.db.query(PromptTemplateModel).filter(
+                PromptTemplateModel.id == prompt_id
+            ).first()
+            
+            if not db_prompt:
+                return False
+                
+            self.db.delete(db_prompt)
+            self.db.commit()
+            return True
+        except Exception as e:
+            self.db.rollback()
+            logger.error(f"删除提示词模板失败: {e}")
+            return False
+            
+    def load_to_prompt_manager(self) -> None:
+        """将所有提示词模板加载到提示词管理器中"""
+        try:
+            from app.ai.prompts import prompt_manager
+            
+            # 获取所有提示词模板
+            templates = self.get_all()
+            
+            # 加载到提示词管理器
+            for template in templates:
+                # 使用标题作为模板名称（转为snake_case）
+                name = template.title.lower().replace(' ', '_')
+                prompt_manager.add_template(name, template.content)
+                
+            logger.info(f"成功加载 {len(templates)} 个提示词模板到提示词管理器")
+        except Exception as e:
+            logger.error(f"加载提示词模板到提示词管理器失败: {e}")
+            
+    def get_by_id(self, prompt_id: str) -> Optional[PromptTemplate]:
+        """根据ID获取提示词模板"""
+        try:
+            db_prompt = self.db.query(PromptTemplateModel).filter(
+                PromptTemplateModel.id == prompt_id
+            ).first()
+            
+            if not db_prompt:
+                return None
+                
+            return PromptTemplate(
+                id=db_prompt.id,
+                title=db_prompt.title,
+                content=db_prompt.content,
+                tags=db_prompt.tags,
+                created_at=db_prompt.created_at,
+                updated_at=db_prompt.updated_at
+            )
+        except Exception as e:
+            logger.error(f"获取提示词模板失败: {e}")
+            return None
 
 
 class SettingRepository:

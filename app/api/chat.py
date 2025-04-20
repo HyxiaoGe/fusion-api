@@ -3,6 +3,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from app.ai.prompts import prompt_manager
 from app.db.database import get_db
 from app.schemas.chat import ChatRequest, Conversation, TitleGenerationRequest, TitleGenerationResponse, SuggestedQuestionsRequest, SuggestedQuestionsResponse
 from app.services.chat_service import ChatService
@@ -19,11 +20,16 @@ async def send_message(request: ChatRequest, db: Session = Depends(get_db)):
         hot_topic_service = HotTopicService(db)
         topic = hot_topic_service.get_topic_by_id(request.topic_id)
         if topic:
-            # 构建包含话题信息的提示词
-            enhanced_message = f"请分析以下热点新闻:\n\n标题: {topic.title}\n\n"
-            if topic.description:
-                enhanced_message += f"简介: {topic.description}\n\n"
-            request.message = enhanced_message
+            # 使用提示词管理器生成包含话题信息的提示词
+            additional_content = ""
+            description = topic.description or ""
+            request.message = prompt_manager.format_prompt(
+                "hot_topic_analysis",
+                title=topic.title,
+                description=description,
+                additional_content=additional_content
+            )
+            
             # 增加浏览计数
             hot_topic_service.increment_view_count(request.topic_id)
 

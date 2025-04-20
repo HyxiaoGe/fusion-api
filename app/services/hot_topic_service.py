@@ -337,15 +337,30 @@ class HotTopicService:
             return new_processed_urls
 
     def _clean_html(self, html_content: str) -> str:
-        """清理HTML内容"""
+        """清理HTML内容和Markdown图片链接"""
         if not html_content:
             return ""
             
         try:
+            # 清理Markdown格式的图片链接
+            # 匹配 ![任意文本](图片URL) 格式
+            html_content = re.sub(r'!\[.*?\]\(.*?\)', '', html_content)
+            
+            # 清理Markdown中的纯图片URL链接格式
+            # 匹配 ![](图片URL) 格式
+            html_content = re.sub(r'!\[\]\(.*?\)', '', html_content)
+            
+            # 清理可能包含的其他Markdown语法
+            html_content = re.sub(r'\[.*?\]\(.*?\)', '', html_content)  # 清理链接 [text](url)
+            
             soup = BeautifulSoup(html_content, "html.parser")
             for element in soup(['script', 'style', 'img', 'a', 'video', 'audio', 'iframe', 'input']):
                 element.decompose()
             text = soup.get_text(separator=' ', strip=True)
+            
+            # 移除多余的空行
+            text = re.sub(r'\n\s*\n', '\n\n', text)
+            
             return text
         except Exception as e:
             logger.error(f"清理HTML内容失败: {e}")
