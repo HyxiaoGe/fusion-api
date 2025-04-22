@@ -20,5 +20,5 @@ COPY . .
 # 暴露端口
 EXPOSE 8000
 
-# 启动命令（开发模式，支持热重载，设置2秒延迟）
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-delay", "15"]
+# 启动命令（使用4个工作进程，移除热重载以提高生产环境性能）
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]

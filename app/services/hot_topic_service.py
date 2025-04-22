@@ -35,7 +35,7 @@ class HotTopicService:
                 "category": "微信公众平台",
                 "filter_apply": "title",
                 "filter_type": "include",
-                "filter_rule": "OpenAI|ChatGPT|Claude|GPT|Sora|AI|微软|谷歌|字节|千问|DeepSeek|腾讯|阿里|xAI|马斯克|Gemini|Anthropic|豆包|文心一言"
+                "filter_rule": "OpenAI|ChatGPT|Claude|GPT|Sora|AI|微软|谷歌|字节|千问|DeepSeek|混元|阿里|xAI|马斯克|Gemini|Anthropic|豆包|文心一言"
             },
             {
                 "url": "https://rsshub.rssforever.com/36kr/motif/327686782977",
@@ -58,7 +58,7 @@ class HotTopicService:
                 "category": "科技",
                 "filter_apply": "title",
                 "filter_type": "include",
-                "filter_rule": "OpenAI|ChatGPT|Claude|GPT|Sora|AI|微软|谷歌|字节|千问|DeepSeek|腾讯|阿里|xAI|马斯克|Gemini|Anthropic|豆包|文心一言"
+                "filter_rule": "OpenAI|ChatGPT|Claude|GPT|Sora|AI|微软|谷歌|字节|千问|DeepSeek|混元|阿里|xAI|马斯克|Gemini|Anthropic|豆包|文心一言"
             },
         ]
         
