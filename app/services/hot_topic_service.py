@@ -40,7 +40,10 @@ class HotTopicService:
             {
                 "url": "https://rsshub.rssforever.com/36kr/motif/327686782977",
                 "name": "36氪创投",
-                "category": "AI"
+                "category": "AI",
+                "filter_apply": "title",
+                "filter_type": "include",
+                "filter_rule": "OpenAI|ChatGPT|Claude|GPT|Sora|AI|微软|谷歌|字节|千问|DeepSeek|混元|阿里|xAI|马斯克|Gemini|Anthropic|豆包|文心一言"
             },
             {
                 "url": "https://feeds.feedburner.com/ruanyifeng",

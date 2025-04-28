@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from app.ai.llm_manager import llm_manager
 from app.schemas.chat import Message
 
-
+logger = logging.getLogger(__name__)
 class ModelStrategy(ABC):
     """模型处理策略的抽象基类"""
     
