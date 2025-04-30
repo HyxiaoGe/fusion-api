@@ -7,6 +7,7 @@ from typing import List, Optional, Dict, Any, Union
 
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from app.core.function_manager import function_registry, function_adapter
 from sqlalchemy.orm import Session
 
 from app.ai.llm_manager import llm_manager
@@ -383,59 +384,144 @@ class ChatService:
         
         return questions
         
-    async def handle_function_calls(self, provider: str, model: str, message: str, conversation_id: str):
-        """处理函数调用"""
-
-        functions = [
-            {
-                "name": "web_search",
-                "description": "在互联网上搜索最新信息",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "搜索查询文本"},
-                        "limit": {"type": "integer", "description": "返回结果数量", "default": 5}
-                    },
-                    "required": ["query"]
-                }
-            }
-        ]
-
+    async def handle_function_calls(self, provider, model, messages, conversation_id, options=None):
+        """
+        处理函数调用流程
+        
+        参数:
+            provider: 模型提供商
+            model: 模型名称
+            messages: 聊天消息列表
+            conversation_id: 会话ID
+            options: 其他选项
+            
+        返回:
+            Chat响应对象
+        """
+        # 默认options
+        if options is None:
+            options = {}
+            
+        # 准备上下文
+        context = {
+            "db": self.db,
+            "conversation_id": conversation_id
+        }
+        
         # 获取AI模型
         llm = llm_manager.get_model(provider=provider, model=model)
-
-        # 调用模型，让其觉得是否需要调用函数
-        response = llm.invoke(
-            [HumanMessage(content=message)],
-            functions=functions
-        )
-
-        # 检查是否需要调用函数
-        function_call = response.additional_kwargs.get("function_call", None)
-
-        if function_call:
-            # 解析函数调用参数
-            function_name = function_call.get("name")
-            function_args = json.loads(function_call.get("arguments", "{}"))
-
-            # 处理web_search函数调用
-            if function_name == "web_search":
-                # 调用web_search服务
-                search_service = WebSearchService()
-                search_results = await search_service.search(
-                    function_args.get("query"),
-                    function_args.get("limit", 5)
-                )
-
-                # 将搜索结果返回给模型，让它生成最终回答
-                search_result_response = llm.invoke([
-                    HumanMessage(content=message),
-                    AIMessage(content=response.content),
-                    {"role": "function", "name": "web_search", "content": json.dumps(search_results)}
-                ])
-
-                return search_result_response.content
-
-        return response.content
-                
+        
+        # 准备函数定义
+        functions_kwargs = function_adapter.prepare_functions_for_model(provider, model)
+        
+        try:
+            # 调用模型，让其决定是否需要调用函数
+            response = await llm.ainvoke(messages, **functions_kwargs)
             
+            # 提取函数调用信息
+            function_call, tool_call_id = function_adapter.extract_function_call(provider, response)
+            
+            # 如果没有函数调用，直接创建回复消息
+            if not function_call:
+                # 创建AI消息
+                ai_message = Message(
+                    role="assistant",
+                    content=response.content if hasattr(response, 'content') else str(response)
+                )
+                
+                # 获取会话
+                conversation = self.memory_service.get_conversation(conversation_id)
+                
+                # 添加AI响应到会话
+                conversation.messages.append(ai_message)
+                
+                # 更新并保存会话
+                conversation.updated_at = datetime.now()
+                self.memory_service.save_conversation(conversation)
+                
+                # 返回响应
+                return ChatResponse(
+                    id=str(uuid.uuid4()),
+                    provider=provider,
+                    model=model,
+                    message=ai_message,
+                    conversation_id=conversation.id
+                )
+            
+            # 记录函数调用
+            logger.info(f"模型选择调用函数: {function_call.get('name')}")
+            
+            # 获取会话
+            conversation = self.memory_service.get_conversation(conversation_id)
+            
+            # 添加AI选择调用函数的消息
+            ai_function_message = Message(
+                role="assistant",
+                content=response.content if hasattr(response, 'content') and response.content else f"我需要调用 {function_call.get('name')} 函数获取更多信息..."
+            )
+            conversation.messages.append(ai_function_message)
+            
+            # 处理函数调用
+            function_result = await function_adapter.process_function_call(provider, function_call, context)
+            
+            # 准备工具消息
+            function_name = function_call.get("name", "")
+            tool_message_data = function_adapter.prepare_tool_message(
+                provider, function_name, function_result, tool_call_id
+            )
+            
+            # 创建工具消息
+            tool_message = Message(
+                role=tool_message_data["role"],
+                content=tool_message_data["content"]
+            )
+            conversation.messages.append(tool_message)
+            
+            # 复制原始消息并添加函数调用结果
+            full_messages = list(messages)
+            full_messages.append(response)
+            full_messages.append(tool_message_data)
+            
+            # 再次调用模型生成最终回答
+            final_response = await llm.ainvoke(full_messages)
+            
+            # 创建最终AI消息
+            final_ai_message = Message(
+                role="assistant",
+                content=final_response.content if hasattr(final_response, 'content') else str(final_response)
+            )
+            
+            # 添加最终消息到会话
+            conversation.messages.append(final_ai_message)
+            
+            # 更新并保存会话
+            conversation.updated_at = datetime.now()
+            self.memory_service.save_conversation(conversation)
+            
+            # 返回响应
+            return ChatResponse(
+                id=str(uuid.uuid4()),
+                provider=provider,
+                model=model,
+                message=final_ai_message,
+                conversation_id=conversation.id
+            )
+        except Exception as e:
+            logger.error(f"函数调用处理失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            
+            # 创建错误消息
+            error_message = Message(
+                role="assistant",
+                content=f"在处理函数调用时出现错误: {str(e)}"
+            )
+            
+            # 返回错误响应
+            return ChatResponse(
+                id=str(uuid.uuid4()),
+                provider=provider,
+                model=model,
+                message=error_message,
+                conversation_id=conversation_id
+            )
