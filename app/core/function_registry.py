@@ -19,7 +19,7 @@ class FunctionRegistry:
         }
         
     def register(self, name: str, description: str, parameters: Dict[str, Any],
-                 handler: FunctionHandler, catagories: Optional[list[str]] = None) -> None:
+                 handler: FunctionHandler, categories: Optional[list[str]] = None) -> None:
         """
         注册一个新函数
         
@@ -39,7 +39,7 @@ class FunctionRegistry:
         self._functions[name] = {
             "definition": function_def,
             "handler": handler,
-            "categories": catagories or []
+            "categories": categories or []
         }
         
         # 清除缓存的格式化函数

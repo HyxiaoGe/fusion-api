@@ -63,20 +63,23 @@ class FunctionCallAdapter:
             # 根据不同提供商提取函数名和参数
             if provider == "openai":
                 function_name = function_call.get("name")
-                arguments = json.loads(function_call.get("arguments", "{}"))
+                arguments_str = function_call.get("arguments", "{}")
+                arguments = json.loads(arguments_str) if arguments_str.strip() else {}
             elif provider == "anthropic":
                 function_name = function_call.get("name")
-                arguments = json.loads(function_call.get("arguments", "{}"))
+                arguments_str = function_call.get("arguments", "{}")
+                arguments = json.loads(arguments_str) if arguments_str.strip() else {}
             elif provider == "deepseek":
                 function_name = function_call.get("name")
-                arguments = json.loads(function_call.get("arguments", "{}"))
+                arguments_str = function_call.get("arguments", "{}")
+                arguments = json.loads(arguments_str) if arguments_str.strip() else {}
             else:
                 # 通用格式
                 function_name = function_call.get("name")
                 arguments = function_call.get("arguments", {})
                 if isinstance(arguments, str):
                     try:
-                        arguments = json.loads(arguments)
+                        arguments = json.loads(arguments) if arguments.strip() else {}
                     except:
                         arguments = {}
                 
@@ -139,6 +142,68 @@ class FunctionCallAdapter:
                     
         return function_call, tool_call_id
     
+    def detect_function_call_in_stream(self, chunk, model_type=None):
+        """
+        从流式响应中检测函数调用
+        
+        参数:
+            chunk: 流式响应的一个数据块
+            model_type: 模型类型（可选，用于特殊处理）
+            
+        返回:
+            (已检测到函数调用, 函数调用数据)
+        """
+        # 默认未检测到
+        function_call_detected = False
+        function_call_data = {}
+        
+        print(f"chunk: {chunk}")
+        
+        if hasattr(chunk, "additional_kwargs") and "tool_calls" in chunk.additional_kwargs:
+            tool_calls = chunk.additional_kwargs["tool_calls"]
+            if tool_calls and len(tool_calls) > 0:
+                # 完整性检查
+                function_name = tool_calls[0].get("function", {}).get("name")
+                if function_name:
+                    return True, {
+                        "function": tool_calls[0].get("function", {}),
+                        "tool_call_id": tool_calls[0].get("id")
+                    }
+        
+        try:
+            # 基于OpenAI格式的模型（包括OpenAI, QwQ, 火山引擎等）
+            # if hasattr(chunk, "tool_calls") and chunk.tool_calls:
+            #     function_call_detected = True
+            #     function_call_data = {
+            #         "function": chunk.tool_calls[0].function,
+            #         "tool_call_id": chunk.tool_calls[0].id
+            #     }
+            
+            # # 基于additional_kwargs格式的模型
+            # elif hasattr(chunk, "additional_kwargs"):
+            #     # Anthropic格式
+            #     if "tool_calls" in chunk.additional_kwargs and chunk.additional_kwargs["tool_calls"]:
+            #         function_call_detected = True
+            #         tool_call = chunk.additional_kwargs["tool_calls"][0]
+            #         function_call_data = {
+            #             "function": tool_call.get("function", {}),
+            #             "tool_call_id": tool_call.get("id")
+            #         }
+                
+            #     # DeepSeek格式
+            #     elif "function_call" in chunk.additional_kwargs:
+            #         function_call_detected = True
+            #         function_call_data = {
+            #             "function": chunk.additional_kwargs["function_call"],
+            #             "tool_call_id": None
+            #         }
+            
+            return function_call_detected, function_call_data
+        
+        except Exception as e:
+            logger.error(f"流式函数调用检测出错: {e}")
+            return False, {}
+    
     def prepare_tool_message(self, provider: str, function_name: str, function_result: Dict[str, Any], tool_call_id: Optional[str] = None) -> Dict[str, Any]:
         """
         准备工具/函数响应消息
@@ -154,17 +219,11 @@ class FunctionCallAdapter:
         """
         content = json.dumps(function_result, ensure_ascii=False)
         
-        if provider in ["openai", "anthropic", "qwen", "volcengine"] and tool_call_id:
+        if provider in ["openai", "anthropic", "qwen", "volcengine", "deepseek"] and tool_call_id:
             return {
                 "role": "tool", 
                 "content": content,
                 "tool_call_id": tool_call_id
-            }
-        elif provider == "deepseek":
-            return {
-                "role": "function", 
-                "name": function_name,
-                "content": content
             }
         else:
             # 通用格式

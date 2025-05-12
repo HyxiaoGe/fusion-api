@@ -113,6 +113,15 @@ class ChatService:
         # 判断是否使用推理模式
         use_reasoning = options.get("use_reasoning", False)
         
+        # 判断是否使用函数调用
+        use_function_call = options.get("use_function_call", False)
+        print("use_function_call.....................", use_function_call)
+        if use_function_call:
+            return StreamingResponse(
+                self.generate_function_call_stream(provider, model, messages, conversation_id, options),
+                media_type="text/event-stream"
+            )
+        
         # 火山引擎特殊处理 - 直接使用OpenAI客户端访问API
         if provider == "volcengine":
             return StreamingResponse(
@@ -179,6 +188,341 @@ class ChatService:
         except Exception as e:
             logger.error(f"模型处理失败: {e}")
             raise
+
+    async def generate_function_call_stream(self, provider, model, messages, conversation_id, options=None):
+        """生成支持函数调用的流式响应"""
+        
+        print("generate_function_call_stream.....................")
+        
+        # 构造发送事件辅助函数
+        async def send_event(event_type, content=None):
+            data = {"type": event_type, "conversation_id": conversation_id}
+            if content is not None:
+                data["content"] = content
+            return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+        
+        # 函数类型处理器映射
+        function_handlers = {
+            "web_search": self._handle_web_search_function,
+            "hot_topics": self._handle_hot_topics_function,
+            # 将来可以在这里添加更多函数处理器
+        }
+        
+        # 创建上下文
+        context = {
+            "db": self.db,
+            "conversation_id": conversation_id
+        }
+        
+        # 获取模型
+        llm = llm_manager.get_model(provider=provider, model=model)
+        
+        # 准备函数定义
+        functions_kwargs = function_adapter.prepare_functions_for_model(provider, model)
+        
+        try:
+            # 开始函数流
+            yield await send_event("function_stream_start")
+            
+            # 第一次流式调用模型
+            full_response = ""
+            function_call_detected = False
+            function_call_data = {}
+            
+            # 处理流式响应中的函数调用检测
+            for chunk in llm.stream(messages, **functions_kwargs):
+                # 检查流中是否有函数调用
+                if not function_call_detected:
+                    # 使用适配器检测函数调用
+                    function_call_detected, function_call_data = function_adapter.detect_function_call_in_stream(chunk)
+                    
+                    if function_call_detected:
+                        function_name = function_call_data['function'].get('name')
+                        yield await send_event("function_call_detected", {
+                            "function_type": function_name,
+                            "description": f"需要调用函数: {function_name}"
+                        })
+                        break
+                
+                # 如果无函数调用，正常返回内容
+                content = chunk.content if hasattr(chunk, 'content') else chunk
+                if content:
+                    full_response += content
+                    yield await send_event("content", content)
+            
+            # 如果没有检测到函数调用，结束流
+            if not function_call_detected:
+                # 保存完整回应到会话历史
+                await self.save_stream_response(conversation_id, full_response)
+                yield await send_event("done")
+                return
+            
+            # 执行函数调用
+            function_name = function_call_data["function"].get("name", "")
+            yield await send_event("executing_function", 
+                                f"正在执行函数 {function_name}...")
+            
+            # 检查是否是web_search函数且没有query参数
+            function_args = function_call_data["function"].get("arguments", "{}")
+            
+            # 尝试解析参数
+            try:
+                if isinstance(function_args, str):
+                    args_dict = json.loads(function_args) if function_args.strip() else {}
+                else:
+                    args_dict = function_args
+            except:
+                args_dict = {}
+                
+            # 如果是web_search函数但没有query参数，使用LLM生成搜索查询
+            if function_name == "web_search" and not args_dict.get("query"):
+                yield await send_event("generating_query", "正在优化搜索查询...")
+                
+                # 从原始消息中提取用户的最后一条消息
+                user_message = ""
+                for msg in reversed(messages):
+                    # 处理不同类型的消息对象
+                    if hasattr(msg, "type") and msg.type == "human":
+                        user_message = msg.content
+                        break
+                    elif hasattr(msg, "role") and msg.role == "user":
+                        user_message = msg.content
+                        break
+                    elif isinstance(msg, dict) and msg.get("role") == "user":
+                        user_message = msg.get("content", "")
+                        break
+                
+                if user_message:
+                    # 让LLM生成优化后的搜索查询
+                    current_date = datetime.now().strftime("%Y年%m月%d日")
+                    search_query_prompt = f"为以下用户问题生成一个简洁明确的搜索查询: '{user_message}'。如果问题中包含与当前时间相关的指代（例如'今天'、'目前'），请以 {current_date} 作为当前日期进行理解。请仅返回搜索查询文本本身，不要附加任何解释或说明。"
+                    search_query_msgs = [{"role": "user", "content": search_query_prompt}]
+                    
+                    # 使用现有模型生成查询
+                    search_query_response = await llm.ainvoke(search_query_msgs)
+                    search_query = search_query_response.content if hasattr(search_query_response, 'content') else str(search_query_response)
+                    
+                    # 清理搜索查询（去除引号等）
+                    search_query = search_query.strip().strip('"\'')
+                    
+                    # 更新函数参数
+                    args_dict["query"] = search_query
+                    function_call_data["function"]["arguments"] = json.dumps(args_dict)
+                    
+                    yield await send_event("query_generated", f"搜索查询: {search_query}")
+            
+            # 处理函数调用
+            function_result = await function_adapter.process_function_call(
+                provider, function_call_data["function"], context
+            )
+            
+            # 准备工具消息
+            tool_message_data = function_adapter.prepare_tool_message(
+                provider, function_name, function_result, 
+                function_call_data.get("tool_call_id")
+            )
+            
+            # 通知函数执行完成
+            yield await send_event("function_executed", {
+                "function_type": function_name,
+                "result": json.dumps(function_result, ensure_ascii=False)
+            })
+            
+            # 检查是否有专门的处理器处理该函数类型
+            handler = function_handlers.get(function_name)
+            if handler:
+                # 使用专门的处理器处理该函数类型
+                async for event in handler(
+                    send_event, function_call_data, function_result, conversation_id, llm, messages
+                ):
+                    yield event
+                return
+                
+            # 如果没有专门的处理器，使用默认处理流程
+                
+            # 复制原始消息并添加函数调用结果
+            full_messages = list(messages)
+            # 添加LLM的函数调用响应
+            if provider in ["deepseek", "openai", "anthropic", "qwen", "volcengine"]:
+                # 使用tool_calls格式
+                full_messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "type": "function",
+                        "function": function_call_data["function"],
+                        "id": function_call_data.get("tool_call_id", "call_1")
+                    }]
+                })
+            else:
+                # 使用传统function_call格式
+                full_messages.append({
+                    "role": "assistant",
+                    "content": "",
+                    "function_call": function_call_data["function"]
+                })
+            # 添加函数执行结果
+            full_messages.append(function_result)
+            
+            # 第二次调用模型生成最终回答
+            yield await send_event("generating_response", "正在生成最终回答...")
+            
+            # 处理最终回答的流式响应
+            final_response = ""
+            for chunk in llm.stream(full_messages):
+                content = chunk.content if hasattr(chunk, 'content') else chunk
+                if content:
+                    final_response += content
+                    yield await send_event("content", content)
+            
+            # 保存完整对话历史
+            await self.save_function_call_stream_response(
+                conversation_id=conversation_id,
+                function_name=function_name,
+                function_args=function_call_data["function"].get("arguments", "{}"),
+                function_result=function_result,
+                final_response=final_response
+            )
+            
+            # 完成标志
+            yield await send_event("done")
+            
+        except Exception as e:
+            # 错误处理
+            logger.error(f"函数调用流处理出错: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            yield await send_event("error", f"处理出错: {str(e)}")
+
+    async def _handle_web_search_function(self, send_event, function_call_data, function_result, 
+                                          conversation_id, llm, messages):
+        """处理web_search函数的专门处理器"""
+        function_name = "web_search"
+        
+        # 对web_search函数的特殊处理
+        if "results" in function_result:
+            yield await send_event("content_direct", {
+                "function_type": "web_search",
+                "status": "processing"
+            })
+            
+            # 格式化搜索结果
+            results = function_result.get("results", [])
+            query = function_result.get("query", "")
+            
+            if results:
+                final_response = f"以下是关于{query}的搜索结果：\n\n"
+                for i, result in enumerate(results, 1):
+                    final_response += f"{i}. {result.get('title')}\n"
+                    final_response += f"   {result.get('snippet')}\n"
+                    final_response += f"   来源: {result.get('link')}\n\n"
+            else:
+                final_response = f"未找到关于{query}的搜索结果。"
+            
+            # 发送格式化的内容
+            yield await send_event("content", final_response)
+            
+            # 保存完整对话历史
+            await self.save_function_call_stream_response(
+                conversation_id=conversation_id,
+                function_name=function_name,
+                function_args=function_call_data["function"].get("arguments", "{}"),
+                function_result=function_result,
+                final_response=final_response
+            )
+            
+            # 完成标志
+            yield await send_event("done")
+        else:
+            # 如果结果格式不符合预期，使用默认处理
+            yield await send_event("error", "搜索结果格式不正确")
+
+    async def _handle_hot_topics_function(self, send_event, function_call_data, function_result, 
+                                          conversation_id, llm, messages):
+        """处理hot_topics函数的专门处理器"""
+        function_name = "hot_topics"
+        
+        # 对hot_topics函数的特殊处理
+        if "topics" in function_result:
+            yield await send_event("content_direct", {
+                "function_type": "hot_topics",
+                "status": "processing"
+            })
+            
+            # 格式化热点话题结果
+            topics = function_result.get("topics", [])
+            if topics:
+                final_response = "以下是最新热点话题：\n\n"
+                for i, topic in enumerate(topics, 1):
+                    final_response += f"{i}. {topic.get('title')}\n"
+                    final_response += f"   {topic.get('description')}\n"
+                    final_response += f"   来源: {topic.get('source')}, 类别: {topic.get('category')}\n\n"
+            else:
+                final_response = "当前没有热点话题信息。"
+            
+            # 发送格式化的内容
+            yield await send_event("content", final_response)
+            
+            # 保存完整对话历史
+            await self.save_function_call_stream_response(
+                conversation_id=conversation_id,
+                function_name=function_name,
+                function_args=function_call_data["function"].get("arguments", "{}"),
+                function_result=function_result,
+                final_response=final_response
+            )
+            
+            # 完成标志
+            yield await send_event("done")
+        else:
+            # 如果结果格式不符合预期，使用默认处理
+            yield await send_event("error", "热点话题结果格式不正确")
+
+    async def save_function_call_stream_response(self, conversation_id, function_name, 
+                                           function_args, function_result, final_response):
+        """保存函数调用流式响应到对话历史"""
+        try:
+            conversation = self.memory_service.get_conversation(conversation_id)
+            if conversation:
+                # 创建函数调用请求消息，根据函数类型提供不同描述
+                function_descriptions = {
+                    "web_search": "我需要搜索网络获取更多信息...",
+                    "hot_topics": "我将查询最新的热点话题...",
+                    # 未来可以在这里添加更多函数类型描述
+                }
+                
+                function_desc = function_descriptions.get(function_name, f"我需要调用 {function_name} 函数获取信息...")
+                
+                # 创建函数调用消息
+                function_call_message = Message(
+                    role="assistant",
+                    content=function_desc
+                )
+                
+                # 创建函数结果消息
+                function_result_message = Message(
+                    role="function",
+                    content=json.dumps(function_result, ensure_ascii=False)
+                )
+                
+                # 创建最终AI响应消息
+                ai_message = Message(
+                    role="assistant",
+                    content=final_response
+                )
+                
+                # 添加所有消息到会话
+                conversation.messages.append(function_call_message)
+                conversation.messages.append(function_result_message)
+                conversation.messages.append(ai_message)
+                
+                # 更新会话时间
+                conversation.updated_at = datetime.now()
+                
+                # 保存到数据库
+                self.memory_service.save_conversation(conversation)
+        except Exception as e:
+            logger.error(f"保存函数调用流式响应失败: {e}")
 
     def get_all_conversations(self) -> List[Conversation]:
         """获取所有对话"""
@@ -525,3 +869,25 @@ class ChatService:
                 message=error_message,
                 conversation_id=conversation_id
             )
+
+    async def save_stream_response(self, conversation_id, response_content):
+        """保存普通流式响应到对话历史"""
+        try:
+            conversation = self.memory_service.get_conversation(conversation_id)
+            if conversation:
+                # 创建AI响应消息
+                ai_message = Message(
+                    role="assistant",
+                    content=response_content
+                )
+                
+                # 添加AI响应到会话
+                conversation.messages.append(ai_message)
+                
+                # 更新会话时间
+                conversation.updated_at = datetime.now()
+                
+                # 保存到数据库
+                self.memory_service.save_conversation(conversation)
+        except Exception as e:
+            logger.error(f"保存流式响应失败: {e}")

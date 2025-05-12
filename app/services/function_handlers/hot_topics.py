@@ -12,7 +12,7 @@ async def hot_topics_handler(args: Dict[str, Any], context: Dict[str, Any]) -> D
     参数:
         args: 函数参数，包含:
             - category: 类别 (可选)
-            - limit: 返回结果数量 (可选，默认5)
+            - limit: 返回结果数量 (可选，默认10)
             - topic_id: 特定话题ID (可选)
         context: 上下文信息，包含数据库连接
         
@@ -22,7 +22,7 @@ async def hot_topics_handler(args: Dict[str, Any], context: Dict[str, Any]) -> D
     try:
         # 提取参数
         category = args.get("category")
-        limit = int(args.get("limit", 5))
+        limit = int(args.get("limit", 10))
         topic_id = args.get("topic_id")
         
         # 获取数据库连接

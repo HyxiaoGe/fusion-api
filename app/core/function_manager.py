@@ -22,12 +22,12 @@ def init_function_registry():
         # 注册Web搜索函数
         function_registry.register(
             name="web_search",
-            description="在互联网上搜索最新信息",
+            description="用于在互联网上搜索和获取最新、实时或你知识库中未包含的信息。当用户的问题涉及当前事件、最新数据、新闻、实时动态，或你无法确定答案时，请优先调用此工具。",
             parameters={
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "搜索查询文本"},
-                    "limit": {"type": "integer", "description": "返回结果数量", "default": 5}
+                    "limit": {"type": "integer", "description": "返回结果数量", "default": 10}
                 },
                 "required": ["query"]
             },
@@ -38,7 +38,7 @@ def init_function_registry():
         # 注册文件分析函数
         function_registry.register(
             name="analyze_file",
-            description="分析上传的文件内容",
+            description="用于分析用户上传的文件内容。当用户的问题涉及文件摘要、数据提取或需要基于文件内容进行问答时，请优先调用此工具。支持生成摘要、提取结构化数据、或根据文件内容回答具体问题。",
             parameters={
                 "type": "object",
                 "properties": {
@@ -59,12 +59,12 @@ def init_function_registry():
         # 注册热点话题函数
         function_registry.register(
             name="hot_topics",
-            description="获取当前热点话题信息",
+            description="用于获取当前最新的热点话题信息，涵盖科技、财经等多个领域。当用户询问最近流行、关注度高或最新发生的事件、新闻、趋势时，请优先调用此工具。",
             parameters={
                 "type": "object",
                 "properties": {
                     "category": {"type": "string", "description": "话题类别，如科技、财经等(可选)"},
-                    "limit": {"type": "integer", "description": "返回结果数量", "default": 5},
+                    "limit": {"type": "integer", "description": "返回结果数量", "default": 10},
                     "topic_id": {"type": "string", "description": "如果要获取特定话题详情，提供话题ID"}
                 }
             },

@@ -16,7 +16,7 @@ class WebSearchService:
         self.retry_delay = 2  # 重试间隔秒数
         
 
-    async def search(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    async def search(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
         """执行网络搜索
         
         Args:

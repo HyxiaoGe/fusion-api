@@ -25,7 +25,6 @@ async def lifespan(app: FastAPI):
         
         # 初始化函数注册表
         init_function_registry()
-        app_logger.info("函数注册表初始化完成")
 
         # 启动调度器
         scheduler = SchedulerService()

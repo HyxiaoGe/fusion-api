@@ -17,7 +17,7 @@ async def web_search_handler(args: Dict[str, Any], context: Dict[str, Any]) -> D
     参数:
         args: 函数参数，包含:
             - query: 搜索查询文本
-            - limit: 返回结果数量 (可选，默认5)
+            - limit: 返回结果数量 (可选，默认10)
         context: 上下文信息
         
     返回:
@@ -29,7 +29,7 @@ async def web_search_handler(args: Dict[str, Any], context: Dict[str, Any]) -> D
         if not query:
             return {"error": "搜索查询不能为空"}
             
-        limit = int(args.get("limit", 5))
+        limit = int(args.get("limit", 10))
         
         logger.info(f"执行网络搜索: {query}, 限制: {limit}")
         

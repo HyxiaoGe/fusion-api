@@ -11,7 +11,7 @@ router = APIRouter()
 @router.post("/")
 async def search_web(
     query: str = Query(..., description="搜索查询文本"),
-    limit: int = Query(5, description="返回结果数量限制", ge=1, le=20),
+    limit: int = Query(10, description="返回结果数量限制", ge=1, le=20),
     db: Session = Depends(get_db)
 ):
     """执行网络搜索"""
