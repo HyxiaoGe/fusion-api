@@ -322,12 +322,6 @@ class ChatService:
                 function_call_data.get("tool_call_id")
             )
             
-            # 通知函数执行完成
-            yield await send_event("function_executed", {
-                "function_type": function_name,
-                "result": json.dumps(function_result, ensure_ascii=False)
-            })
-            
             # 检查是否有专门的处理器处理该函数类型
             handler = function_handlers.get(function_name)
             if handler:
@@ -364,9 +358,6 @@ class ChatService:
             # 添加函数执行结果
             full_messages.append(function_result)
             
-            # 第二次调用模型生成最终回答
-            yield await send_event("generating_response", "正在生成最终回答...")
-            
             # 处理最终回答的流式响应
             final_response = ""
             for chunk in llm.stream(full_messages):
@@ -399,84 +390,132 @@ class ChatService:
         """处理web_search函数的专门处理器"""
         function_name = "web_search"
         
-        # 对web_search函数的特殊处理
-        if "results" in function_result:
-            yield await send_event("content_direct", {
-                "function_type": "web_search",
-                "status": "processing"
-            })
+        # 1. 先将 function_result 以 function_result 类型消息返回前端
+        yield await send_event("function_result", {
+            "function_type": function_name,
+            "result": function_result
+        })
+
+        # 2. 构造新的消息列表：原始 messages + tool_calls + tool 消息
+        full_messages = list(messages)
+        
+        # 从 function_call_data 获取 tool_call_id 和 arguments
+        original_tool_call_id = function_call_data.get("tool_call_id", f"call_{uuid.uuid4()}") # 备用方案
+        original_arguments_str = function_call_data["function"].get("arguments", "{}")
+        
+        # 确保 arguments 是有效的 JSON string, 至少是 "{}"
+        try:
+            json.loads(original_arguments_str)
+            valid_arguments_str = original_arguments_str if original_arguments_str.strip() else "{}"
+        except json.JSONDecodeError:
+            valid_arguments_str = "{}"
             
-            # 格式化搜索结果
-            results = function_result.get("results", [])
-            query = function_result.get("query", "")
-            
-            if results:
-                final_response = f"以下是关于{query}的搜索结果：\n\n"
-                for i, result in enumerate(results, 1):
-                    final_response += f"{i}. {result.get('title')}\n"
-                    final_response += f"   {result.get('snippet')}\n"
-                    final_response += f"   来源: {result.get('link')}\n\n"
-            else:
-                final_response = f"未找到关于{query}的搜索结果。"
-            
-            # 发送格式化的内容
-            yield await send_event("content", final_response)
-            
-            # 保存完整对话历史
-            await self.save_function_call_stream_response(
-                conversation_id=conversation_id,
-                function_name=function_name,
-                function_args=function_call_data["function"].get("arguments", "{}"),
-                function_result=function_result,
-                final_response=final_response
-            )
-            
-            # 完成标志
-            yield await send_event("done")
-        else:
-            # 如果结果格式不符合预期，使用默认处理
-            yield await send_event("error", "搜索结果格式不正确")
+        # 添加 assistant 的工具调用消息
+        full_messages.append({
+            "role": "assistant", 
+            "content": None,
+            "tool_calls": [{
+                "id": original_tool_call_id, # 使用原始 tool_call_id
+                "type": "function",
+                "function": {
+                    "name": function_name,
+                    "arguments": valid_arguments_str # 使用处理后的 arguments
+                }
+            }]
+        })
+        
+        # 添加工具响应消息
+        full_messages.append({
+            "role": "tool",
+            "tool_call_id": original_tool_call_id, # 保持一致
+            "content": json.dumps(function_result, ensure_ascii=False)
+        })
+
+        # 4. 流式返回 LLM 的最终回复
+        final_response = ""
+        for chunk in llm.stream(full_messages):
+            content = chunk.content if hasattr(chunk, 'content') else chunk
+            if content:
+                final_response += content
+                yield await send_event("content", content)
+
+        # 5. 保存完整对话历史
+        await self.save_function_call_stream_response(
+            conversation_id=conversation_id,
+            function_name=function_name,
+            function_args=valid_arguments_str, # 保存处理后的 arguments
+            function_result=function_result,
+            final_response=final_response
+        )
+
+        # 6. 完成标志
+        yield await send_event("done")
 
     async def _handle_hot_topics_function(self, send_event, function_call_data, function_result, 
                                           conversation_id, llm, messages):
         """处理hot_topics函数的专门处理器"""
         function_name = "hot_topics"
         
-        # 对hot_topics函数的特殊处理
-        if "topics" in function_result:
-            yield await send_event("content_direct", {
-                "function_type": "hot_topics",
-                "status": "processing"
-            })
-            
-            # 格式化热点话题结果
-            topics = function_result.get("topics", [])
-            if topics:
-                final_response = "以下是最新热点话题：\n\n"
-                for i, topic in enumerate(topics, 1):
-                    final_response += f"{i}. {topic.get('title')}\n"
-                    final_response += f"   {topic.get('description')}\n"
-                    final_response += f"   来源: {topic.get('source')}, 类别: {topic.get('category')}\n\n"
-            else:
-                final_response = "当前没有热点话题信息。"
-            
-            # 发送格式化的内容
-            yield await send_event("content", final_response)
-            
-            # 保存完整对话历史
-            await self.save_function_call_stream_response(
-                conversation_id=conversation_id,
-                function_name=function_name,
-                function_args=function_call_data["function"].get("arguments", "{}"),
-                function_result=function_result,
-                final_response=final_response
-            )
-            
-            # 完成标志
-            yield await send_event("done")
-        else:
-            # 如果结果格式不符合预期，使用默认处理
-            yield await send_event("error", "热点话题结果格式不正确")
+        # 1. 先将 function_result 以 function_result 类型消息返回前端
+        yield await send_event("function_result", {
+            "function_type": function_name,
+            "result": function_result
+        })
+
+        # 2. 构造新的消息列表：原始 messages + tool_calls + tool 消息
+        full_messages = list(messages)
+        
+        # 从 function_call_data 获取 tool_call_id 和 arguments
+        original_tool_call_id = function_call_data.get("tool_call_id", f"call_{uuid.uuid4()}") # 备用方案
+        original_arguments_str = function_call_data["function"].get("arguments", "{}")
+        
+        # 确保 arguments 是有效的 JSON string, 至少是 "{}"
+        try:
+            json.loads(original_arguments_str)
+            valid_arguments_str = original_arguments_str if original_arguments_str.strip() else "{}"
+        except json.JSONDecodeError:
+            valid_arguments_str = "{}"
+
+        # 添加 assistant 的工具调用消息
+        full_messages.append({
+            "role": "assistant", 
+            "content": None,
+            "tool_calls": [{
+                "id": original_tool_call_id, # 使用原始 tool_call_id
+                "type": "function",
+                "function": {
+                    "name": function_name,
+                    "arguments": valid_arguments_str # 使用处理后的 arguments
+                }
+            }]
+        })
+        
+        # 添加工具响应消息
+        full_messages.append({
+            "role": "tool",
+            "tool_call_id": original_tool_call_id, # 保持一致
+            "content": json.dumps(function_result, ensure_ascii=False)
+        })
+
+        # 4. 流式返回 LLM 的最终回复
+        final_response = ""
+        for chunk in llm.stream(full_messages):
+            content = chunk.content if hasattr(chunk, 'content') else chunk
+            if content:
+                final_response += content
+                yield await send_event("content", content)
+
+        # 5. 保存完整对话历史
+        await self.save_function_call_stream_response(
+            conversation_id=conversation_id,
+            function_name=function_name,
+            function_args=valid_arguments_str, # 保存处理后的 arguments
+            function_result=function_result,
+            final_response=final_response
+        )
+
+        # 6. 完成标志
+        yield await send_event("done")
 
     async def save_function_call_stream_response(self, conversation_id, function_name, 
                                            function_args, function_result, final_response):
