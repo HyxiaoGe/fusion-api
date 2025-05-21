@@ -9,7 +9,8 @@ from app.ai.prompts.templates import (
     GENERATE_SUGGESTED_QUESTIONS_PROMPT,
     FILE_ANALYSIS_PROMPT,
     FILE_CONTENT_ENHANCEMENT_PROMPT,
-    HOT_TOPIC_ANALYSIS_PROMPT
+    HOT_TOPIC_ANALYSIS_PROMPT,
+    WEB_SEARCH_RESULTS_PROMPT
 )
 
 
@@ -23,7 +24,8 @@ class PromptManager:
             "generate_suggested_questions": GENERATE_SUGGESTED_QUESTIONS_PROMPT,
             "file_analysis": FILE_ANALYSIS_PROMPT,
             "file_content_enhancement": FILE_CONTENT_ENHANCEMENT_PROMPT,
-            "hot_topic_analysis": HOT_TOPIC_ANALYSIS_PROMPT
+            "hot_topic_analysis": HOT_TOPIC_ANALYSIS_PROMPT,
+            "web_search_results": WEB_SEARCH_RESULTS_PROMPT
         }
     
     def get_template(self, template_name: str) -> str:

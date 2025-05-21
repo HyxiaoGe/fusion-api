@@ -73,7 +73,8 @@ def sync_default_templates(db: Session = Depends(get_db)):
         GENERATE_SUGGESTED_QUESTIONS_PROMPT,
         FILE_ANALYSIS_PROMPT,
         FILE_CONTENT_ENHANCEMENT_PROMPT,
-        HOT_TOPIC_ANALYSIS_PROMPT
+        HOT_TOPIC_ANALYSIS_PROMPT,
+        WEB_SEARCH_RESULTS_PROMPT
     )
     
     # 默认模板集合
@@ -82,7 +83,8 @@ def sync_default_templates(db: Session = Depends(get_db)):
         {"title": "生成推荐问题", "content": GENERATE_SUGGESTED_QUESTIONS_PROMPT, "tags": ["system", "questions"]},
         {"title": "文件分析", "content": FILE_ANALYSIS_PROMPT, "tags": ["system", "file"]},
         {"title": "文件内容增强", "content": FILE_CONTENT_ENHANCEMENT_PROMPT, "tags": ["system", "file"]},
-        {"title": "热点话题分析", "content": HOT_TOPIC_ANALYSIS_PROMPT, "tags": ["system", "topic"]}
+        {"title": "热点话题分析", "content": HOT_TOPIC_ANALYSIS_PROMPT, "tags": ["system", "topic"]},
+        {"title": "提炼网页搜索结果", "content": WEB_SEARCH_RESULTS_PROMPT, "tags": ["system", "web"]}
     ]
     
     repo = PromptTemplateRepository(db=db)

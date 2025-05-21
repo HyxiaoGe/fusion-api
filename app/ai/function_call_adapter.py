@@ -157,7 +157,7 @@ class FunctionCallAdapter:
         function_call_detected = False
         function_call_data = {}
         
-        print(f"chunk: {chunk}")
+        # print(f"chunk: {chunk}")
         
         if hasattr(chunk, "additional_kwargs") and "tool_calls" in chunk.additional_kwargs:
             tool_calls = chunk.additional_kwargs["tool_calls"]

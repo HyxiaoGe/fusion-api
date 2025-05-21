@@ -37,20 +37,3 @@ services:
         limits:
           cpus: '1'
           memory: 1024M
-
-  nginx:
-    image: nginx:latest
-    container_name: nginx_proxy
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf
-    depends_on:
-      - app
-    restart: always
-    deploy:
-      resources:
-        limits:
-          cpus: '0.3'
-          memory: 256M

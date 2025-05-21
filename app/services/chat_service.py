@@ -6,12 +6,13 @@ from datetime import datetime
 from typing import List, Optional, Dict, Any, Union
 
 from fastapi.responses import StreamingResponse
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
 from app.core.function_manager import function_registry, function_adapter
 from sqlalchemy.orm import Session
 
 from app.ai.llm_manager import llm_manager
 from app.ai.prompts import prompt_manager
+from app.ai.prompts.templates import FUNCTION_CALL_BEHAVIOR_PROMPT, SYNTHESIZE_TOOL_RESULT_PROMPT
 from app.core.logger import app_logger as logger
 from app.db.repositories import FileRepository
 from app.processor.file_processor import FileProcessor
@@ -194,6 +195,10 @@ class ChatService:
         
         print("generate_function_call_stream.....................")
         
+        if options is None:
+            options = {}
+        use_reasoning = options.get("use_reasoning", False)
+        
         # 构造发送事件辅助函数
         async def send_event(event_type, content=None):
             data = {"type": event_type, "conversation_id": conversation_id}
@@ -220,6 +225,18 @@ class ChatService:
         # 准备函数定义
         functions_kwargs = function_adapter.prepare_functions_for_model(provider, model)
         
+        # 构建新的系统提示字典
+        new_system_prompt_dict = {
+            "role": "system",
+            "content": FUNCTION_CALL_BEHAVIOR_PROMPT
+        }
+        
+        # 确保 messages 是可修改的列表副本，并且将新系统提示放在最前面
+        # 移除原始 messages 中已有的 system角色的消息，以避免混淆或重复的系统指令
+        processed_messages = [new_system_prompt_dict] + [
+            msg for msg in messages if not (isinstance(msg, dict) and msg.get("role") == "system")
+        ]
+        
         try:
             # 开始函数流
             yield await send_event("function_stream_start")
@@ -230,7 +247,19 @@ class ChatService:
             function_call_data = {}
             
             # 处理流式响应中的函数调用检测
-            for chunk in llm.stream(messages, **functions_kwargs):
+            reasoning_start_sent = False
+            for chunk in llm.stream(processed_messages, **functions_kwargs):
+                print(f"chat service chunk: {chunk}")
+                # Handle reasoning content from additional_kwargs if use_reasoning is True
+                if use_reasoning and hasattr(chunk, 'additional_kwargs') and 'reasoning_content' in chunk.additional_kwargs:
+                    reasoning_content_from_kw = chunk.additional_kwargs['reasoning_content']
+                    if reasoning_content_from_kw and reasoning_content_from_kw.strip():
+                        if not reasoning_start_sent:
+                            yield await send_event("reasoning_start")
+                            reasoning_start_sent = True
+                        # Stream reasoning_content from additional_kwargs, not from full_response later
+                        yield await send_event("reasoning_content", reasoning_content_from_kw)
+
                 # 检查流中是否有函数调用
                 if not function_call_detected:
                     # 使用适配器检测函数调用
@@ -242,25 +271,36 @@ class ChatService:
                             "function_type": function_name,
                             "description": f"需要调用函数: {function_name}"
                         })
-                        break
                 
-                # 如果无函数调用，正常返回内容
-                content = chunk.content if hasattr(chunk, 'content') else chunk
-                if content:
-                    full_response += content
-                    yield await send_event("content", content)
+                #累积第一次LLM的思考过程 (chunk.content)
+                content_chunk_text = chunk.content if hasattr(chunk, 'content') else None # Ensure we have content
+                if content_chunk_text:
+                    full_response += content_chunk_text
+                
+                # 如果已检测到函数调用，并且当前chunk的所有相关信息已处理完毕，则可以退出循环
+                if function_call_detected:
+                    break
             
-            # 如果没有检测到函数调用，结束流
+            # 将累积的第一次LLM的完整思考过程（之前是full_response）保存到function_call_data中
+            # 这些思考过程将在handler中通过 reasoning_content 事件发送
+            function_call_data["first_llm_thought"] = full_response
+            
+            # 如果没有检测到函数调用 (例如，LLM直接回答了问题而没有调用工具)
             if not function_call_detected:
-                # 保存完整回应到会话历史
+                # 这种情况下，第一次LLM的输出 full_response 就是最终答案
+                # 此时，我们才应该将 full_response 作为 "content" 发送
+                if full_response:
+                    yield await send_event("content", full_response)
+                
+                if reasoning_start_sent: # True if use_reasoning and actual reasoning was streamed
+                    yield await send_event("reasoning_complete")
+                
                 await self.save_stream_response(conversation_id, full_response)
                 yield await send_event("done")
                 return
             
-            # 执行函数调用
+            # 执行函数调用 (这部分移到这里，确保在 full_response 收集完毕之后)
             function_name = function_call_data["function"].get("name", "")
-            yield await send_event("executing_function", 
-                                f"正在执行函数 {function_name}...")
             
             # 检查是否是web_search函数且没有query参数
             function_args = function_call_data["function"].get("arguments", "{}")
@@ -327,7 +367,7 @@ class ChatService:
             if handler:
                 # 使用专门的处理器处理该函数类型
                 async for event in handler(
-                    send_event, function_call_data, function_result, conversation_id, llm, messages
+                    send_event, function_call_data, function_result, conversation_id, llm, messages, options
                 ):
                     yield event
                 return
@@ -386,58 +426,122 @@ class ChatService:
             yield await send_event("error", f"处理出错: {str(e)}")
 
     async def _handle_web_search_function(self, send_event, function_call_data, function_result, 
-                                          conversation_id, llm, messages):
+                                          conversation_id, llm, messages, options):
         """处理web_search函数的专门处理器"""
         function_name = "web_search"
+        use_reasoning = options.get("use_reasoning", False)
         
         # 1. 先将 function_result 以 function_result 类型消息返回前端
         yield await send_event("function_result", {
             "function_type": function_name,
             "result": function_result
         })
+        
+        # --- 开始为第二次LLM调用构建新的消息列表 ---
 
-        # 2. 构造新的消息列表：原始 messages + tool_calls + tool 消息
-        full_messages = list(messages)
-        
-        # 从 function_call_data 获取 tool_call_id 和 arguments
-        original_tool_call_id = function_call_data.get("tool_call_id", f"call_{uuid.uuid4()}") # 备用方案
+        # 1. 获取用户原始提问 (Simplified: take the last user/human message)
+        original_user_query = "用户的先前问题" # Default fallback
+        if messages:
+            for i in range(len(messages) - 1, -1, -1):
+                msg = messages[i]
+                content_to_check = None
+                is_user_role = False
+                if isinstance(msg, dict):
+                    if msg.get("role") == "user":
+                        content_to_check = msg.get("content")
+                        is_user_role = True
+                elif hasattr(msg, 'type') and msg.type == 'human' and hasattr(msg, 'content'): # Langchain HumanMessage
+                    content_to_check = msg.content
+                    is_user_role = True
+                
+                if is_user_role and content_to_check:
+                    original_user_query = content_to_check
+                    break
+            if original_user_query == "用户的先前问题" and messages: # If loop didn't find specific user query, take last message if user.
+                last_msg_obj = messages[-1]
+                if isinstance(last_msg_obj, dict) and last_msg_obj.get("role") == "user":
+                    original_user_query = last_msg_obj.get("content", original_user_query)
+                elif hasattr(last_msg_obj, 'type') and last_msg_obj.type == 'human' and hasattr(last_msg_obj, 'content'):
+                     original_user_query = last_msg_obj.content
+
+
+        # 2. 格式化新的系统提示
+        system_prompt_content = SYNTHESIZE_TOOL_RESULT_PROMPT.format(
+            original_user_query=original_user_query,
+            tool_name=function_name,
+            tool_results_json=json.dumps(function_result, ensure_ascii=False)
+        )
+
+        # 3. 构建第二次LLM调用的消息列表
+        second_llm_messages = [
+            SystemMessage(content=system_prompt_content) # Use SystemMessage for Langchain compatibility
+        ]
+
+        original_tool_call_id = function_call_data.get("tool_call_id", f"call_{uuid.uuid4()}")
         original_arguments_str = function_call_data["function"].get("arguments", "{}")
-        
-        # 确保 arguments 是有效的 JSON string, 至少是 "{}"
+        first_llm_thought_content = function_call_data.get("first_llm_thought", None)
+
         try:
             json.loads(original_arguments_str)
             valid_arguments_str = original_arguments_str if original_arguments_str.strip() else "{}"
         except json.JSONDecodeError:
             valid_arguments_str = "{}"
-            
-        # 添加 assistant 的工具调用消息
-        full_messages.append({
-            "role": "assistant", 
-            "content": None,
-            "tool_calls": [{
-                "id": original_tool_call_id, # 使用原始 tool_call_id
-                "type": "function",
-                "function": {
-                    "name": function_name,
-                    "arguments": valid_arguments_str # 使用处理后的 arguments
-                }
-            }]
-        })
+
+        assistant_tool_call_dict = {
+            "id": original_tool_call_id,
+            "type": "function",
+            "function": {
+                "name": function_name,
+                "arguments": valid_arguments_str
+            }
+        }
         
-        # 添加工具响应消息
-        full_messages.append({
-            "role": "tool",
-            "tool_call_id": original_tool_call_id, # 保持一致
-            "content": json.dumps(function_result, ensure_ascii=False)
-        })
+        ai_message_content = first_llm_thought_content if first_llm_thought_content and first_llm_thought_content.strip() else None
+
+        current_assistant_message_dict = {
+            "role": "assistant",
+            "content": ai_message_content, # Can be None
+            "tool_calls": [assistant_tool_call_dict]
+        }
+        second_llm_messages.append(current_assistant_message_dict) # Append as dict
+
+        tool_message_content = json.dumps(function_result, ensure_ascii=False)
+        second_llm_messages.append(ToolMessage(content=tool_message_content, tool_call_id=original_tool_call_id).dict()) # Convert to dict for mixed list
+
 
         # 4. 流式返回 LLM 的最终回复
         final_response = ""
-        for chunk in llm.stream(full_messages):
-            content = chunk.content if hasattr(chunk, 'content') else chunk
-            if content:
-                final_response += content
-                yield await send_event("content", content)
+        logger.info(f"{function_name}_handler: Preparing for second LLM stream to generate final answer.")
+        reasoning_start_sent_phase2 = False
+        reasoning_complete_sent_phase2 = False # New flag
+
+        for chunk in llm.stream(second_llm_messages): #  <--- 使用新的消息列表
+            has_new_reasoning_in_this_chunk = False
+            # Handle Phase 2 reasoning from second LLM if use_reasoning is True
+            if use_reasoning and hasattr(chunk, 'additional_kwargs') and 'reasoning_content' in chunk.additional_kwargs:
+                reasoning_content_from_kw_phase2 = chunk.additional_kwargs['reasoning_content']
+                if reasoning_content_from_kw_phase2 and reasoning_content_from_kw_phase2.strip():
+                    if not reasoning_start_sent_phase2:
+                        yield await send_event("reasoning_start")
+                        reasoning_start_sent_phase2 = True
+                    yield await send_event("reasoning_content", reasoning_content_from_kw_phase2)
+                    has_new_reasoning_in_this_chunk = True
+
+            # Handle final content from second LLM
+            content_chunk_text = chunk.content if hasattr(chunk, 'content') else None
+            
+            # Decide if reasoning_complete should be sent
+            if content_chunk_text is not None and content_chunk_text.strip(): # Actual content is starting
+                if reasoning_start_sent_phase2 and not reasoning_complete_sent_phase2 and not has_new_reasoning_in_this_chunk:
+                    yield await send_event("reasoning_complete")
+            
+            if content_chunk_text is not None:
+                final_response += content_chunk_text
+                yield await send_event("content", content_chunk_text)
+
+        # After the loop, if reasoning started but 'reasoning_complete' was not sent
+        if reasoning_start_sent_phase2 and not reasoning_complete_sent_phase2:
+            yield await send_event("reasoning_complete")
 
         # 5. 保存完整对话历史
         await self.save_function_call_stream_response(
@@ -452,9 +556,10 @@ class ChatService:
         yield await send_event("done")
 
     async def _handle_hot_topics_function(self, send_event, function_call_data, function_result, 
-                                          conversation_id, llm, messages):
+                                          conversation_id, llm, messages, options):
         """处理hot_topics函数的专门处理器"""
         function_name = "hot_topics"
+        use_reasoning = options.get("use_reasoning", False)
         
         # 1. 先将 function_result 以 function_result 类型消息返回前端
         yield await send_event("function_result", {
@@ -462,48 +567,104 @@ class ChatService:
             "result": function_result
         })
 
-        # 2. 构造新的消息列表：原始 messages + tool_calls + tool 消息
-        full_messages = list(messages)
-        
-        # 从 function_call_data 获取 tool_call_id 和 arguments
-        original_tool_call_id = function_call_data.get("tool_call_id", f"call_{uuid.uuid4()}") # 备用方案
+        # --- 开始为第二次LLM调用构建新的消息列表 (Similar to _handle_web_search_function) ---
+
+        # 1. 获取用户原始提问
+        original_user_query = "用户的先前问题" # Default fallback
+        if messages:
+            for i in range(len(messages) - 1, -1, -1):
+                msg = messages[i]
+                content_to_check = None
+                is_user_role = False
+                if isinstance(msg, dict):
+                    if msg.get("role") == "user":
+                        content_to_check = msg.get("content")
+                        is_user_role = True
+                elif hasattr(msg, 'type') and msg.type == 'human' and hasattr(msg, 'content'):
+                    content_to_check = msg.content
+                    is_user_role = True
+                
+                if is_user_role and content_to_check:
+                    original_user_query = content_to_check
+                    break
+            if original_user_query == "用户的先前问题" and messages:
+                last_msg_obj = messages[-1]
+                if isinstance(last_msg_obj, dict) and last_msg_obj.get("role") == "user":
+                    original_user_query = last_msg_obj.get("content", original_user_query)
+                elif hasattr(last_msg_obj, 'type') and last_msg_obj.type == 'human' and hasattr(last_msg_obj, 'content'):
+                     original_user_query = last_msg_obj.content
+
+        # 2. 格式化新的系统提示
+        system_prompt_content = SYNTHESIZE_TOOL_RESULT_PROMPT.format(
+            original_user_query=original_user_query,
+            tool_name=function_name,
+            tool_results_json=json.dumps(function_result, ensure_ascii=False)
+        )
+
+        # 3. 构建第二次LLM调用的消息列表
+        second_llm_messages = [
+            SystemMessage(content=system_prompt_content).dict() # Use SystemMessage and convert to dict
+        ]
+
+        original_tool_call_id = function_call_data.get("tool_call_id", f"call_{uuid.uuid4()}")
         original_arguments_str = function_call_data["function"].get("arguments", "{}")
-        
-        # 确保 arguments 是有效的 JSON string, 至少是 "{}"
+        first_llm_thought_content = function_call_data.get("first_llm_thought", None)
+
         try:
             json.loads(original_arguments_str)
             valid_arguments_str = original_arguments_str if original_arguments_str.strip() else "{}"
         except json.JSONDecodeError:
             valid_arguments_str = "{}"
 
-        # 添加 assistant 的工具调用消息
-        full_messages.append({
-            "role": "assistant", 
-            "content": None,
-            "tool_calls": [{
-                "id": original_tool_call_id, # 使用原始 tool_call_id
-                "type": "function",
-                "function": {
-                    "name": function_name,
-                    "arguments": valid_arguments_str # 使用处理后的 arguments
-                }
-            }]
-        })
+        assistant_tool_call_dict = {
+            "id": original_tool_call_id,
+            "type": "function",
+            "function": {
+                "name": function_name,
+                "arguments": valid_arguments_str
+            }
+        }
         
-        # 添加工具响应消息
-        full_messages.append({
-            "role": "tool",
-            "tool_call_id": original_tool_call_id, # 保持一致
-            "content": json.dumps(function_result, ensure_ascii=False)
-        })
+        ai_message_content = first_llm_thought_content if first_llm_thought_content and first_llm_thought_content.strip() else None
+        
+        current_assistant_message_dict = {
+            "role": "assistant",
+            "content": ai_message_content,
+            "tool_calls": [assistant_tool_call_dict]
+        }
+        second_llm_messages.append(current_assistant_message_dict)
+
+        tool_message_content = json.dumps(function_result, ensure_ascii=False)
+        second_llm_messages.append(ToolMessage(content=tool_message_content, tool_call_id=original_tool_call_id).dict()) # Convert to dict
 
         # 4. 流式返回 LLM 的最终回复
         final_response = ""
-        for chunk in llm.stream(full_messages):
-            content = chunk.content if hasattr(chunk, 'content') else chunk
-            if content:
-                final_response += content
-                yield await send_event("content", content)
+        reasoning_start_sent_phase2 = False
+        reasoning_complete_sent_phase2 = False # New flag
+
+        for chunk in llm.stream(second_llm_messages): #  <--- 使用新的消息列表
+            has_new_reasoning_in_this_chunk = False
+            if use_reasoning and hasattr(chunk, 'additional_kwargs') and 'reasoning_content' in chunk.additional_kwargs:
+                reasoning_content_from_kw_phase2 = chunk.additional_kwargs['reasoning_content']
+                if reasoning_content_from_kw_phase2 and reasoning_content_from_kw_phase2.strip():
+                    if not reasoning_start_sent_phase2:
+                        yield await send_event("reasoning_start")
+                        reasoning_start_sent_phase2 = True
+                    yield await send_event("reasoning_content", reasoning_content_from_kw_phase2)
+                    has_new_reasoning_in_this_chunk = True
+            
+            content_chunk_text = chunk.content if hasattr(chunk, 'content') else None
+
+            if content_chunk_text is not None and content_chunk_text.strip(): # Actual content is starting
+                if reasoning_start_sent_phase2 and not reasoning_complete_sent_phase2 and not has_new_reasoning_in_this_chunk:
+                    yield await send_event("reasoning_complete")
+            
+            if content_chunk_text is not None:
+                final_response += content_chunk_text
+                yield await send_event("content", content_chunk_text)
+
+        if reasoning_start_sent_phase2 and not reasoning_complete_sent_phase2:
+            yield await send_event("reasoning_complete")
 
         # 5. 保存完整对话历史
         await self.save_function_call_stream_response(

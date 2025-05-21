@@ -15,7 +15,8 @@ class FunctionRegistry:
         self._formatted_functions: Dict[str, Dict[str, Any]] = {
             "openai": {},
             "anthropic": {},
-            "deepseek": {}
+            "deepseek": {},
+            "qwen": {}
         }
         
     def register(self, name: str, description: str, parameters: Dict[str, Any],
@@ -52,7 +53,7 @@ class FunctionRegistry:
         获取指定提供商格式的函数定义
         
         参数:
-            provider: 模型提供商名称 (openai, anthropic, deepseek 等)
+            provider: 模型提供商名称 (openai, anthropic, deepseek, qwen 等)
             function_names: 要获取的函数名称列表, 如果为None则获取所有函数
             
         返回:
@@ -93,7 +94,7 @@ class FunctionRegistry:
         返回:
             格式化后的函数定义
         """
-        if provider == "openai" or provider == "deepseek":
+        if provider in ["openai", "deepseek", "qwen"]:
             return {
                 "type": "function",
                 "function": function_def
