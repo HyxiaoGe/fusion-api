@@ -24,6 +24,64 @@ from app.services.model_strategies import ModelStrategyFactory
 from app.services.stream_handler import StreamHandler
 from app.services.web_search_service import WebSearchService
 
+
+# ==================== 常量定义 ====================
+
+# 消息角色常量
+class MessageRoles:
+    USER = "user"
+    ASSISTANT = "assistant"
+    SYSTEM = "system"
+    FUNCTION = "function"
+    TOOL = "tool"
+
+
+# 事件类型常量
+class EventTypes:
+    FUNCTION_STREAM_START = "function_stream_start"
+    REASONING_START = "reasoning_start"
+    REASONING_CONTENT = "reasoning_content"
+    REASONING_COMPLETE = "reasoning_complete"
+    CONTENT = "content"
+    DONE = "done"
+    ERROR = "error"
+    FUNCTION_CALL_DETECTED = "function_call_detected"
+    FUNCTION_RESULT = "function_result"
+    GENERATING_QUERY = "generating_query"
+    QUERY_GENERATED = "query_generated"
+    USER_SEARCH_START = "user_search_start"
+    PERFORMING_SEARCH = "performing_search"
+    SYNTHESIZING_ANSWER = "synthesizing_answer"
+
+
+# 函数名称常量
+class FunctionNames:
+    WEB_SEARCH = "web_search"
+    HOT_TOPICS = "hot_topics"
+
+
+# 函数描述常量
+FUNCTION_DESCRIPTIONS = {
+    FunctionNames.WEB_SEARCH: "我需要搜索网络获取更多信息...",
+    FunctionNames.HOT_TOPICS: "我将查询最新的热点话题...",
+}
+
+# 消息文本常量
+class MessageTexts:
+    OPTIMIZING_SEARCH_QUERY = "正在优化搜索查询..."
+    SEARCH_QUERY_PREFIX = "搜索查询: "
+    SYNTHESIZING_ANSWER = "正在结合搜索结果生成回答..."
+    USER_PREVIOUS_QUESTION = "用户的先前问题"
+    NO_USER_QUERY_ERROR = "无法找到用户原始提问以执行联网搜索。"
+    PROCESSING_ERROR_PREFIX = "处理出错: "
+    USER_PRIORITIZED_SEARCH_ERROR_PREFIX = "处理用户优先搜索出错: "
+    FUNCTION_CALL_ERROR_PREFIX = "函数调用流处理出错: "
+    FUNCTION_CALL_NEED_PREFIX = "需要调用函数: "
+    FUNCTION_CALL_GENERIC_PREFIX = "我需要调用 {} 函数获取信息..."
+
+
+# ==================== ChatService 类 ====================
+
 class ChatService:
     def __init__(self, db: Session):
         self.db = db
@@ -54,7 +112,7 @@ class ChatService:
         conversation = self._get_or_create_conversation(conversation_id, provider, model, message)
 
         # 记录用户消息
-        user_message = Message(role="user", content=message)
+        user_message = Message(role=MessageRoles.USER, content=message)
         conversation.messages.append(user_message)
         
         # 准备聊天历史
@@ -199,8 +257,8 @@ class ChatService:
         
         # 函数类型处理器映射
         function_handlers = {
-            "web_search": self._handle_web_search_function,
-            "hot_topics": self._handle_hot_topics_function,
+            FunctionNames.WEB_SEARCH: self._handle_web_search_function,
+            FunctionNames.HOT_TOPICS: self._handle_hot_topics_function,
             # 将来可以在这里添加更多函数处理器
         }
         
@@ -218,19 +276,19 @@ class ChatService:
         
         # 构建新的系统提示字典
         new_system_prompt_dict = {
-            "role": "system",
+            "role": MessageRoles.SYSTEM,
             "content": FUNCTION_CALL_BEHAVIOR_PROMPT
         }
         
         # 确保 messages 是可修改的列表副本，并且将新系统提示放在最前面
         # 移除原始 messages 中已有的 system角色的消息，以避免混淆或重复的系统指令
         processed_messages = [new_system_prompt_dict] + [
-            msg for msg in messages if not (isinstance(msg, dict) and msg.get("role") == "system")
+            msg for msg in messages if not (isinstance(msg, dict) and msg.get("role") == MessageRoles.SYSTEM)
         ]
         
         try:
             # 开始函数流
-            yield await send_event("function_stream_start")
+            yield await send_event(EventTypes.FUNCTION_STREAM_START)
             
             # 第一次流式调用模型
             full_response = ""
@@ -246,10 +304,10 @@ class ChatService:
                     reasoning_content_from_kw = chunk.additional_kwargs['reasoning_content']
                     if reasoning_content_from_kw and reasoning_content_from_kw.strip():
                         if not reasoning_start_sent:
-                            yield await send_event("reasoning_start")
+                            yield await send_event(EventTypes.REASONING_START)
                             reasoning_start_sent = True
                         # Stream reasoning_content from additional_kwargs, not from full_response later
-                        yield await send_event("reasoning_content", reasoning_content_from_kw)
+                        yield await send_event(EventTypes.REASONING_CONTENT, reasoning_content_from_kw)
 
                 # 检查流中是否有函数调用
                 if not function_call_detected:
@@ -258,9 +316,9 @@ class ChatService:
                     
                     if function_call_detected:
                         function_name = function_call_data['function'].get('name')
-                        yield await send_event("function_call_detected", {
+                        yield await send_event(EventTypes.FUNCTION_CALL_DETECTED, {
                             "function_type": function_name,
-                            "description": f"需要调用函数: {function_name}"
+                            "description": f"{MessageTexts.FUNCTION_CALL_NEED_PREFIX}{function_name}"
                         })
                 
                 #累积第一次LLM的思考过程 (chunk.content)
@@ -268,7 +326,7 @@ class ChatService:
                 if content_chunk_text:
                     full_response += content_chunk_text
                     if not function_call_detected:
-                         yield await send_event("content", content_chunk_text)
+                         yield await send_event(EventTypes.CONTENT, content_chunk_text)
                 
                 # 如果已检测到函数调用，并且当前chunk的所有相关信息已处理完毕，则可以退出循环
                 if function_call_detected:
@@ -277,10 +335,10 @@ class ChatService:
             # 如果没有检测到函数调用 (例如，LLM直接回答了问题而没有调用工具)
             if not function_call_detected:
                 if reasoning_start_sent: 
-                    yield await send_event("reasoning_complete")
+                    yield await send_event(EventTypes.REASONING_COMPLETE)
                 
                 await self.save_stream_response(conversation_id, full_response) 
-                yield await send_event("done")
+                yield await send_event(EventTypes.DONE)
                 return 
             
             # 如果执行到这里，说明 function_call_detected is True
@@ -302,8 +360,8 @@ class ChatService:
                 args_dict = {}
                 
             # 如果是web_search函数但没有query参数，使用LLM生成搜索查询
-            if function_name == "web_search" and not args_dict.get("query"):
-                yield await send_event("generating_query", "正在优化搜索查询...")
+            if function_name == FunctionNames.WEB_SEARCH and not args_dict.get("query"):
+                yield await send_event(EventTypes.GENERATING_QUERY, MessageTexts.OPTIMIZING_SEARCH_QUERY)
                 
                 # 从原始消息中提取用户的最后一条消息
                 user_message = ""
@@ -312,10 +370,10 @@ class ChatService:
                     if hasattr(msg, "type") and msg.type == "human":
                         user_message = msg.content
                         break
-                    elif hasattr(msg, "role") and msg.role == "user":
+                    elif hasattr(msg, "role") and msg.role == MessageRoles.USER:
                         user_message = msg.content
                         break
-                    elif isinstance(msg, dict) and msg.get("role") == "user":
+                    elif isinstance(msg, dict) and msg.get("role") == MessageRoles.USER:
                         user_message = msg.get("content", "")
                         break
                 
@@ -323,7 +381,7 @@ class ChatService:
                     # 让LLM生成优化后的搜索查询
                     current_date = datetime.now().strftime("%Y年%m月%d日")
                     search_query_prompt = f"为以下用户问题生成一个简洁明确的搜索查询: '{user_message}'。如果问题中包含与当前时间相关的指代（例如'今天'、'目前'），请以 {current_date} 作为当前日期进行理解。请仅返回搜索查询文本本身，不要附加任何解释或说明。"
-                    search_query_msgs = [{"role": "user", "content": search_query_prompt}]
+                    search_query_msgs = [{"role": MessageRoles.USER, "content": search_query_prompt}]
                     
                     # 使用现有模型生成查询
                     search_query_response = await llm.ainvoke(search_query_msgs)
@@ -336,7 +394,7 @@ class ChatService:
                     args_dict["query"] = search_query
                     function_call_data["function"]["arguments"] = json.dumps(args_dict)
                     
-                    yield await send_event("query_generated", f"搜索查询: {search_query}")
+                    yield await send_event(EventTypes.QUERY_GENERATED, f"{MessageTexts.SEARCH_QUERY_PREFIX}{search_query}")
             
             # 处理函数调用
             function_result = await function_adapter.process_function_call(
@@ -367,7 +425,7 @@ class ChatService:
             if provider in ["deepseek", "openai", "anthropic", "qwen", "volcengine"]:
                 # 使用tool_calls格式
                 full_messages.append({
-                    "role": "assistant",
+                    "role": MessageRoles.ASSISTANT,
                     "content": None,
                     "tool_calls": [{
                         "type": "function",
@@ -378,7 +436,7 @@ class ChatService:
             else:
                 # 使用传统function_call格式
                 full_messages.append({
-                    "role": "assistant",
+                    "role": MessageRoles.ASSISTANT,
                     "content": "",
                     "function_call": function_call_data["function"]
                 })
@@ -391,7 +449,7 @@ class ChatService:
                 content = chunk.content if hasattr(chunk, 'content') else chunk
                 if content:
                     final_response += content
-                    yield await send_event("content", content)
+                    yield await send_event(EventTypes.CONTENT, content)
             
             # 保存完整对话历史
             await self.save_function_call_stream_response(
@@ -403,23 +461,23 @@ class ChatService:
             )
             
             # 完成标志
-            yield await send_event("done")
+            yield await send_event(EventTypes.DONE)
             
         except Exception as e:
             # 错误处理
-            logger.error(f"函数调用流处理出错: {e}")
+            logger.error(f"{MessageTexts.FUNCTION_CALL_ERROR_PREFIX}{e}")
             import traceback
             logger.error(traceback.format_exc())
-            yield await send_event("error", f"处理出错: {str(e)}")
+            yield await send_event(EventTypes.ERROR, f"{MessageTexts.PROCESSING_ERROR_PREFIX}{str(e)}")
 
     async def _handle_web_search_function(self, send_event, function_call_data, function_result, 
                                           conversation_id, llm, messages, options):
         """处理web_search函数的专门处理器"""
-        function_name = "web_search"
+        function_name = FunctionNames.WEB_SEARCH
         use_reasoning = options.get("use_reasoning", False)
         
         # 1. 先将 function_result 以 function_result 类型消息返回前端
-        yield await send_event("function_result", {
+        yield await send_event(EventTypes.FUNCTION_RESULT, {
             "function_type": function_name,
             "result": function_result
         })
@@ -427,14 +485,14 @@ class ChatService:
         # --- 开始为第二次LLM调用构建新的消息列表 ---
 
         # 1. 获取用户原始提问 (Simplified: take the last user/human message)
-        original_user_query = "用户的先前问题" # Default fallback
+        original_user_query = MessageTexts.USER_PREVIOUS_QUESTION # Default fallback
         if messages:
             for i in range(len(messages) - 1, -1, -1):
                 msg = messages[i]
                 content_to_check = None
                 is_user_role = False
                 if isinstance(msg, dict):
-                    if msg.get("role") == "user":
+                    if msg.get("role") == MessageRoles.USER:
                         content_to_check = msg.get("content")
                         is_user_role = True
                 elif hasattr(msg, 'type') and msg.type == 'human' and hasattr(msg, 'content'): # Langchain HumanMessage
@@ -444,9 +502,9 @@ class ChatService:
                 if is_user_role and content_to_check:
                     original_user_query = content_to_check
                     break
-            if original_user_query == "用户的先前问题" and messages: # If loop didn't find specific user query, take last message if user.
+            if original_user_query == MessageTexts.USER_PREVIOUS_QUESTION and messages: # If loop didn't find specific user query, take last message if user.
                 last_msg_obj = messages[-1]
-                if isinstance(last_msg_obj, dict) and last_msg_obj.get("role") == "user":
+                if isinstance(last_msg_obj, dict) and last_msg_obj.get("role") == MessageRoles.USER:
                     original_user_query = last_msg_obj.get("content", original_user_query)
                 elif hasattr(last_msg_obj, 'type') and last_msg_obj.type == 'human' and hasattr(last_msg_obj, 'content'):
                      original_user_query = last_msg_obj.content
@@ -486,7 +544,7 @@ class ChatService:
         ai_message_content = first_llm_thought_content if first_llm_thought_content and first_llm_thought_content.strip() else None
 
         current_assistant_message_dict = {
-            "role": "assistant",
+            "role": MessageRoles.ASSISTANT,
             "content": ai_message_content, # Can be None
             "tool_calls": [assistant_tool_call_dict]
         }
@@ -509,9 +567,9 @@ class ChatService:
                 reasoning_content_from_kw_phase2 = chunk.additional_kwargs['reasoning_content']
                 if reasoning_content_from_kw_phase2 and reasoning_content_from_kw_phase2.strip():
                     if not reasoning_start_sent_phase2:
-                        yield await send_event("reasoning_start")
+                        yield await send_event(EventTypes.REASONING_START)
                         reasoning_start_sent_phase2 = True
-                    yield await send_event("reasoning_content", reasoning_content_from_kw_phase2)
+                    yield await send_event(EventTypes.REASONING_CONTENT, reasoning_content_from_kw_phase2)
                     has_new_reasoning_in_this_chunk = True
 
             # Handle final content from second LLM
@@ -520,15 +578,15 @@ class ChatService:
             # Decide if reasoning_complete should be sent
             if content_chunk_text is not None and content_chunk_text.strip(): # Actual content is starting
                 if reasoning_start_sent_phase2 and not reasoning_complete_sent_phase2 and not has_new_reasoning_in_this_chunk:
-                    yield await send_event("reasoning_complete")
+                    yield await send_event(EventTypes.REASONING_COMPLETE)
             
             if content_chunk_text is not None:
                 final_response += content_chunk_text
-                yield await send_event("content", content_chunk_text)
+                yield await send_event(EventTypes.CONTENT, content_chunk_text)
 
         # After the loop, if reasoning started but 'reasoning_complete' was not sent
         if reasoning_start_sent_phase2 and not reasoning_complete_sent_phase2:
-            yield await send_event("reasoning_complete")
+            yield await send_event(EventTypes.REASONING_COMPLETE)
 
         # 5. 保存完整对话历史
         await self.save_function_call_stream_response(
@@ -540,16 +598,16 @@ class ChatService:
         )
 
         # 6. 完成标志
-        yield await send_event("done")
+        yield await send_event(EventTypes.DONE)
 
     async def _handle_hot_topics_function(self, send_event, function_call_data, function_result, 
                                           conversation_id, llm, messages, options):
         """处理hot_topics函数的专门处理器"""
-        function_name = "hot_topics"
+        function_name = FunctionNames.HOT_TOPICS
         use_reasoning = options.get("use_reasoning", False)
         
         # 1. 先将 function_result 以 function_result 类型消息返回前端
-        yield await send_event("function_result", {
+        yield await send_event(EventTypes.FUNCTION_RESULT, {
             "function_type": function_name,
             "result": function_result
         })
@@ -557,14 +615,14 @@ class ChatService:
         # --- 开始为第二次LLM调用构建新的消息列表 (Similar to _handle_web_search_function) ---
 
         # 1. 获取用户原始提问
-        original_user_query = "用户的先前问题" # Default fallback
+        original_user_query = MessageTexts.USER_PREVIOUS_QUESTION # Default fallback
         if messages:
             for i in range(len(messages) - 1, -1, -1):
                 msg = messages[i]
                 content_to_check = None
                 is_user_role = False
                 if isinstance(msg, dict):
-                    if msg.get("role") == "user":
+                    if msg.get("role") == MessageRoles.USER:
                         content_to_check = msg.get("content")
                         is_user_role = True
                 elif hasattr(msg, 'type') and msg.type == 'human' and hasattr(msg, 'content'):
@@ -574,9 +632,9 @@ class ChatService:
                 if is_user_role and content_to_check:
                     original_user_query = content_to_check
                     break
-            if original_user_query == "用户的先前问题" and messages:
+            if original_user_query == MessageTexts.USER_PREVIOUS_QUESTION and messages:
                 last_msg_obj = messages[-1]
-                if isinstance(last_msg_obj, dict) and last_msg_obj.get("role") == "user":
+                if isinstance(last_msg_obj, dict) and last_msg_obj.get("role") == MessageRoles.USER:
                     original_user_query = last_msg_obj.get("content", original_user_query)
                 elif hasattr(last_msg_obj, 'type') and last_msg_obj.type == 'human' and hasattr(last_msg_obj, 'content'):
                      original_user_query = last_msg_obj.content
@@ -615,7 +673,7 @@ class ChatService:
         ai_message_content = first_llm_thought_content if first_llm_thought_content and first_llm_thought_content.strip() else None
         
         current_assistant_message_dict = {
-            "role": "assistant",
+            "role": MessageRoles.ASSISTANT,
             "content": ai_message_content,
             "tool_calls": [assistant_tool_call_dict]
         }
@@ -635,23 +693,23 @@ class ChatService:
                 reasoning_content_from_kw_phase2 = chunk.additional_kwargs['reasoning_content']
                 if reasoning_content_from_kw_phase2 and reasoning_content_from_kw_phase2.strip():
                     if not reasoning_start_sent_phase2:
-                        yield await send_event("reasoning_start")
+                        yield await send_event(EventTypes.REASONING_START)
                         reasoning_start_sent_phase2 = True
-                    yield await send_event("reasoning_content", reasoning_content_from_kw_phase2)
+                    yield await send_event(EventTypes.REASONING_CONTENT, reasoning_content_from_kw_phase2)
                     has_new_reasoning_in_this_chunk = True
             
             content_chunk_text = chunk.content if hasattr(chunk, 'content') else None
 
             if content_chunk_text is not None and content_chunk_text.strip(): # Actual content is starting
                 if reasoning_start_sent_phase2 and not reasoning_complete_sent_phase2 and not has_new_reasoning_in_this_chunk:
-                    yield await send_event("reasoning_complete")
+                    yield await send_event(EventTypes.REASONING_COMPLETE)
             
             if content_chunk_text is not None:
                 final_response += content_chunk_text
-                yield await send_event("content", content_chunk_text)
+                yield await send_event(EventTypes.CONTENT, content_chunk_text)
 
         if reasoning_start_sent_phase2 and not reasoning_complete_sent_phase2:
-            yield await send_event("reasoning_complete")
+            yield await send_event(EventTypes.REASONING_COMPLETE)
 
         # 5. 保存完整对话历史
         await self.save_function_call_stream_response(
@@ -663,7 +721,7 @@ class ChatService:
         )
 
         # 6. 完成标志
-        yield await send_event("done")
+        yield await send_event(EventTypes.DONE)
 
     async def save_function_call_stream_response(self, conversation_id, function_name, 
                                            function_args, function_result, final_response):
@@ -672,29 +730,23 @@ class ChatService:
             conversation = self.memory_service.get_conversation(conversation_id)
             if conversation:
                 # 创建函数调用请求消息，根据函数类型提供不同描述
-                function_descriptions = {
-                    "web_search": "我需要搜索网络获取更多信息...",
-                    "hot_topics": "我将查询最新的热点话题...",
-                    # 未来可以在这里添加更多函数类型描述
-                }
-                
-                function_desc = function_descriptions.get(function_name, f"我需要调用 {function_name} 函数获取信息...")
+                function_desc = FUNCTION_DESCRIPTIONS.get(function_name, f"我需要调用 {function_name} 函数获取信息...")
                 
                 # 创建函数调用消息
                 function_call_message = Message(
-                    role="assistant",
+                    role=MessageRoles.ASSISTANT,
                     content=function_desc
                 )
                 
                 # 创建函数结果消息
                 function_result_message = Message(
-                    role="function",
+                    role=MessageRoles.FUNCTION,
                     content=json.dumps(function_result, ensure_ascii=False)
                 )
                 
                 # 创建最终AI响应消息
                 ai_message = Message(
-                    role="assistant",
+                    role=MessageRoles.ASSISTANT,
                     content=final_response
                 )
                 
@@ -751,9 +803,9 @@ class ChatService:
                 # 从后向前查找最近的一组对话
                 for i in range(len(conversation.messages) - 1, -1, -1):
                     msg = conversation.messages[i]
-                    if not assistant_message and msg.role == "assistant":
+                    if not assistant_message and msg.role == MessageRoles.ASSISTANT:
                         assistant_message = msg.content
-                    if not user_message and msg.role == "user":
+                    if not user_message and msg.role == MessageRoles.USER:
                         user_message = msg.content
                     if user_message and assistant_message:
                         break
@@ -771,7 +823,7 @@ class ChatService:
                     # 如果没有找到对话，回退到之前的逻辑
                     user_messages = []
                     for msg in conversation.messages:
-                        if msg.role == "user":
+                        if msg.role == MessageRoles.USER:
                             user_messages.append(msg.content)
                             if len(user_messages) >= 3:
                                 break
@@ -842,9 +894,9 @@ class ChatService:
         # 从后向前查找最近的用户消息和AI回答
         for i in range(len(conversation.messages) - 1, -1, -1):
             msg = conversation.messages[i]
-            if not latest_ai_msg and msg.role == "assistant":
+            if not latest_ai_msg and msg.role == MessageRoles.ASSISTANT:
                 latest_ai_msg = msg.content
-            elif not latest_user_msg and msg.role == "user":
+            elif not latest_user_msg and msg.role == MessageRoles.USER:
                 latest_user_msg = msg.content
             if latest_user_msg and latest_ai_msg:
                 break
@@ -956,7 +1008,7 @@ class ChatService:
             if not function_call:
                 # 创建AI消息
                 ai_message = Message(
-                    role="assistant",
+                    role=MessageRoles.ASSISTANT,
                     content=response.content if hasattr(response, 'content') else str(response)
                 )
                 
@@ -987,7 +1039,7 @@ class ChatService:
             
             # 添加AI选择调用函数的消息
             ai_function_message = Message(
-                role="assistant",
+                role=MessageRoles.ASSISTANT,
                 content=response.content if hasattr(response, 'content') and response.content else f"我需要调用 {function_call.get('name')} 函数获取更多信息..."
             )
             conversation.messages.append(ai_function_message)
@@ -1018,7 +1070,7 @@ class ChatService:
             
             # 创建最终AI消息
             final_ai_message = Message(
-                role="assistant",
+                role=MessageRoles.ASSISTANT,
                 content=final_response.content if hasattr(final_response, 'content') else str(final_response)
             )
             
@@ -1044,7 +1096,7 @@ class ChatService:
             
             # 创建错误消息
             error_message = Message(
-                role="assistant",
+                role=MessageRoles.ASSISTANT,
                 content=f"在处理函数调用时出现错误: {str(e)}"
             )
             
@@ -1064,7 +1116,7 @@ class ChatService:
             if conversation:
                 # 创建AI响应消息
                 ai_message = Message(
-                    role="assistant",
+                    role=MessageRoles.ASSISTANT,
                     content=response_content
                 )
                 
@@ -1094,7 +1146,7 @@ class ChatService:
 
         original_user_query_content = ""
         for msg_item in reversed(messages):
-            if isinstance(msg_item, dict) and msg_item.get("role") == "user":
+            if isinstance(msg_item, dict) and msg_item.get("role") == MessageRoles.USER:
                 original_user_query_content = msg_item.get("content", "")
                 break
             elif hasattr(msg_item, 'type') and msg_item.type == 'human' and hasattr(msg_item, 'content'):
@@ -1102,8 +1154,8 @@ class ChatService:
                 break
         if not original_user_query_content:
             logger.warning(f"User-prioritized search: Could not extract original user query from messages: {messages}")
-            yield await send_event("error", "无法找到用户原始提问以执行联网搜索。")
-            yield await send_event("done")
+            yield await send_event(EventTypes.ERROR, MessageTexts.NO_USER_QUERY_ERROR)
+            yield await send_event(EventTypes.DONE)
             return
 
         generated_search_query = ""
@@ -1111,9 +1163,9 @@ class ChatService:
         final_response_content = ""
 
         try:
-            yield await send_event("user_search_start")
+            yield await send_event(EventTypes.USER_SEARCH_START)
 
-            yield await send_event("generating_query", "正在优化搜索查询...")
+            yield await send_event(EventTypes.GENERATING_QUERY, MessageTexts.OPTIMIZING_SEARCH_QUERY)
             current_date = datetime.now().strftime("%Y年%m月%d日")
             search_query_prompt_content = (
                 f"为以下用户问题生成一个简洁明确的搜索查询: '{original_user_query_content}'."
@@ -1125,12 +1177,12 @@ class ChatService:
             search_query_response = await llm.ainvoke(search_query_msgs_for_llm)
             generated_search_query = search_query_response.content if hasattr(search_query_response, 'content') else str(search_query_response)
             generated_search_query = generated_search_query.strip().strip('"\'')
-            yield await send_event("query_generated", f"搜索查询: {generated_search_query}")
+            yield await send_event(EventTypes.QUERY_GENERATED, f"{MessageTexts.SEARCH_QUERY_PREFIX}{generated_search_query}")
 
-            yield await send_event("performing_search", {"query": generated_search_query})
+            yield await send_event(EventTypes.PERFORMING_SEARCH, {"query": generated_search_query})
             context_for_tool = {"db": self.db, "conversation_id": conversation_id}
             web_search_function_call_payload = {
-                "name": "web_search",
+                "name": FunctionNames.WEB_SEARCH,
                 "arguments": json.dumps({"query": generated_search_query})
             }
             search_result_data = await function_adapter.process_function_call(
@@ -1138,15 +1190,15 @@ class ChatService:
                 web_search_function_call_payload,
                 context_for_tool
             )
-            yield await send_event("function_result", {
-                "function_type": "web_search",
+            yield await send_event(EventTypes.FUNCTION_RESULT, {
+                "function_type": FunctionNames.WEB_SEARCH,
                 "result": search_result_data
             })
 
-            yield await send_event("synthesizing_answer", "正在结合搜索结果生成回答...")
+            yield await send_event(EventTypes.SYNTHESIZING_ANSWER, MessageTexts.SYNTHESIZING_ANSWER)
             system_prompt_content_for_synthesis = SYNTHESIZE_TOOL_RESULT_PROMPT.format(
                 original_user_query=original_user_query_content,
-                tool_name="web_search",
+                tool_name=FunctionNames.WEB_SEARCH,
                 tool_results_json=json.dumps(search_result_data, ensure_ascii=False)
             )
             second_llm_messages = [SystemMessage(content=system_prompt_content_for_synthesis)]
@@ -1160,21 +1212,21 @@ class ChatService:
                     reasoning_content_from_kw = chunk.additional_kwargs['reasoning_content']
                     if reasoning_content_from_kw and reasoning_content_from_kw.strip():
                         if not reasoning_start_sent:
-                            yield await send_event("reasoning_start")
+                            yield await send_event(EventTypes.REASONING_START)
                             reasoning_start_sent = True
-                        yield await send_event("reasoning_content", reasoning_content_from_kw)
+                        yield await send_event(EventTypes.REASONING_CONTENT, reasoning_content_from_kw)
                         has_new_reasoning_in_chunk = True
                 content_chunk_text = chunk.content if hasattr(chunk, 'content') else None
                 if content_chunk_text is not None and content_chunk_text.strip():
                     if reasoning_start_sent and not reasoning_complete_sent and not has_new_reasoning_in_chunk:
-                        yield await send_event("reasoning_complete")
+                        yield await send_event(EventTypes.REASONING_COMPLETE)
                         reasoning_complete_sent = True
                 if content_chunk_text is not None:
                     final_response_content += content_chunk_text
-                    yield await send_event("content", content_chunk_text)
+                    yield await send_event(EventTypes.CONTENT, content_chunk_text)
 
             if reasoning_start_sent and not reasoning_complete_sent:
-                yield await send_event("reasoning_complete")
+                yield await send_event(EventTypes.REASONING_COMPLETE)
 
             await self.save_user_prioritized_web_search_stream_response(
                 conversation_id,
@@ -1183,14 +1235,14 @@ class ChatService:
                 search_result_data,
                 final_response_content
             )
-            yield await send_event("done")
+            yield await send_event(EventTypes.DONE)
 
         except Exception as e:
-            logger.error(f"用户优先联网搜索流处理出错: {e}")
+            logger.error(f"{MessageTexts.USER_PRIORITIZED_SEARCH_ERROR_PREFIX}{e}")
             import traceback
             logger.error(traceback.format_exc())
-            yield await send_event("error", f"处理用户优先搜索出错: {str(e)}")
-            yield await send_event("done")
+            yield await send_event(EventTypes.ERROR, f"{MessageTexts.USER_PRIORITIZED_SEARCH_ERROR_PREFIX}{str(e)}")
+            yield await send_event(EventTypes.DONE)
 
     async def save_user_prioritized_web_search_stream_response(self, conversation_id: str, 
                                                original_user_query_content: str,
@@ -1210,24 +1262,24 @@ class ChatService:
                 "id": user_prioritized_tool_call_id,
                 "type": "function",
                 "function": {
-                    "name": "web_search",
+                    "name": FunctionNames.WEB_SEARCH,
                     "arguments": json.dumps({"query": generated_search_query})
                 }
             }
             db_assistant_action_message = Message(
-                role="assistant",
+                role=MessageRoles.ASSISTANT,
                 content="",
                 tool_calls=[assistant_tool_calling_dict]
             )
 
             db_tool_response_message = Message(
-                role="tool", 
+                role=MessageRoles.TOOL, 
                 tool_call_id=user_prioritized_tool_call_id,
                 content=json.dumps(search_result, ensure_ascii=False)
             )
 
             db_final_ai_message = Message(
-                role="assistant",
+                role=MessageRoles.ASSISTANT,
                 content=final_response
             )
             
