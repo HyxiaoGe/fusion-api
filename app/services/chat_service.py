@@ -107,42 +107,33 @@ class ChatService:
 
     async def _handle_stream_response(self, provider, model, messages, conversation_id, options=None):
         """处理流式响应"""
-        # 默认options
         if options is None:
             options = {}
             
-        # 判断是否使用推理模式
+        user_wants_web_search = options.get("use_web_search", False)
+        ai_can_use_functions = options.get("use_function_call", False)
         use_reasoning = options.get("use_reasoning", False)
-        
-        # 判断是否使用函数调用
-        use_function_call = options.get("use_function_call", False)
-        print("use_function_call.....................", use_function_call)
-        if use_function_call:
+
+        if user_wants_web_search:
+            return StreamingResponse(
+                self.generate_user_prioritized_web_search_stream(provider, model, messages, conversation_id, options),
+                media_type="text/event-stream"
+            )
+        elif ai_can_use_functions:
             return StreamingResponse(
                 self.generate_function_call_stream(provider, model, messages, conversation_id, options),
                 media_type="text/event-stream"
             )
-        
-        # 火山引擎特殊处理 - 直接使用OpenAI客户端访问API
-        if provider == "volcengine":
+        elif provider == "volcengine": 
             return StreamingResponse(
                 self.stream_handler.direct_reasoning_stream(provider, model, messages, conversation_id),
                 media_type="text/event-stream"
             )
-            # 根据模型名称判断使用推理模式（向后兼容）
-        elif provider in ("deepseek", "qwen") and use_reasoning:
+        elif use_reasoning or provider in ("deepseek", "qwen"): 
             return StreamingResponse(
                 self.stream_handler.generate_reasoning_stream(provider, model, messages, conversation_id),
                 media_type="text/event-stream"
             )
-        # 根据options判断使用推理模式
-        elif use_reasoning:
-            return StreamingResponse(
-                self.stream_handler.generate_reasoning_stream(provider, model, messages, conversation_id),
-                media_type="text/event-stream"
-            )
-        
-        # 默认使用常规流式响应
         else:
             return StreamingResponse(
                 self.stream_handler.generate_normal_stream(provider, model, messages, conversation_id),
@@ -276,28 +267,24 @@ class ChatService:
                 content_chunk_text = chunk.content if hasattr(chunk, 'content') else None # Ensure we have content
                 if content_chunk_text:
                     full_response += content_chunk_text
+                    if not function_call_detected:
+                         yield await send_event("content", content_chunk_text)
                 
                 # 如果已检测到函数调用，并且当前chunk的所有相关信息已处理完毕，则可以退出循环
                 if function_call_detected:
-                    break
-            
-            # 将累积的第一次LLM的完整思考过程（之前是full_response）保存到function_call_data中
-            # 这些思考过程将在handler中通过 reasoning_content 事件发送
-            function_call_data["first_llm_thought"] = full_response
+                    break 
             
             # 如果没有检测到函数调用 (例如，LLM直接回答了问题而没有调用工具)
             if not function_call_detected:
-                # 这种情况下，第一次LLM的输出 full_response 就是最终答案
-                # 此时，我们才应该将 full_response 作为 "content" 发送
-                if full_response:
-                    yield await send_event("content", full_response)
-                
-                if reasoning_start_sent: # True if use_reasoning and actual reasoning was streamed
+                if reasoning_start_sent: 
                     yield await send_event("reasoning_complete")
                 
-                await self.save_stream_response(conversation_id, full_response)
+                await self.save_stream_response(conversation_id, full_response) 
                 yield await send_event("done")
-                return
+                return 
+            
+            # 如果执行到这里，说明 function_call_detected is True
+            function_call_data["first_llm_thought"] = full_response
             
             # 执行函数调用 (这部分移到这里，确保在 full_response 收集完毕之后)
             function_name = function_call_data["function"].get("name", "")
@@ -1091,3 +1078,168 @@ class ChatService:
                 self.memory_service.save_conversation(conversation)
         except Exception as e:
             logger.error(f"保存流式响应失败: {e}")
+
+    async def generate_user_prioritized_web_search_stream(self, provider, model, messages, conversation_id, options):
+        """生成用户优先的联网搜索流式响应"""
+        if options is None:
+            options = {}
+        use_reasoning = options.get("use_reasoning", False)
+        llm = llm_manager.get_model(provider=provider, model=model)
+
+        async def send_event(event_type, content=None):
+            data = {"type": event_type, "conversation_id": conversation_id}
+            if content is not None:
+                data["content"] = content
+            return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+        original_user_query_content = ""
+        for msg_item in reversed(messages):
+            if isinstance(msg_item, dict) and msg_item.get("role") == "user":
+                original_user_query_content = msg_item.get("content", "")
+                break
+            elif hasattr(msg_item, 'type') and msg_item.type == 'human' and hasattr(msg_item, 'content'):
+                original_user_query_content = msg_item.content
+                break
+        if not original_user_query_content:
+            logger.warning(f"User-prioritized search: Could not extract original user query from messages: {messages}")
+            yield await send_event("error", "无法找到用户原始提问以执行联网搜索。")
+            yield await send_event("done")
+            return
+
+        generated_search_query = ""
+        search_result_data = None
+        final_response_content = ""
+
+        try:
+            yield await send_event("user_search_start")
+
+            yield await send_event("generating_query", "正在优化搜索查询...")
+            current_date = datetime.now().strftime("%Y年%m月%d日")
+            search_query_prompt_content = (
+                f"为以下用户问题生成一个简洁明确的搜索查询: '{original_user_query_content}'."
+                f"如果问题中包含与当前时间相关的指代（例如'今天'、'目前'），请以 {current_date} 作为当前日期进行理解。"
+                "请仅返回搜索查询文本本身，不要附加任何解释或说明。"
+            )
+            search_query_msgs_for_llm = [HumanMessage(content=search_query_prompt_content)]
+            
+            search_query_response = await llm.ainvoke(search_query_msgs_for_llm)
+            generated_search_query = search_query_response.content if hasattr(search_query_response, 'content') else str(search_query_response)
+            generated_search_query = generated_search_query.strip().strip('"\'')
+            yield await send_event("query_generated", f"搜索查询: {generated_search_query}")
+
+            yield await send_event("performing_search", {"query": generated_search_query})
+            context_for_tool = {"db": self.db, "conversation_id": conversation_id}
+            web_search_function_call_payload = {
+                "name": "web_search",
+                "arguments": json.dumps({"query": generated_search_query})
+            }
+            search_result_data = await function_adapter.process_function_call(
+                provider, 
+                web_search_function_call_payload,
+                context_for_tool
+            )
+            yield await send_event("function_result", {
+                "function_type": "web_search",
+                "result": search_result_data
+            })
+
+            yield await send_event("synthesizing_answer", "正在结合搜索结果生成回答...")
+            system_prompt_content_for_synthesis = SYNTHESIZE_TOOL_RESULT_PROMPT.format(
+                original_user_query=original_user_query_content,
+                tool_name="web_search",
+                tool_results_json=json.dumps(search_result_data, ensure_ascii=False)
+            )
+            second_llm_messages = [SystemMessage(content=system_prompt_content_for_synthesis)]
+
+            reasoning_start_sent = False
+            reasoning_complete_sent = False
+
+            for chunk in llm.stream(second_llm_messages):
+                has_new_reasoning_in_chunk = False
+                if use_reasoning and hasattr(chunk, 'additional_kwargs') and 'reasoning_content' in chunk.additional_kwargs:
+                    reasoning_content_from_kw = chunk.additional_kwargs['reasoning_content']
+                    if reasoning_content_from_kw and reasoning_content_from_kw.strip():
+                        if not reasoning_start_sent:
+                            yield await send_event("reasoning_start")
+                            reasoning_start_sent = True
+                        yield await send_event("reasoning_content", reasoning_content_from_kw)
+                        has_new_reasoning_in_chunk = True
+                content_chunk_text = chunk.content if hasattr(chunk, 'content') else None
+                if content_chunk_text is not None and content_chunk_text.strip():
+                    if reasoning_start_sent and not reasoning_complete_sent and not has_new_reasoning_in_chunk:
+                        yield await send_event("reasoning_complete")
+                        reasoning_complete_sent = True
+                if content_chunk_text is not None:
+                    final_response_content += content_chunk_text
+                    yield await send_event("content", content_chunk_text)
+
+            if reasoning_start_sent and not reasoning_complete_sent:
+                yield await send_event("reasoning_complete")
+
+            await self.save_user_prioritized_web_search_stream_response(
+                conversation_id,
+                original_user_query_content, 
+                generated_search_query,
+                search_result_data,
+                final_response_content
+            )
+            yield await send_event("done")
+
+        except Exception as e:
+            logger.error(f"用户优先联网搜索流处理出错: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            yield await send_event("error", f"处理用户优先搜索出错: {str(e)}")
+            yield await send_event("done")
+
+    async def save_user_prioritized_web_search_stream_response(self, conversation_id: str, 
+                                               original_user_query_content: str,
+                                               generated_search_query: str, 
+                                               search_result: Any, 
+                                               final_response: str):
+        """保存用户优先的联网搜索流式响应到对话历史"""
+        try:
+            conversation = self.memory_service.get_conversation(conversation_id)
+            if not conversation:
+                logger.error(f"保存用户优先搜索流时未找到会话: {conversation_id}")
+                return
+
+            user_prioritized_tool_call_id = f"user_search_{uuid.uuid4()}"
+            
+            assistant_tool_calling_dict = {
+                "id": user_prioritized_tool_call_id,
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "arguments": json.dumps({"query": generated_search_query})
+                }
+            }
+            db_assistant_action_message = Message(
+                role="assistant",
+                content="",
+                tool_calls=[assistant_tool_calling_dict]
+            )
+
+            db_tool_response_message = Message(
+                role="tool", 
+                tool_call_id=user_prioritized_tool_call_id,
+                content=json.dumps(search_result, ensure_ascii=False)
+            )
+
+            db_final_ai_message = Message(
+                role="assistant",
+                content=final_response
+            )
+            
+            conversation.messages.append(db_assistant_action_message)
+            conversation.messages.append(db_tool_response_message)
+            conversation.messages.append(db_final_ai_message)
+            
+            conversation.updated_at = datetime.now()
+            self.memory_service.save_conversation(conversation)
+            logger.info(f"用户优先搜索流响应已保存到会话 {conversation_id}")
+
+        except Exception as e:
+            logger.error(f"保存用户优先搜索流响应失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
