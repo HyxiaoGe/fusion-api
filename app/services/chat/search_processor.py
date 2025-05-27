@@ -11,7 +11,7 @@ from typing import Any
 from app.ai.llm_manager import llm_manager
 from app.core.function_manager import function_adapter
 from app.core.logger import app_logger as logger
-from app.constants import EventTypes, FunctionNames, MessageTexts
+from app.constants import EventTypes, FunctionNames, MessageTexts, MessageRoles
 from app.services.chat.stream_processor import StreamProcessor
 from app.services.chat.utils import ChatUtils
 
@@ -97,11 +97,11 @@ class SearchProcessor:
         final_response_content = ""
         
         async for result in self._synthesize_search_answer(llm, user_query, search_result_data, send_event, use_reasoning):
-            if isinstance(result, str):
+            # 传递所有事件给前端
+            yield result
+            # 如果是最终的完整响应（不是事件字符串），保存它
+            if isinstance(result, str) and not result.startswith("data: "):
                 final_response_content = result
-                break
-            else:
-                yield result
 
         # 保存搜索结果
         await self._save_user_prioritized_web_search_stream_response(
@@ -175,7 +175,6 @@ class SearchProcessor:
                 return
 
             from app.schemas.chat import Message
-            from app.constants import MessageRoles
             from datetime import datetime
 
             user_prioritized_tool_call_id = f"user_search_{uuid.uuid4()}"
