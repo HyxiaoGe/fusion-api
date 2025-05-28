@@ -51,7 +51,7 @@ class SearchProcessor:
         try:
             # 执行用户优先搜索流程
             async for event in self._execute_user_search_flow(
-                provider, llm, original_user_query_content, 
+                provider, model, llm, original_user_query_content, 
                 conversation_id, send_event, options
             ):
                 yield event
@@ -63,12 +63,13 @@ class SearchProcessor:
             yield await send_event(EventTypes.ERROR, f"{MessageTexts.USER_PRIORITIZED_SEARCH_ERROR_PREFIX}{str(e)}")
             yield await send_event(EventTypes.DONE)
 
-    async def _execute_user_search_flow(self, provider, llm, user_query, conversation_id, send_event, options):
+    async def _execute_user_search_flow(self, provider, model, llm, user_query, conversation_id, send_event, options):
         """
         执行用户优先搜索的完整流程
         
         Args:
             provider: 模型提供商
+            model: 模型名称
             llm: 语言模型实例
             user_query: 用户查询内容
             conversation_id: 会话ID
@@ -96,7 +97,7 @@ class SearchProcessor:
         yield await send_event(EventTypes.SYNTHESIZING_ANSWER, MessageTexts.SYNTHESIZING_ANSWER)
         final_response_content = ""
         
-        async for result in self._synthesize_search_answer(llm, user_query, search_result_data, send_event, use_reasoning):
+        async for result in self._synthesize_search_answer(llm, user_query, search_result_data, send_event, use_reasoning, provider, model):
             # 传递所有事件给前端
             yield result
             # 如果是最终的完整响应（不是事件字符串），保存它
@@ -132,7 +133,7 @@ class SearchProcessor:
             context_for_tool
         )
 
-    async def _synthesize_search_answer(self, llm, user_query, search_result_data, send_event, use_reasoning):
+    async def _synthesize_search_answer(self, llm, user_query, search_result_data, send_event, use_reasoning, provider=None, model=None):
         """
         合成搜索结果的答案
         
@@ -142,12 +143,14 @@ class SearchProcessor:
             search_result_data: 搜索结果数据
             send_event: 事件发送函数
             use_reasoning: 是否使用推理模式
+            provider: 模型提供商（可选）
+            model: 模型名称（可选）
             
         Returns:
             str: 最终响应内容
         """
         second_llm_messages = StreamProcessor.create_tool_synthesis_messages(
-            user_query, FunctionNames.WEB_SEARCH, search_result_data
+            user_query, FunctionNames.WEB_SEARCH, search_result_data, provider, model, use_reasoning
         )
 
         final_response_content = ""

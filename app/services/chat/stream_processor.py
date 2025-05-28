@@ -6,7 +6,7 @@
 
 import json
 from langchain_core.messages import SystemMessage, ToolMessage
-from app.ai.prompts.templates import SYNTHESIZE_TOOL_RESULT_PROMPT
+from app.ai.prompts.templates import SYNTHESIZE_TOOL_RESULT_PROMPT, SYNTHESIZE_TOOL_RESULT_PROMPT_FOR_REASONING
 from app.constants import EventTypes
 
 
@@ -139,7 +139,7 @@ class StreamProcessor:
             reasoning_state.reasoning_complete_sent = True
 
     @staticmethod
-    def create_tool_synthesis_messages(original_user_query, tool_name, tool_result):
+    def create_tool_synthesis_messages(original_user_query, tool_name, tool_result, provider=None, model=None, use_reasoning=False):
         """
         创建工具结果合成的消息列表
         
@@ -147,6 +147,9 @@ class StreamProcessor:
             original_user_query: 用户原始查询
             tool_name: 工具名称
             tool_result: 工具执行结果
+            provider: 模型提供商（可选）
+            model: 模型名称（可选）
+            use_reasoning: 是否使用推理模式
             
         Returns:
             list: 用于合成的消息列表

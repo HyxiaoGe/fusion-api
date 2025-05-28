@@ -23,7 +23,7 @@ from app.services.message_processor import MessageProcessor
 from app.services.model_strategies import ModelStrategyFactory
 from app.services.stream_handler import StreamHandler
 from app.services.web_search_service import WebSearchService
-from app.constants import MessageRoles, EventTypes, FunctionNames, MessageTexts, FUNCTION_DESCRIPTIONS
+from app.constants import MessageRoles, EventTypes, FunctionNames, MessageTexts, FUNCTION_DESCRIPTIONS, USER_FRIENDLY_FUNCTION_DESCRIPTIONS
 from app.services.chat.stream_processor import ReasoningState, StreamProcessor
 from app.services.chat.utils import ChatUtils
 from app.services.chat.function_call_processor import FunctionCallProcessor
@@ -483,9 +483,14 @@ class ChatService:
             conversation = self.memory_service.get_conversation(conversation_id)
             
             # 添加AI选择调用函数的消息
+            function_name = function_call.get('name')
+            user_friendly_description = USER_FRIENDLY_FUNCTION_DESCRIPTIONS.get(
+                function_name, 
+                "我需要调用工具获取更多信息..."
+            )
             ai_function_message = Message(
                 role=MessageRoles.ASSISTANT,
-                content=response.content if hasattr(response, 'content') and response.content else f"我需要调用 {function_call.get('name')} 函数获取更多信息..."
+                content=response.content if hasattr(response, 'content') and response.content else user_friendly_description
             )
             conversation.messages.append(ai_function_message)
             
@@ -493,7 +498,6 @@ class ChatService:
             function_result = await function_adapter.process_function_call(provider, function_call, context)
             
             # 准备工具消息
-            function_name = function_call.get("name", "")
             tool_message_data = function_adapter.prepare_tool_message(
                 provider, function_name, function_result, tool_call_id
             )

@@ -10,10 +10,10 @@ from typing import Dict, Any, List, Union
 from langchain_core.messages import ToolMessage
 
 from app.ai.llm_manager import llm_manager
-from app.ai.prompts.templates import FUNCTION_CALL_BEHAVIOR_PROMPT
+from app.ai.prompts.templates import FUNCTION_CALL_BEHAVIOR_PROMPT, FUNCTION_CALL_BEHAVIOR_PROMPT_FOR_REASONING
 from app.core.function_manager import function_adapter
 from app.core.logger import app_logger as logger
-from app.constants import MessageRoles, EventTypes, FunctionNames, MessageTexts, FUNCTION_DESCRIPTIONS
+from app.constants import MessageRoles, EventTypes, FunctionNames, MessageTexts, FUNCTION_DESCRIPTIONS, USER_FRIENDLY_FUNCTION_DESCRIPTIONS
 from app.services.chat.stream_processor import ReasoningState, StreamProcessor
 from app.services.chat.utils import ChatUtils
 
@@ -45,7 +45,7 @@ class FunctionCallProcessor:
         context = {"db": self.db, "conversation_id": conversation_id}
         
         # 准备消息和函数定义
-        processed_messages = self._prepare_function_call_messages(messages)
+        processed_messages = self._prepare_function_call_messages(messages, provider, model, options)
         functions_kwargs = function_adapter.prepare_functions_for_model(provider, model)
         
         try:
@@ -53,7 +53,7 @@ class FunctionCallProcessor:
             
             # 处理函数调用流程
             async for event in self._execute_function_call_flow(
-                provider, llm, processed_messages, functions_kwargs, 
+                provider, model, llm, processed_messages, functions_kwargs, 
                 messages, context, send_event, options
             ):
                 yield event
@@ -64,19 +64,33 @@ class FunctionCallProcessor:
             logger.error(traceback.format_exc())
             yield await send_event(EventTypes.ERROR, f"{MessageTexts.PROCESSING_ERROR_PREFIX}{str(e)}")
 
-    def _prepare_function_call_messages(self, messages):
+    def _prepare_function_call_messages(self, messages, provider=None, model=None, options=None):
         """
         准备函数调用的消息列表
         
         Args:
             messages: 原始消息列表
+            provider: 模型提供商（可选）
+            model: 模型名称（可选）
+            options: 选项参数（可选）
             
         Returns:
             list: 处理后的消息列表
         """
+        if options is None:
+            options = {}
+            
+        # 根据options中的use_reasoning参数选择合适的提示词
+        use_reasoning = options.get("use_reasoning", False)
+        
+        if use_reasoning:
+            prompt_content = FUNCTION_CALL_BEHAVIOR_PROMPT_FOR_REASONING
+        else:
+            prompt_content = FUNCTION_CALL_BEHAVIOR_PROMPT
+            
         new_system_prompt_dict = {
             "role": MessageRoles.SYSTEM,
-            "content": FUNCTION_CALL_BEHAVIOR_PROMPT
+            "content": prompt_content
         }
         
         # 移除原有系统消息，添加新的系统提示
@@ -84,13 +98,14 @@ class FunctionCallProcessor:
             msg for msg in messages if not (isinstance(msg, dict) and msg.get("role") == MessageRoles.SYSTEM)
         ]
 
-    async def _execute_function_call_flow(self, provider, llm, processed_messages, functions_kwargs, 
+    async def _execute_function_call_flow(self, provider, model, llm, processed_messages, functions_kwargs, 
                                          original_messages, context, send_event, options):
         """
         执行完整的函数调用流程
         
         Args:
             provider: 模型提供商
+            model: 模型名称
             llm: 语言模型实例
             processed_messages: 处理后的消息列表
             functions_kwargs: 函数调用参数
@@ -145,7 +160,7 @@ class FunctionCallProcessor:
             # 使用专门的处理器
             async for event in handler(
                 send_event, function_call_data, function_result, 
-                context["conversation_id"], llm, original_messages, options
+                context["conversation_id"], llm, original_messages, options, provider, model
             ):
                 yield event
         else:
@@ -206,9 +221,14 @@ class FunctionCallProcessor:
                 
                 if function_call_detected:
                     function_name = function_call_data['function'].get('name')
+                    # 使用用户友好的描述，而不是暴露内部函数名
+                    user_friendly_description = USER_FRIENDLY_FUNCTION_DESCRIPTIONS.get(
+                        function_name, 
+                        "我需要调用工具获取更多信息..."
+                    )
                     yield await send_event(EventTypes.FUNCTION_CALL_DETECTED, {
                         "function_type": function_name,
-                        "description": f"{MessageTexts.FUNCTION_CALL_NEED_PREFIX}{function_name}"
+                        "description": user_friendly_description
                     })
             
             # 累积第一次LLM的思考过程
@@ -308,7 +328,7 @@ class FunctionCallProcessor:
         yield final_response
 
     async def _handle_web_search_function(self, send_event, function_call_data, function_result, 
-                                          conversation_id, llm, messages, options):
+                                          conversation_id, llm, messages, options, provider, model):
         """处理web_search函数的专门处理器"""
         function_name = FunctionNames.WEB_SEARCH
         use_reasoning = options.get("use_reasoning", False)
@@ -326,7 +346,7 @@ class FunctionCallProcessor:
 
         # 2. 构建第二次LLM调用的消息列表
         second_llm_messages = StreamProcessor.create_tool_synthesis_messages(
-            original_user_query, function_name, function_result
+            original_user_query, function_name, function_result, provider, model, use_reasoning
         )
 
         original_tool_call_id = function_call_data.get("tool_call_id", f"call_{uuid.uuid4()}")
@@ -379,7 +399,7 @@ class FunctionCallProcessor:
         yield await send_event(EventTypes.DONE)
 
     async def _handle_hot_topics_function(self, send_event, function_call_data, function_result, 
-                                          conversation_id, llm, messages, options):
+                                          conversation_id, llm, messages, options, provider, model):
         """处理hot_topics函数的专门处理器"""
         function_name = FunctionNames.HOT_TOPICS
         use_reasoning = options.get("use_reasoning", False)
@@ -397,7 +417,7 @@ class FunctionCallProcessor:
 
         # 2. 构建第二次LLM调用的消息列表
         second_llm_messages = StreamProcessor.create_tool_synthesis_messages(
-            original_user_query, function_name, function_result
+            original_user_query, function_name, function_result, provider, model, use_reasoning
         )
 
         original_tool_call_id = function_call_data.get("tool_call_id", f"call_{uuid.uuid4()}")

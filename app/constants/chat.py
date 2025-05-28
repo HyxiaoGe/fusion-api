@@ -35,7 +35,13 @@ class MessageTexts:
     FUNCTION_CALL_GENERIC_PREFIX = "我需要调用 {} 函数获取信息..."
 
 
-# 函数描述常量
+# 用户友好的函数调用描述常量
+USER_FRIENDLY_FUNCTION_DESCRIPTIONS = {
+    FunctionNames.WEB_SEARCH: "我需要搜索网络获取最新信息...",
+    FunctionNames.HOT_TOPICS: "我将查询最新的热点话题...",
+}
+
+# 函数描述常量（内部使用）
 FUNCTION_DESCRIPTIONS = {
     FunctionNames.WEB_SEARCH: "我需要搜索网络获取更多信息...",
     FunctionNames.HOT_TOPICS: "我将查询最新的热点话题...",
