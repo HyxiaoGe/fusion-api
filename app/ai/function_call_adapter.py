@@ -43,6 +43,8 @@ class FunctionCallAdapter:
             return {"tools": functions}
         elif provider == "volcengine":
             return {"tools": functions}
+        elif provider == "google":
+            return {"tools": functions}
         else:
             # 默认格式
             return {"functions": functions}
@@ -139,7 +141,11 @@ class FunctionCallAdapter:
                 if tools and len(tools) > 0:
                     function_call = tools[0].get("function")
                     tool_call_id = tools[0].get("id")
-                    
+        elif provider == "google":
+            if hasattr(response, "additional_kwargs") and "function_call" in response.additional_kwargs:
+                function_call = response.additional_kwargs["function_call"]
+                tool_call_id = None
+        
         return function_call, tool_call_id
     
     def detect_function_call_in_stream(self, chunk, model_type=None):
@@ -157,8 +163,7 @@ class FunctionCallAdapter:
         function_call_detected = False
         function_call_data = {}
         
-        # print(f"chunk: {chunk}")
-        
+        # 1. 首先检查additional_kwargs中的tool_calls格式
         if hasattr(chunk, "additional_kwargs") and "tool_calls" in chunk.additional_kwargs:
             tool_calls = chunk.additional_kwargs["tool_calls"]
             if tool_calls and len(tool_calls) > 0:
@@ -170,39 +175,52 @@ class FunctionCallAdapter:
                         "tool_call_id": tool_calls[0].get("id")
                     }
         
-        try:
-            # 基于OpenAI格式的模型（包括OpenAI, QwQ, 火山引擎等）
-            # if hasattr(chunk, "tool_calls") and chunk.tool_calls:
-            #     function_call_detected = True
-            #     function_call_data = {
-            #         "function": chunk.tool_calls[0].function,
-            #         "tool_call_id": chunk.tool_calls[0].id
-            #     }
-            
-            # # 基于additional_kwargs格式的模型
-            # elif hasattr(chunk, "additional_kwargs"):
-            #     # Anthropic格式
-            #     if "tool_calls" in chunk.additional_kwargs and chunk.additional_kwargs["tool_calls"]:
-            #         function_call_detected = True
-            #         tool_call = chunk.additional_kwargs["tool_calls"][0]
-            #         function_call_data = {
-            #             "function": tool_call.get("function", {}),
-            #             "tool_call_id": tool_call.get("id")
-            #         }
-                
-            #     # DeepSeek格式
-            #     elif "function_call" in chunk.additional_kwargs:
-            #         function_call_detected = True
-            #         function_call_data = {
-            #             "function": chunk.additional_kwargs["function_call"],
-            #             "tool_call_id": None
-            #         }
-            
-            return function_call_detected, function_call_data
+        # 2. 检查additional_kwargs中的function_call格式 (如Google等)
+        if hasattr(chunk, "additional_kwargs") and "function_call" in chunk.additional_kwargs:
+            function_call = chunk.additional_kwargs["function_call"]
+            if isinstance(function_call, dict) and function_call.get("name"):
+                return True, {
+                    "function": function_call,
+                    "tool_call_id": None
+                }
         
-        except Exception as e:
-            logger.error(f"流式函数调用检测出错: {e}")
-            return False, {}
+        # 3. 检查标准tool_calls格式 (适用于Google等模型)
+        if hasattr(chunk, "tool_calls") and chunk.tool_calls:
+            for tool_call in chunk.tool_calls:
+                # 检查是否有name属性（直接在tool_call上）
+                if hasattr(tool_call, 'name') and tool_call.name:
+                    return True, {
+                        "function": {
+                            "name": tool_call.name,
+                            "arguments": getattr(tool_call, 'args', getattr(tool_call, 'arguments', '{}'))
+                        },
+                        "tool_call_id": getattr(tool_call, 'id', None)
+                    }
+                
+                # 检查是否有function属性
+                if hasattr(tool_call, 'function'):
+                    function_data = tool_call.function
+                    if hasattr(function_data, 'name') and function_data.name:
+                        return True, {
+                            "function": {
+                                "name": function_data.name,
+                                "arguments": getattr(function_data, 'arguments', '{}')
+                            },
+                            "tool_call_id": getattr(tool_call, 'id', None)
+                        }
+                
+                # 如果tool_call是字典格式
+                if isinstance(tool_call, dict):
+                    if tool_call.get('name'):
+                        return True, {
+                            "function": {
+                                "name": tool_call.get('name'),
+                                "arguments": tool_call.get('args', tool_call.get('arguments', '{}'))
+                            },
+                            "tool_call_id": tool_call.get('id')
+                        }
+        
+        return function_call_detected, function_call_data
     
     def prepare_tool_message(self, provider: str, function_name: str, function_result: Dict[str, Any], tool_call_id: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -219,7 +237,7 @@ class FunctionCallAdapter:
         """
         content = json.dumps(function_result, ensure_ascii=False)
         
-        if provider in ["openai", "anthropic", "qwen", "volcengine", "deepseek"] and tool_call_id:
+        if provider in ["openai", "anthropic", "qwen", "volcengine", "deepseek", "google"] and tool_call_id:
             return {
                 "role": "tool", 
                 "content": content,

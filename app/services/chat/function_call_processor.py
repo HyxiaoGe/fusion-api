@@ -204,6 +204,7 @@ class FunctionCallProcessor:
         function_call_detected = False
         function_call_data = {}
         reasoning_state = ReasoningState()
+        function_call_sent = False  # 标记是否已发送函数调用检测事件
         
         for chunk in llm.stream(processed_messages, **functions_kwargs):
             # 处理推理内容
@@ -215,11 +216,10 @@ class FunctionCallProcessor:
                 yield event
 
             # 检查流中是否有函数调用
-            has_new_reasoning = len(reasoning_events) > 0
             if not function_call_detected:
                 function_call_detected, function_call_data = function_adapter.detect_function_call_in_stream(chunk)
                 
-                if function_call_detected:
+                if function_call_detected and not function_call_sent:
                     function_name = function_call_data['function'].get('name')
                     # 使用用户友好的描述，而不是暴露内部函数名
                     user_friendly_description = USER_FRIENDLY_FUNCTION_DESCRIPTIONS.get(
@@ -230,17 +230,25 @@ class FunctionCallProcessor:
                         "function_type": function_name,
                         "description": user_friendly_description
                     })
+                    function_call_sent = True
             
             # 累积第一次LLM的思考过程
             content_chunk_text = StreamProcessor.extract_content(chunk)
             if content_chunk_text:
                 full_response += content_chunk_text
+                # 如果已经检测到函数调用，仍然可以继续接收和处理文本内容
+                # 某些模型（如Google）可能在工具调用之后还有文本内容
                 if not function_call_detected:
                      yield await send_event(EventTypes.CONTENT, content_chunk_text)
-            
-            # 如果已检测到函数调用，退出循环
-            if function_call_detected:
-                break
+        
+        # 对于Google模型，即使没有文本内容也可能有有效的函数调用
+        # 如果检测到函数调用但没有文本内容，提供一个默认的说明
+        if function_call_detected and not full_response.strip():
+            function_name = function_call_data['function'].get('name', '')
+            full_response = USER_FRIENDLY_FUNCTION_DESCRIPTIONS.get(
+                function_name, 
+                "我需要调用工具获取更多信息..."
+            )
         
         yield (function_call_detected, function_call_data, full_response, reasoning_state.reasoning_start_sent)
 
@@ -295,15 +303,20 @@ class FunctionCallProcessor:
         full_messages = list(messages)
         
         # 添加LLM的函数调用响应
-        if provider in ["deepseek", "openai", "anthropic", "qwen", "volcengine"]:
+        if provider in ["deepseek", "openai", "anthropic", "qwen", "volcengine", "google"]:
             # 使用tool_calls格式
+            tool_call_id = function_call_data.get("tool_call_id", "call_1")
+            # 确保tool_call_id不为None或空字符串
+            if tool_call_id is None or tool_call_id == "":
+                tool_call_id = "call_1"
+            
             full_messages.append({
                 "role": MessageRoles.ASSISTANT,
                 "content": None,
                 "tool_calls": [{
                     "type": "function",
                     "function": function_call_data["function"],
-                    "id": function_call_data.get("tool_call_id", "call_1")
+                    "id": tool_call_id
                 }]
             })
         else:
@@ -350,6 +363,10 @@ class FunctionCallProcessor:
         )
 
         original_tool_call_id = function_call_data.get("tool_call_id", f"call_{uuid.uuid4()}")
+        # 确保tool_call_id不为None或空字符串
+        if original_tool_call_id is None or original_tool_call_id == "":
+            original_tool_call_id = f"call_{uuid.uuid4()}"
+        
         valid_arguments_str = ChatUtils.validate_and_process_function_arguments(function_call_data)
         first_llm_thought_content = function_call_data.get("first_llm_thought", None)
 
@@ -421,6 +438,10 @@ class FunctionCallProcessor:
         )
 
         original_tool_call_id = function_call_data.get("tool_call_id", f"call_{uuid.uuid4()}")
+        # 确保tool_call_id不为None或空字符串
+        if original_tool_call_id is None or original_tool_call_id == "":
+            original_tool_call_id = f"call_{uuid.uuid4()}"
+        
         valid_arguments_str = ChatUtils.validate_and_process_function_arguments(function_call_data)
         first_llm_thought_content = function_call_data.get("first_llm_thought", None)
 

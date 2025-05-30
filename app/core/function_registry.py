@@ -16,7 +16,9 @@ class FunctionRegistry:
             "openai": {},
             "anthropic": {},
             "deepseek": {},
-            "qwen": {}
+            "qwen": {},
+            "volcengine": {},
+            "google": {}
         }
         
     def register(self, name: str, description: str, parameters: Dict[str, Any],
@@ -94,7 +96,7 @@ class FunctionRegistry:
         返回:
             格式化后的函数定义
         """
-        if provider in ["openai", "deepseek", "qwen", "volcengine"]:
+        if provider in ["openai", "deepseek", "qwen", "volcengine", "google"]:
             return {
                 "type": "function",
                 "function": function_def

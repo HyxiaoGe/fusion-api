@@ -154,12 +154,26 @@ class StreamProcessor:
         Returns:
             list: 用于合成的消息列表
         """
-        system_prompt_content = SYNTHESIZE_TOOL_RESULT_PROMPT.format(
-            original_user_query=original_user_query,
-            tool_name=tool_name,
-            tool_results_json=json.dumps(tool_result, ensure_ascii=False)
-        )
-        return [SystemMessage(content=system_prompt_content)]
+        # 为Google模型创建正确的消息序列
+        if provider == "google":
+            # Google需要：System -> User 的序列来开始对话
+            system_prompt_content = SYNTHESIZE_TOOL_RESULT_PROMPT.format(
+                original_user_query=original_user_query,
+                tool_name=tool_name,
+                tool_results_json=json.dumps(tool_result, ensure_ascii=False)
+            )
+            return [
+                SystemMessage(content=system_prompt_content),
+                {"role": "user", "content": original_user_query}
+            ]
+        else:
+            # 其他模型保持原有逻辑
+            system_prompt_content = SYNTHESIZE_TOOL_RESULT_PROMPT.format(
+                original_user_query=original_user_query,
+                tool_name=tool_name,
+                tool_results_json=json.dumps(tool_result, ensure_ascii=False)
+            )
+            return [SystemMessage(content=system_prompt_content)]
 
     @staticmethod
     async def process_llm_stream_with_reasoning(llm, messages, send_event, use_reasoning=True):
