@@ -219,21 +219,13 @@ class ChatService:
             logger.error(f"模型处理失败: {e}")
             raise
 
-
-
-
-
-
-
-
-
-
-
-
-
     def get_all_conversations(self) -> List[Conversation]:
         """获取所有对话"""
         return self.memory_service.get_all_conversations()
+
+    def get_conversations_paginated(self, page: int = 1, page_size: int = 20):
+        """分页获取对话列表"""
+        return self.memory_service.get_conversations_paginated(page, page_size)
 
     def get_conversation(self, conversation_id: str) -> Optional[Conversation]:
         """获取特定对话"""

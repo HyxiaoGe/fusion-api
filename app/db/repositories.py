@@ -1,7 +1,7 @@
 import logging
 import uuid
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 from sqlalchemy import desc, func
 from sqlalchemy.orm import Session, joinedload
@@ -143,6 +143,33 @@ class ConversationRepository:
         except Exception as e:
             logger.error(f"获取所有对话失败: {e}")
             return []
+
+    def get_paginated(self, page: int = 1, page_size: int = 20) -> Tuple[List[Conversation], int]:
+        """分页获取对话列表（完整信息）"""
+        try:
+            # 计算偏移量
+            offset = (page - 1) * page_size
+            
+            # 获取总数
+            total = self.db.query(ConversationModel).count()
+            
+            # 获取分页数据
+            db_conversations = (
+                self.db.query(ConversationModel)
+                .order_by(ConversationModel.updated_at.desc())
+                .offset(offset)
+                .limit(page_size)
+                .all()
+            )
+            
+            # 转换为完整的Conversation对象
+            conversations = [self._convert_to_schema(db_conv) for db_conv in db_conversations]
+            
+            return conversations, total
+            
+        except Exception as e:
+            logger.error(f"分页获取对话失败: {e}")
+            return [], 0
 
     def _convert_to_schema(self, db_conversation: ConversationModel) -> Conversation:
         """将数据库模型转换为业务模型"""

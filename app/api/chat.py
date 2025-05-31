@@ -1,6 +1,6 @@
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.ai.prompts import prompt_manager
@@ -51,11 +51,15 @@ async def send_message(request: ChatRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/conversations", response_model=List[Conversation])
-def get_conversations(db: Session = Depends(get_db)):
-    """获取所有对话列表"""
+@router.get("/conversations")
+def get_conversations(
+    page: int = Query(default=1, ge=1, description="页码，从1开始"), 
+    page_size: int = Query(default=10, ge=1, le=100, description="每页数量，最大100"),
+    db: Session = Depends(get_db)
+):
+    """分页获取对话列表"""
     chat_service = ChatService(db)
-    return chat_service.get_all_conversations()
+    return chat_service.get_conversations_paginated(page, page_size)
 
 
 @router.get("/conversations/{conversation_id}", response_model=Conversation)

@@ -1,5 +1,6 @@
 import logging
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
+import math
 
 from sqlalchemy.orm import Session
 
@@ -47,6 +48,37 @@ class MemoryService:
         except Exception as e:
             logger.error(f"获取所有对话失败: {e}")
             return []
+
+    def get_conversations_paginated(self, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        """分页获取对话列表"""
+        try:
+            conversations, total = self.repo.get_paginated(page, page_size)
+            
+            # 计算分页信息
+            total_pages = math.ceil(total / page_size) if total > 0 else 0
+            has_next = page < total_pages
+            has_prev = page > 1
+            
+            return {
+                "items": conversations,
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+                "total_pages": total_pages,
+                "has_next": has_next,
+                "has_prev": has_prev
+            }
+        except Exception as e:
+            logger.error(f"分页获取对话失败: {e}")
+            return {
+                "items": [],
+                "total": 0,
+                "page": page,
+                "page_size": page_size,
+                "total_pages": 0,
+                "has_next": False,
+                "has_prev": False
+            }
 
     def delete_conversation(self, conversation_id: str) -> bool:
         """删除特定对话"""
