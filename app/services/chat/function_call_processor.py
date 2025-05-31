@@ -132,6 +132,9 @@ class FunctionCallProcessor:
             yield await send_event(EventTypes.DONE)
             return
         
+        # 如果检测到函数调用，不要在这里发送reasoning_complete，因为还有第二段思考过程
+        # reasoning_complete将在第二段思考过程结束后发送
+        
         # 第二阶段：处理函数调用
         function_call_data["first_llm_thought"] = full_response
         function_name = function_call_data["function"].get("name", "")
@@ -204,6 +207,8 @@ class FunctionCallProcessor:
         function_call_detected = False
         function_call_data = {}
         reasoning_state = ReasoningState()
+        # 设置function call上下文标志，避免在第一段思考过程结束后发送reasoning_complete
+        reasoning_state.function_call_context = True
         function_call_sent = False  # 标记是否已发送函数调用检测事件
         
         for chunk in llm.stream(processed_messages, **functions_kwargs):
@@ -303,7 +308,7 @@ class FunctionCallProcessor:
         full_messages = list(messages)
         
         # 添加LLM的函数调用响应
-        if provider in ["deepseek", "openai", "anthropic", "qwen", "volcengine", "google"]:
+        if provider in ["deepseek", "openai", "anthropic", "qwen", "volcengine", "google", "xai"]:
             # 使用tool_calls格式
             tool_call_id = function_call_data.get("tool_call_id", "call_1")
             # 确保tool_call_id不为None或空字符串
@@ -395,7 +400,7 @@ class FunctionCallProcessor:
         logger.info(f"{function_name}_handler: Preparing for second LLM stream to generate final answer.")
         final_response = ""
         async for result in StreamProcessor.process_llm_stream_with_reasoning(
-            llm, second_llm_messages, send_event, use_reasoning
+            llm, second_llm_messages, send_event, use_reasoning, is_function_call_second_stage=True
         ):
             # 传递所有事件给前端
             yield result
@@ -469,7 +474,7 @@ class FunctionCallProcessor:
         # 4. 流式返回 LLM 的最终回复
         final_response = ""
         async for result in StreamProcessor.process_llm_stream_with_reasoning(
-            llm, second_llm_messages, send_event, use_reasoning
+            llm, second_llm_messages, send_event, use_reasoning, is_function_call_second_stage=True
         ):
             # 传递所有事件给前端
             yield result

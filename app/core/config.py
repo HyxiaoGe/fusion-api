@@ -16,10 +16,7 @@ class Settings(BaseSettings):
     DEFAULT_MODEL: str = "qwen"  # 默认使用的模型
 
     # 数据库配置
-    DATABASE_URL: str = os.getenv(
-        "DATABASE_URL",
-        "postgresql://fusion:fusion123!!@localhost:5432/fusion"
-    )
+    DATABASE_URL: str = os.getenv("DATABASE_URL")
 
     SEARCH_API_KEY: Optional[str] = None
     SEARCH_API_ENDPOINT: str = "https://www.searchapi.io/api/v1/search"

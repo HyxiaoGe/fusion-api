@@ -165,7 +165,7 @@ class ChatService:
                 self.stream_handler.direct_reasoning_stream(provider, model, messages, conversation_id),
                 media_type="text/event-stream"
             )
-        elif use_reasoning or provider in ("deepseek", "qwen"): 
+        elif use_reasoning or provider in ("deepseek", "qwen", "xai"): 
             return StreamingResponse(
                 self.stream_handler.generate_reasoning_stream(provider, model, messages, conversation_id),
                 media_type="text/event-stream"

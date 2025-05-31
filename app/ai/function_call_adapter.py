@@ -45,6 +45,8 @@ class FunctionCallAdapter:
             return {"tools": functions}
         elif provider == "google":
             return {"tools": functions}
+        elif provider == "xai":
+            return {"tools": functions}
         else:
             # 默认格式
             return {"functions": functions}
@@ -72,6 +74,11 @@ class FunctionCallAdapter:
                 arguments_str = function_call.get("arguments", "{}")
                 arguments = json.loads(arguments_str) if arguments_str.strip() else {}
             elif provider == "deepseek":
+                function_name = function_call.get("name")
+                arguments_str = function_call.get("arguments", "{}")
+                arguments = json.loads(arguments_str) if arguments_str.strip() else {}
+            elif provider == "xai":
+                # XAI格式 (OpenAI兼容)
                 function_name = function_call.get("name")
                 arguments_str = function_call.get("arguments", "{}")
                 arguments = json.loads(arguments_str) if arguments_str.strip() else {}
@@ -145,6 +152,11 @@ class FunctionCallAdapter:
             if hasattr(response, "additional_kwargs") and "function_call" in response.additional_kwargs:
                 function_call = response.additional_kwargs["function_call"]
                 tool_call_id = None
+        elif provider == "xai":
+            # XAI格式 (OpenAI兼容)
+            if hasattr(response, "tool_calls") and response.tool_calls:
+                function_call = response.tool_calls[0].function
+                tool_call_id = response.tool_calls[0].id
         
         return function_call, tool_call_id
     
@@ -237,7 +249,7 @@ class FunctionCallAdapter:
         """
         content = json.dumps(function_result, ensure_ascii=False)
         
-        if provider in ["openai", "anthropic", "qwen", "volcengine", "deepseek", "google"] and tool_call_id:
+        if provider in ["openai", "anthropic", "qwen", "volcengine", "deepseek", "google", "xai"] and tool_call_id:
             return {
                 "role": "tool", 
                 "content": content,

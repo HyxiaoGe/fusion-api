@@ -96,7 +96,7 @@ class FunctionRegistry:
         返回:
             格式化后的函数定义
         """
-        if provider in ["openai", "deepseek", "qwen", "volcengine", "google"]:
+        if provider in ["openai", "deepseek", "qwen", "volcengine", "google", "xai"]:
             return {
                 "type": "function",
                 "function": function_def

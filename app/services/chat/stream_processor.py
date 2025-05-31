@@ -16,11 +16,15 @@ class ReasoningState:
     def __init__(self):
         self.reasoning_start_sent = False
         self.reasoning_complete_sent = False
+        self.last_reasoning_chunk = False
+        self.function_call_context = False  # 标记是否在function call流程中
     
     def reset(self):
         """重置推理状态"""
         self.reasoning_start_sent = False
         self.reasoning_complete_sent = False
+        self.last_reasoning_chunk = False
+        self.function_call_context = False
 
 
 class StreamProcessor:
@@ -89,18 +93,35 @@ class StreamProcessor:
         if not use_reasoning:
             return events
             
-        if not (hasattr(chunk, 'additional_kwargs') and 'reasoning_content' in chunk.additional_kwargs):
-            return events
+        # 检查是否有推理内容
+        has_reasoning_content = (hasattr(chunk, 'additional_kwargs') and 
+                               'reasoning_content' in chunk.additional_kwargs)
+        
+        if has_reasoning_content:
+            reasoning_content = chunk.additional_kwargs['reasoning_content']
+            if reasoning_content and reasoning_content.strip():
+                if not reasoning_state.reasoning_start_sent:
+                    events.append(await send_event(EventTypes.REASONING_START))
+                    reasoning_state.reasoning_start_sent = True
+                    
+                events.append(await send_event(EventTypes.REASONING_CONTENT, reasoning_content))
+                # 重置推理结束检测标志
+                reasoning_state.last_reasoning_chunk = True
+                return events
+        
+        # 如果当前chunk没有推理内容，但之前有推理内容，且还没发送完成事件
+        # 这表明推理阶段可能已经结束
+        # 但是如果在function call流程中，不要在第一段思考过程结束后就发送reasoning_complete
+        if (reasoning_state.reasoning_start_sent and 
+            not reasoning_state.reasoning_complete_sent and
+            not has_reasoning_content and
+            getattr(reasoning_state, 'last_reasoning_chunk', False) and
+            not reasoning_state.function_call_context):  # 只有在非function call流程中才发送
             
-        reasoning_content = chunk.additional_kwargs['reasoning_content']
-        if not (reasoning_content and reasoning_content.strip()):
-            return events
+            events.append(await send_event(EventTypes.REASONING_COMPLETE))
+            reasoning_state.reasoning_complete_sent = True
+            reasoning_state.last_reasoning_chunk = False
             
-        if not reasoning_state.reasoning_start_sent:
-            events.append(await send_event(EventTypes.REASONING_START))
-            reasoning_state.reasoning_start_sent = True
-            
-        events.append(await send_event(EventTypes.REASONING_CONTENT, reasoning_content))
         return events
     
     @staticmethod
@@ -176,7 +197,7 @@ class StreamProcessor:
             return [SystemMessage(content=system_prompt_content)]
 
     @staticmethod
-    async def process_llm_stream_with_reasoning(llm, messages, send_event, use_reasoning=True):
+    async def process_llm_stream_with_reasoning(llm, messages, send_event, use_reasoning=True, is_function_call_second_stage=False):
         """
         处理LLM流式响应，包含推理处理
         
@@ -185,11 +206,13 @@ class StreamProcessor:
             messages: 消息列表
             send_event: 事件发送函数
             use_reasoning: 是否启用推理模式
+            is_function_call_second_stage: 是否是function call的第二阶段
             
         Yields:
             str: 流式事件或最终响应内容
         """
         reasoning_state = ReasoningState()
+        # 正常情况下不设置function_call_context，允许正常的推理流程
         final_response = ""
 
         for chunk in llm.stream(messages):
@@ -200,18 +223,9 @@ class StreamProcessor:
             # 如果有推理事件，yield它们
             for event in reasoning_events:
                 yield event
-            has_new_reasoning = len(reasoning_events) > 0
             
             # 处理内容
             content_chunk_text = StreamProcessor.extract_content(chunk)
-            if content_chunk_text is not None and content_chunk_text.strip():
-                # 如果开始有实际内容且推理已开始但未完成，发送推理完成事件
-                if (reasoning_state.reasoning_start_sent and 
-                    not reasoning_state.reasoning_complete_sent and 
-                    not has_new_reasoning):
-                    yield await send_event(EventTypes.REASONING_COMPLETE)
-                    reasoning_state.reasoning_complete_sent = True
-            
             if content_chunk_text is not None:
                 yield await send_event(EventTypes.CONTENT, content_chunk_text)
                 final_response += content_chunk_text

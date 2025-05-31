@@ -130,10 +130,11 @@ class XAIFactory:
         from langchain_xai import ChatXAI
 
         return ChatXAI(
-            model="grok-beta",
+            model=model,
             temperature=0,
             max_tokens=None,
             max_retries=2,
+            streaming=True,
             xai_api_key=credentials.get("api_key"),
             xai_api_base=credentials.get("base_url"),
         )
