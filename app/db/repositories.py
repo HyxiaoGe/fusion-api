@@ -145,7 +145,7 @@ class ConversationRepository:
             return []
 
     def get_paginated(self, page: int = 1, page_size: int = 20) -> Tuple[List[Conversation], int]:
-        """分页获取对话列表（完整信息）"""
+        """分页获取对话列表（不包含消息内容）"""
         try:
             # 计算偏移量
             offset = (page - 1) * page_size
@@ -153,7 +153,7 @@ class ConversationRepository:
             # 获取总数
             total = self.db.query(ConversationModel).count()
             
-            # 获取分页数据
+            # 获取分页数据，不加载messages
             db_conversations = (
                 self.db.query(ConversationModel)
                 .order_by(ConversationModel.updated_at.desc())
@@ -162,8 +162,19 @@ class ConversationRepository:
                 .all()
             )
             
-            # 转换为完整的Conversation对象
-            conversations = [self._convert_to_schema(db_conv) for db_conv in db_conversations]
+            # 转换为Conversation对象，但不包含messages
+            conversations = []
+            for db_conv in db_conversations:
+                conversation = Conversation(
+                    id=db_conv.id,
+                    title=db_conv.title,
+                    provider=get_model_display_name(db_conv.model),
+                    model=db_conv.model,
+                    messages=[],  # 空的messages数组
+                    created_at=db_conv.created_at,
+                    updated_at=db_conv.updated_at
+                )
+                conversations.append(conversation)
             
             return conversations, total
             
