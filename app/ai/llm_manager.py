@@ -12,12 +12,12 @@ logger = llm_logger
 class ModelFactory(Protocol):
     """模型工厂接口"""
     @abstractmethod
-    def create_model(self, model: str, credentials: Dict[str, Any] = None) -> Union[LLM, BaseChatModel]:
+    def create_model(self, model: str, credentials: Dict[str, Any] = None, options: Dict[str, Any] = None) -> Union[LLM, BaseChatModel]:
         """创建模型实例"""
         pass
 
 class AnthropicFactory:
-    def create_model(self, model: str, credentials: Dict[str, Any] = None) -> Union[LLM, BaseChatModel]:
+    def create_model(self, model: str, credentials: Dict[str, Any] = None, options: Dict[str, Any] = None) -> Union[LLM, BaseChatModel]:
         from langchain_anthropic import ChatAnthropic
         
         
@@ -32,7 +32,7 @@ class AnthropicFactory:
         )
 
 class DeepseekFactory:
-    def create_model(self, model: str, credentials: Dict[str, Any] = None) -> Union[LLM, BaseChatModel]:
+    def create_model(self, model: str, credentials: Dict[str, Any] = None, options: Dict[str, Any] = None) -> Union[LLM, BaseChatModel]:
         from langchain_deepseek import ChatDeepSeek
         return ChatDeepSeek(
             model=model,
@@ -45,7 +45,7 @@ class DeepseekFactory:
         )
 
 class GoogleFactory:
-    def create_model(self, model: str, credentials: Dict[str, Any] = None) -> Union[LLM, BaseChatModel]:
+    def create_model(self, model: str, credentials: Dict[str, Any] = None, options: Dict[str, Any] = None) -> Union[LLM, BaseChatModel]:
         from langchain_google_genai import ChatGoogleGenerativeAI
         return ChatGoogleGenerativeAI(
             model=model,
@@ -59,7 +59,7 @@ class GoogleFactory:
         )
 
 class HunyuanFactory:
-    def create_model(self, model: str, credentials: Dict[str, Any] = None) -> Union[LLM, BaseChatModel]:
+    def create_model(self, model: str, credentials: Dict[str, Any] = None, options: Dict[str, Any] = None) -> Union[LLM, BaseChatModel]:
         from langchain_community.chat_models.hunyuan import ChatHunyuan
         return ChatHunyuan(
             model=model,
@@ -70,7 +70,7 @@ class HunyuanFactory:
         )
 
 class OpenAIFactory:
-    def create_model(self, model: str, credentials: Dict[str, Any] = None) -> Union[LLM, BaseChatModel]:
+    def create_model(self, model: str, credentials: Dict[str, Any] = None, options: Dict[str, Any] = None) -> Union[LLM, BaseChatModel]:
         from langchain_openai import ChatOpenAI
         return ChatOpenAI(
             model=model,
@@ -81,7 +81,10 @@ class OpenAIFactory:
         ) 
 
 class QwenFactory:
-    def create_model(self, model: str, credentials: Dict[str, Any] = None) -> Union[LLM, BaseChatModel]:
+    def create_model(self, model: str, credentials: Dict[str, Any] = None, options: Dict[str, Any] = None) -> Union[LLM, BaseChatModel]:
+        if options is None:
+            options = {}
+            
         if "qwq" in model.lower():
             from langchain_qwq import ChatQwQ
             return ChatQwQ(
@@ -93,6 +96,26 @@ class QwenFactory:
                 api_base=credentials.get("base_url"),
                 api_key=credentials.get("api_key"),
             )
+        elif "qwen3" in model.lower():
+            # QWen3模型需要特殊的enable_thinking配置
+            from langchain_community.chat_models.tongyi import ChatTongyi
+            
+            # 根据options中的use_reasoning参数控制enable_thinking
+            # 只有当use_reasoning未明确设置时才默认启用思考模式
+            use_reasoning = options.get("use_reasoning")
+            if use_reasoning is None:
+                use_reasoning = True  # QWen3默认启用思考模式
+            
+            model_kwargs = {}
+            if use_reasoning:
+                model_kwargs["enable_thinking"] = True
+                
+            return ChatTongyi(
+                model=model,
+                streaming=True,
+                model_kwargs=model_kwargs,
+                dashscope_api_key=credentials.get("api_key") if credentials else None,
+            )
         else:
             from langchain_community.chat_models.tongyi import ChatTongyi
             return ChatTongyi(
@@ -101,7 +124,7 @@ class QwenFactory:
             )
 
 class VolcengineFactory:
-    def create_model(self, model: str, credentials: Dict[str, Any] = None) -> Union[LLM, BaseChatModel]:
+    def create_model(self, model: str, credentials: Dict[str, Any] = None, options: Dict[str, Any] = None) -> Union[LLM, BaseChatModel]:
         from langchain_openai import ChatOpenAI
         return ChatOpenAI(
             model=model,
@@ -115,7 +138,7 @@ class VolcengineFactory:
         )
 
 class WenxinFactory:
-    def create_model(self, model: str, credentials: Dict[str, Any] = None) -> Union[LLM, BaseChatModel]:
+    def create_model(self, model: str, credentials: Dict[str, Any] = None, options: Dict[str, Any] = None) -> Union[LLM, BaseChatModel]:
         from langchain_community.chat_models import QianfanChatEndpoint
         return QianfanChatEndpoint(
             model=model,
@@ -126,7 +149,7 @@ class WenxinFactory:
         )
  
 class XAIFactory:
-    def create_model(self, model: str, credentials: Dict[str, Any] = None) -> Union[LLM, BaseChatModel]:
+    def create_model(self, model: str, credentials: Dict[str, Any] = None, options: Dict[str, Any] = None) -> Union[LLM, BaseChatModel]:
         from langchain_xai import ChatXAI
 
         return ChatXAI(
@@ -158,7 +181,7 @@ class LLMManager:
         }
         self.db = None
 
-    def get_model(self, provider: str = None, model: str = None) -> Union[LLM, BaseChatModel]:
+    def get_model(self, provider: str = None, model: str = None, options: Dict[str, Any] = None) -> Union[LLM, BaseChatModel]:
         """获取指定的LLM模型实例"""
         logger.info(f"获取模型: provider={provider}, model={model}")
 
@@ -168,7 +191,7 @@ class LLMManager:
                 if factory:
                     # 获取模型凭证
                     credentials = self._get_model_credentials(provider, model)
-                    return factory.create_model(model, credentials)
+                    return factory.create_model(model, credentials, options)
                 else:
                     raise ValueError(f"不支持的模型提供者: {provider}")
             except Exception as e:

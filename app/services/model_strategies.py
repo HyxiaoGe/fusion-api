@@ -23,7 +23,7 @@ class NormalModelStrategy(ModelStrategy):
             
         try:
             # 获取AI模型
-            llm = llm_manager.get_model(provider=provider, model=model)
+            llm = llm_manager.get_model(provider=provider, model=model, options=options)
 
             # 调用模型
             response = llm.invoke(messages)
@@ -52,7 +52,7 @@ class ReasoningModelStrategy(ModelStrategy):
             
         try:
             # 获取AI模型
-            llm = llm_manager.get_model(provider=provider, model=model)
+            llm = llm_manager.get_model(provider=provider, model=model, options=options)
 
             # 调用模型
             response = llm.invoke(messages)
@@ -105,13 +105,17 @@ class ModelStrategyFactory:
         if options is None:
             options = {}
             
-        # 获取是否使用推理模式的标志
-        use_reasoning = options.get("use_reasoning", False)
+        # 获取是否使用推理模式的标志，不设置默认值
+        use_reasoning = options.get("use_reasoning")
         
         # 优先根据options中的use_reasoning判断
-        if use_reasoning:
+        if use_reasoning is True:
             return ReasoningModelStrategy()
+        elif use_reasoning is False:
+            # 如果明确设置为False，则使用普通策略
+            return NormalModelStrategy()
         
+        # 当use_reasoning未明确设置时（None），根据模型特性自动判断
         # 火山引擎模型特殊处理
         if provider == "volcengine" and ("thinking" in model.lower() or "deepseek-r1" in model.lower()):
             return ReasoningModelStrategy()
@@ -119,7 +123,7 @@ class ModelStrategyFactory:
         # 根据模型名称判断（兼容旧代码）
         if provider == "deepseek" and model == "deepseek-reasoner":
             return ReasoningModelStrategy()
-        elif provider == "qwen" and "qwq" in model.lower():
+        elif provider == "qwen" and ("qwq" in model.lower() or "qwen3" in model.lower()):
             return ReasoningModelStrategy()
         else:
             return NormalModelStrategy() 

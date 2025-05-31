@@ -17,9 +17,12 @@ class StreamHandler:
         self.memory_service = memory_service
         self.message_processor = MessageProcessor(db)
 
-    async def generate_normal_stream(self, provider, model, messages, conversation_id) -> AsyncGenerator:
+    async def generate_normal_stream(self, provider, model, messages, conversation_id, options=None) -> AsyncGenerator:
         """生成常规流式响应（无推理模式）"""
-        llm = llm_manager.get_model(provider=provider, model=model)
+        if options is None:
+            options = {}
+            
+        llm = llm_manager.get_model(provider=provider, model=model, options=options)
         full_response = ""
 
         # 流式响应处理
@@ -55,8 +58,10 @@ class StreamHandler:
         except Exception as e:
             logging.error(f"保存流式响应失败: {str(e)}")
 
-    async def generate_reasoning_stream(self, provider, model, messages, conversation_id) -> AsyncGenerator:
+    async def generate_reasoning_stream(self, provider, model, messages, conversation_id, options=None) -> AsyncGenerator:
         """生成带推理功能的流式响应，适用于支持推理能力的模型"""
+        if options is None:
+            options = {}
         
         # 构造发送事件的辅助函数
         async def send_event(event_type, content=None):
@@ -68,7 +73,7 @@ class StreamHandler:
         yield await send_event("reasoning_start")
         
         # 获取模型
-        llm = llm_manager.get_model(provider=provider, model=model)
+        llm = llm_manager.get_model(provider=provider, model=model, options=options)
         reasoning_result = ""
         answer_result = ""
         
@@ -175,9 +180,12 @@ class StreamHandler:
         except Exception as e:
             logging.error(f"保存推理流式响应失败: {str(e)}")
 
-    async def direct_reasoning_stream(self, provider, model, messages, conversation_id) -> AsyncGenerator:
+    async def direct_reasoning_stream(self, provider, model, messages, conversation_id, options=None) -> AsyncGenerator:
         """直接使用OpenAI客户端生成带推理功能的流式响应，绕过LangChain"""
         from openai import AsyncOpenAI
+        
+        if options is None:
+            options = {}
         
         # 如果消息是单个消息而非列表，则转换为列表
         if not isinstance(messages, list):

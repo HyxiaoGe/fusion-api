@@ -146,33 +146,35 @@ class ChatService:
         if options is None:
             options = {}
             
-        user_wants_web_search = options.get("use_web_search", False)
-        ai_can_use_functions = options.get("use_function_call", False)
+        # 检查是否启用函数调用
+        use_function_calls = options.get("use_function_calls", False)
         use_reasoning = options.get("use_reasoning", False)
-
-        if user_wants_web_search:
-            return StreamingResponse(
-                self.search_processor.generate_user_prioritized_web_search_stream(provider, model, messages, conversation_id, options),
-                media_type="text/event-stream"
-            )
-        elif ai_can_use_functions:
+        
+        if use_function_calls:
             return StreamingResponse(
                 self.function_call_processor.generate_function_call_stream(provider, model, messages, conversation_id, options),
                 media_type="text/event-stream"
             )
         elif provider == "volcengine": 
             return StreamingResponse(
-                self.stream_handler.direct_reasoning_stream(provider, model, messages, conversation_id),
+                self.stream_handler.direct_reasoning_stream(provider, model, messages, conversation_id, options),
                 media_type="text/event-stream"
             )
-        elif use_reasoning or provider in ("deepseek", "qwen", "xai"): 
+        elif use_reasoning:
+            # 只有当显式启用推理时才使用推理流
             return StreamingResponse(
-                self.stream_handler.generate_reasoning_stream(provider, model, messages, conversation_id),
+                self.stream_handler.generate_reasoning_stream(provider, model, messages, conversation_id, options),
+                media_type="text/event-stream"
+            )
+        elif use_reasoning is None and provider in ("deepseek", "qwen", "xai"):
+            # 只有当use_reasoning未明确设置时，才根据provider自动判断
+            return StreamingResponse(
+                self.stream_handler.generate_reasoning_stream(provider, model, messages, conversation_id, options),
                 media_type="text/event-stream"
             )
         else:
             return StreamingResponse(
-                self.stream_handler.generate_normal_stream(provider, model, messages, conversation_id),
+                self.stream_handler.generate_normal_stream(provider, model, messages, conversation_id, options),
                 media_type="text/event-stream"
             )
 

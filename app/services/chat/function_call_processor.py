@@ -41,7 +41,7 @@ class FunctionCallProcessor:
         
         # 初始化基础组件
         send_event = ChatUtils.create_event_sender(conversation_id)
-        llm = llm_manager.get_model(provider=provider, model=model)
+        llm = llm_manager.get_model(provider=provider, model=model, options=options)
         context = {"db": self.db, "conversation_id": conversation_id}
         
         # 准备消息和函数定义
