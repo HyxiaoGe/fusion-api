@@ -21,8 +21,8 @@ class Conversation(Base):
     created_at = Column(DateTime, default=get_china_time)
     updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
 
-    # 建立与Message的关系
-    messages = relationship("Message", back_populates="conversation", cascade="all, delete-orphan")
+    # 建立与Message的关系，按创建时间排序
+    messages = relationship("Message", back_populates="conversation", cascade="all, delete-orphan", order_by="Message.created_at")
 
 
 class File(Base):
