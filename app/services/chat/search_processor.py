@@ -11,7 +11,7 @@ from typing import Any
 from app.ai.llm_manager import llm_manager
 from app.core.function_manager import function_adapter
 from app.core.logger import app_logger as logger
-from app.constants import EventTypes, FunctionNames, MessageTexts, MessageRoles
+from app.constants import EventTypes, FunctionNames, MessageTexts, MessageRoles, MessageTypes
 from app.services.chat.stream_processor import StreamProcessor
 from app.services.chat.utils import ChatUtils
 
@@ -192,18 +192,21 @@ class SearchProcessor:
             }
             db_assistant_action_message = Message(
                 role=MessageRoles.ASSISTANT,
+                type=MessageTypes.WEB_SEARCH,
                 content="",
                 tool_calls=[assistant_tool_calling_dict]
             )
 
             db_tool_response_message = Message(
-                role=MessageRoles.TOOL, 
+                role=MessageRoles.SYSTEM, 
+                type=MessageTypes.FUNCTION_RESULT,
                 tool_call_id=user_prioritized_tool_call_id,
                 content=json.dumps(search_result, ensure_ascii=False)
             )
 
             db_final_ai_message = Message(
                 role=MessageRoles.ASSISTANT,
+                type=MessageTypes.ASSISTANT_CONTENT,
                 content=final_response
             )
             

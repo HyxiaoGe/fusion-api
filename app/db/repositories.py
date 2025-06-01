@@ -43,7 +43,9 @@ class ConversationRepository:
                 db_message = MessageModel(
                     id=msg.id,
                     role=msg.role,
+                    type=msg.type,
                     content=msg.content,
+                    duration=msg.duration,
                     created_at=msg.created_at
                 )
                 db_conversation.messages.append(db_message)
@@ -86,7 +88,9 @@ class ConversationRepository:
                     id=msg.id,
                     conversation_id=conversation.id,
                     role=msg.role,
+                    type=msg.type,
                     content=msg.content,
+                    duration=msg.duration,
                     created_at=msg.created_at
                 )
                 self.db.add(db_message)
@@ -189,7 +193,9 @@ class ConversationRepository:
             messages.append(Message(
                 id=db_msg.id,
                 role=db_msg.role,
+                type=db_msg.type,
                 content=db_msg.content,
+                duration=db_msg.duration,
                 created_at=db_msg.created_at
             ))
 

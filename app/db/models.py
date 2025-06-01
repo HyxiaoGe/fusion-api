@@ -61,8 +61,10 @@ class Message(Base):
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     conversation_id = Column(String, ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False)
-    role = Column(String, nullable=False)  # 'user' 或 'assistant'
+    role = Column(String, nullable=False)  # 'user', 'assistant', 'system'
+    type = Column(String, nullable=False)  # 'user_query', 'assistant_content', 'reasoning_content', 'function_call', 'function_result', 'web_search', 'hot_topics'
     content = Column(Text, nullable=False)
+    duration = Column(Integer, nullable=False, default=0)  # 处理耗时(毫秒)，默认为0
     created_at = Column(DateTime, default=get_china_time)
 
     # 建立与Conversation的关系

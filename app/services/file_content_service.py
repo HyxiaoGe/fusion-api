@@ -3,6 +3,7 @@ from typing import List, Dict, Optional
 
 from app.db.repositories import FileRepository
 from app.schemas.chat import ChatResponse, Message
+from app.constants import MessageRoles, MessageTypes
 
 
 class FileContentService:
@@ -40,7 +41,8 @@ class FileContentService:
                         provider=provider,
                         model=model,
                         message=Message(
-                            role="assistant",
+                            role=MessageRoles.ASSISTANT,
+                            type=MessageTypes.ASSISTANT_CONTENT,
                             content="文件正在解析中，请稍后再试..."
                         ),
                         conversation_id=conversation_id
@@ -52,7 +54,8 @@ class FileContentService:
                         provider=provider,
                         model=model,
                         message=Message(
-                            role="assistant",
+                            role=MessageRoles.ASSISTANT,
+                            type=MessageTypes.ASSISTANT_CONTENT,
                             content=f"文件处理出错: {file.processing_result.get('message', '未知错误')}"
                         ),
                         conversation_id=conversation_id

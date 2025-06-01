@@ -23,7 +23,7 @@ from app.services.message_processor import MessageProcessor
 from app.services.model_strategies import ModelStrategyFactory
 from app.services.stream_handler import StreamHandler
 from app.services.web_search_service import WebSearchService
-from app.constants import MessageRoles, EventTypes, FunctionNames, MessageTexts, FUNCTION_DESCRIPTIONS, USER_FRIENDLY_FUNCTION_DESCRIPTIONS
+from app.constants import MessageRoles, EventTypes, FunctionNames, MessageTexts, FUNCTION_DESCRIPTIONS, USER_FRIENDLY_FUNCTION_DESCRIPTIONS, MessageTypes
 from app.services.chat.stream_processor import ReasoningState, StreamProcessor
 from app.services.chat.utils import ChatUtils
 from app.services.chat.function_call_processor import FunctionCallProcessor
@@ -90,7 +90,11 @@ class ChatService:
         conversation = self._get_or_create_conversation(conversation_id, provider, model, message)
 
         # 记录用户消息
-        user_message = Message(role=MessageRoles.USER, content=message)
+        user_message = Message(
+            role=MessageRoles.USER, 
+            type=MessageTypes.USER_QUERY,
+            content=message
+        )
         conversation.messages.append(user_message)
         
         # 准备聊天历史
@@ -448,6 +452,7 @@ class ChatService:
                 # 创建AI消息
                 ai_message = Message(
                     role=MessageRoles.ASSISTANT,
+                    type=MessageTypes.ASSISTANT_CONTENT,
                     content=response.content if hasattr(response, 'content') else str(response)
                 )
                 
@@ -484,6 +489,7 @@ class ChatService:
             )
             ai_function_message = Message(
                 role=MessageRoles.ASSISTANT,
+                type=MessageTypes.FUNCTION_CALL,
                 content=response.content if hasattr(response, 'content') and response.content else user_friendly_description
             )
             conversation.messages.append(ai_function_message)
@@ -498,7 +504,8 @@ class ChatService:
             
             # 创建工具消息
             tool_message = Message(
-                role=tool_message_data["role"],
+                role=MessageRoles.SYSTEM,
+                type=MessageTypes.FUNCTION_RESULT,
                 content=tool_message_data["content"]
             )
             conversation.messages.append(tool_message)
@@ -514,6 +521,7 @@ class ChatService:
             # 创建最终AI消息
             final_ai_message = Message(
                 role=MessageRoles.ASSISTANT,
+                type=MessageTypes.ASSISTANT_CONTENT,
                 content=final_response.content if hasattr(final_response, 'content') else str(final_response)
             )
             
@@ -540,6 +548,7 @@ class ChatService:
             # 创建错误消息
             error_message = Message(
                 role=MessageRoles.ASSISTANT,
+                type=MessageTypes.ASSISTANT_CONTENT,
                 content=f"在处理函数调用时出现错误: {str(e)}"
             )
             
@@ -560,6 +569,7 @@ class ChatService:
                 # 创建AI响应消息
                 ai_message = Message(
                     role=MessageRoles.ASSISTANT,
+                    type=MessageTypes.ASSISTANT_CONTENT,
                     content=response_content
                 )
                 

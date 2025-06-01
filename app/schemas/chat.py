@@ -1,14 +1,26 @@
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
+from app.constants import MessageRoles, MessageTypes
+
 
 class Message(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
-    role: str  # user 或 assistant
+    role: Literal["user", "assistant", "system"]  # 限制为标准角色
+    type: Literal[
+        "user_query", 
+        "assistant_content", 
+        "reasoning_content", 
+        "function_call", 
+        "function_result", 
+        "web_search", 
+        "hot_topics"
+    ]  # 限制为预定义的消息类型
     content: str
+    duration: int = Field(0, description="处理耗时(毫秒)")  # 默认为0毫秒
     created_at: datetime = Field(default_factory=datetime.now)
 
     class Config:

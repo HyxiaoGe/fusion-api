@@ -13,7 +13,7 @@ from app.ai.llm_manager import llm_manager
 from app.ai.prompts.templates import FUNCTION_CALL_BEHAVIOR_PROMPT, FUNCTION_CALL_BEHAVIOR_PROMPT_FOR_REASONING
 from app.core.function_manager import function_adapter
 from app.core.logger import app_logger as logger
-from app.constants import MessageRoles, EventTypes, FunctionNames, MessageTexts, FUNCTION_DESCRIPTIONS, USER_FRIENDLY_FUNCTION_DESCRIPTIONS
+from app.constants import MessageRoles, EventTypes, FunctionNames, MessageTexts, FUNCTION_DESCRIPTIONS, USER_FRIENDLY_FUNCTION_DESCRIPTIONS, MessageTypes
 from app.services.chat.stream_processor import ReasoningState, StreamProcessor
 from app.services.chat.utils import ChatUtils
 
@@ -508,18 +508,21 @@ class FunctionCallProcessor:
                 # 创建函数调用消息
                 function_call_message = Message(
                     role=MessageRoles.ASSISTANT,
+                    type=MessageTypes.FUNCTION_CALL,
                     content=function_desc
                 )
                 
                 # 创建函数结果消息
                 function_result_message = Message(
-                    role=MessageRoles.FUNCTION,
+                    role=MessageRoles.SYSTEM,
+                    type=MessageTypes.FUNCTION_RESULT,
                     content=json.dumps(function_result, ensure_ascii=False)
                 )
                 
                 # 创建最终AI响应消息
                 ai_message = Message(
                     role=MessageRoles.ASSISTANT,
+                    type=MessageTypes.ASSISTANT_CONTENT,
                     content=final_response
                 )
                 
@@ -548,6 +551,7 @@ class FunctionCallProcessor:
                 # 创建AI响应消息
                 ai_message = Message(
                     role=MessageRoles.ASSISTANT,
+                    type=MessageTypes.ASSISTANT_CONTENT,
                     content=response_content
                 )
                 

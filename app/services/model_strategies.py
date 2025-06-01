@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 
 from app.ai.llm_manager import llm_manager
 from app.schemas.chat import Message
+from app.constants import MessageRoles, MessageTypes
 
 logger = logging.getLogger(__name__)
 class ModelStrategy(ABC):
@@ -33,7 +34,8 @@ class NormalModelStrategy(ModelStrategy):
 
             # 记录最终答案
             ai_message = Message(
-                role="assistant",
+                role=MessageRoles.ASSISTANT,
+                type=MessageTypes.ASSISTANT_CONTENT,
                 content=ai_content
             )
             
@@ -71,13 +73,15 @@ class ReasoningModelStrategy(ModelStrategy):
             reasoning_message = None
             if reasoning_content:
                 reasoning_message = Message(
-                    role="reasoning",
+                    role=MessageRoles.ASSISTANT,
+                    type=MessageTypes.REASONING_CONTENT,
                     content=reasoning_content
                 )
 
             # 记录最终答案
             ai_message = Message(
-                role="assistant",
+                role=MessageRoles.ASSISTANT,
+                type=MessageTypes.ASSISTANT_CONTENT,
                 content=ai_content
             )
             

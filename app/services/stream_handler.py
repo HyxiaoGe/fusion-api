@@ -10,6 +10,7 @@ from app.services.message_processor import MessageProcessor
 from app.core.logger import app_logger as logger
 from openai import AsyncOpenAI
 import inspect
+from app.constants import MessageRoles, MessageTypes
 
 class StreamHandler:
     def __init__(self, db, memory_service):
@@ -47,7 +48,8 @@ class StreamHandler:
             if conversation:
                 # 创建并添加AI响应消息
                 ai_message = Message(
-                    role="assistant",
+                    role=MessageRoles.ASSISTANT,
+                    type=MessageTypes.ASSISTANT_CONTENT,
                     content=response_text
                 )
                 conversation.messages.append(ai_message)
@@ -162,14 +164,16 @@ class StreamHandler:
                 # 如果有推理内容，创建推理消息
                 if reasoning_text:
                     reasoning_message = Message(
-                        role="reasoning",
+                        role=MessageRoles.ASSISTANT,
+                        type=MessageTypes.REASONING_CONTENT,
                         content=reasoning_text
                     )
                     conversation.messages.append(reasoning_message)
 
                 # 创建并添加AI响应消息
                 ai_message = Message(
-                    role="assistant",
+                    role=MessageRoles.ASSISTANT,
+                    type=MessageTypes.ASSISTANT_CONTENT,
                     content=response_text
                 )
                 conversation.messages.append(ai_message)
