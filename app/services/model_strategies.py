@@ -10,7 +10,7 @@ class ModelStrategy(ABC):
     """模型处理策略的抽象基类"""
     
     @abstractmethod
-    async def process(self, provider, model, messages, conversation_id, memory_service, options=None):
+    async def process(self, provider, model, messages, conversation_id, memory_service, options=None, turn_id=None):
         """处理请求并返回响应"""
         pass
 
@@ -18,7 +18,7 @@ class ModelStrategy(ABC):
 class NormalModelStrategy(ModelStrategy):
     """普通模型处理策略"""
     
-    async def process(self, provider, model, messages, conversation_id, memory_service, options=None):
+    async def process(self, provider, model, messages, conversation_id, memory_service, options=None, turn_id=None):
         if options is None:
             options = {}
             
@@ -36,7 +36,8 @@ class NormalModelStrategy(ModelStrategy):
             ai_message = Message(
                 role=MessageRoles.ASSISTANT,
                 type=MessageTypes.ASSISTANT_CONTENT,
-                content=ai_content
+                content=ai_content,
+                turn_id=turn_id
             )
             
             return ai_message, None
@@ -48,7 +49,7 @@ class NormalModelStrategy(ModelStrategy):
 class ReasoningModelStrategy(ModelStrategy):
     """推理模型处理策略"""
     
-    async def process(self, provider, model, messages, conversation_id, memory_service, options=None):
+    async def process(self, provider, model, messages, conversation_id, memory_service, options=None, turn_id=None):
         if options is None:
             options = {}
             
@@ -75,14 +76,16 @@ class ReasoningModelStrategy(ModelStrategy):
                 reasoning_message = Message(
                     role=MessageRoles.ASSISTANT,
                     type=MessageTypes.REASONING_CONTENT,
-                    content=reasoning_content
+                    content=reasoning_content,
+                    turn_id=turn_id
                 )
 
             # 记录最终答案
             ai_message = Message(
                 role=MessageRoles.ASSISTANT,
                 type=MessageTypes.ASSISTANT_CONTENT,
-                content=ai_content
+                content=ai_content,
+                turn_id=turn_id
             )
             
             return ai_message, reasoning_message

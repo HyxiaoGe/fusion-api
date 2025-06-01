@@ -20,6 +20,7 @@ class Message(BaseModel):
         "hot_topics"
     ]  # 限制为预定义的消息类型
     content: str
+    turn_id: Optional[str] = Field(None, description="对话轮次ID，使用该轮对话中用户消息的ID")
     duration: int = Field(0, description="处理耗时(毫秒)")  # 默认为0毫秒
     created_at: datetime = Field(default_factory=datetime.now)
 

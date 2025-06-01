@@ -64,6 +64,7 @@ class Message(Base):
     role = Column(String, nullable=False)  # 'user', 'assistant', 'system'
     type = Column(String, nullable=False)  # 'user_query', 'assistant_content', 'reasoning_content', 'function_call', 'function_result', 'web_search', 'hot_topics'
     content = Column(Text, nullable=False)
+    turn_id = Column(String, nullable=True)  # 对话轮次ID，使用该轮对话中用户消息的ID
     duration = Column(Integer, nullable=False, default=0)  # 处理耗时(毫秒)，默认为0
     created_at = Column(DateTime, default=get_china_time)
 

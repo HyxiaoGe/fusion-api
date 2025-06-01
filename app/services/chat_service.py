@@ -95,6 +95,11 @@ class ChatService:
             type=MessageTypes.USER_QUERY,
             content=message
         )
+        
+        # 使用用户消息的ID作为turn_id
+        turn_id = user_message.id
+        user_message.turn_id = turn_id
+        
         conversation.messages.append(user_message)
         
         # 准备聊天历史
@@ -123,9 +128,9 @@ class ChatService:
 
         # 根据是否为流式响应分别处理
         if stream:
-            return await self._handle_stream_response(provider, model, messages, conversation.id, options)
+            return await self._handle_stream_response(provider, model, messages, conversation.id, options, turn_id)
         else:
-            return await self._handle_normal_response(provider, model, messages, conversation.id, options)
+            return await self._handle_normal_response(provider, model, messages, conversation.id, options, turn_id)
 
     def _get_or_create_conversation(self, conversation_id, provider, model, message):
         """获取或创建会话"""
@@ -145,7 +150,7 @@ class ChatService:
             
         return conversation
 
-    async def _handle_stream_response(self, provider, model, messages, conversation_id, options=None):
+    async def _handle_stream_response(self, provider, model, messages, conversation_id, options=None, turn_id=None):
         """处理流式响应"""
         if options is None:
             options = {}
@@ -156,33 +161,33 @@ class ChatService:
         
         if use_function_calls:
             return StreamingResponse(
-                self.function_call_processor.generate_function_call_stream(provider, model, messages, conversation_id, options),
+                self.function_call_processor.generate_function_call_stream(provider, model, messages, conversation_id, options, turn_id),
                 media_type="text/event-stream"
             )
         elif provider == "volcengine": 
             return StreamingResponse(
-                self.stream_handler.direct_reasoning_stream(provider, model, messages, conversation_id, options),
+                self.stream_handler.direct_reasoning_stream(provider, model, messages, conversation_id, options, turn_id),
                 media_type="text/event-stream"
             )
         elif use_reasoning:
             # 只有当显式启用推理时才使用推理流
             return StreamingResponse(
-                self.stream_handler.generate_reasoning_stream(provider, model, messages, conversation_id, options),
+                self.stream_handler.generate_reasoning_stream(provider, model, messages, conversation_id, options, turn_id),
                 media_type="text/event-stream"
             )
         elif use_reasoning is None and provider in ("deepseek", "qwen", "xai"):
             # 只有当use_reasoning未明确设置时，才根据provider自动判断
             return StreamingResponse(
-                self.stream_handler.generate_reasoning_stream(provider, model, messages, conversation_id, options),
+                self.stream_handler.generate_reasoning_stream(provider, model, messages, conversation_id, options, turn_id),
                 media_type="text/event-stream"
             )
         else:
             return StreamingResponse(
-                self.stream_handler.generate_normal_stream(provider, model, messages, conversation_id, options),
+                self.stream_handler.generate_normal_stream(provider, model, messages, conversation_id, options, turn_id),
                 media_type="text/event-stream"
             )
 
-    async def _handle_normal_response(self, provider, model, messages, conversation_id, options=None):
+    async def _handle_normal_response(self, provider, model, messages, conversation_id, options=None, turn_id=None):
         """处理非流式响应"""
         # 默认options
         if options is None:
@@ -193,7 +198,7 @@ class ChatService:
         
         try:
             # 使用策略处理请求
-            ai_message, reasoning_message = await strategy.process(provider, model, messages, conversation_id, self.memory_service, options)
+            ai_message, reasoning_message = await strategy.process(provider, model, messages, conversation_id, self.memory_service, options, turn_id)
             
             # 获取会话
             conversation = self.memory_service.get_conversation(conversation_id)

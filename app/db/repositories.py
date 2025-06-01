@@ -45,6 +45,7 @@ class ConversationRepository:
                     role=msg.role,
                     type=msg.type,
                     content=msg.content,
+                    turn_id=msg.turn_id,
                     duration=msg.duration,
                     created_at=msg.created_at
                 )
@@ -90,6 +91,7 @@ class ConversationRepository:
                     role=msg.role,
                     type=msg.type,
                     content=msg.content,
+                    turn_id=msg.turn_id,
                     duration=msg.duration,
                     created_at=msg.created_at
                 )
@@ -193,9 +195,10 @@ class ConversationRepository:
             messages.append(Message(
                 id=db_msg.id,
                 role=db_msg.role,
-                type=db_msg.type,
+                type=db_msg.type or "assistant_content",  # 为旧数据提供默认值
                 content=db_msg.content,
-                duration=db_msg.duration,
+                turn_id=db_msg.turn_id,
+                duration=db_msg.duration or 0,  # 为旧数据提供默认值0
                 created_at=db_msg.created_at
             ))
 
