@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from contextlib import asynccontextmanager
 import asyncio
 import time
@@ -15,38 +16,33 @@ from app.core.function_manager import init_function_registry
 
 
 # 超时中间件
-class TimeoutMiddleware:
+class TimeoutMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, timeout_seconds: int = 10):
-        self.app = app
+        super().__init__(app)
         self.timeout_seconds = timeout_seconds
 
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-
+    async def dispatch(self, request: Request, call_next):
         start_time = time.time()
-        
-        async def timeout_handler():
-            try:
-                await asyncio.wait_for(
-                    self.app(scope, receive, send),
-                    timeout=self.timeout_seconds
-                )
-            except asyncio.TimeoutError:
-                # 构造超时响应
-                response = JSONResponse(
-                    status_code=408,
-                    content={
-                        "detail": f"请求超时，处理时间超过{self.timeout_seconds}秒",
-                        "timeout_seconds": self.timeout_seconds,
-                        "process_time": time.time() - start_time
-                    },
-                    headers={"X-Process-Time": str(time.time() - start_time)}
-                )
-                await response(scope, receive, send)
-
-        await timeout_handler()
+        try:
+            response = await asyncio.wait_for(
+                call_next(request), 
+                timeout=self.timeout_seconds
+            )
+            # 添加处理时间头
+            process_time = time.time() - start_time
+            response.headers["X-Process-Time"] = str(process_time)
+            return response
+        except asyncio.TimeoutError:
+            process_time = time.time() - start_time
+            return JSONResponse(
+                status_code=408,
+                content={
+                    "detail": f"请求超时，处理时间超过{self.timeout_seconds}秒",
+                    "timeout_seconds": self.timeout_seconds,
+                    "process_time": process_time
+                },
+                headers={"X-Process-Time": str(process_time)}
+            )
 
 
 @asynccontextmanager
