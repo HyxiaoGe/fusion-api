@@ -1,6 +1,9 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
+import asyncio
+import time
 from app.core.config import settings
 from app.api import chat, settings as settings_api, prompts, files, hot_topics, scheduled_tasks, web_search, models, credentials
 from app.core.logger import app_logger
@@ -9,6 +12,41 @@ from app.db.database import SessionLocal
 from app.ai.llm_manager import llm_manager
 from app.services.scheduler_service import SchedulerService
 from app.core.function_manager import init_function_registry
+
+
+# 超时中间件
+class TimeoutMiddleware:
+    def __init__(self, app, timeout_seconds: int = 10):
+        self.app = app
+        self.timeout_seconds = timeout_seconds
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        start_time = time.time()
+        
+        async def timeout_handler():
+            try:
+                await asyncio.wait_for(
+                    self.app(scope, receive, send),
+                    timeout=self.timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                # 构造超时响应
+                response = JSONResponse(
+                    status_code=408,
+                    content={
+                        "detail": f"请求超时，处理时间超过{self.timeout_seconds}秒",
+                        "timeout_seconds": self.timeout_seconds,
+                        "process_time": time.time() - start_time
+                    },
+                    headers={"X-Process-Time": str(time.time() - start_time)}
+                )
+                await response(scope, receive, send)
+
+        await timeout_handler()
 
 
 @asynccontextmanager
@@ -41,6 +79,9 @@ app = FastAPI(title=settings.APP_NAME, version=settings.APP_VERSION, lifespan=li
 
 # 输出启动日志
 app_logger.info(f"正在启动 {settings.APP_NAME} v{settings.APP_VERSION}")
+
+# 添加超时中间件
+app.add_middleware(TimeoutMiddleware, timeout_seconds=10)
 
 # 配置CORS
 app.add_middleware(
