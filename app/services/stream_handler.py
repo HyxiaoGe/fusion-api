@@ -18,7 +18,7 @@ class StreamHandler:
         self.memory_service = memory_service
         self.message_processor = MessageProcessor(db)
 
-    async def generate_normal_stream(self, provider, model, messages, conversation_id, options=None) -> AsyncGenerator:
+    async def generate_normal_stream(self, provider, model, messages, conversation_id, options=None, turn_id=None) -> AsyncGenerator:
         """生成常规流式响应（无推理模式）"""
         if options is None:
             options = {}
@@ -36,12 +36,12 @@ class StreamHandler:
                 await asyncio.sleep(0.01)
 
         # 流结束后，将完整响应保存到对话历史
-        await self.save_stream_response(conversation_id, full_response)
+        await self.save_stream_response(conversation_id, full_response, turn_id)
         # 发送结束信号
         yield f"data: {json.dumps({'content': '[DONE]', 'conversation_id': conversation_id})}\n\n"
         
 
-    async def save_stream_response(self, conversation_id, response_text):
+    async def save_stream_response(self, conversation_id, response_text, turn_id=None):
         """保存流式响应到对话历史"""
         try:
             conversation = self.memory_service.get_conversation(conversation_id)
@@ -50,7 +50,8 @@ class StreamHandler:
                 ai_message = Message(
                     role=MessageRoles.ASSISTANT,
                     type=MessageTypes.ASSISTANT_CONTENT,
-                    content=response_text
+                    content=response_text,
+                    turn_id=turn_id
                 )
                 conversation.messages.append(ai_message)
                 conversation.updated_at = datetime.now()
@@ -60,7 +61,7 @@ class StreamHandler:
         except Exception as e:
             logging.error(f"保存流式响应失败: {str(e)}")
 
-    async def generate_reasoning_stream(self, provider, model, messages, conversation_id, options=None) -> AsyncGenerator:
+    async def generate_reasoning_stream(self, provider, model, messages, conversation_id, options=None, turn_id=None) -> AsyncGenerator:
         """生成带推理功能的流式响应，适用于支持推理能力的模型"""
         if options is None:
             options = {}
@@ -150,13 +151,14 @@ class StreamHandler:
         await self.save_stream_response_with_reasoning(
             conversation_id=conversation_id,
             response_text=answer_result,
-            reasoning_text=reasoning_result
+            reasoning_text=reasoning_result,
+            turn_id=turn_id
         )
 
         # 完成标志
         yield await send_event("done")
 
-    async def save_stream_response_with_reasoning(self, conversation_id, response_text, reasoning_text):
+    async def save_stream_response_with_reasoning(self, conversation_id, response_text, reasoning_text, turn_id=None):
         """保存流式响应和推理过程到对话历史"""
         try:
             conversation = self.memory_service.get_conversation(conversation_id)
@@ -166,7 +168,8 @@ class StreamHandler:
                     reasoning_message = Message(
                         role=MessageRoles.ASSISTANT,
                         type=MessageTypes.REASONING_CONTENT,
-                        content=reasoning_text
+                        content=reasoning_text,
+                        turn_id=turn_id
                     )
                     conversation.messages.append(reasoning_message)
 
@@ -174,7 +177,8 @@ class StreamHandler:
                 ai_message = Message(
                     role=MessageRoles.ASSISTANT,
                     type=MessageTypes.ASSISTANT_CONTENT,
-                    content=response_text
+                    content=response_text,
+                    turn_id=turn_id
                 )
                 conversation.messages.append(ai_message)
                 conversation.updated_at = datetime.now()
@@ -184,7 +188,7 @@ class StreamHandler:
         except Exception as e:
             logging.error(f"保存推理流式响应失败: {str(e)}")
 
-    async def direct_reasoning_stream(self, provider, model, messages, conversation_id, options=None) -> AsyncGenerator:
+    async def direct_reasoning_stream(self, provider, model, messages, conversation_id, options=None, turn_id=None) -> AsyncGenerator:
         """直接使用OpenAI客户端生成带推理功能的流式响应，绕过LangChain"""
         from openai import AsyncOpenAI
         
@@ -330,7 +334,8 @@ class StreamHandler:
         await self.save_stream_response_with_reasoning(
             conversation_id=conversation_id,
             response_text=answer_result,
-            reasoning_text=reasoning_result
+            reasoning_text=reasoning_result,
+            turn_id=turn_id
         )
         
         # 完成标志

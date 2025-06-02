@@ -80,6 +80,7 @@ class ChatService:
             stream: bool = False,
             options: Optional[Dict[str, Any]] = None,
             file_ids: Optional[List[str]] = None,
+            topic_info: Optional[Dict[str, Any]] = None,
     ) -> Union[StreamingResponse, ChatResponse]:
         """处理用户消息并获取AI响应"""
         # 初始化options
@@ -89,11 +90,11 @@ class ChatService:
         # 获取或创建会话
         conversation = self._get_or_create_conversation(conversation_id, provider, model, message)
 
-        # 记录用户消息
+        # 记录用户消息（保持用户原始完整消息，如："请帮我分析以下热点话题： xxx"）
         user_message = Message(
             role=MessageRoles.USER, 
             type=MessageTypes.USER_QUERY,
-            content=message
+            content=message  # 保持用户原始完整消息内容
         )
         
         # 使用用户消息的ID作为turn_id
@@ -102,10 +103,24 @@ class ChatService:
         
         conversation.messages.append(user_message)
         
+        # 处理话题信息：如果有话题信息，生成扩展的话题分析提示词发送给LLM
+        llm_message = message  # 默认使用用户原始消息
+        if topic_info:
+            # 使用提示词管理器生成包含话题详细信息的分析提示词
+            llm_message = prompt_manager.format_prompt(
+                "hot_topic_analysis",
+                title=topic_info.get("title", ""),
+                description=topic_info.get("description", ""),
+                additional_content=topic_info.get("additional_content", "")
+            )
+        
         # 准备聊天历史
         chat_history = []
-        for msg in conversation.messages:
+        for msg in conversation.messages[:-1]:  # 排除刚添加的用户消息
             chat_history.append({"role": msg.role, "content": msg.content})
+        
+        # 添加用于LLM处理的消息（可能是原始消息或扩展后的话题分析提示词）
+        chat_history.append({"role": MessageRoles.USER, "content": llm_message})
 
         # 从聊天历史中提取消息
         messages = self.message_processor.prepare_chat_messages(chat_history)
@@ -124,7 +139,7 @@ class ChatService:
             # 获取文件内容并增强消息
             file_contents = self.file_service.get_files_content(file_ids)
             if file_contents:
-                messages = self.message_processor.enhance_with_file_content(messages, message, file_contents)
+                messages = self.message_processor.enhance_with_file_content(messages, llm_message, file_contents)
 
         # 根据是否为流式响应分别处理
         if stream:

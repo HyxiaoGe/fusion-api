@@ -14,21 +14,30 @@ router = APIRouter()
 async def send_message(request: ChatRequest, db: Session = Depends(get_db)):
     """发送消息到指定的AI模型并获取响应"""
     print(f"收到聊天请求: conversation_id={request.conversation_id}")
+    print(f"接收到的消息: {request.message}")
+    print(f"话题ID: {request.topic_id}")
 
+    # 处理话题相关逻辑
+    topic_info = None
+    original_message = request.message  # 保存原始消息
+    
     if request.topic_id:
         from app.services.hot_topic_service import HotTopicService
         hot_topic_service = HotTopicService(db)
         topic = hot_topic_service.get_topic_by_id(request.topic_id)
         if topic:
-            # 使用提示词管理器生成包含话题信息的提示词
-            additional_content = ""
-            description = topic.description or ""
-            request.message = prompt_manager.format_prompt(
-                "hot_topic_analysis",
-                title=topic.title,
-                description=description,
-                additional_content=additional_content
-            )
+            print(f"找到话题: {topic.title}")
+            # 保存话题信息，传递给ChatService处理
+            topic_info = {
+                "title": topic.title,
+                "description": topic.description or "",
+                "additional_content": ""
+            }
+            
+            # 如果用户消息就是话题标题，自动构造完整的分析请求
+            if request.message.strip() == topic.title.strip():
+                request.message = f"请帮我分析以下热点话题： {topic.title}"
+                print(f"自动构造用户消息: {request.message}")
             
             # 增加浏览计数
             hot_topic_service.increment_view_count(request.topic_id)
@@ -38,11 +47,12 @@ async def send_message(request: ChatRequest, db: Session = Depends(get_db)):
         response = await chat_service.process_message(
             provider=request.provider,
             model=request.model,
-            message=request.message,
+            message=request.message,  # 保持用户原始完整消息
             conversation_id=request.conversation_id,
             stream=request.stream,
             options=request.options,
-            file_ids=request.file_ids
+            file_ids=request.file_ids,
+            topic_info=topic_info  # 传递话题信息用于LLM处理
         )
         print(f"请求处理完成，返回响应")
         return response

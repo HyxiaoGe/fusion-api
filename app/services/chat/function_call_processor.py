@@ -25,7 +25,7 @@ class FunctionCallProcessor:
         self.db = db
         self.memory_service = memory_service
     
-    async def generate_function_call_stream(self, provider, model, messages, conversation_id, options=None):
+    async def generate_function_call_stream(self, provider, model, messages, conversation_id, options=None, turn_id=None):
         """
         生成支持函数调用的流式响应
         
@@ -35,6 +35,7 @@ class FunctionCallProcessor:
             messages: 消息列表
             conversation_id: 会话ID
             options: 可选参数
+            turn_id: 对话轮次ID
         """
         if options is None:
             options = {}
@@ -54,7 +55,7 @@ class FunctionCallProcessor:
             # 处理函数调用流程
             async for event in self._execute_function_call_flow(
                 provider, model, llm, processed_messages, functions_kwargs, 
-                messages, context, send_event, options
+                messages, context, send_event, options, turn_id
             ):
                 yield event
                 
@@ -99,7 +100,7 @@ class FunctionCallProcessor:
         ]
 
     async def _execute_function_call_flow(self, provider, model, llm, processed_messages, functions_kwargs, 
-                                         original_messages, context, send_event, options):
+                                         original_messages, context, send_event, options, turn_id=None):
         """
         执行完整的函数调用流程
         
@@ -113,6 +114,7 @@ class FunctionCallProcessor:
             context: 上下文信息
             send_event: 事件发送函数
             options: 可选参数
+            turn_id: 对话轮次ID
         """
         use_reasoning = options.get("use_reasoning", False)
         
@@ -163,7 +165,7 @@ class FunctionCallProcessor:
             # 使用专门的处理器
             async for event in handler(
                 send_event, function_call_data, function_result, 
-                context["conversation_id"], llm, original_messages, options, provider, model
+                context["conversation_id"], llm, original_messages, options, provider, model, turn_id
             ):
                 yield event
         else:
@@ -183,7 +185,8 @@ class FunctionCallProcessor:
                 function_name=function_name,
                 function_args=function_call_data["function"].get("arguments", "{}"),
                 function_result=function_result,
-                final_response=final_response
+                final_response=final_response,
+                turn_id=turn_id
             )
             
             yield await send_event(EventTypes.DONE)
@@ -346,7 +349,7 @@ class FunctionCallProcessor:
         yield final_response
 
     async def _handle_web_search_function(self, send_event, function_call_data, function_result, 
-                                          conversation_id, llm, messages, options, provider, model):
+                                          conversation_id, llm, messages, options, provider, model, turn_id):
         """处理web_search函数的专门处理器"""
         function_name = FunctionNames.WEB_SEARCH
         use_reasoning = options.get("use_reasoning", False)
@@ -414,14 +417,15 @@ class FunctionCallProcessor:
             function_name=function_name,
             function_args=valid_arguments_str,
             function_result=function_result,
-            final_response=final_response
+            final_response=final_response,
+            turn_id=turn_id
         )
 
         # 6. 完成标志
         yield await send_event(EventTypes.DONE)
 
     async def _handle_hot_topics_function(self, send_event, function_call_data, function_result, 
-                                          conversation_id, llm, messages, options, provider, model):
+                                          conversation_id, llm, messages, options, provider, model, turn_id):
         """处理hot_topics函数的专门处理器"""
         function_name = FunctionNames.HOT_TOPICS
         use_reasoning = options.get("use_reasoning", False)
@@ -488,14 +492,15 @@ class FunctionCallProcessor:
             function_name=function_name,
             function_args=valid_arguments_str,
             function_result=function_result,
-            final_response=final_response
+            final_response=final_response,
+            turn_id=turn_id
         )
 
         # 6. 完成标志
         yield await send_event(EventTypes.DONE)
 
     async def _save_function_call_stream_response(self, conversation_id, function_name, 
-                                           function_args, function_result, final_response):
+                                           function_args, function_result, final_response, turn_id=None):
         """保存函数调用流式响应到对话历史"""
         try:
             conversation = self.memory_service.get_conversation(conversation_id)
@@ -509,21 +514,24 @@ class FunctionCallProcessor:
                 function_call_message = Message(
                     role=MessageRoles.ASSISTANT,
                     type=MessageTypes.FUNCTION_CALL,
-                    content=function_desc
+                    content=function_desc,
+                    turn_id=turn_id
                 )
                 
                 # 创建函数结果消息
                 function_result_message = Message(
                     role=MessageRoles.SYSTEM,
                     type=MessageTypes.FUNCTION_RESULT,
-                    content=json.dumps(function_result, ensure_ascii=False)
+                    content=json.dumps(function_result, ensure_ascii=False),
+                    turn_id=turn_id
                 )
                 
                 # 创建最终AI响应消息
                 ai_message = Message(
                     role=MessageRoles.ASSISTANT,
                     type=MessageTypes.ASSISTANT_CONTENT,
-                    content=final_response
+                    content=final_response,
+                    turn_id=turn_id
                 )
                 
                 # 添加所有消息到会话
