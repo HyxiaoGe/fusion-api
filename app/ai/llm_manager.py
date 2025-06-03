@@ -221,18 +221,26 @@ class LLMManager:
         """从数据库获取模型凭证"""
             
         try:
-            # 从数据库获取凭证
+            # 使用独立的数据库Session，避免全局连接事务问题
+            from app.db.database import SessionLocal
             from app.db.repositories import ModelSourceRepository, ModelCredentialRepository
             
-            # 获取模型信息
-            model_repo = ModelSourceRepository(self.db)
-            model_source = model_repo.get_by_id(model)
+            db = SessionLocal()
+            try:
+                # 获取模型信息
+                model_repo = ModelSourceRepository(db)
+                model_source = model_repo.get_by_id(model)
+                    
+                # 获取模型凭证
+                cred_repo = ModelCredentialRepository(db)
+                credential = cred_repo.get_default(model)
                 
-            # 获取模型凭证
-            cred_repo = ModelCredentialRepository(self.db)
-            credential = cred_repo.get_default(model)
-                
-            return credential.credentials
+                if not credential:
+                    raise ValueError(f"未找到模型 {model} 的凭证配置")
+                    
+                return credential.credentials
+            finally:
+                db.close()
         except Exception as e:
             logger.error(f"获取模型凭证失败: {e}")
             raise

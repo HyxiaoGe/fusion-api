@@ -10,7 +10,6 @@ from app.api import chat, settings as settings_api, prompts, files, hot_topics, 
 from app.core.logger import app_logger
 from app.db.init_db import init_db
 from app.db.database import SessionLocal
-from app.ai.llm_manager import llm_manager
 from app.services.scheduler_service import SchedulerService
 from app.core.function_manager import init_function_registry
 
@@ -51,11 +50,6 @@ async def lifespan(app: FastAPI):
         app_logger.info("应用启动中...")
         init_db()
         app_logger.info("数据库初始化完成")
-
-        # 初始化LLM管理器的数据库连接
-        db = SessionLocal()
-        llm_manager.db = db
-        app_logger.info("LLM管理器数据库初始化完成")
         
         # 初始化函数注册表
         init_function_registry()
@@ -65,9 +59,8 @@ async def lifespan(app: FastAPI):
         scheduler.start()
         app_logger.info("调度器启动完成")
         yield
-        # 应用关闭时，关闭数据库连接
-        if llm_manager.db:
-            llm_manager.db.close()
+        # 应用关闭时的清理工作
+        app_logger.info("应用关闭中...")
     except Exception as e:
         app_logger.error(f"应用启动失败: {e}")
 
