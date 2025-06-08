@@ -17,6 +17,8 @@ from app.db.models import ModelSource, ModelCredential
 from app.schemas.chat import Conversation, Message
 from app.schemas.prompts import PromptTemplate
 from app.schemas.models import ModelInfo, ModelCapabilities, ModelPricing, AuthConfig, ModelConfiguration, ModelConfigParam, ModelBasicInfo, AuthConfigField, ModelCredentialInfo
+from app.db.models import RssSource as RssSourceModel
+from app.schemas.rss import RssSourceCreate, RssSourceUpdate
 
 logger = logging.getLogger(__name__)
 
@@ -415,6 +417,74 @@ class HotTopicRepository:
         except Exception as e:
             self.db.rollback()
             return False
+
+
+class RssSourceRepository:
+    """RSS源数据仓库"""
+
+    def __init__(self, db: Session):
+        self.db = db
+
+    def get_by_id(self, source_id: str) -> Optional[RssSourceModel]:
+        return self.db.query(RssSourceModel).filter(RssSourceModel.id == source_id).first()
+
+    def get_all(self, skip: int = 0, limit: int = 100) -> List[RssSourceModel]:
+        return self.db.query(RssSourceModel).order_by(RssSourceModel.name).offset(skip).limit(limit).all()
+
+    def get_all_enabled(self) -> List[RssSourceModel]:
+        """获取所有启用的RSS源"""
+        return self.db.query(RssSourceModel).filter(RssSourceModel.is_enabled == True).order_by(RssSourceModel.name).all()
+
+    def create(self, rss_source: RssSourceCreate) -> RssSourceModel:
+        db_source = RssSourceModel(**rss_source.dict())
+        try:
+            self.db.add(db_source)
+            self.db.commit()
+            self.db.refresh(db_source)
+            return db_source
+        except Exception as e:
+            self.db.rollback()
+            raise e
+
+    def update(self, source_id: str, rss_source: RssSourceUpdate) -> Optional[RssSourceModel]:
+        db_source = self.get_by_id(source_id)
+        if db_source:
+            update_data = rss_source.dict(exclude_unset=True)
+            for key, value in update_data.items():
+                setattr(db_source, key, value)
+            try:
+                self.db.commit()
+                self.db.refresh(db_source)
+                return db_source
+            except Exception as e:
+                self.db.rollback()
+                raise e
+        return None
+
+    def delete(self, source_id: str) -> bool:
+        db_source = self.get_by_id(source_id)
+        if db_source:
+            try:
+                self.db.delete(db_source)
+                self.db.commit()
+                return True
+            except Exception as e:
+                self.db.rollback()
+                raise e
+        return False
+
+    def touch(self, source_id: str) -> bool:
+        """仅更新指定RSS源的 updated_at 时间戳"""
+        db_source = self.get_by_id(source_id)
+        if db_source:
+            try:
+                db_source.updated_at = get_china_time()
+                self.db.commit()
+                return True
+            except Exception as e:
+                self.db.rollback()
+                raise e
+        return False
 
 
 class ScheduledTaskRepository:

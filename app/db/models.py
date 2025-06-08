@@ -87,6 +87,28 @@ class HotTopic(Base):
     view_count = Column(Integer, default=0)  # 浏览次数，用于排序
 
 
+class RssSource(Base):
+    __tablename__ = "rss_sources"
+    
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    name = Column(String, nullable=False, unique=True)
+    url = Column(String, nullable=False, unique=True)
+    description = Column(String, nullable=True)
+    category = Column(String, nullable=True)
+    is_enabled = Column(Boolean, default=True)
+    
+    # 过滤规则
+    filter_apply = Column(String, nullable=True)  # 应用于: title, description, ...
+    filter_type = Column(String, nullable=True)   # 过滤类型: include, exclude, ...
+    filter_rule = Column(String, nullable=True)   # 规则: 关键字或正则表达式
+    
+    created_at = Column(DateTime, default=get_china_time)
+    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
+    
+    def to_dict(self):
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
 class ScheduledTask(Base):
     __tablename__ = "scheduled_tasks"
     

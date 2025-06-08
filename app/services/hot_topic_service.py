@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.logger import app_logger as logger
 from app.db.models import HotTopic
-from app.db.repositories import HotTopicRepository, ScheduledTaskRepository
+from app.db.repositories import HotTopicRepository, ScheduledTaskRepository, RssSourceRepository
 
 class HotTopicService:
     """热点话题服务，负责从RSS获取热点数据并定期更新"""
@@ -24,49 +24,95 @@ class HotTopicService:
         self.db = db
         self.repo = HotTopicRepository(db)
         self.task_repo = ScheduledTaskRepository(db)
+        self.rss_repo = RssSourceRepository(db)
         # 项目根目录下的docs文件夹路径
         self.docs_folder = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "docs")
         
-        # RSS源配置
-        self.rss_sources = [
-            {
-                "url": "http://www.jintiankansha.me/rss/GE2TG7DCGM4DIYLFGJTGEMLEMQZWCZRRMRSDIYZQGNSDMOBQGFSDIOJYMVTGCOBRGU4WKNI=",
-                "name": "差评快讯",
-                "category": "微信公众平台",
-                "filter_apply": "title",
-                "filter_type": "include",
-                "filter_rule": "OpenAI|ChatGPT|Claude|GPT|Sora|AI|微软|谷歌|字节|千问|DeepSeek|混元|阿里|xAI|马斯克|Gemini|Anthropic|豆包|文心一言"
-            },
-            {
-                "url": "https://rsshub.rssforever.com/36kr/motif/327686782977",
-                "name": "36氪创投",
-                "category": "AI",
-                "filter_apply": "title",
-                "filter_type": "include",
-                "filter_rule": "OpenAI|ChatGPT|Claude|GPT|Sora|AI|微软|谷歌|字节|千问|DeepSeek|混元|阿里|xAI|马斯克|Gemini|Anthropic|豆包|文心一言"
-            },
-            {
-                "url": "https://feeds.feedburner.com/ruanyifeng",
-                "name": "科技爱好者周刊",
-                "category": "weekly"
-            },
-            {
-                "url": "http://www.jintiankansha.me/rss/GMZTSOJTGZ6DOMBUHE2WGZTGMI2TKMRQG4YWGMRVGQYTSZJYGJRTENBYGYZTKMRWHAYTGMLDMM3Q====",
-                "name": "知危",
-                "category": "微信公众平台"
-            },
-            {
-                "url": "https://www.ithome.com/rss/",
-                "name": "IT之家",
-                "category": "科技",
-                "filter_apply": "title",
-                "filter_type": "include",
-                "filter_rule": "OpenAI|ChatGPT|Claude|GPT|Sora|AI|微软|谷歌|字节|千问|DeepSeek|混元|阿里|xAI|马斯克|Gemini|Anthropic|豆包|文心一言"
-            },
-        ]
-        
         # 初始化任务
         self._init_tasks()
+        # 初始化种子RSS数据
+        self._seed_rss_sources()
+
+    def _seed_rss_sources(self):
+        """如果数据库为空，则植入初始的RSS源数据"""
+        try:
+            existing_sources = self.rss_repo.get_all(limit=1)
+            if existing_sources:
+                return
+
+            logger.info("数据库中没有RSS源，开始植入初始数据...")
+            
+            initial_sources = [
+                {
+                    "url": "http://www.jintiankansha.me/rss/GE2TG7DCGM4DIYLFGJTGEMLEMQZWCZRRMRSDIYZQGNSDMOBQGFSDIOJYMVTGCOBRGU4WKNI=",
+                    "name": "差评快讯",
+                    "category": "微信公众平台",
+                    "filter_apply": "title",
+                    "filter_type": "include",
+                    "filter_rule": "OpenAI|ChatGPT|Claude|GPT|Sora|AI|微软|谷歌|字节|千问|DeepSeek|混元|阿里|xAI|马斯克|Gemini|Anthropic|豆包|文心一言"
+                },
+                {
+                    "url": "https://rsshub.rssforever.com/36kr/motif/327686782977",
+                    "name": "36氪创投",
+                    "category": "AI",
+                    "filter_apply": "title",
+                    "filter_type": "include",
+                    "filter_rule": "OpenAI|ChatGPT|Claude|GPT|Sora|AI|微软|谷歌|字节|千问|DeepSeek|混元|阿里|xAI|马斯克|Gemini|Anthropic|豆包|文心一言"
+                },
+                {
+                    "url": "https://rsshub.app/36kr/hot-list",
+                    "name": "36氪 - 24小时热榜",
+                    "category": "热榜"
+                },
+                {
+                    "url": "https://rsshub.app/sspai/matrix",
+                    "name": "少数派",
+                    "category": "热榜"
+                },
+                {
+                    "url": "https://rsshub.app/woshipm/popular",
+                    "name": "人人都是产品经理",
+                    "category": "热榜"
+                },
+                {
+                    "url": "https://feeds.feedburner.com/ruanyifeng",
+                    "name": "科技爱好者周刊",
+                    "category": "weekly"
+                },
+                {
+                    "url": "http://www.jintiankansha.me/rss/GMZTSOJTGZ6DOMBUHE2WGZTGMI2TKMRQG4YWGMRVGQYTSZJYGJRTENBYGYZTKMRWHAYTGMLDMM3Q====",
+                    "name": "知危",
+                    "category": "微信公众平台"
+                },
+                {
+                    "url": "https://www.ithome.com/rss/",
+                    "name": "IT之家",
+                    "category": "科技",
+                    "filter_apply": "title",
+                    "filter_type": "include",
+                    "filter_rule": "OpenAI|ChatGPT|Claude|GPT|Sora|AI|微软|谷歌|字节|千问|DeepSeek|混元|阿里|xAI|马斯克|Gemini|Anthropic|豆包|文心一言"
+                },
+                {
+                    "url": "https://rsshub.app/aibase/news",
+                    "name": "AIbase",
+                    "category": "AI"
+                },
+                {
+                    "url": "https://rsshub.app/huxiu/article",
+                    "name": "虎嗅网",
+                    "category": "热榜"
+                },
+            ]
+
+            for source_data in initial_sources:
+                from app.schemas.rss import RssSourceCreate
+                source_create = RssSourceCreate(**source_data)
+                self.rss_repo.create(source_create)
+            
+            logger.info(f"成功植入 {len(initial_sources)} 条初始RSS源数据。")
+
+        except Exception as e:
+            logger.error(f"植入初始RSS源数据失败: {e}")
 
     def _init_tasks(self):
         """初始化所有定时任务记录"""
@@ -225,12 +271,20 @@ class HotTopicService:
         
         new_processed_urls = set()
 
-        for source in self.rss_sources:
+        rss_sources = self.rss_repo.get_all_enabled()
+        logger.info(f"从数据库加载了 {len(rss_sources)} 个启用的RSS源进行处理。")
+
+        for source in rss_sources:
             try:
-                source_urls = await self._process_rss_source(source, processed_urls)
+                source_dict = source.to_dict()
+                source_urls = await self._process_rss_source(source_dict, processed_urls)
                 new_processed_urls.update(source_urls)
+                
+                # 更新RSS源的检查时间
+                self.rss_repo.touch(source.id)
+                logger.debug(f"已更新RSS源 '{source.name}' 的 updated_at 时间戳。")
             except Exception as e:
-                logger.error(f"处理RSS源 {source['name']} 失败: {e}")
+                logger.error(f"处理RSS源 {source.name} 失败: {e}")
                 
         # 更新已处理的URL列表
         processed_urls.update(new_processed_urls)
