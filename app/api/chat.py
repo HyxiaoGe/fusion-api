@@ -13,9 +13,6 @@ router = APIRouter()
 @router.post("/send")
 async def send_message(request: ChatRequest, db: Session = Depends(get_db)):
     """发送消息到指定的AI模型并获取响应"""
-    print(f"收到聊天请求: conversation_id={request.conversation_id}")
-    print(f"接收到的消息: {request.message}")
-    print(f"话题ID: {request.topic_id}")
 
     # 处理话题相关逻辑
     topic_info = None
@@ -26,7 +23,6 @@ async def send_message(request: ChatRequest, db: Session = Depends(get_db)):
         hot_topic_service = HotTopicService(db)
         topic = hot_topic_service.get_topic_by_id(request.topic_id)
         if topic:
-            print(f"找到话题: {topic.title}")
             # 保存话题信息，传递给ChatService处理
             topic_info = {
                 "title": topic.title,
@@ -37,7 +33,6 @@ async def send_message(request: ChatRequest, db: Session = Depends(get_db)):
             # 如果用户消息就是话题标题，自动构造完整的分析请求
             if request.message.strip() == topic.title.strip():
                 request.message = f"请帮我分析以下热点话题： {topic.title}"
-                print(f"自动构造用户消息: {request.message}")
             
             # 增加浏览计数
             hot_topic_service.increment_view_count(request.topic_id)
@@ -54,7 +49,6 @@ async def send_message(request: ChatRequest, db: Session = Depends(get_db)):
             file_ids=request.file_ids,
             topic_info=topic_info  # 传递话题信息用于LLM处理
         )
-        print(f"请求处理完成，返回响应")
         return response
     except Exception as e:
         print(f"处理过程中出错: {str(e)}")
