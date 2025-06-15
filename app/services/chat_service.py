@@ -255,14 +255,21 @@ class ChatService:
         """获取特定对话"""
         return self.memory_service.get_conversation(conversation_id)
 
+    def update_message(self, message_id: str, update_data: Dict[str, Any]) -> Optional[Message]:
+        """更新消息信息"""
+        filtered_update_data = {k: v for k, v in update_data.items() if v is not None}
+        if not filtered_update_data:
+            return self.memory_service.get_message_by_id(message_id)
+        
+        updated_message = self.memory_service.update_message(message_id, filtered_update_data)
+
+        # 这里可以添加逻辑，比如如果更新了消息内容，可能需要重新生成建议问题等
+        
+        return updated_message
+
     def delete_conversation(self, conversation_id: str) -> bool:
         """删除特定对话"""
-        try:
-            # 然后删除数据库记录
-            return self.memory_service.delete_conversation(conversation_id)
-        except Exception as e:
-            logging.error(f"删除对话失败: {e}")
-            return False
+        return self.memory_service.delete_conversation(conversation_id)
 
     async def generate_title(
             self,

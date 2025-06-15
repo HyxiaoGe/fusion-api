@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.ai.prompts import prompt_manager
 from app.db.database import get_db
-from app.schemas.chat import ChatRequest, Conversation, TitleGenerationRequest, TitleGenerationResponse, SuggestedQuestionsRequest, SuggestedQuestionsResponse
+from app.schemas.chat import ChatRequest, Conversation, TitleGenerationRequest, TitleGenerationResponse, SuggestedQuestionsRequest, SuggestedQuestionsResponse, MessageUpdateRequest, Message
 from app.services.chat_service import ChatService
 router = APIRouter()
 
@@ -74,6 +74,34 @@ def get_conversation(conversation_id: str, db: Session = Depends(get_db)):
     if not conversation:
         raise HTTPException(status_code=404, detail="对话不存在")
     return conversation
+
+
+@router.put("/conversations/{conversation_id}/messages/{message_id}", response_model=Message)
+def update_message(
+    conversation_id: str,
+    message_id: str,
+    update_request: MessageUpdateRequest,
+    db: Session = Depends(get_db)
+):
+    """更新特定消息的信息，如内容、类型或持续时间"""
+    chat_service = ChatService(db)
+
+    # 验证消息是否属于该会话
+    conversation = chat_service.get_conversation(conversation_id)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    
+    message_ids = [msg.id for msg in conversation.messages]
+    if message_id not in message_ids:
+        raise HTTPException(status_code=404, detail="消息不属于此对话")
+
+    updated_message = chat_service.update_message(
+        message_id, update_request.model_dump()
+    )
+    if not updated_message:
+        raise HTTPException(status_code=404, detail="消息不存在或更新失败")
+        
+    return updated_message
 
 
 @router.delete("/conversations/{conversation_id}")

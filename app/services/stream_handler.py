@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime
-from typing import List, Dict, Any, AsyncGenerator, Callable
+from typing import List, Dict, Any, AsyncGenerator, Callable, Optional
 
 from app.ai.llm_manager import llm_manager
 from app.schemas.chat import Message, Conversation
@@ -18,31 +18,65 @@ class StreamHandler:
         self.memory_service = memory_service
         self.message_processor = MessageProcessor(db)
 
+    async def _create_placeholder_message(self, conversation_id: str, message_type: str, turn_id: Optional[str]) -> Message:
+        """在数据库中创建一个空的占位消息并返回"""
+        placeholder_message = Message(
+            role=MessageRoles.ASSISTANT,
+            type=message_type,
+            content="",  # 内容为空
+            turn_id=turn_id
+        )
+        # 直接创建消息，而不是修改整个会话
+        return self.memory_service.create_message(placeholder_message, conversation_id)
+
     async def generate_normal_stream(self, provider, model, messages, conversation_id, options=None, turn_id=None) -> AsyncGenerator:
         """生成常规流式响应（无推理模式）"""
         if options is None:
             options = {}
             
+        # 1. 创建占位消息
+        assistant_message = await self._create_placeholder_message(conversation_id, MessageTypes.ASSISTANT_CONTENT, turn_id)
+        assistant_message_id = assistant_message.id
+
         llm = llm_manager.get_model(provider=provider, model=model, options=options)
         full_response = ""
 
-        # 流式响应处理
+        # 2. 流式响应处理，并在事件中加入message_id
         for chunk in llm.stream(messages):
             content = chunk.content if hasattr(chunk, 'content') else chunk
 
             if content:
                 full_response += content
-                yield f"data: {json.dumps({'content': content, 'conversation_id': conversation_id})}\n\n"
+                event_data = {
+                    "content": content,
+                    "conversation_id": conversation_id,
+                    "message_id": assistant_message_id
+                }
+                yield f"data: {json.dumps(event_data)}\n\n"
                 await asyncio.sleep(0.01)
 
-        # 流结束后，将完整响应保存到对话历史
-        await self.save_stream_response(conversation_id, full_response, turn_id)
-        # 发送结束信号
-        yield f"data: {json.dumps({'content': '[DONE]', 'conversation_id': conversation_id})}\n\n"
+        # 3. 流结束后，更新占位消息
+        await self.update_stream_response(assistant_message_id, full_response)
+        
+        # 4. 发送结束信号
+        done_data = {
+            "content": "[DONE]",
+            "conversation_id": conversation_id,
+            "message_id": assistant_message_id
+        }
+        yield f"data: {json.dumps(done_data)}\n\n"
         
 
+    async def update_stream_response(self, message_id: str, response_text: str):
+        """更新流式响应到数据库"""
+        try:
+            update_data = {"content": response_text}
+            self.memory_service.update_message(message_id, update_data)
+        except Exception as e:
+            logging.error(f"更新流式响应失败: {str(e)}")
+
     async def save_stream_response(self, conversation_id, response_text, turn_id=None):
-        """保存流式响应到对话历史"""
+        """保存流式响应到对话历史 - 此方法将在后续被废弃"""
         try:
             conversation = self.memory_service.get_conversation(conversation_id)
             if conversation:
@@ -66,14 +100,20 @@ class StreamHandler:
         if options is None:
             options = {}
         
+        # 1. 创建占位消息
+        reasoning_message = await self._create_placeholder_message(conversation_id, MessageTypes.REASONING_CONTENT, turn_id)
+        assistant_message = await self._create_placeholder_message(conversation_id, MessageTypes.ASSISTANT_CONTENT, turn_id)
+
         # 构造发送事件的辅助函数
-        async def send_event(event_type, content=None):
+        async def send_event(event_type, content=None, message_id=None):
             data = {"type": event_type, "conversation_id": conversation_id}
             if content is not None:
                 data["content"] = content
+            if message_id:
+                data["message_id"] = message_id
             return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
-        yield await send_event("reasoning_start")
+        yield await send_event("reasoning_start", message_id=reasoning_message.id)
         
         # 获取模型
         llm = llm_manager.get_model(provider=provider, model=model, options=options)
@@ -100,7 +140,7 @@ class StreamHandler:
                 reasoning_content = chunk.additional_kwargs['reasoning_content']
                 if reasoning_content and reasoning_content.strip():
                     reasoning_result += reasoning_content
-                    yield await send_event("reasoning_content", reasoning_content)
+                    yield await send_event("reasoning_content", reasoning_content, message_id=reasoning_message.id)
                     has_reasoning = True
             
             # 处理最终答案
@@ -113,14 +153,14 @@ class StreamHandler:
                     if in_reasoning_phase and not reasoning_completed and not has_reasoning:
                         in_reasoning_phase = False
                         reasoning_completed = True
-                        yield await send_event("reasoning_complete")
+                        yield await send_event("reasoning_complete", message_id=reasoning_message.id)
                     
                     if not answering_started:
                         answering_started = True
-                        yield await send_event("answering_start")
+                        yield await send_event("answering_start", message_id=assistant_message.id)
                     
                     answer_result += content
-                    yield await send_event("answering_content", content)
+                    yield await send_event("answering_content", content, message_id=assistant_message.id)
                     has_answer = True
             else:
                 if content and content.strip():
@@ -128,38 +168,42 @@ class StreamHandler:
                     if in_reasoning_phase and not reasoning_completed and not has_reasoning:
                         in_reasoning_phase = False
                         reasoning_completed = True
-                        yield await send_event("reasoning_complete")
+                        yield await send_event("reasoning_complete", message_id=reasoning_message.id)
                     
                     if not answering_started:
                         answering_started = True
-                        yield await send_event("answering_start")
+                        yield await send_event("answering_start", message_id=assistant_message.id)
                     
                     answer_result += content
-                    yield await send_event("answering_content", content)
+                    yield await send_event("answering_content", content, message_id=assistant_message.id)
                     has_answer = True
         
         # 确保所有阶段正确结束
         if in_reasoning_phase and not reasoning_completed:
-            yield await send_event("reasoning_complete")
+            yield await send_event("reasoning_complete", message_id=reasoning_message.id)
         
         if not answering_started:
-            yield await send_event("answering_start")
+            yield await send_event("answering_start", message_id=assistant_message.id)
         
-        yield await send_event("answering_complete")
+        yield await send_event("answering_complete", message_id=assistant_message.id)
 
-        # 保存到数据库的最终结果
-        await self.save_stream_response_with_reasoning(
-            conversation_id=conversation_id,
-            response_text=answer_result,
-            reasoning_text=reasoning_result,
-            turn_id=turn_id
-        )
+        # 更新数据库中的占位消息
+        if reasoning_result:
+            await self.update_stream_response(reasoning_message.id, reasoning_result)
+        if answer_result:
+            await self.update_stream_response(assistant_message.id, answer_result)
 
         # 完成标志
-        yield await send_event("done")
+        done_data = {
+            "type": "done",
+            "conversation_id": conversation_id,
+            "message_id": assistant_message.id,
+            "reasoning_message_id": reasoning_message.id,
+        }
+        yield f"data: {json.dumps(done_data, ensure_ascii=False)}\n\n"
 
     async def save_stream_response_with_reasoning(self, conversation_id, response_text, reasoning_text, turn_id=None):
-        """保存流式响应和推理过程到对话历史"""
+        """保存流式响应和推理过程到对话历史 - 此方法将在后续被废弃"""
         try:
             conversation = self.memory_service.get_conversation(conversation_id)
             if conversation:
@@ -199,11 +243,17 @@ class StreamHandler:
         if not isinstance(messages, list):
             messages = [messages]
         
+        # 1. 创建占位消息
+        reasoning_message = await self._create_placeholder_message(conversation_id, MessageTypes.REASONING_CONTENT, turn_id)
+        assistant_message = await self._create_placeholder_message(conversation_id, MessageTypes.ASSISTANT_CONTENT, turn_id)
+
         # 构造发送事件的辅助函数
-        async def send_event(event_type, content=None):
+        async def send_event(event_type, content=None, message_id=None):
             data = {"type": event_type, "conversation_id": conversation_id}
             if content is not None:
                 data["content"] = content
+            if message_id:
+                data["message_id"] = message_id
             return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
         # 获取API凭证
@@ -228,7 +278,7 @@ class StreamHandler:
         answering_started = False
         
         # 开始推理流
-        yield await send_event("reasoning_start")
+        yield await send_event("reasoning_start", message_id=reasoning_message.id)
         
         # 准备发送的消息
         openai_messages = []
@@ -295,7 +345,7 @@ class StreamHandler:
                     reasoning_content = chunk.choices[0].delta.reasoning_content
                     if reasoning_content:
                         reasoning_result += reasoning_content
-                        yield await send_event("reasoning_content", reasoning_content)
+                        yield await send_event("reasoning_content", reasoning_content, message_id=reasoning_message.id)
                         has_reasoning = True
                 
                 # 提取内容
@@ -306,25 +356,25 @@ class StreamHandler:
                         if in_reasoning_phase and not reasoning_completed and not has_reasoning:
                             in_reasoning_phase = False
                             reasoning_completed = True
-                            yield await send_event("reasoning_complete")
+                            yield await send_event("reasoning_complete", message_id=reasoning_message.id)
                         
                         # 如果尚未开始回答阶段，则开始回答阶段
                         if not answering_started:
                             answering_started = True
-                            yield await send_event("answering_start")
+                            yield await send_event("answering_start", message_id=assistant_message.id)
                         
                         # 累积回答内容并发送事件
                         answer_result += content
-                        yield await send_event("answering_content", content)
+                        yield await send_event("answering_content", content, message_id=assistant_message.id)
             
             # 确保所有阶段正确结束
             if in_reasoning_phase and not reasoning_completed:
-                yield await send_event("reasoning_complete")
+                yield await send_event("reasoning_complete", message_id=reasoning_message.id)
             
             if not answering_started:
-                yield await send_event("answering_start")
+                yield await send_event("answering_start", message_id=assistant_message.id)
             
-            yield await send_event("answering_complete")
+            yield await send_event("answering_complete", message_id=assistant_message.id)
             
         except Exception as e:
             logger.error(f"直接API调用出错: {str(e)}")
@@ -339,4 +389,10 @@ class StreamHandler:
         )
         
         # 完成标志
-        yield await send_event("done") 
+        done_data = {
+            "type": "done",
+            "conversation_id": conversation_id,
+            "message_id": assistant_message.id,
+            "reasoning_message_id": reasoning_message.id,
+        }
+        yield f"data: {json.dumps(done_data, ensure_ascii=False)}\n\n" 

@@ -5,7 +5,7 @@ import math
 from sqlalchemy.orm import Session
 
 from app.db.repositories import ConversationRepository
-from app.schemas.chat import Conversation
+from app.schemas.chat import Conversation, Message
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,22 @@ class MemoryService:
             logger.error(f"获取所有对话失败: {e}")
             return []
 
+    def get_message_by_id(self, message_id: str) -> Optional[Message]:
+        """获取特定消息"""
+        try:
+            return self.repo.get_message_by_id(message_id)
+        except Exception as e:
+            logger.error(f"获取消息失败: {e}")
+            return None
+
+    def update_message(self, message_id: str, update_data: Dict[str, Any]) -> Optional[Message]:
+        """更新消息"""
+        try:
+            return self.repo.update_message(message_id, update_data)
+        except Exception as e:
+            logger.error(f"更新消息失败: {e}")
+            return None
+
     def get_conversations_paginated(self, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
         """分页获取对话列表"""
         try:
@@ -87,3 +103,11 @@ class MemoryService:
         except Exception as e:
             logger.error(f"删除对话失败: {e}")
             return False
+
+    def create_message(self, message: Message, conversation_id: str) -> Message:
+        """创建新消息"""
+        try:
+            return self.repo.create_message(message, conversation_id)
+        except Exception as e:
+            logger.error(f"创建消息失败: {e}")
+            raise

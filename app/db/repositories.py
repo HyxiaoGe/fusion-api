@@ -190,19 +190,74 @@ class ConversationRepository:
             logger.error(f"分页获取对话失败: {e}")
             return [], 0
 
+    def create_message(self, message: Message, conversation_id: str) -> Message:
+        """创建新的消息并关联到对话"""
+        try:
+            db_message = MessageModel(
+                id=message.id,
+                conversation_id=conversation_id,
+                role=message.role,
+                type=message.type,
+                content=message.content,
+                turn_id=message.turn_id,
+                duration=message.duration,
+                created_at=message.created_at
+            )
+            self.db.add(db_message)
+            self.db.commit()
+            self.db.refresh(db_message)
+            return self._convert_message_to_schema(db_message)
+        except Exception as e:
+            self.db.rollback()
+            logger.error(f"创建消息失败: {e}")
+            raise
+
+    def get_message_by_id(self, message_id: str) -> Optional[Message]:
+        """根据ID获取消息"""
+        try:
+            db_message = self.db.query(MessageModel).filter(MessageModel.id == message_id).first()
+            if not db_message:
+                return None
+            return self._convert_message_to_schema(db_message)
+        except Exception as e:
+            logger.error(f"获取消息失败: {e}")
+            return None
+
+    def update_message(self, message_id: str, update_data: Dict[str, Any]) -> Optional[Message]:
+        """部分更新消息"""
+        try:
+            db_message = self.db.query(MessageModel).filter(MessageModel.id == message_id).first()
+            if not db_message:
+                return None
+
+            for key, value in update_data.items():
+                if hasattr(db_message, key) and value is not None:
+                    setattr(db_message, key, value)
+            
+            self.db.commit()
+            self.db.refresh(db_message)
+
+            return self._convert_message_to_schema(db_message)
+        except Exception as e:
+            self.db.rollback()
+            logger.error(f"部分更新消息失败: {e}")
+            raise
+
+    def _convert_message_to_schema(self, db_message: MessageModel) -> Message:
+        """将消息数据库模型转换为业务模型"""
+        return Message(
+            id=db_message.id,
+            role=db_message.role,
+            type=db_message.type or "assistant_content",
+            content=db_message.content,
+            turn_id=db_message.turn_id,
+            duration=db_message.duration or 0,
+            created_at=db_message.created_at
+        )
+
     def _convert_to_schema(self, db_conversation: ConversationModel) -> Conversation:
         """将数据库模型转换为业务模型"""
-        messages = []
-        for db_msg in db_conversation.messages:
-            messages.append(Message(
-                id=db_msg.id,
-                role=db_msg.role,
-                type=db_msg.type or "assistant_content",  # 为旧数据提供默认值
-                content=db_msg.content,
-                turn_id=db_msg.turn_id,
-                duration=db_msg.duration or 0,  # 为旧数据提供默认值0
-                created_at=db_msg.created_at
-            ))
+        messages = [self._convert_message_to_schema(db_msg) for db_msg in db_conversation.messages]
 
         return Conversation(
             id=db_conversation.id,

@@ -28,6 +28,12 @@ class Message(BaseModel):
         from_attributes = True
 
 
+class MessageUpdateRequest(BaseModel):
+    content: Optional[str] = None
+    duration: Optional[int] = None
+    type: Optional[str] = None
+
+
 class ChatRequest(BaseModel):
     provider: str
     model: str
