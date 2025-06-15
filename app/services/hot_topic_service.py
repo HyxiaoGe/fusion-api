@@ -320,7 +320,7 @@ class HotTopicService:
         
         try:
             # 获取RSS数据
-            feed = feedparser.parse(source["url"])
+            feed = await asyncio.to_thread(feedparser.parse, source["url"])
             
             if not feed.entries:
                 logger.warning(f"RSS源 {source['name']} 没有条目")
