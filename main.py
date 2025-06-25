@@ -2,11 +2,12 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.sessions import SessionMiddleware
 from contextlib import asynccontextmanager
 import asyncio
 import time
 from app.core.config import settings
-from app.api import chat, settings as settings_api, prompts, files, hot_topics, scheduled_tasks, web_search, models, credentials, rss
+from app.api import chat, settings as settings_api, prompts, files, hot_topics, scheduled_tasks, web_search, models, credentials, rss, auth
 from app.core.logger import app_logger
 from app.db.init_db import init_db
 from app.db.database import SessionLocal
@@ -69,6 +70,9 @@ app = FastAPI(title=settings.APP_NAME, version=settings.APP_VERSION, lifespan=li
 # 输出启动日志
 app_logger.info(f"正在启动 {settings.APP_NAME} v{settings.APP_VERSION}")
 
+# 添加 Session 中间件
+app.add_middleware(SessionMiddleware, secret_key=settings.SECRET_KEY)
+
 # 添加超时中间件
 app.add_middleware(TimeoutMiddleware, timeout_seconds=10)
 
@@ -92,6 +96,7 @@ app.include_router(web_search.router, prefix="/api/web_search", tags=["web_searc
 app.include_router(models.router, prefix="/api/models", tags=["models"])
 app.include_router(credentials.router, prefix="/api/credentials", tags=["credentials"])
 app.include_router(rss.router, prefix="/api/rss", tags=["rss"])
+app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 
 if __name__ == "__main__":
     import uvicorn

@@ -23,7 +23,7 @@ class MemoryService:
     def save_conversation(self, conversation: Conversation) -> bool:
         """保存或更新对话"""
         try:
-            existing = self.repo.get_by_id(conversation.id)
+            existing = self.repo.get_by_id(conversation.id, conversation.user_id)
             if existing:
                 self.repo.update(conversation)
             else:
@@ -33,18 +33,18 @@ class MemoryService:
             logger.error(f"保存对话失败: {e}")
             return False
 
-    def get_conversation(self, conversation_id: str) -> Optional[Conversation]:
+    def get_conversation(self, conversation_id: str, user_id: str) -> Optional[Conversation]:
         """获取特定对话"""
         try:
-            return self.repo.get_by_id(conversation_id)
+            return self.repo.get_by_id(conversation_id, user_id)
         except Exception as e:
             logger.error(f"获取对话失败: {e}")
             return None
 
-    def get_all_conversations(self) -> List[Conversation]:
-        """获取所有对话"""
+    def get_all_conversations(self, user_id: str) -> List[Conversation]:
+        """获取指定用户的所有对话"""
         try:
-            return self.repo.get_all()
+            return self.repo.get_all(user_id)
         except Exception as e:
             logger.error(f"获取所有对话失败: {e}")
             return []
@@ -65,10 +65,10 @@ class MemoryService:
             logger.error(f"更新消息失败: {e}")
             return None
 
-    def get_conversations_paginated(self, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+    def get_conversations_paginated(self, user_id: str, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
         """分页获取对话列表"""
         try:
-            conversations, total = self.repo.get_paginated(page, page_size)
+            conversations, total = self.repo.get_paginated(user_id, page, page_size)
             
             # 计算分页信息
             total_pages = math.ceil(total / page_size) if total > 0 else 0
@@ -96,10 +96,10 @@ class MemoryService:
                 "has_prev": False
             }
 
-    def delete_conversation(self, conversation_id: str) -> bool:
+    def delete_conversation(self, conversation_id: str, user_id: str) -> bool:
         """删除特定对话"""
         try:
-            return self.repo.delete(conversation_id)
+            return self.repo.delete(conversation_id, user_id)
         except Exception as e:
             logger.error(f"删除对话失败: {e}")
             return False

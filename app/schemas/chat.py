@@ -65,6 +65,7 @@ class SuggestedQuestionsResponse(BaseModel):
 
 class Conversation(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
+    user_id: str
     provider: str
     model: str
     title: str

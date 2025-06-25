@@ -5,8 +5,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
+from app.db.models import User
 from app.db.repositories import PromptTemplateRepository
 from app.schemas.prompts import PromptTemplate
+from app.core.security import get_current_user
 
 router = APIRouter()
 PROMPTS_DIR = "./prompts"
@@ -14,46 +16,46 @@ os.makedirs(PROMPTS_DIR, exist_ok=True)
 
 
 @router.get("/", response_model=List[PromptTemplate])
-def get_prompts(db: Session = Depends(get_db)):
+def get_prompts(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """获取所有提示词模板"""
     repo = PromptTemplateRepository(db=db)
-    return repo.get_all()
+    return repo.get_all(user_id=current_user.id)
 
 
 @router.post("/", response_model=PromptTemplate)
-def create_prompt(prompt: PromptTemplate, db: Session = Depends(get_db)):
+def create_prompt(prompt: PromptTemplate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """创建新的提示词模板"""
     repo = PromptTemplateRepository(db=db)
-    return repo.create(prompt)
+    return repo.create(prompt, user_id=current_user.id)
 
 
 @router.get("/{prompt_id}", response_model=PromptTemplate)
-def get_prompt(prompt_id: str, db: Session = Depends(get_db)):
+def get_prompt(prompt_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """获取特定提示词模板"""
     repo = PromptTemplateRepository(db=db)
-    prompt = repo.get_by_id(prompt_id)
+    prompt = repo.get_by_id(prompt_id, user_id=current_user.id)
     if not prompt:
-        raise HTTPException(status_code=404, detail="提示词模板未找到")
+        raise HTTPException(status_code=404, detail="提示词模板未找到或无权访问")
     return prompt
 
 
 @router.put("/{prompt_id}", response_model=PromptTemplate)
-def update_prompt(prompt_id: str, prompt_data: Dict[str, Any], db: Session = Depends(get_db)):
+def update_prompt(prompt_id: str, prompt_data: Dict[str, Any], db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """更新提示词模板"""
     repo = PromptTemplateRepository(db=db)
-    prompt = repo.update(prompt_id, prompt_data)
+    prompt = repo.update(prompt_id, prompt_data, user_id=current_user.id)
     if not prompt:
-        raise HTTPException(status_code=404, detail="提示词模板未找到")
+        raise HTTPException(status_code=404, detail="提示词模板未找到或无权访问")
     return prompt
 
 
 @router.delete("/{prompt_id}")
-def delete_prompt(prompt_id: str, db: Session = Depends(get_db)):
+def delete_prompt(prompt_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """删除提示词模板"""
     repo = PromptTemplateRepository(db=db)
-    success = repo.delete(prompt_id)
+    success = repo.delete(prompt_id, user_id=current_user.id)
     if not success:
-        raise HTTPException(status_code=404, detail="提示词模板未找到")
+        raise HTTPException(status_code=404, detail="提示词模板未找到或无权访问")
     return {"status": "success", "message": "提示词模板已删除"}
 
 

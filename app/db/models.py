@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import Column, String, Integer, Text, ForeignKey, DateTime, JSON, Boolean, Float, UniqueConstraint
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, backref
 
 from app.db.database import Base
 
@@ -11,24 +11,59 @@ def get_china_time():
     return datetime.now(timezone(timedelta(hours=8)))
 
 
+class User(Base):
+    __tablename__ = 'users'
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    username = Column(String, unique=True, index=True, nullable=False)
+    nickname = Column(String, nullable=True)
+    avatar = Column(String, nullable=True)
+    mobile = Column(String, nullable=True)
+    email = Column(String, unique=True, index=True, nullable=True)
+    created_at = Column(DateTime, default=get_china_time)
+    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
+
+    social_accounts = relationship('SocialAccount', back_populates='user', cascade='all, delete-orphan')
+    conversations = relationship('Conversation', back_populates='user', cascade='all, delete-orphan')
+    files = relationship('File', back_populates='user', cascade='all, delete-orphan')
+    rss_sources = relationship('RssSource', back_populates='user', cascade='all, delete-orphan')
+    prompt_templates = relationship('PromptTemplate', back_populates='user', cascade='all, delete-orphan')
+
+
+class SocialAccount(Base):
+    __tablename__ = 'social_accounts'
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    provider = Column(String, nullable=False)
+    provider_user_id = Column(String, nullable=False)
+    created_at = Column(DateTime, default=get_china_time)
+    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
+
+    user = relationship('User', back_populates='social_accounts')
+
+    __table_args__ = (UniqueConstraint('provider', 'provider_user_id', name='uix_provider_user_id'),)
+
+
 class Conversation(Base):
     __tablename__ = "conversations"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
     title = Column(String, nullable=False)
     provider = Column(String, nullable=False)
     model = Column(String, nullable=False)
     created_at = Column(DateTime, default=get_china_time)
     updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
 
-    # 建立与Message的关系，按创建时间排序
+    user = relationship('User', back_populates='conversations')
     messages = relationship("Message", back_populates="conversation", cascade="all, delete-orphan", order_by="Message.created_at")
+    files = relationship("ConversationFile", back_populates="conversation", cascade="all, delete-orphan")
 
 
 class File(Base):
     __tablename__ = "files"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
     filename = Column(String, nullable=False)  # 存储的文件名
     original_filename = Column(String, nullable=False)  # 原始文件名
     mimetype = Column(String, nullable=False)  # 文件MIME类型
@@ -39,6 +74,8 @@ class File(Base):
     parsed_content = Column(Text, nullable=True)  # 解析后的内容
     created_at = Column(DateTime, default=get_china_time)
     updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
+
+    user = relationship('User', back_populates='files')
 
 
 class ConversationFile(Base):
@@ -51,9 +88,6 @@ class ConversationFile(Base):
     # 关系
     conversation = relationship("Conversation", back_populates="files")
     file = relationship("File")
-
-
-Conversation.files = relationship("ConversationFile", back_populates="conversation", cascade="all, delete-orphan")
 
 
 class Message(Base):
@@ -91,6 +125,7 @@ class RssSource(Base):
     __tablename__ = "rss_sources"
     
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=True, index=True)
     name = Column(String, nullable=False, unique=True)
     url = Column(String, nullable=False, unique=True)
     description = Column(String, nullable=True)
@@ -104,6 +139,8 @@ class RssSource(Base):
     
     created_at = Column(DateTime, default=get_china_time)
     updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
+
+    user = relationship('User', back_populates='rss_sources')
     
     def to_dict(self):
         return {c.name: getattr(self, c.name) for c in self.__table__.columns}
@@ -131,11 +168,14 @@ class PromptTemplate(Base):
     __tablename__ = "prompt_templates"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=True, index=True)
     title = Column(String, nullable=False)
     content = Column(Text, nullable=False)
     tags = Column(JSON, default=list)
     created_at = Column(DateTime, default=get_china_time)
     updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
+
+    user = relationship('User', back_populates='prompt_templates')
 
 
 class Setting(Base):

@@ -43,17 +43,19 @@ class FileService:
         safe_filename = "".join(c for c in filename if c.isalnum() or c in "._- ")
         return safe_filename
 
-    async def upload_files(self, files: List[UploadFile], conversation_id: str, provider: str, model: str) -> List[str]:
+    async def upload_files(self, files: List[UploadFile], user_id: str, conversation_id: str, provider: str, model: str) -> List[str]:
         """处理文件上传并关联到对话"""
         file_ids = []
 
         conv_repo = ConversationRepository(self.db)
-        conversation = conv_repo.get_by_id(conversation_id)
+        conversation = conv_repo.get_by_id(conversation_id, user_id)
 
         if not conversation:
+            # 如果会话不存在，需要创建一个与用户关联的新会话
             model = model or settings.DEFAULT_MODEL
             temp_conversation = Conversation(
                 id=conversation_id,
+                user_id=user_id,
                 title="新会话",
                 messages=[],
                 provider=provider,
@@ -99,6 +101,7 @@ class FileService:
                 # 创建文件记录
                 file_record = {
                     "id": file_id,
+                    "user_id": user_id,
                     "filename": os.path.basename(file_path),
                     "original_filename": file.filename,
                     "mimetype": file.content_type,
@@ -198,27 +201,16 @@ class FileService:
         else:
             return f"请分析这个文件(文件名:{filename})的内容并提供详细摘要。"
 
-    def get_file_status(self, file_id: str) -> Dict[str, Any]:
-        """获取文件处理状态信息"""
-        try:
-            file = self.file_repo.get_file_by_id(file_id)
-            if not file:
-                return None
-
-            # 构建状态响应
-            return {
-                "id": file.id,
-                "status": file.status,  # pending, parsing, processed, error
-                "original_filename": file.original_filename,
-                "mimetype": file.mimetype,
-                "size": file.size,
-                "processing_result": file.processing_result,
-                "created_at": file.created_at.isoformat() if file.created_at else None,
-                "updated_at": file.updated_at.isoformat() if file.updated_at else None
-            }
-        except Exception as e:
-            logger.error(f"获取文件状态失败: {e}")
+    def get_file_status(self, file_id: str, user_id: str) -> Dict[str, Any]:
+        """获取文件状态，并验证用户权限"""
+        file = self.file_repo.get_file_by_id(file_id, user_id=user_id)
+        if not file:
             return None
+        return {
+            "id": file.id,
+            "status": file.status,
+            "processing_result": file.processing_result,
+        }
 
     def get_parsed_file_content(self, file_ids: List[str]) -> Dict[str, str]:
         """获取文件的解析内容，用于后续对话"""
@@ -231,39 +223,45 @@ class FileService:
 
     def get_conversation_files(self, conversation_id: str) -> List[Dict[str, Any]]:
         """获取对话关联的所有文件信息"""
-        try:
-            conversation_files = self.file_repo.get_conversation_files(conversation_id)
-            return [
-                {
-                    "id": cf.file.id,
-                    "filename": cf.file.original_filename,
-                    "mimetype": cf.file.mimetype,
-                    "size": cf.file.size,
-                    "created_at": cf.created_at
-                }
-                for cf in conversation_files
-            ]
-        except Exception as e:
-            logger.error(f"获取对话文件列表失败: {e}")
-            return []
+        files = self.file_repo.get_conversation_files(conversation_id)
+        return [
+            {
+                "id": f.file.id,
+                "filename": f.file.original_filename,
+                "mimetype": f.file.mimetype,
+                "size": f.file.size,
+                "status": f.file.status,
+            }
+            for f in files
+        ]
 
-    def delete_file(self, file_id: str) -> bool:
-        """删除文件"""
-        try:
-            # 获取文件信息
-            file = self.file_repo.get_file_by_id(file_id)
-            if not file:
-                logger.warning(f"要删除的文件不存在: {file_id}")
-                return False
+    def get_files_by_user(self, user_id: str) -> List[Dict[str, Any]]:
+        """获取用户的所有文件"""
+        files = self.file_repo.get_files_by_user_id(user_id)
+        return [
+            {
+                "id": file.id,
+                "filename": file.original_filename,
+                "mimetype": file.mimetype,
+                "size": file.size,
+                "status": file.status,
+            }
+            for file in files
+        ]
 
-            # 删除物理文件
+    def delete_file(self, file_id: str, user_id: str) -> bool:
+        """删除文件，并验证用户权限"""
+        file = self.file_repo.get_file_by_id(file_id, user_id=user_id)
+        if not file:
+            return False
+
+        # 从文件系统删除
+        try:
             if os.path.exists(file.path):
                 os.remove(file.path)
+        except OSError as e:
+            logger.error(f"删除物理文件失败: {file.path}, 错误: {e}")
+            # 根据策略决定是否继续，这里选择继续删除数据库记录
 
-            # 删除数据库记录
-            self.file_repo.delete_file(file_id)
-            logger.info(f"文件删除成功: {file_id}")
-            return True
-        except Exception as e:
-            logger.error(f"删除文件失败: {e}")
-            return False
+        # 从数据库删除
+        return self.file_repo.delete_file(file_id, user_id)

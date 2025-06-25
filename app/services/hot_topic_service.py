@@ -36,7 +36,8 @@ class HotTopicService:
     def _seed_rss_sources(self):
         """如果数据库为空，则植入初始的RSS源数据"""
         try:
-            existing_sources = self.rss_repo.get_all(limit=1)
+            # 检查是否已存在全局RSS源
+            existing_sources = self.rss_repo.get_all_enabled()
             if existing_sources:
                 return
 
@@ -107,7 +108,7 @@ class HotTopicService:
             for source_data in initial_sources:
                 from app.schemas.rss import RssSourceCreate
                 source_create = RssSourceCreate(**source_data)
-                self.rss_repo.create(source_create)
+                self.rss_repo.create(source_create, user_id=None)
             
             logger.info(f"成功植入 {len(initial_sources)} 条初始RSS源数据。")
 

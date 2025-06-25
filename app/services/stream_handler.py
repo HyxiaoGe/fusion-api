@@ -72,6 +72,7 @@ class StreamHandler:
         try:
             update_data = {"content": response_text}
             self.memory_service.update_message(message_id, update_data)
+            self.db.commit()  # 提交事务，确保数据持久化
         except Exception as e:
             logging.error(f"更新流式响应失败: {str(e)}")
 

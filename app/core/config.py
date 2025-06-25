@@ -35,6 +35,23 @@ class Settings(BaseSettings):
         "text/plain", "text/markdown", "text/csv"
     ]
 
+    # Github OAuth
+    GITHUB_CLIENT_ID: Optional[str] = None
+    GITHUB_CLIENT_SECRET: Optional[str] = None
+    FRONTEND_AUTH_CALLBACK_URL: str = "http://localhost:3000/auth/callback"
+
+    POSTGRES_SERVER: str = os.getenv("POSTGRES_SERVER", "localhost")
+    POSTGRES_USER: str = os.getenv("POSTGRES_USER", "postgres")
+
+    API_V1_STR: str = "/api/v1"
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "a_secret_key")
+    # 60 minutes * 24 hours * 8 days = 8 days
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 8
+    SERVER_NAME: str = "localhost"
+    SERVER_HOST: str = "http://localhost:8000"
+    PROJECT_NAME: str = "Fusion API"
+    SENTRY_DSN: Optional[str] = None
+
     class Config:
         env_file = ".env"
         extra = "ignore"

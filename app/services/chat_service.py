@@ -73,6 +73,7 @@ class ChatService:
 
     async def process_message(
             self,
+            user_id: str,
             provider: str,
             model: str,
             message: str,
@@ -86,9 +87,8 @@ class ChatService:
         # 初始化options
         if options is None:
             options = {}
-        
         # 获取或创建会话
-        conversation = self._get_or_create_conversation(conversation_id, provider, model, message)
+        conversation = self._get_or_create_conversation(conversation_id, user_id, provider, model, message)
 
         # 记录用户消息（保持用户原始完整消息，如："请帮我分析以下热点话题： xxx"）
         user_message = Message(
@@ -125,9 +125,10 @@ class ChatService:
         # 从聊天历史中提取消息
         messages = self.message_processor.prepare_chat_messages(chat_history)
 
-        # 保存会话（先保存用户消息）
+        # 保存会话和用户消息，确保在流式处理前它们已存在于数据库中
         conversation.updated_at = datetime.now()
         self.memory_service.save_conversation(conversation)
+        self.db.commit()
 
         # 处理文件内容
         if file_ids and len(file_ids) > 0:
@@ -143,32 +144,36 @@ class ChatService:
 
         # 根据是否为流式响应分别处理
         if stream:
-            return await self._handle_stream_response(provider, model, messages, conversation.id, options, turn_id)
+            return await self._handle_stream_response(provider, model, messages, conversation.id, user_id, options, turn_id)
         else:
-            return await self._handle_normal_response(provider, model, messages, conversation.id, options, turn_id)
+            return await self._handle_normal_response(provider, model, messages, conversation.id, user_id, options, turn_id)
 
-    def _get_or_create_conversation(self, conversation_id, provider, model, message):
+    def _get_or_create_conversation(self, conversation_id: Optional[str], user_id: str, provider: str, model: str, message: str) -> Conversation:
         """获取或创建会话"""
-        conversation = None
         if conversation_id:
-            conversation = self.memory_service.get_conversation(conversation_id)
+            conversation = self.memory_service.get_conversation(conversation_id, user_id)
+            if conversation:
+                print(f"conversation1: {conversation}")
+                return conversation
+    
+    
+        print(f"user_id: {user_id}")
+        # 创建新对话
+        return Conversation(
+            id=conversation_id or str(uuid.uuid4()),
+            user_id=user_id,
+            title=message[:30] + "..." if len(message) > 30 else message,
+            provider=provider,
+            model=model,
+            messages=[]
+        )
 
-        if not conversation:
-            # 创建新对话
-            conversation = Conversation(
-                id=conversation_id or str(uuid.uuid4()),
-                title=message[:30] + "..." if len(message) > 30 else message,
-                provider=provider,
-                model=model,
-                messages=[]
-            )
-            
-        return conversation
-
-    async def _handle_stream_response(self, provider, model, messages, conversation_id, options=None, turn_id=None):
+    async def _handle_stream_response(self, provider, model, messages, conversation_id, user_id: str, options=None, turn_id=None):
         """处理流式响应"""
         if options is None:
             options = {}
+        # 将user_id注入到options中，以便下游处理器可以访问
+        options["user_id"] = user_id
             
         # 检查是否启用函数调用
         use_function_calls = options.get("use_function_calls", False)
@@ -202,7 +207,7 @@ class ChatService:
                 media_type="text/event-stream"
             )
 
-    async def _handle_normal_response(self, provider, model, messages, conversation_id, options=None, turn_id=None):
+    async def _handle_normal_response(self, provider, model, messages, conversation_id, user_id: str, options=None, turn_id=None):
         """处理非流式响应"""
         # 默认options
         if options is None:
@@ -216,7 +221,7 @@ class ChatService:
             ai_message, reasoning_message = await strategy.process(provider, model, messages, conversation_id, self.memory_service, options, turn_id)
             
             # 获取会话
-            conversation = self.memory_service.get_conversation(conversation_id)
+            conversation = self.memory_service.get_conversation(conversation_id, user_id)
             
             # 如果有推理内容，添加到会话
             if reasoning_message:
@@ -243,36 +248,35 @@ class ChatService:
             logger.error(f"模型处理失败: {e}")
             raise
 
-    def get_all_conversations(self) -> List[Conversation]:
-        """获取所有对话"""
-        return self.memory_service.get_all_conversations()
+    def get_all_conversations(self, user_id: str) -> List[Conversation]:
+        """获取指定用户的所有对话"""
+        return self.memory_service.get_all_conversations(user_id)
 
-    def get_conversations_paginated(self, page: int = 1, page_size: int = 20):
-        """分页获取对话列表"""
-        return self.memory_service.get_conversations_paginated(page, page_size)
+    def get_conversations_paginated(self, user_id: str, page: int = 1, page_size: int = 20):
+        """分页获取指定用户的对话列表"""
+        return self.memory_service.get_conversations_paginated(user_id, page, page_size)
 
-    def get_conversation(self, conversation_id: str) -> Optional[Conversation]:
-        """获取特定对话"""
-        return self.memory_service.get_conversation(conversation_id)
+    def get_conversation(self, conversation_id: str, user_id: str) -> Optional[Conversation]:
+        """获取特定对话的详细信息，并验证用户权限"""
+        conversation = self.memory_service.get_conversation(conversation_id, user_id)
+        if conversation and conversation.user_id == user_id:
+            return conversation
+        return None
 
     def update_message(self, message_id: str, update_data: Dict[str, Any]) -> Optional[Message]:
-        """更新消息信息"""
-        filtered_update_data = {k: v for k, v in update_data.items() if v is not None}
-        if not filtered_update_data:
-            return self.memory_service.get_message_by_id(message_id)
-        
-        updated_message = self.memory_service.update_message(message_id, filtered_update_data)
+        """更新消息"""
+        return self.memory_service.update_message(message_id, update_data)
 
-        # 这里可以添加逻辑，比如如果更新了消息内容，可能需要重新生成建议问题等
-        
-        return updated_message
-
-    def delete_conversation(self, conversation_id: str) -> bool:
-        """删除特定对话"""
-        return self.memory_service.delete_conversation(conversation_id)
+    def delete_conversation(self, conversation_id: str, user_id: str) -> bool:
+        """删除特定对话，并验证用户权限"""
+        conversation = self.memory_service.get_conversation(conversation_id, user_id)
+        if not conversation:
+            return False  # 对话不存在或用户无权访问
+        return self.memory_service.delete_conversation(conversation_id, user_id)
 
     async def generate_title(
             self,
+            user_id: str,
             message: Optional[str] = None,
             conversation_id: Optional[str] = None,
             options: Optional[Dict[str, Any]] = None
@@ -281,7 +285,7 @@ class ChatService:
         # 如果提供了会话ID，获取会话
         conversation = None
         if conversation_id:
-            conversation = self.memory_service.get_conversation(conversation_id)
+            conversation = self.memory_service.get_conversation(conversation_id, user_id)
             if not conversation:
                 raise ValueError(f"找不到会话ID: {conversation_id}")
 
@@ -368,13 +372,14 @@ class ChatService:
 
     async def generate_suggested_questions(
         self,
+        user_id: str,
         conversation_id: str,
         latest_only: bool = True,
         options: Optional[Dict[str, Any]] = None
     ) -> List[str]:
         """生成与当前对话轮次相关的推荐问题"""
         # 获取会话
-        conversation = self.memory_service.get_conversation(conversation_id)
+        conversation = self.memory_service.get_conversation(conversation_id, user_id)
         if not conversation:
             raise ValueError(f"找不到会话ID: {conversation_id}")
 
@@ -437,7 +442,7 @@ class ChatService:
         """从响应文本中解析出问题列表"""
         return ChatUtils.parse_questions(response_text)
         
-    async def handle_function_calls(self, provider, model, messages, conversation_id, options=None):
+    async def handle_function_calls(self, provider, model, messages, conversation_id, user_id: str, options=None):
         """
         处理函数调用流程
         
@@ -446,6 +451,7 @@ class ChatService:
             model: 模型名称
             messages: 聊天消息列表
             conversation_id: 会话ID
+            user_id: 用户ID
             options: 其他选项
             
         返回:
@@ -464,152 +470,167 @@ class ChatService:
         # 获取AI模型
         llm = llm_manager.get_model(provider=provider, model=model)
         
-        # 准备函数定义
-        functions_kwargs = function_adapter.prepare_functions_for_model(provider, model)
+        # 绑定工具（函数）
+        llm_with_tools = llm.bind_tools(function_adapter)
         
+        # 构建消息链
+        chain = llm_with_tools
+        
+        # 添加用于合成工具结果的提示词
+        synthesize_prompt = SystemMessage(content=SYNTHESIZE_TOOL_RESULT_PROMPT)
+        
+        response = None
+        
+        # 初始调用
         try:
-            # 调用模型，让其决定是否需要调用函数
-            response = await llm.ainvoke(messages, **functions_kwargs)
-            
-            # 提取函数调用信息
-            function_call, tool_call_id = function_adapter.extract_function_call(provider, response)
-            
-            # 如果没有函数调用，直接创建回复消息
-            if not function_call:
-                # 创建AI消息
-                ai_message = Message(
-                    role=MessageRoles.ASSISTANT,
-                    type=MessageTypes.ASSISTANT_CONTENT,
-                    content=response.content if hasattr(response, 'content') else str(response)
-                )
-                
-                # 获取会话
-                conversation = self.memory_service.get_conversation(conversation_id)
-                
-                # 添加AI响应到会话
-                conversation.messages.append(ai_message)
-                
-                # 更新并保存会话
-                conversation.updated_at = datetime.now()
-                self.memory_service.save_conversation(conversation)
-                
-                # 返回响应
-                return ChatResponse(
-                    id=str(uuid.uuid4()),
-                    provider=provider,
-                    model=model,
-                    message=ai_message,
-                    conversation_id=conversation.id
-                )
-            
-            # 记录函数调用
-            logger.info(f"模型选择调用函数: {function_call.get('name')}")
-            
             # 获取会话
-            conversation = self.memory_service.get_conversation(conversation_id)
+            conversation = self.memory_service.get_conversation(conversation_id, user_id)
+            if not conversation:
+                logger.error(f"在函数调用中未找到会话: {conversation_id}")
+                return ChatResponse(
+                    message=Message(role="assistant", type="assistant_content", content="会话丢失，请重试。"),
+                    conversation_id=conversation_id,
+                    provider=provider,
+                    model=model
+                )
+
+            # 获取最后的用户消息
+            last_user_message = self._extract_user_message_from_messages(messages)
+
+            # 如果找到 function_call，说明是第二次进入
+            if any(isinstance(m, AIMessage) and m.tool_calls for m in messages):
+                 # 添加合成提示词，并调用LLM进行最终回答
+                final_messages = messages + [synthesize_prompt]
+                response = chain.invoke(final_messages)
+            else:
+                # 第一次进入，正常调用
+                response = chain.invoke(messages)
+
+            # 保存AI的响应（可能是函数调用或最终回答）
+            if isinstance(response, AIMessage):
+                ai_message_schema = Message(
+                    role="assistant",
+                    type="function_call" if response.tool_calls else "assistant_content",
+                    content=response.content or "",
+                    turn_id=conversation.messages[-1].turn_id if conversation.messages else None
+                )
+                
+                # 如果是函数调用，需要特殊处理
+                if response.tool_calls:
+                    # 将 tool_calls 转换为JSON字符串存储
+                    ai_message_schema.content = json.dumps([
+                        {"id": tc["id"], "name": tc["name"], "args": tc["args"]}
+                        for tc in response.tool_calls
+                    ])
+
+                conversation.messages.append(ai_message_schema)
             
-            # 添加AI选择调用函数的消息
-            function_name = function_call.get('name')
-            user_friendly_description = USER_FRIENDLY_FUNCTION_DESCRIPTIONS.get(
-                function_name, 
-                "我需要调用工具获取更多信息..."
-            )
-            ai_function_message = Message(
-                role=MessageRoles.ASSISTANT,
-                type=MessageTypes.FUNCTION_CALL,
-                content=response.content if hasattr(response, 'content') and response.content else user_friendly_description
-            )
-            conversation.messages.append(ai_function_message)
-            
-            # 处理函数调用
-            function_result = await function_adapter.process_function_call(provider, function_call, context)
-            
-            # 准备工具消息
-            tool_message_data = function_adapter.prepare_tool_message(
-                provider, function_name, function_result, tool_call_id
-            )
-            
-            # 创建工具消息
-            tool_message = Message(
-                role=MessageRoles.SYSTEM,
-                type=MessageTypes.FUNCTION_RESULT,
-                content=tool_message_data["content"]
-            )
-            conversation.messages.append(tool_message)
-            
-            # 复制原始消息并添加函数调用结果
-            full_messages = list(messages)
-            full_messages.append(response)
-            full_messages.append(tool_message_data)
-            
-            # 再次调用模型生成最终回答
-            final_response = await llm.ainvoke(full_messages)
-            
-            # 创建最终AI消息
-            final_ai_message = Message(
-                role=MessageRoles.ASSISTANT,
-                type=MessageTypes.ASSISTANT_CONTENT,
-                content=final_response.content if hasattr(final_response, 'content') else str(final_response)
-            )
-            
-            # 添加最终消息到会话
-            conversation.messages.append(final_ai_message)
-            
-            # 更新并保存会话
-            conversation.updated_at = datetime.now()
+            # 更新会话
             self.memory_service.save_conversation(conversation)
-            
-            # 返回响应
-            return ChatResponse(
-                id=str(uuid.uuid4()),
-                provider=provider,
-                model=model,
-                message=final_ai_message,
-                conversation_id=conversation.id
-            )
+
         except Exception as e:
-            logger.error(f"函数调用处理失败: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            
-            # 创建错误消息
-            error_message = Message(
-                role=MessageRoles.ASSISTANT,
-                type=MessageTypes.ASSISTANT_CONTENT,
-                content=f"在处理函数调用时出现错误: {str(e)}"
-            )
-            
-            # 返回错误响应
+            logger.error(f"处理函数调用时发生错误: {e}")
+            # 返回错误信息给用户
             return ChatResponse(
-                id=str(uuid.uuid4()),
+                message=Message(role="assistant", type="assistant_content", content=f"处理函数调用时发生错误: {e}"),
+                conversation_id=conversation_id,
                 provider=provider,
-                model=model,
-                message=error_message,
-                conversation_id=conversation_id
+                model=model
             )
 
-    async def save_stream_response(self, conversation_id, response_content):
-        """保存普通流式响应到对话历史"""
+        # 如果没有函数调用，直接返回响应
+        if not isinstance(response, AIMessage) or not response.tool_calls:
+            return ChatResponse(
+                message=Message(
+                    role="assistant",
+                    type="assistant_content",
+                    content=response.content if hasattr(response, "content") else str(response)
+                ),
+                conversation_id=conversation_id,
+                provider=provider,
+                model=model
+            )
+
+        # 执行函数调用
+        tool_outputs = []
+        for tool_call in response.tool_calls:
+            function_name = tool_call["name"]
+            function_args_raw = tool_call["args"]
+            
+            # 解析函数参数
+            function_args = self._parse_function_arguments(function_args_raw)
+            
+            # 执行函数
+            try:
+                # 再次获取会话以确保数据最新
+                conversation = self.memory_service.get_conversation(conversation_id, user_id)
+                if not conversation:
+                    raise Exception("会话在函数执行期间丢失")
+                
+                # 更新上下文信息
+                context["conversation"] = conversation
+                
+                # 动态执行函数
+                selected_function = function_registry.get(function_name)
+                if not selected_function:
+                    raise Exception(f"未找到函数: {function_name}")
+                
+                # 执行函数并获取结果
+                function_result = await selected_function(**function_args, context=context)
+                
+                tool_outputs.append(
+                    ToolMessage(content=str(function_result), tool_call_id=tool_call["id"])
+                )
+            except Exception as e:
+                logger.error(f"执行函数 {function_name} 失败: {e}")
+                tool_outputs.append(
+                    ToolMessage(content=f"执行函数时出错: {e}", tool_call_id=tool_call["id"])
+                )
+
+        # 将函数执行结果添加到消息历史中
+        messages.extend(tool_outputs)
+        
+        # 再次调用，让模型根据函数结果生成最终回答
+        return await self.handle_function_calls(provider, model, messages, conversation_id, user_id, options)
+
+    async def save_stream_response(self, conversation_id: str, user_id: str, response_content: str):
+        """保存流式响应的最终结果"""
         try:
-            conversation = self.memory_service.get_conversation(conversation_id)
-            if conversation:
-                # 创建AI响应消息
-                ai_message = Message(
+            conversation = self.memory_service.get_conversation(conversation_id, user_id)
+            if not conversation:
+                logger.error(f"保存流式响应时未找到会d话: {conversation_id}")
+                return
+
+            # 更新最后一条助手消息的内容
+            if conversation.messages and conversation.messages[-1].role == MessageRoles.ASSISTANT:
+                conversation.messages[-1].content = response_content
+            else:
+                # 如果最后一条不是助手消息，则创建一条新的
+                assistant_message = Message(
                     role=MessageRoles.ASSISTANT,
                     type=MessageTypes.ASSISTANT_CONTENT,
                     content=response_content
                 )
-                
-                # 添加AI响应到会话
-                conversation.messages.append(ai_message)
-                
-                # 更新会话时间
-                conversation.updated_at = datetime.now()
-                
-                # 保存到数据库
-                self.memory_service.save_conversation(conversation)
+                conversation.messages.append(assistant_message)
+            
+            # 更新会话
+            conversation.updated_at = datetime.now()
+            self.memory_service.save_conversation(conversation)
+            
         except Exception as e:
             logger.error(f"保存流式响应失败: {e}")
+
+    def get_latest_user_message(self, conversation_id: str, user_id: str) -> Optional[Message]:
+        """获取最新的用户消息"""
+        conversation = self.memory_service.get_conversation(conversation_id, user_id)
+        if not conversation:
+            return None
+        
+        for i in range(len(conversation.messages) - 1, -1, -1):
+            if conversation.messages[i].role == MessageRoles.USER:
+                return conversation.messages[i]
+        
+        return None
 
 
 
