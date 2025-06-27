@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 import asyncio
 import time
 from app.core.config import settings
-from app.api import chat, settings as settings_api, prompts, files, hot_topics, scheduled_tasks, web_search, models, credentials, rss, auth
+from app.api import chat, settings as settings_api, prompts, files, hot_topics, scheduled_tasks, web_search, models, credentials, rss, auth, users
 from app.core.logger import app_logger
 from app.db.init_db import init_db
 from app.db.database import SessionLocal
@@ -97,6 +97,7 @@ app.include_router(models.router, prefix="/api/models", tags=["models"])
 app.include_router(credentials.router, prefix="/api/credentials", tags=["credentials"])
 app.include_router(rss.router, prefix="/api/rss", tags=["rss"])
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
+app.include_router(users.router, prefix="/api/users", tags=["users"])
 
 if __name__ == "__main__":
     import uvicorn
