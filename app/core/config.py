@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     # Github OAuth
     GITHUB_CLIENT_ID: Optional[str] = None
     GITHUB_CLIENT_SECRET: Optional[str] = None
+    
+    # Google OAuth
+    GOOGLE_CLIENT_ID: Optional[str] = None
+    GOOGLE_CLIENT_SECRET: Optional[str] = None
+    
     FRONTEND_AUTH_CALLBACK_URL: str = "http://localhost:3000/auth/callback"
 
     POSTGRES_SERVER: str = os.getenv("POSTGRES_SERVER", "localhost")
