@@ -186,7 +186,8 @@ class FunctionCallProcessor:
                 function_args=function_call_data["function"].get("arguments", "{}"),
                 function_result=function_result,
                 final_response=final_response,
-                turn_id=turn_id
+                turn_id=turn_id,
+                user_id=options.get("user_id")
             )
             
             yield await send_event(EventTypes.DONE)
@@ -418,7 +419,8 @@ class FunctionCallProcessor:
             function_args=valid_arguments_str,
             function_result=function_result,
             final_response=final_response,
-            turn_id=turn_id
+            turn_id=turn_id,
+            user_id=options.get("user_id")
         )
 
         # 6. 完成标志
@@ -493,17 +495,22 @@ class FunctionCallProcessor:
             function_args=valid_arguments_str,
             function_result=function_result,
             final_response=final_response,
-            turn_id=turn_id
+            turn_id=turn_id,
+            user_id=options.get("user_id")
         )
 
         # 6. 完成标志
         yield await send_event(EventTypes.DONE)
 
     async def _save_function_call_stream_response(self, conversation_id, function_name, 
-                                           function_args, function_result, final_response, turn_id=None):
+                                           function_args, function_result, final_response, turn_id=None, user_id=None):
         """保存函数调用流式响应到对话历史"""
         try:
-            conversation = self.memory_service.get_conversation(conversation_id)
+            if not user_id:
+                logger.error("保存函数调用响应时缺少 user_id")
+                return
+                
+            conversation = self.memory_service.get_conversation(conversation_id, user_id)
             if conversation:
                 from app.schemas.chat import Message
                 
