@@ -12,7 +12,7 @@ services:
       - ./logs:/app/logs
       - ~/.cache/huggingface:/root/.cache/huggingface
     environment:
-      - DATABASE_URL=postgresql://fusion:fusion123!!@localhost:5432/fusion?client_encoding=utf8
+      - DATABASE_URL=postgresql://fusion:fusion123!!@fusion_postgres:5432/fusion?client_encoding=utf8
       - DEFAULT_MODEL=${DEFAULT_MODEL:-}
       - SEARCH_API_KEY=${SEARCH_API_KEY:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
@@ -37,3 +37,8 @@ services:
         limits:
           cpus: '1'
           memory: 1024M
+
+networks:
+  default:
+    external:
+      name: fusion_fusion_network

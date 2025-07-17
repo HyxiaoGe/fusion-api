@@ -285,11 +285,14 @@ class ConversationRepository:
 
     def _convert_message_to_schema(self, db_message: MessageModel) -> Message:
         """将消息数据库模型转换为业务模型"""
+        # 处理可能的 NULL content
+        content = db_message.content if db_message.content is not None else ""
+        
         return Message(
             id=db_message.id,
             role=db_message.role,
             type=db_message.type or "assistant_content",
-            content=db_message.content,
+            content=content,
             turn_id=db_message.turn_id,
             duration=db_message.duration or 0,
             created_at=db_message.created_at
