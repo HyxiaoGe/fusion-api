@@ -15,3 +15,5 @@ __pycache__
 docs
 
 .cursor
+
+CLAUDE.md
