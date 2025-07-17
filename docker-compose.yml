@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   app:
     build: .
@@ -36,9 +34,9 @@ services:
       resources:
         limits:
           cpus: '1'
-          memory: 1024M
+          memory: 2g
 
 networks:
   default:
-    external:
-      name: fusion_fusion_network
+    name: fusion_fusion_network
+    external: true

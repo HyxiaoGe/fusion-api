@@ -130,7 +130,7 @@ class FunctionCallProcessor:
         if not function_call_detected:
             if reasoning_start_sent: 
                 yield await send_event(EventTypes.REASONING_COMPLETE)
-            await self._save_stream_response(context["conversation_id"], full_response) 
+            await self._save_stream_response(context["conversation_id"], full_response, options.get("user_id")) 
             yield await send_event(EventTypes.DONE)
             return
         
@@ -505,12 +505,14 @@ class FunctionCallProcessor:
     async def _save_function_call_stream_response(self, conversation_id, function_name, 
                                            function_args, function_result, final_response, turn_id=None, user_id=None):
         """保存函数调用流式响应到对话历史"""
+        logger.info(f"开始保存函数调用响应 - conversation_id: {conversation_id}, function_name: {function_name}, user_id: {user_id}")
         try:
             if not user_id:
                 logger.error("保存函数调用响应时缺少 user_id")
                 return
                 
             conversation = self.memory_service.get_conversation(conversation_id, user_id)
+            logger.info(f"获取到会话: {conversation is not None}")
             if conversation:
                 from app.schemas.chat import Message
                 
@@ -552,13 +554,21 @@ class FunctionCallProcessor:
                 
                 # 保存到数据库
                 self.memory_service.save_conversation(conversation)
+                self.db.commit()  # 提交事务
+                logger.info(f"成功保存函数调用响应 - 消息数: {len(conversation.messages)}")
         except Exception as e:
             logger.error(f"保存函数调用流式响应失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
-    async def _save_stream_response(self, conversation_id, response_content):
+    async def _save_stream_response(self, conversation_id, response_content, user_id=None):
         """保存普通流式响应到对话历史"""
         try:
-            conversation = self.memory_service.get_conversation(conversation_id)
+            if not user_id:
+                logger.error("保存流式响应时缺少 user_id")
+                return
+                
+            conversation = self.memory_service.get_conversation(conversation_id, user_id)
             if conversation:
                 from app.schemas.chat import Message
                 from datetime import datetime
@@ -578,5 +588,6 @@ class FunctionCallProcessor:
                 
                 # 保存到数据库
                 self.memory_service.save_conversation(conversation)
+                self.db.commit()  # 提交事务
         except Exception as e:
             logger.error(f"保存流式响应失败: {e}") 
