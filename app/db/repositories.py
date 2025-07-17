@@ -274,8 +274,10 @@ class ConversationRepository:
             if db_message:
                 for key, value in update_data.items():
                     setattr(db_message, key, value)
+                # 不在这里提交，让调用方决定何时提交事务
                 # self.db.commit()
-                # self.db.refresh(db_message)
+                self.db.flush()  # 刷新会话，确保更改被跟踪
+                self.db.refresh(db_message)  # 刷新对象状态
                 return self._convert_message_to_schema(db_message)
             return None
         except Exception as e:
