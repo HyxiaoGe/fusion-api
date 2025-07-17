@@ -103,7 +103,7 @@ def update_message(
         raise HTTPException(status_code=404, detail="消息不属于此对话")
 
     updated_message = chat_service.update_message(
-        message_id, update_request.model_dump()
+        message_id, update_request.model_dump(exclude_unset=True)
     )
     if not updated_message:
         raise HTTPException(status_code=404, detail="消息不存在或更新失败")
