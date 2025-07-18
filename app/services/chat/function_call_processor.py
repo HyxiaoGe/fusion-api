@@ -187,7 +187,8 @@ class FunctionCallProcessor:
                 function_result=function_result,
                 final_response=final_response,
                 turn_id=turn_id,
-                user_id=options.get("user_id")
+                user_id=options.get("user_id"),
+                first_llm_thought=function_call_data.get("first_llm_thought")
             )
             
             yield await send_event(EventTypes.DONE)
@@ -424,7 +425,8 @@ class FunctionCallProcessor:
             function_result=function_result,
             final_response=final_response,
             turn_id=turn_id,
-            user_id=options.get("user_id")
+            user_id=options.get("user_id"),
+            first_llm_thought=function_call_data.get("first_llm_thought")
         )
 
         # 6. 完成标志
@@ -504,14 +506,15 @@ class FunctionCallProcessor:
             function_result=function_result,
             final_response=final_response,
             turn_id=turn_id,
-            user_id=options.get("user_id")
+            user_id=options.get("user_id"),
+            first_llm_thought=function_call_data.get("first_llm_thought")
         )
 
         # 6. 完成标志
         yield await send_event(EventTypes.DONE)
 
     async def _save_function_call_stream_response(self, conversation_id, function_name, 
-                                           function_args, function_result, final_response, turn_id=None, user_id=None):
+                                           function_args, function_result, final_response, turn_id=None, user_id=None, first_llm_thought=None):
         """保存函数调用流式响应到对话历史"""
         logger.info(f"开始保存函数调用响应 - conversation_id: {conversation_id}, function_name: {function_name}, user_id: {user_id}")
         try:
@@ -524,8 +527,11 @@ class FunctionCallProcessor:
             if conversation:
                 from app.schemas.chat import Message
                 
-                # 创建函数调用请求消息，根据函数类型提供不同描述
-                function_desc = FUNCTION_DESCRIPTIONS.get(function_name, f"我需要调用 {function_name} 函数获取信息...")
+                # 创建函数调用请求消息，使用LLM的实际输出或默认描述
+                if first_llm_thought and first_llm_thought.strip():
+                    function_desc = first_llm_thought
+                else:
+                    function_desc = FUNCTION_DESCRIPTIONS.get(function_name, f"我需要调用 {function_name} 函数获取信息...")
                 
                 # 创建函数调用消息
                 function_call_message = Message(
