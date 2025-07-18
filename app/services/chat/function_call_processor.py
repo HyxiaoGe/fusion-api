@@ -403,14 +403,18 @@ class FunctionCallProcessor:
         # 4. 流式返回 LLM 的最终回复
         logger.info(f"{function_name}_handler: Preparing for second LLM stream to generate final answer.")
         final_response = ""
+        results = []
         async for result in StreamProcessor.process_llm_stream_with_reasoning(
             llm, second_llm_messages, send_event, use_reasoning, is_function_call_second_stage=True
         ):
+            results.append(result)
             # 传递所有事件给前端
             yield result
-            # 如果是最终的完整响应（不是事件字符串），保存它
-            if isinstance(result, str) and not result.startswith("data: "):
-                final_response = result
+        
+        # 最后一个结果应该是 final_response
+        if results and isinstance(results[-1], str) and not results[-1].startswith("data: "):
+            final_response = results[-1]
+            logger.info(f"捕获到最终响应，长度: {len(final_response)}")
 
         # 5. 保存完整对话历史
         await self._save_function_call_stream_response(
@@ -479,14 +483,18 @@ class FunctionCallProcessor:
 
         # 4. 流式返回 LLM 的最终回复
         final_response = ""
+        results = []
         async for result in StreamProcessor.process_llm_stream_with_reasoning(
             llm, second_llm_messages, send_event, use_reasoning, is_function_call_second_stage=True
         ):
+            results.append(result)
             # 传递所有事件给前端
             yield result
-            # 如果是最终的完整响应（不是事件字符串），保存它
-            if isinstance(result, str) and not result.startswith("data: "):
-                final_response = result
+        
+        # 最后一个结果应该是 final_response
+        if results and isinstance(results[-1], str) and not results[-1].startswith("data: "):
+            final_response = results[-1]
+            logger.info(f"捕获到最终响应，长度: {len(final_response)}")
 
         # 5. 保存完整对话历史
         await self._save_function_call_stream_response(
