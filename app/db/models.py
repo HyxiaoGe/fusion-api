@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone, timedelta
 
-from sqlalchemy import Column, String, Integer, Text, ForeignKey, DateTime, JSON, Boolean, Float, UniqueConstraint
+from sqlalchemy import Column, String, Integer, Text, ForeignKey, DateTime, Date, JSON, Boolean, Float, UniqueConstraint
 from sqlalchemy.orm import relationship, backref
 
 from app.db.database import Base
@@ -229,3 +229,59 @@ class ModelCredential(Base):
     __table_args__ = (
         UniqueConstraint('model_id', 'name', name='uix_model_credential_name'),
     )
+
+
+class DailyTopicDigest(Base):
+    """每日话题聚合摘要"""
+    __tablename__ = "daily_topic_digests"
+    
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    date = Column(Date, nullable=False, index=True)  # 聚合日期
+    category = Column(String, nullable=False)  # 领域分类：AI、科技、财经、社会等
+    
+    # 聚合信息
+    cluster_title = Column(String, nullable=False)  # 聚类主题标题，如"AI大模型技术突破"
+    cluster_summary = Column(Text, nullable=True)  # 主题摘要
+    key_points = Column(JSON, default=list)  # 关键要点列表 ["GPT-5发布", "开源模型崛起", ...]
+    
+    # 相关话题
+    topic_ids = Column(JSON, default=list)  # 相关的hot_topic id列表
+    topic_count = Column(Integer, default=0)  # 话题数量
+    
+    # 向量信息（可选，用于相似度计算）
+    cluster_vector = Column(JSON, nullable=True)  # 聚类中心向量
+    
+    # 热度信息
+    heat_score = Column(Float, default=0.0)  # 热度分数
+    view_count = Column(Integer, default=0)  # 查看次数
+    
+    # 排序和展示
+    display_order = Column(Integer, default=0)  # 展示顺序
+    is_featured = Column(Boolean, default=False)  # 是否精选
+    
+    created_at = Column(DateTime, default=get_china_time)
+    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
+    
+    # 添加唯一约束，确保每天每个分类只有一个聚合
+    __table_args__ = (
+        UniqueConstraint('date', 'category', name='_date_category_uc'),
+    )
+
+
+class TopicClusterItem(Base):
+    """话题聚类项 - 存储具体的聚类详情"""
+    __tablename__ = "topic_cluster_items"
+    
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    digest_id = Column(String, ForeignKey('daily_topic_digests.id', ondelete='CASCADE'), nullable=False)
+    hot_topic_id = Column(String, ForeignKey('hot_topics.id', ondelete='CASCADE'), nullable=False)
+    
+    # 在聚类中的信息
+    similarity_score = Column(Float, default=0.0)  # 与聚类中心的相似度
+    is_representative = Column(Boolean, default=False)  # 是否是代表性话题
+    
+    created_at = Column(DateTime, default=get_china_time)
+    
+    # 关系
+    digest = relationship("DailyTopicDigest", backref="cluster_items")
+    hot_topic = relationship("HotTopic")

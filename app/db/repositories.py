@@ -1,6 +1,6 @@
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any, Tuple
 
 from sqlalchemy import desc, func
@@ -515,6 +515,37 @@ class HotTopicRepository:
         except Exception as e:
             self.db.rollback()
             return False
+    
+    def get_topics_after(self, after_time: datetime) -> List[HotTopicModel]:
+        """获取指定时间之后的话题"""
+        try:
+            return self.db.query(HotTopicModel).filter(
+                HotTopicModel.created_at > after_time
+            ).all()
+        except Exception as e:
+            logger.error(f"获取新话题失败: {e}")
+            return []
+    
+    def get_updated_topics_after(self, after_time: datetime) -> List[HotTopicModel]:
+        """获取指定时间之后更新的话题"""
+        try:
+            return self.db.query(HotTopicModel).filter(
+                HotTopicModel.updated_at > after_time
+            ).all()
+        except Exception as e:
+            logger.error(f"获取更新话题失败: {e}")
+            return []
+    
+    def get_recent_topics(self, days: int = 7, limit: int = 100) -> List[HotTopicModel]:
+        """获取最近几天的话题"""
+        try:
+            after_time = datetime.now() - timedelta(days=days)
+            return self.db.query(HotTopicModel).filter(
+                HotTopicModel.created_at > after_time
+            ).order_by(desc(HotTopicModel.published_at)).limit(limit).all()
+        except Exception as e:
+            logger.error(f"获取最近话题失败: {e}")
+            return []
 
 
 class RssSourceRepository:

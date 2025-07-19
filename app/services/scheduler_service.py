@@ -6,6 +6,7 @@ from app.core.logger import app_logger as logger
 from app.services.hot_topic_service import HotTopicService
 from app.db.database import SessionLocal
 from app.db.repositories import ScheduledTaskRepository
+from app.tasks.vector_tasks import VectorTasks
 
 class SchedulerService:
     """调度服务，管理定时任务"""
@@ -23,10 +24,41 @@ class SchedulerService:
             replace_existing=True
         )
         
+        # 每小时向量化新话题
+        self.scheduler.add_job(
+            VectorTasks.vectorize_new_topics,
+            CronTrigger(minute=30),  # 每小时的30分执行
+            id="vectorize_new_topics",
+            replace_existing=True
+        )
+        
+        # 每天凌晨2点生成话题摘要
+        self.scheduler.add_job(
+            VectorTasks.generate_daily_digest,
+            CronTrigger(hour=2, minute=0),
+            id="generate_daily_digest",
+            replace_existing=True
+        )
+        
+        # 每天凌晨3点清理旧摘要
+        self.scheduler.add_job(
+            VectorTasks.cleanup_old_digests,
+            CronTrigger(hour=3, minute=0),
+            id="cleanup_old_digests",
+            replace_existing=True
+        )
+        
         # 启动时也立即执行一次
         self.scheduler.add_job(
             self._check_and_run_tasks,
             id="initial_check_tasks",
+            replace_existing=True
+        )
+        
+        # 启动时检查是否需要初始化向量索引
+        self.scheduler.add_job(
+            self._init_vector_index_if_needed,
+            id="init_vector_index",
             replace_existing=True
         )
         
@@ -89,3 +121,27 @@ class SchedulerService:
         """执行本地文档更新任务"""
         service = HotTopicService(db)
         await service.update_local_docs(True)
+    
+    async def _init_vector_index_if_needed(self):
+        """初始化向量索引（如果需要）"""
+        try:
+            from app.services.vector_service import VectorService
+            db = SessionLocal()
+            try:
+                vector_service = VectorService(db)
+                # 检查集合是否为空
+                collection_info = vector_service.client.get_collection(vector_service.collection_name)
+                if collection_info.points_count == 0:
+                    logger.info("检测到向量集合为空，开始初始化向量索引...")
+                    await VectorTasks.initial_batch_index()
+                    logger.info("向量索引初始化完成")
+                    # 初始化后立即生成今日摘要
+                    await VectorTasks.generate_daily_digest()
+                else:
+                    logger.info(f"向量集合已有 {collection_info.points_count} 个向量，跳过初始化")
+            finally:
+                db.close()
+        except Exception as e:
+            logger.error(f"初始化向量索引失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
