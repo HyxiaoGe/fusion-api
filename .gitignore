@@ -17,3 +17,6 @@ docs
 .cursor
 
 CLAUDE.md
+
+# Qdrant 向量数据库存储
+qdrant_storage/
