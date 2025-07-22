@@ -18,5 +18,7 @@ docs
 
 CLAUDE.md
 
+.mcp.json
+
 # Qdrant 向量数据库存储
 qdrant_storage/
