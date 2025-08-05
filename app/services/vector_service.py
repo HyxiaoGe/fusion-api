@@ -35,14 +35,25 @@ class VectorService:
         self.db = db
         self.hot_topic_repo = HotTopicRepository(db)
         
-        # 初始化 Qdrant 客户端 - 本地部署
-        # 在 Docker 环境中使用容器名
-        qdrant_host = os.getenv("QDRANT_HOST", "fusion-qdrant")
-        self.client = QdrantClient(
-            host=qdrant_host,
-            port=6333,
-            # 本地部署通常不需要 API key
-        )
+        # 初始化 Qdrant 客户端 - 支持本地和云端部署
+        qdrant_url = os.getenv("QDRANT_URL")
+        qdrant_api_key = os.getenv("QDRANT_API_KEY")
+        
+        if qdrant_url:
+            # 云端部署使用URL和API Key
+            logger.info(f"连接Qdrant Cloud: {qdrant_url}")
+            self.client = QdrantClient(
+                url=qdrant_url,
+                api_key=qdrant_api_key,
+            )
+        else:
+            # 本地部署使用host+port
+            qdrant_host = os.getenv("QDRANT_HOST", "fusion-qdrant")
+            logger.info(f"连接本地Qdrant: {qdrant_host}:6333")
+            self.client = QdrantClient(
+                host=qdrant_host,
+                port=6333,
+            )
         
         # 初始化 Embedding 模型
         self.embeddings = OpenAIEmbeddings(
