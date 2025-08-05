@@ -85,6 +85,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 健康检查端点（Railway需要）
+@app.get("/health")
+async def health_check():
+    """健康检查端点，Railway用来判断应用是否正常运行"""
+    try:
+        from datetime import datetime
+        from sqlalchemy import text
+        
+        # 简单的数据库连接测试
+        db = SessionLocal()
+        db.execute(text("SELECT 1"))
+        db.close()
+        
+        return {
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "database": "connected",
+            "service": "fusion-api",
+            "version": settings.APP_VERSION
+        }
+    except Exception as e:
+        app_logger.error(f"健康检查失败: {e}")
+        return {
+            "status": "unhealthy", 
+            "error": str(e),
+            "timestamp": datetime.now().isoformat(),
+            "service": "fusion-api"
+        }
+
 # 注册路由
 app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 app.include_router(files.router, prefix="/api/files", tags=["files"])
