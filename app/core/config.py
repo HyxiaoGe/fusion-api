@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     # 60 minutes * 24 hours * 8 days = 8 days
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 8
     SERVER_NAME: str = "localhost"
-    SERVER_HOST: str = "http://localhost:8000"
+    SERVER_HOST: str = os.getenv("SERVER_HOST", "http://localhost:8000")
     PROJECT_NAME: str = "Fusion API"
     SENTRY_DSN: Optional[str] = None
 

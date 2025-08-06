@@ -37,11 +37,14 @@ oauth.register(
 @router.get("/login/{provider}")
 async def login(request: Request, provider: str):
     try:
-        redirect_uri = str(request.url_for('callback', provider=provider))
+        # 使用配置的服务器地址构建回调URL，而不是依赖request.url_for
+        base_url = settings.SERVER_HOST.rstrip('/')
+        redirect_uri = f"{base_url}/api/auth/callback/{provider}"
+        
         client = oauth.create_client(provider)
         return await client.authorize_redirect(request, redirect_uri)
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Failed to create authorization URL.")
+        raise HTTPException(status_code=500, detail=f"Failed to create authorization URL: {str(e)}")
 
 
 @router.get("/callback/{provider}")
