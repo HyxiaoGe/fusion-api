@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_ID: Optional[str] = None
     GOOGLE_CLIENT_SECRET: Optional[str] = None
     
-    FRONTEND_AUTH_CALLBACK_URL: str = "http://localhost:3000/auth/callback"
+    FRONTEND_AUTH_CALLBACK_URL: str = os.getenv("FRONTEND_AUTH_CALLBACK_URL", "http://localhost:3000/auth/callback")
 
     POSTGRES_SERVER: str = os.getenv("POSTGRES_SERVER", "localhost")
     POSTGRES_USER: str = os.getenv("POSTGRES_USER", "postgres")
