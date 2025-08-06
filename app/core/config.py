@@ -43,7 +43,14 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_ID: Optional[str] = None
     GOOGLE_CLIENT_SECRET: Optional[str] = None
     
-    FRONTEND_AUTH_CALLBACK_URL: str = os.getenv("FRONTEND_AUTH_CALLBACK_URL", "http://localhost:3000/auth/callback")
+    # 前端基础URL，回调路径会自动拼接
+    FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    FRONTEND_AUTH_CALLBACK_PATH: str = "/auth/callback"
+    
+    @property
+    def FRONTEND_AUTH_CALLBACK_URL(self) -> str:
+        """动态生成前端OAuth回调URL"""
+        return f"{self.FRONTEND_URL.rstrip('/')}{self.FRONTEND_AUTH_CALLBACK_PATH}"
 
     POSTGRES_SERVER: str = os.getenv("POSTGRES_SERVER", "localhost")
     POSTGRES_USER: str = os.getenv("POSTGRES_USER", "postgres")
