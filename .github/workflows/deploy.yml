@@ -1,0 +1,16 @@
+name: Deploy to Dev Server
+on:
+  push:
+    branches: ["master"]
+  workflow_dispatch:
+jobs:
+  deploy:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy
+        run: |
+          cd ~/project/fusion
+          cd fusion-api && git pull && cd ..
+          docker compose up -d --build fusion-api
+          docker image prune -f
