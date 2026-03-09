@@ -2,18 +2,18 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.logger import app_logger as logger
 from app.services.hot_topic_service import HotTopicService
 from app.db.database import SessionLocal
 from app.db.repositories import ScheduledTaskRepository
-from app.tasks.vector_tasks import VectorTasks
 
 class SchedulerService:
     """调度服务，管理定时任务"""
-    
+
     def __init__(self):
         self.scheduler = AsyncIOScheduler()
-        
+
     def start(self):
         """启动调度器"""
         # 每小时更新一次热点数据
@@ -23,45 +23,52 @@ class SchedulerService:
             id="check_and_run_tasks",
             replace_existing=True
         )
-        
-        # 每小时向量化新话题
-        self.scheduler.add_job(
-            VectorTasks.vectorize_new_topics,
-            CronTrigger(minute=30),  # 每小时的30分执行
-            id="vectorize_new_topics",
-            replace_existing=True
-        )
-        
-        # 每天凌晨2点生成话题摘要
-        self.scheduler.add_job(
-            VectorTasks.generate_daily_digest,
-            CronTrigger(hour=2, minute=0),
-            id="generate_daily_digest",
-            replace_existing=True
-        )
-        
-        # 每天凌晨3点清理旧摘要
-        self.scheduler.add_job(
-            VectorTasks.cleanup_old_digests,
-            CronTrigger(hour=3, minute=0),
-            id="cleanup_old_digests",
-            replace_existing=True
-        )
-        
+
+        # 向量相关任务仅在启用时注册
+        if settings.ENABLE_VECTOR_EMBEDDINGS:
+            from app.tasks.vector_tasks import VectorTasks
+
+            # 每小时向量化新话题
+            self.scheduler.add_job(
+                VectorTasks.vectorize_new_topics,
+                CronTrigger(minute=30),  # 每小时的30分执行
+                id="vectorize_new_topics",
+                replace_existing=True
+            )
+
+            # 每天凌晨2点生成话题摘要
+            self.scheduler.add_job(
+                VectorTasks.generate_daily_digest,
+                CronTrigger(hour=2, minute=0),
+                id="generate_daily_digest",
+                replace_existing=True
+            )
+
+            # 每天凌晨3点清理旧摘要
+            self.scheduler.add_job(
+                VectorTasks.cleanup_old_digests,
+                CronTrigger(hour=3, minute=0),
+                id="cleanup_old_digests",
+                replace_existing=True
+            )
+
+            # 启动时检查是否需要初始化向量索引
+            self.scheduler.add_job(
+                self._init_vector_index_if_needed,
+                id="init_vector_index",
+                replace_existing=True
+            )
+            logger.info("向量相关定时任务已注册")
+        else:
+            logger.info("向量功能未启用，跳过向量相关定时任务")
+
         # 启动时也立即执行一次
         self.scheduler.add_job(
             self._check_and_run_tasks,
             id="initial_check_tasks",
             replace_existing=True
         )
-        
-        # 启动时检查是否需要初始化向量索引
-        self.scheduler.add_job(
-            self._init_vector_index_if_needed,
-            id="init_vector_index",
-            replace_existing=True
-        )
-        
+
         self.scheduler.start()
         logger.info("调度器已启动")
         
