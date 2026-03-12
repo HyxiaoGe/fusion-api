@@ -19,7 +19,6 @@ class MessageTypes:
     REASONING_CONTENT = "reasoning_content"      # AI推理过程
     FUNCTION_CALL = "function_call"              # 函数调用
     FUNCTION_RESULT = "function_result"          # 函数调用结果
-    WEB_SEARCH = "web_search"                    # 网络搜索结果
 
 
 # 函数名称常量
@@ -33,14 +32,9 @@ class MessageTexts:
     """消息文本常量类"""
     OPTIMIZING_SEARCH_QUERY = "正在优化搜索查询..."
     SEARCH_QUERY_PREFIX = "搜索查询: "
-    SYNTHESIZING_ANSWER = "正在结合搜索结果生成回答..."
     USER_PREVIOUS_QUESTION = "用户的先前问题"
-    NO_USER_QUERY_ERROR = "无法找到用户原始提问以执行联网搜索。"
     PROCESSING_ERROR_PREFIX = "处理出错: "
-    USER_PRIORITIZED_SEARCH_ERROR_PREFIX = "处理用户优先搜索出错: "
     FUNCTION_CALL_ERROR_PREFIX = "函数调用流处理出错: "
-    FUNCTION_CALL_NEED_PREFIX = "需要调用函数: "
-    FUNCTION_CALL_GENERIC_PREFIX = "我需要调用 {} 函数获取信息..."
 
 
 # 用户友好的函数调用描述常量

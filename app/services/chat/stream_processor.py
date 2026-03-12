@@ -5,7 +5,7 @@
 """
 
 import json
-from langchain_core.messages import SystemMessage, ToolMessage
+from langchain_core.messages import SystemMessage
 from app.ai.prompts.templates import SYNTHESIZE_TOOL_RESULT_PROMPT, SYNTHESIZE_TOOL_RESULT_PROMPT_FOR_REASONING
 from app.constants import EventTypes
 
@@ -18,13 +18,6 @@ class ReasoningState:
         self.reasoning_complete_sent = False
         self.last_reasoning_chunk = False
         self.function_call_context = False  # 标记是否在function call流程中
-    
-    def reset(self):
-        """重置推理状态"""
-        self.reasoning_start_sent = False
-        self.reasoning_complete_sent = False
-        self.last_reasoning_chunk = False
-        self.function_call_context = False
 
 
 class StreamProcessor:
@@ -42,37 +35,6 @@ class StreamProcessor:
             str: 提取的内容，如果没有则返回None
         """
         return chunk.content if hasattr(chunk, 'content') else None
-    
-    @staticmethod
-    async def handle_reasoning_content(chunk, send_event, reasoning_state, use_reasoning=True):
-        """
-        处理推理内容
-        
-        Args:
-            chunk: 流式响应块
-            send_event: 事件发送函数
-            reasoning_state: 推理状态对象
-            use_reasoning: 是否启用推理模式
-            
-        Returns:
-            bool: 是否在此块中处理了新的推理内容
-        """
-        if not use_reasoning:
-            return False
-            
-        if not (hasattr(chunk, 'additional_kwargs') and 'reasoning_content' in chunk.additional_kwargs):
-            return False
-            
-        reasoning_content = chunk.additional_kwargs['reasoning_content']
-        if not (reasoning_content and reasoning_content.strip()):
-            return False
-            
-        if not reasoning_state.reasoning_start_sent:
-            await send_event(EventTypes.REASONING_START)
-            reasoning_state.reasoning_start_sent = True
-            
-        await send_event(EventTypes.REASONING_CONTENT, reasoning_content)
-        return True
 
     @staticmethod
     async def handle_reasoning_content_with_events(chunk, send_event, reasoning_state, use_reasoning=True):
@@ -123,41 +85,6 @@ class StreamProcessor:
             reasoning_state.last_reasoning_chunk = False
             
         return events
-    
-    @staticmethod
-    async def handle_content_and_reasoning_complete(content_chunk_text, send_event, reasoning_state, has_new_reasoning):
-        """
-        处理内容并在适当时发送推理完成事件
-        
-        Args:
-            content_chunk_text: 内容文本
-            send_event: 事件发送函数
-            reasoning_state: 推理状态对象
-            has_new_reasoning: 当前块是否有新的推理内容
-        """
-        if content_chunk_text is not None and content_chunk_text.strip():
-            # 如果开始有实际内容且推理已开始但未完成，发送推理完成事件
-            if (reasoning_state.reasoning_start_sent and 
-                not reasoning_state.reasoning_complete_sent and 
-                not has_new_reasoning):
-                await send_event(EventTypes.REASONING_COMPLETE)
-                reasoning_state.reasoning_complete_sent = True
-        
-        if content_chunk_text is not None:
-            await send_event(EventTypes.CONTENT, content_chunk_text)
-    
-    @staticmethod
-    async def finalize_reasoning(send_event, reasoning_state):
-        """
-        完成推理处理，确保推理完成事件被发送
-        
-        Args:
-            send_event: 事件发送函数
-            reasoning_state: 推理状态对象
-        """
-        if reasoning_state.reasoning_start_sent and not reasoning_state.reasoning_complete_sent:
-            await send_event(EventTypes.REASONING_COMPLETE)
-            reasoning_state.reasoning_complete_sent = True
 
     @staticmethod
     def create_tool_synthesis_messages(original_user_query, tool_name, tool_result, provider=None, model=None, use_reasoning=False):
