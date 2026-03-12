@@ -64,6 +64,29 @@ class ChatServiceTests(unittest.TestCase):
         service.memory_service.save_conversation.assert_called_once_with(conversation)
         service.db.commit.assert_called_once()
 
+    def test_update_message_commits_when_update_succeeds(self):
+        service = object.__new__(ChatService)
+        service.db = MagicMock()
+        service.memory_service = MagicMock()
+
+        updated_message = Message(
+            id="assistant-msg-1",
+            role="assistant",
+            type="assistant_content",
+            content="updated",
+            turn_id="turn-1",
+        )
+        service.memory_service.update_message.return_value = updated_message
+
+        result = service.update_message("assistant-msg-1", {"content": "updated"})
+
+        self.assertIs(result, updated_message)
+        service.memory_service.update_message.assert_called_once_with(
+            "assistant-msg-1",
+            {"content": "updated"},
+        )
+        service.db.commit.assert_called_once()
+
     def test_generate_suggested_questions_uses_prompt_manager_and_limits_output(self):
         service = object.__new__(ChatService)
         service.memory_service = MagicMock()

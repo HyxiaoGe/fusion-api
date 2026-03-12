@@ -82,8 +82,7 @@ def update_message(
     )
     if not updated_message:
         raise HTTPException(status_code=404, detail="消息不存在或更新失败")
-        
-    db.commit()
+
     return updated_message
 
 

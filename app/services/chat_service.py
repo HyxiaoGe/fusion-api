@@ -335,7 +335,10 @@ class ChatService:
 
     def update_message(self, message_id: str, update_data: Dict[str, Any]) -> Optional[Message]:
         """更新消息"""
-        return self.memory_service.update_message(message_id, update_data)
+        updated_message = self.memory_service.update_message(message_id, update_data)
+        if updated_message:
+            self.db.commit()
+        return updated_message
 
     def delete_conversation(self, conversation_id: str, user_id: str) -> bool:
         """删除特定对话，并验证用户权限"""
