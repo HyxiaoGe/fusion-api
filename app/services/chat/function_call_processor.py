@@ -6,13 +6,16 @@
 
 import json
 import uuid
-from typing import Dict, Any, List, Union
+from datetime import datetime
+from typing import Dict, Any, List
+
 from langchain_core.messages import ToolMessage
 
 from app.ai.llm_manager import llm_manager
 from app.ai.prompts.templates import FUNCTION_CALL_BEHAVIOR_PROMPT, FUNCTION_CALL_BEHAVIOR_PROMPT_FOR_REASONING
 from app.core.function_manager import function_adapter
 from app.core.logger import app_logger as logger
+from app.schemas.chat import Message
 from app.constants import MessageRoles, EventTypes, FunctionNames, MessageTexts, FUNCTION_DESCRIPTIONS, USER_FRIENDLY_FUNCTION_DESCRIPTIONS, MessageTypes
 from app.services.chat.stream_processor import ReasoningState, StreamProcessor
 from app.services.chat.utils import ChatUtils
@@ -24,6 +27,15 @@ class FunctionCallProcessor:
     def __init__(self, db, memory_service):
         self.db = db
         self.memory_service = memory_service
+
+    @staticmethod
+    def _resolve_tool_call_id(tool_call_id: str | None, prefix: str = "call") -> str:
+        """保证工具调用 ID 始终有稳定可用的值。"""
+        if tool_call_id:
+            return tool_call_id
+        if prefix == "call_1":
+            return "call_1"
+        return f"{prefix}_{uuid.uuid4()}"
     
     async def generate_function_call_stream(self, provider, model, messages, conversation_id, options=None, turn_id=None):
         """
@@ -46,7 +58,7 @@ class FunctionCallProcessor:
         context = {"db": self.db, "conversation_id": conversation_id}
         
         # 准备消息和函数定义
-        processed_messages = self._prepare_function_call_messages(messages, provider, model, options)
+        processed_messages = self._prepare_function_call_messages(messages, options)
         functions_kwargs = function_adapter.prepare_functions_for_model(provider, model)
         
         try:
@@ -61,18 +73,15 @@ class FunctionCallProcessor:
                 
         except Exception as e:
             logger.error(f"{MessageTexts.FUNCTION_CALL_ERROR_PREFIX}{e}")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.exception("函数调用流处理异常详情")
             yield await send_event(EventTypes.ERROR, f"{MessageTexts.PROCESSING_ERROR_PREFIX}{str(e)}")
 
-    def _prepare_function_call_messages(self, messages, provider=None, model=None, options=None):
+    def _prepare_function_call_messages(self, messages, options=None):
         """
         准备函数调用的消息列表
         
         Args:
             messages: 原始消息列表
-            provider: 模型提供商（可选）
-            model: 模型名称（可选）
             options: 选项参数（可选）
             
         Returns:
@@ -155,14 +164,9 @@ class FunctionCallProcessor:
         )
         
         # 第三阶段：处理函数结果
-        function_handlers = {
-            FunctionNames.WEB_SEARCH: self._handle_web_search_function,
-        }
-        
-        handler = function_handlers.get(function_name)
-        if handler:
+        if function_name == FunctionNames.WEB_SEARCH:
             # 使用专门的处理器
-            async for event in handler(
+            async for event in self._handle_web_search_function(
                 send_event, function_call_data, function_result, 
                 context["conversation_id"], llm, original_messages, options, provider, model, turn_id
             ):
@@ -182,7 +186,6 @@ class FunctionCallProcessor:
             await self._save_function_call_stream_response(
                 conversation_id=context["conversation_id"],
                 function_name=function_name,
-                function_args=function_call_data["function"].get("arguments", "{}"),
                 function_result=function_result,
                 final_response=final_response,
                 turn_id=turn_id,
@@ -314,10 +317,7 @@ class FunctionCallProcessor:
         # 添加LLM的函数调用响应
         if provider in ["deepseek", "openai", "anthropic", "qwen", "volcengine", "google", "xai"]:
             # 使用tool_calls格式
-            tool_call_id = function_call_data.get("tool_call_id", "call_1")
-            # 确保tool_call_id不为None或空字符串
-            if tool_call_id is None or tool_call_id == "":
-                tool_call_id = "call_1"
+            tool_call_id = self._resolve_tool_call_id(function_call_data.get("tool_call_id"), "call_1")
             
             full_messages.append({
                 "role": MessageRoles.ASSISTANT,
@@ -371,10 +371,7 @@ class FunctionCallProcessor:
             original_user_query, function_name, function_result, provider, model, use_reasoning
         )
 
-        original_tool_call_id = function_call_data.get("tool_call_id", f"call_{uuid.uuid4()}")
-        # 确保tool_call_id不为None或空字符串
-        if original_tool_call_id is None or original_tool_call_id == "":
-            original_tool_call_id = f"call_{uuid.uuid4()}"
+        original_tool_call_id = self._resolve_tool_call_id(function_call_data.get("tool_call_id"))
         
         valid_arguments_str = ChatUtils.validate_and_process_function_arguments(function_call_data)
         first_llm_thought_content = function_call_data.get("first_llm_thought", None)
@@ -420,7 +417,6 @@ class FunctionCallProcessor:
         await self._save_function_call_stream_response(
             conversation_id=conversation_id,
             function_name=function_name,
-            function_args=valid_arguments_str,
             function_result=function_result,
             final_response=final_response,
             turn_id=turn_id,
@@ -431,8 +427,8 @@ class FunctionCallProcessor:
         # 6. 完成标志
         yield await send_event(EventTypes.DONE)
 
-    async def _save_function_call_stream_response(self, conversation_id, function_name, 
-                                           function_args, function_result, final_response, turn_id=None, user_id=None, first_llm_thought=None):
+    async def _save_function_call_stream_response(self, conversation_id, function_name,
+                                           function_result, final_response, turn_id=None, user_id=None, first_llm_thought=None):
         """保存函数调用流式响应到对话历史"""
         logger.info(f"开始保存函数调用响应 - conversation_id: {conversation_id}, function_name: {function_name}, user_id: {user_id}")
         try:
@@ -441,9 +437,7 @@ class FunctionCallProcessor:
                 return
                 
             conversation = self.memory_service.get_conversation(conversation_id, user_id)
-            logger.info(f"获取到会话: {conversation is not None}")
             if conversation:
-                from app.schemas.chat import Message
                 
                 # 创建函数调用请求消息，使用LLM的实际输出或默认描述
                 if first_llm_thought and first_llm_thought.strip():
@@ -481,17 +475,14 @@ class FunctionCallProcessor:
                 conversation.messages.append(ai_message)
                 
                 # 更新会话时间
-                from datetime import datetime
                 conversation.updated_at = datetime.now()
                 
                 # 保存到数据库
                 self.memory_service.save_conversation(conversation)
                 self.db.commit()  # 提交事务
-                logger.info(f"成功保存函数调用响应 - 消息数: {len(conversation.messages)}")
         except Exception as e:
             logger.error(f"保存函数调用流式响应失败: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.exception("保存函数调用响应异常详情")
 
     async def _save_stream_response(self, conversation_id, response_content, user_id=None):
         """保存普通流式响应到对话历史"""
@@ -502,9 +493,6 @@ class FunctionCallProcessor:
                 
             conversation = self.memory_service.get_conversation(conversation_id, user_id)
             if conversation:
-                from app.schemas.chat import Message
-                from datetime import datetime
-                
                 # 创建AI响应消息
                 ai_message = Message(
                     role=MessageRoles.ASSISTANT,
@@ -522,4 +510,5 @@ class FunctionCallProcessor:
                 self.memory_service.save_conversation(conversation)
                 self.db.commit()  # 提交事务
         except Exception as e:
-            logger.error(f"保存流式响应失败: {e}") 
+            logger.error(f"保存流式响应失败: {e}")
+            logger.exception("保存普通流式响应异常详情")
