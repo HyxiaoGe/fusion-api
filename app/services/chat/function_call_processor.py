@@ -371,7 +371,7 @@ class FunctionCallProcessor:
 
         # 2. 构建第二次LLM调用的消息列表
         second_llm_messages = StreamProcessor.create_tool_synthesis_messages(
-            original_user_query, function_name, function_result, provider, model, use_reasoning
+            original_user_query, function_name, function_result, provider
         )
 
         original_tool_call_id = self._resolve_tool_call_id(function_call_data.get("tool_call_id"))
@@ -407,7 +407,7 @@ class FunctionCallProcessor:
         final_response = ""
         results = []
         async for result in StreamProcessor.process_llm_stream_with_reasoning(
-            llm, second_llm_messages, send_event, use_reasoning, is_function_call_second_stage=True
+            llm, second_llm_messages, send_event, use_reasoning
         ):
             results.append(result)
             # 传递所有事件给前端

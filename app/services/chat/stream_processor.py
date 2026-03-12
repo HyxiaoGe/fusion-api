@@ -6,7 +6,7 @@
 
 import json
 from langchain_core.messages import SystemMessage
-from app.ai.prompts.templates import SYNTHESIZE_TOOL_RESULT_PROMPT, SYNTHESIZE_TOOL_RESULT_PROMPT_FOR_REASONING
+from app.ai.prompts.templates import SYNTHESIZE_TOOL_RESULT_PROMPT
 from app.constants import EventTypes
 
 
@@ -87,7 +87,7 @@ class StreamProcessor:
         return events
 
     @staticmethod
-    def create_tool_synthesis_messages(original_user_query, tool_name, tool_result, provider=None, model=None, use_reasoning=False):
+    def create_tool_synthesis_messages(original_user_query, tool_name, tool_result, provider=None):
         """
         创建工具结果合成的消息列表
         
@@ -96,35 +96,28 @@ class StreamProcessor:
             tool_name: 工具名称
             tool_result: 工具执行结果
             provider: 模型提供商（可选）
-            model: 模型名称（可选）
-            use_reasoning: 是否使用推理模式
             
         Returns:
             list: 用于合成的消息列表
         """
+        system_prompt_content = SYNTHESIZE_TOOL_RESULT_PROMPT.format(
+            original_user_query=original_user_query,
+            tool_name=tool_name,
+            tool_results_json=json.dumps(tool_result, ensure_ascii=False)
+        )
+
         # 为Google模型创建正确的消息序列
         if provider == "google":
             # Google需要：System -> User 的序列来开始对话
-            system_prompt_content = SYNTHESIZE_TOOL_RESULT_PROMPT.format(
-                original_user_query=original_user_query,
-                tool_name=tool_name,
-                tool_results_json=json.dumps(tool_result, ensure_ascii=False)
-            )
             return [
                 SystemMessage(content=system_prompt_content),
                 {"role": "user", "content": original_user_query}
             ]
-        else:
-            # 其他模型保持原有逻辑
-            system_prompt_content = SYNTHESIZE_TOOL_RESULT_PROMPT.format(
-                original_user_query=original_user_query,
-                tool_name=tool_name,
-                tool_results_json=json.dumps(tool_result, ensure_ascii=False)
-            )
-            return [SystemMessage(content=system_prompt_content)]
+        # 其他模型保持原有逻辑
+        return [SystemMessage(content=system_prompt_content)]
 
     @staticmethod
-    async def process_llm_stream_with_reasoning(llm, messages, send_event, use_reasoning=True, is_function_call_second_stage=False):
+    async def process_llm_stream_with_reasoning(llm, messages, send_event, use_reasoning=True):
         """
         处理LLM流式响应，包含推理处理
         
@@ -133,7 +126,6 @@ class StreamProcessor:
             messages: 消息列表
             send_event: 事件发送函数
             use_reasoning: 是否启用推理模式
-            is_function_call_second_stage: 是否是function call的第二阶段
             
         Yields:
             str: 流式事件或最终响应内容
