@@ -117,6 +117,57 @@ class ChatServiceTests(unittest.TestCase):
         )
         llm.invoke.assert_called_once()
 
+    def test_generate_title_persists_conversation_inside_service(self):
+        service = object.__new__(ChatService)
+        service.db = MagicMock()
+        service.memory_service = MagicMock()
+
+        conversation = Conversation(
+            id="conv-1",
+            user_id="user-1",
+            title="old",
+            provider="qwen",
+            model="qwen-max-latest",
+            messages=[
+                Message(
+                    id="user-msg-1",
+                    role="user",
+                    type="user_query",
+                    content="Explain fusion",
+                    turn_id="turn-1",
+                ),
+                Message(
+                    id="assistant-msg-1",
+                    role="assistant",
+                    type="assistant_content",
+                    content="Fusion is a chat product.",
+                    turn_id="turn-1",
+                ),
+            ],
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+        )
+        service.memory_service.get_conversation.return_value = conversation
+
+        llm = MagicMock()
+        llm.invoke.return_value = SimpleNamespace(content="Fusion Chat")
+
+        with patch(
+            "app.services.chat_service.llm_manager.get_default_model",
+            return_value=llm,
+        ):
+            title = asyncio.run(
+                service.generate_title(
+                    user_id="user-1",
+                    conversation_id="conv-1",
+                )
+            )
+
+        self.assertEqual(title, "Fusion Chat")
+        self.assertEqual(conversation.title, "Fusion Chat")
+        service.memory_service.save_conversation.assert_called_once_with(conversation)
+        service.db.commit.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

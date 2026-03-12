@@ -114,7 +114,6 @@ async def generate_title(request: TitleGenerationRequest, db: Session = Depends(
             conversation_id=request.conversation_id,
             options=request.options
         )
-        db.commit()
         return TitleGenerationResponse(title=title, conversation_id=request.conversation_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

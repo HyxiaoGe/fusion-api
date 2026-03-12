@@ -6,7 +6,6 @@
 
 import json
 import uuid
-from datetime import datetime
 from typing import Dict, Any, List
 
 from langchain_core.messages import ToolMessage
@@ -36,6 +35,11 @@ class FunctionCallProcessor:
         if prefix == "call_1":
             return "call_1"
         return f"{prefix}_{uuid.uuid4()}"
+
+    def _persist_conversation(self, conversation):
+        """统一保存函数调用产生的会话变更。"""
+        self.memory_service.save_conversation(conversation)
+        self.db.commit()
     
     async def generate_function_call_stream(self, provider, model, messages, conversation_id, options=None, turn_id=None):
         """
@@ -479,12 +483,7 @@ class FunctionCallProcessor:
                 conversation.messages.append(function_result_message)
                 conversation.messages.append(ai_message)
                 
-                # 更新会话时间
-                conversation.updated_at = datetime.now()
-                
-                # 保存到数据库
-                self.memory_service.save_conversation(conversation)
-                self.db.commit()  # 提交事务
+                self._persist_conversation(conversation)
         except Exception as e:
             logger.error(f"保存函数调用流式响应失败: {e}")
             logger.exception("保存函数调用响应异常详情")
@@ -508,12 +507,7 @@ class FunctionCallProcessor:
                 # 添加AI响应到会话
                 conversation.messages.append(ai_message)
                 
-                # 更新会话时间
-                conversation.updated_at = datetime.now()
-                
-                # 保存到数据库
-                self.memory_service.save_conversation(conversation)
-                self.db.commit()  # 提交事务
+                self._persist_conversation(conversation)
         except Exception as e:
             logger.error(f"保存流式响应失败: {e}")
             logger.exception("保存普通流式响应异常详情")

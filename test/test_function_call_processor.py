@@ -1,7 +1,10 @@
+import asyncio
 import unittest
+from datetime import datetime
 from unittest.mock import MagicMock
 
-from app.constants import MessageRoles
+from app.constants import MessageRoles, MessageTypes
+from app.schemas.chat import Conversation, Message
 from app.services.chat.function_call_processor import FunctionCallProcessor
 
 
@@ -27,6 +30,70 @@ class FunctionCallProcessorTests(unittest.TestCase):
 
     def test_resolve_tool_call_id_preserves_existing_value(self):
         self.assertEqual(self.processor._resolve_tool_call_id("tool-123"), "tool-123")
+
+    def test_save_stream_response_persists_conversation_changes(self):
+        conversation = Conversation(
+            id="conv-1",
+            user_id="user-1",
+            title="hello",
+            provider="qwen",
+            model="qwen-max-latest",
+            messages=[],
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+        )
+        self.processor.memory_service.get_conversation.return_value = conversation
+
+        asyncio.run(
+            self.processor._save_stream_response(
+                conversation_id="conv-1",
+                response_content="assistant reply",
+                user_id="user-1",
+            )
+        )
+
+        self.assertEqual(len(conversation.messages), 1)
+        self.assertEqual(conversation.messages[0].role, MessageRoles.ASSISTANT)
+        self.assertEqual(conversation.messages[0].type, MessageTypes.ASSISTANT_CONTENT)
+        self.assertEqual(conversation.messages[0].content, "assistant reply")
+        self.processor.memory_service.save_conversation.assert_called_once_with(conversation)
+        self.processor.db.commit.assert_called_once()
+
+    def test_save_function_call_stream_response_persists_all_messages(self):
+        conversation = Conversation(
+            id="conv-1",
+            user_id="user-1",
+            title="hello",
+            provider="qwen",
+            model="qwen-max-latest",
+            messages=[],
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+        )
+        self.processor.memory_service.get_conversation.return_value = conversation
+
+        asyncio.run(
+            self.processor._save_function_call_stream_response(
+                conversation_id="conv-1",
+                function_name="web_search",
+                function_result={"status": "ok"},
+                final_response="final answer",
+                turn_id="turn-1",
+                user_id="user-1",
+                first_llm_thought="我需要查一下",
+            )
+        )
+
+        self.assertEqual(
+            [(msg.role, msg.type) for msg in conversation.messages],
+            [
+                (MessageRoles.ASSISTANT, MessageTypes.FUNCTION_CALL),
+                (MessageRoles.SYSTEM, MessageTypes.FUNCTION_RESULT),
+                (MessageRoles.ASSISTANT, MessageTypes.ASSISTANT_CONTENT),
+            ],
+        )
+        self.processor.memory_service.save_conversation.assert_called_once_with(conversation)
+        self.processor.db.commit.assert_called_once()
 
 
 if __name__ == "__main__":

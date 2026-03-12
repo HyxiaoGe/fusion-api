@@ -28,6 +28,12 @@ class ChatService:
         self.stream_handler = StreamHandler(db, self.memory_service)
         self.function_call_processor = FunctionCallProcessor(db, self.memory_service)
 
+    def _persist_conversation(self, conversation: Conversation):
+        """统一保存会话并提交事务。"""
+        conversation.updated_at = datetime.now()
+        self.memory_service.save_conversation(conversation)
+        self.db.commit()
+
     def _prepare_chat_messages(self, chat_history: List[Dict[str, str]]) -> List[Union[HumanMessage, AIMessage, SystemMessage]]:
         """将会话历史转换成 LLM 可消费的消息列表。"""
         messages = []
@@ -187,9 +193,7 @@ class ChatService:
         messages = self._prepare_chat_messages(chat_history)
 
         # 保存会话和用户消息，确保在流式处理前它们已存在于数据库中
-        conversation.updated_at = datetime.now()
-        self.memory_service.save_conversation(conversation)
-        self.db.commit()
+        self._persist_conversation(conversation)
 
         # 处理文件内容
         if file_ids and len(file_ids) > 0:
@@ -299,9 +303,7 @@ class ChatService:
             if reasoning_message:
                 conversation.messages.append(reasoning_message)
             conversation.messages.append(ai_message)
-            conversation.updated_at = datetime.now()
-            self.memory_service.save_conversation(conversation)
-            self.db.commit()
+            self._persist_conversation(conversation)
 
             reasoning_content = reasoning_message.content if reasoning_message else ""
             return ChatResponse(
@@ -426,8 +428,7 @@ class ChatService:
             # 如果提供了会话ID，更新会话标题
             if conversation_id and conversation:
                 conversation.title = title
-                conversation.updated_at = datetime.now()
-                self.memory_service.save_conversation(conversation)
+                self._persist_conversation(conversation)
 
             return title
         except Exception as e:
