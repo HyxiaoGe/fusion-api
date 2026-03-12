@@ -7,12 +7,10 @@
 from .stream_processor import ReasoningState, StreamProcessor
 from .utils import ChatUtils
 from .function_call_processor import FunctionCallProcessor
-from .search_processor import SearchProcessor
 
 __all__ = [
     'ReasoningState',
     'StreamProcessor', 
     'ChatUtils',
-    'FunctionCallProcessor',
-    'SearchProcessor'
+    'FunctionCallProcessor'
 ] 

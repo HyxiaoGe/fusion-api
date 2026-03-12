@@ -1,6 +1,7 @@
 import logging
 import uuid
-from datetime import datetime, timedelta
+from copy import deepcopy
+from datetime import datetime
 from typing import List, Optional, Dict, Any, Tuple
 
 from sqlalchemy import desc, func
@@ -9,17 +10,10 @@ from sqlalchemy.orm import Session, joinedload
 from app.ai.llm_manager import get_model_display_name
 from app.db.models import Conversation as ConversationModel, get_china_time, File, ConversationFile
 from app.db.models import Message as MessageModel
-from app.db.models import PromptTemplate as PromptTemplateModel
-from app.db.models import Setting as SettingModel
-from app.db.models import HotTopic as HotTopicModel
-from app.db.models import ScheduledTask as ScheduledTaskModel
 from app.db.models import ModelSource, ModelCredential
 from app.db.models import User as UserModel, SocialAccount as SocialAccountModel
 from app.schemas.chat import Conversation, Message
-from app.schemas.prompts import PromptTemplate
 from app.schemas.models import ModelInfo, ModelCapabilities, ModelPricing, AuthConfig, ModelConfiguration, ModelConfigParam, ModelBasicInfo, AuthConfigField, ModelCredentialInfo
-from app.db.models import RssSource as RssSourceModel
-from app.schemas.rss import RssSourceCreate, RssSourceUpdate
 from app.schemas.auth import User as UserSchema
 
 logger = logging.getLogger(__name__)
@@ -324,13 +318,15 @@ class FileRepository:
         try:
             db_file = File(
                 id=file_data.get("id", str(uuid.uuid4())),
+                user_id=file_data["user_id"],
                 filename=file_data["filename"],
                 original_filename=file_data["original_filename"],
                 mimetype=file_data["mimetype"],
                 size=file_data["size"],
                 path=file_data["path"],
                 status=file_data.get("status", "pending"),
-                processing_result=file_data.get("processing_result")
+                processing_result=file_data.get("processing_result"),
+                parsed_content=file_data.get("parsed_content"),
             )
             self.db.add(db_file)
             self.db.commit()
@@ -455,406 +451,6 @@ class FileRepository:
             return False
 
 
-class HotTopicRepository:
-    """热点话题数据仓库"""
-    
-    def __init__(self, db: Session):
-        self.db = db
-        
-    def create(self, hot_topic: HotTopicModel) -> HotTopicModel:
-        """创建新的热点话题"""
-        try:
-            self.db.add(hot_topic)
-            self.db.commit()
-            self.db.refresh(hot_topic)
-            return hot_topic
-        except Exception as e:
-            self.db.rollback()
-            raise e
-            
-    def exists_by_url(self, url: str) -> bool:
-        """检查指定URL的热点是否已存在"""
-        if not url:
-            return False
-        return self.db.query(HotTopicModel).filter(HotTopicModel.url == url).first() is not None
-        
-    def get_hot_topics(self, category: Optional[str] = None, limit: int = 10) -> List[HotTopicModel]:
-        """获取热点话题列表，可按分类筛选"""
-        query = self.db.query(HotTopicModel)
-        
-        if category:
-            query = query.filter(HotTopicModel.category == category)
-            
-        # 先按浏览次数排序，再按发布时间排序
-        return query.order_by(desc(HotTopicModel.published_at)).limit(limit).all()
-        
-    def get_topic_by_id(self, topic_id: str) -> Optional[HotTopicModel]:
-        """根据ID获取热点话题"""
-        return self.db.query(HotTopicModel).filter(HotTopicModel.id == topic_id).first()
-        
-    def delete_before_date(self, date: datetime) -> int:
-        """删除指定日期之前的热点话题"""
-        try:
-            result = self.db.query(HotTopicModel).filter(HotTopicModel.published_at < date).delete()
-            self.db.commit()
-            return result
-        except Exception as e:
-            self.db.rollback()
-            raise e
-            
-    def increment_view_count(self, topic_id: str) -> bool:
-        """增加热点的浏览计数"""
-        try:
-            topic = self.db.query(HotTopicModel).filter(HotTopicModel.id == topic_id).first()
-            if not topic:
-                return False
-                
-            topic.view_count += 1
-            self.db.commit()
-            return True
-        except Exception as e:
-            self.db.rollback()
-            return False
-    
-    def get_topics_after(self, after_time: datetime) -> List[HotTopicModel]:
-        """获取指定时间之后的话题"""
-        try:
-            return self.db.query(HotTopicModel).filter(
-                HotTopicModel.created_at > after_time
-            ).all()
-        except Exception as e:
-            logger.error(f"获取新话题失败: {e}")
-            return []
-    
-    def get_updated_topics_after(self, after_time: datetime) -> List[HotTopicModel]:
-        """获取指定时间之后更新的话题"""
-        try:
-            return self.db.query(HotTopicModel).filter(
-                HotTopicModel.updated_at > after_time
-            ).all()
-        except Exception as e:
-            logger.error(f"获取更新话题失败: {e}")
-            return []
-    
-    def get_recent_topics(self, days: int = 7, limit: int = 100) -> List[HotTopicModel]:
-        """获取最近几天的话题"""
-        try:
-            after_time = datetime.now() - timedelta(days=days)
-            return self.db.query(HotTopicModel).filter(
-                HotTopicModel.created_at > after_time
-            ).order_by(desc(HotTopicModel.published_at)).limit(limit).all()
-        except Exception as e:
-            logger.error(f"获取最近话题失败: {e}")
-            return []
-
-
-class RssSourceRepository:
-    """RSS源数据仓库"""
-
-    def __init__(self, db: Session):
-        self.db = db
-
-    def get_by_id(self, source_id: str, user_id: str) -> Optional[RssSourceModel]:
-        return self.db.query(RssSourceModel).filter(
-            RssSourceModel.id == source_id,
-            (RssSourceModel.user_id == user_id) | (RssSourceModel.user_id == None)
-        ).first()
-
-    def get_all(self, user_id: str, skip: int = 0, limit: int = 100) -> List[RssSourceModel]:
-        return self.db.query(RssSourceModel).filter(
-            (RssSourceModel.user_id == user_id) | (RssSourceModel.user_id == None)
-        ).offset(skip).limit(limit).all()
-
-    def get_all_enabled(self) -> List[RssSourceModel]:
-        """获取所有启用的全局RSS源，供调度器使用"""
-        return self.db.query(RssSourceModel).filter(
-            RssSourceModel.is_enabled == True,
-            RssSourceModel.user_id == None
-        ).all()
-
-    def create(self, rss_source: RssSourceCreate, user_id: Optional[str] = None) -> RssSourceModel:
-        db_source = RssSourceModel(**rss_source.model_dump(), user_id=user_id)
-        self.db.add(db_source)
-        self.db.commit()
-        self.db.refresh(db_source)
-        return db_source
-
-    def update(self, source_id: str, rss_source: RssSourceUpdate, user_id: str) -> Optional[RssSourceModel]:
-        db_source = self.db.query(RssSourceModel).filter(RssSourceModel.id == source_id, RssSourceModel.user_id == user_id).first()
-        if db_source:
-            update_data = rss_source.model_dump(exclude_unset=True)
-            for key, value in update_data.items():
-                setattr(db_source, key, value)
-            self.db.commit()
-            self.db.refresh(db_source)
-            return db_source
-        return None
-
-    def delete(self, source_id: str, user_id: str) -> bool:
-        result = self.db.query(RssSourceModel).filter(
-            RssSourceModel.id == source_id,
-            RssSourceModel.user_id == user_id
-        ).delete()
-        if result > 0:
-            self.db.commit()
-            return True
-        return False
-
-    def touch(self, source_id: str) -> bool:
-        db_source = self.db.query(RssSourceModel).filter(RssSourceModel.id == source_id).first()
-        if db_source:
-            db_source.updated_at = get_china_time()
-            self.db.commit()
-            return True
-        return False
-
-
-class ScheduledTaskRepository:
-    """定时任务数据仓库"""
-    
-    def __init__(self, db: Session):
-        self.db = db
-        
-    def get_task_by_name(self, name: str) -> Optional[ScheduledTaskModel]:
-        """根据名称获取任务"""
-        return self.db.query(ScheduledTaskModel).filter(ScheduledTaskModel.name == name).first()
-        
-    def get_all_active_tasks(self) -> List[ScheduledTaskModel]:
-        """获取所有活跃的任务"""
-        return self.db.query(ScheduledTaskModel).filter(ScheduledTaskModel.status == "active").all()
-        
-    def create_task(self, task_data: Dict[str, Any]) -> ScheduledTaskModel:
-        """创建新任务"""
-        try:
-            task = ScheduledTaskModel(**task_data)
-            self.db.add(task)
-            self.db.commit()
-            self.db.refresh(task)
-            return task
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"创建定时任务失败: {e}")
-            raise
-            
-    def update_task(self, name: str, update_data: Dict[str, Any]) -> bool:
-        """更新任务信息"""
-        try:
-            task = self.get_task_by_name(name)
-            if not task:
-                return False
-                
-            for key, value in update_data.items():
-                if hasattr(task, key):
-                    setattr(task, key, value)
-                    
-            self.db.commit()
-            return True
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"更新定时任务失败: {e}")
-            return False
-            
-    def update_last_run(self, name: str, new_task_data: Optional[Dict] = None) -> bool:
-        """更新任务的最后执行时间和下次执行时间"""
-        try:
-            task = self.get_task_by_name(name)
-            if not task:
-                return False
-                
-            now = datetime.now()
-            task.last_run_at = now
-            
-            # 计算下次执行时间
-            if task.interval:
-                from datetime import timedelta
-                task.next_run_at = now + timedelta(seconds=task.interval)
-                
-            # 更新任务数据
-            if new_task_data is not None:
-                task.task_data = new_task_data
-                
-            self.db.commit()
-            return True
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"更新任务执行时间失败: {e}")
-            return False
-    
-    def should_run_task(self, name: str) -> bool:
-        """检查任务是否应该执行"""
-        task = self.get_task_by_name(name)
-        if not task or task.status != "active":
-            return False
-            
-        if not task.next_run_at:
-            return True
-            
-        return datetime.now() >= task.next_run_at
-
-
-class PromptTemplateRepository:
-    def __init__(self, db: Session):
-        self.db = db
-
-    def create(self, prompt: PromptTemplate, user_id: Optional[str] = None) -> PromptTemplate:
-        """创建新的提示词模板"""
-        try:
-            db_prompt = PromptTemplateModel(
-                id=prompt.id,
-                user_id=user_id,
-                title=prompt.title,
-                content=prompt.content,
-                tags=prompt.tags,
-                created_at=prompt.created_at,
-                updated_at=prompt.updated_at
-            )
-            self.db.add(db_prompt)
-            self.db.commit()
-            self.db.refresh(db_prompt)
-            return self._convert_to_schema(db_prompt)
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"创建提示词模板失败: {e}")
-            raise
-
-    def get_all(self, user_id: Optional[str] = None) -> List[PromptTemplate]:
-        """获取所有提示词模板（用户的和全局的）"""
-        try:
-            query = self.db.query(PromptTemplateModel)
-            if user_id:
-                query = query.filter(
-                    (PromptTemplateModel.user_id == user_id) | (PromptTemplateModel.user_id == None)
-                )
-            db_prompts = query.order_by(PromptTemplateModel.created_at.desc()).all()
-            return [self._convert_to_schema(p) for p in db_prompts]
-        except Exception as e:
-            logger.error(f"获取所有提示词模板失败: {e}")
-            return []
-
-    def update(self, prompt_id: str, prompt_data: Dict, user_id: str) -> Optional[PromptTemplate]:
-        """更新提示词模板"""
-        try:
-            db_prompt = self.db.query(PromptTemplateModel).filter(
-                PromptTemplateModel.id == prompt_id,
-                PromptTemplateModel.user_id == user_id
-            ).first()
-
-            if not db_prompt:
-                return None
-
-            for key, value in prompt_data.items():
-                setattr(db_prompt, key, value)
-            
-            db_prompt.updated_at = get_china_time()
-            self.db.commit()
-            self.db.refresh(db_prompt)
-            return self._convert_to_schema(db_prompt)
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"更新提示词模板失败: {e}")
-            return None
-
-    def delete(self, prompt_id: str, user_id: str) -> bool:
-        """删除提示词模板"""
-        try:
-            result = self.db.query(PromptTemplateModel).filter(
-                PromptTemplateModel.id == prompt_id,
-                PromptTemplateModel.user_id == user_id
-            ).delete()
-            self.db.commit()
-            return result > 0
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"删除提示词模板失败: {e}")
-            return False
-
-    def load_to_prompt_manager(self) -> None:
-        """将所有提示词模板加载到PromptManager"""
-        try:
-            all_prompts = self.get_all() # Should be all global prompts
-            for prompt in all_prompts:
-                prompt_manager.add_template(
-                    name=prompt.title,
-                    template=prompt.content,
-                    tags=prompt.tags,
-                    overwrite=True  # 允许覆盖
-                )
-            logger.info(f"成功加载 {len(all_prompts)} 个提示词模板到管理器")
-        except Exception as e:
-            logger.error(f"加载提示词模板到管理器时出错: {e}")
-
-    def get_by_id(self, prompt_id: str, user_id: Optional[str] = None) -> Optional[PromptTemplate]:
-        """根据ID获取提示词模板"""
-        try:
-            query = self.db.query(PromptTemplateModel).filter(PromptTemplateModel.id == prompt_id)
-            if user_id:
-                query = query.filter(
-                    (PromptTemplateModel.user_id == user_id) | (PromptTemplateModel.user_id == None)
-                )
-            db_prompt = query.first()
-            if not db_prompt:
-                return None
-            return self._convert_to_schema(db_prompt)
-        except Exception as e:
-            logger.error(f"获取提示词模板失败: {e}")
-            return None
-
-    def _convert_to_schema(self, db_prompt: PromptTemplateModel) -> PromptTemplate:
-        """将数据库模型转换为业务模型"""
-        return PromptTemplate(
-            id=db_prompt.id,
-            title=db_prompt.title,
-            content=db_prompt.content,
-            tags=db_prompt.tags,
-            created_at=db_prompt.created_at,
-            updated_at=db_prompt.updated_at
-        )
-
-
-class SettingRepository:
-    def __init__(self, db: Session):
-        self.db = db
-
-    def get(self, key: str) -> Optional[Dict[str, Any]]:
-        """获取设置值"""
-        try:
-            db_setting = self.db.query(SettingModel).filter(
-                SettingModel.key == key
-            ).first()
-
-            if not db_setting:
-                return None
-
-            return db_setting.value
-        except Exception as e:
-            logger.error(f"获取设置失败: {e}")
-            return None
-
-    def set(self, key: str, value: Dict[str, Any]) -> bool:
-        """设置或更新设置值"""
-        try:
-            db_setting = self.db.query(SettingModel).filter(
-                SettingModel.key == key
-            ).first()
-
-            if db_setting:
-                db_setting.value = value
-                db_setting.updated_at = datetime.utcnow()
-            else:
-                db_setting = SettingModel(
-                    key=key,
-                    value=value
-                )
-                self.db.add(db_setting)
-
-            self.db.commit()
-            return True
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"设置值失败: {e}")
-            return False
-
-
 class ModelSourceRepository:
     def __init__(self, db: Session):
         self.db = db
@@ -885,10 +481,37 @@ class ModelSourceRepository:
     def get_by_id(self, model_id: str) -> Optional[ModelSource]:
         """根据模型ID获取模型数据源"""
         return self.db.query(ModelSource).filter(ModelSource.model_id == model_id).first()
+
+    def _get_provider_template(self, provider: Optional[str]) -> Optional[ModelSource]:
+        """获取同 provider 的模板模型，用于继承认证和参数配置。"""
+        if not provider:
+            return None
+
+        candidates = (
+            self.db.query(ModelSource)
+            .filter(ModelSource.provider == provider)
+            .order_by(ModelSource.priority, ModelSource.id)
+            .all()
+        )
+
+        for candidate in candidates:
+            if candidate.auth_config or candidate.model_configuration:
+                return candidate
+
+        return None
     
     def create(self, model_data: Dict[str, Any]) -> ModelSource:
         """创建新的模型数据源"""
         now = get_china_time()
+        provider_template = self._get_provider_template(model_data.get("provider"))
+
+        auth_config = model_data.get("auth_config")
+        if auth_config is None and provider_template and provider_template.auth_config:
+            auth_config = deepcopy(provider_template.auth_config)
+
+        model_configuration = model_data.get("model_configuration")
+        if model_configuration is None and provider_template and provider_template.model_configuration:
+            model_configuration = deepcopy(provider_template.model_configuration)
         
         # 将Pydantic模型转换为数据库模型
         model_source = ModelSource(
@@ -898,8 +521,9 @@ class ModelSourceRepository:
             knowledge_cutoff=model_data.get("knowledgeCutoff"),
             capabilities=model_data.get("capabilities"),
             pricing=model_data.get("pricing"),
-            auth_config=model_data.get("auth_config"),
-            model_configuration=model_data.get("model_configuration"),
+            auth_config=auth_config,
+            model_configuration=model_configuration,
+            priority=model_data.get("priority", 100),
             enabled=model_data.get("enabled", True),
             description=model_data.get("description", ""),
             created_at=now,

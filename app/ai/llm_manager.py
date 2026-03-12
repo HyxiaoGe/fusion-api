@@ -121,6 +121,7 @@ class QwenFactory:
             return ChatTongyi(
                 model=model,
                 streaming=True,
+                dashscope_api_key=credentials.get("api_key") if credentials else None,
             )
 
 class VolcengineFactory:

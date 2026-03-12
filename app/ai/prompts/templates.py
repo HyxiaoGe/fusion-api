@@ -44,15 +44,6 @@ FILE_CONTENT_ENHANCEMENT_PROMPT = """用户问题: {query}
 参考以下文件内容:
 {file_content}"""
 
-# 热点话题分析提示词
-HOT_TOPIC_ANALYSIS_PROMPT = """请对以下热点新闻/文章进行深入分析，包括但不限于其核心观点、潜在影响、相关背景等内容。如有需要，可引用原文内容进行佐证，并可结合相似事件或话题，提出洞见或类比:
-
-标题: {title}
-
-简介: {description}
-
-{additional_content}"""
-
 # 提炼网页搜索结果的提示词 (中文)
 WEB_SEARCH_RESULTS_PROMPT = """你是一个负责总结网页搜索结果的助手。
 请根据以下搜索查询：'{search_query}'

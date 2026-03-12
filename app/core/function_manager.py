@@ -2,12 +2,10 @@
 函数调用管理器
 负责初始化和管理全局函数注册表
 """
-import asyncio
-from typing import Dict, List, Any, Optional
 
 from app.core.function_registry import FunctionRegistry
 from app.ai.function_call_adapter import FunctionCallAdapter
-from app.services.function_handlers import web_search_handler, analyze_file_handler, hot_topics_handler
+from app.services.function_handlers import web_search_handler, analyze_file_handler
 from app.core.logger import app_logger as logger
 
 # 创建全局函数注册表实例
@@ -56,26 +54,9 @@ def init_function_registry():
             categories=["file", "analysis"]
         )
         
-        # 注册热点话题函数
-        function_registry.register(
-            name="hot_topics",
-            description="用于获取当前最新的热点话题信息，涵盖科技、财经等多个领域。当用户询问最近流行、关注度高或最新发生的事件、新闻、趋势时，请优先调用此工具。",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "category": {"type": "string", "description": "话题类别，如科技、财经等(可选)"},
-                    "limit": {"type": "integer", "description": "返回结果数量", "default": 10},
-                    "topic_id": {"type": "string", "description": "如果要获取特定话题详情，提供话题ID"}
-                }
-            },
-            handler=hot_topics_handler,
-            categories=["news", "topics"]
-        )
-
         logger.info("函数注册表初始化完成")
         return True
     except Exception as e:
         logger.error(f"初始化函数注册表失败: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+        logger.exception("函数注册表初始化异常详情")
         return False

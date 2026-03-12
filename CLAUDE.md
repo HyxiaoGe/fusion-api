@@ -135,27 +135,20 @@ The application follows a clean architecture pattern with clear separation of co
 
 2. **API Layer** (`app/api/`)
    - FastAPI routers for different resource endpoints
-   - Main endpoints: chat, files, settings, prompts, models, credentials
+   - Main endpoints: chat, files, models, auth
    - Authentication endpoints for OAuth flows
 
 3. **Service Layer** (`app/services/`)
    - Business logic separated from API layer
    - Key services:
-     - `conversation_service.py`: Manages chat sessions and history
      - `file_service.py`: Handles file uploads and processing
-     - `auto_title_service.py`: Generates conversation titles using LLMs
-     - `hot_topic_service.py`: Manages trending topics
-     - `scheduled_task_service.py`: Background task scheduling
+     - `chat_service.py`: Manages chat sessions, streaming, titles, and suggested follow-up questions
+     - `scheduler_service.py`: Currently disabled placeholder to keep startup surface stable
 
 4. **Data Layer** (`app/db/`)
    - SQLAlchemy models for PostgreSQL
    - Repository pattern for data access
-   - Models: Conversation, Message, File, Setting, User, etc.
-
-5. **Vector Search** (`app/services/chromadb_service.py`)
-   - ChromaDB integration for semantic search
-   - Embeddings storage and retrieval
-   - RAG (Retrieval Augmented Generation) support
+   - Models: Conversation, Message, File, User, ModelSource, ModelCredential
 
 ### Key Design Patterns
 
@@ -177,10 +170,10 @@ The application follows a clean architecture pattern with clear separation of co
 The application uses PostgreSQL with the following main tables:
 - `conversations`: Chat sessions with metadata
 - `messages`: Individual messages in conversations
-- `files`: Uploaded files with vector embeddings
-- `settings`: Application and user settings
+- `files`: Uploaded files with parsed content and processing status
 - `users`: User accounts with OAuth associations
-- `credentials`: Encrypted API credentials for LLM providers
+- `model_sources`: Model definitions and capabilities
+- `model_credentials`: Stored API credentials for model providers
 
 ### Testing
 

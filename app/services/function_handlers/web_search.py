@@ -1,4 +1,3 @@
-import asyncio
 from datetime import datetime
 from typing import Dict, Any
 
@@ -55,6 +54,5 @@ async def web_search_handler(args: Dict[str, Any], context: Dict[str, Any]) -> D
         }
     except Exception as e:
         logger.error(f"网络搜索处理器出错: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+        logger.exception("网络搜索处理器异常详情")
         return {"error": f"搜索失败: {str(e)}"}

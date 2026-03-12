@@ -1,33 +1,21 @@
-import asyncio
-import json
-import logging
 import uuid
 from datetime import datetime
 from typing import List, Optional, Dict, Any, Union
 
 from fastapi.responses import StreamingResponse
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
-from app.core.function_manager import function_registry, function_adapter
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from app.ai.prompts import prompt_manager
 from sqlalchemy.orm import Session
 
 from app.ai.llm_manager import llm_manager
-from app.ai.prompts import prompt_manager
-from app.ai.prompts.templates import FUNCTION_CALL_BEHAVIOR_PROMPT, SYNTHESIZE_TOOL_RESULT_PROMPT
 from app.core.logger import app_logger as logger
 from app.db.repositories import FileRepository
-from app.processor.file_processor import FileProcessor
 from app.schemas.chat import ChatResponse, Message, Conversation
-from app.services.file_content_service import FileContentService
 from app.services.memory_service import MemoryService
-from app.services.message_processor import MessageProcessor
-from app.services.model_strategies import ModelStrategyFactory
 from app.services.stream_handler import StreamHandler
-from app.services.web_search_service import WebSearchService
-from app.constants import MessageRoles, EventTypes, FunctionNames, MessageTexts, FUNCTION_DESCRIPTIONS, USER_FRIENDLY_FUNCTION_DESCRIPTIONS, MessageTypes
-from app.services.chat.stream_processor import ReasoningState, StreamProcessor
+from app.constants import MessageRoles, MessageTypes
 from app.services.chat.utils import ChatUtils
 from app.services.chat.function_call_processor import FunctionCallProcessor
-from app.services.chat.search_processor import SearchProcessor
 
 
 # ==================== ChatService 类 ====================
@@ -35,41 +23,127 @@ from app.services.chat.search_processor import SearchProcessor
 class ChatService:
     def __init__(self, db: Session):
         self.db = db
-        # 初始化各种服务
         self.memory_service = MemoryService(db)
-        self.file_processor = FileProcessor()
-        
-        self.message_processor = MessageProcessor(db)
+        self.file_repo = FileRepository(db)
         self.stream_handler = StreamHandler(db, self.memory_service)
-        self.file_service = FileContentService(db)
-        
-        # 初始化新的处理器
         self.function_call_processor = FunctionCallProcessor(db, self.memory_service)
-        self.search_processor = SearchProcessor(db, self.memory_service)
 
-    def _create_event_sender(self, conversation_id: str):
-        """创建事件发送器函数"""
-        return ChatUtils.create_event_sender(conversation_id)
+    def _prepare_chat_messages(self, chat_history: List[Dict[str, str]]) -> List[Union[HumanMessage, AIMessage, SystemMessage]]:
+        """将会话历史转换成 LLM 可消费的消息列表。"""
+        messages = []
+        last_role = None
 
-    def _extract_user_message_from_messages(self, messages: List) -> str:
-        """从消息列表中提取最后一条用户消息"""
-        return ChatUtils.extract_user_message_from_messages(messages)
+        for msg in chat_history:
+            current_role = msg["role"]
 
-    def _parse_function_arguments(self, function_args: Union[str, dict]) -> dict:
-        """解析函数参数，确保返回有效的字典"""
-        return ChatUtils.parse_function_arguments(function_args)
+            if current_role == "reasoning":
+                continue
 
-    async def _generate_search_query(self, user_message: str, llm) -> str:
-        """生成优化后的搜索查询"""
-        return await ChatUtils.generate_search_query(user_message, llm)
+            if last_role == current_role:
+                if current_role == MessageRoles.USER:
+                    messages[-1].content += "\n" + msg["content"]
+                    continue
+                if current_role == MessageRoles.ASSISTANT:
+                    continue
 
-    def _extract_original_user_query(self, messages: List) -> str:
-        """从消息列表中提取用户原始查询"""
-        return ChatUtils.extract_original_user_query(messages)
+            if current_role == MessageRoles.USER:
+                messages.append(HumanMessage(content=msg["content"]))
+            elif current_role == MessageRoles.ASSISTANT:
+                messages.append(AIMessage(content=msg["content"]))
+            elif current_role == MessageRoles.SYSTEM:
+                messages.append(SystemMessage(content=msg["content"]))
 
-    def _validate_and_process_function_arguments(self, function_call_data: dict) -> str:
-        """验证和处理函数参数，确保返回有效的JSON字符串"""
-        return ChatUtils.validate_and_process_function_arguments(function_call_data)
+            last_role = current_role
+
+        return messages
+
+    def _enhance_with_file_content(self, messages, message: str, file_contents: Dict[str, str]):
+        """将文件内容拼进最后一条用户消息。"""
+        if not file_contents:
+            return messages
+
+        file_content_text = "\n\n".join(
+            f"文件内容 ({i + 1}):\n{content}"
+            for i, content in enumerate(file_contents.values())
+        )
+        enhanced_message = prompt_manager.format_prompt(
+            "file_content_enhancement",
+            query=message,
+            file_content=file_content_text,
+        )
+        messages[-1] = HumanMessage(content=enhanced_message)
+        return messages
+
+    def _get_files_content(self, file_ids: List[str]) -> Dict[str, str]:
+        """读取已经完成解析的文件内容。"""
+        if not file_ids:
+            return {}
+        return self.file_repo.get_parsed_file_content(file_ids)
+
+    def _check_files_status(self, file_ids: List[str], provider: str, model: str, conversation_id: str) -> Optional[ChatResponse]:
+        """如果有文件尚未就绪，返回可直接响应给聊天接口的消息。"""
+        if not file_ids:
+            return None
+
+        file_contents = self.file_repo.get_parsed_file_content(file_ids)
+        for file_id in file_ids:
+            if file_id in file_contents:
+                continue
+
+            file = self.file_repo.get_file_by_id(file_id)
+            if file and file.status == "parsing":
+                return ChatResponse(
+                    id="file_parsing",
+                    provider=provider,
+                    model=model,
+                    message=Message(
+                        role=MessageRoles.ASSISTANT,
+                        type=MessageTypes.ASSISTANT_CONTENT,
+                        content="文件正在解析中，请稍后再试...",
+                    ),
+                    conversation_id=conversation_id,
+                )
+            if file and file.status == "error":
+                return ChatResponse(
+                    id="file_error",
+                    provider=provider,
+                    model=model,
+                    message=Message(
+                        role=MessageRoles.ASSISTANT,
+                        type=MessageTypes.ASSISTANT_CONTENT,
+                        content=f"文件处理出错: {file.processing_result.get('message', '未知错误')}",
+                    ),
+                    conversation_id=conversation_id,
+                )
+        return None
+
+    def _should_use_reasoning_strategy(self, provider: str, model: str, options: Optional[Dict[str, Any]] = None) -> bool:
+        """决定非流式请求是否走 reasoning 解析。"""
+        if options is None:
+            options = {}
+
+        use_reasoning = options.get("use_reasoning")
+        if use_reasoning is True:
+            return True
+        if use_reasoning is False:
+            return False
+
+        model_name = model.lower()
+        if provider == "volcengine" and ("thinking" in model_name or "deepseek-r1" in model_name):
+            return True
+        if provider == "deepseek" and model == "deepseek-reasoner":
+            return True
+        if provider == "qwen" and ("qwq" in model_name or "qwen3" in model_name):
+            return True
+        return False
+
+    async def _invoke_non_stream_model(self, provider: str, model: str, messages, options: Optional[Dict[str, Any]] = None):
+        """执行一次非流式模型调用。"""
+        if options is None:
+            options = {}
+
+        llm = llm_manager.get_model(provider=provider, model=model, options=options)
+        return llm.invoke(messages)
 
     async def process_message(
             self,
@@ -81,7 +155,6 @@ class ChatService:
             stream: bool = False,
             options: Optional[Dict[str, Any]] = None,
             file_ids: Optional[List[str]] = None,
-            topic_info: Optional[Dict[str, Any]] = None,
     ) -> Union[StreamingResponse, ChatResponse]:
         """处理用户消息并获取AI响应"""
         # 初始化options
@@ -90,11 +163,11 @@ class ChatService:
         # 获取或创建会话
         conversation = self._get_or_create_conversation(conversation_id, user_id, provider, model, message)
 
-        # 记录用户消息（保持用户原始完整消息，如："请帮我分析以下热点话题： xxx"）
+        # 记录用户消息
         user_message = Message(
             role=MessageRoles.USER, 
             type=MessageTypes.USER_QUERY,
-            content=message  # 保持用户原始完整消息内容
+            content=message
         )
         
         # 使用用户消息的ID作为turn_id
@@ -103,27 +176,15 @@ class ChatService:
         
         conversation.messages.append(user_message)
         
-        # 处理话题信息：如果有话题信息，生成扩展的话题分析提示词发送给LLM
-        llm_message = message  # 默认使用用户原始消息
-        if topic_info:
-            # 使用提示词管理器生成包含话题详细信息的分析提示词
-            llm_message = prompt_manager.format_prompt(
-                "hot_topic_analysis",
-                title=topic_info.get("title", ""),
-                description=topic_info.get("description", ""),
-                additional_content=topic_info.get("additional_content", "")
-            )
-        
         # 准备聊天历史
         chat_history = []
         for msg in conversation.messages[:-1]:  # 排除刚添加的用户消息
             chat_history.append({"role": msg.role, "content": msg.content})
         
-        # 添加用于LLM处理的消息（可能是原始消息或扩展后的话题分析提示词）
-        chat_history.append({"role": MessageRoles.USER, "content": llm_message})
+        chat_history.append({"role": MessageRoles.USER, "content": message})
 
         # 从聊天历史中提取消息
-        messages = self.message_processor.prepare_chat_messages(chat_history)
+        messages = self._prepare_chat_messages(chat_history)
 
         # 保存会话和用户消息，确保在流式处理前它们已存在于数据库中
         conversation.updated_at = datetime.now()
@@ -133,14 +194,14 @@ class ChatService:
         # 处理文件内容
         if file_ids and len(file_ids) > 0:
             # 检查文件状态
-            status_response = self.file_service.check_files_status(file_ids, provider, model, conversation.id)
+            status_response = self._check_files_status(file_ids, provider, model, conversation.id)
             if status_response:
                 return status_response
                 
             # 获取文件内容并增强消息
-            file_contents = self.file_service.get_files_content(file_ids)
+            file_contents = self._get_files_content(file_ids)
             if file_contents:
-                messages = self.message_processor.enhance_with_file_content(messages, llm_message, file_contents)
+                messages = self._enhance_with_file_content(messages, message, file_contents)
 
         # 根据是否为流式响应分别处理
         if stream:
@@ -153,11 +214,8 @@ class ChatService:
         if conversation_id:
             conversation = self.memory_service.get_conversation(conversation_id, user_id)
             if conversation:
-                print(f"conversation1: {conversation}")
                 return conversation
-    
-    
-        print(f"user_id: {user_id}")
+
         # 创建新对话
         return Conversation(
             id=conversation_id or str(uuid.uuid4()),
@@ -209,32 +267,42 @@ class ChatService:
 
     async def _handle_normal_response(self, provider, model, messages, conversation_id, user_id: str, options=None, turn_id=None):
         """处理非流式响应"""
-        # 默认options
         if options is None:
             options = {}
-        
-        # 获取适合的模型处理策略
-        strategy = ModelStrategyFactory.get_strategy(provider, model, options)
-        
+
         try:
-            # 使用策略处理请求
-            ai_message, reasoning_message = await strategy.process(provider, model, messages, conversation_id, self.memory_service, options, turn_id)
-            
-            # 获取会话
+            response = await self._invoke_non_stream_model(provider, model, messages, options)
+            reasoning_message = None
+            if self._should_use_reasoning_strategy(provider, model, options):
+                reasoning_content = ""
+                if hasattr(response, "reasoning_content"):
+                    reasoning_content = response.reasoning_content
+                elif hasattr(response, "additional_kwargs") and "reasoning_content" in response.additional_kwargs:
+                    reasoning_content = response.additional_kwargs["reasoning_content"]
+                if reasoning_content:
+                    reasoning_message = Message(
+                        role=MessageRoles.ASSISTANT,
+                        type=MessageTypes.REASONING_CONTENT,
+                        content=reasoning_content,
+                        turn_id=turn_id,
+                    )
+
+            ai_content = response.content if hasattr(response, "content") else response
+            ai_message = Message(
+                role=MessageRoles.ASSISTANT,
+                type=MessageTypes.ASSISTANT_CONTENT,
+                content=ai_content,
+                turn_id=turn_id,
+            )
+
             conversation = self.memory_service.get_conversation(conversation_id, user_id)
-            
-            # 如果有推理内容，添加到会话
             if reasoning_message:
                 conversation.messages.append(reasoning_message)
-            
-            # 添加AI响应到会话
             conversation.messages.append(ai_message)
-            
-            # 更新并保存会话
             conversation.updated_at = datetime.now()
             self.memory_service.save_conversation(conversation)
-            
-            # 返回响应
+            self.db.commit()
+
             reasoning_content = reasoning_message.content if reasoning_message else ""
             return ChatResponse(
                 id=str(uuid.uuid4()),
@@ -363,7 +431,7 @@ class ChatService:
 
             return title
         except Exception as e:
-            logging.error(f"生成标题时发生错误: {str(e)}")
+            logger.error(f"生成标题时发生错误: {str(e)}")
             # 如果生成失败，返回一个默认标题
             if conversation_id:
                 return f"对话 {conversation_id[:8]}..."
@@ -441,196 +509,3 @@ class ChatService:
     def _parse_questions(self, response_text: str) -> List[str]:
         """从响应文本中解析出问题列表"""
         return ChatUtils.parse_questions(response_text)
-        
-    async def handle_function_calls(self, provider, model, messages, conversation_id, user_id: str, options=None):
-        """
-        处理函数调用流程
-        
-        参数:
-            provider: 模型提供商
-            model: 模型名称
-            messages: 聊天消息列表
-            conversation_id: 会话ID
-            user_id: 用户ID
-            options: 其他选项
-            
-        返回:
-            Chat响应对象
-        """
-        # 默认options
-        if options is None:
-            options = {}
-            
-        # 准备上下文
-        context = {
-            "db": self.db,
-            "conversation_id": conversation_id
-        }
-        
-        # 获取AI模型
-        llm = llm_manager.get_model(provider=provider, model=model)
-        
-        # 绑定工具（函数）
-        llm_with_tools = llm.bind_tools(function_adapter)
-        
-        # 构建消息链
-        chain = llm_with_tools
-        
-        # 添加用于合成工具结果的提示词
-        synthesize_prompt = SystemMessage(content=SYNTHESIZE_TOOL_RESULT_PROMPT)
-        
-        response = None
-        
-        # 初始调用
-        try:
-            # 获取会话
-            conversation = self.memory_service.get_conversation(conversation_id, user_id)
-            if not conversation:
-                logger.error(f"在函数调用中未找到会话: {conversation_id}")
-                return ChatResponse(
-                    message=Message(role="assistant", type="assistant_content", content="会话丢失，请重试。"),
-                    conversation_id=conversation_id,
-                    provider=provider,
-                    model=model
-                )
-
-            # 获取最后的用户消息
-            last_user_message = self._extract_user_message_from_messages(messages)
-
-            # 如果找到 function_call，说明是第二次进入
-            if any(isinstance(m, AIMessage) and m.tool_calls for m in messages):
-                 # 添加合成提示词，并调用LLM进行最终回答
-                final_messages = messages + [synthesize_prompt]
-                response = chain.invoke(final_messages)
-            else:
-                # 第一次进入，正常调用
-                response = chain.invoke(messages)
-
-            # 保存AI的响应（可能是函数调用或最终回答）
-            if isinstance(response, AIMessage):
-                ai_message_schema = Message(
-                    role="assistant",
-                    type="function_call" if response.tool_calls else "assistant_content",
-                    content=response.content or "",
-                    turn_id=conversation.messages[-1].turn_id if conversation.messages else None
-                )
-                
-                # 如果是函数调用，需要特殊处理
-                if response.tool_calls:
-                    # 将 tool_calls 转换为JSON字符串存储
-                    ai_message_schema.content = json.dumps([
-                        {"id": tc["id"], "name": tc["name"], "args": tc["args"]}
-                        for tc in response.tool_calls
-                    ])
-
-                conversation.messages.append(ai_message_schema)
-            
-            # 更新会话
-            self.memory_service.save_conversation(conversation)
-
-        except Exception as e:
-            logger.error(f"处理函数调用时发生错误: {e}")
-            # 返回错误信息给用户
-            return ChatResponse(
-                message=Message(role="assistant", type="assistant_content", content=f"处理函数调用时发生错误: {e}"),
-                conversation_id=conversation_id,
-                provider=provider,
-                model=model
-            )
-
-        # 如果没有函数调用，直接返回响应
-        if not isinstance(response, AIMessage) or not response.tool_calls:
-            return ChatResponse(
-                message=Message(
-                    role="assistant",
-                    type="assistant_content",
-                    content=response.content if hasattr(response, "content") else str(response)
-                ),
-                conversation_id=conversation_id,
-                provider=provider,
-                model=model
-            )
-
-        # 执行函数调用
-        tool_outputs = []
-        for tool_call in response.tool_calls:
-            function_name = tool_call["name"]
-            function_args_raw = tool_call["args"]
-            
-            # 解析函数参数
-            function_args = self._parse_function_arguments(function_args_raw)
-            
-            # 执行函数
-            try:
-                # 再次获取会话以确保数据最新
-                conversation = self.memory_service.get_conversation(conversation_id, user_id)
-                if not conversation:
-                    raise Exception("会话在函数执行期间丢失")
-                
-                # 更新上下文信息
-                context["conversation"] = conversation
-                
-                # 动态执行函数
-                selected_function = function_registry.get(function_name)
-                if not selected_function:
-                    raise Exception(f"未找到函数: {function_name}")
-                
-                # 执行函数并获取结果
-                function_result = await selected_function(**function_args, context=context)
-                
-                tool_outputs.append(
-                    ToolMessage(content=str(function_result), tool_call_id=tool_call["id"])
-                )
-            except Exception as e:
-                logger.error(f"执行函数 {function_name} 失败: {e}")
-                tool_outputs.append(
-                    ToolMessage(content=f"执行函数时出错: {e}", tool_call_id=tool_call["id"])
-                )
-
-        # 将函数执行结果添加到消息历史中
-        messages.extend(tool_outputs)
-        
-        # 再次调用，让模型根据函数结果生成最终回答
-        return await self.handle_function_calls(provider, model, messages, conversation_id, user_id, options)
-
-    async def save_stream_response(self, conversation_id: str, user_id: str, response_content: str):
-        """保存流式响应的最终结果"""
-        try:
-            conversation = self.memory_service.get_conversation(conversation_id, user_id)
-            if not conversation:
-                logger.error(f"保存流式响应时未找到会d话: {conversation_id}")
-                return
-
-            # 更新最后一条助手消息的内容
-            if conversation.messages and conversation.messages[-1].role == MessageRoles.ASSISTANT:
-                conversation.messages[-1].content = response_content
-            else:
-                # 如果最后一条不是助手消息，则创建一条新的
-                assistant_message = Message(
-                    role=MessageRoles.ASSISTANT,
-                    type=MessageTypes.ASSISTANT_CONTENT,
-                    content=response_content
-                )
-                conversation.messages.append(assistant_message)
-            
-            # 更新会话
-            conversation.updated_at = datetime.now()
-            self.memory_service.save_conversation(conversation)
-            
-        except Exception as e:
-            logger.error(f"保存流式响应失败: {e}")
-
-    def get_latest_user_message(self, conversation_id: str, user_id: str) -> Optional[Message]:
-        """获取最新的用户消息"""
-        conversation = self.memory_service.get_conversation(conversation_id, user_id)
-        if not conversation:
-            return None
-        
-        for i in range(len(conversation.messages) - 1, -1, -1):
-            if conversation.messages[i].role == MessageRoles.USER:
-                return conversation.messages[i]
-        
-        return None
-
-
-

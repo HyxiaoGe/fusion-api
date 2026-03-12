@@ -20,14 +20,12 @@ class MessageTypes:
     FUNCTION_CALL = "function_call"              # 函数调用
     FUNCTION_RESULT = "function_result"          # 函数调用结果
     WEB_SEARCH = "web_search"                    # 网络搜索结果
-    HOT_TOPICS = "hot_topics"                    # 热点话题信息
 
 
 # 函数名称常量
 class FunctionNames:
     """函数名称常量类"""
     WEB_SEARCH = "web_search"
-    HOT_TOPICS = "hot_topics"
 
 
 # 消息文本常量
@@ -48,11 +46,9 @@ class MessageTexts:
 # 用户友好的函数调用描述常量
 USER_FRIENDLY_FUNCTION_DESCRIPTIONS = {
     FunctionNames.WEB_SEARCH: "我需要搜索网络获取最新信息...",
-    FunctionNames.HOT_TOPICS: "我将查询最新的热点话题...",
 }
 
 # 函数描述常量（内部使用）
 FUNCTION_DESCRIPTIONS = {
     FunctionNames.WEB_SEARCH: "我需要搜索网络获取更多信息...",
-    FunctionNames.HOT_TOPICS: "我将查询最新的热点话题...",
-} 
+}

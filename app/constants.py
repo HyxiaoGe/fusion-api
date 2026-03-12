@@ -13,4 +13,3 @@ class MessageTypes:
     FUNCTION_CALL = "function_call"              # 函数调用
     FUNCTION_RESULT = "function_result"          # 函数调用结果
     WEB_SEARCH = "web_search"                    # 网络搜索结果
-    HOT_TOPICS = "hot_topics"                    # 热点话题信息 

@@ -157,7 +157,6 @@ class FunctionCallProcessor:
         # 第三阶段：处理函数结果
         function_handlers = {
             FunctionNames.WEB_SEARCH: self._handle_web_search_function,
-            FunctionNames.HOT_TOPICS: self._handle_hot_topics_function,
         }
         
         handler = function_handlers.get(function_name)
@@ -403,87 +402,6 @@ class FunctionCallProcessor:
 
         # 4. 流式返回 LLM 的最终回复
         logger.info(f"{function_name}_handler: Preparing for second LLM stream to generate final answer.")
-        final_response = ""
-        results = []
-        async for result in StreamProcessor.process_llm_stream_with_reasoning(
-            llm, second_llm_messages, send_event, use_reasoning, is_function_call_second_stage=True
-        ):
-            results.append(result)
-            # 传递所有事件给前端
-            yield result
-        
-        # 最后一个结果应该是 final_response
-        if results and isinstance(results[-1], str) and not results[-1].startswith("data: "):
-            final_response = results[-1]
-            logger.info(f"捕获到最终响应，长度: {len(final_response)}")
-
-        # 5. 保存完整对话历史
-        await self._save_function_call_stream_response(
-            conversation_id=conversation_id,
-            function_name=function_name,
-            function_args=valid_arguments_str,
-            function_result=function_result,
-            final_response=final_response,
-            turn_id=turn_id,
-            user_id=options.get("user_id"),
-            first_llm_thought=function_call_data.get("first_llm_thought")
-        )
-
-        # 6. 完成标志
-        yield await send_event(EventTypes.DONE)
-
-    async def _handle_hot_topics_function(self, send_event, function_call_data, function_result, 
-                                          conversation_id, llm, messages, options, provider, model, turn_id):
-        """处理hot_topics函数的专门处理器"""
-        function_name = FunctionNames.HOT_TOPICS
-        use_reasoning = options.get("use_reasoning", False)
-        
-        # 1. 先将 function_result 以 function_result 类型消息返回前端
-        yield await send_event(EventTypes.FUNCTION_RESULT, {
-            "function_type": function_name,
-            "result": function_result
-        })
-
-        # --- 开始为第二次LLM调用构建新的消息列表 (Similar to _handle_web_search_function) ---
-
-        # 1. 获取用户原始提问
-        original_user_query = ChatUtils.extract_original_user_query(messages)
-
-        # 2. 构建第二次LLM调用的消息列表
-        second_llm_messages = StreamProcessor.create_tool_synthesis_messages(
-            original_user_query, function_name, function_result, provider, model, use_reasoning
-        )
-
-        original_tool_call_id = function_call_data.get("tool_call_id", f"call_{uuid.uuid4()}")
-        # 确保tool_call_id不为None或空字符串
-        if original_tool_call_id is None or original_tool_call_id == "":
-            original_tool_call_id = f"call_{uuid.uuid4()}"
-        
-        valid_arguments_str = ChatUtils.validate_and_process_function_arguments(function_call_data)
-        first_llm_thought_content = function_call_data.get("first_llm_thought", None)
-
-        assistant_tool_call_dict = {
-            "id": original_tool_call_id,
-            "type": "function",
-            "function": {
-                "name": function_name,
-                "arguments": valid_arguments_str
-            }
-        }
-        
-        ai_message_content = first_llm_thought_content if first_llm_thought_content and first_llm_thought_content.strip() else None
-        
-        current_assistant_message_dict = {
-            "role": MessageRoles.ASSISTANT,
-            "content": ai_message_content,
-            "tool_calls": [assistant_tool_call_dict]
-        }
-        second_llm_messages.append(current_assistant_message_dict)
-
-        tool_message_content = json.dumps(function_result, ensure_ascii=False)
-        second_llm_messages.append(ToolMessage(content=tool_message_content, tool_call_id=original_tool_call_id).dict())
-
-        # 4. 流式返回 LLM 的最终回复
         final_response = ""
         results = []
         async for result in StreamProcessor.process_llm_stream_with_reasoning(

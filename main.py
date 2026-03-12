@@ -7,11 +7,10 @@ from contextlib import asynccontextmanager
 import asyncio
 import time
 from app.core.config import settings
-from app.api import chat, settings as settings_api, prompts, files, hot_topics, scheduled_tasks, web_search, models, credentials, rss, auth, users, digests
+from app.api import chat, files, models, auth
 from app.core.logger import app_logger
 from app.db.init_db import init_db
 from app.db.database import SessionLocal
-from app.services.scheduler_service import SchedulerService
 from app.core.function_manager import init_function_registry
 
 
@@ -54,11 +53,6 @@ async def lifespan(app: FastAPI):
         
         # 初始化函数注册表
         init_function_registry()
-
-        # 启动调度器
-        scheduler = SchedulerService()
-        scheduler.start()
-        app_logger.info("调度器启动完成")
         yield
         # 应用关闭时的清理工作
         app_logger.info("应用关闭中...")
@@ -117,17 +111,8 @@ async def health_check():
 # 注册路由
 app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 app.include_router(files.router, prefix="/api/files", tags=["files"])
-app.include_router(settings_api.router, prefix="/api/settings", tags=["settings"])
-app.include_router(prompts.router, prefix="/api/prompts", tags=["prompts"])
-app.include_router(hot_topics.router, prefix="/api/topics", tags=["topics"])
-app.include_router(scheduled_tasks.router, prefix="/api/scheduled-tasks", tags=["scheduled-tasks"])
-app.include_router(web_search.router, prefix="/api/web_search", tags=["web_search"])
 app.include_router(models.router, prefix="/api/models", tags=["models"])
-app.include_router(credentials.router, prefix="/api/credentials", tags=["credentials"])
-app.include_router(rss.router, prefix="/api/rss", tags=["rss"])
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
-app.include_router(users.router, prefix="/api/users", tags=["users"])
-app.include_router(digests.router, prefix="/api/digests", tags=["digests"])
 
 if __name__ == "__main__":
     import uvicorn

@@ -1,8 +1,8 @@
 import uuid
 from datetime import datetime, timezone, timedelta
 
-from sqlalchemy import Column, String, Integer, Text, ForeignKey, DateTime, Date, JSON, Boolean, Float, UniqueConstraint
-from sqlalchemy.orm import relationship, backref
+from sqlalchemy import Column, String, Integer, Text, ForeignKey, DateTime, JSON, Boolean, UniqueConstraint
+from sqlalchemy.orm import relationship
 
 from app.db.database import Base
 
@@ -25,8 +25,6 @@ class User(Base):
     social_accounts = relationship('SocialAccount', back_populates='user', cascade='all, delete-orphan')
     conversations = relationship('Conversation', back_populates='user', cascade='all, delete-orphan')
     files = relationship('File', back_populates='user', cascade='all, delete-orphan')
-    rss_sources = relationship('RssSource', back_populates='user', cascade='all, delete-orphan')
-    prompt_templates = relationship('PromptTemplate', back_populates='user', cascade='all, delete-orphan')
 
 
 class SocialAccount(Base):
@@ -96,94 +94,13 @@ class Message(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     conversation_id = Column(String, ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False)
     role = Column(String, nullable=False)  # 'user', 'assistant', 'system'
-    type = Column(String, nullable=False)  # 'user_query', 'assistant_content', 'reasoning_content', 'function_call', 'function_result', 'web_search', 'hot_topics'
+    type = Column(String, nullable=False)  # 'user_query', 'assistant_content', 'reasoning_content', 'function_call', 'function_result', 'web_search'
     content = Column(Text, nullable=True)  # 允许为空，reasoning_content 初始时可能为空
     turn_id = Column(String, nullable=True)  # 对话轮次ID，使用该轮对话中用户消息的ID
     duration = Column(Integer, nullable=False, default=0)  # 处理耗时(毫秒)，默认为0
     created_at = Column(DateTime, default=get_china_time)
 
-    # 建立与Conversation的关系
     conversation = relationship("Conversation", back_populates="messages")
-
-
-class HotTopic(Base):
-    __tablename__ = "hot_topics"
-    
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    title = Column(String, nullable=False)
-    description = Column(Text, nullable=True)
-    source = Column(String, nullable=False)  # 来源，如"36氪"
-    category = Column(String, nullable=True)  # 分类，如"科技"、"财经"
-    url = Column(String, nullable=True)  # 原文链接
-    published_at = Column(DateTime, nullable=True)  # 发布时间
-    created_at = Column(DateTime, default=get_china_time)
-    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
-    view_count = Column(Integer, default=0)  # 浏览次数，用于排序
-
-
-class RssSource(Base):
-    __tablename__ = "rss_sources"
-    
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=True, index=True)
-    name = Column(String, nullable=False, unique=True)
-    url = Column(String, nullable=False, unique=True)
-    description = Column(String, nullable=True)
-    category = Column(String, nullable=True)
-    is_enabled = Column(Boolean, default=True)
-    
-    # 过滤规则
-    filter_apply = Column(String, nullable=True)  # 应用于: title, description, ...
-    filter_type = Column(String, nullable=True)   # 过滤类型: include, exclude, ...
-    filter_rule = Column(String, nullable=True)   # 规则: 关键字或正则表达式
-    
-    created_at = Column(DateTime, default=get_china_time)
-    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
-
-    user = relationship('User', back_populates='rss_sources')
-    
-    def to_dict(self):
-        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
-
-
-class ScheduledTask(Base):
-    __tablename__ = "scheduled_tasks"
-    
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    name = Column(String, nullable=False, unique=True)  # 任务名称，如"rss_hot_topics_update"
-    description = Column(Text, nullable=True)  # 任务描述
-    status = Column(String, nullable=False, default="active")  # 任务状态：active, paused
-    interval = Column(Integer, nullable=False)  # 间隔时间（秒）
-    last_run_at = Column(DateTime, nullable=True)  # 上次执行时间
-    next_run_at = Column(DateTime, nullable=True)  # 下次执行时间
-    params = Column(JSON, nullable=True)  # 任务参数，以JSON格式存储
-    created_at = Column(DateTime, default=get_china_time)
-    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
-    
-    # 额外字段用于存储任务特定数据
-    task_data = Column(JSON, nullable=True)  # 如已处理的URL等
-
-
-class PromptTemplate(Base):
-    __tablename__ = "prompt_templates"
-
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=True, index=True)
-    title = Column(String, nullable=False)
-    content = Column(Text, nullable=False)
-    tags = Column(JSON, default=list)
-    created_at = Column(DateTime, default=get_china_time)
-    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
-
-    user = relationship('User', back_populates='prompt_templates')
-
-
-class Setting(Base):
-    __tablename__ = "settings"
-
-    key = Column(String, primary_key=True)
-    value = Column(JSON, nullable=False)
-    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
 
 
 class ModelSource(Base):
@@ -229,59 +146,3 @@ class ModelCredential(Base):
     __table_args__ = (
         UniqueConstraint('model_id', 'name', name='uix_model_credential_name'),
     )
-
-
-class DailyTopicDigest(Base):
-    """每日话题聚合摘要"""
-    __tablename__ = "daily_topic_digests"
-    
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    date = Column(Date, nullable=False, index=True)  # 聚合日期
-    category = Column(String, nullable=False)  # 领域分类：AI、科技、财经、社会等
-    
-    # 聚合信息
-    cluster_title = Column(String, nullable=False)  # 聚类主题标题，如"AI大模型技术突破"
-    cluster_summary = Column(Text, nullable=True)  # 主题摘要
-    key_points = Column(JSON, default=list)  # 关键要点列表 ["GPT-5发布", "开源模型崛起", ...]
-    
-    # 相关话题
-    topic_ids = Column(JSON, default=list)  # 相关的hot_topic id列表
-    topic_count = Column(Integer, default=0)  # 话题数量
-    
-    # 向量信息（可选，用于相似度计算）
-    cluster_vector = Column(JSON, nullable=True)  # 聚类中心向量
-    
-    # 热度信息
-    heat_score = Column(Float, default=0.0)  # 热度分数
-    view_count = Column(Integer, default=0)  # 查看次数
-    
-    # 排序和展示
-    display_order = Column(Integer, default=0)  # 展示顺序
-    is_featured = Column(Boolean, default=False)  # 是否精选
-    
-    created_at = Column(DateTime, default=get_china_time)
-    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
-    
-    # 添加唯一约束，确保每天每个分类只有一个聚合
-    __table_args__ = (
-        UniqueConstraint('date', 'category', name='_date_category_uc'),
-    )
-
-
-class TopicClusterItem(Base):
-    """话题聚类项 - 存储具体的聚类详情"""
-    __tablename__ = "topic_cluster_items"
-    
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    digest_id = Column(String, ForeignKey('daily_topic_digests.id', ondelete='CASCADE'), nullable=False)
-    hot_topic_id = Column(String, ForeignKey('hot_topics.id', ondelete='CASCADE'), nullable=False)
-    
-    # 在聚类中的信息
-    similarity_score = Column(Float, default=0.0)  # 与聚类中心的相似度
-    is_representative = Column(Boolean, default=False)  # 是否是代表性话题
-    
-    created_at = Column(DateTime, default=get_china_time)
-    
-    # 关系
-    digest = relationship("DailyTopicDigest", backref="cluster_items")
-    hot_topic = relationship("HotTopic")

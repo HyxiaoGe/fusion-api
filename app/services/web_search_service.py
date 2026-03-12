@@ -1,7 +1,9 @@
-import httpx
-import logging
 import asyncio
+import logging
 from typing import List, Dict, Any
+
+import httpx
+
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -29,6 +31,10 @@ class WebSearchService:
         try:
             logger.info(f"执行网络搜索: query='{query}', limit={limit}")
 
+            if not self.api_key or not self.search_endpoint:
+                logger.warning("网络搜索未配置 API key 或 endpoint，跳过搜索")
+                return []
+
             # 构建请求参数
             params = {
                 "api_key": self.api_key,
@@ -51,11 +57,9 @@ class WebSearchService:
                         
                         # 解析响应
                         results = response.json()
-                        
-                        print(f"results: {results}")
 
                         # 解析响应
-                        webpages = results.get("organic_results", {})
+                        webpages = results.get("organic_results", [])
                         
                         # 提取搜索结果
                         formatted_results = []
@@ -81,7 +85,6 @@ class WebSearchService:
                         
         except Exception as e:
             logger.error(f"网络搜索失败: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.exception("网络搜索异常详情")
             return []
                     

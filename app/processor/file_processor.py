@@ -13,18 +13,7 @@ class FileProcessor:
 
     def __init__(self):
         self.model = "qwen-omni-turbo"
-
-        try:
-            pass
-            # from openai import OpenAI
-            # self.client = OpenAI(
-            #     api_key=os.getenv("DASHSCOPE_API_KEY"),
-            #     base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
-            # )
-            # logger.info(f"通义千问视觉模型初始化成功: {self.model}")
-        except Exception as e:
-            logger.error(f"初始化通义千问视觉模型失败: {e}")
-            raise e
+        self.client = None
 
     async def process_files(
             self,
@@ -53,6 +42,14 @@ class FileProcessor:
                 mime_type = mime_types[i] if mime_types and i < len(mime_types) else self._guess_mime_type(path)
                 file_data = self._prepare_file_data(path, mime_type)
                 files_data.append(file_data)
+
+            text_only_content = self._build_text_only_content(files_data)
+            if text_only_content is not None:
+                return {
+                    "content": text_only_content,
+                    "model": "local-text-extraction",
+                }
+
             # 构造提示信息
             prompt = self._build_prompt(query, files_data)
             # 调用模型
@@ -66,12 +63,35 @@ class FileProcessor:
 
         except Exception as e:
             logger.error(f"处理文件失败: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.exception("文件处理异常详情")
             return {
                 "content": f"处理文件时发生错误: {str(e)}",
                 "error": str(e)
             }
+
+    def _build_text_only_content(self, files_data: List[Dict[str, Any]]) -> Optional[str]:
+        """对纯文本类文件直接返回本地提取内容，避免依赖外部视觉模型。"""
+        if not files_data:
+            return ""
+
+        extracted_sections = []
+        for index, file_data in enumerate(files_data, start=1):
+            if file_data["mime_type"].startswith("image/"):
+                return None
+
+            extracted_text = file_data.get("extracted_text")
+            if not extracted_text:
+                return None
+
+            normalized_text = extracted_text.strip()
+            if len(normalized_text) > 6000:
+                normalized_text = normalized_text[:6000] + "...(内容过长已截断)"
+
+            extracted_sections.append(
+                f"文件 {index}: {file_data['file_name']} (类型: {file_data['mime_type']})\n{normalized_text}"
+            )
+
+        return "\n\n".join(extracted_sections)
 
     def _prepare_file_data(self, file_path: str, mime_type: str) -> Dict[str, Any]:
         """准备文件数据"""
@@ -85,7 +105,8 @@ class FileProcessor:
                 return {
                     "file_name": os.path.basename(file_path),
                     "mime_type": mime_type,
-                    "content": b64_content
+                    "content": b64_content,
+                    "extracted_text": extracted_text,
                 }
         except Exception as e:
             logger.error(f"准备文件数据失败 {file_path}: {e}")
@@ -216,6 +237,9 @@ class FileProcessor:
     async def _call_model(self, prompt: str, files_data: List[Dict[str, Any]]) -> str:
         """使用通义千问视觉模型处理文件"""
         try:
+            if self.client is None:
+                raise RuntimeError("文件解析模型未配置")
+
             # 构建消息内容
             messages = [
                 {
@@ -272,8 +296,7 @@ class FileProcessor:
                                 full_response += delta.content
                 except Exception as e:
                     logger.error(f"处理流式响应时出错: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
+                    logger.exception("文件流式响应异常详情")
 
             # 处理流式响应
             await process_stream()
@@ -288,6 +311,5 @@ class FileProcessor:
 
         except Exception as e:
             logger.error(f"调用千问视觉模型失败: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.exception("文件模型调用异常详情")
             raise

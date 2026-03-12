@@ -1,22 +1,17 @@
 import asyncio
 import json
-import logging
 from datetime import datetime
-from typing import List, Dict, Any, AsyncGenerator, Callable, Optional
+from typing import AsyncGenerator, Optional
 
 from app.ai.llm_manager import llm_manager
-from app.schemas.chat import Message, Conversation
-from app.services.message_processor import MessageProcessor
+from app.schemas.chat import Message
 from app.core.logger import app_logger as logger
-from openai import AsyncOpenAI
-import inspect
 from app.constants import MessageRoles, MessageTypes
 
 class StreamHandler:
     def __init__(self, db, memory_service):
         self.db = db
         self.memory_service = memory_service
-        self.message_processor = MessageProcessor(db)
 
     async def _create_placeholder_message(self, conversation_id: str, message_type: str, turn_id: Optional[str]) -> Message:
         """在数据库中创建一个空的占位消息并返回"""
@@ -74,27 +69,7 @@ class StreamHandler:
             self.memory_service.update_message(message_id, update_data)
             self.db.commit()  # 提交事务，确保数据持久化
         except Exception as e:
-            logging.error(f"更新流式响应失败: {str(e)}")
-
-    async def save_stream_response(self, conversation_id, response_text, turn_id=None):
-        """保存流式响应到对话历史 - 此方法将在后续被废弃"""
-        try:
-            conversation = self.memory_service.get_conversation(conversation_id)
-            if conversation:
-                # 创建并添加AI响应消息
-                ai_message = Message(
-                    role=MessageRoles.ASSISTANT,
-                    type=MessageTypes.ASSISTANT_CONTENT,
-                    content=response_text,
-                    turn_id=turn_id
-                )
-                conversation.messages.append(ai_message)
-                conversation.updated_at = datetime.now()
-
-                # 保存到数据库
-                self.memory_service.save_conversation(conversation)
-        except Exception as e:
-            logging.error(f"保存流式响应失败: {str(e)}")
+            logger.error(f"更新流式响应失败: {str(e)}")
 
     async def generate_reasoning_stream(self, provider, model, messages, conversation_id, options=None, turn_id=None) -> AsyncGenerator:
         """生成带推理功能的流式响应，适用于支持推理能力的模型"""
@@ -231,7 +206,7 @@ class StreamHandler:
                 # 保存到数据库
                 self.memory_service.save_conversation(conversation)
         except Exception as e:
-            logging.error(f"保存推理流式响应失败: {str(e)}")
+            logger.error(f"保存推理流式响应失败: {str(e)}")
 
     async def direct_reasoning_stream(self, provider, model, messages, conversation_id, options=None, turn_id=None) -> AsyncGenerator:
         """直接使用OpenAI客户端生成带推理功能的流式响应，绕过LangChain"""

@@ -34,6 +34,11 @@ oauth.register(
     client_kwargs={'scope': 'email profile'},
 )
 
+
+@router.get("/me", response_model=UserSchema)
+async def read_current_user(current_user: UserModel = Depends(security.get_current_user)):
+    return current_user
+
 @router.get("/login/{provider}")
 async def login(request: Request, provider: str):
     try:

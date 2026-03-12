@@ -1,8 +1,8 @@
-# Fusion API - AI聊天集成平台
+# Fusion API - Chat Core
 
 ## 📖 项目介绍
 
-Fusion API 是一个 AI 聊天集成平台，提供统一的 API 接口来访问多种大型语言模型（LLM）。系统支持流式响应、函数调用、文件处理等功能。
+Fusion API 是 Fusion 的聊天核心后端，提供认证、模型管理、会话管理、流式回复和文件辅助聊天能力。
 
 ## ✨ 主要功能
 
@@ -10,19 +10,13 @@ Fusion API 是一个 AI 聊天集成平台，提供统一的 API 接口来访问
 - **多模型支持**：集成 DeepSeek、OpenAI、Google、Anthropic、通义千问、文心一言、火山引擎、讯飞星火等模型
 - **流式响应**：支持实时流式输出，提供更好的用户体验
 - **会话管理**：保存完整的对话历史，支持多轮对话
-- **推理模式**：支持 DeepSeek 等模型的思维链推理功能
-
-### 高级功能
-- **函数调用**：支持模型调用外部函数，如网络搜索、获取热点话题等
 - **文件处理**：支持上传和处理 PDF、Word、文本等格式文件
-- **提示词模板**：内置多种提示词模板，支持自定义
-- **用户认证**：支持用户注册、登录、Google OAuth 等
+- **用户认证**：支持 GitHub / Google OAuth 和 JWT
+- **模型管理**：动态配置和管理不同的 AI 模型
 
 ### 实用功能
 - **自动生成标题**：基于对话内容智能生成对话标题
 - **推荐问题**：根据当前对话生成相关的推荐问题
-- **热点话题**：通过 RSS 源获取和展示热点新闻
-- **模型管理**：动态配置和管理不同的 AI 模型
 
 ## 🔧 技术栈
 
@@ -44,10 +38,14 @@ cd fusion-api
 ```
 
 2. 配置环境变量
-创建 `.env` 文件，配置必要的 API 密钥：
+创建 `.env` 文件，配置数据库、OAuth 和至少一个模型凭证：
 ```env
 # 数据库配置
 DATABASE_URL=postgresql://fusion:fusion123!!@fusion_postgres:5432/fusion
+
+# OAuth
+GITHUB_CLIENT_ID=your_github_client_id
+GITHUB_CLIENT_SECRET=your_github_client_secret
 
 # AI 模型 API 密钥（根据需要配置）
 DEEPSEEK_API_KEY=your_deepseek_key
@@ -76,12 +74,7 @@ pip install -r requirements.txt
 2. 配置数据库
 确保 PostgreSQL 已安装并创建数据库
 
-3. 运行数据库迁移
-```bash
-python app/tools/sync_db.py
-```
-
-4. 启动应用
+3. 启动应用
 ```bash
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
@@ -97,7 +90,6 @@ POST /api/chat/send
   "message": "你好",
   "stream": true,
   "options": {
-    "use_function_calls": true,
     "use_reasoning": true
   }
 }
@@ -116,11 +108,11 @@ POST /api/chat/generate-title
 }
 ```
 
-## ⚠️ 已知问题
+## 当前范围
 
-- 函数调用结果保存需要确保数据库事务正确提交
-- 部分模型的流式响应处理可能存在兼容性问题
-- 用户认证系统还在完善中
+- 默认运行面仅暴露 `chat / auth / files / models`
+- RSS、热点、摘要、调度等内容平台能力已退出当前主产品范围
+- `web search` 和 `function call` 作为后续可控增强能力保留在代码边缘，不是当前默认产品面
 
 ## 🤝 贡献
 

@@ -16,8 +16,7 @@ class Message(BaseModel):
         "reasoning_content", 
         "function_call", 
         "function_result", 
-        "web_search", 
-        "hot_topics"
+        "web_search"
     ]  # 限制为预定义的消息类型
     content: str
     turn_id: Optional[str] = Field(None, description="对话轮次ID，使用该轮对话中用户消息的ID")
@@ -39,7 +38,6 @@ class ChatRequest(BaseModel):
     model: str
     message: str
     conversation_id: Optional[str] = None
-    topic_id: Optional[str] = None
     stream: bool = False
     options: Optional[Dict[str, Any]] = None
     file_ids: Optional[List[str]] = None

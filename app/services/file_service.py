@@ -3,7 +3,7 @@ import json
 import os
 import uuid
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import aiofiles
 from fastapi import UploadFile
@@ -112,7 +112,7 @@ class FileService:
                 }
 
                 # 保存到数据库
-                saved_file = self.file_repo.create_file(file_record)
+                self.file_repo.create_file(file_record)
                 self.file_repo.link_file_to_conversation(conversation_id, file_id)
 
                 file_ids.append(file_id)
@@ -145,15 +145,6 @@ class FileService:
                 logger.warning(f"要解析的文件不存在: {file_id}")
                 return
 
-            # 更新文件状态为解析中
-            self.file_repo.update_file(
-                file_id=file_id,
-                updates={
-                    "status": "processed",
-                    "processing_result": {"status": "success", "timestamp": datetime.now().isoformat()}
-                }
-            )
-
             # 使用文件处理器解析文件
             response = await self.file_processor.process_files(
                 file_paths=[file_path],
@@ -162,12 +153,14 @@ class FileService:
             )
 
             # 获取解析结果
-            parsed_content = response.get("content", "无法解析文件内容")
+            error_message = response.get("error")
+            if error_message:
+                raise RuntimeError(error_message)
 
-            if isinstance(parsed_content, (dict, list)):
-                parsed_content = json.dumps(parsed_content, ensure_ascii=False)
+            parsed_content = self._normalize_parsed_content(response.get("content"))
+            if not parsed_content:
+                raise ValueError("无法解析文件内容")
 
-            # 更新文件状态和解析结果
             self.file_repo.update_file(
                 file_id=file_id,
                 updates={
@@ -190,6 +183,17 @@ class FileService:
                 }
             )
 
+    @staticmethod
+    def _normalize_parsed_content(content: Any) -> Optional[str]:
+        """将解析结果规范化为可持久化文本。"""
+        if content is None:
+            return None
+        if isinstance(content, (dict, list)):
+            return json.dumps(content, ensure_ascii=False)
+
+        text = str(content).strip()
+        return text or None
+
     def _get_file_parsing_prompt(self, mimetype: str, filename: str) -> str:
         """根据文件类型生成解析提示词"""
         if mimetype.startswith("image/"):
@@ -211,15 +215,6 @@ class FileService:
             "status": file.status,
             "processing_result": file.processing_result,
         }
-
-    def get_parsed_file_content(self, file_ids: List[str]) -> Dict[str, str]:
-        """获取文件的解析内容，用于后续对话"""
-        result = {}
-        for file_id in file_ids:
-            file = self.file_repo.get_file_by_id(file_id)
-            if file and file.status == "processed" and file.parsed_content:
-                result[file_id] = file.parsed_content
-        return result
 
     def get_conversation_files(self, conversation_id: str) -> List[Dict[str, Any]]:
         """获取对话关联的所有文件信息"""

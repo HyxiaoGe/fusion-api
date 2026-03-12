@@ -3,9 +3,9 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from app.ai.prompts import prompt_manager
 from app.db.database import get_db
 from app.db.models import User
+from app.core.logger import app_logger
 from app.schemas.chat import ChatRequest, Conversation, TitleGenerationRequest, TitleGenerationResponse, SuggestedQuestionsRequest, SuggestedQuestionsResponse, MessageUpdateRequest, Message
 from app.services.chat_service import ChatService
 from app.core.security import get_current_user
@@ -17,32 +17,8 @@ router = APIRouter()
 async def send_message(request: ChatRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """发送消息到指定的AI模型并获取响应"""
 
-    # 处理话题相关逻辑
-    topic_info = None
-    original_message = request.message  # 保存原始消息
-    
-    if request.topic_id:
-        from app.services.hot_topic_service import HotTopicService
-        hot_topic_service = HotTopicService(db)
-        topic = hot_topic_service.get_topic_by_id(request.topic_id)
-        if topic:
-            # 保存话题信息，传递给ChatService处理
-            topic_info = {
-                "title": topic.title,
-                "description": topic.description or "",
-                "additional_content": ""
-            }
-            
-            # 如果用户消息就是话题标题，自动构造完整的分析请求
-            if request.message.strip() == topic.title.strip():
-                request.message = f"请帮我分析以下热点话题： {topic.title}"
-            
-            # 增加浏览计数
-            hot_topic_service.increment_view_count(request.topic_id)
-
     chat_service = ChatService(db)
     try:
-        print(f"userID: {current_user.id}")
         response = await chat_service.process_message(
             user_id=current_user.id,
             provider=request.provider,
@@ -52,11 +28,10 @@ async def send_message(request: ChatRequest, db: Session = Depends(get_db), curr
             stream=request.stream,
             options=request.options,
             file_ids=request.file_ids,
-            topic_info=topic_info  # 传递话题信息用于LLM处理
         )
         return response
     except Exception as e:
-        print(f"处理过程中出错: {str(e)}")
+        app_logger.exception("处理聊天请求失败")
         raise HTTPException(status_code=500, detail=str(e))
 
 
