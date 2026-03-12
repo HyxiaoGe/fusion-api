@@ -1,6 +1,5 @@
 import asyncio
 import json
-from datetime import datetime
 from typing import AsyncGenerator, Optional
 
 from app.ai.llm_manager import llm_manager
@@ -12,6 +11,97 @@ class StreamHandler:
     def __init__(self, db, memory_service):
         self.db = db
         self.memory_service = memory_service
+
+    @staticmethod
+    def _create_stream_event_sender(conversation_id: str):
+        """创建统一的 SSE 事件发送器。"""
+        async def send_event(event_type, content=None, message_id=None):
+            data = {"type": event_type, "conversation_id": conversation_id}
+            if content is not None:
+                data["content"] = content
+            if message_id:
+                data["message_id"] = message_id
+            return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+        return send_event
+
+    @staticmethod
+    def _build_done_event(conversation_id: str, message_id: str, reasoning_message_id: Optional[str] = None) -> str:
+        """构造统一的 done 事件。"""
+        data = {
+            "type": "done",
+            "conversation_id": conversation_id,
+            "message_id": message_id,
+        }
+        if reasoning_message_id:
+            data["reasoning_message_id"] = reasoning_message_id
+        return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    @staticmethod
+    def _normalize_direct_stream_messages(messages) -> list[dict]:
+        """将多种消息对象归一化为 OpenAI 兼容消息格式。"""
+        openai_messages = []
+
+        for msg in messages:
+            msg_dict = None
+
+            try:
+                if hasattr(msg, "dict") and callable(msg.dict):
+                    msg_dict = msg.dict()
+                elif hasattr(msg, "model_dump") and callable(msg.model_dump):
+                    msg_dict = msg.model_dump()
+
+                if msg_dict and "type" in msg_dict:
+                    msg_type = msg_dict.get("type", "")
+                    msg_content = msg_dict.get("content", "")
+
+                    if msg_type == "human":
+                        openai_messages.append({"role": "user", "content": msg_content})
+                    elif msg_type == "ai":
+                        openai_messages.append({"role": "assistant", "content": msg_content})
+                    elif msg_type == "system":
+                        openai_messages.append({"role": "system", "content": msg_content})
+                    continue
+            except Exception as e:
+                logger.error(f"尝试获取消息字典时出错: {e}")
+
+            class_name = msg.__class__.__name__
+            if class_name == "HumanMessage":
+                openai_messages.append({"role": "user", "content": msg.content})
+            elif class_name == "AIMessage":
+                openai_messages.append({"role": "assistant", "content": msg.content})
+            elif class_name == "SystemMessage":
+                openai_messages.append({"role": "system", "content": msg.content})
+            elif hasattr(msg, "type") and hasattr(msg, "content"):
+                if msg.type == "human":
+                    openai_messages.append({"role": "user", "content": msg.content})
+                elif msg.type == "ai":
+                    openai_messages.append({"role": "assistant", "content": msg.content})
+                elif msg.type == "system":
+                    openai_messages.append({"role": "system", "content": msg.content})
+                else:
+                    logger.warning(f"无法识别的消息 type: {msg.type}")
+            elif hasattr(msg, "role") and hasattr(msg, "content"):
+                openai_messages.append({"role": msg.role, "content": msg.content})
+            elif isinstance(msg, dict) and "role" in msg and "content" in msg:
+                openai_messages.append(msg)
+            else:
+                logger.warning(f"无法识别的消息格式: {type(msg)}")
+
+        return openai_messages
+
+    async def _persist_stream_placeholders(
+        self,
+        assistant_message_id: str,
+        answer_text: str,
+        reasoning_message_id: Optional[str] = None,
+        reasoning_text: str = "",
+    ):
+        """将流式阶段收集的内容写回占位消息。"""
+        if reasoning_message_id and reasoning_text:
+            await self.update_stream_response(reasoning_message_id, reasoning_text)
+        if answer_text:
+            await self.update_stream_response(assistant_message_id, answer_text)
 
     async def _create_placeholder_message(self, conversation_id: str, message_type: str, turn_id: Optional[str]) -> Message:
         """在数据库中创建一个空的占位消息并返回"""
@@ -54,12 +144,7 @@ class StreamHandler:
         await self.update_stream_response(assistant_message_id, full_response)
         
         # 4. 发送结束信号
-        done_data = {
-            "content": "[DONE]",
-            "conversation_id": conversation_id,
-            "message_id": assistant_message_id
-        }
-        yield f"data: {json.dumps(done_data)}\n\n"
+        yield f"data: {json.dumps({'content': '[DONE]', 'conversation_id': conversation_id, 'message_id': assistant_message_id})}\n\n"
         
 
     async def update_stream_response(self, message_id: str, response_text: str):
@@ -80,14 +165,7 @@ class StreamHandler:
         reasoning_message = await self._create_placeholder_message(conversation_id, MessageTypes.REASONING_CONTENT, turn_id)
         assistant_message = await self._create_placeholder_message(conversation_id, MessageTypes.ASSISTANT_CONTENT, turn_id)
 
-        # 构造发送事件的辅助函数
-        async def send_event(event_type, content=None, message_id=None):
-            data = {"type": event_type, "conversation_id": conversation_id}
-            if content is not None:
-                data["content"] = content
-            if message_id:
-                data["message_id"] = message_id
-            return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+        send_event = self._create_stream_event_sender(conversation_id)
 
         yield await send_event("reasoning_start", message_id=reasoning_message.id)
         
@@ -164,49 +242,15 @@ class StreamHandler:
         yield await send_event("answering_complete", message_id=assistant_message.id)
 
         # 更新数据库中的占位消息
-        if reasoning_result:
-            await self.update_stream_response(reasoning_message.id, reasoning_result)
-        if answer_result:
-            await self.update_stream_response(assistant_message.id, answer_result)
+        await self._persist_stream_placeholders(
+            assistant_message.id,
+            answer_result,
+            reasoning_message.id,
+            reasoning_result,
+        )
 
         # 完成标志
-        done_data = {
-            "type": "done",
-            "conversation_id": conversation_id,
-            "message_id": assistant_message.id,
-            "reasoning_message_id": reasoning_message.id,
-        }
-        yield f"data: {json.dumps(done_data, ensure_ascii=False)}\n\n"
-
-    async def save_stream_response_with_reasoning(self, conversation_id, response_text, reasoning_text, turn_id=None):
-        """保存流式响应和推理过程到对话历史 - 此方法将在后续被废弃"""
-        try:
-            conversation = self.memory_service.get_conversation(conversation_id)
-            if conversation:
-                # 如果有推理内容，创建推理消息
-                if reasoning_text:
-                    reasoning_message = Message(
-                        role=MessageRoles.ASSISTANT,
-                        type=MessageTypes.REASONING_CONTENT,
-                        content=reasoning_text,
-                        turn_id=turn_id
-                    )
-                    conversation.messages.append(reasoning_message)
-
-                # 创建并添加AI响应消息
-                ai_message = Message(
-                    role=MessageRoles.ASSISTANT,
-                    type=MessageTypes.ASSISTANT_CONTENT,
-                    content=response_text,
-                    turn_id=turn_id
-                )
-                conversation.messages.append(ai_message)
-                conversation.updated_at = datetime.now()
-
-                # 保存到数据库
-                self.memory_service.save_conversation(conversation)
-        except Exception as e:
-            logger.error(f"保存推理流式响应失败: {str(e)}")
+        yield self._build_done_event(conversation_id, assistant_message.id, reasoning_message.id)
 
     async def direct_reasoning_stream(self, provider, model, messages, conversation_id, options=None, turn_id=None) -> AsyncGenerator:
         """直接使用OpenAI客户端生成带推理功能的流式响应，绕过LangChain"""
@@ -223,14 +267,7 @@ class StreamHandler:
         reasoning_message = await self._create_placeholder_message(conversation_id, MessageTypes.REASONING_CONTENT, turn_id)
         assistant_message = await self._create_placeholder_message(conversation_id, MessageTypes.ASSISTANT_CONTENT, turn_id)
 
-        # 构造发送事件的辅助函数
-        async def send_event(event_type, content=None, message_id=None):
-            data = {"type": event_type, "conversation_id": conversation_id}
-            if content is not None:
-                data["content"] = content
-            if message_id:
-                data["message_id"] = message_id
-            return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+        send_event = self._create_stream_event_sender(conversation_id)
 
         # 获取API凭证
         credentials = llm_manager._get_model_credentials(provider, model)
@@ -257,49 +294,7 @@ class StreamHandler:
         yield await send_event("reasoning_start", message_id=reasoning_message.id)
         
         # 准备发送的消息
-        openai_messages = []
-        
-        for msg in messages:
-            # 检查是否是LangChain消息类型
-            msg_dict = None
-            
-            try:
-                # 尝试获取消息的字典表示
-                if hasattr(msg, 'dict') and callable(msg.dict):
-                    msg_dict = msg.dict()
-                elif hasattr(msg, 'model_dump') and callable(msg.model_dump):
-                    msg_dict = msg.model_dump()
-                
-                if msg_dict and 'type' in msg_dict:
-                    msg_type = msg_dict.get('type', '')
-                    msg_content = msg_dict.get('content', '')
-                    
-                    if msg_type == 'human':
-                        openai_messages.append({"role": "user", "content": msg_content})
-                    elif msg_type == 'ai':
-                        openai_messages.append({"role": "assistant", "content": msg_content})
-                    elif msg_type == 'system':
-                        openai_messages.append({"role": "system", "content": msg_content})
-                    continue
-            except Exception as e:
-                logger.error(f"尝试获取消息字典时出错: {e}")
-            
-            # 通过类名判断
-            class_name = msg.__class__.__name__
-            if class_name == 'HumanMessage':
-                openai_messages.append({"role": "user", "content": msg.content})
-            elif class_name == 'AIMessage':
-                openai_messages.append({"role": "assistant", "content": msg.content})
-            elif class_name == 'SystemMessage':
-                openai_messages.append({"role": "system", "content": msg.content})
-            # 处理自定义消息对象
-            elif hasattr(msg, 'role') and hasattr(msg, 'content'):
-                openai_messages.append({"role": msg.role, "content": msg.content})
-            # 如果是已经格式化好的字典
-            elif isinstance(msg, dict) and 'role' in msg and 'content' in msg:
-                openai_messages.append(msg)
-            else:
-                logger.warning(f"无法识别的消息格式: {type(msg)}")
+        openai_messages = self._normalize_direct_stream_messages(messages)
         
         if not openai_messages:
             raise ValueError("无有效消息可发送，请检查消息格式")
@@ -357,18 +352,12 @@ class StreamHandler:
             yield await send_event("error", f"生成出错: {str(e)}")
         
         # 保存到数据库
-        await self.save_stream_response_with_reasoning(
-            conversation_id=conversation_id,
-            response_text=answer_result,
-            reasoning_text=reasoning_result,
-            turn_id=turn_id
+        await self._persist_stream_placeholders(
+            assistant_message.id,
+            answer_result,
+            reasoning_message.id,
+            reasoning_result,
         )
         
         # 完成标志
-        done_data = {
-            "type": "done",
-            "conversation_id": conversation_id,
-            "message_id": assistant_message.id,
-            "reasoning_message_id": reasoning_message.id,
-        }
-        yield f"data: {json.dumps(done_data, ensure_ascii=False)}\n\n" 
+        yield self._build_done_event(conversation_id, assistant_message.id, reasoning_message.id)
