@@ -7,7 +7,8 @@
 import json
 import re
 from datetime import datetime
-from typing import List, Union
+from typing import Any, List, Union
+
 from app.constants import MessageRoles, MessageTexts
 
 
@@ -33,25 +34,24 @@ class ChatUtils:
         return send_event
 
     @staticmethod
-    def extract_user_message_from_messages(messages: List) -> str:
-        """
-        从消息列表中提取最后一条用户消息
-        
-        Args:
-            messages: 消息列表，可能包含不同类型的消息对象
-            
-        Returns:
-            str: 最后一条用户消息的内容，如果没有找到则返回空字符串
-        """
-        for msg in reversed(messages):
-            # 处理不同类型的消息对象
-            if hasattr(msg, "type") and msg.type == "human":
-                return msg.content
-            elif hasattr(msg, "role") and msg.role == MessageRoles.USER:
-                return msg.content
-            elif isinstance(msg, dict) and msg.get("role") == MessageRoles.USER:
-                return msg.get("content", "")
+    def _extract_user_content(message: Any) -> str:
+        """从单条消息对象中提取用户文本。"""
+        if hasattr(message, "type") and message.type == "human":
+            return getattr(message, "content", "") or ""
+        if hasattr(message, "role") and message.role == MessageRoles.USER:
+            return getattr(message, "content", "") or ""
+        if isinstance(message, dict) and message.get("role") == MessageRoles.USER:
+            return message.get("content", "") or ""
         return ""
+
+    @staticmethod
+    def extract_latest_user_content(messages: List, default: str = "") -> str:
+        """从消息列表中提取最后一条用户消息内容。"""
+        for message in reversed(messages):
+            content = ChatUtils._extract_user_content(message)
+            if content:
+                return content
+        return default
 
     @staticmethod
     def parse_function_arguments(function_args: Union[str, dict]) -> dict:
@@ -69,7 +69,7 @@ class ChatUtils:
                 return json.loads(function_args) if function_args.strip() else {}
             else:
                 return function_args
-        except:
+        except json.JSONDecodeError:
             return {}
 
     @staticmethod
@@ -96,60 +96,10 @@ class ChatUtils:
         return search_query.strip().strip('"\'')
 
     @staticmethod
-    def extract_original_user_query(messages: List) -> str:
-        """
-        从消息列表中提取用户原始查询
-        
-        Args:
-            messages: 消息列表，包含各种类型的消息对象
-            
-        Returns:
-            str: 用户原始查询内容，如果没有找到则返回默认文本
-        """
-        original_user_query = MessageTexts.USER_PREVIOUS_QUESTION
-        if messages:
-            for i in range(len(messages) - 1, -1, -1):
-                msg = messages[i]
-                content_to_check = None
-                is_user_role = False
-                if isinstance(msg, dict):
-                    if msg.get("role") == MessageRoles.USER:
-                        content_to_check = msg.get("content")
-                        is_user_role = True
-                elif hasattr(msg, 'type') and msg.type == 'human' and hasattr(msg, 'content'):
-                    content_to_check = msg.content
-                    is_user_role = True
-                
-                if is_user_role and content_to_check:
-                    original_user_query = content_to_check
-                    break
-            
-            if original_user_query == MessageTexts.USER_PREVIOUS_QUESTION and messages:
-                last_msg_obj = messages[-1]
-                if isinstance(last_msg_obj, dict) and last_msg_obj.get("role") == MessageRoles.USER:
-                    original_user_query = last_msg_obj.get("content", original_user_query)
-                elif hasattr(last_msg_obj, 'type') and last_msg_obj.type == 'human' and hasattr(last_msg_obj, 'content'):
-                     original_user_query = last_msg_obj.content
-        
-        return original_user_query
-
-    @staticmethod
-    def validate_and_process_function_arguments(function_call_data: dict) -> str:
-        """
-        验证和处理函数参数，确保返回有效的JSON字符串
-        
-        Args:
-            function_call_data: 函数调用数据字典
-            
-        Returns:
-            str: 有效的JSON字符串，验证失败时返回空对象字符串"{}"
-        """
-        original_arguments_str = function_call_data["function"].get("arguments", "{}")
-        try:
-            json.loads(original_arguments_str)
-            return original_arguments_str if original_arguments_str.strip() else "{}"
-        except json.JSONDecodeError:
-            return "{}"
+    def stringify_function_arguments(function_args: Union[str, dict]) -> str:
+        """将函数参数标准化为稳定的 JSON 字符串。"""
+        arguments = ChatUtils.parse_function_arguments(function_args)
+        return json.dumps(arguments, ensure_ascii=False) if arguments else "{}"
 
     @staticmethod
     def parse_questions(response_text: str) -> List[str]:

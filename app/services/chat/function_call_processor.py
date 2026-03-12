@@ -285,7 +285,7 @@ class FunctionCallProcessor:
         if function_name == FunctionNames.WEB_SEARCH and not args_dict.get("query"):
             yield await send_event(EventTypes.GENERATING_QUERY, MessageTexts.OPTIMIZING_SEARCH_QUERY)
             
-            user_message = ChatUtils.extract_user_message_from_messages(messages)
+            user_message = ChatUtils.extract_latest_user_content(messages)
             
             if user_message:
                 search_query = await ChatUtils.generate_search_query(user_message, llm)
@@ -364,7 +364,10 @@ class FunctionCallProcessor:
         # --- 开始为第二次LLM调用构建新的消息列表 ---
 
         # 1. 获取用户原始提问 (Simplified: take the last user/human message)
-        original_user_query = ChatUtils.extract_original_user_query(messages)
+        original_user_query = ChatUtils.extract_latest_user_content(
+            messages,
+            MessageTexts.USER_PREVIOUS_QUESTION,
+        )
 
         # 2. 构建第二次LLM调用的消息列表
         second_llm_messages = StreamProcessor.create_tool_synthesis_messages(
@@ -373,7 +376,9 @@ class FunctionCallProcessor:
 
         original_tool_call_id = self._resolve_tool_call_id(function_call_data.get("tool_call_id"))
         
-        valid_arguments_str = ChatUtils.validate_and_process_function_arguments(function_call_data)
+        valid_arguments_str = ChatUtils.stringify_function_arguments(
+            function_call_data["function"].get("arguments", "{}")
+        )
         first_llm_thought_content = function_call_data.get("first_llm_thought", None)
 
         assistant_tool_call_dict = {
