@@ -13,6 +13,11 @@ class StreamHandler:
         self.memory_service = memory_service
 
     @staticmethod
+    def _serialize_sse_event(data: dict) -> str:
+        """统一序列化 SSE 事件字符串。"""
+        return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    @staticmethod
     def _create_stream_event_sender(conversation_id: str):
         """创建统一的 SSE 事件发送器。"""
         async def send_event(event_type, content=None, message_id=None):
@@ -21,7 +26,7 @@ class StreamHandler:
                 data["content"] = content
             if message_id:
                 data["message_id"] = message_id
-            return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+            return StreamHandler._serialize_sse_event(data)
 
         return send_event
 
@@ -35,7 +40,7 @@ class StreamHandler:
         }
         if reasoning_message_id:
             data["reasoning_message_id"] = reasoning_message_id
-        return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+        return StreamHandler._serialize_sse_event(data)
 
     @staticmethod
     def _build_content_event(conversation_id: str, message_id: str, content: str) -> str:
@@ -45,7 +50,7 @@ class StreamHandler:
             "conversation_id": conversation_id,
             "message_id": message_id,
         }
-        return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+        return StreamHandler._serialize_sse_event(data)
 
     @staticmethod
     def _build_done_marker_event(conversation_id: str, message_id: str) -> str:

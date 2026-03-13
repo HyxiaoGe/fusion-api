@@ -37,6 +37,11 @@ class StreamHandlerTests(unittest.IsolatedAsyncioTestCase):
             'data: {"content": "hello", "conversation_id": "conv-1", "message_id": "msg-1"}\n\n',
         )
 
+    def test_serialize_sse_event_wraps_json_payload(self):
+        event = self.handler._serialize_sse_event({"type": "ping"})
+
+        self.assertEqual(event, 'data: {"type": "ping"}\n\n')
+
     def test_build_done_marker_event_uses_done_content(self):
         event = self.handler._build_done_marker_event("conv-1", "msg-1")
 
