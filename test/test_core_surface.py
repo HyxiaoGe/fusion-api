@@ -4,7 +4,7 @@ import sys
 import unittest
 from urllib.parse import quote
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 from fastapi.responses import StreamingResponse
@@ -34,12 +34,14 @@ class ChatCoreSurfaceTests(unittest.TestCase):
 
         from app.api import chat as chat_api
         from app.api import files as files_api
+        from app.api import auth as auth_api
         from app.core.config import settings
         from app.core.security import get_current_user
         from app.db.database import get_db
 
         cls.chat_api = chat_api
         cls.files_api = files_api
+        cls.auth_api = auth_api
         cls.settings = settings
         cls.get_current_user = get_current_user
         cls.get_db = get_db
@@ -60,6 +62,13 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         self.main.app.dependency_overrides[self.get_db] = override_db
         self.main.app.dependency_overrides[self.chat_api.get_db] = override_db
         self.main.app.dependency_overrides[self.files_api.get_db] = override_db
+
+    def _override_db_dependency(self, db_obj):
+        def override_db():
+            yield db_obj
+
+        self.main.app.dependency_overrides[self.get_db] = override_db
+        self.main.app.dependency_overrides[self.auth_api.get_db] = override_db
 
     def test_health_endpoint_stays_available(self):
         response = self.client.get("/health")
@@ -291,6 +300,79 @@ class ChatCoreSurfaceTests(unittest.TestCase):
             location,
         )
         self.assertNotIn("localhost", location)
+
+    def test_github_callback_redirects_to_frontend_with_token_for_existing_social_account(self):
+        fake_db = MagicMock()
+        fake_user = SimpleNamespace(
+            id="user-1",
+            email=None,
+            nickname=None,
+            avatar=None,
+        )
+        fake_social_account = SimpleNamespace(user=fake_user)
+        fake_client = MagicMock()
+        fake_client.authorize_access_token = AsyncMock(return_value={"access_token": "provider-token"})
+        fake_client.get = AsyncMock(
+            return_value=SimpleNamespace(
+                status_code=200,
+                json=lambda: {
+                    "id": 123,
+                    "login": "fusion-user",
+                    "email": "fusion@example.com",
+                    "name": "Fusion User",
+                    "avatar_url": "https://example.com/avatar.png",
+                },
+            )
+        )
+        self._override_db_dependency(fake_db)
+
+        with patch.object(self.auth_api.oauth, "create_client", return_value=fake_client), \
+             patch.object(self.auth_api, "UserRepository") as user_repo_cls, \
+             patch.object(self.auth_api, "SocialAccountRepository") as social_repo_cls, \
+             patch.object(self.auth_api.security, "create_access_token", return_value="jwt-token"):
+            user_repo_cls.return_value = MagicMock()
+            social_repo_cls.return_value.get_by_provider.return_value = fake_social_account
+
+            response = self.client.get(
+                "/api/auth/callback/github",
+                follow_redirects=False,
+            )
+
+        self.assertEqual(response.status_code, 307)
+        self.assertEqual(
+            response.headers["location"],
+            f"{self.settings.FRONTEND_AUTH_CALLBACK_URL}?token=jwt-token&token_type=bearer",
+        )
+        fake_client.authorize_access_token.assert_awaited_once()
+        fake_client.get.assert_awaited_once_with("user", token={"access_token": "provider-token"})
+        self.assertEqual(fake_user.email, "fusion@example.com")
+        self.assertEqual(fake_user.nickname, "Fusion User")
+        self.assertEqual(fake_user.avatar, "https://example.com/avatar.png")
+        fake_db.commit.assert_called_once()
+        fake_db.refresh.assert_called_once_with(fake_user)
+
+    def test_google_callback_returns_500_when_provider_userinfo_fails(self):
+        fake_db = MagicMock()
+        fake_client = MagicMock()
+        fake_client.authorize_access_token = AsyncMock(return_value={"access_token": "provider-token"})
+        fake_client.get = AsyncMock(
+            return_value=SimpleNamespace(
+                status_code=500,
+                json=lambda: {},
+            )
+        )
+        self._override_db_dependency(fake_db)
+
+        with patch.object(self.auth_api.oauth, "create_client", return_value=fake_client):
+            response = self.client.get(
+                "/api/auth/callback/google",
+                follow_redirects=False,
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["detail"], "OAuth callback failed.")
+        fake_client.authorize_access_token.assert_awaited_once()
+        fake_client.get.assert_awaited_once_with("userinfo", token={"access_token": "provider-token"})
 
 
 if __name__ == "__main__":
