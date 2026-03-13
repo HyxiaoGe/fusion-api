@@ -114,6 +114,21 @@ class ChatUtils:
         return re.sub(r'^\d+[\.\)]\s*', '', line).strip()
 
     @staticmethod
+    def _split_non_empty_lines(text: str) -> List[str]:
+        """按行切分并去掉空行。"""
+        return [line.strip() for line in text.split('\n') if line.strip()]
+
+    @staticmethod
+    def _extract_numbered_questions(response_text: str) -> List[str]:
+        """提取按编号组织的问题列表。"""
+        numbered_questions = re.findall(
+            r'\d+[\.\)]\s*(.*?)(?=\n\d+[\.\)]|\n*$)',
+            response_text,
+            re.DOTALL,
+        )
+        return [q.strip() for q in numbered_questions]
+
+    @staticmethod
     def parse_questions(response_text: str) -> List[str]:
         """
         从响应文本中解析出问题列表
@@ -128,12 +143,12 @@ class ChatUtils:
         
         # 尝试不同的解析方法
         # 1. 尝试按数字列表解析
-        numbered_questions = re.findall(r'\d+[\.\)]\s*(.*?)(?=\n\d+[\.\)]|\n*$)', response_text, re.DOTALL)
+        numbered_questions = ChatUtils._extract_numbered_questions(response_text)
         if numbered_questions and len(numbered_questions) >= 3:
-            return [q.strip() for q in numbered_questions]
+            return numbered_questions
         
         # 2. 按行分割
-        lines = [line.strip() for line in response_text.split('\n') if line.strip()]
+        lines = ChatUtils._split_non_empty_lines(response_text)
         for line in lines:
             cleaned_line = ChatUtils._strip_question_prefix(line)
             if cleaned_line:
