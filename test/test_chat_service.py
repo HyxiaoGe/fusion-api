@@ -9,6 +9,20 @@ from app.services.chat_service import ChatService
 
 
 class ChatServiceTests(unittest.TestCase):
+    def test_get_response_text_prefers_content_attribute(self):
+        service = object.__new__(ChatService)
+
+        text = service._get_response_text(SimpleNamespace(content="hello"))
+
+        self.assertEqual(text, "hello")
+
+    def test_get_response_text_falls_back_to_raw_response(self):
+        service = object.__new__(ChatService)
+
+        text = service._get_response_text("hello")
+
+        self.assertEqual(text, "hello")
+
     def test_build_recent_dialog_content_prefers_latest_user_assistant_pair(self):
         service = object.__new__(ChatService)
         conversation = Conversation(

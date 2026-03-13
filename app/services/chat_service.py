@@ -34,6 +34,11 @@ class ChatService:
         self.memory_service.save_conversation(conversation)
         self.db.commit()
 
+    @staticmethod
+    def _get_response_text(response: Any) -> Any:
+        """统一提取模型响应正文。"""
+        return response.content if hasattr(response, "content") else response
+
     def _prepare_chat_messages(self, chat_history: List[Dict[str, str]]) -> List[Union[HumanMessage, AIMessage, SystemMessage]]:
         """将会话历史转换成 LLM 可消费的消息列表。"""
         messages = []
@@ -291,7 +296,7 @@ class ChatService:
                         turn_id=turn_id,
                     )
 
-            ai_content = response.content if hasattr(response, "content") else response
+            ai_content = self._get_response_text(response)
             ai_message = Message(
                 role=MessageRoles.ASSISTANT,
                 type=MessageTypes.ASSISTANT_CONTENT,
@@ -315,7 +320,7 @@ class ChatService:
                 reasoning=reasoning_content
             )
         except Exception as e:
-            logger.error(f"模型处理失败: {e}")
+            logger.exception(f"模型处理失败: {e}")
             raise
 
     def get_all_conversations(self, user_id: str) -> List[Conversation]:
@@ -408,10 +413,7 @@ class ChatService:
             llm = llm_manager.get_default_model()
             response = llm.invoke([HumanMessage(content=prompt)])
 
-            if hasattr(response, 'content'):  # ChatModel返回的响应
-                title = response.content
-            else:  # 普通LLM返回的响应
-                title = response
+            title = self._get_response_text(response)
 
             # 清理标题（去除多余的引号、空白和解释性文字）
             title = title.strip().strip('"\'')
@@ -433,7 +435,7 @@ class ChatService:
 
             return title
         except Exception as e:
-            logger.error(f"生成标题时发生错误: {str(e)}")
+            logger.exception(f"生成标题时发生错误: {str(e)}")
             # 如果生成失败，返回一个默认标题
             if conversation_id:
                 return f"对话 {conversation_id[:8]}..."
@@ -471,17 +473,14 @@ class ChatService:
             llm = llm_manager.get_default_model()
             response = llm.invoke([HumanMessage(content=prompt)])
 
-            if hasattr(response, 'content'):  # ChatModel返回的响应
-                response_text = response.content
-            else:  # 普通LLM返回的响应
-                response_text = response
+            response_text = self._get_response_text(response)
 
             # 解析响应文本，提取问题
             questions = self._parse_questions(response_text)
             
             return questions[:3]  # 确保只返回3个问题
         except Exception as e:
-            logger.error(f"生成推荐问题时发生错误: {str(e)}")
+            logger.exception(f"生成推荐问题时发生错误: {str(e)}")
             # 如果生成失败，返回默认问题
             return [
                 "您对这个主题还有其他问题吗？",
