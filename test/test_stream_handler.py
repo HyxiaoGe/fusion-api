@@ -72,6 +72,25 @@ class StreamHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.handler.update_stream_response.assert_any_await("assistant-1", "final answer")
         self.assertEqual(self.handler.update_stream_response.await_count, 2)
 
+    async def test_create_reasoning_placeholders_returns_both_messages(self):
+        self.handler._create_placeholder_message = AsyncMock(
+            side_effect=[
+                SimpleNamespace(id="reasoning-1"),
+                SimpleNamespace(id="assistant-1"),
+            ]
+        )
+
+        reasoning_message, assistant_message = await self.handler._create_reasoning_placeholders("conv-1", "turn-1")
+
+        self.assertEqual(reasoning_message.id, "reasoning-1")
+        self.assertEqual(assistant_message.id, "assistant-1")
+        self.handler._create_placeholder_message.assert_has_awaits(
+            [
+                call("conv-1", "reasoning_content", "turn-1"),
+                call("conv-1", "assistant_content", "turn-1"),
+            ]
+        )
+
     async def test_finalize_reasoning_events_emits_missing_phase_events(self):
         send_event = AsyncMock()
 

@@ -202,6 +202,20 @@ class StreamHandler:
         # 直接创建消息，而不是修改整个会话
         return self.memory_service.create_message(placeholder_message, conversation_id)
 
+    async def _create_reasoning_placeholders(self, conversation_id: str, turn_id: Optional[str]) -> tuple[Message, Message]:
+        """为推理流统一创建 reasoning/assistant 两个占位消息。"""
+        reasoning_message = await self._create_placeholder_message(
+            conversation_id,
+            MessageTypes.REASONING_CONTENT,
+            turn_id,
+        )
+        assistant_message = await self._create_placeholder_message(
+            conversation_id,
+            MessageTypes.ASSISTANT_CONTENT,
+            turn_id,
+        )
+        return reasoning_message, assistant_message
+
     async def generate_normal_stream(self, provider, model, messages, conversation_id, options=None, turn_id=None) -> AsyncGenerator:
         """生成常规流式响应（无推理模式）"""
         if options is None:
@@ -245,8 +259,7 @@ class StreamHandler:
             options = {}
         
         # 1. 创建占位消息
-        reasoning_message = await self._create_placeholder_message(conversation_id, MessageTypes.REASONING_CONTENT, turn_id)
-        assistant_message = await self._create_placeholder_message(conversation_id, MessageTypes.ASSISTANT_CONTENT, turn_id)
+        reasoning_message, assistant_message = await self._create_reasoning_placeholders(conversation_id, turn_id)
 
         send_event = self._create_stream_event_sender(conversation_id)
 
@@ -353,8 +366,7 @@ class StreamHandler:
             messages = [messages]
         
         # 1. 创建占位消息
-        reasoning_message = await self._create_placeholder_message(conversation_id, MessageTypes.REASONING_CONTENT, turn_id)
-        assistant_message = await self._create_placeholder_message(conversation_id, MessageTypes.ASSISTANT_CONTENT, turn_id)
+        reasoning_message, assistant_message = await self._create_reasoning_placeholders(conversation_id, turn_id)
 
         send_event = self._create_stream_event_sender(conversation_id)
 
