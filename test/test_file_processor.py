@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from app.processor.file_processor import FileProcessor
 
@@ -53,6 +54,26 @@ class FileProcessorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("...(内容过长已截断)", prompt)
         self.assertIn("总结一下", prompt)
+
+    def test_run_optional_text_extractor_returns_none_on_missing_dependency(self):
+        result = FileProcessor._run_optional_text_extractor(
+            lambda: (_ for _ in ()).throw(ImportError("missing")),
+            missing_dependency_message="missing dependency",
+            failure_message="failure",
+        )
+
+        self.assertIsNone(result)
+
+    def test_run_optional_text_extractor_returns_none_on_runtime_error(self):
+        with patch("app.processor.file_processor.logger") as logger:
+            result = FileProcessor._run_optional_text_extractor(
+                lambda: (_ for _ in ()).throw(ValueError("bad content")),
+                missing_dependency_message="missing dependency",
+                failure_message="failure",
+            )
+
+        self.assertIsNone(result)
+        logger.error.assert_called_once()
 
 
 if __name__ == "__main__":

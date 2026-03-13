@@ -119,72 +119,47 @@ class FileProcessor:
         """从文件中提取文本内容"""
         try:
             # 根据文件类型提取文本
-            if mime_type.startswith("text/") or file_path.endswith((".txt", ".md", ".text")):
+            if mime_type.startswith("text/") or self._has_extension(file_path, ".txt", ".md", ".text"):
                 # 文本文件
                 return file_content.decode('utf-8', errors='replace')
 
-            elif mime_type == "application/pdf" or file_path.endswith(".pdf"):
+            elif mime_type == "application/pdf" or self._has_extension(file_path, ".pdf"):
                 # PDF文件
-                try:
-                    import PyPDF2
-                    with io.BytesIO(file_content) as pdf_file:
-                        reader = PyPDF2.PdfReader(pdf_file)
-                        text = ""
-                        for page_num in range(len(reader.pages)):
-                            text += reader.pages[page_num].extract_text() + "\n"
-                        return text
-                except ImportError:
-                    logger.warning("PyPDF2库未安装，无法解析PDF文件内容")
-                    return None
-                except Exception as e:
-                    logger.error(f"解析PDF文件失败: {e}")
-                    return None
+                return self._run_optional_text_extractor(
+                    lambda: self._extract_pdf_text(file_content),
+                    missing_dependency_message="PyPDF2库未安装，无法解析PDF文件内容",
+                    failure_message="解析PDF文件失败",
+                )
 
             elif mime_type in ["application/vnd.ms-excel",
-                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"] or file_path.endswith(
-                (".xls", ".xlsx")):
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"] or self._has_extension(
+                file_path, ".xls", ".xlsx"
+            ):
                 # Excel文件
-                try:
-                    import pandas as pd
-                    with io.BytesIO(file_content) as excel_file:
-                        df = pd.read_excel(excel_file)
-                        return df.to_string(index=False)
-                except ImportError:
-                    logger.warning("pandas库未安装，无法解析Excel文件内容")
-                    return None
-                except Exception as e:
-                    logger.error(f"解析Excel文件失败: {e}")
-                    return None
+                return self._run_optional_text_extractor(
+                    lambda: self._extract_excel_text(file_content),
+                    missing_dependency_message="pandas库未安装，无法解析Excel文件内容",
+                    failure_message="解析Excel文件失败",
+                )
 
-            elif mime_type == "text/csv" or file_path.endswith(".csv"):
+            elif mime_type == "text/csv" or self._has_extension(file_path, ".csv"):
                 # CSV文件
-                try:
-                    import pandas as pd
-                    with io.BytesIO(file_content) as csv_file:
-                        df = pd.read_csv(csv_file)
-                        return df.to_string(index=False)
-                except ImportError:
-                    logger.warning("pandas库未安装，无法解析CSV文件内容")
-                    return None
-                except Exception as e:
-                    logger.error(f"解析CSV文件失败: {e}")
-                    return None
+                return self._run_optional_text_extractor(
+                    lambda: self._extract_csv_text(file_content),
+                    missing_dependency_message="pandas库未安装，无法解析CSV文件内容",
+                    failure_message="解析CSV文件失败",
+                )
 
             elif mime_type in ["application/msword",
-                               "application/vnd.openxmlformats-officedocument.wordprocessingml.document"] or file_path.endswith(
-                (".doc", ".docx", ".dot")):
+                               "application/vnd.openxmlformats-officedocument.wordprocessingml.document"] or self._has_extension(
+                file_path, ".doc", ".docx", ".dot"
+            ):
                 # Word文档
-                try:
-                    import docx
-                    with io.BytesIO(file_content) as doc_file:
-                        doc = docx.Document(doc_file)
-                        return "\n".join([para.text for para in doc.paragraphs])
-                except ImportError:
-                    logger.warning("python-docx库未安装，无法解析Word文件内容")
-                    return None
-                except Exception as e:
-                    logger.error(f"解析Word文件失败: {e}")
-                    return None
+                return self._run_optional_text_extractor(
+                    lambda: self._extract_word_text(file_content),
+                    missing_dependency_message="python-docx库未安装，无法解析Word文件内容",
+                    failure_message="解析Word文件失败",
+                )
 
             # 其他文件类型不提取文本
             return None
@@ -192,6 +167,53 @@ class FileProcessor:
         except Exception as e:
             logger.error(f"提取文件文本失败: {e}")
             return None
+
+    @staticmethod
+    def _has_extension(file_path: str, *extensions: str) -> bool:
+        return file_path.endswith(extensions)
+
+    @staticmethod
+    def _run_optional_text_extractor(extractor, missing_dependency_message: str, failure_message: str) -> Optional[str]:
+        try:
+            return extractor()
+        except ImportError:
+            logger.warning(missing_dependency_message)
+            return None
+        except Exception as e:
+            logger.error(f"{failure_message}: {e}")
+            return None
+
+    @staticmethod
+    def _extract_pdf_text(file_content: bytes) -> str:
+        import PyPDF2
+
+        with io.BytesIO(file_content) as pdf_file:
+            reader = PyPDF2.PdfReader(pdf_file)
+            return "".join((page.extract_text() or "") + "\n" for page in reader.pages)
+
+    @staticmethod
+    def _extract_excel_text(file_content: bytes) -> str:
+        import pandas as pd
+
+        with io.BytesIO(file_content) as excel_file:
+            df = pd.read_excel(excel_file)
+            return df.to_string(index=False)
+
+    @staticmethod
+    def _extract_csv_text(file_content: bytes) -> str:
+        import pandas as pd
+
+        with io.BytesIO(file_content) as csv_file:
+            df = pd.read_csv(csv_file)
+            return df.to_string(index=False)
+
+    @staticmethod
+    def _extract_word_text(file_content: bytes) -> str:
+        import docx
+
+        with io.BytesIO(file_content) as doc_file:
+            doc = docx.Document(doc_file)
+            return "\n".join(para.text for para in doc.paragraphs)
 
     def _guess_mime_type(self, file_path: str) -> str:
         """根据文件扩展名猜测MIME类型"""
