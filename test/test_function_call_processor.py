@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 from datetime import datetime
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from app.constants import FUNCTION_DESCRIPTIONS, MessageRoles, MessageTypes
 from app.schemas.chat import Conversation, Message
@@ -38,6 +38,52 @@ class FunctionCallProcessorTests(unittest.TestCase):
             ],
         )
         self.assertEqual(messages[0].content, FUNCTION_DESCRIPTIONS["web_search"])
+
+    def test_build_assistant_function_call_message_uses_tool_calls_for_supported_provider(self):
+        message, tool_call_id = self.processor._build_assistant_function_call_message(
+            "qwen",
+            {"function": {"name": "web_search", "arguments": {"query": "fusion"}}},
+            "thinking",
+        )
+
+        self.assertEqual(message["role"], MessageRoles.ASSISTANT)
+        self.assertEqual(message["content"], "thinking")
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "web_search")
+        self.assertEqual(
+            message["tool_calls"][0]["function"]["arguments"],
+            '{"query": "fusion"}',
+        )
+        self.assertEqual(message["tool_calls"][0]["id"], tool_call_id)
+
+    def test_build_assistant_function_call_message_falls_back_to_function_call_for_legacy_provider(self):
+        message, tool_call_id = self.processor._build_assistant_function_call_message(
+            "legacy",
+            {"function": {"name": "web_search", "arguments": "{}"}},
+        )
+
+        self.assertEqual(message["role"], MessageRoles.ASSISTANT)
+        self.assertEqual(message["content"], "")
+        self.assertEqual(message["function_call"]["name"], "web_search")
+        self.assertTrue(tool_call_id.startswith("call_"))
+
+    @patch("app.services.chat.function_call_processor.StreamProcessor.create_tool_synthesis_messages")
+    def test_build_web_search_followup_messages_appends_tool_messages(self, mock_create_tool_synthesis_messages):
+        mock_create_tool_synthesis_messages.return_value = [{"role": MessageRoles.SYSTEM, "content": "seed"}]
+
+        messages = self.processor._build_web_search_followup_messages(
+            messages=[{"role": MessageRoles.USER, "content": "帮我查 fusion"}],
+            function_call_data={
+                "tool_call_id": "tool-1",
+                "function": {"name": "web_search", "arguments": {"query": "fusion"}},
+                "first_llm_thought": "我先查一下",
+            },
+            function_result={"status": "ok"},
+            provider="qwen",
+        )
+
+        self.assertEqual(messages[1]["tool_calls"][0]["id"], "tool-1")
+        self.assertEqual(messages[1]["content"], "我先查一下")
+        self.assertEqual(messages[2]["tool_call_id"], "tool-1")
 
     def test_prepare_function_call_messages_replaces_existing_system_prompt(self):
         messages = [

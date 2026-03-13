@@ -22,6 +22,7 @@ from app.services.chat.utils import ChatUtils
 
 class FunctionCallProcessor:
     """函数调用处理器类"""
+    TOOL_CALL_PROVIDERS = {"deepseek", "openai", "anthropic", "qwen", "volcengine", "google", "xai"}
     
     def __init__(self, db, memory_service):
         self.db = db
@@ -97,6 +98,80 @@ class FunctionCallProcessor:
         )
         ai_message = self._build_assistant_content_message(final_response, turn_id)
         return [function_call_message, function_result_message, ai_message]
+
+    @classmethod
+    def _provider_uses_tool_calls(cls, provider: str) -> bool:
+        """判断 provider 是否使用 tool_calls 格式。"""
+        return provider in cls.TOOL_CALL_PROVIDERS
+
+    def _build_assistant_function_call_message(
+        self,
+        provider: str,
+        function_call_data: Dict[str, Any],
+        content: str | None = None,
+    ) -> tuple[Dict[str, Any], str]:
+        """统一构造 assistant 的函数调用消息。"""
+        tool_call_id = self._resolve_tool_call_id(function_call_data.get("tool_call_id"), "call_1")
+        function_payload = function_call_data["function"]
+
+        if self._provider_uses_tool_calls(provider):
+            return {
+                "role": MessageRoles.ASSISTANT,
+                "content": content,
+                "tool_calls": [{
+                    "type": "function",
+                    "function": {
+                        "name": function_payload.get("name", ""),
+                        "arguments": ChatUtils.stringify_function_arguments(
+                            function_payload.get("arguments", "{}")
+                        ),
+                    },
+                    "id": tool_call_id,
+                }],
+            }, tool_call_id
+
+        return {
+            "role": MessageRoles.ASSISTANT,
+            "content": content if content is not None else "",
+            "function_call": function_payload,
+        }, tool_call_id
+
+    @staticmethod
+    def _build_tool_result_message(function_result, tool_call_id: str) -> Dict[str, Any]:
+        """统一构造 tool 执行结果消息。"""
+        return ToolMessage(
+            content=json.dumps(function_result, ensure_ascii=False),
+            tool_call_id=tool_call_id,
+        ).model_dump()
+
+    def _build_web_search_followup_messages(
+        self,
+        messages,
+        function_call_data: Dict[str, Any],
+        function_result,
+        provider: str,
+    ) -> List[Dict[str, Any]]:
+        """统一构造 web_search 第二次 LLM 调用的消息列表。"""
+        original_user_query = ChatUtils.extract_latest_user_content(
+            messages,
+            MessageTexts.USER_PREVIOUS_QUESTION,
+        )
+        second_llm_messages = StreamProcessor.create_tool_synthesis_messages(
+            original_user_query,
+            FunctionNames.WEB_SEARCH,
+            function_result,
+            provider,
+        )
+        assistant_message, tool_call_id = self._build_assistant_function_call_message(
+            provider,
+            function_call_data,
+            function_call_data.get("first_llm_thought") or None,
+        )
+        second_llm_messages.append(assistant_message)
+        second_llm_messages.append(
+            self._build_tool_result_message(function_result, tool_call_id)
+        )
+        return second_llm_messages
     
     async def generate_function_call_stream(self, provider, model, messages, conversation_id, options=None, turn_id=None):
         """
@@ -374,29 +449,13 @@ class FunctionCallProcessor:
         """
         # 复制原始消息并添加函数调用结果
         full_messages = list(messages)
-        
-        # 添加LLM的函数调用响应
-        if provider in ["deepseek", "openai", "anthropic", "qwen", "volcengine", "google", "xai"]:
-            # 使用tool_calls格式
-            tool_call_id = self._resolve_tool_call_id(function_call_data.get("tool_call_id"), "call_1")
-            
-            full_messages.append({
-                "role": MessageRoles.ASSISTANT,
-                "content": None,
-                "tool_calls": [{
-                    "type": "function",
-                    "function": function_call_data["function"],
-                    "id": tool_call_id
-                }]
-            })
-        else:
-            # 使用传统function_call格式
-            full_messages.append({
-                "role": MessageRoles.ASSISTANT,
-                "content": "",
-                "function_call": function_call_data["function"]
-            })
-        
+
+        assistant_function_message, _ = self._build_assistant_function_call_message(
+            provider,
+            function_call_data,
+        )
+        full_messages.append(assistant_function_message)
+
         # 添加函数执行结果
         full_messages.append(function_result)
         
@@ -425,43 +484,12 @@ class FunctionCallProcessor:
         # --- 开始为第二次LLM调用构建新的消息列表 ---
 
         # 1. 获取用户原始提问 (Simplified: take the last user/human message)
-        original_user_query = ChatUtils.extract_latest_user_content(
+        second_llm_messages = self._build_web_search_followup_messages(
             messages,
-            MessageTexts.USER_PREVIOUS_QUESTION,
+            function_call_data,
+            function_result,
+            provider,
         )
-
-        # 2. 构建第二次LLM调用的消息列表
-        second_llm_messages = StreamProcessor.create_tool_synthesis_messages(
-            original_user_query, function_name, function_result, provider
-        )
-
-        original_tool_call_id = self._resolve_tool_call_id(function_call_data.get("tool_call_id"))
-        
-        valid_arguments_str = ChatUtils.stringify_function_arguments(
-            function_call_data["function"].get("arguments", "{}")
-        )
-        first_llm_thought_content = function_call_data.get("first_llm_thought", None)
-
-        assistant_tool_call_dict = {
-            "id": original_tool_call_id,
-            "type": "function",
-            "function": {
-                "name": function_name,
-                "arguments": valid_arguments_str
-            }
-        }
-        
-        ai_message_content = first_llm_thought_content if first_llm_thought_content and first_llm_thought_content.strip() else None
-
-        current_assistant_message_dict = {
-            "role": MessageRoles.ASSISTANT,
-            "content": ai_message_content,
-            "tool_calls": [assistant_tool_call_dict]
-        }
-        second_llm_messages.append(current_assistant_message_dict)
-
-        tool_message_content = json.dumps(function_result, ensure_ascii=False)
-        second_llm_messages.append(ToolMessage(content=tool_message_content, tool_call_id=original_tool_call_id).dict())
 
         # 4. 流式返回 LLM 的最终回复
         final_response = ""
