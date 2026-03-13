@@ -106,6 +106,41 @@ class FunctionCallProcessorTests(unittest.TestCase):
             {"function_type": "web_search", "result": {"status": "ok", "items": [1, 2]}},
         )
 
+    def test_extract_final_stream_response_returns_last_non_event_string(self):
+        final_response = self.processor._extract_final_stream_response(
+            ["data: {\"type\": \"content\"}\n\n", "final answer"]
+        )
+
+        self.assertEqual(final_response, "final answer")
+
+    def test_extract_final_stream_response_returns_empty_for_event_only_results(self):
+        final_response = self.processor._extract_final_stream_response(
+            ["data: {\"type\": \"done\"}\n\n"]
+        )
+
+        self.assertEqual(final_response, "")
+
+    def test_finalize_first_pass_response_uses_friendly_description_when_content_missing(self):
+        final_response = self.processor._finalize_first_pass_response(
+            True,
+            {"function": {"name": "web_search"}},
+            "",
+        )
+
+        self.assertEqual(
+            final_response,
+            USER_FRIENDLY_FUNCTION_DESCRIPTIONS["web_search"],
+        )
+
+    def test_finalize_first_pass_response_preserves_existing_content(self):
+        final_response = self.processor._finalize_first_pass_response(
+            True,
+            {"function": {"name": "web_search"}},
+            "已有回答",
+        )
+
+        self.assertEqual(final_response, "已有回答")
+
     @patch("app.services.chat.function_call_processor.StreamProcessor.create_tool_synthesis_messages")
     def test_build_web_search_followup_messages_appends_tool_messages(self, mock_create_tool_synthesis_messages):
         mock_create_tool_synthesis_messages.return_value = [{"role": MessageRoles.SYSTEM, "content": "seed"}]

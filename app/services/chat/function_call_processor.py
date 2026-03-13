@@ -132,6 +132,13 @@ class FunctionCallProcessor:
         }
 
     @staticmethod
+    def _extract_final_stream_response(results: List[Any]) -> str:
+        """统一提取流式处理结束后的最终文本结果。"""
+        if results and isinstance(results[-1], str) and not results[-1].startswith("data: "):
+            return results[-1]
+        return ""
+
+    @staticmethod
     def _update_function_arguments(
         function_call_data: Dict[str, Any],
         arguments: Dict[str, Any],
@@ -139,6 +146,34 @@ class FunctionCallProcessor:
         """统一回写函数参数。"""
         function_call_data["function"]["arguments"] = json.dumps(arguments, ensure_ascii=False)
         return function_call_data
+
+    async def _send_function_detected_event(
+        self,
+        send_event,
+        function_call_data: Dict[str, Any],
+        function_call_sent: bool,
+    ) -> bool:
+        """统一发送函数检测事件，避免重复发送。"""
+        if function_call_sent:
+            return True
+        await send_event(
+            EventTypes.FUNCTION_CALL_DETECTED,
+            self._build_function_detected_event_data(function_call_data),
+        )
+        return True
+
+    def _finalize_first_pass_response(
+        self,
+        function_call_detected: bool,
+        function_call_data: Dict[str, Any],
+        full_response: str,
+    ) -> str:
+        """统一补全第一段调用缺失的默认响应文本。"""
+        if function_call_detected and not full_response.strip():
+            return self._get_user_friendly_function_description(
+                self._get_function_name(function_call_data)
+            )
+        return full_response
 
     @classmethod
     def _provider_uses_tool_calls(cls, provider: str) -> bool:
@@ -409,11 +444,11 @@ class FunctionCallProcessor:
                 function_call_detected, function_call_data = function_adapter.detect_function_call_in_stream(chunk)
                 
                 if function_call_detected and not function_call_sent:
-                    yield await send_event(
-                        EventTypes.FUNCTION_CALL_DETECTED,
-                        self._build_function_detected_event_data(function_call_data),
+                    function_call_sent = await self._send_function_detected_event(
+                        send_event,
+                        function_call_data,
+                        function_call_sent,
                     )
-                    function_call_sent = True
             
             # 累积第一次LLM的思考过程
             content_chunk_text = StreamProcessor.extract_content(chunk)
@@ -426,10 +461,11 @@ class FunctionCallProcessor:
         
         # 对于Google模型，即使没有文本内容也可能有有效的函数调用
         # 如果检测到函数调用但没有文本内容，提供一个默认的说明
-        if function_call_detected and not full_response.strip():
-            full_response = self._get_user_friendly_function_description(
-                self._get_function_name(function_call_data)
-            )
+        full_response = self._finalize_first_pass_response(
+            function_call_detected,
+            function_call_data,
+            full_response,
+        )
         
         yield (function_call_detected, function_call_data, full_response, reasoning_state.reasoning_start_sent)
 
@@ -533,10 +569,7 @@ class FunctionCallProcessor:
             results.append(result)
             # 传递所有事件给前端
             yield result
-        
-        # 最后一个结果应该是 final_response
-        if results and isinstance(results[-1], str) and not results[-1].startswith("data: "):
-            final_response = results[-1]
+        final_response = self._extract_final_stream_response(results)
 
         # 5. 保存完整对话历史
         await self._save_function_call_stream_response(
