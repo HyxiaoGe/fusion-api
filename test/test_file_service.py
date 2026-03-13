@@ -33,6 +33,31 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    def test_get_file_status_uses_shared_status_serializer(self):
+        self.service.file_repo.get_file_by_id.return_value = SimpleNamespace(
+            id="file-1",
+            status="processed",
+            processing_result={"status": "success"},
+        )
+
+        result = self.service.get_file_status("file-1", "user-1")
+
+        self.assertEqual(
+            result,
+            {
+                "id": "file-1",
+                "status": "processed",
+                "processing_result": {"status": "success"},
+            },
+        )
+
+    def test_get_file_status_returns_none_when_file_is_missing(self):
+        self.service.file_repo.get_file_by_id.return_value = None
+
+        result = self.service.get_file_status("missing-file", "user-1")
+
+        self.assertIsNone(result)
+
     async def test_parse_file_marks_error_when_processor_returns_error(self):
         self.service.file_repo.get_file_by_id.return_value = SimpleNamespace(
             mimetype="text/plain",

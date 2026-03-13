@@ -163,11 +163,7 @@ class FileService:
 
             self.file_repo.update_file(
                 file_id=file_id,
-                updates={
-                    "status": "processed",
-                    "parsed_content": parsed_content,
-                    "processing_result": {"status": "success", "timestamp": datetime.now().isoformat()}
-                }
+                updates=self._build_processed_file_updates(parsed_content),
             )
 
             logger.info(f"文件 {file_id} 解析成功")
@@ -188,6 +184,22 @@ class FileService:
                 "processing_result": {"status": "error", "message": message},
             },
         )
+
+    @staticmethod
+    def _build_success_processing_result() -> Dict[str, str]:
+        """统一构造文件解析成功结果。"""
+        return {
+            "status": "success",
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    def _build_processed_file_updates(self, parsed_content: str) -> Dict[str, Any]:
+        """统一构造文件解析成功后的更新内容。"""
+        return {
+            "status": "processed",
+            "parsed_content": parsed_content,
+            "processing_result": self._build_success_processing_result(),
+        }
 
     @staticmethod
     def _normalize_parsed_content(content: Any) -> Optional[str]:
@@ -227,11 +239,7 @@ class FileService:
         file = self.file_repo.get_file_by_id(file_id, user_id=user_id)
         if not file:
             return None
-        return {
-            "id": file.id,
-            "status": file.status,
-            "processing_result": file.processing_result,
-        }
+        return self._serialize_file_status(file)
 
     def get_conversation_files(self, conversation_id: str) -> List[Dict[str, Any]]:
         """获取对话关联的所有文件信息"""
@@ -250,6 +258,15 @@ class FileService:
         """获取用户的所有文件"""
         files = self.file_repo.get_files_by_user_id(user_id)
         return [self._serialize_file_summary(file) for file in files]
+
+    @staticmethod
+    def _serialize_file_status(file_obj) -> Dict[str, Any]:
+        """统一序列化文件状态响应。"""
+        return {
+            "id": file_obj.id,
+            "status": file_obj.status,
+            "processing_result": file_obj.processing_result,
+        }
 
     def delete_file(self, file_id: str, user_id: str) -> bool:
         """删除文件，并验证用户权限"""
