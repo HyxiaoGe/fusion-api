@@ -109,6 +109,11 @@ class ChatUtils:
         return json.dumps(arguments, ensure_ascii=False) if arguments else "{}"
 
     @staticmethod
+    def _strip_question_prefix(line: str) -> str:
+        """去掉问题列表行首的编号前缀。"""
+        return re.sub(r'^\d+[\.\)]\s*', '', line).strip()
+
+    @staticmethod
     def parse_questions(response_text: str) -> List[str]:
         """
         从响应文本中解析出问题列表
@@ -130,8 +135,7 @@ class ChatUtils:
         # 2. 按行分割
         lines = [line.strip() for line in response_text.split('\n') if line.strip()]
         for line in lines:
-            # 移除行首的数字、点、括号等
-            cleaned_line = re.sub(r'^\d+[\.\)]\s*', '', line).strip()
+            cleaned_line = ChatUtils._strip_question_prefix(line)
             if cleaned_line:
                 questions.append(cleaned_line)
         

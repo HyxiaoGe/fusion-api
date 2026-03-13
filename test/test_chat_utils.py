@@ -47,6 +47,14 @@ class ChatUtilsTests(unittest.TestCase):
 
         self.assertEqual(query, "fusion ai")
 
+    def test_strip_question_prefix_removes_numbering(self):
+        self.assertEqual(ChatUtils._strip_question_prefix("2. 第二个问题"), "第二个问题")
+
+    def test_parse_questions_cleans_line_prefixes(self):
+        questions = ChatUtils.parse_questions("1. 第一个问题\n2) 第二个问题\n3. 第三个问题")
+
+        self.assertEqual(questions, ["第一个问题", "第二个问题", "第三个问题"])
+
 
 if __name__ == "__main__":
     unittest.main()
