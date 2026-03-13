@@ -413,10 +413,8 @@ class ChatService:
             llm = llm_manager.get_default_model()
             response = llm.invoke([HumanMessage(content=prompt)])
 
-            title = self._get_response_text(response)
-
             # 清理标题（去除多余的引号、空白和解释性文字）
-            title = title.strip().strip('"\'')
+            title = ChatUtils.clean_model_text(self._get_response_text(response))
 
             # 如果标题中包含"标题："等前缀，去除
             prefixes = ["标题：", "标题:", "主题：", "主题:"]

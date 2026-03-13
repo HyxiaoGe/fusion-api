@@ -1,11 +1,22 @@
+import asyncio
 from types import SimpleNamespace
 import unittest
+from unittest.mock import AsyncMock
 
 from app.constants import MessageRoles, MessageTexts
 from app.services.chat.utils import ChatUtils
 
 
 class ChatUtilsTests(unittest.TestCase):
+    def test_get_response_text_prefers_content_attribute(self):
+        self.assertEqual(
+            ChatUtils.get_response_text(SimpleNamespace(content="hello")),
+            "hello",
+        )
+
+    def test_clean_model_text_trims_whitespace_and_quotes(self):
+        self.assertEqual(ChatUtils.clean_model_text('  "hello"  '), "hello")
+
     def test_extract_latest_user_content_prefers_last_user_message(self):
         messages = [
             {"role": MessageRoles.USER, "content": "first"},
@@ -28,6 +39,13 @@ class ChatUtilsTests(unittest.TestCase):
             ChatUtils.stringify_function_arguments({"query": "fusion"}),
             '{"query": "fusion"}',
         )
+
+    def test_generate_search_query_reuses_text_cleaning(self):
+        llm = SimpleNamespace(ainvoke=AsyncMock(return_value=SimpleNamespace(content='  "fusion ai"  ')))
+
+        query = asyncio.run(ChatUtils.generate_search_query("fusion 是什么", llm))
+
+        self.assertEqual(query, "fusion ai")
 
 
 if __name__ == "__main__":

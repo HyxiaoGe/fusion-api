@@ -14,6 +14,16 @@ from app.constants import MessageRoles, MessageTexts
 
 class ChatUtils:
     """聊天服务工具类"""
+
+    @staticmethod
+    def get_response_text(response: Any) -> str:
+        """统一提取模型返回的正文文本。"""
+        return response.content if hasattr(response, "content") else str(response)
+
+    @staticmethod
+    def clean_model_text(text: str) -> str:
+        """清理模型文本输出的外围空白和引号。"""
+        return text.strip().strip("\"'")
     
     @staticmethod
     def create_event_sender(conversation_id: str):
@@ -90,10 +100,7 @@ class ChatUtils:
         
         # 使用现有模型生成查询
         search_query_response = await llm.ainvoke(search_query_msgs)
-        search_query = search_query_response.content if hasattr(search_query_response, 'content') else str(search_query_response)
-        
-        # 清理搜索查询（去除引号等）
-        return search_query.strip().strip('"\'')
+        return ChatUtils.clean_model_text(ChatUtils.get_response_text(search_query_response))
 
     @staticmethod
     def stringify_function_arguments(function_args: Union[str, dict]) -> str:
