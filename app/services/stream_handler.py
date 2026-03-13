@@ -53,6 +53,11 @@ class StreamHandler:
         return StreamHandler._build_content_event(conversation_id, message_id, "[DONE]")
 
     @staticmethod
+    def _extract_chunk_content(chunk) -> str:
+        """统一提取流式 chunk 的正文内容。"""
+        return chunk.content if hasattr(chunk, "content") else chunk
+
+    @staticmethod
     async def _finalize_reasoning_events(
         send_event,
         reasoning_completed: bool,
@@ -183,7 +188,7 @@ class StreamHandler:
 
         # 2. 流式响应处理，并在事件中加入message_id
         for chunk in llm.stream(messages):
-            content = chunk.content if hasattr(chunk, 'content') else chunk
+            content = self._extract_chunk_content(chunk)
 
             if content:
                 full_response += content
@@ -248,7 +253,7 @@ class StreamHandler:
                     has_reasoning = True
             
             # 处理最终答案
-            content = chunk.content if hasattr(chunk, 'content') else chunk
+            content = self._extract_chunk_content(chunk)
             
             # Deepseek模型需要额外检查content不等于reasoning_result
             if provider == "deepseek":

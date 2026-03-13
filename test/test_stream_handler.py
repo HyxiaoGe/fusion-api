@@ -45,6 +45,14 @@ class StreamHandlerTests(unittest.IsolatedAsyncioTestCase):
             'data: {"content": "[DONE]", "conversation_id": "conv-1", "message_id": "msg-1"}\n\n',
         )
 
+    def test_extract_chunk_content_prefers_content_attribute(self):
+        chunk = SimpleNamespace(content="hello")
+
+        self.assertEqual(self.handler._extract_chunk_content(chunk), "hello")
+
+    def test_extract_chunk_content_falls_back_to_raw_chunk(self):
+        self.assertEqual(self.handler._extract_chunk_content("hello"), "hello")
+
     async def test_persist_stream_placeholders_updates_existing_messages(self):
         self.handler.update_stream_response = AsyncMock()
 
