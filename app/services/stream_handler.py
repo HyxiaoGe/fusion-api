@@ -126,6 +126,36 @@ class StreamHandler:
         return events, in_reasoning_phase, reasoning_completed, answering_started
 
     @staticmethod
+    async def _process_answer_content(
+        send_event,
+        content: str,
+        answer_result: str,
+        in_reasoning_phase: bool,
+        reasoning_completed: bool,
+        answering_started: bool,
+        has_reasoning: bool,
+        reasoning_message_id: str,
+        assistant_message_id: str,
+    ) -> tuple[list[str], str, bool, bool, bool]:
+        """统一处理回答内容的阶段切换、累积和事件发送。"""
+        if not content or not content.strip():
+            return [], answer_result, in_reasoning_phase, reasoning_completed, answering_started
+
+        events, in_reasoning_phase, reasoning_completed, answering_started = await StreamHandler._transition_to_answer_phase(
+            send_event,
+            in_reasoning_phase,
+            reasoning_completed,
+            answering_started,
+            has_reasoning,
+            reasoning_message_id,
+            assistant_message_id,
+        )
+
+        answer_result += content
+        events.append(await send_event("answering_content", content, message_id=assistant_message_id))
+        return events, answer_result, in_reasoning_phase, reasoning_completed, answering_started
+
+    @staticmethod
     def _normalize_direct_stream_messages(messages) -> list[dict]:
         """将多种消息对象归一化为 OpenAI 兼容消息格式。"""
         openai_messages = []
@@ -341,8 +371,10 @@ class StreamHandler:
             # Deepseek模型需要额外检查content不等于reasoning_result
             if provider == "deepseek":
                 if content and content.strip() and content != reasoning_result:
-                    transition_events, in_reasoning_phase, reasoning_completed, answering_started = await self._transition_to_answer_phase(
+                    answer_events, answer_result, in_reasoning_phase, reasoning_completed, answering_started = await self._process_answer_content(
                         send_event,
+                        content,
+                        answer_result,
                         in_reasoning_phase,
                         reasoning_completed,
                         answering_started,
@@ -350,16 +382,15 @@ class StreamHandler:
                         reasoning_message.id,
                         assistant_message.id,
                     )
-                    for event in transition_events:
+                    for event in answer_events:
                         yield event
-                    
-                    answer_result += content
-                    yield await send_event("answering_content", content, message_id=assistant_message.id)
                     has_answer = True
             else:
                 if content and content.strip():
-                    transition_events, in_reasoning_phase, reasoning_completed, answering_started = await self._transition_to_answer_phase(
+                    answer_events, answer_result, in_reasoning_phase, reasoning_completed, answering_started = await self._process_answer_content(
                         send_event,
+                        content,
+                        answer_result,
                         in_reasoning_phase,
                         reasoning_completed,
                         answering_started,
@@ -367,11 +398,8 @@ class StreamHandler:
                         reasoning_message.id,
                         assistant_message.id,
                     )
-                    for event in transition_events:
+                    for event in answer_events:
                         yield event
-                    
-                    answer_result += content
-                    yield await send_event("answering_content", content, message_id=assistant_message.id)
                     has_answer = True
         
         final_events = await self._finalize_reasoning_stream(
@@ -454,8 +482,10 @@ class StreamHandler:
                 if len(chunk.choices) > 0 and hasattr(chunk.choices[0].delta, 'content'):
                     content = chunk.choices[0].delta.content
                     if content:
-                        transition_events, in_reasoning_phase, reasoning_completed, answering_started = await self._transition_to_answer_phase(
+                        answer_events, answer_result, in_reasoning_phase, reasoning_completed, answering_started = await self._process_answer_content(
                             send_event,
+                            content,
+                            answer_result,
                             in_reasoning_phase,
                             reasoning_completed,
                             answering_started,
@@ -463,12 +493,8 @@ class StreamHandler:
                             reasoning_message.id,
                             assistant_message.id,
                         )
-                        for event in transition_events:
+                        for event in answer_events:
                             yield event
-                        
-                        # 累积回答内容并发送事件
-                        answer_result += content
-                        yield await send_event("answering_content", content, message_id=assistant_message.id)
             
         except Exception as e:
             logger.error(f"直接API调用出错: {str(e)}")

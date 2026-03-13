@@ -237,6 +237,55 @@ class StreamHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(reasoning_completed)
         self.assertTrue(answering_started)
 
+    async def test_process_answer_content_appends_answering_event_and_result(self):
+        async def send_event(event_type, content=None, message_id=None):
+            payload = {"type": event_type, "content": content, "message_id": message_id}
+            return f"data: {payload}"
+
+        events, answer_result, in_reasoning_phase, reasoning_completed, answering_started = await self.handler._process_answer_content(
+            send_event,
+            content="final answer",
+            answer_result="prefix ",
+            in_reasoning_phase=True,
+            reasoning_completed=False,
+            answering_started=False,
+            has_reasoning=False,
+            reasoning_message_id="reasoning-1",
+            assistant_message_id="assistant-1",
+        )
+
+        self.assertEqual(
+            events,
+            [
+                "data: {'type': 'reasoning_complete', 'content': None, 'message_id': 'reasoning-1'}",
+                "data: {'type': 'answering_start', 'content': None, 'message_id': 'assistant-1'}",
+                "data: {'type': 'answering_content', 'content': 'final answer', 'message_id': 'assistant-1'}",
+            ],
+        )
+        self.assertEqual(answer_result, "prefix final answer")
+        self.assertFalse(in_reasoning_phase)
+        self.assertTrue(reasoning_completed)
+        self.assertTrue(answering_started)
+
+    async def test_process_answer_content_skips_blank_content(self):
+        events, answer_result, in_reasoning_phase, reasoning_completed, answering_started = await self.handler._process_answer_content(
+            AsyncMock(),
+            content="   ",
+            answer_result="existing",
+            in_reasoning_phase=True,
+            reasoning_completed=False,
+            answering_started=False,
+            has_reasoning=False,
+            reasoning_message_id="reasoning-1",
+            assistant_message_id="assistant-1",
+        )
+
+        self.assertEqual(events, [])
+        self.assertEqual(answer_result, "existing")
+        self.assertTrue(in_reasoning_phase)
+        self.assertFalse(reasoning_completed)
+        self.assertFalse(answering_started)
+
 
 if __name__ == "__main__":
     unittest.main()
