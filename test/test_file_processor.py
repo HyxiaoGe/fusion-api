@@ -20,6 +20,19 @@ class FileProcessorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("文件 1: note.txt", result["content"])
         self.assertIn("第一行", result["content"])
 
+    async def test_process_files_returns_error_payload_when_prepare_fails(self):
+        processor = FileProcessor()
+
+        def raise_error(path, mime_type):
+            raise ValueError("bad file")
+
+        processor._prepare_file_data = raise_error
+
+        result = await processor.process_files(["/tmp/bad.txt"], mime_types=["text/plain"])
+
+        self.assertEqual(result["error"], "bad file")
+        self.assertIn("处理文件时发生错误", result["content"])
+
     def test_build_text_only_content_truncates_long_text(self):
         processor = FileProcessor()
         long_text = "a" * (processor.LOCAL_TEXT_PREVIEW_LIMIT + 20)

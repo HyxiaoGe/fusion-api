@@ -64,8 +64,7 @@ class FileProcessor:
             }
 
         except Exception as e:
-            logger.error(f"处理文件失败: {e}")
-            logger.exception("文件处理异常详情")
+            logger.exception(f"处理文件失败: {e}")
             return {
                 "content": f"处理文件时发生错误: {str(e)}",
                 "error": str(e)
@@ -112,7 +111,7 @@ class FileProcessor:
                     "extracted_text": extracted_text,
                 }
         except Exception as e:
-            logger.error(f"准备文件数据失败 {file_path}: {e}")
+            logger.exception(f"准备文件数据失败 {file_path}: {e}")
             raise
 
     def _extract_text_content(self, file_path: str, file_content: bytes, mime_type: str) -> Optional[str]:
@@ -315,22 +314,14 @@ class FileProcessor:
 
             # 收集流式响应
             full_response = ""
-
-            async def process_stream():
-                nonlocal full_response
-                try:
-                    # 迭代处理每个响应块
-                    for chunk in stream_response:
-                        if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
-                            delta = chunk.choices[0].delta
-                            if hasattr(delta, 'content') and delta.content:
-                                full_response += delta.content
-                except Exception as e:
-                    logger.error(f"处理流式响应时出错: {e}")
-                    logger.exception("文件流式响应异常详情")
-
-            # 处理流式响应
-            await process_stream()
+            try:
+                for chunk in stream_response:
+                    if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
+                        delta = chunk.choices[0].delta
+                        if hasattr(delta, 'content') and delta.content:
+                            full_response += delta.content
+            except Exception as e:
+                logger.exception(f"处理流式响应时出错: {e}")
 
             # 返回完整响应
             if full_response:
@@ -340,6 +331,5 @@ class FileProcessor:
                 return "无法处理图片，API返回为空"
 
         except Exception as e:
-            logger.error(f"调用千问视觉模型失败: {e}")
-            logger.exception("文件模型调用异常详情")
+            logger.exception(f"调用千问视觉模型失败: {e}")
             raise
