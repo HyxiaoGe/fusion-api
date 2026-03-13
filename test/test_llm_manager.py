@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from app.ai.llm_manager import QwenFactory
+from app.ai.llm_manager import QwenFactory, get_model_display_name
 
 
 class QwenFactoryTests(unittest.TestCase):
@@ -19,6 +19,9 @@ class QwenFactoryTests(unittest.TestCase):
             streaming=True,
             dashscope_api_key="dashscope-test-key",
         )
+
+    def test_get_model_display_name_uses_wenxin_key(self):
+        self.assertEqual(get_model_display_name("wenxin"), "文心一言")
 
 
 if __name__ == "__main__":

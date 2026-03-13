@@ -53,8 +53,6 @@ def init_function_registry():
             handler=analyze_file_handler,
             categories=["file", "analysis"]
         )
-        
-        logger.info("函数注册表初始化完成")
         return True
     except Exception as e:
         logger.error(f"初始化函数注册表失败: {e}")

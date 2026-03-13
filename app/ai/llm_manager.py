@@ -1,6 +1,5 @@
 from typing import Union, Dict, Type, Protocol, Any
 from abc import ABC, abstractmethod
-import os
 
 from langchain.chat_models.base import BaseChatModel
 from langchain.llms.base import LLM
@@ -184,8 +183,6 @@ class LLMManager:
 
     def get_model(self, provider: str = None, model: str = None, options: Dict[str, Any] = None) -> Union[LLM, BaseChatModel]:
         """获取指定的LLM模型实例"""
-        logger.info(f"获取模型: provider={provider}, model={model}")
-
         if provider and model:
             try:
                 factory = self._factories.get(provider)
@@ -224,14 +221,10 @@ class LLMManager:
         try:
             # 使用独立的数据库Session，避免全局连接事务问题
             from app.db.database import SessionLocal
-            from app.db.repositories import ModelSourceRepository, ModelCredentialRepository
+            from app.db.repositories import ModelCredentialRepository
             
             db = SessionLocal()
             try:
-                # 获取模型信息
-                model_repo = ModelSourceRepository(db)
-                model_source = model_repo.get_by_id(model)
-                    
                 # 获取模型凭证
                 cred_repo = ModelCredentialRepository(db)
                 credential = cred_repo.get_default(model)
@@ -297,7 +290,7 @@ MODEL_DISPLAY_NAMES = {
     "openai": "OpenAI",
     "qwen": "通义千问",
     "volcengine": "火山引擎",
-    "weixin": "文心一言",
+    "wenxin": "文心一言",
     "xai": "XAI"
 }
 
