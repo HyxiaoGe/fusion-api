@@ -70,6 +70,29 @@ class StreamHandler:
         await send_event("answering_complete", message_id=assistant_message_id)
 
     @staticmethod
+    async def _collect_final_reasoning_events(
+        send_event,
+        reasoning_completed: bool,
+        answering_started: bool,
+        reasoning_message_id: str,
+        assistant_message_id: str,
+    ) -> list[str]:
+        """收集推理流收尾阶段需要补发的事件。"""
+        final_events = []
+
+        async def record_event(event_type, content=None, message_id=None):
+            final_events.append(await send_event(event_type, content, message_id))
+
+        await StreamHandler._finalize_reasoning_events(
+            record_event,
+            reasoning_completed=reasoning_completed,
+            answering_started=answering_started,
+            reasoning_message_id=reasoning_message_id,
+            assistant_message_id=assistant_message_id,
+        )
+        return final_events
+
+    @staticmethod
     def _normalize_direct_stream_messages(messages) -> list[dict]:
         """将多种消息对象归一化为 OpenAI 兼容消息格式。"""
         openai_messages = []
@@ -260,13 +283,8 @@ class StreamHandler:
                     has_answer = True
         
         # 确保所有阶段正确结束
-        final_events = []
-
-        async def record_event(event_type, content=None, message_id=None):
-            final_events.append(await send_event(event_type, content, message_id))
-
-        await self._finalize_reasoning_events(
-            record_event,
+        final_events = await self._collect_final_reasoning_events(
+            send_event,
             reasoning_completed=reasoning_completed,
             answering_started=answering_started,
             reasoning_message_id=reasoning_message.id,
@@ -373,13 +391,8 @@ class StreamHandler:
                         yield await send_event("answering_content", content, message_id=assistant_message.id)
             
             # 确保所有阶段正确结束
-            final_events = []
-
-            async def record_event(event_type, content=None, message_id=None):
-                final_events.append(await send_event(event_type, content, message_id))
-
-            await self._finalize_reasoning_events(
-                record_event,
+            final_events = await self._collect_final_reasoning_events(
+                send_event,
                 reasoning_completed=reasoning_completed,
                 answering_started=answering_started,
                 reasoning_message_id=reasoning_message.id,

@@ -95,6 +95,27 @@ class StreamHandlerTests(unittest.IsolatedAsyncioTestCase):
             [call("answering_complete", message_id="assistant-1")],
         )
 
+    async def test_collect_final_reasoning_events_returns_serialized_events(self):
+        async def send_event(event_type, content=None, message_id=None):
+            payload = {"type": event_type, "message_id": message_id}
+            return f"data: {payload}"
+
+        events = await self.handler._collect_final_reasoning_events(
+            send_event,
+            reasoning_completed=False,
+            answering_started=True,
+            reasoning_message_id="reasoning-1",
+            assistant_message_id="assistant-1",
+        )
+
+        self.assertEqual(
+            events,
+            [
+                "data: {'type': 'reasoning_complete', 'message_id': 'reasoning-1'}",
+                "data: {'type': 'answering_complete', 'message_id': 'assistant-1'}",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
