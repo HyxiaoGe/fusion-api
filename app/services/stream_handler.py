@@ -98,6 +98,29 @@ class StreamHandler:
         return final_events
 
     @staticmethod
+    async def _transition_to_answer_phase(
+        send_event,
+        in_reasoning_phase: bool,
+        reasoning_completed: bool,
+        answering_started: bool,
+        has_reasoning: bool,
+        reasoning_message_id: str,
+        assistant_message_id: str,
+    ) -> tuple[list[str], bool, bool, bool]:
+        """在收到答案内容时，统一处理从推理阶段切换到回答阶段的事件。"""
+        events = []
+        if in_reasoning_phase and not reasoning_completed and not has_reasoning:
+            in_reasoning_phase = False
+            reasoning_completed = True
+            events.append(await send_event("reasoning_complete", message_id=reasoning_message_id))
+
+        if not answering_started:
+            answering_started = True
+            events.append(await send_event("answering_start", message_id=assistant_message_id))
+
+        return events, in_reasoning_phase, reasoning_completed, answering_started
+
+    @staticmethod
     def _normalize_direct_stream_messages(messages) -> list[dict]:
         """将多种消息对象归一化为 OpenAI 兼容消息格式。"""
         openai_messages = []
@@ -258,30 +281,34 @@ class StreamHandler:
             # Deepseek模型需要额外检查content不等于reasoning_result
             if provider == "deepseek":
                 if content and content.strip() and content != reasoning_result:
-                    # 如果推理阶段结束但还没发送完成信号
-                    if in_reasoning_phase and not reasoning_completed and not has_reasoning:
-                        in_reasoning_phase = False
-                        reasoning_completed = True
-                        yield await send_event("reasoning_complete", message_id=reasoning_message.id)
-                    
-                    if not answering_started:
-                        answering_started = True
-                        yield await send_event("answering_start", message_id=assistant_message.id)
+                    transition_events, in_reasoning_phase, reasoning_completed, answering_started = await self._transition_to_answer_phase(
+                        send_event,
+                        in_reasoning_phase,
+                        reasoning_completed,
+                        answering_started,
+                        has_reasoning,
+                        reasoning_message.id,
+                        assistant_message.id,
+                    )
+                    for event in transition_events:
+                        yield event
                     
                     answer_result += content
                     yield await send_event("answering_content", content, message_id=assistant_message.id)
                     has_answer = True
             else:
                 if content and content.strip():
-                    # 如果开始接收到答案内容，但还没有结束推理阶段
-                    if in_reasoning_phase and not reasoning_completed and not has_reasoning:
-                        in_reasoning_phase = False
-                        reasoning_completed = True
-                        yield await send_event("reasoning_complete", message_id=reasoning_message.id)
-                    
-                    if not answering_started:
-                        answering_started = True
-                        yield await send_event("answering_start", message_id=assistant_message.id)
+                    transition_events, in_reasoning_phase, reasoning_completed, answering_started = await self._transition_to_answer_phase(
+                        send_event,
+                        in_reasoning_phase,
+                        reasoning_completed,
+                        answering_started,
+                        has_reasoning,
+                        reasoning_message.id,
+                        assistant_message.id,
+                    )
+                    for event in transition_events:
+                        yield event
                     
                     answer_result += content
                     yield await send_event("answering_content", content, message_id=assistant_message.id)
@@ -380,16 +407,17 @@ class StreamHandler:
                 if len(chunk.choices) > 0 and hasattr(chunk.choices[0].delta, 'content'):
                     content = chunk.choices[0].delta.content
                     if content:
-                        # 如果仍在推理阶段且没有接收到推理内容，则推理阶段结束
-                        if in_reasoning_phase and not reasoning_completed and not has_reasoning:
-                            in_reasoning_phase = False
-                            reasoning_completed = True
-                            yield await send_event("reasoning_complete", message_id=reasoning_message.id)
-                        
-                        # 如果尚未开始回答阶段，则开始回答阶段
-                        if not answering_started:
-                            answering_started = True
-                            yield await send_event("answering_start", message_id=assistant_message.id)
+                        transition_events, in_reasoning_phase, reasoning_completed, answering_started = await self._transition_to_answer_phase(
+                            send_event,
+                            in_reasoning_phase,
+                            reasoning_completed,
+                            answering_started,
+                            has_reasoning,
+                            reasoning_message.id,
+                            assistant_message.id,
+                        )
+                        for event in transition_events:
+                            yield event
                         
                         # 累积回答内容并发送事件
                         answer_result += content

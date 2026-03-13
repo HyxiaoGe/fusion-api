@@ -124,6 +124,32 @@ class StreamHandlerTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_transition_to_answer_phase_returns_events_and_state(self):
+        async def send_event(event_type, content=None, message_id=None):
+            payload = {"type": event_type, "message_id": message_id}
+            return f"data: {payload}"
+
+        events, in_reasoning_phase, reasoning_completed, answering_started = await self.handler._transition_to_answer_phase(
+            send_event,
+            in_reasoning_phase=True,
+            reasoning_completed=False,
+            answering_started=False,
+            has_reasoning=False,
+            reasoning_message_id="reasoning-1",
+            assistant_message_id="assistant-1",
+        )
+
+        self.assertEqual(
+            events,
+            [
+                "data: {'type': 'reasoning_complete', 'message_id': 'reasoning-1'}",
+                "data: {'type': 'answering_start', 'message_id': 'assistant-1'}",
+            ],
+        )
+        self.assertFalse(in_reasoning_phase)
+        self.assertTrue(reasoning_completed)
+        self.assertTrue(answering_started)
+
 
 if __name__ == "__main__":
     unittest.main()
