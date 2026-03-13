@@ -11,6 +11,9 @@ from app.ai.prompts import prompt_manager
 class FileProcessor:
     """文件处理器，统一使用千问视觉大模型来处理文件"""
 
+    LOCAL_TEXT_PREVIEW_LIMIT = 6000
+    PROMPT_TEXT_PREVIEW_LIMIT = 3000
+
     def __init__(self):
         self.model = "qwen-omni-turbo"
         self.client = None
@@ -82,9 +85,10 @@ class FileProcessor:
             if not extracted_text:
                 return None
 
-            normalized_text = extracted_text.strip()
-            if len(normalized_text) > 6000:
-                normalized_text = normalized_text[:6000] + "...(内容过长已截断)"
+            normalized_text = self._truncate_text(
+                extracted_text,
+                self.LOCAL_TEXT_PREVIEW_LIMIT,
+            )
 
             extracted_sections.append(
                 f"文件 {index}: {file_data['file_name']} (类型: {file_data['mime_type']})\n{normalized_text}"
@@ -212,6 +216,14 @@ class FileProcessor:
         }
         return mime_map.get(ext, "application/octet-stream")
 
+    @staticmethod
+    def _truncate_text(text: str, limit: int) -> str:
+        """统一截断长文本，避免提示或本地摘要过大。"""
+        normalized_text = text.strip()
+        if len(normalized_text) > limit:
+            return normalized_text[:limit] + "...(内容过长已截断)"
+        return normalized_text
+
     def _build_prompt(self, query: str, files_data: List[Dict[str, Any]]) -> str:
         """构建模型提示"""
         # 准备文件内容
@@ -221,10 +233,10 @@ class FileProcessor:
 
             # 如果有提取的文本内容，添加到提示中
             if file.get('extracted_text'):
-                # 限制文本长度，避免提示过长
-                text = file['extracted_text']
-                if len(text) > 3000:  # 限制每个文件提取的文本长度
-                    text = text[:3000] + "...(内容过长已截断)"
+                text = self._truncate_text(
+                    file["extracted_text"],
+                    self.PROMPT_TEXT_PREVIEW_LIMIT,
+                )
 
                 file_content_text += f"文件内容:\n{text}\n\n"
 

@@ -19,6 +19,41 @@ class FileProcessorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("文件 1: note.txt", result["content"])
         self.assertIn("第一行", result["content"])
 
+    def test_build_text_only_content_truncates_long_text(self):
+        processor = FileProcessor()
+        long_text = "a" * (processor.LOCAL_TEXT_PREVIEW_LIMIT + 20)
+
+        content = processor._build_text_only_content(
+            [
+                {
+                    "file_name": "note.txt",
+                    "mime_type": "text/plain",
+                    "extracted_text": long_text,
+                }
+            ]
+        )
+
+        self.assertIn("...(内容过长已截断)", content)
+        self.assertIn("文件 1: note.txt", content)
+
+    def test_build_prompt_truncates_extracted_text(self):
+        processor = FileProcessor()
+        long_text = "b" * (processor.PROMPT_TEXT_PREVIEW_LIMIT + 20)
+
+        prompt = processor._build_prompt(
+            "总结一下",
+            [
+                {
+                    "file_name": "note.txt",
+                    "mime_type": "text/plain",
+                    "extracted_text": long_text,
+                }
+            ],
+        )
+
+        self.assertIn("...(内容过长已截断)", prompt)
+        self.assertIn("总结一下", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
