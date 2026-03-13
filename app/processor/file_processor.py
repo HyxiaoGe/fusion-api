@@ -54,7 +54,6 @@ class FileProcessor:
             prompt = self._build_prompt(query, files_data)
             # 调用模型
             response = await self._call_model(prompt, files_data)
-            logger.info(f"处理文件成功: {response}")
 
             return {
                 "content": response,
@@ -270,8 +269,6 @@ class FileProcessor:
                 "content": user_content
             })
 
-            logger.info(f"正在调用千问视觉模型处理文件，提示长度: {len(prompt)}")
-
             # 调用API
             stream_response = await asyncio.to_thread(
                 self.client.chat.completions.create,
@@ -303,7 +300,6 @@ class FileProcessor:
 
             # 返回完整响应
             if full_response:
-                logger.info(f"full_response: {full_response}")
                 return full_response
             else:
                 logger.warning("流式API响应中没有找到有效内容")
