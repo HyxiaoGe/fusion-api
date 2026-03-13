@@ -38,6 +38,23 @@ class StreamHandler:
         return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
     @staticmethod
+    async def _finalize_reasoning_events(
+        send_event,
+        reasoning_completed: bool,
+        answering_started: bool,
+        reasoning_message_id: str,
+        assistant_message_id: str,
+    ) -> None:
+        """统一结束推理流的阶段事件。"""
+        if not reasoning_completed:
+            await send_event("reasoning_complete", message_id=reasoning_message_id)
+
+        if not answering_started:
+            await send_event("answering_start", message_id=assistant_message_id)
+
+        await send_event("answering_complete", message_id=assistant_message_id)
+
+    @staticmethod
     def _normalize_direct_stream_messages(messages) -> list[dict]:
         """将多种消息对象归一化为 OpenAI 兼容消息格式。"""
         openai_messages = []
@@ -233,13 +250,20 @@ class StreamHandler:
                     has_answer = True
         
         # 确保所有阶段正确结束
-        if in_reasoning_phase and not reasoning_completed:
-            yield await send_event("reasoning_complete", message_id=reasoning_message.id)
-        
-        if not answering_started:
-            yield await send_event("answering_start", message_id=assistant_message.id)
-        
-        yield await send_event("answering_complete", message_id=assistant_message.id)
+        final_events = []
+
+        async def record_event(event_type, content=None, message_id=None):
+            final_events.append(await send_event(event_type, content, message_id))
+
+        await self._finalize_reasoning_events(
+            record_event,
+            reasoning_completed=reasoning_completed,
+            answering_started=answering_started,
+            reasoning_message_id=reasoning_message.id,
+            assistant_message_id=assistant_message.id,
+        )
+        for event in final_events:
+            yield event
 
         # 更新数据库中的占位消息
         await self._persist_stream_placeholders(
@@ -339,13 +363,20 @@ class StreamHandler:
                         yield await send_event("answering_content", content, message_id=assistant_message.id)
             
             # 确保所有阶段正确结束
-            if in_reasoning_phase and not reasoning_completed:
-                yield await send_event("reasoning_complete", message_id=reasoning_message.id)
-            
-            if not answering_started:
-                yield await send_event("answering_start", message_id=assistant_message.id)
-            
-            yield await send_event("answering_complete", message_id=assistant_message.id)
+            final_events = []
+
+            async def record_event(event_type, content=None, message_id=None):
+                final_events.append(await send_event(event_type, content, message_id))
+
+            await self._finalize_reasoning_events(
+                record_event,
+                reasoning_completed=reasoning_completed,
+                answering_started=answering_started,
+                reasoning_message_id=reasoning_message.id,
+                assistant_message_id=assistant_message.id,
+            )
+            for event in final_events:
+                yield event
             
         except Exception as e:
             logger.error(f"直接API调用出错: {str(e)}")
