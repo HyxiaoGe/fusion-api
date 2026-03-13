@@ -38,6 +38,21 @@ class StreamHandler:
         return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
     @staticmethod
+    def _build_content_event(conversation_id: str, message_id: str, content: str) -> str:
+        """构造普通流内容事件。"""
+        data = {
+            "content": content,
+            "conversation_id": conversation_id,
+            "message_id": message_id,
+        }
+        return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    @staticmethod
+    def _build_done_marker_event(conversation_id: str, message_id: str) -> str:
+        """构造普通流的 [DONE] 标记事件。"""
+        return StreamHandler._build_content_event(conversation_id, message_id, "[DONE]")
+
+    @staticmethod
     async def _finalize_reasoning_events(
         send_event,
         reasoning_completed: bool,
@@ -149,19 +164,14 @@ class StreamHandler:
 
             if content:
                 full_response += content
-                event_data = {
-                    "content": content,
-                    "conversation_id": conversation_id,
-                    "message_id": assistant_message_id
-                }
-                yield f"data: {json.dumps(event_data)}\n\n"
+                yield self._build_content_event(conversation_id, assistant_message_id, content)
                 await asyncio.sleep(0.01)
 
         # 3. 流结束后，更新占位消息
         await self.update_stream_response(assistant_message_id, full_response)
         
         # 4. 发送结束信号
-        yield f"data: {json.dumps({'content': '[DONE]', 'conversation_id': conversation_id, 'message_id': assistant_message_id})}\n\n"
+        yield self._build_done_marker_event(conversation_id, assistant_message_id)
         
 
     async def update_stream_response(self, message_id: str, response_text: str):

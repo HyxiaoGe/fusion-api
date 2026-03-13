@@ -29,6 +29,22 @@ class StreamHandlerTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    def test_build_content_event_includes_message_metadata(self):
+        event = self.handler._build_content_event("conv-1", "msg-1", "hello")
+
+        self.assertEqual(
+            event,
+            'data: {"content": "hello", "conversation_id": "conv-1", "message_id": "msg-1"}\n\n',
+        )
+
+    def test_build_done_marker_event_uses_done_content(self):
+        event = self.handler._build_done_marker_event("conv-1", "msg-1")
+
+        self.assertEqual(
+            event,
+            'data: {"content": "[DONE]", "conversation_id": "conv-1", "message_id": "msg-1"}\n\n',
+        )
+
     async def test_persist_stream_placeholders_updates_existing_messages(self):
         self.handler.update_stream_response = AsyncMock()
 
