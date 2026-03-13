@@ -49,8 +49,9 @@ def get_conversation_files(
 ):
     """获取对话关联的所有文件"""
     file_service = FileService(db)
-    # TODO: 验证用户是否有权访问此对话
-    files = file_service.get_conversation_files(conversation_id)
+    files = file_service.get_conversation_files_for_user(conversation_id, current_user.id)
+    if files is None:
+        raise HTTPException(status_code=404, detail="对话不存在或无权访问")
     return {"files": files}
 
 

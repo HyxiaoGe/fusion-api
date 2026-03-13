@@ -7,7 +7,6 @@ from typing import List, Optional, Dict, Any, Tuple
 from sqlalchemy import desc, func
 from sqlalchemy.orm import Session, joinedload
 
-from app.ai.llm_manager import get_model_display_name
 from app.db.models import Conversation as ConversationModel, get_china_time, File, ConversationFile
 from app.db.models import Message as MessageModel
 from app.db.models import ModelSource, ModelCredential

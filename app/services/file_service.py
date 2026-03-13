@@ -240,6 +240,14 @@ class FileService:
             for f in files
         ]
 
+    def get_conversation_files_for_user(self, conversation_id: str, user_id: str) -> Optional[List[Dict[str, Any]]]:
+        """获取用户有权访问的对话文件列表。"""
+        conv_repo = ConversationRepository(self.db)
+        conversation = conv_repo.get_by_id(conversation_id, user_id)
+        if not conversation:
+            return None
+        return self.get_conversation_files(conversation_id)
+
     def get_files_by_user(self, user_id: str) -> List[Dict[str, Any]]:
         """获取用户的所有文件"""
         files = self.file_repo.get_files_by_user_id(user_id)

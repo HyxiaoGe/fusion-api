@@ -228,6 +228,32 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         self.assertEqual(response.json()["detail"], "文件不存在或无权访问")
         service.get_file_status.assert_called_once_with("file-404", user_id="user-123")
 
+    def test_conversation_files_require_authorized_conversation(self):
+        self._enable_authenticated_overrides()
+
+        with patch.object(self.files_api, "FileService") as file_service_cls:
+            service = file_service_cls.return_value
+            service.get_conversation_files_for_user.return_value = None
+
+            response = self.client.get("/api/files/conversation/conv-404")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["detail"], "对话不存在或无权访问")
+        service.get_conversation_files_for_user.assert_called_once_with("conv-404", "user-123")
+
+    def test_conversation_files_use_authenticated_user_scope(self):
+        self._enable_authenticated_overrides()
+
+        with patch.object(self.files_api, "FileService") as file_service_cls:
+            service = file_service_cls.return_value
+            service.get_conversation_files_for_user.return_value = [{"id": "file-1"}]
+
+            response = self.client.get("/api/files/conversation/conv-1")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"files": [{"id": "file-1"}]})
+        service.get_conversation_files_for_user.assert_called_once_with("conv-1", "user-123")
+
     def test_github_login_redirect_uses_configured_server_host(self):
         response = self.client.get(
             "/api/auth/login/github",
