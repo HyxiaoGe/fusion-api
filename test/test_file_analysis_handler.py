@@ -24,8 +24,7 @@ class AnalyzeFileHandlerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result["summary"], "已有摘要")
-        file_processor_cls.assert_called_once()
-        file_processor_cls.return_value.process_files.assert_not_called()
+        file_processor_cls.assert_not_called()
         repo.update_file.assert_not_called()
 
     async def test_summary_returns_error_instead_of_persisting_failed_parse(self):

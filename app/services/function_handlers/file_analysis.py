@@ -65,9 +65,6 @@ async def analyze_file_handler(args: Dict[str, Any], context: Dict[str, Any]) ->
         if not file:
             return {"error": f"文件不存在: {file_id}"}
             
-        logger.info(f"分析文件: {file_id}, 类型: {analysis_type}, 原始文件名: {file.original_filename}")
-        file_processor = FileProcessor()
-        
         # 根据分析类型处理
         if analysis_type == "summary":
             if file.parsed_content:
@@ -80,7 +77,7 @@ async def analyze_file_handler(args: Dict[str, Any], context: Dict[str, Any]) ->
                 }
 
             content = await _run_file_analysis(
-                file_processor,
+                FileProcessor(),
                 file,
                 "请提供这个文件的简短摘要",
             )
@@ -103,7 +100,7 @@ async def analyze_file_handler(args: Dict[str, Any], context: Dict[str, Any]) ->
         elif analysis_type == "extract_data":
             # 提取文件中的数据
             content = await _run_file_analysis(
-                file_processor,
+                FileProcessor(),
                 file,
                 "请提取这个文件中的关键数据和信息，使用结构化格式" + (f": {query}" if query else ""),
             )
@@ -121,7 +118,7 @@ async def analyze_file_handler(args: Dict[str, Any], context: Dict[str, Any]) ->
                 return {"error": "需要提供问题 (query 参数)"}
                 
             # 回答关于文件的问题
-            content = await _run_file_analysis(file_processor, file, query)
+            content = await _run_file_analysis(FileProcessor(), file, query)
             
             return {
                 "file_id": file_id,
@@ -135,7 +132,9 @@ async def analyze_file_handler(args: Dict[str, Any], context: Dict[str, Any]) ->
         else:
             return {"error": f"不支持的分析类型: {analysis_type}"}
             
+    except (RuntimeError, ValueError) as e:
+        logger.warning(f"文件分析失败: {e}")
+        return {"error": f"文件分析失败: {str(e)}"}
     except Exception as e:
-        logger.error(f"文件分析处理器出错: {e}")
         logger.exception("文件分析处理器异常详情")
         return {"error": f"文件分析失败: {str(e)}"}

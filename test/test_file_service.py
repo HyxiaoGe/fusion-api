@@ -56,6 +56,26 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_parse_file_marks_error_when_content_is_empty(self):
+        self.service.file_repo.get_file_by_id.return_value = SimpleNamespace(
+            mimetype="text/plain",
+            original_filename="note.txt",
+        )
+        self.service.file_processor.process_files.return_value = {"content": "   "}
+
+        await self.service._parse_file_with_llm("file-789", "/tmp/file-789_note.txt")
+
+        self.service.file_repo.update_file.assert_called_once_with(
+            file_id="file-789",
+            updates={
+                "status": "error",
+                "processing_result": {
+                    "status": "error",
+                    "message": "无法解析文件内容",
+                },
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

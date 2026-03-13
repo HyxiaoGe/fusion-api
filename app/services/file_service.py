@@ -172,8 +172,18 @@ class FileService:
 
             logger.info(f"文件 {file_id} 解析成功")
 
+        except (RuntimeError, ValueError) as e:
+            logger.warning(f"文件解析失败 {file_id}: {e}")
+            # 更新文件状态为错误
+            self.file_repo.update_file(
+                file_id=file_id,
+                updates={
+                    "status": "error",
+                    "processing_result": {"status": "error", "message": str(e)}
+                }
+            )
         except Exception as e:
-            logger.error(f"文件解析失败 {file_id}: {e}")
+            logger.exception(f"文件解析异常 {file_id}")
             # 更新文件状态为错误
             self.file_repo.update_file(
                 file_id=file_id,
