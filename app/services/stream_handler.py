@@ -229,6 +229,38 @@ class StreamHandler:
         }
         return reasoning_message, assistant_message, send_event, state
 
+    async def _finalize_reasoning_stream(
+        self,
+        conversation_id: str,
+        send_event,
+        reasoning_message: Message,
+        assistant_message: Message,
+        reasoning_result: str,
+        answer_result: str,
+        reasoning_completed: bool,
+        answering_started: bool,
+    ) -> list[str]:
+        """统一处理推理流结尾的补事件、占位消息回写和 done 事件。"""
+        final_events = await self._collect_final_reasoning_events(
+            send_event,
+            reasoning_completed=reasoning_completed,
+            answering_started=answering_started,
+            reasoning_message_id=reasoning_message.id,
+            assistant_message_id=assistant_message.id,
+        )
+
+        await self._persist_stream_placeholders(
+            assistant_message.id,
+            answer_result,
+            reasoning_message.id,
+            reasoning_result,
+        )
+
+        final_events.append(
+            self._build_done_event(conversation_id, assistant_message.id, reasoning_message.id)
+        )
+        return final_events
+
     async def generate_normal_stream(self, provider, model, messages, conversation_id, options=None, turn_id=None) -> AsyncGenerator:
         """生成常规流式响应（无推理模式）"""
         if options is None:
@@ -342,27 +374,18 @@ class StreamHandler:
                     yield await send_event("answering_content", content, message_id=assistant_message.id)
                     has_answer = True
         
-        # 确保所有阶段正确结束
-        final_events = await self._collect_final_reasoning_events(
+        final_events = await self._finalize_reasoning_stream(
+            conversation_id,
             send_event,
-            reasoning_completed=reasoning_completed,
-            answering_started=answering_started,
-            reasoning_message_id=reasoning_message.id,
-            assistant_message_id=assistant_message.id,
+            reasoning_message,
+            assistant_message,
+            reasoning_result,
+            answer_result,
+            reasoning_completed,
+            answering_started,
         )
         for event in final_events:
             yield event
-
-        # 更新数据库中的占位消息
-        await self._persist_stream_placeholders(
-            assistant_message.id,
-            answer_result,
-            reasoning_message.id,
-            reasoning_result,
-        )
-
-        # 完成标志
-        yield self._build_done_event(conversation_id, assistant_message.id, reasoning_message.id)
 
     async def direct_reasoning_stream(self, provider, model, messages, conversation_id, options=None, turn_id=None) -> AsyncGenerator:
         """直接使用OpenAI客户端生成带推理功能的流式响应，绕过LangChain"""
@@ -447,28 +470,19 @@ class StreamHandler:
                         answer_result += content
                         yield await send_event("answering_content", content, message_id=assistant_message.id)
             
-            # 确保所有阶段正确结束
-            final_events = await self._collect_final_reasoning_events(
-                send_event,
-                reasoning_completed=reasoning_completed,
-                answering_started=answering_started,
-                reasoning_message_id=reasoning_message.id,
-                assistant_message_id=assistant_message.id,
-            )
-            for event in final_events:
-                yield event
-            
         except Exception as e:
             logger.error(f"直接API调用出错: {str(e)}")
             yield await send_event("error", f"生成出错: {str(e)}")
-        
-        # 保存到数据库
-        await self._persist_stream_placeholders(
-            assistant_message.id,
-            answer_result,
-            reasoning_message.id,
+
+        final_events = await self._finalize_reasoning_stream(
+            conversation_id,
+            send_event,
+            reasoning_message,
+            assistant_message,
             reasoning_result,
+            answer_result,
+            reasoning_completed,
+            answering_started,
         )
-        
-        # 完成标志
-        yield self._build_done_event(conversation_id, assistant_message.id, reasoning_message.id)
+        for event in final_events:
+            yield event
