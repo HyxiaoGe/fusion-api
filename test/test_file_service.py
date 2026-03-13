@@ -96,6 +96,58 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    def test_get_conversation_files_uses_shared_summary_serializer(self):
+        conversation_file = SimpleNamespace(
+            file=SimpleNamespace(
+                id="file-1",
+                original_filename="note.txt",
+                mimetype="text/plain",
+                size=12,
+                status="processed",
+            )
+        )
+        self.service.file_repo.get_conversation_files.return_value = [conversation_file]
+
+        result = self.service.get_conversation_files("conv-1")
+
+        self.assertEqual(
+            result,
+            [
+                {
+                    "id": "file-1",
+                    "filename": "note.txt",
+                    "mimetype": "text/plain",
+                    "size": 12,
+                    "status": "processed",
+                }
+            ],
+        )
+
+    def test_get_files_by_user_uses_shared_summary_serializer(self):
+        file_record = SimpleNamespace(
+            id="file-2",
+            original_filename="report.pdf",
+            mimetype="application/pdf",
+            size=24,
+            status="parsing",
+        )
+        self.service.file_repo.get_files_by_user_id.return_value = [file_record]
+
+        result = self.service.get_files_by_user("user-1")
+
+        self.assertEqual(
+            result,
+            [
+                {
+                    "id": "file-2",
+                    "filename": "report.pdf",
+                    "mimetype": "application/pdf",
+                    "size": 24,
+                    "status": "parsing",
+                }
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

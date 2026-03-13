@@ -211,6 +211,17 @@ class FileService:
         else:
             return f"请分析这个文件(文件名:{filename})的内容并提供详细摘要。"
 
+    @staticmethod
+    def _serialize_file_summary(file_obj) -> Dict[str, Any]:
+        """统一序列化文件列表摘要。"""
+        return {
+            "id": file_obj.id,
+            "filename": file_obj.original_filename,
+            "mimetype": file_obj.mimetype,
+            "size": file_obj.size,
+            "status": file_obj.status,
+        }
+
     def get_file_status(self, file_id: str, user_id: str) -> Dict[str, Any]:
         """获取文件状态，并验证用户权限"""
         file = self.file_repo.get_file_by_id(file_id, user_id=user_id)
@@ -225,16 +236,7 @@ class FileService:
     def get_conversation_files(self, conversation_id: str) -> List[Dict[str, Any]]:
         """获取对话关联的所有文件信息"""
         files = self.file_repo.get_conversation_files(conversation_id)
-        return [
-            {
-                "id": f.file.id,
-                "filename": f.file.original_filename,
-                "mimetype": f.file.mimetype,
-                "size": f.file.size,
-                "status": f.file.status,
-            }
-            for f in files
-        ]
+        return [self._serialize_file_summary(f.file) for f in files]
 
     def get_conversation_files_for_user(self, conversation_id: str, user_id: str) -> Optional[List[Dict[str, Any]]]:
         """获取用户有权访问的对话文件列表。"""
@@ -247,16 +249,7 @@ class FileService:
     def get_files_by_user(self, user_id: str) -> List[Dict[str, Any]]:
         """获取用户的所有文件"""
         files = self.file_repo.get_files_by_user_id(user_id)
-        return [
-            {
-                "id": file.id,
-                "filename": file.original_filename,
-                "mimetype": file.mimetype,
-                "size": file.size,
-                "status": file.status,
-            }
-            for file in files
-        ]
+        return [self._serialize_file_summary(file) for file in files]
 
     def delete_file(self, file_id: str, user_id: str) -> bool:
         """删除文件，并验证用户权限"""
