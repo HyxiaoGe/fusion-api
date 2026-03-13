@@ -57,14 +57,11 @@ class FunctionCallAdapter:
         try:
             function_name = function_call.get("name")
             arguments = self._parse_function_arguments(provider, function_call)
-                
-            logger.info(f"正在调用函数: {function_name}, 参数: {arguments}")
-                
+
             # 调用函数并返回结果
             result = await self.function_registry.call_function(
                 function_name, arguments, context
             )
-            logger.info(f"函数调用结果: {result}")
             return result
         except Exception as e:
             logger.error(f"处理函数调用时出错: {e}")
