@@ -91,6 +91,36 @@ class StreamHandlerTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
 
+    async def test_initialize_reasoning_stream_returns_sender_and_default_state(self):
+        self.handler._create_reasoning_placeholders = AsyncMock(
+            return_value=(
+                SimpleNamespace(id="reasoning-1"),
+                SimpleNamespace(id="assistant-1"),
+            )
+        )
+
+        reasoning_message, assistant_message, send_event, state = await self.handler._initialize_reasoning_stream(
+            "conv-1",
+            "turn-1",
+        )
+
+        self.assertEqual(reasoning_message.id, "reasoning-1")
+        self.assertEqual(assistant_message.id, "assistant-1")
+        self.assertEqual(
+            state,
+            {
+                "reasoning_result": "",
+                "answer_result": "",
+                "in_reasoning_phase": True,
+                "reasoning_completed": False,
+                "answering_started": False,
+            },
+        )
+        self.assertEqual(
+            await send_event("reasoning_start", message_id="reasoning-1"),
+            'data: {"type": "reasoning_start", "conversation_id": "conv-1", "message_id": "reasoning-1"}\n\n',
+        )
+
     async def test_finalize_reasoning_events_emits_missing_phase_events(self):
         send_event = AsyncMock()
 

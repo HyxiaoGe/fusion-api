@@ -216,6 +216,19 @@ class StreamHandler:
         )
         return reasoning_message, assistant_message
 
+    async def _initialize_reasoning_stream(self, conversation_id: str, turn_id: Optional[str]):
+        """统一初始化推理流的占位消息、事件发送器和阶段状态。"""
+        reasoning_message, assistant_message = await self._create_reasoning_placeholders(conversation_id, turn_id)
+        send_event = self._create_stream_event_sender(conversation_id)
+        state = {
+            "reasoning_result": "",
+            "answer_result": "",
+            "in_reasoning_phase": True,
+            "reasoning_completed": False,
+            "answering_started": False,
+        }
+        return reasoning_message, assistant_message, send_event, state
+
     async def generate_normal_stream(self, provider, model, messages, conversation_id, options=None, turn_id=None) -> AsyncGenerator:
         """生成常规流式响应（无推理模式）"""
         if options is None:
@@ -258,22 +271,19 @@ class StreamHandler:
         if options is None:
             options = {}
         
-        # 1. 创建占位消息
-        reasoning_message, assistant_message = await self._create_reasoning_placeholders(conversation_id, turn_id)
-
-        send_event = self._create_stream_event_sender(conversation_id)
-
+        reasoning_message, assistant_message, send_event, state = await self._initialize_reasoning_stream(
+            conversation_id,
+            turn_id,
+        )
         yield await send_event("reasoning_start", message_id=reasoning_message.id)
         
         # 获取模型
         llm = llm_manager.get_model(provider=provider, model=model, options=options)
-        reasoning_result = ""
-        answer_result = ""
-        
-        # 状态跟踪
-        in_reasoning_phase = True
-        reasoning_completed = False
-        answering_started = False
+        reasoning_result = state["reasoning_result"]
+        answer_result = state["answer_result"]
+        in_reasoning_phase = state["in_reasoning_phase"]
+        reasoning_completed = state["reasoning_completed"]
+        answering_started = state["answering_started"]
 
         # 根据不同模型准备参数
         stream_kwargs = {}
@@ -365,10 +375,10 @@ class StreamHandler:
         if not isinstance(messages, list):
             messages = [messages]
         
-        # 1. 创建占位消息
-        reasoning_message, assistant_message = await self._create_reasoning_placeholders(conversation_id, turn_id)
-
-        send_event = self._create_stream_event_sender(conversation_id)
+        reasoning_message, assistant_message, send_event, state = await self._initialize_reasoning_stream(
+            conversation_id,
+            turn_id,
+        )
 
         # 获取API凭证
         credentials = llm_manager._get_model_credentials(provider, model)
@@ -382,14 +392,11 @@ class StreamHandler:
             timeout=60 * 30  # 30分钟超时
         )
         
-        # 准备推理和回答内容
-        reasoning_result = ""
-        answer_result = ""
-        
-        # 状态跟踪
-        in_reasoning_phase = True
-        reasoning_completed = False
-        answering_started = False
+        reasoning_result = state["reasoning_result"]
+        answer_result = state["answer_result"]
+        in_reasoning_phase = state["in_reasoning_phase"]
+        reasoning_completed = state["reasoning_completed"]
+        answering_started = state["answering_started"]
         
         # 开始推理流
         yield await send_event("reasoning_start", message_id=reasoning_message.id)
