@@ -29,8 +29,6 @@ class WebSearchService:
             搜索结果列表，每个结果包含标题、摘要、URL等
         """
         try:
-            logger.info(f"执行网络搜索: query='{query}', limit={limit}")
-
             if not self.api_key or not self.search_endpoint:
                 logger.warning("网络搜索未配置 API key 或 endpoint，跳过搜索")
                 return []
@@ -70,8 +68,6 @@ class WebSearchService:
                                 "link": page.get("link", ""),
                                 "source": page.get("source", "")
                             })
-
-                        logger.info(f"搜索成功，找到 {len(formatted_results)} 个结果")
                         return formatted_results
                         
                 except httpx.ReadTimeout:

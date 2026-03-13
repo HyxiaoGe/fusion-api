@@ -407,7 +407,6 @@ class FunctionCallProcessor:
         second_llm_messages.append(ToolMessage(content=tool_message_content, tool_call_id=original_tool_call_id).dict())
 
         # 4. 流式返回 LLM 的最终回复
-        logger.info(f"{function_name}_handler: Preparing for second LLM stream to generate final answer.")
         final_response = ""
         results = []
         async for result in StreamProcessor.process_llm_stream_with_reasoning(
@@ -420,7 +419,6 @@ class FunctionCallProcessor:
         # 最后一个结果应该是 final_response
         if results and isinstance(results[-1], str) and not results[-1].startswith("data: "):
             final_response = results[-1]
-            logger.info(f"捕获到最终响应，长度: {len(final_response)}")
 
         # 5. 保存完整对话历史
         await self._save_function_call_stream_response(
@@ -439,7 +437,6 @@ class FunctionCallProcessor:
     async def _save_function_call_stream_response(self, conversation_id, function_name,
                                            function_result, final_response, turn_id=None, user_id=None, first_llm_thought=None):
         """保存函数调用流式响应到对话历史"""
-        logger.info(f"开始保存函数调用响应 - conversation_id: {conversation_id}, function_name: {function_name}, user_id: {user_id}")
         try:
             if not user_id:
                 logger.error("保存函数调用响应时缺少 user_id")

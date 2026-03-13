@@ -30,8 +30,6 @@ async def web_search_handler(args: Dict[str, Any], context: Dict[str, Any]) -> D
             
         limit = int(args.get("limit", 10))
         
-        logger.info(f"执行网络搜索: {query}, 限制: {limit}")
-        
         # 执行搜索
         search_service = WebSearchService()
         results = await search_service.search(query, limit)
