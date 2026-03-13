@@ -76,6 +76,26 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_parse_file_marks_error_when_processor_raises_unexpected_exception(self):
+        self.service.file_repo.get_file_by_id.return_value = SimpleNamespace(
+            mimetype="text/plain",
+            original_filename="note.txt",
+        )
+        self.service.file_processor.process_files.side_effect = Exception("boom")
+
+        await self.service._parse_file_with_llm("file-999", "/tmp/file-999_note.txt")
+
+        self.service.file_repo.update_file.assert_called_once_with(
+            file_id="file-999",
+            updates={
+                "status": "error",
+                "processing_result": {
+                    "status": "error",
+                    "message": "boom",
+                },
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

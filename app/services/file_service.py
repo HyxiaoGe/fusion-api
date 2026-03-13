@@ -174,24 +174,20 @@ class FileService:
 
         except (RuntimeError, ValueError) as e:
             logger.warning(f"文件解析失败 {file_id}: {e}")
-            # 更新文件状态为错误
-            self.file_repo.update_file(
-                file_id=file_id,
-                updates={
-                    "status": "error",
-                    "processing_result": {"status": "error", "message": str(e)}
-                }
-            )
+            self._mark_file_error(file_id, str(e))
         except Exception as e:
             logger.exception(f"文件解析异常 {file_id}")
-            # 更新文件状态为错误
-            self.file_repo.update_file(
-                file_id=file_id,
-                updates={
-                    "status": "error",
-                    "processing_result": {"status": "error", "message": str(e)}
-                }
-            )
+            self._mark_file_error(file_id, str(e))
+
+    def _mark_file_error(self, file_id: str, message: str) -> None:
+        """统一记录文件解析失败状态。"""
+        self.file_repo.update_file(
+            file_id=file_id,
+            updates={
+                "status": "error",
+                "processing_result": {"status": "error", "message": message},
+            },
+        )
 
     @staticmethod
     def _normalize_parsed_content(content: Any) -> Optional[str]:
