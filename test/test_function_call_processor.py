@@ -3,7 +3,7 @@ import unittest
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
-from app.constants import FUNCTION_DESCRIPTIONS, MessageRoles, MessageTypes
+from app.constants import FUNCTION_DESCRIPTIONS, USER_FRIENDLY_FUNCTION_DESCRIPTIONS, MessageRoles, MessageTypes
 from app.schemas.chat import Conversation, Message
 from app.services.chat.function_call_processor import FunctionCallProcessor
 
@@ -65,6 +65,46 @@ class FunctionCallProcessorTests(unittest.TestCase):
         self.assertEqual(message["content"], "")
         self.assertEqual(message["function_call"]["name"], "web_search")
         self.assertTrue(tool_call_id.startswith("call_"))
+
+    def test_build_function_detected_event_data_uses_user_friendly_description(self):
+        payload = self.processor._build_function_detected_event_data(
+            {"function": {"name": "web_search"}}
+        )
+
+        self.assertEqual(payload["function_type"], "web_search")
+        self.assertEqual(
+            payload["description"],
+            USER_FRIENDLY_FUNCTION_DESCRIPTIONS["web_search"],
+        )
+
+    def test_update_function_arguments_serializes_with_utf8(self):
+        function_call_data = {
+            "function": {
+                "name": "web_search",
+                "arguments": "{}",
+            }
+        }
+
+        updated = self.processor._update_function_arguments(
+            function_call_data,
+            {"query": "融合聊天"},
+        )
+
+        self.assertEqual(
+            updated["function"]["arguments"],
+            '{"query": "融合聊天"}',
+        )
+
+    def test_build_function_result_event_data_preserves_result_payload(self):
+        payload = self.processor._build_function_result_event_data(
+            "web_search",
+            {"status": "ok", "items": [1, 2]},
+        )
+
+        self.assertEqual(
+            payload,
+            {"function_type": "web_search", "result": {"status": "ok", "items": [1, 2]}},
+        )
 
     @patch("app.services.chat.function_call_processor.StreamProcessor.create_tool_synthesis_messages")
     def test_build_web_search_followup_messages_appends_tool_messages(self, mock_create_tool_synthesis_messages):

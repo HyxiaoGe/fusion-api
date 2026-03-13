@@ -99,6 +99,47 @@ class FunctionCallProcessor:
         ai_message = self._build_assistant_content_message(final_response, turn_id)
         return [function_call_message, function_result_message, ai_message]
 
+    @staticmethod
+    def _get_function_name(function_call_data: Dict[str, Any]) -> str:
+        """统一读取函数名。"""
+        return function_call_data.get("function", {}).get("name", "")
+
+    @staticmethod
+    def _get_user_friendly_function_description(function_name: str) -> str:
+        """统一读取用户友好的函数描述。"""
+        return USER_FRIENDLY_FUNCTION_DESCRIPTIONS.get(
+            function_name,
+            "我需要调用工具获取更多信息...",
+        )
+
+    def _build_function_detected_event_data(
+        self,
+        function_call_data: Dict[str, Any],
+    ) -> Dict[str, str]:
+        """统一构造函数检测事件 payload。"""
+        function_name = self._get_function_name(function_call_data)
+        return {
+            "function_type": function_name,
+            "description": self._get_user_friendly_function_description(function_name),
+        }
+
+    @staticmethod
+    def _build_function_result_event_data(function_name: str, function_result) -> Dict[str, Any]:
+        """统一构造函数结果事件 payload。"""
+        return {
+            "function_type": function_name,
+            "result": function_result,
+        }
+
+    @staticmethod
+    def _update_function_arguments(
+        function_call_data: Dict[str, Any],
+        arguments: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """统一回写函数参数。"""
+        function_call_data["function"]["arguments"] = json.dumps(arguments, ensure_ascii=False)
+        return function_call_data
+
     @classmethod
     def _provider_uses_tool_calls(cls, provider: str) -> bool:
         """判断 provider 是否使用 tool_calls 格式。"""
@@ -368,16 +409,10 @@ class FunctionCallProcessor:
                 function_call_detected, function_call_data = function_adapter.detect_function_call_in_stream(chunk)
                 
                 if function_call_detected and not function_call_sent:
-                    function_name = function_call_data['function'].get('name')
-                    # 使用用户友好的描述，而不是暴露内部函数名
-                    user_friendly_description = USER_FRIENDLY_FUNCTION_DESCRIPTIONS.get(
-                        function_name, 
-                        "我需要调用工具获取更多信息..."
+                    yield await send_event(
+                        EventTypes.FUNCTION_CALL_DETECTED,
+                        self._build_function_detected_event_data(function_call_data),
                     )
-                    yield await send_event(EventTypes.FUNCTION_CALL_DETECTED, {
-                        "function_type": function_name,
-                        "description": user_friendly_description
-                    })
                     function_call_sent = True
             
             # 累积第一次LLM的思考过程
@@ -392,10 +427,8 @@ class FunctionCallProcessor:
         # 对于Google模型，即使没有文本内容也可能有有效的函数调用
         # 如果检测到函数调用但没有文本内容，提供一个默认的说明
         if function_call_detected and not full_response.strip():
-            function_name = function_call_data['function'].get('name', '')
-            full_response = USER_FRIENDLY_FUNCTION_DESCRIPTIONS.get(
-                function_name, 
-                "我需要调用工具获取更多信息..."
+            full_response = self._get_user_friendly_function_description(
+                self._get_function_name(function_call_data)
             )
         
         yield (function_call_detected, function_call_data, full_response, reasoning_state.reasoning_start_sent)
@@ -413,7 +446,7 @@ class FunctionCallProcessor:
         Returns:
             dict: 更新后的函数调用数据
         """
-        function_name = function_call_data["function"].get("name", "")
+        function_name = self._get_function_name(function_call_data)
         function_args = function_call_data["function"].get("arguments", "{}")
         args_dict = ChatUtils.parse_function_arguments(function_args)
             
@@ -426,7 +459,7 @@ class FunctionCallProcessor:
             if user_message:
                 search_query = await ChatUtils.generate_search_query(user_message, llm)
                 args_dict["query"] = search_query
-                function_call_data["function"]["arguments"] = json.dumps(args_dict)
+                self._update_function_arguments(function_call_data, args_dict)
                 yield await send_event(EventTypes.QUERY_GENERATED, f"{MessageTexts.SEARCH_QUERY_PREFIX}{search_query}")
         
         yield function_call_data
@@ -476,10 +509,10 @@ class FunctionCallProcessor:
         use_reasoning = options.get("use_reasoning", False)
         
         # 1. 先将 function_result 以 function_result 类型消息返回前端
-        yield await send_event(EventTypes.FUNCTION_RESULT, {
-            "function_type": function_name,
-            "result": function_result
-        })
+        yield await send_event(
+            EventTypes.FUNCTION_RESULT,
+            self._build_function_result_event_data(function_name, function_result),
+        )
         
         # --- 开始为第二次LLM调用构建新的消息列表 ---
 
