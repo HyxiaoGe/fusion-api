@@ -40,6 +40,19 @@ class FunctionCallProcessor:
         """统一保存函数调用产生的会话变更。"""
         self.memory_service.save_conversation(conversation)
         self.db.commit()
+
+    def _get_persistable_conversation(self, conversation_id: str, user_id: str | None, error_message: str):
+        """统一校验持久化上下文，返回可写入的会话。"""
+        if not user_id:
+            logger.error(error_message)
+            return None
+        return self.memory_service.get_conversation(conversation_id, user_id)
+
+    def _append_and_persist_messages(self, conversation, messages: List[Message]) -> None:
+        """向会话追加消息并落库。"""
+        for message in messages:
+            conversation.messages.append(message)
+        self._persist_conversation(conversation)
     
     async def generate_function_call_stream(self, provider, model, messages, conversation_id, options=None, turn_id=None):
         """
@@ -438,13 +451,12 @@ class FunctionCallProcessor:
                                            function_result, final_response, turn_id=None, user_id=None, first_llm_thought=None):
         """保存函数调用流式响应到对话历史"""
         try:
-            if not user_id:
-                logger.error("保存函数调用响应时缺少 user_id")
-                return
-                
-            conversation = self.memory_service.get_conversation(conversation_id, user_id)
+            conversation = self._get_persistable_conversation(
+                conversation_id,
+                user_id,
+                "保存函数调用响应时缺少 user_id",
+            )
             if conversation:
-                
                 # 创建函数调用请求消息，使用LLM的实际输出或默认描述
                 if first_llm_thought and first_llm_thought.strip():
                     function_desc = first_llm_thought
@@ -474,13 +486,11 @@ class FunctionCallProcessor:
                     content=final_response,
                     turn_id=turn_id
                 )
-                
-                # 添加所有消息到会话
-                conversation.messages.append(function_call_message)
-                conversation.messages.append(function_result_message)
-                conversation.messages.append(ai_message)
-                
-                self._persist_conversation(conversation)
+
+                self._append_and_persist_messages(
+                    conversation,
+                    [function_call_message, function_result_message, ai_message],
+                )
         except Exception as e:
             logger.error(f"保存函数调用流式响应失败: {e}")
             logger.exception("保存函数调用响应异常详情")
@@ -488,11 +498,11 @@ class FunctionCallProcessor:
     async def _save_stream_response(self, conversation_id, response_content, user_id=None):
         """保存普通流式响应到对话历史"""
         try:
-            if not user_id:
-                logger.error("保存流式响应时缺少 user_id")
-                return
-                
-            conversation = self.memory_service.get_conversation(conversation_id, user_id)
+            conversation = self._get_persistable_conversation(
+                conversation_id,
+                user_id,
+                "保存流式响应时缺少 user_id",
+            )
             if conversation:
                 # 创建AI响应消息
                 ai_message = Message(
@@ -500,11 +510,8 @@ class FunctionCallProcessor:
                     type=MessageTypes.ASSISTANT_CONTENT,
                     content=response_content
                 )
-                
-                # 添加AI响应到会话
-                conversation.messages.append(ai_message)
-                
-                self._persist_conversation(conversation)
+
+                self._append_and_persist_messages(conversation, [ai_message])
         except Exception as e:
             logger.error(f"保存流式响应失败: {e}")
             logger.exception("保存普通流式响应异常详情")

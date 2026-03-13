@@ -95,6 +95,19 @@ class FunctionCallProcessorTests(unittest.TestCase):
         self.processor.memory_service.save_conversation.assert_called_once_with(conversation)
         self.processor.db.commit.assert_called_once()
 
+    def test_save_stream_response_skips_persistence_without_user_id(self):
+        asyncio.run(
+            self.processor._save_stream_response(
+                conversation_id="conv-1",
+                response_content="assistant reply",
+                user_id=None,
+            )
+        )
+
+        self.processor.memory_service.get_conversation.assert_not_called()
+        self.processor.memory_service.save_conversation.assert_not_called()
+        self.processor.db.commit.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
