@@ -53,6 +53,50 @@ class FunctionCallProcessor:
         for message in messages:
             conversation.messages.append(message)
         self._persist_conversation(conversation)
+
+    @staticmethod
+    def _build_assistant_content_message(content: str, turn_id: str | None = None) -> Message:
+        """统一构造 assistant 正文消息。"""
+        return Message(
+            role=MessageRoles.ASSISTANT,
+            type=MessageTypes.ASSISTANT_CONTENT,
+            content=content,
+            turn_id=turn_id,
+        )
+
+    @staticmethod
+    def _resolve_function_call_description(
+        function_name: str,
+        first_llm_thought: str | None,
+    ) -> str:
+        """统一决定函数调用描述文本。"""
+        if first_llm_thought and first_llm_thought.strip():
+            return first_llm_thought
+        return FUNCTION_DESCRIPTIONS.get(function_name, f"我需要调用 {function_name} 函数获取信息...")
+
+    def _build_function_call_history_messages(
+        self,
+        function_name: str,
+        function_result,
+        final_response: str,
+        turn_id: str | None = None,
+        first_llm_thought: str | None = None,
+    ) -> List[Message]:
+        """统一构造函数调用落库所需的消息列表。"""
+        function_call_message = Message(
+            role=MessageRoles.ASSISTANT,
+            type=MessageTypes.FUNCTION_CALL,
+            content=self._resolve_function_call_description(function_name, first_llm_thought),
+            turn_id=turn_id,
+        )
+        function_result_message = Message(
+            role=MessageRoles.SYSTEM,
+            type=MessageTypes.FUNCTION_RESULT,
+            content=json.dumps(function_result, ensure_ascii=False),
+            turn_id=turn_id,
+        )
+        ai_message = self._build_assistant_content_message(final_response, turn_id)
+        return [function_call_message, function_result_message, ai_message]
     
     async def generate_function_call_stream(self, provider, model, messages, conversation_id, options=None, turn_id=None):
         """
@@ -457,39 +501,15 @@ class FunctionCallProcessor:
                 "保存函数调用响应时缺少 user_id",
             )
             if conversation:
-                # 创建函数调用请求消息，使用LLM的实际输出或默认描述
-                if first_llm_thought and first_llm_thought.strip():
-                    function_desc = first_llm_thought
-                else:
-                    function_desc = FUNCTION_DESCRIPTIONS.get(function_name, f"我需要调用 {function_name} 函数获取信息...")
-                
-                # 创建函数调用消息
-                function_call_message = Message(
-                    role=MessageRoles.ASSISTANT,
-                    type=MessageTypes.FUNCTION_CALL,
-                    content=function_desc,
-                    turn_id=turn_id
-                )
-                
-                # 创建函数结果消息
-                function_result_message = Message(
-                    role=MessageRoles.SYSTEM,
-                    type=MessageTypes.FUNCTION_RESULT,
-                    content=json.dumps(function_result, ensure_ascii=False),
-                    turn_id=turn_id
-                )
-                
-                # 创建最终AI响应消息
-                ai_message = Message(
-                    role=MessageRoles.ASSISTANT,
-                    type=MessageTypes.ASSISTANT_CONTENT,
-                    content=final_response,
-                    turn_id=turn_id
-                )
-
                 self._append_and_persist_messages(
                     conversation,
-                    [function_call_message, function_result_message, ai_message],
+                    self._build_function_call_history_messages(
+                        function_name,
+                        function_result,
+                        final_response,
+                        turn_id,
+                        first_llm_thought,
+                    ),
                 )
         except Exception as e:
             logger.error(f"保存函数调用流式响应失败: {e}")
@@ -504,14 +524,10 @@ class FunctionCallProcessor:
                 "保存流式响应时缺少 user_id",
             )
             if conversation:
-                # 创建AI响应消息
-                ai_message = Message(
-                    role=MessageRoles.ASSISTANT,
-                    type=MessageTypes.ASSISTANT_CONTENT,
-                    content=response_content
+                self._append_and_persist_messages(
+                    conversation,
+                    [self._build_assistant_content_message(response_content)],
                 )
-
-                self._append_and_persist_messages(conversation, [ai_message])
         except Exception as e:
             logger.error(f"保存流式响应失败: {e}")
             logger.exception("保存普通流式响应异常详情")

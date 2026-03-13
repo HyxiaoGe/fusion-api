@@ -3,7 +3,7 @@ import unittest
 from datetime import datetime
 from unittest.mock import MagicMock
 
-from app.constants import MessageRoles, MessageTypes
+from app.constants import FUNCTION_DESCRIPTIONS, MessageRoles, MessageTypes
 from app.schemas.chat import Conversation, Message
 from app.services.chat.function_call_processor import FunctionCallProcessor
 
@@ -11,6 +11,33 @@ from app.services.chat.function_call_processor import FunctionCallProcessor
 class FunctionCallProcessorTests(unittest.TestCase):
     def setUp(self):
         self.processor = FunctionCallProcessor(MagicMock(), MagicMock())
+
+    def test_build_assistant_content_message_uses_assistant_content_type(self):
+        message = self.processor._build_assistant_content_message("hello", "turn-1")
+
+        self.assertEqual(message.role, MessageRoles.ASSISTANT)
+        self.assertEqual(message.type, MessageTypes.ASSISTANT_CONTENT)
+        self.assertEqual(message.content, "hello")
+        self.assertEqual(message.turn_id, "turn-1")
+
+    def test_build_function_call_history_messages_uses_fallback_description(self):
+        messages = self.processor._build_function_call_history_messages(
+            function_name="web_search",
+            function_result={"status": "ok"},
+            final_response="final answer",
+            turn_id="turn-1",
+            first_llm_thought=None,
+        )
+
+        self.assertEqual(
+            [(msg.role, msg.type) for msg in messages],
+            [
+                (MessageRoles.ASSISTANT, MessageTypes.FUNCTION_CALL),
+                (MessageRoles.SYSTEM, MessageTypes.FUNCTION_RESULT),
+                (MessageRoles.ASSISTANT, MessageTypes.ASSISTANT_CONTENT),
+            ],
+        )
+        self.assertEqual(messages[0].content, FUNCTION_DESCRIPTIONS["web_search"])
 
     def test_prepare_function_call_messages_replaces_existing_system_prompt(self):
         messages = [
