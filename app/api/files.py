@@ -23,8 +23,6 @@ async def upload_files(
     """上传文件到指定对话"""
     try:
         file_service = FileService(db)
-        # 验证用户是否有权访问此对话
-        # (这部分逻辑在ChatService中，这里可以简化或调用)
         file_ids = await file_service.upload_files(files, current_user.id, conversation_id, provider, model)
         return {"status": "success", "file_ids": file_ids}
     except ValueError as e:

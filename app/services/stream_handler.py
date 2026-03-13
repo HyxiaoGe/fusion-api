@@ -63,7 +63,7 @@ class StreamHandler:
                         openai_messages.append({"role": "system", "content": msg_content})
                     continue
             except Exception as e:
-                logger.error(f"尝试获取消息字典时出错: {e}")
+                logger.warning(f"跳过无法转换的消息对象: {e}")
 
             class_name = msg.__class__.__name__
             if class_name == "HumanMessage":
@@ -80,13 +80,13 @@ class StreamHandler:
                 elif msg.type == "system":
                     openai_messages.append({"role": "system", "content": msg.content})
                 else:
-                    logger.warning(f"无法识别的消息 type: {msg.type}")
+                    logger.warning(f"跳过无法识别的消息 type: {msg.type}")
             elif hasattr(msg, "role") and hasattr(msg, "content"):
                 openai_messages.append({"role": msg.role, "content": msg.content})
             elif isinstance(msg, dict) and "role" in msg and "content" in msg:
                 openai_messages.append(msg)
             else:
-                logger.warning(f"无法识别的消息格式: {type(msg)}")
+                logger.warning(f"跳过无法识别的消息格式: {type(msg)}")
 
         return openai_messages
 
