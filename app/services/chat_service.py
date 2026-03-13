@@ -333,6 +333,37 @@ class ChatService:
             return conversation
         return None
 
+    def _build_recent_dialog_content(self, conversation: Conversation, fallback_user_limit: int = 3) -> str:
+        """提取最近一轮用户/助手对话，必要时回退到最近几条用户消息。"""
+        latest_user_msg = None
+        latest_ai_msg = None
+
+        for msg in reversed(conversation.messages):
+            if not latest_ai_msg and msg.role == MessageRoles.ASSISTANT:
+                latest_ai_msg = msg.content
+            elif not latest_user_msg and msg.role == MessageRoles.USER:
+                latest_user_msg = msg.content
+            if latest_user_msg and latest_ai_msg:
+                break
+
+        dialog_lines = []
+        if latest_user_msg:
+            dialog_lines.append(f"用户: {latest_user_msg}")
+        if latest_ai_msg:
+            dialog_lines.append(f"助手: {latest_ai_msg}")
+
+        if dialog_lines:
+            return "\n".join(dialog_lines)
+
+        fallback_user_messages = []
+        for msg in conversation.messages:
+            if msg.role == MessageRoles.USER:
+                fallback_user_messages.append(msg.content)
+                if len(fallback_user_messages) >= fallback_user_limit:
+                    break
+
+        return "\n".join(fallback_user_messages)
+
     def update_message(self, message_id: str, update_data: Dict[str, Any]) -> Optional[Message]:
         """更新消息"""
         updated_message = self.memory_service.update_message(message_id, update_data)
@@ -364,40 +395,7 @@ class ChatService:
 
             # 使用会话的最后一次对话（用户和助手的消息）作为输入
             if not message and conversation.messages:
-                # 获取会话中最后的用户和助手消息
-                user_message = None
-                assistant_message = None
-                
-                # 从后向前查找最近的一组对话
-                for i in range(len(conversation.messages) - 1, -1, -1):
-                    msg = conversation.messages[i]
-                    if not assistant_message and msg.role == MessageRoles.ASSISTANT:
-                        assistant_message = msg.content
-                    if not user_message and msg.role == MessageRoles.USER:
-                        user_message = msg.content
-                    if user_message and assistant_message:
-                        break
-                
-                # 组合用户和助手的消息
-                dialog_messages = []
-                if user_message:
-                    dialog_messages.append(f"用户: {user_message}")
-                if assistant_message:
-                    dialog_messages.append(f"助手: {assistant_message}")
-                
-                if dialog_messages:
-                    message = "\n".join(dialog_messages)
-                else:
-                    # 如果没有找到对话，回退到之前的逻辑
-                    user_messages = []
-                    for msg in conversation.messages:
-                        if msg.role == MessageRoles.USER:
-                            user_messages.append(msg.content)
-                            if len(user_messages) >= 3:
-                                break
-                    
-                    if user_messages:
-                        message = "\n".join(user_messages)
+                message = self._build_recent_dialog_content(conversation)
 
         if not message:
             raise ValueError("必须提供消息内容或有效的会话ID")
@@ -455,26 +453,7 @@ class ChatService:
         if not conversation:
             raise ValueError(f"找不到会话ID: {conversation_id}")
 
-        # 准备对话内容 - 只取最近一轮对话(最新的用户问题和AI回答)
-        latest_user_msg = None
-        latest_ai_msg = None
-        
-        # 从后向前查找最近的用户消息和AI回答
-        for i in range(len(conversation.messages) - 1, -1, -1):
-            msg = conversation.messages[i]
-            if not latest_ai_msg and msg.role == MessageRoles.ASSISTANT:
-                latest_ai_msg = msg.content
-            elif not latest_user_msg and msg.role == MessageRoles.USER:
-                latest_user_msg = msg.content
-            if latest_user_msg and latest_ai_msg:
-                break
-        
-        # 组合最近一轮对话
-        dialog_content = ""
-        if latest_user_msg:
-            dialog_content += f"用户: {latest_user_msg}\n"
-        if latest_ai_msg:
-            dialog_content += f"助手: {latest_ai_msg}"
+        dialog_content = self._build_recent_dialog_content(conversation)
         
         if not dialog_content:
             # 如果没有对话内容，返回默认问题

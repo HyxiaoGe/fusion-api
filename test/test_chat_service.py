@@ -9,6 +9,84 @@ from app.services.chat_service import ChatService
 
 
 class ChatServiceTests(unittest.TestCase):
+    def test_build_recent_dialog_content_prefers_latest_user_assistant_pair(self):
+        service = object.__new__(ChatService)
+        conversation = Conversation(
+            id="conv-1",
+            user_id="user-1",
+            title="hello",
+            provider="qwen",
+            model="qwen-max-latest",
+            messages=[
+                Message(
+                    id="user-msg-1",
+                    role="user",
+                    type="user_query",
+                    content="old question",
+                    turn_id="turn-1",
+                ),
+                Message(
+                    id="assistant-msg-1",
+                    role="assistant",
+                    type="assistant_content",
+                    content="old answer",
+                    turn_id="turn-1",
+                ),
+                Message(
+                    id="user-msg-2",
+                    role="user",
+                    type="user_query",
+                    content="latest question",
+                    turn_id="turn-2",
+                ),
+                Message(
+                    id="assistant-msg-2",
+                    role="assistant",
+                    type="assistant_content",
+                    content="latest answer",
+                    turn_id="turn-2",
+                ),
+            ],
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+        )
+
+        content = service._build_recent_dialog_content(conversation)
+
+        self.assertEqual(content, "用户: latest question\n助手: latest answer")
+
+    def test_build_recent_dialog_content_falls_back_to_user_messages(self):
+        service = object.__new__(ChatService)
+        conversation = Conversation(
+            id="conv-1",
+            user_id="user-1",
+            title="hello",
+            provider="qwen",
+            model="qwen-max-latest",
+            messages=[
+                Message(
+                    id="user-msg-1",
+                    role="user",
+                    type="user_query",
+                    content="question one",
+                    turn_id="turn-1",
+                ),
+                Message(
+                    id="user-msg-2",
+                    role="user",
+                    type="user_query",
+                    content="question two",
+                    turn_id="turn-2",
+                ),
+            ],
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+        )
+
+        content = service._build_recent_dialog_content(conversation)
+
+        self.assertEqual(content, "用户: question two")
+
     def test_handle_normal_response_commits_assistant_message(self):
         service = object.__new__(ChatService)
         service.db = MagicMock()
