@@ -114,6 +114,10 @@ POST /api/chat/generate-title
 - RSS、热点、摘要、调度等内容平台能力已退出当前主产品范围
 - `web search` 和 `function call` 作为后续可控增强能力保留在代码边缘，不是当前默认产品面
 
+## 数据流文档
+
+- 聊天核心数据流说明见 [`CHAT_CORE_DATA_FLOW.md`](/Users/sean/code/fusion/fusion-api/CHAT_CORE_DATA_FLOW.md)
+
 ## 🤝 贡献
 
 欢迎提交 Issue 和 Pull Request！
