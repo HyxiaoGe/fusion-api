@@ -116,10 +116,9 @@ def _sync_user_from_claims(db: Session, payload: dict, token: str) -> User:
     social_repo = SocialAccountRepository(db)
 
     social_account = social_repo.get_by_provider(AUTH_PROVIDER, subject)
-    if social_account:
-        return social_account.user
-
-    user = user_repo.get(subject)
+    user = social_account.user if social_account else None
+    if not user:
+        user = user_repo.get(subject)
     if not user and email:
         user = user_repo.get_by_email(email)
 
@@ -159,7 +158,7 @@ def _sync_user_from_claims(db: Session, payload: dict, token: str) -> User:
             db.commit()
             db.refresh(user)
 
-    if not social_repo.get_by_provider(AUTH_PROVIDER, subject):
+    if not social_account:
         social_repo.create(
             {
                 "user_id": user.id,
