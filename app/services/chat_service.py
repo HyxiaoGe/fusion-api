@@ -409,9 +409,16 @@ class ChatService:
         prompt = prompt_manager.format_prompt("generate_title", content=message)
 
         try:
-            # 获取AI模型并生成标题
-            llm = llm_manager.get_default_model()
-            response = llm.invoke([HumanMessage(content=prompt)])
+            if conversation:
+                response = await self._invoke_non_stream_model(
+                    conversation.provider,
+                    conversation.model,
+                    [HumanMessage(content=prompt)],
+                    {"use_reasoning": False},
+                )
+            else:
+                llm = llm_manager.get_default_model()
+                response = llm.invoke([HumanMessage(content=prompt)])
 
             # 清理标题（去除多余的引号、空白和解释性文字）
             title = ChatUtils.clean_model_text(self._get_response_text(response))
@@ -467,9 +474,12 @@ class ChatService:
         prompt = prompt_manager.format_prompt("generate_suggested_questions", content=dialog_content)
 
         try:
-            # 获取AI模型并生成问题
-            llm = llm_manager.get_default_model()
-            response = llm.invoke([HumanMessage(content=prompt)])
+            response = await self._invoke_non_stream_model(
+                conversation.provider,
+                conversation.model,
+                [HumanMessage(content=prompt)],
+                {"use_reasoning": False},
+            )
 
             response_text = self._get_response_text(response)
 

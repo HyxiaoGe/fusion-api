@@ -210,14 +210,13 @@ class ChatServiceTests(unittest.TestCase):
         )
         service.memory_service.get_conversation.return_value = conversation
 
-        llm = MagicMock()
-        llm.invoke.return_value = SimpleNamespace(
-            content="1. Follow-up A\n2. Follow-up B\n3. Follow-up C\n4. Follow-up D"
-        )
-
         with patch(
-            "app.services.chat_service.llm_manager.get_default_model",
-            return_value=llm,
+            "app.services.chat_service.ChatService._invoke_non_stream_model",
+            new=AsyncMock(
+                return_value=SimpleNamespace(
+                    content="1. Follow-up A\n2. Follow-up B\n3. Follow-up C\n4. Follow-up D"
+                )
+            ),
         ):
             questions = asyncio.run(
                 service.generate_suggested_questions(
@@ -230,7 +229,6 @@ class ChatServiceTests(unittest.TestCase):
             questions,
             ["Follow-up A", "Follow-up B", "Follow-up C"],
         )
-        llm.invoke.assert_called_once()
 
     def test_generate_title_persists_conversation_inside_service(self):
         service = object.__new__(ChatService)
@@ -264,12 +262,9 @@ class ChatServiceTests(unittest.TestCase):
         )
         service.memory_service.get_conversation.return_value = conversation
 
-        llm = MagicMock()
-        llm.invoke.return_value = SimpleNamespace(content="Fusion Chat")
-
         with patch(
-            "app.services.chat_service.llm_manager.get_default_model",
-            return_value=llm,
+            "app.services.chat_service.ChatService._invoke_non_stream_model",
+            new=AsyncMock(return_value=SimpleNamespace(content="Fusion Chat")),
         ):
             title = asyncio.run(
                 service.generate_title(
