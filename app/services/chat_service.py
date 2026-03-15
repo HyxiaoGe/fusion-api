@@ -369,6 +369,13 @@ class ChatService:
 
         return "\n".join(fallback_user_messages)
 
+    def _get_latest_user_message_content(self, conversation: Conversation) -> str:
+        """提取最后一条用户消息作为标题种子。"""
+        for msg in reversed(conversation.messages):
+            if msg.role == MessageRoles.USER and msg.content:
+                return msg.content
+        return ""
+
     def update_message(self, message_id: str, update_data: Dict[str, Any]) -> Optional[Message]:
         """更新消息"""
         updated_message = self.memory_service.update_message(message_id, update_data)
@@ -398,9 +405,9 @@ class ChatService:
             if not conversation:
                 raise ValueError(f"找不到会话ID: {conversation_id}")
 
-            # 使用会话的最后一次对话（用户和助手的消息）作为输入
+            # 标题只基于最后一条用户问题，避免被助手回复干扰
             if not message and conversation.messages:
-                message = self._build_recent_dialog_content(conversation)
+                message = self._get_latest_user_message_content(conversation)
 
         if not message:
             raise ValueError("必须提供消息内容或有效的会话ID")

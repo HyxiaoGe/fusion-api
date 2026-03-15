@@ -278,6 +278,46 @@ class ChatServiceTests(unittest.TestCase):
         service.memory_service.save_conversation.assert_called_once_with(conversation)
         service.db.commit.assert_called_once()
 
+    def test_generate_title_prefers_latest_user_message_only(self):
+        service = object.__new__(ChatService)
+        conversation = Conversation(
+            id="conv-1",
+            user_id="user-1",
+            title="old",
+            provider="qwen",
+            model="qwen-max-latest",
+            messages=[
+                Message(
+                    id="user-msg-1",
+                    role="user",
+                    type="user_query",
+                    content="第一个问题",
+                    turn_id="turn-1",
+                ),
+                Message(
+                    id="assistant-msg-1",
+                    role="assistant",
+                    type="assistant_content",
+                    content="第一个回答",
+                    turn_id="turn-1",
+                ),
+                Message(
+                    id="user-msg-2",
+                    role="user",
+                    type="user_query",
+                    content="最后一个问题",
+                    turn_id="turn-2",
+                ),
+            ],
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+        )
+
+        self.assertEqual(
+            service._get_latest_user_message_content(conversation),
+            "最后一个问题",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
