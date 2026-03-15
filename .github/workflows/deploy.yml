@@ -11,6 +11,17 @@ jobs:
       - name: Sync deploy checkout
         run: cd ~/project/fusion/fusion-api && git fetch origin && git reset --hard origin/master && git clean -fd
       - name: Build and deploy
-        run: cd ~/project/fusion && docker compose up -d --build fusion-api
+        run: |
+          cd ~/project/fusion
+          for attempt in 1 2 3; do
+            if docker compose up -d --build fusion-api; then
+              exit 0
+            fi
+
+            docker compose rm -sf fusion-api || true
+            sleep 5
+          done
+
+          exit 1
       - name: Cleanup
         run: docker image prune -f
