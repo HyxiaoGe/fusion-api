@@ -46,11 +46,19 @@ class Settings(BaseSettings):
     # 前端基础URL，回调路径会自动拼接
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000")
     FRONTEND_AUTH_CALLBACK_PATH: str = "/auth/callback"
+
+    AUTH_SERVICE_BASE_URL: str = os.getenv("AUTH_SERVICE_BASE_URL", "http://localhost:8100")
+    AUTH_SERVICE_CLIENT_ID: Optional[str] = os.getenv("AUTH_SERVICE_CLIENT_ID")
+    AUTH_SERVICE_JWKS_URL: Optional[str] = os.getenv("AUTH_SERVICE_JWKS_URL")
     
     @property
     def FRONTEND_AUTH_CALLBACK_URL(self) -> str:
         """动态生成前端OAuth回调URL"""
         return f"{self.FRONTEND_URL.rstrip('/')}{self.FRONTEND_AUTH_CALLBACK_PATH}"
+
+    @property
+    def RESOLVED_AUTH_SERVICE_JWKS_URL(self) -> str:
+        return self.AUTH_SERVICE_JWKS_URL or f"{self.AUTH_SERVICE_BASE_URL.rstrip('/')}/.well-known/jwks.json"
 
     POSTGRES_SERVER: str = os.getenv("POSTGRES_SERVER", "localhost")
     POSTGRES_USER: str = os.getenv("POSTGRES_USER", "postgres")

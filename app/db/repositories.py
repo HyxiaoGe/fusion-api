@@ -1,4 +1,5 @@
 import logging
+import re
 import uuid
 from copy import deepcopy
 from datetime import datetime
@@ -27,6 +28,25 @@ class UserRepository:
 
     def get_by_username(self, username: str) -> Optional[UserModel]:
         return self.db.query(UserModel).filter(UserModel.username == username).first()
+
+    def get_by_email(self, email: str) -> Optional[UserModel]:
+        return self.db.query(UserModel).filter(UserModel.email == email).first()
+
+    def build_unique_username(self, preferred: str, fallback_suffix: str) -> str:
+        slug = re.sub(r"[^a-zA-Z0-9_]+", "-", preferred).strip("-").lower()
+        slug = slug or f"user-{fallback_suffix[:8]}"
+
+        if not self.get_by_username(slug):
+            return slug
+
+        candidate = f"{slug}-{fallback_suffix[:8]}"
+        if not self.get_by_username(candidate):
+            return candidate
+
+        counter = 2
+        while self.get_by_username(f"{candidate}-{counter}"):
+            counter += 1
+        return f"{candidate}-{counter}"
 
     def create(self, obj_in: Dict[str, Any]) -> UserModel:
         db_obj = UserModel(**obj_in)
