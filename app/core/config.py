@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     def RESOLVED_AUTH_SERVICE_JWKS_URL(self) -> str:
         return self.AUTH_SERVICE_JWKS_URL or f"{self.AUTH_SERVICE_BASE_URL.rstrip('/')}/.well-known/jwks.json"
 
+    @property
+    def AUTH_SERVICE_USERINFO_URL(self) -> str:
+        return f"{self.AUTH_SERVICE_BASE_URL.rstrip('/')}/auth/userinfo"
+
     POSTGRES_SERVER: str = os.getenv("POSTGRES_SERVER", "localhost")
     POSTGRES_USER: str = os.getenv("POSTGRES_USER", "postgres")
 

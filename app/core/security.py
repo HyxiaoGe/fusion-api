@@ -89,9 +89,28 @@ def _build_username_seed(email: str | None, subject: str) -> str:
     return f"user-{subject[:8]}"
 
 
-def _sync_user_from_claims(db: Session, payload: dict) -> User:
+def _fetch_auth_service_userinfo(token: str) -> dict:
+    response = httpx.get(
+        settings.AUTH_SERVICE_USERINFO_URL,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10.0,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _sync_user_from_claims(db: Session, payload: dict, token: str) -> User:
     subject = payload["sub"]
     email = (payload.get("email") or "").strip() or None
+    try:
+        userinfo = _fetch_auth_service_userinfo(token)
+    except httpx.HTTPError as exc:
+        logger.warning("Auth userinfo fetch failed: %s", exc)
+        userinfo = {}
+
+    email = (userinfo.get("email") or email or "").strip() or None
+    nickname = (userinfo.get("name") or "").strip() or None
+    avatar = (userinfo.get("avatar_url") or "").strip() or None
 
     user_repo = UserRepository(db)
     social_repo = SocialAccountRepository(db)
@@ -113,6 +132,8 @@ def _sync_user_from_claims(db: Session, payload: dict) -> User:
                     subject,
                 ),
                 "email": email,
+                "nickname": nickname,
+                "avatar": avatar,
             }
         )
         db.commit()
@@ -121,6 +142,12 @@ def _sync_user_from_claims(db: Session, payload: dict) -> User:
         should_commit = False
         if email and user.email != email:
             user.email = email
+            should_commit = True
+        if nickname != user.nickname:
+            user.nickname = nickname
+            should_commit = True
+        if avatar != user.avatar:
+            user.avatar = avatar
             should_commit = True
         if not user.username:
             user.username = user_repo.build_unique_username(
@@ -158,7 +185,7 @@ def get_current_user(db: Session = Depends(get_db), token: str = Depends(oauth2_
         logger.warning("Auth token verification failed: %s", exc)
         raise credentials_exception
 
-    user = _sync_user_from_claims(db, payload)
+    user = _sync_user_from_claims(db, payload, token)
     if user is None:
         raise credentials_exception
     return user
