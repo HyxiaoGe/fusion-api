@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     # 前端基础URL，回调路径会自动拼接
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000")
     FRONTEND_AUTH_CALLBACK_PATH: str = "/auth/callback"
+    CORS_ORIGINS: str = os.getenv("CORS_ORIGINS", "")
 
     AUTH_SERVICE_BASE_URL: str = os.getenv("AUTH_SERVICE_BASE_URL", "http://localhost:8100")
     AUTH_SERVICE_CLIENT_ID: Optional[str] = os.getenv("AUTH_SERVICE_CLIENT_ID")
@@ -55,6 +56,13 @@ class Settings(BaseSettings):
     def FRONTEND_AUTH_CALLBACK_URL(self) -> str:
         """动态生成前端OAuth回调URL"""
         return f"{self.FRONTEND_URL.rstrip('/')}{self.FRONTEND_AUTH_CALLBACK_PATH}"
+
+    @property
+    def RESOLVED_CORS_ORIGINS(self) -> List[str]:
+        configured = [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
+        origins = configured or [self.FRONTEND_URL.rstrip("/")]
+        # Keep order stable while de-duplicating.
+        return list(dict.fromkeys(origins))
 
     @property
     def RESOLVED_AUTH_SERVICE_JWKS_URL(self) -> str:

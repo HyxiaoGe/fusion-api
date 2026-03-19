@@ -73,7 +73,7 @@ app.add_middleware(TimeoutMiddleware, timeout_seconds=10)
 # 配置CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 开发环境可以设置为"*"，生产环境应该限制
+    allow_origins=settings.RESOLVED_CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
