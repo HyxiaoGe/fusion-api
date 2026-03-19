@@ -3,6 +3,8 @@ services:
     build: .
     container_name: fusion-api
     restart: always
+    env_file:
+      - .env
     ports:
       - "8000:8000"
     volumes:
@@ -10,7 +12,12 @@ services:
       - ./logs:/app/logs
       - ~/.cache/huggingface:/root/.cache/huggingface
     environment:
-      - DATABASE_URL=postgresql://fusion:fusion123!!@fusion_postgres:5432/fusion?client_encoding=utf8
+      - DATABASE_URL=${DATABASE_URL}
+      - SERVER_HOST=${SERVER_HOST:-http://localhost:8000}
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3000}
+      - AUTH_SERVICE_BASE_URL=${AUTH_SERVICE_BASE_URL:-http://localhost:8100}
+      - AUTH_SERVICE_JWKS_URL=${AUTH_SERVICE_JWKS_URL:-}
+      - AUTH_SERVICE_CLIENT_ID=${AUTH_SERVICE_CLIENT_ID:-}
       - DEFAULT_MODEL=${DEFAULT_MODEL:-}
       - SEARCH_API_KEY=${SEARCH_API_KEY:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
@@ -30,6 +37,10 @@ services:
       - QIANFAN_SK=${QIANFAN_SK:-}
       - XAI_API_KEY=${XAI_API_KEY:-}
       - XAI_API_BASE=${XAI_API_BASE:-}
+      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-}
+      - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET:-}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
     deploy:
       resources:
         limits:
