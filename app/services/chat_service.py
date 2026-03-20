@@ -1,4 +1,5 @@
 import uuid
+from collections import defaultdict
 from datetime import datetime
 from typing import List, Optional, Dict, Any, Union
 
@@ -15,7 +16,10 @@ from app.services.memory_service import MemoryService
 from app.services.stream_handler import StreamHandler
 from app.constants import MessageRoles, MessageTypes
 from app.services.chat.utils import ChatUtils
-from app.services.chat.function_call_processor import FunctionCallProcessor
+
+
+class FunctionCallsNotSupportedError(ValueError):
+    pass
 
 
 # ==================== ChatService 类 ====================
@@ -26,7 +30,6 @@ class ChatService:
         self.memory_service = MemoryService(db)
         self.file_repo = FileRepository(db)
         self.stream_handler = StreamHandler(db, self.memory_service)
-        self.function_call_processor = FunctionCallProcessor(db, self.memory_service)
 
     def _persist_conversation(self, conversation: Conversation):
         """统一保存会话并提交事务。"""
@@ -244,35 +247,14 @@ class ChatService:
             
         # 检查是否启用函数调用
         use_function_calls = options.get("use_function_calls", False)
-        use_reasoning = options.get("use_reasoning", False)
         
         if use_function_calls:
-            return StreamingResponse(
-                self.function_call_processor.generate_function_call_stream(provider, model, messages, conversation_id, options, turn_id),
-                media_type="text/event-stream"
-            )
-        elif provider == "volcengine": 
-            return StreamingResponse(
-                self.stream_handler.direct_reasoning_stream(provider, model, messages, conversation_id, options, turn_id),
-                media_type="text/event-stream"
-            )
-        elif use_reasoning:
-            # 只有当显式启用推理时才使用推理流
-            return StreamingResponse(
-                self.stream_handler.generate_reasoning_stream(provider, model, messages, conversation_id, options, turn_id),
-                media_type="text/event-stream"
-            )
-        elif use_reasoning is None and provider in ("deepseek", "qwen", "xai"):
-            # 只有当use_reasoning未明确设置时，才根据provider自动判断
-            return StreamingResponse(
-                self.stream_handler.generate_reasoning_stream(provider, model, messages, conversation_id, options, turn_id),
-                media_type="text/event-stream"
-            )
-        else:
-            return StreamingResponse(
-                self.stream_handler.generate_normal_stream(provider, model, messages, conversation_id, options, turn_id),
-                media_type="text/event-stream"
-            )
+            raise FunctionCallsNotSupportedError("工具调用功能当前未启用")
+
+        return StreamingResponse(
+            self.stream_handler.generate_stream(provider, model, messages, conversation_id, options, turn_id),
+            media_type="text/event-stream"
+        )
 
     async def _handle_normal_response(self, provider, model, messages, conversation_id, user_id: str, options=None, turn_id=None):
         """处理非流式响应"""
@@ -335,8 +317,35 @@ class ChatService:
         """获取特定对话的详细信息，并验证用户权限"""
         conversation = self.memory_service.get_conversation(conversation_id, user_id)
         if conversation and conversation.user_id == user_id:
-            return conversation
+            return self._aggregate_reasoning_messages(conversation)
         return None
+
+    def _aggregate_reasoning_messages(self, conversation: Conversation) -> Conversation:
+        reasoning_by_turn = defaultdict(list)
+        visible_messages = []
+
+        for message in sorted(conversation.messages, key=lambda msg: msg.created_at):
+            if message.type == MessageTypes.REASONING_CONTENT and message.turn_id:
+                reasoning_by_turn[message.turn_id].append(message)
+                continue
+
+            visible_message = message.model_copy(deep=True)
+            visible_message.reasoning = None
+            visible_messages.append(visible_message)
+
+        for message in visible_messages:
+            if message.type != MessageTypes.ASSISTANT_CONTENT or not message.turn_id:
+                continue
+
+            reasoning_messages = reasoning_by_turn.get(message.turn_id, [])
+            if not reasoning_messages:
+                continue
+
+            ordered_messages = sorted(reasoning_messages, key=lambda item: item.created_at)
+            reasoning_text = "".join(item.content for item in ordered_messages if item.content)
+            message.reasoning = reasoning_text or None
+
+        return conversation.model_copy(update={"messages": visible_messages}, deep=True)
 
     def _build_recent_dialog_content(self, conversation: Conversation, fallback_user_limit: int = 3) -> str:
         """提取最近一轮用户/助手对话，必要时回退到最近几条用户消息。"""

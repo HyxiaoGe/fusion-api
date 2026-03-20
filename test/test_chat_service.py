@@ -179,6 +179,123 @@ class ChatServiceTests(unittest.TestCase):
         )
         service.db.commit.assert_called_once()
 
+    def test_get_conversation_attaches_reasoning_to_assistant_message(self):
+        service = object.__new__(ChatService)
+        service.memory_service = MagicMock()
+
+        conversation = Conversation(
+            id="conv-1",
+            user_id="user-1",
+            title="hello",
+            provider="qwen",
+            model="qwen-max-latest",
+            messages=[
+                Message(
+                    id="user-msg-1",
+                    role="user",
+                    type="user_query",
+                    content="question",
+                    turn_id="turn-1",
+                ),
+                Message(
+                    id="reasoning-msg-1",
+                    role="assistant",
+                    type="reasoning_content",
+                    content="thought",
+                    turn_id="turn-1",
+                ),
+                Message(
+                    id="assistant-msg-1",
+                    role="assistant",
+                    type="assistant_content",
+                    content="answer",
+                    turn_id="turn-1",
+                ),
+            ],
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+        )
+        service.memory_service.get_conversation.return_value = conversation
+
+        result = service.get_conversation("conv-1", "user-1")
+
+        self.assertEqual([msg.id for msg in result.messages], ["user-msg-1", "assistant-msg-1"])
+        self.assertEqual(result.messages[1].reasoning, "thought")
+
+    def test_get_conversation_concatenates_multiple_reasoning_messages_by_created_at(self):
+        service = object.__new__(ChatService)
+        service.memory_service = MagicMock()
+        now = datetime.now()
+
+        conversation = Conversation(
+            id="conv-1",
+            user_id="user-1",
+            title="hello",
+            provider="qwen",
+            model="qwen-max-latest",
+            messages=[
+                Message(
+                    id="assistant-msg-1",
+                    role="assistant",
+                    type="assistant_content",
+                    content="answer",
+                    turn_id="turn-1",
+                    created_at=now,
+                ),
+                Message(
+                    id="reasoning-msg-2",
+                    role="assistant",
+                    type="reasoning_content",
+                    content="second",
+                    turn_id="turn-1",
+                    created_at=now.replace(microsecond=2),
+                ),
+                Message(
+                    id="reasoning-msg-1",
+                    role="assistant",
+                    type="reasoning_content",
+                    content="first",
+                    turn_id="turn-1",
+                    created_at=now.replace(microsecond=1),
+                ),
+            ],
+            created_at=now,
+            updated_at=now,
+        )
+        service.memory_service.get_conversation.return_value = conversation
+
+        result = service.get_conversation("conv-1", "user-1")
+
+        self.assertEqual(result.messages[0].reasoning, "firstsecond")
+
+    def test_get_conversation_returns_null_reasoning_when_absent(self):
+        service = object.__new__(ChatService)
+        service.memory_service = MagicMock()
+
+        conversation = Conversation(
+            id="conv-1",
+            user_id="user-1",
+            title="hello",
+            provider="qwen",
+            model="qwen-max-latest",
+            messages=[
+                Message(
+                    id="assistant-msg-1",
+                    role="assistant",
+                    type="assistant_content",
+                    content="answer",
+                    turn_id="turn-1",
+                ),
+            ],
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+        )
+        service.memory_service.get_conversation.return_value = conversation
+
+        result = service.get_conversation("conv-1", "user-1")
+
+        self.assertIsNone(result.messages[0].reasoning)
+
     def test_generate_suggested_questions_uses_prompt_manager_and_limits_output(self):
         service = object.__new__(ChatService)
         service.memory_service = MagicMock()

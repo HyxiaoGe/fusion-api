@@ -1,159 +1,46 @@
 import asyncio
-import json
 from typing import AsyncGenerator, Optional
 
 from app.ai.llm_manager import llm_manager
-from app.schemas.chat import Message
+from app.constants import FinishReasons, MessageRoles, MessageTypes
 from app.core.logger import app_logger as logger
-from app.constants import MessageRoles, MessageTypes
+from app.schemas.chat import Message
+from app.services.stream_serializer import StreamSerializer
+
 
 class StreamHandler:
+    REASONING_PROVIDERS = {"deepseek", "qwen", "xai", "volcengine"}
+
     def __init__(self, db, memory_service):
         self.db = db
         self.memory_service = memory_service
 
-    @staticmethod
-    def _serialize_sse_event(data: dict) -> str:
-        """统一序列化 SSE 事件字符串。"""
-        return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+    async def generate_stream(
+        self,
+        provider,
+        model,
+        messages,
+        conversation_id,
+        options=None,
+        turn_id=None,
+    ) -> AsyncGenerator[str, None]:
+        if options is None:
+            options = {}
 
-    @staticmethod
-    def _create_stream_event_sender(conversation_id: str):
-        """创建统一的 SSE 事件发送器。"""
-        async def send_event(event_type, content=None, message_id=None):
-            data = {"type": event_type, "conversation_id": conversation_id}
-            if content is not None:
-                data["content"] = content
-            if message_id:
-                data["message_id"] = message_id
-            return StreamHandler._serialize_sse_event(data)
-
-        return send_event
-
-    @staticmethod
-    def _build_done_event(conversation_id: str, message_id: str, reasoning_message_id: Optional[str] = None) -> str:
-        """构造统一的 done 事件。"""
-        data = {
-            "type": "done",
-            "conversation_id": conversation_id,
-            "message_id": message_id,
-        }
-        if reasoning_message_id:
-            data["reasoning_message_id"] = reasoning_message_id
-        return StreamHandler._serialize_sse_event(data)
-
-    @staticmethod
-    def _build_content_event(conversation_id: str, message_id: str, content: str) -> str:
-        """构造普通流内容事件。"""
-        data = {
-            "content": content,
-            "conversation_id": conversation_id,
-            "message_id": message_id,
-        }
-        return StreamHandler._serialize_sse_event(data)
-
-    @staticmethod
-    def _build_done_marker_event(conversation_id: str, message_id: str) -> str:
-        """构造普通流的 [DONE] 标记事件。"""
-        return StreamHandler._build_content_event(conversation_id, message_id, "[DONE]")
-
-    @staticmethod
-    def _extract_chunk_content(chunk) -> str:
-        """统一提取流式 chunk 的正文内容。"""
-        return chunk.content if hasattr(chunk, "content") else chunk
-
-    @staticmethod
-    async def _finalize_reasoning_events(
-        send_event,
-        reasoning_completed: bool,
-        answering_started: bool,
-        reasoning_message_id: str,
-        assistant_message_id: str,
-    ) -> None:
-        """统一结束推理流的阶段事件。"""
-        if not reasoning_completed:
-            await send_event("reasoning_complete", message_id=reasoning_message_id)
-
-        if not answering_started:
-            await send_event("answering_start", message_id=assistant_message_id)
-
-        await send_event("answering_complete", message_id=assistant_message_id)
-
-    @staticmethod
-    async def _collect_final_reasoning_events(
-        send_event,
-        reasoning_completed: bool,
-        answering_started: bool,
-        reasoning_message_id: str,
-        assistant_message_id: str,
-    ) -> list[str]:
-        """收集推理流收尾阶段需要补发的事件。"""
-        final_events = []
-
-        async def record_event(event_type, content=None, message_id=None):
-            final_events.append(await send_event(event_type, content, message_id))
-
-        await StreamHandler._finalize_reasoning_events(
-            record_event,
-            reasoning_completed=reasoning_completed,
-            answering_started=answering_started,
-            reasoning_message_id=reasoning_message_id,
-            assistant_message_id=assistant_message_id,
-        )
-        return final_events
-
-    @staticmethod
-    async def _transition_to_answer_phase(
-        send_event,
-        in_reasoning_phase: bool,
-        reasoning_completed: bool,
-        answering_started: bool,
-        has_reasoning: bool,
-        reasoning_message_id: str,
-        assistant_message_id: str,
-    ) -> tuple[list[str], bool, bool, bool]:
-        """在收到答案内容时，统一处理从推理阶段切换到回答阶段的事件。"""
-        events = []
-        if in_reasoning_phase and not reasoning_completed and not has_reasoning:
-            in_reasoning_phase = False
-            reasoning_completed = True
-            events.append(await send_event("reasoning_complete", message_id=reasoning_message_id))
-
-        if not answering_started:
-            answering_started = True
-            events.append(await send_event("answering_start", message_id=assistant_message_id))
-
-        return events, in_reasoning_phase, reasoning_completed, answering_started
-
-    @staticmethod
-    async def _process_answer_content(
-        send_event,
-        content: str,
-        answer_result: str,
-        in_reasoning_phase: bool,
-        reasoning_completed: bool,
-        answering_started: bool,
-        has_reasoning: bool,
-        reasoning_message_id: str,
-        assistant_message_id: str,
-    ) -> tuple[list[str], str, bool, bool, bool]:
-        """统一处理回答内容的阶段切换、累积和事件发送。"""
-        if not content or not content.strip():
-            return [], answer_result, in_reasoning_phase, reasoning_completed, answering_started
-
-        events, in_reasoning_phase, reasoning_completed, answering_started = await StreamHandler._transition_to_answer_phase(
-            send_event,
-            in_reasoning_phase,
-            reasoning_completed,
-            answering_started,
-            has_reasoning,
-            reasoning_message_id,
-            assistant_message_id,
+        use_reasoning = options.get("use_reasoning")
+        should_use_reasoning = (
+            use_reasoning is True
+            or (use_reasoning is None and provider in self.REASONING_PROVIDERS)
         )
 
-        answer_result += content
-        events.append(await send_event("answering_content", content, message_id=assistant_message_id))
-        return events, answer_result, in_reasoning_phase, reasoning_completed, answering_started
+        stream = (
+            self._stream_with_reasoning(provider, model, messages, conversation_id, options, turn_id)
+            if should_use_reasoning
+            else self._stream_normal(provider, model, messages, conversation_id, options, turn_id)
+        )
+
+        async for event in stream:
+            yield event
 
     @staticmethod
     def _normalize_direct_stream_messages(messages) -> list[dict]:
@@ -180,8 +67,8 @@ class StreamHandler:
                     elif msg_type == "system":
                         openai_messages.append({"role": "system", "content": msg_content})
                     continue
-            except Exception as e:
-                logger.warning(f"跳过无法转换的消息对象: {e}")
+            except Exception as exc:
+                logger.warning(f"跳过无法转换的消息对象: {exc}")
 
             class_name = msg.__class__.__name__
             if class_name == "HumanMessage":
@@ -208,32 +95,156 @@ class StreamHandler:
 
         return openai_messages
 
-    async def _persist_stream_placeholders(
+    @staticmethod
+    def _extract_chunk_content(chunk) -> str:
+        if hasattr(chunk, "content"):
+            return chunk.content or ""
+        return chunk if isinstance(chunk, str) else ""
+
+    @staticmethod
+    def _extract_openai_delta(chunk):
+        choices = getattr(chunk, "choices", None)
+        if not choices:
+            return None
+        choice = choices[0]
+        return getattr(choice, "delta", None)
+
+    def _extract_reasoning_content(self, chunk) -> str:
+        additional_kwargs = getattr(chunk, "additional_kwargs", None)
+        if isinstance(additional_kwargs, dict):
+            reasoning_content = additional_kwargs.get("reasoning_content")
+            if reasoning_content:
+                return reasoning_content
+
+        delta = self._extract_openai_delta(chunk)
+        if delta is None:
+            return ""
+
+        if isinstance(delta, dict):
+            return delta.get("reasoning_content") or ""
+        return getattr(delta, "reasoning_content", "") or ""
+
+    def _extract_openai_content(self, chunk) -> str:
+        delta = self._extract_openai_delta(chunk)
+        if delta is None:
+            return ""
+
+        if isinstance(delta, dict):
+            return delta.get("content") or ""
+        return getattr(delta, "content", "") or ""
+
+    def _extract_finish_reason(self, chunk) -> Optional[str]:
+        choices = getattr(chunk, "choices", None)
+        if choices:
+            finish_reason = getattr(choices[0], "finish_reason", None)
+            if finish_reason:
+                return finish_reason
+
+        response_metadata = getattr(chunk, "response_metadata", None)
+        if isinstance(response_metadata, dict) and response_metadata.get("finish_reason"):
+            return response_metadata["finish_reason"]
+
+        generation_info = getattr(chunk, "generation_info", None)
+        if isinstance(generation_info, dict) and generation_info.get("finish_reason"):
+            return generation_info["finish_reason"]
+
+        additional_kwargs = getattr(chunk, "additional_kwargs", None)
+        if isinstance(additional_kwargs, dict) and additional_kwargs.get("finish_reason"):
+            return additional_kwargs["finish_reason"]
+
+        return None
+
+    async def _create_placeholder_message(self, conversation_id: str, message_type: str, turn_id: Optional[str]) -> Message:
+        placeholder_message = Message(
+            role=MessageRoles.ASSISTANT,
+            type=message_type,
+            content="",
+            turn_id=turn_id,
+        )
+        return self.memory_service.create_message(placeholder_message, conversation_id)
+
+    async def _persist_accumulated_content(
         self,
         assistant_message_id: str,
         answer_text: str,
         reasoning_message_id: Optional[str] = None,
         reasoning_text: str = "",
     ):
-        """将流式阶段收集的内容写回占位消息。"""
         if reasoning_message_id and reasoning_text:
             await self.update_stream_response(reasoning_message_id, reasoning_text)
         if answer_text:
             await self.update_stream_response(assistant_message_id, answer_text)
 
-    async def _create_placeholder_message(self, conversation_id: str, message_type: str, turn_id: Optional[str]) -> Message:
-        """在数据库中创建一个空的占位消息并返回"""
-        placeholder_message = Message(
-            role=MessageRoles.ASSISTANT,
-            type=message_type,
-            content="",  # 内容为空
-            turn_id=turn_id
-        )
-        # 直接创建消息，而不是修改整个会话
-        return self.memory_service.create_message(placeholder_message, conversation_id)
+    async def update_stream_response(self, message_id: str, response_text: str):
+        try:
+            self.memory_service.update_message(message_id, {"content": response_text})
+            self.db.commit()
+        except Exception as exc:
+            logger.error(f"更新流式响应失败: {exc}")
 
-    async def _create_reasoning_placeholders(self, conversation_id: str, turn_id: Optional[str]) -> tuple[Message, Message]:
-        """为推理流统一创建 reasoning/assistant 两个占位消息。"""
+    async def _stream_normal(
+        self,
+        provider,
+        model,
+        messages,
+        conversation_id,
+        options=None,
+        turn_id=None,
+    ) -> AsyncGenerator[str, None]:
+        if options is None:
+            options = {}
+
+        assistant_message = await self._create_placeholder_message(
+            conversation_id,
+            MessageTypes.ASSISTANT_CONTENT,
+            turn_id,
+        )
+        llm = llm_manager.get_model(provider=provider, model=model, options=options)
+
+        answer_result = ""
+        finish_reason = FinishReasons.STOP
+
+        try:
+            for chunk in llm.stream(messages):
+                observed_finish_reason = self._extract_finish_reason(chunk)
+                if observed_finish_reason:
+                    finish_reason = observed_finish_reason
+
+                content = self._extract_chunk_content(chunk) or self._extract_openai_content(chunk)
+                if not content:
+                    continue
+
+                answer_result += content
+                yield StreamSerializer.content_chunk(assistant_message.id, conversation_id, content)
+                await asyncio.sleep(0)
+
+            await self._persist_accumulated_content(assistant_message.id, answer_result)
+            yield StreamSerializer.finish_chunk(
+                assistant_message.id,
+                conversation_id,
+                finish_reason=finish_reason,
+            )
+            yield StreamSerializer.done_marker()
+        except Exception as exc:
+            await self._persist_accumulated_content(assistant_message.id, answer_result)
+            logger.exception(f"普通流式响应失败: {exc}")
+            yield StreamSerializer.error_chunk(assistant_message.id, conversation_id, str(exc))
+            yield StreamSerializer.done_marker()
+
+    async def _stream_with_reasoning(
+        self,
+        provider,
+        model,
+        messages,
+        conversation_id,
+        options=None,
+        turn_id=None,
+    ) -> AsyncGenerator[str, None]:
+        from openai import AsyncOpenAI
+
+        if options is None:
+            options = {}
+
         reasoning_message = await self._create_placeholder_message(
             conversation_id,
             MessageTypes.REASONING_CONTENT,
@@ -244,271 +255,129 @@ class StreamHandler:
             MessageTypes.ASSISTANT_CONTENT,
             turn_id,
         )
-        return reasoning_message, assistant_message
 
-    async def _initialize_reasoning_stream(self, conversation_id: str, turn_id: Optional[str]):
-        """统一初始化推理流的占位消息、事件发送器和阶段状态。"""
-        reasoning_message, assistant_message = await self._create_reasoning_placeholders(conversation_id, turn_id)
-        send_event = self._create_stream_event_sender(conversation_id)
-        state = {
-            "reasoning_result": "",
-            "answer_result": "",
-            "in_reasoning_phase": True,
-            "reasoning_completed": False,
-            "answering_started": False,
-        }
-        return reasoning_message, assistant_message, send_event, state
+        reasoning_result = ""
+        answer_result = ""
+        finish_reason = FinishReasons.STOP
 
-    async def _finalize_reasoning_stream(
-        self,
-        conversation_id: str,
-        send_event,
-        reasoning_message: Message,
-        assistant_message: Message,
-        reasoning_result: str,
-        answer_result: str,
-        reasoning_completed: bool,
-        answering_started: bool,
-    ) -> list[str]:
-        """统一处理推理流结尾的补事件、占位消息回写和 done 事件。"""
-        final_events = await self._collect_final_reasoning_events(
-            send_event,
-            reasoning_completed=reasoning_completed,
-            answering_started=answering_started,
-            reasoning_message_id=reasoning_message.id,
-            assistant_message_id=assistant_message.id,
-        )
+        if provider == "volcengine":
+            credentials = llm_manager._get_model_credentials(provider, model)
+            if not credentials:
+                raise ValueError(f"未找到{provider}的API凭证")
 
-        await self._persist_stream_placeholders(
-            assistant_message.id,
-            answer_result,
-            reasoning_message.id,
-            reasoning_result,
-        )
+            client = AsyncOpenAI(
+                api_key=credentials.get("api_key"),
+                base_url=credentials.get("base_url"),
+                timeout=60 * 30,
+            )
+            openai_messages = self._normalize_direct_stream_messages(messages)
+            if not openai_messages:
+                raise ValueError("无有效消息可发送，请检查消息格式")
 
-        final_events.append(
-            self._build_done_event(conversation_id, assistant_message.id, reasoning_message.id)
-        )
-        return final_events
-
-    async def generate_normal_stream(self, provider, model, messages, conversation_id, options=None, turn_id=None) -> AsyncGenerator:
-        """生成常规流式响应（无推理模式）"""
-        if options is None:
-            options = {}
-            
-        # 1. 创建占位消息
-        assistant_message = await self._create_placeholder_message(conversation_id, MessageTypes.ASSISTANT_CONTENT, turn_id)
-        assistant_message_id = assistant_message.id
-
-        llm = llm_manager.get_model(provider=provider, model=model, options=options)
-        full_response = ""
-
-        # 2. 流式响应处理，并在事件中加入message_id
-        for chunk in llm.stream(messages):
-            content = self._extract_chunk_content(chunk)
-
-            if content:
-                full_response += content
-                yield self._build_content_event(conversation_id, assistant_message_id, content)
-                await asyncio.sleep(0.01)
-
-        # 3. 流结束后，更新占位消息
-        await self.update_stream_response(assistant_message_id, full_response)
-        
-        # 4. 发送结束信号
-        yield self._build_done_marker_event(conversation_id, assistant_message_id)
-        
-
-    async def update_stream_response(self, message_id: str, response_text: str):
-        """更新流式响应到数据库"""
-        try:
-            update_data = {"content": response_text}
-            self.memory_service.update_message(message_id, update_data)
-            self.db.commit()  # 提交事务，确保数据持久化
-        except Exception as e:
-            logger.error(f"更新流式响应失败: {str(e)}")
-
-    async def generate_reasoning_stream(self, provider, model, messages, conversation_id, options=None, turn_id=None) -> AsyncGenerator:
-        """生成带推理功能的流式响应，适用于支持推理能力的模型"""
-        if options is None:
-            options = {}
-        
-        reasoning_message, assistant_message, send_event, state = await self._initialize_reasoning_stream(
-            conversation_id,
-            turn_id,
-        )
-        yield await send_event("reasoning_start", message_id=reasoning_message.id)
-        
-        # 获取模型
-        llm = llm_manager.get_model(provider=provider, model=model, options=options)
-        reasoning_result = state["reasoning_result"]
-        answer_result = state["answer_result"]
-        in_reasoning_phase = state["in_reasoning_phase"]
-        reasoning_completed = state["reasoning_completed"]
-        answering_started = state["answering_started"]
-
-        # 根据不同模型准备参数
-        stream_kwargs = {}
-        if provider == "deepseek":
-            stream_kwargs["reasoning_effort"] = "medium"
-        
-        # 流式获取响应
-        for chunk in llm.stream(messages, **stream_kwargs):
-            has_reasoning = False
-            has_answer = False
-                        
-            # 处理思考过程
-            if hasattr(chunk, 'additional_kwargs') and 'reasoning_content' in chunk.additional_kwargs:
-                reasoning_content = chunk.additional_kwargs['reasoning_content']
-                if reasoning_content and reasoning_content.strip():
-                    reasoning_result += reasoning_content
-                    yield await send_event("reasoning_content", reasoning_content, message_id=reasoning_message.id)
-                    has_reasoning = True
-            
-            # 处理最终答案
-            content = self._extract_chunk_content(chunk)
-            
-            # Deepseek模型需要额外检查content不等于reasoning_result
-            if provider == "deepseek":
-                if content and content.strip() and content != reasoning_result:
-                    answer_events, answer_result, in_reasoning_phase, reasoning_completed, answering_started = await self._process_answer_content(
-                        send_event,
-                        content,
-                        answer_result,
-                        in_reasoning_phase,
-                        reasoning_completed,
-                        answering_started,
-                        has_reasoning,
-                        reasoning_message.id,
-                        assistant_message.id,
-                    )
-                    for event in answer_events:
-                        yield event
-                    has_answer = True
-            else:
-                if content and content.strip():
-                    answer_events, answer_result, in_reasoning_phase, reasoning_completed, answering_started = await self._process_answer_content(
-                        send_event,
-                        content,
-                        answer_result,
-                        in_reasoning_phase,
-                        reasoning_completed,
-                        answering_started,
-                        has_reasoning,
-                        reasoning_message.id,
-                        assistant_message.id,
-                    )
-                    for event in answer_events:
-                        yield event
-                    has_answer = True
-        
-        final_events = await self._finalize_reasoning_stream(
-            conversation_id,
-            send_event,
-            reasoning_message,
-            assistant_message,
-            reasoning_result,
-            answer_result,
-            reasoning_completed,
-            answering_started,
-        )
-        for event in final_events:
-            yield event
-
-    async def direct_reasoning_stream(self, provider, model, messages, conversation_id, options=None, turn_id=None) -> AsyncGenerator:
-        """直接使用OpenAI客户端生成带推理功能的流式响应，绕过LangChain"""
-        from openai import AsyncOpenAI
-        
-        if options is None:
-            options = {}
-        
-        # 如果消息是单个消息而非列表，则转换为列表
-        if not isinstance(messages, list):
-            messages = [messages]
-        
-        reasoning_message, assistant_message, send_event, state = await self._initialize_reasoning_stream(
-            conversation_id,
-            turn_id,
-        )
-
-        # 获取API凭证
-        credentials = llm_manager._get_model_credentials(provider, model)
-        if not credentials:
-            raise ValueError(f"未找到{provider}的API凭证")
-        
-        # 初始化OpenAI客户端
-        client = AsyncOpenAI(
-            api_key=credentials.get("api_key"),
-            base_url=credentials.get("base_url"),
-            timeout=60 * 30  # 30分钟超时
-        )
-        
-        reasoning_result = state["reasoning_result"]
-        answer_result = state["answer_result"]
-        in_reasoning_phase = state["in_reasoning_phase"]
-        reasoning_completed = state["reasoning_completed"]
-        answering_started = state["answering_started"]
-        
-        # 开始推理流
-        yield await send_event("reasoning_start", message_id=reasoning_message.id)
-        
-        # 准备发送的消息
-        openai_messages = self._normalize_direct_stream_messages(messages)
-        
-        if not openai_messages:
-            raise ValueError("无有效消息可发送，请检查消息格式")
-        
-        try:
-            # 创建流式请求
             stream = await client.chat.completions.create(
                 model=model,
                 messages=openai_messages,
-                stream=True
+                stream=True,
             )
-            
-            # 处理流式响应
-            async for chunk in stream:
-                has_reasoning = False
-                
-                # 提取推理内容
-                if len(chunk.choices) > 0 and hasattr(chunk.choices[0].delta, 'reasoning_content'):
-                    reasoning_content = chunk.choices[0].delta.reasoning_content
+
+            try:
+                async for chunk in stream:
+                    observed_finish_reason = self._extract_finish_reason(chunk)
+                    if observed_finish_reason:
+                        finish_reason = observed_finish_reason
+
+                    reasoning_content = self._extract_reasoning_content(chunk)
                     if reasoning_content:
                         reasoning_result += reasoning_content
-                        yield await send_event("reasoning_content", reasoning_content, message_id=reasoning_message.id)
-                        has_reasoning = True
-                
-                # 提取内容
-                if len(chunk.choices) > 0 and hasattr(chunk.choices[0].delta, 'content'):
-                    content = chunk.choices[0].delta.content
-                    if content:
-                        answer_events, answer_result, in_reasoning_phase, reasoning_completed, answering_started = await self._process_answer_content(
-                            send_event,
-                            content,
-                            answer_result,
-                            in_reasoning_phase,
-                            reasoning_completed,
-                            answering_started,
-                            has_reasoning,
-                            reasoning_message.id,
+                        yield StreamSerializer.reasoning_chunk(
                             assistant_message.id,
+                            conversation_id,
+                            reasoning_content,
                         )
-                        for event in answer_events:
-                            yield event
-            
-        except Exception as e:
-            logger.error(f"直接API调用出错: {str(e)}")
-            yield await send_event("error", f"生成出错: {str(e)}")
 
-        final_events = await self._finalize_reasoning_stream(
-            conversation_id,
-            send_event,
-            reasoning_message,
-            assistant_message,
-            reasoning_result,
-            answer_result,
-            reasoning_completed,
-            answering_started,
-        )
-        for event in final_events:
-            yield event
+                    content = self._extract_openai_content(chunk) or self._extract_chunk_content(chunk)
+                    if content and content != reasoning_result:
+                        answer_result += content
+                        yield StreamSerializer.content_chunk(
+                            assistant_message.id,
+                            conversation_id,
+                            content,
+                        )
+
+                    await asyncio.sleep(0)
+
+                await self._persist_accumulated_content(
+                    assistant_message.id,
+                    answer_result,
+                    reasoning_message.id,
+                    reasoning_result,
+                )
+                yield StreamSerializer.finish_chunk(
+                    assistant_message.id,
+                    conversation_id,
+                    finish_reason=finish_reason,
+                )
+                yield StreamSerializer.done_marker()
+            except Exception as exc:
+                await self._persist_accumulated_content(
+                    assistant_message.id,
+                    answer_result,
+                    reasoning_message.id,
+                    reasoning_result,
+                )
+                logger.exception(f"推理流式响应失败: {exc}")
+                yield StreamSerializer.error_chunk(assistant_message.id, conversation_id, str(exc))
+                yield StreamSerializer.done_marker()
+            return
+
+        llm = llm_manager.get_model(provider=provider, model=model, options=options)
+        stream_kwargs = {"reasoning_effort": "medium"} if provider == "deepseek" else {}
+
+        try:
+            for chunk in llm.stream(messages, **stream_kwargs):
+                observed_finish_reason = self._extract_finish_reason(chunk)
+                if observed_finish_reason:
+                    finish_reason = observed_finish_reason
+
+                reasoning_content = self._extract_reasoning_content(chunk)
+                if reasoning_content:
+                    reasoning_result += reasoning_content
+                    yield StreamSerializer.reasoning_chunk(
+                        assistant_message.id,
+                        conversation_id,
+                        reasoning_content,
+                    )
+
+                content = self._extract_chunk_content(chunk) or self._extract_openai_content(chunk)
+                if content and content != reasoning_result:
+                    answer_result += content
+                    yield StreamSerializer.content_chunk(
+                        assistant_message.id,
+                        conversation_id,
+                        content,
+                    )
+
+                await asyncio.sleep(0)
+
+            await self._persist_accumulated_content(
+                assistant_message.id,
+                answer_result,
+                reasoning_message.id,
+                reasoning_result,
+            )
+            yield StreamSerializer.finish_chunk(
+                assistant_message.id,
+                conversation_id,
+                finish_reason=finish_reason,
+            )
+            yield StreamSerializer.done_marker()
+        except Exception as exc:
+            await self._persist_accumulated_content(
+                assistant_message.id,
+                answer_result,
+                reasoning_message.id,
+                reasoning_result,
+            )
+            logger.exception(f"推理流式响应失败: {exc}")
+            yield StreamSerializer.error_chunk(assistant_message.id, conversation_id, str(exc))
+            yield StreamSerializer.done_marker()

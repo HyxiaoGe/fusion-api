@@ -6,7 +6,7 @@
 
 import json
 import uuid
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from langchain_core.messages import ToolMessage
 
@@ -29,7 +29,7 @@ class FunctionCallProcessor:
         self.memory_service = memory_service
 
     @staticmethod
-    def _resolve_tool_call_id(tool_call_id: str | None, prefix: str = "call") -> str:
+    def _resolve_tool_call_id(tool_call_id: Optional[str], prefix: str = "call") -> str:
         """保证工具调用 ID 始终有稳定可用的值。"""
         if tool_call_id:
             return tool_call_id
@@ -42,7 +42,7 @@ class FunctionCallProcessor:
         self.memory_service.save_conversation(conversation)
         self.db.commit()
 
-    def _get_persistable_conversation(self, conversation_id: str, user_id: str | None, error_message: str):
+    def _get_persistable_conversation(self, conversation_id: str, user_id: Optional[str], error_message: str):
         """统一校验持久化上下文，返回可写入的会话。"""
         if not user_id:
             logger.error(error_message)
@@ -56,7 +56,7 @@ class FunctionCallProcessor:
         self._persist_conversation(conversation)
 
     @staticmethod
-    def _build_assistant_content_message(content: str, turn_id: str | None = None) -> Message:
+    def _build_assistant_content_message(content: str, turn_id: Optional[str] = None) -> Message:
         """统一构造 assistant 正文消息。"""
         return Message(
             role=MessageRoles.ASSISTANT,
@@ -68,7 +68,7 @@ class FunctionCallProcessor:
     @staticmethod
     def _resolve_function_call_description(
         function_name: str,
-        first_llm_thought: str | None,
+        first_llm_thought: Optional[str],
     ) -> str:
         """统一决定函数调用描述文本。"""
         if first_llm_thought and first_llm_thought.strip():
@@ -80,8 +80,8 @@ class FunctionCallProcessor:
         function_name: str,
         function_result,
         final_response: str,
-        turn_id: str | None = None,
-        first_llm_thought: str | None = None,
+        turn_id: Optional[str] = None,
+        first_llm_thought: Optional[str] = None,
     ) -> List[Message]:
         """统一构造函数调用落库所需的消息列表。"""
         function_call_message = Message(
@@ -184,7 +184,7 @@ class FunctionCallProcessor:
         self,
         provider: str,
         function_call_data: Dict[str, Any],
-        content: str | None = None,
+        content: Optional[str] = None,
     ) -> tuple[Dict[str, Any], str]:
         """统一构造 assistant 的函数调用消息。"""
         tool_call_id = self._resolve_tool_call_id(function_call_data.get("tool_call_id"), "call_1")

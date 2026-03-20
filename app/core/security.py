@@ -1,6 +1,7 @@
 import logging
 import re
 import time
+from typing import Dict, Optional
 
 import httpx
 import jwt
@@ -24,14 +25,14 @@ class AuthServiceJWTValidator:
         self,
         jwks_url: str,
         issuer: str,
-        audience: str | None = None,
+        audience: Optional[str] = None,
         cache_ttl: int = 300,
     ):
         self.jwks_url = jwks_url
         self.issuer = issuer
         self.audience = audience
         self.cache_ttl = cache_ttl
-        self._jwks_cache: dict | None = None
+        self._jwks_cache: Optional[Dict] = None
         self._cache_time = 0.0
 
     def _fetch_jwks(self) -> dict:
@@ -80,7 +81,7 @@ jwt_validator = AuthServiceJWTValidator(
 )
 
 
-def _build_username_seed(email: str | None, subject: str) -> str:
+def _build_username_seed(email: Optional[str], subject: str) -> str:
     if email and email.strip():
         local_part = email.split("@")[0]
         slug = re.sub(r"[^a-zA-Z0-9_]+", "-", local_part).strip("-").lower()

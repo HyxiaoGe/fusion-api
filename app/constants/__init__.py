@@ -5,7 +5,7 @@
 """
 
 from .chat import MessageRoles, MessageTypes, FunctionNames, MessageTexts, FUNCTION_DESCRIPTIONS, USER_FRIENDLY_FUNCTION_DESCRIPTIONS
-from .events import EventTypes
+from .events import EventTypes, FinishReasons
 
 __all__ = [
     'MessageRoles',
@@ -14,5 +14,6 @@ __all__ = [
     'MessageTexts',
     'FUNCTION_DESCRIPTIONS',
     'USER_FRIENDLY_FUNCTION_DESCRIPTIONS',
-    'EventTypes'
-] 
+    'EventTypes',
+    'FinishReasons'
+]

@@ -1,6 +1,7 @@
+import json
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from app.services.stream_handler import StreamHandler
 
@@ -11,7 +12,13 @@ class StreamHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.memory_service = MagicMock()
         self.handler = StreamHandler(self.db, self.memory_service)
 
-    def test_normalize_direct_stream_messages_supports_mixed_message_shapes(self):
+    @staticmethod
+    def _parse_event(event: str):
+        if event == "data: [DONE]\n\n":
+            return "[DONE]"
+        return json.loads(event.removeprefix("data: ").strip())
+
+    async def test_normalize_direct_stream_messages_supports_mixed_message_shapes(self):
         messages = [
             {"role": "system", "content": "system"},
             SimpleNamespace(type="human", content="hello"),
@@ -29,263 +36,202 @@ class StreamHandlerTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    def test_build_content_event_includes_message_metadata(self):
-        event = self.handler._build_content_event("conv-1", "msg-1", "hello")
-
-        self.assertEqual(
-            event,
-            'data: {"content": "hello", "conversation_id": "conv-1", "message_id": "msg-1"}\n\n',
-        )
-
-    def test_serialize_sse_event_wraps_json_payload(self):
-        event = self.handler._serialize_sse_event({"type": "ping"})
-
-        self.assertEqual(event, 'data: {"type": "ping"}\n\n')
-
-    def test_build_done_marker_event_uses_done_content(self):
-        event = self.handler._build_done_marker_event("conv-1", "msg-1")
-
-        self.assertEqual(
-            event,
-            'data: {"content": "[DONE]", "conversation_id": "conv-1", "message_id": "msg-1"}\n\n',
-        )
-
-    def test_extract_chunk_content_prefers_content_attribute(self):
-        chunk = SimpleNamespace(content="hello")
-
-        self.assertEqual(self.handler._extract_chunk_content(chunk), "hello")
-
-    def test_extract_chunk_content_falls_back_to_raw_chunk(self):
-        self.assertEqual(self.handler._extract_chunk_content("hello"), "hello")
-
-    async def test_persist_stream_placeholders_updates_existing_messages(self):
+    async def test_generate_stream_emits_content_finish_and_done_for_normal_flow(self):
+        self.memory_service.create_message.return_value = SimpleNamespace(id="assistant-1")
         self.handler.update_stream_response = AsyncMock()
+        llm = MagicMock()
+        llm.stream.return_value = [
+            SimpleNamespace(content="Hel"),
+            SimpleNamespace(content="lo"),
+            SimpleNamespace(content="!"),
+        ]
 
-        await self.handler._persist_stream_placeholders(
-            assistant_message_id="assistant-1",
-            answer_text="final answer",
-            reasoning_message_id="reasoning-1",
-            reasoning_text="thought process",
-        )
-
-        self.handler.update_stream_response.assert_any_await("reasoning-1", "thought process")
-        self.handler.update_stream_response.assert_any_await("assistant-1", "final answer")
-        self.assertEqual(self.handler.update_stream_response.await_count, 2)
-
-    async def test_create_reasoning_placeholders_returns_both_messages(self):
-        self.handler._create_placeholder_message = AsyncMock(
-            side_effect=[
-                SimpleNamespace(id="reasoning-1"),
-                SimpleNamespace(id="assistant-1"),
+        with patch("app.services.stream_handler.llm_manager.get_model", return_value=llm):
+            events = [
+                event
+                async for event in self.handler.generate_stream(
+                    "openai",
+                    "gpt",
+                    [SimpleNamespace(content="hi")],
+                    "conv-1",
+                    {"use_reasoning": False},
+                    "turn-1",
+                )
             ]
+
+        payloads = [self._parse_event(event) for event in events]
+        self.assertEqual(
+            [payload["choices"][0]["delta"]["content"] for payload in payloads[:-2]],
+            ["Hel", "lo", "!"],
         )
+        self.assertEqual(payloads[-2]["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(payloads[-1], "[DONE]")
+        self.handler.update_stream_response.assert_awaited_once_with("assistant-1", "Hello!")
 
-        reasoning_message, assistant_message = await self.handler._create_reasoning_placeholders("conv-1", "turn-1")
+    async def test_generate_stream_emits_reasoning_and_content_with_same_public_message_id(self):
+        self.memory_service.create_message.side_effect = [
+            SimpleNamespace(id="reasoning-1"),
+            SimpleNamespace(id="assistant-1"),
+        ]
+        self.handler.update_stream_response = AsyncMock()
+        llm = MagicMock()
+        llm.stream.return_value = [
+            SimpleNamespace(additional_kwargs={"reasoning_content": "think-1"}, content=""),
+            SimpleNamespace(additional_kwargs={"reasoning_content": "think-2"}, content=""),
+            SimpleNamespace(additional_kwargs={}, content="answer-1"),
+            SimpleNamespace(additional_kwargs={}, content="answer-2"),
+        ]
 
-        self.assertEqual(reasoning_message.id, "reasoning-1")
-        self.assertEqual(assistant_message.id, "assistant-1")
-        self.handler._create_placeholder_message.assert_has_awaits(
+        with patch("app.services.stream_handler.llm_manager.get_model", return_value=llm):
+            events = [
+                event
+                async for event in self.handler.generate_stream(
+                    "qwen",
+                    "qwen-max",
+                    [SimpleNamespace(content="hi")],
+                    "conv-1",
+                    {},
+                    "turn-1",
+                )
+            ]
+
+        payloads = [self._parse_event(event) for event in events]
+        ids = [payload["id"] for payload in payloads[:-1] if payload != "[DONE]"]
+        self.assertTrue(all(message_id == "assistant-1" for message_id in ids))
+
+        reasoning_indexes = [
+            index for index, payload in enumerate(payloads)
+            if payload != "[DONE]" and "reasoning_content" in payload["choices"][0]["delta"]
+        ]
+        content_indexes = [
+            index for index, payload in enumerate(payloads)
+            if payload != "[DONE]" and "content" in payload["choices"][0]["delta"]
+        ]
+        self.assertTrue(max(reasoning_indexes) < min(content_indexes))
+        self.assertEqual(payloads[-2]["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(payloads[-1], "[DONE]")
+        self.handler.update_stream_response.assert_has_awaits(
             [
-                call("conv-1", "reasoning_content", "turn-1"),
-                call("conv-1", "assistant_content", "turn-1"),
+                call("reasoning-1", "think-1think-2"),
+                call("assistant-1", "answer-1answer-2"),
             ]
         )
 
-    async def test_initialize_reasoning_stream_returns_sender_and_default_state(self):
-        self.handler._create_reasoning_placeholders = AsyncMock(
-            return_value=(
-                SimpleNamespace(id="reasoning-1"),
-                SimpleNamespace(id="assistant-1"),
+    async def test_pre_stream_exception_bubbles_up_without_sse_events(self):
+        self.memory_service.create_message.return_value = SimpleNamespace(id="assistant-1")
+
+        with patch("app.services.stream_handler.llm_manager.get_model", side_effect=RuntimeError("boom")):
+            stream = self.handler.generate_stream(
+                "openai",
+                "gpt",
+                [SimpleNamespace(content="hi")],
+                "conv-1",
+                {"use_reasoning": False},
+                "turn-1",
             )
-        )
+            with self.assertRaises(RuntimeError):
+                await stream.__anext__()
 
-        reasoning_message, assistant_message, send_event, state = await self.handler._initialize_reasoning_stream(
-            "conv-1",
-            "turn-1",
-        )
+    async def test_stream_internal_exception_before_first_content_emits_error_and_done(self):
+        self.memory_service.create_message.return_value = SimpleNamespace(id="assistant-1")
+        self.handler.update_stream_response = AsyncMock()
+        llm = MagicMock()
 
-        self.assertEqual(reasoning_message.id, "reasoning-1")
-        self.assertEqual(assistant_message.id, "assistant-1")
+        def failing_stream(_messages):
+            if False:
+                yield None
+            raise RuntimeError("boom")
+
+        llm.stream.return_value = failing_stream([SimpleNamespace(content="hi")])
+
+        with patch("app.services.stream_handler.llm_manager.get_model", return_value=llm):
+            events = [
+                event
+                async for event in self.handler.generate_stream(
+                    "openai",
+                    "gpt",
+                    [SimpleNamespace(content="hi")],
+                    "conv-1",
+                    {"use_reasoning": False},
+                    "turn-1",
+                )
+            ]
+
+        payloads = [self._parse_event(event) for event in events]
+        self.assertEqual(payloads[0]["choices"][0]["finish_reason"], "error")
+        self.assertEqual(payloads[0]["error"]["message"], "boom")
+        self.assertEqual(payloads[1], "[DONE]")
+        self.handler.update_stream_response.assert_not_awaited()
+
+    async def test_stream_internal_exception_after_partial_answer_persists_partial_content(self):
+        self.memory_service.create_message.return_value = SimpleNamespace(id="assistant-1")
+        self.handler.update_stream_response = AsyncMock()
+        llm = MagicMock()
+
+        def partial_stream(_messages):
+            yield SimpleNamespace(content="a")
+            yield SimpleNamespace(content="b")
+            raise RuntimeError("boom")
+
+        llm.stream.return_value = partial_stream([SimpleNamespace(content="hi")])
+
+        with patch("app.services.stream_handler.llm_manager.get_model", return_value=llm):
+            events = [
+                event
+                async for event in self.handler.generate_stream(
+                    "openai",
+                    "gpt",
+                    [SimpleNamespace(content="hi")],
+                    "conv-1",
+                    {"use_reasoning": False},
+                    "turn-1",
+                )
+            ]
+
+        payloads = [self._parse_event(event) for event in events]
         self.assertEqual(
-            state,
-            {
-                "reasoning_result": "",
-                "answer_result": "",
-                "in_reasoning_phase": True,
-                "reasoning_completed": False,
-                "answering_started": False,
-            },
+            [payload["choices"][0]["delta"]["content"] for payload in payloads[:2]],
+            ["a", "b"],
         )
-        self.assertEqual(
-            await send_event("reasoning_start", message_id="reasoning-1"),
-            'data: {"type": "reasoning_start", "conversation_id": "conv-1", "message_id": "reasoning-1"}\n\n',
-        )
+        self.assertEqual(payloads[2]["choices"][0]["finish_reason"], "error")
+        self.assertEqual(payloads[3], "[DONE]")
+        self.handler.update_stream_response.assert_awaited_once_with("assistant-1", "ab")
 
-    async def test_finalize_reasoning_stream_returns_events_after_persisting_placeholders(self):
-        self.handler._collect_final_reasoning_events = AsyncMock(
-            return_value=["data: {'type': 'answering_complete'}"]
-        )
-        self.handler._persist_stream_placeholders = AsyncMock()
-        reasoning_message = SimpleNamespace(id="reasoning-1")
-        assistant_message = SimpleNamespace(id="assistant-1")
+    async def test_deepseek_same_chunk_duplicate_content_is_filtered(self):
+        self.memory_service.create_message.side_effect = [
+            SimpleNamespace(id="reasoning-1"),
+            SimpleNamespace(id="assistant-1"),
+        ]
+        self.handler.update_stream_response = AsyncMock()
+        llm = MagicMock()
+        llm.stream.return_value = [
+            SimpleNamespace(additional_kwargs={"reasoning_content": "dup"}, content="dup"),
+            SimpleNamespace(additional_kwargs={}, content="final"),
+        ]
 
-        events = await self.handler._finalize_reasoning_stream(
-            "conv-1",
-            AsyncMock(),
-            reasoning_message,
-            assistant_message,
-            "reasoning text",
-            "answer text",
-            reasoning_completed=True,
-            answering_started=True,
-        )
+        with patch("app.services.stream_handler.llm_manager.get_model", return_value=llm):
+            events = [
+                event
+                async for event in self.handler.generate_stream(
+                    "deepseek",
+                    "deepseek-reasoner",
+                    [SimpleNamespace(content="hi")],
+                    "conv-1",
+                    {},
+                    "turn-1",
+                )
+            ]
 
-        self.handler._persist_stream_placeholders.assert_awaited_once_with(
-            "assistant-1",
-            "answer text",
-            "reasoning-1",
-            "reasoning text",
-        )
-        self.assertEqual(
-            events,
-            [
-                "data: {'type': 'answering_complete'}",
-                'data: {"type": "done", "conversation_id": "conv-1", "message_id": "assistant-1", "reasoning_message_id": "reasoning-1"}\n\n',
-            ],
-        )
-
-    async def test_finalize_reasoning_events_emits_missing_phase_events(self):
-        send_event = AsyncMock()
-
-        await self.handler._finalize_reasoning_events(
-            send_event,
-            reasoning_completed=False,
-            answering_started=False,
-            reasoning_message_id="reasoning-1",
-            assistant_message_id="assistant-1",
-        )
-
-        self.assertEqual(
-            send_event.await_args_list,
-            [
-                call("reasoning_complete", message_id="reasoning-1"),
-                call("answering_start", message_id="assistant-1"),
-                call("answering_complete", message_id="assistant-1"),
-            ],
-        )
-
-    async def test_finalize_reasoning_events_skips_completed_phases(self):
-        send_event = AsyncMock()
-
-        await self.handler._finalize_reasoning_events(
-            send_event,
-            reasoning_completed=True,
-            answering_started=True,
-            reasoning_message_id="reasoning-1",
-            assistant_message_id="assistant-1",
-        )
-
-        self.assertEqual(
-            send_event.await_args_list,
-            [call("answering_complete", message_id="assistant-1")],
-        )
-
-    async def test_collect_final_reasoning_events_returns_serialized_events(self):
-        async def send_event(event_type, content=None, message_id=None):
-            payload = {"type": event_type, "message_id": message_id}
-            return f"data: {payload}"
-
-        events = await self.handler._collect_final_reasoning_events(
-            send_event,
-            reasoning_completed=False,
-            answering_started=True,
-            reasoning_message_id="reasoning-1",
-            assistant_message_id="assistant-1",
-        )
-
-        self.assertEqual(
-            events,
-            [
-                "data: {'type': 'reasoning_complete', 'message_id': 'reasoning-1'}",
-                "data: {'type': 'answering_complete', 'message_id': 'assistant-1'}",
-            ],
-        )
-
-    async def test_transition_to_answer_phase_returns_events_and_state(self):
-        async def send_event(event_type, content=None, message_id=None):
-            payload = {"type": event_type, "message_id": message_id}
-            return f"data: {payload}"
-
-        events, in_reasoning_phase, reasoning_completed, answering_started = await self.handler._transition_to_answer_phase(
-            send_event,
-            in_reasoning_phase=True,
-            reasoning_completed=False,
-            answering_started=False,
-            has_reasoning=False,
-            reasoning_message_id="reasoning-1",
-            assistant_message_id="assistant-1",
-        )
-
-        self.assertEqual(
-            events,
-            [
-                "data: {'type': 'reasoning_complete', 'message_id': 'reasoning-1'}",
-                "data: {'type': 'answering_start', 'message_id': 'assistant-1'}",
-            ],
-        )
-        self.assertFalse(in_reasoning_phase)
-        self.assertTrue(reasoning_completed)
-        self.assertTrue(answering_started)
-
-    async def test_process_answer_content_appends_answering_event_and_result(self):
-        async def send_event(event_type, content=None, message_id=None):
-            payload = {"type": event_type, "content": content, "message_id": message_id}
-            return f"data: {payload}"
-
-        events, answer_result, in_reasoning_phase, reasoning_completed, answering_started = await self.handler._process_answer_content(
-            send_event,
-            content="final answer",
-            answer_result="prefix ",
-            in_reasoning_phase=True,
-            reasoning_completed=False,
-            answering_started=False,
-            has_reasoning=False,
-            reasoning_message_id="reasoning-1",
-            assistant_message_id="assistant-1",
-        )
-
-        self.assertEqual(
-            events,
-            [
-                "data: {'type': 'reasoning_complete', 'content': None, 'message_id': 'reasoning-1'}",
-                "data: {'type': 'answering_start', 'content': None, 'message_id': 'assistant-1'}",
-                "data: {'type': 'answering_content', 'content': 'final answer', 'message_id': 'assistant-1'}",
-            ],
-        )
-        self.assertEqual(answer_result, "prefix final answer")
-        self.assertFalse(in_reasoning_phase)
-        self.assertTrue(reasoning_completed)
-        self.assertTrue(answering_started)
-
-    async def test_process_answer_content_skips_blank_content(self):
-        events, answer_result, in_reasoning_phase, reasoning_completed, answering_started = await self.handler._process_answer_content(
-            AsyncMock(),
-            content="   ",
-            answer_result="existing",
-            in_reasoning_phase=True,
-            reasoning_completed=False,
-            answering_started=False,
-            has_reasoning=False,
-            reasoning_message_id="reasoning-1",
-            assistant_message_id="assistant-1",
-        )
-
-        self.assertEqual(events, [])
-        self.assertEqual(answer_result, "existing")
-        self.assertTrue(in_reasoning_phase)
-        self.assertFalse(reasoning_completed)
-        self.assertFalse(answering_started)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        payloads = [self._parse_event(event) for event in events]
+        content_values = [
+            payload["choices"][0]["delta"]["content"]
+            for payload in payloads
+            if payload != "[DONE]" and "content" in payload["choices"][0]["delta"]
+        ]
+        reasoning_values = [
+            payload["choices"][0]["delta"]["reasoning_content"]
+            for payload in payloads
+            if payload != "[DONE]" and "reasoning_content" in payload["choices"][0]["delta"]
+        ]
+        self.assertEqual(reasoning_values, ["dup"])
+        self.assertEqual(content_values, ["final"])

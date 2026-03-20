@@ -3,7 +3,14 @@
 """
 
 
-# 事件类型常量
+class FinishReasons:
+    STOP = "stop"
+    LENGTH = "length"
+    TOOL_CALLS = "tool_calls"
+    ERROR = "error"
+
+
+# 保留旧事件枚举，避免未纳入本次改造范围的 function_call 逻辑被打断。
 class EventTypes:
     """事件类型常量类"""
     FUNCTION_STREAM_START = "function_stream_start"
@@ -19,4 +26,4 @@ class EventTypes:
     QUERY_GENERATED = "query_generated"
     USER_SEARCH_START = "user_search_start"
     PERFORMING_SEARCH = "performing_search"
-    SYNTHESIZING_ANSWER = "synthesizing_answer" 
+    SYNTHESIZING_ANSWER = "synthesizing_answer"

@@ -22,6 +22,7 @@ class Message(BaseModel):
     turn_id: Optional[str] = Field(None, description="对话轮次ID，使用该轮对话中用户消息的ID")
     duration: int = Field(0, description="处理耗时(毫秒)")  # 默认为0毫秒
     created_at: datetime = Field(default_factory=datetime.now)
+    reasoning: Optional[str] = None
 
     class Config:
         from_attributes = True
