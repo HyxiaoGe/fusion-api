@@ -274,13 +274,13 @@ class StreamHandler:
             if not openai_messages:
                 raise ValueError("无有效消息可发送，请检查消息格式")
 
-            stream = await client.chat.completions.create(
-                model=model,
-                messages=openai_messages,
-                stream=True,
-            )
-
             try:
+                stream = await client.chat.completions.create(
+                    model=model,
+                    messages=openai_messages,
+                    stream=True,
+                )
+
                 async for chunk in stream:
                     observed_finish_reason = self._extract_finish_reason(chunk)
                     if observed_finish_reason:

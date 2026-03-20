@@ -242,8 +242,6 @@ class ChatService:
         """处理流式响应"""
         if options is None:
             options = {}
-        # 将user_id注入到options中，以便下游处理器可以访问
-        options["user_id"] = user_id
             
         # 检查是否启用函数调用
         use_function_calls = options.get("use_function_calls", False)

@@ -235,3 +235,38 @@ class StreamHandlerTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(reasoning_values, ["dup"])
         self.assertEqual(content_values, ["final"])
+
+    async def test_volcengine_connection_failure_emits_error_and_done(self):
+        self.memory_service.create_message.side_effect = [
+            SimpleNamespace(id="reasoning-1"),
+            SimpleNamespace(id="assistant-1"),
+        ]
+        self.handler.update_stream_response = AsyncMock()
+
+        failing_client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=AsyncMock(side_effect=RuntimeError("connect failed"))
+                )
+            )
+        )
+
+        with patch("app.services.stream_handler.llm_manager._get_model_credentials", return_value={"api_key": "k", "base_url": "https://example.com"}):
+            with patch("openai.AsyncOpenAI", return_value=failing_client):
+                events = [
+                    event
+                    async for event in self.handler.generate_stream(
+                        "volcengine",
+                        "deepseek-r1",
+                        [{"role": "user", "content": "hi"}],
+                        "conv-1",
+                        {},
+                        "turn-1",
+                    )
+                ]
+
+        payloads = [self._parse_event(event) for event in events]
+        self.assertEqual(payloads[0]["choices"][0]["finish_reason"], "error")
+        self.assertEqual(payloads[0]["error"]["message"], "connect failed")
+        self.assertEqual(payloads[1], "[DONE]")
+        self.handler.update_stream_response.assert_not_awaited()
