@@ -35,6 +35,10 @@ class StreamSerializer:
         return StreamSerializer._chunk(message_id, conversation_id, {"content": content})
 
     @staticmethod
+    def init_chunk(message_id: str, conversation_id: str) -> str:
+        return StreamSerializer._chunk(message_id, conversation_id, {})
+
+    @staticmethod
     def reasoning_chunk(message_id: str, conversation_id: str, reasoning_content: str) -> str:
         return StreamSerializer._chunk(
             message_id,

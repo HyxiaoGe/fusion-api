@@ -60,8 +60,10 @@ class StreamHandlerTests(unittest.IsolatedAsyncioTestCase):
             ]
 
         payloads = [self._parse_event(event) for event in events]
+        self.assertEqual(payloads[0]["choices"][0]["delta"], {})
+        self.assertIsNone(payloads[0]["choices"][0]["finish_reason"])
         self.assertEqual(
-            [payload["choices"][0]["delta"]["content"] for payload in payloads[:-2]],
+            [payload["choices"][0]["delta"]["content"] for payload in payloads[1:-2]],
             ["Hel", "lo", "!"],
         )
         self.assertEqual(payloads[-2]["choices"][0]["finish_reason"], "stop")
@@ -96,6 +98,7 @@ class StreamHandlerTests(unittest.IsolatedAsyncioTestCase):
             ]
 
         payloads = [self._parse_event(event) for event in events]
+        self.assertEqual(payloads[0]["choices"][0]["delta"], {})
         ids = [payload["id"] for payload in payloads[:-1] if payload != "[DONE]"]
         self.assertTrue(all(message_id == "assistant-1" for message_id in ids))
 
@@ -118,9 +121,9 @@ class StreamHandlerTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_pre_stream_exception_bubbles_up_without_sse_events(self):
-        self.memory_service.create_message.return_value = SimpleNamespace(id="assistant-1")
+        self.memory_service.create_message.side_effect = RuntimeError("boom")
 
-        with patch("app.services.stream_handler.llm_manager.get_model", side_effect=RuntimeError("boom")):
+        with patch("app.services.stream_handler.llm_manager.get_model", return_value=MagicMock()):
             stream = self.handler.generate_stream(
                 "openai",
                 "gpt",
@@ -158,9 +161,11 @@ class StreamHandlerTests(unittest.IsolatedAsyncioTestCase):
             ]
 
         payloads = [self._parse_event(event) for event in events]
-        self.assertEqual(payloads[0]["choices"][0]["finish_reason"], "error")
-        self.assertEqual(payloads[0]["error"]["message"], "boom")
-        self.assertEqual(payloads[1], "[DONE]")
+        self.assertEqual(payloads[0]["choices"][0]["delta"], {})
+        self.assertIsNone(payloads[0]["choices"][0]["finish_reason"])
+        self.assertEqual(payloads[1]["choices"][0]["finish_reason"], "error")
+        self.assertEqual(payloads[1]["error"]["message"], "boom")
+        self.assertEqual(payloads[2], "[DONE]")
         self.handler.update_stream_response.assert_not_awaited()
 
     async def test_stream_internal_exception_after_partial_answer_persists_partial_content(self):
@@ -190,11 +195,11 @@ class StreamHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         payloads = [self._parse_event(event) for event in events]
         self.assertEqual(
-            [payload["choices"][0]["delta"]["content"] for payload in payloads[:2]],
+            [payload["choices"][0]["delta"]["content"] for payload in payloads[1:3]],
             ["a", "b"],
         )
-        self.assertEqual(payloads[2]["choices"][0]["finish_reason"], "error")
-        self.assertEqual(payloads[3], "[DONE]")
+        self.assertEqual(payloads[3]["choices"][0]["finish_reason"], "error")
+        self.assertEqual(payloads[4], "[DONE]")
         self.handler.update_stream_response.assert_awaited_once_with("assistant-1", "ab")
 
     async def test_deepseek_same_chunk_duplicate_content_is_filtered(self):
@@ -266,7 +271,8 @@ class StreamHandlerTests(unittest.IsolatedAsyncioTestCase):
                 ]
 
         payloads = [self._parse_event(event) for event in events]
-        self.assertEqual(payloads[0]["choices"][0]["finish_reason"], "error")
-        self.assertEqual(payloads[0]["error"]["message"], "connect failed")
-        self.assertEqual(payloads[1], "[DONE]")
+        self.assertEqual(payloads[0]["choices"][0]["delta"], {})
+        self.assertEqual(payloads[1]["choices"][0]["finish_reason"], "error")
+        self.assertEqual(payloads[1]["error"]["message"], "connect failed")
+        self.assertEqual(payloads[2], "[DONE]")
         self.handler.update_stream_response.assert_not_awaited()

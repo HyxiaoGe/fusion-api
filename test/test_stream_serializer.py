@@ -25,6 +25,14 @@ class StreamSerializerTests(unittest.TestCase):
         self.assertEqual(payload["choices"][0]["delta"], {"reasoning_content": "think"})
         self.assertIsNone(payload["choices"][0]["finish_reason"])
 
+    def test_init_chunk_uses_empty_delta_without_finish_reason(self):
+        payload = self._parse_event(StreamSerializer.init_chunk("msg-1", "conv-1"))
+
+        self.assertEqual(payload["id"], "msg-1")
+        self.assertEqual(payload["conversation_id"], "conv-1")
+        self.assertEqual(payload["choices"][0]["delta"], {})
+        self.assertIsNone(payload["choices"][0]["finish_reason"])
+
     def test_finish_chunk_uses_empty_delta_and_finish_reason(self):
         payload = self._parse_event(StreamSerializer.finish_chunk("msg-1", "conv-1", "stop"))
 

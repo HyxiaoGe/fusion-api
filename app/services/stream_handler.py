@@ -199,12 +199,14 @@ class StreamHandler:
             MessageTypes.ASSISTANT_CONTENT,
             turn_id,
         )
-        llm = llm_manager.get_model(provider=provider, model=model, options=options)
 
         answer_result = ""
         finish_reason = FinishReasons.STOP
 
+        yield StreamSerializer.init_chunk(assistant_message.id, conversation_id)
+
         try:
+            llm = llm_manager.get_model(provider=provider, model=model, options=options)
             for chunk in llm.stream(messages):
                 observed_finish_reason = self._extract_finish_reason(chunk)
                 if observed_finish_reason:
@@ -260,21 +262,23 @@ class StreamHandler:
         answer_result = ""
         finish_reason = FinishReasons.STOP
 
+        yield StreamSerializer.init_chunk(assistant_message.id, conversation_id)
+
         if provider == "volcengine":
-            credentials = llm_manager._get_model_credentials(provider, model)
-            if not credentials:
-                raise ValueError(f"未找到{provider}的API凭证")
-
-            client = AsyncOpenAI(
-                api_key=credentials.get("api_key"),
-                base_url=credentials.get("base_url"),
-                timeout=60 * 30,
-            )
-            openai_messages = self._normalize_direct_stream_messages(messages)
-            if not openai_messages:
-                raise ValueError("无有效消息可发送，请检查消息格式")
-
             try:
+                credentials = llm_manager._get_model_credentials(provider, model)
+                if not credentials:
+                    raise ValueError(f"未找到{provider}的API凭证")
+
+                client = AsyncOpenAI(
+                    api_key=credentials.get("api_key"),
+                    base_url=credentials.get("base_url"),
+                    timeout=60 * 30,
+                )
+                openai_messages = self._normalize_direct_stream_messages(messages)
+                if not openai_messages:
+                    raise ValueError("无有效消息可发送，请检查消息格式")
+
                 stream = await client.chat.completions.create(
                     model=model,
                     messages=openai_messages,
@@ -330,10 +334,10 @@ class StreamHandler:
                 yield StreamSerializer.done_marker()
             return
 
-        llm = llm_manager.get_model(provider=provider, model=model, options=options)
         stream_kwargs = {"reasoning_effort": "medium"} if provider == "deepseek" else {}
 
         try:
+            llm = llm_manager.get_model(provider=provider, model=model, options=options)
             for chunk in llm.stream(messages, **stream_kwargs):
                 observed_finish_reason = self._extract_finish_reason(chunk)
                 if observed_finish_reason:
