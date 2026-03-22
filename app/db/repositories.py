@@ -125,32 +125,12 @@ class ConversationRepository:
             if not db_conversation:
                 raise ValueError(f"找不到对话ID: {conversation.id} 或无权访问")
 
-            # 更新对话属性
+            # 仅更新对话元数据，不触碰消息（消息通过 create_message() 单独写入）
             db_conversation.title = conversation.title
             db_conversation.model = conversation.model
             db_conversation.updated_at = get_china_time()
 
-            # 删除旧消息并添加新消息
-            self.db.query(MessageModel).filter(
-                MessageModel.conversation_id == conversation.id
-            ).delete()
-
-            for msg in conversation.messages:
-                db_message = MessageModel(
-                    id=msg.id,
-                    conversation_id=conversation.id,
-                    role=msg.role,
-                    type=msg.type,
-                    content=msg.content,
-                    turn_id=msg.turn_id,
-                    duration=msg.duration,
-                    created_at=msg.created_at
-                )
-                self.db.add(db_message)
-
-            # 提交更改
-            # self.db.commit()
-            # self.db.refresh(db_conversation)
+            self.db.flush()
 
             # 转换回业务模型
             return self._convert_to_schema(db_conversation)

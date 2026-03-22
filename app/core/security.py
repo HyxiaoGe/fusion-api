@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import re
 import time
@@ -90,14 +91,29 @@ def _build_username_seed(email: Optional[str], subject: str) -> str:
     return f"user-{subject[:8]}"
 
 
+# 用户信息缓存，key 为 token 的 SHA256 哈希前缀，value 为 (userinfo, timestamp)
+_userinfo_cache: dict[str, tuple[dict, float]] = {}
+_USERINFO_CACHE_TTL = 300  # 5分钟，与 JWKS 缓存 TTL 保持一致
+
+
 def _fetch_auth_service_userinfo(token: str) -> dict:
+    token_key = hashlib.sha256(token.encode()).hexdigest()[:32]
+    now = time.time()
+
+    cached = _userinfo_cache.get(token_key)
+    if cached and (now - cached[1]) < _USERINFO_CACHE_TTL:
+        return cached[0]
+
     response = httpx.get(
         settings.AUTH_SERVICE_USERINFO_URL,
         headers={"Authorization": f"Bearer {token}"},
         timeout=10.0,
     )
     response.raise_for_status()
-    return response.json()
+    userinfo = response.json()
+
+    _userinfo_cache[token_key] = (userinfo, now)
+    return userinfo
 
 
 def _sync_user_from_claims(db: Session, payload: dict, token: str) -> User:
