@@ -200,8 +200,12 @@ class ChatService:
         # 从聊天历史中提取消息
         messages = self._prepare_chat_messages(chat_history)
 
-        # 保存会话和用户消息，确保在流式处理前它们已存在于数据库中
+        # 保存会话元数据 + 用户消息，确保在流式处理前它们已存在于数据库中
         self._persist_conversation(conversation)
+        # update() 只更新元数据不写消息，需要显式保存用户消息
+        if conversation_id:
+            self.memory_service.create_message(user_message, conversation.id)
+            self.db.commit()
 
         # 处理文件内容
         if file_ids and len(file_ids) > 0:
