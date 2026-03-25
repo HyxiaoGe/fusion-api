@@ -14,6 +14,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **提交信息格式要求**：
 
+  - **必须使用类型前缀 + 中文摘要**：格式固定为 `<type>: <中文描述>`
+  - 示例：
+    - `feat: 添加 RAG 检索增强功能`
+    - `fix: 修复 SSE 收尾边界问题`
+    - `refactor: 重构聊天 SSE 流式协议`
+
   ```
   feat: 添加RAG检索增强功能
   

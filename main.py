@@ -11,7 +11,7 @@ from app.api import chat, files, models, auth
 from app.core.logger import app_logger
 from app.db.init_db import init_db
 from app.db.database import SessionLocal
-from app.core.function_manager import init_function_registry
+
 
 
 # 超时中间件
@@ -51,8 +51,6 @@ async def lifespan(app: FastAPI):
         init_db()
         app_logger.info("数据库初始化完成")
         
-        # 初始化函数注册表
-        init_function_registry()
         yield
         # 应用关闭时的清理工作
         app_logger.info("应用关闭中...")

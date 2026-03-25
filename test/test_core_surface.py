@@ -23,7 +23,6 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         sys.modules.pop("main", None)
         main = importlib.import_module("main")
         main.init_db = lambda: None
-        main.init_function_registry = lambda: None
 
         cls.main = main
         cls.client = TestClient(main.app)

@@ -4,16 +4,12 @@
 集中管理所有应用常量
 """
 
-from .chat import MessageRoles, MessageTypes, FunctionNames, MessageTexts, FUNCTION_DESCRIPTIONS, USER_FRIENDLY_FUNCTION_DESCRIPTIONS
+from .chat import MessageRoles, MessageTypes
 from .events import EventTypes, FinishReasons
 
 __all__ = [
     'MessageRoles',
     'MessageTypes',
-    'FunctionNames', 
-    'MessageTexts',
-    'FUNCTION_DESCRIPTIONS',
-    'USER_FRIENDLY_FUNCTION_DESCRIPTIONS',
     'EventTypes',
-    'FinishReasons'
+    'FinishReasons',
 ]

@@ -18,8 +18,6 @@ from app.constants import MessageRoles, MessageTypes
 from app.services.chat.utils import ChatUtils
 
 
-class FunctionCallsNotSupportedError(ValueError):
-    pass
 
 
 # ==================== ChatService 类 ====================
@@ -247,12 +245,6 @@ class ChatService:
         if options is None:
             options = {}
             
-        # 检查是否启用函数调用
-        use_function_calls = options.get("use_function_calls", False)
-        
-        if use_function_calls:
-            raise FunctionCallsNotSupportedError("工具调用功能当前未启用")
-
         return StreamingResponse(
             self.stream_handler.generate_stream(provider, model, messages, conversation_id, options, turn_id),
             media_type="text/event-stream"

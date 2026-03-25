@@ -7,7 +7,7 @@ from app.db.database import get_db
 from app.db.models import User
 from app.core.logger import app_logger
 from app.schemas.chat import ChatRequest, Conversation, TitleGenerationRequest, TitleGenerationResponse, SuggestedQuestionsRequest, SuggestedQuestionsResponse, MessageUpdateRequest, Message
-from app.services.chat_service import ChatService, FunctionCallsNotSupportedError
+from app.services.chat_service import ChatService
 from app.core.security import get_current_user
 
 router = APIRouter()
@@ -30,8 +30,6 @@ async def send_message(request: ChatRequest, db: Session = Depends(get_db), curr
             file_ids=request.file_ids,
         )
         return response
-    except FunctionCallsNotSupportedError as e:
-        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         app_logger.exception("处理聊天请求失败")
         raise HTTPException(status_code=500, detail=str(e))

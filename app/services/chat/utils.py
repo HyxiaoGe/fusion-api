@@ -9,7 +9,7 @@ import re
 from datetime import datetime
 from typing import Any, List, Union
 
-from app.constants import MessageRoles, MessageTexts
+from app.constants import MessageRoles
 
 
 class ChatUtils:
