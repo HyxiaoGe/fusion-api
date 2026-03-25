@@ -11,12 +11,9 @@ class Message(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     role: Literal["user", "assistant", "system"]  # 限制为标准角色
     type: Literal[
-        "user_query", 
-        "assistant_content", 
-        "reasoning_content", 
-        "function_call", 
-        "function_result", 
-        "web_search"
+        "user_query",
+        "assistant_content",
+        "reasoning_content",
     ]  # 限制为预定义的消息类型
     content: str
     turn_id: Optional[str] = Field(None, description="对话轮次ID，使用该轮对话中用户消息的ID")

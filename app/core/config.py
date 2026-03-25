@@ -18,13 +18,6 @@ class Settings(BaseSettings):
     # 数据库配置
     DATABASE_URL: str = os.getenv("DATABASE_URL")
 
-    SEARCH_API_KEY: Optional[str] = None
-    SEARCH_API_ENDPOINT: str = "https://www.searchapi.io/api/v1/search"
-    BING_API_ENDPOINT: Optional[str] = "https://api.bing.microsoft.com/v7.0/search"
-    ENABLE_WEB_SEARCH: bool = True
-    
-    WEAVIATE_URL: str = os.getenv("WEAVIATE_URL", "http://localhost:8080")
-
     # 文件存储配置
     FILE_STORAGE_PATH: str = os.getenv("FILE_STORAGE_PATH", "./storage/files")
     MAX_FILE_SIZE: int = 10 * 1024 * 1024  # 10MB

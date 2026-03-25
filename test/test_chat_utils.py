@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock
 
-from app.constants import MessageRoles, MessageTexts
+from app.constants import MessageRoles
 from app.services.chat.utils import ChatUtils
 
 
@@ -27,8 +27,8 @@ class ChatUtilsTests(unittest.TestCase):
 
     def test_extract_latest_user_content_returns_default_when_missing(self):
         self.assertEqual(
-            ChatUtils.extract_latest_user_content([], MessageTexts.USER_PREVIOUS_QUESTION),
-            MessageTexts.USER_PREVIOUS_QUESTION,
+            ChatUtils.extract_latest_user_content([], "用户的先前问题"),
+            "用户的先前问题",
         )
 
     def test_stringify_function_arguments_normalizes_invalid_json(self):

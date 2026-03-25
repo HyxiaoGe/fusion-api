@@ -110,9 +110,8 @@ POST /api/chat/generate-title
 
 ## 当前范围
 
-- 默认运行面仅暴露 `chat / auth / files / models`
-- RSS、热点、摘要、调度等内容平台能力已退出当前主产品范围
-- `web search` 和 `function call` 作为后续可控增强能力保留在代码边缘，不是当前默认产品面
+- 运行面暴露 `chat / auth / files / models` 四个 API 路由
+- RSS、热点、摘要、调度、web search、function call 等扩展能力已清理，代码中不再保留
 
 ## 数据流文档
 

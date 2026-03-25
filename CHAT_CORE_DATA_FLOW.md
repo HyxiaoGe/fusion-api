@@ -1,6 +1,6 @@
 # Chat Core Data Flow
 
-这份文档只描述当前 `Fusion API` 的聊天核心运行面，不覆盖已经退出主产品范围的 RSS、热点、摘要、调度等内容平台能力。
+这份文档描述当前 `Fusion API` 的聊天核心运行面。
 
 ## Runtime Surface
 
@@ -84,22 +84,6 @@ JWT 校验在 [`app/core/security.py`](/Users/sean/code/fusion/fusion-api/app/co
 - `error`
 
 推理流的占位消息会先落库，再在流结束后回写最终内容。
-
-## Function Call / Web Search Position
-
-这两块现在还在代码里，但不属于当前默认产品面。
-
-边界如下：
-
-- 用户主界面不再默认暴露这些入口
-- 后端聊天主线仍保留受控能力
-- 相关主逻辑在 [`app/services/chat/function_call_processor.py`](/Users/sean/code/fusion/fusion-api/app/services/chat/function_call_processor.py)
-
-当前策略是：
-
-- 不删除能力本身
-- 不把它继续扩成更重的产品面
-- 等聊天主链路稳定后，再决定是否以轻量联网增强方式恢复
 
 ## File Flow
 

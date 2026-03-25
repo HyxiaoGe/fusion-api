@@ -94,7 +94,7 @@ class Message(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     conversation_id = Column(String, ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False)
     role = Column(String, nullable=False)  # 'user', 'assistant', 'system'
-    type = Column(String, nullable=False)  # 'user_query', 'assistant_content', 'reasoning_content', 'function_call', 'function_result', 'web_search'
+    type = Column(String, nullable=False)  # 'user_query', 'assistant_content', 'reasoning_content'
     content = Column(Text, nullable=True)  # 允许为空，reasoning_content 初始时可能为空
     turn_id = Column(String, nullable=True)  # 对话轮次ID，使用该轮对话中用户消息的ID
     duration = Column(Integer, nullable=False, default=0)  # 处理耗时(毫秒)，默认为0
