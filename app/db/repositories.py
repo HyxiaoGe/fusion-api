@@ -12,7 +12,7 @@ from app.db.models import Conversation as ConversationModel, get_china_time, Fil
 from app.db.models import Message as MessageModel
 from app.db.models import ModelSource, ModelCredential
 from app.db.models import User as UserModel, SocialAccount as SocialAccountModel
-from app.schemas.chat import Conversation, Message
+from app.schemas.chat import Conversation, Message, TextBlock, ThinkingBlock, FileBlock, Usage
 from app.schemas.models import ModelInfo, ModelCapabilities, ModelPricing, AuthConfig, ModelConfiguration, ModelConfigParam, ModelBasicInfo, AuthConfigField, ModelCredentialInfo
 from app.schemas.auth import User as UserSchema
 
@@ -77,36 +77,28 @@ class ConversationRepository:
     def create(self, conversation: Conversation) -> Conversation:
         """创建新的对话"""
         try:
-            # 转换为数据库模型
             db_conversation = ConversationModel(
                 id=conversation.id,
                 user_id=conversation.user_id,
                 title=conversation.title,
-                provider=conversation.provider,
-                model=conversation.model,
+                model_id=conversation.model_id,
                 created_at=conversation.created_at,
                 updated_at=conversation.updated_at
             )
 
-            # 添加消息
+            # 添加消息（content blocks 序列化为 JSONB）
             for msg in conversation.messages:
                 db_message = MessageModel(
                     id=msg.id,
                     role=msg.role,
-                    type=msg.type,
-                    content=msg.content,
-                    turn_id=msg.turn_id,
-                    duration=msg.duration,
+                    content=[block.model_dump() for block in msg.content],
+                    model_id=msg.model_id,
+                    usage=msg.usage.model_dump() if msg.usage else None,
                     created_at=msg.created_at
                 )
                 db_conversation.messages.append(db_message)
 
-            # 保存到数据库
             self.db.add(db_conversation)
-            # self.db.commit()
-            # self.db.refresh(db_conversation)
-
-            # 转换回业务模型
             return self._convert_to_schema(db_conversation)
         except Exception as e:
             self.db.rollback()
@@ -116,7 +108,6 @@ class ConversationRepository:
     def update(self, conversation: Conversation) -> Conversation:
         """更新现有对话"""
         try:
-            # 查找现有对话
             db_conversation = self.db.query(ConversationModel).filter(
                 ConversationModel.id == conversation.id,
                 ConversationModel.user_id == conversation.user_id
@@ -127,17 +118,22 @@ class ConversationRepository:
 
             # 仅更新对话元数据，不触碰消息（消息通过 create_message() 单独写入）
             db_conversation.title = conversation.title
-            db_conversation.model = conversation.model
+            db_conversation.model_id = conversation.model_id
             db_conversation.updated_at = get_china_time()
 
             self.db.flush()
-
-            # 转换回业务模型
             return self._convert_to_schema(db_conversation)
         except Exception as e:
             self.db.rollback()
             logger.error(f"更新对话失败: {e}")
             raise
+
+    def update_title(self, conversation_id: str, title: str) -> None:
+        """仅更新会话标题"""
+        self.db.query(ConversationModel)\
+            .filter(ConversationModel.id == conversation_id)\
+            .update({"title": title, "updated_at": get_china_time()})
+        self.db.flush()
 
     def delete(self, conversation_id: str, user_id: str) -> bool:
         """删除对话"""
@@ -188,15 +184,10 @@ class ConversationRepository:
     def get_paginated(self, user_id: str, page: int = 1, page_size: int = 20) -> Tuple[List[Conversation], int]:
         """分页获取对话列表（不包含消息内容）"""
         try:
-            # 计算偏移量
             offset = (page - 1) * page_size
-            
             query = self.db.query(ConversationModel).filter(ConversationModel.user_id == user_id)
-            
-            # 获取总数
             total = query.count()
-            
-            # 获取分页数据，不加载messages
+
             db_conversations = (
                 query
                 .order_by(ConversationModel.updated_at.desc())
@@ -204,24 +195,22 @@ class ConversationRepository:
                 .limit(page_size)
                 .all()
             )
-            
-            # 转换为Conversation对象，但不包含messages
+
             conversations = []
             for db_conv in db_conversations:
                 conversation = Conversation(
                     id=db_conv.id,
                     user_id=db_conv.user_id,
+                    model_id=db_conv.model_id,
                     title=db_conv.title,
-                    provider=db_conv.provider,
-                    model=db_conv.model,
-                    messages=[],  # 空的messages数组
+                    messages=[],
                     created_at=db_conv.created_at,
                     updated_at=db_conv.updated_at
                 )
                 conversations.append(conversation)
-            
+
             return conversations, total
-            
+
         except Exception as e:
             logger.error(f"分页获取对话失败: {e}")
             return [], 0
@@ -233,10 +222,9 @@ class ConversationRepository:
                 id=message.id,
                 conversation_id=conversation_id,
                 role=message.role,
-                type=message.type,
-                content=message.content,
-                turn_id=message.turn_id,
-                duration=message.duration,
+                content=[block.model_dump() for block in message.content],
+                model_id=message.model_id,
+                usage=message.usage.model_dump() if message.usage else None,
                 created_at=message.created_at,
             )
 
@@ -266,11 +254,14 @@ class ConversationRepository:
             db_message = self.db.query(MessageModel).filter(MessageModel.id == message_id).first()
             if db_message:
                 for key, value in update_data.items():
+                    # content blocks 和 usage 需要序列化为 dict 再写入 JSONB
+                    if key == "content" and isinstance(value, list):
+                        value = [block.model_dump() if hasattr(block, 'model_dump') else block for block in value]
+                    if key == "usage" and hasattr(value, 'model_dump'):
+                        value = value.model_dump()
                     setattr(db_message, key, value)
-                # 不在这里提交，让调用方决定何时提交事务
-                # self.db.commit()
-                self.db.flush()  # 刷新会话，确保更改被跟踪
-                self.db.refresh(db_message)  # 刷新对象状态
+                self.db.flush()
+                self.db.refresh(db_message)
                 return self._convert_message_to_schema(db_message)
             return None
         except Exception as e:
@@ -279,18 +270,25 @@ class ConversationRepository:
             return None
 
     def _convert_message_to_schema(self, db_message: MessageModel) -> Message:
-        """将消息数据库模型转换为业务模型"""
-        # 处理可能的 NULL content
-        content = db_message.content if db_message.content is not None else ""
-        
+        """将消息数据库模型转换为业务模型（JSONB → content blocks）"""
+        content_blocks = []
+        for block_data in (db_message.content or []):
+            block_type = block_data.get("type")
+            if block_type == "text":
+                content_blocks.append(TextBlock(**block_data))
+            elif block_type == "thinking":
+                content_blocks.append(ThinkingBlock(**block_data))
+            elif block_type == "file":
+                content_blocks.append(FileBlock(**block_data))
+            # 未知类型跳过，保持前向兼容
+
         return Message(
             id=db_message.id,
             role=db_message.role,
-            type=db_message.type or "assistant_content",
-            content=content,
-            turn_id=db_message.turn_id,
-            duration=db_message.duration or 0,
-            created_at=db_message.created_at
+            content=content_blocks,
+            model_id=db_message.model_id,
+            usage=Usage(**db_message.usage) if db_message.usage else None,
+            created_at=db_message.created_at,
         )
 
     def _convert_to_schema(self, db_conversation: ConversationModel) -> Conversation:
@@ -299,12 +297,11 @@ class ConversationRepository:
         return Conversation(
             id=db_conversation.id,
             user_id=db_conversation.user_id,
+            model_id=db_conversation.model_id,
             title=db_conversation.title,
-            provider=db_conversation.provider,
-            model=db_conversation.model,
             messages=messages,
             created_at=db_conversation.created_at,
-            updated_at=db_conversation.updated_at
+            updated_at=db_conversation.updated_at,
         )
 
 

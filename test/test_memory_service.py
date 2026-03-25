@@ -1,6 +1,8 @@
 import unittest
+from datetime import datetime
 from unittest.mock import MagicMock
 
+from app.schemas.chat import Conversation
 from app.services.memory_service import MemoryService
 
 
@@ -30,22 +32,35 @@ class MemoryServiceTests(unittest.TestCase):
         self.service.repo.create.assert_not_called()
 
     def test_get_conversations_paginated_builds_pagination_flags(self):
-        self.service.repo.get_paginated.return_value = (["conv-1", "conv-2"], 5)
+        now = datetime.now()
+        mock_conversations = [
+            Conversation(
+                id=f"conv-{i}",
+                user_id="user-1",
+                model_id="qwen-max",
+                title=f"Title {i}",
+                messages=[],
+                created_at=now,
+                updated_at=now,
+            )
+            for i in range(1, 3)
+        ]
+        self.service.repo.get_paginated.return_value = (mock_conversations, 5)
 
         result = self.service.get_conversations_paginated("user-1", page=2, page_size=2)
 
-        self.assertEqual(
-            result,
-            {
-                "items": ["conv-1", "conv-2"],
-                "total": 5,
-                "page": 2,
-                "page_size": 2,
-                "total_pages": 3,
-                "has_next": True,
-                "has_prev": True,
-            },
-        )
+        self.assertEqual(result["total"], 5)
+        self.assertEqual(result["page"], 2)
+        self.assertEqual(result["page_size"], 2)
+        self.assertEqual(result["total_pages"], 3)
+        self.assertTrue(result["has_next"])
+        self.assertTrue(result["has_prev"])
+        # 返回的是 ConversationSummary，不含 messages
+        self.assertEqual(len(result["items"]), 2)
+        item = result["items"][0]
+        self.assertEqual(item.id, "conv-1")
+        self.assertEqual(item.model_id, "qwen-max")
+        self.assertFalse(hasattr(item, "messages"))
 
 
 if __name__ == "__main__":

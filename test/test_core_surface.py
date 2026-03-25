@@ -96,8 +96,7 @@ class ChatCoreSurfaceTests(unittest.TestCase):
     def test_send_message_routes_to_chat_service(self):
         self._enable_authenticated_overrides()
         payload = {
-            "provider": "openai",
-            "model": "gpt-4.1",
+            "model_id": "gpt-4.1",
             "message": "hello",
             "conversation_id": "conv-1",
             "stream": False,
@@ -119,10 +118,9 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["conversation_id"], "conv-1")
         service.process_message.assert_awaited_once_with(
-            user_id="user-123",
-            provider="openai",
-            model="gpt-4.1",
+            model_id="gpt-4.1",
             message="hello",
+            user_id="user-123",
             conversation_id="conv-1",
             stream=False,
             options={"temperature": 0.3},
@@ -147,8 +145,7 @@ class ChatCoreSurfaceTests(unittest.TestCase):
             response = self.client.post(
                 "/api/chat/send",
                 json={
-                    "provider": "openai",
-                    "model": "gpt-4.1",
+                    "model_id": "gpt-4.1",
                     "message": "stream please",
                     "stream": True,
                 },

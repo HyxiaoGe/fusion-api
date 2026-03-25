@@ -4,61 +4,40 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.schemas.chat import Conversation, Message
+from app.schemas.chat import Conversation, Message, TextBlock, ThinkingBlock, Usage
 from app.services.chat_service import ChatService
 
 
 class ChatServiceTests(unittest.TestCase):
-    def test_get_response_text_prefers_content_attribute(self):
-        service = object.__new__(ChatService)
-
-        text = service._get_response_text(SimpleNamespace(content="hello"))
-
-        self.assertEqual(text, "hello")
-
-    def test_get_response_text_falls_back_to_raw_response(self):
-        service = object.__new__(ChatService)
-
-        text = service._get_response_text("hello")
-
-        self.assertEqual(text, "hello")
-
     def test_build_recent_dialog_content_prefers_latest_user_assistant_pair(self):
         service = object.__new__(ChatService)
         conversation = Conversation(
             id="conv-1",
             user_id="user-1",
             title="hello",
-            provider="qwen",
-            model="qwen-max-latest",
+            model_id="qwen-max-latest",
             messages=[
                 Message(
                     id="user-msg-1",
                     role="user",
-                    type="user_query",
-                    content="old question",
-                    turn_id="turn-1",
+                    content=[TextBlock(type="text", text="old question")],
                 ),
                 Message(
                     id="assistant-msg-1",
                     role="assistant",
-                    type="assistant_content",
-                    content="old answer",
-                    turn_id="turn-1",
+                    content=[TextBlock(type="text", text="old answer")],
+                    model_id="qwen-max-latest",
                 ),
                 Message(
                     id="user-msg-2",
                     role="user",
-                    type="user_query",
-                    content="latest question",
-                    turn_id="turn-2",
+                    content=[TextBlock(type="text", text="latest question")],
                 ),
                 Message(
                     id="assistant-msg-2",
                     role="assistant",
-                    type="assistant_content",
-                    content="latest answer",
-                    turn_id="turn-2",
+                    content=[TextBlock(type="text", text="latest answer")],
+                    model_id="qwen-max-latest",
                 ),
             ],
             created_at=datetime.now(),
@@ -75,22 +54,17 @@ class ChatServiceTests(unittest.TestCase):
             id="conv-1",
             user_id="user-1",
             title="hello",
-            provider="qwen",
-            model="qwen-max-latest",
+            model_id="qwen-max-latest",
             messages=[
                 Message(
                     id="user-msg-1",
                     role="user",
-                    type="user_query",
-                    content="question one",
-                    turn_id="turn-1",
+                    content=[TextBlock(type="text", text="question one")],
                 ),
                 Message(
                     id="user-msg-2",
                     role="user",
-                    type="user_query",
-                    content="question two",
-                    turn_id="turn-2",
+                    content=[TextBlock(type="text", text="question two")],
                 ),
             ],
             created_at=datetime.now(),
@@ -101,60 +75,32 @@ class ChatServiceTests(unittest.TestCase):
 
         self.assertEqual(content, "用户: question two")
 
-    def test_handle_normal_response_commits_assistant_message(self):
-        service = object.__new__(ChatService)
-        service.db = MagicMock()
-        service.memory_service = MagicMock()
+    def test_build_llm_messages_filters_thinking_blocks(self):
+        """thinking block 不应传给 LLM"""
+        messages = [
+            Message(
+                role="user",
+                content=[TextBlock(type="text", text="hello")],
+            ),
+            Message(
+                role="assistant",
+                content=[
+                    ThinkingBlock(type="thinking", thinking="let me think"),
+                    TextBlock(type="text", text="answer"),
+                ],
+                model_id="qwen-max-latest",
+            ),
+        ]
 
-        conversation = Conversation(
-            id="conv-1",
-            user_id="user-1",
-            title="hello",
-            provider="qwen",
-            model="qwen-max-latest",
-            messages=[
-                Message(
-                    id="user-msg-1",
-                    role="user",
-                    type="user_query",
-                    content="hello",
-                    turn_id="user-msg-1",
-                )
-            ],
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
-        )
-        service.memory_service.get_conversation.return_value = conversation
+        result = ChatService._build_llm_messages(messages)
 
-        response = SimpleNamespace(content="OK")
-
-        with patch(
-            "app.services.chat_service.ChatService._invoke_non_stream_model",
-            new=AsyncMock(return_value=response),
-        ):
-            response = asyncio.run(
-                service._handle_normal_response(
-                    "qwen",
-                    "qwen-max-latest",
-                    messages=[{"role": "user", "content": "hello"}],
-                    conversation_id="conv-1",
-                    user_id="user-1",
-                    options={},
-                    turn_id="user-msg-1",
-                )
-            )
-
-        self.assertEqual(response.message.content, "OK")
-        self.assertEqual(response.reasoning, "")
         self.assertEqual(
-            [(msg.role, msg.type, msg.content) for msg in conversation.messages],
+            result,
             [
-                ("user", "user_query", "hello"),
-                ("assistant", "assistant_content", "OK"),
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "answer"},
             ],
         )
-        service.memory_service.save_conversation.assert_called_once_with(conversation)
-        service.db.commit.assert_called_once()
 
     def test_update_message_commits_when_update_succeeds(self):
         service = object.__new__(ChatService)
@@ -164,52 +110,41 @@ class ChatServiceTests(unittest.TestCase):
         updated_message = Message(
             id="assistant-msg-1",
             role="assistant",
-            type="assistant_content",
-            content="updated",
-            turn_id="turn-1",
+            content=[TextBlock(type="text", text="updated")],
+            model_id="qwen-max-latest",
         )
         service.memory_service.update_message.return_value = updated_message
 
-        result = service.update_message("assistant-msg-1", {"content": "updated"})
+        result = service.update_message(
+            "assistant-msg-1",
+            {"content": [TextBlock(type="text", text="updated")]},
+        )
 
         self.assertIs(result, updated_message)
-        service.memory_service.update_message.assert_called_once_with(
-            "assistant-msg-1",
-            {"content": "updated"},
-        )
         service.db.commit.assert_called_once()
 
-    def test_get_conversation_attaches_reasoning_to_assistant_message(self):
+    def test_generate_suggested_questions_limits_output_to_three(self):
         service = object.__new__(ChatService)
+        service.db = MagicMock()
         service.memory_service = MagicMock()
+        service.file_repo = MagicMock()
 
         conversation = Conversation(
             id="conv-1",
             user_id="user-1",
             title="hello",
-            provider="qwen",
-            model="qwen-max-latest",
+            model_id="qwen-max-latest",
             messages=[
                 Message(
                     id="user-msg-1",
                     role="user",
-                    type="user_query",
-                    content="question",
-                    turn_id="turn-1",
-                ),
-                Message(
-                    id="reasoning-msg-1",
-                    role="assistant",
-                    type="reasoning_content",
-                    content="thought",
-                    turn_id="turn-1",
+                    content=[TextBlock(type="text", text="Explain this answer")],
                 ),
                 Message(
                     id="assistant-msg-1",
                     role="assistant",
-                    type="assistant_content",
-                    content="answer",
-                    turn_id="turn-1",
+                    content=[TextBlock(type="text", text="Here is the answer")],
+                    model_id="qwen-max-latest",
                 ),
             ],
             created_at=datetime.now(),
@@ -217,124 +152,19 @@ class ChatServiceTests(unittest.TestCase):
         )
         service.memory_service.get_conversation.return_value = conversation
 
-        result = service.get_conversation("conv-1", "user-1")
-
-        self.assertEqual([msg.id for msg in result.messages], ["user-msg-1", "assistant-msg-1"])
-        self.assertEqual(result.messages[1].reasoning, "thought")
-
-    def test_get_conversation_concatenates_multiple_reasoning_messages_by_created_at(self):
-        service = object.__new__(ChatService)
-        service.memory_service = MagicMock()
-        now = datetime.now()
-
-        conversation = Conversation(
-            id="conv-1",
-            user_id="user-1",
-            title="hello",
-            provider="qwen",
-            model="qwen-max-latest",
-            messages=[
-                Message(
-                    id="assistant-msg-1",
-                    role="assistant",
-                    type="assistant_content",
-                    content="answer",
-                    turn_id="turn-1",
-                    created_at=now,
-                ),
-                Message(
-                    id="reasoning-msg-2",
-                    role="assistant",
-                    type="reasoning_content",
-                    content="second",
-                    turn_id="turn-1",
-                    created_at=now.replace(microsecond=2),
-                ),
-                Message(
-                    id="reasoning-msg-1",
-                    role="assistant",
-                    type="reasoning_content",
-                    content="first",
-                    turn_id="turn-1",
-                    created_at=now.replace(microsecond=1),
-                ),
-            ],
-            created_at=now,
-            updated_at=now,
-        )
-        service.memory_service.get_conversation.return_value = conversation
-
-        result = service.get_conversation("conv-1", "user-1")
-
-        self.assertEqual(result.messages[0].reasoning, "firstsecond")
-
-    def test_get_conversation_returns_null_reasoning_when_absent(self):
-        service = object.__new__(ChatService)
-        service.memory_service = MagicMock()
-
-        conversation = Conversation(
-            id="conv-1",
-            user_id="user-1",
-            title="hello",
-            provider="qwen",
-            model="qwen-max-latest",
-            messages=[
-                Message(
-                    id="assistant-msg-1",
-                    role="assistant",
-                    type="assistant_content",
-                    content="answer",
-                    turn_id="turn-1",
-                ),
-            ],
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
-        )
-        service.memory_service.get_conversation.return_value = conversation
-
-        result = service.get_conversation("conv-1", "user-1")
-
-        self.assertIsNone(result.messages[0].reasoning)
-
-    def test_generate_suggested_questions_uses_prompt_manager_and_limits_output(self):
-        service = object.__new__(ChatService)
-        service.memory_service = MagicMock()
-
-        conversation = Conversation(
-            id="conv-1",
-            user_id="user-1",
-            title="hello",
-            provider="qwen",
-            model="qwen-max-latest",
-            messages=[
-                Message(
-                    id="user-msg-1",
-                    role="user",
-                    type="user_query",
-                    content="Explain this answer",
-                    turn_id="turn-1",
-                ),
-                Message(
-                    id="assistant-msg-1",
-                    role="assistant",
-                    type="assistant_content",
-                    content="Here is the answer",
-                    turn_id="turn-1",
-                ),
-            ],
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
-        )
-        service.memory_service.get_conversation.return_value = conversation
-
-        with patch(
-            "app.services.chat_service.ChatService._invoke_non_stream_model",
-            new=AsyncMock(
-                return_value=SimpleNamespace(
+        mock_response = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
                     content="1. Follow-up A\n2. Follow-up B\n3. Follow-up C\n4. Follow-up D"
                 )
-            ),
-        ):
+            )]
+        )
+
+        with patch("app.services.chat_service.litellm") as mock_litellm, \
+             patch("app.services.chat_service.llm_manager") as mock_manager:
+            mock_manager.resolve_model.return_value = ("openai/qwen-max-latest", "qwen", {})
+            mock_litellm.acompletion = AsyncMock(return_value=mock_response)
+
             questions = asyncio.run(
                 service.generate_suggested_questions(
                     user_id="user-1",
@@ -342,36 +172,25 @@ class ChatServiceTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(
-            questions,
-            ["Follow-up A", "Follow-up B", "Follow-up C"],
-        )
+        self.assertEqual(len(questions), 3)
+        self.assertEqual(questions, ["Follow-up A", "Follow-up B", "Follow-up C"])
 
-    def test_generate_title_persists_conversation_inside_service(self):
+    def test_generate_title_persists_title_to_database(self):
         service = object.__new__(ChatService)
         service.db = MagicMock()
         service.memory_service = MagicMock()
+        service.file_repo = MagicMock()
 
         conversation = Conversation(
             id="conv-1",
             user_id="user-1",
             title="old",
-            provider="qwen",
-            model="qwen-max-latest",
+            model_id="qwen-max-latest",
             messages=[
                 Message(
                     id="user-msg-1",
                     role="user",
-                    type="user_query",
-                    content="Explain fusion",
-                    turn_id="turn-1",
-                ),
-                Message(
-                    id="assistant-msg-1",
-                    role="assistant",
-                    type="assistant_content",
-                    content="Fusion is a chat product.",
-                    turn_id="turn-1",
+                    content=[TextBlock(type="text", text="Explain fusion")],
                 ),
             ],
             created_at=datetime.now(),
@@ -379,10 +198,17 @@ class ChatServiceTests(unittest.TestCase):
         )
         service.memory_service.get_conversation.return_value = conversation
 
-        with patch(
-            "app.services.chat_service.ChatService._invoke_non_stream_model",
-            new=AsyncMock(return_value=SimpleNamespace(content="Fusion Chat")),
-        ):
+        mock_response = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="Fusion Chat")
+            )]
+        )
+
+        with patch("app.services.chat_service.litellm") as mock_litellm, \
+             patch("app.services.chat_service.llm_manager") as mock_manager:
+            mock_manager.resolve_model.return_value = ("openai/qwen-max-latest", "qwen", {})
+            mock_litellm.acompletion = AsyncMock(return_value=mock_response)
+
             title = asyncio.run(
                 service.generate_title(
                     user_id="user-1",
@@ -391,49 +217,8 @@ class ChatServiceTests(unittest.TestCase):
             )
 
         self.assertEqual(title, "Fusion Chat")
-        self.assertEqual(conversation.title, "Fusion Chat")
-        service.memory_service.save_conversation.assert_called_once_with(conversation)
+        service.memory_service.repo.update_title.assert_called_once_with("conv-1", "Fusion Chat")
         service.db.commit.assert_called_once()
-
-    def test_generate_title_prefers_latest_user_message_only(self):
-        service = object.__new__(ChatService)
-        conversation = Conversation(
-            id="conv-1",
-            user_id="user-1",
-            title="old",
-            provider="qwen",
-            model="qwen-max-latest",
-            messages=[
-                Message(
-                    id="user-msg-1",
-                    role="user",
-                    type="user_query",
-                    content="第一个问题",
-                    turn_id="turn-1",
-                ),
-                Message(
-                    id="assistant-msg-1",
-                    role="assistant",
-                    type="assistant_content",
-                    content="第一个回答",
-                    turn_id="turn-1",
-                ),
-                Message(
-                    id="user-msg-2",
-                    role="user",
-                    type="user_query",
-                    content="最后一个问题",
-                    turn_id="turn-2",
-                ),
-            ],
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
-        )
-
-        self.assertEqual(
-            service._get_latest_user_message_content(conversation),
-            "最后一个问题",
-        )
 
 
 if __name__ == "__main__":

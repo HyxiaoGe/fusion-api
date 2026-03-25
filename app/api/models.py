@@ -127,7 +127,7 @@ async def test_model_credential(
                 detail=f"模型 {request.model_id} 不存在"
             )
 
-        result = await llm_manager.test_credentials(model.provider, request.credentials)
+        result = await llm_manager.test_credentials(model.provider, request.model_id, request.credentials)
         if result:
             return CredentialTestResponse(success=True, message="凭证有效")
         return CredentialTestResponse(success=False, message="凭证无效")

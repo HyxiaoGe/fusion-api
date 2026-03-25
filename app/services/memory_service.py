@@ -4,7 +4,7 @@ from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session
 
 from app.db.repositories import ConversationRepository
-from app.schemas.chat import Conversation, Message
+from app.schemas.chat import Conversation, ConversationSummary, Message
 
 
 class MemoryService:
@@ -43,15 +43,27 @@ class MemoryService:
         return self.repo.update_message(message_id, update_data)
 
     def get_conversations_paginated(self, user_id: str, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
-        """分页获取对话列表"""
+        """分页获取对话列表，返回 ConversationSummary（不含 messages）"""
         conversations, total = self.repo.get_paginated(user_id, page, page_size)
+
+        # 转为轻量 ConversationSummary，不携带 messages
+        summaries = [
+            ConversationSummary(
+                id=conv.id,
+                model_id=conv.model_id,
+                title=conv.title,
+                created_at=conv.created_at,
+                updated_at=conv.updated_at,
+            )
+            for conv in conversations
+        ]
 
         total_pages = math.ceil(total / page_size) if total > 0 else 0
         has_next = page < total_pages
         has_prev = page > 1
 
         return {
-            "items": conversations,
+            "items": summaries,
             "total": total,
             "page": page,
             "page_size": page_size,

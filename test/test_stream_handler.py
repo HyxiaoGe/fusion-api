@@ -1,7 +1,7 @@
 import json
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.stream_handler import StreamHandler
 
@@ -18,261 +18,194 @@ class StreamHandlerTests(unittest.IsolatedAsyncioTestCase):
             return "[DONE]"
         return json.loads(event.removeprefix("data: ").strip())
 
-    async def test_normalize_direct_stream_messages_supports_mixed_message_shapes(self):
-        messages = [
-            {"role": "system", "content": "system"},
-            SimpleNamespace(type="human", content="hello"),
-            SimpleNamespace(role="assistant", content="world"),
+    async def test_generate_stream_emits_content_finish_and_done(self):
+        """正常流式响应：心跳帧 → 内容帧 → 结束帧 → [DONE]"""
+        # 模拟 litellm.acompletion 流式响应
+        mock_chunks = [
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(content="Hel", reasoning_content=None), finish_reason=None)],
+                usage=None,
+            ),
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(content="lo!", reasoning_content=None), finish_reason=None)],
+                usage=None,
+            ),
         ]
 
-        normalized = self.handler._normalize_direct_stream_messages(messages)
+        async def mock_stream():
+            for chunk in mock_chunks:
+                yield chunk
 
-        self.assertEqual(
-            normalized,
-            [
-                {"role": "system", "content": "system"},
-                {"role": "user", "content": "hello"},
-                {"role": "assistant", "content": "world"},
-            ],
-        )
-
-    async def test_generate_stream_emits_content_finish_and_done_for_normal_flow(self):
-        self.memory_service.create_message.return_value = SimpleNamespace(id="assistant-1")
-        self.handler.update_stream_response = AsyncMock()
-        llm = MagicMock()
-        llm.stream.return_value = [
-            SimpleNamespace(content="Hel"),
-            SimpleNamespace(content="lo"),
-            SimpleNamespace(content="!"),
-        ]
-
-        with patch("app.services.stream_handler.llm_manager.get_model", return_value=llm):
+        with patch("app.services.stream_handler.litellm") as mock_litellm:
+            mock_litellm.acompletion = AsyncMock(return_value=mock_stream())
             events = [
                 event
                 async for event in self.handler.generate_stream(
-                    "openai",
-                    "gpt",
-                    [SimpleNamespace(content="hi")],
-                    "conv-1",
-                    {"use_reasoning": False},
-                    "turn-1",
+                    litellm_model="openai/gpt-4o",
+                    provider="openai",
+                    model_id="gpt-4o",
+                    litellm_kwargs={"api_key": "test"},
+                    messages=[{"role": "user", "content": "hi"}],
+                    conversation_id="conv-1",
+                    options={"use_reasoning": False},
                 )
             ]
 
-        payloads = [self._parse_event(event) for event in events]
-        self.assertEqual(payloads[0]["choices"][0]["delta"], {})
+        payloads = [self._parse_event(e) for e in events]
+        # 第一帧是心跳
         self.assertIsNone(payloads[0]["choices"][0]["finish_reason"])
-        self.assertEqual(
-            [payload["choices"][0]["delta"]["content"] for payload in payloads[1:-2]],
-            ["Hel", "lo", "!"],
-        )
+        # 中间帧有内容
+        text_deltas = []
+        for p in payloads[1:-2]:
+            if p != "[DONE]":
+                blocks = p["choices"][0]["delta"].get("content", [])
+                for b in blocks:
+                    if b["type"] == "text":
+                        text_deltas.append(b["text"])
+        self.assertEqual(text_deltas, ["Hel", "lo!"])
+        # 结束帧
         self.assertEqual(payloads[-2]["choices"][0]["finish_reason"], "stop")
+        # [DONE] 标记
         self.assertEqual(payloads[-1], "[DONE]")
-        self.handler.update_stream_response.assert_awaited_once_with("assistant-1", "Hello!")
+        # 消息已落库
+        self.memory_service.create_message.assert_called_once()
 
-    async def test_generate_stream_emits_reasoning_and_content_with_same_public_message_id(self):
-        self.memory_service.create_message.side_effect = [
-            SimpleNamespace(id="reasoning-1"),
-            SimpleNamespace(id="assistant-1"),
-        ]
-        self.handler.update_stream_response = AsyncMock()
-        llm = MagicMock()
-        llm.stream.return_value = [
-            SimpleNamespace(additional_kwargs={"reasoning_content": "think-1"}, content=""),
-            SimpleNamespace(additional_kwargs={"reasoning_content": "think-2"}, content=""),
-            SimpleNamespace(additional_kwargs={}, content="answer-1"),
-            SimpleNamespace(additional_kwargs={}, content="answer-2"),
+    async def test_generate_stream_emits_reasoning_and_content_blocks(self):
+        """推理模型：先输出 thinking block，再输出 text block"""
+        mock_chunks = [
+            SimpleNamespace(
+                choices=[SimpleNamespace(
+                    delta=SimpleNamespace(content="", reasoning_content="think-1"),
+                    finish_reason=None,
+                )],
+                usage=None,
+            ),
+            SimpleNamespace(
+                choices=[SimpleNamespace(
+                    delta=SimpleNamespace(content="answer-1", reasoning_content=None),
+                    finish_reason=None,
+                )],
+                usage=None,
+            ),
         ]
 
-        with patch("app.services.stream_handler.llm_manager.get_model", return_value=llm):
+        async def mock_stream():
+            for chunk in mock_chunks:
+                yield chunk
+
+        with patch("app.services.stream_handler.litellm") as mock_litellm:
+            mock_litellm.acompletion = AsyncMock(return_value=mock_stream())
             events = [
                 event
                 async for event in self.handler.generate_stream(
-                    "qwen",
-                    "qwen-max",
-                    [SimpleNamespace(content="hi")],
-                    "conv-1",
-                    {},
-                    "turn-1",
+                    litellm_model="openai/qwen-max",
+                    provider="qwen",
+                    model_id="qwen-max",
+                    litellm_kwargs={},
+                    messages=[{"role": "user", "content": "hi"}],
+                    conversation_id="conv-1",
+                    options={},
                 )
             ]
 
-        payloads = [self._parse_event(event) for event in events]
-        self.assertEqual(payloads[0]["choices"][0]["delta"], {})
-        ids = [payload["id"] for payload in payloads[:-1] if payload != "[DONE]"]
-        self.assertTrue(all(message_id == "assistant-1" for message_id in ids))
+        payloads = [self._parse_event(e) for e in events]
+        # 所有帧使用相同的 message id
+        ids = [p["id"] for p in payloads if p != "[DONE]"]
+        self.assertTrue(all(mid == ids[0] for mid in ids))
 
-        reasoning_indexes = [
-            index for index, payload in enumerate(payloads)
-            if payload != "[DONE]" and "reasoning_content" in payload["choices"][0]["delta"]
-        ]
-        content_indexes = [
-            index for index, payload in enumerate(payloads)
-            if payload != "[DONE]" and "content" in payload["choices"][0]["delta"]
-        ]
-        self.assertTrue(max(reasoning_indexes) < min(content_indexes))
-        self.assertEqual(payloads[-2]["choices"][0]["finish_reason"], "stop")
-        self.assertEqual(payloads[-1], "[DONE]")
-        self.handler.update_stream_response.assert_has_awaits(
-            [
-                call("reasoning-1", "think-1think-2"),
-                call("assistant-1", "answer-1answer-2"),
-            ]
-        )
+        # 验证有 thinking 和 text 类型的 block
+        block_types = []
+        for p in payloads:
+            if p == "[DONE]":
+                continue
+            blocks = p["choices"][0]["delta"].get("content", [])
+            for b in blocks:
+                block_types.append(b["type"])
+        self.assertIn("thinking", block_types)
+        self.assertIn("text", block_types)
 
-    async def test_pre_stream_exception_bubbles_up_without_sse_events(self):
-        self.memory_service.create_message.side_effect = RuntimeError("boom")
-
-        with patch("app.services.stream_handler.llm_manager.get_model", return_value=MagicMock()):
-            stream = self.handler.generate_stream(
-                "openai",
-                "gpt",
-                [SimpleNamespace(content="hi")],
-                "conv-1",
-                {"use_reasoning": False},
-                "turn-1",
-            )
-            with self.assertRaises(RuntimeError):
-                await stream.__anext__()
-
-    async def test_stream_internal_exception_before_first_content_emits_error_and_done(self):
-        self.memory_service.create_message.return_value = SimpleNamespace(id="assistant-1")
-        self.handler.update_stream_response = AsyncMock()
-        llm = MagicMock()
-
-        def failing_stream(_messages):
-            if False:
-                yield None
+    async def test_stream_exception_emits_error_and_done(self):
+        """流式过程中异常：发出 error 帧 + [DONE]"""
+        async def failing_stream():
             raise RuntimeError("boom")
+            yield  # noqa: unreachable - makes this an async generator
 
-        llm.stream.return_value = failing_stream([SimpleNamespace(content="hi")])
-
-        with patch("app.services.stream_handler.llm_manager.get_model", return_value=llm):
+        with patch("app.services.stream_handler.litellm") as mock_litellm:
+            mock_litellm.acompletion = AsyncMock(return_value=failing_stream())
             events = [
                 event
                 async for event in self.handler.generate_stream(
-                    "openai",
-                    "gpt",
-                    [SimpleNamespace(content="hi")],
-                    "conv-1",
-                    {"use_reasoning": False},
-                    "turn-1",
+                    litellm_model="openai/gpt-4o",
+                    provider="openai",
+                    model_id="gpt-4o",
+                    litellm_kwargs={},
+                    messages=[{"role": "user", "content": "hi"}],
+                    conversation_id="conv-1",
+                    options={"use_reasoning": False},
                 )
             ]
 
-        payloads = [self._parse_event(event) for event in events]
-        self.assertEqual(payloads[0]["choices"][0]["delta"], {})
+        payloads = [self._parse_event(e) for e in events]
+        # 心跳帧
         self.assertIsNone(payloads[0]["choices"][0]["finish_reason"])
+        # error 帧
         self.assertEqual(payloads[1]["choices"][0]["finish_reason"], "error")
-        self.assertEqual(payloads[1]["error"]["message"], "boom")
-        self.assertEqual(payloads[2], "[DONE]")
-        self.handler.update_stream_response.assert_not_awaited()
+        # [DONE]
+        self.assertEqual(payloads[-1], "[DONE]")
 
-    async def test_stream_internal_exception_after_partial_answer_persists_partial_content(self):
-        self.memory_service.create_message.return_value = SimpleNamespace(id="assistant-1")
-        self.handler.update_stream_response = AsyncMock()
-        llm = MagicMock()
+    async def test_duplicate_reasoning_in_content_is_filtered(self):
+        """部分 provider 会在 content 和 reasoning_content 重复输出，应去重"""
+        mock_chunks = [
+            SimpleNamespace(
+                choices=[SimpleNamespace(
+                    delta=SimpleNamespace(content="dup", reasoning_content="dup"),
+                    finish_reason=None,
+                )],
+                usage=None,
+            ),
+            SimpleNamespace(
+                choices=[SimpleNamespace(
+                    delta=SimpleNamespace(content="final", reasoning_content=None),
+                    finish_reason=None,
+                )],
+                usage=None,
+            ),
+        ]
 
-        def partial_stream(_messages):
-            yield SimpleNamespace(content="a")
-            yield SimpleNamespace(content="b")
-            raise RuntimeError("boom")
+        async def mock_stream():
+            for chunk in mock_chunks:
+                yield chunk
 
-        llm.stream.return_value = partial_stream([SimpleNamespace(content="hi")])
-
-        with patch("app.services.stream_handler.llm_manager.get_model", return_value=llm):
+        with patch("app.services.stream_handler.litellm") as mock_litellm:
+            mock_litellm.acompletion = AsyncMock(return_value=mock_stream())
             events = [
                 event
                 async for event in self.handler.generate_stream(
-                    "openai",
-                    "gpt",
-                    [SimpleNamespace(content="hi")],
-                    "conv-1",
-                    {"use_reasoning": False},
-                    "turn-1",
+                    litellm_model="deepseek/deepseek-reasoner",
+                    provider="deepseek",
+                    model_id="deepseek-reasoner",
+                    litellm_kwargs={},
+                    messages=[{"role": "user", "content": "hi"}],
+                    conversation_id="conv-1",
+                    options={},
                 )
             ]
 
-        payloads = [self._parse_event(event) for event in events]
-        self.assertEqual(
-            [payload["choices"][0]["delta"]["content"] for payload in payloads[1:3]],
-            ["a", "b"],
-        )
-        self.assertEqual(payloads[3]["choices"][0]["finish_reason"], "error")
-        self.assertEqual(payloads[4], "[DONE]")
-        self.handler.update_stream_response.assert_awaited_once_with("assistant-1", "ab")
+        payloads = [self._parse_event(e) for e in events]
+        text_values = []
+        thinking_values = []
+        for p in payloads:
+            if p == "[DONE]":
+                continue
+            for b in p["choices"][0]["delta"].get("content", []):
+                if b["type"] == "text":
+                    text_values.append(b["text"])
+                elif b["type"] == "thinking":
+                    thinking_values.append(b["thinking"])
+        # reasoning_content="dup" 输出为 thinking，content="dup" 被去重过滤
+        self.assertEqual(thinking_values, ["dup"])
+        self.assertEqual(text_values, ["final"])
 
-    async def test_deepseek_same_chunk_duplicate_content_is_filtered(self):
-        self.memory_service.create_message.side_effect = [
-            SimpleNamespace(id="reasoning-1"),
-            SimpleNamespace(id="assistant-1"),
-        ]
-        self.handler.update_stream_response = AsyncMock()
-        llm = MagicMock()
-        llm.stream.return_value = [
-            SimpleNamespace(additional_kwargs={"reasoning_content": "dup"}, content="dup"),
-            SimpleNamespace(additional_kwargs={}, content="final"),
-        ]
 
-        with patch("app.services.stream_handler.llm_manager.get_model", return_value=llm):
-            events = [
-                event
-                async for event in self.handler.generate_stream(
-                    "deepseek",
-                    "deepseek-reasoner",
-                    [SimpleNamespace(content="hi")],
-                    "conv-1",
-                    {},
-                    "turn-1",
-                )
-            ]
-
-        payloads = [self._parse_event(event) for event in events]
-        content_values = [
-            payload["choices"][0]["delta"]["content"]
-            for payload in payloads
-            if payload != "[DONE]" and "content" in payload["choices"][0]["delta"]
-        ]
-        reasoning_values = [
-            payload["choices"][0]["delta"]["reasoning_content"]
-            for payload in payloads
-            if payload != "[DONE]" and "reasoning_content" in payload["choices"][0]["delta"]
-        ]
-        self.assertEqual(reasoning_values, ["dup"])
-        self.assertEqual(content_values, ["final"])
-
-    async def test_volcengine_connection_failure_emits_error_and_done(self):
-        self.memory_service.create_message.side_effect = [
-            SimpleNamespace(id="reasoning-1"),
-            SimpleNamespace(id="assistant-1"),
-        ]
-        self.handler.update_stream_response = AsyncMock()
-
-        failing_client = SimpleNamespace(
-            chat=SimpleNamespace(
-                completions=SimpleNamespace(
-                    create=AsyncMock(side_effect=RuntimeError("connect failed"))
-                )
-            )
-        )
-
-        with patch("app.services.stream_handler.llm_manager._get_model_credentials", return_value={"api_key": "k", "base_url": "https://example.com"}):
-            with patch("openai.AsyncOpenAI", return_value=failing_client):
-                events = [
-                    event
-                    async for event in self.handler.generate_stream(
-                        "volcengine",
-                        "deepseek-r1",
-                        [{"role": "user", "content": "hi"}],
-                        "conv-1",
-                        {},
-                        "turn-1",
-                    )
-                ]
-
-        payloads = [self._parse_event(event) for event in events]
-        self.assertEqual(payloads[0]["choices"][0]["delta"], {})
-        self.assertEqual(payloads[1]["choices"][0]["finish_reason"], "error")
-        self.assertEqual(payloads[1]["error"]["message"], "connect failed")
-        self.assertEqual(payloads[2], "[DONE]")
-        self.handler.update_stream_response.assert_not_awaited()
+if __name__ == "__main__":
+    unittest.main()

@@ -11,9 +11,8 @@ class MessageRoles:
     SYSTEM = "system"
 
 
-# 消息类型常量
-class MessageTypes:
-    """消息类型常量类"""
-    USER_QUERY = "user_query"                    # 用户提问
-    ASSISTANT_CONTENT = "assistant_content"      # AI正常回复
-    REASONING_CONTENT = "reasoning_content"      # AI推理过程
+# FinishReasons 从 events.py 移入，stream_handler 使用
+class FinishReasons:
+    """流式响应结束原因"""
+    STOP = "stop"
+    ERROR = "error"

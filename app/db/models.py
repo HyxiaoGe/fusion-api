@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import Column, String, Integer, Text, ForeignKey, DateTime, JSON, Boolean, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 
 from app.db.database import Base
@@ -47,8 +48,8 @@ class Conversation(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
     title = Column(String, nullable=False)
-    provider = Column(String, nullable=False)
-    model = Column(String, nullable=False)
+    # model_id 对应 model_sources 表中的 model_id，支持中途切换模型
+    model_id = Column(String, nullable=False)
     created_at = Column(DateTime, default=get_china_time)
     updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
 
@@ -93,11 +94,20 @@ class Message(Base):
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     conversation_id = Column(String, ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False)
-    role = Column(String, nullable=False)  # 'user', 'assistant', 'system'
-    type = Column(String, nullable=False)  # 'user_query', 'assistant_content', 'reasoning_content'
-    content = Column(Text, nullable=True)  # 允许为空，reasoning_content 初始时可能为空
-    turn_id = Column(String, nullable=True)  # 对话轮次ID，使用该轮对话中用户消息的ID
-    duration = Column(Integer, nullable=False, default=0)  # 处理耗时(毫秒)，默认为0
+    role = Column(String, nullable=False)  # 'user' | 'assistant'
+
+    # content blocks 数组，结构示例：
+    # 用户消息: [{"type": "text", "text": "..."}, {"type": "file", "file_id": "...", "filename": "...", "mime_type": "..."}]
+    # AI 回复:  [{"type": "thinking", "id": "blk_001", "thinking": "..."}, {"type": "text", "id": "blk_002", "text": "..."}]
+    content = Column(JSONB, nullable=False)
+
+    # 仅 assistant 消息填充，记录实际生成该消息时使用的模型
+    model_id = Column(String, nullable=True)
+
+    # 仅 assistant 消息填充，记录本次请求的 token 消耗
+    # 结构: {"input_tokens": 312, "output_tokens": 876}
+    usage = Column(JSONB, nullable=True)
+
     created_at = Column(DateTime, default=get_china_time)
 
     conversation = relationship("Conversation", back_populates="messages")
