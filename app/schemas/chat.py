@@ -133,6 +133,7 @@ class StreamChoice(BaseModel):
 class StreamChunk(BaseModel):
     """SSE 单个 chunk 的完整结构"""
     id: str                                          # 与最终落库的 message.id 一致
+    conversation_id: str                             # 会话 ID，前端据此关联消息
     choices: List[StreamChoice]
     # 仅在 finish_reason=stop 的最后一个 chunk 携带
     usage: Optional[Usage] = None

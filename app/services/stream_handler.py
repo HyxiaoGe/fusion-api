@@ -57,6 +57,7 @@ class StreamHandler:
         # 发送初始心跳帧，客户端据此确认连接建立
         yield _serialize(StreamChunk(
             id=assistant_message_id,
+            conversation_id=conversation_id,
             choices=[StreamChoice(delta=StreamDelta())],
         ))
 
@@ -105,6 +106,7 @@ class StreamHandler:
                     reasoning_buf += reasoning_delta
                     yield _serialize(StreamChunk(
                         id=assistant_message_id,
+                        conversation_id=conversation_id,
                         choices=[StreamChoice(delta=StreamDelta(content=[
                             ThinkingBlock(id=thinking_block_id, thinking=reasoning_delta)
                         ]))],
@@ -115,6 +117,7 @@ class StreamHandler:
                     content_buf += content_delta
                     yield _serialize(StreamChunk(
                         id=assistant_message_id,
+                        conversation_id=conversation_id,
                         choices=[StreamChoice(delta=StreamDelta(content=[
                             TextBlock(id=text_block_id, text=content_delta)
                         ]))],
@@ -146,6 +149,7 @@ class StreamHandler:
             # 发送结束帧（携带完整 usage）
             yield _serialize(StreamChunk(
                 id=assistant_message_id,
+                conversation_id=conversation_id,
                 choices=[StreamChoice(
                     delta=StreamDelta(),
                     finish_reason=FinishReasons.STOP,
@@ -157,6 +161,7 @@ class StreamHandler:
             logger.error(f"流式处理异常 [{litellm_model}]: {e}")
             yield _serialize(StreamChunk(
                 id=assistant_message_id,
+                conversation_id=conversation_id,
                 choices=[StreamChoice(
                     delta=StreamDelta(),
                     finish_reason=FinishReasons.ERROR,
