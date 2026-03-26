@@ -9,6 +9,8 @@ from app.core.logger import app_logger as logger
 
 # 关闭 LiteLLM 的冗余日志
 litellm.suppress_debug_info = True
+litellm.drop_params = True
+logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 
 # provider 内部标识 → LiteLLM 模型前缀映射
 # 部分 provider 使用 OpenAI 兼容接口，需要通过 api_base 指定，前缀统一用 openai/
