@@ -288,8 +288,30 @@ class ConversationRepository:
             content=content_blocks,
             model_id=db_message.model_id,
             usage=Usage(**db_message.usage) if db_message.usage else None,
+            suggested_questions=db_message.suggested_questions or None,
             created_at=db_message.created_at,
         )
+
+    def get_last_assistant_message(self, conversation_id: str) -> Optional[MessageModel]:
+        """获取会话中最后一条 assistant 消息的原始 DB 对象"""
+        return (
+            self.db.query(MessageModel)
+            .filter(
+                MessageModel.conversation_id == conversation_id,
+                MessageModel.role == "assistant",
+            )
+            .order_by(MessageModel.created_at.desc())
+            .first()
+        )
+
+    def update_message_suggested_questions(
+        self, message_id: str, questions: list[str]
+    ) -> None:
+        """将推荐问题写回到指定消息"""
+        self.db.query(MessageModel).filter(MessageModel.id == message_id).update(
+            {"suggested_questions": questions}
+        )
+        self.db.flush()
 
     def _convert_to_schema(self, db_conversation: ConversationModel) -> Conversation:
         """将数据库模型转换为业务模型"""

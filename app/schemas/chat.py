@@ -62,6 +62,8 @@ class Message(BaseModel):
     model_id: Optional[str] = None
     # 仅 assistant 消息填充
     usage: Optional[Usage] = None
+    # 仅 assistant 消息填充，持久化推荐问题
+    suggested_questions: Optional[List[str]] = None
     created_at: datetime = Field(default_factory=datetime.now)
 
     class Config:

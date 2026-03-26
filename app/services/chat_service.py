@@ -291,8 +291,15 @@ class ChatService:
                 **litellm_kwargs,
             )
             raw = response.choices[0].message.content or ""
-            questions = ChatUtils.parse_questions(raw)
-            return questions[:3]
+            questions = ChatUtils.parse_questions(raw)[:3]
+
+            # 写回到最后一条 assistant 消息，刷新后随消息一起返回
+            last_msg = self.memory_service.repo.get_last_assistant_message(conversation_id)
+            if last_msg and questions:
+                self.memory_service.repo.update_message_suggested_questions(last_msg.id, questions)
+                self.db.commit()
+
+            return questions
 
         except Exception as e:
             logger.error(f"生成推荐问题失败: {e}")

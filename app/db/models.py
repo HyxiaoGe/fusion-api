@@ -108,6 +108,10 @@ class Message(Base):
     # 结构: {"input_tokens": 312, "output_tokens": 876}
     usage = Column(JSONB, nullable=True)
 
+    # 仅 assistant 消息填充，持久化推荐问题（只保留最新一批）
+    # 结构: ["问题1", "问题2", "问题3"]
+    suggested_questions = Column(JSONB, nullable=True)
+
     created_at = Column(DateTime, default=get_china_time)
 
     conversation = relationship("Conversation", back_populates="messages")
