@@ -108,7 +108,7 @@ class StreamHandler:
                         id=assistant_message_id,
                         conversation_id=conversation_id,
                         choices=[StreamChoice(delta=StreamDelta(content=[
-                            ThinkingBlock(id=thinking_block_id, thinking=reasoning_delta)
+                            ThinkingBlock(type="thinking", id=thinking_block_id, thinking=reasoning_delta)
                         ]))],
                     ))
 
@@ -119,7 +119,7 @@ class StreamHandler:
                         id=assistant_message_id,
                         conversation_id=conversation_id,
                         choices=[StreamChoice(delta=StreamDelta(content=[
-                            TextBlock(id=text_block_id, text=content_delta)
+                            TextBlock(type="text", id=text_block_id, text=content_delta)
                         ]))],
                     ))
 
@@ -133,9 +133,9 @@ class StreamHandler:
             # 构造完整 assistant 消息落库
             final_blocks = []
             if reasoning_buf:
-                final_blocks.append(ThinkingBlock(id=thinking_block_id, thinking=reasoning_buf))
+                final_blocks.append(ThinkingBlock(type="thinking", id=thinking_block_id, thinking=reasoning_buf))
             if content_buf:
-                final_blocks.append(TextBlock(id=text_block_id, text=content_buf))
+                final_blocks.append(TextBlock(type="text", id=text_block_id, text=content_buf))
 
             assistant_message = Message(
                 id=assistant_message_id,
