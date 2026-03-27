@@ -1,8 +1,24 @@
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: fusion-redis
+    restart: always
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --save ""
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
   app:
     build: .
     container_name: fusion-api
     restart: always
+    depends_on:
+      redis:
+        condition: service_healthy
     env_file:
       - .env
     ports:
@@ -41,6 +57,7 @@ services:
       - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET:-}
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+      - REDIS_URL=${REDIS_URL:-redis://fusion-redis:6379/0}
     deploy:
       resources:
         limits:

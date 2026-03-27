@@ -21,6 +21,7 @@ from app.schemas.chat import (
     TitleGenerationResponse,
 )
 from app.services.chat_service import ChatService
+from app.services.stream_state_service import get_stream_status as get_stream_status_from_redis
 
 router = APIRouter()
 
@@ -186,3 +187,23 @@ async def suggest_questions(
     except Exception:
         app_logger.exception("生成推荐问题失败")
         raise HTTPException(status_code=500, detail="服务器内部错误")
+
+
+@router.get("/stream-status/{conv_id}")
+async def get_stream_status_endpoint(
+    conv_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    查询指定会话的流式状态（Redis 缓存）。
+    前端在页面 mount 时调用，判断是否有未完成的流需要恢复。
+    """
+    state = await get_stream_status_from_redis(conv_id)
+    if state is None:
+        return {"status": "completed"}
+
+    # 安全校验：只允许流的所有者查询
+    if state.get("user_id") != str(current_user.id):
+        return {"status": "completed"}
+
+    return state

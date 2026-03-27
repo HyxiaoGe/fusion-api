@@ -92,6 +92,7 @@ class ChatService:
                     messages=lm_messages,
                     conversation_id=conversation.id,
                     options=options,
+                    user_id=user_id,
                 ),
                 media_type="text/event-stream",
             )

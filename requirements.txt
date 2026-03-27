@@ -22,3 +22,4 @@ python-jose[cryptography]
 PyJWT[crypto]>=2.8.0
 passlib[bcrypt]
 itsdangerous
+redis[hiredis]>=5.0.0

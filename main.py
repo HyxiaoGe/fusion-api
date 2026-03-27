@@ -11,6 +11,7 @@ from app.api import chat, files, models, auth
 from app.core.logger import app_logger
 from app.db.init_db import init_db
 from app.db.database import SessionLocal
+from app.core.redis import init_redis, close_redis
 
 
 
@@ -50,9 +51,11 @@ async def lifespan(app: FastAPI):
         app_logger.info("应用启动中...")
         init_db()
         app_logger.info("数据库初始化完成")
-        
+        await init_redis()
+
         yield
         # 应用关闭时的清理工作
+        await close_redis()
         app_logger.info("应用关闭中...")
     except Exception as e:
         app_logger.error(f"应用启动失败: {e}")

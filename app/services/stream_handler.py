@@ -11,6 +11,17 @@ from app.schemas.chat import (
     Message, TextBlock, ThinkingBlock, Usage,
     StreamChunk, StreamChoice, StreamDelta,
 )
+from app.services.stream_state_service import (
+    acquire_stream_lock,
+    is_lock_owner,
+    set_stream_start,
+    append_stream_chunk,
+    set_stream_complete,
+    set_stream_error,
+)
+
+# 每 N 个 chunk 检查一次锁状态，避免每个 chunk 都查 Redis
+LOCK_CHECK_INTERVAL = 20
 
 
 class StreamHandler:
@@ -35,6 +46,7 @@ class StreamHandler:
         messages: list[dict],
         conversation_id: str,
         options: Optional[dict] = None,
+        user_id: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
         """
         生成 SSE 流式响应。
@@ -54,6 +66,14 @@ class StreamHandler:
         thinking_block_id = f"blk_{uuid.uuid4().hex[:12]}"
         text_block_id = f"blk_{uuid.uuid4().hex[:12]}"
 
+        # Redis 流状态：获取互斥锁 + 写入初始状态
+        request_id = await acquire_stream_lock(conversation_id)
+        await set_stream_start(
+            conversation_id=conversation_id,
+            user_id=user_id or "",
+            model=model_id,
+        )
+
         # 发送初始心跳帧，客户端据此确认连接建立
         yield _serialize(StreamChunk(
             id=assistant_message_id,
@@ -64,13 +84,14 @@ class StreamHandler:
         reasoning_buf = ""
         content_buf = ""
         usage_data: Optional[Usage] = None
+        chunk_count = 0
 
         try:
             response = await litellm.acompletion(
                 model=litellm_model,
                 messages=messages,
                 stream=True,
-                stream_options={"include_usage": True},  # 要求最后一帧带 usage
+                stream_options={"include_usage": True},
                 **litellm_kwargs,
             )
 
@@ -104,6 +125,7 @@ class StreamHandler:
                 # 发送 thinking 增量
                 if reasoning_delta:
                     reasoning_buf += reasoning_delta
+                    await append_stream_chunk(conversation_id, "reasoning", reasoning_delta)
                     yield _serialize(StreamChunk(
                         id=assistant_message_id,
                         conversation_id=conversation_id,
@@ -115,6 +137,7 @@ class StreamHandler:
                 # 发送 text 增量
                 if content_delta:
                     content_buf += content_delta
+                    await append_stream_chunk(conversation_id, "answering", content_delta)
                     yield _serialize(StreamChunk(
                         id=assistant_message_id,
                         conversation_id=conversation_id,
@@ -129,6 +152,13 @@ class StreamHandler:
                         input_tokens=chunk.usage.prompt_tokens or 0,
                         output_tokens=chunk.usage.completion_tokens or 0,
                     )
+
+                # 每 N 个 chunk 检查一次锁，检测是否被后来的请求踢掉
+                chunk_count += 1
+                if chunk_count % LOCK_CHECK_INTERVAL == 0:
+                    if not await is_lock_owner(conversation_id, request_id):
+                        logger.warning(f"流被新请求踢掉，主动终止: conv_id={conversation_id}")
+                        return
 
             # 构造完整 assistant 消息落库
             final_blocks = []
@@ -146,6 +176,9 @@ class StreamHandler:
             )
             await self._persist_message(assistant_message, conversation_id)
 
+            # 落库成功后清除 Redis 状态
+            await set_stream_complete(conversation_id)
+
             # 发送结束帧（携带完整 usage）
             yield _serialize(StreamChunk(
                 id=assistant_message_id,
@@ -159,6 +192,7 @@ class StreamHandler:
 
         except Exception as e:
             logger.error(f"流式处理异常 [{litellm_model}]: {e}")
+            await set_stream_error(conversation_id, str(e))
             yield _serialize(StreamChunk(
                 id=assistant_message_id,
                 conversation_id=conversation_id,

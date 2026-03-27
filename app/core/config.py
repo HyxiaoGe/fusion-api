@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     # 数据库配置
     DATABASE_URL: str = os.getenv("DATABASE_URL")
 
+    # Redis 配置
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    REDIS_STREAM_TTL: int = 300  # 流状态缓存 TTL（秒）
+
     # 文件存储配置
     FILE_STORAGE_PATH: str = os.getenv("FILE_STORAGE_PATH", "./storage/files")
     MAX_FILE_SIZE: int = 10 * 1024 * 1024  # 10MB
