@@ -5,12 +5,33 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.stream_handler import StreamHandler
 
+# 统一 mock 所有 Redis 流状态操作，确保测试不依赖 Redis
+REDIS_MOCKS = {
+    "app.services.stream_handler.acquire_stream_lock": AsyncMock(return_value="mock-request-id"),
+    "app.services.stream_handler.is_lock_owner": AsyncMock(return_value=True),
+    "app.services.stream_handler.set_stream_start": AsyncMock(),
+    "app.services.stream_handler.append_stream_chunk": AsyncMock(),
+    "app.services.stream_handler.set_stream_complete": AsyncMock(),
+    "app.services.stream_handler.set_stream_error": AsyncMock(),
+}
+
 
 class StreamHandlerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.db = MagicMock()
         self.memory_service = MagicMock()
         self.handler = StreamHandler(self.db, self.memory_service)
+        # 启动所有 Redis mock
+        self._redis_patchers = []
+        for target, mock_obj in REDIS_MOCKS.items():
+            mock_obj.reset_mock()
+            p = patch(target, mock_obj)
+            p.start()
+            self._redis_patchers.append(p)
+
+    def tearDown(self):
+        for p in self._redis_patchers:
+            p.stop()
 
     @staticmethod
     def _parse_event(event: str):
