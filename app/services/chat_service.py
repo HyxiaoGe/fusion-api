@@ -26,7 +26,7 @@ class ChatService:
         self.db = db
         self.memory_service = MemoryService(db)
         self.file_repo = FileRepository(db)
-        self.stream_handler = StreamHandler(db, self.memory_service)
+        self.stream_handler = StreamHandler()
 
     async def process_message(
         self,
