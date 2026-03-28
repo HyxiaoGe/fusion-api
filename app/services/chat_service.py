@@ -138,7 +138,7 @@ class ChatService:
                 return existing
 
         return Conversation(
-            id=conversation_id or str(uuid.uuid4()),
+            id=conversation_id or str(uuid_mod.uuid4()),
             user_id=user_id,
             model_id=model_id,
             title=message[:30] + "..." if len(message) > 30 else message,
