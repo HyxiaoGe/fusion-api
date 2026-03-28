@@ -47,18 +47,18 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    app_logger.info("应用启动中...")
     try:
-        app_logger.info("应用启动中...")
         init_db()
         app_logger.info("数据库初始化完成")
-        await init_redis()
-
-        yield
-        # 应用关闭时的清理工作
-        await close_redis()
-        app_logger.info("应用关闭中...")
     except Exception as e:
-        app_logger.error(f"应用启动失败: {e}")
+        app_logger.error(f"数据库初始化失败: {e}")
+    await init_redis()
+
+    yield
+
+    await close_redis()
+    app_logger.info("应用关闭完成")
 
 app = FastAPI(title=settings.APP_NAME, version=settings.APP_VERSION, lifespan=lifespan)
 
