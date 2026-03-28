@@ -11,6 +11,26 @@ from app.core.logger import app_logger as logger
 # 模块级连接池，全局唯一
 _redis_pool: aioredis.Redis | None = None
 
+# Redis Stream key 和 TTL 常量
+STREAM_CHUNK_TTL = 600     # 流进行中 TTL（10 分钟）
+STREAM_DONE_TTL = 60       # 流结束后 TTL（60 秒，供断线重连最后窗口）
+LOCK_TTL = 600             # 互斥锁 TTL
+
+
+def stream_chunks_key(conversation_id: str) -> str:
+    """Redis Stream key：存储流的所有 chunk"""
+    return f"stream:chunks:{conversation_id}"
+
+
+def stream_meta_key(conversation_id: str) -> str:
+    """Redis Hash key：存储流的元信息"""
+    return f"stream:meta:{conversation_id}"
+
+
+def stream_lock_key(conversation_id: str) -> str:
+    """Redis String key：流的互斥锁"""
+    return f"stream:lock:{conversation_id}"
+
 
 async def init_redis() -> None:
     """在 lifespan startup 阶段调用"""
@@ -21,7 +41,6 @@ async def init_redis() -> None:
         decode_responses=True,
         max_connections=20,
     )
-    # 验证连接
     try:
         await _redis_pool.ping()
         logger.info("Redis 连接池初始化成功")
@@ -40,17 +59,10 @@ async def close_redis() -> None:
 
 
 def get_redis_pool() -> aioredis.Redis | None:
-    """
-    返回模块级连接池实例。
-    stream_state_service 直接调用此函数。
-    返回 None 表示 Redis 不可用（降级模式）。
-    """
+    """返回模块级连接池实例。返回 None 表示 Redis 不可用。"""
     return _redis_pool
 
 
 async def get_redis() -> aioredis.Redis | None:
-    """
-    FastAPI 依赖函数，供路由层注入。
-    用法：redis = Depends(get_redis)
-    """
+    """FastAPI 依赖函数，供路由层注入。"""
     return _redis_pool

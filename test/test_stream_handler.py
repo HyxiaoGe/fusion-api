@@ -1,27 +1,28 @@
+"""
+stream_handler 单元测试（Redis Stream 架构）
+
+测试 generate_to_redis（后台任务）和 stream_redis_as_sse（SSE 读取器）。
+"""
 import json
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.services.stream_handler import StreamHandler
+from app.services.stream_handler import StreamHandler, stream_redis_as_sse
 
-# 统一 mock 所有 Redis 流状态操作，确保测试不依赖 Redis
+
+# 统一 mock Redis Stream 操作
 REDIS_MOCKS = {
-    "app.services.stream_handler.acquire_stream_lock": AsyncMock(return_value="mock-request-id"),
-    "app.services.stream_handler.is_lock_owner": AsyncMock(return_value=True),
-    "app.services.stream_handler.set_stream_start": AsyncMock(),
-    "app.services.stream_handler.append_stream_chunk": AsyncMock(),
-    "app.services.stream_handler.set_stream_complete": AsyncMock(),
-    "app.services.stream_handler.set_stream_error": AsyncMock(),
+    "app.services.stream_handler.init_stream": AsyncMock(),
+    "app.services.stream_handler.append_chunk": AsyncMock(return_value="1-0"),
+    "app.services.stream_handler.finalize_stream": AsyncMock(),
+    "app.services.stream_handler.check_lock_owner": AsyncMock(return_value=True),
 }
 
 
-class StreamHandlerTests(unittest.IsolatedAsyncioTestCase):
+class GenerateToRedisTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.db = MagicMock()
-        self.memory_service = MagicMock()
-        self.handler = StreamHandler(self.db, self.memory_service)
-        # 启动所有 Redis mock
+        self.handler = StreamHandler()
         self._redis_patchers = []
         for target, mock_obj in REDIS_MOCKS.items():
             mock_obj.reset_mock()
@@ -29,81 +30,25 @@ class StreamHandlerTests(unittest.IsolatedAsyncioTestCase):
             p.start()
             self._redis_patchers.append(p)
 
+        # Mock SessionLocal
+        self.mock_db = MagicMock()
+        self.db_patcher = patch(
+            "app.services.stream_handler.SessionLocal",
+            return_value=self.mock_db,
+        )
+        self.db_patcher.start()
+
     def tearDown(self):
         for p in self._redis_patchers:
             p.stop()
+        self.db_patcher.stop()
 
-    @staticmethod
-    def _parse_event(event: str):
-        if event == "data: [DONE]\n\n":
-            return "[DONE]"
-        return json.loads(event.removeprefix("data: ").strip())
-
-    async def test_generate_stream_emits_content_finish_and_done(self):
-        """正常流式响应：心跳帧 → 内容帧 → 结束帧 → [DONE]"""
-        # 模拟 litellm.acompletion 流式响应
-        mock_chunks = [
-            SimpleNamespace(
-                choices=[SimpleNamespace(delta=SimpleNamespace(content="Hel", reasoning_content=None), finish_reason=None)],
-                usage=None,
-            ),
-            SimpleNamespace(
-                choices=[SimpleNamespace(delta=SimpleNamespace(content="lo!", reasoning_content=None), finish_reason=None)],
-                usage=None,
-            ),
-        ]
-
-        async def mock_stream():
-            for chunk in mock_chunks:
-                yield chunk
-
-        with patch("app.services.stream_handler.litellm") as mock_litellm:
-            mock_litellm.acompletion = AsyncMock(return_value=mock_stream())
-            events = [
-                event
-                async for event in self.handler.generate_stream(
-                    litellm_model="openai/gpt-4o",
-                    provider="openai",
-                    model_id="gpt-4o",
-                    litellm_kwargs={"api_key": "test"},
-                    messages=[{"role": "user", "content": "hi"}],
-                    conversation_id="conv-1",
-                    options={"use_reasoning": False},
-                )
-            ]
-
-        payloads = [self._parse_event(e) for e in events]
-        # 第一帧是心跳
-        self.assertIsNone(payloads[0]["choices"][0]["finish_reason"])
-        # 中间帧有内容
-        text_deltas = []
-        for p in payloads[1:-2]:
-            if p != "[DONE]":
-                blocks = p["choices"][0]["delta"].get("content", [])
-                for b in blocks:
-                    if b["type"] == "text":
-                        text_deltas.append(b["text"])
-        self.assertEqual(text_deltas, ["Hel", "lo!"])
-        # 结束帧
-        self.assertEqual(payloads[-2]["choices"][0]["finish_reason"], "stop")
-        # [DONE] 标记
-        self.assertEqual(payloads[-1], "[DONE]")
-        # 消息已落库
-        self.memory_service.create_message.assert_called_once()
-
-    async def test_generate_stream_emits_reasoning_and_content_blocks(self):
-        """推理模型：先输出 thinking block，再输出 text block"""
+    async def test_generate_writes_chunks_and_finalizes(self):
+        """正常生成：写 chunk 到 Redis + 落库 + finalize"""
         mock_chunks = [
             SimpleNamespace(
                 choices=[SimpleNamespace(
-                    delta=SimpleNamespace(content="", reasoning_content="think-1"),
-                    finish_reason=None,
-                )],
-                usage=None,
-            ),
-            SimpleNamespace(
-                choices=[SimpleNamespace(
-                    delta=SimpleNamespace(content="answer-1", reasoning_content=None),
+                    delta=SimpleNamespace(content="Hello", reasoning_content=None),
                     finish_reason=None,
                 )],
                 usage=None,
@@ -116,116 +61,104 @@ class StreamHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("app.services.stream_handler.litellm") as mock_litellm:
             mock_litellm.acompletion = AsyncMock(return_value=mock_stream())
-            events = [
-                event
-                async for event in self.handler.generate_stream(
-                    litellm_model="openai/qwen-max",
-                    provider="qwen",
-                    model_id="qwen-max",
-                    litellm_kwargs={},
-                    messages=[{"role": "user", "content": "hi"}],
-                    conversation_id="conv-1",
-                    options={},
-                )
-            ]
 
-        payloads = [self._parse_event(e) for e in events]
-        # 所有帧使用相同的 message id
-        ids = [p["id"] for p in payloads if p != "[DONE]"]
-        self.assertTrue(all(mid == ids[0] for mid in ids))
+            await self.handler.generate_to_redis(
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="gpt-4",
+                litellm_model="openai/gpt-4",
+                litellm_kwargs={},
+                provider="openai",
+                messages=[{"role": "user", "content": "hi"}],
+                assistant_message_id="msg-1",
+                task_id="task-1",
+                options={"use_reasoning": False},
+            )
 
-        # 验证有 thinking 和 text 类型的 block
-        block_types = []
-        for p in payloads:
-            if p == "[DONE]":
-                continue
-            blocks = p["choices"][0]["delta"].get("content", [])
-            for b in blocks:
-                block_types.append(b["type"])
-        self.assertIn("thinking", block_types)
-        self.assertIn("text", block_types)
+        # 验证 init_stream 被调用
+        REDIS_MOCKS["app.services.stream_handler.init_stream"].assert_awaited_once()
 
-    async def test_stream_exception_emits_error_and_done(self):
-        """流式过程中异常：发出 error 帧 + [DONE]"""
+        # 验证 append_chunk 被调用（content "Hello"）
+        REDIS_MOCKS["app.services.stream_handler.append_chunk"].assert_awaited()
+
+        # 验证 finalize_stream 被调用且 success=True
+        REDIS_MOCKS["app.services.stream_handler.finalize_stream"].assert_awaited_once_with(
+            "conv-1", success=True
+        )
+
+        # 验证 DB 写入
+        self.mock_db.add.assert_called_once()
+        self.mock_db.commit.assert_called_once()
+        self.mock_db.close.assert_called_once()
+
+    async def test_generate_handles_exception(self):
+        """LLM 异常时：尝试保存已有内容 + finalize error"""
         async def failing_stream():
-            raise RuntimeError("boom")
-            yield  # noqa: unreachable - makes this an async generator
+            raise RuntimeError("LLM crashed")
+            yield  # noqa
 
         with patch("app.services.stream_handler.litellm") as mock_litellm:
             mock_litellm.acompletion = AsyncMock(return_value=failing_stream())
-            events = [
-                event
-                async for event in self.handler.generate_stream(
-                    litellm_model="openai/gpt-4o",
-                    provider="openai",
-                    model_id="gpt-4o",
-                    litellm_kwargs={},
-                    messages=[{"role": "user", "content": "hi"}],
-                    conversation_id="conv-1",
-                    options={"use_reasoning": False},
-                )
-            ]
 
-        payloads = [self._parse_event(e) for e in events]
-        # 心跳帧
-        self.assertIsNone(payloads[0]["choices"][0]["finish_reason"])
-        # error 帧
-        self.assertEqual(payloads[1]["choices"][0]["finish_reason"], "error")
-        # [DONE]
-        self.assertEqual(payloads[-1], "[DONE]")
+            await self.handler.generate_to_redis(
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="gpt-4",
+                litellm_model="openai/gpt-4",
+                litellm_kwargs={},
+                provider="openai",
+                messages=[{"role": "user", "content": "hi"}],
+                assistant_message_id="msg-1",
+                task_id="task-1",
+                options={"use_reasoning": False},
+            )
 
-    async def test_duplicate_reasoning_in_content_is_filtered(self):
-        """部分 provider 会在 content 和 reasoning_content 重复输出，应去重"""
+        # 验证 finalize 被调用且 success=False
+        call_args = REDIS_MOCKS["app.services.stream_handler.finalize_stream"].call_args
+        self.assertFalse(call_args[1].get("success", call_args[0][1]))
+
+        # DB session 被关闭
+        self.mock_db.close.assert_called_once()
+
+
+class StreamRedisAsSSETests(unittest.IsolatedAsyncioTestCase):
+    async def test_formats_chunks_as_sse(self):
+        """read_stream_chunks 的输出被正确格式化为 SSE"""
         mock_chunks = [
-            SimpleNamespace(
-                choices=[SimpleNamespace(
-                    delta=SimpleNamespace(content="dup", reasoning_content="dup"),
-                    finish_reason=None,
-                )],
-                usage=None,
-            ),
-            SimpleNamespace(
-                choices=[SimpleNamespace(
-                    delta=SimpleNamespace(content="final", reasoning_content=None),
-                    finish_reason=None,
-                )],
-                usage=None,
-            ),
+            {"entry_id": "1-0", "type": "start", "content": ""},
+            {"entry_id": "2-0", "type": "reasoning", "content": "thinking", "block_id": "blk_t"},
+            {"entry_id": "3-0", "type": "answering", "content": "answer", "block_id": "blk_c"},
+            {"entry_id": "4-0", "type": "done", "content": ""},
         ]
 
-        async def mock_stream():
+        async def mock_reader(*args, **kwargs):
             for chunk in mock_chunks:
                 yield chunk
 
-        with patch("app.services.stream_handler.litellm") as mock_litellm:
-            mock_litellm.acompletion = AsyncMock(return_value=mock_stream())
-            events = [
-                event
-                async for event in self.handler.generate_stream(
-                    litellm_model="deepseek/deepseek-reasoner",
-                    provider="deepseek",
-                    model_id="deepseek-reasoner",
-                    litellm_kwargs={},
-                    messages=[{"role": "user", "content": "hi"}],
-                    conversation_id="conv-1",
-                    options={},
-                )
-            ]
+        with patch("app.services.stream_handler.read_stream_chunks", side_effect=mock_reader):
+            events = [event async for event in stream_redis_as_sse("conv-1", "msg-1")]
 
-        payloads = [self._parse_event(e) for e in events]
-        text_values = []
-        thinking_values = []
-        for p in payloads:
-            if p == "[DONE]":
-                continue
-            for b in p["choices"][0]["delta"].get("content", []):
-                if b["type"] == "text":
-                    text_values.append(b["text"])
-                elif b["type"] == "thinking":
-                    thinking_values.append(b["thinking"])
-        # reasoning_content="dup" 输出为 thinking，content="dup" 被去重过滤
-        self.assertEqual(thinking_values, ["dup"])
-        self.assertEqual(text_values, ["final"])
+        # 过滤掉 [DONE]
+        data_events = [e for e in events if not e.startswith("data: [DONE]")]
+
+        # start 被跳过，应该有 3 个数据事件（reasoning + answering + done）
+        self.assertEqual(len(data_events), 3)
+
+        # 验证 reasoning 事件
+        first = data_events[0]
+        self.assertIn("id: 2-0", first)
+        payload = json.loads(first.split("data: ")[1])
+        self.assertEqual(payload["id"], "msg-1")
+        self.assertEqual(payload["conversation_id"], "conv-1")
+        self.assertEqual(payload["choices"][0]["delta"]["content"][0]["type"], "thinking")
+
+        # 验证 done 事件
+        last_data = data_events[-1]
+        payload = json.loads(last_data.split("data: ")[1])
+        self.assertEqual(payload["choices"][0]["finish_reason"], "stop")
+
+        # 最后一条是 [DONE]
+        self.assertEqual(events[-1], "data: [DONE]\n\n")
 
 
 if __name__ == "__main__":

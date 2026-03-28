@@ -1,5 +1,6 @@
 # app/services/chat_service.py
-import uuid
+import asyncio
+import uuid as uuid_mod
 from typing import Any, Dict, List, Optional, Union
 
 import litellm
@@ -15,7 +16,8 @@ from app.schemas.chat import (
     TextBlock, FileBlock, Usage,
 )
 from app.services.memory_service import MemoryService
-from app.services.stream_handler import StreamHandler
+from app.services.stream_handler import StreamHandler, stream_redis_as_sse
+from app.services.task_manager import register_task
 from app.services.chat.utils import ChatUtils
 
 
@@ -83,18 +85,38 @@ class ChatService:
                 lm_messages = self._inject_file_content(lm_messages, message, file_contents)
 
         if stream:
-            return StreamingResponse(
-                self.stream_handler.generate_stream(
-                    litellm_model=litellm_model,
-                    provider=provider,
-                    model_id=model_id,
-                    litellm_kwargs=litellm_kwargs,
-                    messages=lm_messages,
+            # 预分配 assistant 消息 ID 和 task ID
+            assistant_message_id = str(uuid_mod.uuid4())
+            task_id = str(uuid_mod.uuid4())
+
+            # 启动后台生成任务（独立于 HTTP 连接生命周期）
+            task = asyncio.create_task(
+                self.stream_handler.generate_to_redis(
                     conversation_id=conversation.id,
-                    options=options,
                     user_id=user_id,
+                    model_id=model_id,
+                    litellm_model=litellm_model,
+                    litellm_kwargs=litellm_kwargs,
+                    provider=provider,
+                    messages=lm_messages,
+                    assistant_message_id=assistant_message_id,
+                    task_id=task_id,
+                    options=options,
+                )
+            )
+            register_task(conversation.id, task, task_id)
+
+            # SSE 从 Redis Stream 读取，不直接调 LLM
+            return StreamingResponse(
+                stream_redis_as_sse(
+                    conversation_id=conversation.id,
+                    message_id=assistant_message_id,
                 ),
                 media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
             )
         else:
             return await self._handle_non_stream(

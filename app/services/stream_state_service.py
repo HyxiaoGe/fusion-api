@@ -1,167 +1,202 @@
 """
-流式状态缓存服务
+流状态服务（基于 Redis Stream）
 
-负责管理 SSE 流的生命周期状态，存储于 Redis。
-key 格式：stream:{conversation_id}
-lock key 格式：stream:lock:{conversation_id}
-TTL：由 settings.REDIS_STREAM_TTL 控制（默认 300 秒）
+职责：
+1. 写端：后台任务调用，把 LLM chunk 写入 Redis Stream
+2. 读端：SSE 端点调用，从 Redis Stream 消费 chunk 推送给客户端
+3. 元数据：记录流状态供 /stream-status 查询
 
-Redis 不可用时所有操作静默降级（不影响主流程）。
+Redis 不可用时所有写操作静默降级。
 """
 import json
 import time
-import uuid
-from typing import Optional
+from typing import AsyncIterator, Optional
 
-from app.core.config import settings
-from app.core.redis import get_redis_pool
+from app.core.redis import (
+    get_redis_pool,
+    stream_chunks_key, stream_meta_key, stream_lock_key,
+    STREAM_CHUNK_TTL, STREAM_DONE_TTL, LOCK_TTL,
+)
 from app.core.logger import app_logger as logger
 
 
-def _stream_key(conversation_id: str) -> str:
-    return f"stream:{conversation_id}"
+# ──────────────────────────────────────────────
+# 写端（后台任务调用）
+# ──────────────────────────────────────────────
 
-
-def _lock_key(conversation_id: str) -> str:
-    return f"stream:lock:{conversation_id}"
-
-
-async def acquire_stream_lock(conversation_id: str) -> str:
-    """
-    获取流互斥锁，防止同一会话并发开流。
-    返回本次请求的 request_id（锁持有者标识）。
-    后来者强制覆盖前者。
-    """
+async def init_stream(
+    conversation_id: str,
+    user_id: str,
+    model: str,
+    message_id: str,
+    task_id: str,
+) -> None:
+    """流开始时初始化 Redis Stream 和 Meta"""
     redis = get_redis_pool()
     if not redis:
-        return str(uuid.uuid4())
+        return
     try:
-        request_id = str(uuid.uuid4())
-        await redis.set(_lock_key(conversation_id), request_id, ex=settings.REDIS_STREAM_TTL)
-        return request_id
+        # 写 meta
+        await redis.hset(stream_meta_key(conversation_id), mapping={
+            "status": "streaming",
+            "user_id": user_id,
+            "model": model,
+            "started_at": str(int(time.time())),
+            "message_id": message_id,
+            "conversation_id": conversation_id,
+        })
+        await redis.expire(stream_meta_key(conversation_id), STREAM_CHUNK_TTL)
+
+        # 写 lock
+        await redis.set(stream_lock_key(conversation_id), task_id, ex=LOCK_TTL)
+
+        # 初始化 Stream（写一条 start 标记）
+        await redis.xadd(
+            stream_chunks_key(conversation_id),
+            {"type": "start", "content": ""},
+        )
+        await redis.expire(stream_chunks_key(conversation_id), STREAM_CHUNK_TTL)
+
+        logger.debug(f"Stream 初始化: conv_id={conversation_id}, msg_id={message_id}")
     except Exception as e:
-        logger.warning(f"获取流锁失败: {e}")
-        return str(uuid.uuid4())
+        logger.warning(f"Stream 初始化失败: {e}")
 
 
-async def is_lock_owner(conversation_id: str, request_id: str) -> bool:
-    """检查当前 request_id 是否仍是锁持有者"""
+async def append_chunk(
+    conversation_id: str,
+    chunk_type: str,
+    content: str,
+    block_id: str,
+) -> Optional[str]:
+    """
+    追加一个 chunk 到 Redis Stream。
+    返回 Redis 分配的 entry ID。
+    """
     redis = get_redis_pool()
     if not redis:
-        return True  # Redis 不可用时默认不踢
+        return None
     try:
-        current = await redis.get(_lock_key(conversation_id))
-        return current == request_id
+        entry_id = await redis.xadd(
+            stream_chunks_key(conversation_id),
+            {"type": chunk_type, "content": content, "block_id": block_id},
+        )
+        # 刷新 TTL
+        await redis.expire(stream_chunks_key(conversation_id), STREAM_CHUNK_TTL)
+        return entry_id
+    except Exception as e:
+        logger.warning(f"追加 chunk 失败: {e}")
+        return None
+
+
+async def finalize_stream(conversation_id: str, success: bool, error_msg: str = "") -> None:
+    """流结束时调用，写 done/error 标记，更新 meta，缩短 TTL。"""
+    redis = get_redis_pool()
+    if not redis:
+        return
+    try:
+        if success:
+            await redis.xadd(
+                stream_chunks_key(conversation_id),
+                {"type": "done", "content": ""},
+            )
+            await redis.hset(stream_meta_key(conversation_id), "status", "done")
+        else:
+            await redis.xadd(
+                stream_chunks_key(conversation_id),
+                {"type": "error", "content": error_msg},
+            )
+            await redis.hset(stream_meta_key(conversation_id), "status", "error")
+
+        # 缩短 TTL，给断线重连留 60 秒窗口
+        await redis.expire(stream_chunks_key(conversation_id), STREAM_DONE_TTL)
+        await redis.expire(stream_meta_key(conversation_id), STREAM_DONE_TTL)
+        await redis.delete(stream_lock_key(conversation_id))
+    except Exception as e:
+        logger.warning(f"finalize stream 失败: {e}")
+
+
+async def check_lock_owner(conversation_id: str, task_id: str) -> bool:
+    """检查当前 task_id 是否仍是锁持有者"""
+    redis = get_redis_pool()
+    if not redis:
+        return True
+    try:
+        current = await redis.get(stream_lock_key(conversation_id))
+        return current == task_id
     except Exception:
         return True
 
 
-async def set_stream_start(
-    conversation_id: str,
-    user_id: str,
-    model: str,
-) -> None:
-    """流开始时写入初始状态"""
+async def get_stream_meta(conversation_id: str) -> Optional[dict]:
+    """查询流元数据（供 /stream-status 端点）"""
     redis = get_redis_pool()
     if not redis:
-        return
+        return None
     try:
-        state = {
-            "status": "streaming",
-            "user_id": user_id,
-            "model": model,
-            "started_at": int(time.time()),
-            "content_blocks": [],
-            "last_chunk_at": int(time.time()),
-        }
-        await redis.set(
-            _stream_key(conversation_id),
-            json.dumps(state, ensure_ascii=False),
-            ex=settings.REDIS_STREAM_TTL,
-        )
+        meta = await redis.hgetall(stream_meta_key(conversation_id))
+        return meta if meta else None
     except Exception as e:
-        logger.warning(f"写入流状态失败: {e}")
+        logger.warning(f"查询 stream meta 失败: {e}")
+        return None
 
 
-async def append_stream_chunk(
+# ──────────────────────────────────────────────
+# 读端（SSE 端点调用）
+# ──────────────────────────────────────────────
+
+async def read_stream_chunks(
     conversation_id: str,
-    block_type: str,
-    content_delta: str,
-) -> None:
+    last_entry_id: str = "0",
+) -> AsyncIterator[dict]:
     """
-    追加 chunk 到 content_blocks。
-    简单 GET → 修改 → SET（单写者场景，无需乐观锁）。
+    异步生成器，从 Redis Stream 读取 chunk 并 yield。
+    阻塞等待新 chunk（XREAD BLOCK），直到读到 done/error 为止。
+
+    last_entry_id:
+      "0"        → 从头读（新连接）
+      "xxx-xxx"  → 从该 ID 之后续读（断线重连）
     """
     redis = get_redis_pool()
     if not redis:
         return
-    try:
-        key = _stream_key(conversation_id)
-        raw = await redis.get(key)
-        if not raw:
+
+    key = stream_chunks_key(conversation_id)
+    current_id = last_entry_id
+
+    # 最多等 30 分钟
+    deadline = time.time() + 1800
+
+    while time.time() < deadline:
+        try:
+            results = await redis.xread(
+                {key: current_id},
+                block=5000,
+                count=50,
+            )
+        except Exception as e:
+            logger.warning(f"XREAD 失败: {e}")
             return
 
-        state = json.loads(raw)
-        blocks = state.get("content_blocks", [])
+        if not results:
+            # 超时没有新数据，检查流是否已结束
+            meta = await get_stream_meta(conversation_id)
+            if meta and meta.get("status") in ("done", "error"):
+                # 把剩余 entry 全部读完
+                try:
+                    remaining = await redis.xrange(key, min=current_id, count=100)
+                    for entry_id, fields in remaining:
+                        if entry_id == current_id:
+                            continue
+                        current_id = entry_id
+                        yield {"entry_id": entry_id, **fields}
+                except Exception:
+                    pass
+                return
+            continue
 
-        # 同类型 block 合并，不同类型新建
-        if blocks and blocks[-1]["type"] == block_type:
-            blocks[-1]["content"] += content_delta
-        else:
-            blocks.append({"type": block_type, "content": content_delta})
-
-        state["content_blocks"] = blocks
-        state["last_chunk_at"] = int(time.time())
-
-        await redis.set(key, json.dumps(state, ensure_ascii=False), ex=settings.REDIS_STREAM_TTL)
-    except Exception as e:
-        logger.warning(f"追加流 chunk 失败: {e}")
-
-
-async def set_stream_complete(conversation_id: str) -> None:
-    """流正常结束，清除 Redis 状态"""
-    redis = get_redis_pool()
-    if not redis:
-        return
-    try:
-        await redis.delete(_stream_key(conversation_id))
-        await redis.delete(_lock_key(conversation_id))
-    except Exception as e:
-        logger.warning(f"清除流状态失败: {e}")
-
-
-async def set_stream_error(conversation_id: str, error_msg: str = "") -> None:
-    """流异常结束，更新状态为 error，保留 content_blocks 供前端恢复"""
-    redis = get_redis_pool()
-    if not redis:
-        return
-    try:
-        key = _stream_key(conversation_id)
-        raw = await redis.get(key)
-        if raw:
-            state = json.loads(raw)
-            state["status"] = "error"
-            state["error"] = error_msg
-            # 保留较短 TTL（60 秒），让前端有时间读取后自动过期
-            await redis.set(key, json.dumps(state, ensure_ascii=False), ex=60)
-        await redis.delete(_lock_key(conversation_id))
-    except Exception as e:
-        logger.warning(f"更新流错误状态失败: {e}")
-
-
-async def get_stream_status(conversation_id: str) -> Optional[dict]:
-    """
-    查询流状态，供 /stream-status 端点和前端重连使用。
-    返回 None 表示无进行中的流。
-    """
-    redis = get_redis_pool()
-    if not redis:
-        return None
-    try:
-        raw = await redis.get(_stream_key(conversation_id))
-        if not raw:
-            return None
-        return json.loads(raw)
-    except Exception as e:
-        logger.warning(f"查询流状态失败: {e}")
-        return None
+        for _stream_key, entries in results:
+            for entry_id, fields in entries:
+                current_id = entry_id
+                yield {"entry_id": entry_id, **fields}
+                if fields.get("type") in ("done", "error"):
+                    return

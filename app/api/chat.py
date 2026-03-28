@@ -20,8 +20,12 @@ from app.schemas.chat import (
     TitleGenerationRequest,
     TitleGenerationResponse,
 )
+from fastapi.responses import StreamingResponse
 from app.services.chat_service import ChatService
-from app.services.stream_state_service import get_stream_status as get_stream_status_from_redis
+from app.services.stream_state_service import get_stream_meta
+from app.services.stream_handler import stream_redis_as_sse
+from app.services.task_manager import cancel_task
+from app.core.redis import get_redis_pool, stream_chunks_key
 
 router = APIRouter()
 
@@ -195,15 +199,65 @@ async def get_stream_status_endpoint(
     current_user: User = Depends(get_current_user),
 ):
     """
-    查询指定会话的流式状态（Redis 缓存）。
-    前端在页面 mount 时调用，判断是否有未完成的流需要恢复。
+    查询流状态。前端 mount 时调用，判断是否有未完成的流。
+    返回 streaming 时附带 last_entry_id 和 message_id 供重连使用。
     """
-    state = await get_stream_status_from_redis(conv_id)
-    if state is None:
-        return {"status": "completed"}
+    meta = await get_stream_meta(conv_id)
+    if not meta:
+        return {"status": "not_found"}
 
-    # 安全校验：只允许流的所有者查询
-    if state.get("user_id") != str(current_user.id):
-        return {"status": "completed"}
+    if meta.get("user_id") != str(current_user.id):
+        return {"status": "not_found"}
 
-    return state
+    if meta["status"] == "streaming":
+        # 查询 Redis Stream 最新 entry ID
+        redis = get_redis_pool()
+        last_entry_id = "0"
+        if redis:
+            try:
+                entries = await redis.xrevrange(stream_chunks_key(conv_id), count=1)
+                if entries:
+                    last_entry_id = entries[0][0]
+            except Exception:
+                pass
+
+        return {
+            "status": "streaming",
+            "last_entry_id": last_entry_id,
+            "message_id": meta.get("message_id"),
+        }
+
+    return {"status": meta["status"]}
+
+
+@router.get("/stream/{conv_id}")
+async def reconnect_stream(
+    conv_id: str,
+    last_entry_id: str = "0",
+    current_user: User = Depends(get_current_user),
+):
+    """
+    断线重连端点：从 Redis Stream 的断点续读 SSE。
+    独立于 /send，不创建新消息、不调 LLM。
+    """
+    meta = await get_stream_meta(conv_id)
+    if not meta or meta.get("user_id") != str(current_user.id):
+        raise HTTPException(status_code=404, detail="无进行中的流")
+
+    message_id = meta.get("message_id", "")
+
+    return StreamingResponse(
+        stream_redis_as_sse(conv_id, message_id, last_entry_id),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/stop/{conv_id}")
+async def stop_stream(
+    conv_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """用户手动停止流生成。后台任务会在 CancelledError 处理中落库。"""
+    cancelled = cancel_task(conv_id)
+    return {"cancelled": cancelled}
