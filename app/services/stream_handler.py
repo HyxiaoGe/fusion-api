@@ -134,6 +134,19 @@ class StreamHandler:
                 if chunk_count % LOCK_CHECK_INTERVAL == 0:
                     if not await check_lock_owner(conversation_id, task_id):
                         logger.info(f"任务被踢掉，主动退出: conv_id={conversation_id}")
+                        # 落库已有内容 + finalize
+                        if reasoning_buf or content_buf:
+                            kicked_blocks = []
+                            if reasoning_buf:
+                                kicked_blocks.append(ThinkingBlock(type="thinking", id=thinking_block_id, thinking=reasoning_buf))
+                            if content_buf:
+                                kicked_blocks.append(TextBlock(type="text", id=text_block_id, text=content_buf))
+                            kicked_msg = Message(
+                                id=assistant_message_id, role="assistant",
+                                content=kicked_blocks, model_id=model_id, usage=usage_data,
+                            )
+                            self._persist_message(db, kicked_msg, conversation_id)
+                        await finalize_stream(conversation_id, success=False, error_msg="被新请求取代")
                         return
 
             # 生成完成，落库 PostgreSQL
@@ -227,7 +240,20 @@ async def stream_redis_as_sse(
     不调用 LLM，只读 Redis。
 
     每条 SSE 事件包含 id 行（Redis entry ID），供断线重连使用。
+    Redis 不可用时立即返回 error 帧。
     """
+    from app.core.redis import get_redis_pool
+    if not get_redis_pool():
+        # Redis 不可用，立即返回 error
+        error_payload = {
+            "id": message_id,
+            "conversation_id": conversation_id,
+            "choices": [{"delta": {}, "finish_reason": "error"}],
+        }
+        yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+
     async for chunk in read_stream_chunks(conversation_id, last_entry_id):
         entry_id = chunk.pop("entry_id")
         chunk_type = chunk.get("type")
