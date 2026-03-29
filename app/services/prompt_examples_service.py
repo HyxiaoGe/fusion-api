@@ -105,9 +105,13 @@ async def get_prompt_examples(limit: int = 8) -> dict:
     # 4. 按 category 均匀采样
     sampled = _balanced_sample(examples, limit)
 
+    # refreshed_at 可能是 datetime 对象（从 DB）或字符串（从 Redis 缓存）
+    if refreshed_at and hasattr(refreshed_at, 'isoformat'):
+        refreshed_at = refreshed_at.isoformat()
+
     return {
         "examples": sampled,
-        "refreshed_at": refreshed_at.isoformat() if refreshed_at else None,
+        "refreshed_at": refreshed_at,
     }
 
 
