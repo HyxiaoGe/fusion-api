@@ -91,12 +91,19 @@ async def append_chunk(
         return None
 
 
-async def finalize_stream(conversation_id: str, success: bool, error_msg: str = "") -> None:
+async def finalize_stream(conversation_id: str, success: bool, error_msg: str = "", task_id: str = "") -> None:
     """流结束时调用，写 done/error 标记，更新 meta，缩短 TTL。"""
     redis = get_redis_pool()
     if not redis:
         return
     try:
+        # 如果提供了 task_id，检查是否还是当前锁持有者
+        # 被新任务接管后不应该往 Stream 里写，否则会污染新任务的数据
+        if task_id:
+            current_lock = await redis.get(stream_lock_key(conversation_id))
+            if current_lock and current_lock != task_id:
+                logger.debug(f"finalize 跳过：锁已转移给新任务 conv_id={conversation_id}")
+                return
         if success:
             await redis.xadd(
                 stream_chunks_key(conversation_id),

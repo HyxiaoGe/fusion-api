@@ -146,7 +146,7 @@ class StreamHandler:
                                 content=kicked_blocks, model_id=model_id, usage=usage_data,
                             )
                             self._persist_message(db, kicked_msg, conversation_id)
-                        await finalize_stream(conversation_id, success=False, error_msg="被新请求取代")
+                        await finalize_stream(conversation_id, success=False, error_msg="被新请求取代", task_id=task_id)
                         return
 
             # 生成完成，落库 PostgreSQL
@@ -166,7 +166,7 @@ class StreamHandler:
             self._persist_message(db, assistant_message, conversation_id)
 
             # 标记 Stream 正常结束
-            await finalize_stream(conversation_id, success=True)
+            await finalize_stream(conversation_id, success=True, task_id=task_id)
 
         except asyncio.CancelledError:
             # 任务被取消（用户手动 stop 或新消息踢掉）
@@ -186,7 +186,7 @@ class StreamHandler:
                     usage=usage_data,
                 )
                 self._persist_message(db, assistant_message, conversation_id)
-            await finalize_stream(conversation_id, success=False, error_msg="用户中止")
+            await finalize_stream(conversation_id, success=False, error_msg="用户中止", task_id=task_id)
             raise  # 必须 re-raise
 
         except Exception as e:
@@ -206,7 +206,7 @@ class StreamHandler:
                     usage=usage_data,
                 )
                 self._persist_message(db, assistant_message, conversation_id)
-            await finalize_stream(conversation_id, success=False, error_msg=str(e))
+            await finalize_stream(conversation_id, success=False, error_msg=str(e), task_id=task_id)
 
         finally:
             db.close()
