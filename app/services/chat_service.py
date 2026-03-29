@@ -17,6 +17,7 @@ from app.schemas.chat import (
 )
 from app.services.memory_service import MemoryService
 from app.services.stream_handler import StreamHandler, stream_redis_as_sse
+from app.services.stream_state_service import init_stream
 from app.services.task_manager import register_task
 from app.services.chat.utils import ChatUtils
 
@@ -88,6 +89,10 @@ class ChatService:
             # 预分配 assistant 消息 ID 和 task ID
             assistant_message_id = str(uuid_mod.uuid4())
             task_id = str(uuid_mod.uuid4())
+
+            # 先初始化 Redis Stream（清除旧数据 + 写 start 标记），
+            # 必须在 SSE 读取器启动之前完成，否则读取器会读到上一轮残留数据
+            await init_stream(conversation.id, str(user_id), model_id, assistant_message_id, task_id)
 
             # 启动后台生成任务（独立于 HTTP 连接生命周期）
             task = asyncio.create_task(

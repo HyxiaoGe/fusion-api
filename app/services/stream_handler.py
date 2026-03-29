@@ -71,8 +71,8 @@ class StreamHandler:
         usage_data: Optional[Usage] = None
         chunk_count = 0
 
-        # 初始化 Redis Stream
-        await init_stream(conversation_id, str(user_id), model_id, assistant_message_id, task_id)
+        # init_stream 已在 chat_service.process_message 中提前调用，
+        # 确保旧数据清除后 SSE 读取器才开始读取
 
         # 后台任务独立管理 DB Session
         db = SessionLocal()
