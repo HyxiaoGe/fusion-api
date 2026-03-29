@@ -50,6 +50,9 @@ async def init_stream(
         # 写 lock
         await redis.set(stream_lock_key(conversation_id), task_id, ex=LOCK_TTL)
 
+        # 清除上一轮的 Stream 数据，避免新轮次读到旧内容
+        await redis.delete(stream_chunks_key(conversation_id))
+
         # 初始化 Stream（写一条 start 标记）
         await redis.xadd(
             stream_chunks_key(conversation_id),
