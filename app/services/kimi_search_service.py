@@ -17,7 +17,7 @@ SYSTEM_PROMPT = """你是一个话题策划助手。
 将其改写成适合向AI提问的问题形式。
 要求：
 - 问题要自然、口语化，像用户真实会问的那样
-- 覆盖三个类别：热点新闻(3条)、技术/AI动态(3条)、通用有趣话题(4条)
+- 覆盖三个类别：热点新闻(7条)、技术/AI动态(7条)、通用有趣话题(6条)
 - 每条问题不超过25个字
 - 只返回JSON数组，格式：
   [{"category": "news|tech|general", "question": "..."}]
@@ -49,7 +49,7 @@ async def fetch_trending_questions() -> Optional[list[dict]]:
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": "请搜索今天的热点，生成10条示例问题。"},
+        {"role": "user", "content": "请搜索今天的热点，生成20条示例问题。"},
     ]
 
     try:
