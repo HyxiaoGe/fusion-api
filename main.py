@@ -7,11 +7,12 @@ from contextlib import asynccontextmanager
 import asyncio
 import time
 from app.core.config import settings
-from app.api import chat, files, models, auth
+from app.api import chat, files, models, auth, prompts
 from app.core.logger import app_logger
 from app.db.init_db import init_db
 from app.db.database import SessionLocal
 from app.core.redis import init_redis, close_redis
+from app.services.scheduler_service import start_scheduler, stop_scheduler
 
 
 
@@ -54,9 +55,11 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         app_logger.error(f"数据库初始化失败: {e}")
     await init_redis()
+    await start_scheduler()
 
     yield
 
+    await stop_scheduler()
     await close_redis()
     app_logger.info("应用关闭完成")
 
@@ -114,6 +117,7 @@ app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 app.include_router(files.router, prefix="/api/files", tags=["files"])
 app.include_router(models.router, prefix="/api/models", tags=["models"])
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
+app.include_router(prompts.router, prefix="/api/prompts", tags=["prompts"])
 
 if __name__ == "__main__":
     import uvicorn

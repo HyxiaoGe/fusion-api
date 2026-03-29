@@ -160,3 +160,16 @@ class ModelCredential(Base):
     __table_args__ = (
         UniqueConstraint('model_id', 'name', name='uix_model_credential_name'),
     )
+
+
+class PromptExample(Base):
+    """动态示例问题（由 Kimi $web_search 定时生成）"""
+    __tablename__ = "prompt_examples"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    question = Column(String, nullable=False)
+    category = Column(String, nullable=False)       # "news" | "tech" | "general"
+    source = Column(String, default="kimi")          # 预留给未来其他来源
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=get_china_time)
+    expires_at = Column(DateTime, nullable=True)

@@ -81,6 +81,9 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "Fusion API"
     SENTRY_DSN: Optional[str] = None
 
+    # Moonshot (Kimi) — 用于 $web_search 生成动态示例问题
+    MOONSHOT_API_KEY: Optional[str] = os.getenv("MOONSHOT_API_KEY")
+
     class Config:
         env_file = ".env"
         extra = "ignore"

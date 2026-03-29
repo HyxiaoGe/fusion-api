@@ -23,3 +23,4 @@ PyJWT[crypto]>=2.8.0
 passlib[bcrypt]
 itsdangerous
 redis[hiredis]>=5.0.0
+apscheduler>=3.10.0,<4.0.0
