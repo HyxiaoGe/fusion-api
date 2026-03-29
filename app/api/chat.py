@@ -22,7 +22,7 @@ from app.schemas.chat import (
 )
 from fastapi.responses import StreamingResponse
 from app.services.chat_service import ChatService
-from app.services.stream_state_service import get_stream_meta
+from app.services.stream_state_service import get_stream_meta, cancel_stream
 from app.services.stream_handler import stream_redis_as_sse
 from app.services.task_manager import cancel_task
 from app.core.redis import get_redis_pool, stream_chunks_key
@@ -258,6 +258,13 @@ async def stop_stream(
     conv_id: str,
     current_user: User = Depends(get_current_user),
 ):
-    """用户手动停止流生成。后台任务会在 CancelledError 处理中落库。"""
-    cancelled = cancel_task(conv_id)
-    return {"cancelled": cancelled}
+    """
+    用户手动停止流生成。
+
+    双通道取消：
+    1. cancel_task — 同进程内取消 asyncio 任务（即时生效）
+    2. cancel_stream — 通过 Redis 删除 lock（跨 worker 生效，后台任务下次 check 时退出）
+    """
+    local_cancelled = cancel_task(conv_id)
+    redis_cancelled = await cancel_stream(conv_id)
+    return {"cancelled": local_cancelled or redis_cancelled}

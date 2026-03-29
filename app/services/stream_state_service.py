@@ -124,6 +124,36 @@ async def finalize_stream(conversation_id: str, success: bool, error_msg: str = 
         logger.warning(f"finalize stream 失败: {e}")
 
 
+async def cancel_stream(conversation_id: str) -> bool:
+    """
+    跨 worker 取消流：删除 lock + 写 error entry + 更新 meta。
+
+    1. 删除 lock → 后台任务 check_lock_owner 发现失效，主动退出并落库
+    2. 写 error entry → SSE 读取器收到结束信号，不会卡住等待
+    3. 更新 meta → 刷新页面时 stream-status 不再返回 "streaming"
+    """
+    redis = get_redis_pool()
+    if not redis:
+        return False
+    try:
+        lock_key = stream_lock_key(conversation_id)
+        deleted = await redis.delete(lock_key)
+        if deleted:
+            # 写 error entry 让 SSE 读取器正常结束
+            await redis.xadd(
+                stream_chunks_key(conversation_id),
+                {"type": "error", "content": "用户中止"},
+            )
+            await redis.hset(stream_meta_key(conversation_id), "status", "cancelled")
+            await redis.expire(stream_chunks_key(conversation_id), STREAM_DONE_TTL)
+            await redis.expire(stream_meta_key(conversation_id), STREAM_DONE_TTL)
+            logger.info(f"流已通过 Redis 取消: conv_id={conversation_id}")
+        return bool(deleted)
+    except Exception as e:
+        logger.warning(f"取消流失败: {e}")
+        return False
+
+
 async def check_lock_owner(conversation_id: str, task_id: str) -> bool:
     """检查当前 task_id 是否仍是锁持有者"""
     redis = get_redis_pool()
@@ -189,7 +219,7 @@ async def read_stream_chunks(
         if not results:
             # 超时没有新数据，检查流是否已结束
             meta = await get_stream_meta(conversation_id)
-            if meta and meta.get("status") in ("done", "error"):
+            if meta and meta.get("status") in ("done", "error", "cancelled"):
                 # 把剩余 entry 全部读完
                 try:
                     remaining = await redis.xrange(key, min=current_id, count=100)
