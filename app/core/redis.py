@@ -84,3 +84,4 @@ def _load_lua(name: str) -> str:
 
 LUA_FINALIZE_STREAM = _load_lua("finalize_stream")
 LUA_RELEASE_LOCK = _load_lua("release_lock")
+LUA_CANCEL_STREAM = _load_lua("cancel_stream")

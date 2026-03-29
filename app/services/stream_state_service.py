@@ -16,7 +16,7 @@ from app.core.redis import (
     get_redis_pool,
     stream_chunks_key, stream_meta_key, stream_lock_key,
     STREAM_CHUNK_TTL, STREAM_DONE_TTL, LOCK_TTL,
-    LUA_FINALIZE_STREAM,
+    LUA_FINALIZE_STREAM, LUA_CANCEL_STREAM,
 )
 from app.core.logger import app_logger as logger
 
@@ -124,31 +124,32 @@ async def finalize_stream(conversation_id: str, success: bool, error_msg: str = 
         logger.warning(f"finalize stream 失败: {e}")
 
 
-async def cancel_stream(conversation_id: str) -> bool:
+async def cancel_stream(conversation_id: str, message_id: str = "") -> bool:
     """
     跨 worker 取消流：删除 lock + 写 error entry + 更新 meta。
 
-    1. 删除 lock → 后台任务 check_lock_owner 发现失效，主动退出并落库
-    2. 写 error entry → SSE 读取器收到结束信号，不会卡住等待
-    3. 更新 meta → 刷新页面时 stream-status 不再返回 "streaming"
+    使用 Lua 脚本原子执行：
+    - 仅当 meta 状态为 streaming 时才取消
+    - 如果传了 message_id，还要校验匹配（防止误杀新一轮的流）
     """
     redis = get_redis_pool()
     if not redis:
         return False
     try:
-        lock_key = stream_lock_key(conversation_id)
-        deleted = await redis.delete(lock_key)
-        if deleted:
-            # 写 error entry 让 SSE 读取器正常结束
-            await redis.xadd(
-                stream_chunks_key(conversation_id),
-                {"type": "error", "content": "用户中止"},
-            )
-            await redis.hset(stream_meta_key(conversation_id), "status", "cancelled")
-            await redis.expire(stream_chunks_key(conversation_id), STREAM_DONE_TTL)
-            await redis.expire(stream_meta_key(conversation_id), STREAM_DONE_TTL)
+        result = await redis.eval(
+            LUA_CANCEL_STREAM,
+            3,
+            stream_lock_key(conversation_id),
+            stream_chunks_key(conversation_id),
+            stream_meta_key(conversation_id),
+            str(STREAM_DONE_TTL),
+            message_id or "",
+        )
+        if result:
             logger.info(f"流已通过 Redis 取消: conv_id={conversation_id}")
-        return bool(deleted)
+        else:
+            logger.debug(f"cancel_stream 跳过（非 streaming 状态）: conv_id={conversation_id}")
+        return bool(result)
     except Exception as e:
         logger.warning(f"取消流失败: {e}")
         return False

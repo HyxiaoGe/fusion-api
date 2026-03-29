@@ -256,6 +256,7 @@ async def reconnect_stream(
 @router.post("/stop/{conv_id}")
 async def stop_stream(
     conv_id: str,
+    message_id: str = Query(default="", description="要取消的消息 ID，防止误杀新一轮流"),
     current_user: User = Depends(get_current_user),
 ):
     """
@@ -263,8 +264,8 @@ async def stop_stream(
 
     双通道取消：
     1. cancel_task — 同进程内取消 asyncio 任务（即时生效）
-    2. cancel_stream — 通过 Redis 删除 lock（跨 worker 生效，后台任务下次 check 时退出）
+    2. cancel_stream — 通过 Redis 原子取消（跨 worker，校验 message_id 防误杀）
     """
     local_cancelled = cancel_task(conv_id)
-    redis_cancelled = await cancel_stream(conv_id)
+    redis_cancelled = await cancel_stream(conv_id, message_id)
     return {"cancelled": local_cancelled or redis_cancelled}
