@@ -52,13 +52,17 @@ async def refresh_prompt_examples() -> None:
         now = datetime.now(timezone(timedelta(hours=8)))
         expires_at = now + timedelta(hours=2)
 
-        # 旧的标记为不活跃
-        db.query(PromptExample).filter(PromptExample.is_active == True).update(
-            {"is_active": False}
+        # 累积写入（不清除旧数据），池子自然增长
+        # 去重：跳过已存在的问题
+        existing = set(
+            r[0] for r in db.query(PromptExample.question)
+            .filter(PromptExample.is_active == True).all()
         )
 
-        # 写入新的一批
+        new_count = 0
         for item in questions:
+            if item["question"] in existing:
+                continue
             db.add(PromptExample(
                 question=item["question"],
                 category=item["category"],
@@ -67,12 +71,30 @@ async def refresh_prompt_examples() -> None:
                 created_at=now,
                 expires_at=expires_at,
             ))
+            new_count += 1
+
+        # 池子上限 200 条，超出的旧数据标记为不活跃
+        active_count = db.query(PromptExample).filter(PromptExample.is_active == True).count()
+        if active_count + new_count > 200:
+            overflow = active_count + new_count - 200
+            old_ids = [
+                r[0] for r in db.query(PromptExample.id)
+                .filter(PromptExample.is_active == True)
+                .order_by(PromptExample.created_at.asc())
+                .limit(overflow).all()
+            ]
+            if old_ids:
+                db.query(PromptExample).filter(PromptExample.id.in_(old_ids)).update(
+                    {"is_active": False}, synchronize_session=False
+                )
 
         db.commit()
-        logger.info(f"示例问题已写入数据库: {len(questions)} 条")
+        logger.info(f"示例问题已写入数据库: {new_count} 条新增，池子共 {min(active_count + new_count, 200)} 条")
 
-        # 写 Redis 缓存
-        await _cache_to_redis(questions, now)
+        # 写 Redis 缓存（全量活跃池，不只是本批次）
+        all_active = db.query(PromptExample).filter(PromptExample.is_active == True).all()
+        all_examples = [{"question": r.question, "category": r.category} for r in all_active]
+        await _cache_to_redis(all_examples, now)
 
     except Exception as e:
         logger.error(f"刷新示例问题失败: {e}")
