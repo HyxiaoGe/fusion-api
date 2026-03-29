@@ -3,7 +3,10 @@ Redis 连接管理模块
 
 连接池在应用启动时初始化，shutdown 时关闭。
 get_redis() 作为 FastAPI 依赖函数，供路由层注入。
+Lua 脚本在模块加载时从文件读取，供 stream_state_service 调用。
 """
+from pathlib import Path
+
 import redis.asyncio as aioredis
 from app.core.config import settings
 from app.core.logger import app_logger as logger
@@ -66,3 +69,18 @@ def get_redis_pool() -> aioredis.Redis | None:
 async def get_redis() -> aioredis.Redis | None:
     """FastAPI 依赖函数，供路由层注入。"""
     return _redis_pool
+
+
+# ──────────────────────────────────────────────
+# Lua 脚本加载
+# ──────────────────────────────────────────────
+
+_LUA_DIR = Path(__file__).parent / "lua"
+
+
+def _load_lua(name: str) -> str:
+    return (_LUA_DIR / f"{name}.lua").read_text()
+
+
+LUA_FINALIZE_STREAM = _load_lua("finalize_stream")
+LUA_RELEASE_LOCK = _load_lua("release_lock")

@@ -16,6 +16,7 @@ from app.core.redis import (
     get_redis_pool,
     stream_chunks_key, stream_meta_key, stream_lock_key,
     STREAM_CHUNK_TTL, STREAM_DONE_TTL, LOCK_TTL,
+    LUA_FINALIZE_STREAM,
 )
 from app.core.logger import app_logger as logger
 
@@ -92,35 +93,33 @@ async def append_chunk(
 
 
 async def finalize_stream(conversation_id: str, success: bool, error_msg: str = "", task_id: str = "") -> None:
-    """流结束时调用，写 done/error 标记，更新 meta，缩短 TTL。"""
+    """
+    流结束时调用，写 done/error 标记，更新 meta，缩短 TTL，释放锁。
+
+    使用 Lua 脚本保证原子性：锁检查 + 写标记 + 释放锁在同一个 Redis 命令内完成，
+    彻底避免并发任务之间的竞态条件。
+    """
     redis = get_redis_pool()
     if not redis:
         return
     try:
-        # 如果提供了 task_id，检查是否还是当前锁持有者
-        # 被新任务接管后不应该往 Stream 里写，否则会污染新任务的数据
-        if task_id:
-            current_lock = await redis.get(stream_lock_key(conversation_id))
-            if current_lock and current_lock != task_id:
-                logger.debug(f"finalize 跳过：锁已转移给新任务 conv_id={conversation_id}")
-                return
-        if success:
-            await redis.xadd(
-                stream_chunks_key(conversation_id),
-                {"type": "done", "content": ""},
-            )
-            await redis.hset(stream_meta_key(conversation_id), "status", "done")
-        else:
-            await redis.xadd(
-                stream_chunks_key(conversation_id),
-                {"type": "error", "content": error_msg},
-            )
-            await redis.hset(stream_meta_key(conversation_id), "status", "error")
+        entry_type = "done" if success else "error"
+        entry_content = "" if success else error_msg
 
-        # 缩短 TTL，给断线重连留 60 秒窗口
-        await redis.expire(stream_chunks_key(conversation_id), STREAM_DONE_TTL)
-        await redis.expire(stream_meta_key(conversation_id), STREAM_DONE_TTL)
-        await redis.delete(stream_lock_key(conversation_id))
+        result = await redis.eval(
+            LUA_FINALIZE_STREAM,
+            3,  # KEYS 数量
+            stream_lock_key(conversation_id),
+            stream_chunks_key(conversation_id),
+            stream_meta_key(conversation_id),
+            task_id,
+            entry_type,
+            entry_content,
+            str(STREAM_DONE_TTL),
+        )
+
+        if not result:
+            logger.debug(f"finalize 跳过（Lua 原子检查）：锁不匹配 conv_id={conversation_id}")
     except Exception as e:
         logger.warning(f"finalize stream 失败: {e}")
 

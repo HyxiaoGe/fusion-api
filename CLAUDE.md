@@ -100,7 +100,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Fusion API is a Python-based AI chat integration platform built with FastAPI that provides a unified interface for multiple Large Language Model (LLM) providers including Anthropic, OpenAI, Google Gemini, DeepSeek, and various Chinese AI services (Qwen, Wenxin, Hunyuan, etc.).
+Fusion API 是基于 FastAPI 的 AI 对话集成平台，通过 **LiteLLM** 提供统一的多 LLM 提供商接口。
+
+支持的 LLM 提供商（9 个）：
+
+| 提供商 | LiteLLM 前缀 | 接口类型 | 备注 |
+|--------|-------------|---------|------|
+| OpenAI | `openai` | 原生 | GPT 系列 |
+| Anthropic | `anthropic` | 原生 | Claude 系列 |
+| DeepSeek | `deepseek` | 原生 | |
+| Google | `gemini` | 原生 | Gemini 系列 |
+| Qwen（通义千问） | `openai` | OpenAI 兼容 | 阿里云 DashScope |
+| Volcengine（火山引擎） | `openai` | OpenAI 兼容 | 字节跳动 |
+| Wenxin（文心一言） | `openai` | OpenAI 兼容 | 百度 |
+| Hunyuan（混元） | `openai` | OpenAI 兼容 | 腾讯 |
+| xAI | `xai` | 原生 | Grok 系列 |
+
+需要自定义 `api_base` 的提供商：qwen、volcengine、wenxin、hunyuan（从数据库凭证中读取 `base_url`）。
 
 ## Key Commands
 
@@ -130,94 +146,177 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
 
 ## Architecture Overview
 
-The application follows a clean architecture pattern with clear separation of concerns:
+应用采用分层架构，职责清晰分离：
 
-### Core Components
+```
+┌─────────────────────────────────────┐
+│   API Layer (app/api/)              │
+│   chat / files / models / auth      │
+└──────────────┬──────────────────────┘
+               │
+┌──────────────▼──────────────────────┐
+│   Service Layer (app/services/)     │
+│   ChatService / StreamHandler /     │
+│   FileService / MemoryService       │
+└──────────────┬──────────────────────┘
+               │
+┌──────────────▼──────────────────────┐
+│   AI Layer (app/ai/)                │
+│   LLMManager (LiteLLM 统一接口)     │
+└──────────────┬──────────────────────┘
+               │
+┌──────────────▼──────────────────────┐
+│   Data Layer                        │
+│   PostgreSQL + Redis Stream         │
+└─────────────────────────────────────┘
+```
 
-1. **AI Integration Layer** (`app/ai/`)
-   - `llm_manager.py`: Central manager for all LLM integrations
-   - Provider-specific adapters in `providers/` subdirectory
-   - Each provider adapter implements a common interface for chat completions
+### 核心组件
 
-2. **API Layer** (`app/api/`)
-   - FastAPI routers for different resource endpoints
-   - Main endpoints: chat, files, models, auth
-   - Authentication endpoints for OAuth flows
+1. **AI 集成层** (`app/ai/`)
+   - `llm_manager.py`：统一 LLM 调用管理器，基于 LiteLLM
+   - `PROVIDER_LITELLM_PREFIX` 字典定义提供商到 LiteLLM 前缀的映射
+   - `resolve_model()` 根据 `model_id` 从数据库查询凭证，构造 LiteLLM 调用参数
+   - `prompts/`：提示词模板管理（`prompt_manager.py`、`templates.py`）
+   - `adapters/`：文件适配器
 
-3. **Service Layer** (`app/services/`)
-   - Business logic separated from API layer
-   - Key services:
-     - `file_service.py`: Handles file uploads and processing
-     - `chat_service.py`: Manages chat sessions, streaming, titles, and suggested follow-up questions
-     - `scheduler_service.py`: Currently disabled placeholder to keep startup surface stable
+2. **API 层** (`app/api/`)
+   - `chat.py`：对话端点（发送消息、会话管理、流状态查询、流重连、停止生成）
+   - `files.py`：文件上传与管理
+   - `models.py`：模型与凭证 CRUD
+   - `auth.py`：用户认证（JWT + auth-service）
 
-4. **Data Layer** (`app/db/`)
-   - SQLAlchemy models for PostgreSQL
-   - Repository pattern for data access
-   - Models: Conversation, Message, File, User, ModelSource, ModelCredential
+3. **Service 层** (`app/services/`)
+   - `chat_service.py`：对话业务逻辑（消息处理、会话管理、标题生成、推荐问题）
+   - `stream_handler.py`：**Redis Stream 两段式流架构**（核心）
+     - Part A: `generate_to_redis()` — 后台任务，调用 LLM 写 Redis Stream + 落库 PostgreSQL
+     - Part B: `stream_redis_as_sse()` — SSE 读取器，从 Redis Stream 消费推送给客户端
+   - `stream_state_service.py`：Redis Stream 状态管理（init/append/finalize/read）
+   - `memory_service.py`：数据库持久化（对话/消息落库）
+   - `task_manager.py`：后台任务注册与取消
+   - `file_service.py`：文件上传、解析、存储
 
-### Key Design Patterns
+4. **数据层** (`app/db/`)
+   - SQLAlchemy ORM 模型（`models.py`）
+   - Repository 模式数据访问（`repositories.py`）
+   - 数据库初始化（`init_db.py`、`database.py`）
 
-1. **Adapter Pattern**: Each LLM provider has an adapter implementing a common interface
-2. **Repository Pattern**: Database access is abstracted through repository classes
-3. **Dependency Injection**: FastAPI's dependency injection for services and database sessions
-4. **Middleware Pipeline**: Request timeout, CORS, and session management
+5. **核心工具** (`app/core/`)
+   - `config.py`：Pydantic Settings 配置管理
+   - `redis.py`：Redis 异步连接池（lifespan 启动/关闭）
+   - `security.py`：JWT 认证 + auth-service JWKS 验证
+   - `logger.py`：日志配置
 
-### Important Implementation Details
+### 关键架构：Redis Stream 两段式流
 
-1. **Stream Support**: All LLM integrations support streaming responses
-2. **Error Handling**: Custom exceptions with proper HTTP status codes
-3. **Configuration**: Environment-based configuration via `.env` file
-4. **Authentication**: JWT tokens with OAuth provider support (GitHub, Google)
-5. **File Processing**: Supports PDF, DOCX, and text file uploads with content extraction
+这是系统最核心的设计，解耦了 LLM 生成与 HTTP 连接生命周期：
 
-### Database Schema
+```
+POST /send
+  ├─ asyncio.create_task(generate_to_redis())   # 后台任务，独立生命周期
+  │    └─ LLM chunk → XADD Redis Stream
+  │    └─ 生成完成 → 写 PostgreSQL → XADD done
+  │
+  └─ StreamingResponse(stream_redis_as_sse())   # SSE 只读 Redis，不调 LLM
+       └─ XREAD Redis Stream → 推送给客户端
 
-The application uses PostgreSQL with the following main tables:
-- `conversations`: Chat sessions with metadata
-- `messages`: Individual messages in conversations
-- `files`: Uploaded files with parsed content and processing status
-- `users`: User accounts with OAuth associations
-- `model_sources`: Model definitions and capabilities
-- `model_credentials`: Stored API credentials for model providers
+客户端断线 → SSE reader 取消 → 后台任务继续运行
+客户端重连 → GET /stream/{conv_id} → 从断点 ID 续读
+```
 
-### Testing
+### 数据库模型（PostgreSQL）
 
-Currently, the project has minimal test infrastructure. When adding tests:
-- Create test files in the `test/` directory
-- Consider adding pytest to requirements.txt
-- Test API endpoints using FastAPI's TestClient
-- Mock external LLM API calls to avoid using real credentials
+| 表名 | 说明 | 关键字段 |
+|------|------|---------|
+| `users` | 用户账户 | id, username, nickname, email, avatar |
+| `social_accounts` | OAuth 关联 | user_id, provider, provider_user_id |
+| `conversations` | 对话会话 | id, user_id, title, model_id |
+| `messages` | 消息（JSONB content blocks） | id, conversation_id, role, content, usage |
+| `files` | 上传文件 | id, user_id, filename, status, parsed_content |
+| `conversation_files` | 文件-对话关联表 | conversation_id, file_id |
+| `model_sources` | 模型定义与能力 | model_id, provider, capabilities, pricing |
+| `model_credentials` | API 凭证（JSON） | model_id, credentials, is_default |
 
-### Common Development Tasks
+注意：
+- `messages.content` 是 JSONB 类型，存储 content blocks 数组（TextBlock / ThinkingBlock）
+- 主键使用 UUID
+- 时间戳使用中国时区（+8）
+- 关联关系 cascade 删除
 
-1. **Adding a New LLM Provider**:
-   - Create a new adapter in `app/ai/providers/`
-   - Implement the base adapter interface
-   - Register in `LLMManager` in `app/ai/llm_manager.py`
-   - Add configuration constants in `app/constants/`
+### 认证机制
 
-2. **Adding New API Endpoints**:
-   - Create router in `app/api/`
-   - Implement service logic in `app/services/`
-   - Add Pydantic schemas in `app/schemas/`
-   - Register router in `main.py`
+- 独立的 auth-service（默认 `http://localhost:8100`）负责用户注册/登录/OAuth
+- fusion-api 通过 JWKS 验证 JWT token（`security.py`）
+- 支持 GitHub、Google OAuth 登录
+- Token 有效期默认 8 天（11520 分钟）
 
-3. **Database Migrations**:
-   - Modify models in `app/db/models/`
-   - The app auto-creates tables on startup (see `app/db/base.py`)
-   - For production, consider using Alembic for migrations
+### API 端点一览
 
-### Performance Considerations
+**Chat (`/api/chat`):**
+- `POST /send` — 发送消息（支持流式/非流式）
+- `GET /conversations` — 分页对话列表
+- `GET /conversations/{id}` — 对话详情
+- `DELETE /conversations/{id}` — 删除对话
+- `PUT /conversations/{id}/messages/{msg_id}` — 编辑消息
+- `POST /generate-title` — 自动生成标题
+- `POST /suggest-questions` — 推荐后续问题
+- `GET /stream-status/{conv_id}` — 查询流状态
+- `GET /stream/{conv_id}` — 重连 SSE 流
+- `POST /stop/{conv_id}` — 停止生成
 
-1. **Docker Resource Limits**: CPU limited to 1 core, memory to 1GB
-2. **Request Timeout**: 10-second timeout middleware applied
-3. **Database Connections**: Connection pooling via SQLAlchemy
-4. **Streaming**: Use streaming for long LLM responses to improve UX
+**Files (`/api/files`):**
+- `POST /upload` — 上传文件
+- `GET /` — 用户文件列表
+- `GET /conversation/{id}` — 对话文件列表
+- `GET /{file_id}/status` — 文件处理状态
+- `DELETE /{file_id}` — 删除文件
 
-### Security Notes
+**Models (`/api/models`):**
+- CRUD 模型定义 + 凭证管理 + 凭证测试
 
-1. API credentials are encrypted before storage
-2. CORS is currently open - restrict for production
-3. Environment variables for sensitive configuration
-4. JWT tokens for authentication with configurable expiry
+**Auth (`/api/auth`):**
+- `GET /me` — 获取当前用户信息
+
+### 测试
+
+- 测试文件在 `test/` 目录，使用 pytest
+- 运行测试：`pytest test/`
+- 覆盖范围：security、llm_manager、chat_service、file_service、stream_handler、memory_service、repositories、chat utils、file_processor 等
+- LLM 调用使用 mock，不依赖真实凭证
+- Redis 测试使用 fakeredis
+
+### 常见开发任务
+
+1. **添加新 LLM 提供商**：
+   - 在 `app/ai/llm_manager.py` 的 `PROVIDER_LITELLM_PREFIX` 字典中添加映射
+   - 如需自定义 api_base，加入 `CUSTOM_BASE_URL_PROVIDERS` 集合
+   - 在 `.env` 和 `docker-compose.yml` 中添加 API key 环境变量
+
+2. **添加新 API 端点**：
+   - 在 `app/api/` 创建路由
+   - 在 `app/services/` 实现业务逻辑
+   - 在 `app/schemas/` 添加 Pydantic 模型
+   - 在 `main.py` 注册路由
+
+3. **数据库变更**：
+   - 修改 `app/db/models.py` 中的 ORM 模型
+   - 应用启动时自动建表（`init_db.py`）
+   - 生产环境建议使用 Alembic 迁移
+
+### 性能与部署
+
+- **Docker 资源限制**：CPU 1 核，内存 2GB
+- **请求超时**：10 秒超时中间件
+- **数据库连接池**：SQLAlchemy 连接池
+- **Redis**：异步连接池，max_connections=20
+- **生产模式**：4 worker Uvicorn
+- **部署方式**：Docker Compose / Railway
+- **网络**：`fusion_fusion_network`（外部）、`middleware_default`（外部，连接 Redis 等中间件）
+
+### 安全
+
+- API 凭证加密存储
+- CORS 通过 `CORS_ORIGINS` 环境变量配置
+- 敏感配置通过 `.env` 管理
+- JWT token 认证 + JWKS 验证
+- 支持的文件类型白名单（图片、PDF、Word、文本等）
