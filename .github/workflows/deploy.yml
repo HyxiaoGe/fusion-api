@@ -10,18 +10,24 @@ jobs:
       - uses: actions/checkout@v4
       - name: Sync deploy checkout
         run: cd ~/project/fusion/fusion-api && git fetch origin && git reset --hard origin/master && git clean -fd
-      - name: Build and deploy
+      - name: Deploy
         run: |
-          cd ~/project/fusion
-          for attempt in 1 2 3; do
-            if docker compose up -d --build fusion-api; then
-              exit 0
-            fi
-
-            docker compose rm -sf fusion-api || true
-            sleep 5
-          done
-
-          exit 1
+          cd ~/project/fusion/fusion-api
+          if git diff HEAD~1 --name-only | grep -qE 'requirements\.txt|Dockerfile|docker-compose'; then
+            cd ~/project/fusion
+            for attempt in 1 2 3; do
+              if docker compose up -d --build fusion-api; then
+                exit 0
+              fi
+              docker compose rm -sf fusion-api || true
+              sleep 5
+            done
+            exit 1
+          else
+            cd ~/project/fusion
+            docker compose restart fusion-api
+          fi
       - name: Cleanup
-        run: docker image prune -f
+        run: |
+          docker image prune -f
+          docker builder prune --filter "until=72h" -f
