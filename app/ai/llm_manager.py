@@ -15,15 +15,15 @@ logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 # provider 内部标识 → LiteLLM 模型前缀映射
 # 部分 provider 使用 OpenAI 兼容接口，需要通过 api_base 指定，前缀统一用 openai/
 PROVIDER_LITELLM_PREFIX = {
-    "openai":      "openai",
-    "anthropic":   "anthropic",
-    "deepseek":    "deepseek",
-    "google":      "gemini",
-    "qwen":        "openai",      # 通义千问使用 OpenAI 兼容接口
-    "volcengine":  "openai",      # 火山引擎使用 OpenAI 兼容接口
-    "wenxin":      "openai",      # 文心一言使用 OpenAI 兼容接口
-    "hunyuan":     "openai",      # 混元使用 OpenAI 兼容接口
-    "xai":         "xai",
+    "openai":      "openrouter/openai",       # 通过 OpenRouter 路由
+    "anthropic":   "openrouter/anthropic",    # 通过 OpenRouter 路由
+    "google":      "openrouter/google",       # 通过 OpenRouter 路由
+    "xai":         "openrouter/x-ai",         # 通过 OpenRouter 路由（OpenRouter 上为 x-ai）
+    "deepseek":    "deepseek",                # 直连
+    "qwen":        "openai",                  # 通义千问使用 OpenAI 兼容接口
+    "volcengine":  "openai",                  # 火山引擎使用 OpenAI 兼容接口
+    "wenxin":      "openai",                  # 文心一言使用 OpenAI 兼容接口
+    "hunyuan":     "openai",                  # 混元使用 OpenAI 兼容接口
 }
 
 # 需要自定义 api_base 的 provider（从凭证里读取 base_url）
