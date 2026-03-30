@@ -22,8 +22,6 @@ PROVIDER_LITELLM_PREFIX = {
     "deepseek":    "deepseek",                # 直连
     "qwen":        "openai",                  # 通义千问使用 OpenAI 兼容接口
     "volcengine":  "openai",                  # 火山引擎使用 OpenAI 兼容接口
-    "wenxin":      "openai",                  # 文心一言使用 OpenAI 兼容接口
-    "hunyuan":     "openai",                  # 混元使用 OpenAI 兼容接口
 }
 
 # 需要自定义 api_base 的 provider（从凭证里读取 base_url）
@@ -116,11 +114,9 @@ MODEL_DISPLAY_NAMES = {
     "anthropic":  "Anthropic",
     "deepseek":   "DeepSeek",
     "google":     "Google",
-    "hunyuan":    "混元",
     "openai":     "OpenAI",
     "qwen":       "通义千问",
     "volcengine": "火山引擎",
-    "wenxin":     "文心一言",
     "xai":        "xAI",
 }
 
