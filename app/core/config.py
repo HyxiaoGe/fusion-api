@@ -84,6 +84,9 @@ class Settings(BaseSettings):
     # Moonshot (Kimi) — 用于 $web_search 生成动态示例问题
     MOONSHOT_API_KEY: Optional[str] = os.getenv("MOONSHOT_API_KEY")
 
+    # 搜索服务地址（容器间通过 Docker 内网访问）
+    SEARCH_SERVICE_URL: str = os.getenv("SEARCH_SERVICE_URL", "http://search-service:8080")
+
     class Config:
         env_file = ".env"
         extra = "ignore"

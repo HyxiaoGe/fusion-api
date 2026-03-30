@@ -33,8 +33,23 @@ class FileBlock(BaseModel):
     mime_type: str
 
 
+class SearchSource(BaseModel):
+    """单条搜索来源"""
+    title: str
+    url: str
+    description: str
+
+
+class SearchBlock(BaseModel):
+    """搜索结果内容块，出现在 assistant 消息中"""
+    type: Literal["search"]
+    id: str = Field(default_factory=lambda: f"blk_{uuid4().hex[:12]}")
+    query: str                          # 搜索使用的关键词
+    sources: List[SearchSource]         # 来源列表
+
+
 # content block 的联合类型，后续扩展直接在此添加
-ContentBlock = Union[TextBlock, ThinkingBlock, FileBlock]
+ContentBlock = Union[TextBlock, ThinkingBlock, FileBlock, SearchBlock]
 
 
 # ============================================================

@@ -12,7 +12,7 @@ from app.db.models import Conversation as ConversationModel, get_china_time, Fil
 from app.db.models import Message as MessageModel
 from app.db.models import ModelSource, ModelCredential
 from app.db.models import User as UserModel, SocialAccount as SocialAccountModel
-from app.schemas.chat import Conversation, Message, TextBlock, ThinkingBlock, FileBlock, Usage
+from app.schemas.chat import Conversation, Message, TextBlock, ThinkingBlock, FileBlock, SearchBlock, SearchSource, Usage
 from app.schemas.models import ModelInfo, ModelCapabilities, ModelPricing, AuthConfig, ModelConfiguration, ModelConfigParam, ModelBasicInfo, AuthConfigField, ModelCredentialInfo
 from app.schemas.auth import User as UserSchema
 
@@ -280,6 +280,13 @@ class ConversationRepository:
                 content_blocks.append(ThinkingBlock(**block_data))
             elif block_type == "file":
                 content_blocks.append(FileBlock(**block_data))
+            elif block_type == "search":
+                content_blocks.append(SearchBlock(
+                    type="search",
+                    id=block_data.get("id", f"blk_{__import__('uuid').uuid4().hex[:12]}"),
+                    query=block_data.get("query", ""),
+                    sources=[SearchSource(**s) for s in block_data.get("sources", [])],
+                ))
             # 未知类型跳过，保持前向兼容
 
         return Message(

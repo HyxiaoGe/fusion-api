@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.ai.llm_manager import llm_manager
 from app.ai.prompts import prompt_manager
 from app.core.logger import app_logger as logger
-from app.db.repositories import FileRepository
+from app.db.repositories import FileRepository, ModelSourceRepository
 from app.schemas.chat import (
     ChatResponse, Conversation, Message,
     TextBlock, FileBlock, Usage,
@@ -45,6 +45,10 @@ class ChatService:
 
         # 解析模型调用参数
         litellm_model, provider, litellm_kwargs = llm_manager.resolve_model(model_id, self.db)
+
+        # 获取模型能力（用于判断是否启用 web_search tool）
+        model_source = ModelSourceRepository(self.db).get_by_id(model_id)
+        capabilities = model_source.capabilities if model_source else {}
 
         # 获取或创建会话
         conversation = self._get_or_create_conversation(
@@ -107,6 +111,7 @@ class ChatService:
                     assistant_message_id=assistant_message_id,
                     task_id=task_id,
                     options=options,
+                    capabilities=capabilities,
                 )
             )
             register_task(conversation.id, task, task_id)
