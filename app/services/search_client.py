@@ -19,7 +19,14 @@ async def search_web(query: str, count: int = 5) -> List[SearchSource]:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
                 f"{settings.SEARCH_SERVICE_URL}/search",
-                json={"query": query, "type": "web", "count": count},
+                json={
+                    "query": query,
+                    "type": "web",
+                    "count": count,
+                    "freshness": "pw",   # 优先返回一周内的结果
+                    "lang": "zh",        # 中文优先
+                    "region": "cn",      # 中国区域
+                },
             )
             resp.raise_for_status()
             data = resp.json()

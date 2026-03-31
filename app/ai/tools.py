@@ -23,7 +23,13 @@ WEB_SEARCH_TOOL = {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "搜索关键词，简洁精准，1-6 个词效果最佳",
+                    "description": (
+                        "搜索关键词。规则：\n"
+                        "- 使用与用户消息相同的语言（用户用中文就搜中文）\n"
+                        "- 简洁精准，3-8 个词\n"
+                        "- 包含时间限定词（如 '2026年'、'最新'、'今日'）以获取最新结果\n"
+                        "- 示例：'2026年3月缅甸地震最新伤亡' 而不是 'Myanmar earthquake'"
+                    ),
                 }
             },
             "required": ["query"],

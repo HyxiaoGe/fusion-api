@@ -104,6 +104,11 @@ class StreamHandler:
             tool_call_name = None
             tool_call_args = ""
 
+            # 第一轮 thinking 缓冲（supports_fc 时不直接推送，等确认是否 tool_call）
+            first_round_buffering = supports_fc
+            first_round_thinking_buf = ""
+            thinking_pending_sent = False
+
             async for chunk in response:
                 choice = chunk.choices[0] if chunk.choices else None
 
@@ -128,8 +133,9 @@ class StreamHandler:
                     if tc.function and tc.function.arguments:
                         tool_call_args += tc.function.arguments
 
-                # tool_call 完整了（finish_reason 可能在单独的 chunk 中，不一定和 delta.tool_calls 同帧）
+                # tool_call 完整了
                 if finish_reason == "tool_calls" and tool_call_name:
+                    # 丢弃第一轮 thinking（tool_call 推理噪音）
                     await self._handle_tool_call(
                         db=db,
                         conversation_id=conversation_id,
@@ -147,16 +153,15 @@ class StreamHandler:
                         should_use_reasoning=should_use_reasoning,
                         thinking_block_id=thinking_block_id,
                         text_block_id=text_block_id,
-                        first_round_reasoning=reasoning_buf,
+                        first_round_reasoning="",  # 丢弃
                     )
-                    return  # _handle_tool_call 内部完成落库和 finalize
+                    return
 
                 if hasattr(delta, "tool_calls") and delta.tool_calls:
-                    continue  # 有 tool_call 数据的 chunk 不走文本分支
+                    continue
 
-                # ===== 分支 2: 正常文本输出（现有逻辑，不变） =====
+                # ===== 分支 2: 正常文本/thinking =====
 
-                # 提取 reasoning_content
                 reasoning_delta = ""
                 if should_use_reasoning:
                     reasoning_delta = getattr(delta, "reasoning_content", None) or ""
@@ -165,42 +170,60 @@ class StreamHandler:
 
                 content_delta = delta.content or ""
 
-                # 去重
                 if reasoning_delta and content_delta == reasoning_delta:
                     content_delta = ""
 
-                # 写 reasoning chunk 到 Redis Stream
+                # thinking 处理：缓冲模式 vs 直推模式
                 if reasoning_delta:
-                    reasoning_buf += reasoning_delta
-                    await append_chunk(conversation_id, "reasoning", reasoning_delta, thinking_block_id)
+                    if first_round_buffering:
+                        # 缓冲：不写 Redis，但推一个 thinking_pending 让前端显示脉冲动画
+                        first_round_thinking_buf += reasoning_delta
+                        if not thinking_pending_sent:
+                            await append_chunk(conversation_id, "thinking_pending", "", thinking_block_id)
+                            thinking_pending_sent = True
+                    else:
+                        reasoning_buf += reasoning_delta
+                        await append_chunk(conversation_id, "reasoning", reasoning_delta, thinking_block_id)
 
-                # 写 content chunk 到 Redis Stream
+                # content 出现意味着第一轮结束且没有 tool_call → 回放缓冲的 thinking
                 if content_delta:
+                    if first_round_buffering and first_round_thinking_buf:
+                        # 回放缓冲的 thinking 到 Redis
+                        await append_chunk(conversation_id, "reasoning", first_round_thinking_buf, thinking_block_id)
+                        reasoning_buf += first_round_thinking_buf
+                        first_round_thinking_buf = ""
+                        first_round_buffering = False
+
                     content_buf += content_delta
                     await append_chunk(conversation_id, "answering", content_delta, text_block_id)
 
-                # usage
                 if hasattr(chunk, "usage") and chunk.usage:
                     usage_data = Usage(
                         input_tokens=chunk.usage.prompt_tokens or 0,
                         output_tokens=chunk.usage.completion_tokens or 0,
                     )
 
-                # 每 N 个 chunk 检查锁
                 chunk_count += 1
                 if chunk_count % LOCK_CHECK_INTERVAL == 0:
                     if not await check_lock_owner(conversation_id, task_id):
                         logger.info(f"任务被踢掉，主动退出: conv_id={conversation_id}")
-                        if reasoning_buf or content_buf:
+                        # 回放未写入的 thinking
+                        all_reasoning = reasoning_buf + first_round_thinking_buf
+                        if all_reasoning or content_buf:
                             self._persist_message(
                                 db, assistant_message_id, conversation_id, model_id,
-                                self._build_content_blocks(reasoning_buf, content_buf, thinking_block_id, text_block_id),
+                                self._build_content_blocks(all_reasoning, content_buf, thinking_block_id, text_block_id),
                                 usage_data,
                             )
                         await finalize_stream(conversation_id, success=False, error_msg="被新请求取代", task_id=task_id)
                         return
 
-            # 生成完成，落库 PostgreSQL
+            # 回放未写入的 thinking（没有 tool_call 也没有 content 的极端情况）
+            if first_round_thinking_buf:
+                await append_chunk(conversation_id, "reasoning", first_round_thinking_buf, thinking_block_id)
+                reasoning_buf += first_round_thinking_buf
+
+            # 生成完成，落库
             self._persist_message(
                 db, assistant_message_id, conversation_id, model_id,
                 self._build_content_blocks(reasoning_buf, content_buf, thinking_block_id, text_block_id),
@@ -565,6 +588,22 @@ async def stream_redis_as_sse(
                             "type": "thinking",
                             "id": chunk.get("block_id", ""),
                             "thinking": chunk["content"],
+                        }]
+                    },
+                    "finish_reason": None,
+                }]
+            }
+        elif chunk_type == "thinking_pending":
+            # 思考中占位事件：前端显示脉冲动画但不展示具体内容
+            payload = {
+                "id": message_id,
+                "conversation_id": conversation_id,
+                "choices": [{
+                    "delta": {
+                        "content": [{
+                            "type": "thinking",
+                            "id": chunk.get("block_id", ""),
+                            "thinking": "",
                         }]
                     },
                     "finish_reason": None,
