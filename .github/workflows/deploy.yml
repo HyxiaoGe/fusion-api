@@ -12,21 +12,15 @@ jobs:
         run: cd ~/project/fusion/fusion-api && git fetch origin && git reset --hard origin/master && git clean -fd
       - name: Deploy
         run: |
-          cd ~/project/fusion/fusion-api
-          if git diff HEAD~1 --name-only | grep -qE 'requirements\.txt|Dockerfile|docker-compose'; then
-            cd ~/project/fusion
-            for attempt in 1 2 3; do
-              if docker compose up -d --build fusion-api; then
-                exit 0
-              fi
-              docker compose rm -sf fusion-api || true
-              sleep 5
-            done
-            exit 1
-          else
-            cd ~/project/fusion
-            docker compose restart fusion-api
-          fi
+          cd ~/project/fusion
+          for attempt in 1 2 3; do
+            if docker compose up -d --build fusion-api; then
+              exit 0
+            fi
+            docker compose rm -sf fusion-api || true
+            sleep 5
+          done
+          exit 1
       - name: Cleanup
         run: |
           docker image prune -f
