@@ -495,7 +495,13 @@ class StreamHandler:
         for i, source in enumerate(sources, 1):
             parts.append(f"[{i}] {source.title}")
             parts.append(f"    来源: {source.url}")
-            parts.append(f"    摘要: {source.description}")
+            # 优先使用正文内容，没有则用 description 摘要
+            if source.content:
+                # 截取前 1000 字，避免上下文过长
+                content_text = source.content[:1000]
+                parts.append(f"    正文: {content_text}")
+            else:
+                parts.append(f"    摘要: {source.description}")
             parts.append("")
 
         parts.append("注意：")

@@ -38,6 +38,7 @@ class SearchSource(BaseModel):
     title: str
     url: str
     description: str
+    content: Optional[str] = None     # 网页正文摘要（Tavily 等 provider 支持）
 
 
 class SearchBlock(BaseModel):

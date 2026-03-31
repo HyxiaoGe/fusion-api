@@ -34,6 +34,7 @@ async def search_web(query: str, count: int = 5) -> List[SearchSource]:
                 title=r.get("title", ""),
                 url=r.get("url", ""),
                 description=r.get("description", ""),
+                content=r.get("content"),
             )
             for r in data.get("results", [])
         ]
