@@ -24,8 +24,6 @@ async def search_web(query: str, count: int = 5) -> List[SearchSource]:
                     "type": "web",
                     "count": count,
                     "freshness": "pw",   # 优先返回一周内的结果
-                    "lang": "zh",        # 中文优先
-                    "region": "cn",      # 中国区域
                 },
             )
             resp.raise_for_status()
