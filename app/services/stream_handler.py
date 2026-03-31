@@ -118,7 +118,7 @@ class StreamHandler:
                 delta = choice.delta
                 finish_reason = choice.finish_reason
 
-                # ===== 分支 1: tool_call 检测 =====
+                # ===== 分支 1: tool_call 累积 =====
                 if hasattr(delta, "tool_calls") and delta.tool_calls:
                     tc = delta.tool_calls[0]
                     if tc.id:
@@ -128,29 +128,31 @@ class StreamHandler:
                     if tc.function and tc.function.arguments:
                         tool_call_args += tc.function.arguments
 
-                    # tool_call 完整了
-                    if finish_reason == "tool_calls":
-                        await self._handle_tool_call(
-                            db=db,
-                            conversation_id=conversation_id,
-                            user_id=user_id,
-                            model_id=model_id,
-                            litellm_model=litellm_model,
-                            litellm_kwargs=litellm_kwargs,
-                            provider=provider,
-                            messages=messages,
-                            assistant_message_id=assistant_message_id,
-                            task_id=task_id,
-                            tool_call_id=tool_call_id,
-                            tool_call_name=tool_call_name,
-                            tool_call_args=tool_call_args,
-                            should_use_reasoning=should_use_reasoning,
-                            thinking_block_id=thinking_block_id,
-                            text_block_id=text_block_id,
-                        )
-                        return  # _handle_tool_call 内部完成落库和 finalize
+                # tool_call 完整了（finish_reason 可能在单独的 chunk 中，不一定和 delta.tool_calls 同帧）
+                if finish_reason == "tool_calls" and tool_call_name:
+                    await self._handle_tool_call(
+                        db=db,
+                        conversation_id=conversation_id,
+                        user_id=user_id,
+                        model_id=model_id,
+                        litellm_model=litellm_model,
+                        litellm_kwargs=litellm_kwargs,
+                        provider=provider,
+                        messages=messages,
+                        assistant_message_id=assistant_message_id,
+                        task_id=task_id,
+                        tool_call_id=tool_call_id,
+                        tool_call_name=tool_call_name,
+                        tool_call_args=tool_call_args,
+                        should_use_reasoning=should_use_reasoning,
+                        thinking_block_id=thinking_block_id,
+                        text_block_id=text_block_id,
+                        first_round_reasoning=reasoning_buf,
+                    )
+                    return  # _handle_tool_call 内部完成落库和 finalize
 
-                    continue  # 继续累积 tool_call 参数
+                if hasattr(delta, "tool_calls") and delta.tool_calls:
+                    continue  # 有 tool_call 数据的 chunk 不走文本分支
 
                 # ===== 分支 2: 正常文本输出（现有逻辑，不变） =====
 
@@ -252,6 +254,7 @@ class StreamHandler:
         should_use_reasoning: bool,
         thinking_block_id: str,
         text_block_id: str,
+        first_round_reasoning: str = "",
     ) -> None:
         """
         处理 LLM 返回的 tool_call。当前仅支持 web_search。
@@ -337,8 +340,10 @@ class StreamHandler:
         )
 
         # 7. 落库：content 数组包含 SearchBlock
+        # 合并第一轮的 reasoning（模型思考是否需要搜索）和第二轮的 reasoning
+        combined_reasoning = first_round_reasoning + reasoning_buf
         content_blocks = self._build_content_blocks(
-            reasoning_buf, content_buf, thinking_block_id, text_block_id,
+            combined_reasoning, content_buf, thinking_block_id, text_block_id,
             search_query=query, search_sources=sources, search_block_id=search_block_id,
         )
         self._persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks, usage_data)
