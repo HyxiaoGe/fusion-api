@@ -328,6 +328,9 @@ class StreamHandler:
         ]
 
         # 6. 第二轮 LLM 流式调用（不再传 tools，避免无限循环）
+        # 第一轮 reasoning 是"决定要不要搜索"的内部推理（含 tool_call 细节），
+        # 对用户没有价值，丢弃。用新的 block ID 接收第二轮的有效 reasoning。
+        second_thinking_id = f"blk_{uuid.uuid4().hex[:12]}"
         reasoning_buf, content_buf, usage_data = await self._stream_llm_to_redis(
             litellm_model=litellm_model,
             litellm_kwargs=litellm_kwargs,
@@ -335,15 +338,14 @@ class StreamHandler:
             conversation_id=conversation_id,
             task_id=task_id,
             should_use_reasoning=should_use_reasoning,
-            thinking_block_id=thinking_block_id,
+            thinking_block_id=second_thinking_id,
             text_block_id=text_block_id,
         )
 
         # 7. 落库：content 数组包含 SearchBlock
-        # 合并第一轮的 reasoning（模型思考是否需要搜索）和第二轮的 reasoning
-        combined_reasoning = first_round_reasoning + reasoning_buf
+        # 只保留第二轮 reasoning（基于搜索结果的分析思考），不保留第一轮
         content_blocks = self._build_content_blocks(
-            combined_reasoning, content_buf, thinking_block_id, text_block_id,
+            reasoning_buf, content_buf, second_thinking_id, text_block_id,
             search_query=query, search_sources=sources, search_block_id=search_block_id,
         )
         self._persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks, usage_data)
