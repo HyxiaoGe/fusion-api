@@ -39,6 +39,7 @@ class SearchSource(BaseModel):
     url: str
     description: str
     content: Optional[str] = None     # 网页正文摘要（Tavily 等 provider 支持）
+    favicon: Optional[str] = None     # 网站 favicon URL
 
 
 class SearchBlock(BaseModel):

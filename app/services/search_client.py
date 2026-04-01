@@ -35,6 +35,7 @@ async def search_web(query: str, count: int = 5) -> List[SearchSource]:
                 url=r.get("url", ""),
                 description=r.get("description", ""),
                 content=r.get("content"),
+                favicon=r.get("favicon"),
             )
             for r in data.get("results", [])
         ]
