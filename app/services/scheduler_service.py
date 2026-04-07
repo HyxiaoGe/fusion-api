@@ -20,10 +20,10 @@ async def start_scheduler() -> None:
 
     _scheduler = AsyncIOScheduler()
 
-    # 每小时刷新示例问题
+    # 每 12 小时刷新示例问题
     _scheduler.add_job(
         refresh_prompt_examples,
-        trigger=IntervalTrigger(hours=1),
+        trigger=IntervalTrigger(hours=12),
         id="refresh_prompt_examples",
         replace_existing=True,
     )
