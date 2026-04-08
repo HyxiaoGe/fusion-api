@@ -76,8 +76,7 @@ class FileService:
                 user_id=user_id,
                 title="新会话",
                 messages=[],
-                provider=provider,
-                model=model,
+                model_id=model or settings.DEFAULT_MODEL,
                 created_at=datetime.now(),
                 updated_at=datetime.now()
             )
