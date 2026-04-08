@@ -1,5 +1,6 @@
 # app/services/chat_service.py
 import asyncio
+import base64
 import uuid as uuid_mod
 from typing import Any, Dict, List, Optional, Union
 
@@ -15,11 +16,16 @@ from app.schemas.chat import (
     ChatResponse, Conversation, Message,
     TextBlock, FileBlock, Usage,
 )
+from app.services.file_service import is_image_mime
 from app.services.memory_service import MemoryService
+from app.services.storage import get_storage
 from app.services.stream_handler import StreamHandler, stream_redis_as_sse
 from app.services.stream_state_service import init_stream
 from app.services.task_manager import register_task
 from app.services.chat.utils import ChatUtils
+
+# 历史消息中保留图片的最大轮数（避免 token 爆炸）
+MAX_VISION_HISTORY_TURNS = 3
 
 
 class ChatService:
@@ -46,9 +52,10 @@ class ChatService:
         # 解析模型调用参数
         litellm_model, provider, litellm_kwargs = llm_manager.resolve_model(model_id, self.db)
 
-        # 获取模型能力（用于判断是否启用 web_search tool）
+        # 获取模型能力（用于判断是否启用 web_search tool / vision）
         model_source = ModelSourceRepository(self.db).get_by_id(model_id)
         capabilities = model_source.capabilities if model_source else {}
+        has_vision = capabilities.get("vision", False)
 
         # 获取或创建会话
         conversation = self._get_or_create_conversation(
@@ -59,15 +66,30 @@ class ChatService:
         # 构造用户消息 content blocks
         user_content = [TextBlock(type="text", text=message)]
         if file_ids:
+            storage = get_storage()
             for fid in file_ids:
                 file_info = self.file_repo.get_file_by_id(fid)
                 if file_info:
-                    user_content.append(FileBlock(
-                        type="file",
-                        file_id=fid,
-                        filename=file_info.original_filename,
-                        mime_type=file_info.mimetype,
-                    ))
+                    # 构造 FileBlock，图片文件附带缩略图信息
+                    block_kwargs = {
+                        "type": "file",
+                        "file_id": fid,
+                        "filename": file_info.original_filename,
+                        "mime_type": file_info.mimetype,
+                    }
+                    if is_image_mime(file_info.mimetype) and getattr(file_info, "thumbnail_key", None):
+                        from app.core.config import settings
+                        try:
+                            thumb_url = await storage.get_url(
+                                file_info.thumbnail_key,
+                                expires=settings.MINIO_PRESIGN_EXPIRES,
+                            )
+                            block_kwargs["thumbnail_url"] = thumb_url
+                        except Exception:
+                            pass
+                        block_kwargs["width"] = getattr(file_info, "width", None)
+                        block_kwargs["height"] = getattr(file_info, "height", None)
+                    user_content.append(FileBlock(**block_kwargs))
 
         user_message = Message(role="user", content=user_content)
 
@@ -80,14 +102,22 @@ class ChatService:
 
         conversation.messages.append(user_message)
 
-        # 将会话历史转为 LiteLLM 所需的 dict 格式
-        lm_messages = self._build_llm_messages(conversation.messages)
+        # 将会话历史转为 LiteLLM 所需的 dict 格式（支持多模态）
+        lm_messages = await self._build_llm_messages(
+            conversation.messages, has_vision=has_vision
+        )
 
-        # 注入文件内容到 LLM 上下文（纯文本注入，不影响 content blocks 存储）
+        # 非图片文件仍走文本注入（图片由 _build_llm_messages 处理 base64 注入）
         if file_ids:
-            file_contents = self.file_repo.get_parsed_file_content(file_ids)
-            if file_contents:
-                lm_messages = self._inject_file_content(lm_messages, message, file_contents)
+            non_image_ids = [
+                fid for fid in file_ids if not self._is_image_file(fid)
+            ]
+            if non_image_ids:
+                file_contents = self.file_repo.get_parsed_file_content(non_image_ids)
+                if file_contents:
+                    lm_messages = self._inject_file_content(
+                        lm_messages, message, file_contents
+                    )
 
         if stream:
             # 预分配 assistant 消息 ID 和 task ID
@@ -155,23 +185,97 @@ class ChatService:
             messages=[],
         )
 
-    @staticmethod
-    def _build_llm_messages(messages: List[Message]) -> List[dict]:
+    async def _build_llm_messages(
+        self,
+        messages: List[Message],
+        has_vision: bool = False,
+    ) -> List[dict]:
         """
         将 content blocks 消息列表转为 LLM 可消费的 dict 格式。
-        thinking block 不传给 LLM（避免污染上下文）。
+        - thinking / search block 不传给 LLM（避免污染上下文）
+        - 当 has_vision=True 时，图片 FileBlock 转为 base64 image_url 内容块
+        - 历史消息中的图片仅保留最近 MAX_VISION_HISTORY_TURNS 轮
         """
         result = []
-        for msg in messages:
-            text_parts = [
-                block.text
-                for block in msg.content
-                if block.type == "text"
-            ]
-            text = "\n".join(text_parts)
-            if text:
-                result.append({"role": msg.role, "content": text})
+
+        # 计算最近 N 轮用户消息的起始索引，用于控制图片注入范围
+        vision_cutoff_idx = 0
+        if has_vision:
+            user_msg_count = 0
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].role == "user":
+                    user_msg_count += 1
+                    if user_msg_count >= MAX_VISION_HISTORY_TURNS:
+                        vision_cutoff_idx = i
+                        break
+
+        for idx, msg in enumerate(messages):
+            content_parts = []
+            has_image = False
+            # 仅在最近几轮中注入图片 base64
+            inject_images = has_vision and idx >= vision_cutoff_idx
+
+            for block in msg.content:
+                if block.type == "text":
+                    if block.text:
+                        content_parts.append({
+                            "type": "text",
+                            "text": block.text,
+                        })
+
+                elif block.type == "file" and inject_images:
+                    # 图片 FileBlock → base64 image_url
+                    mime = getattr(block, "mime_type", "")
+                    if is_image_mime(mime):
+                        image_part = await self._file_block_to_image_part(block)
+                        if image_part:
+                            content_parts.append(image_part)
+                            has_image = True
+
+                # thinking / search block 不传给 LLM
+
+            if not content_parts:
+                continue
+
+            # 无图片时退化为纯文本（节省 token 开销）
+            if (
+                not has_image
+                and len(content_parts) == 1
+                and content_parts[0]["type"] == "text"
+            ):
+                result.append({
+                    "role": msg.role,
+                    "content": content_parts[0]["text"],
+                })
+            else:
+                result.append({
+                    "role": msg.role,
+                    "content": content_parts,
+                })
+
         return result
+
+    async def _file_block_to_image_part(self, block) -> Optional[dict]:
+        """将图片 FileBlock 转为 LiteLLM image_url content part"""
+        try:
+            file_record = self.file_repo.get_file_by_id(block.file_id)
+            if not file_record or not file_record.storage_key:
+                return None
+
+            storage = get_storage()
+            image_data = await storage.download(file_record.storage_key)
+            b64 = base64.b64encode(image_data).decode()
+            mime = file_record.mimetype or "image/jpeg"
+
+            return {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime};base64,{b64}",
+                },
+            }
+        except Exception as e:
+            logger.warning(f"图片 base64 注入失败 (file_id={block.file_id}): {e}")
+            return None
 
     @staticmethod
     def _inject_file_content(
@@ -192,6 +296,13 @@ class ChatService:
         result = messages.copy()
         result[-1] = {"role": "user", "content": enhanced}
         return result
+
+    def _is_image_file(self, file_id: str) -> bool:
+        """判断 file_id 对应的文件是否为图片"""
+        file_record = self.file_repo.get_file_by_id(file_id)
+        if not file_record:
+            return False
+        return is_image_mime(file_record.mimetype or "")
 
     async def _handle_non_stream(
         self,

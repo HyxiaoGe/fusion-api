@@ -27,10 +27,20 @@ class Settings(BaseSettings):
     MAX_FILE_SIZE: int = 10 * 1024 * 1024  # 10MB
     ALLOWED_FILE_TYPES: List[str] = [
         "image/jpeg", "image/png", "image/gif", "image/bmp", "image/webp",
+        "image/heic", "image/heif",
         "application/pdf",
         "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "text/plain", "text/markdown", "text/csv"
     ]
+
+    # 存储后端配置（"local" 或 "minio"）
+    STORAGE_BACKEND: str = os.getenv("STORAGE_BACKEND", "local")
+    MINIO_ENDPOINT: str = os.getenv("MINIO_ENDPOINT", "")
+    MINIO_ACCESS_KEY: str = os.getenv("MINIO_ACCESS_KEY", "")
+    MINIO_SECRET_KEY: str = os.getenv("MINIO_SECRET_KEY", "")
+    MINIO_BUCKET: str = os.getenv("MINIO_BUCKET", "fusion-files")
+    MINIO_USE_SSL: bool = os.getenv("MINIO_USE_SSL", "false").lower() == "true"
+    MINIO_PRESIGN_EXPIRES: int = int(os.getenv("MINIO_PRESIGN_EXPIRES", "3600"))
 
     # Github OAuth
     GITHUB_CLIENT_ID: Optional[str] = None

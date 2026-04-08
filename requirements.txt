@@ -24,3 +24,6 @@ passlib[bcrypt]
 itsdangerous
 redis[hiredis]>=5.0.0
 apscheduler>=3.10.0,<4.0.0
+boto3>=1.34.0
+Pillow>=10.0.0
+pillow-heif>=0.15.0

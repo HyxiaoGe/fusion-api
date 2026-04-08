@@ -352,6 +352,11 @@ class FileRepository:
                 status=file_data.get("status", "pending"),
                 processing_result=file_data.get("processing_result"),
                 parsed_content=file_data.get("parsed_content"),
+                storage_key=file_data.get("storage_key"),
+                thumbnail_key=file_data.get("thumbnail_key"),
+                storage_backend=file_data.get("storage_backend", "local"),
+                width=file_data.get("width"),
+                height=file_data.get("height"),
             )
             self.db.add(db_file)
             self.db.commit()

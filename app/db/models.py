@@ -67,10 +67,18 @@ class File(Base):
     original_filename = Column(String, nullable=False)  # 原始文件名
     mimetype = Column(String, nullable=False)  # 文件MIME类型
     size = Column(Integer, nullable=False)  # 文件大小(字节)
-    path = Column(String, nullable=False)  # 存储路径
+    path = Column(String, nullable=False)  # 存储路径（兼容旧数据）
     status = Column(String, nullable=False, default="pending")  # 状态
     processing_result = Column(JSON, nullable=True)  # 处理结果
     parsed_content = Column(Text, nullable=True)  # 解析后的内容
+
+    # 图片相关字段（阶段2新增）
+    storage_key = Column(String, nullable=True)       # 处理图的存储键
+    thumbnail_key = Column(String, nullable=True)     # 缩略图的存储键
+    storage_backend = Column(String, default="local") # 存储后端标识（"local" 或 "minio"）
+    width = Column(Integer, nullable=True)            # 图片宽度
+    height = Column(Integer, nullable=True)           # 图片高度
+
     created_at = Column(DateTime, default=get_china_time)
     updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
 

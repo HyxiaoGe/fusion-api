@@ -31,6 +31,9 @@ class FileBlock(BaseModel):
     file_id: str
     filename: str
     mime_type: str
+    thumbnail_url: Optional[str] = None   # 缩略图 URL（presigned 或 API 代理）
+    width: Optional[int] = None           # 图片宽度
+    height: Optional[int] = None          # 图片高度
 
 
 class SearchSource(BaseModel):

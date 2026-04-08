@@ -13,7 +13,22 @@ from app.core.config import settings
 from app.core.logger import app_logger as logger
 from app.db.repositories import FileRepository, ConversationRepository
 from app.processor.file_processor import FileProcessor
+from app.processor.image_processor import ImageProcessor
 from app.schemas.chat import Conversation
+from app.services.storage import get_storage
+from app.services.storage.base import StorageBackend
+
+
+# 图片 MIME 类型集合
+IMAGE_MIME_TYPES = {
+    "image/jpeg", "image/png", "image/gif", "image/bmp", "image/webp",
+    "image/heic", "image/heif",
+}
+
+
+def is_image_mime(mime_type: str) -> bool:
+    """判断 MIME 类型是否为图片"""
+    return mime_type in IMAGE_MIME_TYPES or mime_type.startswith("image/")
 
 
 class FileService:
@@ -23,35 +38,38 @@ class FileService:
         self.db = db
         self.file_repo = FileRepository(db)
         self.base_path = settings.FILE_STORAGE_PATH
-        # 确保存储目录存在
+        # 确保存储目录存在（兼容本地模式）
         os.makedirs(self.base_path, exist_ok=True)
         # 初始化文件处理器
         self.file_processor = FileProcessor()
+        self.image_processor = ImageProcessor()
+        # 获取存储后端
+        self.storage: StorageBackend = get_storage()
 
     def _validate_file(self, file: UploadFile) -> None:
         """验证文件类型和大小"""
-        # 检查文件类型
         allowed_mimetypes = settings.ALLOWED_FILE_TYPES
         if file.content_type not in allowed_mimetypes:
             raise ValueError(f"不支持的文件类型: {file.content_type}")
 
-        # 文件大小检查会在上传过程中进行
-
     def _safe_filename(self, filename: str) -> str:
         """生成安全的文件名"""
-        # 移除不安全字符
         safe_filename = "".join(c for c in filename if c.isalnum() or c in "._- ")
         return safe_filename
 
-    async def upload_files(self, files: List[UploadFile], user_id: str, conversation_id: str, provider: str, model: str) -> List[str]:
-        """处理文件上传并关联到对话"""
-        file_ids = []
+    async def upload_files(self, files: List[UploadFile], user_id: str, conversation_id: str, provider: str, model: str) -> List[Dict[str, Any]]:
+        """
+        处理文件上传并关联到对话。
+
+        Returns:
+            包含 file_id 和 thumbnail_url 的字典列表
+        """
+        results = []
 
         conv_repo = ConversationRepository(self.db)
         conversation = conv_repo.get_by_id(conversation_id, user_id)
 
         if not conversation:
-            # 如果会话不存在，需要创建一个与用户关联的新会话
             model = model or settings.DEFAULT_MODEL
             temp_conversation = Conversation(
                 id=conversation_id,
@@ -70,89 +88,184 @@ class FileService:
         if existing_count + len(files) > 5:
             raise ValueError(f"每个对话最多支持5个文件，当前已有{existing_count}个")
 
-        # 确保对话目录存在
+        # 确保对话目录存在（兼容本地模式）
         conversation_dir = os.path.join(self.base_path, conversation_id)
         os.makedirs(conversation_dir, exist_ok=True)
 
-        # 处理每个文件
         for file in files:
-            # 验证文件类型
             self._validate_file(file)
 
-            # 生成文件ID和存储路径
             file_id = str(uuid.uuid4())
             safe_filename = self._safe_filename(file.filename)
-            file_path = os.path.join(conversation_dir, f"{file_id}_{safe_filename}")
 
-            # 保存文件
             try:
-                # 读取文件内容，检查大小
                 content = await file.read()
                 if len(content) > settings.MAX_FILE_SIZE:
                     raise ValueError(f"文件过大，最大允许{settings.MAX_FILE_SIZE / (1024 * 1024)}MB")
 
-                # 写入文件
-                async with aiofiles.open(file_path, "wb") as f:
-                    await f.write(content)
-
-                # 重置文件指针，以便后续可能的操作
                 await file.seek(0)
+
+                mime_type = file.content_type
+                thumbnail_url = None
+                storage_key = None
+                thumbnail_key = None
+                width = None
+                height = None
+
+                if is_image_mime(mime_type):
+                    # 图片走预处理管线
+                    result = await self._process_and_store_image(
+                        content, mime_type, conversation_id, file_id
+                    )
+                    storage_key = result["storage_key"]
+                    thumbnail_key = result["thumbnail_key"]
+                    thumbnail_url = result["thumbnail_url"]
+                    mime_type = result["mime_type"]
+                    width = result["width"]
+                    height = result["height"]
+                    file_status = "processed"  # 图片预处理完成即可用
+                    file_path = storage_key  # 存储 key 作为路径
+                else:
+                    # 非图片文件：沿用现有流程写入存储
+                    file_path_local = os.path.join(conversation_dir, f"{file_id}_{safe_filename}")
+                    storage_key = f"{conversation_id}/{file_id}/{safe_filename}"
+
+                    await self.storage.upload(storage_key, content, mime_type)
+
+                    # 兼容本地模式：同时写一份到本地（供 file_processor 读取）
+                    if settings.STORAGE_BACKEND == "local":
+                        file_path = os.path.join(self.base_path, storage_key)
+                    else:
+                        # MinIO 模式：仍需本地临时文件供 LLM 解析
+                        async with aiofiles.open(file_path_local, "wb") as f:
+                            await f.write(content)
+                        file_path = file_path_local
+
+                    file_status = "parsing"
 
                 # 创建文件记录
                 file_record = {
                     "id": file_id,
                     "user_id": user_id,
-                    "filename": os.path.basename(file_path),
+                    "filename": os.path.basename(f"{file_id}_{safe_filename}"),
                     "original_filename": file.filename,
-                    "mimetype": file.content_type,
+                    "mimetype": mime_type,
                     "size": len(content),
                     "path": file_path,
-                    "status": "parsing",
-                    "processing_result": None
+                    "status": file_status,
+                    "processing_result": None,
+                    "storage_key": storage_key,
+                    "thumbnail_key": thumbnail_key,
+                    "storage_backend": settings.STORAGE_BACKEND,
+                    "width": width,
+                    "height": height,
                 }
 
-                # 保存到数据库
                 self.file_repo.create_file(file_record)
                 self.file_repo.link_file_to_conversation(conversation_id, file_id)
 
-                file_ids.append(file_id)
+                result_item = {"file_id": file_id, "thumbnail_url": thumbnail_url}
+                results.append(result_item)
 
-                # 异步解析文件内容
-                asyncio.create_task(
-                    self._parse_file_with_llm(
-                        file_id=file_id,
-                        file_path=file_path
+                # 非图片文件：启动异步 LLM 解析
+                if not is_image_mime(file.content_type):
+                    asyncio.create_task(
+                        self._parse_file_with_llm(file_id=file_id, file_path=file_path)
                     )
-                )
 
-                logger.info(f"文件上传成功: {file_id}, 原始文件名: {file.filename}")
+                logger.info(f"文件上传成功: {file_id}, 原始文件名: {file.filename}, 类型: {file.content_type}")
 
             except Exception as e:
                 logger.error(f"文件上传失败: {e}, 文件名: {file.filename}")
-                # 清理可能已创建的文件
-                if os.path.exists(file_path):
-                    os.remove(file_path)
                 raise
 
-        return file_ids
+        return results
+
+    async def _process_and_store_image(
+        self, content: bytes, mime_type: str, conversation_id: str, file_id: str
+    ) -> Dict[str, Any]:
+        """图片预处理 + 存储处理图和缩略图"""
+        # Pillow 预处理
+        processed = await self.image_processor.process(content, mime_type)
+
+        # 确定文件扩展名
+        ext_map = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/webp": ".webp",
+            "image/gif": ".gif",
+        }
+        ext = ext_map.get(processed["mime_type"], ".jpg")
+
+        # 存储键
+        storage_key = f"{conversation_id}/{file_id}/processed{ext}"
+        thumbnail_key = f"{conversation_id}/{file_id}/thumbnail{ext}"
+
+        # 上传到存储后端
+        await self.storage.upload(storage_key, processed["processed"], processed["mime_type"])
+        await self.storage.upload(thumbnail_key, processed["thumbnail"], processed["mime_type"])
+
+        # 获取缩略图访问 URL
+        thumbnail_url = await self.storage.get_url(
+            thumbnail_key, expires=settings.MINIO_PRESIGN_EXPIRES
+        )
+
+        return {
+            "storage_key": storage_key,
+            "thumbnail_key": thumbnail_key,
+            "thumbnail_url": thumbnail_url,
+            "mime_type": processed["mime_type"],
+            "width": processed["width"],
+            "height": processed["height"],
+        }
+
+    async def get_file_url(self, file_id: str, user_id: str, variant: str = "thumbnail") -> Optional[str]:
+        """获取文件访问 URL"""
+        file = self.file_repo.get_file_by_id(file_id, user_id=user_id)
+        if not file:
+            return None
+
+        key = file.thumbnail_key if variant == "thumbnail" else file.storage_key
+        if not key:
+            return None
+
+        return await self.storage.get_url(key, expires=settings.MINIO_PRESIGN_EXPIRES)
+
+    async def get_file_content(self, file_id: str, user_id: str, variant: str = "thumbnail") -> Optional[tuple]:
+        """
+        获取文件内容（用于本地模式代理）。
+
+        Returns:
+            (bytes, mime_type) 或 None
+        """
+        file = self.file_repo.get_file_by_id(file_id, user_id=user_id)
+        if not file:
+            return None
+
+        key = file.thumbnail_key if variant == "thumbnail" else file.storage_key
+        if not key:
+            return None
+
+        try:
+            data = await self.storage.download(key)
+            return data, file.mimetype
+        except FileNotFoundError:
+            return None
 
     async def _parse_file_with_llm(self, file_id: str, file_path: str) -> None:
         """使用LLM模型解析文件内容"""
         try:
-            # 获取文件信息
             file = self.file_repo.get_file_by_id(file_id)
             if not file:
                 logger.warning(f"要解析的文件不存在: {file_id}")
                 return
 
-            # 使用文件处理器解析文件
             response = await self.file_processor.process_files(
                 file_paths=[file_path],
                 query=self._get_file_parsing_prompt(file.mimetype, file.original_filename),
                 mime_types=[file.mimetype]
             )
 
-            # 获取解析结果
             error_message = response.get("error")
             if error_message:
                 raise RuntimeError(error_message)
@@ -176,7 +289,7 @@ class FileService:
             self._mark_file_error(file_id, str(e))
 
     def _mark_file_error(self, file_id: str, message: str) -> None:
-        """统一记录文件解析失败状态。"""
+        """统一记录文件解析失败状态"""
         self.file_repo.update_file(
             file_id=file_id,
             updates={
@@ -187,14 +300,14 @@ class FileService:
 
     @staticmethod
     def _build_success_processing_result() -> Dict[str, str]:
-        """统一构造文件解析成功结果。"""
+        """统一构造文件解析成功结果"""
         return {
             "status": "success",
             "timestamp": datetime.now().isoformat(),
         }
 
     def _build_processed_file_updates(self, parsed_content: str) -> Dict[str, Any]:
-        """统一构造文件解析成功后的更新内容。"""
+        """统一构造文件解析成功后的更新内容"""
         return {
             "status": "processed",
             "parsed_content": parsed_content,
@@ -203,12 +316,11 @@ class FileService:
 
     @staticmethod
     def _normalize_parsed_content(content: Any) -> Optional[str]:
-        """将解析结果规范化为可持久化文本。"""
+        """将解析结果规范化为可持久化文本"""
         if content is None:
             return None
         if isinstance(content, (dict, list)):
             return json.dumps(content, ensure_ascii=False)
-
         text = str(content).strip()
         return text or None
 
@@ -225,13 +337,16 @@ class FileService:
 
     @staticmethod
     def _serialize_file_summary(file_obj) -> Dict[str, Any]:
-        """统一序列化文件列表摘要。"""
+        """统一序列化文件列表摘要"""
         return {
             "id": file_obj.id,
             "filename": file_obj.original_filename,
             "mimetype": file_obj.mimetype,
             "size": file_obj.size,
             "status": file_obj.status,
+            "thumbnail_key": getattr(file_obj, "thumbnail_key", None),
+            "width": getattr(file_obj, "width", None),
+            "height": getattr(file_obj, "height", None),
         }
 
     def get_file_status(self, file_id: str, user_id: str) -> Dict[str, Any]:
@@ -247,7 +362,7 @@ class FileService:
         return [self._serialize_file_summary(f.file) for f in files]
 
     def get_conversation_files_for_user(self, conversation_id: str, user_id: str) -> Optional[List[Dict[str, Any]]]:
-        """获取用户有权访问的对话文件列表。"""
+        """获取用户有权访问的对话文件列表"""
         conv_repo = ConversationRepository(self.db)
         conversation = conv_repo.get_by_id(conversation_id, user_id)
         if not conversation:
@@ -261,26 +376,30 @@ class FileService:
 
     @staticmethod
     def _serialize_file_status(file_obj) -> Dict[str, Any]:
-        """统一序列化文件状态响应。"""
+        """统一序列化文件状态响应"""
         return {
             "id": file_obj.id,
             "status": file_obj.status,
             "processing_result": file_obj.processing_result,
+            "thumbnail_url": None,  # 前端会单独请求 URL
         }
 
-    def delete_file(self, file_id: str, user_id: str) -> bool:
+    async def delete_file(self, file_id: str, user_id: str) -> bool:
         """删除文件，并验证用户权限"""
         file = self.file_repo.get_file_by_id(file_id, user_id=user_id)
         if not file:
             return False
 
-        # 从文件系统删除
+        # 删除存储后端中的文件
         try:
-            if os.path.exists(file.path):
+            if file.storage_key:
+                await self.storage.delete(file.storage_key)
+            if file.thumbnail_key:
+                await self.storage.delete(file.thumbnail_key)
+            # 兼容旧数据：删除本地路径文件
+            if file.path and os.path.exists(file.path):
                 os.remove(file.path)
-        except OSError as e:
-            logger.error(f"删除物理文件失败: {file.path}, 错误: {e}")
-            # 根据策略决定是否继续，这里选择继续删除数据库记录
+        except Exception as e:
+            logger.error(f"删除物理文件失败: {e}")
 
-        # 从数据库删除
         return self.file_repo.delete_file(file_id, user_id)

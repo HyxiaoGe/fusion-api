@@ -13,6 +13,7 @@ from app.db.init_db import init_db
 from app.db.database import SessionLocal
 from app.core.redis import init_redis, close_redis
 from app.services.scheduler_service import start_scheduler, stop_scheduler
+from app.services.storage import init_storage
 
 
 
@@ -55,6 +56,8 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         app_logger.error(f"数据库初始化失败: {e}")
     await init_redis()
+    storage = await init_storage()
+    app_logger.info(f"存储后端初始化完成: {settings.STORAGE_BACKEND}")
     await start_scheduler()
 
     yield

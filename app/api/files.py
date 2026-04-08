@@ -1,6 +1,7 @@
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -23,12 +24,50 @@ async def upload_files(
     """上传文件到指定对话"""
     try:
         file_service = FileService(db)
-        file_ids = await file_service.upload_files(files, current_user.id, conversation_id, provider, model)
-        return {"status": "success", "file_ids": file_ids}
+        results = await file_service.upload_files(files, current_user.id, conversation_id, provider, model)
+        # 兼容旧前端：返回 file_ids 列表 + 新增 files 详情
+        file_ids = [r["file_id"] for r in results]
+        return {"status": "success", "file_ids": file_ids, "files": results}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"文件上传失败: {str(e)}")
+
+
+@router.get("/{file_id}/url")
+async def get_file_url(
+        file_id: str,
+        variant: str = Query("thumbnail", pattern="^(processed|thumbnail)$"),
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    """获取文件访问 URL（presigned URL 或 API 代理路径）"""
+    file_service = FileService(db)
+    url = await file_service.get_file_url(file_id, current_user.id, variant)
+    if not url:
+        raise HTTPException(status_code=404, detail="文件不存在或无权访问")
+    return {"url": url}
+
+
+@router.get("/{file_id}/content")
+async def get_file_content(
+        file_id: str,
+        variant: str = Query("thumbnail", pattern="^(processed|thumbnail)$"),
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    """直接返回文件内容（用于本地存储模式的代理访问）"""
+    file_service = FileService(db)
+    result = await file_service.get_file_content(file_id, current_user.id, variant)
+    if not result:
+        raise HTTPException(status_code=404, detail="文件不存在或无权访问")
+
+    data, mime_type = result
+    return Response(
+        content=data,
+        media_type=mime_type,
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
 
 
 @router.get("/")
@@ -68,14 +107,14 @@ def get_file_status(
 
 
 @router.delete("/{file_id}")
-def delete_file(
+async def delete_file(
         file_id: str,
         db: Session = Depends(get_db),
         current_user: User = Depends(get_current_user)
 ):
     """删除文件"""
     file_service = FileService(db)
-    success = file_service.delete_file(file_id, user_id=current_user.id)
+    success = await file_service.delete_file(file_id, user_id=current_user.id)
     if not success:
         raise HTTPException(status_code=404, detail="文件不存在或删除失败")
     return {"status": "success", "message": "文件已删除"}

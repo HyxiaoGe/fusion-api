@@ -9,6 +9,7 @@ class ModelCapabilities(BaseModel):
     fileSupport: bool = False
     functionCalling: bool = False
     webSearch: bool = False
+    vision: bool = False  # 是否支持图片理解（多模态视觉输入）
 
 
 class ModelPricing(BaseModel):
