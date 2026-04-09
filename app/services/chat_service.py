@@ -1,6 +1,5 @@
 # app/services/chat_service.py
 import asyncio
-import base64
 import uuid as uuid_mod
 from typing import Any, Dict, List, Optional, Union
 
@@ -23,9 +22,9 @@ from app.services.stream_handler import StreamHandler, stream_redis_as_sse
 from app.services.stream_state_service import init_stream
 from app.services.task_manager import register_task
 from app.services.chat.utils import ChatUtils
-
-# 历史消息中保留图片的最大轮数（避免 token 爆炸）
-MAX_VISION_HISTORY_TURNS = 3
+from app.services.chat.message_builder import (
+    build_llm_messages, inject_file_content, is_image_file,
+)
 
 
 class ChatService:
@@ -102,23 +101,6 @@ class ChatService:
 
         conversation.messages.append(user_message)
 
-        # 将会话历史转为 LiteLLM 所需的 dict 格式（支持多模态）
-        lm_messages = await self._build_llm_messages(
-            conversation.messages, has_vision=has_vision
-        )
-
-        # 非图片文件仍走文本注入（图片由 _build_llm_messages 处理 base64 注入）
-        if file_ids:
-            non_image_ids = [
-                fid for fid in file_ids if not self._is_image_file(fid)
-            ]
-            if non_image_ids:
-                file_contents = self.file_repo.get_parsed_file_content(non_image_ids)
-                if file_contents:
-                    lm_messages = self._inject_file_content(
-                        lm_messages, message, file_contents
-                    )
-
         if stream:
             # 预分配 assistant 消息 ID 和 task ID
             assistant_message_id = str(uuid_mod.uuid4())
@@ -129,6 +111,7 @@ class ChatService:
             await init_stream(conversation.id, str(user_id), model_id, assistant_message_id, task_id)
 
             # 启动后台生成任务（独立于 HTTP 连接生命周期）
+            # 图片 base64 编码等耗时操作在后台任务中完成，不阻塞 SSE 首字节
             task = asyncio.create_task(
                 self.stream_handler.generate_to_redis(
                     conversation_id=conversation.id,
@@ -137,7 +120,10 @@ class ChatService:
                     litellm_model=litellm_model,
                     litellm_kwargs=litellm_kwargs,
                     provider=provider,
-                    messages=lm_messages,
+                    raw_messages=conversation.messages,
+                    has_vision=has_vision,
+                    file_ids=file_ids,
+                    original_message=message,
                     assistant_message_id=assistant_message_id,
                     task_id=task_id,
                     options=options,
@@ -159,6 +145,20 @@ class ChatService:
                 },
             )
         else:
+            # 非流式模式：同步构建消息（含图片 base64）
+            lm_messages = await build_llm_messages(
+                conversation.messages, has_vision=has_vision, file_repo=self.file_repo
+            )
+            if file_ids:
+                non_image_ids = [
+                    fid for fid in file_ids if not is_image_file(fid, self.file_repo)
+                ]
+                if non_image_ids:
+                    file_contents = self.file_repo.get_parsed_file_content(non_image_ids)
+                    if file_contents:
+                        lm_messages = inject_file_content(
+                            lm_messages, message, file_contents
+                        )
             return await self._handle_non_stream(
                 litellm_model, model_id, litellm_kwargs,
                 lm_messages, conversation.id, options,
@@ -184,125 +184,6 @@ class ChatService:
             title=message[:30] + "..." if len(message) > 30 else message,
             messages=[],
         )
-
-    async def _build_llm_messages(
-        self,
-        messages: List[Message],
-        has_vision: bool = False,
-    ) -> List[dict]:
-        """
-        将 content blocks 消息列表转为 LLM 可消费的 dict 格式。
-        - thinking / search block 不传给 LLM（避免污染上下文）
-        - 当 has_vision=True 时，图片 FileBlock 转为 base64 image_url 内容块
-        - 历史消息中的图片仅保留最近 MAX_VISION_HISTORY_TURNS 轮
-        """
-        result = []
-
-        # 计算最近 N 轮用户消息的起始索引，用于控制图片注入范围
-        vision_cutoff_idx = 0
-        if has_vision:
-            user_msg_count = 0
-            for i in range(len(messages) - 1, -1, -1):
-                if messages[i].role == "user":
-                    user_msg_count += 1
-                    if user_msg_count >= MAX_VISION_HISTORY_TURNS:
-                        vision_cutoff_idx = i
-                        break
-
-        for idx, msg in enumerate(messages):
-            content_parts = []
-            has_image = False
-            # 仅在最近几轮中注入图片 base64
-            inject_images = has_vision and idx >= vision_cutoff_idx
-
-            for block in msg.content:
-                if block.type == "text":
-                    if block.text:
-                        content_parts.append({
-                            "type": "text",
-                            "text": block.text,
-                        })
-
-                elif block.type == "file" and inject_images:
-                    # 图片 FileBlock → base64 image_url
-                    mime = getattr(block, "mime_type", "")
-                    if is_image_mime(mime):
-                        image_part = await self._file_block_to_image_part(block)
-                        if image_part:
-                            content_parts.append(image_part)
-                            has_image = True
-
-                # thinking / search block 不传给 LLM
-
-            if not content_parts:
-                continue
-
-            # 无图片时退化为纯文本（节省 token 开销）
-            if (
-                not has_image
-                and len(content_parts) == 1
-                and content_parts[0]["type"] == "text"
-            ):
-                result.append({
-                    "role": msg.role,
-                    "content": content_parts[0]["text"],
-                })
-            else:
-                result.append({
-                    "role": msg.role,
-                    "content": content_parts,
-                })
-
-        return result
-
-    async def _file_block_to_image_part(self, block) -> Optional[dict]:
-        """将图片 FileBlock 转为 LiteLLM image_url content part"""
-        try:
-            file_record = self.file_repo.get_file_by_id(block.file_id)
-            if not file_record or not file_record.storage_key:
-                return None
-
-            storage = get_storage()
-            image_data = await storage.download(file_record.storage_key)
-            b64 = base64.b64encode(image_data).decode()
-            mime = file_record.mimetype or "image/jpeg"
-
-            return {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{mime};base64,{b64}",
-                },
-            }
-        except Exception as e:
-            logger.warning(f"图片 base64 注入失败 (file_id={block.file_id}): {e}")
-            return None
-
-    @staticmethod
-    def _inject_file_content(
-        messages: List[dict],
-        original_message: str,
-        file_contents: Dict[str, str],
-    ) -> List[dict]:
-        """将文件内容注入到最后一条用户消息的文本中"""
-        if not messages:
-            return messages
-
-        combined = "\n\n".join(
-            f"文件内容 ({i + 1}):\n{content}"
-            for i, content in enumerate(file_contents.values())
-        )
-        enhanced = f"{original_message}\n\n以下是相关文件内容，请结合这些内容回答：\n{combined}"
-
-        result = messages.copy()
-        result[-1] = {"role": "user", "content": enhanced}
-        return result
-
-    def _is_image_file(self, file_id: str) -> bool:
-        """判断 file_id 对应的文件是否为图片"""
-        file_record = self.file_repo.get_file_by_id(file_id)
-        if not file_record:
-            return False
-        return is_image_mime(file_record.mimetype or "")
 
     async def _handle_non_stream(
         self,

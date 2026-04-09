@@ -19,6 +19,10 @@ from app.schemas.chat import (
     Message, TextBlock, ThinkingBlock, SearchBlock, SearchSource, Usage,
     StreamChunk, StreamChoice, StreamDelta,
 )
+from app.db.repositories import FileRepository
+from app.services.chat.message_builder import (
+    build_llm_messages, inject_file_content, is_image_file,
+)
 from app.services.stream_state_service import (
     init_stream,
     append_chunk,
@@ -45,7 +49,10 @@ class StreamHandler:
         litellm_model: str,
         litellm_kwargs: dict,
         provider: str,
-        messages: list[dict],
+        raw_messages: list,
+        has_vision: bool,
+        file_ids: Optional[list],
+        original_message: str,
         assistant_message_id: str,
         task_id: str,
         options: Optional[dict] = None,
@@ -54,6 +61,9 @@ class StreamHandler:
         """
         后台任务：调用 LLM，chunk 写入 Redis Stream，完成后落库 PostgreSQL。
         生命周期完全独立于 HTTP 连接。
+
+        消息构建（含图片 base64 编码）在此后台任务中完成，
+        不阻塞 SSE 首字节返回。
 
         支持 web_search tool_call 检测：
         - capabilities.functionCalling=true 时，传 tools=[web_search]
@@ -90,6 +100,23 @@ class StreamHandler:
         db = SessionLocal()
 
         try:
+            # 在后台任务中构建 LLM 消息（含图片 base64 编码），不阻塞主请求
+            file_repo = FileRepository(db)
+            messages = await build_llm_messages(raw_messages, has_vision, file_repo)
+
+            # 非图片文件内容注入
+            if file_ids:
+                non_image_ids = [
+                    fid for fid in file_ids
+                    if not is_image_file(fid, file_repo)
+                ]
+                if non_image_ids:
+                    file_contents = file_repo.get_parsed_file_content(non_image_ids)
+                    if file_contents:
+                        messages = inject_file_content(
+                            messages, original_message, file_contents
+                        )
+
             response = await litellm.acompletion(
                 model=litellm_model,
                 messages=messages,
