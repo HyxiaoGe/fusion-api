@@ -603,6 +603,31 @@ class ModelSourceRepository:
         self.db.commit()
         return True
     
+    def get_providers(self) -> list:
+        """从数据库聚合去重提供商列表，按最小优先级排序"""
+        from sqlalchemy import func
+        from app.ai.llm_manager import get_model_display_name
+
+        rows = (
+            self.db.query(
+                ModelSource.provider,
+                func.min(ModelSource.priority).label("min_priority"),
+            )
+            .filter(ModelSource.enabled == True)
+            .group_by(ModelSource.provider)
+            .order_by(func.min(ModelSource.priority))
+            .all()
+        )
+
+        providers = []
+        for idx, row in enumerate(rows, start=1):
+            providers.append({
+                "id": row.provider,
+                "name": get_model_display_name(row.provider),
+                "order": idx,
+            })
+        return providers
+
     def to_basic_schema(self, model_source: ModelSource) -> ModelBasicInfo:
         """将数据库模型转换为基础Pydantic模型"""
         capabilities = ModelCapabilities(**model_source.capabilities)

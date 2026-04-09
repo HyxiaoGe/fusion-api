@@ -11,6 +11,7 @@ from app.db.repositories import ModelSourceRepository, ModelCredentialRepository
 from app.schemas.models import (
     ModelInfo,
     ModelsResponse,
+    ProviderInfo,
     ModelCreate,
     ModelUpdate,
     ModelCredentialInfo,
@@ -37,7 +38,8 @@ async def get_models(
     
     # 将数据库模型转换为Pydantic模型
     models = [repository.to_basic_schema(model) for model in model_sources]
-    return ModelsResponse(models=models)
+    providers = [ProviderInfo(**p) for p in repository.get_providers()]
+    return ModelsResponse(models=models, providers=providers)
 
 
 @router.get("/{model_id}/credentials", response_model=CredentialsResponse)

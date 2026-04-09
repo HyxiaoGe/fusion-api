@@ -5,16 +5,13 @@ from app.ai.llm_manager import get_model_display_name, LLMManager, PROVIDER_LITE
 
 
 class LLMManagerTests(unittest.TestCase):
-    def test_get_model_display_name_uses_wenxin_key(self):
-        self.assertEqual(get_model_display_name("wenxin"), "文心一言")
-
     def test_get_model_display_name_returns_raw_for_unknown(self):
         self.assertEqual(get_model_display_name("unknown_provider"), "unknown_provider")
 
     def test_provider_prefix_mapping_covers_all_providers(self):
         expected_providers = {
             "openai", "anthropic", "deepseek", "google",
-            "qwen", "volcengine", "wenxin", "hunyuan", "xai",
+            "qwen", "volcengine", "xai",
         }
         self.assertEqual(set(PROVIDER_LITELLM_PREFIX.keys()), expected_providers)
 

@@ -25,7 +25,7 @@ PROVIDER_LITELLM_PREFIX = {
 }
 
 # 需要自定义 api_base 的 provider（从凭证里读取 base_url）
-CUSTOM_BASE_URL_PROVIDERS = {"qwen", "volcengine", "wenxin", "hunyuan"}
+CUSTOM_BASE_URL_PROVIDERS = {"qwen", "volcengine"}
 
 
 class LLMManager:

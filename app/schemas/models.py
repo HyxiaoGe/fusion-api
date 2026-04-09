@@ -88,10 +88,18 @@ class ModelUpdate(BaseModel):
     enabled: Optional[bool] = None
     description: Optional[str] = None
 
+class ProviderInfo(BaseModel):
+    """提供商信息"""
+    id: str
+    name: str
+    order: int
+
+
 # 模型列表响应
 class ModelsResponse(BaseModel):
     """模型列表响应"""
     models: List[ModelBasicInfo]
+    providers: List[ProviderInfo] = []
 
 class ModelCredentialInfo(BaseModel):
     """模型凭证信息"""
