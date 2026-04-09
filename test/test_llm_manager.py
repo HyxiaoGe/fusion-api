@@ -12,6 +12,7 @@ class LLMManagerTests(unittest.TestCase):
         expected_providers = {
             "openai", "anthropic", "deepseek", "google",
             "qwen", "volcengine", "xai",
+            "xiaomi", "minimax", "moonshot",
         }
         self.assertEqual(set(PROVIDER_LITELLM_PREFIX.keys()), expected_providers)
 

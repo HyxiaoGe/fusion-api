@@ -38,6 +38,8 @@ services:
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
       - REDIS_URL=${REDIS_URL:-redis://middleware-redis:6379/0}
       - MOONSHOT_API_KEY=${MOONSHOT_API_KEY:-}
+      - XIAOMI_API_KEY=${XIAOMI_API_KEY:-}
+      - MINIMAX_API_KEY=${MINIMAX_API_KEY:-}
     deploy:
       resources:
         limits:
