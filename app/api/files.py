@@ -1,15 +1,40 @@
-from typing import List
+import logging
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Form, Query
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
 from app.db.models import User
 from app.services.file_service import FileService
-from app.core.security import get_current_user
+from app.core.security import get_current_user, jwt_validator
+from app.core.file_token import verify_file_token
+from app.db.repositories import UserRepository
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _resolve_user_from_bearer(request: Request, db: Session) -> Optional[User]:
+    """
+    从 Authorization header 中提取 Bearer token 并验证用户。
+    成功返回 User，失败返回 None（不抛异常）。
+    """
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+
+    token = auth_header[len("Bearer "):]
+    try:
+        payload = jwt_validator.verify(token)
+        subject = payload.get("sub")
+        if not subject:
+            return None
+        user_repo = UserRepository(db)
+        return user_repo.get(subject)
+    except Exception:
+        return None
 
 
 @router.post("/upload")
@@ -53,12 +78,35 @@ async def get_file_url(
 async def get_file_content(
         file_id: str,
         variant: str = Query("thumbnail", pattern="^(processed|thumbnail)$"),
+        token: Optional[str] = Query(None),
+        request: Request = None,
         db: Session = Depends(get_db),
-        current_user: User = Depends(get_current_user)
 ):
-    """直接返回文件内容（用于本地存储模式的代理访问）"""
+    """
+    直接返回文件内容（用于本地存储模式的代理访问）。
+
+    认证方式（二选一）：
+    - Bearer token（Authorization header）
+    - 签名 token（?token=xxx query 参数，本地存储签名 URL 使用）
+    """
+    user_id: Optional[str] = None
+
+    # 优先尝试 Bearer token 认证
+    current_user = _resolve_user_from_bearer(request, db)
+    if current_user:
+        user_id = current_user.id
+    elif token:
+        # 签名 token 认证：验证签名和过期时间，匹配 file_id
+        verified_file_id = verify_file_token(token)
+        if not verified_file_id or verified_file_id != file_id:
+            raise HTTPException(status_code=401, detail="无效或过期的文件访问令牌")
+        # 签名 token 已验证 file_id，跳过 user_id 过滤（token 本身即授权凭证）
+        user_id = None
+    else:
+        raise HTTPException(status_code=401, detail="需要认证才能访问文件")
+
     file_service = FileService(db)
-    result = await file_service.get_file_content(file_id, current_user.id, variant)
+    result = await file_service.get_file_content(file_id, user_id, variant)
     if not result:
         raise HTTPException(status_code=404, detail="文件不存在或无权访问")
 

@@ -15,6 +15,7 @@ from app.db.repositories import FileRepository, ConversationRepository
 from app.processor.file_processor import FileProcessor
 from app.processor.image_processor import ImageProcessor
 from app.schemas.chat import Conversation
+from app.core.file_token import generate_file_token
 from app.services.storage import get_storage
 from app.services.storage.base import StorageBackend
 
@@ -45,6 +46,18 @@ class FileService:
         self.image_processor = ImageProcessor()
         # 获取存储后端
         self.storage: StorageBackend = get_storage()
+
+    @staticmethod
+    def _sign_local_url(url: str, file_id: str, expires: int) -> str:
+        """
+        为本地存储模式的相对路径 URL 追加签名 token。
+        MinIO presigned URL（绝对路径）直接原样返回。
+        """
+        if not url.startswith("/"):
+            return url
+        token = generate_file_token(file_id, expires)
+        separator = "&" if "?" in url else "?"
+        return f"{url}{separator}token={token}"
 
     def _validate_file(self, file: UploadFile) -> None:
         """验证文件类型和大小"""
@@ -204,10 +217,11 @@ class FileService:
         await self.storage.upload(storage_key, processed["processed"], processed["mime_type"])
         await self.storage.upload(thumbnail_key, processed["thumbnail"], processed["mime_type"])
 
-        # 获取缩略图访问 URL
+        # 获取缩略图访问 URL（本地存储模式追加签名 token）
         thumbnail_url = await self.storage.get_url(
             thumbnail_key, expires=settings.MINIO_PRESIGN_EXPIRES
         )
+        thumbnail_url = self._sign_local_url(thumbnail_url, file_id, settings.MINIO_PRESIGN_EXPIRES)
 
         return {
             "storage_key": storage_key,
@@ -219,7 +233,7 @@ class FileService:
         }
 
     async def get_file_url(self, file_id: str, user_id: str, variant: str = "thumbnail") -> Optional[str]:
-        """获取文件访问 URL"""
+        """获取文件访问 URL（MinIO 返回 presigned URL，本地存储返回带签名的代理 URL）"""
         file = self.file_repo.get_file_by_id(file_id, user_id=user_id)
         if not file:
             return None
@@ -228,7 +242,8 @@ class FileService:
         if not key:
             return None
 
-        return await self.storage.get_url(key, expires=settings.MINIO_PRESIGN_EXPIRES)
+        url = await self.storage.get_url(key, expires=settings.MINIO_PRESIGN_EXPIRES)
+        return self._sign_local_url(url, file_id, settings.MINIO_PRESIGN_EXPIRES)
 
     async def get_file_content(self, file_id: str, user_id: str, variant: str = "thumbnail") -> Optional[tuple]:
         """
