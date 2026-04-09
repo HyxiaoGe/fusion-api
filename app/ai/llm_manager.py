@@ -22,13 +22,13 @@ PROVIDER_LITELLM_PREFIX = {
     "deepseek":    "deepseek",                # 直连
     "qwen":        "openai",                  # 通义千问使用 OpenAI 兼容接口
     "volcengine":  "openai",                  # 火山引擎使用 OpenAI 兼容接口
-    "xiaomi":      "xiaomi_mimo",             # 小米 MiMo，LiteLLM 原生支持
-    "minimax":     "minimax",                 # MiniMax，LiteLLM 原生支持
+    "xiaomi":      "openai",                  # 小米 MiMo，OpenAI 兼容接口
+    "minimax":     "openai",                  # MiniMax，OpenAI 兼容接口
     "moonshot":    "moonshot",                # 月之暗面，LiteLLM 原生支持
 }
 
 # 需要自定义 api_base 的 provider（从凭证里读取 base_url）
-CUSTOM_BASE_URL_PROVIDERS = {"qwen", "volcengine"}
+CUSTOM_BASE_URL_PROVIDERS = {"qwen", "volcengine", "xiaomi", "minimax"}
 
 
 class LLMManager:
