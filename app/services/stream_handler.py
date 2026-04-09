@@ -100,6 +100,11 @@ class StreamHandler:
         db = SessionLocal()
 
         try:
+            # 立即推送 preparing 事件，让前端收到 SSE 首帧
+            # → 新对话：触发 onReady → 页面跳转 + 显示用户消息
+            # → 已有对话：前端显示 AI 加载状态
+            await append_chunk(conversation_id, "preparing", "", "")
+
             # 在后台任务中构建 LLM 消息（含图片 base64 编码），不阻塞主请求
             file_repo = FileRepository(db)
             messages = await build_llm_messages(raw_messages, has_vision, file_repo)
@@ -609,6 +614,20 @@ async def stream_redis_as_sse(
 
         # 跳过 start 标记
         if chunk_type == "start":
+            continue
+
+        # preparing 事件：后台任务已启动，前端收到此帧即触发 onReady
+        # 不携带 content，仅作为 SSE 首帧让前端感知到流已开始
+        if chunk_type == "preparing":
+            payload = {
+                "id": message_id,
+                "conversation_id": conversation_id,
+                "choices": [{
+                    "delta": {},
+                    "finish_reason": None,
+                }]
+            }
+            yield f"id: {entry_id}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
             continue
 
         if chunk_type == "reasoning":
