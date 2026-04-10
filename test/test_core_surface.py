@@ -90,9 +90,10 @@ class ChatCoreSurfaceTests(unittest.TestCase):
 
     def test_auth_me_requires_authentication(self):
         response = self.client.get("/api/auth/me")
-
         self.assertEqual(response.status_code, 401)
-        self.assertEqual(response.json()["detail"], "Not authenticated")
+        body = response.json()
+        self.assertEqual(body["code"], "UNAUTHORIZED")
+        self.assertIsNone(body["data"])
 
     def test_send_message_routes_to_chat_service(self):
         self._enable_authenticated_overrides()
@@ -117,7 +118,9 @@ class ChatCoreSurfaceTests(unittest.TestCase):
             response = self.client.post("/api/chat/send", json=payload)
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["conversation_id"], "conv-1")
+        body = response.json()
+        self.assertEqual(body["code"], "SUCCESS")
+        self.assertEqual(body["data"]["conversation_id"], "conv-1")
         service.process_message.assert_awaited_once_with(
             model_id="gpt-4.1",
             message="hello",
@@ -172,7 +175,9 @@ class ChatCoreSurfaceTests(unittest.TestCase):
             response = self.client.get("/api/chat/conversations?page=1&page_size=10")
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["total"], 0)
+        body = response.json()
+        self.assertEqual(body["code"], "SUCCESS")
+        self.assertEqual(body["data"]["total"], 0)
         service.get_conversations_paginated.assert_called_once_with("user-123", 1, 10)
 
     def test_file_upload_routes_to_file_service(self):
@@ -180,7 +185,7 @@ class ChatCoreSurfaceTests(unittest.TestCase):
 
         with patch.object(self.files_api, "FileService") as file_service_cls:
             service = file_service_cls.return_value
-            service.upload_files = AsyncMock(return_value=["file-1", "file-2"])
+            service.upload_files = AsyncMock(return_value=[{"file_id": "file-1"}, {"file_id": "file-2"}])
 
             response = self.client.post(
                 "/api/files/upload",
@@ -192,8 +197,10 @@ class ChatCoreSurfaceTests(unittest.TestCase):
                 files=[("files", ("note.txt", b"hello", "text/plain"))],
             )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"status": "success", "file_ids": ["file-1", "file-2"]})
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual(body["code"], "SUCCESS")
+        self.assertEqual(body["data"]["files"], [{"file_id": "file-1"}, {"file_id": "file-2"}])
         service.upload_files.assert_awaited_once()
         args = service.upload_files.await_args
         self.assertEqual(args.args[1:], ("user-123", "conv-1", "openai", "gpt-4.1"))
@@ -210,7 +217,9 @@ class ChatCoreSurfaceTests(unittest.TestCase):
             response = self.client.get("/api/files/file-404/status")
 
         self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.json()["detail"], "文件不存在或无权访问")
+        body = response.json()
+        self.assertEqual(body["code"], "NOT_FOUND")
+        self.assertEqual(body["message"], "文件不存在或无权访问")
         service.get_file_status.assert_called_once_with("file-404", user_id="user-123")
 
     def test_conversation_files_require_authorized_conversation(self):
@@ -223,7 +232,9 @@ class ChatCoreSurfaceTests(unittest.TestCase):
             response = self.client.get("/api/files/conversation/conv-404")
 
         self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.json()["detail"], "对话不存在或无权访问")
+        body = response.json()
+        self.assertEqual(body["code"], "NOT_FOUND")
+        self.assertEqual(body["message"], "对话不存在或无权访问")
         service.get_conversation_files_for_user.assert_called_once_with("conv-404", "user-123")
 
     def test_conversation_files_use_authenticated_user_scope(self):
@@ -236,7 +247,9 @@ class ChatCoreSurfaceTests(unittest.TestCase):
             response = self.client.get("/api/files/conversation/conv-1")
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"files": [{"id": "file-1"}]})
+        body = response.json()
+        self.assertEqual(body["code"], "SUCCESS")
+        self.assertEqual(body["data"]["files"], [{"id": "file-1"}])
         service.get_conversation_files_for_user.assert_called_once_with("conv-1", "user-123")
 
 
