@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     CHROMA_URL: str = os.getenv("CHROMA_URL", "http://localhost:8001")
 
     # 模型配置
-    DEFAULT_MODEL: str = "qwen"  # 默认使用的模型
+    DEFAULT_MODEL: str = "qwen-max-latest"  # 默认使用的模型（用于标题生成、推荐问题等辅助功能）
 
     # 数据库配置
     DATABASE_URL: str = os.getenv("DATABASE_URL")
