@@ -27,7 +27,7 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
         start_time = time.time()
         try:
             response = await asyncio.wait_for(
-                call_next(request), 
+                call_next(request),
                 timeout=self.timeout_seconds
             )
             # 添加处理时间头

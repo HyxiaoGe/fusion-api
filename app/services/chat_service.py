@@ -223,6 +223,16 @@ class ChatService:
             message=assistant_message,
         )
 
+    # 辅助功能（标题、推荐问题）固定使用的轻量模型，避免 thinking 模型浪费 token 和时间
+    UTILITY_MODEL_ID = "qwen-max-latest"
+
+    def _resolve_utility_model(self, conversation_model_id: str) -> tuple:
+        """解析辅助功能模型，固定用轻量模型，找不到则回退对话模型"""
+        try:
+            return llm_manager.resolve_model(self.UTILITY_MODEL_ID, self.db)
+        except ValueError:
+            return llm_manager.resolve_model(conversation_model_id, self.db)
+
     async def generate_title(
         self,
         user_id: str,
@@ -251,9 +261,7 @@ class ChatService:
 
         try:
             prompt = prompt_manager.format_prompt("generate_title", content=seed_text)
-            litellm_model, _, litellm_kwargs = llm_manager.resolve_model(
-                conversation.model_id, self.db
-            )
+            litellm_model, _, litellm_kwargs = self._resolve_utility_model(conversation.model_id)
             response = await litellm.acompletion(
                 model=litellm_model,
                 messages=[{"role": "user", "content": prompt}],
@@ -304,9 +312,7 @@ class ChatService:
 
         try:
             prompt = prompt_manager.format_prompt("generate_suggested_questions", content=dialog_content)
-            litellm_model, _, litellm_kwargs = llm_manager.resolve_model(
-                conversation.model_id, self.db
-            )
+            litellm_model, _, litellm_kwargs = self._resolve_utility_model(conversation.model_id)
             response = await litellm.acompletion(
                 model=litellm_model,
                 messages=[{"role": "user", "content": prompt}],
