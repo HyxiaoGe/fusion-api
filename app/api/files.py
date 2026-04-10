@@ -10,6 +10,7 @@ from app.core.security import get_current_user, jwt_validator
 from app.db.database import get_db
 from app.db.models import User
 from app.db.repositories import UserRepository
+from app.schemas.response import success
 from app.services.file_service import FileService
 
 logger = logging.getLogger(__name__)
@@ -37,8 +38,9 @@ def _resolve_user_from_bearer(request: Request, db: Session) -> Optional[User]:
         return None
 
 
-@router.post("/upload")
+@router.post("/upload", status_code=201)
 async def upload_files(
+    request: Request,
     provider: str = Form(...),
     model: str = Form(...),
     conversation_id: str = Form(...),
@@ -50,9 +52,7 @@ async def upload_files(
     try:
         file_service = FileService(db)
         results = await file_service.upload_files(files, current_user.id, conversation_id, provider, model)
-        # 兼容旧前端：返回 file_ids 列表 + 新增 files 详情
-        file_ids = [r["file_id"] for r in results]
-        return {"status": "success", "file_ids": file_ids, "files": results}
+        return success(data={"files": results}, message="上传成功", request_id=request.state.request_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -62,16 +62,17 @@ async def upload_files(
 @router.get("/{file_id}/url")
 async def get_file_url(
     file_id: str,
+    request: Request,
     variant: str = Query("thumbnail", pattern="^(processed|thumbnail)$"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """获取文件访问 URL（presigned URL 或 API 代理路径）"""
+    """获取文件访问 URL"""
     file_service = FileService(db)
     url = await file_service.get_file_url(file_id, current_user.id, variant)
     if not url:
         raise HTTPException(status_code=404, detail="文件不存在或无权访问")
-    return {"url": url}
+    return success(data={"url": url}, request_id=request.state.request_id)
 
 
 @router.get("/{file_id}/content")
@@ -119,40 +120,47 @@ async def get_file_content(
 
 
 @router.get("/")
-def get_user_files(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def get_user_files(request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """获取当前用户的所有文件"""
     file_service = FileService(db)
     files = file_service.get_files_by_user(current_user.id)
-    return {"files": files}
+    return success(data={"files": files}, request_id=request.state.request_id)
 
 
 @router.get("/conversation/{conversation_id}")
 def get_conversation_files(
-    conversation_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+    conversation_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """获取对话关联的所有文件"""
     file_service = FileService(db)
     files = file_service.get_conversation_files_for_user(conversation_id, current_user.id)
     if files is None:
         raise HTTPException(status_code=404, detail="对话不存在或无权访问")
-    return {"files": files}
+    return success(data={"files": files}, request_id=request.state.request_id)
 
 
 @router.get("/{file_id}/status")
-def get_file_status(file_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def get_file_status(
+    file_id: str, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+):
     """获取文件处理状态"""
     file_service = FileService(db)
     file = file_service.get_file_status(file_id, user_id=current_user.id)
     if not file:
         raise HTTPException(status_code=404, detail="文件不存在或无权访问")
-    return file
+    return success(data=file, request_id=request.state.request_id)
 
 
 @router.delete("/{file_id}")
-async def delete_file(file_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+async def delete_file(
+    file_id: str, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+):
     """删除文件"""
     file_service = FileService(db)
-    success = await file_service.delete_file(file_id, user_id=current_user.id)
-    if not success:
+    result = await file_service.delete_file(file_id, user_id=current_user.id)
+    if not result:
         raise HTTPException(status_code=404, detail="文件不存在或删除失败")
-    return {"status": "success", "message": "文件已删除"}
+    return success(message="文件已删除", request_id=request.state.request_id)
