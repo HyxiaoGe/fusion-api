@@ -2,7 +2,7 @@ import asyncio
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -14,6 +14,7 @@ from app.core.logger import app_logger
 from app.core.redis import close_redis, init_redis
 from app.db.database import SessionLocal
 from app.db.init_db import init_db
+from app.schemas.response import ApiException, generate_request_id
 from app.services.scheduler_service import start_scheduler, stop_scheduler
 from app.services.storage import init_storage
 
@@ -37,9 +38,10 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
             return JSONResponse(
                 status_code=408,
                 content={
-                    "detail": f"请求超时，处理时间超过{self.timeout_seconds}秒",
-                    "timeout_seconds": self.timeout_seconds,
-                    "process_time": process_time,
+                    "code": "REQUEST_TIMEOUT",
+                    "message": f"请求超时，处理时间超过{self.timeout_seconds}秒",
+                    "data": None,
+                    "request_id": getattr(request.state, "request_id", generate_request_id()),
                 },
                 headers={"X-Process-Time": str(process_time)},
             )
@@ -69,6 +71,15 @@ app = FastAPI(title=settings.APP_NAME, version=settings.APP_VERSION, lifespan=li
 
 # 输出启动日志
 app_logger.info(f"正在启动 {settings.APP_NAME} v{settings.APP_VERSION}")
+
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    request.state.request_id = generate_request_id()
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request.state.request_id
+    return response
+
 
 # 添加 Session 中间件
 app.add_middleware(SessionMiddleware, secret_key=settings.SECRET_KEY)
@@ -115,6 +126,54 @@ async def health_check():
             "timestamp": datetime.now().isoformat(),
             "service": "fusion-api",
         }
+
+
+@app.exception_handler(ApiException)
+async def api_exception_handler(request: Request, exc: ApiException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "code": exc.code,
+            "message": exc.message,
+            "data": None,
+            "request_id": getattr(request.state, "request_id", generate_request_id()),
+        },
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    code_map = {
+        400: "INVALID_PARAM",
+        401: "UNAUTHORIZED",
+        403: "FORBIDDEN",
+        404: "NOT_FOUND",
+        409: "CONFLICT",
+        500: "INTERNAL_ERROR",
+    }
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "code": code_map.get(exc.status_code, "INTERNAL_ERROR"),
+            "message": str(exc.detail),
+            "data": None,
+            "request_id": getattr(request.state, "request_id", generate_request_id()),
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    app_logger.exception("未预期的异常")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "code": "INTERNAL_ERROR",
+            "message": "服务器内部错误",
+            "data": None,
+            "request_id": getattr(request.state, "request_id", generate_request_id()),
+        },
+    )
 
 
 # 注册路由
