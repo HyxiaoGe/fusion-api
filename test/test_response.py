@@ -1,4 +1,18 @@
+import importlib
+import os
+import sys
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+os.environ.setdefault("DATABASE_URL", "sqlite:///./fusion-test.db")
+os.environ.setdefault("SERVER_HOST", "http://dev.example:8002")
+os.environ.setdefault("FRONTEND_URL", "http://dev.example:3004")
+os.environ.setdefault("AUTH_SERVICE_BASE_URL", "http://auth.example:8100")
+os.environ.setdefault("AUTH_SERVICE_CLIENT_ID", "fusion-client")
+os.environ.setdefault("AUTH_SERVICE_JWKS_URL", "http://auth.example:8100/.well-known/jwks.json")
+
+from fastapi.testclient import TestClient
 
 from app.schemas.response import ApiException, ApiResponse, ErrorCode, generate_request_id, success
 
@@ -65,26 +79,6 @@ class TestApiException(unittest.TestCase):
     def test_default_status_code(self):
         exc = ApiException(ErrorCode.INVALID_PARAM, "参数错误")
         self.assertEqual(exc.status_code, 400)
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
-import importlib
-import os
-import sys
-from types import SimpleNamespace
-from unittest.mock import patch
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///./fusion-test.db")
-os.environ.setdefault("SERVER_HOST", "http://dev.example:8002")
-os.environ.setdefault("FRONTEND_URL", "http://dev.example:3004")
-os.environ.setdefault("AUTH_SERVICE_BASE_URL", "http://auth.example:8100")
-os.environ.setdefault("AUTH_SERVICE_CLIENT_ID", "fusion-client")
-os.environ.setdefault("AUTH_SERVICE_JWKS_URL", "http://auth.example:8100/.well-known/jwks.json")
-
-from fastapi.testclient import TestClient
 
 
 class TestRequestIdMiddleware(unittest.TestCase):
