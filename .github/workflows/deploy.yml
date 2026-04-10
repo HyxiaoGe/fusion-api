@@ -9,7 +9,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: 安装检查工具
-        run: pip3 install --quiet ruff
+        run: pip3 install --user --quiet ruff
       - name: 架构检查
         run: python3 scripts/check_architecture.py
       - name: Lint 检查
