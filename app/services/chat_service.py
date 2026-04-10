@@ -57,10 +57,9 @@ class ChatService:
         has_vision = capabilities.get("vision", False)
 
         # 获取或创建会话
-        conversation = self._get_or_create_conversation(
+        conversation, is_new_conversation = self._get_or_create_conversation(
             conversation_id, user_id, model_id, message
         )
-        is_new_conversation = not conversation_id
 
         # 构造用户消息 content blocks
         user_content = [TextBlock(type="text", text=message)]
@@ -92,7 +91,7 @@ class ChatService:
 
         user_message = Message(role="user", content=user_content)
 
-        # 持久化用户消息
+        # 持久化会话（包括前端传了 ID 但数据库不存在的情况）
         if is_new_conversation:
             self.memory_service.save_conversation(conversation)
             self.db.commit()
@@ -170,12 +169,12 @@ class ChatService:
         user_id: str,
         model_id: str,
         message: str,
-    ) -> Conversation:
-        """获取已有会话，或初始化新会话对象"""
+    ) -> tuple:
+        """获取已有会话，或初始化新会话对象。返回 (conversation, is_new)"""
         if conversation_id:
             existing = self.memory_service.get_conversation(conversation_id, user_id)
             if existing:
-                return existing
+                return existing, False
 
         return Conversation(
             id=conversation_id or str(uuid_mod.uuid4()),
@@ -183,7 +182,7 @@ class ChatService:
             model_id=model_id,
             title=message[:30] + "..." if len(message) > 30 else message,
             messages=[],
-        )
+        ), True
 
     async def _handle_non_stream(
         self,
