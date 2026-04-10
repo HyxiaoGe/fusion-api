@@ -136,10 +136,10 @@ class StreamHandler:
             tool_call_name = None
             tool_call_args = ""
 
-            # 第一轮 thinking 缓冲（supports_fc 时不直接推送，等确认是否 tool_call）
+            # 第一轮 tool_call 判断：缓冲 thinking 文本用于持久化决策
+            # thinking 内容始终实时推送给前端，不影响用户体验
             first_round_buffering = supports_fc
             first_round_thinking_buf = ""
-            thinking_pending_sent = False
 
             async for chunk in response:
                 choice = chunk.choices[0] if chunk.choices else None
@@ -205,23 +205,18 @@ class StreamHandler:
                 if reasoning_delta and content_delta == reasoning_delta:
                     content_delta = ""
 
-                # thinking 处理：缓冲模式 vs 直推模式
+                # thinking 处理：始终实时推送到 Redis，缓冲模式下额外记录用于 tool_call 判断
                 if reasoning_delta:
+                    await append_chunk(conversation_id, "reasoning", reasoning_delta, thinking_block_id)
                     if first_round_buffering:
-                        # 缓冲：不写 Redis，但推一个 thinking_pending 让前端显示脉冲动画
+                        # 缓冲记录：如果最终是 tool_call，持久化时丢弃这些内容
                         first_round_thinking_buf += reasoning_delta
-                        if not thinking_pending_sent:
-                            await append_chunk(conversation_id, "thinking_pending", "", thinking_block_id)
-                            thinking_pending_sent = True
                     else:
                         reasoning_buf += reasoning_delta
-                        await append_chunk(conversation_id, "reasoning", reasoning_delta, thinking_block_id)
 
-                # content 出现意味着第一轮结束且没有 tool_call → 回放缓冲的 thinking
+                # content 出现意味着第一轮结束且没有 tool_call → 缓冲的 thinking 转入正式记录
                 if content_delta:
-                    if first_round_buffering and first_round_thinking_buf:
-                        # 回放缓冲的 thinking 到 Redis
-                        await append_chunk(conversation_id, "reasoning", first_round_thinking_buf, thinking_block_id)
+                    if first_round_buffering:
                         reasoning_buf += first_round_thinking_buf
                         first_round_thinking_buf = ""
                         first_round_buffering = False
