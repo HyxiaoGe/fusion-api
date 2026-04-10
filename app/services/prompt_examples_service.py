@@ -6,14 +6,12 @@
 - 缓存到 Redis（TTL 2 小时）
 - 读取时优先 Redis，miss 则查 PostgreSQL 并回填
 """
+
 import json
 import random
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy.orm import Session
-
-from app.core.config import settings
 from app.core.logger import app_logger as logger
 from app.core.redis import get_redis_pool
 from app.db.database import SessionLocal
@@ -54,23 +52,22 @@ async def refresh_prompt_examples() -> None:
 
         # 累积写入（不清除旧数据），池子自然增长
         # 去重：跳过已存在的问题
-        existing = set(
-            r[0] for r in db.query(PromptExample.question)
-            .filter(PromptExample.is_active == True).all()
-        )
+        existing = set(r[0] for r in db.query(PromptExample.question).filter(PromptExample.is_active == True).all())
 
         new_count = 0
         for item in questions:
             if item["question"] in existing:
                 continue
-            db.add(PromptExample(
-                question=item["question"],
-                category=item["category"],
-                source="kimi",
-                is_active=True,
-                created_at=now,
-                expires_at=expires_at,
-            ))
+            db.add(
+                PromptExample(
+                    question=item["question"],
+                    category=item["category"],
+                    source="kimi",
+                    is_active=True,
+                    created_at=now,
+                    expires_at=expires_at,
+                )
+            )
             new_count += 1
 
         # 池子上限 200 条，超出的旧数据标记为不活跃
@@ -78,10 +75,12 @@ async def refresh_prompt_examples() -> None:
         if active_count + new_count > 200:
             overflow = active_count + new_count - 200
             old_ids = [
-                r[0] for r in db.query(PromptExample.id)
+                r[0]
+                for r in db.query(PromptExample.id)
                 .filter(PromptExample.is_active == True)
                 .order_by(PromptExample.created_at.asc())
-                .limit(overflow).all()
+                .limit(overflow)
+                .all()
             ]
             if old_ids:
                 db.query(PromptExample).filter(PromptExample.id.in_(old_ids)).update(
@@ -128,7 +127,7 @@ async def get_prompt_examples(limit: int = 8) -> dict:
     sampled = _balanced_sample(examples, limit)
 
     # refreshed_at 可能是 datetime 对象（从 DB）或字符串（从 Redis 缓存）
-    if refreshed_at and hasattr(refreshed_at, 'isoformat'):
+    if refreshed_at and hasattr(refreshed_at, "isoformat"):
         refreshed_at = refreshed_at.isoformat()
 
     return {
@@ -158,7 +157,7 @@ def _balanced_sample(examples: list[dict], limit: int) -> list[dict]:
     # 补足到 limit
     remaining = [item for item in examples if item not in result]
     random.shuffle(remaining)
-    result.extend(remaining[:limit - len(result)])
+    result.extend(remaining[: limit - len(result)])
 
     random.shuffle(result)
     return result[:limit]
@@ -168,9 +167,12 @@ def _read_from_db() -> tuple[Optional[list[dict]], Optional[datetime]]:
     """从 PostgreSQL 读取活跃的示例问题"""
     db = SessionLocal()
     try:
-        rows = db.query(PromptExample).filter(
-            PromptExample.is_active == True
-        ).order_by(PromptExample.created_at.desc()).all()
+        rows = (
+            db.query(PromptExample)
+            .filter(PromptExample.is_active == True)
+            .order_by(PromptExample.created_at.desc())
+            .all()
+        )
 
         if not rows:
             return None, None

@@ -9,7 +9,7 @@ def setup_logger(name, log_file, level=logging.INFO):
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
 
     # 创建格式化器
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
     # 文件处理器
     file_handler = RotatingFileHandler(log_file, maxBytes=10485760, backupCount=5)
@@ -50,7 +50,7 @@ def setup_root_logger():
     # 添加控制台处理器
     console = logging.StreamHandler()
     console.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     console.setFormatter(formatter)
     root_logger.addHandler(console)
 
@@ -59,11 +59,11 @@ def setup_root_logger():
 setup_root_logger()
 
 # 主应用日志
-app_logger = setup_logger('app', './logs/app.log')
+app_logger = setup_logger("app", "./logs/app.log")
 # API日志
-api_logger = setup_logger('api', './logs/api.log')
+api_logger = setup_logger("api", "./logs/api.log")
 # LLM日志
-llm_logger = setup_logger('llm', './logs/llm.log')
+llm_logger = setup_logger("llm", "./logs/llm.log")
 
 # 输出一条明显的日志，帮助确认配置生效
 app_logger.info("=== 日志系统初始化完成 ===")

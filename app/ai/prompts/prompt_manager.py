@@ -2,13 +2,12 @@
 提示词管理器
 负责提供各种提示词模板，并支持模板变量替换
 """
-from typing import Dict, Any
 
 from app.ai.prompts.templates import (
-    GENERATE_TITLE_PROMPT,
-    GENERATE_SUGGESTED_QUESTIONS_PROMPT,
     FILE_ANALYSIS_PROMPT,
     FILE_CONTENT_ENHANCEMENT_PROMPT,
+    GENERATE_SUGGESTED_QUESTIONS_PROMPT,
+    GENERATE_TITLE_PROMPT,
 )
 
 

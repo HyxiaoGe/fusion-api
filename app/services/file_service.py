@@ -3,27 +3,31 @@ import json
 import os
 import uuid
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 
 import aiofiles
 from fastapi import UploadFile
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.file_token import generate_file_token
 from app.core.logger import app_logger as logger
-from app.db.repositories import FileRepository, ConversationRepository
+from app.db.repositories import ConversationRepository, FileRepository
 from app.processor.file_processor import FileProcessor
 from app.processor.image_processor import ImageProcessor
 from app.schemas.chat import Conversation
-from app.core.file_token import generate_file_token
 from app.services.storage import get_storage
 from app.services.storage.base import StorageBackend
 
-
 # 图片 MIME 类型集合
 IMAGE_MIME_TYPES = {
-    "image/jpeg", "image/png", "image/gif", "image/bmp", "image/webp",
-    "image/heic", "image/heif",
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/bmp",
+    "image/webp",
+    "image/heic",
+    "image/heif",
 }
 
 
@@ -70,7 +74,9 @@ class FileService:
         safe_filename = "".join(c for c in filename if c.isalnum() or c in "._- ")
         return safe_filename
 
-    async def upload_files(self, files: List[UploadFile], user_id: str, conversation_id: str, provider: str, model: str) -> List[Dict[str, Any]]:
+    async def upload_files(
+        self, files: List[UploadFile], user_id: str, conversation_id: str, provider: str, model: str
+    ) -> List[Dict[str, Any]]:
         """
         处理文件上传并关联到对话。
 
@@ -91,7 +97,7 @@ class FileService:
                 messages=[],
                 model_id=model or settings.DEFAULT_MODEL,
                 created_at=datetime.now(),
-                updated_at=datetime.now()
+                updated_at=datetime.now(),
             )
             conv_repo.create(temp_conversation)
 
@@ -126,9 +132,7 @@ class FileService:
 
                 if is_image_mime(mime_type):
                     # 图片走预处理管线
-                    result = await self._process_and_store_image(
-                        content, mime_type, conversation_id, file_id
-                    )
+                    result = await self._process_and_store_image(content, mime_type, conversation_id, file_id)
                     storage_key = result["storage_key"]
                     thumbnail_key = result["thumbnail_key"]
                     thumbnail_url = result["thumbnail_url"]
@@ -181,9 +185,7 @@ class FileService:
 
                 # 非图片文件：启动异步 LLM 解析
                 if not is_image_mime(file.content_type):
-                    asyncio.create_task(
-                        self._parse_file_with_llm(file_id=file_id, file_path=file_path)
-                    )
+                    asyncio.create_task(self._parse_file_with_llm(file_id=file_id, file_path=file_path))
 
                 logger.info(f"文件上传成功: {file_id}, 原始文件名: {file.filename}, 类型: {file.content_type}")
 
@@ -218,9 +220,7 @@ class FileService:
         await self.storage.upload(thumbnail_key, processed["thumbnail"], processed["mime_type"])
 
         # 获取缩略图访问 URL（本地存储模式追加签名 token）
-        thumbnail_url = await self.storage.get_url(
-            thumbnail_key, expires=settings.MINIO_PRESIGN_EXPIRES
-        )
+        thumbnail_url = await self.storage.get_url(thumbnail_key, expires=settings.MINIO_PRESIGN_EXPIRES)
         thumbnail_url = self._sign_local_url(thumbnail_url, file_id, settings.MINIO_PRESIGN_EXPIRES)
 
         return {
@@ -277,7 +277,7 @@ class FileService:
             response = await self.file_processor.process_files(
                 file_paths=[file_path],
                 query=self._get_file_parsing_prompt(file.mimetype, file.original_filename),
-                mime_types=[file.mimetype]
+                mime_types=[file.mimetype],
             )
 
             error_message = response.get("error")

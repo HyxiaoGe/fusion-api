@@ -6,6 +6,7 @@ from app.services.chat.utils import ChatUtils
 class ChatUtilsTests(unittest.TestCase):
     def test_get_response_text_prefers_content_attribute(self):
         from types import SimpleNamespace
+
         self.assertEqual(
             ChatUtils.get_response_text(SimpleNamespace(content="hello")),
             "hello",

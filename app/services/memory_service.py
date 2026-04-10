@@ -1,5 +1,5 @@
 import math
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
@@ -69,7 +69,7 @@ class MemoryService:
             "page_size": page_size,
             "total_pages": total_pages,
             "has_next": has_next,
-            "has_prev": has_prev
+            "has_prev": has_prev,
         }
 
     def delete_conversation(self, conversation_id: str, user_id: str) -> bool:

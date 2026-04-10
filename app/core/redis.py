@@ -5,9 +5,11 @@ Redis 连接管理模块
 get_redis() 作为 FastAPI 依赖函数，供路由层注入。
 Lua 脚本在模块加载时从文件读取，供 stream_state_service 调用。
 """
+
 from pathlib import Path
 
 import redis.asyncio as aioredis
+
 from app.core.config import settings
 from app.core.logger import app_logger as logger
 
@@ -15,9 +17,9 @@ from app.core.logger import app_logger as logger
 _redis_pool: aioredis.Redis | None = None
 
 # Redis Stream key 和 TTL 常量
-STREAM_CHUNK_TTL = 600     # 流进行中 TTL（10 分钟）
-STREAM_DONE_TTL = 60       # 流结束后 TTL（60 秒，供断线重连最后窗口）
-LOCK_TTL = 600             # 互斥锁 TTL
+STREAM_CHUNK_TTL = 600  # 流进行中 TTL（10 分钟）
+STREAM_DONE_TTL = 60  # 流结束后 TTL（60 秒，供断线重连最后窗口）
+LOCK_TTL = 600  # 互斥锁 TTL
 
 
 def stream_chunks_key(conversation_id: str) -> str:

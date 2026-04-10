@@ -1,6 +1,5 @@
 import base64
-import os
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 
 
 class FileDialogAdapter:
@@ -24,10 +23,7 @@ class QwenFileAdapter(FileDialogAdapter):
                 base64_image = base64.b64encode(image_content).decode("utf-8")
                 images.append({"url": f"data:image/jpeg;base64,{base64_image}"})
 
-        return {
-            "message": message,
-            "images": images
-        }
+        return {"message": message, "images": images}
 
 
 class DefaultFileAdapter(FileDialogAdapter):
@@ -41,8 +37,5 @@ class DefaultFileAdapter(FileDialogAdapter):
 
 def get_file_adapter(provider: str) -> FileDialogAdapter:
     """获取指定模型的文件适配器"""
-    adapters = {
-        "qwen": QwenFileAdapter(),
-        "deepseek": DefaultFileAdapter()
-    }
+    adapters = {"qwen": QwenFileAdapter(), "deepseek": DefaultFileAdapter()}
     return adapters.get(provider, DefaultFileAdapter())

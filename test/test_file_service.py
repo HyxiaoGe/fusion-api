@@ -1,5 +1,5 @@
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from app.services.file_service import FileService
@@ -28,7 +28,9 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
                 "parsed_content": "整理后的内容",
                 "processing_result": {
                     "status": "success",
-                    "timestamp": self.service.file_repo.update_file.call_args.kwargs["updates"]["processing_result"]["timestamp"],
+                    "timestamp": self.service.file_repo.update_file.call_args.kwargs["updates"]["processing_result"][
+                        "timestamp"
+                    ],
                 },
             },
         )

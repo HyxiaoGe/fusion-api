@@ -8,13 +8,13 @@ import httpx
 import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy.orm import Session
 from jwt import InvalidTokenError, PyJWK
+from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db.database import get_db
-from app.db.repositories import SocialAccountRepository, UserRepository
 from app.db.models import User
+from app.db.repositories import SocialAccountRepository, UserRepository
 
 logger = logging.getLogger(__name__)
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/token")

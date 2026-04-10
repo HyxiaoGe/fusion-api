@@ -5,6 +5,7 @@
 同一 conversation 发新消息时，取消旧任务。
 任务完成后自动从 registry 移除。
 """
+
 import asyncio
 from typing import Optional
 

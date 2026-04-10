@@ -5,6 +5,7 @@
 Part A: generate_to_redis() — 后台任务，调用 LLM 写 Redis Stream + 落库 PostgreSQL
 Part B: stream_redis_as_sse() — SSE 读取器，从 Redis Stream 消费推送给客户端
 """
+
 import asyncio
 import json
 import uuid
@@ -12,23 +13,25 @@ from typing import AsyncGenerator, List, Optional
 
 import litellm
 
-from app.constants.chat import FinishReasons
 from app.core.logger import app_logger as logger
 from app.db.database import SessionLocal
-from app.schemas.chat import (
-    Message, TextBlock, ThinkingBlock, SearchBlock, SearchSource, Usage,
-    StreamChunk, StreamChoice, StreamDelta,
-)
 from app.db.repositories import FileRepository
+from app.schemas.chat import (
+    SearchBlock,
+    SearchSource,
+    TextBlock,
+    ThinkingBlock,
+    Usage,
+)
 from app.services.chat.message_builder import (
-    build_llm_messages, inject_file_content, is_image_file,
+    build_llm_messages,
+    inject_file_content,
+    is_image_file,
 )
 from app.services.stream_state_service import (
-    init_stream,
     append_chunk,
-    finalize_stream,
     check_lock_owner,
-    get_stream_meta,
+    finalize_stream,
     read_stream_chunks,
 )
 
@@ -75,10 +78,7 @@ class StreamHandler:
             capabilities = {}
 
         use_reasoning = options.get("use_reasoning")
-        should_use_reasoning = (
-            use_reasoning is True
-            or (use_reasoning is None and provider in self.REASONING_PROVIDERS)
-        )
+        should_use_reasoning = use_reasoning is True or (use_reasoning is None and provider in self.REASONING_PROVIDERS)
 
         thinking_block_id = f"blk_{uuid.uuid4().hex[:12]}"
         text_block_id = f"blk_{uuid.uuid4().hex[:12]}"
@@ -93,6 +93,7 @@ class StreamHandler:
         call_kwargs = {}
         if supports_fc:
             from app.ai.tools import WEB_SEARCH_TOOL
+
             call_kwargs["tools"] = [WEB_SEARCH_TOOL]
             call_kwargs["tool_choice"] = "auto"
 
@@ -111,16 +112,11 @@ class StreamHandler:
 
             # 非图片文件内容注入
             if file_ids:
-                non_image_ids = [
-                    fid for fid in file_ids
-                    if not is_image_file(fid, file_repo)
-                ]
+                non_image_ids = [fid for fid in file_ids if not is_image_file(fid, file_repo)]
                 if non_image_ids:
                     file_contents = file_repo.get_parsed_file_content(non_image_ids)
                     if file_contents:
-                        messages = inject_file_content(
-                            messages, original_message, file_contents
-                        )
+                        messages = inject_file_content(messages, original_message, file_contents)
 
             response = await litellm.acompletion(
                 model=litellm_model,
@@ -238,8 +234,13 @@ class StreamHandler:
                         all_reasoning = reasoning_buf + first_round_thinking_buf
                         if all_reasoning or content_buf:
                             self._persist_message(
-                                db, assistant_message_id, conversation_id, model_id,
-                                self._build_content_blocks(all_reasoning, content_buf, thinking_block_id, text_block_id),
+                                db,
+                                assistant_message_id,
+                                conversation_id,
+                                model_id,
+                                self._build_content_blocks(
+                                    all_reasoning, content_buf, thinking_block_id, text_block_id
+                                ),
                                 usage_data,
                             )
                         await finalize_stream(conversation_id, success=False, error_msg="被新请求取代", task_id=task_id)
@@ -252,7 +253,10 @@ class StreamHandler:
 
             # 生成完成，落库
             self._persist_message(
-                db, assistant_message_id, conversation_id, model_id,
+                db,
+                assistant_message_id,
+                conversation_id,
+                model_id,
                 self._build_content_blocks(reasoning_buf, content_buf, thinking_block_id, text_block_id),
                 usage_data,
             )
@@ -262,7 +266,10 @@ class StreamHandler:
             logger.info(f"任务被取消: conv_id={conversation_id}")
             if reasoning_buf or content_buf:
                 self._persist_message(
-                    db, assistant_message_id, conversation_id, model_id,
+                    db,
+                    assistant_message_id,
+                    conversation_id,
+                    model_id,
                     self._build_content_blocks(reasoning_buf, content_buf, thinking_block_id, text_block_id),
                     usage_data,
                 )
@@ -273,7 +280,10 @@ class StreamHandler:
             logger.error(f"生成异常: conv_id={conversation_id}, error={e}")
             if reasoning_buf or content_buf:
                 self._persist_message(
-                    db, assistant_message_id, conversation_id, model_id,
+                    db,
+                    assistant_message_id,
+                    conversation_id,
+                    model_id,
                     self._build_content_blocks(reasoning_buf, content_buf, thinking_block_id, text_block_id),
                     usage_data,
                 )
@@ -315,9 +325,18 @@ class StreamHandler:
         if tool_call_name != "web_search":
             logger.warning(f"未知的 tool_call: {tool_call_name}，降级为无搜索回答")
             await self._fallback_no_search(
-                db, conversation_id, model_id, litellm_model, litellm_kwargs,
-                provider, messages, assistant_message_id, task_id,
-                should_use_reasoning, thinking_block_id, text_block_id,
+                db,
+                conversation_id,
+                model_id,
+                litellm_model,
+                litellm_kwargs,
+                provider,
+                messages,
+                assistant_message_id,
+                task_id,
+                should_use_reasoning,
+                thinking_block_id,
+                text_block_id,
             )
             return
 
@@ -331,16 +350,26 @@ class StreamHandler:
         if not query:
             logger.warning("tool_call web_search 的 query 为空，降级为无搜索回答")
             await self._fallback_no_search(
-                db, conversation_id, model_id, litellm_model, litellm_kwargs,
-                provider, messages, assistant_message_id, task_id,
-                should_use_reasoning, thinking_block_id, text_block_id,
+                db,
+                conversation_id,
+                model_id,
+                litellm_model,
+                litellm_kwargs,
+                provider,
+                messages,
+                assistant_message_id,
+                task_id,
+                should_use_reasoning,
+                thinking_block_id,
+                text_block_id,
             )
             return
 
         # 2. 推送 search_start SSE 事件
         search_block_id = f"blk_{uuid.uuid4().hex[:12]}"
         await append_chunk(
-            conversation_id, "search_start",
+            conversation_id,
+            "search_start",
             json.dumps({"query": query}, ensure_ascii=False),
             search_block_id,
         )
@@ -350,11 +379,15 @@ class StreamHandler:
 
         # 4. 推送 search_complete SSE 事件
         await append_chunk(
-            conversation_id, "search_complete",
-            json.dumps({
-                "query": query,
-                "sources": [s.model_dump() for s in sources],
-            }, ensure_ascii=False),
+            conversation_id,
+            "search_complete",
+            json.dumps(
+                {
+                    "query": query,
+                    "sources": [s.model_dump() for s in sources],
+                },
+                ensure_ascii=False,
+            ),
             search_block_id,
         )
 
@@ -364,11 +397,13 @@ class StreamHandler:
             {
                 "role": "assistant",
                 "content": None,
-                "tool_calls": [{
-                    "id": tool_call_id,
-                    "type": "function",
-                    "function": {"name": "web_search", "arguments": tool_call_args},
-                }],
+                "tool_calls": [
+                    {
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {"name": "web_search", "arguments": tool_call_args},
+                    }
+                ],
             },
             {
                 "role": "tool",
@@ -395,8 +430,13 @@ class StreamHandler:
         # 7. 落库：content 数组包含 SearchBlock
         # 只保留第二轮 reasoning（基于搜索结果的分析思考），不保留第一轮
         content_blocks = self._build_content_blocks(
-            reasoning_buf, content_buf, second_thinking_id, text_block_id,
-            search_query=query, search_sources=sources, search_block_id=search_block_id,
+            reasoning_buf,
+            content_buf,
+            second_thinking_id,
+            text_block_id,
+            search_query=query,
+            search_sources=sources,
+            search_block_id=search_block_id,
         )
         self._persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks, usage_data)
         await finalize_stream(conversation_id, success=True, task_id=task_id)
@@ -559,12 +599,18 @@ class StreamHandler:
         return blocks
 
     def _persist_message(
-        self, db, assistant_message_id: str, conversation_id: str,
-        model_id: str, content_blocks: list, usage_data: Optional[Usage],
+        self,
+        db,
+        assistant_message_id: str,
+        conversation_id: str,
+        model_id: str,
+        content_blocks: list,
+        usage_data: Optional[Usage],
     ) -> None:
         """将 assistant 消息写入 PostgreSQL"""
         try:
             from app.db.models import Message as MessageModel
+
             db_message = MessageModel(
                 id=assistant_message_id,
                 conversation_id=conversation_id,
@@ -593,6 +639,7 @@ async def stream_redis_as_sse(
     Redis 不可用时立即返回 error 帧。
     """
     from app.core.redis import get_redis_pool
+
     if not get_redis_pool():
         error_payload = {
             "id": message_id,
@@ -617,10 +664,12 @@ async def stream_redis_as_sse(
             payload = {
                 "id": message_id,
                 "conversation_id": conversation_id,
-                "choices": [{
-                    "delta": {},
-                    "finish_reason": None,
-                }]
+                "choices": [
+                    {
+                        "delta": {},
+                        "finish_reason": None,
+                    }
+                ],
             }
             yield f"id: {entry_id}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
             continue
@@ -629,47 +678,59 @@ async def stream_redis_as_sse(
             payload = {
                 "id": message_id,
                 "conversation_id": conversation_id,
-                "choices": [{
-                    "delta": {
-                        "content": [{
-                            "type": "thinking",
-                            "id": chunk.get("block_id", ""),
-                            "thinking": chunk["content"],
-                        }]
-                    },
-                    "finish_reason": None,
-                }]
+                "choices": [
+                    {
+                        "delta": {
+                            "content": [
+                                {
+                                    "type": "thinking",
+                                    "id": chunk.get("block_id", ""),
+                                    "thinking": chunk["content"],
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
             }
         elif chunk_type == "thinking_pending":
             # 思考中占位事件：前端显示脉冲动画但不展示具体内容
             payload = {
                 "id": message_id,
                 "conversation_id": conversation_id,
-                "choices": [{
-                    "delta": {
-                        "content": [{
-                            "type": "thinking",
-                            "id": chunk.get("block_id", ""),
-                            "thinking": "",
-                        }]
-                    },
-                    "finish_reason": None,
-                }]
+                "choices": [
+                    {
+                        "delta": {
+                            "content": [
+                                {
+                                    "type": "thinking",
+                                    "id": chunk.get("block_id", ""),
+                                    "thinking": "",
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
             }
         elif chunk_type == "answering":
             payload = {
                 "id": message_id,
                 "conversation_id": conversation_id,
-                "choices": [{
-                    "delta": {
-                        "content": [{
-                            "type": "text",
-                            "id": chunk.get("block_id", ""),
-                            "text": chunk["content"],
-                        }]
-                    },
-                    "finish_reason": None,
-                }]
+                "choices": [
+                    {
+                        "delta": {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "id": chunk.get("block_id", ""),
+                                    "text": chunk["content"],
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
             }
         elif chunk_type == "search_start":
             # 搜索开始事件
@@ -677,17 +738,21 @@ async def stream_redis_as_sse(
             payload = {
                 "id": message_id,
                 "conversation_id": conversation_id,
-                "choices": [{
-                    "delta": {
-                        "content": [{
-                            "type": "search",
-                            "id": chunk.get("block_id", ""),
-                            "search_event": "start",
-                            "query": search_data.get("query", ""),
-                        }]
-                    },
-                    "finish_reason": None,
-                }]
+                "choices": [
+                    {
+                        "delta": {
+                            "content": [
+                                {
+                                    "type": "search",
+                                    "id": chunk.get("block_id", ""),
+                                    "search_event": "start",
+                                    "query": search_data.get("query", ""),
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
             }
         elif chunk_type == "search_complete":
             # 搜索完成事件
@@ -695,36 +760,44 @@ async def stream_redis_as_sse(
             payload = {
                 "id": message_id,
                 "conversation_id": conversation_id,
-                "choices": [{
-                    "delta": {
-                        "content": [{
-                            "type": "search",
-                            "id": chunk.get("block_id", ""),
-                            "search_event": "complete",
-                            "query": search_data.get("query", ""),
-                            "sources": search_data.get("sources", []),
-                        }]
-                    },
-                    "finish_reason": None,
-                }]
+                "choices": [
+                    {
+                        "delta": {
+                            "content": [
+                                {
+                                    "type": "search",
+                                    "id": chunk.get("block_id", ""),
+                                    "search_event": "complete",
+                                    "query": search_data.get("query", ""),
+                                    "sources": search_data.get("sources", []),
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
             }
         elif chunk_type == "done":
             payload = {
                 "id": message_id,
                 "conversation_id": conversation_id,
-                "choices": [{
-                    "delta": {},
-                    "finish_reason": "stop",
-                }]
+                "choices": [
+                    {
+                        "delta": {},
+                        "finish_reason": "stop",
+                    }
+                ],
             }
         elif chunk_type == "error":
             payload = {
                 "id": message_id,
                 "conversation_id": conversation_id,
-                "choices": [{
-                    "delta": {},
-                    "finish_reason": "error",
-                }]
+                "choices": [
+                    {
+                        "delta": {},
+                        "finish_reason": "error",
+                    }
+                ],
             }
         else:
             continue

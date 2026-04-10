@@ -8,22 +8,27 @@
 
 Redis 不可用时所有写操作静默降级。
 """
-import json
+
 import time
 from typing import AsyncIterator, Optional
 
-from app.core.redis import (
-    get_redis_pool,
-    stream_chunks_key, stream_meta_key, stream_lock_key,
-    STREAM_CHUNK_TTL, STREAM_DONE_TTL, LOCK_TTL,
-    LUA_FINALIZE_STREAM, LUA_CANCEL_STREAM,
-)
 from app.core.logger import app_logger as logger
-
+from app.core.redis import (
+    LOCK_TTL,
+    LUA_CANCEL_STREAM,
+    LUA_FINALIZE_STREAM,
+    STREAM_CHUNK_TTL,
+    STREAM_DONE_TTL,
+    get_redis_pool,
+    stream_chunks_key,
+    stream_lock_key,
+    stream_meta_key,
+)
 
 # ──────────────────────────────────────────────
 # 写端（后台任务调用）
 # ──────────────────────────────────────────────
+
 
 async def init_stream(
     conversation_id: str,
@@ -38,14 +43,17 @@ async def init_stream(
         return
     try:
         # 写 meta
-        await redis.hset(stream_meta_key(conversation_id), mapping={
-            "status": "streaming",
-            "user_id": user_id,
-            "model": model,
-            "started_at": str(int(time.time())),
-            "message_id": message_id,
-            "conversation_id": conversation_id,
-        })
+        await redis.hset(
+            stream_meta_key(conversation_id),
+            mapping={
+                "status": "streaming",
+                "user_id": user_id,
+                "model": model,
+                "started_at": str(int(time.time())),
+                "message_id": message_id,
+                "conversation_id": conversation_id,
+            },
+        )
         await redis.expire(stream_meta_key(conversation_id), STREAM_CHUNK_TTL)
 
         # 写 lock
@@ -183,6 +191,7 @@ async def get_stream_meta(conversation_id: str) -> Optional[dict]:
 # ──────────────────────────────────────────────
 # 读端（SSE 端点调用）
 # ──────────────────────────────────────────────
+
 
 async def read_stream_chunks(
     conversation_id: str,

@@ -1,20 +1,21 @@
-from fastapi import FastAPI, Request, HTTPException
+import asyncio
+import time
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
-from contextlib import asynccontextmanager
-import asyncio
-import time
+
+from app.api import auth, chat, files, models, prompts
 from app.core.config import settings
-from app.api import chat, files, models, auth, prompts
 from app.core.logger import app_logger
-from app.db.init_db import init_db
+from app.core.redis import close_redis, init_redis
 from app.db.database import SessionLocal
-from app.core.redis import init_redis, close_redis
+from app.db.init_db import init_db
 from app.services.scheduler_service import start_scheduler, stop_scheduler
 from app.services.storage import init_storage
-
 
 
 # 超时中间件
@@ -26,10 +27,7 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         start_time = time.time()
         try:
-            response = await asyncio.wait_for(
-                call_next(request),
-                timeout=self.timeout_seconds
-            )
+            response = await asyncio.wait_for(call_next(request), timeout=self.timeout_seconds)
             # 添加处理时间头
             process_time = time.time() - start_time
             response.headers["X-Process-Time"] = str(process_time)
@@ -41,9 +39,9 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
                 content={
                     "detail": f"请求超时，处理时间超过{self.timeout_seconds}秒",
                     "timeout_seconds": self.timeout_seconds,
-                    "process_time": process_time
+                    "process_time": process_time,
                 },
-                headers={"X-Process-Time": str(process_time)}
+                headers={"X-Process-Time": str(process_time)},
             )
 
 
@@ -56,7 +54,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         app_logger.error(f"数据库初始化失败: {e}")
     await init_redis()
-    storage = await init_storage()
+    await init_storage()
     app_logger.info(f"存储后端初始化完成: {settings.STORAGE_BACKEND}")
     await start_scheduler()
 
@@ -65,6 +63,7 @@ async def lifespan(app: FastAPI):
     await stop_scheduler()
     await close_redis()
     app_logger.info("应用关闭完成")
+
 
 app = FastAPI(title=settings.APP_NAME, version=settings.APP_VERSION, lifespan=lifespan)
 
@@ -86,34 +85,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # 健康检查端点（Railway需要）
 @app.get("/health")
 async def health_check():
     """健康检查端点，Railway用来判断应用是否正常运行"""
     try:
         from datetime import datetime
+
         from sqlalchemy import text
-        
+
         # 简单的数据库连接测试
         db = SessionLocal()
         db.execute(text("SELECT 1"))
         db.close()
-        
+
         return {
             "status": "healthy",
             "timestamp": datetime.now().isoformat(),
             "database": "connected",
             "service": "fusion-api",
-            "version": settings.APP_VERSION
+            "version": settings.APP_VERSION,
         }
     except Exception as e:
         app_logger.error(f"健康检查失败: {e}")
         return {
-            "status": "unhealthy", 
+            "status": "unhealthy",
             "error": str(e),
             "timestamp": datetime.now().isoformat(),
-            "service": "fusion-api"
+            "service": "fusion-api",
         }
+
 
 # 注册路由
 app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
@@ -124,10 +126,6 @@ app.include_router(prompts.router, prefix="/api/prompts", tags=["prompts"])
 
 if __name__ == "__main__":
     import uvicorn
+
     app_logger.info("使用 uvicorn 启动服务器")
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

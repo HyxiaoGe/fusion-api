@@ -4,9 +4,9 @@
 集中管理所有应用常量
 """
 
-from .chat import MessageRoles, FinishReasons
+from .chat import FinishReasons, MessageRoles
 
 __all__ = [
-    'MessageRoles',
-    'FinishReasons',
+    "MessageRoles",
+    "FinishReasons",
 ]

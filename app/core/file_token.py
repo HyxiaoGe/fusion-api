@@ -8,7 +8,7 @@ token 格式：{file_id}.{expires_ts}.{signature}
 import hashlib
 import hmac
 import time
-from typing import Optional, Tuple
+from typing import Optional
 
 from app.core.config import settings
 
@@ -26,9 +26,7 @@ def generate_file_token(file_id: str, expires: int = 3600) -> str:
     """
     expires_ts = int(time.time()) + expires
     message = f"{file_id}:{expires_ts}"
-    signature = hmac.new(
-        settings.SECRET_KEY.encode(), message.encode(), hashlib.sha256
-    ).hexdigest()
+    signature = hmac.new(settings.SECRET_KEY.encode(), message.encode(), hashlib.sha256).hexdigest()
     return f"{file_id}.{expires_ts}.{signature}"
 
 
@@ -59,9 +57,7 @@ def verify_file_token(token: str) -> Optional[str]:
 
     # 验证签名
     message = f"{file_id}:{expires_ts_str}"
-    expected = hmac.new(
-        settings.SECRET_KEY.encode(), message.encode(), hashlib.sha256
-    ).hexdigest()
+    expected = hmac.new(settings.SECRET_KEY.encode(), message.encode(), hashlib.sha256).hexdigest()
 
     if not hmac.compare_digest(signature, expected):
         return None

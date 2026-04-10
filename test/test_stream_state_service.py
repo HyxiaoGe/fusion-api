@@ -3,9 +3,9 @@
 
 使用 FakeRedis mock 模拟 Redis Stream 操作。
 """
-import json
+
 import unittest
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import patch
 
 
 class FakeRedis:
@@ -92,6 +92,7 @@ class TestStreamStateService(unittest.IsolatedAsyncioTestCase):
 
     async def test_init_stream_creates_meta_and_start_entry(self):
         from app.services.stream_state_service import init_stream
+
         await init_stream("conv-1", "user-1", "gpt-4", "msg-1", "task-1")
 
         meta = await self.fake_redis.hgetall("stream:meta:conv-1")
@@ -104,7 +105,8 @@ class TestStreamStateService(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entries[0][1]["type"], "start")
 
     async def test_append_chunk_writes_to_stream(self):
-        from app.services.stream_state_service import init_stream, append_chunk
+        from app.services.stream_state_service import append_chunk, init_stream
+
         await init_stream("conv-1", "user-1", "gpt-4", "msg-1", "task-1")
         await append_chunk("conv-1", "answering", "Hello", "blk-1")
         await append_chunk("conv-1", "answering", " World", "blk-1")
@@ -115,7 +117,8 @@ class TestStreamStateService(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entries[2][1]["content"], " World")
 
     async def test_finalize_stream_success_writes_done(self):
-        from app.services.stream_state_service import init_stream, finalize_stream
+        from app.services.stream_state_service import finalize_stream, init_stream
+
         await init_stream("conv-1", "user-1", "gpt-4", "msg-1", "task-1")
         await finalize_stream("conv-1", success=True)
 
@@ -125,7 +128,8 @@ class TestStreamStateService(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(meta["status"], "done")
 
     async def test_finalize_stream_error_preserves_content(self):
-        from app.services.stream_state_service import init_stream, append_chunk, finalize_stream
+        from app.services.stream_state_service import append_chunk, finalize_stream, init_stream
+
         await init_stream("conv-1", "user-1", "gpt-4", "msg-1", "task-1")
         await append_chunk("conv-1", "answering", "部分内容", "blk-1")
         await finalize_stream("conv-1", success=False, error_msg="LLM 超时")
@@ -137,17 +141,20 @@ class TestStreamStateService(unittest.IsolatedAsyncioTestCase):
 
     async def test_get_stream_meta_returns_none_when_not_exists(self):
         from app.services.stream_state_service import get_stream_meta
+
         result = await get_stream_meta("nonexistent")
         self.assertIsNone(result)
 
     async def test_check_lock_owner(self):
-        from app.services.stream_state_service import init_stream, check_lock_owner
+        from app.services.stream_state_service import check_lock_owner, init_stream
+
         await init_stream("conv-1", "user-1", "gpt-4", "msg-1", "task-1")
         self.assertTrue(await check_lock_owner("conv-1", "task-1"))
         self.assertFalse(await check_lock_owner("conv-1", "task-other"))
 
     async def test_read_stream_chunks_yields_entries(self):
-        from app.services.stream_state_service import init_stream, append_chunk, finalize_stream, read_stream_chunks
+        from app.services.stream_state_service import append_chunk, finalize_stream, init_stream, read_stream_chunks
+
         await init_stream("conv-1", "user-1", "gpt-4", "msg-1", "task-1")
         await append_chunk("conv-1", "reasoning", "思考中", "blk-t")
         await append_chunk("conv-1", "answering", "回答", "blk-c")
@@ -167,8 +174,12 @@ class TestStreamStateService(unittest.IsolatedAsyncioTestCase):
         self.patcher.stop()
         with patch("app.services.stream_state_service.get_redis_pool", return_value=None):
             from app.services.stream_state_service import (
-                init_stream, append_chunk, finalize_stream, get_stream_meta,
+                append_chunk,
+                finalize_stream,
+                get_stream_meta,
+                init_stream,
             )
+
             await init_stream("conv-1", "user", "model", "msg", "task")
             result = await append_chunk("conv-1", "answering", "test", "blk")
             self.assertIsNone(result)

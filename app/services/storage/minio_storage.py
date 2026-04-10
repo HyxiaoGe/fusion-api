@@ -1,7 +1,6 @@
 """MinIO/S3 兼容对象存储后端实现"""
 
 import io
-from functools import lru_cache
 
 import boto3
 from botocore.config import Config as BotoConfig

@@ -9,7 +9,7 @@
 """
 
 import io
-from typing import Dict, Any
+from typing import Any, Dict
 
 from PIL import Image, ImageOps
 
@@ -18,6 +18,7 @@ from app.core.logger import app_logger as logger
 # 尝试导入 HEIC 支持
 try:
     import pillow_heif
+
     pillow_heif.register_heif_opener()
     HEIC_SUPPORTED = True
 except ImportError:

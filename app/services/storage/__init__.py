@@ -16,6 +16,7 @@ async def init_storage() -> StorageBackend:
 
     if settings.STORAGE_BACKEND == "minio":
         from app.services.storage.minio_storage import MinIOStorageBackend
+
         _storage_backend = MinIOStorageBackend(
             endpoint=settings.MINIO_ENDPOINT,
             access_key=settings.MINIO_ACCESS_KEY,

@@ -12,19 +12,25 @@ from app.ai.prompts import prompt_manager
 from app.core.logger import app_logger as logger
 from app.db.repositories import FileRepository, ModelSourceRepository
 from app.schemas.chat import (
-    ChatResponse, Conversation, Message,
-    TextBlock, FileBlock, Usage,
+    ChatResponse,
+    Conversation,
+    FileBlock,
+    Message,
+    TextBlock,
+    Usage,
 )
+from app.services.chat.message_builder import (
+    build_llm_messages,
+    inject_file_content,
+    is_image_file,
+)
+from app.services.chat.utils import ChatUtils
 from app.services.file_service import is_image_mime
 from app.services.memory_service import MemoryService
 from app.services.storage import get_storage
 from app.services.stream_handler import StreamHandler, stream_redis_as_sse
 from app.services.stream_state_service import init_stream
 from app.services.task_manager import register_task
-from app.services.chat.utils import ChatUtils
-from app.services.chat.message_builder import (
-    build_llm_messages, inject_file_content, is_image_file,
-)
 
 
 class ChatService:
@@ -77,6 +83,7 @@ class ChatService:
                     }
                     if is_image_mime(file_info.mimetype) and getattr(file_info, "thumbnail_key", None):
                         from app.core.config import settings
+
                         try:
                             thumb_url = await storage.get_url(
                                 file_info.thumbnail_key,
@@ -149,18 +156,18 @@ class ChatService:
                 conversation.messages, has_vision=has_vision, file_repo=self.file_repo
             )
             if file_ids:
-                non_image_ids = [
-                    fid for fid in file_ids if not is_image_file(fid, self.file_repo)
-                ]
+                non_image_ids = [fid for fid in file_ids if not is_image_file(fid, self.file_repo)]
                 if non_image_ids:
                     file_contents = self.file_repo.get_parsed_file_content(non_image_ids)
                     if file_contents:
-                        lm_messages = inject_file_content(
-                            lm_messages, message, file_contents
-                        )
+                        lm_messages = inject_file_content(lm_messages, message, file_contents)
             return await self._handle_non_stream(
-                litellm_model, model_id, litellm_kwargs,
-                lm_messages, conversation.id, options,
+                litellm_model,
+                model_id,
+                litellm_kwargs,
+                lm_messages,
+                conversation.id,
+                options,
             )
 
     def _get_or_create_conversation(
@@ -275,7 +282,7 @@ class ChatService:
             title = raw.strip().strip('"').strip("'")
             for prefix in ["标题：", "标题:", "Title:", "Title："]:
                 if title.startswith(prefix):
-                    title = title[len(prefix):].strip()
+                    title = title[len(prefix) :].strip()
             title = title[:30] if len(title) > 30 else title
             title = title or fallback_title
 
@@ -304,11 +311,7 @@ class ChatService:
         dialog_content = self._build_recent_dialog_content(conversation)
 
         if not dialog_content:
-            return [
-                "有什么我可以帮您解答的问题吗？",
-                "您想了解更多哪方面的信息？",
-                "还有其他我能帮助您的事情吗？"
-            ]
+            return ["有什么我可以帮您解答的问题吗？", "您想了解更多哪方面的信息？", "还有其他我能帮助您的事情吗？"]
 
         try:
             prompt = prompt_manager.format_prompt("generate_suggested_questions", content=dialog_content)
@@ -333,11 +336,7 @@ class ChatService:
 
         except Exception as e:
             logger.error(f"生成推荐问题失败: {e}")
-            return [
-                "您对这个主题还有其他问题吗？",
-                "您想了解更多相关信息吗？",
-                "您想要探讨这个话题的哪些方面？"
-            ]
+            return ["您对这个主题还有其他问题吗？", "您想了解更多相关信息吗？", "您想要探讨这个话题的哪些方面？"]
 
     def _build_recent_dialog_content(self, conversation: Conversation) -> str:
         """提取最近一轮用户/助手对话内容"""

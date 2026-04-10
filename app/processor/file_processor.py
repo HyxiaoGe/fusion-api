@@ -2,10 +2,10 @@ import asyncio
 import base64
 import io
 import os
-from typing import List, Optional, Any, Dict
+from typing import Any, Dict, List, Optional
 
-from app.core.logger import app_logger as logger
 from app.ai.prompts import prompt_manager
+from app.core.logger import app_logger as logger
 
 
 class FileProcessor:
@@ -19,10 +19,7 @@ class FileProcessor:
         self.client = None
 
     async def process_files(
-            self,
-            file_paths: List[str],
-            query: str = None,
-            mime_types: Optional[List[str]] = None
+        self, file_paths: List[str], query: str = None, mime_types: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """
         处理文件并返回处理结果
@@ -58,17 +55,11 @@ class FileProcessor:
             # 调用模型
             response = await self._call_model(prompt, files_data)
 
-            return {
-                "content": response,
-                "model": self.model
-            }
+            return {"content": response, "model": self.model}
 
         except Exception as e:
             logger.exception(f"处理文件失败: {e}")
-            return {
-                "content": f"处理文件时发生错误: {str(e)}",
-                "error": str(e)
-            }
+            return {"content": f"处理文件时发生错误: {str(e)}", "error": str(e)}
 
     def _build_text_only_content(self, files_data: List[Dict[str, Any]]) -> Optional[str]:
         """对纯文本类文件直接返回本地提取内容，避免依赖外部视觉模型。"""
@@ -120,7 +111,7 @@ class FileProcessor:
             # 根据文件类型提取文本
             if mime_type.startswith("text/") or self._has_extension(file_path, ".txt", ".md", ".text"):
                 # 文本文件
-                return file_content.decode('utf-8', errors='replace')
+                return file_content.decode("utf-8", errors="replace")
 
             elif mime_type == "application/pdf" or self._has_extension(file_path, ".pdf"):
                 # PDF文件
@@ -130,10 +121,10 @@ class FileProcessor:
                     failure_message="解析PDF文件失败",
                 )
 
-            elif mime_type in ["application/vnd.ms-excel",
-                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"] or self._has_extension(
-                file_path, ".xls", ".xlsx"
-            ):
+            elif mime_type in [
+                "application/vnd.ms-excel",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ] or self._has_extension(file_path, ".xls", ".xlsx"):
                 # Excel文件
                 return self._run_optional_text_extractor(
                     lambda: self._extract_excel_text(file_content),
@@ -149,10 +140,10 @@ class FileProcessor:
                     failure_message="解析CSV文件失败",
                 )
 
-            elif mime_type in ["application/msword",
-                               "application/vnd.openxmlformats-officedocument.wordprocessingml.document"] or self._has_extension(
-                file_path, ".doc", ".docx", ".dot"
-            ):
+            elif mime_type in [
+                "application/msword",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ] or self._has_extension(file_path, ".doc", ".docx", ".dot"):
                 # Word文档
                 return self._run_optional_text_extractor(
                     lambda: self._extract_word_text(file_content),
@@ -233,7 +224,7 @@ class FileProcessor:
             ".md": "text/markdown",
             ".csv": "text/csv",
             ".xls": "application/vnd.ms-excel",
-            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         }
         return mime_map.get(ext, "application/octet-stream")
 
@@ -253,7 +244,7 @@ class FileProcessor:
             file_content_text += f"文件 {i + 1}: {file['file_name']} (类型: {file['mime_type']})\n"
 
             # 如果有提取的文本内容，添加到提示中
-            if file.get('extracted_text'):
+            if file.get("extracted_text"):
                 text = self._truncate_text(
                     file["extracted_text"],
                     self.PROMPT_TEXT_PREVIEW_LIMIT,
@@ -262,9 +253,7 @@ class FileProcessor:
                 file_content_text += f"文件内容:\n{text}\n\n"
 
         # 使用提示词管理器构建提示
-        return prompt_manager.format_prompt("file_analysis", 
-                                           query=query, 
-                                           file_content=file_content_text)
+        return prompt_manager.format_prompt("file_analysis", query=query, file_content=file_content_text)
 
     async def _call_model(self, prompt: str, files_data: List[Dict[str, Any]]) -> str:
         """使用通义千问视觉模型处理文件"""
@@ -276,7 +265,7 @@ class FileProcessor:
             messages = [
                 {
                     "role": "system",
-                    "content": [{"type": "text", "text": "你是一个专业的图像分析助手，请详细分析图片内容。"}]
+                    "content": [{"type": "text", "text": "你是一个专业的图像分析助手，请详细分析图片内容。"}],
                 }
             ]
 
@@ -286,21 +275,18 @@ class FileProcessor:
             # 添加图片
             for file in files_data:
                 if file["mime_type"].startswith("image/"):
-                    user_content.append({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{file['mime_type']};base64,{file['content']}"
+                    user_content.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{file['mime_type']};base64,{file['content']}"},
                         }
-                    })
+                    )
 
             # 添加文本提示
             user_content.append({"type": "text", "text": prompt})
 
             # 添加完整的用户消息
-            messages.append({
-                "role": "user",
-                "content": user_content
-            })
+            messages.append({"role": "user", "content": user_content})
 
             # 调用API
             stream_response = await asyncio.to_thread(
@@ -309,16 +295,16 @@ class FileProcessor:
                 messages=messages,
                 stream=True,
                 stream_options={"include_usage": True},
-                modalities=["text"]  # 只需要文本输出
+                modalities=["text"],  # 只需要文本输出
             )
 
             # 收集流式响应
             full_response = ""
             try:
                 for chunk in stream_response:
-                    if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
+                    if hasattr(chunk, "choices") and len(chunk.choices) > 0:
                         delta = chunk.choices[0].delta
-                        if hasattr(delta, 'content') and delta.content:
+                        if hasattr(delta, "content") and delta.content:
                             full_response += delta.content
             except Exception as e:
                 logger.exception(f"处理流式响应时出错: {e}")

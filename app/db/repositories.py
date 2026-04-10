@@ -2,19 +2,37 @@ import logging
 import re
 import uuid
 from copy import deepcopy
-from datetime import datetime
-from typing import List, Optional, Dict, Any, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import desc, func
+from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
-from app.db.models import Conversation as ConversationModel, get_china_time, File, ConversationFile
+from app.db.models import Conversation as ConversationModel
+from app.db.models import ConversationFile, File, ModelCredential, ModelSource, get_china_time
 from app.db.models import Message as MessageModel
-from app.db.models import ModelSource, ModelCredential
-from app.db.models import User as UserModel, SocialAccount as SocialAccountModel
-from app.schemas.chat import Conversation, Message, TextBlock, ThinkingBlock, FileBlock, SearchBlock, SearchSource, Usage
-from app.schemas.models import ModelInfo, ModelCapabilities, ModelPricing, AuthConfig, ModelConfiguration, ModelConfigParam, ModelBasicInfo, AuthConfigField, ModelCredentialInfo
-from app.schemas.auth import User as UserSchema
+from app.db.models import SocialAccount as SocialAccountModel
+from app.db.models import User as UserModel
+from app.schemas.chat import (
+    Conversation,
+    FileBlock,
+    Message,
+    SearchBlock,
+    SearchSource,
+    TextBlock,
+    ThinkingBlock,
+    Usage,
+)
+from app.schemas.models import (
+    AuthConfig,
+    AuthConfigField,
+    ModelBasicInfo,
+    ModelCapabilities,
+    ModelConfigParam,
+    ModelConfiguration,
+    ModelCredentialInfo,
+    ModelInfo,
+    ModelPricing,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,10 +77,11 @@ class SocialAccountRepository:
         self.db = db
 
     def get_by_provider(self, provider: str, provider_user_id: str) -> Optional[SocialAccountModel]:
-        return self.db.query(SocialAccountModel).filter(
-            SocialAccountModel.provider == provider,
-            SocialAccountModel.provider_user_id == provider_user_id
-        ).first()
+        return (
+            self.db.query(SocialAccountModel)
+            .filter(SocialAccountModel.provider == provider, SocialAccountModel.provider_user_id == provider_user_id)
+            .first()
+        )
 
     def create(self, obj_in: Dict[str, Any]) -> SocialAccountModel:
         db_obj = SocialAccountModel(**obj_in)
@@ -83,7 +102,7 @@ class ConversationRepository:
                 title=conversation.title,
                 model_id=conversation.model_id,
                 created_at=conversation.created_at,
-                updated_at=conversation.updated_at
+                updated_at=conversation.updated_at,
             )
 
             # 添加消息（content blocks 序列化为 JSONB）
@@ -94,7 +113,7 @@ class ConversationRepository:
                     content=[block.model_dump() for block in msg.content],
                     model_id=msg.model_id,
                     usage=msg.usage.model_dump() if msg.usage else None,
-                    created_at=msg.created_at
+                    created_at=msg.created_at,
                 )
                 db_conversation.messages.append(db_message)
 
@@ -108,10 +127,11 @@ class ConversationRepository:
     def update(self, conversation: Conversation) -> Conversation:
         """更新现有对话"""
         try:
-            db_conversation = self.db.query(ConversationModel).filter(
-                ConversationModel.id == conversation.id,
-                ConversationModel.user_id == conversation.user_id
-            ).first()
+            db_conversation = (
+                self.db.query(ConversationModel)
+                .filter(ConversationModel.id == conversation.id, ConversationModel.user_id == conversation.user_id)
+                .first()
+            )
 
             if not db_conversation:
                 raise ValueError(f"找不到对话ID: {conversation.id} 或无权访问")
@@ -130,19 +150,20 @@ class ConversationRepository:
 
     def update_title(self, conversation_id: str, title: str) -> None:
         """仅更新会话标题"""
-        self.db.query(ConversationModel)\
-            .filter(ConversationModel.id == conversation_id)\
-            .update({"title": title, "updated_at": get_china_time()})
+        self.db.query(ConversationModel).filter(ConversationModel.id == conversation_id).update(
+            {"title": title, "updated_at": get_china_time()}
+        )
         self.db.flush()
 
     def delete(self, conversation_id: str, user_id: str) -> bool:
         """删除对话"""
         try:
             # 查找对话
-            result = self.db.query(ConversationModel).filter(
-                ConversationModel.id == conversation_id,
-                ConversationModel.user_id == user_id
-            ).delete()
+            result = (
+                self.db.query(ConversationModel)
+                .filter(ConversationModel.id == conversation_id, ConversationModel.user_id == user_id)
+                .delete()
+            )
 
             self.db.commit()
             return result > 0
@@ -154,10 +175,11 @@ class ConversationRepository:
     def get_by_id(self, conversation_id: str, user_id: str) -> Optional[Conversation]:
         """根据ID获取对话"""
         try:
-            db_conversation = self.db.query(ConversationModel).filter(
-                ConversationModel.id == conversation_id,
-                ConversationModel.user_id == user_id
-            ).first()
+            db_conversation = (
+                self.db.query(ConversationModel)
+                .filter(ConversationModel.id == conversation_id, ConversationModel.user_id == user_id)
+                .first()
+            )
 
             if not db_conversation:
                 return None
@@ -170,11 +192,12 @@ class ConversationRepository:
     def get_all(self, user_id: str) -> List[Conversation]:
         """获取指定用户的所有对话"""
         try:
-            db_conversations = self.db.query(ConversationModel).filter(
-                ConversationModel.user_id == user_id
-            ).order_by(
-                ConversationModel.updated_at.desc()
-            ).all()
+            db_conversations = (
+                self.db.query(ConversationModel)
+                .filter(ConversationModel.user_id == user_id)
+                .order_by(ConversationModel.updated_at.desc())
+                .all()
+            )
 
             return [self._convert_to_schema(db_conv) for db_conv in db_conversations]
         except Exception as e:
@@ -188,13 +211,7 @@ class ConversationRepository:
             query = self.db.query(ConversationModel).filter(ConversationModel.user_id == user_id)
             total = query.count()
 
-            db_conversations = (
-                query
-                .order_by(ConversationModel.updated_at.desc())
-                .offset(offset)
-                .limit(page_size)
-                .all()
-            )
+            db_conversations = query.order_by(ConversationModel.updated_at.desc()).offset(offset).limit(page_size).all()
 
             conversations = []
             for db_conv in db_conversations:
@@ -205,7 +222,7 @@ class ConversationRepository:
                     title=db_conv.title,
                     messages=[],
                     created_at=db_conv.created_at,
-                    updated_at=db_conv.updated_at
+                    updated_at=db_conv.updated_at,
                 )
                 conversations.append(conversation)
 
@@ -256,8 +273,8 @@ class ConversationRepository:
                 for key, value in update_data.items():
                     # content blocks 和 usage 需要序列化为 dict 再写入 JSONB
                     if key == "content" and isinstance(value, list):
-                        value = [block.model_dump() if hasattr(block, 'model_dump') else block for block in value]
-                    if key == "usage" and hasattr(value, 'model_dump'):
+                        value = [block.model_dump() if hasattr(block, "model_dump") else block for block in value]
+                    if key == "usage" and hasattr(value, "model_dump"):
                         value = value.model_dump()
                     setattr(db_message, key, value)
                 self.db.flush()
@@ -272,7 +289,7 @@ class ConversationRepository:
     def _convert_message_to_schema(self, db_message: MessageModel) -> Message:
         """将消息数据库模型转换为业务模型（JSONB → content blocks）"""
         content_blocks = []
-        for block_data in (db_message.content or []):
+        for block_data in db_message.content or []:
             block_type = block_data.get("type")
             if block_type == "text":
                 content_blocks.append(TextBlock(**block_data))
@@ -281,12 +298,14 @@ class ConversationRepository:
             elif block_type == "file":
                 content_blocks.append(FileBlock(**block_data))
             elif block_type == "search":
-                content_blocks.append(SearchBlock(
-                    type="search",
-                    id=block_data.get("id", f"blk_{__import__('uuid').uuid4().hex[:12]}"),
-                    query=block_data.get("query", ""),
-                    sources=[SearchSource(**s) for s in block_data.get("sources", [])],
-                ))
+                content_blocks.append(
+                    SearchBlock(
+                        type="search",
+                        id=block_data.get("id", f"blk_{__import__('uuid').uuid4().hex[:12]}"),
+                        query=block_data.get("query", ""),
+                        sources=[SearchSource(**s) for s in block_data.get("sources", [])],
+                    )
+                )
             # 未知类型跳过，保持前向兼容
 
         return Message(
@@ -311,13 +330,9 @@ class ConversationRepository:
             .first()
         )
 
-    def update_message_suggested_questions(
-        self, message_id: str, questions: list[str]
-    ) -> None:
+    def update_message_suggested_questions(self, message_id: str, questions: list[str]) -> None:
         """将推荐问题写回到指定消息"""
-        self.db.query(MessageModel).filter(MessageModel.id == message_id).update(
-            {"suggested_questions": questions}
-        )
+        self.db.query(MessageModel).filter(MessageModel.id == message_id).update({"suggested_questions": questions})
         self.db.flush()
 
     def _convert_to_schema(self, db_conversation: ConversationModel) -> Conversation:
@@ -371,19 +386,17 @@ class FileRepository:
         """关联文件到对话"""
         try:
             # 检查是否已存在关联
-            existing = self.db.query(ConversationFile).filter(
-                ConversationFile.conversation_id == conversation_id,
-                ConversationFile.file_id == file_id
-            ).first()
+            existing = (
+                self.db.query(ConversationFile)
+                .filter(ConversationFile.conversation_id == conversation_id, ConversationFile.file_id == file_id)
+                .first()
+            )
 
             if existing:
                 return True
 
             # 创建新关联
-            conv_file = ConversationFile(
-                conversation_id=conversation_id,
-                file_id=file_id
-            )
+            conv_file = ConversationFile(conversation_id=conversation_id, file_id=file_id)
             self.db.add(conv_file)
             self.db.commit()
             return True
@@ -400,10 +413,7 @@ class FileRepository:
                 return result
 
             # 查询指定ID的所有已处理文件
-            files = self.db.query(File).filter(
-                File.id.in_(file_ids),
-                File.status == "processed"
-            ).all()
+            files = self.db.query(File).filter(File.id.in_(file_ids), File.status == "processed").all()
 
             # 构建ID到内容的映射
             for file in files:
@@ -418,9 +428,12 @@ class FileRepository:
     def get_conversation_files(self, conversation_id: str) -> List[ConversationFile]:
         """获取对话关联的所有文件"""
         try:
-            return self.db.query(ConversationFile).filter(
-                ConversationFile.conversation_id == conversation_id
-            ).options(joinedload(ConversationFile.file)).all()
+            return (
+                self.db.query(ConversationFile)
+                .filter(ConversationFile.conversation_id == conversation_id)
+                .options(joinedload(ConversationFile.file))
+                .all()
+            )
         except Exception as e:
             logger.error(f"获取对话文件失败: {e}")
             return []
@@ -428,9 +441,7 @@ class FileRepository:
     def count_conversation_files(self, conversation_id: str) -> int:
         """计算对话关联的文件数量"""
         try:
-            return self.db.query(ConversationFile).filter(
-                ConversationFile.conversation_id == conversation_id
-            ).count()
+            return self.db.query(ConversationFile).filter(ConversationFile.conversation_id == conversation_id).count()
         except Exception as e:
             logger.error(f"计算对话文件数量失败: {e}")
             return 0
@@ -485,29 +496,28 @@ class ModelSourceRepository:
     def __init__(self, db: Session):
         self.db = db
 
-    def get_all(self, 
-                provider: Optional[str] = None, 
-                enabled: Optional[bool] = None,
-                capability: Optional[str] = None) -> List[ModelSource]:
+    def get_all(
+        self, provider: Optional[str] = None, enabled: Optional[bool] = None, capability: Optional[str] = None
+    ) -> List[ModelSource]:
         """获取所有模型数据源，支持筛选"""
         query = self.db.query(ModelSource)
-        
+
         # 应用筛选条件
         if provider:
             query = query.filter(ModelSource.provider == provider)
-        
+
         if enabled is not None:
             query = query.filter(ModelSource.enabled == enabled)
-            
+
         if capability:
             # JSON查询，需根据具体数据库类型调整
             query = query.filter(ModelSource.capabilities[capability].as_boolean() == True)
-            
+
         # 按优先级排序，数字小的排前面
         query = query.order_by(ModelSource.priority, ModelSource.name)
-            
+
         return query.all()
-    
+
     def get_by_id(self, model_id: str) -> Optional[ModelSource]:
         """根据模型ID获取模型数据源"""
         return self.db.query(ModelSource).filter(ModelSource.model_id == model_id).first()
@@ -529,7 +539,7 @@ class ModelSourceRepository:
                 return candidate
 
         return None
-    
+
     def create(self, model_data: Dict[str, Any]) -> ModelSource:
         """创建新的模型数据源"""
         now = get_china_time()
@@ -542,7 +552,7 @@ class ModelSourceRepository:
         model_configuration = model_data.get("model_configuration")
         if model_configuration is None and provider_template and provider_template.model_configuration:
             model_configuration = deepcopy(provider_template.model_configuration)
-        
+
         # 将Pydantic模型转换为数据库模型
         model_source = ModelSource(
             model_id=model_data.get("modelId"),
@@ -557,20 +567,20 @@ class ModelSourceRepository:
             enabled=model_data.get("enabled", True),
             description=model_data.get("description", ""),
             created_at=now,
-            updated_at=now
+            updated_at=now,
         )
-        
+
         self.db.add(model_source)
         self.db.commit()
         self.db.refresh(model_source)
         return model_source
-    
+
     def update(self, model_id: str, update_data: Dict[str, Any]) -> Optional[ModelSource]:
         """更新模型数据源"""
         model_source = self.get_by_id(model_id)
         if not model_source:
             return None
-        
+
         # 更新属性
         for key, value in update_data.items():
             # 转换键名格式
@@ -583,29 +593,28 @@ class ModelSourceRepository:
                 field_name = "auth_config"
             elif key == "model_configuration":
                 field_name = "model_configuration"
-                
+
             # 设置值
             if hasattr(model_source, field_name):
                 setattr(model_source, field_name, value)
-        
+
         model_source.updated_at = get_china_time()
         self.db.commit()
         self.db.refresh(model_source)
         return model_source
-    
+
     def delete(self, model_id: str) -> bool:
         """删除模型数据源"""
         model_source = self.get_by_id(model_id)
         if not model_source:
             return False
-        
+
         self.db.delete(model_source)
         self.db.commit()
         return True
-    
+
     def get_providers(self) -> list:
         """从数据库聚合去重提供商列表，按最小优先级排序"""
-        from sqlalchemy import func
         from app.ai.llm_manager import get_model_display_name
 
         rows = (
@@ -621,17 +630,19 @@ class ModelSourceRepository:
 
         providers = []
         for idx, row in enumerate(rows, start=1):
-            providers.append({
-                "id": row.provider,
-                "name": get_model_display_name(row.provider),
-                "order": idx,
-            })
+            providers.append(
+                {
+                    "id": row.provider,
+                    "name": get_model_display_name(row.provider),
+                    "order": idx,
+                }
+            )
         return providers
 
     def to_basic_schema(self, model_source: ModelSource) -> ModelBasicInfo:
         """将数据库模型转换为基础Pydantic模型"""
         capabilities = ModelCapabilities(**model_source.capabilities)
-        
+
         return ModelBasicInfo(
             modelId=model_source.model_id,
             name=model_source.name,
@@ -640,33 +651,30 @@ class ModelSourceRepository:
             capabilities=capabilities,
             priority=model_source.priority,
             enabled=model_source.enabled,
-            description=model_source.description
+            description=model_source.description,
         )
-        
+
     def to_full_schema(self, model_source: ModelSource) -> ModelInfo:
         """将数据库模型转换为完整Pydantic模型"""
         capabilities = ModelCapabilities(**model_source.capabilities)
         pricing = ModelPricing(**model_source.pricing)
-        
+
         auth_config = None
         if model_source.auth_config:
             fields = []
             for field_data in model_source.auth_config.get("fields", []):
                 fields.append(AuthConfigField(**field_data))
-            
-            auth_config = AuthConfig(
-                fields=fields,
-                auth_type=model_source.auth_config.get("auth_type", "api_key")
-            )
-        
+
+            auth_config = AuthConfig(fields=fields, auth_type=model_source.auth_config.get("auth_type", "api_key"))
+
         model_configuration = None
         if model_source.model_configuration:
             params = []
             for param_data in model_source.model_configuration.get("params", []):
                 params.append(ModelConfigParam(**param_data))
-            
+
             model_configuration = ModelConfiguration(params=params)
-        
+
         return ModelInfo(
             modelId=model_source.model_id,
             name=model_source.name,
@@ -678,22 +686,22 @@ class ModelSourceRepository:
             model_configuration=model_configuration,
             priority=model_source.priority,
             enabled=model_source.enabled,
-            description=model_source.description
+            description=model_source.description,
         )
-    
+
     def to_schema(self, model_source: ModelSource) -> ModelInfo:
         """将数据库模型转换为Pydantic模型"""
         capabilities = ModelCapabilities(**model_source.capabilities)
         pricing = ModelPricing(**model_source.pricing)
-        
+
         auth_config = None
         if model_source.auth_config:
             auth_config = AuthConfig(**model_source.auth_config)
-            
+
         model_configuration = None
         if model_source.model_configuration:
             model_configuration = ModelConfiguration(**model_source.model_configuration)
-        
+
         return ModelInfo(
             modelId=model_source.model_id,
             name=model_source.name,
@@ -704,8 +712,9 @@ class ModelSourceRepository:
             auth_config=auth_config,
             model_configuration=model_configuration,
             enabled=model_source.enabled,
-            description=model_source.description
+            description=model_source.description,
         )
+
 
 class ModelCredentialRepository:
     def __init__(self, db: Session):
@@ -717,88 +726,86 @@ class ModelCredentialRepository:
         if model_id:
             query = query.filter(ModelCredential.model_id == model_id)
         return query.all()
-    
+
     def get_by_id(self, credential_id: int) -> Optional[ModelCredential]:
         """根据ID获取凭证"""
         return self.db.query(ModelCredential).filter(ModelCredential.id == credential_id).first()
-    
+
     def get_default(self, model_id: str) -> Optional[ModelCredential]:
         """获取模型的默认凭证"""
-        return self.db.query(ModelCredential).filter(
-            ModelCredential.model_id == model_id,
-            ModelCredential.is_default == True
-        ).first()
-    
+        return (
+            self.db.query(ModelCredential)
+            .filter(ModelCredential.model_id == model_id, ModelCredential.is_default == True)
+            .first()
+        )
+
     def create(self, credential_data: Dict[str, Any]) -> ModelCredential:
         """创建新的凭证"""
         # 如果设置为默认凭证，先取消其他默认凭证
-        if credential_data.get('is_default', False):
-            self._reset_default_status(credential_data['model_id'])
-            
+        if credential_data.get("is_default", False):
+            self._reset_default_status(credential_data["model_id"])
+
         credential = ModelCredential(**credential_data)
         self.db.add(credential)
         self.db.commit()
         self.db.refresh(credential)
         return credential
-    
+
     def update(self, credential_id: int, update_data: Dict[str, Any]) -> Optional[ModelCredential]:
         """更新凭证"""
         credential = self.get_by_id(credential_id)
         if not credential:
             return None
-            
+
         # 如果设置为默认凭证，先取消其他默认凭证
-        if update_data.get('is_default', False) and not credential.is_default:
+        if update_data.get("is_default", False) and not credential.is_default:
             self._reset_default_status(credential.model_id)
-            
+
         # 更新字段
         for key, value in update_data.items():
             if hasattr(credential, key):
                 setattr(credential, key, value)
-                
+
         credential.updated_at = get_china_time()
         self.db.commit()
         self.db.refresh(credential)
         return credential
-    
+
     def delete(self, credential_id: int) -> bool:
         """删除凭证"""
         credential = self.get_by_id(credential_id)
         if not credential:
             return False
-            
+
         # 如果是默认凭证，可能需要设置另一个凭证为默认
         was_default = credential.is_default
         model_id = credential.model_id
-        
+
         self.db.delete(credential)
         self.db.commit()
-        
+
         # 如果删除的是默认凭证，尝试设置另一个为默认
         if was_default:
             self._set_new_default(model_id)
-            
+
         return True
-    
+
     def _reset_default_status(self, model_id: str) -> None:
         """重置指定模型的所有凭证的默认状态"""
         self.db.query(ModelCredential).filter(
-            ModelCredential.model_id == model_id,
-            ModelCredential.is_default == True
-        ).update({'is_default': False})
+            ModelCredential.model_id == model_id, ModelCredential.is_default == True
+        ).update({"is_default": False})
         self.db.commit()
-    
+
     def _set_new_default(self, model_id: str) -> None:
         """设置一个新的默认凭证"""
         # 获取第一个可用的凭证并设置为默认
-        credential = self.db.query(ModelCredential).filter(
-            ModelCredential.model_id == model_id
-        ).first()
-        
+        credential = self.db.query(ModelCredential).filter(ModelCredential.model_id == model_id).first()
+
         if credential:
             credential.is_default = True
             self.db.commit()
-    
+
     def to_schema(self, credential: ModelCredential) -> ModelCredentialInfo:
         """将数据库模型转换为Pydantic模型"""
         return ModelCredentialInfo(
@@ -808,5 +815,5 @@ class ModelCredentialRepository:
             is_default=credential.is_default,
             credentials=credential.credentials,
             created_at=credential.created_at,
-            updated_at=credential.updated_at
+            updated_at=credential.updated_at,
         )

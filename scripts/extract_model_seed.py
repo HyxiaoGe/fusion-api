@@ -4,7 +4,6 @@ import re
 import sys
 from pathlib import Path
 
-
 TABLES = ("model_sources", "model_credentials")
 
 

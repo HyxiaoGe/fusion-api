@@ -7,5 +7,5 @@
 from .utils import ChatUtils
 
 __all__ = [
-    'ChatUtils',
+    "ChatUtils",
 ]

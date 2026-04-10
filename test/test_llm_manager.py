@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import MagicMock
 
-from app.ai.llm_manager import get_model_display_name, LLMManager, PROVIDER_LITELLM_PREFIX
+from app.ai.llm_manager import PROVIDER_LITELLM_PREFIX, LLMManager, get_model_display_name
 
 
 class LLMManagerTests(unittest.TestCase):
@@ -10,9 +10,16 @@ class LLMManagerTests(unittest.TestCase):
 
     def test_provider_prefix_mapping_covers_all_providers(self):
         expected_providers = {
-            "openai", "anthropic", "deepseek", "google",
-            "qwen", "volcengine", "xai",
-            "xiaomi", "minimax", "moonshot",
+            "openai",
+            "anthropic",
+            "deepseek",
+            "google",
+            "qwen",
+            "volcengine",
+            "xai",
+            "xiaomi",
+            "minimax",
+            "moonshot",
         }
         self.assertEqual(set(PROVIDER_LITELLM_PREFIX.keys()), expected_providers)
 
@@ -28,8 +35,10 @@ class LLMManagerTests(unittest.TestCase):
         mock_credential = MagicMock()
         mock_credential.credentials = {"api_key": "test-key", "base_url": "https://api.example.com"}
 
-        with unittest.mock.patch("app.ai.llm_manager.ModelSourceRepository") as mock_source_repo, \
-             unittest.mock.patch("app.ai.llm_manager.ModelCredentialRepository") as mock_cred_repo:
+        with (
+            unittest.mock.patch("app.ai.llm_manager.ModelSourceRepository") as mock_source_repo,
+            unittest.mock.patch("app.ai.llm_manager.ModelCredentialRepository") as mock_cred_repo,
+        ):
             mock_source_repo.return_value.get_by_id.return_value = mock_source
             mock_cred_repo.return_value.get_default.return_value = mock_credential
 

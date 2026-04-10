@@ -4,6 +4,7 @@ Kimi $web_search 调用服务
 使用 Kimi K2.5 的内置 $web_search 工具搜索热点，
 由 LLM 改写成适合向 AI 提问的示例问题。
 """
+
 import json
 from typing import Optional
 
@@ -72,11 +73,13 @@ async def fetch_trending_questions() -> Optional[list[dict]]:
             if choice.message.tool_calls:
                 messages.append(choice.message.model_dump())
                 for tool_call in choice.message.tool_calls:
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": tool_call.function.arguments,
-                    })
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": tool_call.function.arguments,
+                        }
+                    )
             else:
                 # 无 tool_call 也没 stop，异常退出
                 break
@@ -106,7 +109,8 @@ def _parse_questions(content: str) -> Optional[list[dict]]:
 
     # 尝试从 markdown 代码块中提取
     import re
-    json_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', content, re.DOTALL)
+
+    json_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", content, re.DOTALL)
     if json_match:
         try:
             data = json.loads(json_match.group(1))

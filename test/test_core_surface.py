@@ -8,7 +8,6 @@ from unittest.mock import AsyncMock, patch
 from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
 
-
 os.environ["DATABASE_URL"] = "sqlite:///./fusion-test.db"
 os.environ["SERVER_HOST"] = "http://dev.example:8002"
 os.environ["FRONTEND_URL"] = "http://dev.example:3004"
@@ -44,7 +43,9 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         self.main.app.dependency_overrides.clear()
 
     def _enable_authenticated_overrides(self):
-        current_user_override = lambda: self.fake_user
+        def current_user_override():
+            return self.fake_user
+
         self.main.app.dependency_overrides[self.get_current_user] = current_user_override
         self.main.app.dependency_overrides[self.chat_api.get_current_user] = current_user_override
         self.main.app.dependency_overrides[self.files_api.get_current_user] = current_user_override

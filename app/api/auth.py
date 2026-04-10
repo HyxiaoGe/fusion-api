@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends
-from app.db.models import User as UserModel
+
 from app.core import security
+from app.db.models import User as UserModel
 from app.schemas.auth import User as UserSchema
 
 router = APIRouter()

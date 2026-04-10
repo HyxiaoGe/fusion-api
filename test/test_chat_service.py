@@ -4,7 +4,7 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.schemas.chat import Conversation, Message, TextBlock, ThinkingBlock, Usage
+from app.schemas.chat import Conversation, Message, TextBlock, ThinkingBlock
 from app.services.chat_service import ChatService
 
 
@@ -153,15 +153,17 @@ class ChatServiceTests(unittest.TestCase):
         service.memory_service.get_conversation.return_value = conversation
 
         mock_response = SimpleNamespace(
-            choices=[SimpleNamespace(
-                message=SimpleNamespace(
-                    content="1. Follow-up A\n2. Follow-up B\n3. Follow-up C\n4. Follow-up D"
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="1. Follow-up A\n2. Follow-up B\n3. Follow-up C\n4. Follow-up D")
                 )
-            )]
+            ]
         )
 
-        with patch("app.services.chat_service.litellm") as mock_litellm, \
-             patch("app.services.chat_service.llm_manager") as mock_manager:
+        with (
+            patch("app.services.chat_service.litellm") as mock_litellm,
+            patch("app.services.chat_service.llm_manager") as mock_manager,
+        ):
             mock_manager.resolve_model.return_value = ("openai/qwen-max-latest", "qwen", {})
             mock_litellm.acompletion = AsyncMock(return_value=mock_response)
 
@@ -198,14 +200,12 @@ class ChatServiceTests(unittest.TestCase):
         )
         service.memory_service.get_conversation.return_value = conversation
 
-        mock_response = SimpleNamespace(
-            choices=[SimpleNamespace(
-                message=SimpleNamespace(content="Fusion Chat")
-            )]
-        )
+        mock_response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="Fusion Chat"))])
 
-        with patch("app.services.chat_service.litellm") as mock_litellm, \
-             patch("app.services.chat_service.llm_manager") as mock_manager:
+        with (
+            patch("app.services.chat_service.litellm") as mock_litellm,
+            patch("app.services.chat_service.llm_manager") as mock_manager,
+        ):
             mock_manager.resolve_model.return_value = ("openai/qwen-max-latest", "qwen", {})
             mock_litellm.acompletion = AsyncMock(return_value=mock_response)
 

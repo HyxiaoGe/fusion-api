@@ -50,18 +50,18 @@ class ChatUtils:
     @staticmethod
     def _strip_question_prefix(line: str) -> str:
         """去掉问题列表行首的编号前缀。"""
-        return re.sub(r'^\d+[\.\)]\s*', '', line).strip()
+        return re.sub(r"^\d+[\.\)]\s*", "", line).strip()
 
     @staticmethod
     def _split_non_empty_lines(text: str) -> List[str]:
         """按行切分并去掉空行。"""
-        return [line.strip() for line in text.split('\n') if line.strip()]
+        return [line.strip() for line in text.split("\n") if line.strip()]
 
     @staticmethod
     def _extract_numbered_questions(response_text: str) -> List[str]:
         """提取按编号组织的问题列表。"""
         numbered_questions = re.findall(
-            r'\d+[\.\)]\s*(.*?)(?=\n\d+[\.\)]|\n*$)',
+            r"\d+[\.\)]\s*(.*?)(?=\n\d+[\.\)]|\n*$)",
             response_text,
             re.DOTALL,
         )

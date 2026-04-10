@@ -1,18 +1,17 @@
 # app/api/chat.py
-from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.core.logger import app_logger
+from app.core.redis import get_redis_pool, stream_chunks_key
 from app.core.security import get_current_user
 from app.db.database import get_db
 from app.db.models import User
 from app.schemas.chat import (
     ChatRequest,
-    ChatResponse,
     Conversation,
-    ConversationSummary,
     Message,
     MessageUpdateRequest,
     SuggestedQuestionsRequest,
@@ -20,12 +19,10 @@ from app.schemas.chat import (
     TitleGenerationRequest,
     TitleGenerationResponse,
 )
-from fastapi.responses import StreamingResponse
 from app.services.chat_service import ChatService
-from app.services.stream_state_service import get_stream_meta, cancel_stream
 from app.services.stream_handler import stream_redis_as_sse
+from app.services.stream_state_service import cancel_stream, get_stream_meta
 from app.services.task_manager import cancel_task
-from app.core.redis import get_redis_pool, stream_chunks_key
 
 router = APIRouter()
 
@@ -137,9 +134,7 @@ async def generate_title(
     chat_service = ChatService(db)
 
     # 校验会话归属
-    conversation = chat_service.get_conversation(
-        request.conversation_id, user_id=current_user.id
-    )
+    conversation = chat_service.get_conversation(request.conversation_id, user_id=current_user.id)
     if not conversation:
         raise HTTPException(status_code=404, detail="会话不存在或无权访问")
 
@@ -170,9 +165,7 @@ async def suggest_questions(
     chat_service = ChatService(db)
 
     # 校验会话归属
-    conversation = chat_service.get_conversation(
-        request.conversation_id, user_id=current_user.id
-    )
+    conversation = chat_service.get_conversation(request.conversation_id, user_id=current_user.id)
     if not conversation:
         raise HTTPException(status_code=404, detail="会话不存在或无权访问")
 

@@ -6,6 +6,7 @@ LLM 消息构建模块
 
 独立为模块，避免 chat_service ↔ stream_handler 循环导入。
 """
+
 import base64
 from typing import Dict, List, Optional
 
@@ -75,10 +76,12 @@ async def build_llm_messages(
         for block in msg.content:
             if block.type == "text":
                 if block.text:
-                    content_parts.append({
-                        "type": "text",
-                        "text": block.text,
-                    })
+                    content_parts.append(
+                        {
+                            "type": "text",
+                            "text": block.text,
+                        }
+                    )
 
             elif block.type == "file" and inject_images:
                 # 图片 FileBlock → base64 image_url
@@ -95,20 +98,20 @@ async def build_llm_messages(
             continue
 
         # 无图片时退化为纯文本（节省 token 开销）
-        if (
-            not has_image
-            and len(content_parts) == 1
-            and content_parts[0]["type"] == "text"
-        ):
-            result.append({
-                "role": msg.role,
-                "content": content_parts[0]["text"],
-            })
+        if not has_image and len(content_parts) == 1 and content_parts[0]["type"] == "text":
+            result.append(
+                {
+                    "role": msg.role,
+                    "content": content_parts[0]["text"],
+                }
+            )
         else:
-            result.append({
-                "role": msg.role,
-                "content": content_parts,
-            })
+            result.append(
+                {
+                    "role": msg.role,
+                    "content": content_parts,
+                }
+            )
 
     return result
 
@@ -122,10 +125,7 @@ def inject_file_content(
     if not messages:
         return messages
 
-    combined = "\n\n".join(
-        f"文件内容 ({i + 1}):\n{content}"
-        for i, content in enumerate(file_contents.values())
-    )
+    combined = "\n\n".join(f"文件内容 ({i + 1}):\n{content}" for i, content in enumerate(file_contents.values()))
     enhanced = f"{original_message}\n\n以下是相关文件内容，请结合这些内容回答：\n{combined}"
 
     result = messages.copy()

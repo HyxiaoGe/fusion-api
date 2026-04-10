@@ -1,6 +1,7 @@
 """
 搜索服务客户端 — 封装对私有 search-service 的 HTTP 调用
 """
+
 from typing import List
 
 import httpx
@@ -23,7 +24,7 @@ async def search_web(query: str, count: int = 5) -> List[SearchSource]:
                     "query": query,
                     "type": "web",
                     "count": count,
-                    "freshness": "pw",   # 优先返回一周内的结果
+                    "freshness": "pw",  # 优先返回一周内的结果
                 },
             )
             resp.raise_for_status()

@@ -1,5 +1,5 @@
 import os
-from typing import Dict, List, Optional, Any
+from typing import List, Optional
 
 from pydantic_settings import BaseSettings
 
@@ -26,11 +26,19 @@ class Settings(BaseSettings):
     FILE_STORAGE_PATH: str = os.getenv("FILE_STORAGE_PATH", "./storage/files")
     MAX_FILE_SIZE: int = 10 * 1024 * 1024  # 10MB
     ALLOWED_FILE_TYPES: List[str] = [
-        "image/jpeg", "image/png", "image/gif", "image/bmp", "image/webp",
-        "image/heic", "image/heif",
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/bmp",
+        "image/webp",
+        "image/heic",
+        "image/heif",
         "application/pdf",
-        "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "text/plain", "text/markdown", "text/csv"
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "text/plain",
+        "text/markdown",
+        "text/csv",
     ]
 
     # 存储后端配置（"local" 或 "minio"）
@@ -45,11 +53,11 @@ class Settings(BaseSettings):
     # Github OAuth
     GITHUB_CLIENT_ID: Optional[str] = None
     GITHUB_CLIENT_SECRET: Optional[str] = None
-    
+
     # Google OAuth
     GOOGLE_CLIENT_ID: Optional[str] = None
     GOOGLE_CLIENT_SECRET: Optional[str] = None
-    
+
     # 前端基础URL，回调路径会自动拼接
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000")
     FRONTEND_AUTH_CALLBACK_PATH: str = "/auth/callback"
@@ -58,7 +66,7 @@ class Settings(BaseSettings):
     AUTH_SERVICE_BASE_URL: str = os.getenv("AUTH_SERVICE_BASE_URL", "http://localhost:8100")
     AUTH_SERVICE_CLIENT_ID: Optional[str] = os.getenv("AUTH_SERVICE_CLIENT_ID")
     AUTH_SERVICE_JWKS_URL: Optional[str] = os.getenv("AUTH_SERVICE_JWKS_URL")
-    
+
     @property
     def FRONTEND_AUTH_CALLBACK_URL(self) -> str:
         """动态生成前端OAuth回调URL"""

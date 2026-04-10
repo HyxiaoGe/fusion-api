@@ -1,16 +1,16 @@
 import logging
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Form, Query
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
+from app.core.file_token import verify_file_token
+from app.core.security import get_current_user, jwt_validator
 from app.db.database import get_db
 from app.db.models import User
-from app.services.file_service import FileService
-from app.core.security import get_current_user, jwt_validator
-from app.core.file_token import verify_file_token
 from app.db.repositories import UserRepository
+from app.services.file_service import FileService
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -25,7 +25,7 @@ def _resolve_user_from_bearer(request: Request, db: Session) -> Optional[User]:
     if not auth_header.startswith("Bearer "):
         return None
 
-    token = auth_header[len("Bearer "):]
+    token = auth_header[len("Bearer ") :]
     try:
         payload = jwt_validator.verify(token)
         subject = payload.get("sub")
@@ -39,12 +39,12 @@ def _resolve_user_from_bearer(request: Request, db: Session) -> Optional[User]:
 
 @router.post("/upload")
 async def upload_files(
-        provider: str = Form(...),
-        model: str = Form(...),
-        conversation_id: str = Form(...),
-        files: List[UploadFile] = File(...),
-        db: Session = Depends(get_db),
-        current_user: User = Depends(get_current_user)
+    provider: str = Form(...),
+    model: str = Form(...),
+    conversation_id: str = Form(...),
+    files: List[UploadFile] = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """上传文件到指定对话"""
     try:
@@ -61,10 +61,10 @@ async def upload_files(
 
 @router.get("/{file_id}/url")
 async def get_file_url(
-        file_id: str,
-        variant: str = Query("thumbnail", pattern="^(processed|thumbnail)$"),
-        db: Session = Depends(get_db),
-        current_user: User = Depends(get_current_user)
+    file_id: str,
+    variant: str = Query("thumbnail", pattern="^(processed|thumbnail)$"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """获取文件访问 URL（presigned URL 或 API 代理路径）"""
     file_service = FileService(db)
@@ -76,11 +76,11 @@ async def get_file_url(
 
 @router.get("/{file_id}/content")
 async def get_file_content(
-        file_id: str,
-        variant: str = Query("thumbnail", pattern="^(processed|thumbnail)$"),
-        token: Optional[str] = Query(None),
-        request: Request = None,
-        db: Session = Depends(get_db),
+    file_id: str,
+    variant: str = Query("thumbnail", pattern="^(processed|thumbnail)$"),
+    token: Optional[str] = Query(None),
+    request: Request = None,
+    db: Session = Depends(get_db),
 ):
     """
     直接返回文件内容（用于本地存储模式的代理访问）。
@@ -128,9 +128,7 @@ def get_user_files(db: Session = Depends(get_db), current_user: User = Depends(g
 
 @router.get("/conversation/{conversation_id}")
 def get_conversation_files(
-        conversation_id: str,
-        db: Session = Depends(get_db),
-        current_user: User = Depends(get_current_user)
+    conversation_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
 ):
     """获取对话关联的所有文件"""
     file_service = FileService(db)
@@ -141,11 +139,7 @@ def get_conversation_files(
 
 
 @router.get("/{file_id}/status")
-def get_file_status(
-        file_id: str,
-        db: Session = Depends(get_db),
-        current_user: User = Depends(get_current_user)
-):
+def get_file_status(file_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """获取文件处理状态"""
     file_service = FileService(db)
     file = file_service.get_file_status(file_id, user_id=current_user.id)
@@ -155,11 +149,7 @@ def get_file_status(
 
 
 @router.delete("/{file_id}")
-async def delete_file(
-        file_id: str,
-        db: Session = Depends(get_db),
-        current_user: User = Depends(get_current_user)
-):
+async def delete_file(file_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """删除文件"""
     file_service = FileService(db)
     success = await file_service.delete_file(file_id, user_id=current_user.id)

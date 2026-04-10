@@ -3,13 +3,13 @@ stream_handler 单元测试（Redis Stream 架构）
 
 测试 generate_to_redis（后台任务）和 stream_redis_as_sse（SSE 读取器）。
 """
+
 import json
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.stream_handler import StreamHandler, stream_redis_as_sse
-
 
 # 统一 mock Redis Stream 操作
 REDIS_MOCKS = {
@@ -47,10 +47,12 @@ class GenerateToRedisTests(unittest.IsolatedAsyncioTestCase):
         """正常生成：写 chunk 到 Redis + 落库 + finalize"""
         mock_chunks = [
             SimpleNamespace(
-                choices=[SimpleNamespace(
-                    delta=SimpleNamespace(content="Hello", reasoning_content=None),
-                    finish_reason=None,
-                )],
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="Hello", reasoning_content=None),
+                        finish_reason=None,
+                    )
+                ],
                 usage=None,
             ),
         ]
@@ -82,9 +84,7 @@ class GenerateToRedisTests(unittest.IsolatedAsyncioTestCase):
         REDIS_MOCKS["app.services.stream_handler.append_chunk"].assert_awaited()
 
         # 验证 finalize_stream 被调用且 success=True
-        REDIS_MOCKS["app.services.stream_handler.finalize_stream"].assert_awaited_once_with(
-            "conv-1", success=True
-        )
+        REDIS_MOCKS["app.services.stream_handler.finalize_stream"].assert_awaited_once_with("conv-1", success=True)
 
         # 验证 DB 写入
         self.mock_db.add.assert_called_once()
@@ -93,6 +93,7 @@ class GenerateToRedisTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_generate_handles_exception(self):
         """LLM 异常时：尝试保存已有内容 + finalize error"""
+
         async def failing_stream():
             raise RuntimeError("LLM crashed")
             yield  # noqa
