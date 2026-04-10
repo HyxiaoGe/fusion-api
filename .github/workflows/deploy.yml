@@ -8,12 +8,15 @@ jobs:
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
-      - name: 安装检查工具
-        run: pip3 install --user --quiet ruff
+      - name: 安装 ruff
+        run: |
+          if ! command -v ruff &> /dev/null; then
+            curl -LsSf https://astral.sh/ruff/install.sh | sh
+          fi
       - name: 架构检查
         run: python3 scripts/check_architecture.py
       - name: Lint 检查
-        run: python3 -m ruff check .
+        run: ~/.cargo/bin/ruff check . || ruff check .
   deploy:
     needs: check
     runs-on: self-hosted
