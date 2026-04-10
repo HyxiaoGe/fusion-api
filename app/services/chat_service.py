@@ -223,11 +223,6 @@ class ChatService:
             message=assistant_message,
         )
 
-    def _resolve_utility_model(self) -> tuple:
-        """解析辅助功能使用的模型（标题生成、推荐问题等），避免使用 thinking 模型"""
-        from app.core.config import settings
-        return llm_manager.resolve_model(settings.DEFAULT_MODEL, self.db)
-
     async def generate_title(
         self,
         user_id: str,
@@ -256,8 +251,9 @@ class ChatService:
 
         try:
             prompt = prompt_manager.format_prompt("generate_title", content=seed_text)
-            # 使用默认模型而非对话模型，避免 thinking 模型浪费 token
-            litellm_model, _, litellm_kwargs = self._resolve_utility_model()
+            litellm_model, _, litellm_kwargs = llm_manager.resolve_model(
+                conversation.model_id, self.db
+            )
             response = await litellm.acompletion(
                 model=litellm_model,
                 messages=[{"role": "user", "content": prompt}],
@@ -308,8 +304,9 @@ class ChatService:
 
         try:
             prompt = prompt_manager.format_prompt("generate_suggested_questions", content=dialog_content)
-            # 使用默认模型而非对话模型，避免 thinking 模型浪费 token
-            litellm_model, _, litellm_kwargs = self._resolve_utility_model()
+            litellm_model, _, litellm_kwargs = llm_manager.resolve_model(
+                conversation.model_id, self.db
+            )
             response = await litellm.acompletion(
                 model=litellm_model,
                 messages=[{"role": "user", "content": prompt}],
