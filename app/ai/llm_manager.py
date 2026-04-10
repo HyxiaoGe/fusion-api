@@ -5,6 +5,7 @@ from typing import Any, Dict, Tuple
 import litellm
 from sqlalchemy.orm import Session
 
+from app.constants.providers import get_model_display_name  # noqa: F401 — 保持向后兼容
 from app.core.logger import app_logger as logger
 
 # 关闭 LiteLLM 的冗余日志
@@ -112,20 +113,3 @@ class LLMManager:
 llm_manager = LLMManager()
 
 
-# 保留展示名称映射，其他地方有引用
-MODEL_DISPLAY_NAMES = {
-    "anthropic": "Anthropic",
-    "deepseek": "DeepSeek",
-    "google": "Google",
-    "openai": "OpenAI",
-    "qwen": "通义千问",
-    "volcengine": "火山引擎",
-    "xai": "xAI",
-    "xiaomi": "小米 MiMo",
-    "minimax": "MiniMax",
-    "moonshot": "月之暗面",
-}
-
-
-def get_model_display_name(provider: str) -> str:
-    return MODEL_DISPLAY_NAMES.get(provider, provider)

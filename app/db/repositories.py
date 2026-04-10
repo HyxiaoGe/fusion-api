@@ -615,7 +615,7 @@ class ModelSourceRepository:
 
     def get_providers(self) -> list:
         """从数据库聚合去重提供商列表，按最小优先级排序"""
-        from app.ai.llm_manager import get_model_display_name
+        from app.constants.providers import get_model_display_name
 
         rows = (
             self.db.query(
