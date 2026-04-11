@@ -46,6 +46,7 @@ async def build_llm_messages(
     messages,
     has_vision: bool = False,
     file_repo: FileRepository = None,
+    user_memories: Optional[List] = None,
 ) -> List[dict]:
     """
     将 content blocks 消息列表转为 LLM 可消费的 dict 格式。
@@ -55,6 +56,18 @@ async def build_llm_messages(
     - 历史消息中的图片仅保留最近 MAX_VISION_HISTORY_TURNS 轮
     """
     result = []
+
+    # 如果有用户记忆，注入 system prompt
+    if user_memories:
+        memory_text = "\n".join(f"- {m.content}" for m in user_memories)
+        result.append({
+            "role": "system",
+            "content": (
+                "你了解以下关于用户的信息，在回答时自然地参考这些信息，"
+                "但不要主动提及\"我记得你说过...\"之类的话，除非用户问起。\n\n"
+                f"{memory_text}"
+            ),
+        })
 
     # 计算最近 N 轮用户消息的起始索引，用于控制图片注入范围
     vision_cutoff_idx = 0

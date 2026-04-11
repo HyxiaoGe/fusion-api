@@ -152,8 +152,12 @@ class ChatService:
             )
         else:
             # 非流式模式：同步构建消息（含图片 base64）
+            from app.db.repositories import MemoryRepository
+            memory_repo = MemoryRepository(self.db)
+            user_memories = memory_repo.get_active(user_id)
             lm_messages = await build_llm_messages(
-                conversation.messages, has_vision=has_vision, file_repo=self.file_repo
+                conversation.messages, has_vision=has_vision, file_repo=self.file_repo,
+                user_memories=user_memories,
             )
             if file_ids:
                 non_image_ids = [fid for fid in file_ids if not is_image_file(fid, self.file_repo)]

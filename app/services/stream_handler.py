@@ -112,7 +112,11 @@ class StreamHandler:
 
             # 在后台任务中构建 LLM 消息（含图片 base64 编码），不阻塞主请求
             file_repo = FileRepository(db)
-            messages = await build_llm_messages(raw_messages, has_vision, file_repo)
+            # 查询用户记忆，注入 system prompt
+            from app.db.repositories import MemoryRepository
+            memory_repo = MemoryRepository(db)
+            user_memories = memory_repo.get_active(user_id)
+            messages = await build_llm_messages(raw_messages, has_vision, file_repo, user_memories)
 
             # 非图片文件内容注入
             if file_ids:
@@ -265,6 +269,11 @@ class StreamHandler:
                 usage_data,
             )
             await finalize_stream(conversation_id, success=True, task_id=task_id)
+
+            # 异步提取用户记忆（fire-and-forget，失败不影响主流程）
+            asyncio.create_task(
+                self._extract_user_memories(conversation_id, user_id)
+            )
 
         except asyncio.CancelledError:
             logger.info(f"任务被取消: conv_id={conversation_id}")
@@ -444,6 +453,11 @@ class StreamHandler:
         )
         self._persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks, usage_data)
         await finalize_stream(conversation_id, success=True, task_id=task_id)
+
+        # 异步提取用户记忆
+        asyncio.create_task(
+            self._extract_user_memories(conversation_id, user_id)
+        )
 
     async def _fallback_no_search(
         self,
@@ -628,6 +642,19 @@ class StreamHandler:
         except Exception as e:
             logger.error(f"写入 assistant 消息失败: {e}")
             db.rollback()
+
+    @staticmethod
+    async def _extract_user_memories(conversation_id: str, user_id: str) -> None:
+        """异步提取用户记忆，使用独立的 DB Session"""
+        db = SessionLocal()
+        try:
+            from app.services.user_memory_service import UserMemoryService
+            service = UserMemoryService(db)
+            await service.extract_memories(conversation_id, user_id)
+        except Exception as e:
+            logger.warning(f"异步记忆提取失败: conv_id={conversation_id}, error={e}")
+        finally:
+            db.close()
 
 
 async def stream_redis_as_sse(
