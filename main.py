@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
-from app.api import auth, chat, files, models, prompts, providers
+from app.api import auth, chat, files, memories, models, prompts, providers
 from app.core.config import settings
 from app.core.logger import app_logger
 from app.core.redis import close_redis, init_redis
@@ -183,6 +183,7 @@ app.include_router(models.router, prefix="/api/models", tags=["models"])
 app.include_router(providers.router, prefix="/api/providers", tags=["providers"])
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(prompts.router, prefix="/api/prompts", tags=["prompts"])
+app.include_router(memories.router, prefix="/api/memories", tags=["memories"])
 
 if __name__ == "__main__":
     import uvicorn
