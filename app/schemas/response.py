@@ -39,7 +39,7 @@ class ApiResponse(BaseModel, Generic[T]):
 
 
 def generate_request_id() -> str:
-    return f"req_{uuid.uuid4().hex[:12]}"
+    return uuid.uuid4().hex
 
 
 def success(data: Any = None, message: str = "ok", request_id: str = "") -> ApiResponse:

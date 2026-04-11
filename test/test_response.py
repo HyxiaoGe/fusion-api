@@ -20,8 +20,8 @@ from app.schemas.response import ApiException, ApiResponse, ErrorCode, generate_
 class TestGenerateRequestId(unittest.TestCase):
     def test_format(self):
         rid = generate_request_id()
-        self.assertTrue(rid.startswith("req_"))
-        self.assertEqual(len(rid), 16)  # "req_" + 12 hex chars
+        self.assertEqual(len(rid), 32)  # uuid4 hex, 32 chars
+        int(rid, 16)  # 应为合法的十六进制字符串
 
     def test_unique(self):
         ids = {generate_request_id() for _ in range(100)}
@@ -92,7 +92,7 @@ class TestRequestIdMiddleware(unittest.TestCase):
     def test_health_has_request_id_header(self):
         response = self.client.get("/health")
         self.assertIn("x-request-id", response.headers)
-        self.assertTrue(response.headers["x-request-id"].startswith("req_"))
+        self.assertEqual(len(response.headers["x-request-id"]), 32)
 
     def test_request_id_is_unique_per_request(self):
         r1 = self.client.get("/health")
@@ -139,7 +139,7 @@ class TestGlobalExceptionHandlers(unittest.TestCase):
         self.assertEqual(body["code"], "NOT_FOUND")
         self.assertEqual(body["message"], "会话不存在或无权访问")
         self.assertIsNone(body["data"])
-        self.assertTrue(body["request_id"].startswith("req_"))
+        self.assertEqual(len(body["request_id"]), 32)
 
     def test_401_returns_unauthorized_code(self):
         response = self.client.get("/api/auth/me")
