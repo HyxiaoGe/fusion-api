@@ -87,10 +87,19 @@ class ModelInfo(ModelBasicInfo):
         from_attributes = True
 
 
-class ModelCreate(ModelInfo):
+class ModelCreate(BaseModel):
     """创建模型请求"""
 
-    pass
+    modelId: str
+    name: str
+    provider: str
+    knowledgeCutoff: Optional[str] = None
+    capabilities: ModelCapabilities
+    pricing: ModelPricing
+    model_configuration: Optional[ModelConfiguration] = None
+    priority: int = 100
+    enabled: bool = True
+    description: str = ""
 
 
 class ModelUpdate(BaseModel):
@@ -101,7 +110,6 @@ class ModelUpdate(BaseModel):
     knowledgeCutoff: Optional[str] = None
     capabilities: Optional[ModelCapabilities] = None
     pricing: Optional[ModelPricing] = None
-    auth_config: Optional[AuthConfig] = None
     model_configuration: Optional[ModelConfiguration] = None
     priority: Optional[int] = None
     enabled: Optional[bool] = None
@@ -113,7 +121,38 @@ class ProviderInfo(BaseModel):
 
     id: str
     name: str
-    order: int
+    auth_config: Optional[AuthConfig] = None
+    litellm_prefix: str = ""
+    custom_base_url: bool = False
+    priority: int = 100
+    enabled: bool = True
+    order: int = 0  # 前端排序用，由 API 层计算
+
+    class Config:
+        from_attributes = True
+
+
+class ProviderCreate(BaseModel):
+    """创建提供商"""
+
+    id: str
+    name: str
+    auth_config: AuthConfig
+    litellm_prefix: str
+    custom_base_url: bool = False
+    priority: int = 100
+    enabled: bool = True
+
+
+class ProviderUpdate(BaseModel):
+    """更新提供商"""
+
+    name: Optional[str] = None
+    auth_config: Optional[AuthConfig] = None
+    litellm_prefix: Optional[str] = None
+    custom_base_url: Optional[bool] = None
+    priority: Optional[int] = None
+    enabled: Optional[bool] = None
 
 
 # 模型列表响应
