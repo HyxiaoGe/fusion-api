@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
-from app.api import auth, chat, files, models, prompts
+from app.api import auth, chat, files, models, prompts, providers
 from app.core.config import settings
 from app.core.logger import app_logger
 from app.core.redis import close_redis, init_redis
@@ -180,6 +180,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 app.include_router(files.router, prefix="/api/files", tags=["files"])
 app.include_router(models.router, prefix="/api/models", tags=["models"])
+app.include_router(providers.router, prefix="/api/providers", tags=["providers"])
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(prompts.router, prefix="/api/prompts", tags=["prompts"])
 

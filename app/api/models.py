@@ -115,7 +115,7 @@ async def test_model_credential(
         model = model_repo.get_by_id(test_request.model_id)
         if not model:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"模型 {test_request.model_id} 不存在")
-        result = await llm_manager.test_credentials(model.provider, test_request.model_id, test_request.credentials)
+        result = await llm_manager.test_credentials(model.provider, test_request.model_id, test_request.credentials, db=db)
         if result:
             return success(data={"success": True, "message": "凭证有效"}, request_id=request.state.request_id)
         return success(data={"success": False, "message": "凭证无效"}, request_id=request.state.request_id)

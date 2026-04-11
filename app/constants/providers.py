@@ -1,21 +1,11 @@
 """
 提供商相关常量定义
-"""
 
-# 提供商展示名称映射
-MODEL_DISPLAY_NAMES = {
-    "anthropic": "Anthropic",
-    "deepseek": "DeepSeek",
-    "google": "Google",
-    "openai": "OpenAI",
-    "qwen": "通义千问",
-    "volcengine": "火山引擎",
-    "xai": "xAI",
-    "xiaomi": "小米 MiMo",
-    "minimax": "MiniMax",
-    "moonshot": "月之暗面",
-}
+注意：provider 显示名称已迁移到 providers 表，
+此模块仅保留向后兼容的辅助函数。
+"""
 
 
 def get_model_display_name(provider: str) -> str:
-    return MODEL_DISPLAY_NAMES.get(provider, provider)
+    """向后兼容：直接返回 provider id，实际显示名称从 DB 获取"""
+    return provider
