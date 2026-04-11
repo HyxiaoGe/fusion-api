@@ -96,9 +96,9 @@ class StreamHandler:
 
             call_kwargs["tools"] = [WEB_SEARCH_TOOL]
             call_kwargs["tool_choice"] = "auto"
-            # 第一轮带 tools 时，禁用 thinking 避免 tool_call 决策阶段的噪音
-            # 搜索路径：第二轮会恢复默认 thinking；非搜索路径：不输出思考过程
-            if should_use_reasoning:
+            # 仅 volcengine（豆包）：第一轮禁用 thinking，避免 tool_call 决策噪音
+            # 其他 provider 保持默认，不影响 tool_call 决策质量
+            if should_use_reasoning and provider == "volcengine":
                 call_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
 
         # 后台任务独立管理 DB Session
