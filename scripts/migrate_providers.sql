@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS providers (
 );
 
 -- 2. 从现有数据和硬编码常量插入 provider 数据
--- auth_config 从 model_sources 中每个 provider 取第一条有效记录
+-- 每个 provider 取优先级最高（数字最小）的模型的 auth_config
 INSERT INTO providers (id, name, auth_config, litellm_prefix, custom_base_url, priority, enabled)
 SELECT DISTINCT ON (ms.provider)
     ms.provider AS id,
@@ -52,12 +52,11 @@ SELECT DISTINCT ON (ms.provider)
     CASE WHEN ms.provider IN ('qwen', 'volcengine', 'xiaomi', 'minimax', 'moonshot')
         THEN TRUE ELSE FALSE
     END AS custom_base_url,
-    MIN(ms.priority) AS priority,
+    ms.priority AS priority,
     TRUE AS enabled
 FROM model_sources ms
 WHERE ms.auth_config IS NOT NULL AND ms.auth_config::text != '{}'
-GROUP BY ms.provider, ms.auth_config
-ORDER BY ms.provider, MIN(ms.priority);
+ORDER BY ms.provider, ms.priority;
 
 -- 3. model_sources: JSON 列升级为 JSONB
 ALTER TABLE model_sources
