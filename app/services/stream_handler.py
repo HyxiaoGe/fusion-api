@@ -96,6 +96,10 @@ class StreamHandler:
 
             call_kwargs["tools"] = [WEB_SEARCH_TOOL]
             call_kwargs["tool_choice"] = "auto"
+            # 第一轮带 tools 时，thinking 设为 auto 让模型自行决定是否输出思考过程
+            # 避免 tool_call 决策阶段输出大段噪音（如"要不要搜索"的自我辩论）
+            if should_use_reasoning:
+                call_kwargs["extra_body"] = {"thinking": {"type": "auto"}}
 
         # 后台任务独立管理 DB Session
         db = SessionLocal()
