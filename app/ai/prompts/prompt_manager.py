@@ -4,6 +4,7 @@
 """
 
 from app.ai.prompts.templates import (
+    EXTRACT_MEMORIES_PROMPT,
     FILE_ANALYSIS_PROMPT,
     FILE_CONTENT_ENHANCEMENT_PROMPT,
     GENERATE_SUGGESTED_QUESTIONS_PROMPT,
@@ -21,6 +22,7 @@ class PromptManager:
             "generate_suggested_questions": GENERATE_SUGGESTED_QUESTIONS_PROMPT,
             "file_analysis": FILE_ANALYSIS_PROMPT,
             "file_content_enhancement": FILE_CONTENT_ENHANCEMENT_PROMPT,
+            "extract_memories": EXTRACT_MEMORIES_PROMPT,
         }
 
     def get_template(self, template_name: str) -> str:

@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session, joinedload
 
 from app.db.models import Conversation as ConversationModel
-from app.db.models import ConversationFile, File, ModelCredential, ModelSource, Provider, get_china_time
+from app.db.models import ConversationFile, File, Memory, ModelCredential, ModelSource, Provider, get_china_time
 from app.db.models import Message as MessageModel
 from app.db.models import SocialAccount as SocialAccountModel
 from app.db.models import User as UserModel
@@ -345,6 +345,83 @@ class ConversationRepository:
             messages=messages,
             created_at=db_conversation.created_at,
             updated_at=db_conversation.updated_at,
+        )
+
+
+class MemoryRepository:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def get_active(self, user_id: str) -> List[Memory]:
+        """获取用户所有活跃且未删除的记忆"""
+        return (
+            self.db.query(Memory)
+            .filter(Memory.user_id == user_id, Memory.is_active == True, Memory.is_deleted == False)
+            .order_by(Memory.created_at)
+            .all()
+        )
+
+    def get_all(self, user_id: str) -> List[Memory]:
+        """获取用户所有未删除的记忆（含停用的）"""
+        return (
+            self.db.query(Memory)
+            .filter(Memory.user_id == user_id, Memory.is_deleted == False)
+            .order_by(Memory.created_at.desc())
+            .all()
+        )
+
+    def create(self, memory_data: Dict[str, Any]) -> Memory:
+        """创建新记忆"""
+        memory = Memory(**memory_data)
+        self.db.add(memory)
+        self.db.flush()
+        self.db.refresh(memory)
+        return memory
+
+    def update_content(self, memory_id: str, user_id: str, content: str) -> Optional[Memory]:
+        """更新记忆内容"""
+        memory = (
+            self.db.query(Memory)
+            .filter(Memory.id == memory_id, Memory.user_id == user_id, Memory.is_deleted == False)
+            .first()
+        )
+        if not memory:
+            return None
+        memory.content = content
+        memory.updated_at = get_china_time()
+        self.db.flush()
+        return memory
+
+    def toggle_active(self, memory_id: str, user_id: str, is_active: bool) -> Optional[Memory]:
+        """切换记忆启用/停用状态"""
+        memory = (
+            self.db.query(Memory)
+            .filter(Memory.id == memory_id, Memory.user_id == user_id, Memory.is_deleted == False)
+            .first()
+        )
+        if not memory:
+            return None
+        memory.is_active = is_active
+        memory.updated_at = get_china_time()
+        self.db.flush()
+        return memory
+
+    def soft_delete(self, memory_id: str, user_id: str) -> bool:
+        """软删除记忆"""
+        result = (
+            self.db.query(Memory)
+            .filter(Memory.id == memory_id, Memory.user_id == user_id, Memory.is_deleted == False)
+            .update({"is_deleted": True, "updated_at": get_china_time()})
+        )
+        self.db.flush()
+        return result > 0
+
+    def count_active(self, user_id: str) -> int:
+        """统计用户活跃记忆数量"""
+        return (
+            self.db.query(Memory)
+            .filter(Memory.user_id == user_id, Memory.is_active == True, Memory.is_deleted == False)
+            .count()
         )
 
 
