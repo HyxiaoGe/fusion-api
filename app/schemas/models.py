@@ -116,8 +116,16 @@ class ModelUpdate(BaseModel):
     description: Optional[str] = None
 
 
+class ProviderBasicInfo(BaseModel):
+    """提供商基础信息（用于模型列表的筛选下拉）"""
+
+    id: str
+    name: str
+    order: int = 0
+
+
 class ProviderInfo(BaseModel):
-    """提供商信息"""
+    """提供商完整信息"""
 
     id: str
     name: str
@@ -126,7 +134,7 @@ class ProviderInfo(BaseModel):
     custom_base_url: bool = False
     priority: int = 100
     enabled: bool = True
-    order: int = 0  # 前端排序用，由 API 层计算
+    order: int = 0
 
     class Config:
         from_attributes = True
@@ -160,7 +168,7 @@ class ModelsResponse(BaseModel):
     """模型列表响应"""
 
     models: List[ModelBasicInfo]
-    providers: List[ProviderInfo] = []
+    providers: List[ProviderBasicInfo] = []
 
 
 class ModelCredentialInfo(BaseModel):

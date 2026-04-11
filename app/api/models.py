@@ -14,7 +14,7 @@ from app.schemas.models import (
     ModelCredentialCreate,
     ModelCredentialUpdate,
     ModelUpdate,
-    ProviderInfo,
+    ProviderBasicInfo,
 )
 from app.schemas.response import success
 
@@ -33,7 +33,7 @@ async def get_models(
     repository = ModelSourceRepository(db)
     model_sources = repository.get_all(provider, enabled, capability)
     models = [repository.to_basic_schema(model) for model in model_sources]
-    providers = [ProviderInfo(**p) for p in repository.get_providers()]
+    providers = [ProviderBasicInfo(**p) for p in repository.get_providers()]
     return success(data={"models": models, "providers": providers}, request_id=request.state.request_id)
 
 
