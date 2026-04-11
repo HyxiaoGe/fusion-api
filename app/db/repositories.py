@@ -1,14 +1,12 @@
 import logging
 import re
 import uuid
-from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from app.db.models import Conversation as ConversationModel
-from app.db.models import ConversationFile, File, ModelCredential, ModelSource, get_china_time
+from app.db.models import ConversationFile, File, ModelCredential, ModelSource, Provider, get_china_time
 from app.db.models import Message as MessageModel
 from app.db.models import SocialAccount as SocialAccountModel
 from app.db.models import User as UserModel
@@ -32,6 +30,7 @@ from app.schemas.models import (
     ModelCredentialInfo,
     ModelInfo,
     ModelPricing,
+    ProviderInfo,
 )
 
 logger = logging.getLogger(__name__)
@@ -492,6 +491,80 @@ class FileRepository:
             return False
 
 
+class ProviderRepository:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def get_all(self, enabled: Optional[bool] = None) -> List[Provider]:
+        """获取所有 provider"""
+        query = self.db.query(Provider)
+        if enabled is not None:
+            query = query.filter(Provider.enabled == enabled)
+        return query.order_by(Provider.priority, Provider.name).all()
+
+    def get_by_id(self, provider_id: str) -> Optional[Provider]:
+        """根据 ID 获取 provider"""
+        return self.db.query(Provider).filter(Provider.id == provider_id).first()
+
+    def create(self, data: Dict[str, Any]) -> Provider:
+        """创建 provider"""
+        now = get_china_time()
+        provider = Provider(
+            id=data["id"],
+            name=data["name"],
+            auth_config=data.get("auth_config", {}),
+            litellm_prefix=data["litellm_prefix"],
+            custom_base_url=data.get("custom_base_url", False),
+            priority=data.get("priority", 100),
+            enabled=data.get("enabled", True),
+            created_at=now,
+            updated_at=now,
+        )
+        self.db.add(provider)
+        self.db.commit()
+        self.db.refresh(provider)
+        return provider
+
+    def update(self, provider_id: str, update_data: Dict[str, Any]) -> Optional[Provider]:
+        """更新 provider"""
+        provider = self.get_by_id(provider_id)
+        if not provider:
+            return None
+        for key, value in update_data.items():
+            if hasattr(provider, key):
+                setattr(provider, key, value)
+        provider.updated_at = get_china_time()
+        self.db.commit()
+        self.db.refresh(provider)
+        return provider
+
+    def delete(self, provider_id: str) -> bool:
+        """删除 provider"""
+        provider = self.get_by_id(provider_id)
+        if not provider:
+            return False
+        self.db.delete(provider)
+        self.db.commit()
+        return True
+
+    def to_schema(self, provider: Provider, order: int = 0) -> ProviderInfo:
+        """转换为 Pydantic Schema"""
+        auth_config = None
+        if provider.auth_config:
+            auth_config = AuthConfig(**provider.auth_config)
+
+        return ProviderInfo(
+            id=provider.id,
+            name=provider.name,
+            auth_config=auth_config,
+            litellm_prefix=provider.litellm_prefix,
+            custom_base_url=provider.custom_base_url,
+            priority=provider.priority,
+            enabled=provider.enabled,
+            order=order,
+        )
+
+
 class ModelSourceRepository:
     def __init__(self, db: Session):
         self.db = db
@@ -522,38 +595,10 @@ class ModelSourceRepository:
         """根据模型ID获取模型数据源"""
         return self.db.query(ModelSource).filter(ModelSource.model_id == model_id).first()
 
-    def _get_provider_template(self, provider: Optional[str]) -> Optional[ModelSource]:
-        """获取同 provider 的模板模型，用于继承认证和参数配置。"""
-        if not provider:
-            return None
-
-        candidates = (
-            self.db.query(ModelSource)
-            .filter(ModelSource.provider == provider)
-            .order_by(ModelSource.priority, ModelSource.id)
-            .all()
-        )
-
-        for candidate in candidates:
-            if candidate.auth_config or candidate.model_configuration:
-                return candidate
-
-        return None
-
     def create(self, model_data: Dict[str, Any]) -> ModelSource:
         """创建新的模型数据源"""
         now = get_china_time()
-        provider_template = self._get_provider_template(model_data.get("provider"))
 
-        auth_config = model_data.get("auth_config")
-        if auth_config is None and provider_template and provider_template.auth_config:
-            auth_config = deepcopy(provider_template.auth_config)
-
-        model_configuration = model_data.get("model_configuration")
-        if model_configuration is None and provider_template and provider_template.model_configuration:
-            model_configuration = deepcopy(provider_template.model_configuration)
-
-        # 将Pydantic模型转换为数据库模型
         model_source = ModelSource(
             model_id=model_data.get("modelId"),
             name=model_data.get("name"),
@@ -561,8 +606,7 @@ class ModelSourceRepository:
             knowledge_cutoff=model_data.get("knowledgeCutoff"),
             capabilities=model_data.get("capabilities"),
             pricing=model_data.get("pricing"),
-            auth_config=auth_config,
-            model_configuration=model_configuration,
+            model_configuration=model_data.get("model_configuration"),
             priority=model_data.get("priority", 100),
             enabled=model_data.get("enabled", True),
             description=model_data.get("description", ""),
@@ -581,20 +625,13 @@ class ModelSourceRepository:
         if not model_source:
             return None
 
-        # 更新属性
         for key, value in update_data.items():
-            # 转换键名格式
             field_name = key
             if key == "modelId":
                 field_name = "model_id"
             elif key == "knowledgeCutoff":
                 field_name = "knowledge_cutoff"
-            elif key == "auth_config":
-                field_name = "auth_config"
-            elif key == "model_configuration":
-                field_name = "model_configuration"
 
-            # 设置值
             if hasattr(model_source, field_name):
                 setattr(model_source, field_name, value)
 
@@ -614,30 +651,17 @@ class ModelSourceRepository:
         return True
 
     def get_providers(self) -> list:
-        """从数据库聚合去重提供商列表，按最小优先级排序"""
-        from app.constants.providers import get_model_display_name
-
-        rows = (
-            self.db.query(
-                ModelSource.provider,
-                func.min(ModelSource.priority).label("min_priority"),
-            )
-            .filter(ModelSource.enabled == True)
-            .group_by(ModelSource.provider)
-            .order_by(func.min(ModelSource.priority))
-            .all()
-        )
-
-        providers = []
-        for idx, row in enumerate(rows, start=1):
-            providers.append(
-                {
-                    "id": row.provider,
-                    "name": get_model_display_name(row.provider),
-                    "order": idx,
-                }
-            )
-        return providers
+        """获取所有启用的 provider 列表"""
+        provider_repo = ProviderRepository(self.db)
+        providers = provider_repo.get_all(enabled=True)
+        return [
+            {
+                "id": p.id,
+                "name": p.name,
+                "order": idx,
+            }
+            for idx, p in enumerate(providers, start=1)
+        ]
 
     def to_basic_schema(self, model_source: ModelSource) -> ModelBasicInfo:
         """将数据库模型转换为基础Pydantic模型"""
@@ -655,24 +679,26 @@ class ModelSourceRepository:
         )
 
     def to_full_schema(self, model_source: ModelSource) -> ModelInfo:
-        """将数据库模型转换为完整Pydantic模型"""
+        """将数据库模型转换为完整 Pydantic 模型"""
         capabilities = ModelCapabilities(**model_source.capabilities)
         pricing = ModelPricing(**model_source.pricing)
 
+        # auth_config 从关联的 provider 读取
         auth_config = None
-        if model_source.auth_config:
+        if model_source.provider_rel and model_source.provider_rel.auth_config:
             fields = []
-            for field_data in model_source.auth_config.get("fields", []):
+            for field_data in model_source.provider_rel.auth_config.get("fields", []):
                 fields.append(AuthConfigField(**field_data))
-
-            auth_config = AuthConfig(fields=fields, auth_type=model_source.auth_config.get("auth_type", "api_key"))
+            auth_config = AuthConfig(
+                fields=fields,
+                auth_type=model_source.provider_rel.auth_config.get("auth_type", "api_key"),
+            )
 
         model_configuration = None
         if model_source.model_configuration:
             params = []
             for param_data in model_source.model_configuration.get("params", []):
                 params.append(ModelConfigParam(**param_data))
-
             model_configuration = ModelConfiguration(params=params)
 
         return ModelInfo(
@@ -690,13 +716,13 @@ class ModelSourceRepository:
         )
 
     def to_schema(self, model_source: ModelSource) -> ModelInfo:
-        """将数据库模型转换为Pydantic模型"""
+        """将数据库模型转换为 Pydantic 模型"""
         capabilities = ModelCapabilities(**model_source.capabilities)
         pricing = ModelPricing(**model_source.pricing)
 
         auth_config = None
-        if model_source.auth_config:
-            auth_config = AuthConfig(**model_source.auth_config)
+        if model_source.provider_rel and model_source.provider_rel.auth_config:
+            auth_config = AuthConfig(**model_source.provider_rel.auth_config)
 
         model_configuration = None
         if model_source.model_configuration:
