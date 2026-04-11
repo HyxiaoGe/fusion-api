@@ -132,8 +132,9 @@ class StreamHandler:
             tool_call_name = None
             tool_call_args = ""
 
-            # 第一轮 tool_call 判断：缓冲 thinking 文本，不推送到前端
-            # 确认非 tool_call 后再回放，避免"要不要搜索"的噪音泄露
+            # 第一轮 tool_call 判断：thinking 实时推送给前端，同时缓冲用于持久化决策
+            # 搜索路径：前端 startSearch 清理噪音 + 后端不持久化第一轮 thinking
+            # 非搜索路径：thinking 正常展示和持久化
             first_round_buffering = supports_fc
             first_round_thinking_buf = ""
 
@@ -201,21 +202,17 @@ class StreamHandler:
                 if reasoning_delta and content_delta == reasoning_delta:
                     content_delta = ""
 
-                # thinking 处理：第一轮缓冲期间只记录不推送，避免"要不要搜索"的噪音泄露给前端
+                # thinking 处理：始终实时推送，缓冲模式下额外记录用于持久化决策
                 if reasoning_delta:
+                    await append_chunk(conversation_id, "reasoning", reasoning_delta, thinking_block_id)
                     if first_round_buffering:
                         first_round_thinking_buf += reasoning_delta
                     else:
-                        await append_chunk(conversation_id, "reasoning", reasoning_delta, thinking_block_id)
                         reasoning_buf += reasoning_delta
 
-                # content 出现意味着第一轮结束且没有 tool_call
-                # 非搜索路径：thinking 含有效推理，回放给前端并持久化
-                # （搜索路径在 _handle_tool_call 中已单独丢弃第一轮 thinking）
+                # content 出现意味着第一轮结束且没有 tool_call → 缓冲的 thinking 转入正式记录
                 if content_delta:
                     if first_round_buffering:
-                        if first_round_thinking_buf:
-                            await append_chunk(conversation_id, "reasoning", first_round_thinking_buf, thinking_block_id)
                         reasoning_buf += first_round_thinking_buf
                         first_round_thinking_buf = ""
                         first_round_buffering = False
