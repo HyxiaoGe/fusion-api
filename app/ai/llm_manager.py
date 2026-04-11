@@ -6,6 +6,7 @@ import litellm
 from sqlalchemy.orm import Session
 
 from app.core.logger import app_logger as logger
+from app.db.repositories import ModelCredentialRepository, ModelSourceRepository, ProviderRepository
 
 # 关闭 LiteLLM 的冗余日志
 litellm.suppress_debug_info = True
@@ -24,7 +25,6 @@ class LLMManager:
         根据 model_id 解析出 LiteLLM 调用所需的完整参数。
         返回：(litellm_model_string, provider, litellm_kwargs)
         """
-        from app.db.repositories import ModelCredentialRepository, ModelSourceRepository
 
         model_source = ModelSourceRepository(db).get_by_id(model_id)
         if not model_source:
@@ -62,8 +62,6 @@ class LLMManager:
     ) -> bool:
         """测试凭证是否有效，发送最小测试请求"""
         try:
-            from app.db.repositories import ProviderRepository
-
             if not db:
                 raise ValueError("需要数据库会话来查询 provider 配置")
 

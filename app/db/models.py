@@ -1,9 +1,18 @@
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import os
+
 from sqlalchemy import JSON, Boolean, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
+
+# 生产环境（PostgreSQL）使用 JSONB 以获得更好的查询性能；
+# 测试环境（SQLite）回退到通用 JSON 类型
+_db_url = os.getenv("DATABASE_URL", "")
+if _db_url.startswith("postgresql"):
+    from sqlalchemy.dialects.postgresql import JSONB
+else:
+    JSONB = JSON  # type: ignore[misc,assignment]
 
 from app.db.database import Base
 
