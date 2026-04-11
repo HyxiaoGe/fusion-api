@@ -127,6 +127,25 @@ class Message(Base):
     conversation = relationship("Conversation", back_populates="messages")
 
 
+class Provider(Base):
+    """LLM 提供商表"""
+
+    __tablename__ = "providers"
+
+    id = Column(String, primary_key=True)  # 如 'openai', 'qwen'
+    name = Column(String, nullable=False)  # 显示名称
+    auth_config = Column(JSONB, nullable=False, default={})  # 认证配置模板
+    litellm_prefix = Column(String, nullable=False)  # LiteLLM 路由前缀
+    custom_base_url = Column(Boolean, default=False)  # 是否需要自定义 base_url
+    priority = Column(Integer, default=100)
+    enabled = Column(Boolean, default=True)
+
+    created_at = Column(DateTime, default=get_china_time)
+    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
+
+    models = relationship("ModelSource", back_populates="provider_rel")
+
+
 class ModelSource(Base):
     """模型数据源表"""
 
@@ -135,14 +154,12 @@ class ModelSource(Base):
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     model_id = Column(String, unique=True, index=True, nullable=False)
     name = Column(String, nullable=False)
-    provider = Column(String, nullable=False)
+    provider = Column(String, ForeignKey("providers.id"), nullable=False)
     knowledge_cutoff = Column(String, nullable=True)
 
-    capabilities = Column(JSON, nullable=False, default={})  # 模型能力配置
-    pricing = Column(JSON, nullable=False, default={})  # 模型定价信息
-
-    auth_config = Column(JSON, nullable=False, default={})  # 认证配置模板
-    model_configuration = Column(JSON, nullable=False, default={})  # 模型默认参数配置
+    capabilities = Column(JSONB, nullable=False, default={})  # 模型能力配置
+    pricing = Column(JSONB, nullable=False, default={})  # 模型定价信息
+    model_configuration = Column(JSONB, nullable=False, default={})  # 模型默认参数配置
     priority = Column(Integer, default=100)  # 优先级，默认100，数字越小优先级越高
 
     enabled = Column(Boolean, default=True)
@@ -151,6 +168,7 @@ class ModelSource(Base):
     created_at = Column(DateTime, default=get_china_time)
     updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
 
+    provider_rel = relationship("Provider", back_populates="models")
     credentials = relationship("ModelCredential", back_populates="model_source", cascade="all, delete-orphan")
 
 
