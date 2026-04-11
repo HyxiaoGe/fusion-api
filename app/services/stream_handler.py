@@ -209,12 +209,12 @@ class StreamHandler:
                         await append_chunk(conversation_id, "reasoning", reasoning_delta, thinking_block_id)
                         reasoning_buf += reasoning_delta
 
-                # content 出现意味着第一轮结束且没有 tool_call → 缓冲的 thinking 回放到 Redis 并转入正式记录
+                # content 出现意味着第一轮结束且没有 tool_call
+                # 第一轮 thinking 是 tool_call 决策噪音，无论是否触发搜索都丢弃
                 if content_delta:
                     if first_round_buffering:
                         if first_round_thinking_buf:
-                            await append_chunk(conversation_id, "reasoning", first_round_thinking_buf, thinking_block_id)
-                        reasoning_buf += first_round_thinking_buf
+                            logger.debug(f"丢弃第一轮 thinking ({len(first_round_thinking_buf)} 字符)")
                         first_round_thinking_buf = ""
                         first_round_buffering = False
 
@@ -231,8 +231,8 @@ class StreamHandler:
                 if chunk_count % LOCK_CHECK_INTERVAL == 0:
                     if not await check_lock_owner(conversation_id, task_id):
                         logger.info(f"任务被踢掉，主动退出: conv_id={conversation_id}")
-                        # 回放未写入的 thinking
-                        all_reasoning = reasoning_buf + first_round_thinking_buf
+                        # 只保留有效 reasoning，丢弃第一轮 tool_call 决策噪音
+                        all_reasoning = reasoning_buf
                         if all_reasoning or content_buf:
                             self._persist_message(
                                 db,
@@ -247,10 +247,10 @@ class StreamHandler:
                         await finalize_stream(conversation_id, success=False, error_msg="被新请求取代", task_id=task_id)
                         return
 
-            # 回放未写入的 thinking（没有 tool_call 也没有 content 的极端情况）
+            # 丢弃未消费的第一轮 thinking（极端情况：没有 tool_call 也没有 content）
             if first_round_thinking_buf:
-                await append_chunk(conversation_id, "reasoning", first_round_thinking_buf, thinking_block_id)
-                reasoning_buf += first_round_thinking_buf
+                logger.debug(f"丢弃残留第一轮 thinking ({len(first_round_thinking_buf)} 字符)")
+                first_round_thinking_buf = ""
 
             # 生成完成，落库
             self._persist_message(
