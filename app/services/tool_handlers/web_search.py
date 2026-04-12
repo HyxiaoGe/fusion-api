@@ -6,7 +6,6 @@ WebSearchHandler — 网络搜索工具处理器
 import time
 from typing import List
 
-from app.core.logger import app_logger as logger
 from app.schemas.chat import SearchBlock, SearchSource, SearchSourceSummary
 from app.services.search_client import search_web
 from app.services.tool_handlers.base import BaseToolHandler, ToolResult
