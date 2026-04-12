@@ -3,7 +3,6 @@ import os
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 os.environ.setdefault("DATABASE_URL", "sqlite:///./fusion-test.db")
 os.environ.setdefault("SERVER_HOST", "http://dev.example:8002")
@@ -134,15 +133,10 @@ class TestGlobalExceptionHandlers(unittest.TestCase):
         cls.main = main
         cls.client = TestClient(main.app)
 
-        from app.api import chat as chat_api
-        from app.api import files as files_api
-        from app.core.security import get_current_user
-        from app.db.database import get_db
+        from app.api.deps import get_chat_service, get_current_user
 
-        cls.chat_api = chat_api
-        cls.files_api = files_api
         cls.get_current_user = get_current_user
-        cls.get_db = get_db
+        cls.get_chat_service = get_chat_service
         cls.fake_user = SimpleNamespace(id="user-123")
 
     def tearDown(self):
@@ -150,15 +144,13 @@ class TestGlobalExceptionHandlers(unittest.TestCase):
 
     def _auth(self):
         self.main.app.dependency_overrides[self.get_current_user] = lambda: self.fake_user
-        self.main.app.dependency_overrides[self.chat_api.get_current_user] = lambda: self.fake_user
-        self.main.app.dependency_overrides[self.get_db] = lambda: (yield object())
-        self.main.app.dependency_overrides[self.chat_api.get_db] = lambda: (yield object())
 
     def test_http_exception_returns_unified_format(self):
         self._auth()
-        with patch.object(self.chat_api, "ChatService") as cls:
-            cls.return_value.get_conversation.return_value = None
-            response = self.client.get("/api/chat/conversations/nonexistent")
+        mock_svc = SimpleNamespace(get_conversation=lambda *a, **kw: None)
+        self.main.app.dependency_overrides[self.get_chat_service] = lambda: mock_svc
+
+        response = self.client.get("/api/chat/conversations/nonexistent")
         self.assertEqual(response.status_code, 404)
         body = response.json()
         self.assertEqual(body["code"], "NOT_FOUND")

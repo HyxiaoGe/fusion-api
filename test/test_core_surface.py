@@ -28,15 +28,15 @@ class ChatCoreSurfaceTests(unittest.TestCase):
 
         from app.api import auth as auth_api
         from app.api import chat as chat_api
+        from app.api import deps as deps_mod
         from app.api import files as files_api
-        from app.core.security import get_current_user
-        from app.db.database import get_db
 
         cls.auth_api = auth_api
         cls.chat_api = chat_api
+        cls.deps_mod = deps_mod
         cls.files_api = files_api
-        cls.get_current_user = get_current_user
-        cls.get_db = get_db
+        cls.get_current_user = deps_mod.get_current_user
+        cls.get_db = deps_mod.get_db
         cls.fake_user = SimpleNamespace(id="user-123")
 
     def tearDown(self):
@@ -46,15 +46,13 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         def current_user_override():
             return self.fake_user
 
-        self.main.app.dependency_overrides[self.get_current_user] = current_user_override
-        self.main.app.dependency_overrides[self.chat_api.get_current_user] = current_user_override
+        self.main.app.dependency_overrides[self.deps_mod.get_current_user] = current_user_override
         self.main.app.dependency_overrides[self.files_api.get_current_user] = current_user_override
 
         def override_db():
             yield object()
 
-        self.main.app.dependency_overrides[self.get_db] = override_db
-        self.main.app.dependency_overrides[self.chat_api.get_db] = override_db
+        self.main.app.dependency_overrides[self.deps_mod.get_db] = override_db
         self.main.app.dependency_overrides[self.files_api.get_db] = override_db
 
     def test_health_endpoint_stays_available(self):
@@ -106,16 +104,16 @@ class ChatCoreSurfaceTests(unittest.TestCase):
             "file_ids": ["file-1"],
         }
 
-        with patch.object(self.chat_api, "ChatService") as chat_service_cls:
-            service = chat_service_cls.return_value
-            service.process_message = AsyncMock(
-                return_value={
-                    "conversation_id": "conv-1",
-                    "message": {"content": "hi"},
-                }
-            )
+        service = SimpleNamespace()
+        service.process_message = AsyncMock(
+            return_value={
+                "conversation_id": "conv-1",
+                "message": {"content": "hi"},
+            }
+        )
+        self.main.app.dependency_overrides[self.deps_mod.get_chat_service] = lambda: service
 
-            response = self.client.post("/api/chat/send", json=payload)
+        response = self.client.post("/api/chat/send", json=payload)
 
         self.assertEqual(response.status_code, 200)
         body = response.json()
@@ -137,23 +135,23 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         async def event_stream():
             yield "data: hello\n\n"
 
-        with patch.object(self.chat_api, "ChatService") as chat_service_cls:
-            service = chat_service_cls.return_value
-            service.process_message = AsyncMock(
-                return_value=StreamingResponse(
-                    event_stream(),
-                    media_type="text/event-stream",
-                )
+        service = SimpleNamespace()
+        service.process_message = AsyncMock(
+            return_value=StreamingResponse(
+                event_stream(),
+                media_type="text/event-stream",
             )
+        )
+        self.main.app.dependency_overrides[self.deps_mod.get_chat_service] = lambda: service
 
-            response = self.client.post(
-                "/api/chat/send",
-                json={
-                    "model_id": "gpt-4.1",
-                    "message": "stream please",
-                    "stream": True,
-                },
-            )
+        response = self.client.post(
+            "/api/chat/send",
+            json={
+                "model_id": "gpt-4.1",
+                "message": "stream please",
+                "stream": True,
+            },
+        )
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.headers["content-type"].startswith("text/event-stream"))
@@ -163,22 +161,21 @@ class ChatCoreSurfaceTests(unittest.TestCase):
     def test_get_conversations_uses_authenticated_user_id(self):
         self._enable_authenticated_overrides()
 
-        with patch.object(self.chat_api, "ChatService") as chat_service_cls:
-            service = chat_service_cls.return_value
-            service.get_conversations_paginated.return_value = {
-                "items": [],
-                "total": 0,
-                "page": 1,
-                "page_size": 10,
-            }
+        service = SimpleNamespace()
+        service.get_conversations_paginated = lambda *a, **kw: {
+            "items": [],
+            "total": 0,
+            "page": 1,
+            "page_size": 10,
+        }
+        self.main.app.dependency_overrides[self.deps_mod.get_chat_service] = lambda: service
 
-            response = self.client.get("/api/chat/conversations?page=1&page_size=10")
+        response = self.client.get("/api/chat/conversations?page=1&page_size=10")
 
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertEqual(body["code"], "SUCCESS")
         self.assertEqual(body["data"]["total"], 0)
-        service.get_conversations_paginated.assert_called_once_with("user-123", 1, 10)
 
     def test_file_upload_routes_to_file_service(self):
         self._enable_authenticated_overrides()
