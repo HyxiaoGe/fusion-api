@@ -4,6 +4,7 @@ stream_handler 单元测试（Redis Stream 架构）
 测试 generate_to_redis（后台任务）和 stream_redis_as_sse（SSE 读取器）。
 """
 
+import asyncio
 import json
 import unittest
 from types import SimpleNamespace
@@ -160,6 +161,120 @@ class StreamRedisAsSSETests(unittest.IsolatedAsyncioTestCase):
 
         # 最后一条是 [DONE]
         self.assertEqual(events[-1], "data: [DONE]\n\n")
+
+
+class HandleToolCallTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.handler = StreamHandler()
+        self._redis_patchers = []
+        for target, mock_obj in REDIS_MOCKS.items():
+            mock_obj.reset_mock()
+            p = patch(target, mock_obj)
+            p.start()
+            self._redis_patchers.append(p)
+
+        self.mock_db = MagicMock()
+
+    def tearDown(self):
+        for p in self._redis_patchers:
+            p.stop()
+
+    async def test_handle_tool_call_logs_success(self):
+        """搜索成功时写入 tool_call_log 且 status=success"""
+        from app.schemas.chat import SearchSource
+
+        mock_sources = [
+            SearchSource(
+                title="Result 1",
+                url="https://example.com",
+                description="desc",
+                content="body",
+                favicon=None,
+            )
+        ]
+
+        with (
+            patch(
+                "app.services.search_client.search_web",
+                new_callable=AsyncMock,
+                return_value=mock_sources,
+            ),
+            patch(
+                "app.services.stream_handler.log_tool_call",
+                new_callable=AsyncMock,
+            ) as mock_log,
+            patch.object(
+                self.handler,
+                "_stream_llm_to_redis",
+                new_callable=AsyncMock,
+                return_value=("", "answer", None),
+            ),
+            patch.object(self.handler, "_persist_message"),
+            patch.object(self.handler, "_extract_user_memories", new_callable=AsyncMock),
+        ):
+            await self.handler._handle_tool_call(
+                db=self.mock_db,
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="gpt-4",
+                litellm_model="openai/gpt-4",
+                litellm_kwargs={},
+                provider="openai",
+                messages=[],
+                assistant_message_id="msg-1",
+                task_id="task-1",
+                tool_call_id="tc-1",
+                tool_call_name="web_search",
+                tool_call_args='{"query": "test"}',
+                should_use_reasoning=False,
+                thinking_block_id="blk_t",
+                text_block_id="blk_c",
+            )
+
+            # 等待 asyncio.create_task 调度的日志任务完成
+            await asyncio.sleep(0)
+
+            mock_log.assert_awaited_once()
+            call_kwargs = mock_log.call_args[1]
+            self.assertEqual(call_kwargs["tool_name"], "web_search")
+            self.assertEqual(call_kwargs["status"], "success")
+            self.assertEqual(call_kwargs["input_params"], {"query": "test"})
+            self.assertIsNotNone(call_kwargs["duration_ms"])
+
+    async def test_handle_tool_call_logs_degraded_on_empty_query(self):
+        """query 为空时写入 degraded 记录"""
+        with (
+            patch(
+                "app.services.stream_handler.log_tool_call",
+                new_callable=AsyncMock,
+            ) as mock_log,
+            patch.object(self.handler, "_fallback_no_search", new_callable=AsyncMock),
+        ):
+            await self.handler._handle_tool_call(
+                db=self.mock_db,
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="gpt-4",
+                litellm_model="openai/gpt-4",
+                litellm_kwargs={},
+                provider="openai",
+                messages=[],
+                assistant_message_id="msg-1",
+                task_id="task-1",
+                tool_call_id="tc-1",
+                tool_call_name="web_search",
+                tool_call_args='{"query": ""}',
+                should_use_reasoning=False,
+                thinking_block_id="blk_t",
+                text_block_id="blk_c",
+            )
+
+            # 等待 asyncio.create_task 调度的日志任务完成
+            await asyncio.sleep(0)
+
+            mock_log.assert_awaited_once()
+            call_kwargs = mock_log.call_args[1]
+            self.assertEqual(call_kwargs["status"], "degraded")
 
 
 if __name__ == "__main__":
