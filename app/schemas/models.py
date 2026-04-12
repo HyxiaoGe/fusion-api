@@ -10,8 +10,7 @@ class ModelCapabilities(BaseModel):
     imageGen: bool = False
     deepThinking: bool = False
     fileSupport: bool = False
-    functionCalling: bool = False
-    webSearch: bool = False
+    functionCalling: bool = False  # 工具调用（含联网搜索）
     vision: bool = False  # 是否支持图片理解（多模态视觉输入）
 
 
