@@ -32,12 +32,6 @@ async def start_scheduler() -> None:
     _scheduler.start()
     logger.info("定时任务调度器已启动")
 
-    # 启动后立即执行一次（确保冷启动有数据）
-    try:
-        await refresh_prompt_examples()
-    except Exception as e:
-        logger.warning(f"首次刷新示例问题失败（不影响启动）: {e}")
-
 
 async def stop_scheduler() -> None:
     """关闭定时任务调度器"""
