@@ -406,18 +406,23 @@ class StreamHandler:
 
         # 5. 构造第二轮 LLM 调用的消息（注入搜索上下文）
         search_context = self._format_search_context(sources)
+        # 推理模型（DeepSeek 等）要求 assistant 消息包含 reasoning_content，
+        # 否则 API 报 400：thinking is enabled but reasoning_content is missing
+        assistant_tool_msg = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {"name": "web_search", "arguments": tool_call_args},
+                }
+            ],
+        }
+        if should_use_reasoning:
+            assistant_tool_msg["reasoning_content"] = ""
         augmented_messages = messages + [
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": tool_call_id,
-                        "type": "function",
-                        "function": {"name": "web_search", "arguments": tool_call_args},
-                    }
-                ],
-            },
+            assistant_tool_msg,
             {
                 "role": "tool",
                 "tool_call_id": tool_call_id,
