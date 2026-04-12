@@ -106,7 +106,7 @@ class Settings(BaseSettings):
     SEARCH_SERVICE_URL: str = os.getenv("SEARCH_SERVICE_URL", "http://search-service:8080")
 
     # 网页读取服务地址
-    READER_SERVICE_URL: str = os.getenv("READER_SERVICE_URL", "http://reader-service:8090")
+    READER_SERVICE_URL: str = os.getenv("READER_SERVICE_URL", "http://reader-service:8091")
 
     class Config:
         env_file = ".env"
