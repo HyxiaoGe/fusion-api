@@ -25,7 +25,7 @@ GENERATE_SUGGESTED_QUESTIONS_PROMPT = """根据以下最近一轮对话内容，
 4. 直接给出问题列表，不需要任何额外说明
 5. 确保问题有实际价值，能够产生有意义的回答
 6. 问题应该使用中文，语言自然流畅
-
+{user_memory_section}
 对话内容：
 {content}
 

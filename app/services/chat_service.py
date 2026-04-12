@@ -318,7 +318,24 @@ class ChatService:
             return ["有什么我可以帮您解答的问题吗？", "您想了解更多哪方面的信息？", "还有其他我能帮助您的事情吗？"]
 
         try:
-            prompt = prompt_manager.format_prompt("generate_suggested_questions", content=dialog_content)
+            # 查询用户记忆，注入推荐问题 prompt 实现个性化
+            from app.db.repositories import MemoryRepository
+            memory_repo = MemoryRepository(self.db)
+            user_memories = memory_repo.get_active(user_id)
+            if user_memories:
+                memory_text = "\n".join(f"- {m.content}" for m in user_memories)
+                user_memory_section = (
+                    "\n7. 结合以下用户背景信息，让推荐问题更贴合用户的实际需求和兴趣：\n"
+                    f"{memory_text}\n"
+                )
+            else:
+                user_memory_section = ""
+
+            prompt = prompt_manager.format_prompt(
+                "generate_suggested_questions",
+                content=dialog_content,
+                user_memory_section=user_memory_section,
+            )
             litellm_model, _, litellm_kwargs = self._resolve_utility_model(conversation.model_id)
             response = await litellm.acompletion(
                 model=litellm_model,
