@@ -133,22 +133,28 @@ class TestGlobalExceptionHandlers(unittest.TestCase):
         cls.main = main
         cls.client = TestClient(main.app)
 
-        from app.api.deps import get_chat_service, get_current_user
+        # 从路由的实际依赖中提取函数引用，避免模块重导入导致函数对象不一致
+        cls._dep_overrides = {}
+        for route in main.app.routes:
+            if hasattr(route, "path") and route.path == "/api/chat/conversations/{conversation_id}":
+                for dep in route.dependant.dependencies:
+                    cls._dep_overrides[dep.call.__qualname__] = dep.call
+                break
 
-        cls.get_current_user = get_current_user
-        cls.get_chat_service = get_chat_service
         cls.fake_user = SimpleNamespace(id="user-123")
 
     def tearDown(self):
         self.main.app.dependency_overrides.clear()
 
     def _auth(self):
-        self.main.app.dependency_overrides[self.get_current_user] = lambda: self.fake_user
+        gcu = self._dep_overrides["get_current_user"]
+        self.main.app.dependency_overrides[gcu] = lambda: self.fake_user
 
     def test_http_exception_returns_unified_format(self):
         self._auth()
+        gcs = self._dep_overrides["get_chat_service"]
         mock_svc = SimpleNamespace(get_conversation=lambda *a, **kw: None)
-        self.main.app.dependency_overrides[self.get_chat_service] = lambda: mock_svc
+        self.main.app.dependency_overrides[gcs] = lambda: mock_svc
 
         response = self.client.get("/api/chat/conversations/nonexistent")
         self.assertEqual(response.status_code, 404)

@@ -3,7 +3,7 @@ import os
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
@@ -25,35 +25,30 @@ class ChatCoreSurfaceTests(unittest.TestCase):
 
         cls.main = main
         cls.client = TestClient(main.app)
-
-        from app.api import auth as auth_api
-        from app.api import chat as chat_api
-        from app.api import deps as deps_mod
-        from app.api import files as files_api
-
-        cls.auth_api = auth_api
-        cls.chat_api = chat_api
-        cls.deps_mod = deps_mod
-        cls.files_api = files_api
-        cls.get_current_user = deps_mod.get_current_user
-        cls.get_db = deps_mod.get_db
         cls.fake_user = SimpleNamespace(id="user-123")
+
+        # 从路由依赖中提取实际函数引用，避免模块重导入导致的函数对象不一致
+        cls._route_deps = {}
+        for route in main.app.routes:
+            if hasattr(route, "dependant"):
+                for dep in route.dependant.dependencies:
+                    name = dep.call.__qualname__
+                    if name not in cls._route_deps:
+                        cls._route_deps[name] = dep.call
 
     def tearDown(self):
         self.main.app.dependency_overrides.clear()
 
     def _enable_authenticated_overrides(self):
-        def current_user_override():
-            return self.fake_user
+        gcu = self._route_deps.get("get_current_user")
+        if gcu:
+            self.main.app.dependency_overrides[gcu] = lambda: self.fake_user
 
-        self.main.app.dependency_overrides[self.deps_mod.get_current_user] = current_user_override
-        self.main.app.dependency_overrides[self.files_api.get_current_user] = current_user_override
-
-        def override_db():
-            yield object()
-
-        self.main.app.dependency_overrides[self.deps_mod.get_db] = override_db
-        self.main.app.dependency_overrides[self.files_api.get_db] = override_db
+        gdb = self._route_deps.get("get_db")
+        if gdb:
+            def override_db():
+                yield object()
+            self.main.app.dependency_overrides[gdb] = override_db
 
     def test_health_endpoint_stays_available(self):
         response = self.client.get("/health")
@@ -111,7 +106,7 @@ class ChatCoreSurfaceTests(unittest.TestCase):
                 "message": {"content": "hi"},
             }
         )
-        self.main.app.dependency_overrides[self.deps_mod.get_chat_service] = lambda: service
+        self.main.app.dependency_overrides[self._route_deps["get_chat_service"]] = lambda: service
 
         response = self.client.post("/api/chat/send", json=payload)
 
@@ -142,7 +137,7 @@ class ChatCoreSurfaceTests(unittest.TestCase):
                 media_type="text/event-stream",
             )
         )
-        self.main.app.dependency_overrides[self.deps_mod.get_chat_service] = lambda: service
+        self.main.app.dependency_overrides[self._route_deps["get_chat_service"]] = lambda: service
 
         response = self.client.post(
             "/api/chat/send",
@@ -168,7 +163,7 @@ class ChatCoreSurfaceTests(unittest.TestCase):
             "page": 1,
             "page_size": 10,
         }
-        self.main.app.dependency_overrides[self.deps_mod.get_chat_service] = lambda: service
+        self.main.app.dependency_overrides[self._route_deps["get_chat_service"]] = lambda: service
 
         response = self.client.get("/api/chat/conversations?page=1&page_size=10")
 
@@ -177,22 +172,32 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         self.assertEqual(body["code"], "SUCCESS")
         self.assertEqual(body["data"]["total"], 0)
 
+    def _mock_file_service(self, **methods):
+        """创建文件服务 mock 并注入依赖覆盖"""
+        from unittest.mock import MagicMock
+        service = MagicMock()
+        for name, val in methods.items():
+            setattr(service, name, val)
+        gfs = self._route_deps.get("get_file_service")
+        if gfs:
+            self.main.app.dependency_overrides[gfs] = lambda: service
+        return service
+
     def test_file_upload_routes_to_file_service(self):
         self._enable_authenticated_overrides()
+        service = self._mock_file_service(
+            upload_files=AsyncMock(return_value=[{"file_id": "file-1"}, {"file_id": "file-2"}])
+        )
 
-        with patch.object(self.files_api, "FileService") as file_service_cls:
-            service = file_service_cls.return_value
-            service.upload_files = AsyncMock(return_value=[{"file_id": "file-1"}, {"file_id": "file-2"}])
-
-            response = self.client.post(
-                "/api/files/upload",
-                data={
-                    "provider": "openai",
-                    "model": "gpt-4.1",
-                    "conversation_id": "conv-1",
-                },
-                files=[("files", ("note.txt", b"hello", "text/plain"))],
-            )
+        response = self.client.post(
+            "/api/files/upload",
+            data={
+                "provider": "openai",
+                "model": "gpt-4.1",
+                "conversation_id": "conv-1",
+            },
+            files=[("files", ("note.txt", b"hello", "text/plain"))],
+        )
 
         self.assertEqual(response.status_code, 201)
         body = response.json()
@@ -206,12 +211,10 @@ class ChatCoreSurfaceTests(unittest.TestCase):
 
     def test_file_status_returns_not_found_when_service_has_no_record(self):
         self._enable_authenticated_overrides()
+        service = self._mock_file_service()
+        service.get_file_status.return_value = None
 
-        with patch.object(self.files_api, "FileService") as file_service_cls:
-            service = file_service_cls.return_value
-            service.get_file_status.return_value = None
-
-            response = self.client.get("/api/files/file-404/status")
+        response = self.client.get("/api/files/file-404/status")
 
         self.assertEqual(response.status_code, 404)
         body = response.json()
@@ -221,12 +224,10 @@ class ChatCoreSurfaceTests(unittest.TestCase):
 
     def test_conversation_files_require_authorized_conversation(self):
         self._enable_authenticated_overrides()
+        service = self._mock_file_service()
+        service.get_conversation_files_for_user.return_value = None
 
-        with patch.object(self.files_api, "FileService") as file_service_cls:
-            service = file_service_cls.return_value
-            service.get_conversation_files_for_user.return_value = None
-
-            response = self.client.get("/api/files/conversation/conv-404")
+        response = self.client.get("/api/files/conversation/conv-404")
 
         self.assertEqual(response.status_code, 404)
         body = response.json()
@@ -236,12 +237,10 @@ class ChatCoreSurfaceTests(unittest.TestCase):
 
     def test_conversation_files_use_authenticated_user_scope(self):
         self._enable_authenticated_overrides()
+        service = self._mock_file_service()
+        service.get_conversation_files_for_user.return_value = [{"id": "file-1"}]
 
-        with patch.object(self.files_api, "FileService") as file_service_cls:
-            service = file_service_cls.return_value
-            service.get_conversation_files_for_user.return_value = [{"id": "file-1"}]
-
-            response = self.client.get("/api/files/conversation/conv-1")
+        response = self.client.get("/api/files/conversation/conv-1")
 
         self.assertEqual(response.status_code, 200)
         body = response.json()
