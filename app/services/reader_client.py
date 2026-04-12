@@ -46,5 +46,5 @@ async def read_url(url: str, timeout: float = 5.0) -> Optional[UrlReadResult]:
             fetch_ms=data.get("fetch_ms", 0),
         )
     except Exception as e:
-        logger.error(f"reader-service 调用失败: url={url}, error={e}")
+        logger.error(f"reader-service 调用失败: url={url}, error={type(e).__name__}: {e}")
         return None

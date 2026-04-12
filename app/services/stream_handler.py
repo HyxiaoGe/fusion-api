@@ -146,14 +146,15 @@ class StreamHandler:
                         url_read_block_id,
                     )
 
-                    # 异步抓取（5 秒超时）
+                    # 异步抓取（8 秒超时，给 reader-service 足够时间处理慢页面）
                     try:
                         from app.services.reader_client import read_url
                         read_result = await asyncio.wait_for(
-                            read_url(auto_detected_url, timeout=5.0),
-                            timeout=5.0,
+                            read_url(auto_detected_url, timeout=8.0),
+                            timeout=8.0,
                         )
                     except asyncio.TimeoutError:
+                        logger.warning(f"URL 自动抓取超时: {auto_detected_url}")
                         read_result = None
 
                     if read_result:
