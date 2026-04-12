@@ -1,9 +1,9 @@
 """reader_client 单元测试"""
 
 import unittest
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.services.reader_client import read_url, UrlReadResult
+from app.services.reader_client import read_url
 
 
 class ReadUrlTests(unittest.IsolatedAsyncioTestCase):
