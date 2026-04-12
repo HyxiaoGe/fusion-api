@@ -55,3 +55,27 @@ class ApiException(Exception):
         self.message = message
         self.status_code = status_code
         super().__init__(message)
+
+    @classmethod
+    def bad_request(cls, message: str = "参数错误") -> "ApiException":
+        return cls(ErrorCode.INVALID_PARAM, message, 400)
+
+    @classmethod
+    def not_found(cls, message: str = "资源不存在") -> "ApiException":
+        return cls(ErrorCode.NOT_FOUND, message, 404)
+
+    @classmethod
+    def unauthorized(cls, message: str = "未授权") -> "ApiException":
+        return cls(ErrorCode.UNAUTHORIZED, message, 401)
+
+    @classmethod
+    def forbidden(cls, message: str = "无权限") -> "ApiException":
+        return cls(ErrorCode.FORBIDDEN, message, 403)
+
+    @classmethod
+    def conflict(cls, message: str = "资源冲突") -> "ApiException":
+        return cls(ErrorCode.CONFLICT, message, 409)
+
+    @classmethod
+    def internal_error(cls, message: str = "服务器内部错误") -> "ApiException":
+        return cls(ErrorCode.INTERNAL_ERROR, message, 500)

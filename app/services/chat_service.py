@@ -19,6 +19,7 @@ from app.schemas.chat import (
     TextBlock,
     Usage,
 )
+from app.schemas.response import ApiException
 from app.services.chat.message_builder import (
     build_llm_messages,
     inject_file_content,
@@ -101,7 +102,6 @@ class ChatService:
         # 持久化会话（包括前端传了 ID 但数据库不存在的情况）
         if is_new_conversation:
             self.memory_service.save_conversation(conversation)
-            self.db.commit()
         self.memory_service.create_message(user_message, conversation.id)
         self.db.commit()
 
@@ -253,7 +253,7 @@ class ChatService:
         """基于会话最后一条用户消息生成标题，并写回数据库"""
         conversation = self.memory_service.get_conversation(conversation_id, user_id)
         if not conversation:
-            raise ValueError(f"找不到会话: {conversation_id}")
+            raise ApiException.not_found(f"找不到会话: {conversation_id}")
 
         # 提取最后一条用户消息文本
         seed_text = ""
@@ -265,7 +265,7 @@ class ChatService:
                     break
 
         if not seed_text:
-            raise ValueError("会话中没有可用的用户消息")
+            raise ApiException.bad_request("会话中没有可用的用户消息")
 
         # 生成失败时的回退标题
         fallback_title = seed_text[:30] + "..." if len(seed_text) > 30 else seed_text
