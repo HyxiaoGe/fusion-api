@@ -599,6 +599,7 @@ class StreamHandler:
         parts.append("- 优先使用搜索结果中的信息回答")
         parts.append("- 如果搜索结果不足以回答，可以结合自身知识补充")
         parts.append("- 引用时使用 [n] 格式标注来源编号")
+        parts.append("- 直接回答问题，不要再发起搜索或输出任何工具调用指令")
 
         return "\n".join(parts)
 
