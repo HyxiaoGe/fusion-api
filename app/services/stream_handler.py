@@ -344,12 +344,33 @@ class StreamHandler:
                 reasoning_buf += first_round_thinking_buf
 
             # 生成完成，落库
+            content_blocks = self._build_content_blocks(reasoning_buf, content_buf, thinking_block_id, text_block_id)
+
+            # 路径 A 自动检测成功时，在 content blocks 中插入 UrlBlock
+            if url_read_content and auto_detected_url:
+                from app.schemas.chat import UrlBlock
+                url_block = UrlBlock(
+                    type="url_read",
+                    id=url_read_block_id,
+                    url=auto_detected_url,
+                    title=url_read_content.title,
+                    favicon=url_read_content.favicon,
+                )
+                # 插入到 ThinkingBlock 之后、TextBlock 之前
+                insert_pos = 0
+                for i, b in enumerate(content_blocks):
+                    if hasattr(b, 'type') and b.type == 'text':
+                        insert_pos = i
+                        break
+                    insert_pos = i + 1
+                content_blocks.insert(insert_pos, url_block)
+
             self._persist_message(
                 db,
                 assistant_message_id,
                 conversation_id,
                 model_id,
-                self._build_content_blocks(reasoning_buf, content_buf, thinking_block_id, text_block_id),
+                content_blocks,
                 usage_data,
             )
             await finalize_stream(conversation_id, success=True, task_id=task_id)
