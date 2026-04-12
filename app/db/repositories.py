@@ -18,6 +18,7 @@ from app.schemas.chat import (
     SearchSourceSummary,
     TextBlock,
     ThinkingBlock,
+    UrlBlock,
     Usage,
 )
 from app.schemas.models import (
@@ -306,6 +307,8 @@ class ConversationRepository:
                         sources=[SearchSourceSummary(**s) for s in block_data.get("sources", [])],
                     )
                 )
+            elif block_type == "url_read":
+                content_blocks.append(UrlBlock(**block_data))
             # 未知类型跳过，保持前向兼容
 
         return Message(
