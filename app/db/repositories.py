@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session, joinedload
 
 from app.db.models import Conversation as ConversationModel
-from app.db.models import ConversationFile, File, Memory, ModelCredential, ModelSource, Provider, ToolCallLog, get_china_time
+from app.db.models import ConversationFile, File, Memory, ModelCredential, ModelSource, Provider, get_china_time
 from app.db.models import Message as MessageModel
 from app.db.models import SocialAccount as SocialAccountModel
 from app.db.models import User as UserModel
@@ -923,46 +923,3 @@ class ModelCredentialRepository:
         )
 
 
-class ToolCallLogRepository:
-    """工具调用统计日志 Repository"""
-
-    def __init__(self, db):
-        self.db = db
-
-    def create(
-        self,
-        conversation_id: str,
-        message_id: Optional[str],
-        user_id: str,
-        tool_name: str,
-        status: str,
-        duration_ms: Optional[int],
-        model_id: str,
-        provider: str,
-        input_params: Optional[dict] = None,
-        output_data: Optional[dict] = None,
-        error_message: Optional[str] = None,
-        metadata: Optional[dict] = None,
-    ) -> Optional[ToolCallLog]:
-        try:
-            log = ToolCallLog(
-                conversation_id=conversation_id,
-                message_id=message_id,
-                user_id=user_id,
-                tool_name=tool_name,
-                status=status,
-                error_message=error_message,
-                duration_ms=duration_ms,
-                model_id=model_id,
-                provider=provider,
-                input_params=input_params,
-                output_data=output_data,
-                extra_metadata=metadata,
-            )
-            self.db.add(log)
-            self.db.commit()
-            return log
-        except Exception as e:
-            logger.error(f"写入工具调用日志失败: {e}")
-            self.db.rollback()
-            return None

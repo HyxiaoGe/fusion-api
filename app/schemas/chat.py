@@ -63,7 +63,7 @@ class SearchBlock(BaseModel):
     type: Literal["search"]
     id: str = Field(default_factory=lambda: f"blk_{uuid4().hex[:12]}")
     query: str
-    tool_call_log_id: str  # 关联 tool_call_logs 表
+    tool_call_log_id: str = ""  # 关联 tool_call_logs 表
     sources: List[SearchSourceSummary]  # 轻量版，前端展示用
 
 

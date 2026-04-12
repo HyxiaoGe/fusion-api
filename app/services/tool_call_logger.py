@@ -29,8 +29,8 @@ async def log_tool_call(
     log_id: Optional[str] = None,
 ) -> None:
     """异步记录工具调用日志，失败时静默处理不影响主流程"""
-    db = SessionLocal()
     try:
+        db = SessionLocal()
         log = ToolCallLog(
             id=log_id or str(_uuid.uuid4()),
             conversation_id=conversation_id,
