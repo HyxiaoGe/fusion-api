@@ -162,6 +162,20 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     )
 
 
+@app.exception_handler(ValueError)
+async def value_error_handler(request: Request, exc: ValueError):
+    """兼容旧代码中抛出的 ValueError，统一转为 400"""
+    return JSONResponse(
+        status_code=400,
+        content={
+            "code": "INVALID_PARAM",
+            "message": str(exc),
+            "data": None,
+            "request_id": getattr(request.state, "request_id", generate_request_id()),
+        },
+    )
+
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     app_logger.exception("未预期的异常")

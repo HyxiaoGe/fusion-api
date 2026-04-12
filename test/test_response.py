@@ -80,6 +80,31 @@ class TestApiException(unittest.TestCase):
         exc = ApiException(ErrorCode.INVALID_PARAM, "参数错误")
         self.assertEqual(exc.status_code, 400)
 
+    def test_bad_request_factory(self):
+        exc = ApiException.bad_request("字段 X 无效")
+        self.assertEqual(exc.code, "INVALID_PARAM")
+        self.assertEqual(exc.status_code, 400)
+        self.assertEqual(exc.message, "字段 X 无效")
+
+    def test_not_found_factory(self):
+        exc = ApiException.not_found("会话不存在")
+        self.assertEqual(exc.code, "NOT_FOUND")
+        self.assertEqual(exc.status_code, 404)
+
+    def test_not_found_default_message(self):
+        exc = ApiException.not_found()
+        self.assertEqual(exc.message, "资源不存在")
+
+    def test_conflict_factory(self):
+        exc = ApiException.conflict("ID 已存在")
+        self.assertEqual(exc.code, "CONFLICT")
+        self.assertEqual(exc.status_code, 409)
+
+    def test_internal_error_factory(self):
+        exc = ApiException.internal_error()
+        self.assertEqual(exc.code, "INTERNAL_ERROR")
+        self.assertEqual(exc.status_code, 500)
+
 
 class TestRequestIdMiddleware(unittest.TestCase):
     @classmethod
@@ -148,3 +173,38 @@ class TestGlobalExceptionHandlers(unittest.TestCase):
         self.assertEqual(body["code"], "UNAUTHORIZED")
         self.assertIsNone(body["data"])
         self.assertIn("request_id", body)
+
+
+class TestValueErrorHandler(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        sys.modules.pop("main", None)
+        main = importlib.import_module("main")
+        main.init_db = lambda: None
+        cls.main = main
+        cls.client = TestClient(main.app)
+
+    def tearDown(self):
+        self.main.app.dependency_overrides.clear()
+
+    def test_value_error_returns_400(self):
+        """ValueError 应返回 400 而非 500"""
+        from fastapi import APIRouter
+
+        test_router = APIRouter()
+
+        @test_router.get("/test-value-error")
+        async def raise_value_error():
+            raise ValueError("模型不存在")
+
+        self.main.app.include_router(test_router)
+        try:
+            response = self.client.get("/test-value-error")
+            self.assertEqual(response.status_code, 400)
+            body = response.json()
+            self.assertEqual(body["code"], "INVALID_PARAM")
+            self.assertEqual(body["message"], "模型不存在")
+            self.assertIn("request_id", body)
+        finally:
+            # 清理测试路由
+            self.main.app.routes[:] = [r for r in self.main.app.routes if not getattr(r, 'path', '').endswith('/test-value-error')]
