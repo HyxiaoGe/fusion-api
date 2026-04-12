@@ -105,6 +105,9 @@ class Settings(BaseSettings):
     # 搜索服务地址（容器间通过 Docker 内网访问）
     SEARCH_SERVICE_URL: str = os.getenv("SEARCH_SERVICE_URL", "http://search-service:8080")
 
+    # 网页读取服务地址
+    READER_SERVICE_URL: str = os.getenv("READER_SERVICE_URL", "http://reader-service:8090")
+
     class Config:
         env_file = ".env"
         extra = "ignore"

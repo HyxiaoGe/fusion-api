@@ -36,3 +36,30 @@ WEB_SEARCH_TOOL = {
         },
     },
 }
+
+URL_READ_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "url_read",
+        "description": (
+            "读取指定 URL 的网页内容。以下情况应该使用此工具：\n"
+            "- 用户要求你查看、分析或总结某个网页链接\n"
+            "- 对话中提到了一个具体的 URL 需要获取内容\n"
+            "- 搜索结果中的某个链接需要深入阅读\n\n"
+            "以下情况不应使用此工具：\n"
+            "- 用户的当前消息中已经包含 URL（系统会自动预读取）\n"
+            "- 不确定具体的 URL 地址\n"
+            "- 需要搜索信息而非读取特定网页（应使用 web_search）"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "要读取的完整 URL 地址（包含 http:// 或 https://）",
+                }
+            },
+            "required": ["url"],
+        },
+    },
+}

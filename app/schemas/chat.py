@@ -67,8 +67,19 @@ class SearchBlock(BaseModel):
     sources: List[SearchSourceSummary]  # 轻量版，前端展示用
 
 
+class UrlBlock(BaseModel):
+    """网页读取内容块，出现在 assistant 消息中"""
+
+    type: Literal["url_read"]
+    id: str = Field(default_factory=lambda: f"blk_{uuid4().hex[:12]}")
+    url: str
+    title: Optional[str] = None
+    favicon: Optional[str] = None
+    tool_call_log_id: str = ""
+
+
 # content block 的联合类型，后续扩展直接在此添加
-ContentBlock = Union[TextBlock, ThinkingBlock, FileBlock, SearchBlock]
+ContentBlock = Union[TextBlock, ThinkingBlock, FileBlock, SearchBlock, UrlBlock]
 
 
 # ============================================================
