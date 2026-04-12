@@ -1,16 +1,16 @@
 import logging
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
+from app.api.deps import get_current_user, get_db, get_file_service
 from app.core.file_token import verify_file_token
-from app.core.security import get_current_user, jwt_validator
-from app.db.database import get_db
+from app.core.security import jwt_validator
 from app.db.models import User
 from app.db.repositories import UserRepository
-from app.schemas.response import success
+from app.schemas.response import ApiException, success
 from app.services.file_service import FileService
 
 logger = logging.getLogger(__name__)
@@ -45,18 +45,12 @@ async def upload_files(
     model: str = Form(...),
     conversation_id: str = Form(...),
     files: List[UploadFile] = File(...),
-    db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    file_service: FileService = Depends(get_file_service),
 ):
     """上传文件到指定对话"""
-    try:
-        file_service = FileService(db)
-        results = await file_service.upload_files(files, current_user.id, conversation_id, provider, model)
-        return success(data={"files": results}, message="上传成功", request_id=request.state.request_id)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"文件上传失败: {str(e)}")
+    results = await file_service.upload_files(files, current_user.id, conversation_id, provider, model)
+    return success(data={"files": results}, message="上传成功", request_id=request.state.request_id)
 
 
 @router.get("/{file_id}/url")
@@ -64,14 +58,13 @@ async def get_file_url(
     file_id: str,
     request: Request,
     variant: str = Query("thumbnail", pattern="^(processed|thumbnail)$"),
-    db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    file_service: FileService = Depends(get_file_service),
 ):
     """获取文件访问 URL"""
-    file_service = FileService(db)
     url = await file_service.get_file_url(file_id, current_user.id, variant)
     if not url:
-        raise HTTPException(status_code=404, detail="文件不存在或无权访问")
+        raise ApiException.not_found("文件不存在或无权访问")
     return success(data={"url": url}, request_id=request.state.request_id)
 
 
@@ -100,16 +93,16 @@ async def get_file_content(
         # 签名 token 认证：验证签名和过期时间，匹配 file_id
         verified_file_id = verify_file_token(token)
         if not verified_file_id or verified_file_id != file_id:
-            raise HTTPException(status_code=401, detail="无效或过期的文件访问令牌")
+            raise ApiException.unauthorized("无效或过期的文件访问令牌")
         # 签名 token 已验证 file_id，跳过 user_id 过滤（token 本身即授权凭证）
         user_id = None
     else:
-        raise HTTPException(status_code=401, detail="需要认证才能访问文件")
+        raise ApiException.unauthorized("需要认证才能访问文件")
 
     file_service = FileService(db)
     result = await file_service.get_file_content(file_id, user_id, variant)
     if not result:
-        raise HTTPException(status_code=404, detail="文件不存在或无权访问")
+        raise ApiException.not_found("文件不存在或无权访问")
 
     data, mime_type = result
     return Response(
@@ -120,9 +113,12 @@ async def get_file_content(
 
 
 @router.get("/")
-def get_user_files(request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def get_user_files(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    file_service: FileService = Depends(get_file_service),
+):
     """获取当前用户的所有文件"""
-    file_service = FileService(db)
     files = file_service.get_files_by_user(current_user.id)
     return success(data={"files": files}, request_id=request.state.request_id)
 
@@ -131,36 +127,39 @@ def get_user_files(request: Request, db: Session = Depends(get_db), current_user
 def get_conversation_files(
     conversation_id: str,
     request: Request,
-    db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    file_service: FileService = Depends(get_file_service),
 ):
     """获取对话关联的所有文件"""
-    file_service = FileService(db)
     files = file_service.get_conversation_files_for_user(conversation_id, current_user.id)
     if files is None:
-        raise HTTPException(status_code=404, detail="对话不存在或无权访问")
+        raise ApiException.not_found("对话不存在或无权访问")
     return success(data={"files": files}, request_id=request.state.request_id)
 
 
 @router.get("/{file_id}/status")
 def get_file_status(
-    file_id: str, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+    file_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    file_service: FileService = Depends(get_file_service),
 ):
     """获取文件处理状态"""
-    file_service = FileService(db)
     file = file_service.get_file_status(file_id, user_id=current_user.id)
     if not file:
-        raise HTTPException(status_code=404, detail="文件不存在或无权访问")
+        raise ApiException.not_found("文件不存在或无权访问")
     return success(data=file, request_id=request.state.request_id)
 
 
 @router.delete("/{file_id}")
 async def delete_file(
-    file_id: str, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+    file_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    file_service: FileService = Depends(get_file_service),
 ):
     """删除文件"""
-    file_service = FileService(db)
     result = await file_service.delete_file(file_id, user_id=current_user.id)
     if not result:
-        raise HTTPException(status_code=404, detail="文件不存在或删除失败")
+        raise ApiException.not_found("文件不存在或删除失败")
     return success(message="文件已删除", request_id=request.state.request_id)
