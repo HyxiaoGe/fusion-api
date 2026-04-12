@@ -7,6 +7,7 @@
 """
 
 import json
+from functools import wraps
 from typing import Optional
 
 import litellm
@@ -24,6 +25,20 @@ UTILITY_MODEL_ID = "qwen-max-latest"
 MAX_NEW_MEMORIES_PER_TURN = 3
 
 
+def transactional(method):
+    """Service 方法事务装饰器：成功 commit，异常 rollback"""
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            result = method(self, *args, **kwargs)
+            self.db.commit()
+            return result
+        except Exception:
+            self.db.rollback()
+            raise
+    return wrapper
+
+
 class UserMemoryService:
     def __init__(self, db: Session):
         self.db = db
@@ -39,6 +54,7 @@ class UserMemoryService:
         """获取用户所有记忆（用于管理页面）"""
         return self.repo.get_all(user_id)
 
+    @transactional
     def create_memory(
         self,
         user_id: str,
@@ -47,35 +63,27 @@ class UserMemoryService:
         conversation_id: Optional[str] = None,
     ):
         """创建新记忆"""
-        memory = self.repo.create({
+        return self.repo.create({
             "user_id": user_id,
             "content": content,
             "source": source,
             "conversation_id": conversation_id,
         })
-        self.db.commit()
-        return memory
 
+    @transactional
     def update_memory(self, memory_id: str, user_id: str, content: str):
         """更新记忆内容"""
-        memory = self.repo.update_content(memory_id, user_id, content)
-        if memory:
-            self.db.commit()
-        return memory
+        return self.repo.update_content(memory_id, user_id, content)
 
+    @transactional
     def toggle_memory(self, memory_id: str, user_id: str, is_active: bool):
         """切换记忆启用/停用"""
-        memory = self.repo.toggle_active(memory_id, user_id, is_active)
-        if memory:
-            self.db.commit()
-        return memory
+        return self.repo.toggle_active(memory_id, user_id, is_active)
 
+    @transactional
     def delete_memory(self, memory_id: str, user_id: str) -> bool:
         """软删除记忆"""
-        result = self.repo.soft_delete(memory_id, user_id)
-        if result:
-            self.db.commit()
-        return result
+        return self.repo.soft_delete(memory_id, user_id)
 
     # ==================== LLM 自动提取 ====================
 
