@@ -204,6 +204,9 @@ class StreamHandler:
                 # 在 messages 最后一条 user 消息之前插入
                 messages.insert(-1, url_context_msg)
                 # call_kwargs["tools"] 已包含 WEB_SEARCH_TOOL，不追加 url_read
+                # 恢复 volcengine thinking（路径 A 成功，无需 tool_call 决策，thinking 不再是噪音）
+                if "extra_body" in call_kwargs and call_kwargs["extra_body"].get("thinking", {}).get("type") == "disabled":
+                    del call_kwargs["extra_body"]
             else:
                 # 自动检测失败或没有 URL → 传 url_read tool 让 LLM 可以 function calling
                 if supports_fc:
