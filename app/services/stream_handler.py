@@ -653,13 +653,15 @@ class StreamHandler:
     @staticmethod
     async def _extract_user_memories(conversation_id: str, user_id: str) -> None:
         """异步提取用户记忆，使用独立的 DB Session"""
+        logger.info(f"开始记忆提取: conv_id={conversation_id}, user_id={user_id}")
         db = SessionLocal()
         try:
             from app.services.user_memory_service import UserMemoryService
             service = UserMemoryService(db)
             await service.extract_memories(conversation_id, user_id)
+            logger.info(f"记忆提取完成: conv_id={conversation_id}")
         except Exception as e:
-            logger.warning(f"异步记忆提取失败: conv_id={conversation_id}, error={e}")
+            logger.warning(f"异步记忆提取失败: conv_id={conversation_id}, error={e}", exc_info=True)
         finally:
             db.close()
 

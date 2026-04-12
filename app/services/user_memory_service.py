@@ -97,11 +97,16 @@ class UserMemoryService:
             # 获取最近对话内容
             conv_repo = ConversationRepository(self.db)
             conversation = conv_repo.get_by_id(conversation_id, user_id)
-            if not conversation or len(conversation.messages) < 2:
+            if not conversation:
+                logger.info(f"记忆提取跳过: 对话不存在 conv_id={conversation_id}, user_id={user_id}")
+                return
+            if len(conversation.messages) < 2:
+                logger.info(f"记忆提取跳过: 消息数不足 ({len(conversation.messages)}条) conv_id={conversation_id}")
                 return
 
             recent_dialog = self._build_recent_dialog(conversation)
             if not recent_dialog:
+                logger.info(f"记忆提取跳过: 无有效对话文本 conv_id={conversation_id}")
                 return
 
             # 获取已有记忆用于去重
