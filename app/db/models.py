@@ -229,3 +229,27 @@ class PromptExample(Base):
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=get_china_time)
     expires_at = Column(DateTime, nullable=True)
+
+
+class ToolCallLog(Base):
+    """工具调用统计日志"""
+
+    __tablename__ = "tool_call_logs"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    conversation_id = Column(String, ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True)
+    message_id = Column(String, ForeignKey("messages.id", ondelete="SET NULL"), nullable=True)
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    tool_name = Column(String(50), nullable=False, index=True)
+    status = Column(String(20), nullable=False)  # 'success' | 'failed' | 'degraded'
+    error_message = Column(Text, nullable=True)
+    duration_ms = Column(Integer, nullable=True)
+    model_id = Column(String(100), nullable=False)
+    provider = Column(String(50), nullable=False)
+
+    input_params = Column(JSONB, nullable=True)
+    output_data = Column(JSONB, nullable=True)
+    extra_metadata = Column("metadata", JSONB, nullable=True)
+
+    created_at = Column(DateTime, default=get_china_time, index=True)
