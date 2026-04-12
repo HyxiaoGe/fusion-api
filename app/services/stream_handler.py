@@ -172,7 +172,8 @@ class StreamHandler:
 
                 # tool_call 完整了
                 if finish_reason == "tool_calls" and tool_call_name:
-                    # 丢弃第一轮 thinking（tool_call 推理噪音）
+                    # 传入第一轮 thinking：前端展示已丢弃，但 DeepSeek 等推理模型
+                    # 要求 assistant tool_call 消息必须包含实际的 reasoning_content
                     await self._handle_tool_call(
                         db=db,
                         conversation_id=conversation_id,
@@ -190,7 +191,7 @@ class StreamHandler:
                         should_use_reasoning=should_use_reasoning,
                         thinking_block_id=thinking_block_id,
                         text_block_id=text_block_id,
-                        first_round_reasoning="",  # 丢弃
+                        first_round_reasoning=first_round_thinking_buf,
                     )
                     return
 
@@ -420,7 +421,7 @@ class StreamHandler:
             ],
         }
         if should_use_reasoning:
-            assistant_tool_msg["reasoning_content"] = ""
+            assistant_tool_msg["reasoning_content"] = first_round_reasoning or ""
         augmented_messages = messages + [
             assistant_tool_msg,
             {
