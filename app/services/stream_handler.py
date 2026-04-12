@@ -127,6 +127,88 @@ class StreamHandler:
                     if file_contents:
                         messages = inject_file_content(messages, original_message, file_contents)
 
+            # ── URL 自动检测预处理（路径 A）──
+            url_read_content = None
+            auto_detected_url = None
+            if supports_fc:
+                import re
+                url_pattern = re.compile(r'https?://[^\s<>"\')\]]+')
+                urls_in_message = url_pattern.findall(original_message)
+                if urls_in_message:
+                    auto_detected_url = urls_in_message[0]  # 取第一个 URL
+                    url_read_block_id = f"blk_{uuid.uuid4().hex[:12]}"
+
+                    # 推送 url_read_start SSE
+                    await append_chunk(
+                        conversation_id,
+                        "url_read_start",
+                        json.dumps({"url": auto_detected_url, "source": "auto"}, ensure_ascii=False),
+                        url_read_block_id,
+                    )
+
+                    # 异步抓取（5 秒超时）
+                    try:
+                        from app.services.reader_client import read_url
+                        read_result = await asyncio.wait_for(
+                            read_url(auto_detected_url, timeout=5.0),
+                            timeout=5.0,
+                        )
+                    except asyncio.TimeoutError:
+                        read_result = None
+
+                    if read_result:
+                        url_read_content = read_result
+                        # 推送 url_read_complete SSE（成功）
+                        await append_chunk(
+                            conversation_id,
+                            "url_read_complete",
+                            json.dumps({
+                                "url": auto_detected_url,
+                                "title": read_result.title,
+                                "favicon": read_result.favicon,
+                                "status": "success",
+                            }, ensure_ascii=False),
+                            url_read_block_id,
+                        )
+                    else:
+                        # 推送 url_read_complete SSE（失败）
+                        await append_chunk(
+                            conversation_id,
+                            "url_read_complete",
+                            json.dumps({
+                                "url": auto_detected_url,
+                                "status": "failed",
+                            }, ensure_ascii=False),
+                            url_read_block_id,
+                        )
+
+            # 如果自动检测成功，注入网页内容到 messages，不传 url_read tool
+            if url_read_content:
+                from app.services.tool_handlers.url_read import MAX_CONTENT_CHARS
+                content_text = url_read_content.content
+                truncation_note = ""
+                if len(content_text) > MAX_CONTENT_CHARS:
+                    content_text = content_text[:MAX_CONTENT_CHARS]
+                    truncation_note = "\n（内容已截断，仅展示前部分）"
+
+                url_context_msg = {
+                    "role": "system",
+                    "content": (
+                        f"以下是用户消息中提到的网页 {auto_detected_url} 的内容：\n"
+                        f"标题：{url_read_content.title or '未知'}\n\n"
+                        f"{content_text}{truncation_note}\n\n"
+                        "请基于以上网页内容回答用户的问题。"
+                    ),
+                }
+                # 在 messages 最后一条 user 消息之前插入
+                messages.insert(-1, url_context_msg)
+                # call_kwargs["tools"] 已包含 WEB_SEARCH_TOOL，不追加 url_read
+            else:
+                # 自动检测失败或没有 URL → 传 url_read tool 让 LLM 可以 function calling
+                if supports_fc:
+                    from app.ai.tools import URL_READ_TOOL
+                    call_kwargs["tools"].append(URL_READ_TOOL)
+
             response = await litellm.acompletion(
                 model=litellm_model,
                 messages=messages,
