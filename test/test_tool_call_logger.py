@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 from app.db.models import ToolCallLog
 from app.db.repositories import ToolCallLogRepository
+from app.services.tool_call_logger import log_tool_call
 
 
 class ToolCallLogModelTests(unittest.TestCase):
@@ -69,6 +70,57 @@ class ToolCallLogRepositoryTests(unittest.TestCase):
 
         self.assertIsNone(log)
         self.mock_db.rollback.assert_called_once()
+
+
+class LogToolCallTests(unittest.IsolatedAsyncioTestCase):
+    @patch("app.services.tool_call_logger.SessionLocal")
+    async def test_log_tool_call_creates_record(self, mock_session_cls):
+        """log_tool_call 使用独立 session 写入记录"""
+        mock_db = MagicMock()
+        mock_session_cls.return_value = mock_db
+
+        await log_tool_call(
+            conversation_id="conv-1",
+            message_id="msg-1",
+            user_id="user-1",
+            tool_name="web_search",
+            status="success",
+            duration_ms=200,
+            model_id="gpt-4",
+            provider="openai",
+            input_params={"query": "test"},
+            output_data={"result_count": 1, "sources": []},
+            log_id="custom-log-id",
+        )
+
+        mock_db.add.assert_called_once()
+        mock_db.commit.assert_called_once()
+        mock_db.close.assert_called_once()
+        # 验证使用了自定义 log_id
+        added_obj = mock_db.add.call_args[0][0]
+        self.assertEqual(added_obj.id, "custom-log-id")
+
+    @patch("app.services.tool_call_logger.SessionLocal")
+    async def test_log_tool_call_handles_error_gracefully(self, mock_session_cls):
+        """log_tool_call 异常时不抛出，静默失败"""
+        mock_db = MagicMock()
+        mock_db.commit.side_effect = Exception("DB down")
+        mock_session_cls.return_value = mock_db
+
+        # 不应抛异常
+        await log_tool_call(
+            conversation_id="conv-1",
+            message_id="msg-1",
+            user_id="user-1",
+            tool_name="web_search",
+            status="failed",
+            duration_ms=100,
+            model_id="gpt-4",
+            provider="openai",
+        )
+
+        mock_db.rollback.assert_called_once()
+        mock_db.close.assert_called_once()
 
 
 if __name__ == "__main__":
