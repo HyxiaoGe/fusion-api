@@ -857,6 +857,54 @@ async def stream_redis_as_sse(
                     }
                 ],
             }
+        elif chunk_type == "url_read_start":
+            # URL 读取开始事件
+            url_data = json.loads(chunk.get("content", "{}"))
+            payload = {
+                "id": message_id,
+                "conversation_id": conversation_id,
+                "choices": [
+                    {
+                        "delta": {
+                            "content": [
+                                {
+                                    "type": "url_read",
+                                    "id": chunk.get("block_id", ""),
+                                    "url_read_event": "start",
+                                    "url": url_data.get("url", ""),
+                                    "source": url_data.get("source", "auto"),
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            }
+        elif chunk_type == "url_read_complete":
+            # URL 读取完成事件
+            url_data = json.loads(chunk.get("content", "{}"))
+            payload = {
+                "id": message_id,
+                "conversation_id": conversation_id,
+                "choices": [
+                    {
+                        "delta": {
+                            "content": [
+                                {
+                                    "type": "url_read",
+                                    "id": chunk.get("block_id", ""),
+                                    "url_read_event": "complete",
+                                    "url": url_data.get("url", ""),
+                                    "title": url_data.get("title"),
+                                    "favicon": url_data.get("favicon"),
+                                    "status": url_data.get("status", "success"),
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            }
         elif chunk_type == "done":
             payload = {
                 "id": message_id,
