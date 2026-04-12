@@ -343,7 +343,7 @@ class StreamHandler:
             asyncio.create_task(
                 log_tool_call(
                     conversation_id=conversation_id,
-                    message_id=assistant_message_id,
+                    message_id=None,
                     user_id=user_id,
                     tool_name=tool_call_name or "unknown",
                     status="degraded",
@@ -382,7 +382,7 @@ class StreamHandler:
             asyncio.create_task(
                 log_tool_call(
                     conversation_id=conversation_id,
-                    message_id=assistant_message_id,
+                    message_id=None,
                     user_id=user_id,
                     tool_name="web_search",
                     status="degraded",
@@ -432,12 +432,13 @@ class StreamHandler:
             sources = []
 
         # 异步记录工具调用日志
+        # message_id 传 None：此时 assistant message 尚未落库，FK 约束会失败
         tool_call_log_id = str(uuid.uuid4())
         asyncio.create_task(
             log_tool_call(
                 log_id=tool_call_log_id,
                 conversation_id=conversation_id,
-                message_id=assistant_message_id,
+                message_id=None,
                 user_id=user_id,
                 tool_name="web_search",
                 status=search_status,
