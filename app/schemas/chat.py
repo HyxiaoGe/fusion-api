@@ -49,13 +49,22 @@ class SearchSource(BaseModel):
     favicon: Optional[str] = None  # 网站 favicon URL
 
 
+class SearchSourceSummary(BaseModel):
+    """轻量搜索来源摘要，用于 Message.content 中的 SearchBlock"""
+
+    title: str
+    url: str
+    favicon: Optional[str] = None
+
+
 class SearchBlock(BaseModel):
     """搜索结果内容块，出现在 assistant 消息中"""
 
     type: Literal["search"]
     id: str = Field(default_factory=lambda: f"blk_{uuid4().hex[:12]}")
-    query: str  # 搜索使用的关键词
-    sources: List[SearchSource]  # 来源列表
+    query: str
+    tool_call_log_id: str  # 关联 tool_call_logs 表
+    sources: List[SearchSourceSummary]  # 轻量版，前端展示用
 
 
 # content block 的联合类型，后续扩展直接在此添加

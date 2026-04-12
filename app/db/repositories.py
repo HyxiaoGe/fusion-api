@@ -15,7 +15,7 @@ from app.schemas.chat import (
     FileBlock,
     Message,
     SearchBlock,
-    SearchSource,
+    SearchSourceSummary,
     TextBlock,
     ThinkingBlock,
     Usage,
@@ -302,7 +302,8 @@ class ConversationRepository:
                         type="search",
                         id=block_data.get("id", f"blk_{__import__('uuid').uuid4().hex[:12]}"),
                         query=block_data.get("query", ""),
-                        sources=[SearchSource(**s) for s in block_data.get("sources", [])],
+                        tool_call_log_id=block_data.get("tool_call_log_id", ""),
+                        sources=[SearchSourceSummary(**s) for s in block_data.get("sources", [])],
                     )
                 )
             # 未知类型跳过，保持前向兼容

@@ -123,5 +123,29 @@ class LogToolCallTests(unittest.IsolatedAsyncioTestCase):
         mock_db.close.assert_called_once()
 
 
+from app.schemas.chat import SearchBlock, SearchSourceSummary
+
+
+class SearchBlockSchemaTests(unittest.TestCase):
+    def test_search_source_summary_fields(self):
+        """SearchSourceSummary 只包含 title、url、favicon"""
+        summary = SearchSourceSummary(title="Test", url="https://example.com", favicon="https://example.com/favicon.ico")
+        data = summary.model_dump()
+        self.assertEqual(set(data.keys()), {"title", "url", "favicon"})
+
+    def test_search_block_has_tool_call_log_id(self):
+        """SearchBlock 包含 tool_call_log_id 字段"""
+        block = SearchBlock(
+            type="search",
+            id="blk_test",
+            query="test query",
+            tool_call_log_id="log-123",
+            sources=[SearchSourceSummary(title="T", url="https://example.com")],
+        )
+        self.assertEqual(block.tool_call_log_id, "log-123")
+        self.assertEqual(len(block.sources), 1)
+        self.assertIsInstance(block.sources[0], SearchSourceSummary)
+
+
 if __name__ == "__main__":
     unittest.main()
