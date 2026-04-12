@@ -8,9 +8,8 @@ Part B: stream_redis_as_sse() — SSE 读取器，从 Redis Stream 消费推送�
 
 import asyncio
 import json
-import time
 import uuid
-from typing import AsyncGenerator, List, Optional
+from typing import AsyncGenerator, Optional
 
 import litellm
 
@@ -18,9 +17,6 @@ from app.core.logger import app_logger as logger
 from app.db.database import SessionLocal
 from app.db.repositories import FileRepository
 from app.schemas.chat import (
-    SearchBlock,
-    SearchSource,
-    SearchSourceSummary,
     TextBlock,
     ThinkingBlock,
     Usage,
@@ -37,6 +33,7 @@ from app.services.stream_state_service import (
     read_stream_chunks,
 )
 from app.services.tool_call_logger import log_tool_call
+from app.services.tool_handlers import get_handler
 
 # 每 N 个 chunk 检查一次锁状态
 LOCK_CHECK_INTERVAL = 20
@@ -333,13 +330,12 @@ class StreamHandler:
         first_round_reasoning: str = "",
     ) -> None:
         """
-        处理 LLM 返回的 tool_call。当前仅支持 web_search。
-        完整流程：search_start SSE → 调搜索 → search_complete SSE → 第二轮 LLM → 落库 + finalize。
+        处理 LLM 返回的 tool_call，通过 ToolDispatcher 分发到对应 handler。
         """
-        from app.services.search_client import search_web
+        handler = get_handler(tool_call_name)
 
-        if tool_call_name != "web_search":
-            logger.warning(f"未知的 tool_call: {tool_call_name}，降级为无搜索回答")
+        if not handler:
+            logger.warning(f"未知的 tool_call: {tool_call_name}，降级为无工具回答")
             asyncio.create_task(
                 log_tool_call(
                     conversation_id=conversation_id,
@@ -355,138 +351,65 @@ class StreamHandler:
                 )
             )
             await self._fallback_no_search(
-                db,
-                conversation_id,
-                model_id,
-                litellm_model,
-                litellm_kwargs,
-                provider,
-                messages,
-                assistant_message_id,
-                task_id,
-                should_use_reasoning,
-                thinking_block_id,
-                text_block_id,
+                db, conversation_id, model_id, litellm_model, litellm_kwargs,
+                provider, messages, assistant_message_id, task_id,
+                should_use_reasoning, thinking_block_id, text_block_id,
             )
             return
 
-        # 1. 解析搜索 query
+        # 解析参数
         try:
             args = json.loads(tool_call_args)
-            query = args.get("query", "")
         except json.JSONDecodeError:
-            query = ""
+            args = {}
 
-        if not query:
-            logger.warning("tool_call web_search 的 query 为空，降级为无搜索回答")
-            asyncio.create_task(
-                log_tool_call(
-                    conversation_id=conversation_id,
-                    message_id=None,
-                    user_id=user_id,
-                    tool_name="web_search",
-                    status="degraded",
-                    duration_ms=None,
-                    model_id=model_id,
-                    provider=provider,
-                    input_params={"query": "", "raw_args": tool_call_args},
-                    error_message="query 为空",
-                )
-            )
-            await self._fallback_no_search(
-                db,
-                conversation_id,
-                model_id,
-                litellm_model,
-                litellm_kwargs,
-                provider,
-                messages,
-                assistant_message_id,
-                task_id,
-                should_use_reasoning,
-                thinking_block_id,
-                text_block_id,
-            )
-            return
-
-        # 2. 推送 search_start SSE 事件
-        search_block_id = f"blk_{uuid.uuid4().hex[:12]}"
-        await append_chunk(
-            conversation_id,
-            "search_start",
-            json.dumps({"query": query}, ensure_ascii=False),
-            search_block_id,
-        )
-
-        # 3. 调用 search-service（计时 + 异常捕获）
-        search_start = time.monotonic()
-        try:
-            sources = await search_web(query, count=5)
-            search_duration_ms = int((time.monotonic() - search_start) * 1000)
-            search_status = "success" if sources else "degraded"
-            search_error = None if sources else "搜索返回空结果"
-        except Exception as e:
-            search_duration_ms = int((time.monotonic() - search_start) * 1000)
-            search_status = "failed"
-            search_error = str(e)
-            sources = []
-
-        # 异步记录工具调用日志
-        # message_id 传 None：此时 assistant message 尚未落库，FK 约束会失败
+        # 生成 block ID 和 log ID
+        block_id = f"blk_{uuid.uuid4().hex[:12]}"
         tool_call_log_id = str(uuid.uuid4())
-        asyncio.create_task(
-            log_tool_call(
-                log_id=tool_call_log_id,
-                conversation_id=conversation_id,
-                message_id=None,
-                user_id=user_id,
-                tool_name="web_search",
-                status=search_status,
-                duration_ms=search_duration_ms,
-                model_id=model_id,
-                provider=provider,
-                input_params={"query": query},
-                output_data={"result_count": len(sources), "sources": [s.model_dump() for s in sources]},
-                error_message=search_error,
-            )
+
+        # 推送 start SSE
+        sse_start_data = {**args}
+        if handler.tool_name == "url_read":
+            sse_start_data["source"] = "tool_call"
+        await handler.push_sse_start(conversation_id, block_id, sse_start_data)
+
+        # 执行工具
+        result = await handler.execute(args)
+
+        # 记录日志
+        await handler.log(
+            log_id=tool_call_log_id,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            model_id=model_id,
+            provider=provider,
+            result=result,
+            input_params=args,
         )
 
-        # 搜索失败时降级
-        if search_status == "failed":
+        # 执行失败 → 降级
+        if result.status == "failed":
             await self._fallback_no_search(
-                db,
-                conversation_id,
-                model_id,
-                litellm_model,
-                litellm_kwargs,
-                provider,
-                messages,
-                assistant_message_id,
-                task_id,
-                should_use_reasoning,
-                thinking_block_id,
-                text_block_id,
+                db, conversation_id, model_id, litellm_model, litellm_kwargs,
+                provider, messages, assistant_message_id, task_id,
+                should_use_reasoning, thinking_block_id, text_block_id,
             )
             return
 
-        # 4. 推送 search_complete SSE 事件
-        await append_chunk(
-            conversation_id,
-            "search_complete",
-            json.dumps(
-                {
-                    "query": query,
-                    "sources": [s.model_dump() for s in sources],
-                },
-                ensure_ascii=False,
-            ),
-            search_block_id,
-        )
+        # 推送 complete SSE
+        sse_complete_data = {**args, "status": result.status}
+        if handler.tool_name == "web_search":
+            sources = result.data.get("sources", [])
+            sse_complete_data["sources"] = [s.model_dump() for s in sources]
+        elif handler.tool_name == "url_read":
+            sse_complete_data.update({
+                "title": result.data.get("title"),
+                "favicon": result.data.get("favicon"),
+            })
+        await handler.push_sse_complete(conversation_id, block_id, sse_complete_data)
 
-        # 5. 构造第二轮 LLM 调用的消息（注入搜索上下文）
-        search_context = self._format_search_context(sources)
-        # 推理模型（DeepSeek 等）要求 assistant 消息包含 reasoning_content，
-        # 否则 API 报 400：thinking is enabled but reasoning_content is missing
+        # 构造第二轮 LLM 调用的消息
+        tool_context = handler.format_llm_context(result)
         assistant_tool_msg = {
             "role": "assistant",
             "content": None,
@@ -494,24 +417,19 @@ class StreamHandler:
                 {
                     "id": tool_call_id,
                     "type": "function",
-                    "function": {"name": "web_search", "arguments": tool_call_args},
+                    "function": {"name": tool_call_name, "arguments": tool_call_args},
                 }
             ],
         }
         if should_use_reasoning:
             assistant_tool_msg["reasoning_content"] = first_round_reasoning or ""
+
         augmented_messages = messages + [
             assistant_tool_msg,
-            {
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": search_context,
-            },
+            {"role": "tool", "tool_call_id": tool_call_id, "content": tool_context},
         ]
 
-        # 6. 第二轮 LLM 流式调用（不再传 tools，避免无限循环）
-        # 第一轮 reasoning 是"决定要不要搜索"的内部推理（含 tool_call 细节），
-        # 对用户没有价值，丢弃。用新的 block ID 接收第二轮的有效 reasoning。
+        # 第二轮 LLM 流式调用
         second_thinking_id = f"blk_{uuid.uuid4().hex[:12]}"
         reasoning_buf, content_buf, usage_data = await self._stream_llm_to_redis(
             litellm_model=litellm_model,
@@ -524,22 +442,18 @@ class StreamHandler:
             text_block_id=text_block_id,
         )
 
-        # 7. 落库：content 数组包含 SearchBlock
-        # 只保留第二轮 reasoning（基于搜索结果的分析思考），不保留第一轮
-        content_blocks = self._build_content_blocks(
-            reasoning_buf,
-            content_buf,
-            second_thinking_id,
-            text_block_id,
-            search_query=query,
-            search_sources=[SearchSourceSummary(title=s.title, url=s.url, favicon=s.favicon) for s in sources],
-            search_block_id=search_block_id,
-            tool_call_log_id=tool_call_log_id,
-        )
+        # 落库
+        content_block = handler.build_content_block(result, block_id, tool_call_log_id)
+        content_blocks = []
+        if reasoning_buf:
+            content_blocks.append(ThinkingBlock(type="thinking", id=second_thinking_id, thinking=reasoning_buf))
+        content_blocks.append(content_block)
+        if content_buf:
+            content_blocks.append(TextBlock(type="text", id=text_block_id, text=content_buf))
+
         self._persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks, usage_data)
         await finalize_stream(conversation_id, success=True, task_id=task_id)
 
-        # 异步提取用户记忆
         asyncio.create_task(self._extract_user_memories(conversation_id, user_id))
 
     async def _fallback_no_search(
@@ -652,59 +566,16 @@ class StreamHandler:
     # ──────────────────────────────────────────────
 
     @staticmethod
-    def _format_search_context(sources: List[SearchSource]) -> str:
-        """将搜索结果格式化为 LLM 可消费的上下文文本"""
-        if not sources:
-            return "搜索未返回结果。请基于你的知识回答用户的问题。"
-
-        parts = ["以下是从网络搜索获取的参考信息，请结合这些信息回答用户的问题。"]
-        parts.append("如果引用了某条信息，请在相关内容后标注来源编号，格式为 [1]、[2] 等。\n")
-
-        for i, source in enumerate(sources, 1):
-            parts.append(f"[{i}] {source.title}")
-            parts.append(f"    来源: {source.url}")
-            # 优先使用正文内容，没有则用 description 摘要
-            if source.content:
-                # 截取前 1000 字，避免上下文过长
-                content_text = source.content[:1000]
-                parts.append(f"    正文: {content_text}")
-            else:
-                parts.append(f"    摘要: {source.description}")
-            parts.append("")
-
-        parts.append("注意：")
-        parts.append("- 优先使用搜索结果中的信息回答")
-        parts.append("- 如果搜索结果不足以回答，可以结合自身知识补充")
-        parts.append("- 引用时使用 [n] 格式标注来源编号")
-        parts.append("- 直接回答问题，不要再发起搜索或输出任何工具调用指令")
-
-        return "\n".join(parts)
-
-    @staticmethod
     def _build_content_blocks(
         reasoning_buf: str,
         content_buf: str,
         thinking_block_id: str,
         text_block_id: str,
-        search_query: str = "",
-        search_sources: Optional[List[SearchSourceSummary]] = None,
-        search_block_id: str = "",
-        tool_call_log_id: str = "",
     ) -> list:
-        """构建 assistant 消息的 content blocks 数组"""
+        """构建 assistant 消息的 content blocks 数组（非 tool_call 路径）"""
         blocks = []
         if reasoning_buf:
             blocks.append(ThinkingBlock(type="thinking", id=thinking_block_id, thinking=reasoning_buf))
-        if search_query and search_sources is not None:
-            blocks.append(
-                SearchBlock(
-                    type="search",
-                    id=search_block_id,
-                    query=search_query,
-                    tool_call_log_id=tool_call_log_id,
-                    sources=search_sources,
-                )
-            )
         if content_buf:
             blocks.append(TextBlock(type="text", id=text_block_id, text=content_buf))
         return blocks
