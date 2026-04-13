@@ -805,6 +805,106 @@ class StreamHandler:
                     continue
                 raise
 
+    @staticmethod
+    async def _execute_tool_with_retry(
+        handler,
+        args: dict,
+        max_retries: int = AGENT_TOOL_MAX_RETRIES,
+    ) -> "ToolResult":
+        """带重试的工具执行（仅瞬时故障重试）"""
+        from app.services.tool_handlers import ToolResult
+
+        for attempt in range(max_retries + 1):
+            try:
+                result = await asyncio.wait_for(
+                    handler.execute(args),
+                    timeout=AGENT_TOOL_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                result = ToolResult(status="failed", error_message="工具调用超时")
+
+            if result.status == "success":
+                return result
+
+            # 永久性错误不重试
+            err = (result.error_message or "").lower()
+            is_permanent = any(kw in err for kw in ["not_found", "invalid", "rate_limit", "400", "401", "403", "404"])
+            if is_permanent or attempt >= max_retries:
+                return result
+
+            logger.warning(f"工具 {handler.tool_name} 执行失败（{attempt+1}/{max_retries+1}），1s 后重试")
+            await asyncio.sleep(1)
+
+        return result
+
+    async def _execute_tools_parallel(
+        self,
+        tool_calls: list[dict],
+        conversation_id: str,
+        user_id: str,
+        model_id: str,
+        provider: str,
+    ) -> list[tuple[dict, "ToolResult", "BaseToolHandler | None", str, str]]:
+        """
+        并行执行所有 tool_calls。
+        返回 [(tool_call, result, handler, block_id, log_id), ...]
+        """
+        from app.services.tool_handlers import ToolResult, get_handler as _get_handler
+
+        async def _run_one(tc: dict):
+            handler = _get_handler(tc["name"])
+            block_id = f"blk_{uuid.uuid4().hex[:12]}"
+            log_id = str(uuid.uuid4())
+
+            if not handler:
+                logger.warning(f"未知的 tool_call: {tc['name']}")
+                result = ToolResult(status="failed", error_message=f"未知工具: {tc['name']}")
+                return tc, result, None, block_id, log_id
+
+            # 解析参数
+            try:
+                args = json.loads(tc["arguments"]) if isinstance(tc["arguments"], str) else tc["arguments"]
+            except json.JSONDecodeError:
+                args = {}
+
+            # 推送 start SSE
+            sse_start_data = {**args}
+            if handler.tool_name == "url_read":
+                sse_start_data["source"] = "tool_call"
+            sse_start_data["tool_call_id"] = tc["id"]
+            await handler.push_sse_start(conversation_id, block_id, sse_start_data)
+
+            # 执行（带重试）
+            result = await self._execute_tool_with_retry(handler, args)
+
+            # 推送 complete SSE
+            sse_complete_data = {**args, "status": result.status, "tool_call_id": tc["id"]}
+            if handler.tool_name == "web_search" and result.status == "success":
+                sources = result.data.get("sources", [])
+                sse_complete_data["sources"] = [s.model_dump() for s in sources]
+            elif handler.tool_name == "url_read" and result.status == "success":
+                sse_complete_data.update({
+                    "title": result.data.get("title"),
+                    "favicon": result.data.get("favicon"),
+                })
+            await handler.push_sse_complete(conversation_id, block_id, sse_complete_data)
+
+            # 异步记录日志
+            await handler.log(
+                log_id=log_id,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                model_id=model_id,
+                provider=provider,
+                result=result,
+                input_params=args,
+            )
+
+            return tc, result, handler, block_id, log_id
+
+        results = await asyncio.gather(*[_run_one(tc) for tc in tool_calls])
+        return list(results)
+
     # ──────────────────────────────────────────────
     # 辅助方法
     # ──────────────────────────────────────────────
