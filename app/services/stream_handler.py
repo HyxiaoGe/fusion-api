@@ -1,8 +1,8 @@
 # app/services/stream_handler.py
 """
-流式处理器 — 基于 Redis Stream 的两段式架构
+流式处理器 — 基于 Redis Stream 的两段式架构 + Agent Loop
 
-Part A: generate_to_redis() — 后台任务，调用 LLM 写 Redis Stream + 落库 PostgreSQL
+Part A: generate_to_redis() — 后台任务，Agent Loop 多轮调用 LLM/工具，写 Redis Stream + 落库 PostgreSQL
 Part B: stream_redis_as_sse() — SSE 读取器，从 Redis Stream 消费推送给客户端
 """
 
@@ -32,8 +32,6 @@ from app.services.stream_state_service import (
     finalize_stream,
     read_stream_chunks,
 )
-from app.services.tool_call_logger import log_tool_call
-from app.services.tool_handlers import get_handler
 
 # 每 N 个 chunk 检查一次锁状态
 LOCK_CHECK_INTERVAL = 20
@@ -71,14 +69,7 @@ class StreamHandler:
     ) -> None:
         """
         后台任务：调用 LLM，chunk 写入 Redis Stream，完成后落库 PostgreSQL。
-        生命周期完全独立于 HTTP 连接。
-
-        消息构建（含图片 base64 编码）在此后台任务中完成，
-        不阻塞 SSE 首字节返回。
-
-        支持 web_search tool_call 检测：
-        - capabilities.functionCalling=true 时，传 tools=[web_search]
-        - 模型返回 tool_call 时，调搜索 → 注入上下文 → 第二轮流式调用
+        支持 Agent Loop：LLM 可多轮调用工具，直到自行决定 stop。
         """
         if options is None:
             options = {}
@@ -88,46 +79,35 @@ class StreamHandler:
         use_reasoning = options.get("use_reasoning")
         should_use_reasoning = use_reasoning is True or (use_reasoning is None and provider in self.REASONING_PROVIDERS)
 
-        thinking_block_id = f"blk_{uuid.uuid4().hex[:12]}"
-        text_block_id = f"blk_{uuid.uuid4().hex[:12]}"
-
-        reasoning_buf = ""
-        content_buf = ""
-        usage_data: Optional[Usage] = None
-        chunk_count = 0
-
-        # 判断是否启用搜索工具
+        # 判断是否启用工具
         supports_fc = capabilities.get("functionCalling", False)
         call_kwargs = {}
         if supports_fc:
             from app.ai.tools import WEB_SEARCH_TOOL
-
             call_kwargs["tools"] = [WEB_SEARCH_TOOL]
             call_kwargs["tool_choice"] = "auto"
-            # 仅 volcengine（豆包）：第一轮禁用 thinking，避免 tool_call 决策噪音
-            # 其他 provider 保持默认，不影响 tool_call 决策质量
             if should_use_reasoning and provider == "volcengine":
                 call_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
 
-        # 后台任务独立管理 DB Session
         db = SessionLocal()
 
+        # agent loop 状态
+        content_blocks: list = []
+        accumulated_usage = Usage(input_tokens=0, output_tokens=0)
+        step = 0
+        total_tool_calls = 0
+        finish_reason = "stop"
+
         try:
-            # 立即推送 preparing 事件，让前端收到 SSE 首帧
-            # → 新对话：触发 onReady → 页面跳转 + 显示用户消息
-            # → 已有对话：前端显示 AI 加载状态
             await append_chunk(conversation_id, "preparing", "", "")
 
-            # 在后台任务中构建 LLM 消息（含图片 base64 编码），不阻塞主请求
+            # 构建 LLM 消息
             file_repo = FileRepository(db)
-            # 查询用户记忆，注入 system prompt
             from app.db.repositories import MemoryRepository
-
             memory_repo = MemoryRepository(db)
             user_memories = memory_repo.get_active(user_id)
             messages = await build_llm_messages(raw_messages, has_vision, file_repo, user_memories)
 
-            # 非图片文件内容注入
             if file_ids:
                 non_image_ids = [fid for fid in file_ids if not is_image_file(fid, file_repo)]
                 if non_image_ids:
@@ -135,63 +115,48 @@ class StreamHandler:
                     if file_contents:
                         messages = inject_file_content(messages, original_message, file_contents)
 
-            # ── URL 自动检测预处理（路径 A）──
+            # ── URL 自动检测预处理（路径 A，保持不变）──
             url_read_content = None
             auto_detected_url = None
+            url_read_block_id = None
             if supports_fc:
                 import re
                 url_pattern = re.compile(r'https?://[^\s<>"\')\]]+')
                 urls_in_message = url_pattern.findall(original_message)
                 if urls_in_message:
-                    auto_detected_url = urls_in_message[0]  # 取第一个 URL
+                    auto_detected_url = urls_in_message[0]
                     url_read_block_id = f"blk_{uuid.uuid4().hex[:12]}"
 
-                    # 推送 url_read_start SSE
                     await append_chunk(
-                        conversation_id,
-                        "url_read_start",
+                        conversation_id, "url_read_start",
                         json.dumps({"url": auto_detected_url, "source": "auto"}, ensure_ascii=False),
                         url_read_block_id,
                     )
 
-                    # 异步抓取（8 秒超时，给 reader-service 足够时间处理慢页面）
                     try:
                         from app.services.reader_client import read_url
-                        read_result = await asyncio.wait_for(
-                            read_url(auto_detected_url, timeout=8.0),
-                            timeout=8.0,
-                        )
+                        read_result = await asyncio.wait_for(read_url(auto_detected_url, timeout=8.0), timeout=8.0)
                     except asyncio.TimeoutError:
                         logger.warning(f"URL 自动抓取超时: {auto_detected_url}")
                         read_result = None
 
                     if read_result:
                         url_read_content = read_result
-                        # 推送 url_read_complete SSE（成功）
                         await append_chunk(
-                            conversation_id,
-                            "url_read_complete",
+                            conversation_id, "url_read_complete",
                             json.dumps({
-                                "url": auto_detected_url,
-                                "title": read_result.title,
-                                "favicon": read_result.favicon,
-                                "status": "success",
+                                "url": auto_detected_url, "title": read_result.title,
+                                "favicon": read_result.favicon, "status": "success",
                             }, ensure_ascii=False),
                             url_read_block_id,
                         )
                     else:
-                        # 推送 url_read_complete SSE（失败）
                         await append_chunk(
-                            conversation_id,
-                            "url_read_complete",
-                            json.dumps({
-                                "url": auto_detected_url,
-                                "status": "failed",
-                            }, ensure_ascii=False),
+                            conversation_id, "url_read_complete",
+                            json.dumps({"url": auto_detected_url, "status": "failed"}, ensure_ascii=False),
                             url_read_block_id,
                         )
 
-            # 如果自动检测成功，注入网页内容到 messages，不传 url_read tool
             if url_read_content:
                 from app.services.tool_handlers.url_read import MAX_CONTENT_CHARS
                 content_text = url_read_content.content
@@ -199,7 +164,6 @@ class StreamHandler:
                 if len(content_text) > MAX_CONTENT_CHARS:
                     content_text = content_text[:MAX_CONTENT_CHARS]
                     truncation_note = "\n（内容已截断，仅展示前部分）"
-
                 url_context_msg = {
                     "role": "system",
                     "content": (
@@ -209,472 +173,211 @@ class StreamHandler:
                         "请基于以上网页内容回答用户的问题。"
                     ),
                 }
-                # 在 messages 最后一条 user 消息之前插入
                 messages.insert(-1, url_context_msg)
-                # call_kwargs["tools"] 已包含 WEB_SEARCH_TOOL，不追加 url_read
-                # 恢复 volcengine thinking（路径 A 成功，无需 tool_call 决策，thinking 不再是噪音）
                 if "extra_body" in call_kwargs and call_kwargs["extra_body"].get("thinking", {}).get("type") == "disabled":
                     del call_kwargs["extra_body"]
             else:
-                # 自动检测失败或没有 URL → 传 url_read tool 让 LLM 可以 function calling
                 if supports_fc:
                     from app.ai.tools import URL_READ_TOOL
-                    call_kwargs["tools"].append(URL_READ_TOOL)
+                    if URL_READ_TOOL not in call_kwargs.get("tools", []):
+                        call_kwargs.setdefault("tools", []).append(URL_READ_TOOL)
 
-            response = await litellm.acompletion(
-                model=litellm_model,
-                messages=messages,
-                stream=True,
-                stream_options={"include_usage": True},
-                **litellm_kwargs,
-                **call_kwargs,
-            )
-
-            # tool_call 累积缓冲区
-            tool_call_id = None
-            tool_call_name = None
-            tool_call_args = ""
-
-            # 第一轮 tool_call 判断：thinking 实时推送给前端，同时缓冲用于持久化决策
-            # 搜索路径：前端 startSearch 清理噪音 + 后端不持久化第一轮 thinking
-            # 非搜索路径：thinking 正常展示和持久化
-            first_round_buffering = supports_fc
-            first_round_thinking_buf = ""
-
-            async for chunk in response:
-                choice = chunk.choices[0] if chunk.choices else None
-
-                if not choice:
-                    if hasattr(chunk, "usage") and chunk.usage:
-                        usage_data = Usage(
-                            input_tokens=chunk.usage.prompt_tokens or 0,
-                            output_tokens=chunk.usage.completion_tokens or 0,
-                        )
-                    continue
-
-                delta = choice.delta
-                finish_reason = choice.finish_reason
-
-                # ===== 分支 1: tool_call 累积 =====
-                if hasattr(delta, "tool_calls") and delta.tool_calls:
-                    tc = delta.tool_calls[0]
-                    if tc.id:
-                        tool_call_id = tc.id
-                    if tc.function and tc.function.name:
-                        tool_call_name = tc.function.name
-                    if tc.function and tc.function.arguments:
-                        tool_call_args += tc.function.arguments
-
-                # tool_call 完整了
-                if finish_reason == "tool_calls" and tool_call_name:
-                    # 传入第一轮 thinking：前端展示已丢弃，但 DeepSeek 等推理模型
-                    # 要求 assistant tool_call 消息必须包含实际的 reasoning_content
-                    await self._handle_tool_call(
-                        db=db,
-                        conversation_id=conversation_id,
-                        user_id=user_id,
-                        model_id=model_id,
-                        litellm_model=litellm_model,
-                        litellm_kwargs=litellm_kwargs,
-                        provider=provider,
-                        messages=messages,
-                        assistant_message_id=assistant_message_id,
-                        task_id=task_id,
-                        tool_call_id=tool_call_id,
-                        tool_call_name=tool_call_name,
-                        tool_call_args=tool_call_args,
-                        should_use_reasoning=should_use_reasoning,
-                        thinking_block_id=thinking_block_id,
-                        text_block_id=text_block_id,
-                        first_round_reasoning=first_round_thinking_buf,
-                    )
-                    return
-
-                if hasattr(delta, "tool_calls") and delta.tool_calls:
-                    continue
-
-                # ===== 分支 2: 正常文本/thinking =====
-
-                reasoning_delta = ""
-                if should_use_reasoning:
-                    reasoning_delta = getattr(delta, "reasoning_content", None) or ""
-                    if not reasoning_delta and hasattr(delta, "model_extra") and delta.model_extra:
-                        reasoning_delta = delta.model_extra.get("reasoning_content", "") or ""
-
-                content_delta = delta.content or ""
-
-                if reasoning_delta and content_delta == reasoning_delta:
-                    content_delta = ""
-
-                # thinking 处理：始终实时推送，缓冲模式下额外记录用于持久化决策
-                if reasoning_delta:
-                    await append_chunk(conversation_id, "reasoning", reasoning_delta, thinking_block_id)
-                    if first_round_buffering:
-                        first_round_thinking_buf += reasoning_delta
-                    else:
-                        reasoning_buf += reasoning_delta
-
-                # content 出现意味着第一轮结束且没有 tool_call → 缓冲的 thinking 转入正式记录
-                if content_delta:
-                    if first_round_buffering:
-                        reasoning_buf += first_round_thinking_buf
-                        first_round_thinking_buf = ""
-                        first_round_buffering = False
-
-                    content_buf += content_delta
-                    await append_chunk(conversation_id, "answering", content_delta, text_block_id)
-
-                if hasattr(chunk, "usage") and chunk.usage:
-                    usage_data = Usage(
-                        input_tokens=chunk.usage.prompt_tokens or 0,
-                        output_tokens=chunk.usage.completion_tokens or 0,
-                    )
-
-                chunk_count += 1
-                if chunk_count % LOCK_CHECK_INTERVAL == 0:
-                    if not await check_lock_owner(conversation_id, task_id):
-                        logger.info(f"任务被踢掉，主动退出: conv_id={conversation_id}")
-                        # 合并已确认的 reasoning 和可能残留的第一轮 thinking
-                        all_reasoning = reasoning_buf + first_round_thinking_buf
-                        if all_reasoning or content_buf:
-                            self._persist_message(
-                                db,
-                                assistant_message_id,
-                                conversation_id,
-                                model_id,
-                                self._build_content_blocks(
-                                    all_reasoning, content_buf, thinking_block_id, text_block_id
-                                ),
-                                usage_data,
-                            )
-                        await finalize_stream(conversation_id, success=False, error_msg="被新请求取代", task_id=task_id)
-                        return
-
-            # 回放未消费的第一轮 thinking（极端情况：没有 tool_call 也没有 content）
-            if first_round_thinking_buf:
-                await append_chunk(conversation_id, "reasoning", first_round_thinking_buf, thinking_block_id)
-                reasoning_buf += first_round_thinking_buf
-
-            # 生成完成，落库
-            content_blocks = self._build_content_blocks(reasoning_buf, content_buf, thinking_block_id, text_block_id)
-
-            # 路径 A 自动检测成功时，在 content blocks 中插入 UrlBlock
+            # 路径 A 成功时，URL block 加入 content_blocks
             if url_read_content and auto_detected_url:
                 from app.schemas.chat import UrlBlock
-                url_block = UrlBlock(
-                    type="url_read",
-                    id=url_read_block_id,
+                content_blocks.append(UrlBlock(
+                    type="url_read", id=url_read_block_id,
                     url=auto_detected_url,
                     title=url_read_content.title,
                     favicon=url_read_content.favicon,
-                )
-                # 插入到 ThinkingBlock 之后、TextBlock 之前
-                insert_pos = 0
-                for i, b in enumerate(content_blocks):
-                    if hasattr(b, 'type') and b.type == 'text':
-                        insert_pos = i
-                        break
-                    insert_pos = i + 1
-                content_blocks.insert(insert_pos, url_block)
+                ))
 
-            self._persist_message(
-                db,
-                assistant_message_id,
-                conversation_id,
-                model_id,
-                content_blocks,
-                usage_data,
-            )
+            # ═══════════════════════════════════════
+            # Agent Loop
+            # ═══════════════════════════════════════
+            import time
+            start_time = time.time()
+
+            while step < AGENT_MAX_STEPS and total_tool_calls < AGENT_MAX_TOOL_CALLS:
+                if time.time() - start_time > AGENT_TOTAL_TIMEOUT:
+                    finish_reason = "timeout"
+                    break
+
+                thinking_block_id = f"blk_{uuid.uuid4().hex[:12]}"
+                text_block_id = f"blk_{uuid.uuid4().hex[:12]}"
+
+                response = await self._llm_call_with_retry(
+                    litellm_model, litellm_kwargs, messages, **call_kwargs,
+                )
+
+                reasoning_buf, content_buf, tool_calls_list, finish_reason, usage_data = \
+                    await self._stream_round(
+                        response, conversation_id, task_id,
+                        should_use_reasoning, thinking_block_id, text_block_id,
+                    )
+
+                # 累积 usage
+                if usage_data:
+                    accumulated_usage = Usage(
+                        input_tokens=accumulated_usage.input_tokens + usage_data.input_tokens,
+                        output_tokens=accumulated_usage.output_tokens + usage_data.output_tokens,
+                    )
+
+                # ── 情况 1: LLM 直接回答 ──
+                if finish_reason == "stop":
+                    if reasoning_buf:
+                        content_blocks.append(ThinkingBlock(type="thinking", id=thinking_block_id, thinking=reasoning_buf))
+                    if content_buf:
+                        content_blocks.append(TextBlock(type="text", id=text_block_id, text=content_buf))
+                    break
+
+                # ── 情况 2: 被踢掉 ──
+                if finish_reason == "cancelled":
+                    if reasoning_buf:
+                        content_blocks.append(ThinkingBlock(type="thinking", id=thinking_block_id, thinking=reasoning_buf))
+                    if content_buf:
+                        content_blocks.append(TextBlock(type="text", id=text_block_id, text=content_buf))
+                    self._persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks,
+                                          accumulated_usage if accumulated_usage.input_tokens > 0 else None)
+                    await finalize_stream(conversation_id, success=False, error_msg="被新请求取代", task_id=task_id)
+                    return
+
+                # ── 情况 3: LLM 请求工具调用 ──
+                if finish_reason == "tool_calls" and tool_calls_list:
+                    step += 1
+
+                    await append_chunk(
+                        conversation_id, "agent_step_start",
+                        json.dumps({"step": step, "max_steps": AGENT_MAX_STEPS, "tool_count": len(tool_calls_list)}, ensure_ascii=False),
+                        "",
+                    )
+
+                    # 收集本轮 reasoning（tool_call 决策推理）
+                    if reasoning_buf:
+                        content_blocks.append(ThinkingBlock(type="thinking", id=thinking_block_id, thinking=reasoning_buf))
+
+                    # 并行执行工具
+                    results = await self._execute_tools_parallel(
+                        tool_calls_list, conversation_id, user_id, model_id, provider,
+                    )
+                    total_tool_calls += len(tool_calls_list)
+
+                    # 构建 assistant tool_call message
+                    assistant_tool_msg = {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": tc["id"],
+                                "type": "function",
+                                "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                            }
+                            for tc in tool_calls_list
+                        ],
+                    }
+                    if should_use_reasoning and reasoning_buf:
+                        assistant_tool_msg["reasoning_content"] = reasoning_buf
+                    messages.append(assistant_tool_msg)
+
+                    # 每个工具结果注入 messages + 收集 content blocks
+                    for tc, result, handler, block_id, log_id in results:
+                        if handler and result.status == "success":
+                            tool_context = handler.format_llm_context(result)
+                            content_blocks.append(handler.build_content_block(result, block_id, log_id))
+                        elif handler:
+                            tool_context = f"工具调用失败：{result.error_message}"
+                            content_blocks.append(handler.build_content_block(result, block_id, log_id))
+                        else:
+                            tool_context = f"工具调用失败：{result.error_message}"
+
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": tool_context,
+                        })
+
+                    # Checkpoint：每步写入 DB，进程崩溃不丢已完成步骤
+                    self._persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks, partial=True)
+
+                    await append_chunk(
+                        conversation_id, "agent_step_end",
+                        json.dumps({"step": step, "total_tool_calls": total_tool_calls}, ensure_ascii=False),
+                        "",
+                    )
+
+                    # 恢复 volcengine thinking（首轮 tool_call 决策已完成）
+                    if "extra_body" in call_kwargs and call_kwargs["extra_body"].get("thinking", {}).get("type") == "disabled":
+                        del call_kwargs["extra_body"]
+
+                    continue
+
+                # 未知 finish_reason → 跳出循环
+                break
+
+            # ═══════════════════════════════════════
+            # 触顶强制总结
+            # ═══════════════════════════════════════
+            if finish_reason == "tool_calls" or finish_reason == "timeout":
+                reason = "timeout" if finish_reason == "timeout" else (
+                    "max_steps" if step >= AGENT_MAX_STEPS else "max_tool_calls"
+                )
+                await append_chunk(
+                    conversation_id, "agent_limit_reached",
+                    json.dumps({"reason": reason}, ensure_ascii=False),
+                    "",
+                )
+
+                messages.append({
+                    "role": "system",
+                    "content": "你已达到工具调用上限，请基于已收集的信息给出最终回答。不要再调用任何工具。",
+                })
+                final_call_kwargs = {k: v for k, v in call_kwargs.items() if k not in ("tools", "tool_choice")}
+                thinking_block_id = f"blk_{uuid.uuid4().hex[:12]}"
+                text_block_id = f"blk_{uuid.uuid4().hex[:12]}"
+
+                response = await self._llm_call_with_retry(
+                    litellm_model, litellm_kwargs, messages, **final_call_kwargs,
+                )
+                reasoning_buf, content_buf, _, _, usage_data = await self._stream_round(
+                    response, conversation_id, task_id,
+                    should_use_reasoning, thinking_block_id, text_block_id,
+                )
+                if usage_data:
+                    accumulated_usage = Usage(
+                        input_tokens=accumulated_usage.input_tokens + usage_data.input_tokens,
+                        output_tokens=accumulated_usage.output_tokens + usage_data.output_tokens,
+                    )
+                if reasoning_buf:
+                    content_blocks.append(ThinkingBlock(type="thinking", id=thinking_block_id, thinking=reasoning_buf))
+                if content_buf:
+                    content_blocks.append(TextBlock(type="text", id=text_block_id, text=content_buf))
+
+            # ═══════════════════════════════════════
+            # 最终落库
+            # ═══════════════════════════════════════
+            final_usage = accumulated_usage if accumulated_usage.input_tokens > 0 else None
+            self._persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks, final_usage)
             await finalize_stream(conversation_id, success=True, task_id=task_id)
 
-            # 异步提取用户记忆（fire-and-forget，失败不影响主流程）
             asyncio.create_task(self._extract_user_memories(conversation_id, user_id))
 
         except asyncio.CancelledError:
-            logger.info(f"任务被取消: conv_id={conversation_id}")
-            if reasoning_buf or content_buf:
-                self._persist_message(
-                    db,
-                    assistant_message_id,
-                    conversation_id,
-                    model_id,
-                    self._build_content_blocks(reasoning_buf, content_buf, thinking_block_id, text_block_id),
-                    usage_data,
-                )
+            logger.info(f"Agent 任务被取消: conv_id={conversation_id}")
+            if content_blocks:
+                self._persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks,
+                                      accumulated_usage if accumulated_usage.input_tokens > 0 else None)
             await finalize_stream(conversation_id, success=False, error_msg="用户中止", task_id=task_id)
             raise
 
         except Exception as e:
-            logger.error(f"生成异常: conv_id={conversation_id}, error={e}")
-            if reasoning_buf or content_buf:
-                self._persist_message(
-                    db,
-                    assistant_message_id,
-                    conversation_id,
-                    model_id,
-                    self._build_content_blocks(reasoning_buf, content_buf, thinking_block_id, text_block_id),
-                    usage_data,
-                )
+            logger.error(f"Agent 生成异常: conv_id={conversation_id}, error={e}")
+            if content_blocks:
+                self._persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks,
+                                      accumulated_usage if accumulated_usage.input_tokens > 0 else None)
             await finalize_stream(conversation_id, success=False, error_msg=str(e), task_id=task_id)
 
         finally:
             db.close()
-
-    # ──────────────────────────────────────────────
-    # Tool Call 处理
-    # ──────────────────────────────────────────────
-
-    async def _handle_tool_call(
-        self,
-        db,
-        conversation_id: str,
-        user_id: str,
-        model_id: str,
-        litellm_model: str,
-        litellm_kwargs: dict,
-        provider: str,
-        messages: list[dict],
-        assistant_message_id: str,
-        task_id: str,
-        tool_call_id: str,
-        tool_call_name: str,
-        tool_call_args: str,
-        should_use_reasoning: bool,
-        thinking_block_id: str,
-        text_block_id: str,
-        first_round_reasoning: str = "",
-    ) -> None:
-        """
-        处理 LLM 返回的 tool_call，通过 ToolDispatcher 分发到对应 handler。
-        """
-        handler = get_handler(tool_call_name)
-
-        if not handler:
-            logger.warning(f"未知的 tool_call: {tool_call_name}，降级为无工具回答")
-            asyncio.create_task(
-                log_tool_call(
-                    conversation_id=conversation_id,
-                    message_id=None,
-                    user_id=user_id,
-                    tool_name=tool_call_name or "unknown",
-                    status="degraded",
-                    duration_ms=None,
-                    model_id=model_id,
-                    provider=provider,
-                    input_params={"raw_args": tool_call_args},
-                    error_message=f"未知的 tool_call: {tool_call_name}",
-                )
-            )
-            await self._fallback_no_search(
-                db, conversation_id, model_id, litellm_model, litellm_kwargs,
-                provider, messages, assistant_message_id, task_id,
-                should_use_reasoning, thinking_block_id, text_block_id,
-            )
-            return
-
-        # 解析参数
-        try:
-            args = json.loads(tool_call_args)
-        except json.JSONDecodeError:
-            args = {}
-
-        # 生成 block ID 和 log ID
-        block_id = f"blk_{uuid.uuid4().hex[:12]}"
-        tool_call_log_id = str(uuid.uuid4())
-
-        # 推送 start SSE
-        sse_start_data = {**args}
-        if handler.tool_name == "url_read":
-            sse_start_data["source"] = "tool_call"
-        await handler.push_sse_start(conversation_id, block_id, sse_start_data)
-
-        # 执行工具
-        result = await handler.execute(args)
-
-        # 记录日志
-        await handler.log(
-            log_id=tool_call_log_id,
-            conversation_id=conversation_id,
-            user_id=user_id,
-            model_id=model_id,
-            provider=provider,
-            result=result,
-            input_params=args,
-        )
-
-        # 执行失败 → 降级
-        if result.status == "failed":
-            await self._fallback_no_search(
-                db, conversation_id, model_id, litellm_model, litellm_kwargs,
-                provider, messages, assistant_message_id, task_id,
-                should_use_reasoning, thinking_block_id, text_block_id,
-            )
-            return
-
-        # 推送 complete SSE
-        sse_complete_data = {**args, "status": result.status}
-        if handler.tool_name == "web_search":
-            sources = result.data.get("sources", [])
-            sse_complete_data["sources"] = [s.model_dump() for s in sources]
-        elif handler.tool_name == "url_read":
-            sse_complete_data.update({
-                "title": result.data.get("title"),
-                "favicon": result.data.get("favicon"),
-            })
-        await handler.push_sse_complete(conversation_id, block_id, sse_complete_data)
-
-        # 构造第二轮 LLM 调用的消息
-        tool_context = handler.format_llm_context(result)
-        assistant_tool_msg = {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": tool_call_id,
-                    "type": "function",
-                    "function": {"name": tool_call_name, "arguments": tool_call_args},
-                }
-            ],
-        }
-        if should_use_reasoning:
-            assistant_tool_msg["reasoning_content"] = first_round_reasoning or ""
-
-        augmented_messages = messages + [
-            assistant_tool_msg,
-            {"role": "tool", "tool_call_id": tool_call_id, "content": tool_context},
-        ]
-
-        # 第二轮 LLM 流式调用
-        second_thinking_id = f"blk_{uuid.uuid4().hex[:12]}"
-        reasoning_buf, content_buf, usage_data = await self._stream_llm_to_redis(
-            litellm_model=litellm_model,
-            litellm_kwargs=litellm_kwargs,
-            messages=augmented_messages,
-            conversation_id=conversation_id,
-            task_id=task_id,
-            should_use_reasoning=should_use_reasoning,
-            thinking_block_id=second_thinking_id,
-            text_block_id=text_block_id,
-        )
-
-        # 落库
-        content_block = handler.build_content_block(result, block_id, tool_call_log_id)
-        content_blocks = []
-        if reasoning_buf:
-            content_blocks.append(ThinkingBlock(type="thinking", id=second_thinking_id, thinking=reasoning_buf))
-        content_blocks.append(content_block)
-        if content_buf:
-            content_blocks.append(TextBlock(type="text", id=text_block_id, text=content_buf))
-
-        self._persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks, usage_data)
-        await finalize_stream(conversation_id, success=True, task_id=task_id)
-
-        asyncio.create_task(self._extract_user_memories(conversation_id, user_id))
-
-    async def _fallback_no_search(
-        self,
-        db,
-        conversation_id: str,
-        model_id: str,
-        litellm_model: str,
-        litellm_kwargs: dict,
-        provider: str,
-        messages: list[dict],
-        assistant_message_id: str,
-        task_id: str,
-        should_use_reasoning: bool,
-        thinking_block_id: str,
-        text_block_id: str,
-    ) -> None:
-        """tool_call 失败时的降级路径：不带 tools 重新调用 LLM"""
-        reasoning_buf, content_buf, usage_data = await self._stream_llm_to_redis(
-            litellm_model=litellm_model,
-            litellm_kwargs=litellm_kwargs,
-            messages=messages,
-            conversation_id=conversation_id,
-            task_id=task_id,
-            should_use_reasoning=should_use_reasoning,
-            thinking_block_id=thinking_block_id,
-            text_block_id=text_block_id,
-        )
-        content_blocks = self._build_content_blocks(reasoning_buf, content_buf, thinking_block_id, text_block_id)
-        self._persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks, usage_data)
-        await finalize_stream(conversation_id, success=True, task_id=task_id)
-
-    async def _stream_llm_to_redis(
-        self,
-        litellm_model: str,
-        litellm_kwargs: dict,
-        messages: list[dict],
-        conversation_id: str,
-        task_id: str,
-        should_use_reasoning: bool,
-        thinking_block_id: str,
-        text_block_id: str,
-    ) -> tuple:
-        """
-        通用的 LLM 流式调用 + 写 Redis Stream 方法。
-        不传 tools，纯流式输出。用于第二轮调用和 fallback 场景。
-        返回 (reasoning_buf, content_buf, usage_data)。
-        """
-        reasoning_buf = ""
-        content_buf = ""
-        usage_data: Optional[Usage] = None
-        chunk_count = 0
-
-        response = await litellm.acompletion(
-            model=litellm_model,
-            messages=messages,
-            stream=True,
-            stream_options={"include_usage": True},
-            **litellm_kwargs,
-        )
-
-        async for chunk in response:
-            choice = chunk.choices[0] if chunk.choices else None
-
-            if not choice:
-                if hasattr(chunk, "usage") and chunk.usage:
-                    usage_data = Usage(
-                        input_tokens=chunk.usage.prompt_tokens or 0,
-                        output_tokens=chunk.usage.completion_tokens or 0,
-                    )
-                continue
-
-            delta = choice.delta
-
-            reasoning_delta = ""
-            if should_use_reasoning:
-                reasoning_delta = getattr(delta, "reasoning_content", None) or ""
-                if not reasoning_delta and hasattr(delta, "model_extra") and delta.model_extra:
-                    reasoning_delta = delta.model_extra.get("reasoning_content", "") or ""
-
-            content_delta = delta.content or ""
-
-            if reasoning_delta and content_delta == reasoning_delta:
-                content_delta = ""
-
-            if reasoning_delta:
-                reasoning_buf += reasoning_delta
-                await append_chunk(conversation_id, "reasoning", reasoning_delta, thinking_block_id)
-
-            if content_delta:
-                content_buf += content_delta
-                await append_chunk(conversation_id, "answering", content_delta, text_block_id)
-
-            if hasattr(chunk, "usage") and chunk.usage:
-                usage_data = Usage(
-                    input_tokens=chunk.usage.prompt_tokens or 0,
-                    output_tokens=chunk.usage.completion_tokens or 0,
-                )
-
-            chunk_count += 1
-            if chunk_count % LOCK_CHECK_INTERVAL == 0:
-                if not await check_lock_owner(conversation_id, task_id):
-                    logger.info(f"第二轮调用被踢掉: conv_id={conversation_id}")
-                    break
-
-        return reasoning_buf, content_buf, usage_data
 
     async def _stream_round(
         self,
@@ -810,8 +513,8 @@ class StreamHandler:
         handler,
         args: dict,
         max_retries: int = AGENT_TOOL_MAX_RETRIES,
-    ) -> "ToolResult":
-        """带重试的工具执行（仅瞬时故障重试）"""
+    ):
+        """带重试的工具执行（仅瞬时故障重试），返回 ToolResult"""
         from app.services.tool_handlers import ToolResult
 
         for attempt in range(max_retries + 1):
@@ -844,12 +547,13 @@ class StreamHandler:
         user_id: str,
         model_id: str,
         provider: str,
-    ) -> list[tuple[dict, "ToolResult", "BaseToolHandler | None", str, str]]:
+    ) -> list:
         """
         并行执行所有 tool_calls。
-        返回 [(tool_call, result, handler, block_id, log_id), ...]
+        返回 [(tool_call: dict, result: ToolResult, handler: BaseToolHandler|None, block_id: str, log_id: str), ...]
         """
-        from app.services.tool_handlers import ToolResult, get_handler as _get_handler
+        from app.services.tool_handlers import ToolResult
+        from app.services.tool_handlers import get_handler as _get_handler
 
         async def _run_one(tc: dict):
             handler = _get_handler(tc["name"])
@@ -908,21 +612,6 @@ class StreamHandler:
     # ──────────────────────────────────────────────
     # 辅助方法
     # ──────────────────────────────────────────────
-
-    @staticmethod
-    def _build_content_blocks(
-        reasoning_buf: str,
-        content_buf: str,
-        thinking_block_id: str,
-        text_block_id: str,
-    ) -> list:
-        """构建 assistant 消息的 content blocks 数组（非 tool_call 路径）"""
-        blocks = []
-        if reasoning_buf:
-            blocks.append(ThinkingBlock(type="thinking", id=thinking_block_id, thinking=reasoning_buf))
-        if content_buf:
-            blocks.append(TextBlock(type="text", id=text_block_id, text=content_buf))
-        return blocks
 
     def _persist_message(
         self,
