@@ -195,6 +195,22 @@ class StreamHandler:
             # ═══════════════════════════════════════
             # Agent Loop
             # ═══════════════════════════════════════
+
+            # 注入 agent 行为引导（仅当启用工具时）
+            if supports_fc:
+                agent_guidance = {
+                    "role": "system",
+                    "content": (
+                        "你可以多次使用工具来收集信息。策略建议：\n"
+                        "- 需要对比多个主题时，为每个主题分别搜索以获取更全面的信息\n"
+                        "- 搜索结果不够详细时，可以使用 url_read 深入阅读关键网页\n"
+                        "- 可以在一次回复中调用多个工具并行搜索\n"
+                        "- 当你认为已收集到足够信息时，直接给出回答即可"
+                    ),
+                }
+                # 插入到最后一条 user 消息之前
+                messages.insert(-1, agent_guidance)
+
             import time
             start_time = time.time()
 
