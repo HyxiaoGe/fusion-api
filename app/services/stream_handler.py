@@ -789,6 +789,7 @@ async def stream_redis_as_sse(
                                     "id": chunk.get("block_id", ""),
                                     "search_event": "start",
                                     "query": search_data.get("query", ""),
+                                    "tool_call_id": search_data.get("tool_call_id"),
                                 }
                             ]
                         },
@@ -812,6 +813,7 @@ async def stream_redis_as_sse(
                                     "search_event": "complete",
                                     "query": search_data.get("query", ""),
                                     "sources": search_data.get("sources", []),
+                                    "tool_call_id": search_data.get("tool_call_id"),
                                 }
                             ]
                         },
@@ -835,6 +837,7 @@ async def stream_redis_as_sse(
                                     "url_read_event": "start",
                                     "url": url_data.get("url", ""),
                                     "source": url_data.get("source", "auto"),
+                                    "tool_call_id": url_data.get("tool_call_id"),
                                 }
                             ]
                         },
@@ -860,6 +863,7 @@ async def stream_redis_as_sse(
                                     "title": url_data.get("title"),
                                     "favicon": url_data.get("favicon"),
                                     "status": url_data.get("status", "success"),
+                                    "tool_call_id": url_data.get("tool_call_id"),
                                 }
                             ]
                         },
