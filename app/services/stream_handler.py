@@ -223,6 +223,10 @@ class StreamHandler:
                 thinking_block_id = f"blk_{uuid.uuid4().hex[:12]}"
                 text_block_id = f"blk_{uuid.uuid4().hex[:12]}"
 
+                # 调试日志：LLM 调用前记录消息结构
+                msg_summary = [(m.get("role"), m.get("content", "")[:50] if m.get("content") else None, bool(m.get("tool_calls"))) for m in messages]
+                logger.info(f"Agent round {step+1}: conv={conversation_id}, model={litellm_model}, msgs={len(messages)}, structure={msg_summary[-5:]}, call_kwargs_keys={list(call_kwargs.keys())}")
+
                 response = await self._llm_call_with_retry(
                     litellm_model, litellm_kwargs, messages, **call_kwargs,
                 )
