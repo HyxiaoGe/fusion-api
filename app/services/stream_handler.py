@@ -931,21 +931,32 @@ class StreamHandler:
         conversation_id: str,
         model_id: str,
         content_blocks: list,
-        usage_data: Optional[Usage],
+        usage_data: Optional[Usage] = None,
+        partial: bool = False,
     ) -> None:
-        """将 assistant 消息写入 PostgreSQL"""
+        """
+        将 assistant 消息写入 PostgreSQL。
+        partial=True 时增量更新 content blocks（checkpoint），不写 usage。
+        partial=False 时写入完整数据（最终落库）。
+        """
         try:
             from app.db.models import Message as MessageModel
 
-            db_message = MessageModel(
-                id=assistant_message_id,
-                conversation_id=conversation_id,
-                role="assistant",
-                content=[block.model_dump() for block in content_blocks],
-                model_id=model_id,
-                usage=usage_data.model_dump() if usage_data else None,
-            )
-            db.add(db_message)
+            existing = db.query(MessageModel).filter_by(id=assistant_message_id).first()
+            if existing:
+                existing.content = [block.model_dump() for block in content_blocks]
+                if usage_data and not partial:
+                    existing.usage = usage_data.model_dump()
+            else:
+                db_message = MessageModel(
+                    id=assistant_message_id,
+                    conversation_id=conversation_id,
+                    role="assistant",
+                    content=[block.model_dump() for block in content_blocks],
+                    model_id=model_id,
+                    usage=usage_data.model_dump() if usage_data and not partial else None,
+                )
+                db.add(db_message)
             db.commit()
         except Exception as e:
             logger.error(f"写入 assistant 消息失败: {e}")
