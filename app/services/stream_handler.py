@@ -38,7 +38,7 @@ LOCK_CHECK_INTERVAL = 20
 
 # Agent Loop 限制
 AGENT_MAX_STEPS = 8               # LLM 调用轮次上限
-AGENT_MAX_TOOL_CALLS = 15         # 工具执行总次数上限
+AGENT_MAX_TOOL_CALLS = 20         # 工具执行总次数上限
 AGENT_TOTAL_TIMEOUT = 300         # 5 分钟硬超时
 AGENT_TOOL_TIMEOUT = 30           # 单次工具调用超时
 AGENT_TOOL_MAX_RETRIES = 1        # 瞬时故障重试次数
@@ -201,10 +201,11 @@ class StreamHandler:
                 agent_guidance = {
                     "role": "system",
                     "content": (
-                        "你可以多次使用工具来收集信息。策略建议：\n"
+                        f"你可以多次使用工具来收集信息，总预算为 {AGENT_MAX_TOOL_CALLS} 次工具调用。策略建议：\n"
                         "- 需要对比多个主题时，为每个主题分别搜索以获取更全面的信息\n"
                         "- 搜索结果不够详细时，可以使用 url_read 深入阅读关键网页\n"
                         "- 可以在一次回复中调用多个工具并行搜索\n"
+                        "- 请合理规划搜索策略，避免重复搜索相似关键词\n"
                         "- 当你认为已收集到足够信息时，直接给出回答即可"
                     ),
                 }
@@ -310,6 +311,14 @@ class StreamHandler:
                             "role": "tool",
                             "tool_call_id": tc["id"],
                             "content": tool_context,
+                        })
+
+                    # 注入剩余预算提示，帮助 LLM 规划后续搜索策略
+                    remaining = AGENT_MAX_TOOL_CALLS - total_tool_calls
+                    if remaining > 0:
+                        messages.append({
+                            "role": "system",
+                            "content": f"[预算] 已用 {total_tool_calls}/{AGENT_MAX_TOOL_CALLS} 次工具调用，剩余 {remaining} 次。请据此规划后续搜索。",
                         })
 
                     # Checkpoint：每步写入 DB，进程崩溃不丢已完成步骤
