@@ -867,6 +867,69 @@ async def stream_redis_as_sse(
                     }
                 ],
             }
+        elif chunk_type == "agent_step_start":
+            step_data = json.loads(chunk.get("content", "{}"))
+            payload = {
+                "id": message_id,
+                "conversation_id": conversation_id,
+                "choices": [
+                    {
+                        "delta": {
+                            "content": [
+                                {
+                                    "type": "agent_step",
+                                    "agent_event": "step_start",
+                                    "step": step_data.get("step", 0),
+                                    "max_steps": step_data.get("max_steps", AGENT_MAX_STEPS),
+                                    "tool_count": step_data.get("tool_count", 0),
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            }
+        elif chunk_type == "agent_step_end":
+            step_data = json.loads(chunk.get("content", "{}"))
+            payload = {
+                "id": message_id,
+                "conversation_id": conversation_id,
+                "choices": [
+                    {
+                        "delta": {
+                            "content": [
+                                {
+                                    "type": "agent_step",
+                                    "agent_event": "step_end",
+                                    "step": step_data.get("step", 0),
+                                    "total_tool_calls": step_data.get("total_tool_calls", 0),
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            }
+        elif chunk_type == "agent_limit_reached":
+            limit_data = json.loads(chunk.get("content", "{}"))
+            payload = {
+                "id": message_id,
+                "conversation_id": conversation_id,
+                "choices": [
+                    {
+                        "delta": {
+                            "content": [
+                                {
+                                    "type": "agent_step",
+                                    "agent_event": "limit_reached",
+                                    "reason": limit_data.get("reason", ""),
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            }
         elif chunk_type == "done":
             payload = {
                 "id": message_id,
