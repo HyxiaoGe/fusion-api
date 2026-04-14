@@ -196,26 +196,9 @@ class StreamHandler:
             # Agent Loop
             # ═══════════════════════════════════════
 
-            # 注入 agent 行为引导（仅当启用工具时）
-            if supports_fc:
-                guidance_text = (
-                    f"你可以多次使用工具来收集信息，总预算为 {AGENT_MAX_TOOL_CALLS} 次工具调用。策略建议：\n"
-                    "- 需要对比多个主题时，为每个主题分别搜索以获取更全面的信息\n"
-                    "- 搜索结果不够详细时，可以使用 url_read 深入阅读关键网页\n"
-                    "- 可以在一次回复中调用多个工具并行搜索\n"
-                    "- 请合理规划搜索策略，避免重复搜索相似关键词\n"
-                    "- 当你认为已收集到足够信息时，直接给出回答即可"
-                )
-                # 部分 provider（minimax、volcengine）不支持多个 system 消息，
-                # 将引导合并到 user 消息中；其余 provider 使用独立 system 消息
-                single_system_providers = {"minimax", "volcengine"}
-                if provider in single_system_providers:
-                    if messages and messages[-1].get("role") == "user":
-                        user_content = messages[-1].get("content", "")
-                        if isinstance(user_content, str):
-                            messages[-1]["content"] = f"[工具使用指引]\n{guidance_text}\n\n[用户问题]\n{user_content}"
-                else:
-                    messages.insert(-1, {"role": "system", "content": guidance_text})
+            # [A/B 测试] 暂时禁用 agent 引导，对比并行行为
+            # if supports_fc:
+            #     ...（引导注入逻辑暂时跳过）
 
             import time
             start_time = time.time()
