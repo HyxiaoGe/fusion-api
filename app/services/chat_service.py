@@ -50,6 +50,7 @@ class ChatService:
         stream: bool = True,
         options: Optional[Dict[str, Any]] = None,
         file_ids: Optional[List[str]] = None,
+        trace_id: Optional[str] = None,
     ) -> Union[StreamingResponse, ChatResponse]:
         """处理用户消息，路由到流式或非流式响应"""
         if options is None:
@@ -134,6 +135,7 @@ class ChatService:
                     task_id=task_id,
                     options=options,
                     capabilities=capabilities,
+                    trace_id=trace_id,
                 )
             )
             register_task(conversation.id, task, task_id)

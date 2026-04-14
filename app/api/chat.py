@@ -37,6 +37,7 @@ async def send_message(
         stream=chat_request.stream,
         options=chat_request.options,
         file_ids=chat_request.file_ids,
+        trace_id=request.state.request_id,
     )
     if isinstance(result, StreamingResponse):
         return result
