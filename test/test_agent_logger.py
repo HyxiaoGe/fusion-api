@@ -18,6 +18,7 @@ class ToolCallLogModelTests(unittest.TestCase):
             "tool_name", "status", "error_message", "duration_ms",
             "model_id", "provider",
             "input_params", "output_data", "metadata",
+            "trace_id", "step_number",
             "created_at",
         }
         actual_columns = {c.name for c in ToolCallLog.__table__.columns}
