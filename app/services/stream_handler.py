@@ -21,12 +21,12 @@ from app.schemas.chat import (
     ThinkingBlock,
     Usage,
 )
+from app.services.agent_logger import log_agent_session, log_agent_step
 from app.services.chat.message_builder import (
     build_llm_messages,
     inject_file_content,
     is_image_file,
 )
-from app.services.agent_logger import log_agent_step, log_agent_session
 from app.services.stream_state_service import (
     append_chunk,
     check_lock_owner,

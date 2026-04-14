@@ -8,10 +8,10 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from app.schemas.chat import ContentBlock
-from app.services.stream_state_service import append_chunk
 from app.core.logger import app_logger as logger
+from app.schemas.chat import ContentBlock
 from app.services.agent_logger import log_tool_call
+from app.services.stream_state_service import append_chunk
 
 
 @dataclass
