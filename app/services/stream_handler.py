@@ -26,12 +26,14 @@ from app.services.chat.message_builder import (
     inject_file_content,
     is_image_file,
 )
+from app.services.agent_logger import log_agent_step, log_agent_session
 from app.services.stream_state_service import (
     append_chunk,
     check_lock_owner,
     finalize_stream,
     read_stream_chunks,
 )
+from app.services.tool_handlers.base import _task_done_callback
 
 # 每 N 个 chunk 检查一次锁状态
 LOCK_CHECK_INTERVAL = 20
@@ -66,6 +68,7 @@ class StreamHandler:
         task_id: str,
         options: Optional[dict] = None,
         capabilities: Optional[dict] = None,
+        trace_id: Optional[str] = None,
     ) -> None:
         """
         后台任务：调用 LLM，chunk 写入 Redis Stream，完成后落库 PostgreSQL。
@@ -246,10 +249,14 @@ class StreamHandler:
                 # ── 情况 3: LLM 请求工具调用 ──
                 if finish_reason == "tool_calls" and tool_calls_list:
                     step += 1
+                    step_start_time = time.time()
 
                     await append_chunk(
                         conversation_id, "agent_step_start",
-                        json.dumps({"step": step, "max_steps": AGENT_MAX_STEPS, "tool_count": len(tool_calls_list)}, ensure_ascii=False),
+                        json.dumps({
+                            "step": step, "max_steps": AGENT_MAX_STEPS,
+                            "tool_count": len(tool_calls_list), "trace_id": trace_id,
+                        }, ensure_ascii=False),
                         "",
                     )
 
@@ -260,6 +267,7 @@ class StreamHandler:
                     # 并行执行工具
                     results = await self._execute_tools_parallel(
                         tool_calls_list, conversation_id, user_id, model_id, provider,
+                        trace_id=trace_id, step_number=step,
                     )
                     total_tool_calls += len(tool_calls_list)
 
@@ -302,9 +310,27 @@ class StreamHandler:
 
                     await append_chunk(
                         conversation_id, "agent_step_end",
-                        json.dumps({"step": step, "total_tool_calls": total_tool_calls}, ensure_ascii=False),
+                        json.dumps({
+                            "step": step, "total_tool_calls": total_tool_calls,
+                            "trace_id": trace_id,
+                        }, ensure_ascii=False),
                         "",
                     )
+
+                    # 记录 Agent step
+                    if trace_id:
+                        step_duration = int((time.time() - step_start_time) * 1000)
+                        step_tool_names = [tc["name"] for tc, *_ in results]
+                        task = asyncio.create_task(
+                            log_agent_step(
+                                trace_id=trace_id,
+                                step_number=step,
+                                tool_calls_count=len(results),
+                                tool_names=step_tool_names,
+                                duration_ms=step_duration,
+                            )
+                        )
+                        task.add_done_callback(_task_done_callback)
 
                     # 恢复 volcengine thinking（首轮 tool_call 决策已完成）
                     if "extra_body" in call_kwargs and call_kwargs["extra_body"].get("thinking", {}).get("type") == "disabled":
@@ -360,6 +386,36 @@ class StreamHandler:
             self._persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks, final_usage)
             await finalize_stream(conversation_id, success=True, task_id=task_id)
 
+            # 记录 Agent session（仅当有工具调用时）
+            if trace_id and step > 0:
+                agent_duration = int((time.time() - start_time) * 1000)
+                if finish_reason == "stop":
+                    session_status = "completed"
+                    session_limit_reason = None
+                elif finish_reason == "timeout":
+                    session_status = "limit_reached"
+                    session_limit_reason = "timeout"
+                else:
+                    session_status = "limit_reached"
+                    session_limit_reason = "max_steps" if step >= AGENT_MAX_STEPS else "max_tool_calls"
+
+                task = asyncio.create_task(
+                    log_agent_session(
+                        trace_id=trace_id,
+                        conversation_id=conversation_id,
+                        message_id=assistant_message_id,
+                        user_id=user_id,
+                        model_id=model_id,
+                        provider=provider,
+                        total_steps=step,
+                        total_tool_calls=total_tool_calls,
+                        total_duration_ms=agent_duration,
+                        status=session_status,
+                        limit_reason=session_limit_reason,
+                    )
+                )
+                task.add_done_callback(_task_done_callback)
+
             asyncio.create_task(self._extract_user_memories(conversation_id, user_id))
 
         except asyncio.CancelledError:
@@ -376,6 +432,25 @@ class StreamHandler:
                 self._persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks,
                                       accumulated_usage if accumulated_usage.input_tokens > 0 else None)
             await finalize_stream(conversation_id, success=False, error_msg=str(e), task_id=task_id)
+
+            if trace_id and step > 0:
+                agent_duration = int((time.time() - start_time) * 1000)
+                task = asyncio.create_task(
+                    log_agent_session(
+                        trace_id=trace_id,
+                        conversation_id=conversation_id,
+                        message_id=assistant_message_id,
+                        user_id=user_id,
+                        model_id=model_id,
+                        provider=provider,
+                        total_steps=step,
+                        total_tool_calls=total_tool_calls,
+                        total_duration_ms=agent_duration,
+                        status="error",
+                        error_message=str(e),
+                    )
+                )
+                task.add_done_callback(_task_done_callback)
 
         finally:
             db.close()
@@ -548,6 +623,8 @@ class StreamHandler:
         user_id: str,
         model_id: str,
         provider: str,
+        trace_id: str = None,
+        step_number: int = None,
     ) -> list:
         """
         并行执行所有 tool_calls。
@@ -603,6 +680,8 @@ class StreamHandler:
                 provider=provider,
                 result=result,
                 input_params=args,
+                trace_id=trace_id,
+                step_number=step_number,
             )
 
             return tc, result, handler, block_id, log_id
