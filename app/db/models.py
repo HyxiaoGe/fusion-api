@@ -252,4 +252,55 @@ class ToolCallLog(Base):
     output_data = Column(JSONB, nullable=True)
     extra_metadata = Column("metadata", JSONB, nullable=True)
 
+    trace_id = Column(String, nullable=True, index=True)
+    step_number = Column(Integer, nullable=True)
+
     created_at = Column(DateTime, default=get_china_time, index=True)
+
+
+class AgentSession(Base):
+    """Agent 执行会话记录 — 一次 Agent Loop 一条"""
+
+    __tablename__ = "agent_sessions"
+
+    id = Column(String, primary_key=True)  # = HTTP request_id
+    conversation_id = Column(
+        String,
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    message_id = Column(String, nullable=True)
+    user_id = Column(String, nullable=False, index=True)
+    model_id = Column(String(100), nullable=False)
+    provider = Column(String(50), nullable=False)
+
+    total_steps = Column(Integer, default=0)
+    total_tool_calls = Column(Integer, default=0)
+    total_duration_ms = Column(Integer, nullable=True)
+
+    status = Column(String(20), nullable=False)  # "completed" | "limit_reached" | "error"
+    limit_reason = Column(String(30), nullable=True)  # "max_steps" | "max_tool_calls" | "timeout"
+    error_message = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=get_china_time, index=True)
+
+
+class AgentStep(Base):
+    """Agent 单步执行记录 — 每步工具调用完成后写入"""
+
+    __tablename__ = "agent_steps"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    trace_id = Column(String, nullable=False, index=True)
+    step_number = Column(Integer, nullable=False)
+
+    tool_calls_count = Column(Integer, default=0)
+    tool_names = Column(JSONB, nullable=True)  # ["web_search", "url_read"]
+    duration_ms = Column(Integer, nullable=True)
+
+    created_at = Column(DateTime, default=get_china_time)
+
+    __table_args__ = (
+        UniqueConstraint("trace_id", "step_number", name="uq_trace_step"),
+    )
