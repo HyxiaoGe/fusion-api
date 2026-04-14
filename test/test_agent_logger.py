@@ -1,5 +1,5 @@
 """
-tool_call_logger 单元测试
+agent_logger 单元测试
 """
 
 import unittest
@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 from app.db.models import ToolCallLog
 from app.schemas.chat import SearchBlock, SearchSourceSummary
-from app.services.tool_call_logger import log_tool_call
+from app.services.agent_logger import log_tool_call
 
 
 class ToolCallLogModelTests(unittest.TestCase):
@@ -28,7 +28,7 @@ class ToolCallLogModelTests(unittest.TestCase):
 
 
 class LogToolCallTests(unittest.IsolatedAsyncioTestCase):
-    @patch("app.services.tool_call_logger.SessionLocal")
+    @patch("app.services.agent_logger.SessionLocal")
     async def test_log_tool_call_creates_record(self, mock_session_cls):
         """log_tool_call 使用独立 session 写入记录"""
         mock_db = MagicMock()
@@ -55,7 +55,7 @@ class LogToolCallTests(unittest.IsolatedAsyncioTestCase):
         added_obj = mock_db.add.call_args[0][0]
         self.assertEqual(added_obj.id, "custom-log-id")
 
-    @patch("app.services.tool_call_logger.SessionLocal")
+    @patch("app.services.agent_logger.SessionLocal")
     async def test_log_tool_call_handles_error_gracefully(self, mock_session_cls):
         """log_tool_call 异常时不抛出，静默失败"""
         mock_db = MagicMock()
