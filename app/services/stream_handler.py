@@ -196,10 +196,6 @@ class StreamHandler:
             # Agent Loop
             # ═══════════════════════════════════════
 
-            # [A/B 测试] 暂时禁用 agent 引导，对比并行行为
-            # if supports_fc:
-            #     ...（引导注入逻辑暂时跳过）
-
             import time
             start_time = time.time()
 
@@ -300,11 +296,6 @@ class StreamHandler:
                             "tool_call_id": tc["id"],
                             "content": tool_context,
                         })
-
-                    # TODO: 预算提示暂时禁用，待定位 MiniMax 兼容性问题后再启用
-                    # remaining = AGENT_MAX_TOOL_CALLS - total_tool_calls
-                    # if remaining > 0 and messages and messages[-1].get("role") == "tool":
-                    #     messages[-1]["content"] += f"\n\n[工具调用预算] 已用 {total_tool_calls}/{AGENT_MAX_TOOL_CALLS} 次，剩余 {remaining} 次。请据此规划后续搜索策略。"
 
                     # Checkpoint：每步写入 DB，进程崩溃不丢已完成步骤
                     self._persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks, partial=True)
