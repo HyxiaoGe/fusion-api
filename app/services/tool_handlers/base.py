@@ -10,7 +10,8 @@ from typing import Any, Optional
 
 from app.schemas.chat import ContentBlock
 from app.services.stream_state_service import append_chunk
-from app.services.tool_call_logger import log_tool_call
+from app.core.logger import app_logger as logger
+from app.services.agent_logger import log_tool_call
 
 
 @dataclass
@@ -43,6 +44,26 @@ class ToolResult:
     data: dict = field(default_factory=dict)
     error_message: Optional[str] = None
     duration_ms: Optional[int] = None
+
+
+def _serialize_for_json(obj):
+    """递归序列化，确保所有 Pydantic 对象转为 dict"""
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump()
+    if isinstance(obj, list):
+        return [_serialize_for_json(item) for item in obj]
+    if isinstance(obj, dict):
+        return {k: _serialize_for_json(v) for k, v in obj.items()}
+    return obj
+
+
+def _task_done_callback(task: asyncio.Task):
+    """asyncio.create_task 异常回调，确保日志写入失败可见"""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc:
+        logger.error(f"日志写入异步任务异常: {exc}", exc_info=exc)
 
 
 class BaseToolHandler(ABC):
@@ -99,9 +120,11 @@ class BaseToolHandler(ABC):
         provider: str,
         result: ToolResult,
         input_params: dict,
+        trace_id: str = None,
+        step_number: int = None,
     ) -> None:
         """异步记录 ToolCallLog"""
-        asyncio.create_task(
+        task = asyncio.create_task(
             log_tool_call(
                 log_id=log_id,
                 conversation_id=conversation_id,
@@ -113,7 +136,10 @@ class BaseToolHandler(ABC):
                 model_id=model_id,
                 provider=provider,
                 input_params=input_params,
-                output_data=result.data,
+                output_data=_serialize_for_json(result.data),
                 error_message=result.error_message,
+                trace_id=trace_id,
+                step_number=step_number,
             )
         )
+        task.add_done_callback(_task_done_callback)
