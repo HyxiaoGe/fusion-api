@@ -1,12 +1,13 @@
 # app/ai/llm_manager.py
 import logging
+import os
 from typing import Any, Dict, Tuple
 
 import litellm
 from sqlalchemy.orm import Session
 
 from app.core.logger import app_logger as logger
-from app.db.repositories import ModelCredentialRepository, ModelSourceRepository, ProviderRepository
+from app.db.repositories import ModelSourceRepository
 
 # 关闭 LiteLLM 的冗余日志
 litellm.suppress_debug_info = True
@@ -17,12 +18,13 @@ logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 class LLMManager:
     """
     统一的 LLM 调用管理器，基于 LiteLLM。
-    职责：根据 model_id 查询凭证，构造 LiteLLM 调用参数。
+    职责：根据 model_id 查询模型信息，通过 LiteLLM Proxy 路由所有请求。
     """
 
     def resolve_model(self, model_id: str, db: Session) -> Tuple[str, str, Dict[str, Any]]:
         """
         根据 model_id 解析出 LiteLLM 调用所需的完整参数。
+        通过 LiteLLM Proxy 路由，不再直接读取 API 凭证。
         返回：(litellm_model_string, provider, litellm_kwargs)
         """
 
@@ -34,22 +36,16 @@ class LLMManager:
         if not provider_rel:
             raise ValueError(f"模型 {model_id} 的提供商 {model_source.provider} 未配置")
 
-        credential = ModelCredentialRepository(db).get_default(model_id)
-        if not credential:
-            raise ValueError(f"未找到模型 {model_id} 的凭证配置")
+        # 通过 LiteLLM Proxy 路由 — 使用 provider 名称作为前缀
+        litellm_model = f"{model_source.provider}/{model_id}"
 
-        creds = credential.credentials
-
-        # 从 provider 表读取 LiteLLM 前缀
-        litellm_model = f"{provider_rel.litellm_prefix}/{model_id}"
+        proxy_url = os.environ.get("LITELLM_PROXY_URL", "http://litellm-proxy:4000")
+        proxy_key = os.environ.get("LITELLM_API_KEY", "")
 
         litellm_kwargs: Dict[str, Any] = {
-            "api_key": creds.get("api_key"),
+            "api_key": proxy_key,
+            "api_base": proxy_url,
         }
-
-        # 从 provider 表读取是否需要自定义 base_url
-        if provider_rel.custom_base_url and creds.get("base_url"):
-            litellm_kwargs["api_base"] = creds["base_url"]
 
         return litellm_model, model_source.provider, litellm_kwargs
 
@@ -60,26 +56,19 @@ class LLMManager:
         credentials: Dict[str, Any],
         db: Session = None,
     ) -> bool:
-        """测试凭证是否有效，发送最小测试请求"""
+        """通过 LiteLLM Proxy 测试模型是否可用"""
         try:
-            if not db:
-                raise ValueError("需要数据库会话来查询 provider 配置")
+            litellm_model = f"{provider}/{model_id}"
 
-            provider_obj = ProviderRepository(db).get_by_id(provider)
-            if not provider_obj:
-                raise ValueError(f"未找到提供商配置: {provider}")
-
-            litellm_model = f"{provider_obj.litellm_prefix}/{model_id}"
-
-            kwargs: Dict[str, Any] = {"api_key": credentials.get("api_key")}
-            if provider_obj.custom_base_url and credentials.get("base_url"):
-                kwargs["api_base"] = credentials["base_url"]
+            proxy_url = os.environ.get("LITELLM_PROXY_URL", "http://litellm-proxy:4000")
+            proxy_key = os.environ.get("LITELLM_API_KEY", "")
 
             await litellm.acompletion(
                 model=litellm_model,
                 messages=[{"role": "user", "content": "hi"}],
                 max_tokens=1,
-                **kwargs,
+                api_key=proxy_key,
+                api_base=proxy_url,
             )
             return True
         except Exception as e:

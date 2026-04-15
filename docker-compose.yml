@@ -48,6 +48,7 @@ services:
     networks:
       - default
       - middleware
+      - litellm_net
 
 networks:
   default:
@@ -56,3 +57,6 @@ networks:
   middleware:
     name: middleware_default
     external: true
+  litellm_net:
+    external: true
+    name: litellm-proxy_default
