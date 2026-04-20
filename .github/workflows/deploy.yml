@@ -21,6 +21,9 @@ jobs:
     needs: check
     runs-on: self-hosted
     steps:
+      - name: Record start time
+        run: echo "BUILD_START=$(date +%s)" >> $GITHUB_ENV
+
       - name: Sync deploy checkout
         run: cd ~/project/fusion/fusion-api && git fetch origin && git reset --hard origin/master && git clean -fd
       - name: Deploy
@@ -44,3 +47,7 @@ jobs:
         run: |
           docker image prune -f
           docker builder prune --filter "until=72h" -f
+
+      - name: Push deploy metrics
+        if: always()
+        run: bash ~/scripts/push-deploy-metrics.sh fusion-api master ${{ job.status }} ${{ env.BUILD_START }}
