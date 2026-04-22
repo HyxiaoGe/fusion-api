@@ -1,4 +1,5 @@
 import asyncio
+import os
 import time
 from contextlib import asynccontextmanager
 
@@ -67,7 +68,15 @@ async def lifespan(app: FastAPI):
     app_logger.info("应用关闭完成")
 
 
-app = FastAPI(title=settings.APP_NAME, version=settings.APP_VERSION, lifespan=lifespan)
+_enable_docs = os.getenv("ENABLE_DOCS", "true").lower() == "true"
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    lifespan=lifespan,
+    docs_url="/docs" if _enable_docs else None,
+    redoc_url="/redoc" if _enable_docs else None,
+    openapi_url="/openapi.json" if _enable_docs else None,
+)
 
 # 输出启动日志
 app_logger.info(f"正在启动 {settings.APP_NAME} v{settings.APP_VERSION}")
