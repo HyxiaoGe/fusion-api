@@ -1,47 +1,158 @@
-name: Deploy to Dev Server
+name: Fusion API Windows CI
+
 on:
   push:
-    branches: ["master"]
   workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: fusion-api-windows-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  check:
-    runs-on: self-hosted
+  build:
+    name: Build on Windows runner
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 40
+    env:
+      IMAGE_NAME: ghcr.io/hyxiaoge/fusion-api
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    defaults:
+      run:
+        shell: pwsh
+
     steps:
-      - uses: actions/checkout@v4
-      - name: 架构检查
-        run: python3 scripts/check_architecture.py
-      - name: Lint 检查
-        run: ~/.local/bin/ruff check .
-  deploy:
-    needs: check
-    runs-on: self-hosted
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Verify Docker access
+        run: |
+          docker version
+          docker ps
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt ruff
+
+      - name: Architecture check
+        run: python scripts/check_architecture.py
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: python -m unittest discover -s test
+
+      - name: Login to GHCR
+        run: $env:GITHUB_TOKEN | docker login ghcr.io -u $env:GITHUB_ACTOR --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Docker image
+        run: docker build -t "${env:IMAGE_NAME}:${env:GITHUB_SHA}" .
+
+      - name: Push Docker image
+        run: docker push "${env:IMAGE_NAME}:${env:GITHUB_SHA}"
+
+      - name: Cleanup local Docker artifacts
+        if: always()
+        run: |
+          docker image rm "${env:IMAGE_NAME}:${env:GITHUB_SHA}" 2>$null
+          docker builder prune --filter "until=72h" -f
+
+  deploy-dev:
+    name: Deploy master on dev server
+    if: github.ref == 'refs/heads/master'
+    needs: build
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 10
+
     steps:
       - name: Record start time
-        run: echo "BUILD_START=$(date +%s)" >> $GITHUB_ENV
+        run: echo "BUILD_START=$(date +%s)" >> "$GITHUB_ENV"
 
-      - name: Sync deploy checkout
-        run: cd ~/project/fusion/fusion-api && git fetch origin && git reset --hard origin/master && git clean -fd
-      - name: Deploy
+      - name: Login to GHCR
+        run: echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull and restart fusion-api
         run: |
-          cd ~/project/fusion/fusion-api
-          if git diff HEAD~1 --name-only | grep -qE 'requirements\.txt|Dockerfile|docker-compose'; then
-            cd ~/project/fusion
-            for attempt in 1 2 3; do
-              if docker compose up -d --build fusion-api; then
-                exit 0
-              fi
-              docker compose rm -sf fusion-api || true
-              sleep 5
-            done
-            exit 1
-          else
-            cd ~/project/fusion
-            docker compose restart fusion-api
-          fi
-      - name: Cleanup
+          cd ~/project/fusion
+          docker pull ghcr.io/hyxiaoge/fusion-api:${{ github.sha }}
+          cat > docker-compose.fusion-api-ghcr.yml <<'EOF'
+          services:
+            fusion-api:
+              image: ghcr.io/hyxiaoge/fusion-api:${{ github.sha }}
+              container_name: fusion-api
+              command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+              restart: always
+              ports:
+                - "8002:8000"
+              volumes:
+                - ./fusion-api/logs:/app/logs
+              environment:
+                - DATABASE_URL=${DATABASE_URL}
+                - SERVER_HOST=${SERVER_HOST}
+                - FRONTEND_URL=${FRONTEND_URL}
+                - AUTH_SERVICE_BASE_URL=${AUTH_SERVICE_BASE_URL}
+                - AUTH_SERVICE_JWKS_URL=${AUTH_SERVICE_JWKS_URL}
+                - AUTH_SERVICE_CLIENT_ID=${AUTH_SERVICE_CLIENT_ID}
+                - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID}
+                - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET}
+                - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+                - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+                - REDIS_URL=${REDIS_URL:-redis://middleware-redis:6379/0}
+                - MOONSHOT_API_KEY=${MOONSHOT_API_KEY:-}
+                - LITELLM_PROXY_URL=${LITELLM_PROXY_URL:-http://litellm-proxy:4000}
+                - LITELLM_API_KEY=${LITELLM_API_KEY:-}
+                - ENABLE_DOCS=false
+              deploy:
+                resources:
+                  limits:
+                    cpus: "1"
+                    memory: 1g
+              networks:
+                - postgres_default
+                - middleware_default
+
+          networks:
+            postgres_default:
+              external: true
+            middleware_default:
+              external: true
+          EOF
+          docker compose -f docker-compose.fusion-api-ghcr.yml up -d
+
+      - name: Verify health
         run: |
-          docker image prune -f
-          docker builder prune --filter "until=72h" -f
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8002/health | grep -q '"status":"healthy"'; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          docker logs --tail=120 fusion-api || true
+          exit 1
+
+      - name: Cleanup old images
+        if: always()
+        run: |
+          current="ghcr.io/hyxiaoge/fusion-api:${{ github.sha }}"
+          docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' ghcr.io/hyxiaoge/fusion-api \
+            | awk -v current="$current" '$1 != current {print $2}' \
+            | sort -u \
+            | xargs -r docker rmi || true
 
       - name: Push deploy metrics
         if: always()
