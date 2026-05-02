@@ -108,6 +108,7 @@ jobs:
                 - DATABASE_URL=${DATABASE_URL}
                 - SERVER_HOST=${SERVER_HOST}
                 - FRONTEND_URL=${FRONTEND_URL}
+                - CORS_ORIGINS=${CORS_ORIGINS}
                 - AUTH_SERVICE_BASE_URL=${AUTH_SERVICE_BASE_URL}
                 - AUTH_SERVICE_JWKS_URL=${AUTH_SERVICE_JWKS_URL}
                 - AUTH_SERVICE_CLIENT_ID=${AUTH_SERVICE_CLIENT_ID}
