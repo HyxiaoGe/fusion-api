@@ -48,7 +48,8 @@ jobs:
           cicd_pipeline_active_timestamp_seconds{project="fusion-api",branch="$env:GITHUB_REF_NAME",environment="dev",runner="${{ runner.name }}"} $now
           "@
           $body = $metrics -replace "`r`n", "`n"
-          Invoke-WebRequest -UseBasicParsing -Method Post -Uri "http://192.168.1.10:9092/metrics/job/cicd_active/project_key/fusion-api/branch_key/master/environment_key/dev" -ContentType "text/plain; version=0.0.4" -Body $body
+          $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+          Invoke-WebRequest -UseBasicParsing -Method Post -Uri "http://192.168.1.10:9092/metrics/job/cicd_active/project_key/fusion-api/branch_key/master/environment_key/dev" -ContentType "text/plain; version=0.0.4" -Body $bytes
 
       - name: Checkout
         uses: actions/checkout@v6
