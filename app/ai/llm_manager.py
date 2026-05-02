@@ -36,8 +36,9 @@ class LLMManager:
         if not provider_rel:
             raise ValueError(f"模型 {model_id} 的提供商 {model_source.provider} 未配置")
 
-        # 通过 LiteLLM Proxy 路由 — 使用 provider 名称作为前缀
-        litellm_model = f"{model_source.provider}/{model_id}"
+        # 通过 LiteLLM Proxy 路由。Proxy 内部注册的是 provider/model_id，
+        # 本地 LiteLLM SDK 需要 openai/ 前缀才能按 OpenAI-compatible endpoint 转发。
+        litellm_model = f"openai/{model_source.provider}/{model_id}"
 
         proxy_url = os.environ.get("LITELLM_PROXY_URL", "http://litellm-proxy:4000")
         proxy_key = os.environ.get("LITELLM_API_KEY", "")
@@ -58,7 +59,7 @@ class LLMManager:
     ) -> bool:
         """通过 LiteLLM Proxy 测试模型是否可用"""
         try:
-            litellm_model = f"{provider}/{model_id}"
+            litellm_model = f"openai/{provider}/{model_id}"
 
             proxy_url = os.environ.get("LITELLM_PROXY_URL", "http://litellm-proxy:4000")
             proxy_key = os.environ.get("LITELLM_API_KEY", "")
