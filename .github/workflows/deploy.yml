@@ -17,6 +17,8 @@ jobs:
     name: Build on Windows runner
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 40
+    outputs:
+      started_at: ${{ steps.pipeline_start.outputs.started_at }}
     env:
       IMAGE_NAME: ghcr.io/hyxiaoge/fusion-api
     defaults:
@@ -24,6 +26,11 @@ jobs:
         shell: cmd
 
     steps:
+      - name: Record pipeline start
+        id: pipeline_start
+        run: |
+          for /f %%i in ('powershell -NoProfile -ExecutionPolicy Bypass -Command "[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()"') do echo started_at=%%i>>%GITHUB_OUTPUT%
+
       - name: Checkout
         uses: actions/checkout@v6
 
@@ -72,8 +79,8 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Record start time
-        run: echo "BUILD_START=$(date +%s)" >> "$GITHUB_ENV"
+      - name: Record deploy start time
+        run: echo "DEPLOY_START=$(date +%s)" >> "$GITHUB_ENV"
 
       - name: Login to GHCR
         run: echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
@@ -149,6 +156,17 @@ jobs:
             | sort -u \
             | xargs -r docker rmi || true
 
-      - name: Push deploy metrics
+      - name: Push CI/CD metrics
         if: always()
-        run: bash ~/scripts/push-deploy-metrics.sh fusion-api master ${{ job.status }} ${{ env.BUILD_START }}
+        run: |
+          bash ~/scripts/push-cicd-metrics.sh \
+            fusion-api \
+            "${{ github.ref_name }}" \
+            dev \
+            "${{ job.status }}" \
+            "${{ needs.build.outputs.started_at }}" \
+            "ghcr.io/hyxiaoge/fusion-api:${{ github.sha }}" \
+            "${{ github.sha }}" \
+            "${{ runner.name }}" \
+            fusion-api \
+            "${{ env.DEPLOY_START }}"
