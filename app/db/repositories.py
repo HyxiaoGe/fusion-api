@@ -71,6 +71,12 @@ class UserRepository:
         self.db.add(db_obj)
         return db_obj
 
+    def update_system_prompt(self, user: UserModel, system_prompt: str) -> UserModel:
+        user.system_prompt = system_prompt
+        self.db.commit()
+        self.db.refresh(user)
+        return user
+
 
 class SocialAccountRepository:
     def __init__(self, db: Session):

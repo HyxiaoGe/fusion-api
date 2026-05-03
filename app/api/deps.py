@@ -14,6 +14,7 @@ from app.db.repositories import (
     ModelCredentialRepository,
     ModelSourceRepository,
     ProviderRepository,
+    UserRepository,
 )
 from app.services.chat_service import ChatService
 from app.services.file_service import FileService
@@ -37,3 +38,7 @@ def get_model_source_repo(db: Session = Depends(get_db)) -> ModelSourceRepositor
 
 def get_model_credential_repo(db: Session = Depends(get_db)) -> ModelCredentialRepository:
     return ModelCredentialRepository(db)
+
+
+def get_user_repo(db: Session = Depends(get_db)) -> UserRepository:
+    return UserRepository(db)
