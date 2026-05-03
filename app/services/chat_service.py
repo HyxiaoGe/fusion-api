@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.ai.llm_manager import llm_manager
 from app.ai.prompts import prompt_manager
 from app.core.logger import app_logger as logger
-from app.db.repositories import FileRepository, ModelSourceRepository
+from app.db.repositories import ConversationRepository, FileRepository, ModelSourceRepository
 from app.schemas.chat import (
     ChatResponse,
     Conversation,
@@ -155,10 +155,13 @@ class ChatService:
         else:
             # 非流式模式：同步构建消息（含图片 base64）
             from app.db.repositories import MemoryRepository
+
             memory_repo = MemoryRepository(self.db)
             user_memories = memory_repo.get_active(user_id)
             lm_messages = await build_llm_messages(
-                conversation.messages, has_vision=has_vision, file_repo=self.file_repo,
+                conversation.messages,
+                has_vision=has_vision,
+                file_repo=self.file_repo,
                 user_memories=user_memories,
             )
             if file_ids:
@@ -322,13 +325,13 @@ class ChatService:
         try:
             # 查询用户记忆，注入推荐问题 prompt 实现个性化
             from app.db.repositories import MemoryRepository
+
             memory_repo = MemoryRepository(self.db)
             user_memories = memory_repo.get_active(user_id)
             if user_memories:
                 memory_text = "\n".join(f"- {m.content}" for m in user_memories)
                 user_memory_section = (
-                    "\n7. 结合以下用户背景信息，让推荐问题更贴合用户的实际需求和兴趣：\n"
-                    f"{memory_text}\n"
+                    f"\n7. 结合以下用户背景信息，让推荐问题更贴合用户的实际需求和兴趣：\n{memory_text}\n"
                 )
             else:
                 user_memory_section = ""
@@ -395,6 +398,36 @@ class ChatService:
 
     def get_conversations_paginated(self, user_id: str, page: int = 1, page_size: int = 20):
         return self.memory_service.get_conversations_paginated(user_id, page, page_size)
+
+    def get_conversations_metadata(self, user_id: str, conversation_ids: List[str]) -> List[Dict[str, Any]]:
+        """按 ID 列表返回对话元数据（前端用于刷新已显示对话的标题等）。"""
+        repo = ConversationRepository(self.db)
+        conversations = repo.get_metadata_by_ids(user_id, conversation_ids)
+        return [
+            {
+                "id": conv.id,
+                "title": conv.title,
+                "model_id": conv.model_id,
+                "created_at": conv.created_at,
+                "updated_at": conv.updated_at,
+            }
+            for conv in conversations
+        ]
+
+    def search_conversations_by_title(self, user_id: str, query: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """按标题模糊搜索当前用户的对话。"""
+        repo = ConversationRepository(self.db)
+        conversations = repo.search_by_title(user_id, query, limit)
+        return [
+            {
+                "id": conv.id,
+                "title": conv.title,
+                "model_id": conv.model_id,
+                "created_at": conv.created_at,
+                "updated_at": conv.updated_at,
+            }
+            for conv in conversations
+        ]
 
     def update_message(self, message_id: str, update_data: Dict[str, Any]) -> Optional[Message]:
         updated = self.memory_service.update_message(message_id, update_data)

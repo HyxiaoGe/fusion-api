@@ -232,6 +232,70 @@ class ConversationRepository:
             logger.error(f"分页获取对话失败: {e}")
             return [], 0
 
+    def get_metadata_by_ids(self, user_id: str, conversation_ids: List[str]) -> List[Conversation]:
+        """按 ID 列表拉取对话元数据（不含 messages），仅返回属于当前用户的对话。
+
+        用途：发完消息 / 重命名后只刷新已显示对话的标题等，避免重新拉取整个分页。
+        """
+        if not conversation_ids:
+            return []
+        try:
+            db_conversations = (
+                self.db.query(ConversationModel)
+                .filter(
+                    ConversationModel.user_id == user_id,
+                    ConversationModel.id.in_(conversation_ids),
+                )
+                .all()
+            )
+            return [
+                Conversation(
+                    id=db_conv.id,
+                    user_id=db_conv.user_id,
+                    model_id=db_conv.model_id,
+                    title=db_conv.title,
+                    messages=[],
+                    created_at=db_conv.created_at,
+                    updated_at=db_conv.updated_at,
+                )
+                for db_conv in db_conversations
+            ]
+        except Exception as e:
+            logger.error(f"按 ID 列表拉取对话元数据失败: {e}")
+            return []
+
+    def search_by_title(self, user_id: str, query: str, limit: int = 50) -> List[Conversation]:
+        """按标题模糊搜索当前用户的对话，按 updated_at 倒序，限 limit 条。"""
+        if not query or not query.strip():
+            return []
+        try:
+            pattern = f"%{query.strip()}%"
+            db_conversations = (
+                self.db.query(ConversationModel)
+                .filter(
+                    ConversationModel.user_id == user_id,
+                    ConversationModel.title.ilike(pattern),
+                )
+                .order_by(ConversationModel.updated_at.desc())
+                .limit(limit)
+                .all()
+            )
+            return [
+                Conversation(
+                    id=db_conv.id,
+                    user_id=db_conv.user_id,
+                    model_id=db_conv.model_id,
+                    title=db_conv.title,
+                    messages=[],
+                    created_at=db_conv.created_at,
+                    updated_at=db_conv.updated_at,
+                )
+                for db_conv in db_conversations
+            ]
+        except Exception as e:
+            logger.error(f"按标题搜索对话失败: {e}")
+            return []
+
     def create_message(self, message: Message, conversation_id: str) -> Message:
         """创建新消息并附加到现有对话"""
         try:
@@ -924,5 +988,3 @@ class ModelCredentialRepository:
             created_at=credential.created_at,
             updated_at=credential.updated_at,
         )
-
-
