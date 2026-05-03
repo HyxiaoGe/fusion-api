@@ -57,6 +57,39 @@ def get_conversations(
     return success(data=data, request_id=request.state.request_id)
 
 
+@router.get("/conversations/metadata")
+def get_conversations_metadata(
+    request: Request,
+    ids: str = Query(..., description="逗号分隔的对话 ID 列表，最多 100 个"),
+    chat_service: ChatService = Depends(get_chat_service),
+    current_user: User = Depends(get_current_user),
+):
+    """按 ID 列表拉取对话元数据（标题/updated_at/model_id），不含消息内容。
+
+    前端用于"发完消息后刷新当前侧边栏已显示对话"，避免重新拉取整个分页导致列表收起。
+    """
+    id_list = [s.strip() for s in ids.split(",") if s.strip()]
+    if not id_list:
+        return success(data={"items": []}, request_id=request.state.request_id)
+    if len(id_list) > 100:
+        raise ApiException.bad_request("ids 数量不能超过 100")
+    items = chat_service.get_conversations_metadata(current_user.id, id_list)
+    return success(data={"items": items}, request_id=request.state.request_id)
+
+
+@router.get("/conversations/search")
+def search_conversations(
+    request: Request,
+    q: str = Query(..., min_length=1, max_length=200, description="搜索关键词"),
+    limit: int = Query(50, ge=1, le=100, description="结果上限"),
+    chat_service: ChatService = Depends(get_chat_service),
+    current_user: User = Depends(get_current_user),
+):
+    """按标题模糊搜索当前用户的对话，按 updated_at 倒序。"""
+    items = chat_service.search_conversations_by_title(current_user.id, q, limit)
+    return success(data={"items": items}, request_id=request.state.request_id)
+
+
 @router.get("/conversations/{conversation_id}")
 def get_conversation(
     conversation_id: str,
