@@ -310,6 +310,12 @@ class ConversationRepository:
             )
 
             self.db.add(db_message)
+
+            # 同步刷新 conversation.updated_at，让 sidebar 排序正确反映最近活跃对话
+            db_conversation = self.db.query(ConversationModel).filter(ConversationModel.id == conversation_id).first()
+            if db_conversation:
+                db_conversation.updated_at = get_china_time()
+
             self.db.flush()
             self.db.refresh(db_message)
             return self._convert_message_to_schema(db_message)
