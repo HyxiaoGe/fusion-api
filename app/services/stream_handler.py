@@ -39,12 +39,12 @@ from app.services.tool_handlers.base import _task_done_callback
 LOCK_CHECK_INTERVAL = 20
 
 # Agent Loop 限制
-AGENT_MAX_STEPS = 8               # LLM 调用轮次上限
-AGENT_MAX_TOOL_CALLS = 20         # 工具执行总次数上限
-AGENT_TOTAL_TIMEOUT = 300         # 5 分钟硬超时
-AGENT_TOOL_TIMEOUT = 30           # 单次工具调用超时
-AGENT_TOOL_MAX_RETRIES = 1        # 瞬时故障重试次数
-AGENT_LLM_MAX_RETRIES = 1         # LLM 调用重试次数
+AGENT_MAX_STEPS = 8  # LLM 调用轮次上限
+AGENT_MAX_TOOL_CALLS = 20  # 工具执行总次数上限
+AGENT_TOTAL_TIMEOUT = 300  # 5 分钟硬超时
+AGENT_TOOL_TIMEOUT = 30  # 单次工具调用超时
+AGENT_TOOL_MAX_RETRIES = 1  # 瞬时故障重试次数
+AGENT_LLM_MAX_RETRIES = 1  # LLM 调用重试次数
 
 
 class StreamHandler:
@@ -87,6 +87,7 @@ class StreamHandler:
         call_kwargs = {}
         if supports_fc:
             from app.ai.tools import WEB_SEARCH_TOOL
+
             call_kwargs["tools"] = [WEB_SEARCH_TOOL]
             call_kwargs["tool_choice"] = "auto"
             if should_use_reasoning and provider == "volcengine":
@@ -106,10 +107,11 @@ class StreamHandler:
 
             # 构建 LLM 消息
             file_repo = FileRepository(db)
-            from app.db.repositories import MemoryRepository
-            memory_repo = MemoryRepository(db)
-            user_memories = memory_repo.get_active(user_id)
-            messages = await build_llm_messages(raw_messages, has_vision, file_repo, user_memories)
+            from app.db.models import User as UserModel
+
+            user_record = db.query(UserModel).filter(UserModel.id == user_id).first()
+            user_system_prompt = user_record.system_prompt if user_record else None
+            messages = await build_llm_messages(raw_messages, has_vision, file_repo, user_system_prompt)
 
             if file_ids:
                 non_image_ids = [fid for fid in file_ids if not is_image_file(fid, file_repo)]
@@ -124,6 +126,7 @@ class StreamHandler:
             url_read_block_id = None
             if supports_fc:
                 import re
+
                 url_pattern = re.compile(r'https?://[^\s<>"\')\]]+')
                 urls_in_message = url_pattern.findall(original_message)
                 if urls_in_message:
@@ -131,13 +134,15 @@ class StreamHandler:
                     url_read_block_id = f"blk_{uuid.uuid4().hex[:12]}"
 
                     await append_chunk(
-                        conversation_id, "url_read_start",
+                        conversation_id,
+                        "url_read_start",
                         json.dumps({"url": auto_detected_url, "source": "auto"}, ensure_ascii=False),
                         url_read_block_id,
                     )
 
                     try:
                         from app.services.reader_client import read_url
+
                         read_result = await asyncio.wait_for(read_url(auto_detected_url, timeout=8.0), timeout=8.0)
                     except asyncio.TimeoutError:
                         logger.warning(f"URL 自动抓取超时: {auto_detected_url}")
@@ -146,22 +151,30 @@ class StreamHandler:
                     if read_result:
                         url_read_content = read_result
                         await append_chunk(
-                            conversation_id, "url_read_complete",
-                            json.dumps({
-                                "url": auto_detected_url, "title": read_result.title,
-                                "favicon": read_result.favicon, "status": "success",
-                            }, ensure_ascii=False),
+                            conversation_id,
+                            "url_read_complete",
+                            json.dumps(
+                                {
+                                    "url": auto_detected_url,
+                                    "title": read_result.title,
+                                    "favicon": read_result.favicon,
+                                    "status": "success",
+                                },
+                                ensure_ascii=False,
+                            ),
                             url_read_block_id,
                         )
                     else:
                         await append_chunk(
-                            conversation_id, "url_read_complete",
+                            conversation_id,
+                            "url_read_complete",
                             json.dumps({"url": auto_detected_url, "status": "failed"}, ensure_ascii=False),
                             url_read_block_id,
                         )
 
             if url_read_content:
                 from app.services.tool_handlers.url_read import MAX_CONTENT_CHARS
+
                 content_text = url_read_content.content
                 truncation_note = ""
                 if len(content_text) > MAX_CONTENT_CHARS:
@@ -177,29 +190,38 @@ class StreamHandler:
                     ),
                 }
                 messages.insert(-1, url_context_msg)
-                if "extra_body" in call_kwargs and call_kwargs["extra_body"].get("thinking", {}).get("type") == "disabled":
+                if (
+                    "extra_body" in call_kwargs
+                    and call_kwargs["extra_body"].get("thinking", {}).get("type") == "disabled"
+                ):
                     del call_kwargs["extra_body"]
             else:
                 if supports_fc:
                     from app.ai.tools import URL_READ_TOOL
+
                     if URL_READ_TOOL not in call_kwargs.get("tools", []):
                         call_kwargs.setdefault("tools", []).append(URL_READ_TOOL)
 
             # 路径 A 成功时，URL block 加入 content_blocks
             if url_read_content and auto_detected_url:
                 from app.schemas.chat import UrlBlock
-                content_blocks.append(UrlBlock(
-                    type="url_read", id=url_read_block_id,
-                    url=auto_detected_url,
-                    title=url_read_content.title,
-                    favicon=url_read_content.favicon,
-                ))
+
+                content_blocks.append(
+                    UrlBlock(
+                        type="url_read",
+                        id=url_read_block_id,
+                        url=auto_detected_url,
+                        title=url_read_content.title,
+                        favicon=url_read_content.favicon,
+                    )
+                )
 
             # ═══════════════════════════════════════
             # Agent Loop
             # ═══════════════════════════════════════
 
             import time
+
             start_time = time.time()
 
             while step < AGENT_MAX_STEPS and total_tool_calls < AGENT_MAX_TOOL_CALLS:
@@ -211,14 +233,20 @@ class StreamHandler:
                 text_block_id = f"blk_{uuid.uuid4().hex[:12]}"
 
                 response = await self._llm_call_with_retry(
-                    litellm_model, litellm_kwargs, messages, **call_kwargs,
+                    litellm_model,
+                    litellm_kwargs,
+                    messages,
+                    **call_kwargs,
                 )
 
-                reasoning_buf, content_buf, tool_calls_list, finish_reason, usage_data = \
-                    await self._stream_round(
-                        response, conversation_id, task_id,
-                        should_use_reasoning, thinking_block_id, text_block_id,
-                    )
+                reasoning_buf, content_buf, tool_calls_list, finish_reason, usage_data = await self._stream_round(
+                    response,
+                    conversation_id,
+                    task_id,
+                    should_use_reasoning,
+                    thinking_block_id,
+                    text_block_id,
+                )
 
                 # 累积 usage
                 if usage_data:
@@ -230,7 +258,9 @@ class StreamHandler:
                 # ── 情况 1: LLM 直接回答 ──
                 if finish_reason == "stop":
                     if reasoning_buf:
-                        content_blocks.append(ThinkingBlock(type="thinking", id=thinking_block_id, thinking=reasoning_buf))
+                        content_blocks.append(
+                            ThinkingBlock(type="thinking", id=thinking_block_id, thinking=reasoning_buf)
+                        )
                     if content_buf:
                         content_blocks.append(TextBlock(type="text", id=text_block_id, text=content_buf))
                     break
@@ -238,11 +268,19 @@ class StreamHandler:
                 # ── 情况 2: 被踢掉 ──
                 if finish_reason == "cancelled":
                     if reasoning_buf:
-                        content_blocks.append(ThinkingBlock(type="thinking", id=thinking_block_id, thinking=reasoning_buf))
+                        content_blocks.append(
+                            ThinkingBlock(type="thinking", id=thinking_block_id, thinking=reasoning_buf)
+                        )
                     if content_buf:
                         content_blocks.append(TextBlock(type="text", id=text_block_id, text=content_buf))
-                    self._persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks,
-                                          accumulated_usage if accumulated_usage.input_tokens > 0 else None)
+                    self._persist_message(
+                        db,
+                        assistant_message_id,
+                        conversation_id,
+                        model_id,
+                        content_blocks,
+                        accumulated_usage if accumulated_usage.input_tokens > 0 else None,
+                    )
                     await finalize_stream(conversation_id, success=False, error_msg="被新请求取代", task_id=task_id)
                     return
 
@@ -252,22 +290,35 @@ class StreamHandler:
                     step_start_time = time.time()
 
                     await append_chunk(
-                        conversation_id, "agent_step_start",
-                        json.dumps({
-                            "step": step, "max_steps": AGENT_MAX_STEPS,
-                            "tool_count": len(tool_calls_list), "trace_id": trace_id,
-                        }, ensure_ascii=False),
+                        conversation_id,
+                        "agent_step_start",
+                        json.dumps(
+                            {
+                                "step": step,
+                                "max_steps": AGENT_MAX_STEPS,
+                                "tool_count": len(tool_calls_list),
+                                "trace_id": trace_id,
+                            },
+                            ensure_ascii=False,
+                        ),
                         "",
                     )
 
                     # 收集本轮 reasoning（tool_call 决策推理）
                     if reasoning_buf:
-                        content_blocks.append(ThinkingBlock(type="thinking", id=thinking_block_id, thinking=reasoning_buf))
+                        content_blocks.append(
+                            ThinkingBlock(type="thinking", id=thinking_block_id, thinking=reasoning_buf)
+                        )
 
                     # 并行执行工具
                     results = await self._execute_tools_parallel(
-                        tool_calls_list, conversation_id, user_id, model_id, provider,
-                        trace_id=trace_id, step_number=step,
+                        tool_calls_list,
+                        conversation_id,
+                        user_id,
+                        model_id,
+                        provider,
+                        trace_id=trace_id,
+                        step_number=step,
                     )
                     total_tool_calls += len(tool_calls_list)
 
@@ -299,21 +350,30 @@ class StreamHandler:
                         else:
                             tool_context = f"工具调用失败：{result.error_message}"
 
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc["id"],
-                            "content": tool_context,
-                        })
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": tool_context,
+                            }
+                        )
 
                     # Checkpoint：每步写入 DB，进程崩溃不丢已完成步骤
-                    self._persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks, partial=True)
+                    self._persist_message(
+                        db, assistant_message_id, conversation_id, model_id, content_blocks, partial=True
+                    )
 
                     await append_chunk(
-                        conversation_id, "agent_step_end",
-                        json.dumps({
-                            "step": step, "total_tool_calls": total_tool_calls,
-                            "trace_id": trace_id,
-                        }, ensure_ascii=False),
+                        conversation_id,
+                        "agent_step_end",
+                        json.dumps(
+                            {
+                                "step": step,
+                                "total_tool_calls": total_tool_calls,
+                                "trace_id": trace_id,
+                            },
+                            ensure_ascii=False,
+                        ),
                         "",
                     )
 
@@ -333,7 +393,10 @@ class StreamHandler:
                         task.add_done_callback(_task_done_callback)
 
                     # 恢复 volcengine thinking（首轮 tool_call 决策已完成）
-                    if "extra_body" in call_kwargs and call_kwargs["extra_body"].get("thinking", {}).get("type") == "disabled":
+                    if (
+                        "extra_body" in call_kwargs
+                        and call_kwargs["extra_body"].get("thinking", {}).get("type") == "disabled"
+                    ):
                         del call_kwargs["extra_body"]
 
                     continue
@@ -345,29 +408,41 @@ class StreamHandler:
             # 触顶强制总结
             # ═══════════════════════════════════════
             if finish_reason == "tool_calls" or finish_reason == "timeout":
-                reason = "timeout" if finish_reason == "timeout" else (
-                    "max_steps" if step >= AGENT_MAX_STEPS else "max_tool_calls"
+                reason = (
+                    "timeout"
+                    if finish_reason == "timeout"
+                    else ("max_steps" if step >= AGENT_MAX_STEPS else "max_tool_calls")
                 )
                 await append_chunk(
-                    conversation_id, "agent_limit_reached",
+                    conversation_id,
+                    "agent_limit_reached",
                     json.dumps({"reason": reason}, ensure_ascii=False),
                     "",
                 )
 
-                messages.append({
-                    "role": "system",
-                    "content": "你已达到工具调用上限，请基于已收集的信息给出最终回答。不要再调用任何工具。",
-                })
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": "你已达到工具调用上限，请基于已收集的信息给出最终回答。不要再调用任何工具。",
+                    }
+                )
                 final_call_kwargs = {k: v for k, v in call_kwargs.items() if k not in ("tools", "tool_choice")}
                 thinking_block_id = f"blk_{uuid.uuid4().hex[:12]}"
                 text_block_id = f"blk_{uuid.uuid4().hex[:12]}"
 
                 response = await self._llm_call_with_retry(
-                    litellm_model, litellm_kwargs, messages, **final_call_kwargs,
+                    litellm_model,
+                    litellm_kwargs,
+                    messages,
+                    **final_call_kwargs,
                 )
                 reasoning_buf, content_buf, _, _, usage_data = await self._stream_round(
-                    response, conversation_id, task_id,
-                    should_use_reasoning, thinking_block_id, text_block_id,
+                    response,
+                    conversation_id,
+                    task_id,
+                    should_use_reasoning,
+                    thinking_block_id,
+                    text_block_id,
                 )
                 if usage_data:
                     accumulated_usage = Usage(
@@ -416,21 +491,31 @@ class StreamHandler:
                 )
                 task.add_done_callback(_task_done_callback)
 
-            asyncio.create_task(self._extract_user_memories(conversation_id, user_id))
-
         except asyncio.CancelledError:
             logger.info(f"Agent 任务被取消: conv_id={conversation_id}")
             if content_blocks:
-                self._persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks,
-                                      accumulated_usage if accumulated_usage.input_tokens > 0 else None)
+                self._persist_message(
+                    db,
+                    assistant_message_id,
+                    conversation_id,
+                    model_id,
+                    content_blocks,
+                    accumulated_usage if accumulated_usage.input_tokens > 0 else None,
+                )
             await finalize_stream(conversation_id, success=False, error_msg="用户中止", task_id=task_id)
             raise
 
         except Exception as e:
             logger.error(f"Agent 生成异常: conv_id={conversation_id}, error={e}")
             if content_blocks:
-                self._persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks,
-                                      accumulated_usage if accumulated_usage.input_tokens > 0 else None)
+                self._persist_message(
+                    db,
+                    assistant_message_id,
+                    conversation_id,
+                    model_id,
+                    content_blocks,
+                    accumulated_usage if accumulated_usage.input_tokens > 0 else None,
+                )
             await finalize_stream(conversation_id, success=False, error_msg=str(e), task_id=task_id)
 
             if trace_id and step > 0:
@@ -548,11 +633,7 @@ class StreamHandler:
                     finish_reason = "cancelled"
                     break
 
-        tool_calls_list = [
-            tool_calls_acc[idx]
-            for idx in sorted(tool_calls_acc.keys())
-            if tool_calls_acc[idx]["name"]
-        ]
+        tool_calls_list = [tool_calls_acc[idx] for idx in sorted(tool_calls_acc.keys()) if tool_calls_acc[idx]["name"]]
 
         return reasoning_buf, content_buf, tool_calls_list, finish_reason, usage_data
 
@@ -579,7 +660,7 @@ class StreamHandler:
                 error_str = str(e).lower()
                 is_retryable = any(kw in error_str for kw in ["429", "rate", "503", "502", "timeout"])
                 if is_retryable and attempt < max_retries:
-                    logger.warning(f"LLM 调用失败（{attempt+1}/{max_retries+1}），2s 后重试: {e}")
+                    logger.warning(f"LLM 调用失败（{attempt + 1}/{max_retries + 1}），2s 后重试: {e}")
                     await asyncio.sleep(2)
                     continue
                 raise
@@ -611,7 +692,7 @@ class StreamHandler:
             if is_permanent or attempt >= max_retries:
                 return result
 
-            logger.warning(f"工具 {handler.tool_name} 执行失败（{attempt+1}/{max_retries+1}），1s 后重试")
+            logger.warning(f"工具 {handler.tool_name} 执行失败（{attempt + 1}/{max_retries + 1}），1s 后重试")
             await asyncio.sleep(1)
 
         return result
@@ -665,10 +746,12 @@ class StreamHandler:
                 sources = result.data.get("sources", [])
                 sse_complete_data["sources"] = [s.model_dump() for s in sources]
             elif handler.tool_name == "url_read" and result.status == "success":
-                sse_complete_data.update({
-                    "title": result.data.get("title"),
-                    "favicon": result.data.get("favicon"),
-                })
+                sse_complete_data.update(
+                    {
+                        "title": result.data.get("title"),
+                        "favicon": result.data.get("favicon"),
+                    }
+                )
             await handler.push_sse_complete(conversation_id, block_id, sse_complete_data)
 
             # 异步记录日志
@@ -730,22 +813,6 @@ class StreamHandler:
         except Exception as e:
             logger.error(f"写入 assistant 消息失败: {e}")
             db.rollback()
-
-    @staticmethod
-    async def _extract_user_memories(conversation_id: str, user_id: str) -> None:
-        """异步提取用户记忆，使用独立的 DB Session"""
-        logger.info(f"开始记忆提取: conv_id={conversation_id}, user_id={user_id}")
-        db = SessionLocal()
-        try:
-            from app.services.user_memory_service import UserMemoryService
-
-            service = UserMemoryService(db)
-            await service.extract_memories(conversation_id, user_id)
-            logger.info(f"记忆提取完成: conv_id={conversation_id}")
-        except Exception as e:
-            logger.warning(f"异步记忆提取失败: conv_id={conversation_id}, error={e}", exc_info=True)
-        finally:
-            db.close()
 
 
 async def stream_redis_as_sse(

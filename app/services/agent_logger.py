@@ -124,7 +124,9 @@ async def log_agent_session(
         )
         db.add(session)
         db.commit()
-        logger.info(f"Agent session 已记录: trace={trace_id}, steps={total_steps}, tools={total_tool_calls}, status={status}")
+        logger.info(
+            f"Agent session 已记录: trace={trace_id}, steps={total_steps}, tools={total_tool_calls}, status={status}"
+        )
     except Exception as e:
         logger.error(f"写入 Agent session 日志失败: {e}")
         db.rollback()

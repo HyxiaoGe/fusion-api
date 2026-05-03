@@ -3,12 +3,12 @@ from datetime import datetime
 from unittest.mock import MagicMock
 
 from app.schemas.chat import Conversation
-from app.services.memory_service import MemoryService
+from app.services.conversation_service import ConversationService
 
 
-class MemoryServiceTests(unittest.TestCase):
+class ConversationServiceTests(unittest.TestCase):
     def setUp(self):
-        self.service = MemoryService(MagicMock())
+        self.service = ConversationService(MagicMock())
         self.service.repo = MagicMock()
 
     def test_save_conversation_creates_when_missing(self):

@@ -46,8 +46,10 @@ class ChatCoreSurfaceTests(unittest.TestCase):
 
         gdb = self._route_deps.get("get_db")
         if gdb:
+
             def override_db():
                 yield object()
+
             self.main.app.dependency_overrides[gdb] = override_db
 
     def test_health_endpoint_stays_available(self):
@@ -175,6 +177,7 @@ class ChatCoreSurfaceTests(unittest.TestCase):
     def _mock_file_service(self, **methods):
         """创建文件服务 mock 并注入依赖覆盖"""
         from unittest.mock import MagicMock
+
         service = MagicMock()
         for name, val in methods.items():
             setattr(service, name, val)

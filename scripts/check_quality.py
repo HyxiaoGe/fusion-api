@@ -39,7 +39,9 @@ def check_long_functions(py_files: list[Path]) -> list[str]:
                 func_lines = last_line - node.lineno + 1
                 if func_lines > MAX_FUNCTION_LINES:
                     rel = filepath.relative_to(PROJECT_ROOT)
-                    warnings.append(f"  {rel}:{node.lineno} — {node.name}() 共 {func_lines} 行（上限 {MAX_FUNCTION_LINES}）")
+                    warnings.append(
+                        f"  {rel}:{node.lineno} — {node.name}() 共 {func_lines} 行（上限 {MAX_FUNCTION_LINES}）"
+                    )
 
     return warnings
 

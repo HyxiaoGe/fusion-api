@@ -16,9 +16,7 @@ class WebSearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         """搜索成功返回 sources"""
         from app.schemas.chat import SearchSource
 
-        mock_sources = [
-            SearchSource(title="Result", url="https://example.com", description="desc")
-        ]
+        mock_sources = [SearchSource(title="Result", url="https://example.com", description="desc")]
         with patch(
             "app.services.tool_handlers.web_search.search_web",
             new_callable=AsyncMock,

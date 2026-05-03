@@ -26,8 +26,8 @@ from app.services.chat.message_builder import (
     is_image_file,
 )
 from app.services.chat.utils import ChatUtils
+from app.services.conversation_service import ConversationService
 from app.services.file_service import is_image_mime
-from app.services.memory_service import MemoryService
 from app.services.storage import get_storage
 from app.services.stream_handler import StreamHandler, stream_redis_as_sse
 from app.services.stream_state_service import init_stream
@@ -37,7 +37,7 @@ from app.services.task_manager import register_task
 class ChatService:
     def __init__(self, db: Session):
         self.db = db
-        self.memory_service = MemoryService(db)
+        self.conversation_service = ConversationService(db)
         self.file_repo = FileRepository(db)
         self.stream_handler = StreamHandler()
 
@@ -102,8 +102,8 @@ class ChatService:
 
         # 持久化会话（包括前端传了 ID 但数据库不存在的情况）
         if is_new_conversation:
-            self.memory_service.save_conversation(conversation)
-        self.memory_service.create_message(user_message, conversation.id)
+            self.conversation_service.save_conversation(conversation)
+        self.conversation_service.create_message(user_message, conversation.id)
         self.db.commit()
 
         conversation.messages.append(user_message)
@@ -154,15 +154,15 @@ class ChatService:
             )
         else:
             # 非流式模式：同步构建消息（含图片 base64）
-            from app.db.repositories import MemoryRepository
+            from app.db.models import User as UserModel
 
-            memory_repo = MemoryRepository(self.db)
-            user_memories = memory_repo.get_active(user_id)
+            user_record = self.db.query(UserModel).filter(UserModel.id == user_id).first()
+            user_system_prompt = user_record.system_prompt if user_record else None
             lm_messages = await build_llm_messages(
                 conversation.messages,
                 has_vision=has_vision,
                 file_repo=self.file_repo,
-                user_memories=user_memories,
+                user_system_prompt=user_system_prompt,
             )
             if file_ids:
                 non_image_ids = [fid for fid in file_ids if not is_image_file(fid, self.file_repo)]
@@ -188,7 +188,7 @@ class ChatService:
     ) -> tuple:
         """获取已有会话，或初始化新会话对象。返回 (conversation, is_new)"""
         if conversation_id:
-            existing = self.memory_service.get_conversation(conversation_id, user_id)
+            existing = self.conversation_service.get_conversation(conversation_id, user_id)
             if existing:
                 return existing, False
 
@@ -231,7 +231,7 @@ class ChatService:
             model_id=model_id,
             usage=usage_data,
         )
-        self.memory_service.create_message(assistant_message, conversation_id)
+        self.conversation_service.create_message(assistant_message, conversation_id)
         self.db.commit()
 
         return ChatResponse(
@@ -256,7 +256,7 @@ class ChatService:
         options: Optional[Dict[str, Any]] = None,
     ) -> str:
         """基于会话最后一条用户消息生成标题，并写回数据库"""
-        conversation = self.memory_service.get_conversation(conversation_id, user_id)
+        conversation = self.conversation_service.get_conversation(conversation_id, user_id)
         if not conversation:
             raise ApiException.not_found(f"找不到会话: {conversation_id}")
 
@@ -300,7 +300,7 @@ class ChatService:
             title = fallback_title
 
         # 写回数据库
-        self.memory_service.repo.update_title(conversation_id, title)
+        self.conversation_service.repo.update_title(conversation_id, title)
         self.db.commit()
 
         return title
@@ -312,7 +312,7 @@ class ChatService:
         options: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
         """基于会话内容生成推荐问题"""
-        conversation = self.memory_service.get_conversation(conversation_id, user_id)
+        conversation = self.conversation_service.get_conversation(conversation_id, user_id)
         if not conversation:
             raise ValueError(f"找不到会话: {conversation_id}")
 
@@ -323,23 +323,9 @@ class ChatService:
             return ["有什么我可以帮您解答的问题吗？", "您想了解更多哪方面的信息？", "还有其他我能帮助您的事情吗？"]
 
         try:
-            # 查询用户记忆，注入推荐问题 prompt 实现个性化
-            from app.db.repositories import MemoryRepository
-
-            memory_repo = MemoryRepository(self.db)
-            user_memories = memory_repo.get_active(user_id)
-            if user_memories:
-                memory_text = "\n".join(f"- {m.content}" for m in user_memories)
-                user_memory_section = (
-                    f"\n7. 结合以下用户背景信息，让推荐问题更贴合用户的实际需求和兴趣：\n{memory_text}\n"
-                )
-            else:
-                user_memory_section = ""
-
             prompt = prompt_manager.format_prompt(
                 "generate_suggested_questions",
                 content=dialog_content,
-                user_memory_section=user_memory_section,
             )
             litellm_model, _, litellm_kwargs = self._resolve_utility_model(conversation.model_id)
             response = await litellm.acompletion(
@@ -353,9 +339,9 @@ class ChatService:
             questions = ChatUtils.parse_questions(raw)[:3]
 
             # 写回到最后一条 assistant 消息，刷新后随消息一起返回
-            last_msg = self.memory_service.repo.get_last_assistant_message(conversation_id)
+            last_msg = self.conversation_service.repo.get_last_assistant_message(conversation_id)
             if last_msg and questions:
-                self.memory_service.repo.update_message_suggested_questions(last_msg.id, questions)
+                self.conversation_service.repo.update_message_suggested_questions(last_msg.id, questions)
                 self.db.commit()
 
             return questions
@@ -391,13 +377,13 @@ class ChatService:
     # ==================== CRUD 代理方法 ====================
 
     def get_conversation(self, conversation_id: str, user_id: str):
-        return self.memory_service.get_conversation(conversation_id, user_id)
+        return self.conversation_service.get_conversation(conversation_id, user_id)
 
     def get_all_conversations(self, user_id: str):
-        return self.memory_service.get_all_conversations(user_id)
+        return self.conversation_service.get_all_conversations(user_id)
 
     def get_conversations_paginated(self, user_id: str, page: int = 1, page_size: int = 20):
-        return self.memory_service.get_conversations_paginated(user_id, page, page_size)
+        return self.conversation_service.get_conversations_paginated(user_id, page, page_size)
 
     def get_conversations_metadata(self, user_id: str, conversation_ids: List[str]) -> List[Dict[str, Any]]:
         """按 ID 列表返回对话元数据（前端用于刷新已显示对话的标题等）。"""
@@ -430,10 +416,10 @@ class ChatService:
         ]
 
     def update_message(self, message_id: str, update_data: Dict[str, Any]) -> Optional[Message]:
-        updated = self.memory_service.update_message(message_id, update_data)
+        updated = self.conversation_service.update_message(message_id, update_data)
         if updated:
             self.db.commit()
         return updated
 
     def delete_conversation(self, conversation_id: str, user_id: str) -> bool:
-        return self.memory_service.delete_conversation(conversation_id, user_id)
+        return self.conversation_service.delete_conversation(conversation_id, user_id)

@@ -17,7 +17,6 @@ from app.db.repositories import (
 )
 from app.services.chat_service import ChatService
 from app.services.file_service import FileService
-from app.services.user_memory_service import UserMemoryService
 
 
 def get_chat_service(db: Session = Depends(get_db)) -> ChatService:
@@ -26,10 +25,6 @@ def get_chat_service(db: Session = Depends(get_db)) -> ChatService:
 
 def get_file_service(db: Session = Depends(get_db)) -> FileService:
     return FileService(db)
-
-
-def get_user_memory_service(db: Session = Depends(get_db)) -> UserMemoryService:
-    return UserMemoryService(db)
 
 
 def get_provider_repo(db: Session = Depends(get_db)) -> ProviderRepository:

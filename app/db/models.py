@@ -28,13 +28,13 @@ class User(Base):
     avatar = Column(String, nullable=True)
     mobile = Column(String, nullable=True)
     email = Column(String, unique=True, index=True, nullable=True)
+    system_prompt = Column(Text, nullable=False, default="", server_default="")
     created_at = Column(DateTime, default=get_china_time)
     updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
 
     social_accounts = relationship("SocialAccount", back_populates="user", cascade="all, delete-orphan")
     conversations = relationship("Conversation", back_populates="user", cascade="all, delete-orphan")
     files = relationship("File", back_populates="user", cascade="all, delete-orphan")
-    memories = relationship("Memory", back_populates="user", cascade="all, delete-orphan")
 
 
 class SocialAccount(Base):
@@ -199,24 +199,6 @@ class ModelCredential(Base):
     __table_args__ = (UniqueConstraint("model_id", "name", name="uix_model_credential_name"),)
 
 
-class Memory(Base):
-    """用户级记忆"""
-
-    __tablename__ = "memories"
-
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    content = Column(Text, nullable=False)
-    source = Column(String(20), nullable=False)  # 'auto' | 'manual'
-    conversation_id = Column(String, ForeignKey("conversations.id", ondelete="SET NULL"), nullable=True)
-    is_active = Column(Boolean, default=True)
-    is_deleted = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=get_china_time)
-    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
-
-    user = relationship("User", back_populates="memories")
-
-
 class PromptExample(Base):
     """动态示例问题（由 Kimi $web_search 定时生成）"""
 
@@ -301,6 +283,4 @@ class AgentStep(Base):
 
     created_at = Column(DateTime, default=get_china_time)
 
-    __table_args__ = (
-        UniqueConstraint("trace_id", "step_number", name="uq_trace_step"),
-    )
+    __table_args__ = (UniqueConstraint("trace_id", "step_number", name="uq_trace_step"),)

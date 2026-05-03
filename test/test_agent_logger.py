@@ -14,11 +14,21 @@ class ToolCallLogModelTests(unittest.TestCase):
     def test_model_has_expected_columns(self):
         """ToolCallLog 模型包含所有预期字段"""
         expected_columns = {
-            "id", "conversation_id", "message_id", "user_id",
-            "tool_name", "status", "error_message", "duration_ms",
-            "model_id", "provider",
-            "input_params", "output_data", "metadata",
-            "trace_id", "step_number",
+            "id",
+            "conversation_id",
+            "message_id",
+            "user_id",
+            "tool_name",
+            "status",
+            "error_message",
+            "duration_ms",
+            "model_id",
+            "provider",
+            "input_params",
+            "output_data",
+            "metadata",
+            "trace_id",
+            "step_number",
             "created_at",
         }
         actual_columns = {c.name for c in ToolCallLog.__table__.columns}
@@ -82,7 +92,9 @@ class LogToolCallTests(unittest.IsolatedAsyncioTestCase):
 class SearchBlockSchemaTests(unittest.TestCase):
     def test_search_source_summary_fields(self):
         """SearchSourceSummary 只包含 title、url、favicon"""
-        summary = SearchSourceSummary(title="Test", url="https://example.com", favicon="https://example.com/favicon.ico")
+        summary = SearchSourceSummary(
+            title="Test", url="https://example.com", favicon="https://example.com/favicon.ico"
+        )
         data = summary.model_dump()
         self.assertEqual(set(data.keys()), {"title", "url", "favicon"})
 

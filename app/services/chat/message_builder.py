@@ -46,7 +46,7 @@ async def build_llm_messages(
     messages,
     has_vision: bool = False,
     file_repo: FileRepository = None,
-    user_memories: Optional[List] = None,
+    user_system_prompt: Optional[str] = None,
 ) -> List[dict]:
     """
     将 content blocks 消息列表转为 LLM 可消费的 dict 格式。
@@ -54,20 +54,21 @@ async def build_llm_messages(
     - thinking / search block 不传给 LLM（避免污染上下文）
     - 当 has_vision=True 时，图片 FileBlock 转为 base64 image_url 内容块
     - 历史消息中的图片仅保留最近 MAX_VISION_HISTORY_TURNS 轮
+    - 用户自定义 system_prompt 注入到 system 角色，仅作背景，不主动引用
     """
     result = []
 
-    # 如果有用户记忆，注入 system prompt
-    if user_memories:
-        memory_text = "\n".join(f"- {m.content}" for m in user_memories)
-        result.append({
-            "role": "system",
-            "content": (
-                "你了解以下关于用户的信息，在回答时自然地参考这些信息，"
-                "但不要主动提及\"我记得你说过...\"之类的话，除非用户问起。\n\n"
-                f"{memory_text}"
-            ),
-        })
+    # 注入用户自定义个性化 prompt
+    if user_system_prompt and user_system_prompt.strip():
+        result.append(
+            {
+                "role": "system",
+                "content": (
+                    "以下是用户的个性化偏好设置，请在回答中自然遵守，但不要主动提及这些设置本身：\n\n"
+                    f"{user_system_prompt.strip()}"
+                ),
+            }
+        )
 
     # 计算最近 N 轮用户消息的起始索引，用于控制图片注入范围
     vision_cutoff_idx = 0

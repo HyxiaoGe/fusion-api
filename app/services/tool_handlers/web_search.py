@@ -67,10 +67,7 @@ class WebSearchHandler(BaseToolHandler):
             id=block_id,
             query=result.data.get("query", ""),
             tool_call_log_id=log_id,
-            sources=[
-                SearchSourceSummary(title=s.title, url=s.url, favicon=s.favicon)
-                for s in sources
-            ],
+            sources=[SearchSourceSummary(title=s.title, url=s.url, favicon=s.favicon) for s in sources],
         )
 
     def format_llm_context(self, result: ToolResult) -> str:

@@ -205,4 +205,6 @@ class TestValueErrorHandler(unittest.TestCase):
             self.assertIn("request_id", body)
         finally:
             # 清理测试路由
-            self.main.app.routes[:] = [r for r in self.main.app.routes if not getattr(r, 'path', '').endswith('/test-value-error')]
+            self.main.app.routes[:] = [
+                r for r in self.main.app.routes if not getattr(r, "path", "").endswith("/test-value-error")
+            ]

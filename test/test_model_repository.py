@@ -23,9 +23,7 @@ class ProviderRepositoryTests(unittest.TestCase):
                 "id": "qwen",
                 "name": "通义千问",
                 "auth_config": {
-                    "fields": [
-                        {"name": "api_key", "display_name": "API Key", "type": "password", "required": True}
-                    ],
+                    "fields": [{"name": "api_key", "display_name": "API Key", "type": "password", "required": True}],
                     "auth_type": "api_key",
                 },
                 "litellm_prefix": "openai",
@@ -55,9 +53,7 @@ class ModelSourceRepositoryTests(unittest.TestCase):
                 "id": "qwen",
                 "name": "通义千问",
                 "auth_config": {
-                    "fields": [
-                        {"name": "api_key", "display_name": "API Key", "type": "password", "required": True}
-                    ],
+                    "fields": [{"name": "api_key", "display_name": "API Key", "type": "password", "required": True}],
                     "auth_type": "api_key",
                 },
                 "litellm_prefix": "openai",

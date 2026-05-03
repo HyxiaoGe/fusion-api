@@ -7,11 +7,8 @@ from app.db.repositories import ConversationRepository
 from app.schemas.chat import Conversation, ConversationSummary, Message
 
 
-class MemoryService:
-    """
-    内存服务 - 管理对话历史和上下文记忆
-    使用PostgreSQL数据库实现
-    """
+class ConversationService:
+    """会话服务 — 管理对话与消息的持久化"""
 
     def __init__(self, db: Session):
         self.db = db

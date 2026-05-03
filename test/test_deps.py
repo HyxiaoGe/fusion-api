@@ -15,7 +15,6 @@ from app.api.deps import (
     get_model_credential_repo,
     get_model_source_repo,
     get_provider_repo,
-    get_user_memory_service,
 )
 from app.db.repositories import (
     ModelCredentialRepository,
@@ -24,7 +23,6 @@ from app.db.repositories import (
 )
 from app.services.chat_service import ChatService
 from app.services.file_service import FileService
-from app.services.user_memory_service import UserMemoryService
 
 
 class TestDepsFactories(unittest.TestCase):
@@ -42,11 +40,6 @@ class TestDepsFactories(unittest.TestCase):
     def test_get_file_service(self, _mock_storage):
         svc = get_file_service(db=self.mock_db)
         self.assertIsInstance(svc, FileService)
-        self.assertIs(svc.db, self.mock_db)
-
-    def test_get_user_memory_service(self):
-        svc = get_user_memory_service(db=self.mock_db)
-        self.assertIsInstance(svc, UserMemoryService)
         self.assertIs(svc.db, self.mock_db)
 
     def test_get_provider_repo(self):

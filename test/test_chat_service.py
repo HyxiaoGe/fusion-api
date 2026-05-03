@@ -105,7 +105,7 @@ class ChatServiceTests(unittest.TestCase):
     def test_update_message_commits_when_update_succeeds(self):
         service = object.__new__(ChatService)
         service.db = MagicMock()
-        service.memory_service = MagicMock()
+        service.conversation_service = MagicMock()
 
         updated_message = Message(
             id="assistant-msg-1",
@@ -113,7 +113,7 @@ class ChatServiceTests(unittest.TestCase):
             content=[TextBlock(type="text", text="updated")],
             model_id="qwen-max-latest",
         )
-        service.memory_service.update_message.return_value = updated_message
+        service.conversation_service.update_message.return_value = updated_message
 
         result = service.update_message(
             "assistant-msg-1",
@@ -126,7 +126,7 @@ class ChatServiceTests(unittest.TestCase):
     def test_generate_suggested_questions_limits_output_to_three(self):
         service = object.__new__(ChatService)
         service.db = MagicMock()
-        service.memory_service = MagicMock()
+        service.conversation_service = MagicMock()
         service.file_repo = MagicMock()
 
         conversation = Conversation(
@@ -150,7 +150,7 @@ class ChatServiceTests(unittest.TestCase):
             created_at=datetime.now(),
             updated_at=datetime.now(),
         )
-        service.memory_service.get_conversation.return_value = conversation
+        service.conversation_service.get_conversation.return_value = conversation
 
         mock_response = SimpleNamespace(
             choices=[
@@ -180,7 +180,7 @@ class ChatServiceTests(unittest.TestCase):
     def test_generate_title_persists_title_to_database(self):
         service = object.__new__(ChatService)
         service.db = MagicMock()
-        service.memory_service = MagicMock()
+        service.conversation_service = MagicMock()
         service.file_repo = MagicMock()
 
         conversation = Conversation(
@@ -198,7 +198,7 @@ class ChatServiceTests(unittest.TestCase):
             created_at=datetime.now(),
             updated_at=datetime.now(),
         )
-        service.memory_service.get_conversation.return_value = conversation
+        service.conversation_service.get_conversation.return_value = conversation
 
         mock_response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="Fusion Chat"))])
 
@@ -217,7 +217,7 @@ class ChatServiceTests(unittest.TestCase):
             )
 
         self.assertEqual(title, "Fusion Chat")
-        service.memory_service.repo.update_title.assert_called_once_with("conv-1", "Fusion Chat")
+        service.conversation_service.repo.update_title.assert_called_once_with("conv-1", "Fusion Chat")
         service.db.commit.assert_called_once()
 
 
