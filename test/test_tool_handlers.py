@@ -244,6 +244,85 @@ class ExecuteWithEmitterTests(unittest.IsolatedAsyncioTestCase):
         summary = emitter.tool_call_completed.call_args.kwargs["result_summary"]
         self.assertEqual(summary, {"kind": "my_tool", "truncated": False})
 
+    async def test_execute_raises_still_emits_failed_completed_then_reraises(self):
+        """execute 抛异常时：必发 tool_call_completed(status=failed) 再 re-raise"""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.services.tool_handlers.base import BaseToolHandler
+
+        class _Stub(BaseToolHandler):
+            tool_name = "stub"
+            sse_event_prefix = "stub"
+            async def execute(self, args):
+                raise RuntimeError("oops")
+            def build_content_block(self, result, block_id, log_id):
+                return MagicMock()
+            def format_llm_context(self, result):
+                return ""
+
+        emitter = AsyncMock()
+        h = _Stub()
+        with self.assertRaises(RuntimeError):
+            await h.execute_with_emitter(args={}, emitter=emitter, tool_call_id="tc")
+
+        # tool_call_started 仍发了
+        emitter.tool_call_started.assert_awaited_once()
+        # tool_call_completed 也发了（失败）
+        emitter.tool_call_completed.assert_awaited_once()
+        completed = emitter.tool_call_completed.call_args.kwargs
+        self.assertEqual(completed["status"], "failed")
+        self.assertIn("RuntimeError", completed["error"])
+        self.assertIn("oops", completed["error"])
+
+    async def test_execute_cancelled_still_emits_failed_completed_then_propagates(self):
+        """CancelledError 也应触发 tool_call_completed（不留 orphaned running）"""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.services.tool_handlers.base import BaseToolHandler
+
+        class _Stub(BaseToolHandler):
+            tool_name = "stub"
+            sse_event_prefix = "stub"
+            async def execute(self, args):
+                raise asyncio.CancelledError()
+            def build_content_block(self, result, block_id, log_id):
+                return MagicMock()
+            def format_llm_context(self, result):
+                return ""
+
+        emitter = AsyncMock()
+        h = _Stub()
+        with self.assertRaises(asyncio.CancelledError):
+            await h.execute_with_emitter(args={}, emitter=emitter, tool_call_id="tc")
+        emitter.tool_call_completed.assert_awaited_once()
+        self.assertEqual(emitter.tool_call_completed.call_args.kwargs["status"], "failed")
+
+    async def test_degraded_result_passes_error_message_through(self):
+        """status=degraded 时 error 字段也透传 error_message（与 failed 同行为）"""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.services.tool_handlers.base import BaseToolHandler, ToolResult
+
+        class _Stub(BaseToolHandler):
+            tool_name = "stub"
+            sse_event_prefix = "stub"
+            async def execute(self, args):
+                return ToolResult(status="degraded", data={"partial": True},
+                                  error_message="upstream slow")
+            def build_content_block(self, result, block_id, log_id):
+                return MagicMock()
+            def format_llm_context(self, result):
+                return ""
+
+        emitter = AsyncMock()
+        h = _Stub()
+        result = await h.execute_with_emitter(args={}, emitter=emitter, tool_call_id="tc")
+        self.assertEqual(result.status, "degraded")
+        completed = emitter.tool_call_completed.call_args.kwargs
+        self.assertEqual(completed["status"], "degraded")
+        self.assertEqual(completed["error"], "upstream slow")
+
 
 if __name__ == "__main__":
     unittest.main()

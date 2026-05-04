@@ -7,12 +7,15 @@ import json
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from app.core.logger import app_logger as logger
 from app.schemas.chat import ContentBlock
 from app.services.agent_logger import log_tool_call
 from app.services.stream_state_service import append_chunk
+
+if TYPE_CHECKING:
+    from app.services.agent.emitter import AgentEventEmitter
 
 
 @dataclass
@@ -149,10 +152,13 @@ class BaseToolHandler(ABC):
         self,
         *,
         args: dict,
-        emitter,  # type: AgentEventEmitter
+        emitter: "AgentEventEmitter",
         tool_call_id: str,
     ) -> "ToolResult":
         """统一包装：发 tool_call_started → execute → tool_call_completed。
+
+        强保证：tool_call_completed 必发，即使 execute 抛异常（包括 CancelledError）
+        也会先 emit failed 事件再 re-raise，避免 tool_call 永远卡在 running。
 
         包含计时和 result_summary 自动构造。子类只需实现 execute(args) +
         可选覆盖 _build_result_summary 返回轻量 summary。
@@ -163,9 +169,21 @@ class BaseToolHandler(ABC):
             tool_name=self.tool_name,
             arguments=args,
         )
-        start = time.time()
-        result = await self.execute(args)
-        duration_ms = int((time.time() - start) * 1000)
+        start = time.monotonic()
+        try:
+            result = await self.execute(args)
+        except BaseException as exc:  # noqa: BLE001 — 必须在 re-raise 前发 completed
+            duration_ms = int((time.monotonic() - start) * 1000)
+            await emitter.tool_call_completed(
+                tool_call_id=tool_call_id,
+                tool_name=self.tool_name,
+                status="failed",
+                duration_ms=duration_ms,
+                result_summary={"kind": self.tool_name, "truncated": False},
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        duration_ms = int((time.monotonic() - start) * 1000)
         await emitter.tool_call_completed(
             tool_call_id=tool_call_id,
             tool_name=self.tool_name,
@@ -179,6 +197,10 @@ class BaseToolHandler(ABC):
     def _build_result_summary(self, result: "ToolResult") -> dict:
         """子类可覆盖返回轻量摘要（如搜索命中数 / favicon）。
 
-        默认返回最小 {kind, truncated}，由 cap_and_truncate 兜底硬上限。
+        默认返回最小 {kind, truncated}。
+
+        注意：返回值会被 emitter.tool_call_completed 内部的
+        cap_and_truncate(max_bytes=1024) 兜底截断（含递归嵌套），
+        子类无需自己截断字符串字段。
         """
         return {"kind": self.tool_name, "truncated": False}
