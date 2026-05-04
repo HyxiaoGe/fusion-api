@@ -12,7 +12,6 @@ from app.core.security import get_current_user  # noqa: F401 — re-export
 from app.db.database import get_db  # noqa: F401 — re-export
 from app.db.models import User as UserModel
 from app.db.repositories import (
-    ModelCredentialRepository,
     ModelSourceRepository,
     ProviderRepository,
     UserCredentialRepository,
@@ -36,11 +35,6 @@ def get_provider_repo(db: Session = Depends(get_db)) -> ProviderRepository:
 
 def get_model_source_repo(db: Session = Depends(get_db)) -> ModelSourceRepository:
     return ModelSourceRepository(db)
-
-
-def get_model_credential_repo(db: Session = Depends(get_db)) -> ModelCredentialRepository:
-    """旧 model_credentials 工厂，将在 Phase D 删除。新代码不要使用。"""
-    return ModelCredentialRepository(db)
 
 
 def get_user_repo(db: Session = Depends(get_db)) -> UserRepository:

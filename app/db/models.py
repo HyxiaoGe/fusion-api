@@ -187,25 +187,6 @@ class ModelSource(Base):
     updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
 
     provider_rel = relationship("Provider", back_populates="models")
-    credentials = relationship("ModelCredential", back_populates="model_source", cascade="all, delete-orphan")
-
-
-class ModelCredential(Base):
-    __tablename__ = "model_credentials"
-
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    model_id = Column(String, ForeignKey("model_sources.model_id", ondelete="CASCADE"), nullable=False)
-    name = Column(String, nullable=False)  # 凭证名称，如"默认"、"测试环境"等
-    is_default = Column(Boolean, default=False)  # 是否为默认凭证
-    credentials = Column(JSON, nullable=False)  # 存储实际的认证信息
-    created_at = Column(DateTime, default=get_china_time)
-    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
-
-    # 关联关系
-    model_source = relationship("ModelSource", back_populates="credentials")
-
-    # 联合唯一约束
-    __table_args__ = (UniqueConstraint("model_id", "name", name="uix_model_credential_name"),)
 
 
 class PromptExample(Base):

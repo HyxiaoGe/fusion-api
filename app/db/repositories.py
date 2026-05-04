@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session, joinedload
 
 from app.db.models import Conversation as ConversationModel
-from app.db.models import ConversationFile, File, ModelCredential, ModelSource, Provider, UserCredential, get_china_time
+from app.db.models import ConversationFile, File, ModelSource, Provider, UserCredential, get_china_time
 from app.db.models import Message as MessageModel
 from app.db.models import SocialAccount as SocialAccountModel
 from app.db.models import User as UserModel
@@ -29,7 +29,6 @@ from app.schemas.models import (
     ModelCapabilities,
     ModelConfigParam,
     ModelConfiguration,
-    ModelCredentialInfo,
     ModelInfo,
     ModelPricing,
     ProviderInfo,
@@ -828,109 +827,6 @@ class ModelSourceRepository:
             model_configuration=model_configuration,
             enabled=model_source.enabled,
             description=model_source.description,
-        )
-
-
-class ModelCredentialRepository:
-    def __init__(self, db: Session):
-        self.db = db
-
-    def get_all(self, model_id: Optional[str] = None) -> List[ModelCredential]:
-        """获取所有凭证或指定模型的凭证"""
-        query = self.db.query(ModelCredential)
-        if model_id:
-            query = query.filter(ModelCredential.model_id == model_id)
-        return query.all()
-
-    def get_by_id(self, credential_id: int) -> Optional[ModelCredential]:
-        """根据ID获取凭证"""
-        return self.db.query(ModelCredential).filter(ModelCredential.id == credential_id).first()
-
-    def get_default(self, model_id: str) -> Optional[ModelCredential]:
-        """获取模型的默认凭证"""
-        return (
-            self.db.query(ModelCredential)
-            .filter(ModelCredential.model_id == model_id, ModelCredential.is_default == True)
-            .first()
-        )
-
-    def create(self, credential_data: Dict[str, Any]) -> ModelCredential:
-        """创建新的凭证"""
-        # 如果设置为默认凭证，先取消其他默认凭证
-        if credential_data.get("is_default", False):
-            self._reset_default_status(credential_data["model_id"])
-
-        credential = ModelCredential(**credential_data)
-        self.db.add(credential)
-        self.db.commit()
-        self.db.refresh(credential)
-        return credential
-
-    def update(self, credential_id: int, update_data: Dict[str, Any]) -> Optional[ModelCredential]:
-        """更新凭证"""
-        credential = self.get_by_id(credential_id)
-        if not credential:
-            return None
-
-        # 如果设置为默认凭证，先取消其他默认凭证
-        if update_data.get("is_default", False) and not credential.is_default:
-            self._reset_default_status(credential.model_id)
-
-        # 更新字段
-        for key, value in update_data.items():
-            if hasattr(credential, key):
-                setattr(credential, key, value)
-
-        credential.updated_at = get_china_time()
-        self.db.commit()
-        self.db.refresh(credential)
-        return credential
-
-    def delete(self, credential_id: int) -> bool:
-        """删除凭证"""
-        credential = self.get_by_id(credential_id)
-        if not credential:
-            return False
-
-        # 如果是默认凭证，可能需要设置另一个凭证为默认
-        was_default = credential.is_default
-        model_id = credential.model_id
-
-        self.db.delete(credential)
-        self.db.commit()
-
-        # 如果删除的是默认凭证，尝试设置另一个为默认
-        if was_default:
-            self._set_new_default(model_id)
-
-        return True
-
-    def _reset_default_status(self, model_id: str) -> None:
-        """重置指定模型的所有凭证的默认状态"""
-        self.db.query(ModelCredential).filter(
-            ModelCredential.model_id == model_id, ModelCredential.is_default == True
-        ).update({"is_default": False})
-        self.db.commit()
-
-    def _set_new_default(self, model_id: str) -> None:
-        """设置一个新的默认凭证"""
-        # 获取第一个可用的凭证并设置为默认
-        credential = self.db.query(ModelCredential).filter(ModelCredential.model_id == model_id).first()
-
-        if credential:
-            credential.is_default = True
-            self.db.commit()
-
-    def to_schema(self, credential: ModelCredential) -> ModelCredentialInfo:
-        """将数据库模型转换为Pydantic模型"""
-        return ModelCredentialInfo(
-            id=credential.id,
-            model_id=credential.model_id,
-            name=credential.name,
-            is_default=credential.is_default,
-            credentials=credential.credentials,
-            created_at=credential.created_at,
-            updated_at=credential.updated_at,
         )
 
 

@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 from pydantic import BaseModel
 
@@ -178,58 +178,3 @@ class ModelsResponse(BaseModel):
 
     models: List[ModelBasicInfo]
     providers: List[ProviderBasicInfo] = []
-
-
-class ModelCredentialInfo(BaseModel):
-    """模型凭证信息"""
-
-    id: int
-    model_id: str
-    name: str
-    is_default: bool = False
-    credentials: Dict[str, Any]
-    created_at: datetime
-    updated_at: datetime
-
-    class Config:
-        from_attributes = True
-
-
-class ModelCredentialCreate(BaseModel):
-    """创建模型凭证请求"""
-
-    model_id: str
-    name: str
-    is_default: bool = False
-    credentials: Dict[str, Any]
-
-
-class ModelCredentialUpdate(BaseModel):
-    """更新凭证请求"""
-
-    name: Optional[str] = None
-    is_default: Optional[bool] = None
-    credentials: Optional[Dict[str, Any]] = None
-
-
-# 凭证列表响应
-class CredentialsResponse(BaseModel):
-    """凭证列表响应"""
-
-    credentials: List[ModelCredentialInfo]
-
-
-# 凭证测试请求
-class CredentialTestRequest(BaseModel):
-    """凭证测试请求"""
-
-    model_id: str
-    credentials: Dict[str, Any]
-
-
-# 凭证测试响应
-class CredentialTestResponse(BaseModel):
-    """凭证测试响应"""
-
-    success: bool
-    message: str

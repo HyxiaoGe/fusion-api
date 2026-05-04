@@ -12,12 +12,10 @@ os.environ.setdefault("AUTH_SERVICE_JWKS_URL", "http://auth.example:8100/.well-k
 from app.api.deps import (
     get_chat_service,
     get_file_service,
-    get_model_credential_repo,
     get_model_source_repo,
     get_provider_repo,
 )
 from app.db.repositories import (
-    ModelCredentialRepository,
     ModelSourceRepository,
     ProviderRepository,
 )
@@ -49,7 +47,3 @@ class TestDepsFactories(unittest.TestCase):
     def test_get_model_source_repo(self):
         repo = get_model_source_repo(db=self.mock_db)
         self.assertIsInstance(repo, ModelSourceRepository)
-
-    def test_get_model_credential_repo(self):
-        repo = get_model_credential_repo(db=self.mock_db)
-        self.assertIsInstance(repo, ModelCredentialRepository)

@@ -1,0 +1,50 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/Users/sean/code/fusion/fusion-api/.codex/hooks/guard-dangerous.sh'",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/Users/sean/code/fusion/fusion-api/.codex/hooks/check-python-syntax.sh'",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/Users/sean/code/fusion/fusion-api/.codex/hooks/pre-develop-checklist.sh'",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/Users/sean/code/fusion/fusion-api/.codex/hooks/remind-update-skills.sh'",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

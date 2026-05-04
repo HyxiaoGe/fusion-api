@@ -50,7 +50,6 @@ def _build_in_memory_db():
         File,
         Memory,
         Message,
-        ModelCredential,
         ModelSource,
         Provider,
         SocialAccount,
