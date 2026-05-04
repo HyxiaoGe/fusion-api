@@ -3,11 +3,19 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_user_credential_repo
+from app.api.deps import (
+    get_current_user,
+    get_model_source_repo,
+    get_provider_repo,
+    get_user_credential_repo,
+)
 from app.db.database import get_db
-from app.db.models import ModelSource, Provider
 from app.db.models import User as UserModel
-from app.db.repositories import UserCredentialRepository
+from app.db.repositories import (
+    ModelSourceRepository,
+    ProviderRepository,
+    UserCredentialRepository,
+)
 from app.schemas.credentials import (
     UserCredentialTestRequest,
     UserCredentialTestResult,
@@ -36,11 +44,11 @@ async def upsert_credential(
     body: UserCredentialUpsert,
     request: Request,
     current_user: UserModel = Depends(get_current_user),
-    db: Session = Depends(get_db),
     repo: UserCredentialRepository = Depends(get_user_credential_repo),
+    provider_repo: ProviderRepository = Depends(get_provider_repo),
 ):
     """新建或覆盖某 provider 的 user key（自动重置失败状态，等价 reactivate）"""
-    if not db.query(Provider).filter(Provider.id == provider_id).first():
+    if not provider_repo.get_by_id(provider_id):
         raise HTTPException(status_code=404, detail=f"未知 provider: {provider_id}")
     cred = repo.upsert(current_user.id, provider_id, body.api_key, body.is_active)
     return success(data=repo.to_masked_schema(cred).model_dump(), request_id=request.state.request_id)
@@ -68,6 +76,7 @@ async def test_credential(
     current_user: UserModel = Depends(get_current_user),
     db: Session = Depends(get_db),
     repo: UserCredentialRepository = Depends(get_user_credential_repo),
+    model_source_repo: ModelSourceRepository = Depends(get_model_source_repo),
 ):
     """验证 key 有效性。优先用 body.api_key（临时测试未保存的输入），没传则用已存的。
     本接口不写任何 health 状态。"""
@@ -85,19 +94,14 @@ async def test_credential(
     if not api_key_to_test:
         raise HTTPException(status_code=400, detail="没有可测试的 key（body 没传，存量也没有有效 key）")
 
-    # 取该 provider 下任一启用的轻量模型
-    model = (
-        db.query(ModelSource)
-        .filter(ModelSource.provider == provider_id, ModelSource.enabled)
-        .order_by(ModelSource.priority.asc().nulls_last())
-        .first()
-    )
-    if not model:
+    # 取该 provider 下任一启用模型（按优先级排序，取第一个）
+    models = model_source_repo.get_all(provider=provider_id, enabled=True)
+    if not models:
         raise HTTPException(status_code=404, detail=f"provider {provider_id} 下没有可用模型")
 
     result = await llm_manager.test_credentials(
         provider=provider_id,
-        model_id=model.model_id,
+        model_id=models[0].model_id,
         credentials={"api_key": api_key_to_test},
         db=db,
     )
