@@ -157,6 +157,8 @@ class Provider(Base):
     consecutive_failures = Column(Integer, nullable=False, server_default="0")
     last_failure_at = Column(DateTime, nullable=True)
     last_failure_kind = Column(String, nullable=True)
+    # 自动探活：每次探活后更新（不管成功失败），供 scheduler 判断是否到下次探活周期
+    last_probe_at = Column(DateTime, nullable=True)
 
     created_at = Column(DateTime, default=get_china_time)
     updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
