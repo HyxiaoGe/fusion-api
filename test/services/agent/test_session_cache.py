@@ -90,7 +90,7 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
     async def test_write_step_terminal_rejects_invalid_status(self):
         """status 必须是 failed 或 interrupted"""
         with patch("app.services.agent.session_cache.SessionLocal"):
-            with self.assertRaises(AssertionError):
+            with self.assertRaises(ValueError):
                 await write_step_terminal(step_id="s1", status="completed")
 
     async def test_write_session_status_updates_terminal(self):
@@ -108,7 +108,7 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
     async def test_write_session_status_rejects_invalid_status(self):
         """status 必须是 4 个终态值之一"""
         with patch("app.services.agent.session_cache.SessionLocal"):
-            with self.assertRaises(AssertionError):
+            with self.assertRaises(ValueError):
                 await write_session_status(run_id="r1", status="bogus",
                                            total_steps=0, total_tool_calls=0)
 
@@ -120,6 +120,39 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             await write_session_status(run_id="missing", status="completed",
                                        total_steps=0, total_tool_calls=0)
             session.commit.assert_not_called()
+
+    async def test_write_step_completed_sets_tool_calls_count(self):
+        with patch("app.services.agent.session_cache.SessionLocal") as mock_sl:
+            session = MagicMock()
+            mock_sl.return_value.__enter__.return_value = session
+            row = MagicMock()
+            session.get.return_value = row
+            await write_step_completed(step_id="s1", tool_names=["web_search", "url_read"],
+                                       tool_calls_count=2, duration_ms=42)
+            self.assertEqual(row.tool_calls_count, 2)
+
+    async def test_write_step_completed_tool_calls_count_none_skipped(self):
+        """None 时不动 tool_calls_count（不覆盖 row 既有值）"""
+        with patch("app.services.agent.session_cache.SessionLocal") as mock_sl:
+            session = MagicMock()
+            mock_sl.return_value.__enter__.return_value = session
+            row = MagicMock()
+            # 模拟 row 已有 tool_calls_count=5
+            row.tool_calls_count = 5
+            session.get.return_value = row
+            await write_step_completed(step_id="s1", duration_ms=10)
+            self.assertEqual(row.tool_calls_count, 5)  # 未被覆盖
+
+    async def test_write_session_status_sets_total_duration_ms(self):
+        with patch("app.services.agent.session_cache.SessionLocal") as mock_sl:
+            session = MagicMock()
+            mock_sl.return_value.__enter__.return_value = session
+            row = MagicMock()
+            session.get.return_value = row
+            await write_session_status(run_id="r1", status="completed",
+                                       total_steps=2, total_tool_calls=3,
+                                       total_duration_ms=12345)
+            self.assertEqual(row.total_duration_ms, 12345)
 
 
 if __name__ == "__main__":
