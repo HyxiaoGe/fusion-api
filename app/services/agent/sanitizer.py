@@ -17,6 +17,9 @@ def cap_and_truncate(payload: dict[str, Any], max_bytes: int = 1024) -> dict[str
     """把 result_summary 控制在 max_bytes 之内。
 
     超出时截断字符串字段（保留非字符串字段不动），并置 truncated=True。
+
+    注：v1 仅截断顶层 string 字段；嵌套 dict / list 不参与截断。
+    若调用方写入嵌套字段且总体超限，结果可能仍超过 max_bytes（truncated=True 仍会被设）。
     """
     serialized = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     if len(serialized) <= max_bytes:
@@ -29,7 +32,7 @@ def cap_and_truncate(payload: dict[str, Any], max_bytes: int = 1024) -> dict[str
     while len(json.dumps(out, ensure_ascii=False).encode("utf-8")) > max_bytes:
         shrunk = False
         for k, v in list(out.items()):
-            if isinstance(v, str) and len(v) > 8:
+            if isinstance(v, str) and len(v) > 9:
                 out[k] = v[: max(8, len(v) // 2)] + "…"
                 shrunk = True
         if not shrunk:

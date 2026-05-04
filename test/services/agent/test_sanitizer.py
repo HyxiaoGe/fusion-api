@@ -37,3 +37,27 @@ class CapAndTruncateTests(unittest.TestCase):
         out = cap_and_truncate(payload, max_bytes=1024)
         self.assertEqual(out["count"], 99)
         self.assertEqual(out["kind"], "search")
+
+    def test_under_limit_returns_same_object(self):
+        """under-limit 路径必须零拷贝（return 同一对象）"""
+        payload = {"kind": "search", "title": "abc", "truncated": False}
+        out = cap_and_truncate(payload, max_bytes=1024)
+        self.assertIs(out, payload)
+
+    def test_empty_dict(self):
+        """空 dict 应返回 {} 不动"""
+        out = cap_and_truncate({}, max_bytes=1024)
+        self.assertEqual(out, {})
+
+    def test_nested_dict_not_truncated(self):
+        """v1 仅截断顶层 string；嵌套 dict 不参与截断（文档化当前行为）"""
+        payload = {
+            "kind": "search",
+            "meta": {"snippet": "x" * 5000},  # 嵌套 dict 内的长 string
+            "truncated": False,
+        }
+        out = cap_and_truncate(payload, max_bytes=1024)
+        # 顶层 truncated 标志被设
+        self.assertTrue(out["truncated"])
+        # 但嵌套字段不会被裁
+        self.assertEqual(len(out["meta"]["snippet"]), 5000)
