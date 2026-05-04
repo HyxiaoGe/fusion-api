@@ -270,6 +270,7 @@ class AgentStep(Base):
     step_number = Column(Integer, nullable=False)
 
     status = Column(String(20), nullable=False, server_default="completed")  # "running" | "completed" | "failed" | "interrupted"
+    # 注：ORM 层无 default，新建必须显式传 status；server_default 仅用于 ALTER 时兜底已有历史行。
 
     tool_calls_count = Column(Integer, default=0)
     tool_names = Column(JSONB, nullable=True)  # ["web_search", "url_read"]
