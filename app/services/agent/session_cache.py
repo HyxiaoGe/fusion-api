@@ -13,12 +13,27 @@ from app.db.models import AgentSession, AgentStep
 async def write_session_started(*, run_id: str, conversation_id: str,
                                 user_id: str, model_id: str,
                                 provider: str) -> None:
-    """run 启动时立即创建 agent_sessions 行（status='running' 占位）。
+    """run 启动时 UPSERT agent_sessions 行（status='running' 占位）。
+
+    幂等：同 run_id 二次调用（任务重试 / 恢复 / superseded）会更新已有行
+    而不是抛 PK 冲突，避免后续 finally 的 write_session_status 跑不到。
 
     AgentSession 表的 user_id / model_id / provider 都是 NOT NULL，
     必须由调用方提供。终态由 write_session_status 在 finally 块更新。
     """
     with SessionLocal() as session:
+        existing = session.get(AgentSession, run_id)
+        if existing is not None:
+            # 已有行：更新元信息 + 重置为 running 占位
+            existing.conversation_id = conversation_id
+            existing.user_id = user_id
+            existing.model_id = model_id
+            existing.provider = provider
+            existing.status = "running"
+            existing.total_steps = 0
+            existing.total_tool_calls = 0
+            session.commit()
+            return
         row = AgentSession(
             id=run_id,
             conversation_id=conversation_id,

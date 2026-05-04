@@ -16,6 +16,7 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.services.agent.session_cache.SessionLocal") as mock_sl:
             session = MagicMock()
             mock_sl.return_value.__enter__.return_value = session
+            session.get.return_value = None  # 明确无已有行
             await write_session_started(run_id="r1", conversation_id="c1",
                                         user_id="u1", model_id="gpt-4",
                                         provider="openai")
@@ -30,6 +31,51 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row.status, "running")
             self.assertEqual(row.total_steps, 0)
             self.assertEqual(row.total_tool_calls, 0)
+
+    async def test_write_session_started_upserts_existing_row(self):
+        """同 run_id 二次调用：不 add 新行，而是更新已有 row 的字段并重置 totals"""
+        with patch("app.services.agent.session_cache.SessionLocal") as mock_sl:
+            session = MagicMock()
+            mock_sl.return_value.__enter__.return_value = session
+            # 模拟已有行
+            existing = MagicMock()
+            existing.total_steps = 5
+            existing.total_tool_calls = 3
+            existing.status = "completed"
+            session.get.return_value = existing
+
+            await write_session_started(run_id="r1", conversation_id="c2",
+                                        user_id="u2", model_id="gpt-5",
+                                        provider="anthropic")
+
+            # 不应 add 新行
+            session.add.assert_not_called()
+            # 应该更新已有行的元信息 + 重置 totals + 重置 status
+            self.assertEqual(existing.conversation_id, "c2")
+            self.assertEqual(existing.user_id, "u2")
+            self.assertEqual(existing.model_id, "gpt-5")
+            self.assertEqual(existing.provider, "anthropic")
+            self.assertEqual(existing.status, "running")
+            self.assertEqual(existing.total_steps, 0)
+            self.assertEqual(existing.total_tool_calls, 0)
+            session.commit.assert_called_once()
+
+    async def test_write_session_started_inserts_when_no_existing_row(self):
+        """没有已有行：行为同 v1（add 新行）"""
+        with patch("app.services.agent.session_cache.SessionLocal") as mock_sl:
+            session = MagicMock()
+            mock_sl.return_value.__enter__.return_value = session
+            session.get.return_value = None  # 无已有行
+
+            await write_session_started(run_id="r1", conversation_id="c1",
+                                        user_id="u1", model_id="gpt-4",
+                                        provider="openai")
+
+            session.add.assert_called_once()
+            row = session.add.call_args.args[0]
+            self.assertEqual(row.id, "r1")
+            self.assertEqual(row.status, "running")
+            session.commit.assert_called_once()
 
     async def test_write_step_started_inserts_running(self):
         with patch("app.services.agent.session_cache.SessionLocal") as mock_sl:
