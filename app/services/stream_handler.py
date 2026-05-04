@@ -886,18 +886,16 @@ class StreamHandler:
             # 同 gather 内并发 tool_call 会相互覆盖）。这里手动复刻
             # execute_with_emitter 的契约：tool_call_started → 重试执行 → tool_call_completed。
             if emitter is not None:
-                import time as _t
-
                 await emitter.tool_call_started(
                     tool_call_id=tc["id"],
                     tool_name=handler.tool_name,
                     arguments=args,
                 )
-                _start_mono = _t.monotonic()
+                _start_mono = time.monotonic()
                 try:
                     result = await self._execute_tool_with_retry(handler, args)
                 except BaseException as _exc:  # noqa: BLE001 — 必须先 emit completed 再 raise
-                    _dur_ms = int((_t.monotonic() - _start_mono) * 1000)
+                    _dur_ms = int((time.monotonic() - _start_mono) * 1000)
                     synthetic_failed = ToolResult(
                         status="failed",
                         error_message=f"{type(_exc).__name__}: {_exc}",
@@ -910,11 +908,17 @@ class StreamHandler:
                         result_summary=handler._build_result_summary(synthetic_failed),
                         error=f"{type(_exc).__name__}: {_exc}",
                     )
-                    # 上层在 results 中需要 result 对象继续构建消息，不向上 re-raise；
-                    # 这里返回 failed ToolResult，让消息流仍能完成。
+                    # CancelledError 必须向上传播，让外层 generate_to_redis 的
+                    # except CancelledError 块发出 run_interrupted（用户中止反馈）。
+                    # 否则 cancel 会被吃掉，FE 看不到中止反馈。
+                    # 注意：cancel 路径会跳过 try 块外的 handler.log（acceptable，
+                    # emit failed completed 已经到 FE，DB 日志不补偿避免 await 二次取消）。
+                    # 普通 Exception 则吞掉，返回 failed ToolResult，让消息流仍能完成。
+                    if isinstance(_exc, asyncio.CancelledError):
+                        raise
                     result = synthetic_failed
                 else:
-                    _dur_ms = int((_t.monotonic() - _start_mono) * 1000)
+                    _dur_ms = int((time.monotonic() - _start_mono) * 1000)
                     # 同步 ToolResult.duration_ms（部分 handler 不写）
                     if result.duration_ms is None:
                         result.duration_ms = _dur_ms
