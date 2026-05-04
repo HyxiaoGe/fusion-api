@@ -20,14 +20,22 @@ CHINA_TZ = timezone(timedelta(hours=8))
 
 
 def _build_current_date_system_prompt() -> str:
-    """为 LLM 注入"当前日期"系统提示，避免模型凭训练 cutoff 猜年份。"""
+    """为 LLM 注入"当前日期"系统提示，避免模型凭训练 cutoff 猜年份。
+
+    使用强约束语气，列出禁止年份清单。部分中小尺寸模型（如 kimi-k2.5）会
+    无视软建议直接从训练数据生成"2025 年"等过时关键词。
+    """
     now = datetime.now(CHINA_TZ)
     weekday_cn = ["一", "二", "三", "四", "五", "六", "日"][now.weekday()]
+    forbidden_years = ", ".join(str(y) for y in range(now.year - 3, now.year))
     return (
-        f"当前真实日期是 {now.year}年{now.month}月{now.day}日（星期{weekday_cn}），"
-        f"北京时间 {now.strftime('%H:%M')}。"
-        f"涉及时效性问题（最新进展、当前状态、搜索关键词中的年份）时，"
-        f"必须基于这个日期作答，不要使用训练数据中的旧年份。"
+        f"【当前真实日期】{now.year}年{now.month}月{now.day}日（星期{weekday_cn}），"
+        f"北京时间 {now.strftime('%H:%M')}。\n\n"
+        f"硬性规则：\n"
+        f"1. 涉及『最新』『当前』『目前』等时效性问题，必须基于上述日期作答。\n"
+        f"2. **生成搜索关键词时，年份必须使用 {now.year} 或更晚，"
+        f"严禁使用 {forbidden_years} 等过去年份**。\n"
+        f"3. 不要相信训练数据中的『当前年份』印象——你的训练 cutoff 早于现在。"
     )
 
 

@@ -90,9 +90,9 @@ class StreamHandler:
         supports_fc = capabilities.get("functionCalling", False)
         call_kwargs = {}
         if supports_fc:
-            from app.ai.tools import WEB_SEARCH_TOOL
+            from app.ai.tools import build_web_search_tool
 
-            call_kwargs["tools"] = [WEB_SEARCH_TOOL]
+            call_kwargs["tools"] = [build_web_search_tool()]
             call_kwargs["tool_choice"] = "auto"
             if should_use_reasoning and provider == "volcengine":
                 merge_extra_body(call_kwargs, {"thinking": {"type": "disabled"}})
