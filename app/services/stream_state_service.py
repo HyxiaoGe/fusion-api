@@ -9,8 +9,9 @@
 Redis 不可用时所有写操作静默降级。
 """
 
+import json
 import time
-from typing import AsyncIterator, Optional
+from typing import Any, AsyncIterator, Optional
 
 from app.core.logger import app_logger as logger
 from app.core.redis import (
@@ -100,19 +101,38 @@ async def append_chunk(
         return None
 
 
-async def finalize_stream(conversation_id: str, success: bool, error_msg: str = "", task_id: str = "") -> None:
+async def finalize_stream(
+    conversation_id: str,
+    success: bool,
+    error_msg: str = "",
+    task_id: str = "",
+    error_code: str = "",
+    error_data: Optional[dict[str, Any]] = None,
+) -> None:
     """
     流结束时调用，写 done/error 标记，更新 meta，缩短 TTL，释放锁。
 
     使用 Lua 脚本保证原子性：锁检查 + 写标记 + 释放锁在同一个 Redis 命令内完成，
     彻底避免并发任务之间的竞态条件。
+
+    BYOK 协议扩展：当 success=False 且传入 error_code 时，把 {code, message, data}
+    JSON 编码到 entry_content，供 stream_redis_as_sse 解析后挂到 SSE chunk 的
+    顶级 error 字段，前端 chat.ts 据此显示结构化错误卡片 + CTA。
     """
     redis = get_redis_pool()
     if not redis:
         return
     try:
         entry_type = "done" if success else "error"
-        entry_content = "" if success else error_msg
+        if success:
+            entry_content = ""
+        elif error_code:
+            entry_content = json.dumps(
+                {"code": error_code, "message": error_msg or "", "data": error_data or {}},
+                ensure_ascii=False,
+            )
+        else:
+            entry_content = error_msg
 
         result = await redis.eval(
             LUA_FINALIZE_STREAM,

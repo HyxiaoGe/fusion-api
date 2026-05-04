@@ -1103,6 +1103,16 @@ async def stream_redis_as_sse(
                     }
                 ],
             }
+            # BYOK 协议扩展：finalize_stream 传入结构化 error_code 时
+            # 会 JSON 编码到 content，这里 decode 回去挂到顶级 error 字段
+            content = chunk.get("content", "")
+            if content and content.startswith("{") and content.endswith("}"):
+                try:
+                    parsed = json.loads(content)
+                    if isinstance(parsed, dict) and "code" in parsed:
+                        payload["error"] = parsed
+                except (ValueError, TypeError):
+                    pass
         else:
             continue
 
