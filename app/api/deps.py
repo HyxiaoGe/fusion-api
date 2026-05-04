@@ -5,15 +5,17 @@ API 层依赖注入工厂
 路由层通过 Depends() 注入，不再手动 new。
 """
 
-from fastapi import Depends
+from fastapi import Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.core.security import get_current_user  # noqa: F401 — re-export
 from app.db.database import get_db  # noqa: F401 — re-export
+from app.db.models import User as UserModel
 from app.db.repositories import (
     ModelCredentialRepository,
     ModelSourceRepository,
     ProviderRepository,
+    UserCredentialRepository,
     UserRepository,
 )
 from app.services.chat_service import ChatService
@@ -37,8 +39,22 @@ def get_model_source_repo(db: Session = Depends(get_db)) -> ModelSourceRepositor
 
 
 def get_model_credential_repo(db: Session = Depends(get_db)) -> ModelCredentialRepository:
+    """旧 model_credentials 工厂，将在 Phase D 删除。新代码不要使用。"""
     return ModelCredentialRepository(db)
 
 
 def get_user_repo(db: Session = Depends(get_db)) -> UserRepository:
     return UserRepository(db)
+
+
+def get_user_credential_repo(db: Session = Depends(get_db)) -> UserCredentialRepository:
+    return UserCredentialRepository(db)
+
+
+def get_current_admin_user(
+    current_user: UserModel = Depends(get_current_user),
+) -> UserModel:
+    """要求 is_superuser=True，否则 403。用于 admin 专属端点。"""
+    if not getattr(current_user, "is_superuser", False):
+        raise HTTPException(status_code=403, detail="需要管理员权限")
+    return current_user
