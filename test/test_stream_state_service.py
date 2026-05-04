@@ -189,5 +189,55 @@ class TestStreamStateService(unittest.IsolatedAsyncioTestCase):
         self.patcher.start()
 
 
+class AppendChunkExtrasTests(unittest.IsolatedAsyncioTestCase):
+    """spec §4.6: append_chunk **extras 写入 Redis Stream entry 额外 hash 字段"""
+
+    async def test_extras_written_to_redis_hash(self):
+        from unittest.mock import AsyncMock, patch
+
+        with patch("app.services.stream_state_service.get_redis_pool") as gp:
+            redis = AsyncMock()
+            gp.return_value = redis
+            from app.services.stream_state_service import append_chunk
+
+            await append_chunk("c1", "reasoning", "hi", "b1", run_id="r1", step_id="s1")
+            # xadd 调用形式：xadd(key, fields)
+            args = redis.xadd.call_args.args
+            fields = args[1] if len(args) >= 2 else redis.xadd.call_args.kwargs.get("fields", {})
+            self.assertEqual(fields["type"], "reasoning")
+            self.assertEqual(fields["content"], "hi")
+            self.assertEqual(fields["block_id"], "b1")
+            self.assertEqual(fields["run_id"], "r1")
+            self.assertEqual(fields["step_id"], "s1")
+
+    async def test_extras_none_skipped(self):
+        from unittest.mock import AsyncMock, patch
+
+        with patch("app.services.stream_state_service.get_redis_pool") as gp:
+            redis = AsyncMock()
+            gp.return_value = redis
+            from app.services.stream_state_service import append_chunk
+
+            await append_chunk("c1", "reasoning", "hi", "b1", run_id=None, step_id="s1")
+            args = redis.xadd.call_args.args
+            fields = args[1] if len(args) >= 2 else redis.xadd.call_args.kwargs.get("fields", {})
+            self.assertNotIn("run_id", fields)
+            self.assertEqual(fields["step_id"], "s1")
+
+    async def test_legacy_4_arg_call_still_works(self):
+        """旧 4 参数调用方式（无 **extras）应继续工作"""
+        from unittest.mock import AsyncMock, patch
+
+        with patch("app.services.stream_state_service.get_redis_pool") as gp:
+            redis = AsyncMock()
+            gp.return_value = redis
+            from app.services.stream_state_service import append_chunk
+
+            await append_chunk("c1", "answering", "text", "b2")
+            args = redis.xadd.call_args.args
+            fields = args[1] if len(args) >= 2 else redis.xadd.call_args.kwargs.get("fields", {})
+            self.assertEqual(fields, {"type": "answering", "content": "text", "block_id": "b2"})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -80,19 +80,25 @@ async def append_chunk(
     chunk_type: str,
     content: str,
     block_id: str,
+    **extras: Any,
 ) -> Optional[str]:
-    """
-    追加一个 chunk 到 Redis Stream。
+    """追加一个 chunk 到 Redis Stream。
+
+    extras 用于附加 SSE envelope 字段（如 run_id / step_id），
+    会作为额外的 hash field 写入 Redis Stream entry。
+    None 值跳过（避免污染 hash）；非 str 值转 str（Redis hash 字段都是 str）。
     返回 Redis 分配的 entry ID。
     """
     redis = get_redis_pool()
     if not redis:
         return None
     try:
-        entry_id = await redis.xadd(
-            stream_chunks_key(conversation_id),
-            {"type": chunk_type, "content": content, "block_id": block_id},
-        )
+        fields: dict[str, str] = {"type": chunk_type, "content": content, "block_id": block_id}
+        for k, v in extras.items():
+            if v is None:
+                continue
+            fields[k] = v if isinstance(v, str) else str(v)
+        entry_id = await redis.xadd(stream_chunks_key(conversation_id), fields)
         # 刷新 TTL
         await redis.expire(stream_chunks_key(conversation_id), STREAM_CHUNK_TTL)
         return entry_id

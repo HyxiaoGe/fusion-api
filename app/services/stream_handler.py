@@ -867,307 +867,79 @@ class StreamHandler:
             db.rollback()
 
 
+def _entry_to_sse_envelope(entry_fields: dict) -> dict:
+    """把 Redis Stream entry 的 hash 字段转成 {chunk_type, data} envelope。
+
+    spec §4.6 SSE 顶层契约：每条 SSE message 形如 {"chunk_type": <type>, "data": {...}}。
+    本函数不负责 SSE 包装（id: 行、data: 前缀、[DONE]）— 这由 stream_redis_as_sse 处理。
+    """
+    chunk_type = entry_fields.get("type", "")
+    content = entry_fields.get("content", "")
+    block_id = entry_fields.get("block_id", "")
+
+    if chunk_type == "agent_event":
+        # agent_event 的 content 由 emitter 序列化为 JSON dict
+        data = json.loads(content) if content else {}
+    elif chunk_type in ("reasoning", "answering"):
+        data = {"block_id": block_id, "delta": content}
+        # 透传可选关联字段（emitter 通过 append_chunk 的 **extras 写入）
+        for k in ("run_id", "step_id"):
+            if k in entry_fields:
+                data[k] = entry_fields[k]
+    elif chunk_type == "thinking_pending":
+        # 思考中占位事件：FE 用来显示脉冲动画
+        data = {"block_id": block_id}
+    elif chunk_type == "error":
+        # BYOK 结构化 error_code: content 是 {"code":..., ...} JSON 时提升进 data
+        data = {}
+        if content and content.startswith("{") and content.endswith("}"):
+            try:
+                parsed = json.loads(content)
+                if isinstance(parsed, dict):
+                    data = parsed
+            except (ValueError, TypeError):
+                pass
+    else:
+        # done / preparing / 其它已知 type 用空 data
+        data = {}
+
+    return {"chunk_type": chunk_type, "data": data}
+
+
 async def stream_redis_as_sse(
     conversation_id: str,
     message_id: str,
     last_entry_id: str = "0",
 ) -> AsyncGenerator[str, None]:
-    """
-    SSE 读取器：从 Redis Stream 读 chunk，格式化为 SSE 事件推送给客户端。
-    不调用 LLM，只读 Redis。
+    """SSE 读取器：从 Redis Stream 读 chunk，按 spec §4.6 顶层 envelope 输出。
 
-    每条 SSE 事件包含 id 行（Redis entry ID），供断线重连使用。
-    Redis 不可用时立即返回 error 帧。
+    每条 SSE 事件包含 id: 行（Redis entry ID），供断线重连使用。
+    Redis 不可用时立即返回 error 帧 + [DONE]。
     """
     from app.core.redis import get_redis_pool
 
     if not get_redis_pool():
-        error_payload = {
-            "id": message_id,
-            "conversation_id": conversation_id,
-            "choices": [{"delta": {}, "finish_reason": "error"}],
+        # 维持新外层 envelope 形态
+        error_envelope = {
+            "chunk_type": "error",
+            "data": {
+                "code": "redis_unavailable",
+                "message": "Redis 不可用，无法读取流",
+            },
         }
-        yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps(error_envelope, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
         return
 
     async for chunk in read_stream_chunks(conversation_id, last_entry_id):
         entry_id = chunk.pop("entry_id")
-        chunk_type = chunk.get("type")
+        chunk_type = chunk.get("type", "")
 
-        # 跳过 start 标记
+        # 跳过内部 start 标记
         if chunk_type == "start":
             continue
 
-        # preparing 事件：后台任务已启动，前端收到此帧即触发 onReady
-        # 不携带 content，仅作为 SSE 首帧让前端感知到流已开始
-        if chunk_type == "preparing":
-            payload = {
-                "id": message_id,
-                "conversation_id": conversation_id,
-                "choices": [
-                    {
-                        "delta": {},
-                        "finish_reason": None,
-                    }
-                ],
-            }
-            yield f"id: {entry_id}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-            continue
-
-        if chunk_type == "reasoning":
-            payload = {
-                "id": message_id,
-                "conversation_id": conversation_id,
-                "choices": [
-                    {
-                        "delta": {
-                            "content": [
-                                {
-                                    "type": "thinking",
-                                    "id": chunk.get("block_id", ""),
-                                    "thinking": chunk["content"],
-                                }
-                            ]
-                        },
-                        "finish_reason": None,
-                    }
-                ],
-            }
-        elif chunk_type == "thinking_pending":
-            # 思考中占位事件：前端显示脉冲动画但不展示具体内容
-            payload = {
-                "id": message_id,
-                "conversation_id": conversation_id,
-                "choices": [
-                    {
-                        "delta": {
-                            "content": [
-                                {
-                                    "type": "thinking",
-                                    "id": chunk.get("block_id", ""),
-                                    "thinking": "",
-                                }
-                            ]
-                        },
-                        "finish_reason": None,
-                    }
-                ],
-            }
-        elif chunk_type == "answering":
-            payload = {
-                "id": message_id,
-                "conversation_id": conversation_id,
-                "choices": [
-                    {
-                        "delta": {
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "id": chunk.get("block_id", ""),
-                                    "text": chunk["content"],
-                                }
-                            ]
-                        },
-                        "finish_reason": None,
-                    }
-                ],
-            }
-        elif chunk_type == "search_start":
-            # 搜索开始事件
-            search_data = json.loads(chunk.get("content", "{}"))
-            payload = {
-                "id": message_id,
-                "conversation_id": conversation_id,
-                "choices": [
-                    {
-                        "delta": {
-                            "content": [
-                                {
-                                    "type": "search",
-                                    "id": chunk.get("block_id", ""),
-                                    "search_event": "start",
-                                    "query": search_data.get("query", ""),
-                                    "tool_call_id": search_data.get("tool_call_id"),
-                                }
-                            ]
-                        },
-                        "finish_reason": None,
-                    }
-                ],
-            }
-        elif chunk_type == "search_complete":
-            # 搜索完成事件
-            search_data = json.loads(chunk.get("content", "{}"))
-            payload = {
-                "id": message_id,
-                "conversation_id": conversation_id,
-                "choices": [
-                    {
-                        "delta": {
-                            "content": [
-                                {
-                                    "type": "search",
-                                    "id": chunk.get("block_id", ""),
-                                    "search_event": "complete",
-                                    "query": search_data.get("query", ""),
-                                    "sources": search_data.get("sources", []),
-                                    "tool_call_id": search_data.get("tool_call_id"),
-                                }
-                            ]
-                        },
-                        "finish_reason": None,
-                    }
-                ],
-            }
-        elif chunk_type == "url_read_start":
-            # URL 读取开始事件
-            url_data = json.loads(chunk.get("content", "{}"))
-            payload = {
-                "id": message_id,
-                "conversation_id": conversation_id,
-                "choices": [
-                    {
-                        "delta": {
-                            "content": [
-                                {
-                                    "type": "url_read",
-                                    "id": chunk.get("block_id", ""),
-                                    "url_read_event": "start",
-                                    "url": url_data.get("url", ""),
-                                    "source": url_data.get("source", "auto"),
-                                    "tool_call_id": url_data.get("tool_call_id"),
-                                }
-                            ]
-                        },
-                        "finish_reason": None,
-                    }
-                ],
-            }
-        elif chunk_type == "url_read_complete":
-            # URL 读取完成事件
-            url_data = json.loads(chunk.get("content", "{}"))
-            payload = {
-                "id": message_id,
-                "conversation_id": conversation_id,
-                "choices": [
-                    {
-                        "delta": {
-                            "content": [
-                                {
-                                    "type": "url_read",
-                                    "id": chunk.get("block_id", ""),
-                                    "url_read_event": "complete",
-                                    "url": url_data.get("url", ""),
-                                    "title": url_data.get("title"),
-                                    "favicon": url_data.get("favicon"),
-                                    "status": url_data.get("status", "success"),
-                                    "tool_call_id": url_data.get("tool_call_id"),
-                                }
-                            ]
-                        },
-                        "finish_reason": None,
-                    }
-                ],
-            }
-        elif chunk_type == "agent_step_start":
-            step_data = json.loads(chunk.get("content", "{}"))
-            payload = {
-                "id": message_id,
-                "conversation_id": conversation_id,
-                "choices": [
-                    {
-                        "delta": {
-                            "content": [
-                                {
-                                    "type": "agent_step",
-                                    "agent_event": "step_start",
-                                    "step": step_data.get("step", 0),
-                                    "max_steps": step_data.get("max_steps", AGENT_MAX_STEPS),
-                                    "tool_count": step_data.get("tool_count", 0),
-                                }
-                            ]
-                        },
-                        "finish_reason": None,
-                    }
-                ],
-            }
-        elif chunk_type == "agent_step_end":
-            step_data = json.loads(chunk.get("content", "{}"))
-            payload = {
-                "id": message_id,
-                "conversation_id": conversation_id,
-                "choices": [
-                    {
-                        "delta": {
-                            "content": [
-                                {
-                                    "type": "agent_step",
-                                    "agent_event": "step_end",
-                                    "step": step_data.get("step", 0),
-                                    "total_tool_calls": step_data.get("total_tool_calls", 0),
-                                }
-                            ]
-                        },
-                        "finish_reason": None,
-                    }
-                ],
-            }
-        elif chunk_type == "agent_limit_reached":
-            limit_data = json.loads(chunk.get("content", "{}"))
-            payload = {
-                "id": message_id,
-                "conversation_id": conversation_id,
-                "choices": [
-                    {
-                        "delta": {
-                            "content": [
-                                {
-                                    "type": "agent_step",
-                                    "agent_event": "limit_reached",
-                                    "reason": limit_data.get("reason", ""),
-                                }
-                            ]
-                        },
-                        "finish_reason": None,
-                    }
-                ],
-            }
-        elif chunk_type == "done":
-            payload = {
-                "id": message_id,
-                "conversation_id": conversation_id,
-                "choices": [
-                    {
-                        "delta": {},
-                        "finish_reason": "stop",
-                    }
-                ],
-            }
-        elif chunk_type == "error":
-            payload = {
-                "id": message_id,
-                "conversation_id": conversation_id,
-                "choices": [
-                    {
-                        "delta": {},
-                        "finish_reason": "error",
-                    }
-                ],
-            }
-            # BYOK 协议扩展：finalize_stream 传入结构化 error_code 时
-            # 会 JSON 编码到 content，这里 decode 回去挂到顶级 error 字段
-            content = chunk.get("content", "")
-            if content and content.startswith("{") and content.endswith("}"):
-                try:
-                    parsed = json.loads(content)
-                    if isinstance(parsed, dict) and "code" in parsed:
-                        payload["error"] = parsed
-                except (ValueError, TypeError):
-                    pass
-        else:
-            continue
-
-        yield f"id: {entry_id}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        envelope = _entry_to_sse_envelope(chunk)
+        yield f"id: {entry_id}\ndata: {json.dumps(envelope, ensure_ascii=False)}\n\n"
 
     yield "data: [DONE]\n\n"

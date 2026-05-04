@@ -162,5 +162,117 @@ class StreamRedisAsSSETests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1], "data: [DONE]\n\n")
 
 
+class SseEnvelopeFormatterTests(unittest.TestCase):
+    """spec §4.6 SSE 顶层 envelope 形态测试"""
+
+    def test_agent_event_entry_to_envelope(self):
+        from app.services.stream_handler import _entry_to_sse_envelope
+
+        env = _entry_to_sse_envelope({
+            "type": "agent_event",
+            "content": '{"type":"run_started","run_id":"r1","sequence":0}',
+            "block_id": "",
+        })
+        self.assertEqual(env["chunk_type"], "agent_event")
+        self.assertEqual(env["data"]["type"], "run_started")
+        self.assertEqual(env["data"]["sequence"], 0)
+        self.assertEqual(env["data"]["run_id"], "r1")
+
+    def test_reasoning_entry_carries_run_step_ids(self):
+        from app.services.stream_handler import _entry_to_sse_envelope
+
+        env = _entry_to_sse_envelope({
+            "type": "reasoning",
+            "content": "hello",
+            "block_id": "b1",
+            "run_id": "r1",
+            "step_id": "s1",
+        })
+        self.assertEqual(env["chunk_type"], "reasoning")
+        self.assertEqual(env["data"], {
+            "block_id": "b1", "delta": "hello",
+            "run_id": "r1", "step_id": "s1",
+        })
+
+    def test_reasoning_entry_without_run_step_ids(self):
+        """旧消息或缺失 run_id/step_id 时，data 不含这两键"""
+        from app.services.stream_handler import _entry_to_sse_envelope
+
+        env = _entry_to_sse_envelope({
+            "type": "reasoning",
+            "content": "hello",
+            "block_id": "b1",
+        })
+        self.assertEqual(env["data"], {"block_id": "b1", "delta": "hello"})
+
+    def test_answering_entry(self):
+        from app.services.stream_handler import _entry_to_sse_envelope
+
+        env = _entry_to_sse_envelope({
+            "type": "answering",
+            "content": "world",
+            "block_id": "b2",
+            "run_id": "r1",
+            "step_id": "s1",
+        })
+        self.assertEqual(env["chunk_type"], "answering")
+        self.assertEqual(env["data"]["delta"], "world")
+        self.assertEqual(env["data"]["run_id"], "r1")
+
+    def test_done_entry_empty_data(self):
+        from app.services.stream_handler import _entry_to_sse_envelope
+
+        env = _entry_to_sse_envelope({"type": "done", "content": "", "block_id": ""})
+        self.assertEqual(env, {"chunk_type": "done", "data": {}})
+
+    def test_preparing_entry_empty_data(self):
+        from app.services.stream_handler import _entry_to_sse_envelope
+
+        env = _entry_to_sse_envelope({"type": "preparing", "content": "", "block_id": ""})
+        self.assertEqual(env, {"chunk_type": "preparing", "data": {}})
+
+    def test_thinking_pending_entry(self):
+        from app.services.stream_handler import _entry_to_sse_envelope
+
+        env = _entry_to_sse_envelope({"type": "thinking_pending", "content": "", "block_id": "b1"})
+        self.assertEqual(env, {"chunk_type": "thinking_pending", "data": {"block_id": "b1"}})
+
+    def test_error_entry_byok_structured_promoted(self):
+        """BYOK 结构化 error_code: content 是 JSON 时升入 data"""
+        from app.services.stream_handler import _entry_to_sse_envelope
+
+        env = _entry_to_sse_envelope({
+            "type": "error",
+            "content": '{"code":"provider_offline","message":"offline","retryable":true}',
+            "block_id": "",
+        })
+        self.assertEqual(env["chunk_type"], "error")
+        self.assertEqual(env["data"]["code"], "provider_offline")
+        self.assertEqual(env["data"]["message"], "offline")
+        self.assertEqual(env["data"]["retryable"], True)
+
+    def test_error_entry_non_json_content_empty_data(self):
+        """error content 不是 JSON dict 时返回空 data（兼容旧错误形态）"""
+        from app.services.stream_handler import _entry_to_sse_envelope
+
+        env = _entry_to_sse_envelope({
+            "type": "error",
+            "content": "plain text error",
+            "block_id": "",
+        })
+        self.assertEqual(env, {"chunk_type": "error", "data": {}})
+
+    def test_unknown_type_falls_back_empty_data(self):
+        """未知 chunk type 不抛，返回 {chunk_type: <type>, data: {}}"""
+        from app.services.stream_handler import _entry_to_sse_envelope
+
+        env = _entry_to_sse_envelope({
+            "type": "future_unknown_type",
+            "content": "anything",
+            "block_id": "x",
+        })
+        self.assertEqual(env, {"chunk_type": "future_unknown_type", "data": {}})
+
+
 if __name__ == "__main__":
     unittest.main()
