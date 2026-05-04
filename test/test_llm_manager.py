@@ -1,96 +1,80 @@
+import os
 import unittest
-from unittest.mock import MagicMock, patch
 
+os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
+from cryptography.fernet import Fernet
+
+os.environ.setdefault("CREDENTIAL_ENCRYPTION_KEY", Fernet.generate_key().decode())
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+
+from app.ai.litellm_utils import ProviderOfflineError
 from app.ai.llm_manager import LLMManager
+from app.db.database import Base
+from app.db.models import ModelSource, Provider, User
+from app.db.repositories import UserCredentialRepository
 
 
-class LLMManagerTests(unittest.TestCase):
-    def test_resolve_model_constructs_litellm_params(self):
-        manager = LLMManager()
-        db = MagicMock()
+def fresh_db() -> Session:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    db = Session(bind=engine)
+    db.add(User(id="u1", username="u1", email="u1@example.com"))
+    db.add(Provider(id="xai", name="xAI", litellm_prefix="openrouter/x-ai", auth_config={}, status="ok"))
+    db.add(
+        ModelSource(
+            model_id="grok-4.20-beta",
+            name="Grok 4.20",
+            provider="xai",
+            capabilities={},
+            pricing={},
+            model_configuration={},
+            enabled=True,
+        )
+    )
+    db.commit()
+    return db
 
-        # 模拟 Provider
-        mock_provider = MagicMock()
-        mock_provider.litellm_prefix = "openai"
-        mock_provider.custom_base_url = True
 
-        # 模拟 ModelSource
-        mock_source = MagicMock()
-        mock_source.provider = "qwen"
-        mock_source.provider_rel = mock_provider
+class ResolveModelTests(unittest.TestCase):
+    def test_returns_user_key_in_extra_body(self):
+        db = fresh_db()
+        UserCredentialRepository(db).upsert("u1", "xai", "sk-or-user")
 
-        # 模拟 ModelCredential
-        mock_credential = MagicMock()
-        mock_credential.credentials = {"api_key": "test-key", "base_url": "https://api.example.com"}
+        litellm_model, provider_id, kwargs = LLMManager().resolve_model("grok-4.20-beta", db, user_id="u1")
+        self.assertEqual(litellm_model, "openai/openrouter/x-ai/grok-4.20-beta")
+        self.assertEqual(provider_id, "xai")
+        self.assertIn("extra_body", kwargs)
+        self.assertEqual(kwargs["extra_body"]["api_key"], "sk-or-user")
+        self.assertEqual(kwargs["metadata"]["credential_source"], "user")
 
-        with (
-            patch("app.ai.llm_manager.ModelSourceRepository") as mock_source_repo,
-            patch("app.ai.llm_manager.ModelCredentialRepository") as mock_cred_repo,
-        ):
-            mock_source_repo.return_value.get_by_id.return_value = mock_source
-            mock_cred_repo.return_value.get_default.return_value = mock_credential
+    def test_no_user_key_no_extra_body(self):
+        db = fresh_db()
+        _, _, kwargs = LLMManager().resolve_model("grok-4.20-beta", db, user_id="u1")
+        self.assertNotIn("extra_body", kwargs)
+        self.assertEqual(kwargs["metadata"]["credential_source"], "system")
 
-            litellm_model, provider, kwargs = manager.resolve_model("qwen-max-latest", db)
+    def test_offline_provider_raises(self):
+        db = fresh_db()
+        provider = db.query(Provider).filter(Provider.id == "xai").one()
+        provider.status = "offline"
+        provider.offline_reason = "quota_exceeded"
+        provider.offline_message = "no balance"
+        db.commit()
 
-        self.assertEqual(litellm_model, "openai/qwen-max-latest")
-        self.assertEqual(provider, "qwen")
-        self.assertEqual(kwargs["api_key"], "test-key")
-        self.assertEqual(kwargs["api_base"], "https://api.example.com")
+        with self.assertRaises(ProviderOfflineError) as ctx:
+            LLMManager().resolve_model("grok-4.20-beta", db, user_id="u1")
+        self.assertEqual(ctx.exception.provider_id, "xai")
+        self.assertEqual(ctx.exception.reason, "quota_exceeded")
 
-    def test_resolve_model_raises_on_missing_source(self):
-        manager = LLMManager()
-        db = MagicMock()
-
-        with patch("app.ai.llm_manager.ModelSourceRepository") as mock_source_repo:
-            mock_source_repo.return_value.get_by_id.return_value = None
-
-            with self.assertRaises(ValueError) as ctx:
-                manager.resolve_model("nonexistent-model", db)
-
-            self.assertIn("未找到模型配置", str(ctx.exception))
-
-    def test_resolve_model_raises_on_missing_provider(self):
-        manager = LLMManager()
-        db = MagicMock()
-
-        mock_source = MagicMock()
-        mock_source.provider = "unknown"
-        mock_source.provider_rel = None
-
-        with patch("app.ai.llm_manager.ModelSourceRepository") as mock_source_repo:
-            mock_source_repo.return_value.get_by_id.return_value = mock_source
-
-            with self.assertRaises(ValueError) as ctx:
-                manager.resolve_model("some-model", db)
-
-            self.assertIn("未配置", str(ctx.exception))
-
-    def test_resolve_model_no_base_url_when_not_custom(self):
-        manager = LLMManager()
-        db = MagicMock()
-
-        mock_provider = MagicMock()
-        mock_provider.litellm_prefix = "openrouter/openai"
-        mock_provider.custom_base_url = False
-
-        mock_source = MagicMock()
-        mock_source.provider = "openai"
-        mock_source.provider_rel = mock_provider
-
-        mock_credential = MagicMock()
-        mock_credential.credentials = {"api_key": "test-key"}
-
-        with (
-            patch("app.ai.llm_manager.ModelSourceRepository") as mock_source_repo,
-            patch("app.ai.llm_manager.ModelCredentialRepository") as mock_cred_repo,
-        ):
-            mock_source_repo.return_value.get_by_id.return_value = mock_source
-            mock_cred_repo.return_value.get_default.return_value = mock_credential
-
-            litellm_model, provider, kwargs = manager.resolve_model("gpt-5.4", db)
-
-        self.assertEqual(litellm_model, "openrouter/openai/gpt-5.4")
-        self.assertNotIn("api_base", kwargs)
+    def test_no_user_id_skips_credential_lookup(self):
+        # 兼容路径：legacy 调用方未传 user_id，等同 system
+        db = fresh_db()
+        UserCredentialRepository(db).upsert("u1", "xai", "sk-or-user")
+        _, _, kwargs = LLMManager().resolve_model("grok-4.20-beta", db)
+        self.assertNotIn("extra_body", kwargs)
+        self.assertEqual(kwargs["metadata"]["credential_source"], "system")
 
 
 if __name__ == "__main__":
