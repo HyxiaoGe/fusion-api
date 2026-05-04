@@ -56,6 +56,8 @@ async def fetch_trending_questions() -> Optional[list[dict]]:
     try:
         # Kimi 的 $web_search 需要多轮 tool_call 循环
         for _ in range(5):  # 最多 5 轮（通常 2-3 轮就结束）
+            # 注：此路径直接用 OpenAI client 调 Moonshot API，不经过 LLMManager / proxy，
+            # 没有前置层注入的 extra_body，所以直接赋值是安全的（不需要 merge_extra_body）。
             response = await client.chat.completions.create(
                 model="kimi-k2.5",
                 messages=messages,

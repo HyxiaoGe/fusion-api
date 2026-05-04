@@ -4,7 +4,7 @@ import re
 import sys
 from pathlib import Path
 
-TABLES = ("model_sources", "model_credentials")
+TABLES = ("model_sources",)
 
 
 def extract_copy_block(sql_text: str, table_name: str) -> str:
@@ -26,13 +26,11 @@ def build_seed_sql(sql_text: str) -> str:
 
     return (
         "BEGIN;\n"
-        "TRUNCATE TABLE public.model_credentials, public.model_sources RESTART IDENTITY CASCADE;\n\n"
+        "TRUNCATE TABLE public.model_sources RESTART IDENTITY CASCADE;\n\n"
         + "\n".join(blocks)
         + "\n"
         + "SELECT setval('public.model_sources_id_seq', COALESCE((SELECT MAX(id) FROM public.model_sources), 1), "
         + "(SELECT COUNT(*) > 0 FROM public.model_sources));\n"
-        + "SELECT setval('public.model_credentials_id_seq', COALESCE((SELECT MAX(id) FROM public.model_credentials), 1), "
-        + "(SELECT COUNT(*) > 0 FROM public.model_credentials));\n"
         + "COMMIT;\n"
     )
 
