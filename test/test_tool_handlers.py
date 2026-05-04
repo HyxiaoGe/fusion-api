@@ -160,5 +160,90 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(block.title, "Example")
 
 
+class ExecuteWithEmitterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_wraps_with_tool_call_started_and_completed(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.services.tool_handlers.base import BaseToolHandler, ToolResult
+
+        class _Stub(BaseToolHandler):
+            tool_name = "stub"
+            sse_event_prefix = "stub"  # 满足抽象 property（虽本期不用 push_sse_*）
+            async def execute(self, args):
+                return ToolResult(status="success", data={"k": 1})
+            def build_content_block(self, result, block_id, log_id):
+                return MagicMock()
+            def format_llm_context(self, result):
+                return "ctx"
+
+        emitter = AsyncMock()
+        h = _Stub()
+        result = await h.execute_with_emitter(args={"x": 1}, emitter=emitter,
+                                              tool_call_id="tc1")
+        self.assertEqual(result.status, "success")
+        emitter.tool_call_started.assert_awaited_once()
+        emitter.tool_call_completed.assert_awaited_once()
+        # tool_call_started 调用时带 tool_call_id / tool_name / arguments
+        started_kwargs = emitter.tool_call_started.call_args.kwargs
+        self.assertEqual(started_kwargs["tool_call_id"], "tc1")
+        self.assertEqual(started_kwargs["tool_name"], "stub")
+        self.assertEqual(started_kwargs["arguments"], {"x": 1})
+        # tool_call_completed 携带 status / duration_ms / result_summary
+        completed_kwargs = emitter.tool_call_completed.call_args.kwargs
+        self.assertEqual(completed_kwargs["tool_call_id"], "tc1")
+        self.assertEqual(completed_kwargs["tool_name"], "stub")
+        self.assertEqual(completed_kwargs["status"], "success")
+        self.assertIsInstance(completed_kwargs["duration_ms"], int)
+        self.assertEqual(completed_kwargs["result_summary"]["kind"], "stub")
+        self.assertIsNone(completed_kwargs.get("error"))
+
+    async def test_failed_execute_emits_failed_completed_with_error(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.services.tool_handlers.base import BaseToolHandler, ToolResult
+
+        class _Stub(BaseToolHandler):
+            tool_name = "stub"
+            sse_event_prefix = "stub"
+            async def execute(self, args):
+                return ToolResult(status="failed", data={},
+                                  error_message="boom")
+            def build_content_block(self, result, block_id, log_id):
+                return MagicMock()
+            def format_llm_context(self, result):
+                return "ctx"
+
+        emitter = AsyncMock()
+        h = _Stub()
+        result = await h.execute_with_emitter(args={}, emitter=emitter,
+                                              tool_call_id="tc2")
+        self.assertEqual(result.status, "failed")
+        completed_kwargs = emitter.tool_call_completed.call_args.kwargs
+        self.assertEqual(completed_kwargs["status"], "failed")
+        self.assertEqual(completed_kwargs["error"], "boom")
+
+    async def test_default_result_summary_uses_tool_name(self):
+        """子类未覆盖 _build_result_summary 时，默认 summary kind=tool_name + truncated=False"""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.services.tool_handlers.base import BaseToolHandler, ToolResult
+
+        class _Stub(BaseToolHandler):
+            tool_name = "my_tool"
+            sse_event_prefix = "my_tool"
+            async def execute(self, args):
+                return ToolResult(status="success", data={})
+            def build_content_block(self, result, block_id, log_id):
+                return MagicMock()
+            def format_llm_context(self, result):
+                return ""
+
+        emitter = AsyncMock()
+        h = _Stub()
+        await h.execute_with_emitter(args={}, emitter=emitter, tool_call_id="tc3")
+        summary = emitter.tool_call_completed.call_args.kwargs["result_summary"]
+        self.assertEqual(summary, {"kind": "my_tool", "truncated": False})
+
+
 if __name__ == "__main__":
     unittest.main()

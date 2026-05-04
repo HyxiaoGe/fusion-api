@@ -4,6 +4,7 @@ Tool Handler 抽象基类 — 所有工具处理器的共性接口和共享能�
 
 import asyncio
 import json
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -143,3 +144,41 @@ class BaseToolHandler(ABC):
             )
         )
         task.add_done_callback(_task_done_callback)
+
+    async def execute_with_emitter(
+        self,
+        *,
+        args: dict,
+        emitter,  # type: AgentEventEmitter
+        tool_call_id: str,
+    ) -> "ToolResult":
+        """统一包装：发 tool_call_started → execute → tool_call_completed。
+
+        包含计时和 result_summary 自动构造。子类只需实现 execute(args) +
+        可选覆盖 _build_result_summary 返回轻量 summary。
+        本方法不调 push_sse_start / push_sse_complete（旧实时 chunk 已废弃）。
+        """
+        await emitter.tool_call_started(
+            tool_call_id=tool_call_id,
+            tool_name=self.tool_name,
+            arguments=args,
+        )
+        start = time.time()
+        result = await self.execute(args)
+        duration_ms = int((time.time() - start) * 1000)
+        await emitter.tool_call_completed(
+            tool_call_id=tool_call_id,
+            tool_name=self.tool_name,
+            status=result.status,
+            duration_ms=duration_ms,
+            result_summary=self._build_result_summary(result),
+            error=result.error_message if result.status != "success" else None,
+        )
+        return result
+
+    def _build_result_summary(self, result: "ToolResult") -> dict:
+        """子类可覆盖返回轻量摘要（如搜索命中数 / favicon）。
+
+        默认返回最小 {kind, truncated}，由 cap_and_truncate 兜底硬上限。
+        """
+        return {"kind": self.tool_name, "truncated": False}
