@@ -8,12 +8,28 @@ LLM 消息构建模块
 """
 
 import base64
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 from app.core.logger import app_logger as logger
 from app.db.repositories import FileRepository
 from app.services.file_service import is_image_mime
 from app.services.storage import get_storage
+
+CHINA_TZ = timezone(timedelta(hours=8))
+
+
+def _build_current_date_system_prompt() -> str:
+    """为 LLM 注入"当前日期"系统提示，避免模型凭训练 cutoff 猜年份。"""
+    now = datetime.now(CHINA_TZ)
+    weekday_cn = ["一", "二", "三", "四", "五", "六", "日"][now.weekday()]
+    return (
+        f"当前真实日期是 {now.year}年{now.month}月{now.day}日（星期{weekday_cn}），"
+        f"北京时间 {now.strftime('%H:%M')}。"
+        f"涉及时效性问题（最新进展、当前状态、搜索关键词中的年份）时，"
+        f"必须基于这个日期作答，不要使用训练数据中的旧年份。"
+    )
+
 
 # 历史消息中保留图片的最大轮数（避免 token 爆炸）
 MAX_VISION_HISTORY_TURNS = 3
@@ -55,8 +71,12 @@ async def build_llm_messages(
     - 当 has_vision=True 时，图片 FileBlock 转为 base64 image_url 内容块
     - 历史消息中的图片仅保留最近 MAX_VISION_HISTORY_TURNS 轮
     - 用户自定义 system_prompt 注入到 system 角色，仅作背景，不主动引用
+    - 默认注入"当前日期"system 消息，避免模型凭训练数据猜年份
     """
     result = []
+
+    # 注入当前日期（始终注入，对所有对话生效）
+    result.append({"role": "system", "content": _build_current_date_system_prompt()})
 
     # 注入用户自定义个性化 prompt
     if user_system_prompt and user_system_prompt.strip():
