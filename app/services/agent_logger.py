@@ -105,7 +105,14 @@ async def log_agent_session(
     limit_reason: Optional[str] = None,
     error_message: Optional[str] = None,
 ) -> None:
-    """异步记录 Agent 会话汇总，失败时静默处理"""
+    """[DEPRECATED] agent_sessions 写入已迁移到 session_cache.write_session_started/status。
+
+    本函数保留仅为向后兼容（agent_logger 函数签名上若有外部脚本/迁移工具调用），
+    stream_handler 已不再调用本函数。session 行的创建和终态更新现在由
+    app.services.agent.session_cache 在 emit 调用点平行调用。
+
+    待 grep 确认整库无其它调用方后可删除。
+    """
     try:
         db = SessionLocal()
         session = AgentSession(
