@@ -210,13 +210,29 @@ class SseEnvelopeFormatterTests(unittest.TestCase):
         self.assertEqual(env["data"]["message"], "offline")
         self.assertEqual(env["data"]["retryable"], True)
 
-    def test_error_entry_non_json_content_empty_data(self):
-        """error content 不是 JSON dict 时返回空 data（兼容旧错误形态）"""
+    def test_error_entry_non_json_content_wrapped_as_message(self):
+        """error content 不是 JSON dict 时兜底为 {code: stream_error, message: <content>}
+
+        修复 P2：避免 finalize_stream(error_msg='用户中止' / '被新请求取代') 这类纯
+        字符串 error 在 FE 端全丢成 {data: {}}。
+        """
         from app.services.stream_handler import _entry_to_sse_envelope
 
         env = _entry_to_sse_envelope({
             "type": "error",
-            "content": "plain text error",
+            "content": "用户中止",
+            "block_id": "",
+        })
+        self.assertEqual(env["chunk_type"], "error")
+        self.assertEqual(env["data"], {"code": "stream_error", "message": "用户中止"})
+
+    def test_error_entry_empty_content_empty_data(self):
+        """error content 为空时 data 也为空"""
+        from app.services.stream_handler import _entry_to_sse_envelope
+
+        env = _entry_to_sse_envelope({
+            "type": "error",
+            "content": "",
             "block_id": "",
         })
         self.assertEqual(env, {"chunk_type": "error", "data": {}})

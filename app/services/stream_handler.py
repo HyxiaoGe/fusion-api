@@ -288,6 +288,20 @@ class StreamHandler:
                     await emitter.run_limit_reached(reason="max_tool_calls")
                     break
 
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                # 每轮 LLM call 之前先开 step（spec §4.2 "1 step = 1 LLM round"）
+                # 这样本轮 reasoning / answering / tool_call_* chunk 都能挂到正确的 step_id；
+                # stop / cancelled / tool_calls 三路径都在分支末尾闭合本 step。
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                step += 1
+                step_start_time = time.time()
+                current_step_id = await emitter.step_started(step_number=step)
+                await session_cache.write_step_started(
+                    run_id=run_id,
+                    step_id=current_step_id,
+                    step_number=step,
+                )
+
                 thinking_block_id = f"blk_{uuid.uuid4().hex[:12]}"
                 text_block_id = f"blk_{uuid.uuid4().hex[:12]}"
 
@@ -338,6 +352,20 @@ class StreamHandler:
                         )
                     if content_buf:
                         content_blocks.append(TextBlock(type="text", id=text_block_id, text=content_buf))
+                    # 闭合本 step：直接回答路径不调工具
+                    stop_step_duration = int((time.time() - step_start_time) * 1000)
+                    await emitter.step_completed(
+                        step_number=step,
+                        tool_call_count=0,
+                        duration_ms=stop_step_duration,
+                    )
+                    await session_cache.write_step_completed(
+                        step_id=current_step_id,
+                        tool_names=[],
+                        tool_calls_count=0,
+                        duration_ms=stop_step_duration,
+                    )
+                    current_step_id = None
                     break
 
                 # ── 情况 2: 被踢掉（superseded）──
@@ -356,6 +384,11 @@ class StreamHandler:
                         content_blocks,
                         accumulated_usage if accumulated_usage.input_tokens > 0 else None,
                     )
+                    # 闭合本 step：标记为 interrupted（在 run_interrupted 之前）
+                    if current_step_id is not None:
+                        await session_cache.write_step_terminal(
+                            step_id=current_step_id, status="interrupted"
+                        )
                     await emitter.run_interrupted(reason="superseded")
                     await session_cache.write_session_status(
                         run_id=run_id,
@@ -370,16 +403,7 @@ class StreamHandler:
 
                 # ── 情况 3: LLM 请求工具调用 ──
                 if finish_reason == "tool_calls" and tool_calls_list:
-                    step += 1
-                    step_start_time = time.time()
-
-                    # emitter.step_started 内部会派发 step_id 并 set 到 _current_step_id
-                    current_step_id = await emitter.step_started(step_number=step)
-                    await session_cache.write_step_started(
-                        run_id=run_id,
-                        step_id=current_step_id,
-                        step_number=step,
-                    )
+                    # step / step_started / write_step_started 已在 while 顶部完成
 
                     # 收集本轮 reasoning（tool_call 决策推理）
                     if reasoning_buf:
@@ -466,7 +490,20 @@ class StreamHandler:
 
                     continue
 
-                # 未知 finish_reason → 跳出循环
+                # 未知 finish_reason（含 tool_calls 但 list 为空的退化情况）→ 闭合本 step 后跳出
+                unknown_step_duration = int((time.time() - step_start_time) * 1000)
+                await emitter.step_completed(
+                    step_number=step,
+                    tool_call_count=0,
+                    duration_ms=unknown_step_duration,
+                )
+                await session_cache.write_step_completed(
+                    step_id=current_step_id,
+                    tool_names=[],
+                    tool_calls_count=0,
+                    duration_ms=unknown_step_duration,
+                )
+                current_step_id = None
                 break
 
             # ═══════════════════════════════════════
@@ -576,10 +613,31 @@ class StreamHandler:
             logger.warning(
                 f"Provider 离线，终止生成: conv_id={conversation_id}, provider={e.provider_id}, reason={e.reason}"
             )
+            error_message = e.message or f"Provider {e.provider_id} 当前不可用"
+            # 协议层终结事件 + cache 终态：补完 agent_event timeline，避免断尾
+            try:
+                if current_step_id is not None:
+                    await session_cache.write_step_terminal(
+                        step_id=current_step_id, status="failed"
+                    )
+                await emitter.run_failed(
+                    error_code="PROVIDER_OFFLINE",
+                    message=error_message,
+                )
+                await session_cache.write_session_status(
+                    run_id=run_id,
+                    status="error",
+                    total_steps=step,
+                    total_tool_calls=total_tool_calls,
+                    total_duration_ms=int((time.time() - run_start) * 1000),
+                )
+                terminal_emitted = True
+            except Exception as _emit_exc:  # noqa: BLE001
+                logger.warning(f"emit run_failed (PROVIDER_OFFLINE) 失败: {_emit_exc}")
             await finalize_stream(
                 conversation_id,
                 success=False,
-                error_msg=e.message or f"Provider {e.provider_id} 当前不可用",
+                error_msg=error_message,
                 error_code="PROVIDER_OFFLINE",
                 error_data={"provider_id": e.provider_id, "reason": e.reason},
                 task_id=task_id,
@@ -1018,15 +1076,20 @@ def _entry_to_sse_envelope(entry_fields: dict) -> dict:
         # 思考中占位事件：FE 用来显示脉冲动画
         data = {"block_id": block_id}
     elif chunk_type == "error":
-        # BYOK 结构化 error_code: content 是 {"code":..., ...} JSON 时提升进 data
-        data = {}
-        if content and content.startswith("{") and content.endswith("}"):
+        # error chunk: BYOK 结构化 error_code (JSON object) 升入 data；
+        # 普通字符串 error_msg 兜底为 {message, code='stream_error'}，避免 FE
+        # 收到 {data: {}} 丢失 "用户中止" / "被新请求取代" 等错误文本。
+        if not content:
+            data = {}
+        else:
             try:
                 parsed = json.loads(content)
                 if isinstance(parsed, dict):
-                    data = parsed
+                    data = parsed  # BYOK 结构化路径（自带 code 字段，不被覆盖）
+                else:
+                    data = {"code": "stream_error", "message": str(parsed)}
             except (ValueError, TypeError):
-                pass
+                data = {"code": "stream_error", "message": content}
     else:
         # done / preparing / 其它已知 type 用空 data
         data = {}
