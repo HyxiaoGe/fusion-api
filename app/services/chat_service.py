@@ -56,8 +56,8 @@ class ChatService:
         if options is None:
             options = {}
 
-        # 解析模型调用参数
-        litellm_model, provider, litellm_kwargs = llm_manager.resolve_model(model_id, self.db)
+        # 解析模型调用参数（传 user_id 支持 BYOK）
+        litellm_model, provider, litellm_kwargs = llm_manager.resolve_model(model_id, self.db, user_id=user_id)
 
         # 获取模型能力（用于判断是否启用 web_search tool / vision）
         model_source = ModelSourceRepository(self.db).get_by_id(model_id)
@@ -170,6 +170,10 @@ class ChatService:
                     file_contents = self.file_repo.get_parsed_file_content(non_image_ids)
                     if file_contents:
                         lm_messages = inject_file_content(lm_messages, message, file_contents)
+            # 提取凭证来源信息，供 health 标记使用
+            _metadata = litellm_kwargs.get("metadata", {})
+            _credential_source = _metadata.get("credential_source", "system")
+            _provider_id = _metadata.get("provider_id", provider)
             return await self._handle_non_stream(
                 litellm_model,
                 model_id,
@@ -177,6 +181,9 @@ class ChatService:
                 lm_messages,
                 conversation.id,
                 options,
+                user_id=user_id,
+                credential_source=_credential_source,
+                provider_id=_provider_id,
             )
 
     def _get_or_create_conversation(
@@ -208,14 +215,37 @@ class ChatService:
         messages: List[dict],
         conversation_id: str,
         options: dict,
+        user_id: Optional[str] = None,
+        credential_source: str = "system",
+        provider_id: str = "",
     ) -> ChatResponse:
         """处理非流式响应"""
-        response = await litellm.acompletion(
-            model=litellm_model,
-            messages=messages,
-            stream=False,
-            **litellm_kwargs,
-        )
+        from app.services.error_categorizer import ErrorKind, categorize
+        from app.services.provider_health import ProviderHealthService
+        from app.services.user_credential_health import UserCredentialHealthService
+
+        try:
+            response = await litellm.acompletion(
+                model=litellm_model,
+                messages=messages,
+                stream=False,
+                **litellm_kwargs,
+            )
+            # 调用成功，更新 health 状态
+            if provider_id:
+                if credential_source == "system":
+                    ProviderHealthService(self.db).mark_success(provider_id)
+                else:
+                    UserCredentialHealthService(self.db).mark_success(user_id, provider_id)
+        except Exception as exc:
+            if provider_id:
+                kind, _msg = categorize(exc)
+                if kind in {ErrorKind.KEY_INVALID, ErrorKind.QUOTA_EXCEEDED, ErrorKind.TOS_BLOCKED}:
+                    if credential_source == "system":
+                        ProviderHealthService(self.db).mark_failure(provider_id, kind, _msg)
+                    else:
+                        UserCredentialHealthService(self.db).mark_failure(user_id, provider_id, kind, _msg)
+            raise
 
         content_text = response.choices[0].message.content or ""
         usage_data = None

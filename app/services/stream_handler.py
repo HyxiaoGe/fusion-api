@@ -13,6 +13,7 @@ from typing import AsyncGenerator, Optional
 
 import litellm
 
+from app.ai.litellm_utils import ProviderOfflineError, merge_extra_body
 from app.core.logger import app_logger as logger
 from app.db.database import SessionLocal
 from app.db.repositories import FileRepository
@@ -27,6 +28,8 @@ from app.services.chat.message_builder import (
     inject_file_content,
     is_image_file,
 )
+from app.services.error_categorizer import ErrorKind, categorize
+from app.services.provider_health import ProviderHealthService
 from app.services.stream_state_service import (
     append_chunk,
     check_lock_owner,
@@ -34,6 +37,7 @@ from app.services.stream_state_service import (
     read_stream_chunks,
 )
 from app.services.tool_handlers.base import _task_done_callback
+from app.services.user_credential_health import UserCredentialHealthService
 
 # 每 N 个 chunk 检查一次锁状态
 LOCK_CHECK_INTERVAL = 20
@@ -91,9 +95,14 @@ class StreamHandler:
             call_kwargs["tools"] = [WEB_SEARCH_TOOL]
             call_kwargs["tool_choice"] = "auto"
             if should_use_reasoning and provider == "volcengine":
-                call_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+                merge_extra_body(call_kwargs, {"thinking": {"type": "disabled"}})
 
         db = SessionLocal()
+
+        # 从 litellm_kwargs metadata 提取凭证来源信息，供 health 标记使用
+        _metadata = litellm_kwargs.get("metadata", {})
+        credential_source = _metadata.get("credential_source", "system")
+        _provider_id = _metadata.get("provider_id", provider)
 
         # agent loop 状态
         content_blocks: list = []
@@ -232,12 +241,26 @@ class StreamHandler:
                 thinking_block_id = f"blk_{uuid.uuid4().hex[:12]}"
                 text_block_id = f"blk_{uuid.uuid4().hex[:12]}"
 
-                response = await self._llm_call_with_retry(
-                    litellm_model,
-                    litellm_kwargs,
-                    messages,
-                    **call_kwargs,
-                )
+                try:
+                    response = await self._llm_call_with_retry(
+                        litellm_model,
+                        litellm_kwargs,
+                        messages,
+                        **call_kwargs,
+                    )
+                    # LLM 调用成功，更新 health 状态
+                    if credential_source == "system":
+                        ProviderHealthService(db).mark_success(_provider_id)
+                    else:
+                        UserCredentialHealthService(db).mark_success(user_id, _provider_id)
+                except Exception as _llm_exc:
+                    kind, _msg = categorize(_llm_exc)
+                    if kind in {ErrorKind.KEY_INVALID, ErrorKind.QUOTA_EXCEEDED, ErrorKind.TOS_BLOCKED}:
+                        if credential_source == "system":
+                            ProviderHealthService(db).mark_failure(_provider_id, kind, _msg)
+                        else:
+                            UserCredentialHealthService(db).mark_failure(user_id, _provider_id, kind, _msg)
+                    raise
 
                 reasoning_buf, content_buf, tool_calls_list, finish_reason, usage_data = await self._stream_round(
                     response,
@@ -430,12 +453,27 @@ class StreamHandler:
                 thinking_block_id = f"blk_{uuid.uuid4().hex[:12]}"
                 text_block_id = f"blk_{uuid.uuid4().hex[:12]}"
 
-                response = await self._llm_call_with_retry(
-                    litellm_model,
-                    litellm_kwargs,
-                    messages,
-                    **final_call_kwargs,
-                )
+                try:
+                    response = await self._llm_call_with_retry(
+                        litellm_model,
+                        litellm_kwargs,
+                        messages,
+                        **final_call_kwargs,
+                    )
+                    # 触顶总结 LLM 调用成功，更新 health 状态
+                    if credential_source == "system":
+                        ProviderHealthService(db).mark_success(_provider_id)
+                    else:
+                        UserCredentialHealthService(db).mark_success(user_id, _provider_id)
+                except Exception as _llm_exc:
+                    kind, _msg = categorize(_llm_exc)
+                    if kind in {ErrorKind.KEY_INVALID, ErrorKind.QUOTA_EXCEEDED, ErrorKind.TOS_BLOCKED}:
+                        if credential_source == "system":
+                            ProviderHealthService(db).mark_failure(_provider_id, kind, _msg)
+                        else:
+                            UserCredentialHealthService(db).mark_failure(user_id, _provider_id, kind, _msg)
+                    raise
+
                 reasoning_buf, content_buf, _, _, usage_data = await self._stream_round(
                     response,
                     conversation_id,
@@ -490,6 +528,20 @@ class StreamHandler:
                     )
                 )
                 task.add_done_callback(_task_done_callback)
+
+        except ProviderOfflineError as e:
+            logger.warning(
+                f"Provider 离线，终止生成: conv_id={conversation_id}, provider={e.provider_id}, reason={e.reason}"
+            )
+            await finalize_stream(
+                conversation_id,
+                success=False,
+                error_msg=e.message or f"Provider {e.provider_id} 当前不可用",
+                error_code="PROVIDER_OFFLINE",
+                error_data={"provider_id": e.provider_id, "reason": e.reason},
+                task_id=task_id,
+            )
+            return
 
         except asyncio.CancelledError:
             logger.info(f"Agent 任务被取消: conv_id={conversation_id}")
