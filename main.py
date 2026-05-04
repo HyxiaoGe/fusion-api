@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
+from app.ai.litellm_utils import ProviderOfflineError
 from app.api import admin, auth, chat, files, models, prompts, providers, user_credentials
 from app.core.config import settings
 from app.core.logger import app_logger
@@ -145,6 +146,20 @@ async def api_exception_handler(request: Request, exc: ApiException):
             "code": exc.code,
             "message": exc.message,
             "data": None,
+            "request_id": getattr(request.state, "request_id", generate_request_id()),
+        },
+    )
+
+
+@app.exception_handler(ProviderOfflineError)
+async def provider_offline_handler(request: Request, exc: ProviderOfflineError):
+    """provider 离线（配额耗尽 / key 失效 / ToS 违规）→ 503，前端据此显示"去管理 Key"。"""
+    return JSONResponse(
+        status_code=503,
+        content={
+            "code": "PROVIDER_OFFLINE",
+            "message": exc.message or f"Provider {exc.provider_id} 当前不可用",
+            "data": {"provider_id": exc.provider_id, "reason": exc.reason},
             "request_id": getattr(request.state, "request_id", generate_request_id()),
         },
     )
