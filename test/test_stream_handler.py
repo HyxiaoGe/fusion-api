@@ -1,15 +1,14 @@
 """
 stream_handler 单元测试（Redis Stream 架构）
 
-测试 generate_to_redis（后台任务）和 stream_redis_as_sse（SSE 读取器）。
+测试 generate_to_redis（后台任务）和 _entry_to_sse_envelope（SSE envelope 格式化）。
 """
 
-import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.services.stream_handler import StreamHandler, stream_redis_as_sse
+from app.services.stream_handler import StreamHandler
 
 # 统一 mock Redis Stream 操作
 REDIS_MOCKS = {
@@ -120,46 +119,6 @@ class GenerateToRedisTests(unittest.IsolatedAsyncioTestCase):
 
         # DB session 被关闭
         self.mock_db.close.assert_called_once()
-
-
-class StreamRedisAsSSETests(unittest.IsolatedAsyncioTestCase):
-    async def test_formats_chunks_as_sse(self):
-        """read_stream_chunks 的输出被正确格式化为 SSE"""
-        mock_chunks = [
-            {"entry_id": "1-0", "type": "start", "content": ""},
-            {"entry_id": "2-0", "type": "reasoning", "content": "thinking", "block_id": "blk_t"},
-            {"entry_id": "3-0", "type": "answering", "content": "answer", "block_id": "blk_c"},
-            {"entry_id": "4-0", "type": "done", "content": ""},
-        ]
-
-        async def mock_reader(*args, **kwargs):
-            for chunk in mock_chunks:
-                yield chunk
-
-        with patch("app.services.stream_handler.read_stream_chunks", side_effect=mock_reader):
-            events = [event async for event in stream_redis_as_sse("conv-1", "msg-1")]
-
-        # 过滤掉 [DONE]
-        data_events = [e for e in events if not e.startswith("data: [DONE]")]
-
-        # start 被跳过，应该有 3 个数据事件（reasoning + answering + done）
-        self.assertEqual(len(data_events), 3)
-
-        # 验证 reasoning 事件
-        first = data_events[0]
-        self.assertIn("id: 2-0", first)
-        payload = json.loads(first.split("data: ")[1])
-        self.assertEqual(payload["id"], "msg-1")
-        self.assertEqual(payload["conversation_id"], "conv-1")
-        self.assertEqual(payload["choices"][0]["delta"]["content"][0]["type"], "thinking")
-
-        # 验证 done 事件
-        last_data = data_events[-1]
-        payload = json.loads(last_data.split("data: ")[1])
-        self.assertEqual(payload["choices"][0]["finish_reason"], "stop")
-
-        # 最后一条是 [DONE]
-        self.assertEqual(events[-1], "data: [DONE]\n\n")
 
 
 class SseEnvelopeFormatterTests(unittest.TestCase):

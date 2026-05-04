@@ -165,28 +165,22 @@ class ChatResponse(BaseModel):
 
 
 class StreamDelta(BaseModel):
-    """
-    SSE 每个 chunk 携带的增量内容。
-    注意：content blocks 里的 text/thinking 字段携带的是增量内容（delta），
-    不是完整内容。同一个 block 的多个 chunk 共享同一个 block id，
-    前端按 block id 拼接还原完整内容。
-    例：
-      chunk1: ThinkingBlock(id="blk_001", thinking="让我")
-      chunk2: ThinkingBlock(id="blk_001", thinking="分析一下")
-      chunk3: TextBlock(id="blk_002", text="根据")
-      chunk4: TextBlock(id="blk_002", text="你的需求")
+    """[DEPRECATED] SSE 输出已切到 {chunk_type, data} envelope（Task 8）。
+    本类待 Task 11/12 FE cut-over 后删除，期间禁止新代码引用。
     """
 
     content: Optional[List[ContentBlock]] = None
 
 
 class StreamChoice(BaseModel):
+    """[DEPRECATED] 同 StreamDelta，待 Task 11/12 后删除。"""
+
     delta: StreamDelta
     finish_reason: Optional[Literal["stop", "error"]] = None
 
 
 class StreamChunk(BaseModel):
-    """SSE 单个 chunk 的完整结构"""
+    """[DEPRECATED] 同 StreamDelta，待 Task 11/12 后删除。"""
 
     id: str  # 与最终落库的 message.id 一致
     conversation_id: str  # 会话 ID，前端据此关联消息
