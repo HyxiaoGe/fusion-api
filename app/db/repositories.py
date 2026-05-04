@@ -643,6 +643,10 @@ class ProviderRepository:
             priority=provider.priority,
             enabled=provider.enabled,
             order=order,
+            status=provider.status or "ok",
+            offline_reason=provider.offline_reason,
+            offline_message=provider.offline_message,
+            last_failure_at=provider.last_failure_at,
         )
 
 
@@ -732,7 +736,7 @@ class ModelSourceRepository:
         return True
 
     def get_providers(self) -> list:
-        """获取所有启用的 provider 列表"""
+        """获取所有启用的 provider 列表（含运行时健康状态，供前端模型选择器灰显离线 provider）"""
         provider_repo = ProviderRepository(self.db)
         providers = provider_repo.get_all(enabled=True)
         return [
@@ -740,6 +744,10 @@ class ModelSourceRepository:
                 "id": p.id,
                 "name": p.name,
                 "order": idx,
+                "status": p.status or "ok",
+                "offline_reason": p.offline_reason,
+                "offline_message": p.offline_message,
+                "last_failure_at": p.last_failure_at,
             }
             for idx, p in enumerate(providers, start=1)
         ]

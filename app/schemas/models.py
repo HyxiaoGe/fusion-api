@@ -116,15 +116,20 @@ class ModelUpdate(BaseModel):
 
 
 class ProviderBasicInfo(BaseModel):
-    """提供商基础信息（用于模型列表的筛选下拉）"""
+    """提供商基础信息（用于模型列表的筛选下拉），含运行时健康状态"""
 
     id: str
     name: str
     order: int = 0
+    # health 字段（前端模型选择器据此灰显离线 provider）
+    status: str = "ok"  # ok | offline
+    offline_reason: Optional[str] = None
+    offline_message: Optional[str] = None
+    last_failure_at: Optional[datetime] = None
 
 
 class ProviderInfo(BaseModel):
-    """提供商完整信息"""
+    """提供商完整信息（管理端用，含 auth_config 和健康状态）"""
 
     id: str
     name: str
@@ -134,6 +139,11 @@ class ProviderInfo(BaseModel):
     priority: int = 100
     enabled: bool = True
     order: int = 0
+    # health 字段
+    status: str = "ok"
+    offline_reason: Optional[str] = None
+    offline_message: Optional[str] = None
+    last_failure_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
