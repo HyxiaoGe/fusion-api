@@ -18,6 +18,7 @@ async def read_current_user(request: Request, current_user: UserModel = Depends(
         "nickname": current_user.nickname,
         "avatar": current_user.avatar,
         "system_prompt": current_user.system_prompt or "",
+        "is_superuser": bool(current_user.is_superuser),
     }
     return success(data=user_data, request_id=request.state.request_id)
 

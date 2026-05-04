@@ -129,6 +129,11 @@ def _sync_user_from_claims(db: Session, payload: dict, token: str) -> User:
     nickname = (userinfo.get("name") or "").strip() or None
     avatar = (userinfo.get("avatar_url") or "").strip() or None
 
+    # auth-service JWT 用 scopes=['admin'|'user']，没有 is_superuser claim
+    # 这里把 'admin' scope 映射成 is_superuser=True，同步到 fusion-api 本地 users 表
+    scopes = payload.get("scopes") or []
+    is_superuser = "admin" in scopes
+
     user_repo = UserRepository(db)
     social_repo = SocialAccountRepository(db)
 
@@ -150,6 +155,7 @@ def _sync_user_from_claims(db: Session, payload: dict, token: str) -> User:
                 "email": email,
                 "nickname": nickname,
                 "avatar": avatar,
+                "is_superuser": is_superuser,
             }
         )
         db.commit()
@@ -170,6 +176,9 @@ def _sync_user_from_claims(db: Session, payload: dict, token: str) -> User:
                 _build_username_seed(email, subject),
                 subject,
             )
+            should_commit = True
+        if user.is_superuser != is_superuser:
+            user.is_superuser = is_superuser
             should_commit = True
         if should_commit:
             db.commit()
