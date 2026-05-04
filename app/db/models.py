@@ -29,6 +29,7 @@ class User(Base):
     mobile = Column(String, nullable=True)
     email = Column(String, unique=True, index=True, nullable=True)
     system_prompt = Column(Text, nullable=False, default="", server_default="")
+    is_superuser = Column(Boolean, nullable=False, server_default="false", default=False)
     created_at = Column(DateTime, default=get_china_time)
     updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
 
@@ -148,6 +149,14 @@ class Provider(Base):
     custom_base_url = Column(Boolean, default=False)  # 是否需要自定义 base_url
     priority = Column(Integer, default=100)
     enabled = Column(Boolean, default=True)
+
+    # health 字段
+    status = Column(String, nullable=False, server_default="ok")  # ok | offline
+    offline_reason = Column(String, nullable=True)  # key_invalid | quota_exceeded | tos_blocked | other
+    offline_message = Column(Text, nullable=True)
+    consecutive_failures = Column(Integer, nullable=False, server_default="0")
+    last_failure_at = Column(DateTime, nullable=True)
+    last_failure_kind = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=get_china_time)
     updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
@@ -284,3 +293,21 @@ class AgentStep(Base):
     created_at = Column(DateTime, default=get_china_time)
 
     __table_args__ = (UniqueConstraint("trace_id", "step_number", name="uq_trace_step"),)
+
+
+class UserCredential(Base):
+    __tablename__ = "user_credentials"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    provider_id = Column(String, ForeignKey("providers.id", ondelete="CASCADE"), nullable=False)
+    api_key = Column(Text, nullable=False)  # Fernet 加密密文
+    is_active = Column(Boolean, nullable=False, default=True, server_default="true")
+    last_error_kind = Column(String, nullable=True)
+    last_error_message = Column(Text, nullable=True)
+    last_failure_at = Column(DateTime, nullable=True)
+    consecutive_failures = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(DateTime, default=get_china_time)
+    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
+
+    __table_args__ = (UniqueConstraint("user_id", "provider_id", name="uq_user_credentials_user_provider"),)
