@@ -1,13 +1,14 @@
 """agent_event 协议 — 10 个事件模型 + 共享 envelope."""
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class AgentEventBase(BaseModel):
     """所有 agent_event 的共享 envelope 字段."""
+    model_config = ConfigDict(extra="forbid")
     type: str
     run_id: str
     parent_run_id: str | None = None
@@ -83,7 +84,8 @@ class RunCompleted(AgentEventBase):
     finish_reason: Literal["stop", "limit_reached"]
 
 
-AnyAgentEvent = (
+AnyAgentEvent = Annotated[
     RunStarted | StepStarted | ToolCallStarted | ToolCallDelta | ToolCallCompleted
-    | StepCompleted | RunLimitReached | RunInterrupted | RunFailed | RunCompleted
-)
+    | StepCompleted | RunLimitReached | RunInterrupted | RunFailed | RunCompleted,
+    Field(discriminator="type"),
+]

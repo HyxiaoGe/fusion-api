@@ -1,6 +1,8 @@
 """agent.events 模型测试"""
 import unittest
 
+from pydantic import ValidationError
+
 from app.services.agent.events import (
     AgentEventBase,
     RunCompleted,
@@ -22,7 +24,7 @@ class AgentEventModelTests(unittest.TestCase):
                     sequence=0, trace_id="t1", ts=1.0)
 
     def test_envelope_required_fields(self):
-        with self.assertRaises(Exception):
+        with self.assertRaises(ValidationError):
             RunStarted(type="run_started", model="m", tools=[], config={})
 
     def test_run_started_payload(self):
@@ -39,7 +41,7 @@ class AgentEventModelTests(unittest.TestCase):
                                duration_ms=12, result_summary={"kind":"search","truncated":False},
                                **self._common())
         self.assertEqual(ev.status, "success")
-        with self.assertRaises(Exception):
+        with self.assertRaises(ValidationError):
             ToolCallCompleted(type="tool_call_completed", tool_name="x",
                               status="bogus", duration_ms=1,
                               result_summary={}, **self._common())
@@ -47,7 +49,7 @@ class AgentEventModelTests(unittest.TestCase):
     def test_run_limit_reached_reason_enum(self):
         for r in ("max_steps", "max_tool_calls", "timeout"):
             RunLimitReached(type="run_limit_reached", reason=r, **self._common())
-        with self.assertRaises(Exception):
+        with self.assertRaises(ValidationError):
             RunLimitReached(type="run_limit_reached", reason="bogus", **self._common())
 
     def test_run_completed_finish_reason_enum(self):
@@ -60,6 +62,11 @@ class AgentEventModelTests(unittest.TestCase):
         d = ev.model_dump()
         self.assertEqual(d["sequence"], 0)
         self.assertEqual(d["run_id"], "r1")
+
+    def test_extra_field_forbidden(self):
+        with self.assertRaises(ValidationError):
+            StepStarted(type="step_started", step_number=1,
+                        bogus_field="x", **self._common())
 
 
 class AgentEventExportTests(unittest.TestCase):
