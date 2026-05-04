@@ -29,11 +29,26 @@ class AgentEventModelTests(unittest.TestCase):
 
     def test_run_started_payload(self):
         ev = RunStarted(type="run_started",
-                        conversation_id="c1", model="gpt", tools=["web_search"],
+                        conversation_id="c1", message_id="msg-1",
+                        model="gpt", tools=["web_search"],
                         config={"max_steps": 8, "max_tool_calls": 20, "timeout_s": 300},
                         **self._common())
         self.assertEqual(ev.type, "run_started")
         self.assertEqual(ev.tools, ["web_search"])
+        self.assertEqual(ev.message_id, "msg-1")
+
+    def test_run_started_message_id_required(self):
+        """RunStarted 缺 message_id 必须抛 ValidationError"""
+        with self.assertRaises(ValidationError):
+            RunStarted(
+                type="run_started",
+                conversation_id="c1",
+                # message_id 漏了
+                model="gpt",
+                tools=[],
+                config={},
+                **self._common(),
+            )
 
     def test_tool_call_completed_status_enum(self):
         ev = ToolCallCompleted(type="tool_call_completed",

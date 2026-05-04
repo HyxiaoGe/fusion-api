@@ -74,11 +74,15 @@ class AgentEventEmitter:
             parent_step_id=None,
         )
 
-    async def run_started(self, *, model: str, tools: list[str],
-                          config: dict[str, Any]) -> None:
+    async def run_started(self, *, message_id: str, model: str,
+                          tools: list[str], config: dict[str, Any]) -> None:
         await self._emit(ev.RunStarted(
             type="run_started",
-            conversation_id=self._conv_id, model=model, tools=tools, config=config,
+            conversation_id=self._conv_id,
+            message_id=message_id,
+            model=model,
+            tools=tools,
+            config=config,
             **self._envelope(step_id=None),
         ))
 

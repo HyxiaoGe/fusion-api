@@ -259,6 +259,7 @@ class StreamHandler:
                 if isinstance(fn, dict) and fn.get("name"):
                     agent_tools_announced.append(fn["name"])
             await emitter.run_started(
+                message_id=assistant_message_id,
                 model=model_id,
                 tools=agent_tools_announced,
                 config={

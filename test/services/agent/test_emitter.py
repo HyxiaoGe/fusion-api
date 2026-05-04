@@ -11,7 +11,7 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
         writer = AsyncMock()
         em = AgentEventEmitter(run_id="r1", trace_id="r1",
                                conversation_id="c1", redis_writer=writer)
-        await em.run_started(model="gpt", tools=["web_search"],
+        await em.run_started(message_id="m1", model="gpt", tools=["web_search"],
                              config={"max_steps": 8})
         writer.append_chunk.assert_awaited_once()
         args, kwargs = writer.append_chunk.call_args
@@ -21,6 +21,7 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args[2]["sequence"], 0)
         self.assertEqual(args[2]["run_id"], "r1")
         self.assertEqual(args[2]["trace_id"], "r1")
+        self.assertEqual(args[2]["message_id"], "m1")
 
     async def test_step_started_returns_step_id_and_persists_context(self):
         writer = AsyncMock()

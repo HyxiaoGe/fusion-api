@@ -23,6 +23,7 @@ class AgentEventBase(BaseModel):
 class RunStarted(AgentEventBase):
     type: Literal["run_started"]
     conversation_id: str
+    message_id: str
     model: str
     tools: list[str]
     config: dict[str, Any]
