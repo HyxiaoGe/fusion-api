@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -6,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session, joinedload
 
 from app.db.models import Conversation as ConversationModel
-from app.db.models import ConversationFile, File, ModelCredential, ModelSource, Provider, get_china_time
+from app.db.models import ConversationFile, File, ModelCredential, ModelSource, Provider, UserCredential, get_china_time
 from app.db.models import Message as MessageModel
 from app.db.models import SocialAccount as SocialAccountModel
 from app.db.models import User as UserModel
@@ -923,3 +924,105 @@ class ModelCredentialRepository:
             created_at=credential.created_at,
             updated_at=credential.updated_at,
         )
+
+
+class UserCredentialRepository:
+    """用户级 API Key CRUD + Fernet 加解密 + 解析（user 优先 / system 兜底）"""
+
+    def __init__(self, db: Session, encryption_key: Optional[str] = None):
+        from cryptography.fernet import Fernet
+
+        self.db = db
+        key = encryption_key or os.environ.get("CREDENTIAL_ENCRYPTION_KEY")
+        if not key:
+            raise ValueError("CREDENTIAL_ENCRYPTION_KEY 环境变量未设置")
+        self._fernet = Fernet(key.encode() if isinstance(key, str) else key)
+
+    def encrypt(self, plaintext: str) -> str:
+        return self._fernet.encrypt(plaintext.encode()).decode()
+
+    def decrypt(self, ciphertext: str) -> str:
+        return self._fernet.decrypt(ciphertext.encode()).decode()
+
+    def get(self, user_id: str, provider_id: str) -> Optional[UserCredential]:
+        return (
+            self.db.query(UserCredential)
+            .filter(UserCredential.user_id == user_id, UserCredential.provider_id == provider_id)
+            .first()
+        )
+
+    def list_by_user(self, user_id: str) -> List[UserCredential]:
+        return self.db.query(UserCredential).filter(UserCredential.user_id == user_id).all()
+
+    def upsert(self, user_id: str, provider_id: str, api_key_plaintext: str, is_active: bool = True) -> UserCredential:
+        existing = self.get(user_id, provider_id)
+        encrypted = self.encrypt(api_key_plaintext)
+        if existing:
+            existing.api_key = encrypted
+            existing.is_active = is_active
+            # 重置失败状态（用户重填即视为重启）
+            existing.consecutive_failures = 0
+            existing.last_error_kind = None
+            existing.last_error_message = None
+            existing.last_failure_at = None
+            self.db.commit()
+            self.db.refresh(existing)
+            return existing
+        cred = UserCredential(
+            user_id=user_id,
+            provider_id=provider_id,
+            api_key=encrypted,
+            is_active=is_active,
+        )
+        self.db.add(cred)
+        self.db.commit()
+        self.db.refresh(cred)
+        return cred
+
+    def delete(self, user_id: str, provider_id: str) -> bool:
+        cred = self.get(user_id, provider_id)
+        if not cred:
+            return False
+        self.db.delete(cred)
+        self.db.commit()
+        return True
+
+    def resolve(self, user_id: str, provider_id: str) -> Tuple[Optional[str], str]:
+        """返回 (api_key_plaintext_or_None, source).
+
+        source='user' 表示用了用户 key；'system' 表示该 fallback 系统 key。
+        """
+        cred = self.get(user_id, provider_id)
+        if cred and cred.is_active:
+            try:
+                return self.decrypt(cred.api_key), "user"
+            except Exception:
+                return None, "system"
+        return None, "system"
+
+    def to_masked_schema(self, cred: UserCredential):
+        from app.schemas.credentials import UserCredentialInfo
+
+        plaintext = ""
+        try:
+            plaintext = self.decrypt(cred.api_key)
+        except Exception:
+            pass
+        masked = self._mask(plaintext) if plaintext else "***"
+        return UserCredentialInfo(
+            provider_id=cred.provider_id,
+            api_key_masked=masked,
+            is_active=cred.is_active,
+            last_error_kind=cred.last_error_kind,
+            last_error_message=cred.last_error_message,
+            last_failure_at=cred.last_failure_at,
+            consecutive_failures=cred.consecutive_failures,
+            created_at=cred.created_at,
+            updated_at=cred.updated_at,
+        )
+
+    @staticmethod
+    def _mask(plaintext: str) -> str:
+        if len(plaintext) <= 8:
+            return "***"
+        return plaintext[:3] + "***" + plaintext[-4:]
