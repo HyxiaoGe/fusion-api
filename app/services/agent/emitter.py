@@ -9,8 +9,19 @@ from typing import Any, Protocol
 from app.services.agent import events as ev
 from app.services.agent.sanitizer import cap_and_truncate, sanitize_arguments
 
+# Sentinel 用于 _envelope 区分"未传 step_id（用 current）"vs"显式传 None"
+_USE_CURRENT_STEP = object()
+
 
 class _RedisWriter(Protocol):
+    """emitter 的 Redis 写入抽象。
+
+    本仓库目前没有具体实现：Task 9 (stream_handler) 会提供一个 adapter，
+    把 (conv_id, chunk_type, payload: dict) 桥接到现有
+    stream_state_service.append_chunk(conv_id, chunk_type, content: str, block_id: str)
+    （payload JSON 序列化进 content，block_id 留空）。
+    单元测试用 unittest.mock.AsyncMock 满足此 Protocol。
+    """
     async def append_chunk(self, conversation_id: str, chunk_type: str,
                            payload: dict[str, Any]) -> None: ...
 
@@ -29,7 +40,13 @@ class AgentEventEmitter:
         self._lock = asyncio.Lock()
 
     async def _emit(self, event: ev.AgentEventBase) -> None:
-        """在 lock 内原子分配 sequence + ts，再 dump + write，最后递增。"""
+        """在 lock 内原子分配 sequence + ts，再 dump + write，最后递增。
+
+        依赖 Pydantic v2 默认行为：模型字段可赋值且不重新校验
+        （未启用 frozen / validate_assignment）。extra="forbid" 只拒绝额外字段，
+        不阻塞已声明字段的 mutation。若未来在 AgentEventBase 启用
+        validate_assignment，本方法的 mutation 会触发额外校验开销。
+        """
         async with self._lock:
             event.sequence = self._sequence
             event.ts = time.time()
@@ -38,14 +55,20 @@ class AgentEventEmitter:
             self._sequence += 1
 
     def _envelope(self, *, tool_call_id: str | None = None,
-                  step_id: str | None = ...) -> dict[str, Any]:
-        """构造 envelope；sequence 与 ts 用占位值，由 _emit 在 lock 内回填。"""
+                  step_id: Any = _USE_CURRENT_STEP) -> dict[str, Any]:
+        """构造 envelope 字段；sequence 与 ts 用占位值，由 _emit 在 lock 内回填。
+
+        返回的 dict 不可直接发出 — sequence/ts 必须由 _emit 在 lock 内回填，
+        否则会和真实顺序错位。
+
+        step_id 默认从 _current_step_id 派生；run-level 事件需显式传 None。
+        """
         return dict(
             run_id=self._run_id,
             trace_id=self._trace_id,
             sequence=0,           # 占位，_emit 回填
             ts=0.0,               # 占位，_emit 回填
-            step_id=self._current_step_id if step_id is ... else step_id,
+            step_id=self._current_step_id if step_id is _USE_CURRENT_STEP else step_id,
             tool_call_id=tool_call_id,
             parent_run_id=None,
             parent_step_id=None,
