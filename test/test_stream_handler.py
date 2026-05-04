@@ -174,10 +174,13 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         # - stream_state_service.append_chunk: _AgentEventRedisWriter 写 agent_event 用
         # - finalize_stream / check_lock_owner: 防真写 Redis
         # - build_llm_messages: raw_messages 用 dict 占位，绕过真实 message 对象 schema
+        # finalize_stream mock 暴露到 self.finalize_mock，便于 test_failed_path 等用例
+        # 在 raise 之后断言 SSE 收尾已先于异常传播完成。
+        self.finalize_mock = AsyncMock()
         self._patchers = [
             patch("app.services.stream_handler.append_chunk", side_effect=_capture_append),
             patch("app.services.stream_state_service.append_chunk", side_effect=_capture_append),
-            patch("app.services.stream_handler.finalize_stream", AsyncMock()),
+            patch("app.services.stream_handler.finalize_stream", self.finalize_mock),
             patch("app.services.stream_handler.check_lock_owner", AsyncMock(return_value=True)),
             patch(
                 "app.services.stream_handler.build_llm_messages",
@@ -354,25 +357,31 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.session_statuses[-1]["status"], "interrupted")
 
     async def test_failed_path(self):
-        """LLM 抛非 Cancelled 异常：发 run_failed + status='error'"""
+        """LLM 抛非 Cancelled 异常：发 run_failed + status='error' + re-raise 给上层"""
         async def _raise_runtime(*args, **kwargs):
             raise RuntimeError("upstream LLM 5xx")
 
-        # generate_to_redis 内 except Exception 块吞掉异常（不再 raise），
-        # 走 run_failed + finalize_stream，函数正常返回。
-        await self._invoke(
-            stream_round_side_effect=_raise_runtime,
-        )
+        # generate_to_redis 内 except Exception 块完成协议层 + SSE 收尾后 re-raise，
+        # 让 background task scheduler 拿到失败信号（与 CancelledError 行为对齐）。
+        with self.assertRaises(RuntimeError) as cm:
+            await self._invoke(
+                stream_round_side_effect=_raise_runtime,
+            )
+        self.assertIn("upstream LLM 5xx", str(cm.exception))
 
+        # 协议终态仍正确写入（即使 raise 也要先收尾）
         events = self._agent_events()
         types = [e["type"] for e in events]
         self.assertEqual(types[0], "run_started")
         self.assertIn("run_failed", types)
-        # 最后一个 agent_event 是 run_failed
         run_failed = [e for e in events if e["type"] == "run_failed"][0]
         self.assertIn("upstream LLM 5xx", run_failed["message"])
+
         # session 终态
         self.assertEqual(self.session_statuses[-1]["status"], "error")
+
+        # SSE finalize 已被调（finalize_stream 在 raise 之前完成）
+        self.finalize_mock.assert_awaited()
 
     async def test_limit_reached_max_steps(self):
         """触顶 max_steps：发 run_limit_reached(max_steps) → 强制总结 → run_completed(limit_reached)"""

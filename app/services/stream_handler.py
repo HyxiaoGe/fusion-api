@@ -707,6 +707,9 @@ class StreamHandler:
             except Exception as _emit_exc:  # noqa: BLE001
                 logger.warning(f"emit run_failed 失败: {_emit_exc}")
             await finalize_stream(conversation_id, success=False, error_msg=str(e), task_id=task_id)
+            # 完成协议层 + DB cache + SSE 收尾后 re-raise，让 background task scheduler 拿到失败信号；
+            # 与 CancelledError 路径行为对齐（spec §5.3）。
+            raise
 
         finally:
             # 兜底：极端路径（例如未匹配任何 except 又没走 try 终段）补一次终态
