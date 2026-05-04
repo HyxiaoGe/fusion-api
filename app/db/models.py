@@ -253,7 +253,7 @@ class AgentSession(Base):
     total_tool_calls = Column(Integer, default=0)
     total_duration_ms = Column(Integer, nullable=True)
 
-    status = Column(String(20), nullable=False)  # "completed" | "limit_reached" | "error"
+    status = Column(String(20), nullable=False)  # "running" | "completed" | "limit_reached" | "error" | "interrupted"
     limit_reason = Column(String(30), nullable=True)  # "max_steps" | "max_tool_calls" | "timeout"
     error_message = Column(Text, nullable=True)
 
@@ -268,6 +268,8 @@ class AgentStep(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     trace_id = Column(String, nullable=False, index=True)
     step_number = Column(Integer, nullable=False)
+
+    status = Column(String(20), nullable=False, server_default="completed")  # "running" | "completed" | "failed" | "interrupted"
 
     tool_calls_count = Column(Integer, default=0)
     tool_names = Column(JSONB, nullable=True)  # ["web_search", "url_read"]
