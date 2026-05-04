@@ -99,3 +99,19 @@ class UrlReadHandler(BaseToolHandler):
         parts.append("\n请基于以上网页内容回答用户的问题。")
 
         return "\n".join(parts)
+
+    def _build_result_summary(self, result: ToolResult) -> dict:
+        """URL 读取轻量摘要：title + favicon。
+
+        emitter.tool_call_completed 内部还会经 cap_and_truncate(1024) 兜底。
+        """
+        if result.status != "success":
+            return {"kind": "url_read", "truncated": False}
+        data = result.data or {}
+        return {
+            "kind": "url_read",
+            "title": data.get("title", ""),
+            "favicon": data.get("favicon"),
+            "count": 1,
+            "truncated": False,
+        }

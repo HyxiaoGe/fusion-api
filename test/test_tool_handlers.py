@@ -69,6 +69,43 @@ class WebSearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(block.type, "search")
         self.assertEqual(len(block.sources), 1)
 
+    def test_build_result_summary_success(self):
+        from app.schemas.chat import SearchSource
+        from app.services.tool_handlers.web_search import WebSearchHandler
+
+        handler = WebSearchHandler()
+        sources = [
+            SearchSource(title="标题1", url="https://example.com/1",
+                         description="d1", content="c1", favicon="https://example.com/fav.ico"),
+            SearchSource(title="标题2", url="https://example.com/2",
+                         description="d2", content="c2"),
+        ]
+        result = ToolResult(status="success", data={"query": "q", "sources": sources, "result_count": 2})
+        summary = handler._build_result_summary(result)
+        self.assertEqual(summary["kind"], "search")
+        self.assertEqual(summary["title"], "标题1")
+        self.assertEqual(summary["count"], 2)
+        self.assertEqual(summary["favicon"], "https://example.com/fav.ico")
+        self.assertFalse(summary["truncated"])
+
+    def test_build_result_summary_empty_sources(self):
+        from app.services.tool_handlers.web_search import WebSearchHandler
+
+        handler = WebSearchHandler()
+        result = ToolResult(status="success", data={"query": "q", "sources": [], "result_count": 0})
+        summary = handler._build_result_summary(result)
+        self.assertEqual(summary["count"], 0)
+        self.assertEqual(summary["title"], "")
+        self.assertIsNone(summary["favicon"])
+
+    def test_build_result_summary_failed_status(self):
+        from app.services.tool_handlers.web_search import WebSearchHandler
+
+        handler = WebSearchHandler()
+        result = ToolResult(status="failed", data={}, error_message="boom")
+        summary = handler._build_result_summary(result)
+        self.assertEqual(summary, {"kind": "search", "truncated": False})
+
 
 class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -158,6 +195,31 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(block.type, "url_read")
         self.assertEqual(block.url, "https://example.com")
         self.assertEqual(block.title, "Example")
+
+    def test_build_result_summary_success(self):
+        from app.services.tool_handlers.url_read import UrlReadHandler
+
+        handler = UrlReadHandler()
+        result = ToolResult(status="success", data={
+            "url": "https://example.com",
+            "title": "页面标题",
+            "favicon": "https://example.com/fav.ico",
+            "content": "...",
+        })
+        summary = handler._build_result_summary(result)
+        self.assertEqual(summary["kind"], "url_read")
+        self.assertEqual(summary["title"], "页面标题")
+        self.assertEqual(summary["count"], 1)
+        self.assertEqual(summary["favicon"], "https://example.com/fav.ico")
+        self.assertFalse(summary["truncated"])
+
+    def test_build_result_summary_failed_status(self):
+        from app.services.tool_handlers.url_read import UrlReadHandler
+
+        handler = UrlReadHandler()
+        result = ToolResult(status="failed", data={"url": "x"}, error_message="boom")
+        summary = handler._build_result_summary(result)
+        self.assertEqual(summary, {"kind": "url_read", "truncated": False})
 
 
 class ExecuteWithEmitterTests(unittest.IsolatedAsyncioTestCase):

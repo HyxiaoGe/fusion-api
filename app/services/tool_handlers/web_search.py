@@ -94,3 +94,20 @@ class WebSearchHandler(BaseToolHandler):
         parts.append("- 直接回答问题，不要再发起搜索或输出任何工具调用指令")
 
         return "\n".join(parts)
+
+    def _build_result_summary(self, result: ToolResult) -> dict:
+        """搜索结果轻量摘要：命中数 + 首条标题/favicon。
+
+        emitter.tool_call_completed 内部还会经 cap_and_truncate(1024) 兜底。
+        """
+        if result.status != "success":
+            return {"kind": "search", "truncated": False}
+        sources = (result.data or {}).get("sources") or []
+        first = sources[0] if sources else None
+        return {
+            "kind": "search",
+            "title": getattr(first, "title", "") if first else "",
+            "count": len(sources),
+            "favicon": getattr(first, "favicon", None) if first else None,
+            "truncated": False,
+        }
