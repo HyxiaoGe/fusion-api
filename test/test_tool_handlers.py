@@ -106,6 +106,16 @@ class WebSearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         summary = handler._build_result_summary(result)
         self.assertEqual(summary, {"kind": "search", "truncated": False})
 
+    def test_build_result_summary_degraded_status(self):
+        from app.services.tool_handlers.web_search import WebSearchHandler
+
+        handler = WebSearchHandler()
+        result = ToolResult(status="degraded", data={"query": "q", "sources": [], "result_count": 0},
+                            error_message="搜索返回空结果")
+        summary = handler._build_result_summary(result)
+        # degraded 与 failed 同行为：返回最小 dict
+        self.assertEqual(summary, {"kind": "search", "truncated": False})
+
 
 class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -209,9 +219,10 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
         summary = handler._build_result_summary(result)
         self.assertEqual(summary["kind"], "url_read")
         self.assertEqual(summary["title"], "页面标题")
-        self.assertEqual(summary["count"], 1)
         self.assertEqual(summary["favicon"], "https://example.com/fav.ico")
         self.assertFalse(summary["truncated"])
+        # url_read 不返回 count（单次只读 1 个 URL，无"命中数"语义）
+        self.assertNotIn("count", summary)
 
     def test_build_result_summary_failed_status(self):
         from app.services.tool_handlers.url_read import UrlReadHandler
@@ -359,6 +370,51 @@ class ExecuteWithEmitterTests(unittest.IsolatedAsyncioTestCase):
             await h.execute_with_emitter(args={}, emitter=emitter, tool_call_id="tc")
         emitter.tool_call_completed.assert_awaited_once()
         self.assertEqual(emitter.tool_call_completed.call_args.kwargs["status"], "failed")
+
+    async def test_kind_consistent_between_failed_and_exception_paths(self):
+        """同一工具：execute 返回 failed vs 抛异常，result_summary.kind 必须相同"""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.services.tool_handlers.base import BaseToolHandler, ToolResult
+
+        class _SearchLikeStub(BaseToolHandler):
+            """模拟 web_search：tool_name='web_search' 但 _build_result_summary kind='search'"""
+            tool_name = "web_search"
+            sse_event_prefix = "search"
+            _raise = False
+
+            async def execute(self, args):
+                if self._raise:
+                    raise RuntimeError("boom")
+                return ToolResult(status="failed", data={}, error_message="empty")
+
+            def _build_result_summary(self, result):
+                return {"kind": "search", "truncated": False}
+
+            def build_content_block(self, result, block_id, log_id):
+                return MagicMock()
+
+            def format_llm_context(self, result):
+                return ""
+
+        # Path 1: execute 返回 failed
+        emitter1 = AsyncMock()
+        h1 = _SearchLikeStub()
+        h1._raise = False
+        await h1.execute_with_emitter(args={}, emitter=emitter1, tool_call_id="t1")
+        summary1 = emitter1.tool_call_completed.call_args.kwargs["result_summary"]
+
+        # Path 2: execute 抛异常
+        emitter2 = AsyncMock()
+        h2 = _SearchLikeStub()
+        h2._raise = True
+        with self.assertRaises(RuntimeError):
+            await h2.execute_with_emitter(args={}, emitter=emitter2, tool_call_id="t2")
+        summary2 = emitter2.tool_call_completed.call_args.kwargs["result_summary"]
+
+        # 关键断言：两路径 kind 必须一致（之前 inline 实现会一个 "search" 一个 "web_search"）
+        self.assertEqual(summary1["kind"], summary2["kind"])
+        self.assertEqual(summary1["kind"], "search")
 
     async def test_degraded_result_passes_error_message_through(self):
         """status=degraded 时 error 字段也透传 error_message（与 failed 同行为）"""

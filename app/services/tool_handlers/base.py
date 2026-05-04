@@ -160,6 +160,10 @@ class BaseToolHandler(ABC):
         强保证：tool_call_completed 必发，即使 execute 抛异常（包括 CancelledError）
         也会先 emit failed 事件再 re-raise，避免 tool_call 永远卡在 running。
 
+        所有失败路径（execute 返回 failed/degraded、execute 抛异常）的 result_summary
+        都走子类 _build_result_summary，保证 kind 字段在 FE 看起来一致（不会出现
+        同一工具的两条失败 chunk 一个 kind="search" 另一个 kind="web_search"）。
+
         包含计时和 result_summary 自动构造。子类只需实现 execute(args) +
         可选覆盖 _build_result_summary 返回轻量 summary。
         本方法不调 push_sse_start / push_sse_complete（旧实时 chunk 已废弃）。
@@ -174,12 +178,18 @@ class BaseToolHandler(ABC):
             result = await self.execute(args)
         except BaseException as exc:  # noqa: BLE001 — 必须在 re-raise 前发 completed
             duration_ms = int((time.monotonic() - start) * 1000)
+            # 用合成 failed result 走子类 _build_result_summary，保证 kind 与失败路径一致
+            synthetic_failed = ToolResult(
+                status="failed",
+                data={},
+                error_message=f"{type(exc).__name__}: {exc}",
+            )
             await emitter.tool_call_completed(
                 tool_call_id=tool_call_id,
                 tool_name=self.tool_name,
                 status="failed",
                 duration_ms=duration_ms,
-                result_summary={"kind": self.tool_name, "truncated": False},
+                result_summary=self._build_result_summary(synthetic_failed),
                 error=f"{type(exc).__name__}: {exc}",
             )
             raise

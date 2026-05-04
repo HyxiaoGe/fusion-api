@@ -103,6 +103,8 @@ class UrlReadHandler(BaseToolHandler):
     def _build_result_summary(self, result: ToolResult) -> dict:
         """URL 读取轻量摘要：title + favicon。
 
+        不返回 count 字段：url_read 单次只读 1 个 URL，count 没有 web_search
+        那种"命中数"的有意义语义；硬编码 1 会让 FE "找到 N 条"显示矛盾。
         emitter.tool_call_completed 内部还会经 cap_and_truncate(1024) 兜底。
         """
         if result.status != "success":
@@ -112,6 +114,5 @@ class UrlReadHandler(BaseToolHandler):
             "kind": "url_read",
             "title": data.get("title", ""),
             "favicon": data.get("favicon"),
-            "count": 1,
             "truncated": False,
         }
