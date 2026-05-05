@@ -349,6 +349,12 @@ class ChatService:
         # 提取最近一轮对话内容
         dialog_content = self._build_recent_dialog_content(conversation)
 
+        fallback_questions = [
+            "您对这个主题还有其他问题吗？",
+            "您想了解更多相关信息吗？",
+            "您想要探讨这个话题的哪些方面？",
+        ]
+
         if not dialog_content:
             return ["有什么我可以帮您解答的问题吗？", "您想了解更多哪方面的信息？", "还有其他我能帮助您的事情吗？"]
 
@@ -367,18 +373,19 @@ class ChatService:
             )
             raw = response.choices[0].message.content or ""
             questions = ChatUtils.parse_questions(raw)[:3]
-
-            # 写回到最后一条 assistant 消息，刷新后随消息一起返回
-            last_msg = self.conversation_service.repo.get_last_assistant_message(conversation_id)
-            if last_msg and questions:
-                self.conversation_service.repo.update_message_suggested_questions(last_msg.id, questions)
-                self.db.commit()
-
-            return questions
-
+            if not questions:
+                questions = fallback_questions
         except Exception as e:
             logger.error(f"生成推荐问题失败: {e}")
-            return ["您对这个主题还有其他问题吗？", "您想了解更多相关信息吗？", "您想要探讨这个话题的哪些方面？"]
+            questions = fallback_questions
+
+        # 统一持久化：happy / 解析空 / except 三条路径都写 DB，刷新不丢
+        last_msg = self.conversation_service.repo.get_last_assistant_message(conversation_id)
+        if last_msg:
+            self.conversation_service.repo.update_message_suggested_questions(last_msg.id, questions)
+            self.db.commit()
+
+        return questions
 
     def _build_recent_dialog_content(self, conversation: Conversation) -> str:
         """提取最近一轮用户/助手对话内容"""
