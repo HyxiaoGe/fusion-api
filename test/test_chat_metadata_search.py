@@ -95,7 +95,6 @@ class ChatMetadataSearchTests(unittest.TestCase):
     def setUpClass(cls):
         sys.modules.pop("main", None)
         main = importlib.import_module("main")
-        main.init_db = lambda: None
 
         cls.main = main
         cls.client = TestClient(main.app)

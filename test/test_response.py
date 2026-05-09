@@ -110,7 +110,6 @@ class TestRequestIdMiddleware(unittest.TestCase):
     def setUpClass(cls):
         sys.modules.pop("main", None)
         main = importlib.import_module("main")
-        main.init_db = lambda: None
         cls.client = TestClient(main.app)
 
     def test_health_has_request_id_header(self):
@@ -129,7 +128,6 @@ class TestGlobalExceptionHandlers(unittest.TestCase):
     def setUpClass(cls):
         sys.modules.pop("main", None)
         main = importlib.import_module("main")
-        main.init_db = lambda: None
         cls.main = main
         cls.client = TestClient(main.app)
 
@@ -178,7 +176,6 @@ class TestValueErrorHandler(unittest.TestCase):
     def setUpClass(cls):
         sys.modules.pop("main", None)
         main = importlib.import_module("main")
-        main.init_db = lambda: None
         cls.main = main
         cls.client = TestClient(main.app)
 
