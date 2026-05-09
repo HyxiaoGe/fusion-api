@@ -177,6 +177,7 @@ class StreamHandler:
             )
 
             limit_reason: Optional[str] = None  # 记录触顶原因，决定后续是否走强制总结
+            unknown_terminated = False  # 雷点 3 修复：退化分支标记，决定 run_finish_reason
 
             while True:
                 # ─── 三段触顶检查（顺序：timeout > max_steps > max_tool_calls）───
@@ -394,7 +395,12 @@ class StreamHandler:
 
                     continue
 
-                # 未知 finish_reason（含 tool_calls 但 list 为空的退化情况）→ 闭合本 step 后跳出
+                # 未知 finish_reason（含 tool_calls 但 list 为空的退化情况）→ 保留已收集内容，闭合本 step 后跳出
+                if reasoning_buf:
+                    content_blocks.append(ThinkingBlock(type="thinking", id=thinking_block_id, thinking=reasoning_buf))
+                if content_buf:
+                    content_blocks.append(TextBlock(type="text", id=text_block_id, text=content_buf))
+                unknown_terminated = True
                 unknown_step_duration = int((time.time() - step_start_time) * 1000)
                 await emitter.step_completed(
                     step_number=step,
@@ -436,6 +442,7 @@ class StreamHandler:
                 text_block_id = f"blk_{uuid.uuid4().hex[:12]}"
 
                 try:
+
                     async def _do_summary():
                         # 健康标记成功路径放在内部，外层 except 仍能捕获
                         response = await llm_call_with_retry(
@@ -466,9 +473,7 @@ class StreamHandler:
                         _do_summary(), timeout=remaining
                     )
                 except asyncio.TimeoutError:
-                    logger.warning(
-                        f"触顶总结超出剩余预算: conv_id={conversation_id}, budget={remaining}s"
-                    )
+                    logger.warning(f"触顶总结超出剩余预算: conv_id={conversation_id}, budget={remaining}s")
                     reasoning_buf, content_buf, usage_data = "", "", None
                 except Exception as _llm_exc:
                     kind, _msg = categorize(_llm_exc)
@@ -509,15 +514,23 @@ class StreamHandler:
             final_usage = accumulated_usage if accumulated_usage.input_tokens > 0 else None
             persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks, final_usage)
 
-            run_finish_reason = "limit_reached" if limit_reason is not None else "stop"
+            if unknown_terminated:
+                run_finish_reason = "incomplete"
+            elif limit_reason is not None:
+                run_finish_reason = "limit_reached"
+            else:
+                run_finish_reason = "stop"
             await emitter.run_completed(
                 total_steps=step,
                 total_tool_calls=total_tool_calls,
                 finish_reason=run_finish_reason,
             )
+            session_status = (
+                "incomplete" if unknown_terminated else "limit_reached" if limit_reason is not None else "completed"
+            )
             await session_cache.write_session_status(
                 run_id=run_id,
-                status="limit_reached" if limit_reason is not None else "completed",
+                status=session_status,
                 total_steps=step,
                 total_tool_calls=total_tool_calls,
                 total_duration_ms=int((time.time() - run_start) * 1000),

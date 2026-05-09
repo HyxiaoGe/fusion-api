@@ -472,9 +472,9 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         # session 终态
         self.assertEqual(self.session_statuses[-1]["status"], "limit_reached")
 
-    async def test_tool_calls_empty_list_lock_in(self):
-        """雷点 3 lock-in: finish_reason=tool_calls + 空 tool_calls_list 退化时
-        content_buf 静默丢失。当前 buggy 行为冻结于此，修复雷点 3 时需改写为正向断言。
+    async def test_tool_calls_empty_list_preserves_content(self):
+        """雷点 3 修复后正向验证：finish_reason=tool_calls + 空 tool_calls_list 退化时，
+        content_buf 应当被 append 到 content_blocks，且 run finish_reason 报告为 incomplete。
         """
         # 截获 persist_message 最终落库时传入的 content_blocks
         persist_calls = []
@@ -496,24 +496,23 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-        # 1. 走到 run_completed（不是 run_failed / run_interrupted）
+        # 1. 走到 run_completed
         events = self._agent_events()
         run_completed_events = [e for e in events if e["type"] == "run_completed"]
         self.assertEqual(len(run_completed_events), 1)
 
-        # finish_reason 报告为 stop（buggy：退化分支没有独立 finish_reason）
-        self.assertEqual(run_completed_events[0]["finish_reason"], "stop")
+        # 修复后：finish_reason 应为 incomplete（不是 stop）
+        self.assertEqual(run_completed_events[0]["finish_reason"], "incomplete")
 
-        # 2. content_buf "Hello world" 没被 append 到 content_blocks（雷点 3：静默丢失）
+        # 2. content_buf "Hello world" 应当被保留在 content_blocks（雷点 3 修复）
         final_blocks = persist_calls[-1] if persist_calls else []
         text_blocks = [b for b in final_blocks if getattr(b, "type", None) == "text"]
         has_hello = any("Hello" in getattr(b, "text", "") for b in text_blocks)
-        self.assertFalse(
+        self.assertTrue(
             has_hello,
-            "雷点 3 lock-in: 当前 buggy 行为是 content_buf 静默丢失，落库不含该文本。"
-            "如果这条断言挂了说明雷点 3 已被修复——请把本测试改写为正向断言。",
+            "雷点 3 修复后：退化分支应保留 content_buf。"
+            "如果这条断言挂了说明修复回归，请检查 runner.py unknown 退化分支。",
         )
-
 
     async def test_limit_reached_summary_timeout_falls_through(self):
         """雷点 2 修复验证：触顶总结超时时不卡死，落库已有内容 + 走 limit_reached 收尾。
