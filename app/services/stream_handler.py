@@ -33,6 +33,7 @@ from app.services.chat.message_builder import (
 )
 from app.services.error_categorizer import ErrorKind, categorize
 from app.services.provider_health import ProviderHealthService
+from app.services.stream.persistence import persist_message, preprocess_url_in_message
 from app.services.stream_state_service import (
     append_chunk,
     check_lock_owner,
@@ -174,76 +175,14 @@ class StreamHandler:
                     if file_contents:
                         messages = inject_file_content(messages, original_message, file_contents)
 
-            # ── URL 自动检测预处理（路径 A）──
-            # 注：旧的 url_read_start / url_read_complete 实时 chunk 已删除，
-            # FE 由 agent_event 统一渲染（路径 A 直接走 LLM 上下文注入，不发事件，
-            # 因为它在 agent run 之外完成）。block 仍写入 content_blocks 以便落库。
-            url_read_content = None
-            auto_detected_url = None
-            url_read_block_id = None
-            if supports_fc:
-                import re
-
-                url_pattern = re.compile(r'https?://[^\s<>"\')\]]+')
-                urls_in_message = url_pattern.findall(original_message)
-                if urls_in_message:
-                    auto_detected_url = urls_in_message[0]
-                    url_read_block_id = f"blk_{uuid.uuid4().hex[:12]}"
-
-                    try:
-                        from app.services.reader_client import read_url
-
-                        read_result = await asyncio.wait_for(read_url(auto_detected_url, timeout=8.0), timeout=8.0)
-                    except asyncio.TimeoutError:
-                        logger.warning(f"URL 自动抓取超时: {auto_detected_url}")
-                        read_result = None
-
-                    if read_result:
-                        url_read_content = read_result
-
-            if url_read_content:
-                from app.services.tool_handlers.url_read import MAX_CONTENT_CHARS
-
-                content_text = url_read_content.content
-                truncation_note = ""
-                if len(content_text) > MAX_CONTENT_CHARS:
-                    content_text = content_text[:MAX_CONTENT_CHARS]
-                    truncation_note = "\n（内容已截断，仅展示前部分）"
-                url_context_msg = {
-                    "role": "system",
-                    "content": (
-                        f"以下是用户消息中提到的网页 {auto_detected_url} 的内容：\n"
-                        f"标题：{url_read_content.title or '未知'}\n\n"
-                        f"{content_text}{truncation_note}\n\n"
-                        "请基于以上网页内容回答用户的问题。"
-                    ),
-                }
+            # ── URL 自动检测预处理（路径 A，已抽到 services/stream/persistence）──
+            url_read_block, url_context_msg, _auto_detected_url = await preprocess_url_in_message(
+                original_message, supports_fc, call_kwargs
+            )
+            if url_context_msg:
                 messages.insert(-1, url_context_msg)
-                if (
-                    "extra_body" in call_kwargs
-                    and call_kwargs["extra_body"].get("thinking", {}).get("type") == "disabled"
-                ):
-                    del call_kwargs["extra_body"]
-            else:
-                if supports_fc:
-                    from app.ai.tools import URL_READ_TOOL
-
-                    if URL_READ_TOOL not in call_kwargs.get("tools", []):
-                        call_kwargs.setdefault("tools", []).append(URL_READ_TOOL)
-
-            # 路径 A 成功时，URL block 加入 content_blocks
-            if url_read_content and auto_detected_url:
-                from app.schemas.chat import UrlBlock
-
-                content_blocks.append(
-                    UrlBlock(
-                        type="url_read",
-                        id=url_read_block_id,
-                        url=auto_detected_url,
-                        title=url_read_content.title,
-                        favicon=url_read_content.favicon,
-                    )
-                )
+            if url_read_block:
+                content_blocks.append(url_read_block)
 
             # ═══════════════════════════════════════
             # Agent Loop
@@ -376,7 +315,7 @@ class StreamHandler:
                         )
                     if content_buf:
                         content_blocks.append(TextBlock(type="text", id=text_block_id, text=content_buf))
-                    self._persist_message(
+                    persist_message(
                         db,
                         assistant_message_id,
                         conversation_id,
@@ -461,7 +400,7 @@ class StreamHandler:
                         )
 
                     # Checkpoint：每步写入 DB，进程崩溃不丢已完成步骤
-                    self._persist_message(
+                    persist_message(
                         db, assistant_message_id, conversation_id, model_id, content_blocks, partial=True
                     )
 
@@ -590,7 +529,7 @@ class StreamHandler:
             # 最终落库 + run_completed
             # ═══════════════════════════════════════
             final_usage = accumulated_usage if accumulated_usage.input_tokens > 0 else None
-            self._persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks, final_usage)
+            persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks, final_usage)
 
             run_finish_reason = "limit_reached" if limit_reason is not None else "stop"
             await emitter.run_completed(
@@ -647,7 +586,7 @@ class StreamHandler:
         except asyncio.CancelledError:
             logger.info(f"Agent 任务被取消: conv_id={conversation_id}")
             if content_blocks:
-                self._persist_message(
+                persist_message(
                     db,
                     assistant_message_id,
                     conversation_id,
@@ -678,7 +617,7 @@ class StreamHandler:
         except Exception as e:
             logger.error(f"Agent 生成异常: conv_id={conversation_id}, error={e}")
             if content_blocks:
-                self._persist_message(
+                persist_message(
                     db,
                     assistant_message_id,
                     conversation_id,
@@ -1013,47 +952,6 @@ class StreamHandler:
         results = await asyncio.gather(*[_run_one(tc) for tc in tool_calls])
         return list(results)
 
-    # ──────────────────────────────────────────────
-    # 辅助方法
-    # ──────────────────────────────────────────────
-
-    def _persist_message(
-        self,
-        db,
-        assistant_message_id: str,
-        conversation_id: str,
-        model_id: str,
-        content_blocks: list,
-        usage_data: Optional[Usage] = None,
-        partial: bool = False,
-    ) -> None:
-        """
-        将 assistant 消息写入 PostgreSQL。
-        partial=True 时增量更新 content blocks（checkpoint），不写 usage。
-        partial=False 时写入完整数据（最终落库）。
-        """
-        try:
-            from app.db.models import Message as MessageModel
-
-            existing = db.query(MessageModel).filter_by(id=assistant_message_id).first()
-            if existing:
-                existing.content = [block.model_dump() for block in content_blocks]
-                if usage_data and not partial:
-                    existing.usage = usage_data.model_dump()
-            else:
-                db_message = MessageModel(
-                    id=assistant_message_id,
-                    conversation_id=conversation_id,
-                    role="assistant",
-                    content=[block.model_dump() for block in content_blocks],
-                    model_id=model_id,
-                    usage=usage_data.model_dump() if usage_data and not partial else None,
-                )
-                db.add(db_message)
-            db.commit()
-        except Exception as e:
-            logger.error(f"写入 assistant 消息失败: {e}")
-            db.rollback()
 
 
 # ──────────────────────────────────────────────
