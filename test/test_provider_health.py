@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.db.database import Base
 from app.db.models import Provider
 from app.services.error_categorizer import ErrorKind
-from app.services.provider_health import ProviderHealthService
+from app.services.health.provider_health import ProviderHealthService
 
 
 def fresh_db() -> Session:

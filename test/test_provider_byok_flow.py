@@ -21,8 +21,8 @@ from app.db.database import Base
 from app.db.models import ModelSource, Provider, User, UserCredential
 from app.db.repositories import UserCredentialRepository
 from app.services.error_categorizer import ErrorKind
-from app.services.provider_health import ProviderHealthService
-from app.services.user_credential_health import UserCredentialHealthService
+from app.services.health.provider_health import ProviderHealthService
+from app.services.health.user_credential_health import UserCredentialHealthService
 
 
 def fresh_db() -> Session:

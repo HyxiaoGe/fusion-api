@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from app.core.logger import app_logger as logger
 from app.db.database import SessionLocal
 from app.db.models import ModelSource, Provider
-from app.services.provider_health import ProviderHealthService
+from app.services.health.provider_health import ProviderHealthService
 
 CHINA_TZ = timezone(timedelta(hours=8))
 

@@ -221,8 +221,8 @@ class ChatService:
     ) -> ChatResponse:
         """处理非流式响应"""
         from app.services.error_categorizer import ErrorKind, categorize
-        from app.services.provider_health import ProviderHealthService
-        from app.services.user_credential_health import UserCredentialHealthService
+        from app.services.health.provider_health import ProviderHealthService
+        from app.services.health.user_credential_health import UserCredentialHealthService
 
         try:
             response = await litellm.acompletion(

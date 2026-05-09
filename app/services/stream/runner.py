@@ -26,7 +26,8 @@ from app.services.chat.message_builder import (
     is_image_file,
 )
 from app.services.error_categorizer import ErrorKind, categorize
-from app.services.provider_health import ProviderHealthService
+from app.services.health.provider_health import ProviderHealthService
+from app.services.health.user_credential_health import UserCredentialHealthService
 from app.services.stream.llm_stream import llm_call_with_retry, stream_round
 from app.services.stream.persistence import persist_message, preprocess_url_in_message
 from app.services.stream.tool_executor import AgentEventRedisWriter, execute_tools_parallel
@@ -34,7 +35,6 @@ from app.services.stream_state_service import (
     append_chunk,
     finalize_stream,
 )
-from app.services.user_credential_health import UserCredentialHealthService
 
 # Agent Loop 限制
 AGENT_MAX_STEPS = 8  # LLM 调用轮次上限

@@ -3,7 +3,7 @@
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.services.reader_client import read_url
+from app.services.external.reader_client import read_url
 
 
 class ReadUrlTests(unittest.IsolatedAsyncioTestCase):
@@ -26,7 +26,7 @@ class ReadUrlTests(unittest.IsolatedAsyncioTestCase):
         mock_client.__aexit__ = AsyncMock(return_value=False)
         mock_client.get = AsyncMock(return_value=mock_resp)
 
-        with patch("app.services.reader_client.httpx.AsyncClient", return_value=mock_client):
+        with patch("app.services.external.reader_client.httpx.AsyncClient", return_value=mock_client):
             result = await read_url("https://example.com")
 
         self.assertIsNotNone(result)
@@ -41,7 +41,7 @@ class ReadUrlTests(unittest.IsolatedAsyncioTestCase):
         mock_client.__aexit__ = AsyncMock(return_value=False)
         mock_client.get = AsyncMock(side_effect=Exception("connection refused"))
 
-        with patch("app.services.reader_client.httpx.AsyncClient", return_value=mock_client):
+        with patch("app.services.external.reader_client.httpx.AsyncClient", return_value=mock_client):
             result = await read_url("https://example.com")
 
         self.assertIsNone(result)
@@ -55,7 +55,7 @@ class ReadUrlTests(unittest.IsolatedAsyncioTestCase):
         mock_client.__aexit__ = AsyncMock(return_value=False)
         mock_client.get = AsyncMock(side_effect=real_httpx.TimeoutException("timeout"))
 
-        with patch("app.services.reader_client.httpx.AsyncClient", return_value=mock_client):
+        with patch("app.services.external.reader_client.httpx.AsyncClient", return_value=mock_client):
             result = await read_url("https://example.com")
 
         self.assertIsNone(result)

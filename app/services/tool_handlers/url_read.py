@@ -5,7 +5,7 @@ UrlReadHandler — 网页读取工具处理器
 import time
 
 from app.schemas.chat import UrlBlock
-from app.services.reader_client import read_url
+from app.services.external.reader_client import read_url
 from app.services.tool_handlers.base import BaseToolHandler, ToolResult
 
 # 注入 LLM 上下文时的最大字符数（约 4000 token）

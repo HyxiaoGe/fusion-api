@@ -8,7 +8,7 @@ from app.db.database import get_db
 from app.db.models import User as UserModel
 from app.db.repositories import ProviderRepository
 from app.schemas.response import success
-from app.services.provider_health import ProviderHealthService
+from app.services.health.provider_health import ProviderHealthService
 
 router = APIRouter()
 

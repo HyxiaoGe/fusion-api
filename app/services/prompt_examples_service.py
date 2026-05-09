@@ -16,7 +16,7 @@ from app.core.logger import app_logger as logger
 from app.core.redis import get_redis_pool
 from app.db.database import SessionLocal
 from app.db.models import PromptExample
-from app.services.kimi_search_service import fetch_trending_questions
+from app.services.external.kimi_search_service import fetch_trending_questions
 
 REDIS_KEY = "prompt:examples"
 REDIS_TTL = 7200  # 2 小时

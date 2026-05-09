@@ -13,7 +13,7 @@ from app.db.database import Base
 from app.db.models import Provider, User
 from app.db.repositories import UserCredentialRepository
 from app.services.error_categorizer import ErrorKind
-from app.services.user_credential_health import UserCredentialHealthService
+from app.services.health.user_credential_health import UserCredentialHealthService
 
 
 def fresh_db() -> Session:

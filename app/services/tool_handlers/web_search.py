@@ -7,7 +7,7 @@ import time
 from typing import List
 
 from app.schemas.chat import SearchBlock, SearchSource, SearchSourceSummary
-from app.services.search_client import search_web
+from app.services.external.search_client import search_web
 from app.services.tool_handlers.base import BaseToolHandler, ToolResult
 
 

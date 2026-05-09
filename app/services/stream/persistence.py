@@ -87,7 +87,7 @@ async def preprocess_url_in_message(
     url_read_block_id = f"blk_{uuid.uuid4().hex[:12]}"
 
     try:
-        from app.services.reader_client import read_url
+        from app.services.external.reader_client import read_url
 
         read_result = await asyncio.wait_for(read_url(auto_detected_url, timeout=8.0), timeout=8.0)
     except asyncio.TimeoutError:

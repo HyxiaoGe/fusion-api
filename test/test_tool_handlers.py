@@ -125,7 +125,7 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_execute_success(self):
         """读取成功返回内容"""
-        from app.services.reader_client import UrlReadResult
+        from app.services.external.reader_client import UrlReadResult
 
         mock_result = UrlReadResult(
             url="https://example.com",

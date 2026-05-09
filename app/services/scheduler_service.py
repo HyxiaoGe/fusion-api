@@ -17,8 +17,8 @@ async def start_scheduler() -> None:
     """启动定时任务调度器"""
     global _scheduler
 
+    from app.services.health.provider_probe import probe_offline_providers
     from app.services.prompt_examples_service import refresh_prompt_examples
-    from app.services.provider_probe import probe_offline_providers
 
     _scheduler = AsyncIOScheduler()
 
