@@ -515,5 +515,61 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+    async def test_limit_reached_summary_timeout_falls_through(self):
+        """雷点 2 修复验证：触顶总结超时时不卡死，落库已有内容 + 走 limit_reached 收尾。
+
+        模拟：max_tool_calls=1 触顶，触顶总结的 LLM 调用 hang 住，
+        asyncio.wait_for(remaining=2s) 超时后应 graceful 收尾，
+        emit run_limit_reached + run_completed(limit_reached)，不 raise。
+        """
+        from app.services.stream import runner as run_mod
+
+        async def _hang_forever(*_a, **_kw):
+            await asyncio.sleep(120)  # 远超 budget
+
+        tool_call = {"id": "tc1", "name": "web_search", "arguments": "{}"}
+
+        with patch.object(run_mod, "AGENT_MAX_TOOL_CALLS", 1):
+            await self._invoke(
+                stream_round_side_effect=[
+                    # 第 1 步：返回 1 个 tool_call，触发 max_tool_calls 触顶
+                    ("", "", [tool_call], "tool_calls", None),
+                    # 触顶总结的 stream_round 不会被消费（_do_summary 内部 hang 住了）
+                ],
+                execute_tools_result=[
+                    (
+                        tool_call,
+                        SimpleNamespace(
+                            status="success",
+                            error_message=None,
+                            duration_ms=10,
+                        ),
+                        None,  # handler=None → 走 else 分支
+                        "blk_x",
+                        "log_x",
+                    ),
+                ],
+                patch_extra=[
+                    # 压缩总 budget 为 2s，让 wait_for 迅速超时
+                    patch("app.services.stream.runner.AGENT_TOTAL_TIMEOUT", 2),
+                    # 覆盖 llm_call_with_retry 让触顶总结永远 hang
+                    patch(
+                        "app.services.stream.runner.llm_call_with_retry",
+                        AsyncMock(side_effect=_hang_forever),
+                    ),
+                ],
+            )
+
+        events = self._agent_events()
+        types = [e["type"] for e in events]
+        # 应当 emit run_limit_reached 然后 run_completed（不卡死、不 raise）
+        self.assertIn("run_limit_reached", types)
+        self.assertIn("run_completed", types)
+        run_completed = [e for e in events if e["type"] == "run_completed"][0]
+        self.assertEqual(run_completed["finish_reason"], "limit_reached")
+        # session 终态也应为 limit_reached
+        self.assertEqual(self.session_statuses[-1]["status"], "limit_reached")
+
+
 if __name__ == "__main__":
     unittest.main()

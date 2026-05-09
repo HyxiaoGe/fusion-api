@@ -436,17 +436,40 @@ class StreamHandler:
                 text_block_id = f"blk_{uuid.uuid4().hex[:12]}"
 
                 try:
-                    response = await llm_call_with_retry(
-                        litellm_model,
-                        litellm_kwargs,
-                        messages,
-                        **final_call_kwargs,
+                    async def _do_summary():
+                        # 健康标记成功路径放在内部，外层 except 仍能捕获
+                        response = await llm_call_with_retry(
+                            litellm_model,
+                            litellm_kwargs,
+                            messages,
+                            **final_call_kwargs,
+                        )
+                        # 触顶总结 LLM 调用成功，更新 health 状态
+                        if credential_source == "system":
+                            ProviderHealthService(db).mark_success(_provider_id)
+                        else:
+                            UserCredentialHealthService(db).mark_success(user_id, _provider_id)
+                        return await stream_round(
+                            response,
+                            conversation_id,
+                            task_id,
+                            should_use_reasoning,
+                            thinking_block_id,
+                            text_block_id,
+                            run_id=run_id,
+                            step_id=summary_step_id,
+                        )
+
+                    # 给触顶总结独立 timeout：剩余 run 预算（兜底 10s 避免负数）
+                    remaining = max(10, AGENT_TOTAL_TIMEOUT - (time.time() - run_start))
+                    reasoning_buf, content_buf, _, _, usage_data = await asyncio.wait_for(
+                        _do_summary(), timeout=remaining
                     )
-                    # 触顶总结 LLM 调用成功，更新 health 状态
-                    if credential_source == "system":
-                        ProviderHealthService(db).mark_success(_provider_id)
-                    else:
-                        UserCredentialHealthService(db).mark_success(user_id, _provider_id)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"触顶总结超出剩余预算: conv_id={conversation_id}, budget={remaining}s"
+                    )
+                    reasoning_buf, content_buf, usage_data = "", "", None
                 except Exception as _llm_exc:
                     kind, _msg = categorize(_llm_exc)
                     if kind in {ErrorKind.KEY_INVALID, ErrorKind.QUOTA_EXCEEDED, ErrorKind.TOS_BLOCKED}:
@@ -456,16 +479,6 @@ class StreamHandler:
                             UserCredentialHealthService(db).mark_failure(user_id, _provider_id, kind, _msg)
                     raise
 
-                reasoning_buf, content_buf, _, _, usage_data = await stream_round(
-                    response,
-                    conversation_id,
-                    task_id,
-                    should_use_reasoning,
-                    thinking_block_id,
-                    text_block_id,
-                    run_id=run_id,
-                    step_id=summary_step_id,
-                )
                 if usage_data:
                     accumulated_usage = Usage(
                         input_tokens=accumulated_usage.input_tokens + usage_data.input_tokens,
