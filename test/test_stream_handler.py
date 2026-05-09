@@ -247,16 +247,16 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         patch_extra: 额外 context manager 列表
         """
         with ExitStack() as stack:
-            stack.enter_context(patch.object(
-                self.handler, "_stream_round",
+            stack.enter_context(patch(
+                "app.services.stream.runner.stream_round",
                 AsyncMock(side_effect=stream_round_side_effect),
             ))
-            stack.enter_context(patch.object(
-                self.handler, "_execute_tools_parallel",
+            stack.enter_context(patch(
+                "app.services.stream.runner.execute_tools_parallel",
                 AsyncMock(return_value=execute_tools_result or []),
             ))
-            stack.enter_context(patch.object(
-                self.handler, "_llm_call_with_retry",
+            stack.enter_context(patch(
+                "app.services.stream.runner.llm_call_with_retry",
                 AsyncMock(return_value=MagicMock()),
             ))
             for cm in patch_extra or []:
