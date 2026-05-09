@@ -1,4 +1,5 @@
 aiofiles==24.1.0
+alembic==1.13.3
 anthropic==0.49.0
 fastapi==0.115.12
 httpx==0.28.1
