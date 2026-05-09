@@ -294,9 +294,7 @@ class StreamHandler:
                     )
                     # 闭合本 step：标记为 interrupted（在 run_interrupted 之前）
                     if current_step_id is not None:
-                        await session_cache.write_step_terminal(
-                            step_id=current_step_id, status="interrupted"
-                        )
+                        await session_cache.write_step_terminal(step_id=current_step_id, status="interrupted")
                     await emitter.run_interrupted(reason="superseded")
                     await session_cache.write_session_status(
                         run_id=run_id,
@@ -369,9 +367,7 @@ class StreamHandler:
                         )
 
                     # Checkpoint：每步写入 DB，进程崩溃不丢已完成步骤
-                    persist_message(
-                        db, assistant_message_id, conversation_id, model_id, content_blocks, partial=True
-                    )
+                    persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks, partial=True)
 
                     # step_completed：emitter + session_cache（step_completed 会清空 _current_step_id）
                     step_duration = int((time.time() - step_start_time) * 1000)
@@ -525,9 +521,7 @@ class StreamHandler:
             # 协议层终结事件 + cache 终态：补完 agent_event timeline，避免断尾
             try:
                 if current_step_id is not None:
-                    await session_cache.write_step_terminal(
-                        step_id=current_step_id, status="failed"
-                    )
+                    await session_cache.write_step_terminal(step_id=current_step_id, status="failed")
                 await emitter.run_failed(
                     error_code="PROVIDER_OFFLINE",
                     message=error_message,
@@ -566,9 +560,7 @@ class StreamHandler:
             # emitter / session_cache 终态：interrupted（user_cancelled）
             try:
                 if current_step_id is not None:
-                    await session_cache.write_step_terminal(
-                        step_id=current_step_id, status="interrupted"
-                    )
+                    await session_cache.write_step_terminal(step_id=current_step_id, status="interrupted")
                 await emitter.run_interrupted(reason="user_cancelled")
                 await session_cache.write_session_status(
                     run_id=run_id,
@@ -596,9 +588,7 @@ class StreamHandler:
                 )
             try:
                 if current_step_id is not None:
-                    await session_cache.write_step_terminal(
-                        step_id=current_step_id, status="failed"
-                    )
+                    await session_cache.write_step_terminal(step_id=current_step_id, status="failed")
                 await emitter.run_failed(
                     error_code=type(e).__name__,
                     message=str(e),

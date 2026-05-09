@@ -120,10 +120,7 @@ async def preprocess_url_in_message(
         ),
     }
 
-    if (
-        "extra_body" in call_kwargs
-        and call_kwargs["extra_body"].get("thinking", {}).get("type") == "disabled"
-    ):
+    if "extra_body" in call_kwargs and call_kwargs["extra_body"].get("thinking", {}).get("type") == "disabled":
         del call_kwargs["extra_body"]
 
     url_read_block = UrlBlock(

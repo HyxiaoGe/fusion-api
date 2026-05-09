@@ -29,9 +29,7 @@ class AgentEventRedisWriter:
     通过本 adapter 桥接：payload JSON 序列化进 content 字段，block_id 留空。
     """
 
-    async def append_chunk(
-        self, conversation_id: str, chunk_type: str, payload: dict
-    ) -> None:
+    async def append_chunk(self, conversation_id: str, chunk_type: str, payload: dict) -> None:
         await append_chunk(
             conversation_id,
             chunk_type,

@@ -22,11 +22,13 @@ class SseEnvelopeFormatterTests(unittest.TestCase):
     def test_agent_event_entry_to_envelope(self):
         from app.services.stream.sse_encoder import entry_to_sse_envelope as _entry_to_sse_envelope
 
-        env = _entry_to_sse_envelope({
-            "type": "agent_event",
-            "content": '{"type":"run_started","run_id":"r1","sequence":0}',
-            "block_id": "",
-        })
+        env = _entry_to_sse_envelope(
+            {
+                "type": "agent_event",
+                "content": '{"type":"run_started","run_id":"r1","sequence":0}',
+                "block_id": "",
+            }
+        )
         self.assertEqual(env["chunk_type"], "agent_event")
         self.assertEqual(env["data"]["type"], "run_started")
         self.assertEqual(env["data"]["sequence"], 0)
@@ -35,40 +37,51 @@ class SseEnvelopeFormatterTests(unittest.TestCase):
     def test_reasoning_entry_carries_run_step_ids(self):
         from app.services.stream.sse_encoder import entry_to_sse_envelope as _entry_to_sse_envelope
 
-        env = _entry_to_sse_envelope({
-            "type": "reasoning",
-            "content": "hello",
-            "block_id": "b1",
-            "run_id": "r1",
-            "step_id": "s1",
-        })
+        env = _entry_to_sse_envelope(
+            {
+                "type": "reasoning",
+                "content": "hello",
+                "block_id": "b1",
+                "run_id": "r1",
+                "step_id": "s1",
+            }
+        )
         self.assertEqual(env["chunk_type"], "reasoning")
-        self.assertEqual(env["data"], {
-            "block_id": "b1", "delta": "hello",
-            "run_id": "r1", "step_id": "s1",
-        })
+        self.assertEqual(
+            env["data"],
+            {
+                "block_id": "b1",
+                "delta": "hello",
+                "run_id": "r1",
+                "step_id": "s1",
+            },
+        )
 
     def test_reasoning_entry_without_run_step_ids(self):
         """旧消息或缺失 run_id/step_id 时，data 不含这两键"""
         from app.services.stream.sse_encoder import entry_to_sse_envelope as _entry_to_sse_envelope
 
-        env = _entry_to_sse_envelope({
-            "type": "reasoning",
-            "content": "hello",
-            "block_id": "b1",
-        })
+        env = _entry_to_sse_envelope(
+            {
+                "type": "reasoning",
+                "content": "hello",
+                "block_id": "b1",
+            }
+        )
         self.assertEqual(env["data"], {"block_id": "b1", "delta": "hello"})
 
     def test_answering_entry(self):
         from app.services.stream.sse_encoder import entry_to_sse_envelope as _entry_to_sse_envelope
 
-        env = _entry_to_sse_envelope({
-            "type": "answering",
-            "content": "world",
-            "block_id": "b2",
-            "run_id": "r1",
-            "step_id": "s1",
-        })
+        env = _entry_to_sse_envelope(
+            {
+                "type": "answering",
+                "content": "world",
+                "block_id": "b2",
+                "run_id": "r1",
+                "step_id": "s1",
+            }
+        )
         self.assertEqual(env["chunk_type"], "answering")
         self.assertEqual(env["data"]["delta"], "world")
         self.assertEqual(env["data"]["run_id"], "r1")
@@ -95,11 +108,13 @@ class SseEnvelopeFormatterTests(unittest.TestCase):
         """BYOK 结构化 error_code: content 是 JSON 时升入 data"""
         from app.services.stream.sse_encoder import entry_to_sse_envelope as _entry_to_sse_envelope
 
-        env = _entry_to_sse_envelope({
-            "type": "error",
-            "content": '{"code":"provider_offline","message":"offline","retryable":true}',
-            "block_id": "",
-        })
+        env = _entry_to_sse_envelope(
+            {
+                "type": "error",
+                "content": '{"code":"provider_offline","message":"offline","retryable":true}',
+                "block_id": "",
+            }
+        )
         self.assertEqual(env["chunk_type"], "error")
         self.assertEqual(env["data"]["code"], "provider_offline")
         self.assertEqual(env["data"]["message"], "offline")
@@ -113,11 +128,13 @@ class SseEnvelopeFormatterTests(unittest.TestCase):
         """
         from app.services.stream.sse_encoder import entry_to_sse_envelope as _entry_to_sse_envelope
 
-        env = _entry_to_sse_envelope({
-            "type": "error",
-            "content": "用户中止",
-            "block_id": "",
-        })
+        env = _entry_to_sse_envelope(
+            {
+                "type": "error",
+                "content": "用户中止",
+                "block_id": "",
+            }
+        )
         self.assertEqual(env["chunk_type"], "error")
         self.assertEqual(env["data"], {"code": "stream_error", "message": "用户中止"})
 
@@ -125,22 +142,26 @@ class SseEnvelopeFormatterTests(unittest.TestCase):
         """error content 为空时 data 也为空"""
         from app.services.stream.sse_encoder import entry_to_sse_envelope as _entry_to_sse_envelope
 
-        env = _entry_to_sse_envelope({
-            "type": "error",
-            "content": "",
-            "block_id": "",
-        })
+        env = _entry_to_sse_envelope(
+            {
+                "type": "error",
+                "content": "",
+                "block_id": "",
+            }
+        )
         self.assertEqual(env, {"chunk_type": "error", "data": {}})
 
     def test_unknown_type_falls_back_empty_data(self):
         """未知 chunk type 不抛，返回 {chunk_type: <type>, data: {}}"""
         from app.services.stream.sse_encoder import entry_to_sse_envelope as _entry_to_sse_envelope
 
-        env = _entry_to_sse_envelope({
-            "type": "future_unknown_type",
-            "content": "anything",
-            "block_id": "x",
-        })
+        env = _entry_to_sse_envelope(
+            {
+                "type": "future_unknown_type",
+                "content": "anything",
+                "block_id": "x",
+            }
+        )
         self.assertEqual(env, {"chunk_type": "future_unknown_type", "data": {}})
 
 
@@ -161,12 +182,14 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         self.append_chunk_calls = []
 
         async def _capture_append(conversation_id, chunk_type, content, block_id, **extras):
-            self.append_chunk_calls.append({
-                "chunk_type": chunk_type,
-                "content": content,
-                "block_id": block_id,
-                **extras,
-            })
+            self.append_chunk_calls.append(
+                {
+                    "chunk_type": chunk_type,
+                    "content": content,
+                    "block_id": block_id,
+                    **extras,
+                }
+            )
             return "1-0"
 
         # mock 顶层依赖：
@@ -206,10 +229,14 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         self.session_statuses = []
 
         async def _capture_status(*, run_id, status, total_steps, total_tool_calls, **kw):
-            self.session_statuses.append({
-                "run_id": run_id, "status": status,
-                "total_steps": total_steps, "total_tool_calls": total_tool_calls,
-            })
+            self.session_statuses.append(
+                {
+                    "run_id": run_id,
+                    "status": status,
+                    "total_steps": total_steps,
+                    "total_tool_calls": total_tool_calls,
+                }
+            )
 
         # session_cache 写入全部 mock 掉，避免命中真 SQLAlchemy 路径；
         # write_session_status 用 side_effect 捕获参数。
@@ -238,8 +265,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                 events.append(json.loads(call["content"]))
         return events
 
-    async def _invoke(self, *, stream_round_side_effect, execute_tools_result=None,
-                      patch_extra=None):
+    async def _invoke(self, *, stream_round_side_effect, execute_tools_result=None, patch_extra=None):
         """通用启动器：mock _stream_round + _execute_tools_parallel 后跑 generate_to_redis。
 
         stream_round_side_effect: callable 或 list；list 时按序消费每次 _stream_round 返回值
@@ -247,18 +273,24 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         patch_extra: 额外 context manager 列表
         """
         with ExitStack() as stack:
-            stack.enter_context(patch(
-                "app.services.stream.runner.stream_round",
-                AsyncMock(side_effect=stream_round_side_effect),
-            ))
-            stack.enter_context(patch(
-                "app.services.stream.runner.execute_tools_parallel",
-                AsyncMock(return_value=execute_tools_result or []),
-            ))
-            stack.enter_context(patch(
-                "app.services.stream.runner.llm_call_with_retry",
-                AsyncMock(return_value=MagicMock()),
-            ))
+            stack.enter_context(
+                patch(
+                    "app.services.stream.runner.stream_round",
+                    AsyncMock(side_effect=stream_round_side_effect),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "app.services.stream.runner.execute_tools_parallel",
+                    AsyncMock(return_value=execute_tools_result or []),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "app.services.stream.runner.llm_call_with_retry",
+                    AsyncMock(return_value=MagicMock()),
+                )
+            )
             for cm in patch_extra or []:
                 stack.enter_context(cm)
 
@@ -289,9 +321,15 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
 
         events = self._agent_events()
         types = [e["type"] for e in events]
-        self.assertEqual(types, [
-            "run_started", "step_started", "step_completed", "run_completed",
-        ])
+        self.assertEqual(
+            types,
+            [
+                "run_started",
+                "step_started",
+                "step_completed",
+                "run_completed",
+            ],
+        )
         # sequence 严格连续 0..3
         seqs = [e["sequence"] for e in events]
         self.assertEqual(seqs, [0, 1, 2, 3])
@@ -341,6 +379,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancelled_path(self):
         """CancelledError 路径：发 run_interrupted + status='interrupted'"""
+
         async def _raise_cancel(*args, **kwargs):
             raise asyncio.CancelledError()
 
@@ -358,6 +397,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_path(self):
         """LLM 抛非 Cancelled 异常：发 run_failed + status='error' + re-raise 给上层"""
+
         async def _raise_runtime(*args, **kwargs):
             raise RuntimeError("upstream LLM 5xx")
 
@@ -421,7 +461,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
 
         # 触顶后还有强制总结的 step_started + step_completed
         limit_idx = types.index("run_limit_reached")
-        post_limit = types[limit_idx + 1:]
+        post_limit = types[limit_idx + 1 :]
         self.assertIn("step_started", post_limit)
         self.assertIn("step_completed", post_limit)
 
@@ -439,8 +479,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         # 截获 persist_message 最终落库时传入的 content_blocks
         persist_calls = []
 
-        def _capture_persist(db, msg_id, conv_id, model_id, content_blocks,
-                             usage_data=None, partial=False):
+        def _capture_persist(db, msg_id, conv_id, model_id, content_blocks, usage_data=None, partial=False):
             if not partial:
                 persist_calls.append(list(content_blocks))
 
