@@ -107,6 +107,16 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Apply alembic migrations
+        run: |
+          cd ~/project/fusion
+          docker pull ghcr.io/hyxiaoge/fusion-api:${{ github.sha }}
+          docker run --rm \
+            --network postgres_default \
+            -e DATABASE_URL="${DATABASE_URL}" \
+            ghcr.io/hyxiaoge/fusion-api:${{ github.sha }} \
+            alembic upgrade head
+
       - name: Pull and restart fusion-api
         run: |
           cd ~/project/fusion
