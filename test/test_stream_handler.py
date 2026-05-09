@@ -432,6 +432,49 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         # session 终态
         self.assertEqual(self.session_statuses[-1]["status"], "limit_reached")
 
+    async def test_tool_calls_empty_list_lock_in(self):
+        """雷点 3 lock-in: finish_reason=tool_calls + 空 tool_calls_list 退化时
+        content_buf 静默丢失。当前 buggy 行为冻结于此，修复雷点 3 时需改写为正向断言。
+        """
+        # 截获 persist_message 最终落库时传入的 content_blocks
+        persist_calls = []
+
+        def _capture_persist(db, msg_id, conv_id, model_id, content_blocks,
+                             usage_data=None, partial=False):
+            if not partial:
+                persist_calls.append(list(content_blocks))
+
+        await self._invoke(
+            stream_round_side_effect=[
+                # 退化场景：content_buf 有文本，但 tool_calls_list 为空，finish_reason="tool_calls"
+                ("", "Hello world", [], "tool_calls", None),
+            ],
+            patch_extra=[
+                patch(
+                    "app.services.stream.runner.persist_message",
+                    side_effect=_capture_persist,
+                ),
+            ],
+        )
+
+        # 1. 走到 run_completed（不是 run_failed / run_interrupted）
+        events = self._agent_events()
+        run_completed_events = [e for e in events if e["type"] == "run_completed"]
+        self.assertEqual(len(run_completed_events), 1)
+
+        # finish_reason 报告为 stop（buggy：退化分支没有独立 finish_reason）
+        self.assertEqual(run_completed_events[0]["finish_reason"], "stop")
+
+        # 2. content_buf "Hello world" 没被 append 到 content_blocks（雷点 3：静默丢失）
+        final_blocks = persist_calls[-1] if persist_calls else []
+        text_blocks = [b for b in final_blocks if getattr(b, "type", None) == "text"]
+        has_hello = any("Hello" in getattr(b, "text", "") for b in text_blocks)
+        self.assertFalse(
+            has_hello,
+            "雷点 3 lock-in: 当前 buggy 行为是 content_buf 静默丢失，落库不含该文本。"
+            "如果这条断言挂了说明雷点 3 已被修复——请把本测试改写为正向断言。",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
