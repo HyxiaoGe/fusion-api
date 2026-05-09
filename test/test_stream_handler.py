@@ -13,14 +13,14 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.services.stream_handler import StreamHandler
+from app.services.stream import StreamHandler
 
 
 class SseEnvelopeFormatterTests(unittest.TestCase):
     """spec §4.6 SSE 顶层 envelope 形态测试"""
 
     def test_agent_event_entry_to_envelope(self):
-        from app.services.stream_handler import _entry_to_sse_envelope
+        from app.services.stream.sse_encoder import entry_to_sse_envelope as _entry_to_sse_envelope
 
         env = _entry_to_sse_envelope({
             "type": "agent_event",
@@ -33,7 +33,7 @@ class SseEnvelopeFormatterTests(unittest.TestCase):
         self.assertEqual(env["data"]["run_id"], "r1")
 
     def test_reasoning_entry_carries_run_step_ids(self):
-        from app.services.stream_handler import _entry_to_sse_envelope
+        from app.services.stream.sse_encoder import entry_to_sse_envelope as _entry_to_sse_envelope
 
         env = _entry_to_sse_envelope({
             "type": "reasoning",
@@ -50,7 +50,7 @@ class SseEnvelopeFormatterTests(unittest.TestCase):
 
     def test_reasoning_entry_without_run_step_ids(self):
         """旧消息或缺失 run_id/step_id 时，data 不含这两键"""
-        from app.services.stream_handler import _entry_to_sse_envelope
+        from app.services.stream.sse_encoder import entry_to_sse_envelope as _entry_to_sse_envelope
 
         env = _entry_to_sse_envelope({
             "type": "reasoning",
@@ -60,7 +60,7 @@ class SseEnvelopeFormatterTests(unittest.TestCase):
         self.assertEqual(env["data"], {"block_id": "b1", "delta": "hello"})
 
     def test_answering_entry(self):
-        from app.services.stream_handler import _entry_to_sse_envelope
+        from app.services.stream.sse_encoder import entry_to_sse_envelope as _entry_to_sse_envelope
 
         env = _entry_to_sse_envelope({
             "type": "answering",
@@ -74,26 +74,26 @@ class SseEnvelopeFormatterTests(unittest.TestCase):
         self.assertEqual(env["data"]["run_id"], "r1")
 
     def test_done_entry_empty_data(self):
-        from app.services.stream_handler import _entry_to_sse_envelope
+        from app.services.stream.sse_encoder import entry_to_sse_envelope as _entry_to_sse_envelope
 
         env = _entry_to_sse_envelope({"type": "done", "content": "", "block_id": ""})
         self.assertEqual(env, {"chunk_type": "done", "data": {}})
 
     def test_preparing_entry_empty_data(self):
-        from app.services.stream_handler import _entry_to_sse_envelope
+        from app.services.stream.sse_encoder import entry_to_sse_envelope as _entry_to_sse_envelope
 
         env = _entry_to_sse_envelope({"type": "preparing", "content": "", "block_id": ""})
         self.assertEqual(env, {"chunk_type": "preparing", "data": {}})
 
     def test_thinking_pending_entry(self):
-        from app.services.stream_handler import _entry_to_sse_envelope
+        from app.services.stream.sse_encoder import entry_to_sse_envelope as _entry_to_sse_envelope
 
         env = _entry_to_sse_envelope({"type": "thinking_pending", "content": "", "block_id": "b1"})
         self.assertEqual(env, {"chunk_type": "thinking_pending", "data": {"block_id": "b1"}})
 
     def test_error_entry_byok_structured_promoted(self):
         """BYOK 结构化 error_code: content 是 JSON 时升入 data"""
-        from app.services.stream_handler import _entry_to_sse_envelope
+        from app.services.stream.sse_encoder import entry_to_sse_envelope as _entry_to_sse_envelope
 
         env = _entry_to_sse_envelope({
             "type": "error",
@@ -111,7 +111,7 @@ class SseEnvelopeFormatterTests(unittest.TestCase):
         修复 P2：避免 finalize_stream(error_msg='用户中止' / '被新请求取代') 这类纯
         字符串 error 在 FE 端全丢成 {data: {}}。
         """
-        from app.services.stream_handler import _entry_to_sse_envelope
+        from app.services.stream.sse_encoder import entry_to_sse_envelope as _entry_to_sse_envelope
 
         env = _entry_to_sse_envelope({
             "type": "error",
@@ -123,7 +123,7 @@ class SseEnvelopeFormatterTests(unittest.TestCase):
 
     def test_error_entry_empty_content_empty_data(self):
         """error content 为空时 data 也为空"""
-        from app.services.stream_handler import _entry_to_sse_envelope
+        from app.services.stream.sse_encoder import entry_to_sse_envelope as _entry_to_sse_envelope
 
         env = _entry_to_sse_envelope({
             "type": "error",
@@ -134,7 +134,7 @@ class SseEnvelopeFormatterTests(unittest.TestCase):
 
     def test_unknown_type_falls_back_empty_data(self):
         """未知 chunk type 不抛，返回 {chunk_type: <type>, data: {}}"""
-        from app.services.stream_handler import _entry_to_sse_envelope
+        from app.services.stream.sse_encoder import entry_to_sse_envelope as _entry_to_sse_envelope
 
         env = _entry_to_sse_envelope({
             "type": "future_unknown_type",
@@ -170,7 +170,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
             return "1-0"
 
         # mock 顶层依赖：
-        # - stream_handler.append_chunk: _stream_round 写 reasoning/answering 用
+        # - stream.runner.append_chunk: _stream_round 写 reasoning/answering 用
         # - stream_state_service.append_chunk: _AgentEventRedisWriter 写 agent_event 用
         # - finalize_stream / check_lock_owner: 防真写 Redis
         # - build_llm_messages: raw_messages 用 dict 占位，绕过真实 message 对象 schema
@@ -178,12 +178,12 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         # 在 raise 之后断言 SSE 收尾已先于异常传播完成。
         self.finalize_mock = AsyncMock()
         self._patchers = [
-            patch("app.services.stream_handler.append_chunk", side_effect=_capture_append),
+            patch("app.services.stream.runner.append_chunk", side_effect=_capture_append),
             patch("app.services.stream_state_service.append_chunk", side_effect=_capture_append),
-            patch("app.services.stream_handler.finalize_stream", self.finalize_mock),
-            patch("app.services.stream_handler.check_lock_owner", AsyncMock(return_value=True)),
+            patch("app.services.stream.runner.finalize_stream", self.finalize_mock),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
             patch(
-                "app.services.stream_handler.build_llm_messages",
+                "app.services.stream.runner.build_llm_messages",
                 AsyncMock(return_value=[{"role": "user", "content": "hi"}]),
             ),
         ]
@@ -193,7 +193,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         # mock SessionLocal（generate_to_redis 内 db.add / db.query）
         self.mock_db = MagicMock()
         self.db_patchers = [
-            patch("app.services.stream_handler.SessionLocal", return_value=self.mock_db),
+            patch("app.services.stream.runner.SessionLocal", return_value=self.mock_db),
             patch(
                 "app.services.agent.session_cache.SessionLocal",
                 return_value=MagicMock(),
@@ -385,7 +385,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_limit_reached_max_steps(self):
         """触顶 max_steps：发 run_limit_reached(max_steps) → 强制总结 → run_completed(limit_reached)"""
-        from app.services import stream_handler as sh
+        from app.services.stream import runner as sh
 
         tool_call = {"id": "tc1", "name": "web_search", "arguments": '{"query":"x"}'}
 

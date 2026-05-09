@@ -14,7 +14,7 @@ from app.schemas.chat import (
 )
 from app.schemas.response import ApiException, success
 from app.services.chat_service import ChatService
-from app.services.stream_handler import stream_redis_as_sse
+from app.services.stream import stream_redis_as_sse
 from app.services.stream_state_service import cancel_stream, get_stream_meta
 from app.services.task_manager import cancel_task
 

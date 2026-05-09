@@ -29,7 +29,7 @@ from app.services.chat.utils import ChatUtils
 from app.services.conversation_service import ConversationService
 from app.services.file_service import is_image_mime
 from app.services.storage import get_storage
-from app.services.stream_handler import StreamHandler, stream_redis_as_sse
+from app.services.stream import StreamHandler, stream_redis_as_sse
 from app.services.stream_state_service import init_stream
 from app.services.task_manager import register_task
 
