@@ -6,6 +6,10 @@ line-length = 120
 select = ["E", "F", "I", "W"]
 ignore = ["E501", "E712"]
 
+[tool.ruff.lint.per-file-ignores]
+# alembic 自动生成的 migration 文件，docstring 模板里有 trailing whitespace
+"alembic/versions/*.py" = ["W291"]
+
 [tool.ruff.lint.isort]
 known-first-party = ["app"]
 
