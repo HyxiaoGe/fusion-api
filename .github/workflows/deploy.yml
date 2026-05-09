@@ -110,6 +110,9 @@ jobs:
       - name: Apply alembic migrations
         run: |
           cd ~/project/fusion
+          set -a
+          source .env
+          set +a
           docker pull ghcr.io/hyxiaoge/fusion-api:${{ github.sha }}
           docker run --rm \
             --network postgres_default \
