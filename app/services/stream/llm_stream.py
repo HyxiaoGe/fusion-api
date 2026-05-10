@@ -6,9 +6,9 @@ spec §4.2。stream_round 把 litellm streaming response 消费成
 个 chunk 检查锁所有权（被踢则提前返回 finish_reason="cancelled"）。
 """
 
-import asyncio
 from typing import Optional
 
+import backoff
 import litellm
 
 from app.core.logger import app_logger as logger
@@ -20,6 +20,14 @@ LOCK_CHECK_INTERVAL = 20
 
 # LLM 调用重试次数
 AGENT_LLM_MAX_RETRIES = 1
+
+# 可重试的错误关键字
+_LLM_RETRYABLE_KEYWORDS = ("429", "rate", "503", "502", "timeout")
+
+
+def _is_llm_error_retryable(exc: Exception) -> bool:
+    err = str(exc).lower()
+    return any(kw in err for kw in _LLM_RETRYABLE_KEYWORDS)
 
 
 async def stream_round(
@@ -138,33 +146,32 @@ async def stream_round(
     return reasoning_buf, content_buf, tool_calls_list, finish_reason, usage_data
 
 
+@backoff.on_exception(
+    backoff.constant,
+    Exception,
+    max_tries=AGENT_LLM_MAX_RETRIES + 1,
+    interval=2,
+    giveup=lambda e: not _is_llm_error_retryable(e),
+    on_backoff=lambda d: logger.warning(
+        f"LLM 调用失败（第 {d['tries']} 次），{d['wait']:.0f}s 后重试: {d['exception']}"
+    ),
+)
 async def llm_call_with_retry(
     litellm_model: str,
     litellm_kwargs: dict,
     messages: list[dict],
-    max_retries: int = AGENT_LLM_MAX_RETRIES,
     **call_kwargs,
 ):
     """带重试的 LLM 调用，返回 streaming response。
 
     可重试错误：429 / rate / 503 / 502 / timeout，固定 2s 间隔。
-    其它错误立即抛出。
+    其它错误立即抛出。重试逻辑由 @backoff.on_exception 装饰器实现。
     """
-    for attempt in range(max_retries + 1):
-        try:
-            return await litellm.acompletion(
-                model=litellm_model,
-                messages=messages,
-                stream=True,
-                stream_options={"include_usage": True},
-                **litellm_kwargs,
-                **call_kwargs,
-            )
-        except Exception as e:
-            error_str = str(e).lower()
-            is_retryable = any(kw in error_str for kw in ["429", "rate", "503", "502", "timeout"])
-            if is_retryable and attempt < max_retries:
-                logger.warning(f"LLM 调用失败（{attempt + 1}/{max_retries + 1}），2s 后重试: {e}")
-                await asyncio.sleep(2)
-                continue
-            raise
+    return await litellm.acompletion(
+        model=litellm_model,
+        messages=messages,
+        stream=True,
+        stream_options={"include_usage": True},
+        **litellm_kwargs,
+        **call_kwargs,
+    )

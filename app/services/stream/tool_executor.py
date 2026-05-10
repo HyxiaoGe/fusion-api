@@ -11,6 +11,8 @@ import time
 import uuid
 from typing import Optional
 
+import backoff
+
 from app.core.logger import app_logger as logger
 from app.services.agent.emitter import AgentEventEmitter
 from app.services.stream_state_service import append_chunk
@@ -19,6 +21,18 @@ from app.services.stream_state_service import append_chunk
 AGENT_TOOL_TIMEOUT = 30
 # 瞬时故障重试次数
 AGENT_TOOL_MAX_RETRIES = 1
+
+# 永久性错误关键字（不重试）
+_TOOL_PERMANENT_KEYWORDS = ("not_found", "invalid", "rate_limit", "400", "401", "403", "404")
+
+
+def _should_retry_tool_result(result) -> bool:
+    """决定 ToolResult 是否应该再试一次（True = 重试，False = 接受当前结果）。"""
+    if result.status == "success":
+        return False
+    err = (result.error_message or "").lower()
+    is_permanent = any(kw in err for kw in _TOOL_PERMANENT_KEYWORDS)
+    return not is_permanent
 
 
 class AgentEventRedisWriter:
@@ -38,40 +52,32 @@ class AgentEventRedisWriter:
         )
 
 
-async def execute_tool_with_retry(
-    handler,
-    args: dict,
-    max_retries: int = AGENT_TOOL_MAX_RETRIES,
-):
+@backoff.on_predicate(
+    backoff.constant,
+    predicate=_should_retry_tool_result,
+    max_tries=AGENT_TOOL_MAX_RETRIES + 1,
+    interval=1,
+    on_backoff=lambda d: logger.warning(
+        f"工具 {d['args'][0].tool_name} 执行失败（第 {d['tries']} 次），"
+        f"{d['wait']:.0f}s 后重试: {d['value'].error_message}"
+    ),
+)
+async def execute_tool_with_retry(handler, args: dict):
     """带重试的工具执行（仅瞬时故障重试），返回 ToolResult。
 
     永久性错误（not_found / invalid / 401 / 403 / 404 / 400 / rate_limit）不重试。
     超时：单次 AGENT_TOOL_TIMEOUT 秒，超时被视为可重试失败。
+    重试逻辑由 @backoff.on_predicate 装饰器实现。
     """
     from app.services.tool_handlers import ToolResult
 
-    for attempt in range(max_retries + 1):
-        try:
-            result = await asyncio.wait_for(
-                handler.execute(args),
-                timeout=AGENT_TOOL_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            result = ToolResult(status="failed", error_message="工具调用超时")
-
-        if result.status == "success":
-            return result
-
-        # 永久性错误不重试
-        err = (result.error_message or "").lower()
-        is_permanent = any(kw in err for kw in ["not_found", "invalid", "rate_limit", "400", "401", "403", "404"])
-        if is_permanent or attempt >= max_retries:
-            return result
-
-        logger.warning(f"工具 {handler.tool_name} 执行失败（{attempt + 1}/{max_retries + 1}），1s 后重试")
-        await asyncio.sleep(1)
-
-    return result
+    try:
+        return await asyncio.wait_for(
+            handler.execute(args),
+            timeout=AGENT_TOOL_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        return ToolResult(status="failed", error_message="工具调用超时")
 
 
 async def execute_tools_parallel(
