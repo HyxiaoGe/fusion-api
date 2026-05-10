@@ -71,9 +71,8 @@ jobs:
         run: |
           docker run --rm "%IMAGE_NAME%:%GITHUB_SHA%" sh -lc "pip install --no-cache-dir ruff && ruff check ."
 
-      - name: Test non-blocking while API test baseline is being cleaned up
-        continue-on-error: true
-        timeout-minutes: 3
+      - name: Run tests
+        timeout-minutes: 5
         run: |
           docker run --rm "%IMAGE_NAME%:%GITHUB_SHA%" python -m unittest discover -s test -t .
 
