@@ -2,17 +2,12 @@
 agent_logger 单元测试
 """
 
-import os
 import unittest
 from unittest.mock import MagicMock, patch
 
-# 必须在 import app.* 之前设置 env，否则 Settings() 实例化触发
-# DATABASE_URL pydantic 验证失败。其他 test 文件用相同 pattern。
-os.environ.setdefault("DATABASE_URL", "sqlite:///./fusion-test.db")
-
-from app.db.models import ToolCallLog  # noqa: E402
-from app.schemas.chat import SearchBlock, SearchSourceSummary  # noqa: E402
-from app.services.agent_logger import log_tool_call  # noqa: E402
+from app.db.models import ToolCallLog
+from app.schemas.chat import SearchBlock, SearchSourceSummary
+from app.services.agent_logger import log_tool_call
 
 
 class ToolCallLogModelTests(unittest.TestCase):
