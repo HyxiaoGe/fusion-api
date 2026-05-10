@@ -2,12 +2,17 @@
 agent_logger 单元测试
 """
 
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 
-from app.db.models import ToolCallLog
-from app.schemas.chat import SearchBlock, SearchSourceSummary
-from app.services.agent_logger import log_tool_call
+# 防御层：万一 unittest discover 没把 test/ 当 package（即没走 test/__init__.py），
+# 这里也能兜住——alphabetical 第一个加载，import app.* 时触发 Settings()。
+os.environ.setdefault("DATABASE_URL", "sqlite:///./fusion-test.db")
+
+from app.db.models import ToolCallLog  # noqa: E402
+from app.schemas.chat import SearchBlock, SearchSourceSummary  # noqa: E402
+from app.services.agent_logger import log_tool_call  # noqa: E402
 
 
 class ToolCallLogModelTests(unittest.TestCase):

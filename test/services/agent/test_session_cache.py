@@ -1,8 +1,12 @@
 """session_cache 单元测试 — mock SessionLocal 验证 ORM 操作"""
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 
-from app.services.agent.session_cache import (
+# 防御层：万一 unittest discover 没把 test/ 当 package，这里兜底
+os.environ.setdefault("DATABASE_URL", "sqlite:///./fusion-test.db")
+
+from app.services.agent.session_cache import (  # noqa: E402
     write_session_started,
     write_session_status,
     write_step_completed,
