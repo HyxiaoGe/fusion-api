@@ -82,7 +82,9 @@ class RunCompleted(AgentEventBase):
     type: Literal["run_completed"]
     total_steps: int
     total_tool_calls: int
-    finish_reason: Literal["stop", "limit_reached"]
+    # incomplete: LLM 返回 unknown finish_reason 退化时（雷点 3 修复路径），
+    # 保留已 emit 的 reasoning/content 并报 incomplete，让前端区分于正常 stop。
+    finish_reason: Literal["stop", "limit_reached", "incomplete"]
 
 
 AnyAgentEvent = Annotated[

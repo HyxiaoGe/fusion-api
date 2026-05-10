@@ -58,6 +58,7 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
                 "id": "file-1",
                 "status": "processed",
                 "processing_result": {"status": "success"},
+                "thumbnail_url": None,
             },
         )
 
@@ -139,6 +140,9 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
                 mimetype="text/plain",
                 size=12,
                 status="processed",
+                thumbnail_key=None,
+                width=None,
+                height=None,
             )
         )
         self.service.file_repo.get_conversation_files.return_value = [conversation_file]
@@ -154,6 +158,9 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
                     "mimetype": "text/plain",
                     "size": 12,
                     "status": "processed",
+                    "thumbnail_key": None,
+                    "width": None,
+                    "height": None,
                 }
             ],
         )
@@ -165,6 +172,9 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
             mimetype="application/pdf",
             size=24,
             status="parsing",
+            thumbnail_key=None,
+            width=None,
+            height=None,
         )
         self.service.file_repo.get_files_by_user_id.return_value = [file_record]
 
@@ -179,6 +189,9 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
                     "mimetype": "application/pdf",
                     "size": 24,
                     "status": "parsing",
+                    "thumbnail_key": None,
+                    "width": None,
+                    "height": None,
                 }
             ],
         )
