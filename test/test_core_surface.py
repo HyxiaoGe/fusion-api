@@ -69,8 +69,11 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         self.assertIn("/api/chat/conversations", paths)
         self.assertIn("/api/files/upload", paths)
         self.assertIn("/api/models/", paths)
-        self.assertIn("/api/models/{model_id}/credentials", paths)
-        self.assertIn("/api/models/credentials/test", paths)
+        # BYOK Phase 1 起，credentials 端点从 /api/models/{model_id}/credentials
+        # 迁移到 /api/user/credentials/{provider_id}（按 provider 维度管理）
+        self.assertIn("/api/user/credentials", paths)
+        self.assertIn("/api/user/credentials/{provider_id}", paths)
+        self.assertIn("/api/user/credentials/{provider_id}/test", paths)
 
         self.assertNotIn("/api/auth/login/{provider}", paths)
         self.assertNotIn("/api/auth/callback/{provider}", paths)
@@ -80,7 +83,8 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         self.assertNotIn("/api/digests", paths)
         self.assertNotIn("/api/web_search/search", paths)
         self.assertNotIn("/api/settings", paths)
-        self.assertNotIn("/api/prompts", paths)
+        # /api/prompts 现已存在（动态示例问题端点 GET /api/prompts/examples）
+        # 旧断言"prompts 不该出现"已过时
 
     def test_auth_me_requires_authentication(self):
         response = self.client.get("/api/auth/me")
@@ -115,6 +119,10 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         body = response.json()
         self.assertEqual(body["code"], "SUCCESS")
         self.assertEqual(body["data"]["conversation_id"], "conv-1")
+        # process_message 在 agent observability 上线后加了 trace_id 参数（每次请求唯一），
+        # 用 ANY 兼容；其余参数显式断言。
+        from unittest.mock import ANY
+
         service.process_message.assert_awaited_once_with(
             model_id="gpt-4.1",
             message="hello",
@@ -123,6 +131,7 @@ class ChatCoreSurfaceTests(unittest.TestCase):
             stream=False,
             options={"temperature": 0.3},
             file_ids=["file-1"],
+            trace_id=ANY,
         )
 
     def test_send_message_can_return_streaming_response(self):

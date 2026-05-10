@@ -1,13 +1,21 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.file_service import FileService
 
 
 class FileServiceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        # FileService.__init__ 里 get_storage() 依赖 lifespan 初始化的全局 storage，
+        # 单测里没走 lifespan，所以 patch 掉，给 service.storage 喂个 MagicMock
+        self._storage_patcher = patch(
+            "app.services.file_service.get_storage",
+            return_value=MagicMock(),
+        )
+        self._storage_patcher.start()
         self.service = FileService(MagicMock())
+        self._storage_patcher.stop()
         self.service.file_repo = MagicMock()
         self.service.file_processor = MagicMock()
         self.service.file_processor.process_files = AsyncMock()

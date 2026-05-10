@@ -48,7 +48,6 @@ def _build_in_memory_db():
     from app.db.models import (  # noqa: F401 — 确保 mapper 注册
         Conversation,
         File,
-        Memory,
         Message,
         ModelSource,
         Provider,

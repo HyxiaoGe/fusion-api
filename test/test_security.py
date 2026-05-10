@@ -14,6 +14,7 @@ class SecurityTests(unittest.TestCase):
             username="old-user",
             nickname=None,
             avatar=None,
+            is_superuser=False,
         )
         user_repo = MagicMock()
         user_repo.get.return_value = existing_user
@@ -55,6 +56,7 @@ class SecurityTests(unittest.TestCase):
             username="18889592303",
             nickname=None,
             avatar=None,
+            is_superuser=False,
         )
         user_repo = MagicMock()
         social_repo = MagicMock()

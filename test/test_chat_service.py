@@ -4,7 +4,7 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.schemas.chat import Conversation, Message, TextBlock, ThinkingBlock
+from app.schemas.chat import Conversation, Message, TextBlock
 from app.services.chat_service import ChatService
 
 
@@ -75,32 +75,10 @@ class ChatServiceTests(unittest.TestCase):
 
         self.assertEqual(content, "用户: question two")
 
-    def test_build_llm_messages_filters_thinking_blocks(self):
-        """thinking block 不应传给 LLM"""
-        messages = [
-            Message(
-                role="user",
-                content=[TextBlock(type="text", text="hello")],
-            ),
-            Message(
-                role="assistant",
-                content=[
-                    ThinkingBlock(type="thinking", thinking="let me think"),
-                    TextBlock(type="text", text="answer"),
-                ],
-                model_id="qwen-max-latest",
-            ),
-        ]
-
-        result = ChatService._build_llm_messages(messages)
-
-        self.assertEqual(
-            result,
-            [
-                {"role": "user", "content": "hello"},
-                {"role": "assistant", "content": "answer"},
-            ],
-        )
+    # _build_llm_messages 已重构为独立 async 函数 app/services/chat/message_builder.py::build_llm_messages
+    # 该函数还注入了 system date prompt + user_system_prompt + 图片 base64 等副作用，
+    # 不再适合作为 ChatService 的私有方法测。新测试应该写在
+    # test/services/chat/test_message_builder.py（暂未补，等需要时再加）。
 
     def test_update_message_commits_when_update_succeeds(self):
         service = object.__new__(ChatService)

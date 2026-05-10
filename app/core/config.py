@@ -15,8 +15,9 @@ class Settings(BaseSettings):
     # 模型配置
     DEFAULT_MODEL: str = "qwen"  # 默认使用的模型
 
-    # 数据库配置
-    DATABASE_URL: str = os.getenv("DATABASE_URL")
+    # 数据库配置（兜底空 string，避免 env 未设时 Settings() 直接 pydantic ValidationError；
+    # 测试和未带 .env 的工具脚本依赖这个兜底）
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "")
 
     # Redis 配置
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
