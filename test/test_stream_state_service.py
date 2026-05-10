@@ -1,91 +1,27 @@
 """
 流状态缓存服务单元测试（Redis Stream 版本）
 
-使用 FakeRedis mock 模拟 Redis Stream 操作。
+使用 fakeredis 模拟 Redis Stream + Lua 脚本（finalize/cancel 走 Lua eval）。
 """
 
 import unittest
 from unittest.mock import patch
 
-
-class FakeRedis:
-    """轻量级 Redis mock，模拟 String/Hash/Stream 操作"""
-
-    def __init__(self):
-        self._store = {}
-        self._streams = {}
-        self._seq = 0
-
-    async def get(self, key):
-        return self._store.get(key)
-
-    async def set(self, key, value, ex=None):
-        self._store[key] = value
-
-    async def delete(self, *keys):
-        for key in keys:
-            self._store.pop(key, None)
-            self._streams.pop(key, None)
-
-    async def hset(self, key, field=None, value=None, mapping=None):
-        if key not in self._store:
-            self._store[key] = {}
-        if mapping:
-            self._store[key].update(mapping)
-        elif field is not None:
-            self._store[key][field] = value
-
-    async def hgetall(self, key):
-        return self._store.get(key, {})
-
-    async def expire(self, key, seconds):
-        pass
-
-    async def xadd(self, key, fields):
-        if key not in self._streams:
-            self._streams[key] = []
-        self._seq += 1
-        entry_id = f"{self._seq}-0"
-        self._streams[key].append((entry_id, fields))
-        return entry_id
-
-    async def xrange(self, key, min=None, count=None):
-        entries = self._streams.get(key, [])
-        if min and min != "0":
-            entries = [(eid, f) for eid, f in entries if eid > min]
-        if count:
-            entries = entries[:count]
-        return entries
-
-    async def xrevrange(self, key, count=None):
-        entries = list(reversed(self._streams.get(key, [])))
-        if count:
-            entries = entries[:count]
-        return entries
-
-    async def xread(self, streams, block=None, count=None):
-        results = []
-        for key, last_id in streams.items():
-            entries = self._streams.get(key, [])
-            new_entries = [(eid, f) for eid, f in entries if eid > last_id]
-            if count:
-                new_entries = new_entries[:count]
-            if new_entries:
-                results.append((key, new_entries))
-        return results if results else None
-
-    async def ping(self):
-        return True
+import fakeredis.aioredis
 
 
 class TestStreamStateService(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.fake_redis = FakeRedis()
+        self.fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
         self.patcher = patch(
             "app.services.stream_state_service.get_redis_pool",
             return_value=self.fake_redis,
         )
         self.patcher.start()
+
+    async def asyncTearDown(self):
+        await self.fake_redis.flushall()
+        await self.fake_redis.aclose()
 
     def tearDown(self):
         self.patcher.stop()
@@ -120,7 +56,7 @@ class TestStreamStateService(unittest.IsolatedAsyncioTestCase):
         from app.services.stream_state_service import finalize_stream, init_stream
 
         await init_stream("conv-1", "user-1", "gpt-4", "msg-1", "task-1")
-        await finalize_stream("conv-1", success=True)
+        await finalize_stream("conv-1", success=True, task_id="task-1")
 
         entries = await self.fake_redis.xrange("stream:chunks:conv-1")
         self.assertEqual(entries[-1][1]["type"], "done")
@@ -132,7 +68,7 @@ class TestStreamStateService(unittest.IsolatedAsyncioTestCase):
 
         await init_stream("conv-1", "user-1", "gpt-4", "msg-1", "task-1")
         await append_chunk("conv-1", "answering", "部分内容", "blk-1")
-        await finalize_stream("conv-1", success=False, error_msg="LLM 超时")
+        await finalize_stream("conv-1", success=False, error_msg="LLM 超时", task_id="task-1")
 
         entries = await self.fake_redis.xrange("stream:chunks:conv-1")
         types = [e[1]["type"] for e in entries]
@@ -158,7 +94,7 @@ class TestStreamStateService(unittest.IsolatedAsyncioTestCase):
         await init_stream("conv-1", "user-1", "gpt-4", "msg-1", "task-1")
         await append_chunk("conv-1", "reasoning", "思考中", "blk-t")
         await append_chunk("conv-1", "answering", "回答", "blk-c")
-        await finalize_stream("conv-1", success=True)
+        await finalize_stream("conv-1", success=True, task_id="task-1")
 
         chunks = []
         async for chunk in read_stream_chunks("conv-1"):
