@@ -108,6 +108,9 @@ class Settings(BaseSettings):
     # 网页读取服务地址
     READER_SERVICE_URL: str = os.getenv("READER_SERVICE_URL", "http://reader-service:8091")
 
+    # 文档站点开关（生产关掉减少攻击面）
+    ENABLE_DOCS: bool = True
+
     class Config:
         env_file = ".env"
         extra = "ignore"
