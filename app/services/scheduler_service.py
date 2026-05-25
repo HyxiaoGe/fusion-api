@@ -17,7 +17,6 @@ async def start_scheduler() -> None:
     """启动定时任务调度器"""
     global _scheduler
 
-    from app.services.health.provider_probe import probe_offline_providers
     from app.services.prompt_examples_service import refresh_prompt_examples
 
     _scheduler = AsyncIOScheduler()
@@ -30,14 +29,7 @@ async def start_scheduler() -> None:
         replace_existing=True,
     )
 
-    # 每 30 min 探活 offline provider（job 内部按 offline_reason 决定是否到期，
-    # tos_blocked 24h、其他 30min — 详见 provider_probe.PROBE_INTERVALS_MINUTES）
-    _scheduler.add_job(
-        probe_offline_providers,
-        trigger=IntervalTrigger(minutes=30),
-        id="probe_offline_providers",
-        replace_existing=True,
-    )
+    # provider 健康追踪已迁移到 LiteLLM Proxy，本进程不再做探活
 
     _scheduler.start()
     logger.info("定时任务调度器已启动")

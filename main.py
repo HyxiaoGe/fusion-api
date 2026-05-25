@@ -8,8 +8,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
-from app.ai.litellm_utils import ProviderOfflineError
-from app.api import admin, auth, chat, files, models, prompts, providers, user_credentials
+from app.api import auth, chat, files, models, prompts
 from app.core.config import settings
 from app.core.logger import app_logger
 from app.core.redis import close_redis, init_redis
@@ -143,20 +142,6 @@ async def api_exception_handler(request: Request, exc: ApiException):
     )
 
 
-@app.exception_handler(ProviderOfflineError)
-async def provider_offline_handler(request: Request, exc: ProviderOfflineError):
-    """provider 离线（配额耗尽 / key 失效 / ToS 违规）→ 503，前端据此显示"去管理 Key"。"""
-    return JSONResponse(
-        status_code=503,
-        content={
-            "code": "PROVIDER_OFFLINE",
-            "message": exc.message or f"Provider {exc.provider_id} 当前不可用",
-            "data": {"provider_id": exc.provider_id, "reason": exc.reason},
-            "request_id": getattr(request.state, "request_id", generate_request_id()),
-        },
-    )
-
-
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     code_map = {
@@ -210,11 +195,8 @@ async def global_exception_handler(request: Request, exc: Exception):
 app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 app.include_router(files.router, prefix="/api/files", tags=["files"])
 app.include_router(models.router, prefix="/api/models", tags=["models"])
-app.include_router(providers.router, prefix="/api/providers", tags=["providers"])
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(prompts.router, prefix="/api/prompts", tags=["prompts"])
-app.include_router(user_credentials.router, prefix="/api/user/credentials", tags=["user-credentials"])
-app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 
 if __name__ == "__main__":
     import uvicorn

@@ -137,60 +137,6 @@ class Message(Base):
     conversation = relationship("Conversation", back_populates="messages")
 
 
-class Provider(Base):
-    """LLM 提供商表"""
-
-    __tablename__ = "providers"
-
-    id = Column(String, primary_key=True)  # 如 'openai', 'qwen'
-    name = Column(String, nullable=False)  # 显示名称
-    auth_config = Column(JSONB, nullable=False, default={})  # 认证配置模板
-    litellm_prefix = Column(String, nullable=False)  # LiteLLM 路由前缀
-    custom_base_url = Column(Boolean, default=False)  # 是否需要自定义 base_url
-    priority = Column(Integer, default=100)
-    enabled = Column(Boolean, default=True)
-
-    # health 字段
-    status = Column(String, nullable=False, server_default="ok")  # ok | offline
-    offline_reason = Column(String, nullable=True)  # key_invalid | quota_exceeded | tos_blocked | other
-    offline_message = Column(Text, nullable=True)
-    consecutive_failures = Column(Integer, nullable=False, server_default="0")
-    last_failure_at = Column(DateTime, nullable=True)
-    last_failure_kind = Column(String, nullable=True)
-    # 自动探活：每次探活后更新（不管成功失败），供 scheduler 判断是否到下次探活周期
-    last_probe_at = Column(DateTime, nullable=True)
-
-    created_at = Column(DateTime, default=get_china_time)
-    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
-
-    models = relationship("ModelSource", back_populates="provider_rel")
-
-
-class ModelSource(Base):
-    """模型数据源表"""
-
-    __tablename__ = "model_sources"
-
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    model_id = Column(String, unique=True, index=True, nullable=False)
-    name = Column(String, nullable=False)
-    provider = Column(String, ForeignKey("providers.id"), nullable=False)
-    knowledge_cutoff = Column(String, nullable=True)
-
-    capabilities = Column(JSONB, nullable=False, default={})  # 模型能力配置
-    pricing = Column(JSONB, nullable=False, default={})  # 模型定价信息
-    model_configuration = Column(JSONB, nullable=False, default={})  # 模型默认参数配置
-    priority = Column(Integer, default=100)  # 优先级，默认100，数字越小优先级越高
-
-    enabled = Column(Boolean, default=True)
-    description = Column(String, nullable=True)
-
-    created_at = Column(DateTime, default=get_china_time)
-    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
-
-    provider_rel = relationship("Provider", back_populates="models")
-
-
 class PromptExample(Base):
     """动态示例问题（由 Kimi $web_search 定时生成）"""
 
@@ -281,19 +227,3 @@ class AgentStep(Base):
     __table_args__ = (UniqueConstraint("trace_id", "step_number", name="uq_trace_step"),)
 
 
-class UserCredential(Base):
-    __tablename__ = "user_credentials"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    provider_id = Column(String, ForeignKey("providers.id", ondelete="CASCADE"), nullable=False)
-    api_key = Column(Text, nullable=False)  # Fernet 加密密文
-    is_active = Column(Boolean, nullable=False, default=True, server_default="true")
-    last_error_kind = Column(String, nullable=True)
-    last_error_message = Column(Text, nullable=True)
-    last_failure_at = Column(DateTime, nullable=True)
-    consecutive_failures = Column(Integer, nullable=False, default=0, server_default="0")
-    created_at = Column(DateTime, default=get_china_time)
-    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
-
-    __table_args__ = (UniqueConstraint("user_id", "provider_id", name="uq_user_credentials_user_provider"),)

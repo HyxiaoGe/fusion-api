@@ -7,10 +7,11 @@ import litellm
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
+from app.ai import litellm_catalog
 from app.ai.llm_manager import llm_manager
 from app.ai.prompts import prompt_manager
 from app.core.logger import app_logger as logger
-from app.db.repositories import ConversationRepository, FileRepository, ModelSourceRepository
+from app.db.repositories import ConversationRepository, FileRepository
 from app.schemas.chat import (
     ChatResponse,
     Conversation,
@@ -56,12 +57,11 @@ class ChatService:
         if options is None:
             options = {}
 
-        # 解析模型调用参数（传 user_id 支持 BYOK）
-        litellm_model, provider, litellm_kwargs = llm_manager.resolve_model(model_id, self.db, user_id=user_id)
+        # 解析模型调用参数（薄代理 LiteLLM，不再走本地 DB）
+        litellm_model, provider, litellm_kwargs = llm_manager.resolve_model(model_id)
 
-        # 获取模型能力（用于判断是否启用 web_search tool / vision）
-        model_source = ModelSourceRepository(self.db).get_by_id(model_id)
-        capabilities = model_source.capabilities if model_source else {}
+        # 模型能力来自 LiteLLM metadata（vision / functionCalling 影响消息构造和工具开关）
+        capabilities = litellm_catalog.get_capabilities(model_id)
         has_vision = capabilities.get("vision", False)
 
         # 获取或创建会话
@@ -170,10 +170,6 @@ class ChatService:
                     file_contents = self.file_repo.get_parsed_file_content(non_image_ids)
                     if file_contents:
                         lm_messages = inject_file_content(lm_messages, message, file_contents)
-            # 提取凭证来源信息，供 health 标记使用
-            _metadata = litellm_kwargs.get("metadata", {})
-            _credential_source = _metadata.get("credential_source", "system")
-            _provider_id = _metadata.get("provider_id", provider)
             return await self._handle_non_stream(
                 litellm_model,
                 model_id,
@@ -181,9 +177,6 @@ class ChatService:
                 lm_messages,
                 conversation.id,
                 options,
-                user_id=user_id,
-                credential_source=_credential_source,
-                provider_id=_provider_id,
             )
 
     def _get_or_create_conversation(
@@ -215,37 +208,14 @@ class ChatService:
         messages: List[dict],
         conversation_id: str,
         options: dict,
-        user_id: Optional[str] = None,
-        credential_source: str = "system",
-        provider_id: str = "",
     ) -> ChatResponse:
-        """处理非流式响应"""
-        from app.services.error_categorizer import ErrorKind, categorize
-        from app.services.health.provider_health import ProviderHealthService
-        from app.services.health.user_credential_health import UserCredentialHealthService
-
-        try:
-            response = await litellm.acompletion(
-                model=litellm_model,
-                messages=messages,
-                stream=False,
-                **litellm_kwargs,
-            )
-            # 调用成功，更新 health 状态
-            if provider_id:
-                if credential_source == "system":
-                    ProviderHealthService(self.db).mark_success(provider_id)
-                else:
-                    UserCredentialHealthService(self.db).mark_success(user_id, provider_id)
-        except Exception as exc:
-            if provider_id:
-                kind, _msg = categorize(exc)
-                if kind in {ErrorKind.KEY_INVALID, ErrorKind.QUOTA_EXCEEDED, ErrorKind.TOS_BLOCKED}:
-                    if credential_source == "system":
-                        ProviderHealthService(self.db).mark_failure(provider_id, kind, _msg)
-                    else:
-                        UserCredentialHealthService(self.db).mark_failure(user_id, provider_id, kind, _msg)
-            raise
+        """处理非流式响应（LiteLLM Proxy 自己管 health / 重试）。"""
+        response = await litellm.acompletion(
+            model=litellm_model,
+            messages=messages,
+            stream=False,
+            **litellm_kwargs,
+        )
 
         content_text = response.choices[0].message.content or ""
         usage_data = None
@@ -275,9 +245,9 @@ class ChatService:
     def _resolve_utility_model(self, conversation_model_id: str) -> tuple:
         """解析辅助功能模型，固定用轻量模型，找不到则回退对话模型"""
         try:
-            return llm_manager.resolve_model(self.UTILITY_MODEL_ID, self.db)
+            return llm_manager.resolve_model(self.UTILITY_MODEL_ID)
         except ValueError:
-            return llm_manager.resolve_model(conversation_model_id, self.db)
+            return llm_manager.resolve_model(conversation_model_id)
 
     async def generate_title(
         self,

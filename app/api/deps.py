@@ -11,12 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.security import get_current_user  # noqa: F401 — re-export
 from app.db.database import get_db  # noqa: F401 — re-export
 from app.db.models import User as UserModel
-from app.db.repositories import (
-    ModelSourceRepository,
-    ProviderRepository,
-    UserCredentialRepository,
-    UserRepository,
-)
+from app.db.repositories import UserRepository
 from app.services.chat_service import ChatService
 from app.services.file_service import FileService
 
@@ -29,20 +24,8 @@ def get_file_service(db: Session = Depends(get_db)) -> FileService:
     return FileService(db)
 
 
-def get_provider_repo(db: Session = Depends(get_db)) -> ProviderRepository:
-    return ProviderRepository(db)
-
-
-def get_model_source_repo(db: Session = Depends(get_db)) -> ModelSourceRepository:
-    return ModelSourceRepository(db)
-
-
 def get_user_repo(db: Session = Depends(get_db)) -> UserRepository:
     return UserRepository(db)
-
-
-def get_user_credential_repo(db: Session = Depends(get_db)) -> UserCredentialRepository:
-    return UserCredentialRepository(db)
 
 
 def get_current_admin_user(

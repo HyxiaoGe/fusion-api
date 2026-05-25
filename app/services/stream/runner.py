@@ -9,7 +9,7 @@ import time
 import uuid
 from typing import Optional
 
-from app.ai.litellm_utils import ProviderOfflineError, merge_extra_body
+from app.ai.litellm_utils import merge_extra_body
 from app.core.logger import app_logger as logger
 from app.db.database import SessionLocal
 from app.db.repositories import FileRepository
@@ -25,9 +25,6 @@ from app.services.chat.message_builder import (
     inject_file_content,
     is_image_file,
 )
-from app.services.error_categorizer import ErrorKind, categorize
-from app.services.health.provider_health import ProviderHealthService
-from app.services.health.user_credential_health import UserCredentialHealthService
 from app.services.stream.llm_stream import llm_call_with_retry, stream_round
 from app.services.stream.persistence import persist_message, preprocess_url_in_message
 from app.services.stream.tool_executor import AgentEventRedisWriter, execute_tools_parallel
@@ -45,7 +42,9 @@ AGENT_TOTAL_TIMEOUT = 300  # 5 分钟硬超时
 class StreamHandler:
     """流式处理器"""
 
-    REASONING_PROVIDERS = {"deepseek", "qwen", "xai", "volcengine"}
+    # 哪些 provider（底层 LiteLLM 路由识别出的）需要走 volcengine 的 disabled-thinking 兼容；
+    # 其余靠 capabilities.deepThinking 推断是否开 reasoning。
+    _VOLCENGINE_PROVIDERS = {"volcengine"}
 
     async def generate_to_redis(
         self,
@@ -74,8 +73,12 @@ class StreamHandler:
         if capabilities is None:
             capabilities = {}
 
+        # use_reasoning 默认跟随 capabilities.deepThinking — 模型本身声明支持 thinking
+        # 就开，不再按 provider 硬编码（refactor 后 qwen/doubao/xiaomi 的底层 provider
+        # 都报告为 "openai"，硬编码集合会漏掉它们）。
         use_reasoning = options.get("use_reasoning")
-        should_use_reasoning = use_reasoning is True or (use_reasoning is None and provider in self.REASONING_PROVIDERS)
+        supports_thinking = bool(capabilities.get("deepThinking", False))
+        should_use_reasoning = use_reasoning is True or (use_reasoning is None and supports_thinking)
 
         # 判断是否启用工具
         supports_fc = capabilities.get("functionCalling", False)
@@ -85,15 +88,10 @@ class StreamHandler:
 
             call_kwargs["tools"] = [build_web_search_tool()]
             call_kwargs["tool_choice"] = "auto"
-            if should_use_reasoning and provider == "volcengine":
+            if should_use_reasoning and provider in self._VOLCENGINE_PROVIDERS:
                 merge_extra_body(call_kwargs, {"thinking": {"type": "disabled"}})
 
         db = SessionLocal()
-
-        # 从 litellm_kwargs metadata 提取凭证来源信息，供 health 标记使用
-        _metadata = litellm_kwargs.get("metadata", {})
-        credential_source = _metadata.get("credential_source", "system")
-        _provider_id = _metadata.get("provider_id", provider)
 
         # agent loop 状态
         content_blocks: list = []
@@ -214,26 +212,13 @@ class StreamHandler:
                 thinking_block_id = f"blk_{uuid.uuid4().hex[:12]}"
                 text_block_id = f"blk_{uuid.uuid4().hex[:12]}"
 
-                try:
-                    response = await llm_call_with_retry(
-                        litellm_model,
-                        litellm_kwargs,
-                        messages,
-                        **call_kwargs,
-                    )
-                    # LLM 调用成功，更新 health 状态
-                    if credential_source == "system":
-                        ProviderHealthService(db).mark_success(_provider_id)
-                    else:
-                        UserCredentialHealthService(db).mark_success(user_id, _provider_id)
-                except Exception as _llm_exc:
-                    kind, _msg = categorize(_llm_exc)
-                    if kind in {ErrorKind.KEY_INVALID, ErrorKind.QUOTA_EXCEEDED, ErrorKind.TOS_BLOCKED}:
-                        if credential_source == "system":
-                            ProviderHealthService(db).mark_failure(_provider_id, kind, _msg)
-                        else:
-                            UserCredentialHealthService(db).mark_failure(user_id, _provider_id, kind, _msg)
-                    raise
+                # LiteLLM Proxy 自己管 health / 重试，这里不再追踪 provider/credential 健康
+                response = await llm_call_with_retry(
+                    litellm_model,
+                    litellm_kwargs,
+                    messages,
+                    **call_kwargs,
+                )
 
                 reasoning_buf, content_buf, tool_calls_list, finish_reason, usage_data = await stream_round(
                     response,
@@ -444,18 +429,12 @@ class StreamHandler:
                 try:
 
                     async def _do_summary():
-                        # 健康标记成功路径放在内部，外层 except 仍能捕获
                         response = await llm_call_with_retry(
                             litellm_model,
                             litellm_kwargs,
                             messages,
                             **final_call_kwargs,
                         )
-                        # 触顶总结 LLM 调用成功，更新 health 状态
-                        if credential_source == "system":
-                            ProviderHealthService(db).mark_success(_provider_id)
-                        else:
-                            UserCredentialHealthService(db).mark_success(user_id, _provider_id)
                         return await stream_round(
                             response,
                             conversation_id,
@@ -475,14 +454,6 @@ class StreamHandler:
                 except asyncio.TimeoutError:
                     logger.warning(f"触顶总结超出剩余预算: conv_id={conversation_id}, budget={remaining}s")
                     reasoning_buf, content_buf, usage_data = "", "", None
-                except Exception as _llm_exc:
-                    kind, _msg = categorize(_llm_exc)
-                    if kind in {ErrorKind.KEY_INVALID, ErrorKind.QUOTA_EXCEEDED, ErrorKind.TOS_BLOCKED}:
-                        if credential_source == "system":
-                            ProviderHealthService(db).mark_failure(_provider_id, kind, _msg)
-                        else:
-                            UserCredentialHealthService(db).mark_failure(user_id, _provider_id, kind, _msg)
-                    raise
 
                 if usage_data:
                     accumulated_usage = Usage(
@@ -538,39 +509,6 @@ class StreamHandler:
             terminal_emitted = True
 
             await finalize_stream(conversation_id, success=True, task_id=task_id)
-
-        except ProviderOfflineError as e:
-            logger.warning(
-                f"Provider 离线，终止生成: conv_id={conversation_id}, provider={e.provider_id}, reason={e.reason}"
-            )
-            error_message = e.message or f"Provider {e.provider_id} 当前不可用"
-            # 协议层终结事件 + cache 终态：补完 agent_event timeline，避免断尾
-            try:
-                if current_step_id is not None:
-                    await session_cache.write_step_terminal(step_id=current_step_id, status="failed")
-                await emitter.run_failed(
-                    error_code="PROVIDER_OFFLINE",
-                    message=error_message,
-                )
-                await session_cache.write_session_status(
-                    run_id=run_id,
-                    status="error",
-                    total_steps=step,
-                    total_tool_calls=total_tool_calls,
-                    total_duration_ms=int((time.time() - run_start) * 1000),
-                )
-                terminal_emitted = True
-            except Exception as _emit_exc:  # noqa: BLE001
-                logger.warning(f"emit run_failed (PROVIDER_OFFLINE) 失败: {_emit_exc}")
-            await finalize_stream(
-                conversation_id,
-                success=False,
-                error_msg=error_message,
-                error_code="PROVIDER_OFFLINE",
-                error_data={"provider_id": e.provider_id, "reason": e.reason},
-                task_id=task_id,
-            )
-            return
 
         except asyncio.CancelledError:
             logger.info(f"Agent 任务被取消: conv_id={conversation_id}")
