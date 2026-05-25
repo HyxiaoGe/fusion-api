@@ -69,11 +69,6 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         self.assertIn("/api/chat/conversations", paths)
         self.assertIn("/api/files/upload", paths)
         self.assertIn("/api/models/", paths)
-        # BYOK Phase 1 起，credentials 端点从 /api/models/{model_id}/credentials
-        # 迁移到 /api/user/credentials/{provider_id}（按 provider 维度管理）
-        self.assertIn("/api/user/credentials", paths)
-        self.assertIn("/api/user/credentials/{provider_id}", paths)
-        self.assertIn("/api/user/credentials/{provider_id}/test", paths)
 
         self.assertNotIn("/api/auth/login/{provider}", paths)
         self.assertNotIn("/api/auth/callback/{provider}", paths)
@@ -83,6 +78,10 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         self.assertNotIn("/api/digests", paths)
         self.assertNotIn("/api/web_search/search", paths)
         self.assertNotIn("/api/settings", paths)
+        # BYOK / admin / user-credentials 三套 API 已随模型注册表迁移到 LiteLLM 彻底删除
+        self.assertNotIn("/api/user/credentials", paths)
+        self.assertNotIn("/api/admin/providers/{provider_id}/recover", paths)
+        self.assertNotIn("/api/providers", paths)
         # /api/prompts 现已存在（动态示例问题端点 GET /api/prompts/examples）
         # 旧断言"prompts 不该出现"已过时
 

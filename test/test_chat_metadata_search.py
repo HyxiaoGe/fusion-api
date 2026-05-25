@@ -49,8 +49,6 @@ def _build_in_memory_db():
         Conversation,
         File,
         Message,
-        ModelSource,
-        Provider,
         SocialAccount,
         User,
     )
