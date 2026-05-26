@@ -57,11 +57,14 @@ class LLMManager:
         proxy_url = os.environ.get("LITELLM_PROXY_URL", "http://litellm-proxy:4000")
         proxy_key = os.environ.get("LITELLM_API_KEY", "")
 
+        # litellm SDK 需要 `litellm_proxy/{alias}` 前缀才会去走 Proxy；只设 api_base
+        # 会被当成 OpenAI 兼容直连，于是 SDK 自己尝试解析 provider 然后报
+        # "LLM Provider NOT provided"。
         kwargs: Dict[str, Any] = {
             "api_key": proxy_key,
             "api_base": proxy_url,
         }
-        return model_id, provider, kwargs
+        return f"litellm_proxy/{model_id}", provider, kwargs
 
 
 # 全局单例
