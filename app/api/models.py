@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Request
 
-from app.ai import litellm_catalog
+from app.ai import litellm_catalog, litellm_health
 from app.schemas.response import success
 
 router = APIRouter()
@@ -64,7 +64,9 @@ def _entry_to_card(alias: str, entry: Dict[str, Any]) -> Dict[str, Any]:
             "output": float(pricing.get("output") or 0),
             "unit": pricing.get("unit") or "USD",
         },
-        "enabled": True,  # LiteLLM 里能查到就是可用
+        "enabled": True,  # LiteLLM 里能查到就算注册成功；可不可调由 health 决定
+        # health 由后台轮询 LiteLLM /health 得到，FE 用来决定是否灰显
+        "health": litellm_health.get_health(alias),
         "description": metadata.get("description") or "",
         "cost_tier": metadata.get("cost_tier") or "mid",
         "recommended_for": list(metadata.get("recommended_for") or []),

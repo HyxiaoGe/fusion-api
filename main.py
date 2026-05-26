@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
+from app.ai import litellm_health
 from app.api import auth, chat, files, models, prompts
 from app.core.config import settings
 from app.core.logger import app_logger
@@ -53,9 +54,11 @@ async def lifespan(app: FastAPI):
     await init_storage()
     app_logger.info(f"存储后端初始化完成: {settings.STORAGE_BACKEND}")
     await start_scheduler()
+    await litellm_health.start()
 
     yield
 
+    await litellm_health.stop()
     await stop_scheduler()
     await close_redis()
     app_logger.info("应用关闭完成")
