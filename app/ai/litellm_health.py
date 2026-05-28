@@ -63,17 +63,66 @@ def _build_alias_index(model_info: List[Dict[str, Any]]) -> Dict[str, str]:
     return index
 
 
-def _extract_error_summary(raw_error: str) -> str:
-    """从 LiteLLM 抛出的 stack trace 里提取人类可读的第一行错误。"""
+def _classify_error(raw_error: str) -> str:
+    """把 LiteLLM 抛出的 stack trace 翻成给用户看的中文一句话。
+
+    分类思路：先看异常类型（AuthenticationError / NotFoundError / BadRequest），
+    再看消息体里的关键词（invalid api key / not activated / Terms Of Service /
+    only support stream / quota / rate limit / timeout）。识别不到时 fallback
+    到 "服务商暂时不可用" — 反正用户能看出 unhealthy，原始 trace 已经在
+    fusion-api 日志里，要排查走那边。
+    """
     if not raw_error:
-        return ""
-    first_line = raw_error.split("\n", 1)[0].strip()
-    # 砍掉 "litellm.APIError: APIError: " 这种重复前缀，留下真正的错误句
-    for prefix in ("litellm.APIError: APIError: ", "litellm.NotFoundError: NotFoundError: "):
-        if first_line.startswith(prefix):
-            first_line = first_line[len(prefix):]
-            break
-    return first_line[:200]
+        return "服务商暂时不可用"
+
+    head = raw_error.split("\n", 1)[0]
+    lower = head.lower()
+
+    # 1) 认证失败：401 / invalid api key / Invalid Authentication / authorized_error
+    if (
+        "authenticationerror" in lower
+        or "invalid api key" in lower
+        or "invalid authentication" in lower
+        or "authorized_error" in lower
+        or '"http_code":"401"' in head
+        or " 401 " in head
+    ):
+        return "服务商认证失败：API key 无效或已过期，请联系管理员补全密钥"
+
+    # 2) 账号未开通模型 / Doubao 的 "has not activated the model"
+    if "has not activated the model" in head or "activate the model service" in lower:
+        return "服务商账号未开通此模型，请到服务商控制台启用后再用"
+
+    # 3) 服务商策略拒绝 / OpenRouter ToS
+    if (
+        "terms of service" in lower
+        or "prohibited" in lower
+        or '"code":403' in head
+        or " 403 " in head
+    ):
+        return "请求被服务商拒绝（额度/合规策略），暂不可用"
+
+    # 4) 调用参数不兼容
+    if "only support stream" in lower or "stream parameter" in lower:
+        return "调用参数不兼容（此模型仅支持流式调用），已在排查"
+    if "model_not_found" in lower or "does not exist" in head.lower() or "permission denied" in lower:
+        return "模型不存在或当前账号无权访问"
+
+    # 5) 额度/限流
+    if (
+        "rate limit" in lower
+        or "ratelimit" in lower
+        or "quota" in lower
+        or "insufficient" in lower
+        or " 429 " in head
+    ):
+        return "服务商额度不足或被限流，稍后再试"
+
+    # 6) 网络/超时
+    if "timeout" in lower or "connectionerror" in lower:
+        return "连接服务商超时，稍后再试"
+
+    return "服务商暂时不可用"
 
 
 async def _fetch_once() -> None:
@@ -100,7 +149,7 @@ async def _fetch_once() -> None:
     for e in (health_data.get("unhealthy_endpoints") or []):
         uuid = e.get("model_id")
         if uuid:
-            unhealthy_by_uuid[uuid] = _extract_error_summary(e.get("error") or "")
+            unhealthy_by_uuid[uuid] = _classify_error(e.get("error") or "")
 
     new_state: Dict[str, Dict[str, Any]] = {}
     for alias, uuid in alias_to_uuid.items():
