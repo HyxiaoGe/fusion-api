@@ -29,7 +29,11 @@ PyJWT[crypto]>=2.8.0
 auth-client[fastapi] @ git+https://github.com/HyxiaoGe/auth-service.git@main#subdirectory=auth-client
 passlib[bcrypt]
 itsdangerous
-redis[hiredis]>=5.0.0
+# 锁 <6：redis 8.x 改了 XREAD 字段键的解码（decode_responses 下不再回字符串键），
+# 导致 read_stream_chunks 取不到 chunk["type"]、识别不到终止标记而无限轮询，
+# stream 测试在 CI 偶发卡死到 5min 超时（floating pin 漂到 redis 8.0.0 才暴露）。
+# 代码按 redis 5.x 行为编写，固定到 5.x 与历史绿构建一致。
+redis[hiredis]>=5.0.0,<6.0.0
 fakeredis[lua]>=2.30.0  # 测试用：原生支持 Lua eval，替代手工 FakeRedis mock
 apscheduler>=3.10.0,<4.0.0
 boto3>=1.34.0
