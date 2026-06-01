@@ -28,8 +28,8 @@ def _resolve_user_from_bearer(request: Request, db: Session) -> Optional[User]:
 
     token = auth_header[len("Bearer ") :]
     try:
-        payload = jwt_validator.verify(token)
-        subject = payload.get("sub")
+        auth_user = jwt_validator.verify(token)
+        subject = auth_user.sub
         if not subject:
             return None
         user_repo = UserRepository(db)

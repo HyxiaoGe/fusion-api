@@ -24,6 +24,9 @@ authlib==1.3.2
 websockets==15.0
 python-dotenv==1.1.0
 PyJWT[crypto]>=2.8.0
+# 共享 JWT 校验 SDK：从 auth-service 仓 git 子目录安装（仓 public，构建期无需鉴权）。
+# 与 audio-web Dockerfile 同款分发，pin @main；需镜像内有 git（见 Dockerfile）。
+auth-client[fastapi] @ git+https://github.com/HyxiaoGe/auth-service.git@main#subdirectory=auth-client
 passlib[bcrypt]
 itsdangerous
 redis[hiredis]>=5.0.0
