@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from auth import AuthenticatedUser
+
 from app.core import security
 
 
@@ -37,7 +39,7 @@ class SecurityTests(unittest.TestCase):
         ):
             user = security._sync_user_from_claims(
                 db,
-                {"sub": "user-1", "email": "old@example.com"},
+                AuthenticatedUser(sub="user-1", email="old@example.com"),
                 "token-123",
             )
 
@@ -76,7 +78,7 @@ class SecurityTests(unittest.TestCase):
         ):
             user = security._sync_user_from_claims(
                 db,
-                {"sub": "user-1", "email": "18889592303@163.com"},
+                AuthenticatedUser(sub="user-1", email="18889592303@163.com"),
                 "token-123",
             )
 
@@ -84,4 +86,36 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(existing_user.nickname, "Xiao")
         self.assertEqual(existing_user.avatar, "https://avatars.githubusercontent.com/u/72925253?v=4")
         social_repo.create.assert_not_called()
+        db.commit.assert_called()
+
+    def test_sync_user_maps_admin_scope_to_is_superuser(self):
+        # 'admin' scope（来自 AuthenticatedUser.scopes）→ 本地 users.is_superuser=True
+        db = MagicMock()
+        existing_user = SimpleNamespace(
+            id="user-1",
+            email="a@b.c",
+            username="user-1",
+            nickname="N",
+            avatar="A",
+            is_superuser=False,
+        )
+        user_repo = MagicMock()
+        social_repo = MagicMock()
+        social_repo.get_by_provider.return_value = SimpleNamespace(user=existing_user)
+
+        with (
+            patch("app.core.security.UserRepository", return_value=user_repo),
+            patch("app.core.security.SocialAccountRepository", return_value=social_repo),
+            patch(
+                "app.core.security._fetch_auth_service_userinfo",
+                return_value={"email": "a@b.c", "name": "N", "avatar_url": "A"},
+            ),
+        ):
+            security._sync_user_from_claims(
+                db,
+                AuthenticatedUser(sub="user-1", email="a@b.c", scopes=["admin"]),
+                "token-123",
+            )
+
+        self.assertTrue(existing_user.is_superuser)
         db.commit.assert_called()
