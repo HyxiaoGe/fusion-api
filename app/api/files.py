@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db, get_file_service
 from app.core.file_token import verify_file_token
+from app.core.revocation import is_user_access_revoked
 from app.core.security import jwt_validator
 from app.db.models import User
 from app.db.repositories import UserRepository
@@ -31,6 +32,9 @@ def _resolve_user_from_bearer(request: Request, db: Session) -> Optional[User]:
         auth_user = jwt_validator.verify(token)
         subject = auth_user.sub
         if not subject:
+            return None
+        # 跨应用单点登出：别处登出后这张令牌虽签名仍有效，也不得再下载文件。
+        if is_user_access_revoked(subject, auth_user.raw_payload.get("iat")):
             return None
         user_repo = UserRepository(db)
         return user_repo.get(subject)
