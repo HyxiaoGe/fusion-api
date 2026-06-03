@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     AUTH_SERVICE_BASE_URL: str = os.getenv("AUTH_SERVICE_BASE_URL", "http://localhost:8100")
     AUTH_SERVICE_CLIENT_ID: Optional[str] = os.getenv("AUTH_SERVICE_CLIENT_ID")
     AUTH_SERVICE_JWKS_URL: Optional[str] = os.getenv("AUTH_SERVICE_JWKS_URL")
+    # 服务端内网直连地址（可选）。设置后 JWKS 抓取与 userinfo 走内网，绕开公网域名经
+    # Cloudflare tunnel 的回环（实测 1-3s → 内网 3-8ms）。issuer/audience 仍用公网
+    # AUTH_SERVICE_BASE_URL 校验，不受影响。
+    AUTH_SERVICE_INTERNAL_BASE_URL: Optional[str] = os.getenv("AUTH_SERVICE_INTERNAL_BASE_URL")
 
     @property
     def FRONTEND_AUTH_CALLBACK_URL(self) -> str:
@@ -81,11 +85,17 @@ class Settings(BaseSettings):
 
     @property
     def RESOLVED_AUTH_SERVICE_JWKS_URL(self) -> str:
+        # 内网 base 优先（绕开公网域名的 CF tunnel 回环）；否则沿用显式 JWKS_URL；
+        # 最后回退公网 base 拼接。
+        if self.AUTH_SERVICE_INTERNAL_BASE_URL:
+            return f"{self.AUTH_SERVICE_INTERNAL_BASE_URL.rstrip('/')}/.well-known/jwks.json"
         return self.AUTH_SERVICE_JWKS_URL or f"{self.AUTH_SERVICE_BASE_URL.rstrip('/')}/.well-known/jwks.json"
 
     @property
     def AUTH_SERVICE_USERINFO_URL(self) -> str:
-        return f"{self.AUTH_SERVICE_BASE_URL.rstrip('/')}/auth/userinfo"
+        # userinfo 是服务端调用，优先内网直连；issuer 校验仍用公网 BASE_URL（见 security.py）。
+        base = (self.AUTH_SERVICE_INTERNAL_BASE_URL or self.AUTH_SERVICE_BASE_URL).rstrip("/")
+        return f"{base}/auth/userinfo"
 
     POSTGRES_SERVER: str = os.getenv("POSTGRES_SERVER", "localhost")
     POSTGRES_USER: str = os.getenv("POSTGRES_USER", "postgres")
