@@ -102,7 +102,15 @@ jobs:
         run: echo "DEPLOY_START=$(date +%s)" >> "$GITHUB_ENV"
 
       - name: Login to GHCR
-        run: echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+        run: |
+          # ghcr.io 经代理偶发连接/TLS 超时，登录失败时重试退避
+          n=0
+          until echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin; do
+            n=$((n+1))
+            if [ $n -ge 6 ]; then echo "docker login 重试 $n 次仍失败"; exit 1; fi
+            echo "docker login 失败（ghcr.io 网络抖动），第 $n 次，10s 后重试..."
+            sleep 10
+          done
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -112,7 +120,13 @@ jobs:
           set -a
           source .env
           set +a
-          docker pull ghcr.io/hyxiaoge/fusion-api:${{ github.sha }}
+          n=0
+          until docker pull ghcr.io/hyxiaoge/fusion-api:${{ github.sha }}; do
+            n=$((n+1))
+            if [ $n -ge 6 ]; then echo "docker pull 重试 $n 次仍失败"; exit 1; fi
+            echo "docker pull 失败（ghcr.io 抖动），第 $n 次，10s 后重试..."
+            sleep 10
+          done
           docker run --rm \
             --network postgres_default \
             -e DATABASE_URL="${DATABASE_URL}" \
@@ -122,7 +136,13 @@ jobs:
       - name: Pull and restart fusion-api
         run: |
           cd ~/project/fusion
-          docker pull ghcr.io/hyxiaoge/fusion-api:${{ github.sha }}
+          n=0
+          until docker pull ghcr.io/hyxiaoge/fusion-api:${{ github.sha }}; do
+            n=$((n+1))
+            if [ $n -ge 6 ]; then echo "docker pull 重试 $n 次仍失败"; exit 1; fi
+            echo "docker pull 失败（ghcr.io 抖动），第 $n 次，10s 后重试..."
+            sleep 10
+          done
           cat > docker-compose.fusion-api-ghcr.yml <<'EOF'
           services:
             fusion-api:
