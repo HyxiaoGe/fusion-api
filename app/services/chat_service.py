@@ -239,8 +239,14 @@ class ChatService:
             message=assistant_message,
         )
 
-    # 辅助功能（标题、推荐问题）固定使用的轻量模型，避免 thinking 模型浪费 token 和时间
-    UTILITY_MODEL_ID = "qwen-max-latest"
+    # 辅助功能（标题、推荐问题）固定使用的轻量快速模型，不跟随对话模型，
+    # 避免对话用的是慢/贵的 thinking 模型时拖累这些"锦上添花"的小活。
+    # 注意：qwen-max-latest 是旗舰重模型，经 LiteLLM Proxy → dashscope 实测约 20s，
+    # 会撞 main.py 的 TimeoutMiddleware(10s) 直接 408，故固定用快速的 deepseek-chat（实测约 3s）。
+    UTILITY_MODEL_ID = "deepseek-chat"
+    # 辅助 LLM 调用的内部超时（秒），必须 < TimeoutMiddleware 的 10s。
+    # 这样即便将来换的辅助模型偏慢，也能在中间件掐断前自己抛错走 fallback，而不是把 408 吐给前端。
+    UTILITY_LLM_TIMEOUT = 8
 
     def _resolve_utility_model(self, conversation_model_id: str) -> tuple:
         """解析辅助功能模型，固定用轻量模型，找不到则回退对话模型"""
@@ -283,6 +289,7 @@ class ChatService:
                 messages=[{"role": "user", "content": prompt}],
                 stream=False,
                 max_tokens=30,
+                timeout=self.UTILITY_LLM_TIMEOUT,
                 **litellm_kwargs,
             )
             raw = response.choices[0].message.content or ""
@@ -339,6 +346,7 @@ class ChatService:
                 messages=[{"role": "user", "content": prompt}],
                 stream=False,
                 max_tokens=200,
+                timeout=self.UTILITY_LLM_TIMEOUT,
                 **litellm_kwargs,
             )
             raw = response.choices[0].message.content or ""
