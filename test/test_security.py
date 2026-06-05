@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import httpx
 from auth import AuthenticatedUser
 
 from app.core import security
@@ -87,6 +88,81 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(existing_user.avatar, "https://avatars.githubusercontent.com/u/72925253?v=4")
         social_repo.create.assert_not_called()
         db.commit.assert_called()
+
+    def test_sync_user_preserves_existing_avatar_when_userinfo_fetch_fails(self):
+        # 慢隧道/抖动致 userinfo 拉取失败（except 分支 userinfo={} → avatar=None）时，
+        # 绝不能把既有头像/昵称抹空——否则 /api/auth/me 返回 avatar:null、前端头像回退单字母。
+        db = MagicMock()
+        existing_user = SimpleNamespace(
+            id="user-1",
+            email="a@b.c",
+            username="user-1",
+            nickname="Sean",
+            avatar="https://lh3.googleusercontent.com/a/keep-me=s96-c",
+            is_superuser=False,
+        )
+        user_repo = MagicMock()
+        social_repo = MagicMock()
+        social_repo.get_by_provider.return_value = SimpleNamespace(user=existing_user)
+
+        with (
+            patch("app.core.security.UserRepository", return_value=user_repo),
+            patch("app.core.security.SocialAccountRepository", return_value=social_repo),
+            patch(
+                "app.core.security._fetch_auth_service_userinfo",
+                side_effect=httpx.HTTPError("boom"),
+            ),
+        ):
+            user = security._sync_user_from_claims(
+                db,
+                AuthenticatedUser(sub="user-1", email="a@b.c"),
+                "token-123",
+            )
+
+        self.assertIs(user, existing_user)
+        self.assertEqual(existing_user.nickname, "Sean")
+        self.assertEqual(
+            existing_user.avatar,
+            "https://lh3.googleusercontent.com/a/keep-me=s96-c",
+        )
+        # 无字段变化 → 不应 commit（避免无谓写库，更别写空值）
+        db.commit.assert_not_called()
+
+    def test_sync_user_preserves_existing_avatar_when_userinfo_omits_fields(self):
+        # userinfo 返回 200 但缺 name/avatar_url（avatar=None）时，同样不得覆盖既有头像。
+        db = MagicMock()
+        existing_user = SimpleNamespace(
+            id="user-1",
+            email="a@b.c",
+            username="user-1",
+            nickname="Sean",
+            avatar="https://lh3.googleusercontent.com/a/keep-me=s96-c",
+            is_superuser=False,
+        )
+        user_repo = MagicMock()
+        social_repo = MagicMock()
+        social_repo.get_by_provider.return_value = SimpleNamespace(user=existing_user)
+
+        with (
+            patch("app.core.security.UserRepository", return_value=user_repo),
+            patch("app.core.security.SocialAccountRepository", return_value=social_repo),
+            patch(
+                "app.core.security._fetch_auth_service_userinfo",
+                return_value={"email": "a@b.c"},
+            ),
+        ):
+            security._sync_user_from_claims(
+                db,
+                AuthenticatedUser(sub="user-1", email="a@b.c"),
+                "token-123",
+            )
+
+        self.assertEqual(existing_user.nickname, "Sean")
+        self.assertEqual(
+            existing_user.avatar,
+            "https://lh3.googleusercontent.com/a/keep-me=s96-c",
+        )
+        db.commit.assert_not_called()
 
     def test_sync_user_maps_admin_scope_to_is_superuser(self):
         # 'admin' scope（来自 AuthenticatedUser.scopes）→ 本地 users.is_superuser=True

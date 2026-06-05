@@ -118,10 +118,15 @@ def _sync_user_from_claims(db: Session, auth_user: AuthenticatedUser, token: str
         if email and user.email != email:
             user.email = email
             should_commit = True
-        if nickname != user.nickname:
+        # 仅在确凿拿到新值时才更新昵称/头像，绝不用空值覆盖既有 profile（与上面 email 的
+        # `email and ...` 守卫同款）。userinfo 拉取失败（慢 cloudflared 隧道超时 → 上面 except
+        # 分支 userinfo={}）或返回里缺 name/avatar_url 时，nickname/avatar 会是 None；旧逻辑无
+        # 条件写入即把既有头像抹成 NULL 并 commit → /api/auth/me 返回 avatar:null → 前端头像
+        # 回退单字母。此处每个鉴权请求都会跑（get_current_user），故空值覆盖会被高频触发。
+        if nickname and nickname != user.nickname:
             user.nickname = nickname
             should_commit = True
-        if avatar != user.avatar:
+        if avatar and avatar != user.avatar:
             user.avatar = avatar
             should_commit = True
         if not user.username:
