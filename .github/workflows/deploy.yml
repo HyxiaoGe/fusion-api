@@ -225,3 +225,73 @@ jobs:
             "${{ needs.build.outputs.runner_name }}" \
             fusion-api \
             "${{ env.DEPLOY_START }}"
+
+      - name: 通知飞书(部署结果)
+        if: always()
+        continue-on-error: true
+        env:
+          FEISHU_INFRA_WEBHOOK: ${{ secrets.FEISHU_INFRA_WEBHOOK }}
+          JOB_STATUS: ${{ job.status }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # 提交信息可含任意字符,只经 env 传入 python(os.environ→json),绝不进 shell,杜绝注入。
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          if [ -z "$FEISHU_INFRA_WEBHOOK" ]; then
+            echo "FEISHU_INFRA_WEBHOOK 未配置,跳过飞书通知"
+            exit 0
+          fi
+          export SHORT_SHA="${GITHUB_SHA:0:7}"
+          export DEPLOY_TS="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          python3 - <<'PY'
+          import json, os, urllib.request
+          ok = os.environ.get("JOB_STATUS") == "success"
+          repo = os.environ.get("REPO", "")
+          ref = os.environ.get("REF_NAME", "")
+          sha = os.environ.get("SHORT_SHA", "")
+          status = os.environ.get("JOB_STATUS", "")
+          ts = os.environ.get("DEPLOY_TS", "")
+          run_url = os.environ.get("RUN_URL", "")
+          raw = os.environ.get("COMMIT_MSG", "") or ""
+          lines = [ln for ln in raw.splitlines() if ln.strip()]
+          msg = "\n".join(lines[:3]) if lines else "(无提交信息)"
+          if len(msg) > 240:
+              msg = msg[:240] + "…"
+          card = {
+              "msg_type": "interactive",
+              "card": {
+                  "config": {"wide_screen_mode": True},
+                  "header": {
+                      "template": "green" if ok else "red",
+                      "title": {"tag": "plain_text",
+                                "content": ("✅ 部署成功 · " if ok else "❌ 部署失败 · ") + repo},
+                  },
+                  "elements": [
+                      {"tag": "div", "text": {"tag": "lark_md", "content": f"**提交信息**\n{msg}"}},
+                      {"tag": "hr"},
+                      {"tag": "div", "fields": [
+                          {"is_short": True, "text": {"tag": "lark_md", "content": f"**分支**\n{ref}"}},
+                          {"is_short": True, "text": {"tag": "lark_md", "content": f"**提交**\n`{sha}`"}},
+                          {"is_short": True, "text": {"tag": "lark_md", "content": f"**结果**\n{status}"}},
+                          {"is_short": True, "text": {"tag": "lark_md", "content": f"**时间**\n{ts}"}},
+                      ]},
+                      {"tag": "action", "actions": [
+                          {"tag": "button", "type": "primary",
+                           "text": {"tag": "plain_text", "content": "查看运行日志"},
+                           "url": run_url}]},
+                      {"tag": "note", "elements": [
+                          {"tag": "plain_text", "content": "🤖 UptimeKuma · CI/CD 部署告警"}]},
+                  ],
+              },
+          }
+          data = json.dumps(card).encode()
+          req = urllib.request.Request(
+              os.environ["FEISHU_INFRA_WEBHOOK"], data=data,
+              headers={"Content-Type": "application/json"})
+          try:
+              with urllib.request.urlopen(req, timeout=15) as r:
+                  print(f"飞书响应 http={r.status} body={r.read().decode()}")
+          except Exception as e:
+              print(f"飞书通知失败(忽略): {e!r}")
+          PY
