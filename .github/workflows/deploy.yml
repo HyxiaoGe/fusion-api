@@ -6,11 +6,15 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: fusion-api-windows-ci-${{ github.ref }}
   cancel-in-progress: true
+
+# 镜像源:阿里云 ACR 个人版(深圳,境内端点);改仓名只动 IMAGE_NAME 一行
+env:
+  REGISTRY: crpi-77w10wlykpqilmmb.cn-shenzhen.personal.cr.aliyuncs.com
+  IMAGE_NAME: crpi-77w10wlykpqilmmb.cn-shenzhen.personal.cr.aliyuncs.com/seanfield/fusion-api
 
 jobs:
   build:
@@ -20,8 +24,6 @@ jobs:
     outputs:
       started_at: ${{ steps.pipeline_start.outputs.started_at }}
       runner_name: ${{ steps.pipeline_start.outputs.runner_name }}
-    env:
-      IMAGE_NAME: ghcr.io/hyxiaoge/fusion-api
     defaults:
       run:
         shell: cmd
@@ -76,10 +78,12 @@ jobs:
         run: |
           docker run --rm "%IMAGE_NAME%:%GITHUB_SHA%" python -m unittest discover -s test -t .
 
-      - name: Login to GHCR
-        run: echo %GITHUB_TOKEN% | docker login ghcr.io -u %GITHUB_ACTOR% --password-stdin
+      - name: Login to ACR
+        # Windows cmd 下 echo|--password-stdin 会把口令传歪致 ACR 401,改用 -p 直传
+        run: docker login %REGISTRY% -u %ACR_USERNAME% -p %ACR_PASSWORD%
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
 
       - name: Push Docker image
         run: docker push "%IMAGE_NAME%:%GITHUB_SHA%"
@@ -101,18 +105,19 @@ jobs:
       - name: Record deploy start time
         run: echo "DEPLOY_START=$(date +%s)" >> "$GITHUB_ENV"
 
-      - name: Login to GHCR
+      - name: Login to ACR
         run: |
-          # ghcr.io 经代理偶发连接/TLS 超时，登录失败时重试退避
+          # 登录失败时重试退避（境内 ACR 通常稳定，保留重试作防御）
           n=0
-          until echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin; do
+          until echo "${ACR_PASSWORD}" | docker login "${REGISTRY}" -u "${ACR_USERNAME}" --password-stdin; do
             n=$((n+1))
             if [ $n -ge 6 ]; then echo "docker login 重试 $n 次仍失败"; exit 1; fi
-            echo "docker login 失败（ghcr.io 网络抖动），第 $n 次，10s 后重试..."
+            echo "docker login 失败（网络抖动），第 $n 次，10s 后重试..."
             sleep 10
           done
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
 
       - name: Apply alembic migrations
         run: |
@@ -121,32 +126,32 @@ jobs:
           source .env
           set +a
           n=0
-          until docker pull ghcr.io/hyxiaoge/fusion-api:${{ github.sha }}; do
+          until docker pull ${{ env.IMAGE_NAME }}:${{ github.sha }}; do
             n=$((n+1))
             if [ $n -ge 6 ]; then echo "docker pull 重试 $n 次仍失败"; exit 1; fi
-            echo "docker pull 失败（ghcr.io 抖动），第 $n 次，10s 后重试..."
+            echo "docker pull 失败（网络抖动），第 $n 次，10s 后重试..."
             sleep 10
           done
           docker run --rm \
             --network postgres_default \
             -e DATABASE_URL="${DATABASE_URL}" \
-            ghcr.io/hyxiaoge/fusion-api:${{ github.sha }} \
+            ${{ env.IMAGE_NAME }}:${{ github.sha }} \
             alembic upgrade head
 
       - name: Pull and restart fusion-api
         run: |
           cd ~/project/fusion
           n=0
-          until docker pull ghcr.io/hyxiaoge/fusion-api:${{ github.sha }}; do
+          until docker pull ${{ env.IMAGE_NAME }}:${{ github.sha }}; do
             n=$((n+1))
             if [ $n -ge 6 ]; then echo "docker pull 重试 $n 次仍失败"; exit 1; fi
-            echo "docker pull 失败（ghcr.io 抖动），第 $n 次，10s 后重试..."
+            echo "docker pull 失败（网络抖动），第 $n 次，10s 后重试..."
             sleep 10
           done
           cat > docker-compose.fusion-api-ghcr.yml <<'EOF'
           services:
             fusion-api:
-              image: ghcr.io/hyxiaoge/fusion-api:${{ github.sha }}
+              image: ${{ env.IMAGE_NAME }}:${{ github.sha }}
               container_name: fusion-api
               command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
               restart: always
@@ -205,8 +210,8 @@ jobs:
       - name: Cleanup old images
         if: always()
         run: |
-          current="ghcr.io/hyxiaoge/fusion-api:${{ github.sha }}"
-          docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' ghcr.io/hyxiaoge/fusion-api \
+          current="${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' ${{ env.IMAGE_NAME }} \
             | awk -v current="$current" '$1 != current {print $2}' \
             | sort -u \
             | xargs -r docker rmi || true
@@ -220,7 +225,7 @@ jobs:
             dev \
             "${{ job.status }}" \
             "${{ needs.build.outputs.started_at }}" \
-            "ghcr.io/hyxiaoge/fusion-api:${{ github.sha }}" \
+            "${{ env.IMAGE_NAME }}:${{ github.sha }}" \
             "${{ github.sha }}" \
             "${{ needs.build.outputs.runner_name }}" \
             fusion-api \
