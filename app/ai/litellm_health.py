@@ -33,8 +33,19 @@ from app.core.logger import app_logger as logger
 _LITELLM_BASE_URL = os.environ.get("LITELLM_PROXY_URL", "http://litellm-proxy:4000").rstrip("/")
 _LITELLM_API_KEY = os.environ.get("LITELLM_API_KEY", "")
 
-# 探测间隔。默认 5min；可被 LITELLM_HEALTH_INTERVAL_SECONDS 覆盖。
-_REFRESH_INTERVAL_SECONDS = float(os.environ.get("LITELLM_HEALTH_INTERVAL_SECONDS", "300"))
+# 探测间隔默认值（秒）。/health 会对 LiteLLM DB 里每个模型各打一次真实 completion，
+# 其中 qwen 等 reasoning 模型每次会生成数百 reasoning token（且 enable_thinking /
+# max_tokens 都压不掉），探得越频繁、在服务商侧产生的真实费用越高。模型存活状态变化
+# 很慢，30min 刷新足够；可用 LITELLM_HEALTH_INTERVAL_SECONDS 覆盖。
+# 详见 https://github.com/HyxiaoGe/fusion-api/issues/10
+_DEFAULT_REFRESH_INTERVAL_SECONDS = 1800.0
+
+
+def _resolve_refresh_interval() -> float:
+    """读取探测间隔（秒）。每轮循环都读一次：运维改 env + 重启即可即时调节，无需改代码。"""
+    return float(
+        os.environ.get("LITELLM_HEALTH_INTERVAL_SECONDS", str(_DEFAULT_REFRESH_INTERVAL_SECONDS))
+    )
 # 单次 `/health` 调用超时——LiteLLM 会并发探测所有端点，但慢的 provider 可能拖到 1min+
 _HEALTH_REQUEST_TIMEOUT = float(os.environ.get("LITELLM_HEALTH_REQUEST_TIMEOUT", "90"))
 
@@ -176,7 +187,7 @@ async def _refresh_loop() -> None:
     try:
         while True:
             await _fetch_once()
-            await asyncio.sleep(_REFRESH_INTERVAL_SECONDS)
+            await asyncio.sleep(_resolve_refresh_interval())
     except asyncio.CancelledError:
         logger.info("litellm_health: refresh loop cancelled")
         raise
@@ -188,7 +199,7 @@ async def start() -> None:
     if _refresh_task is None or _refresh_task.done():
         _refresh_task = asyncio.create_task(_refresh_loop(), name="litellm_health_refresh")
         logger.info(
-            f"litellm_health: background refresh started, interval={_REFRESH_INTERVAL_SECONDS}s"
+            f"litellm_health: background refresh started, interval={_resolve_refresh_interval()}s"
         )
 
 
