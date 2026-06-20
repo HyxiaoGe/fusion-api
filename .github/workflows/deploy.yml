@@ -71,7 +71,7 @@ jobs:
 
       - name: Lint in image
         run: |
-          docker run --rm "%IMAGE_NAME%:%GITHUB_SHA%" sh -lc "pip install --no-cache-dir ruff && ruff check ."
+          docker run --rm "%IMAGE_NAME%:%GITHUB_SHA%" sh -lc "timeout 180s python -m pip install --default-timeout=30 --no-cache-dir ruff && ruff check ."
 
       - name: Run tests
         timeout-minutes: 5

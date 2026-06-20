@@ -23,6 +23,12 @@ class DeployAuthConfigTests(unittest.TestCase):
             self.workflow,
         )
 
+    def test_ci_lint_install_has_process_and_network_timeouts(self):
+        self.assertIn(
+            "timeout 180s python -m pip install --default-timeout=30 --no-cache-dir ruff",
+            self.workflow,
+        )
+
     def test_windows_acr_login_uses_docker_login_action(self):
         self.assertIn("uses: docker/login-action@v3", self.workflow)
         self.assertIn("registry: ${{ env.REGISTRY }}", self.workflow)
