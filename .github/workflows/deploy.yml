@@ -79,14 +79,11 @@ jobs:
           docker run --rm "%IMAGE_NAME%:%GITHUB_SHA%" sh -lc "timeout 270s python -u -m unittest discover -s test -t . -v"
 
       - name: Login to ACR
-        # 避免 Windows cmd 展开未加引号的 -p 时把特殊字符截断，统一走 stdin。
-        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
-        run: |
-          $ErrorActionPreference = "Stop"
-          $env:ACR_PASSWORD | docker login $env:REGISTRY -u $env:ACR_USERNAME --password-stdin
-        env:
-          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
-          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
 
       - name: Push Docker image
         run: docker push "%IMAGE_NAME%:%GITHUB_SHA%"

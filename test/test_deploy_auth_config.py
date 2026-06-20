@@ -23,11 +23,13 @@ class DeployAuthConfigTests(unittest.TestCase):
             self.workflow,
         )
 
-    def test_acr_login_uses_password_stdin_without_cmd_password_expansion(self):
-        self.assertIn(
-            "$env:ACR_PASSWORD | docker login $env:REGISTRY -u $env:ACR_USERNAME --password-stdin",
-            self.workflow,
-        )
+    def test_windows_acr_login_uses_docker_login_action(self):
+        self.assertIn("uses: docker/login-action@v3", self.workflow)
+        self.assertIn("registry: ${{ env.REGISTRY }}", self.workflow)
+        self.assertIn("username: ${{ secrets.ACR_USERNAME }}", self.workflow)
+        self.assertIn("password: ${{ secrets.ACR_PASSWORD }}", self.workflow)
+
+    def test_linux_acr_login_uses_password_stdin_without_shell_echo(self):
         self.assertIn(
             """printf '%s' "${ACR_PASSWORD}" | docker login""",
             self.workflow,
