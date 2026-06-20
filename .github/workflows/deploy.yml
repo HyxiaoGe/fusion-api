@@ -148,6 +148,9 @@ jobs:
             echo "docker pull 失败（网络抖动），第 $n 次，10s 后重试..."
             sleep 10
           done
+          # dev 中 auth-service 只在 Docker 网络内暴露，未发布宿主机 8100。
+          # 显式覆盖旧 .env 里的宿主机地址，避免 fusion-api JWKS/userinfo 校验连到不可达地址。
+          export AUTH_SERVICE_INTERNAL_BASE_URL="http://auth-service:8100"
           cat > docker-compose.fusion-api-ghcr.yml <<'EOF'
           services:
             fusion-api:
@@ -167,7 +170,7 @@ jobs:
                 - AUTH_SERVICE_BASE_URL=${AUTH_SERVICE_BASE_URL}
                 - AUTH_SERVICE_JWKS_URL=${AUTH_SERVICE_JWKS_URL}
                 - AUTH_SERVICE_CLIENT_ID=${AUTH_SERVICE_CLIENT_ID}
-                - AUTH_SERVICE_INTERNAL_BASE_URL=${AUTH_SERVICE_INTERNAL_BASE_URL:-}
+                - AUTH_SERVICE_INTERNAL_BASE_URL=${AUTH_SERVICE_INTERNAL_BASE_URL:-http://auth-service:8100}
                 - CREDENTIAL_ENCRYPTION_KEY=${CREDENTIAL_ENCRYPTION_KEY}
                 - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID}
                 - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET}
@@ -197,15 +200,30 @@ jobs:
 
       - name: Verify health
         run: |
+          healthy=0
           for attempt in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8002/health | grep -q '"status":"healthy"'; then
-              exit 0
+              healthy=1
+              break
             fi
             sleep 2
           done
 
-          docker logs --tail=120 fusion-api || true
-          exit 1
+          if [ "$healthy" != "1" ]; then
+            docker logs --tail=120 fusion-api || true
+            exit 1
+          fi
+
+          docker exec fusion-api python - <<'PY'
+          from app.core.config import settings
+          import urllib.request
+
+          url = settings.RESOLVED_AUTH_SERVICE_JWKS_URL
+          with urllib.request.urlopen(url, timeout=5) as response:
+              if response.status != 200:
+                  raise SystemExit(f"auth JWKS check failed: http={response.status} url={url}")
+          print(f"auth JWKS ok: {url}")
+          PY
 
       - name: Cleanup old images
         if: always()

@@ -21,16 +21,16 @@ class AuthInternalBaseTests(unittest.TestCase):
         s = Settings(
             AUTH_SERVICE_BASE_URL="https://auth.seanfield.org",
             AUTH_SERVICE_JWKS_URL="https://auth.seanfield.org/.well-known/jwks.json",
-            AUTH_SERVICE_INTERNAL_BASE_URL="http://192.168.1.11:8100",
+            AUTH_SERVICE_INTERNAL_BASE_URL="http://auth-service:8100",
         )
         # 服务端取数（JWKS / userinfo）走内网
         self.assertEqual(
             s.RESOLVED_AUTH_SERVICE_JWKS_URL,
-            "http://192.168.1.11:8100/.well-known/jwks.json",
+            "http://auth-service:8100/.well-known/jwks.json",
         )
         self.assertEqual(
             s.AUTH_SERVICE_USERINFO_URL,
-            "http://192.168.1.11:8100/auth/userinfo",
+            "http://auth-service:8100/auth/userinfo",
         )
         # issuer 仍为公网域名，绝不能被内网 base 改写
         self.assertEqual(s.AUTH_SERVICE_BASE_URL, "https://auth.seanfield.org")
@@ -38,15 +38,15 @@ class AuthInternalBaseTests(unittest.TestCase):
     def test_trailing_slash_internal_base_normalized(self):
         s = Settings(
             AUTH_SERVICE_BASE_URL="https://auth.seanfield.org",
-            AUTH_SERVICE_INTERNAL_BASE_URL="http://192.168.1.11:8100/",
+            AUTH_SERVICE_INTERNAL_BASE_URL="http://auth-service:8100/",
         )
         self.assertEqual(
             s.RESOLVED_AUTH_SERVICE_JWKS_URL,
-            "http://192.168.1.11:8100/.well-known/jwks.json",
+            "http://auth-service:8100/.well-known/jwks.json",
         )
         self.assertEqual(
             s.AUTH_SERVICE_USERINFO_URL,
-            "http://192.168.1.11:8100/auth/userinfo",
+            "http://auth-service:8100/auth/userinfo",
         )
 
     def test_without_internal_base_keeps_public_behaviour(self):
