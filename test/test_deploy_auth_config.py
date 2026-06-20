@@ -16,3 +16,9 @@ class DeployAuthConfigTests(unittest.TestCase):
     def test_deploy_health_checks_auth_jwks_from_running_container(self):
         self.assertIn("RESOLVED_AUTH_SERVICE_JWKS_URL", self.workflow)
         self.assertIn("auth JWKS ok", self.workflow)
+
+    def test_ci_runs_tests_with_process_timeout_and_verbose_output(self):
+        self.assertIn(
+            "timeout 270s python -u -m unittest discover -s test -t . -v",
+            self.workflow,
+        )

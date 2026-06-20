@@ -76,7 +76,7 @@ jobs:
       - name: Run tests
         timeout-minutes: 5
         run: |
-          docker run --rm "%IMAGE_NAME%:%GITHUB_SHA%" python -m unittest discover -s test -t .
+          docker run --rm "%IMAGE_NAME%:%GITHUB_SHA%" sh -lc "timeout 270s python -u -m unittest discover -s test -t . -v"
 
       - name: Login to ACR
         # Windows cmd 下 echo|--password-stdin 会把口令传歪致 ACR 401,改用 -p 直传
