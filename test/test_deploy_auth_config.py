@@ -22,3 +22,13 @@ class DeployAuthConfigTests(unittest.TestCase):
             "timeout 270s python -u -m unittest discover -s test -t . -v",
             self.workflow,
         )
+
+    def test_acr_login_uses_password_stdin_without_cmd_password_expansion(self):
+        self.assertIn(
+            "$env:ACR_PASSWORD | docker login $env:REGISTRY -u $env:ACR_USERNAME --password-stdin",
+            self.workflow,
+        )
+        self.assertIn(
+            """printf '%s' "${ACR_PASSWORD}" | docker login""",
+            self.workflow,
+        )
