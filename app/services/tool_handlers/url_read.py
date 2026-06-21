@@ -7,6 +7,8 @@ import time
 from app.core.config import settings
 from app.schemas.chat import UrlBlock
 from app.services.external.reader_client import read_url
+from app.services.security.url_policy import evaluate_url_policy
+from app.services.source_context import UntrustedSourceContext, format_untrusted_source_context
 from app.services.tool_handlers.base import BaseToolHandler, ToolResult
 
 # 注入 LLM 上下文时的最大字符数（约 4000 token）
@@ -30,10 +32,21 @@ class UrlReadHandler(BaseToolHandler):
                 error_message="url 为空",
                 data={"url": url},
             )
+        policy = evaluate_url_policy(url)
+        if not policy.allowed:
+            return ToolResult(
+                status="degraded",
+                error_message=policy.user_visible_message or "URL 不允许读取",
+                data={
+                    "url": url,
+                    "safe_log_url": policy.safe_log_url,
+                    "degraded_reason": policy.reason,
+                },
+            )
 
         start = time.monotonic()
         try:
-            result = await read_url(url, timeout=settings.READER_SERVICE_TIMEOUT)
+            result = await read_url(policy.normalized_url or url, timeout=settings.READER_SERVICE_TIMEOUT)
             duration_ms = int((time.monotonic() - start) * 1000)
 
             if result is None:
@@ -41,7 +54,7 @@ class UrlReadHandler(BaseToolHandler):
                     status="degraded",
                     duration_ms=duration_ms,
                     error_message="reader-service 暂时未返回内容，已跳过网页读取",
-                    data={"url": url},
+                    data={"url": policy.normalized_url or url, "safe_log_url": policy.safe_log_url},
                 )
 
             return ToolResult(
@@ -88,18 +101,20 @@ class UrlReadHandler(BaseToolHandler):
             content = content[:MAX_CONTENT_CHARS]
             truncated = True
 
-        parts = [f"以下是网页 {url} 的内容："]
-        if title:
-            parts.append(f"标题：{title}")
-        parts.append("")
-        parts.append(content)
-
         if truncated:
-            parts.append("\n（内容已截断，仅展示前部分）")
+            content = f"{content}\n（内容已截断，仅展示前部分）"
 
-        parts.append("\n请基于以上网页内容回答用户的问题。")
-
-        return "\n".join(parts)
+        return format_untrusted_source_context(
+            UntrustedSourceContext(
+                source_id="U1",
+                source_type="url_read",
+                title=title or "未知",
+                url=url,
+                content=content,
+                provider="reader-service",
+            ),
+            max_chars=MAX_CONTENT_CHARS + 100,
+        )
 
     def _build_result_summary(self, result: ToolResult) -> dict:
         """URL 读取轻量摘要：title + favicon。

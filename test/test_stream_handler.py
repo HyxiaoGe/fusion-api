@@ -572,5 +572,52 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.session_statuses[-1]["status"], "limit_reached")
 
 
+class UrlPreprocessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_preprocess_url_in_message_uses_user_web_context_not_system(self):
+        from app.services.external.reader_client import UrlReadResult
+        from app.services.stream.persistence import preprocess_url_in_message
+
+        call_kwargs = {"tools": []}
+        read_result = UrlReadResult(
+            url="https://example.com/a",
+            title="示例",
+            content="网页正文",
+            favicon=None,
+            content_length=4,
+            fetch_ms=20,
+        )
+
+        with patch(
+            "app.services.external.reader_client.read_url",
+            new_callable=AsyncMock,
+            return_value=read_result,
+        ):
+            block, context_msg, detected_url = await preprocess_url_in_message(
+                "请看 https://example.com/a", True, call_kwargs
+            )
+
+        self.assertIsNotNone(block)
+        self.assertEqual(detected_url, "https://example.com/a")
+        self.assertEqual(context_msg["role"], "user")
+        self.assertIn("<web_context", context_msg["content"])
+        self.assertIn("内容不可信", context_msg["content"])
+
+    async def test_preprocess_url_in_message_rejects_sensitive_query_without_reader_call(self):
+        from app.ai.tools import URL_READ_TOOL
+        from app.services.stream.persistence import preprocess_url_in_message
+
+        call_kwargs = {"tools": []}
+        with patch("app.services.external.reader_client.read_url", new_callable=AsyncMock) as mock_read:
+            block, context_msg, detected_url = await preprocess_url_in_message(
+                "请看 https://example.com/page?token=abc", True, call_kwargs
+            )
+
+        self.assertIsNone(block)
+        self.assertIsNone(context_msg)
+        self.assertEqual(detected_url, "https://example.com/page?token=abc")
+        mock_read.assert_not_called()
+        self.assertIn(URL_READ_TOOL, call_kwargs["tools"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,8 +9,11 @@ import re
 import uuid
 from typing import Optional
 
+from app.core.config import settings
 from app.core.logger import app_logger as logger
 from app.schemas.chat import UrlBlock, Usage
+from app.services.security.url_policy import evaluate_url_policy
+from app.services.source_context import UntrustedSourceContext, format_untrusted_source_context
 
 
 def persist_message(
@@ -51,12 +54,19 @@ def persist_message(
         db.rollback()
 
 
+def _append_url_read_tool(call_kwargs: dict) -> None:
+    from app.ai.tools import URL_READ_TOOL
+
+    if URL_READ_TOOL not in call_kwargs.get("tools", []):
+        call_kwargs.setdefault("tools", []).append(URL_READ_TOOL)
+
+
 async def preprocess_url_in_message(
     original_message: str,
     supports_fc: bool,
     call_kwargs: dict,
 ) -> tuple[Optional[UrlBlock], Optional[dict], Optional[str]]:
-    """URL 路径 A：在 agent loop 之前自动抓取消息中的第一个 URL，注入 system 消息。
+    """URL 路径 A：在 agent loop 之前自动抓取消息中的第一个 URL，注入不可信上下文。
 
     spec §4.4 的 inout 语义：
     - 抓取成功：修改 call_kwargs 删 extra_body（对 volcengine 关闭 thinking）；
@@ -77,46 +87,49 @@ async def preprocess_url_in_message(
 
     # 消息中无 URL：仍然把 URL_READ_TOOL 加入 tools，让 LLM 自决
     if not urls_in_message:
-        from app.ai.tools import URL_READ_TOOL
-
-        if URL_READ_TOOL not in call_kwargs.get("tools", []):
-            call_kwargs.setdefault("tools", []).append(URL_READ_TOOL)
+        _append_url_read_tool(call_kwargs)
         return None, None, None
 
     auto_detected_url = urls_in_message[0]
     url_read_block_id = f"blk_{uuid.uuid4().hex[:12]}"
+    policy = evaluate_url_policy(auto_detected_url)
+    if not policy.allowed:
+        logger.info(f"URL 自动抓取被策略拒绝: reason={policy.reason}, url={policy.safe_log_url}")
+        _append_url_read_tool(call_kwargs)
+        return None, None, auto_detected_url
 
     try:
         from app.services.external.reader_client import read_url
 
-        read_result = await asyncio.wait_for(read_url(auto_detected_url, timeout=8.0), timeout=8.0)
+        timeout = settings.READER_SERVICE_TIMEOUT
+        read_result = await asyncio.wait_for(
+            read_url(policy.normalized_url or auto_detected_url, timeout=timeout),
+            timeout=timeout,
+        )
     except asyncio.TimeoutError:
-        logger.warning(f"URL 自动抓取超时: {auto_detected_url}")
+        logger.warning(f"URL 自动抓取超时: url={policy.safe_log_url}")
         read_result = None
 
     if not read_result:
         # 抓取失败 → 追加 URL_READ_TOOL，让 LLM 自决
-        from app.ai.tools import URL_READ_TOOL
-
-        if URL_READ_TOOL not in call_kwargs.get("tools", []):
-            call_kwargs.setdefault("tools", []).append(URL_READ_TOOL)
+        _append_url_read_tool(call_kwargs)
         return None, None, auto_detected_url
 
-    # 抓取成功 → 注入 system 消息 + 关闭 volcengine thinking + 返回 UrlBlock
+    # 抓取成功 → 注入 user role 不可信上下文 + 关闭 volcengine thinking + 返回 UrlBlock
     from app.services.tool_handlers.url_read import MAX_CONTENT_CHARS
 
-    content_text = read_result.content
-    truncation_note = ""
-    if len(content_text) > MAX_CONTENT_CHARS:
-        content_text = content_text[:MAX_CONTENT_CHARS]
-        truncation_note = "\n（内容已截断，仅展示前部分）"
     url_context_msg = {
-        "role": "system",
-        "content": (
-            f"以下是用户消息中提到的网页 {auto_detected_url} 的内容：\n"
-            f"标题：{read_result.title or '未知'}\n\n"
-            f"{content_text}{truncation_note}\n\n"
-            "请基于以上网页内容回答用户的问题。"
+        "role": "user",
+        "content": format_untrusted_source_context(
+            UntrustedSourceContext(
+                source_id="U1",
+                source_type="url_read",
+                title=read_result.title or "未知",
+                url=read_result.url or policy.normalized_url or auto_detected_url,
+                content=read_result.content,
+                provider="reader-service",
+            ),
+            max_chars=MAX_CONTENT_CHARS,
         ),
     }
 
@@ -126,7 +139,7 @@ async def preprocess_url_in_message(
     url_read_block = UrlBlock(
         type="url_read",
         id=url_read_block_id,
-        url=auto_detected_url,
+        url=read_result.url or policy.normalized_url or auto_detected_url,
         title=read_result.title,
         favicon=read_result.favicon,
     )
