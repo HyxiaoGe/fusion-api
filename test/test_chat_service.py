@@ -196,6 +196,7 @@ class ChatServiceTests(unittest.TestCase):
             )
 
         self.assertEqual(title, "Fusion Chat")
+        self.assertEqual(mock_litellm.acompletion.await_args.kwargs["max_tokens"], 128)
         service.conversation_service.repo.update_title.assert_called_once_with("conv-1", "Fusion Chat")
         service.db.commit.assert_called_once()
 
