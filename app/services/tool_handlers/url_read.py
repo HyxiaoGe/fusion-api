@@ -4,6 +4,7 @@ UrlReadHandler — 网页读取工具处理器
 
 import time
 
+from app.core.config import settings
 from app.schemas.chat import UrlBlock
 from app.services.external.reader_client import read_url
 from app.services.tool_handlers.base import BaseToolHandler, ToolResult
@@ -32,14 +33,14 @@ class UrlReadHandler(BaseToolHandler):
 
         start = time.monotonic()
         try:
-            result = await read_url(url, timeout=5.0)
+            result = await read_url(url, timeout=settings.READER_SERVICE_TIMEOUT)
             duration_ms = int((time.monotonic() - start) * 1000)
 
             if result is None:
                 return ToolResult(
-                    status="failed",
+                    status="degraded",
                     duration_ms=duration_ms,
-                    error_message="reader-service 返回空结果",
+                    error_message="reader-service 暂时未返回内容，已跳过网页读取",
                     data={"url": url},
                 )
 

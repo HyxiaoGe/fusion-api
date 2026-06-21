@@ -28,7 +28,7 @@ _TOOL_PERMANENT_KEYWORDS = ("not_found", "invalid", "rate_limit", "400", "401", 
 
 def _should_retry_tool_result(result) -> bool:
     """决定 ToolResult 是否应该再试一次（True = 重试，False = 接受当前结果）。"""
-    if result.status == "success":
+    if result.status in ("success", "degraded"):
         return False
     err = (result.error_message or "").lower()
     is_permanent = any(kw in err for kw in _TOOL_PERMANENT_KEYWORDS)

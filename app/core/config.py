@@ -117,6 +117,8 @@ class Settings(BaseSettings):
 
     # 网页读取服务地址
     READER_SERVICE_URL: str = os.getenv("READER_SERVICE_URL", "http://reader-service:8091")
+    # reader-service 内部默认等待 Jina 10s；调用方略长一点，避免冷抓取刚超过 5s 就提前断开。
+    READER_SERVICE_TIMEOUT: float = float(os.getenv("READER_SERVICE_TIMEOUT", "12"))
 
     # 文档站点开关（生产关掉减少攻击面）
     ENABLE_DOCS: bool = True

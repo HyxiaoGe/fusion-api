@@ -151,16 +151,17 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
         result = await self.handler.execute({"url": ""})
         self.assertEqual(result.status, "degraded")
 
-    async def test_execute_failure_returns_failed(self):
-        """读取失败返回 failed"""
+    async def test_execute_failure_returns_degraded(self):
+        """读取失败走工具降级，不阻断对话"""
         with patch(
             "app.services.tool_handlers.url_read.read_url",
             new_callable=AsyncMock,
             return_value=None,
-        ):
+        ) as mock_read:
             result = await self.handler.execute({"url": "https://example.com"})
 
-        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.status, "degraded")
+        mock_read.assert_awaited_once_with("https://example.com", timeout=12.0)
 
     def test_format_llm_context_truncates_long_content(self):
         """超长内容会被截断"""

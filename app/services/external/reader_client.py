@@ -23,13 +23,14 @@ class UrlReadResult:
     fetch_ms: int
 
 
-async def read_url(url: str, timeout: float = 5.0) -> Optional[UrlReadResult]:
+async def read_url(url: str, timeout: float | None = None) -> Optional[UrlReadResult]:
     """
     调用 reader-service 读取网页内容。
     返回 UrlReadResult；失败时返回 None（不阻断对话）。
     """
+    effective_timeout = settings.READER_SERVICE_TIMEOUT if timeout is None else timeout
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=effective_timeout) as client:
             resp = await client.get(
                 f"{settings.READER_SERVICE_URL}/read",
                 params={"url": url},
@@ -45,6 +46,12 @@ async def read_url(url: str, timeout: float = 5.0) -> Optional[UrlReadResult]:
             content_length=data.get("content_length", 0),
             fetch_ms=data.get("fetch_ms", 0),
         )
+    except (httpx.TimeoutException, httpx.RequestError, httpx.HTTPStatusError) as e:
+        logger.warning(
+            f"reader-service 暂时未返回内容，已降级跳过: url={url}, "
+            f"timeout={effective_timeout}s, error={type(e).__name__}: {e}"
+        )
+        return None
     except Exception as e:
-        logger.error(f"reader-service 调用失败: url={url}, error={type(e).__name__}: {e}")
+        logger.error(f"reader-service 响应解析失败: url={url}, error={type(e).__name__}: {e}")
         return None
