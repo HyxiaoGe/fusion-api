@@ -43,6 +43,21 @@ class ChatUtilsTests(unittest.TestCase):
         questions = ChatUtils.parse_questions("1. 第一个问题\n2) 第二个问题\n3. 第三个问题")
         self.assertEqual(questions, ["第一个问题", "第二个问题", "第三个问题"])
 
+    def test_parse_questions_filters_truncated_number_fragment(self):
+        questions = ChatUtils.parse_questions(
+            "1. SSI计划采用哪些具体的技术路线或方法论来实现安全超级智能？\n"
+            "2. Ilya与OpenAI在安全理念上的分歧具体体现在哪些关键事件或决策上？\n"
+            "3"
+        )
+
+        self.assertEqual(
+            questions,
+            [
+                "SSI计划采用哪些具体的技术路线或方法论来实现安全超级智能？",
+                "Ilya与OpenAI在安全理念上的分歧具体体现在哪些关键事件或决策上？",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

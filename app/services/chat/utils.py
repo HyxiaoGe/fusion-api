@@ -58,6 +58,14 @@ class ChatUtils:
         return [line.strip() for line in text.split("\n") if line.strip()]
 
     @staticmethod
+    def _is_valid_question_candidate(text: str) -> bool:
+        """过滤模型被截断时留下的裸编号等无效问题。"""
+        question = text.strip()
+        if not question:
+            return False
+        return re.fullmatch(r"\d+[\.\)]?", question) is None
+
+    @staticmethod
     def _extract_numbered_questions(response_text: str) -> List[str]:
         """提取按编号组织的问题列表。"""
         numbered_questions = re.findall(
@@ -65,7 +73,7 @@ class ChatUtils:
             response_text,
             re.DOTALL,
         )
-        return [q.strip() for q in numbered_questions]
+        return [q.strip() for q in numbered_questions if ChatUtils._is_valid_question_candidate(q)]
 
     @staticmethod
     def parse_questions(response_text: str) -> List[str]:
@@ -89,11 +97,7 @@ class ChatUtils:
         lines = ChatUtils._split_non_empty_lines(response_text)
         for line in lines:
             cleaned_line = ChatUtils._strip_question_prefix(line)
-            if cleaned_line:
+            if ChatUtils._is_valid_question_candidate(cleaned_line):
                 questions.append(cleaned_line)
-
-        # 如果没有找到足够的问题，返回原始文本分成的前三行
-        if len(questions) < 3:
-            questions = lines[:3] if len(lines) >= 3 else lines
 
         return questions

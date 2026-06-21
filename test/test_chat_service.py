@@ -154,6 +154,7 @@ class ChatServiceTests(unittest.TestCase):
 
         self.assertEqual(len(questions), 3)
         self.assertEqual(questions, ["Follow-up A", "Follow-up B", "Follow-up C"])
+        self.assertEqual(mock_litellm.acompletion.await_args.kwargs["max_tokens"], 512)
 
     def test_generate_title_persists_title_to_database(self):
         service = object.__new__(ChatService)

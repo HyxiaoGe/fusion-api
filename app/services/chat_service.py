@@ -247,6 +247,8 @@ class ChatService:
     # 辅助 LLM 调用的内部超时（秒），必须 < TimeoutMiddleware 的 10s。
     # 这样即便将来换的辅助模型偏慢，也能在中间件掐断前自己抛错走 fallback，而不是把 408 吐给前端。
     UTILITY_LLM_TIMEOUT = 8
+    # deepseek-chat 可能把一部分 completion token 用在 reasoning 上，200 容易截断第三个推荐问题。
+    SUGGESTED_QUESTIONS_MAX_TOKENS = 512
 
     def _resolve_utility_model(self, conversation_model_id: str) -> tuple:
         """解析辅助功能模型，固定用轻量模型，找不到则回退对话模型"""
@@ -345,7 +347,7 @@ class ChatService:
                 model=litellm_model,
                 messages=[{"role": "user", "content": prompt}],
                 stream=False,
-                max_tokens=200,
+                max_tokens=self.SUGGESTED_QUESTIONS_MAX_TOKENS,
                 timeout=self.UTILITY_LLM_TIMEOUT,
                 **litellm_kwargs,
             )
