@@ -267,7 +267,15 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                 events.append(json.loads(call["content"]))
         return events
 
-    async def _invoke(self, *, stream_round_side_effect, execute_tools_result=None, patch_extra=None):
+    async def _invoke(
+        self,
+        *,
+        stream_round_side_effect,
+        execute_tools_result=None,
+        patch_extra=None,
+        capabilities=None,
+        options=None,
+    ):
         """通用启动器：mock _stream_round + _execute_tools_parallel 后跑 generate_to_redis。
 
         stream_round_side_effect: callable 或 list；list 时按序消费每次 _stream_round 返回值
@@ -309,7 +317,8 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                 original_message="hi",
                 assistant_message_id="msg-1",
                 task_id="task-1",
-                options={"use_reasoning": False},
+                options=options or {"use_reasoning": False},
+                capabilities=capabilities,
                 trace_id="trace-1",
             )
 
@@ -339,6 +348,51 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1]["finish_reason"], "stop")
         # session 终态
         self.assertEqual(self.session_statuses[-1]["status"], "completed")
+
+    async def test_tool_mode_injects_web_search_contract_prompt(self):
+        """工具模式：调用 LLM 前注入契约，避免 thinking 口头搜索但不发 tool_call。"""
+        captured_messages = []
+
+        async def _capture_llm_call(_model, _kwargs, messages, **_call_kwargs):
+            captured_messages.append(messages)
+            return MagicMock()
+
+        await self._invoke(
+            stream_round_side_effect=[
+                ("", "Hello world", [], "stop", None),
+            ],
+            capabilities={"functionCalling": True, "deepThinking": True},
+            patch_extra=[
+                patch(
+                    "app.services.stream.runner.llm_call_with_retry",
+                    AsyncMock(side_effect=_capture_llm_call),
+                )
+            ],
+        )
+
+        system_prompts = [m["content"] for m in captured_messages[0] if m.get("role") == "system"]
+        contract = "\n".join(system_prompts)
+        self.assertIn("必须调用 web_search", contract)
+        self.assertIn("不要在思考过程或最终回答中声称", contract)
+        self.assertIn("没有调用工具", contract)
+
+    async def test_round_summary_log_records_finish_reason_and_counts(self):
+        """每轮 LLM 结束写诊断日志，后续可直接区分口头搜索和真实 tool_call。"""
+        with patch("app.services.stream.runner.logger.info") as mock_info:
+            await self._invoke(
+                stream_round_side_effect=[
+                    ("想搜索但没有工具调用", "Hello world", [], "stop", None),
+                ],
+                capabilities={"functionCalling": True, "deepThinking": True},
+            )
+
+        log_lines = [str(call.args[0]) for call in mock_info.call_args_list if call.args]
+        round_logs = [line for line in log_lines if "AGENT_ROUND_SUMMARY" in line]
+        self.assertEqual(len(round_logs), 1)
+        self.assertIn("finish_reason=stop", round_logs[0])
+        self.assertIn("tool_calls=0", round_logs[0])
+        self.assertIn("reasoning_chars=10", round_logs[0])
+        self.assertIn("content_chars=11", round_logs[0])
 
     async def test_normal_path_with_tool_calls(self):
         """正常 tool_calls + stop：2 round → run_completed(stop)"""

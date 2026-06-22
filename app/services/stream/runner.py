@@ -38,6 +38,60 @@ AGENT_MAX_STEPS = 8  # LLM 调用轮次上限
 AGENT_MAX_TOOL_CALLS = 20  # 工具执行总次数上限
 AGENT_TOTAL_TIMEOUT = 300  # 5 分钟硬超时
 
+_WEB_SEARCH_TOOL_CONTRACT_PROMPT = (
+    "【工具调用一致性规则】\n"
+    "如果你判断需要联网搜索，必须调用 web_search 工具，不能只在文字里说要搜索。\n"
+    "不要在思考过程或最终回答中声称「我将搜索」「正在搜索」「让我搜索一下」「根据搜索结果」等，"
+    "除非你已经实际调用工具并收到了工具结果。\n"
+    "没有调用工具时，请直接基于已有知识回答，并明确避免暗示已经联网或即将联网。"
+)
+
+
+def _tool_names_from_call_kwargs(call_kwargs: dict) -> set[str]:
+    names: set[str] = set()
+    for tool in call_kwargs.get("tools", []) or []:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function")
+        if isinstance(fn, dict) and fn.get("name"):
+            names.add(str(fn["name"]))
+    return names
+
+
+def _inject_tool_usage_contract(messages: list[dict], call_kwargs: dict) -> list[dict]:
+    """工具模式下补一条 system 约束，避免 reasoning 口头承诺搜索但不发 tool_call。"""
+    if "web_search" not in _tool_names_from_call_kwargs(call_kwargs):
+        return messages
+    if any(msg.get("role") == "system" and "【工具调用一致性规则】" in str(msg.get("content", "")) for msg in messages):
+        return messages
+
+    insert_at = 0
+    while insert_at < len(messages) and messages[insert_at].get("role") == "system":
+        insert_at += 1
+    contract_msg = {"role": "system", "content": _WEB_SEARCH_TOOL_CONTRACT_PROMPT}
+    return [*messages[:insert_at], contract_msg, *messages[insert_at:]]
+
+
+def _log_agent_round_summary(
+    *,
+    conversation_id: str,
+    run_id: str,
+    step_number: int,
+    model_id: str,
+    provider: str,
+    finish_reason: str,
+    tool_calls_count: int,
+    reasoning_buf: str,
+    content_buf: str,
+) -> None:
+    logger.info(
+        "AGENT_ROUND_SUMMARY "
+        f"conv_id={conversation_id} run_id={run_id} step={step_number} "
+        f"model_id={model_id} provider={provider} finish_reason={finish_reason} "
+        f"tool_calls={tool_calls_count} reasoning_chars={len(reasoning_buf)} "
+        f"content_chars={len(content_buf)}"
+    )
+
 
 class StreamHandler:
     """流式处理器"""
@@ -151,6 +205,8 @@ class StreamHandler:
             if url_read_block:
                 content_blocks.append(url_read_block)
 
+            messages = _inject_tool_usage_contract(messages, call_kwargs)
+
             # ═══════════════════════════════════════
             # Agent Loop
             # ═══════════════════════════════════════
@@ -229,6 +285,17 @@ class StreamHandler:
                     text_block_id,
                     run_id=run_id,
                     step_id=current_step_id,
+                )
+                _log_agent_round_summary(
+                    conversation_id=conversation_id,
+                    run_id=run_id,
+                    step_number=step,
+                    model_id=model_id,
+                    provider=provider,
+                    finish_reason=finish_reason,
+                    tool_calls_count=len(tool_calls_list),
+                    reasoning_buf=reasoning_buf,
+                    content_buf=content_buf,
                 )
 
                 # 累积 usage
@@ -450,6 +517,17 @@ class StreamHandler:
                     remaining = max(10, AGENT_TOTAL_TIMEOUT - (time.time() - run_start))
                     reasoning_buf, content_buf, _, _, usage_data = await asyncio.wait_for(
                         _do_summary(), timeout=remaining
+                    )
+                    _log_agent_round_summary(
+                        conversation_id=conversation_id,
+                        run_id=run_id,
+                        step_number=step,
+                        model_id=model_id,
+                        provider=provider,
+                        finish_reason="limit_summary",
+                        tool_calls_count=0,
+                        reasoning_buf=reasoning_buf,
+                        content_buf=content_buf,
                     )
                 except asyncio.TimeoutError:
                     logger.warning(f"触顶总结超出剩余预算: conv_id={conversation_id}, budget={remaining}s")
