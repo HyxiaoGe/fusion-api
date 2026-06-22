@@ -1,4 +1,5 @@
 """session_cache 单元测试 — mock SessionLocal 验证 ORM 操作"""
+
 import os
 import unittest
 from unittest.mock import MagicMock, patch
@@ -21,9 +22,9 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             session = MagicMock()
             mock_sl.return_value.__enter__.return_value = session
             session.get.return_value = None  # 明确无已有行
-            await write_session_started(run_id="r1", conversation_id="c1",
-                                        user_id="u1", model_id="gpt-4",
-                                        provider="openai")
+            await write_session_started(
+                run_id="r1", conversation_id="c1", user_id="u1", model_id="gpt-4", provider="openai"
+            )
             session.add.assert_called_once()
             session.commit.assert_called_once()
             row = session.add.call_args.args[0]
@@ -48,9 +49,9 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             existing.status = "completed"
             session.get.return_value = existing
 
-            await write_session_started(run_id="r1", conversation_id="c2",
-                                        user_id="u2", model_id="gpt-5",
-                                        provider="anthropic")
+            await write_session_started(
+                run_id="r1", conversation_id="c2", user_id="u2", model_id="gpt-5", provider="anthropic"
+            )
 
             # 不应 add 新行
             session.add.assert_not_called()
@@ -71,9 +72,9 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             mock_sl.return_value.__enter__.return_value = session
             session.get.return_value = None  # 无已有行
 
-            await write_session_started(run_id="r1", conversation_id="c1",
-                                        user_id="u1", model_id="gpt-4",
-                                        provider="openai")
+            await write_session_started(
+                run_id="r1", conversation_id="c1", user_id="u1", model_id="gpt-4", provider="openai"
+            )
 
             session.add.assert_called_once()
             row = session.add.call_args.args[0]
@@ -100,8 +101,7 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             mock_sl.return_value.__enter__.return_value = session
             row = MagicMock()
             session.get.return_value = row
-            await write_step_completed(step_id="s1", tool_names=["web_search"],
-                                       duration_ms=42)
+            await write_step_completed(step_id="s1", tool_names=["web_search"], duration_ms=42)
             session.get.assert_called_once()
             self.assertEqual(row.status, "completed")
             self.assertEqual(row.tool_names, ["web_search"])
@@ -114,8 +114,7 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             session = MagicMock()
             mock_sl.return_value.__enter__.return_value = session
             session.get.return_value = None
-            await write_step_completed(step_id="missing", tool_names=None,
-                                       duration_ms=0)
+            await write_step_completed(step_id="missing", tool_names=None, duration_ms=0)
             session.commit.assert_not_called()
 
     async def test_write_step_terminal_sets_failed(self):
@@ -149,26 +148,35 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             mock_sl.return_value.__enter__.return_value = session
             row = MagicMock()
             session.get.return_value = row
-            await write_session_status(run_id="r1", status="interrupted",
-                                       total_steps=2, total_tool_calls=3)
+            await write_session_status(run_id="r1", status="interrupted", total_steps=2, total_tool_calls=3)
             self.assertEqual(row.status, "interrupted")
             self.assertEqual(row.total_steps, 2)
             self.assertEqual(row.total_tool_calls, 3)
 
+    async def test_write_session_status_accepts_incomplete(self):
+        with patch("app.services.agent.session_cache.SessionLocal") as mock_sl:
+            session = MagicMock()
+            mock_sl.return_value.__enter__.return_value = session
+            row = MagicMock()
+            session.get.return_value = row
+            await write_session_status(run_id="r1", status="incomplete", total_steps=1, total_tool_calls=0)
+            self.assertEqual(row.status, "incomplete")
+            self.assertEqual(row.total_steps, 1)
+            self.assertEqual(row.total_tool_calls, 0)
+            session.commit.assert_called_once()
+
     async def test_write_session_status_rejects_invalid_status(self):
-        """status 必须是 4 个终态值之一"""
+        """status 必须是声明过的终态值之一"""
         with patch("app.services.agent.session_cache.SessionLocal"):
             with self.assertRaises(ValueError):
-                await write_session_status(run_id="r1", status="bogus",
-                                           total_steps=0, total_tool_calls=0)
+                await write_session_status(run_id="r1", status="bogus", total_steps=0, total_tool_calls=0)
 
     async def test_write_session_status_missing_row_silently_returns(self):
         with patch("app.services.agent.session_cache.SessionLocal") as mock_sl:
             session = MagicMock()
             mock_sl.return_value.__enter__.return_value = session
             session.get.return_value = None
-            await write_session_status(run_id="missing", status="completed",
-                                       total_steps=0, total_tool_calls=0)
+            await write_session_status(run_id="missing", status="completed", total_steps=0, total_tool_calls=0)
             session.commit.assert_not_called()
 
     async def test_write_step_completed_sets_tool_calls_count(self):
@@ -177,8 +185,9 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             mock_sl.return_value.__enter__.return_value = session
             row = MagicMock()
             session.get.return_value = row
-            await write_step_completed(step_id="s1", tool_names=["web_search", "url_read"],
-                                       tool_calls_count=2, duration_ms=42)
+            await write_step_completed(
+                step_id="s1", tool_names=["web_search", "url_read"], tool_calls_count=2, duration_ms=42
+            )
             self.assertEqual(row.tool_calls_count, 2)
 
     async def test_write_step_completed_tool_calls_count_none_skipped(self):
@@ -199,9 +208,9 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             mock_sl.return_value.__enter__.return_value = session
             row = MagicMock()
             session.get.return_value = row
-            await write_session_status(run_id="r1", status="completed",
-                                       total_steps=2, total_tool_calls=3,
-                                       total_duration_ms=12345)
+            await write_session_status(
+                run_id="r1", status="completed", total_steps=2, total_tool_calls=3, total_duration_ms=12345
+            )
             self.assertEqual(row.total_duration_ms, 12345)
 
 

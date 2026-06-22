@@ -3,6 +3,7 @@
 emitter 不碰 DB；本模块由 stream_handler (Task 9) 在 emit 调用点平行调用。
 所有函数 async，但内部用同步 SQLAlchemy session（沿用项目惯例）。
 """
+
 from __future__ import annotations
 
 from app.core.logger import app_logger as logger
@@ -10,9 +11,9 @@ from app.db.database import SessionLocal
 from app.db.models import AgentSession, AgentStep
 
 
-async def write_session_started(*, run_id: str, conversation_id: str,
-                                user_id: str, model_id: str,
-                                provider: str) -> None:
+async def write_session_started(
+    *, run_id: str, conversation_id: str, user_id: str, model_id: str, provider: str
+) -> None:
     """run 启动时 UPSERT agent_sessions 行（status='running' 占位）。
 
     幂等：同 run_id 二次调用（任务重试 / 恢复 / superseded）会更新已有行
@@ -48,8 +49,7 @@ async def write_session_started(*, run_id: str, conversation_id: str,
         session.commit()
 
 
-async def write_step_started(*, run_id: str, step_id: str,
-                             step_number: int) -> None:
+async def write_step_started(*, run_id: str, step_id: str, step_number: int) -> None:
     """step 开始时插入 agent_steps 行（status='running'）。
 
     duration_ms / tool_names 留空（None / [], 由 write_step_completed 填）；
@@ -68,10 +68,9 @@ async def write_step_started(*, run_id: str, step_id: str,
         session.commit()
 
 
-async def write_step_completed(*, step_id: str,
-                               tool_names: list[str] | None = None,
-                               tool_calls_count: int | None = None,
-                               duration_ms: int = 0) -> None:
+async def write_step_completed(
+    *, step_id: str, tool_names: list[str] | None = None, tool_calls_count: int | None = None, duration_ms: int = 0
+) -> None:
     """step 正常结束时 update agent_steps 行。
 
     tool_names / tool_calls_count 为 None 时不更新对应字段（沿用原值）。
@@ -107,15 +106,15 @@ async def write_step_terminal(*, step_id: str, status: str) -> None:
         session.commit()
 
 
-async def write_session_status(*, run_id: str, status: str,
-                               total_steps: int, total_tool_calls: int,
-                               total_duration_ms: int | None = None) -> None:
+async def write_session_status(
+    *, run_id: str, status: str, total_steps: int, total_tool_calls: int, total_duration_ms: int | None = None
+) -> None:
     """run 终态写入 agent_sessions 行。
 
     total_duration_ms 为 None 时不更新该字段（兼容某些不计时的路径）。
     row 不存在时 silently return + log warning。
     """
-    if status not in ("completed", "limit_reached", "interrupted", "error"):
+    if status not in ("completed", "limit_reached", "incomplete", "interrupted", "error"):
         raise ValueError(f"invalid session terminal status: {status!r}")
     with SessionLocal() as session:
         row = session.get(AgentSession, run_id)

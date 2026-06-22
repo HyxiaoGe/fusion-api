@@ -199,7 +199,9 @@ class AgentSession(Base):
     total_tool_calls = Column(Integer, default=0)
     total_duration_ms = Column(Integer, nullable=True)
 
-    status = Column(String(20), nullable=False)  # "running" | "completed" | "limit_reached" | "error" | "interrupted"
+    status = Column(
+        String(20), nullable=False
+    )  # "running" | "completed" | "limit_reached" | "incomplete" | "error" | "interrupted"
     limit_reason = Column(String(30), nullable=True)  # "max_steps" | "max_tool_calls" | "timeout"
     error_message = Column(Text, nullable=True)
 
@@ -215,7 +217,9 @@ class AgentStep(Base):
     trace_id = Column(String, nullable=False, index=True)
     step_number = Column(Integer, nullable=False)
 
-    status = Column(String(20), nullable=False, server_default="completed")  # "running" | "completed" | "failed" | "interrupted"
+    status = Column(
+        String(20), nullable=False, server_default="completed"
+    )  # "running" | "completed" | "failed" | "interrupted"
     # 注：ORM 层无 default，新建必须显式传 status；server_default 仅用于 ALTER 时兜底已有历史行。
 
     tool_calls_count = Column(Integer, default=0)
@@ -225,5 +229,3 @@ class AgentStep(Base):
     created_at = Column(DateTime, default=get_china_time)
 
     __table_args__ = (UniqueConstraint("trace_id", "step_number", name="uq_trace_step"),)
-
-
