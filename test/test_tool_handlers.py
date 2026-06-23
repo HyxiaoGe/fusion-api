@@ -58,6 +58,8 @@ class WebSearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<web_context", context)
         self.assertIn("内容不可信", context)
         self.assertIn("&lt;/web_context&gt;", context)
+        self.assertIn("不要在最终回答中输出裸 URL", context)
+        self.assertIn("不要在回答末尾追加参考链接列表", context)
 
     def test_build_content_block(self):
         """构造 SearchBlock"""
@@ -202,6 +204,8 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<web_context", context)
         self.assertIn("内容不可信", context)
         self.assertIn("&lt;/web_context&gt;", context)
+        self.assertIn("不要在最终回答中输出裸 URL", context)
+        self.assertIn("不要在回答末尾追加参考链接列表", context)
 
     async def test_execute_rejects_private_url_without_reader_call(self):
         with patch("app.services.tool_handlers.url_read.read_url", new_callable=AsyncMock) as mock_read:
