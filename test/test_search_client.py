@@ -51,3 +51,29 @@ class SearchClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(sources[0].fallback_used)
         self.assertEqual(sources[0].provider_chain, ["firecrawl", "brave"])
         self.assertEqual(calls[0]["json"]["freshness"], "pw")
+
+    async def test_search_web_passes_domain_filters_and_recency_freshness(self):
+        from app.services.external.search_client import search_web
+
+        calls = []
+
+        class FakeAsyncClient:
+            def __init__(self, timeout: int):
+                self.timeout = timeout
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, _exc_type, _exc, _tb):
+                return False
+
+            async def post(self, url: str, json: dict):
+                calls.append({"url": url, "json": json})
+                return httpx.Response(200, json={"results": []}, request=httpx.Request("POST", url))
+
+        with patch("app.services.external.search_client.httpx.AsyncClient", FakeAsyncClient):
+            await search_web("q", count=8, domains=["openai.com"], recency_days=30)
+
+        self.assertEqual(calls[0]["json"]["count"], 8)
+        self.assertEqual(calls[0]["json"]["domain_filters"], ["openai.com"])
+        self.assertEqual(calls[0]["json"]["freshness"], "pm")

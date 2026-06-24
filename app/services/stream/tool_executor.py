@@ -9,13 +9,16 @@ import asyncio
 import json
 import time
 import uuid
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import backoff
 
 from app.core.logger import app_logger as logger
 from app.services.agent.emitter import AgentEventEmitter
 from app.services.stream_state_service import append_chunk
+
+if TYPE_CHECKING:
+    from app.services.stream.network_budget import NetworkToolBudget
 
 # 单次工具调用超时
 AGENT_TOOL_TIMEOUT = 30
@@ -90,6 +93,7 @@ async def execute_tools_parallel(
     step_number: int = None,
     message_id: str | None = None,
     emitter: Optional[AgentEventEmitter] = None,
+    network_budget: "NetworkToolBudget | None" = None,
 ) -> list:
     """
     并行执行所有 tool_calls。
@@ -119,6 +123,44 @@ async def execute_tools_parallel(
             args = json.loads(tc["arguments"]) if isinstance(tc["arguments"], str) else tc["arguments"]
         except json.JSONDecodeError:
             args = {}
+
+        budget_result = None
+        if network_budget is not None:
+            if tc["name"] == "web_search":
+                args, budget_result = network_budget.prepare_web_search_args(args)
+            elif tc["name"] == "url_read":
+                args, budget_result = network_budget.prepare_url_read_args(args)
+
+        if budget_result is not None:
+            result = budget_result
+            if emitter is not None:
+                await emitter.tool_call_started(
+                    tool_call_id=tc["id"],
+                    tool_name=handler.tool_name,
+                    arguments=args,
+                )
+                await emitter.tool_call_completed(
+                    tool_call_id=tc["id"],
+                    tool_name=handler.tool_name,
+                    status=result.status,
+                    duration_ms=result.duration_ms or 0,
+                    result_summary=handler._build_result_summary(result),
+                    error=result.error_message,
+                )
+
+            await handler.log(
+                log_id=log_id,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                model_id=model_id,
+                provider=provider,
+                result=result,
+                input_params=args,
+                trace_id=trace_id,
+                step_number=step_number,
+                message_id=message_id,
+            )
+            return tc, result, handler, block_id, log_id
 
         # ── emitter 路径 ──
         # 直接复用 handler.execute_with_emitter 的发 start/completed 协议，

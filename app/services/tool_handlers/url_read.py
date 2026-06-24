@@ -13,6 +13,7 @@ from app.services.tool_handlers.base import BaseToolHandler, ToolResult
 
 # 注入 LLM 上下文时的最大字符数（约 4000 token）
 MAX_CONTENT_CHARS = 8000
+MAX_REASON_CHARS = 160
 
 
 class UrlReadHandler(BaseToolHandler):
@@ -26,11 +27,12 @@ class UrlReadHandler(BaseToolHandler):
 
     async def execute(self, args: dict) -> ToolResult:
         url = args.get("url", "").strip()
+        reason = _normalize_reason(args.get("reason"))
         if not url:
             return ToolResult(
                 status="degraded",
                 error_message="url 为空",
-                data={"url": url},
+                data={"url": url, "reason": reason},
             )
         policy = evaluate_url_policy(url)
         if not policy.allowed:
@@ -41,6 +43,7 @@ class UrlReadHandler(BaseToolHandler):
                     "url": url,
                     "safe_log_url": policy.safe_log_url,
                     "degraded_reason": policy.reason,
+                    "reason": reason,
                 },
             )
 
@@ -54,7 +57,11 @@ class UrlReadHandler(BaseToolHandler):
                     status="degraded",
                     duration_ms=duration_ms,
                     error_message="reader-service 暂时未返回内容，已跳过网页读取",
-                    data={"url": policy.normalized_url or url, "safe_log_url": policy.safe_log_url},
+                    data={
+                        "url": policy.normalized_url or url,
+                        "safe_log_url": policy.safe_log_url,
+                        "reason": reason,
+                    },
                 )
 
             return ToolResult(
@@ -66,6 +73,7 @@ class UrlReadHandler(BaseToolHandler):
                     "content": result.content,
                     "favicon": result.favicon,
                     "content_length": result.content_length,
+                    "reason": reason,
                 },
             )
         except Exception as e:
@@ -74,7 +82,7 @@ class UrlReadHandler(BaseToolHandler):
                 status="failed",
                 duration_ms=duration_ms,
                 error_message=str(e),
-                data={"url": url},
+                data={"url": url, "reason": reason},
             )
 
     def build_content_block(self, result: ToolResult, block_id: str, log_id: str) -> UrlBlock:
@@ -102,6 +110,7 @@ class UrlReadHandler(BaseToolHandler):
             error_message=result.error_message,
             source_count=len(source_refs),
             source_refs=source_refs,
+            reason=result.data.get("reason"),
         )
 
     def format_llm_context(self, result: ToolResult) -> str:
@@ -149,3 +158,12 @@ class UrlReadHandler(BaseToolHandler):
             "favicon": data.get("favicon"),
             "truncated": False,
         }
+
+
+def _normalize_reason(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    reason = value.strip()
+    if not reason:
+        return None
+    return reason[:MAX_REASON_CHARS]

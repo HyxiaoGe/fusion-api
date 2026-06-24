@@ -11,21 +11,31 @@ from app.core.logger import app_logger as logger
 from app.schemas.chat import SearchSource
 
 
-async def search_web(query: str, count: int = 5) -> List[SearchSource]:
+async def search_web(
+    query: str,
+    count: int = 5,
+    *,
+    domains: list[str] | None = None,
+    recency_days: int | None = None,
+) -> List[SearchSource]:
     """
     调用 search-service 执行网络搜索。
     返回 SearchSource 列表；失败时返回空列表（不阻断对话）。
     """
     try:
+        payload = {
+            "query": query,
+            "type": "web",
+            "count": count,
+            "freshness": _freshness_from_recency_days(recency_days),
+        }
+        if domains:
+            payload["domain_filters"] = domains
+
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
                 f"{settings.SEARCH_SERVICE_URL}/search",
-                json={
-                    "query": query,
-                    "type": "web",
-                    "count": count,
-                    "freshness": "pw",  # 优先返回一周内的结果
-                },
+                json=payload,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -52,3 +62,15 @@ async def search_web(query: str, count: int = 5) -> List[SearchSource]:
     except Exception as e:
         logger.error(f"搜索服务调用失败: {e}")
         return []
+
+
+def _freshness_from_recency_days(recency_days: int | None) -> str:
+    if recency_days is None:
+        return "pw"
+    if recency_days <= 1:
+        return "pd"
+    if recency_days <= 7:
+        return "pw"
+    if recency_days <= 31:
+        return "pm"
+    return "py"

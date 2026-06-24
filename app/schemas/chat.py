@@ -89,6 +89,13 @@ class SearchBlock(BaseModel):
     result_provider: Optional[str] = None
     fallback_used: bool = False
     provider_chain: List[str] = Field(default_factory=list)
+    requested_count: Optional[int] = None
+    actual_count: Optional[int] = None
+    context_source_count: Optional[int] = None
+    intent: Optional[str] = None
+    domains: List[str] = Field(default_factory=list)
+    recency_days: Optional[int] = None
+    budget_limited: bool = False
 
 
 class UrlBlock(BaseModel):
@@ -104,6 +111,7 @@ class UrlBlock(BaseModel):
     error_message: Optional[str] = None
     source_count: int = 0
     source_refs: List[SourceReference] = Field(default_factory=list)
+    reason: Optional[str] = None
 
 
 # content block 的联合类型，后续扩展直接在此添加

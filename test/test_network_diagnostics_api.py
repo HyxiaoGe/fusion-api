@@ -40,8 +40,8 @@ class NetworkDiagnosticsApiTests(unittest.TestCase):
         self.main.app.dependency_overrides[self._route_deps["get_chat_service"]] = lambda: chat_service
 
         diagnostics_service = diagnostics or SimpleNamespace(build_for_message=MagicMock())
-        self.main.app.dependency_overrides[self._route_deps["get_network_diagnostics_service"]] = (
-            lambda: diagnostics_service
+        self.main.app.dependency_overrides[self._route_deps["get_network_diagnostics_service"]] = lambda: (
+            diagnostics_service
         )
         return chat_service, diagnostics_service
 
@@ -97,6 +97,13 @@ class NetworkDiagnosticsApiTests(unittest.TestCase):
                             tool_name="web_search",
                             status="success",
                             target="redis",
+                            requested_count=8,
+                            actual_count=7,
+                            context_count=6,
+                            intent="comparison",
+                            domains=["redis.io"],
+                            recency_days=30,
+                            budget_limited=True,
                             admin={"trace_id": "trace-1"},
                         )
                     ],
@@ -110,6 +117,13 @@ class NetworkDiagnosticsApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         tool = response.json()["data"]["tools"][0]
         self.assertEqual(tool["admin"]["trace_id"], "trace-1")
+        self.assertEqual(tool["requested_count"], 8)
+        self.assertEqual(tool["actual_count"], 7)
+        self.assertEqual(tool["context_count"], 6)
+        self.assertEqual(tool["intent"], "comparison")
+        self.assertEqual(tool["domains"], ["redis.io"])
+        self.assertEqual(tool["recency_days"], 30)
+        self.assertTrue(tool["budget_limited"])
         diagnostics_service.build_for_message.assert_called_once_with(
             conversation_id="conv-1",
             message_id="assistant-1",

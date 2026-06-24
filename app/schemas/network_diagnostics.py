@@ -28,6 +28,13 @@ class NetworkDiagnosticsToolItem(BaseModel):
     target: str = ""
     result_count: int | None = None
     reason: str | None = None
+    requested_count: int | None = None
+    actual_count: int | None = None
+    context_count: int | None = None
+    intent: str | None = None
+    domains: list[str] = Field(default_factory=list)
+    recency_days: int | None = None
+    budget_limited: bool = False
     started_at: datetime | None = None
     admin: dict[str, Any] | None = None
 

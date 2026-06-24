@@ -26,6 +26,7 @@ from app.services.chat.message_builder import (
     is_image_file,
 )
 from app.services.stream.llm_stream import llm_call_with_retry, stream_round
+from app.services.stream.network_budget import NetworkToolBudget
 from app.services.stream.persistence import persist_message, preprocess_url_in_message
 from app.services.stream.tool_executor import AgentEventRedisWriter, execute_tools_parallel
 from app.services.stream_state_service import (
@@ -152,6 +153,7 @@ class StreamHandler:
         accumulated_usage = Usage(input_tokens=0, output_tokens=0)
         step = 0
         total_tool_calls = 0
+        network_budget = NetworkToolBudget()
         finish_reason = "stop"
 
         # ─────── Agent 控制面：emitter + session_cache ───────
@@ -386,6 +388,7 @@ class StreamHandler:
                         step_number=step,
                         message_id=assistant_message_id,
                         emitter=emitter,
+                        network_budget=network_budget,
                     )
                     total_tool_calls += len(tool_calls_list)
 

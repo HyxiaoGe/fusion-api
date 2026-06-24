@@ -49,6 +49,63 @@ class NetworkDiagnosticsServiceTests(unittest.TestCase):
         self.assertEqual(item.result_count, 5)
         self.assertIsNone(item.admin)
 
+    def test_web_search_tool_item_includes_dynamic_network_metadata(self):
+        service = NetworkDiagnosticsService(unittest.mock.MagicMock())
+        log = ToolCallLog(
+            id="log-1",
+            conversation_id="conv-1",
+            message_id="assistant-1",
+            user_id="user-1",
+            tool_name="web_search",
+            status="success",
+            duration_ms=123,
+            model_id="model",
+            provider="provider",
+            input_params={
+                "query": "redis stream",
+                "count": 8,
+                "intent": "comparison",
+                "domains": ["redis.io"],
+                "recency_days": 30,
+            },
+            output_data={
+                "requested_count": 8,
+                "actual_count": 7,
+                "context_source_count": 6,
+                "budget_limited": True,
+            },
+        )
+
+        item = service._tool_item_from_log(log, is_admin=False)
+
+        self.assertEqual(item.requested_count, 8)
+        self.assertEqual(item.actual_count, 7)
+        self.assertEqual(item.context_count, 6)
+        self.assertEqual(item.intent, "comparison")
+        self.assertEqual(item.domains, ["redis.io"])
+        self.assertEqual(item.recency_days, 30)
+        self.assertTrue(item.budget_limited)
+
+    def test_success_url_read_reason_prefers_input_params(self):
+        service = NetworkDiagnosticsService(unittest.mock.MagicMock())
+        log = ToolCallLog(
+            id="log-1",
+            conversation_id="conv-1",
+            message_id="assistant-1",
+            user_id="user-1",
+            tool_name="url_read",
+            status="success",
+            duration_ms=123,
+            model_id="model",
+            provider="provider",
+            input_params={"url": "https://example.com/a", "reason": "需要核实官方原文细节"},
+            output_data={"reason": "旧原因"},
+        )
+
+        item = service._tool_item_from_log(log, is_admin=False)
+
+        self.assertEqual(item.reason, "需要核实官方原文细节")
+
     def test_tool_item_includes_admin_fields_for_admin(self):
         service = NetworkDiagnosticsService(unittest.mock.MagicMock())
         log = ToolCallLog(

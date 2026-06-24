@@ -99,7 +99,14 @@ class NetworkDiagnosticsService:
             duration_ms=log.duration_ms,
             target=self._derive_target(log.tool_name, input_params),
             result_count=self._derive_result_count(log.tool_name, output_data),
-            reason=self._derive_reason(log.status, log.error_message),
+            reason=self._derive_reason(log.tool_name, log.status, log.error_message, input_params, output_data),
+            requested_count=self._derive_requested_count(log.tool_name, input_params, output_data),
+            actual_count=self._derive_actual_count(log.tool_name, output_data),
+            context_count=self._derive_context_count(log.tool_name, output_data),
+            intent=self._derive_intent(log.tool_name, input_params, output_data),
+            domains=self._derive_domains(log.tool_name, input_params, output_data),
+            recency_days=self._derive_recency_days(log.tool_name, input_params, output_data),
+            budget_limited=bool(output_data.get("budget_limited", False)),
             started_at=log.created_at,
             admin=admin,
         )
@@ -124,9 +131,23 @@ class NetworkDiagnosticsService:
             return len(sources)
         return None
 
-    def _derive_reason(self, status: str, error_message: str | None) -> str | None:
+    def _derive_reason(
+        self,
+        tool_name: str,
+        status: str,
+        error_message: str | None,
+        input_params: dict[str, Any],
+        output_data: dict[str, Any],
+    ) -> str | None:
         if error_message and error_message.strip():
             return error_message.strip()
+        if tool_name == "url_read" and status == "success":
+            input_reason = input_params.get("reason")
+            if isinstance(input_reason, str) and input_reason.strip():
+                return input_reason.strip()
+            output_reason = output_data.get("reason")
+            if isinstance(output_reason, str) and output_reason.strip():
+                return output_reason.strip()
         if status == "degraded":
             return "部分内容不可用，已降级处理"
         if status == "failed":
@@ -134,6 +155,66 @@ class NetworkDiagnosticsService:
         if status == "interrupted":
             return "工具调用已中断"
         return None
+
+    def _derive_requested_count(
+        self,
+        tool_name: str,
+        input_params: dict[str, Any],
+        output_data: dict[str, Any],
+    ) -> int | None:
+        if tool_name != "web_search":
+            return None
+        value = output_data.get("requested_count", input_params.get("count"))
+        return value if isinstance(value, int) else None
+
+    def _derive_actual_count(self, tool_name: str, output_data: dict[str, Any]) -> int | None:
+        if tool_name != "web_search":
+            return None
+        value = output_data.get("actual_count", output_data.get("result_count"))
+        return value if isinstance(value, int) else None
+
+    def _derive_context_count(self, tool_name: str, output_data: dict[str, Any]) -> int | None:
+        if tool_name != "web_search":
+            return None
+        value = output_data.get("context_source_count", output_data.get("context_count"))
+        return value if isinstance(value, int) else None
+
+    def _derive_intent(
+        self,
+        tool_name: str,
+        input_params: dict[str, Any],
+        output_data: dict[str, Any],
+    ) -> str | None:
+        if tool_name != "web_search":
+            return None
+        value = output_data.get("intent", input_params.get("intent"))
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return None
+
+    def _derive_domains(
+        self,
+        tool_name: str,
+        input_params: dict[str, Any],
+        output_data: dict[str, Any],
+    ) -> list[str]:
+        if tool_name != "web_search":
+            return []
+        value = output_data.get("domains", input_params.get("domains"))
+        if not isinstance(value, list):
+            return []
+        return [item for item in value if isinstance(item, str)]
+
+    def _derive_recency_days(
+        self,
+        tool_name: str,
+        input_params: dict[str, Any],
+        output_data: dict[str, Any],
+    ) -> int | None:
+        if tool_name != "web_search":
+            return None
+        value = output_data.get("recency_days", input_params.get("recency_days"))
+        return value if isinstance(value, int) else None
 
     def _sanitize_input_params(self, input_params: dict[str, Any]) -> dict[str, Any]:
         allowed_keys = {"query", "url"}

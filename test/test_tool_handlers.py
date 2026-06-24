@@ -28,6 +28,37 @@ class WebSearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "success")
         self.assertEqual(result.data["result_count"], 1)
 
+    async def test_execute_passes_dynamic_network_args_and_records_metadata(self):
+        """搜索 handler 透传归一化参数并记录动态联网 metadata"""
+        from app.schemas.chat import SearchSource
+
+        mock_sources = [
+            SearchSource(title=f"R{i}", url=f"https://example.com/{i}", description="desc") for i in range(7)
+        ]
+        with patch(
+            "app.services.tool_handlers.web_search.search_web",
+            new_callable=AsyncMock,
+            return_value=mock_sources,
+        ) as mock_search:
+            result = await self.handler.execute(
+                {
+                    "query": "redis",
+                    "count": 7,
+                    "intent": "comparison",
+                    "domains": ["redis.io"],
+                    "recency_days": 30,
+                }
+            )
+
+        mock_search.assert_awaited_once_with("redis", count=7, domains=["redis.io"], recency_days=30)
+        self.assertEqual(result.data["requested_count"], 7)
+        self.assertEqual(result.data["actual_count"], 7)
+        self.assertEqual(result.data["context_source_count"], 7)
+        self.assertEqual(result.data["intent"], "comparison")
+        self.assertEqual(result.data["domains"], ["redis.io"])
+        self.assertEqual(result.data["recency_days"], 30)
+        self.assertFalse(result.data["budget_limited"])
+
     async def test_execute_success_keeps_search_provider_metadata(self):
         """搜索成功时保留 search-service 返回的最终 provider"""
         from app.schemas.chat import SearchSource
@@ -90,6 +121,18 @@ class WebSearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不要在最终回答中输出裸 URL", context)
         self.assertIn("不要在回答末尾追加参考链接列表", context)
 
+    def test_format_llm_context_injects_at_most_eight_search_sources(self):
+        from app.schemas.chat import SearchSource
+
+        sources = [SearchSource(title=f"R{i}", url=f"https://example.com/{i}", description=f"d{i}") for i in range(10)]
+        result = ToolResult(status="success", data={"sources": sources, "result_count": 10})
+
+        context = self.handler.format_llm_context(result)
+
+        self.assertIn("[8] R7", context)
+        self.assertNotIn("[9] R8", context)
+        self.assertIn("仅前 8 条", context)
+
     def test_build_content_block(self):
         """构造 SearchBlock"""
         from app.schemas.chat import SearchSource
@@ -107,6 +150,36 @@ class WebSearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(block.source_refs), 1)
         self.assertEqual(block.source_refs[0].kind, "search")
         self.assertEqual(block.source_refs[0].tool_call_log_id, "log_456")
+
+    def test_build_content_block_includes_dynamic_network_metadata(self):
+        """SearchBlock 包含动态联网 metadata"""
+        from app.schemas.chat import SearchSource
+
+        sources = [SearchSource(title="R1", url="https://a.com", description="d1")]
+        result = ToolResult(
+            status="success",
+            data={
+                "query": "q",
+                "sources": sources,
+                "requested_count": 8,
+                "actual_count": 1,
+                "context_source_count": 1,
+                "intent": "comparison",
+                "domains": ["a.com"],
+                "recency_days": 7,
+                "budget_limited": False,
+            },
+        )
+
+        block = self.handler.build_content_block(result, "blk_123", "log_456")
+
+        self.assertEqual(block.requested_count, 8)
+        self.assertEqual(block.actual_count, 1)
+        self.assertEqual(block.context_source_count, 1)
+        self.assertEqual(block.intent, "comparison")
+        self.assertEqual(block.domains, ["a.com"])
+        self.assertEqual(block.recency_days, 7)
+        self.assertFalse(block.budget_limited)
 
     def test_build_content_block_keeps_search_provider_metadata(self):
         """SearchBlock 保留最终搜索 provider 供前端展示"""
@@ -215,6 +288,29 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.data["title"], "Example")
         self.assertIn("Hello world", result.data["content"])
 
+    async def test_execute_truncates_reason_to_result_data(self):
+        """url_read 保留并截断读取原因"""
+        from app.services.external.reader_client import UrlReadResult
+
+        mock_result = UrlReadResult(
+            url="https://example.com",
+            title="Example",
+            content="content",
+            favicon=None,
+            content_length=7,
+            fetch_ms=100,
+        )
+        reason = "需要核实官方原文细节" * 20
+        with patch(
+            "app.services.tool_handlers.url_read.read_url",
+            new_callable=AsyncMock,
+            return_value=mock_result,
+        ):
+            result = await self.handler.execute({"url": "https://example.com", "reason": reason})
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual(result.data["reason"], reason[:160])
+
     async def test_execute_empty_url_returns_degraded(self):
         """url 为空返回 degraded"""
         result = await self.handler.execute({"url": ""})
@@ -293,6 +389,21 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(block.source_refs), 1)
         self.assertEqual(block.source_refs[0].kind, "url_read")
         self.assertEqual(block.source_refs[0].tool_call_log_id, "log_456")
+
+    def test_build_content_block_includes_reason(self):
+        """UrlBlock 包含读取原因"""
+        result = ToolResult(
+            status="success",
+            data={
+                "url": "https://example.com",
+                "title": "Example",
+                "reason": "需要核实官方原文细节",
+            },
+        )
+
+        block = self.handler.build_content_block(result, "blk_123", "log_456")
+
+        self.assertEqual(block.reason, "需要核实官方原文细节")
 
     def test_build_content_block_degraded_keeps_empty_source_refs(self):
         """降级 URL 读取仍有统一状态字段，但不伪造来源"""

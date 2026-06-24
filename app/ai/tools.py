@@ -44,7 +44,24 @@ def build_web_search_tool() -> dict:
                             f"- 包含时间限定词（如 '{year}年'、'最新'、'今日'）以获取最新结果\n"
                             f"- 示例：'{year}年{month}月AI 视频生成最新进展' 而不是 'AI video generation'"
                         ),
-                    }
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "期望返回的搜索结果数量，后端会限制在 3 到 10 条之间，默认 5 条。",
+                    },
+                    "intent": {
+                        "type": "string",
+                        "description": "搜索意图，例如 lookup、news、comparison、official、research、verification。",
+                    },
+                    "domains": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选域名过滤列表，最多 5 个合法域名，例如 openai.com。",
+                    },
+                    "recency_days": {
+                        "type": "integer",
+                        "description": "可选时间范围天数，后端会限制在 1 到 365 天之间。",
+                    },
                 },
                 "required": ["query"],
             },
@@ -77,7 +94,11 @@ URL_READ_TOOL = {
                 "url": {
                     "type": "string",
                     "description": "要读取的完整 URL 地址（包含 http:// 或 https://）",
-                }
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "读取该 URL 的原因，用于联网诊断展示，后端最多保留 160 个字符。",
+                },
             },
             "required": ["url"],
         },
