@@ -1,6 +1,7 @@
-import httpx
 import unittest
 from unittest.mock import patch
+
+import httpx
 
 
 class SearchClientTests(unittest.IsolatedAsyncioTestCase):
