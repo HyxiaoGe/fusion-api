@@ -179,6 +179,7 @@ class StreamHandler:
                 user_id=user_id,
                 model_id=model_id,
                 provider=provider,
+                message_id=assistant_message_id,
             )
 
             # 构建 LLM 消息
@@ -379,6 +380,7 @@ class StreamHandler:
                         provider,
                         trace_id=run_id,
                         step_number=step,
+                        message_id=assistant_message_id,
                         emitter=emitter,
                     )
                     total_tool_calls += len(tool_calls_list)

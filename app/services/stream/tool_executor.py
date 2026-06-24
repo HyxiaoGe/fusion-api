@@ -88,6 +88,7 @@ async def execute_tools_parallel(
     provider: str,
     trace_id: str = None,
     step_number: int = None,
+    message_id: str | None = None,
     emitter: Optional[AgentEventEmitter] = None,
 ) -> list:
     """
@@ -185,6 +186,7 @@ async def execute_tools_parallel(
             input_params=args,
             trace_id=trace_id,
             step_number=step_number,
+            message_id=message_id,
         )
 
         return tc, result, handler, block_id, log_id

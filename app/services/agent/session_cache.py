@@ -12,7 +12,13 @@ from app.db.models import AgentSession, AgentStep
 
 
 async def write_session_started(
-    *, run_id: str, conversation_id: str, user_id: str, model_id: str, provider: str
+    *,
+    run_id: str,
+    conversation_id: str,
+    user_id: str,
+    model_id: str,
+    provider: str,
+    message_id: str | None = None,
 ) -> None:
     """run 启动时 UPSERT agent_sessions 行（status='running' 占位）。
 
@@ -30,6 +36,7 @@ async def write_session_started(
             existing.user_id = user_id
             existing.model_id = model_id
             existing.provider = provider
+            existing.message_id = message_id
             existing.status = "running"
             existing.total_steps = 0
             existing.total_tool_calls = 0
@@ -41,6 +48,7 @@ async def write_session_started(
             user_id=user_id,
             model_id=model_id,
             provider=provider,
+            message_id=message_id,
             status="running",  # 占位，终态由 write_session_status 更新
             total_steps=0,
             total_tool_calls=0,
