@@ -43,6 +43,7 @@ class WebSearchHandler(BaseToolHandler):
                     data={"query": query, "sources": [], "result_count": 0},
                 )
 
+            provider_metadata = _extract_provider_metadata(sources)
             return ToolResult(
                 status="success",
                 duration_ms=duration_ms,
@@ -50,6 +51,7 @@ class WebSearchHandler(BaseToolHandler):
                     "query": query,
                     "sources": sources,
                     "result_count": len(sources),
+                    **provider_metadata,
                 },
             )
         except Exception as e:
@@ -80,11 +82,22 @@ class WebSearchHandler(BaseToolHandler):
             id=block_id,
             query=result.data.get("query", ""),
             tool_call_log_id=log_id,
-            sources=[SearchSourceSummary(title=s.title, url=s.url, favicon=s.favicon) for s in sources],
+            sources=[
+                SearchSourceSummary(
+                    title=s.title,
+                    url=s.url,
+                    favicon=s.favicon,
+                )
+                for s in sources
+            ],
             status=result.status,
             error_message=result.error_message,
             source_count=len(source_refs),
             source_refs=source_refs,
+            requested_provider=result.data.get("requested_provider"),
+            result_provider=result.data.get("result_provider"),
+            fallback_used=bool(result.data.get("fallback_used", False)),
+            provider_chain=result.data.get("provider_chain", []),
         )
 
     def format_llm_context(self, result: ToolResult) -> str:
@@ -137,5 +150,19 @@ class WebSearchHandler(BaseToolHandler):
             "title": getattr(first, "title", "") if first else "",
             "count": len(sources),
             "favicon": getattr(first, "favicon", None) if first else None,
+            "result_provider": result.data.get("result_provider"),
             "truncated": False,
         }
+
+
+def _extract_provider_metadata(sources: List[SearchSource]) -> dict:
+    first = next((source for source in sources if source.result_provider or source.requested_provider), None)
+    if not first:
+        return {}
+
+    return {
+        "requested_provider": first.requested_provider,
+        "result_provider": first.result_provider,
+        "fallback_used": first.fallback_used,
+        "provider_chain": first.provider_chain,
+    }

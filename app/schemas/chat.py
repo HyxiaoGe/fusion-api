@@ -47,6 +47,10 @@ class SearchSource(BaseModel):
     description: str
     content: Optional[str] = None  # 网页正文摘要（Tavily 等 provider 支持）
     favicon: Optional[str] = None  # 网站 favicon URL
+    requested_provider: Optional[str] = None
+    result_provider: Optional[str] = None
+    fallback_used: bool = False
+    provider_chain: List[str] = Field(default_factory=list)
 
 
 class SearchSourceSummary(BaseModel):
@@ -81,6 +85,10 @@ class SearchBlock(BaseModel):
     error_message: Optional[str] = None
     source_count: int = 0
     source_refs: List[SourceReference] = Field(default_factory=list)
+    requested_provider: Optional[str] = None
+    result_provider: Optional[str] = None
+    fallback_used: bool = False
+    provider_chain: List[str] = Field(default_factory=list)
 
 
 class UrlBlock(BaseModel):

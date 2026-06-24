@@ -28,6 +28,34 @@ class WebSearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "success")
         self.assertEqual(result.data["result_count"], 1)
 
+    async def test_execute_success_keeps_search_provider_metadata(self):
+        """搜索成功时保留 search-service 返回的最终 provider"""
+        from app.schemas.chat import SearchSource
+
+        mock_sources = [
+            SearchSource(
+                title="Result",
+                url="https://example.com",
+                description="desc",
+                requested_provider="firecrawl",
+                result_provider="brave",
+                fallback_used=True,
+                provider_chain=["firecrawl", "brave"],
+            )
+        ]
+        with patch(
+            "app.services.tool_handlers.web_search.search_web",
+            new_callable=AsyncMock,
+            return_value=mock_sources,
+        ):
+            result = await self.handler.execute({"query": "test"})
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual(result.data["requested_provider"], "firecrawl")
+        self.assertEqual(result.data["result_provider"], "brave")
+        self.assertTrue(result.data["fallback_used"])
+        self.assertEqual(result.data["provider_chain"], ["firecrawl", "brave"])
+
     async def test_execute_empty_query_returns_degraded(self):
         """query 为空返回 degraded"""
         result = await self.handler.execute({"query": ""})
@@ -79,6 +107,31 @@ class WebSearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(block.source_refs), 1)
         self.assertEqual(block.source_refs[0].kind, "search")
         self.assertEqual(block.source_refs[0].tool_call_log_id, "log_456")
+
+    def test_build_content_block_keeps_search_provider_metadata(self):
+        """SearchBlock 保留最终搜索 provider 供前端展示"""
+        from app.schemas.chat import SearchSource
+
+        sources = [SearchSource(title="R1", url="https://a.com", description="d1")]
+        result = ToolResult(
+            status="success",
+            data={
+                "query": "q",
+                "sources": sources,
+                "result_count": 1,
+                "requested_provider": "firecrawl",
+                "result_provider": "brave",
+                "fallback_used": True,
+                "provider_chain": ["firecrawl", "brave"],
+            },
+        )
+
+        block = self.handler.build_content_block(result, "blk_123", "log_456")
+
+        self.assertEqual(block.requested_provider, "firecrawl")
+        self.assertEqual(block.result_provider, "brave")
+        self.assertTrue(block.fallback_used)
+        self.assertEqual(block.provider_chain, ["firecrawl", "brave"])
 
     def test_build_result_summary_success(self):
         from app.schemas.chat import SearchSource

@@ -30,6 +30,11 @@ async def search_web(query: str, count: int = 5) -> List[SearchSource]:
             resp.raise_for_status()
             data = resp.json()
 
+        requested_provider = data.get("requested_provider")
+        result_provider = data.get("result_provider") or data.get("provider")
+        fallback_used = bool(data.get("fallback_used", False))
+        provider_chain = data.get("provider_chain") if isinstance(data.get("provider_chain"), list) else []
+
         return [
             SearchSource(
                 title=r.get("title", ""),
@@ -37,6 +42,10 @@ async def search_web(query: str, count: int = 5) -> List[SearchSource]:
                 description=r.get("description", ""),
                 content=r.get("content"),
                 favicon=r.get("favicon"),
+                requested_provider=requested_provider,
+                result_provider=result_provider,
+                fallback_used=fallback_used,
+                provider_chain=provider_chain,
             )
             for r in data.get("results", [])
         ]
