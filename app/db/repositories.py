@@ -373,6 +373,10 @@ class ConversationRepository:
                         error_message=block_data.get("error_message"),
                         source_count=block_data.get("source_count", 0),
                         source_refs=block_data.get("source_refs", []),
+                        requested_provider=block_data.get("requested_provider"),
+                        result_provider=block_data.get("result_provider"),
+                        fallback_used=bool(block_data.get("fallback_used", False)),
+                        provider_chain=block_data.get("provider_chain", []),
                     )
                 )
             elif block_type == "url_read":
@@ -561,4 +565,3 @@ class FileRepository:
             self.db.rollback()
             logger.error(f"删除文件失败: {e}")
             return False
-
