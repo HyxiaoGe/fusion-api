@@ -5,7 +5,7 @@ UrlReadHandler — 网页读取工具处理器
 import time
 
 from app.core.config import settings
-from app.schemas.chat import UrlBlock
+from app.schemas.chat import SourceReference, UrlBlock
 from app.services.external.reader_client import read_url
 from app.services.security.url_policy import evaluate_url_policy
 from app.services.source_context import UntrustedSourceContext, format_untrusted_source_context
@@ -78,13 +78,30 @@ class UrlReadHandler(BaseToolHandler):
             )
 
     def build_content_block(self, result: ToolResult, block_id: str, log_id: str) -> UrlBlock:
+        url = result.data.get("url", "")
+        source_refs = []
+        if result.status == "success" and url:
+            source_refs.append(
+                SourceReference(
+                    kind="url_read",
+                    title=result.data.get("title") or "",
+                    url=url,
+                    favicon=result.data.get("favicon"),
+                    status=result.status,
+                    tool_call_log_id=log_id,
+                )
+            )
         return UrlBlock(
             type="url_read",
             id=block_id,
-            url=result.data.get("url", ""),
+            url=url,
             title=result.data.get("title"),
             favicon=result.data.get("favicon"),
             tool_call_log_id=log_id,
+            status=result.status,
+            error_message=result.error_message,
+            source_count=len(source_refs),
+            source_refs=source_refs,
         )
 
     def format_llm_context(self, result: ToolResult) -> str:

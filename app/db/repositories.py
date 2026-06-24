@@ -369,6 +369,10 @@ class ConversationRepository:
                         query=block_data.get("query", ""),
                         tool_call_log_id=block_data.get("tool_call_log_id", ""),
                         sources=[SearchSourceSummary(**s) for s in block_data.get("sources", [])],
+                        status=block_data.get("status", "success"),
+                        error_message=block_data.get("error_message"),
+                        source_count=block_data.get("source_count", 0),
+                        source_refs=block_data.get("source_refs", []),
                     )
                 )
             elif block_type == "url_read":
@@ -557,5 +561,4 @@ class FileRepository:
             self.db.rollback()
             logger.error(f"删除文件失败: {e}")
             return False
-
 

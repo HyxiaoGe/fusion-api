@@ -6,7 +6,7 @@ WebSearchHandler — 网络搜索工具处理器
 import time
 from typing import List
 
-from app.schemas.chat import SearchBlock, SearchSource, SearchSourceSummary
+from app.schemas.chat import SearchBlock, SearchSource, SearchSourceSummary, SourceReference
 from app.services.external.search_client import search_web
 from app.services.source_context import UntrustedSourceContext, format_untrusted_source_context
 from app.services.tool_handlers.base import BaseToolHandler, ToolResult
@@ -63,12 +63,28 @@ class WebSearchHandler(BaseToolHandler):
 
     def build_content_block(self, result: ToolResult, block_id: str, log_id: str) -> SearchBlock:
         sources: List[SearchSource] = result.data.get("sources", [])
+        source_refs = [
+            SourceReference(
+                kind="search",
+                title=s.title,
+                url=s.url,
+                favicon=s.favicon,
+                status=result.status,
+                tool_call_log_id=log_id,
+                error_message=result.error_message,
+            )
+            for s in sources
+        ]
         return SearchBlock(
             type="search",
             id=block_id,
             query=result.data.get("query", ""),
             tool_call_log_id=log_id,
             sources=[SearchSourceSummary(title=s.title, url=s.url, favicon=s.favicon) for s in sources],
+            status=result.status,
+            error_message=result.error_message,
+            source_count=len(source_refs),
+            source_refs=source_refs,
         )
 
     def format_llm_context(self, result: ToolResult) -> str:

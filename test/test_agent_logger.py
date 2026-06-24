@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 os.environ.setdefault("DATABASE_URL", "sqlite:///./fusion-test.db")
 
 from app.db.models import ToolCallLog  # noqa: E402
-from app.schemas.chat import SearchBlock, SearchSourceSummary  # noqa: E402
+from app.schemas.chat import SearchBlock, SearchSourceSummary, SourceReference, UrlBlock  # noqa: E402
 from app.services.agent_logger import log_tool_call  # noqa: E402
 
 
@@ -125,6 +125,38 @@ class SearchBlockSchemaTests(unittest.TestCase):
             sources=[],
         )
         self.assertEqual(block.tool_call_log_id, "")
+
+    def test_search_block_has_unified_source_refs(self):
+        """SearchBlock 暴露统一来源引用字段"""
+        block = SearchBlock(
+            type="search",
+            id="blk_test",
+            query="test query",
+            tool_call_log_id="log-123",
+            sources=[SearchSourceSummary(title="T", url="https://example.com")],
+            source_count=1,
+            source_refs=[
+                SourceReference(
+                    kind="search",
+                    title="T",
+                    url="https://example.com",
+                    tool_call_log_id="log-123",
+                )
+            ],
+        )
+
+        self.assertEqual(block.status, "success")
+        self.assertEqual(block.source_count, 1)
+        self.assertEqual(block.source_refs[0].kind, "search")
+        self.assertEqual(block.source_refs[0].tool_call_log_id, "log-123")
+
+    def test_url_block_has_unified_source_refs_defaults(self):
+        """UrlBlock 兼容旧数据，默认来源引用为空"""
+        block = UrlBlock(type="url_read", id="blk_test", url="https://example.com")
+
+        self.assertEqual(block.status, "success")
+        self.assertEqual(block.source_count, 0)
+        self.assertEqual(block.source_refs, [])
 
 
 if __name__ == "__main__":

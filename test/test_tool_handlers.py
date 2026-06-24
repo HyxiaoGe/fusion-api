@@ -73,6 +73,11 @@ class WebSearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         block = self.handler.build_content_block(result, "blk_123", "log_456")
         self.assertEqual(block.type, "search")
         self.assertEqual(len(block.sources), 1)
+        self.assertEqual(block.status, "success")
+        self.assertEqual(block.source_count, 1)
+        self.assertEqual(len(block.source_refs), 1)
+        self.assertEqual(block.source_refs[0].kind, "search")
+        self.assertEqual(block.source_refs[0].tool_call_log_id, "log_456")
 
     def test_build_result_summary_success(self):
         from app.schemas.chat import SearchSource
@@ -229,6 +234,26 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(block.type, "url_read")
         self.assertEqual(block.url, "https://example.com")
         self.assertEqual(block.title, "Example")
+        self.assertEqual(block.status, "success")
+        self.assertEqual(block.source_count, 1)
+        self.assertEqual(len(block.source_refs), 1)
+        self.assertEqual(block.source_refs[0].kind, "url_read")
+        self.assertEqual(block.source_refs[0].tool_call_log_id, "log_456")
+
+    def test_build_content_block_degraded_keeps_empty_source_refs(self):
+        """降级 URL 读取仍有统一状态字段，但不伪造来源"""
+        result = ToolResult(
+            status="degraded",
+            data={"url": "https://example.com"},
+            error_message="reader-service 暂时未返回内容",
+        )
+
+        block = self.handler.build_content_block(result, "blk_123", "log_456")
+
+        self.assertEqual(block.status, "degraded")
+        self.assertEqual(block.error_message, "reader-service 暂时未返回内容")
+        self.assertEqual(block.source_count, 0)
+        self.assertEqual(block.source_refs, [])
 
     def test_build_result_summary_success(self):
         from app.services.tool_handlers.url_read import UrlReadHandler

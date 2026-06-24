@@ -57,6 +57,18 @@ class SearchSourceSummary(BaseModel):
     favicon: Optional[str] = None
 
 
+class SourceReference(BaseModel):
+    """统一来源引用摘要，用于搜索/URL 读取等联网 content block"""
+
+    kind: Literal["search", "url_read"]
+    title: str = ""
+    url: str = ""
+    favicon: Optional[str] = None
+    status: Literal["success", "failed", "degraded"] = "success"
+    tool_call_log_id: str = ""
+    error_message: Optional[str] = None
+
+
 class SearchBlock(BaseModel):
     """搜索结果内容块，出现在 assistant 消息中"""
 
@@ -65,6 +77,10 @@ class SearchBlock(BaseModel):
     query: str
     tool_call_log_id: str = ""  # 关联 tool_call_logs 表
     sources: List[SearchSourceSummary]  # 轻量版，前端展示用
+    status: Literal["success", "failed", "degraded"] = "success"
+    error_message: Optional[str] = None
+    source_count: int = 0
+    source_refs: List[SourceReference] = Field(default_factory=list)
 
 
 class UrlBlock(BaseModel):
@@ -76,6 +92,10 @@ class UrlBlock(BaseModel):
     title: Optional[str] = None
     favicon: Optional[str] = None
     tool_call_log_id: str = ""
+    status: Literal["success", "failed", "degraded"] = "success"
+    error_message: Optional[str] = None
+    source_count: int = 0
+    source_refs: List[SourceReference] = Field(default_factory=list)
 
 
 # content block 的联合类型，后续扩展直接在此添加
