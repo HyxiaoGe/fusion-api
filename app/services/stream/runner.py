@@ -371,6 +371,10 @@ class StreamHandler:
                             ThinkingBlock(type="thinking", id=thinking_block_id, thinking=reasoning_buf)
                         )
 
+                    # 工具日志会带 assistant_message_id 并写入独立 DB session。
+                    # 先创建/更新 assistant 消息，避免 tool_call_logs.message_id 外键竞态。
+                    persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks, partial=True)
+
                     # 并行执行工具（走 execute_with_emitter，tool_call_started/completed 由 base 统一发）
                     results = await execute_tools_parallel(
                         tool_calls_list,

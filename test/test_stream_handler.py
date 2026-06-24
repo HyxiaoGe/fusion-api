@@ -433,6 +433,51 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1]["finish_reason"], "stop")
         self.assertEqual(self.session_statuses[-1]["status"], "completed")
 
+    async def test_tool_call_checkpoint_persists_message_before_tool_execution(self):
+        """工具日志带 message_id 时，assistant 消息必须先落库，避免 FK 竞态丢诊断。"""
+        tool_call = {"id": "tc1", "name": "web_search", "arguments": '{"query":"x"}'}
+        order = []
+
+        def _capture_persist(db, msg_id, conv_id, model_id, content_blocks, usage_data=None, partial=False):
+            order.append(("persist", msg_id, partial, len(content_blocks)))
+
+        async def _capture_execute(*_args, **kwargs):
+            order.append(("execute", kwargs.get("message_id")))
+            return [
+                (
+                    tool_call,
+                    SimpleNamespace(
+                        status="success",
+                        error_message=None,
+                        duration_ms=10,
+                    ),
+                    None,
+                    "blk_aaa",
+                    "log_aaa",
+                )
+            ]
+
+        await self._invoke(
+            stream_round_side_effect=[
+                ("需要搜索", "", [tool_call], "tool_calls", None),
+                ("", "Final answer", [], "stop", None),
+            ],
+            patch_extra=[
+                patch(
+                    "app.services.stream.runner.persist_message",
+                    side_effect=_capture_persist,
+                ),
+                patch(
+                    "app.services.stream.runner.execute_tools_parallel",
+                    AsyncMock(side_effect=_capture_execute),
+                ),
+            ],
+        )
+
+        self.assertGreaterEqual(len(order), 2)
+        self.assertEqual(order[0], ("persist", "msg-1", True, 1))
+        self.assertEqual(order[1], ("execute", "msg-1"))
+
     async def test_cancelled_path(self):
         """CancelledError 路径：发 run_interrupted + status='interrupted'"""
 
