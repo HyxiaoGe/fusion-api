@@ -51,7 +51,18 @@ def build_web_search_tool() -> dict:
                     },
                     "intent": {
                         "type": "string",
-                        "description": "搜索意图，例如 lookup、news、comparison、official、research、verification。",
+                        "enum": [
+                            "quick_fact",
+                            "freshness",
+                            "comparison",
+                            "deep_research",
+                            "official_source",
+                        ],
+                        "description": (
+                            "搜索意图：quick_fact=快速事实，freshness=最新进展，"
+                            "comparison=多方对比，deep_research=深入调研，"
+                            "official_source=优先官方来源。"
+                        ),
                     },
                     "domains": {
                         "type": "array",

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from urllib.parse import urlparse
 
 from app.services.tool_handlers.base import ToolResult
 
@@ -18,12 +17,11 @@ MIN_RECENCY_DAYS = 1
 MAX_RECENCY_DAYS = 365
 
 SUPPORTED_SEARCH_INTENTS = {
-    "lookup",
-    "news",
+    "quick_fact",
+    "freshness",
     "comparison",
-    "official",
-    "research",
-    "verification",
+    "deep_research",
+    "official_source",
 }
 
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
@@ -140,10 +138,10 @@ def _extract_domain(value: str) -> str | None:
     raw = value.strip().lower()
     if not raw:
         return None
-    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
-    host = parsed.hostname or ""
-    if host.startswith("www."):
-        host = host[4:]
-    if _DOMAIN_RE.match(host):
-        return host
+    if any(char in raw for char in ("://", "/", "?", "#", ":", "*")):
+        return None
+    if raw.startswith("www."):
+        raw = raw[4:]
+    if _DOMAIN_RE.match(raw):
+        return raw
     return None

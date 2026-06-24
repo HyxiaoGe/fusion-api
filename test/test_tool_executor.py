@@ -66,7 +66,6 @@ class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):
         normalized = {
             "query": "redis",
             "count": 10,
-            "domains": ["redis.io"],
             "recency_days": 1,
         }
         handler.execute.assert_awaited_once_with(normalized)

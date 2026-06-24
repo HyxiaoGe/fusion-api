@@ -31,7 +31,25 @@ class NetworkToolBudgetTests(unittest.TestCase):
         self.assertIsNone(degraded)
         self.assertNotIn("intent", args)
 
-    def test_web_search_keeps_at_most_five_valid_domains(self):
+    def test_web_search_keeps_supported_spec_intents(self):
+        supported = [
+            "quick_fact",
+            "freshness",
+            "comparison",
+            "deep_research",
+            "official_source",
+        ]
+
+        for intent in supported:
+            with self.subTest(intent=intent):
+                budget = NetworkToolBudget()
+
+                args, degraded = budget.prepare_web_search_args({"query": "redis", "intent": intent})
+
+                self.assertIsNone(degraded)
+                self.assertEqual(args["intent"], intent)
+
+    def test_web_search_keeps_at_most_five_plain_domains(self):
         budget = NetworkToolBudget()
 
         args, degraded = budget.prepare_web_search_args(
@@ -42,11 +60,15 @@ class NetworkToolBudgetTests(unittest.TestCase):
                     "docs.python.org",
                     "bad domain",
                     "openai.com/path?q=1",
+                    "api.example.com:443",
+                    "*.example.com",
                     "example",
                     "sub.example.org",
                     "localhost",
                     "ietf.org",
                     "github.com",
+                    "www.python.org",
+                    "mozilla.org",
                 ],
             }
         )
@@ -54,7 +76,7 @@ class NetworkToolBudgetTests(unittest.TestCase):
         self.assertIsNone(degraded)
         self.assertEqual(
             args["domains"],
-            ["redis.io", "docs.python.org", "openai.com", "sub.example.org", "ietf.org"],
+            ["docs.python.org", "sub.example.org", "ietf.org", "github.com", "python.org"],
         )
 
     def test_web_search_clamps_recency_days(self):
