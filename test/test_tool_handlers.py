@@ -1,5 +1,6 @@
 """tool_handlers 单元测试"""
 
+import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -283,6 +284,50 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
         result = ToolResult(status="failed", data={"url": "x"}, error_message="boom")
         summary = handler._build_result_summary(result)
         self.assertEqual(summary, {"kind": "url_read", "truncated": False})
+
+
+class ToolHandlerLogTests(unittest.IsolatedAsyncioTestCase):
+    async def test_log_passes_message_id_to_agent_logger(self):
+        from unittest.mock import MagicMock
+
+        from app.services.tool_handlers.base import BaseToolHandler, ToolResult
+
+        class _Stub(BaseToolHandler):
+            tool_name = "web_search"
+            sse_event_prefix = "search"
+
+            async def execute(self, args):
+                return ToolResult(status="success", data={})
+
+            def build_content_block(self, result, block_id, log_id):
+                return MagicMock()
+
+            def format_llm_context(self, result):
+                return ""
+
+        handler = _Stub()
+        result = ToolResult(status="success", duration_ms=12, data={"result_count": 1})
+
+        with patch(
+            "app.services.tool_handlers.base.log_tool_call",
+            new_callable=AsyncMock,
+        ) as mock_log_tool_call:
+            await handler.log(
+                log_id="log-1",
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="model-1",
+                provider="provider-1",
+                result=result,
+                input_params={"query": "redis"},
+                trace_id="trace-1",
+                step_number=1,
+                message_id="assistant-1",
+            )
+            await asyncio.sleep(0)
+
+        mock_log_tool_call.assert_awaited_once()
+        assert mock_log_tool_call.await_args.kwargs["message_id"] == "assistant-1"
 
 
 class ExecuteWithEmitterTests(unittest.IsolatedAsyncioTestCase):

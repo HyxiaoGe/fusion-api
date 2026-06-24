@@ -126,13 +126,14 @@ class BaseToolHandler(ABC):
         input_params: dict,
         trace_id: str = None,
         step_number: int = None,
+        message_id: str | None = None,
     ) -> None:
         """异步记录 ToolCallLog"""
         task = asyncio.create_task(
             log_tool_call(
                 log_id=log_id,
                 conversation_id=conversation_id,
-                message_id=None,
+                message_id=message_id,
                 user_id=user_id,
                 tool_name=self.tool_name,
                 status=result.status,
