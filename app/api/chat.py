@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 
-from app.api.deps import get_chat_service, get_current_user
+from app.api.deps import get_chat_service, get_current_user, get_network_diagnostics_service
 from app.core.redis import get_redis_pool, stream_chunks_key
 from app.db.models import User
 from app.schemas.chat import (
@@ -14,6 +14,7 @@ from app.schemas.chat import (
 )
 from app.schemas.response import ApiException, success
 from app.services.chat_service import ChatService
+from app.services.network_diagnostics_service import NetworkDiagnosticsService
 from app.services.stream import stream_redis_as_sse
 from app.services.stream_state_service import cancel_stream, get_stream_meta
 from app.services.task_manager import cancel_task
@@ -116,6 +117,31 @@ def delete_conversation(
     if not result:
         raise ApiException.not_found("会话不存在或无权访问")
     return success(message="会话已删除", request_id=request.state.request_id)
+
+
+@router.get("/conversations/{conversation_id}/messages/{message_id}/diagnostics")
+def get_message_network_diagnostics(
+    conversation_id: str,
+    message_id: str,
+    request: Request,
+    chat_service: ChatService = Depends(get_chat_service),
+    diagnostics_service: NetworkDiagnosticsService = Depends(get_network_diagnostics_service),
+    current_user: User = Depends(get_current_user),
+):
+    """获取单条 assistant 消息的联网诊断。"""
+    conversation = chat_service.get_conversation(conversation_id, user_id=current_user.id)
+    if not conversation:
+        raise ApiException.not_found("会话不存在或无权访问")
+    message = next((msg for msg in conversation.messages if msg.id == message_id), None)
+    if message is None or message.role != "assistant":
+        raise ApiException.not_found("消息不存在或无权访问")
+
+    data = diagnostics_service.build_for_message(
+        conversation_id=conversation_id,
+        message_id=message_id,
+        is_admin=bool(getattr(current_user, "is_superuser", False)),
+    )
+    return success(data=data, request_id=request.state.request_id)
 
 
 @router.put("/conversations/{conversation_id}/messages/{message_id}")

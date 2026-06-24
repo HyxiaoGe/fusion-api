@@ -14,6 +14,7 @@ from app.db.models import User as UserModel
 from app.db.repositories import UserRepository
 from app.services.chat_service import ChatService
 from app.services.file_service import FileService
+from app.services.network_diagnostics_service import NetworkDiagnosticsService
 
 
 def get_chat_service(db: Session = Depends(get_db)) -> ChatService:
@@ -22,6 +23,10 @@ def get_chat_service(db: Session = Depends(get_db)) -> ChatService:
 
 def get_file_service(db: Session = Depends(get_db)) -> FileService:
     return FileService(db)
+
+
+def get_network_diagnostics_service(db: Session = Depends(get_db)) -> NetworkDiagnosticsService:
+    return NetworkDiagnosticsService(db)
 
 
 def get_user_repo(db: Session = Depends(get_db)) -> UserRepository:
