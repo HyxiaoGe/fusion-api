@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
-from app.ai import litellm_health
+from app.ai import litellm_cleanup, litellm_health
 from app.api import auth, chat, files, models, prompts
 from app.core.config import settings
 from app.core.logger import app_logger
@@ -59,6 +59,7 @@ async def lifespan(app: FastAPI):
     yield
 
     await litellm_health.stop()
+    await litellm_cleanup.close_async_clients()
     await stop_scheduler()
     await close_redis()
     app_logger.info("应用关闭完成")
