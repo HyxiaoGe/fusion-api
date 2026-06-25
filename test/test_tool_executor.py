@@ -78,12 +78,12 @@ class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):
         handler.tool_name = "web_search"
         handler.execute.return_value = ToolResult(status="success")
         budget = NetworkToolBudget()
-        for i in range(3):
+        for i in range(4):
             budget.prepare_web_search_args({"query": f"q{i}"})
 
         with patch("app.services.tool_handlers.get_handler", return_value=handler):
             results = await execute_tools_parallel(
-                [{"id": "call-4", "name": "web_search", "arguments": {"query": "q4", "count": 8}}],
+                [{"id": "call-5", "name": "web_search", "arguments": {"query": "q5", "count": 8}}],
                 conversation_id="conv-1",
                 user_id="user-1",
                 model_id="gpt-4",
