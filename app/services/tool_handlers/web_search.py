@@ -3,8 +3,11 @@ WebSearchHandler — 网络搜索工具处理器
 从 stream_handler.py 提取，行为保持不变
 """
 
+import re
 import time
-from typing import List
+import unicodedata
+from typing import List, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from app.schemas.chat import SearchBlock, SearchSource, SearchSourceSummary, SourceReference
 from app.services.external.search_client import search_web
@@ -12,6 +15,25 @@ from app.services.source_context import UntrustedSourceContext, format_untrusted
 from app.services.tool_handlers.base import BaseToolHandler, ToolResult
 
 MAX_CONTEXT_SOURCES = 8
+DEFAULT_MAX_SOURCES_PER_DOMAIN = 2
+TRACKING_QUERY_PARAMS = {
+    "_hsenc",
+    "_hsmi",
+    "dclid",
+    "fbclid",
+    "gclid",
+    "igshid",
+    "mc_cid",
+    "mc_eid",
+    "mkt_tok",
+    "msclkid",
+    "spm",
+    "ttclid",
+    "twclid",
+    "vero_conv",
+    "vero_id",
+    "yclid",
+}
 
 
 class WebSearchHandler(BaseToolHandler):
@@ -49,11 +71,10 @@ class WebSearchHandler(BaseToolHandler):
         intent = args.get("intent")
         start = time.monotonic()
         try:
-            sources = await search_web(query, count=requested_count, domains=domains, recency_days=recency_days)
+            raw_sources = await search_web(query, count=requested_count, domains=domains, recency_days=recency_days)
             duration_ms = int((time.monotonic() - start) * 1000)
-            context_source_count = min(len(sources), MAX_CONTEXT_SOURCES)
 
-            if not sources:
+            if not raw_sources:
                 return ToolResult(
                     status="degraded",
                     duration_ms=duration_ms,
@@ -72,7 +93,9 @@ class WebSearchHandler(BaseToolHandler):
                     },
                 )
 
-            provider_metadata = _extract_provider_metadata(sources)
+            provider_metadata = _extract_provider_metadata(raw_sources)
+            sources = _post_process_sources(raw_sources, intent=intent, domains=domains)
+            context_source_count = min(len(sources), MAX_CONTEXT_SOURCES)
             return ToolResult(
                 status="success",
                 duration_ms=duration_ms,
@@ -81,7 +104,7 @@ class WebSearchHandler(BaseToolHandler):
                     "sources": sources,
                     "result_count": len(sources),
                     "requested_count": requested_count,
-                    "actual_count": len(sources),
+                    "actual_count": len(raw_sources),
                     "context_source_count": context_source_count,
                     "intent": intent,
                     "domains": domains,
@@ -224,3 +247,123 @@ def _extract_provider_metadata(sources: List[SearchSource]) -> dict:
         "fallback_used": first.fallback_used,
         "provider_chain": first.provider_chain,
     }
+
+
+def _post_process_sources(sources: List[SearchSource], intent: Optional[str], domains: list[str]) -> List[SearchSource]:
+    relax_domain_limit = intent == "official_source" or _has_single_domain_filter(domains)
+    seen_urls: set[str] = set()
+    seen_domain_titles: set[tuple[str, str]] = set()
+    domain_counts: dict[str, int] = {}
+    processed: List[SearchSource] = []
+
+    for source in sources:
+        canonical_url, normalized_domain = _canonicalize_search_url(source.url)
+        url_key = canonical_url or source.url.strip()
+        if url_key in seen_urls:
+            continue
+
+        title_key = _normalize_title(source.title)
+        domain_title_key = (normalized_domain, title_key) if normalized_domain and title_key else None
+        if domain_title_key and domain_title_key in seen_domain_titles:
+            continue
+
+        if (
+            not relax_domain_limit
+            and normalized_domain
+            and domain_counts.get(normalized_domain, 0) >= DEFAULT_MAX_SOURCES_PER_DOMAIN
+        ):
+            continue
+
+        seen_urls.add(url_key)
+        if domain_title_key:
+            seen_domain_titles.add(domain_title_key)
+        if normalized_domain:
+            domain_counts[normalized_domain] = domain_counts.get(normalized_domain, 0) + 1
+        processed.append(_copy_source_with_url(source, canonical_url))
+
+    return processed
+
+
+def _canonicalize_search_url(url: str) -> tuple[str, str]:
+    stripped_url = (url or "").strip()
+    if not stripped_url:
+        return "", ""
+
+    try:
+        parsed = urlsplit(stripped_url)
+    except ValueError:
+        return stripped_url, ""
+
+    if not parsed.netloc:
+        return stripped_url, ""
+
+    scheme = parsed.scheme.lower() or "https"
+    normalized_domain = _normalize_domain(parsed.hostname or "")
+    if not normalized_domain:
+        return stripped_url, ""
+
+    try:
+        port = parsed.port
+    except ValueError:
+        return stripped_url, normalized_domain
+
+    include_port = port and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443))
+    netloc = f"{normalized_domain}:{port}" if include_port else normalized_domain
+    query = _canonicalize_query(parsed.query)
+    path = "" if parsed.path == "/" else parsed.path.rstrip("/")
+    return urlunsplit((scheme, netloc, path, query, "")), normalized_domain
+
+
+def _canonicalize_query(query: str) -> str:
+    params = []
+    for key, value in parse_qsl(query, keep_blank_values=True):
+        normalized_key = key.lower()
+        if normalized_key.startswith("utm_") or normalized_key in TRACKING_QUERY_PARAMS:
+            continue
+        params.append((key, value))
+
+    params.sort(key=lambda item: (item[0].lower(), item[1]))
+    return urlencode(params, doseq=True)
+
+
+def _normalize_domain(domain: str) -> str:
+    normalized = domain.strip().rstrip(".").lower()
+    while normalized.startswith("www."):
+        normalized = normalized[4:]
+    return normalized
+
+
+def _normalize_domain_filter(domain: str) -> str:
+    stripped_domain = (domain or "").strip()
+    if not stripped_domain:
+        return ""
+
+    try:
+        parsed = urlsplit(stripped_domain)
+    except ValueError:
+        parsed = None
+
+    if parsed and parsed.hostname:
+        host = parsed.hostname
+    else:
+        host = stripped_domain.split("/", 1)[0]
+        host = host.split(":", 1)[0]
+
+    return _normalize_domain(host.removeprefix("*."))
+
+
+def _has_single_domain_filter(domains: list[str]) -> bool:
+    normalized_domains = {_normalize_domain_filter(domain) for domain in domains if _normalize_domain_filter(domain)}
+    return len(normalized_domains) == 1
+
+
+def _normalize_title(title: str) -> str:
+    normalized = unicodedata.normalize("NFKC", title or "").casefold()
+    normalized = re.sub(r"[^\w]+", " ", normalized, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _copy_source_with_url(source: SearchSource, url: str) -> SearchSource:
+    if not url or source.url == url:
+        return source
+    return source.model_copy(update={"url": url})

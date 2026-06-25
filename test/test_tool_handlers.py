@@ -87,6 +87,105 @@ class WebSearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.data["fallback_used"])
         self.assertEqual(result.data["provider_chain"], ["firecrawl", "brave"])
 
+    async def test_execute_post_processes_search_sources_before_outputs(self):
+        """搜索结果先去重和做域名多样性限制，再进入结果、内容块和上下文"""
+        from app.schemas.chat import SearchSource
+
+        mock_sources = [
+            SearchSource(
+                title="Redis Docs",
+                url="https://WWW.Example.com/docs?utm_source=newsletter&gclid=abc#intro",
+                description="d1",
+                requested_provider="firecrawl",
+                result_provider="brave",
+                fallback_used=True,
+                provider_chain=["firecrawl", "brave"],
+            ),
+            SearchSource(title="Redis Docs Duplicate", url="https://example.com/docs", description="d2"),
+            SearchSource(title="Redis Docs Trailing Slash", url="https://example.com/docs/", description="d2b"),
+            SearchSource(title="Redis Pricing", url="https://example.com/pricing", description="d3"),
+            SearchSource(title="  redis   pricing ", url="https://www.example.com/pricing-v2", description="d4"),
+            SearchSource(title="Redis Download", url="https://example.com/download", description="d5"),
+            SearchSource(title="Official Redis", url="https://redis.io/docs", description="d6"),
+        ]
+        with patch(
+            "app.services.tool_handlers.web_search.search_web",
+            new_callable=AsyncMock,
+            return_value=mock_sources,
+        ):
+            result = await self.handler.execute({"query": "redis docs", "count": 7})
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual(
+            [source.title for source in result.data["sources"]], ["Redis Docs", "Redis Pricing", "Official Redis"]
+        )
+        self.assertEqual(result.data["sources"][0].url, "https://example.com/docs")
+        self.assertEqual(result.data["actual_count"], 7)
+        self.assertEqual(result.data["result_count"], 3)
+        self.assertEqual(result.data["context_source_count"], 3)
+        self.assertEqual(result.data["result_provider"], "brave")
+        self.assertTrue(result.data["fallback_used"])
+        self.assertEqual(result.data["provider_chain"], ["firecrawl", "brave"])
+
+        block = self.handler.build_content_block(result, "blk_123", "log_456")
+        self.assertEqual(block.source_count, 3)
+        self.assertEqual([source.title for source in block.sources], ["Redis Docs", "Redis Pricing", "Official Redis"])
+
+        context = self.handler.format_llm_context(result)
+        self.assertIn("[3] Official Redis", context)
+        self.assertNotIn("Redis Download", context)
+
+    async def test_execute_relaxes_domain_limit_for_official_or_single_domain_search(self):
+        """官方意图或显式单域限制不按普通搜索的同域 2 条上限裁剪"""
+        from app.schemas.chat import SearchSource
+
+        scenarios = [
+            {"query": "redis docs", "intent": "official_source"},
+            {"query": "redis docs", "domains": ["docs.example.com"]},
+        ]
+        for args in scenarios:
+            with self.subTest(args=args):
+                mock_sources = [
+                    SearchSource(title=f"Doc {i}", url=f"https://docs.example.com/page-{i}", description=f"d{i}")
+                    for i in range(4)
+                ]
+                with patch(
+                    "app.services.tool_handlers.web_search.search_web",
+                    new_callable=AsyncMock,
+                    return_value=mock_sources,
+                ):
+                    result = await self.handler.execute(args)
+
+                self.assertEqual(result.status, "success")
+                self.assertEqual(result.data["actual_count"], 4)
+                self.assertEqual(result.data["result_count"], 4)
+                self.assertEqual(
+                    [source.title for source in result.data["sources"]], ["Doc 0", "Doc 1", "Doc 2", "Doc 3"]
+                )
+
+    async def test_execute_ignores_malformed_source_url_during_post_process(self):
+        """外部搜索返回畸形 URL 时不让整次 web_search 失败"""
+        from app.schemas.chat import SearchSource
+
+        mock_sources = [
+            SearchSource(title="Bad Port", url="https://example.com:bad/path", description="bad"),
+            SearchSource(title="Good Result", url="https://valid.example.com/path", description="good"),
+        ]
+        with patch(
+            "app.services.tool_handlers.web_search.search_web",
+            new_callable=AsyncMock,
+            return_value=mock_sources,
+        ):
+            result = await self.handler.execute({"query": "bad url"})
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual(result.data["actual_count"], 2)
+        self.assertEqual(result.data["result_count"], 2)
+        self.assertEqual(
+            [source.url for source in result.data["sources"]],
+            ["https://example.com:bad/path", "https://valid.example.com/path"],
+        )
+
     async def test_execute_empty_query_returns_degraded(self):
         """query 为空返回 degraded"""
         result = await self.handler.execute({"query": ""})
