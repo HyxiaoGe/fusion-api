@@ -52,6 +52,15 @@ class AdminSearchUsageApiTests(unittest.TestCase):
             "usage_ratio": 0.830334,
             "billing_period_start": "2026-06-01T00:00:00Z",
             "billing_period_end": "2026-06-30T23:59:59Z",
+            "recorded_usage": {
+                "provider": "firecrawl",
+                "available": True,
+                "credits_used": 12,
+                "request_count": 3,
+                "period_start": "2026-06-01T00:00:00Z",
+                "period_end": "2026-06-30T23:59:59Z",
+                "source": "search_response_credits_used",
+            },
         }
         historical = {
             "provider": "firecrawl",
