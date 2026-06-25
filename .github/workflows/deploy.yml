@@ -37,9 +37,9 @@ jobs:
 
       - name: Push CI/CD active metric
         if: github.ref == 'refs/heads/master'
-        continue-on-error: true
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
+          $ProgressPreference = "SilentlyContinue"
           $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
           $metrics = @"
           # HELP cicd_pipeline_active Whether a CI/CD pipeline is currently active (1=true, 0=false).
@@ -51,7 +51,12 @@ jobs:
           "@
           $body = (($metrics -replace "`r`n", "`n").Trim() + "`n")
           $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
-          Invoke-WebRequest -UseBasicParsing -Method Post -Uri "http://192.168.1.10:9092/metrics/job/cicd_active/project_key/fusion-api/branch_key/master/environment_key/dev" -ContentType "text/plain; version=0.0.4" -Body $bytes
+          try {
+            Invoke-WebRequest -UseBasicParsing -Method Post -Uri "http://192.168.1.10:9092/metrics/job/cicd_active/project_key/fusion-api/branch_key/master/environment_key/dev" -ContentType "text/plain; version=0.0.4" -Body $bytes -TimeoutSec 5 | Out-Null
+            Write-Host "CI/CD active metric pushed"
+          } catch {
+            Write-Host "CI/CD active metric push failed, ignored: $($_.Exception.Message)"
+          }
 
       - name: Checkout
         uses: actions/checkout@v6
@@ -237,7 +242,7 @@ jobs:
       - name: Push CI/CD metrics
         if: always()
         run: |
-          bash ~/scripts/push-cicd-metrics.sh \
+          if ! timeout 15s bash ~/scripts/push-cicd-metrics.sh \
             fusion-api \
             "${{ github.ref_name }}" \
             dev \
@@ -247,7 +252,9 @@ jobs:
             "${{ github.sha }}" \
             "${{ needs.build.outputs.runner_name }}" \
             fusion-api \
-            "${{ env.DEPLOY_START }}"
+            "${{ env.DEPLOY_START }}"; then
+            echo "CI/CD metrics push failed, ignored"
+          fi
 
       - name: 通知飞书(部署结果)
         if: always()
