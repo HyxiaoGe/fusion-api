@@ -10,9 +10,21 @@ class SanitizeArgumentsTests(unittest.TestCase):
         args = {"query": "GPT-5 评测"}
         self.assertEqual(sanitize_arguments("web_search", args), args)
 
-    def test_v1_pass_through_url_read(self):
-        args = {"url": "https://example.com"}
-        self.assertEqual(sanitize_arguments("url_read", args), args)
+    def test_url_read_sanitizes_sensitive_url(self):
+        args = {"url": "https://example.com/page?token=secret&safe=1", "reason": "核实原文"}
+        sanitized = sanitize_arguments("url_read", args)
+
+        self.assertEqual(sanitized["url"], "https://example.com/page")
+        self.assertEqual(sanitized["reason"], "核实原文")
+        self.assertNotIn("token", str(sanitized))
+        self.assertEqual(args["url"], "https://example.com/page?token=secret&safe=1")
+
+    def test_url_read_sanitize_malformed_url_is_best_effort(self):
+        args = {"url": "http://[::1", "reason": "核实原文"}
+        sanitized = sanitize_arguments("url_read", args)
+
+        self.assertEqual(sanitized["url"], "")
+        self.assertEqual(sanitized["url_policy_reason"], "invalid_url")
 
     def test_unknown_tool_pass_through(self):
         args = {"x": 1}

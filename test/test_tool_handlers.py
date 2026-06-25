@@ -366,7 +366,7 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_execute_success(self):
         """读取成功返回内容"""
-        from app.services.external.reader_client import UrlReadResult
+        from app.services.external.reader_client import UrlReadResponse, UrlReadResult
 
         mock_result = UrlReadResult(
             url="https://example.com",
@@ -377,19 +377,20 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
             fetch_ms=500,
         )
         with patch(
-            "app.services.tool_handlers.url_read.read_url",
+            "app.services.tool_handlers.url_read.read_url_with_diagnostics",
             new_callable=AsyncMock,
-            return_value=mock_result,
+            return_value=UrlReadResponse(result=mock_result),
         ):
             result = await self.handler.execute({"url": "https://example.com"})
 
         self.assertEqual(result.status, "success")
         self.assertEqual(result.data["title"], "Example")
         self.assertIn("Hello world", result.data["content"])
+        self.assertEqual(result.data["reader_fetch_ms"], 500)
 
     async def test_execute_truncates_reason_to_result_data(self):
         """url_read 保留并截断读取原因"""
-        from app.services.external.reader_client import UrlReadResult
+        from app.services.external.reader_client import UrlReadResponse, UrlReadResult
 
         mock_result = UrlReadResult(
             url="https://example.com",
@@ -401,9 +402,9 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
         )
         reason = "需要核实官方原文细节" * 20
         with patch(
-            "app.services.tool_handlers.url_read.read_url",
+            "app.services.tool_handlers.url_read.read_url_with_diagnostics",
             new_callable=AsyncMock,
-            return_value=mock_result,
+            return_value=UrlReadResponse(result=mock_result),
         ):
             result = await self.handler.execute({"url": "https://example.com", "reason": reason})
 
@@ -417,14 +418,25 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_execute_failure_returns_degraded(self):
         """读取失败走工具降级，不阻断对话"""
+        from app.services.external.reader_client import UrlReadFailure, UrlReadResponse
+
+        failure = UrlReadFailure(
+            kind="timeout",
+            message="reader-service 读取超时，已降级跳过",
+            detail="TimeoutException: timeout",
+        )
         with patch(
-            "app.services.tool_handlers.url_read.read_url",
+            "app.services.tool_handlers.url_read.read_url_with_diagnostics",
             new_callable=AsyncMock,
-            return_value=None,
+            return_value=UrlReadResponse(result=None, failure=failure),
         ) as mock_read:
             result = await self.handler.execute({"url": "https://example.com"})
 
         self.assertEqual(result.status, "degraded")
+        self.assertEqual(result.error_message, "reader-service 读取超时，已降级跳过")
+        self.assertEqual(result.data["failure_kind"], "timeout")
+        self.assertEqual(result.data["failure_detail"], "TimeoutException: timeout")
+        self.assertEqual(result.data["safe_log_url"], "https://example.com")
         mock_read.assert_awaited_once_with("https://example.com", timeout=12.0)
 
     def test_format_llm_context_truncates_long_content(self):
@@ -462,11 +474,22 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不要在回答末尾追加参考链接列表", context)
 
     async def test_execute_rejects_private_url_without_reader_call(self):
-        with patch("app.services.tool_handlers.url_read.read_url", new_callable=AsyncMock) as mock_read:
+        with patch("app.services.tool_handlers.url_read.read_url_with_diagnostics", new_callable=AsyncMock) as mock_read:
             result = await self.handler.execute({"url": "http://127.0.0.1/admin"})
 
         self.assertEqual(result.status, "degraded")
         self.assertEqual(result.data["degraded_reason"], "private_host")
+        mock_read.assert_not_called()
+
+    async def test_execute_rejects_sensitive_query_without_persisting_raw_url(self):
+        with patch("app.services.tool_handlers.url_read.read_url_with_diagnostics", new_callable=AsyncMock) as mock_read:
+            result = await self.handler.execute({"url": "https://example.com/page?token=secret&safe=1"})
+
+        self.assertEqual(result.status, "degraded")
+        self.assertEqual(result.data["degraded_reason"], "sensitive_query")
+        self.assertEqual(result.data["url"], "https://example.com/page")
+        self.assertEqual(result.data["safe_log_url"], "https://example.com/page")
+        self.assertNotIn("token", str(result.data))
         mock_read.assert_not_called()
 
     def test_build_content_block(self):
@@ -591,6 +614,72 @@ class ToolHandlerLogTests(unittest.IsolatedAsyncioTestCase):
 
         mock_log_tool_call.assert_awaited_once()
         assert mock_log_tool_call.await_args.kwargs["message_id"] == "assistant-1"
+
+    async def test_url_read_log_sanitizes_input_url(self):
+        from app.services.tool_handlers.base import ToolResult
+        from app.services.tool_handlers.url_read import UrlReadHandler
+
+        handler = UrlReadHandler()
+        result = ToolResult(
+            status="degraded",
+            data={
+                "url": "https://example.com/page",
+                "safe_log_url": "https://example.com/page",
+                "degraded_reason": "sensitive_query",
+            },
+        )
+
+        with patch(
+            "app.services.tool_handlers.base.log_tool_call",
+            new_callable=AsyncMock,
+        ) as mock_log_tool_call:
+            await handler.log(
+                log_id="log-1",
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="model-1",
+                provider="provider-1",
+                result=result,
+                input_params={"url": "https://example.com/page?token=secret&safe=1", "reason": "核实原文"},
+                trace_id="trace-1",
+                step_number=1,
+                message_id="assistant-1",
+            )
+            await asyncio.sleep(0)
+
+        input_params = mock_log_tool_call.await_args.kwargs["input_params"]
+        self.assertEqual(input_params["url"], "https://example.com/page")
+        self.assertEqual(input_params["reason"], "核实原文")
+        self.assertNotIn("token", str(input_params))
+
+    async def test_url_read_log_sanitize_is_best_effort_for_malformed_url(self):
+        from app.services.tool_handlers.base import ToolResult
+        from app.services.tool_handlers.url_read import UrlReadHandler
+
+        handler = UrlReadHandler()
+        result = ToolResult(status="failed", data={"url": "", "reason": None}, error_message="bad url")
+
+        with patch(
+            "app.services.tool_handlers.base.log_tool_call",
+            new_callable=AsyncMock,
+        ) as mock_log_tool_call:
+            await handler.log(
+                log_id="log-1",
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="model-1",
+                provider="provider-1",
+                result=result,
+                input_params={"url": "http://[::1", "reason": "核实原文"},
+                trace_id="trace-1",
+                step_number=1,
+                message_id="assistant-1",
+            )
+            await asyncio.sleep(0)
+
+        input_params = mock_log_tool_call.await_args.kwargs["input_params"]
+        self.assertEqual(input_params["url"], "")
+        self.assertEqual(input_params["url_policy_reason"], "invalid_url")
 
 
 class ExecuteWithEmitterTests(unittest.IsolatedAsyncioTestCase):

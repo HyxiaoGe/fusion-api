@@ -6,7 +6,7 @@ import time
 
 from app.core.config import settings
 from app.schemas.chat import SourceReference, UrlBlock
-from app.services.external.reader_client import read_url
+from app.services.external.reader_client import read_url_with_diagnostics
 from app.services.security.url_policy import evaluate_url_policy
 from app.services.source_context import UntrustedSourceContext, format_untrusted_source_context
 from app.services.tool_handlers.base import BaseToolHandler, ToolResult
@@ -25,6 +25,21 @@ class UrlReadHandler(BaseToolHandler):
     def sse_event_prefix(self) -> str:
         return "url_read"
 
+    def sanitize_input_params_for_log(self, input_params: dict) -> dict:
+        safe_params = dict(input_params or {})
+        url = safe_params.get("url")
+        if isinstance(url, str):
+            try:
+                policy = evaluate_url_policy(url)
+            except Exception:
+                safe_params["url"] = ""
+                safe_params["url_policy_reason"] = "invalid_url"
+                return safe_params
+            safe_params["url"] = policy.safe_log_url or ""
+            if not policy.allowed:
+                safe_params["url_policy_reason"] = policy.reason
+        return safe_params
+
     async def execute(self, args: dict) -> ToolResult:
         url = args.get("url", "").strip()
         reason = _normalize_reason(args.get("reason"))
@@ -40,7 +55,7 @@ class UrlReadHandler(BaseToolHandler):
                 status="degraded",
                 error_message=policy.user_visible_message or "URL 不允许读取",
                 data={
-                    "url": url,
+                    "url": policy.safe_log_url or "",
                     "safe_log_url": policy.safe_log_url,
                     "degraded_reason": policy.reason,
                     "reason": reason,
@@ -49,18 +64,25 @@ class UrlReadHandler(BaseToolHandler):
 
         start = time.monotonic()
         try:
-            result = await read_url(policy.normalized_url or url, timeout=settings.READER_SERVICE_TIMEOUT)
+            response = await read_url_with_diagnostics(
+                policy.normalized_url or url,
+                timeout=settings.READER_SERVICE_TIMEOUT,
+            )
             duration_ms = int((time.monotonic() - start) * 1000)
+            result = response.result
 
             if result is None:
+                failure = response.failure
                 return ToolResult(
                     status="degraded",
                     duration_ms=duration_ms,
-                    error_message="reader-service 暂时未返回内容，已跳过网页读取",
+                    error_message=failure.message if failure else "reader-service 暂时未返回内容，已跳过网页读取",
                     data={
-                        "url": policy.normalized_url or url,
+                        "url": policy.safe_log_url or policy.normalized_url or "",
                         "safe_log_url": policy.safe_log_url,
                         "reason": reason,
+                        "failure_kind": failure.kind if failure else "empty_result",
+                        "failure_detail": failure.detail if failure else None,
                     },
                 )
 
@@ -73,6 +95,7 @@ class UrlReadHandler(BaseToolHandler):
                     "content": result.content,
                     "favicon": result.favicon,
                     "content_length": result.content_length,
+                    "reader_fetch_ms": result.fetch_ms,
                     "reason": reason,
                 },
             )

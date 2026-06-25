@@ -1,0 +1,52 @@
+[
+  {
+    "id": "openai-api-pricing-latest",
+    "category": "price",
+    "question": "OpenAI API 最新价格是什么？",
+    "query": "OpenAI API pricing latest",
+    "intent": "official_source",
+    "expected_domains": ["openai.com", "platform.openai.com"],
+    "official_domains": ["openai.com", "platform.openai.com"],
+    "min_results": 3
+  },
+  {
+    "id": "redis-vector-search-docs",
+    "category": "technical_docs",
+    "question": "Redis 现在如何创建向量索引？",
+    "query": "Redis vector index HNSW official docs",
+    "intent": "official_source",
+    "expected_domains": ["redis.io"],
+    "official_domains": ["redis.io"],
+    "min_results": 3
+  },
+  {
+    "id": "nba-draft-2026-news",
+    "category": "news",
+    "question": "2026 NBA 选秀首轮结果有哪些重点？",
+    "query": "2026 NBA Draft first round results recap",
+    "intent": "freshness",
+    "expected_domains": ["nba.com", "espn.com", "theathletic.com"],
+    "official_domains": ["nba.com"],
+    "min_results": 5
+  },
+  {
+    "id": "fed-rate-policy-latest",
+    "category": "policy",
+    "question": "美联储最新利率政策有什么变化？",
+    "query": "Federal Reserve latest interest rate decision policy statement",
+    "intent": "freshness",
+    "expected_domains": ["federalreserve.gov", "reuters.com", "cnbc.com"],
+    "official_domains": ["federalreserve.gov"],
+    "min_results": 5
+  },
+  {
+    "id": "apple-wwdc-ai-comparison",
+    "category": "comparison",
+    "question": "Apple WWDC 最新 AI 功能有哪些媒体评价？",
+    "query": "Apple WWDC AI features analysis comparison",
+    "intent": "comparison",
+    "expected_domains": ["apple.com", "theverge.com", "techcrunch.com", "macrumors.com"],
+    "official_domains": ["apple.com"],
+    "min_results": 5
+  }
+]

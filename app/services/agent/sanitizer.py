@@ -5,13 +5,34 @@ import copy
 import json
 from typing import Any
 
+from app.services.security.url_policy import evaluate_url_policy
+
 
 def sanitize_arguments(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """对 tool arguments 做脱敏。
 
-    v1 默认透传；未来加敏感工具时按 tool_name 派发到具体规则。
+    agent_event 会进入 Redis Stream，工具执行前就会发出。
+    url_read 的 URL 需要在这里先清理，不能等到 handler 执行后再处理。
     """
+    if tool_name == "url_read":
+        return _sanitize_url_read_arguments(arguments)
     return arguments
+
+
+def _sanitize_url_read_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(arguments or {})
+    url = sanitized.get("url")
+    if isinstance(url, str):
+        try:
+            policy = evaluate_url_policy(url)
+        except Exception:
+            sanitized["url"] = ""
+            sanitized["url_policy_reason"] = "invalid_url"
+            return sanitized
+        sanitized["url"] = policy.safe_log_url or ""
+        if not policy.allowed:
+            sanitized["url_policy_reason"] = policy.reason
+    return sanitized
 
 
 def _utf8_size(payload: dict[str, Any]) -> int:
