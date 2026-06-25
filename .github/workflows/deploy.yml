@@ -24,8 +24,6 @@ jobs:
     outputs:
       started_at: ${{ steps.pipeline_start.outputs.started_at }}
       runner_name: ${{ steps.pipeline_start.outputs.runner_name }}
-    env:
-      DOCKER_CONFIG: ${{ runner.temp }}/.docker
     defaults:
       run:
         shell: cmd
@@ -36,6 +34,13 @@ jobs:
         run: |
           for /f %%i in ('powershell -NoProfile -ExecutionPolicy Bypass -Command "[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()"') do echo started_at=%%i>>%GITHUB_OUTPUT%
           echo runner_name=${{ runner.name }}>>%GITHUB_OUTPUT%
+
+      - name: Configure Docker credential directory
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $dockerConfig = Join-Path $env:RUNNER_TEMP ".docker-$env:GITHUB_RUN_ID-$env:GITHUB_JOB"
+          New-Item -ItemType Directory -Force -Path $dockerConfig | Out-Null
+          "DOCKER_CONFIG=$dockerConfig" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Push CI/CD active metric
         if: github.ref == 'refs/heads/master'
