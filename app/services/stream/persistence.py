@@ -127,7 +127,7 @@ async def preprocess_url_in_message(
                 title=read_result.title or "未知",
                 url=read_result.url or policy.normalized_url or auto_detected_url,
                 content=read_result.content,
-                provider="reader-service",
+                provider="web",
             ),
             max_chars=MAX_CONTENT_CHARS,
         ),

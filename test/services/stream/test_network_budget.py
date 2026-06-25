@@ -90,16 +90,16 @@ class NetworkToolBudgetTests(unittest.TestCase):
         self.assertEqual(low_args["recency_days"], 1)
         self.assertEqual(high_args["recency_days"], 365)
 
-    def test_fourth_web_search_returns_degraded_without_consuming_handler(self):
+    def test_fifth_web_search_returns_degraded_without_consuming_handler(self):
         budget = NetworkToolBudget()
 
-        for i in range(3):
+        for i in range(4):
             _args, degraded = budget.prepare_web_search_args({"query": f"q{i}"})
             self.assertIsNone(degraded)
 
-        args, degraded = budget.prepare_web_search_args({"query": "q3", "count": 8})
+        args, degraded = budget.prepare_web_search_args({"query": "q4", "count": 8})
 
-        self.assertEqual(args["query"], "q3")
+        self.assertEqual(args["query"], "q4")
         self.assertIsNotNone(degraded)
         self.assertEqual(degraded.status, "degraded")
         self.assertTrue(degraded.data["budget_limited"])

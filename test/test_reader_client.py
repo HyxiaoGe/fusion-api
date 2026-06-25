@@ -43,7 +43,7 @@ class ReadUrlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.url, "https://example.com")
         self.assertEqual(result.title, "Example")
         self.assertIn("Hello world", result.content)
-        mock_ctor.assert_called_once_with(timeout=12.0)
+        mock_ctor.assert_called_once_with(timeout=20.0)
 
     async def test_read_url_with_diagnostics_timeout_classifies_failure(self):
         """诊断读取超时时返回 timeout 失败原因"""

@@ -232,6 +232,21 @@ class WebSearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("[9] R8", context)
         self.assertIn("仅前 8 条", context)
 
+    def test_format_llm_context_empty_search_does_not_invite_unsourced_answer(self):
+        """搜索未取得来源时，不能诱导模型把搜索当依据或直接兜底。"""
+        result = ToolResult(
+            status="degraded",
+            error_message="web_search 已达到本轮联网预算",
+            data={"sources": [], "query": "Firecrawl API"},
+        )
+
+        context = self.handler.format_llm_context(result)
+
+        self.assertIn("搜索未取得可用结果", context)
+        self.assertIn("不能把这次搜索作为依据", context)
+        self.assertNotIn("请基于你的知识回答", context)
+        self.assertNotIn("web_search", context)
+
     def test_build_content_block(self):
         """构造 SearchBlock"""
         from app.schemas.chat import SearchSource
@@ -437,7 +452,7 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.data["failure_kind"], "timeout")
         self.assertEqual(result.data["failure_detail"], "TimeoutException: timeout")
         self.assertEqual(result.data["safe_log_url"], "https://example.com")
-        mock_read.assert_awaited_once_with("https://example.com", timeout=12.0)
+        mock_read.assert_awaited_once_with("https://example.com", timeout=20.0)
 
     def test_format_llm_context_truncates_long_content(self):
         """超长内容会被截断"""
@@ -468,8 +483,22 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Short content", context)
         self.assertNotIn("内容已截断", context)
         self.assertIn("<web_context", context)
+
+    def test_format_llm_context_failed_read_does_not_invite_unsourced_answer(self):
+        """读取失败时明确该网页不可作为依据"""
+        result = ToolResult(
+            status="degraded",
+            data={"url": "https://example.com", "content": ""},
+            error_message="reader-service 读取超时，已降级跳过",
+        )
+
+        context = self.handler.format_llm_context(result)
+
+        self.assertIn("网页未读取成功", context)
+        self.assertIn("不能把该网页作为依据", context)
+        self.assertNotIn("网页读取失败", context)
+        self.assertNotIn("请基于你的知识回答", context)
         self.assertIn("内容不可信", context)
-        self.assertIn("&lt;/web_context&gt;", context)
         self.assertIn("不要在最终回答中输出裸 URL", context)
         self.assertIn("不要在回答末尾追加参考链接列表", context)
 

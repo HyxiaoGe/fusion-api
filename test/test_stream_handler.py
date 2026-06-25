@@ -478,6 +478,52 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order[0], ("persist", "msg-1", True, 1))
         self.assertEqual(order[1], ("execute", "msg-1"))
 
+    async def test_degraded_url_read_injects_safe_tool_context(self):
+        """url_read 降级时，下一轮 LLM 不能看到内部失败原因或被诱导无依据回答。"""
+        from app.services.tool_handlers.base import ToolResult
+        from app.services.tool_handlers.url_read import UrlReadHandler
+
+        tool_call = {"id": "tc-url", "name": "url_read", "arguments": '{"url":"https://example.com"}'}
+        captured_messages = []
+
+        async def _capture_llm_call(_model, _kwargs, messages, **_call_kwargs):
+            captured_messages.append([dict(message) for message in messages])
+            return MagicMock()
+
+        await self._invoke(
+            stream_round_side_effect=[
+                ("", "", [tool_call], "tool_calls", None),
+                ("", "Final answer", [], "stop", None),
+            ],
+            execute_tools_result=[
+                (
+                    tool_call,
+                    ToolResult(
+                        status="degraded",
+                        error_message="reader-service 读取超时，已降级跳过",
+                        data={"url": "https://example.com", "content": ""},
+                    ),
+                    UrlReadHandler(),
+                    "blk_url",
+                    "log_url",
+                ),
+            ],
+            patch_extra=[
+                patch(
+                    "app.services.stream.runner.llm_call_with_retry",
+                    AsyncMock(side_effect=_capture_llm_call),
+                )
+            ],
+        )
+
+        self.assertGreaterEqual(len(captured_messages), 2)
+        tool_messages = [message for message in captured_messages[1] if message.get("role") == "tool"]
+        self.assertEqual(len(tool_messages), 1)
+        tool_context = tool_messages[0]["content"]
+        self.assertIn("不能把该网页作为依据", tool_context)
+        self.assertNotIn("reader-service", tool_context)
+        self.assertNotIn("请基于你的知识回答", tool_context)
+
     async def test_cancelled_path(self):
         """CancelledError 路径：发 run_interrupted + status='interrupted'"""
 

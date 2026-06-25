@@ -142,7 +142,21 @@ class UrlReadHandler(BaseToolHandler):
         content = result.data.get("content", "")
 
         if not content:
-            return f"无法读取网页内容: {url}。请基于你的知识回答用户的问题。"
+            unavailable_message = (
+                "网页未读取成功，不能把该网页作为依据；"
+                "如需回答，请说明该来源不可用，或仅基于其他可用信息回答。"
+            )
+            return format_untrusted_source_context(
+                UntrustedSourceContext(
+                    source_id="U1",
+                    source_type="url_read",
+                    title=title or "网页未读取成功",
+                    url=url,
+                    content=unavailable_message,
+                    provider="web",
+                ),
+                max_chars=MAX_CONTENT_CHARS + 100,
+            )
 
         # 截断过长的内容
         truncated = False
@@ -160,7 +174,7 @@ class UrlReadHandler(BaseToolHandler):
                 title=title or "未知",
                 url=url,
                 content=content,
-                provider="reader-service",
+                provider="web",
             ),
             max_chars=MAX_CONTENT_CHARS + 100,
         )

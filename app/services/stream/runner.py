@@ -411,14 +411,11 @@ class StreamHandler:
 
                     # 每个工具结果注入 messages + 收集 content blocks
                     for tc, result, handler, block_id, log_id in results:
-                        if handler and result.status == "success":
+                        if handler:
                             tool_context = handler.format_llm_context(result)
                             content_blocks.append(handler.build_content_block(result, block_id, log_id))
-                        elif handler:
-                            tool_context = f"工具调用失败：{result.error_message}"
-                            content_blocks.append(handler.build_content_block(result, block_id, log_id))
                         else:
-                            tool_context = f"工具调用失败：{result.error_message}"
+                            tool_context = "工具未取得可用结果，不能把该工具结果作为依据。"
 
                         messages.append(
                             {
