@@ -24,6 +24,8 @@ jobs:
     outputs:
       started_at: ${{ steps.pipeline_start.outputs.started_at }}
       runner_name: ${{ steps.pipeline_start.outputs.runner_name }}
+    env:
+      DOCKER_CONFIG: ${{ runner.temp }}/.docker
     defaults:
       run:
         shell: cmd
