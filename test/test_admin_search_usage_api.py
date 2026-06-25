@@ -88,6 +88,45 @@ class AdminSearchUsageApiTests(unittest.TestCase):
             ],
         )
 
+    def test_search_usage_degrades_when_historical_usage_fails(self):
+        from app.services.external.search_usage_client import SearchUsageClientError
+
+        self._set_current_user(is_superuser=True)
+
+        usage = {
+            "provider": "firecrawl",
+            "available": True,
+            "remaining_credits": 84801,
+            "plan_credits": 1000,
+            "used_credits": None,
+            "usage_ratio": None,
+            "billing_period_start": "2026-06-22T21:35:09.173Z",
+            "billing_period_end": "2026-07-22T21:35:09.173Z",
+        }
+
+        with (
+            patch("app.services.external.search_usage_client.get_firecrawl_usage", AsyncMock(return_value=usage)),
+            patch(
+                "app.services.external.search_usage_client.get_firecrawl_historical_usage",
+                AsyncMock(side_effect=SearchUsageClientError("historical failed with fc-secret-key")),
+            ),
+        ):
+            response = self.client.get("/api/admin/search-usage")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()["data"]
+        self.assertEqual(data["firecrawl"], usage)
+        self.assertEqual(
+            data["historical"],
+            {
+                "provider": "firecrawl",
+                "available": False,
+                "by_api_key": False,
+                "periods": [],
+            },
+        )
+        self.assertNotIn("fc-secret-key", response.text)
+
     def test_search_usage_maps_search_service_failure_without_leaking_secret(self):
         from app.services.external.search_usage_client import SearchUsageClientError
 

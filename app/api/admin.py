@@ -15,9 +15,18 @@ router = APIRouter()
 async def get_search_usage(_admin: UserModel = Depends(get_current_admin_user)):
     try:
         firecrawl_usage = await search_usage_client.get_firecrawl_usage()
-        firecrawl_historical = await search_usage_client.get_firecrawl_historical_usage()
     except SearchUsageClientError as exc:
         raise HTTPException(status_code=502, detail="联网用量查询失败") from exc
+
+    try:
+        firecrawl_historical = await search_usage_client.get_firecrawl_historical_usage()
+    except SearchUsageClientError:
+        firecrawl_historical = {
+            "provider": "firecrawl",
+            "available": False,
+            "by_api_key": False,
+            "periods": [],
+        }
 
     return success(
         {
