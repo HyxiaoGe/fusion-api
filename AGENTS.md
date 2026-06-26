@@ -6,6 +6,8 @@
 
 ## 快速命令
 
+以下启动命令仅供人工本地开发参考。AI 协作者默认不得启动本地 Fusion 服务；调查、验收优先使用测试、CI、远端 dev 日志/状态和已有运行服务。
+
 ```bash
 pip install -r requirements.txt          # 安装依赖
 uvicorn main:app --reload                # 开发服务器
@@ -22,10 +24,15 @@ docker-compose up -d                     # Docker 启动
 
 ## 工作流程
 
-1. **变更前**：超过 3 个文件的改动，先输出影响分析，等人类确认
-2. **编码中**：遵守 [docs/ARCHITECTURE_RULES.md](docs/ARCHITECTURE_RULES.md)，参考 [docs/CODING_CONVENTIONS.md](docs/CODING_CONVENTIONS.md)
-3. **变更后**：运行测试 + ruff 检查，涉及数据流变更则更新对应文档
-4. **提交前**：确认改动已 push 且部署通过，不能只改本地就让用户测试
+1. **默认执行闭环**：用户说“开始”“继续”“修下”“按你说的来”“提交/部署”等，视为授权继续完成实现、验证、提交、push 和 CI/CD 跟踪；不要为常规下一步反复等待确认。
+2. **先定位根因**：bug、线上异常、CI 失败、日志报错必须先读错误、查调用链、对照近期改动和远端证据，确认根因后再改。
+3. **复杂变更先计划**：多文件、跨模块、数据流或协议变化先写简短 implementation plan；必要时更新对应 spec/文档。
+4. **默认 Subagent-Driven**：适合拆分的开发任务默认用 Subagent-Driven；主 Agent 负责拆分、协调、复核，子 Agent 负责独立实现/审查。若工具额度或任务规模不适合启用，需说明原因并按同等 checklist 自审。
+5. **TDD 优先**：bugfix 和行为变更先补能失败的回归测试，再实现；已有测试不足时至少补覆盖核心行为的单测。
+6. **编码中**：遵守 [docs/ARCHITECTURE_RULES.md](docs/ARCHITECTURE_RULES.md)，参考 [docs/CODING_CONVENTIONS.md](docs/CODING_CONVENTIONS.md)，保持改动范围最小，不回滚无关用户改动。
+7. **禁止默认本地启动**：不得为调查或验收启动 `uvicorn`、本地 Docker 或其他 Fusion 服务；优先使用单元测试、ruff、CI、dev 日志和远端健康检查。只有用户明确要求本地启动时才可执行。
+8. **变更后验证**：运行与改动匹配的 pytest/ruff；涉及数据流、联网、Redis Stream、认证或部署逻辑时扩大回归范围并更新文档。
+9. **CI/CD 收尾**：按正常 Git 流程中文提交并包含 `Co-Authored-By`，push 后持续监控 GitHub Actions 和 dev 部署；失败时拉日志定位并修复。
 
 ## 常见开发任务
 
