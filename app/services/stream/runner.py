@@ -25,6 +25,12 @@ from app.services.chat.message_builder import (
     inject_file_content,
     is_image_file,
 )
+from app.services.stream.agent_loop_policy import (
+    AgentLoopLimitReason,
+    AgentLoopLimits,
+    check_agent_loop_limit,
+    map_run_terminal_state,
+)
 from app.services.stream.llm_stream import llm_call_with_retry, stream_round
 from app.services.stream.network_budget import NetworkToolBudget
 from app.services.stream.persistence import persist_message, preprocess_url_in_message
@@ -233,25 +239,24 @@ class StreamHandler:
                 },
             )
 
-            limit_reason: Optional[str] = None  # 记录触顶原因，决定后续是否走强制总结
+            limit_reason: AgentLoopLimitReason | None = None  # 记录触顶原因，决定后续是否走强制总结
             unknown_terminated = False  # 雷点 3 修复：退化分支标记，决定 run_finish_reason
 
             while True:
                 # ─── 三段触顶检查（顺序：timeout > max_steps > max_tool_calls）───
-                if time.time() - start_time > AGENT_TOTAL_TIMEOUT:
-                    finish_reason = "timeout"
-                    limit_reason = "timeout"
-                    await emitter.run_limit_reached(reason="timeout")
-                    break
-                if step >= AGENT_MAX_STEPS:
-                    finish_reason = "tool_calls"
-                    limit_reason = "max_steps"
-                    await emitter.run_limit_reached(reason="max_steps")
-                    break
-                if total_tool_calls >= AGENT_MAX_TOOL_CALLS:
-                    finish_reason = "tool_calls"
-                    limit_reason = "max_tool_calls"
-                    await emitter.run_limit_reached(reason="max_tool_calls")
+                limit_reason = check_agent_loop_limit(
+                    elapsed_seconds=time.time() - start_time,
+                    step=step,
+                    total_tool_calls=total_tool_calls,
+                    limits=AgentLoopLimits(
+                        max_steps=AGENT_MAX_STEPS,
+                        max_tool_calls=AGENT_MAX_TOOL_CALLS,
+                        total_timeout_s=AGENT_TOTAL_TIMEOUT,
+                    ),
+                )
+                if limit_reason is not None:
+                    finish_reason = "timeout" if limit_reason == "timeout" else "tool_calls"
+                    await emitter.run_limit_reached(reason=limit_reason)
                     break
 
                 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -569,23 +574,18 @@ class StreamHandler:
             final_usage = accumulated_usage if accumulated_usage.input_tokens > 0 else None
             persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks, final_usage)
 
-            if unknown_terminated:
-                run_finish_reason = "incomplete"
-            elif limit_reason is not None:
-                run_finish_reason = "limit_reached"
-            else:
-                run_finish_reason = "stop"
+            terminal_state = map_run_terminal_state(
+                unknown_terminated=unknown_terminated,
+                limit_reason=limit_reason,
+            )
             await emitter.run_completed(
                 total_steps=step,
                 total_tool_calls=total_tool_calls,
-                finish_reason=run_finish_reason,
-            )
-            session_status = (
-                "incomplete" if unknown_terminated else "limit_reached" if limit_reason is not None else "completed"
+                finish_reason=terminal_state.run_finish_reason,
             )
             await session_cache.write_session_status(
                 run_id=run_id,
-                status=session_status,
+                status=terminal_state.session_status,
                 total_steps=step,
                 total_tool_calls=total_tool_calls,
                 total_duration_ms=int((time.time() - run_start) * 1000),

@@ -670,8 +670,14 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         """
         from app.services.stream import runner as run_mod
 
-        async def _hang_forever(*_a, **_kw):
-            await asyncio.sleep(120)  # 远超 budget
+        llm_call_count = 0
+
+        async def _hang_on_summary(*_a, **_kw):
+            nonlocal llm_call_count
+            llm_call_count += 1
+            if llm_call_count == 1:
+                return MagicMock()
+            await asyncio.sleep(120)  # 远超触顶总结预算
 
         tool_call = {"id": "tc1", "name": "web_search", "arguments": "{}"}
 
@@ -698,10 +704,10 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                 patch_extra=[
                     # 压缩总 budget 为 2s，让 wait_for 迅速超时
                     patch("app.services.stream.runner.AGENT_TOTAL_TIMEOUT", 2),
-                    # 覆盖 llm_call_with_retry 让触顶总结永远 hang
+                    # 首轮 LLM 立即返回；触顶总结 LLM hang，验证总结 wait_for 超时收尾
                     patch(
                         "app.services.stream.runner.llm_call_with_retry",
-                        AsyncMock(side_effect=_hang_forever),
+                        AsyncMock(side_effect=_hang_on_summary),
                     ),
                 ],
             )
