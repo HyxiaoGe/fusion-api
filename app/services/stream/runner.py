@@ -13,9 +13,6 @@ from app.ai.litellm_utils import merge_extra_body
 from app.core.logger import app_logger as logger
 from app.db.database import SessionLocal
 from app.db.repositories import FileRepository
-from app.schemas.chat import (
-    Usage,
-)
 from app.services.agent import session_cache
 from app.services.agent.emitter import AgentEventEmitter
 from app.services.chat.message_builder import (
@@ -24,11 +21,11 @@ from app.services.chat.message_builder import (
     is_image_file,
 )
 from app.services.stream.agent_loop_policy import (
-    AgentLoopLimitReason,
     AgentLoopLimits,
     check_agent_loop_limit,
     map_run_terminal_state,
 )
+from app.services.stream.agent_loop_state import AgentLoopState
 from app.services.stream.agent_round import run_agent_round
 from app.services.stream.limit_summary import run_limit_summary_step
 from app.services.stream.llm_stream import llm_call_with_retry, stream_round
@@ -36,7 +33,6 @@ from app.services.stream.network_budget import NetworkToolBudget
 from app.services.stream.persistence import persist_message, preprocess_url_in_message
 from app.services.stream.round_completion import append_round_content_blocks, complete_text_response_step
 from app.services.stream.run_finalizer import (
-    AgentRunStats,
     complete_agent_run,
     fail_agent_run,
     interrupt_agent_run,
@@ -164,13 +160,8 @@ class StreamHandler:
 
         db = SessionLocal()
 
-        # agent loop 状态
-        content_blocks: list = []
-        accumulated_usage = Usage(input_tokens=0, output_tokens=0)
-        step = 0
-        total_tool_calls = 0
+        state = AgentLoopState()
         network_budget = NetworkToolBudget()
-        finish_reason = "stop"
 
         # ─────── Agent 控制面：emitter + session_cache ───────
         # trace_id 必须非空（events.py 强约束），缺失时本地 UUID fallback
@@ -182,25 +173,6 @@ class StreamHandler:
             conversation_id=conversation_id,
             redis_writer=AgentEventRedisWriter(),
         )
-        # 当前正在执行的 step_id（用于异常路径回填 step terminal 状态）
-        current_step_id: Optional[str] = None
-        # 标记 finally 路径已经写过终态 / run_completed 事件，避免重复
-        terminal_emitted = False
-
-        def _mark_current_step(step_id: str) -> None:
-            nonlocal current_step_id
-            current_step_id = step_id
-
-        def _run_stats() -> AgentRunStats:
-            return AgentRunStats(
-                run_id=run_id,
-                total_steps=step,
-                total_tool_calls=total_tool_calls,
-            )
-
-        def _record_executed_tool_calls(tool_call_count: int) -> None:
-            nonlocal total_tool_calls
-            total_tool_calls += tool_call_count
 
         def _run_duration_ms() -> int:
             return int((time.time() - run_start) * 1000)
@@ -240,7 +212,7 @@ class StreamHandler:
             if url_context_msg:
                 messages.insert(-1, url_context_msg)
             if url_read_block:
-                content_blocks.append(url_read_block)
+                state.content_blocks.append(url_read_block)
 
             messages = _inject_tool_usage_contract(messages, call_kwargs)
 
@@ -267,24 +239,21 @@ class StreamHandler:
                 },
             )
 
-            limit_reason: AgentLoopLimitReason | None = None  # 记录触顶原因，决定后续是否走强制总结
-            unknown_terminated = False  # 雷点 3 修复：退化分支标记，决定 run_finish_reason
-
             while True:
                 # ─── 三段触顶检查（顺序：timeout > max_steps > max_tool_calls）───
-                limit_reason = check_agent_loop_limit(
+                state.limit_reason = check_agent_loop_limit(
                     elapsed_seconds=time.time() - start_time,
-                    step=step,
-                    total_tool_calls=total_tool_calls,
+                    step=state.step,
+                    total_tool_calls=state.total_tool_calls,
                     limits=AgentLoopLimits(
                         max_steps=AGENT_MAX_STEPS,
                         max_tool_calls=AGENT_MAX_TOOL_CALLS,
                         total_timeout_s=AGENT_TOTAL_TIMEOUT,
                     ),
                 )
-                if limit_reason is not None:
-                    finish_reason = "timeout" if limit_reason == "timeout" else "tool_calls"
-                    await emitter.run_limit_reached(reason=limit_reason)
+                if state.limit_reason is not None:
+                    state.finish_reason = "timeout" if state.limit_reason == "timeout" else "tool_calls"
+                    await emitter.run_limit_reached(reason=state.limit_reason)
                     break
 
                 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -292,16 +261,16 @@ class StreamHandler:
                 # 这样本轮 reasoning / answering / tool_call_* chunk 都能挂到正确的 step_id；
                 # stop / cancelled / tool_calls 三路径都在分支末尾闭合本 step。
                 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                step += 1
+                step_number = state.next_step_number()
                 step_context = await start_agent_step(
                     emitter=emitter,
                     session_cache=session_cache,
                     run_id=run_id,
-                    step_number=step,
+                    step_number=step_number,
                     clock=time.time,
-                    on_step_started=_mark_current_step,
+                    on_step_started=state.mark_current_step,
                 )
-                current_step_id = step_context.step_id
+                state.mark_current_step(step_context.step_id)
                 thinking_block_id = step_context.thinking_block_id
                 text_block_id = step_context.text_block_id
 
@@ -309,7 +278,7 @@ class StreamHandler:
                     conversation_id=conversation_id,
                     task_id=task_id,
                     run_id=run_id,
-                    step_number=step,
+                    step_number=step_number,
                     model_id=model_id,
                     provider=provider,
                     litellm_model=litellm_model,
@@ -317,7 +286,7 @@ class StreamHandler:
                     messages=messages,
                     should_use_reasoning=should_use_reasoning,
                     call_kwargs=call_kwargs,
-                    accumulated_usage=accumulated_usage,
+                    accumulated_usage=state.accumulated_usage,
                     step_context=step_context,
                     llm_call_fn=llm_call_with_retry,
                     stream_round_fn=stream_round,
@@ -326,13 +295,13 @@ class StreamHandler:
                 reasoning_buf = round_result.reasoning_buf
                 content_buf = round_result.content_buf
                 tool_calls_list = round_result.tool_calls
-                finish_reason = round_result.finish_reason
-                accumulated_usage = round_result.accumulated_usage
+                state.finish_reason = round_result.finish_reason
+                state.update_usage(round_result.accumulated_usage)
 
                 # ── 情况 1: LLM 直接回答 ──
-                if finish_reason == "stop":
+                if state.finish_reason == "stop":
                     append_round_content_blocks(
-                        content_blocks,
+                        state.content_blocks,
                         reasoning_buf,
                         content_buf,
                         thinking_block_id,
@@ -346,13 +315,13 @@ class StreamHandler:
                         complete_step_fn=complete_agent_step,
                         clock=time.time,
                     )
-                    current_step_id = None
+                    state.clear_current_step()
                     break
 
                 # ── 情况 2: 被踢掉（superseded）──
-                if finish_reason == "cancelled":
+                if state.finish_reason == "cancelled":
                     append_round_content_blocks(
-                        content_blocks,
+                        state.content_blocks,
                         reasoning_buf,
                         content_buf,
                         thinking_block_id,
@@ -363,23 +332,23 @@ class StreamHandler:
                         assistant_message_id,
                         conversation_id,
                         model_id,
-                        content_blocks,
-                        accumulated_usage if accumulated_usage.input_tokens > 0 else None,
+                        state.content_blocks,
+                        state.final_usage(),
                     )
                     await interrupt_agent_run(
                         emitter=emitter,
                         session_cache=session_cache,
-                        stats=_run_stats(),
+                        stats=state.run_stats(run_id),
                         duration_ms_factory=_run_duration_ms,
-                        current_step_id=current_step_id,
+                        current_step_id=state.current_step_id,
                         reason="superseded",
                     )
-                    terminal_emitted = True
+                    state.mark_terminal_emitted()
                     await finalize_stream(conversation_id, success=False, error_msg="被新请求取代", task_id=task_id)
                     return
 
                 # ── 情况 3: LLM 请求工具调用 ──
-                if finish_reason == "tool_calls" and tool_calls_list:
+                if state.finish_reason == "tool_calls" and tool_calls_list:
                     # step / step_started / write_step_started 已在 while 顶部完成
                     await handle_tool_calls_round(
                         db=db,
@@ -388,13 +357,13 @@ class StreamHandler:
                         user_id=user_id,
                         model_id=model_id,
                         provider=provider,
-                        content_blocks=content_blocks,
+                        content_blocks=state.content_blocks,
                         messages=messages,
                         tool_calls=tool_calls_list,
                         reasoning_buf=reasoning_buf,
                         should_use_reasoning=should_use_reasoning,
                         step_context=step_context,
-                        step_number=step,
+                        step_number=step_number,
                         run_id=run_id,
                         emitter=emitter,
                         session_cache=session_cache,
@@ -403,22 +372,22 @@ class StreamHandler:
                         persist_message_fn=persist_message,
                         execute_tools_fn=execute_tools_parallel,
                         complete_step_fn=complete_agent_step,
-                        on_tools_executed=_record_executed_tool_calls,
+                        on_tools_executed=state.record_executed_tool_calls,
                         clock=time.time,
                     )
-                    current_step_id = None  # 离开 step 上下文
+                    state.clear_current_step()
 
                     continue
 
                 # 未知 finish_reason（含 tool_calls 但 list 为空的退化情况）→ 保留已收集内容，闭合本 step 后跳出
                 append_round_content_blocks(
-                    content_blocks,
+                    state.content_blocks,
                     reasoning_buf,
                     content_buf,
                     thinking_block_id,
                     text_block_id,
                 )
-                unknown_terminated = True
+                state.mark_unknown_terminated()
                 await complete_text_response_step(
                     context=step_context,
                     emitter=emitter,
@@ -426,29 +395,29 @@ class StreamHandler:
                     complete_step_fn=complete_agent_step,
                     clock=time.time,
                 )
-                current_step_id = None
+                state.clear_current_step()
                 break
 
             # ═══════════════════════════════════════
             # 触顶强制总结（timeout / max_steps / max_tool_calls）
             # ═══════════════════════════════════════
-            if limit_reason is not None:
+            if state.limit_reason is not None:
                 # 触顶总结作为一个独立 step（不带 tools）
-                step += 1
+                step_number = state.next_step_number()
                 summary_outcome = await run_limit_summary_step(
                     conversation_id=conversation_id,
                     task_id=task_id,
                     run_id=run_id,
-                    step_number=step,
+                    step_number=step_number,
                     model_id=model_id,
                     provider=provider,
                     litellm_model=litellm_model,
                     litellm_kwargs=litellm_kwargs,
                     messages=messages,
                     should_use_reasoning=should_use_reasoning,
-                    content_blocks=content_blocks,
+                    content_blocks=state.content_blocks,
                     call_kwargs=call_kwargs,
-                    accumulated_usage=accumulated_usage,
+                    accumulated_usage=state.accumulated_usage,
                     emitter=emitter,
                     session_cache=session_cache,
                     total_timeout_s=AGENT_TOTAL_TIMEOUT,
@@ -460,55 +429,56 @@ class StreamHandler:
                     log_round_summary_fn=_log_agent_round_summary,
                     warning_fn=logger.warning,
                     clock=time.time,
-                    on_step_started=_mark_current_step,
+                    on_step_started=state.mark_current_step,
                 )
-                accumulated_usage = summary_outcome.accumulated_usage
-                current_step_id = None
+                state.update_usage(summary_outcome.accumulated_usage)
+                state.clear_current_step()
 
             # ═══════════════════════════════════════
             # 最终落库 + run_completed
             # ═══════════════════════════════════════
-            final_usage = accumulated_usage if accumulated_usage.input_tokens > 0 else None
-            persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks, final_usage)
+            persist_message(
+                db, assistant_message_id, conversation_id, model_id, state.content_blocks, state.final_usage()
+            )
 
             terminal_state = map_run_terminal_state(
-                unknown_terminated=unknown_terminated,
-                limit_reason=limit_reason,
+                unknown_terminated=state.unknown_terminated,
+                limit_reason=state.limit_reason,
             )
             await complete_agent_run(
                 emitter=emitter,
                 session_cache=session_cache,
-                stats=_run_stats(),
+                stats=state.run_stats(run_id),
                 duration_ms_factory=_run_duration_ms,
                 session_status=terminal_state.session_status,
                 finish_reason=terminal_state.run_finish_reason,
             )
-            terminal_emitted = True
+            state.mark_terminal_emitted()
 
             await finalize_stream(conversation_id, success=True, task_id=task_id)
 
         except asyncio.CancelledError:
             logger.info(f"Agent 任务被取消: conv_id={conversation_id}")
-            if content_blocks:
+            if state.content_blocks:
                 persist_message(
                     db,
                     assistant_message_id,
                     conversation_id,
                     model_id,
-                    content_blocks,
-                    accumulated_usage if accumulated_usage.input_tokens > 0 else None,
+                    state.content_blocks,
+                    state.final_usage(),
                 )
             # emitter / session_cache 终态：interrupted（user_cancelled）
             try:
                 await interrupt_agent_run(
                     emitter=emitter,
                     session_cache=session_cache,
-                    stats=_run_stats(),
+                    stats=state.run_stats(run_id),
                     duration_ms_factory=_run_duration_ms,
-                    current_step_id=current_step_id,
+                    current_step_id=state.current_step_id,
                     reason="user_cancelled",
                 )
-                terminal_emitted = True
+                state.mark_terminal_emitted()
             except Exception as _emit_exc:  # noqa: BLE001 — 终态事件失败不能阻塞 cancel 传播
                 logger.warning(f"emit run_interrupted 失败: {_emit_exc}")
             await finalize_stream(conversation_id, success=False, error_msg="用户中止", task_id=task_id)
@@ -516,26 +486,26 @@ class StreamHandler:
 
         except Exception as e:
             logger.error(f"Agent 生成异常: conv_id={conversation_id}, error={e}")
-            if content_blocks:
+            if state.content_blocks:
                 persist_message(
                     db,
                     assistant_message_id,
                     conversation_id,
                     model_id,
-                    content_blocks,
-                    accumulated_usage if accumulated_usage.input_tokens > 0 else None,
+                    state.content_blocks,
+                    state.final_usage(),
                 )
             try:
                 await fail_agent_run(
                     emitter=emitter,
                     session_cache=session_cache,
-                    stats=_run_stats(),
+                    stats=state.run_stats(run_id),
                     duration_ms_factory=_run_duration_ms,
-                    current_step_id=current_step_id,
+                    current_step_id=state.current_step_id,
                     error_code=type(e).__name__,
                     message=str(e),
                 )
-                terminal_emitted = True
+                state.mark_terminal_emitted()
             except Exception as _emit_exc:  # noqa: BLE001
                 logger.warning(f"emit run_failed 失败: {_emit_exc}")
             await finalize_stream(conversation_id, success=False, error_msg=str(e), task_id=task_id)
@@ -545,11 +515,11 @@ class StreamHandler:
 
         finally:
             # 兜底：极端路径（例如未匹配任何 except 又没走 try 终段）补一次终态
-            if not terminal_emitted:
+            if not state.terminal_emitted:
                 try:
                     await write_fallback_error_status(
                         session_cache=session_cache,
-                        stats=_run_stats(),
+                        stats=state.run_stats(run_id),
                         duration_ms_factory=_run_duration_ms,
                     )
                 except Exception as _exc:  # noqa: BLE001
