@@ -1,0 +1,44 @@
+"""工具执行结果记录。
+
+本模块只承载单次工具执行的结果形态和轻量格式化行为，不做 Redis、DB、
+LLM 调用或事件发送。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.schemas.chat import ContentBlock
+    from app.services.tool_handlers.base import BaseToolHandler, ToolResult
+
+TOOL_RESULT_UNAVAILABLE_CONTEXT = "工具未取得可用结果，不能把该工具结果作为依据。"
+
+
+@dataclass
+class ToolExecutionRecord:
+    """单次工具执行记录，避免调用方依赖裸 tuple 位置。"""
+
+    tool_call: dict
+    result: ToolResult
+    handler: BaseToolHandler | None
+    block_id: str
+    log_id: str
+
+    @property
+    def tool_name(self) -> str:
+        """返回 LLM tool_call 中声明的工具名，保持 step 统计语义不变。"""
+        return str(self.tool_call.get("name", ""))
+
+    def format_llm_context(self) -> str:
+        """格式化注入下一轮 LLM 的工具上下文。"""
+        if self.handler is None:
+            return TOOL_RESULT_UNAVAILABLE_CONTEXT
+        return self.handler.format_llm_context(self.result)
+
+    def build_content_block(self) -> ContentBlock | None:
+        """构造可落库的工具结果 content block。"""
+        if self.handler is None:
+            return None
+        return self.handler.build_content_block(self.result, self.block_id, self.log_id)

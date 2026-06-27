@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.stream import StreamHandler
+from app.services.stream.tool_execution_result import ToolExecutionRecord
 
 
 class SseEnvelopeFormatterTests(unittest.TestCase):
@@ -242,11 +243,14 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
 
         # session_cache 写入全部 mock 掉，避免命中真 SQLAlchemy 路径；
         # write_session_status 用 side_effect 捕获参数。
+        self.write_step_started_mock = AsyncMock()
+        self.write_step_completed_mock = AsyncMock()
+        self.write_step_terminal_mock = AsyncMock()
         self.session_cache_patchers = [
             patch("app.services.agent.session_cache.write_session_started", AsyncMock()),
-            patch("app.services.agent.session_cache.write_step_started", AsyncMock()),
-            patch("app.services.agent.session_cache.write_step_completed", AsyncMock()),
-            patch("app.services.agent.session_cache.write_step_terminal", AsyncMock()),
+            patch("app.services.agent.session_cache.write_step_started", self.write_step_started_mock),
+            patch("app.services.agent.session_cache.write_step_completed", self.write_step_completed_mock),
+            patch("app.services.agent.session_cache.write_step_terminal", self.write_step_terminal_mock),
             patch(
                 "app.services.agent.session_cache.write_session_status",
                 side_effect=_capture_status,
@@ -404,17 +408,16 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                 ("", "Final answer", [], "stop", None),
             ],
             execute_tools_result=[
-                # _execute_tools_parallel 返回 [(tc, result, handler, block_id, log_id), ...]
-                (
-                    tool_call,
-                    SimpleNamespace(
+                ToolExecutionRecord(
+                    tool_call=tool_call,
+                    result=SimpleNamespace(
                         status="success",
                         error_message=None,
                         duration_ms=10,
                     ),
-                    None,  # handler=None → 走 else 分支不调用 build_content_block
-                    "blk_aaa",
-                    "log_aaa",
+                    handler=None,  # handler=None → 走 else 分支不调用 build_content_block
+                    block_id="blk_aaa",
+                    log_id="log_aaa",
                 ),
             ],
         )
@@ -444,16 +447,16 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         async def _capture_execute(*_args, **kwargs):
             order.append(("execute", kwargs.get("message_id")))
             return [
-                (
-                    tool_call,
-                    SimpleNamespace(
+                ToolExecutionRecord(
+                    tool_call=tool_call,
+                    result=SimpleNamespace(
                         status="success",
                         error_message=None,
                         duration_ms=10,
                     ),
-                    None,
-                    "blk_aaa",
-                    "log_aaa",
+                    handler=None,
+                    block_id="blk_aaa",
+                    log_id="log_aaa",
                 )
             ]
 
@@ -478,6 +481,37 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order[0], ("persist", "msg-1", True, 1))
         self.assertEqual(order[1], ("execute", "msg-1"))
 
+    async def test_tool_round_post_execute_failure_keeps_tool_call_count(self):
+        """工具执行已返回后，后续注入失败也应保留旧语义：失败终态统计本轮工具调用。"""
+        tool_call = {"id": "tc1", "name": "web_search", "arguments": '{"query":"x"}'}
+        handler = MagicMock()
+        handler.format_llm_context.return_value = "工具上下文"
+        handler.build_content_block.side_effect = RuntimeError("content block boom")
+
+        with self.assertRaises(RuntimeError) as cm:
+            await self._invoke(
+                stream_round_side_effect=[
+                    ("需要搜索", "", [tool_call], "tool_calls", None),
+                ],
+                execute_tools_result=[
+                    ToolExecutionRecord(
+                        tool_call=tool_call,
+                        result=SimpleNamespace(
+                            status="success",
+                            error_message=None,
+                            duration_ms=10,
+                        ),
+                        handler=handler,
+                        block_id="blk_aaa",
+                        log_id="log_aaa",
+                    )
+                ],
+            )
+
+        self.assertIn("content block boom", str(cm.exception))
+        self.assertEqual(self.session_statuses[-1]["status"], "error")
+        self.assertEqual(self.session_statuses[-1]["total_tool_calls"], 1)
+
     async def test_degraded_url_read_injects_safe_tool_context(self):
         """url_read 降级时，下一轮 LLM 不能看到内部失败原因或被诱导无依据回答。"""
         from app.services.tool_handlers.base import ToolResult
@@ -496,16 +530,16 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                 ("", "Final answer", [], "stop", None),
             ],
             execute_tools_result=[
-                (
-                    tool_call,
-                    ToolResult(
+                ToolExecutionRecord(
+                    tool_call=tool_call,
+                    result=ToolResult(
                         status="degraded",
                         error_message="reader-service 读取超时，已降级跳过",
                         data={"url": "https://example.com", "content": ""},
                     ),
-                    UrlReadHandler(),
-                    "blk_url",
-                    "log_url",
+                    handler=UrlReadHandler(),
+                    block_id="blk_url",
+                    log_id="log_url",
                 ),
             ],
             patch_extra=[
@@ -570,6 +604,27 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         # SSE finalize 已被调（finalize_stream 在 raise 之前完成）
         self.finalize_mock.assert_awaited()
 
+    async def test_step_started_cache_failure_marks_active_step_failed(self):
+        """step_started 事件发出后 cache 写入失败时，异常收尾必须标记 active step failed。"""
+        self.write_step_started_mock.side_effect = RuntimeError("step cache boom")
+
+        with self.assertRaises(RuntimeError) as cm:
+            await self._invoke(
+                stream_round_side_effect=[
+                    ("", "不会执行到 stream_round", [], "stop", None),
+                ],
+            )
+        self.assertIn("step cache boom", str(cm.exception))
+
+        events = self._agent_events()
+        step_started = [e for e in events if e["type"] == "step_started"][0]
+        self.write_step_terminal_mock.assert_awaited_once_with(
+            step_id=step_started["step_id"],
+            status="failed",
+        )
+        self.assertIn("run_failed", [e["type"] for e in events])
+        self.assertEqual(self.session_statuses[-1]["status"], "error")
+
     async def test_limit_reached_max_steps(self):
         """触顶 max_steps：发 run_limit_reached(max_steps) → 强制总结 → run_completed(limit_reached)"""
         from app.services.stream import runner as sh
@@ -584,16 +639,16 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
             await self._invoke(
                 stream_round_side_effect=rounds,
                 execute_tools_result=[
-                    (
-                        tool_call,
-                        SimpleNamespace(
+                    ToolExecutionRecord(
+                        tool_call=tool_call,
+                        result=SimpleNamespace(
                             status="success",
                             error_message=None,
                             duration_ms=10,
                         ),
-                        None,
-                        "blk_aaa",
-                        "log_aaa",
+                        handler=None,
+                        block_id="blk_aaa",
+                        log_id="log_aaa",
                     ),
                 ],
             )
@@ -670,8 +725,14 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         """
         from app.services.stream import runner as run_mod
 
-        async def _hang_forever(*_a, **_kw):
-            await asyncio.sleep(120)  # 远超 budget
+        llm_call_count = 0
+
+        async def _hang_on_summary(*_a, **_kw):
+            nonlocal llm_call_count
+            llm_call_count += 1
+            if llm_call_count == 1:
+                return MagicMock()
+            await asyncio.sleep(120)  # 远超触顶总结预算
 
         tool_call = {"id": "tc1", "name": "web_search", "arguments": "{}"}
 
@@ -683,25 +744,25 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                     # 触顶总结的 stream_round 不会被消费（_do_summary 内部 hang 住了）
                 ],
                 execute_tools_result=[
-                    (
-                        tool_call,
-                        SimpleNamespace(
+                    ToolExecutionRecord(
+                        tool_call=tool_call,
+                        result=SimpleNamespace(
                             status="success",
                             error_message=None,
                             duration_ms=10,
                         ),
-                        None,  # handler=None → 走 else 分支
-                        "blk_x",
-                        "log_x",
+                        handler=None,  # handler=None → 走 else 分支
+                        block_id="blk_x",
+                        log_id="log_x",
                     ),
                 ],
                 patch_extra=[
                     # 压缩总 budget 为 2s，让 wait_for 迅速超时
                     patch("app.services.stream.runner.AGENT_TOTAL_TIMEOUT", 2),
-                    # 覆盖 llm_call_with_retry 让触顶总结永远 hang
+                    # 首轮 LLM 立即返回；触顶总结 LLM hang，验证总结 wait_for 超时收尾
                     patch(
                         "app.services.stream.runner.llm_call_with_retry",
-                        AsyncMock(side_effect=_hang_forever),
+                        AsyncMock(side_effect=_hang_on_summary),
                     ),
                 ],
             )
