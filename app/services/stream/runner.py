@@ -31,6 +31,7 @@ from app.services.stream.agent_loop_policy import (
     check_agent_loop_limit,
     map_run_terminal_state,
 )
+from app.services.stream.agent_round import run_agent_round
 from app.services.stream.limit_summary import run_limit_summary_step
 from app.services.stream.llm_stream import llm_call_with_retry, stream_round
 from app.services.stream.network_budget import NetworkToolBudget
@@ -305,42 +306,29 @@ class StreamHandler:
                 thinking_block_id = step_context.thinking_block_id
                 text_block_id = step_context.text_block_id
 
-                # LiteLLM Proxy 自己管 health / 重试，这里不再追踪 provider/credential 健康
-                response = await llm_call_with_retry(
-                    litellm_model,
-                    litellm_kwargs,
-                    messages,
-                    **call_kwargs,
-                )
-
-                reasoning_buf, content_buf, tool_calls_list, finish_reason, usage_data = await stream_round(
-                    response,
-                    conversation_id,
-                    task_id,
-                    should_use_reasoning,
-                    thinking_block_id,
-                    text_block_id,
-                    run_id=run_id,
-                    step_id=current_step_id,
-                )
-                _log_agent_round_summary(
+                round_result = await run_agent_round(
                     conversation_id=conversation_id,
+                    task_id=task_id,
                     run_id=run_id,
                     step_number=step,
                     model_id=model_id,
                     provider=provider,
-                    finish_reason=finish_reason,
-                    tool_calls_count=len(tool_calls_list),
-                    reasoning_buf=reasoning_buf,
-                    content_buf=content_buf,
+                    litellm_model=litellm_model,
+                    litellm_kwargs=litellm_kwargs,
+                    messages=messages,
+                    should_use_reasoning=should_use_reasoning,
+                    call_kwargs=call_kwargs,
+                    accumulated_usage=accumulated_usage,
+                    step_context=step_context,
+                    llm_call_fn=llm_call_with_retry,
+                    stream_round_fn=stream_round,
+                    log_round_summary_fn=_log_agent_round_summary,
                 )
-
-                # 累积 usage
-                if usage_data:
-                    accumulated_usage = Usage(
-                        input_tokens=accumulated_usage.input_tokens + usage_data.input_tokens,
-                        output_tokens=accumulated_usage.output_tokens + usage_data.output_tokens,
-                    )
+                reasoning_buf = round_result.reasoning_buf
+                content_buf = round_result.content_buf
+                tool_calls_list = round_result.tool_calls
+                finish_reason = round_result.finish_reason
+                accumulated_usage = round_result.accumulated_usage
 
                 # ── 情况 1: LLM 直接回答 ──
                 if finish_reason == "stop":
