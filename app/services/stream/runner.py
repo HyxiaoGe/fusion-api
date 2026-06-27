@@ -14,8 +14,6 @@ from app.core.logger import app_logger as logger
 from app.db.database import SessionLocal
 from app.db.repositories import FileRepository
 from app.schemas.chat import (
-    TextBlock,
-    ThinkingBlock,
     Usage,
 )
 from app.services.agent import session_cache
@@ -36,6 +34,7 @@ from app.services.stream.limit_summary import run_limit_summary_step
 from app.services.stream.llm_stream import llm_call_with_retry, stream_round
 from app.services.stream.network_budget import NetworkToolBudget
 from app.services.stream.persistence import persist_message, preprocess_url_in_message
+from app.services.stream.round_completion import append_round_content_blocks, complete_text_response_step
 from app.services.stream.run_finalizer import (
     AgentRunStats,
     complete_agent_run,
@@ -332,19 +331,19 @@ class StreamHandler:
 
                 # ── 情况 1: LLM 直接回答 ──
                 if finish_reason == "stop":
-                    if reasoning_buf:
-                        content_blocks.append(
-                            ThinkingBlock(type="thinking", id=thinking_block_id, thinking=reasoning_buf)
-                        )
-                    if content_buf:
-                        content_blocks.append(TextBlock(type="text", id=text_block_id, text=content_buf))
+                    append_round_content_blocks(
+                        content_blocks,
+                        reasoning_buf,
+                        content_buf,
+                        thinking_block_id,
+                        text_block_id,
+                    )
                     # 闭合本 step：直接回答路径不调工具
-                    await complete_agent_step(
+                    await complete_text_response_step(
                         context=step_context,
                         emitter=emitter,
                         session_cache=session_cache,
-                        tool_names=[],
-                        tool_call_count=0,
+                        complete_step_fn=complete_agent_step,
                         clock=time.time,
                     )
                     current_step_id = None
@@ -352,12 +351,13 @@ class StreamHandler:
 
                 # ── 情况 2: 被踢掉（superseded）──
                 if finish_reason == "cancelled":
-                    if reasoning_buf:
-                        content_blocks.append(
-                            ThinkingBlock(type="thinking", id=thinking_block_id, thinking=reasoning_buf)
-                        )
-                    if content_buf:
-                        content_blocks.append(TextBlock(type="text", id=text_block_id, text=content_buf))
+                    append_round_content_blocks(
+                        content_blocks,
+                        reasoning_buf,
+                        content_buf,
+                        thinking_block_id,
+                        text_block_id,
+                    )
                     persist_message(
                         db,
                         assistant_message_id,
@@ -411,17 +411,19 @@ class StreamHandler:
                     continue
 
                 # 未知 finish_reason（含 tool_calls 但 list 为空的退化情况）→ 保留已收集内容，闭合本 step 后跳出
-                if reasoning_buf:
-                    content_blocks.append(ThinkingBlock(type="thinking", id=thinking_block_id, thinking=reasoning_buf))
-                if content_buf:
-                    content_blocks.append(TextBlock(type="text", id=text_block_id, text=content_buf))
+                append_round_content_blocks(
+                    content_blocks,
+                    reasoning_buf,
+                    content_buf,
+                    thinking_block_id,
+                    text_block_id,
+                )
                 unknown_terminated = True
-                await complete_agent_step(
+                await complete_text_response_step(
                     context=step_context,
                     emitter=emitter,
                     session_cache=session_cache,
-                    tool_names=[],
-                    tool_call_count=0,
+                    complete_step_fn=complete_agent_step,
                     clock=time.time,
                 )
                 current_step_id = None
