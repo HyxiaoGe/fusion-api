@@ -1,8 +1,9 @@
 """tool_executor 重试策略测试"""
 
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+from app.services.stream.tool_execution_result import ToolExecutionRecord
 from app.services.stream.tool_executor import _should_retry_tool_result, execute_tools_parallel
 from app.services.tool_handlers.base import ToolResult
 
@@ -16,6 +17,67 @@ class ToolRetryPolicyTests(unittest.TestCase):
 
 
 class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):
+    async def test_execute_tools_parallel_returns_record_with_named_access_and_handler_helpers(self):
+        """成功执行后返回命名记录，并通过记录方法委派 handler 格式化逻辑。"""
+        handler = MagicMock()
+        handler.tool_name = "web_search"
+        handler.execute = AsyncMock(return_value=ToolResult(status="success", data={"items": []}))
+        handler.log = AsyncMock()
+        handler.format_llm_context.return_value = "LLM 可见上下文"
+        handler.build_content_block.return_value = {"type": "tool_result"}
+
+        tool_call = {"id": "call-1", "name": "web_search", "arguments": {"query": "redis stream"}}
+
+        with patch("app.services.tool_handlers.get_handler", return_value=handler):
+            records = await execute_tools_parallel(
+                [tool_call],
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="gpt-4",
+                provider="openai",
+                message_id="assistant-1",
+            )
+
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertIsInstance(record, ToolExecutionRecord)
+        self.assertIs(record.tool_call, tool_call)
+        self.assertEqual(record.tool_name, "web_search")
+        self.assertEqual(record.result.status, "success")
+        self.assertIs(record.handler, handler)
+        self.assertTrue(record.block_id.startswith("blk_"))
+        self.assertIsInstance(record.log_id, str)
+
+        self.assertEqual(record.format_llm_context(), "LLM 可见上下文")
+        handler.format_llm_context.assert_called_once_with(record.result)
+        self.assertEqual(record.build_content_block(), {"type": "tool_result"})
+        handler.build_content_block.assert_called_once_with(record.result, record.block_id, record.log_id)
+
+    async def test_execute_tools_parallel_returns_record_for_unknown_handler_with_safe_fallbacks(self):
+        """未知工具仍返回记录，但不会产生 content block，LLM context 使用安全兜底文案。"""
+        tool_call = {"id": "call-404", "name": "missing_tool", "arguments": {}}
+
+        with patch("app.services.tool_handlers.get_handler", return_value=None):
+            records = await execute_tools_parallel(
+                [tool_call],
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="gpt-4",
+                provider="openai",
+                message_id="assistant-1",
+            )
+
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertIsInstance(record, ToolExecutionRecord)
+        self.assertIs(record.tool_call, tool_call)
+        self.assertEqual(record.tool_name, "missing_tool")
+        self.assertIsNone(record.handler)
+        self.assertEqual(record.result.status, "failed")
+        self.assertEqual(record.result.error_message, "未知工具: missing_tool")
+        self.assertEqual(record.format_llm_context(), "工具未取得可用结果，不能把该工具结果作为依据。")
+        self.assertIsNone(record.build_content_block())
+
     async def test_execute_tools_parallel_passes_message_id_to_handler_log(self):
         """工具调用日志必须关联最终 assistant message"""
         handler = AsyncMock()
@@ -34,6 +96,50 @@ class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):
 
         handler.log.assert_awaited_once()
         self.assertEqual(handler.log.await_args.kwargs["message_id"], "assistant-1")
+
+    async def test_execute_tools_parallel_with_emitter_keeps_events_log_and_record(self):
+        """emitter 路径仍发工具事件、写日志，并返回命名记录。"""
+        handler = MagicMock()
+        handler.tool_name = "web_search"
+        handler.execute = AsyncMock(return_value=ToolResult(status="success"))
+        handler.log = AsyncMock()
+        handler._build_result_summary.return_value = {"kind": "search", "truncated": False}
+        emitter = AsyncMock()
+        tool_call = {"id": "call-1", "name": "web_search", "arguments": {"query": "redis stream"}}
+
+        with patch("app.services.tool_handlers.get_handler", return_value=handler):
+            records = await execute_tools_parallel(
+                [tool_call],
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="gpt-4",
+                provider="openai",
+                trace_id="trace-1",
+                step_number=2,
+                message_id="assistant-1",
+                emitter=emitter,
+            )
+
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertIsInstance(record, ToolExecutionRecord)
+        self.assertIs(record.tool_call, tool_call)
+        self.assertIs(record.handler, handler)
+        self.assertEqual(record.result.status, "success")
+        emitter.tool_call_started.assert_awaited_once_with(
+            tool_call_id="call-1",
+            tool_name="web_search",
+            arguments={"query": "redis stream"},
+        )
+        emitter.tool_call_completed.assert_awaited_once()
+        completed_kwargs = emitter.tool_call_completed.await_args.kwargs
+        self.assertEqual(completed_kwargs["tool_call_id"], "call-1")
+        self.assertEqual(completed_kwargs["tool_name"], "web_search")
+        self.assertEqual(completed_kwargs["status"], "success")
+        handler.log.assert_awaited_once()
+        self.assertEqual(handler.log.await_args.kwargs["message_id"], "assistant-1")
+        self.assertEqual(handler.log.await_args.kwargs["trace_id"], "trace-1")
+        self.assertEqual(handler.log.await_args.kwargs["step_number"], 2)
 
     async def test_execute_tools_parallel_uses_network_budget_normalized_args_for_handler_and_log(self):
         from app.services.stream.network_budget import NetworkToolBudget
@@ -91,9 +197,12 @@ class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):
                 network_budget=budget,
             )
 
-        result = results[0][1]
-        self.assertEqual(result.status, "degraded")
-        self.assertTrue(result.data["budget_limited"])
+        record = results[0]
+        self.assertIsInstance(record, ToolExecutionRecord)
+        self.assertEqual(record.tool_name, "web_search")
+        self.assertEqual(record.result.status, "degraded")
+        self.assertTrue(record.result.data["budget_limited"])
+        self.assertIs(record.handler, handler)
         handler.execute.assert_not_awaited()
         handler.log.assert_awaited_once()
 

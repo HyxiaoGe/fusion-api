@@ -415,17 +415,16 @@ class StreamHandler:
                     messages.append(assistant_tool_msg)
 
                     # 每个工具结果注入 messages + 收集 content blocks
-                    for tc, result, handler, block_id, log_id in results:
-                        if handler:
-                            tool_context = handler.format_llm_context(result)
-                            content_blocks.append(handler.build_content_block(result, block_id, log_id))
-                        else:
-                            tool_context = "工具未取得可用结果，不能把该工具结果作为依据。"
+                    for record in results:
+                        tool_context = record.format_llm_context()
+                        content_block = record.build_content_block()
+                        if content_block is not None:
+                            content_blocks.append(content_block)
 
                         messages.append(
                             {
                                 "role": "tool",
-                                "tool_call_id": tc["id"],
+                                "tool_call_id": record.tool_call["id"],
                                 "content": tool_context,
                             }
                         )
@@ -435,7 +434,7 @@ class StreamHandler:
 
                     # step_completed：emitter + session_cache（step_completed 会清空 _current_step_id）
                     step_duration = int((time.time() - step_start_time) * 1000)
-                    step_tool_names = [tc["name"] for tc, *_ in results]
+                    step_tool_names = [record.tool_name for record in results]
                     await emitter.step_completed(
                         step_number=step,
                         tool_call_count=len(results),

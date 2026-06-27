@@ -15,6 +15,7 @@ import backoff
 
 from app.core.logger import app_logger as logger
 from app.services.agent.emitter import AgentEventEmitter
+from app.services.stream.tool_execution_result import ToolExecutionRecord
 from app.services.stream_state_service import append_chunk
 
 if TYPE_CHECKING:
@@ -94,7 +95,7 @@ async def execute_tools_parallel(
     message_id: str | None = None,
     emitter: Optional[AgentEventEmitter] = None,
     network_budget: "NetworkToolBudget | None" = None,
-) -> list:
+) -> list[ToolExecutionRecord]:
     """
     并行执行所有 tool_calls。
 
@@ -102,13 +103,12 @@ async def execute_tools_parallel(
     completed agent_event），但中间塞入 execute_tool_with_retry（瞬时重试 +
     30s timeout）。tool_call_logs 仍通过 handler.log 写入。
 
-    返回 [(tool_call: dict, result: ToolResult, handler: BaseToolHandler|None,
-           block_id: str, log_id: str), ...]
+    返回 ToolExecutionRecord 列表，调用方不再依赖裸 tuple 位置。
     """
     from app.services.tool_handlers import ToolResult
     from app.services.tool_handlers import get_handler as _get_handler
 
-    async def _run_one(tc: dict):
+    async def _run_one(tc: dict) -> ToolExecutionRecord:
         handler = _get_handler(tc["name"])
         block_id = f"blk_{uuid.uuid4().hex[:12]}"
         log_id = str(uuid.uuid4())
@@ -116,7 +116,13 @@ async def execute_tools_parallel(
         if not handler:
             logger.warning(f"未知的 tool_call: {tc['name']}")
             result = ToolResult(status="failed", error_message=f"未知工具: {tc['name']}")
-            return tc, result, None, block_id, log_id
+            return ToolExecutionRecord(
+                tool_call=tc,
+                result=result,
+                handler=None,
+                block_id=block_id,
+                log_id=log_id,
+            )
 
         # 解析参数
         try:
@@ -160,7 +166,13 @@ async def execute_tools_parallel(
                 step_number=step_number,
                 message_id=message_id,
             )
-            return tc, result, handler, block_id, log_id
+            return ToolExecutionRecord(
+                tool_call=tc,
+                result=result,
+                handler=handler,
+                block_id=block_id,
+                log_id=log_id,
+            )
 
         # ── emitter 路径 ──
         # 直接复用 handler.execute_with_emitter 的发 start/completed 协议，
@@ -231,7 +243,13 @@ async def execute_tools_parallel(
             message_id=message_id,
         )
 
-        return tc, result, handler, block_id, log_id
+        return ToolExecutionRecord(
+            tool_call=tc,
+            result=result,
+            handler=handler,
+            block_id=block_id,
+            log_id=log_id,
+        )
 
     results = await asyncio.gather(*[_run_one(tc) for tc in tool_calls])
     return list(results)

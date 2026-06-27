@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.stream import StreamHandler
+from app.services.stream.tool_execution_result import ToolExecutionRecord
 
 
 class SseEnvelopeFormatterTests(unittest.TestCase):
@@ -404,17 +405,16 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                 ("", "Final answer", [], "stop", None),
             ],
             execute_tools_result=[
-                # _execute_tools_parallel 返回 [(tc, result, handler, block_id, log_id), ...]
-                (
-                    tool_call,
-                    SimpleNamespace(
+                ToolExecutionRecord(
+                    tool_call=tool_call,
+                    result=SimpleNamespace(
                         status="success",
                         error_message=None,
                         duration_ms=10,
                     ),
-                    None,  # handler=None → 走 else 分支不调用 build_content_block
-                    "blk_aaa",
-                    "log_aaa",
+                    handler=None,  # handler=None → 走 else 分支不调用 build_content_block
+                    block_id="blk_aaa",
+                    log_id="log_aaa",
                 ),
             ],
         )
@@ -444,16 +444,16 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         async def _capture_execute(*_args, **kwargs):
             order.append(("execute", kwargs.get("message_id")))
             return [
-                (
-                    tool_call,
-                    SimpleNamespace(
+                ToolExecutionRecord(
+                    tool_call=tool_call,
+                    result=SimpleNamespace(
                         status="success",
                         error_message=None,
                         duration_ms=10,
                     ),
-                    None,
-                    "blk_aaa",
-                    "log_aaa",
+                    handler=None,
+                    block_id="blk_aaa",
+                    log_id="log_aaa",
                 )
             ]
 
@@ -496,16 +496,16 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                 ("", "Final answer", [], "stop", None),
             ],
             execute_tools_result=[
-                (
-                    tool_call,
-                    ToolResult(
+                ToolExecutionRecord(
+                    tool_call=tool_call,
+                    result=ToolResult(
                         status="degraded",
                         error_message="reader-service 读取超时，已降级跳过",
                         data={"url": "https://example.com", "content": ""},
                     ),
-                    UrlReadHandler(),
-                    "blk_url",
-                    "log_url",
+                    handler=UrlReadHandler(),
+                    block_id="blk_url",
+                    log_id="log_url",
                 ),
             ],
             patch_extra=[
@@ -584,16 +584,16 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
             await self._invoke(
                 stream_round_side_effect=rounds,
                 execute_tools_result=[
-                    (
-                        tool_call,
-                        SimpleNamespace(
+                    ToolExecutionRecord(
+                        tool_call=tool_call,
+                        result=SimpleNamespace(
                             status="success",
                             error_message=None,
                             duration_ms=10,
                         ),
-                        None,
-                        "blk_aaa",
-                        "log_aaa",
+                        handler=None,
+                        block_id="blk_aaa",
+                        log_id="log_aaa",
                     ),
                 ],
             )
@@ -689,16 +689,16 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                     # 触顶总结的 stream_round 不会被消费（_do_summary 内部 hang 住了）
                 ],
                 execute_tools_result=[
-                    (
-                        tool_call,
-                        SimpleNamespace(
+                    ToolExecutionRecord(
+                        tool_call=tool_call,
+                        result=SimpleNamespace(
                             status="success",
                             error_message=None,
                             duration_ms=10,
                         ),
-                        None,  # handler=None → 走 else 分支
-                        "blk_x",
-                        "log_x",
+                        handler=None,  # handler=None → 走 else 分支
+                        block_id="blk_x",
+                        log_id="log_x",
                     ),
                 ],
                 patch_extra=[
