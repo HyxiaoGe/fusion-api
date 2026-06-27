@@ -147,7 +147,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             stack.enter_context(patch("app.services.stream.runner.persist_message", side_effect=_capture_persist))
             stack.enter_context(
                 patch(
-                    "app.services.stream.runner.build_llm_messages",
+                    "app.services.stream.agent_loop_request_prep.build_llm_messages",
                     AsyncMock(return_value=[{"role": "user", "content": "hi"}]),
                 )
             )

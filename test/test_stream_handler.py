@@ -209,7 +209,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
             patch("app.services.stream.runner.finalize_stream", self.finalize_mock),
             patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
             patch(
-                "app.services.stream.runner.build_llm_messages",
+                "app.services.stream.agent_loop_request_prep.build_llm_messages",
                 AsyncMock(return_value=[{"role": "user", "content": "hi"}]),
             ),
         ]
@@ -279,6 +279,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         patch_extra=None,
         capabilities=None,
         options=None,
+        original_message="hi",
     ):
         """通用启动器：mock _stream_round + _execute_tools_parallel 后跑 generate_to_redis。
 
@@ -318,7 +319,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                 raw_messages=[{"role": "user", "content": "hi"}],
                 has_vision=False,
                 file_ids=None,
-                original_message="hi",
+                original_message=original_message,
                 assistant_message_id="msg-1",
                 task_id="task-1",
                 options=options or {"use_reasoning": False},
@@ -352,6 +353,34 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1]["finish_reason"], "stop")
         # session 终态
         self.assertEqual(self.session_statuses[-1]["status"], "completed")
+
+    async def test_run_started_uses_initial_tools_before_url_prep_mutation(self):
+        """run_started 保持既有时序：URL 预处理追加的 url_read 不回填到初始 tools。"""
+        from app.services.external.reader_client import UrlReadResult
+
+        with patch(
+            "app.services.external.reader_client.read_url",
+            new_callable=AsyncMock,
+            return_value=UrlReadResult(
+                url="https://example.com/a",
+                title="示例网页",
+                content="网页正文",
+                favicon=None,
+                content_length=4,
+                fetch_ms=10,
+            ),
+        ):
+            await self._invoke(
+                stream_round_side_effect=[
+                    ("", "Hello world", [], "stop", None),
+                ],
+                capabilities={"functionCalling": True, "deepThinking": True},
+                original_message="请看 https://example.com/a",
+            )
+
+        run_started = self._agent_events()[0]
+        self.assertEqual(run_started["type"], "run_started")
+        self.assertEqual(run_started["tools"], ["web_search"])
 
     async def test_tool_mode_injects_web_search_contract_prompt(self):
         """工具模式：调用 LLM 前注入契约，避免 thinking 口头搜索但不发 tool_call。"""

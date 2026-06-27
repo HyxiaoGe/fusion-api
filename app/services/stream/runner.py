@@ -9,21 +9,18 @@ import time
 import uuid
 from typing import Optional
 
-from app.ai.litellm_utils import merge_extra_body
 from app.core.logger import app_logger as logger
 from app.db.database import SessionLocal
-from app.db.repositories import FileRepository
 from app.services.agent import session_cache
 from app.services.agent.emitter import AgentEventEmitter
-from app.services.chat.message_builder import (
-    build_llm_messages,
-    inject_file_content,
-    is_image_file,
-)
 from app.services.stream.agent_loop_driver import AgentLoopExit, run_agent_loop
 from app.services.stream.agent_loop_policy import (
     AgentLoopLimits,
     map_run_terminal_state,
+)
+from app.services.stream.agent_loop_request_prep import (
+    build_agent_loop_call_config,
+    prepare_agent_loop_messages,
 )
 from app.services.stream.agent_loop_runtime import AgentLoopRuntime
 from app.services.stream.agent_loop_state import AgentLoopState
@@ -31,7 +28,7 @@ from app.services.stream.agent_round import run_agent_round
 from app.services.stream.limit_summary import run_limit_summary_step
 from app.services.stream.llm_stream import llm_call_with_retry, stream_round
 from app.services.stream.network_budget import NetworkToolBudget
-from app.services.stream.persistence import persist_message, preprocess_url_in_message
+from app.services.stream.persistence import persist_message
 from app.services.stream.run_finalizer import (
     complete_agent_run,
     fail_agent_run,
@@ -51,43 +48,6 @@ from app.services.stream_state_service import (
 AGENT_MAX_STEPS = 8  # LLM 调用轮次上限
 AGENT_MAX_TOOL_CALLS = 20  # 工具执行总次数上限
 AGENT_TOTAL_TIMEOUT = 300  # 5 分钟硬超时
-
-_WEB_SEARCH_TOOL_CONTRACT_PROMPT = (
-    "【工具调用一致性规则】\n"
-    "如果你判断需要联网搜索，必须调用 web_search 工具，不能只在文字里说要搜索。\n"
-    "不要在思考过程或最终回答中声称「我将搜索」「正在搜索」「让我搜索一下」「根据搜索结果」等，"
-    "除非你已经实际调用工具并收到了工具结果。\n"
-    "没有调用工具时，请直接基于已有知识回答，并明确避免暗示已经联网或即将联网。"
-)
-
-
-def _tool_names_from_call_kwargs(call_kwargs: dict) -> set[str]:
-    return set(_announced_tool_names_from_call_kwargs(call_kwargs))
-
-
-def _announced_tool_names_from_call_kwargs(call_kwargs: dict) -> list[str]:
-    ordered_names: list[str] = []
-    for tool in call_kwargs.get("tools", []) or []:
-        if not isinstance(tool, dict):
-            continue
-        fn = tool.get("function")
-        if isinstance(fn, dict) and fn.get("name"):
-            ordered_names.append(str(fn["name"]))
-    return ordered_names
-
-
-def _inject_tool_usage_contract(messages: list[dict], call_kwargs: dict) -> list[dict]:
-    """工具模式下补一条 system 约束，避免 reasoning 口头承诺搜索但不发 tool_call。"""
-    if "web_search" not in _tool_names_from_call_kwargs(call_kwargs):
-        return messages
-    if any(msg.get("role") == "system" and "【工具调用一致性规则】" in str(msg.get("content", "")) for msg in messages):
-        return messages
-
-    insert_at = 0
-    while insert_at < len(messages) and messages[insert_at].get("role") == "system":
-        insert_at += 1
-    contract_msg = {"role": "system", "content": _WEB_SEARCH_TOOL_CONTRACT_PROMPT}
-    return [*messages[:insert_at], contract_msg, *messages[insert_at:]]
 
 
 def _log_agent_round_summary(
@@ -113,10 +73,6 @@ def _log_agent_round_summary(
 
 class StreamHandler:
     """流式处理器"""
-
-    # 哪些 provider（底层 LiteLLM 路由识别出的）需要走 volcengine 的 disabled-thinking 兼容；
-    # 其余靠 capabilities.deepThinking 推断是否开 reasoning。
-    _VOLCENGINE_PROVIDERS = {"volcengine"}
 
     async def generate_to_redis(
         self,
@@ -145,23 +101,11 @@ class StreamHandler:
         if capabilities is None:
             capabilities = {}
 
-        # use_reasoning 默认跟随 capabilities.deepThinking — 模型本身声明支持 thinking
-        # 就开，不再按 provider 硬编码（refactor 后 qwen/doubao/xiaomi 的底层 provider
-        # 都报告为 "openai"，硬编码集合会漏掉它们）。
-        use_reasoning = options.get("use_reasoning")
-        supports_thinking = bool(capabilities.get("deepThinking", False))
-        should_use_reasoning = use_reasoning is True or (use_reasoning is None and supports_thinking)
-
-        # 判断是否启用工具
-        supports_fc = capabilities.get("functionCalling", False)
-        call_kwargs = {}
-        if supports_fc:
-            from app.ai.tools import build_web_search_tool
-
-            call_kwargs["tools"] = [build_web_search_tool()]
-            call_kwargs["tool_choice"] = "auto"
-            if should_use_reasoning and provider in self._VOLCENGINE_PROVIDERS:
-                merge_extra_body(call_kwargs, {"thinking": {"type": "disabled"}})
+        call_config = build_agent_loop_call_config(
+            provider=provider,
+            options=options,
+            capabilities=capabilities,
+        )
 
         db = SessionLocal()
 
@@ -194,7 +138,7 @@ class StreamHandler:
                 model_id=model_id,
                 provider=provider,
                 message_id=assistant_message_id,
-                tools=_announced_tool_names_from_call_kwargs(call_kwargs),
+                tools=call_config.announced_tools,
                 config={
                     "max_steps": AGENT_MAX_STEPS,
                     "max_tool_calls": AGENT_MAX_TOOL_CALLS,
@@ -202,31 +146,17 @@ class StreamHandler:
                 },
             )
 
-            # 构建 LLM 消息
-            file_repo = FileRepository(db)
-            from app.db.models import User as UserModel
-
-            user_record = db.query(UserModel).filter(UserModel.id == user_id).first()
-            user_system_prompt = user_record.system_prompt if user_record else None
-            messages = await build_llm_messages(raw_messages, has_vision, file_repo, user_system_prompt)
-
-            if file_ids:
-                non_image_ids = [fid for fid in file_ids if not is_image_file(fid, file_repo)]
-                if non_image_ids:
-                    file_contents = file_repo.get_parsed_file_content(non_image_ids)
-                    if file_contents:
-                        messages = inject_file_content(messages, original_message, file_contents)
-
-            # ── URL 自动检测预处理（路径 A，已抽到 services/stream/persistence）──
-            url_read_block, url_context_msg, _auto_detected_url = await preprocess_url_in_message(
-                original_message, supports_fc, call_kwargs
+            prepared_messages = await prepare_agent_loop_messages(
+                db=db,
+                user_id=user_id,
+                raw_messages=raw_messages,
+                has_vision=has_vision,
+                file_ids=file_ids,
+                original_message=original_message,
+                call_config=call_config,
             )
-            if url_context_msg:
-                messages.insert(-1, url_context_msg)
-            if url_read_block:
-                state.content_blocks.append(url_read_block)
-
-            messages = _inject_tool_usage_contract(messages, call_kwargs)
+            messages = prepared_messages.messages
+            state.content_blocks.extend(prepared_messages.initial_content_blocks)
 
             # ═══════════════════════════════════════
             # Agent Loop
@@ -245,8 +175,8 @@ class StreamHandler:
                     provider=provider,
                     litellm_model=litellm_model,
                     litellm_kwargs=litellm_kwargs,
-                    should_use_reasoning=should_use_reasoning,
-                    call_kwargs=call_kwargs,
+                    should_use_reasoning=call_config.should_use_reasoning,
+                    call_kwargs=call_config.call_kwargs,
                     assistant_message_id=assistant_message_id,
                     run_start=run_start,
                     limits=AgentLoopLimits(
