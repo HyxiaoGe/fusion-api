@@ -243,11 +243,14 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
 
         # session_cache 写入全部 mock 掉，避免命中真 SQLAlchemy 路径；
         # write_session_status 用 side_effect 捕获参数。
+        self.write_step_started_mock = AsyncMock()
+        self.write_step_completed_mock = AsyncMock()
+        self.write_step_terminal_mock = AsyncMock()
         self.session_cache_patchers = [
             patch("app.services.agent.session_cache.write_session_started", AsyncMock()),
-            patch("app.services.agent.session_cache.write_step_started", AsyncMock()),
-            patch("app.services.agent.session_cache.write_step_completed", AsyncMock()),
-            patch("app.services.agent.session_cache.write_step_terminal", AsyncMock()),
+            patch("app.services.agent.session_cache.write_step_started", self.write_step_started_mock),
+            patch("app.services.agent.session_cache.write_step_completed", self.write_step_completed_mock),
+            patch("app.services.agent.session_cache.write_step_terminal", self.write_step_terminal_mock),
             patch(
                 "app.services.agent.session_cache.write_session_status",
                 side_effect=_capture_status,
@@ -569,6 +572,27 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
 
         # SSE finalize 已被调（finalize_stream 在 raise 之前完成）
         self.finalize_mock.assert_awaited()
+
+    async def test_step_started_cache_failure_marks_active_step_failed(self):
+        """step_started 事件发出后 cache 写入失败时，异常收尾必须标记 active step failed。"""
+        self.write_step_started_mock.side_effect = RuntimeError("step cache boom")
+
+        with self.assertRaises(RuntimeError) as cm:
+            await self._invoke(
+                stream_round_side_effect=[
+                    ("", "不会执行到 stream_round", [], "stop", None),
+                ],
+            )
+        self.assertIn("step cache boom", str(cm.exception))
+
+        events = self._agent_events()
+        step_started = [e for e in events if e["type"] == "step_started"][0]
+        self.write_step_terminal_mock.assert_awaited_once_with(
+            step_id=step_started["step_id"],
+            status="failed",
+        )
+        self.assertIn("run_failed", [e["type"] for e in events])
+        self.assertEqual(self.session_statuses[-1]["status"], "error")
 
     async def test_limit_reached_max_steps(self):
         """触顶 max_steps：发 run_limit_reached(max_steps) → 强制总结 → run_completed(limit_reached)"""

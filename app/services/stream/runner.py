@@ -41,6 +41,7 @@ from app.services.stream.run_finalizer import (
     interrupt_agent_run,
     write_fallback_error_status,
 )
+from app.services.stream.step_lifecycle import complete_agent_step, start_agent_step
 from app.services.stream.tool_executor import AgentEventRedisWriter, execute_tools_parallel
 from app.services.stream_state_service import (
     append_chunk,
@@ -184,6 +185,10 @@ class StreamHandler:
         # 标记 finally 路径已经写过终态 / run_completed 事件，避免重复
         terminal_emitted = False
 
+        def _mark_current_step(step_id: str) -> None:
+            nonlocal current_step_id
+            current_step_id = step_id
+
         def _run_stats() -> AgentRunStats:
             return AgentRunStats(
                 run_id=run_id,
@@ -282,16 +287,17 @@ class StreamHandler:
                 # stop / cancelled / tool_calls 三路径都在分支末尾闭合本 step。
                 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
                 step += 1
-                step_start_time = time.time()
-                current_step_id = await emitter.step_started(step_number=step)
-                await session_cache.write_step_started(
+                step_context = await start_agent_step(
+                    emitter=emitter,
+                    session_cache=session_cache,
                     run_id=run_id,
-                    step_id=current_step_id,
                     step_number=step,
+                    clock=time.time,
+                    on_step_started=_mark_current_step,
                 )
-
-                thinking_block_id = f"blk_{uuid.uuid4().hex[:12]}"
-                text_block_id = f"blk_{uuid.uuid4().hex[:12]}"
+                current_step_id = step_context.step_id
+                thinking_block_id = step_context.thinking_block_id
+                text_block_id = step_context.text_block_id
 
                 # LiteLLM Proxy 自己管 health / 重试，这里不再追踪 provider/credential 健康
                 response = await llm_call_with_retry(
@@ -339,17 +345,13 @@ class StreamHandler:
                     if content_buf:
                         content_blocks.append(TextBlock(type="text", id=text_block_id, text=content_buf))
                     # 闭合本 step：直接回答路径不调工具
-                    stop_step_duration = int((time.time() - step_start_time) * 1000)
-                    await emitter.step_completed(
-                        step_number=step,
-                        tool_call_count=0,
-                        duration_ms=stop_step_duration,
-                    )
-                    await session_cache.write_step_completed(
-                        step_id=current_step_id,
+                    await complete_agent_step(
+                        context=step_context,
+                        emitter=emitter,
+                        session_cache=session_cache,
                         tool_names=[],
-                        tool_calls_count=0,
-                        duration_ms=stop_step_duration,
+                        tool_call_count=0,
+                        clock=time.time,
                     )
                     current_step_id = None
                     break
@@ -447,18 +449,14 @@ class StreamHandler:
                     persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks, partial=True)
 
                     # step_completed：emitter + session_cache（step_completed 会清空 _current_step_id）
-                    step_duration = int((time.time() - step_start_time) * 1000)
                     step_tool_names = [record.tool_name for record in results]
-                    await emitter.step_completed(
-                        step_number=step,
-                        tool_call_count=len(results),
-                        duration_ms=step_duration,
-                    )
-                    await session_cache.write_step_completed(
-                        step_id=current_step_id,
+                    await complete_agent_step(
+                        context=step_context,
+                        emitter=emitter,
+                        session_cache=session_cache,
                         tool_names=step_tool_names,
-                        tool_calls_count=len(results),
-                        duration_ms=step_duration,
+                        tool_call_count=len(results),
+                        clock=time.time,
                     )
                     current_step_id = None  # 离开 step 上下文
 
@@ -477,17 +475,13 @@ class StreamHandler:
                 if content_buf:
                     content_blocks.append(TextBlock(type="text", id=text_block_id, text=content_buf))
                 unknown_terminated = True
-                unknown_step_duration = int((time.time() - step_start_time) * 1000)
-                await emitter.step_completed(
-                    step_number=step,
-                    tool_call_count=0,
-                    duration_ms=unknown_step_duration,
-                )
-                await session_cache.write_step_completed(
-                    step_id=current_step_id,
+                await complete_agent_step(
+                    context=step_context,
+                    emitter=emitter,
+                    session_cache=session_cache,
                     tool_names=[],
-                    tool_calls_count=0,
-                    duration_ms=unknown_step_duration,
+                    tool_call_count=0,
+                    clock=time.time,
                 )
                 current_step_id = None
                 break
@@ -498,14 +492,15 @@ class StreamHandler:
             if limit_reason is not None:
                 # 触顶总结作为一个独立 step（不带 tools）
                 step += 1
-                summary_step_id = await emitter.step_started(step_number=step)
-                await session_cache.write_step_started(
+                summary_context = await start_agent_step(
+                    emitter=emitter,
+                    session_cache=session_cache,
                     run_id=run_id,
-                    step_id=summary_step_id,
                     step_number=step,
+                    clock=time.time,
+                    on_step_started=_mark_current_step,
                 )
-                current_step_id = summary_step_id
-                summary_step_start = time.time()
+                current_step_id = summary_context.step_id
 
                 messages.append(
                     {
@@ -514,8 +509,8 @@ class StreamHandler:
                     }
                 )
                 final_call_kwargs = {k: v for k, v in call_kwargs.items() if k not in ("tools", "tool_choice")}
-                thinking_block_id = f"blk_{uuid.uuid4().hex[:12]}"
-                text_block_id = f"blk_{uuid.uuid4().hex[:12]}"
+                thinking_block_id = summary_context.thinking_block_id
+                text_block_id = summary_context.text_block_id
 
                 try:
 
@@ -534,7 +529,7 @@ class StreamHandler:
                             thinking_block_id,
                             text_block_id,
                             run_id=run_id,
-                            step_id=summary_step_id,
+                            step_id=summary_context.step_id,
                         )
 
                     # 给触顶总结独立 timeout：剩余 run 预算（兜底 10s 避免负数）
@@ -567,17 +562,13 @@ class StreamHandler:
                 if content_buf:
                     content_blocks.append(TextBlock(type="text", id=text_block_id, text=content_buf))
 
-                summary_step_duration = int((time.time() - summary_step_start) * 1000)
-                await emitter.step_completed(
-                    step_number=step,
-                    tool_call_count=0,
-                    duration_ms=summary_step_duration,
-                )
-                await session_cache.write_step_completed(
-                    step_id=summary_step_id,
+                await complete_agent_step(
+                    context=summary_context,
+                    emitter=emitter,
+                    session_cache=session_cache,
                     tool_names=[],
-                    tool_calls_count=0,
-                    duration_ms=summary_step_duration,
+                    tool_call_count=0,
+                    clock=time.time,
                 )
                 current_step_id = None
 
