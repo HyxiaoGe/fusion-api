@@ -481,6 +481,37 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order[0], ("persist", "msg-1", True, 1))
         self.assertEqual(order[1], ("execute", "msg-1"))
 
+    async def test_tool_round_post_execute_failure_keeps_tool_call_count(self):
+        """工具执行已返回后，后续注入失败也应保留旧语义：失败终态统计本轮工具调用。"""
+        tool_call = {"id": "tc1", "name": "web_search", "arguments": '{"query":"x"}'}
+        handler = MagicMock()
+        handler.format_llm_context.return_value = "工具上下文"
+        handler.build_content_block.side_effect = RuntimeError("content block boom")
+
+        with self.assertRaises(RuntimeError) as cm:
+            await self._invoke(
+                stream_round_side_effect=[
+                    ("需要搜索", "", [tool_call], "tool_calls", None),
+                ],
+                execute_tools_result=[
+                    ToolExecutionRecord(
+                        tool_call=tool_call,
+                        result=SimpleNamespace(
+                            status="success",
+                            error_message=None,
+                            duration_ms=10,
+                        ),
+                        handler=handler,
+                        block_id="blk_aaa",
+                        log_id="log_aaa",
+                    )
+                ],
+            )
+
+        self.assertIn("content block boom", str(cm.exception))
+        self.assertEqual(self.session_statuses[-1]["status"], "error")
+        self.assertEqual(self.session_statuses[-1]["total_tool_calls"], 1)
+
     async def test_degraded_url_read_injects_safe_tool_context(self):
         """url_read 降级时，下一轮 LLM 不能看到内部失败原因或被诱导无依据回答。"""
         from app.services.tool_handlers.base import ToolResult

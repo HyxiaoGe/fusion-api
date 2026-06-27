@@ -43,6 +43,7 @@ from app.services.stream.run_finalizer import (
 )
 from app.services.stream.step_lifecycle import complete_agent_step, start_agent_step
 from app.services.stream.tool_executor import AgentEventRedisWriter, execute_tools_parallel
+from app.services.stream.tool_round import handle_tool_calls_round
 from app.services.stream_state_service import (
     append_chunk,
     finalize_stream,
@@ -195,6 +196,10 @@ class StreamHandler:
                 total_steps=step,
                 total_tool_calls=total_tool_calls,
             )
+
+        def _record_executed_tool_calls(tool_call_count: int) -> None:
+            nonlocal total_tool_calls
+            total_tool_calls += tool_call_count
 
         def _run_duration_ms() -> int:
             return int((time.time() - run_start) * 1000)
@@ -387,85 +392,32 @@ class StreamHandler:
                 # ── 情况 3: LLM 请求工具调用 ──
                 if finish_reason == "tool_calls" and tool_calls_list:
                     # step / step_started / write_step_started 已在 while 顶部完成
-
-                    # 收集本轮 reasoning（tool_call 决策推理）
-                    if reasoning_buf:
-                        content_blocks.append(
-                            ThinkingBlock(type="thinking", id=thinking_block_id, thinking=reasoning_buf)
-                        )
-
-                    # 工具日志会带 assistant_message_id 并写入独立 DB session。
-                    # 先创建/更新 assistant 消息，避免 tool_call_logs.message_id 外键竞态。
-                    persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks, partial=True)
-
-                    # 并行执行工具（走 execute_with_emitter，tool_call_started/completed 由 base 统一发）
-                    results = await execute_tools_parallel(
-                        tool_calls_list,
-                        conversation_id,
-                        user_id,
-                        model_id,
-                        provider,
-                        trace_id=run_id,
+                    await handle_tool_calls_round(
+                        db=db,
+                        assistant_message_id=assistant_message_id,
+                        conversation_id=conversation_id,
+                        user_id=user_id,
+                        model_id=model_id,
+                        provider=provider,
+                        content_blocks=content_blocks,
+                        messages=messages,
+                        tool_calls=tool_calls_list,
+                        reasoning_buf=reasoning_buf,
+                        should_use_reasoning=should_use_reasoning,
+                        step_context=step_context,
                         step_number=step,
-                        message_id=assistant_message_id,
-                        emitter=emitter,
-                        network_budget=network_budget,
-                    )
-                    total_tool_calls += len(tool_calls_list)
-
-                    # 构建 assistant tool_call message
-                    assistant_tool_msg = {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "id": tc["id"],
-                                "type": "function",
-                                "function": {"name": tc["name"], "arguments": tc["arguments"]},
-                            }
-                            for tc in tool_calls_list
-                        ],
-                    }
-                    if should_use_reasoning and reasoning_buf:
-                        assistant_tool_msg["reasoning_content"] = reasoning_buf
-                    messages.append(assistant_tool_msg)
-
-                    # 每个工具结果注入 messages + 收集 content blocks
-                    for record in results:
-                        tool_context = record.format_llm_context()
-                        content_block = record.build_content_block()
-                        if content_block is not None:
-                            content_blocks.append(content_block)
-
-                        messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": record.tool_call["id"],
-                                "content": tool_context,
-                            }
-                        )
-
-                    # Checkpoint：每步写入 DB，进程崩溃不丢已完成步骤
-                    persist_message(db, assistant_message_id, conversation_id, model_id, content_blocks, partial=True)
-
-                    # step_completed：emitter + session_cache（step_completed 会清空 _current_step_id）
-                    step_tool_names = [record.tool_name for record in results]
-                    await complete_agent_step(
-                        context=step_context,
+                        run_id=run_id,
                         emitter=emitter,
                         session_cache=session_cache,
-                        tool_names=step_tool_names,
-                        tool_call_count=len(results),
+                        network_budget=network_budget,
+                        call_kwargs=call_kwargs,
+                        persist_message_fn=persist_message,
+                        execute_tools_fn=execute_tools_parallel,
+                        complete_step_fn=complete_agent_step,
+                        on_tools_executed=_record_executed_tool_calls,
                         clock=time.time,
                     )
                     current_step_id = None  # 离开 step 上下文
-
-                    # 恢复 volcengine thinking（首轮 tool_call 决策已完成）
-                    if (
-                        "extra_body" in call_kwargs
-                        and call_kwargs["extra_body"].get("thinking", {}).get("type") == "disabled"
-                    ):
-                        del call_kwargs["extra_body"]
 
                     continue
 
