@@ -36,6 +36,7 @@ from app.services.stream.run_finalizer import (
     complete_agent_run,
     fail_agent_run,
     interrupt_agent_run,
+    start_agent_run,
     write_fallback_error_status,
 )
 from app.services.stream.step_lifecycle import complete_agent_step, start_agent_step
@@ -61,14 +62,18 @@ _WEB_SEARCH_TOOL_CONTRACT_PROMPT = (
 
 
 def _tool_names_from_call_kwargs(call_kwargs: dict) -> set[str]:
-    names: set[str] = set()
+    return set(_announced_tool_names_from_call_kwargs(call_kwargs))
+
+
+def _announced_tool_names_from_call_kwargs(call_kwargs: dict) -> list[str]:
+    ordered_names: list[str] = []
     for tool in call_kwargs.get("tools", []) or []:
         if not isinstance(tool, dict):
             continue
         fn = tool.get("function")
         if isinstance(fn, dict) and fn.get("name"):
-            names.add(str(fn["name"]))
-    return names
+            ordered_names.append(str(fn["name"]))
+    return ordered_names
 
 
 def _inject_tool_usage_contract(messages: list[dict], call_kwargs: dict) -> list[dict]:
@@ -180,14 +185,21 @@ class StreamHandler:
         try:
             await append_chunk(conversation_id, "preparing", "", "")
 
-            # session_cache 行：必须传齐 user_id / model_id / provider（NOT NULL）
-            await session_cache.write_session_started(
+            await start_agent_run(
+                emitter=emitter,
+                session_cache=session_cache,
                 run_id=run_id,
                 conversation_id=conversation_id,
                 user_id=user_id,
                 model_id=model_id,
                 provider=provider,
                 message_id=assistant_message_id,
+                tools=_announced_tool_names_from_call_kwargs(call_kwargs),
+                config={
+                    "max_steps": AGENT_MAX_STEPS,
+                    "max_tool_calls": AGENT_MAX_TOOL_CALLS,
+                    "timeout_s": AGENT_TOTAL_TIMEOUT,
+                },
             )
 
             # 构建 LLM 消息
@@ -221,23 +233,6 @@ class StreamHandler:
             # ═══════════════════════════════════════
 
             start_time = run_start
-
-            # run_started 必须在 while 之前 emit（即使 0 step / 直接 stop 也算一个 run）
-            agent_tools_announced: list[str] = []
-            for _t in call_kwargs.get("tools", []) or []:
-                fn = _t.get("function") if isinstance(_t, dict) else None
-                if isinstance(fn, dict) and fn.get("name"):
-                    agent_tools_announced.append(fn["name"])
-            await emitter.run_started(
-                message_id=assistant_message_id,
-                model=model_id,
-                tools=agent_tools_announced,
-                config={
-                    "max_steps": AGENT_MAX_STEPS,
-                    "max_tool_calls": AGENT_MAX_TOOL_CALLS,
-                    "timeout_s": AGENT_TOTAL_TIMEOUT,
-                },
-            )
 
             while True:
                 # ─── 三段触顶检查（顺序：timeout > max_steps > max_tool_calls）───

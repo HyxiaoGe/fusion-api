@@ -7,6 +7,7 @@ from app.services.stream.run_finalizer import (
     complete_agent_run,
     fail_agent_run,
     interrupt_agent_run,
+    start_agent_run,
     write_fallback_error_status,
 )
 
@@ -14,18 +15,22 @@ from app.services.stream.run_finalizer import (
 class RunFinalizerTests(unittest.IsolatedAsyncioTestCase):
     def _deps(self):
         emitter = SimpleNamespace(
+            run_started=AsyncMock(),
             run_completed=AsyncMock(),
             run_interrupted=AsyncMock(),
             run_failed=AsyncMock(),
         )
         cache = SimpleNamespace(
+            write_session_started=AsyncMock(),
             write_step_terminal=AsyncMock(),
             write_session_status=AsyncMock(),
         )
         order = Mock()
+        order.attach_mock(emitter.run_started, "run_started")
         order.attach_mock(emitter.run_completed, "run_completed")
         order.attach_mock(emitter.run_interrupted, "run_interrupted")
         order.attach_mock(emitter.run_failed, "run_failed")
+        order.attach_mock(cache.write_session_started, "write_session_started")
         order.attach_mock(cache.write_step_terminal, "write_step_terminal")
         order.attach_mock(cache.write_session_status, "write_session_status")
         return emitter, cache, order
@@ -41,6 +46,42 @@ class RunFinalizerTests(unittest.IsolatedAsyncioTestCase):
         duration_factory = Mock(return_value=duration_ms)
         order.attach_mock(duration_factory, "duration_ms_factory")
         return duration_factory
+
+    async def test_start_agent_run_writes_session_before_run_started(self):
+        emitter, cache, order = self._deps()
+
+        await start_agent_run(
+            emitter=emitter,
+            session_cache=cache,
+            run_id="run-1",
+            conversation_id="conv-1",
+            user_id="user-1",
+            model_id="gpt-4",
+            provider="openai",
+            message_id="msg-1",
+            tools=["web_search"],
+            config={"max_steps": 8},
+        )
+
+        self.assertEqual(
+            order.mock_calls,
+            [
+                call.write_session_started(
+                    run_id="run-1",
+                    conversation_id="conv-1",
+                    user_id="user-1",
+                    model_id="gpt-4",
+                    provider="openai",
+                    message_id="msg-1",
+                ),
+                call.run_started(
+                    message_id="msg-1",
+                    model="gpt-4",
+                    tools=["web_search"],
+                    config={"max_steps": 8},
+                ),
+            ],
+        )
 
     async def test_complete_agent_run_emits_completed_before_session_status(self):
         emitter, cache, order = self._deps()

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from app.services.stream.agent_loop_policy import AgentSessionStatus, RunCompletedFinishReason
 
@@ -24,6 +24,15 @@ TerminalSessionStatus = AgentSessionStatus | ErrorSessionStatus | InterruptedSes
 
 
 class AgentRunEmitter(Protocol):
+    async def run_started(
+        self,
+        *,
+        message_id: str,
+        model: str,
+        tools: list[str],
+        config: dict[str, Any],
+    ) -> None: ...
+
     async def run_completed(
         self,
         *,
@@ -38,6 +47,17 @@ class AgentRunEmitter(Protocol):
 
 
 class AgentRunSessionCache(Protocol):
+    async def write_session_started(
+        self,
+        *,
+        run_id: str,
+        conversation_id: str,
+        user_id: str,
+        model_id: str,
+        provider: str,
+        message_id: str,
+    ) -> None: ...
+
     async def write_step_terminal(self, *, step_id: str, status: StepTerminalStatus) -> None: ...
 
     async def write_session_status(
@@ -52,6 +72,35 @@ class AgentRunSessionCache(Protocol):
 
 
 DurationMsFactory = Callable[[], int]
+
+
+async def start_agent_run(
+    *,
+    emitter: AgentRunEmitter,
+    session_cache: AgentRunSessionCache,
+    run_id: str,
+    conversation_id: str,
+    user_id: str,
+    model_id: str,
+    provider: str,
+    message_id: str,
+    tools: list[str],
+    config: dict[str, Any],
+) -> None:
+    await session_cache.write_session_started(
+        run_id=run_id,
+        conversation_id=conversation_id,
+        user_id=user_id,
+        model_id=model_id,
+        provider=provider,
+        message_id=message_id,
+    )
+    await emitter.run_started(
+        message_id=message_id,
+        model=model_id,
+        tools=tools,
+        config=config,
+    )
 
 
 async def complete_agent_run(
