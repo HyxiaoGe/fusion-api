@@ -31,6 +31,7 @@ from app.services.stream.agent_loop_policy import (
     check_agent_loop_limit,
     map_run_terminal_state,
 )
+from app.services.stream.limit_summary import run_limit_summary_step
 from app.services.stream.llm_stream import llm_call_with_retry, stream_round
 from app.services.stream.network_budget import NetworkToolBudget
 from app.services.stream.persistence import persist_message, preprocess_url_in_message
@@ -444,84 +445,34 @@ class StreamHandler:
             if limit_reason is not None:
                 # 触顶总结作为一个独立 step（不带 tools）
                 step += 1
-                summary_context = await start_agent_step(
-                    emitter=emitter,
-                    session_cache=session_cache,
+                summary_outcome = await run_limit_summary_step(
+                    conversation_id=conversation_id,
+                    task_id=task_id,
                     run_id=run_id,
                     step_number=step,
+                    model_id=model_id,
+                    provider=provider,
+                    litellm_model=litellm_model,
+                    litellm_kwargs=litellm_kwargs,
+                    messages=messages,
+                    should_use_reasoning=should_use_reasoning,
+                    content_blocks=content_blocks,
+                    call_kwargs=call_kwargs,
+                    accumulated_usage=accumulated_usage,
+                    emitter=emitter,
+                    session_cache=session_cache,
+                    total_timeout_s=AGENT_TOTAL_TIMEOUT,
+                    run_start=run_start,
+                    start_step_fn=start_agent_step,
+                    complete_step_fn=complete_agent_step,
+                    llm_call_fn=llm_call_with_retry,
+                    stream_round_fn=stream_round,
+                    log_round_summary_fn=_log_agent_round_summary,
+                    warning_fn=logger.warning,
                     clock=time.time,
                     on_step_started=_mark_current_step,
                 )
-                current_step_id = summary_context.step_id
-
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": "你已达到工具调用上限，请基于已收集的信息给出最终回答。不要再调用任何工具。",
-                    }
-                )
-                final_call_kwargs = {k: v for k, v in call_kwargs.items() if k not in ("tools", "tool_choice")}
-                thinking_block_id = summary_context.thinking_block_id
-                text_block_id = summary_context.text_block_id
-
-                try:
-
-                    async def _do_summary():
-                        response = await llm_call_with_retry(
-                            litellm_model,
-                            litellm_kwargs,
-                            messages,
-                            **final_call_kwargs,
-                        )
-                        return await stream_round(
-                            response,
-                            conversation_id,
-                            task_id,
-                            should_use_reasoning,
-                            thinking_block_id,
-                            text_block_id,
-                            run_id=run_id,
-                            step_id=summary_context.step_id,
-                        )
-
-                    # 给触顶总结独立 timeout：剩余 run 预算（兜底 10s 避免负数）
-                    remaining = max(10, AGENT_TOTAL_TIMEOUT - (time.time() - run_start))
-                    reasoning_buf, content_buf, _, _, usage_data = await asyncio.wait_for(
-                        _do_summary(), timeout=remaining
-                    )
-                    _log_agent_round_summary(
-                        conversation_id=conversation_id,
-                        run_id=run_id,
-                        step_number=step,
-                        model_id=model_id,
-                        provider=provider,
-                        finish_reason="limit_summary",
-                        tool_calls_count=0,
-                        reasoning_buf=reasoning_buf,
-                        content_buf=content_buf,
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning(f"触顶总结超出剩余预算: conv_id={conversation_id}, budget={remaining}s")
-                    reasoning_buf, content_buf, usage_data = "", "", None
-
-                if usage_data:
-                    accumulated_usage = Usage(
-                        input_tokens=accumulated_usage.input_tokens + usage_data.input_tokens,
-                        output_tokens=accumulated_usage.output_tokens + usage_data.output_tokens,
-                    )
-                if reasoning_buf:
-                    content_blocks.append(ThinkingBlock(type="thinking", id=thinking_block_id, thinking=reasoning_buf))
-                if content_buf:
-                    content_blocks.append(TextBlock(type="text", id=text_block_id, text=content_buf))
-
-                await complete_agent_step(
-                    context=summary_context,
-                    emitter=emitter,
-                    session_cache=session_cache,
-                    tool_names=[],
-                    tool_call_count=0,
-                    clock=time.time,
-                )
+                accumulated_usage = summary_outcome.accumulated_usage
                 current_step_id = None
 
             # ═══════════════════════════════════════
