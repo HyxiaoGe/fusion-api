@@ -206,6 +206,64 @@ class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):
         handler.execute.assert_not_awaited()
         handler.log.assert_awaited_once()
 
+    async def test_execute_tools_parallel_budget_exhausted_with_emitter_emits_events_before_log(self):
+        from app.services.stream.network_budget import NetworkToolBudget
+
+        order = []
+
+        handler = MagicMock()
+        handler.tool_name = "web_search"
+        handler.execute = AsyncMock()
+        handler.log = AsyncMock(side_effect=lambda **_kwargs: order.append("log"))
+        handler._build_result_summary.return_value = {"kind": "search", "truncated": False}
+
+        emitter = AsyncMock()
+
+        async def record_started(**_kwargs):
+            order.append("started")
+
+        async def record_completed(**_kwargs):
+            order.append("completed")
+
+        emitter.tool_call_started.side_effect = record_started
+        emitter.tool_call_completed.side_effect = record_completed
+
+        budget = NetworkToolBudget()
+        for i in range(4):
+            budget.prepare_web_search_args({"query": f"q{i}"})
+
+        with patch("app.services.tool_handlers.get_handler", return_value=handler):
+            results = await execute_tools_parallel(
+                [{"id": "call-5", "name": "web_search", "arguments": {"query": "q5", "count": 8}}],
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="gpt-4",
+                provider="openai",
+                message_id="assistant-1",
+                emitter=emitter,
+                network_budget=budget,
+            )
+
+        record = results[0]
+        self.assertEqual(record.result.status, "degraded")
+        handler.execute.assert_not_awaited()
+        self.assertEqual(order, ["started", "completed", "log"])
+        emitter.tool_call_started.assert_awaited_once_with(
+            tool_call_id="call-5",
+            tool_name="web_search",
+            arguments={"query": "q5", "count": 8},
+        )
+        emitter.tool_call_completed.assert_awaited_once_with(
+            tool_call_id="call-5",
+            tool_name="web_search",
+            status="degraded",
+            duration_ms=0,
+            result_summary={"kind": "search", "truncated": False},
+            error="web_search 已达到本轮联网预算",
+        )
+        handler.log.assert_awaited_once()
+        self.assertEqual(handler.log.await_args.kwargs["message_id"], "assistant-1")
+
 
 if __name__ == "__main__":
     unittest.main()
