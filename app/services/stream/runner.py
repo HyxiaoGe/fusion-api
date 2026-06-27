@@ -22,6 +22,14 @@ from app.services.stream.agent_loop_request_prep import (
     build_agent_loop_call_config,
     prepare_agent_loop_messages,
 )
+from app.services.stream.agent_loop_run_completion import (
+    AgentLoopRunCompletionContext,
+    finalize_cancelled_run,
+    finalize_completed_run,
+    finalize_failed_run,
+    finalize_superseded_run,
+    write_fallback_run_error,
+)
 from app.services.stream.agent_loop_runtime import AgentLoopRuntime
 from app.services.stream.agent_loop_state import AgentLoopState
 from app.services.stream.agent_round import run_agent_round
@@ -126,6 +134,19 @@ class StreamHandler:
         def _run_duration_ms() -> int:
             return int((time.time() - run_start) * 1000)
 
+        completion_context = AgentLoopRunCompletionContext(
+            db=db,
+            conversation_id=conversation_id,
+            task_id=task_id,
+            run_id=run_id,
+            model_id=model_id,
+            assistant_message_id=assistant_message_id,
+            emitter=emitter,
+            session_cache=session_cache,
+            state=state,
+            duration_ms_factory=_run_duration_ms,
+        )
+
         try:
             await append_chunk(conversation_id, "preparing", "", "")
 
@@ -202,119 +223,60 @@ class StreamHandler:
                 ),
             )
             if loop_outcome.exit == AgentLoopExit.SUPERSEDED:
-                persist_message(
-                    db,
-                    assistant_message_id,
-                    conversation_id,
-                    model_id,
-                    state.content_blocks,
-                    state.final_usage(),
-                )
-                await interrupt_agent_run(
-                    emitter=emitter,
-                    session_cache=session_cache,
-                    stats=state.run_stats(run_id),
-                    duration_ms_factory=_run_duration_ms,
-                    current_step_id=state.current_step_id,
-                    reason="superseded",
-                )
-                state.mark_terminal_emitted()
-                await finalize_stream(
-                    conversation_id,
-                    success=False,
-                    error_msg=loop_outcome.error_msg or "被新请求取代",
-                    task_id=task_id,
+                await finalize_superseded_run(
+                    context=completion_context,
+                    error_msg=loop_outcome.error_msg,
+                    persist_message_fn=persist_message,
+                    interrupt_agent_run_fn=interrupt_agent_run,
+                    finalize_stream_fn=finalize_stream,
                 )
                 return
 
             # ═══════════════════════════════════════
             # 最终落库 + run_completed
             # ═══════════════════════════════════════
-            persist_message(
-                db, assistant_message_id, conversation_id, model_id, state.content_blocks, state.final_usage()
-            )
-
             terminal_state = map_run_terminal_state(
                 unknown_terminated=state.unknown_terminated,
                 limit_reason=state.limit_reason,
             )
-            await complete_agent_run(
-                emitter=emitter,
-                session_cache=session_cache,
-                stats=state.run_stats(run_id),
-                duration_ms_factory=_run_duration_ms,
-                session_status=terminal_state.session_status,
-                finish_reason=terminal_state.run_finish_reason,
+            await finalize_completed_run(
+                context=completion_context,
+                terminal_state=terminal_state,
+                persist_message_fn=persist_message,
+                complete_agent_run_fn=complete_agent_run,
+                finalize_stream_fn=finalize_stream,
             )
-            state.mark_terminal_emitted()
-
-            await finalize_stream(conversation_id, success=True, task_id=task_id)
 
         except asyncio.CancelledError:
             logger.info(f"Agent 任务被取消: conv_id={conversation_id}")
-            if state.content_blocks:
-                persist_message(
-                    db,
-                    assistant_message_id,
-                    conversation_id,
-                    model_id,
-                    state.content_blocks,
-                    state.final_usage(),
-                )
-            # emitter / session_cache 终态：interrupted（user_cancelled）
-            try:
-                await interrupt_agent_run(
-                    emitter=emitter,
-                    session_cache=session_cache,
-                    stats=state.run_stats(run_id),
-                    duration_ms_factory=_run_duration_ms,
-                    current_step_id=state.current_step_id,
-                    reason="user_cancelled",
-                )
-                state.mark_terminal_emitted()
-            except Exception as _emit_exc:  # noqa: BLE001 — 终态事件失败不能阻塞 cancel 传播
-                logger.warning(f"emit run_interrupted 失败: {_emit_exc}")
-            await finalize_stream(conversation_id, success=False, error_msg="用户中止", task_id=task_id)
+            await finalize_cancelled_run(
+                context=completion_context,
+                persist_message_fn=persist_message,
+                interrupt_agent_run_fn=interrupt_agent_run,
+                finalize_stream_fn=finalize_stream,
+                warning_fn=logger.warning,
+            )
             raise
 
         except Exception as e:
             logger.error(f"Agent 生成异常: conv_id={conversation_id}, error={e}")
-            if state.content_blocks:
-                persist_message(
-                    db,
-                    assistant_message_id,
-                    conversation_id,
-                    model_id,
-                    state.content_blocks,
-                    state.final_usage(),
-                )
-            try:
-                await fail_agent_run(
-                    emitter=emitter,
-                    session_cache=session_cache,
-                    stats=state.run_stats(run_id),
-                    duration_ms_factory=_run_duration_ms,
-                    current_step_id=state.current_step_id,
-                    error_code=type(e).__name__,
-                    message=str(e),
-                )
-                state.mark_terminal_emitted()
-            except Exception as _emit_exc:  # noqa: BLE001
-                logger.warning(f"emit run_failed 失败: {_emit_exc}")
-            await finalize_stream(conversation_id, success=False, error_msg=str(e), task_id=task_id)
+            await finalize_failed_run(
+                context=completion_context,
+                error=e,
+                persist_message_fn=persist_message,
+                fail_agent_run_fn=fail_agent_run,
+                finalize_stream_fn=finalize_stream,
+                warning_fn=logger.warning,
+            )
             # 完成协议层 + DB cache + SSE 收尾后 re-raise，让 background task scheduler 拿到失败信号；
             # 与 CancelledError 路径行为对齐（spec §5.3）。
             raise
 
         finally:
             # 兜底：极端路径（例如未匹配任何 except 又没走 try 终段）补一次终态
-            if not state.terminal_emitted:
-                try:
-                    await write_fallback_error_status(
-                        session_cache=session_cache,
-                        stats=state.run_stats(run_id),
-                        duration_ms_factory=_run_duration_ms,
-                    )
-                except Exception as _exc:  # noqa: BLE001
-                    logger.warning(f"finally 兜底 write_session_status 失败: {_exc}")
+            await write_fallback_run_error(
+                context=completion_context,
+                write_fallback_error_status_fn=write_fallback_error_status,
+                warning_fn=logger.warning,
+            )
             db.close()
