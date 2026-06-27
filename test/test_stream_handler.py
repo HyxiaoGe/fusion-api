@@ -576,6 +576,46 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         # session 终态
         self.assertEqual(self.session_statuses[-1]["status"], "interrupted")
 
+    async def test_superseded_finish_reason_finalizes_without_reraising(self):
+        """LLM stream 返回 cancelled 表示 lock owner 被替换，应按 superseded 收尾。"""
+        persist_calls = []
+
+        def _capture_persist(db, message_id, conversation_id, model_id, content_blocks, usage_data=None, partial=False):
+            persist_calls.append(
+                {
+                    "message_id": message_id,
+                    "conversation_id": conversation_id,
+                    "model_id": model_id,
+                    "block_types": [block.type for block in content_blocks],
+                    "usage_data": usage_data,
+                    "partial": partial,
+                }
+            )
+
+        await self._invoke(
+            stream_round_side_effect=[
+                ("", "半截回答", [], "cancelled", None),
+            ],
+            patch_extra=[
+                patch("app.services.stream.runner.persist_message", side_effect=_capture_persist),
+            ],
+        )
+
+        events = self._agent_events()
+        types = [e["type"] for e in events]
+        self.assertEqual(types, ["run_started", "step_started", "run_interrupted"])
+        self.assertEqual(events[-1]["reason"], "superseded")
+        self.assertEqual(self.session_statuses[-1]["status"], "interrupted")
+        self.assertEqual(self.session_statuses[-1]["total_steps"], 1)
+        self.assertEqual(persist_calls[-1]["block_types"], ["text"])
+        self.assertEqual(persist_calls[-1]["partial"], False)
+        self.finalize_mock.assert_awaited_with(
+            "conv-1",
+            success=False,
+            error_msg="被新请求取代",
+            task_id="task-1",
+        )
+
     async def test_failed_path(self):
         """LLM 抛非 Cancelled 异常：发 run_failed + status='error' + re-raise 给上层"""
 
