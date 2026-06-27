@@ -34,6 +34,13 @@ from app.services.stream.agent_loop_policy import (
 from app.services.stream.llm_stream import llm_call_with_retry, stream_round
 from app.services.stream.network_budget import NetworkToolBudget
 from app.services.stream.persistence import persist_message, preprocess_url_in_message
+from app.services.stream.run_finalizer import (
+    AgentRunStats,
+    complete_agent_run,
+    fail_agent_run,
+    interrupt_agent_run,
+    write_fallback_error_status,
+)
 from app.services.stream.tool_executor import AgentEventRedisWriter, execute_tools_parallel
 from app.services.stream_state_service import (
     append_chunk,
@@ -176,6 +183,16 @@ class StreamHandler:
         current_step_id: Optional[str] = None
         # 标记 finally 路径已经写过终态 / run_completed 事件，避免重复
         terminal_emitted = False
+
+        def _run_stats() -> AgentRunStats:
+            return AgentRunStats(
+                run_id=run_id,
+                total_steps=step,
+                total_tool_calls=total_tool_calls,
+            )
+
+        def _run_duration_ms() -> int:
+            return int((time.time() - run_start) * 1000)
 
         try:
             await append_chunk(conversation_id, "preparing", "", "")
@@ -353,16 +370,13 @@ class StreamHandler:
                         content_blocks,
                         accumulated_usage if accumulated_usage.input_tokens > 0 else None,
                     )
-                    # 闭合本 step：标记为 interrupted（在 run_interrupted 之前）
-                    if current_step_id is not None:
-                        await session_cache.write_step_terminal(step_id=current_step_id, status="interrupted")
-                    await emitter.run_interrupted(reason="superseded")
-                    await session_cache.write_session_status(
-                        run_id=run_id,
-                        status="interrupted",
-                        total_steps=step,
-                        total_tool_calls=total_tool_calls,
-                        total_duration_ms=int((time.time() - run_start) * 1000),
+                    await interrupt_agent_run(
+                        emitter=emitter,
+                        session_cache=session_cache,
+                        stats=_run_stats(),
+                        duration_ms_factory=_run_duration_ms,
+                        current_step_id=current_step_id,
+                        reason="superseded",
                     )
                     terminal_emitted = True
                     await finalize_stream(conversation_id, success=False, error_msg="被新请求取代", task_id=task_id)
@@ -577,17 +591,13 @@ class StreamHandler:
                 unknown_terminated=unknown_terminated,
                 limit_reason=limit_reason,
             )
-            await emitter.run_completed(
-                total_steps=step,
-                total_tool_calls=total_tool_calls,
+            await complete_agent_run(
+                emitter=emitter,
+                session_cache=session_cache,
+                stats=_run_stats(),
+                duration_ms_factory=_run_duration_ms,
+                session_status=terminal_state.session_status,
                 finish_reason=terminal_state.run_finish_reason,
-            )
-            await session_cache.write_session_status(
-                run_id=run_id,
-                status=terminal_state.session_status,
-                total_steps=step,
-                total_tool_calls=total_tool_calls,
-                total_duration_ms=int((time.time() - run_start) * 1000),
             )
             terminal_emitted = True
 
@@ -606,15 +616,13 @@ class StreamHandler:
                 )
             # emitter / session_cache 终态：interrupted（user_cancelled）
             try:
-                if current_step_id is not None:
-                    await session_cache.write_step_terminal(step_id=current_step_id, status="interrupted")
-                await emitter.run_interrupted(reason="user_cancelled")
-                await session_cache.write_session_status(
-                    run_id=run_id,
-                    status="interrupted",
-                    total_steps=step,
-                    total_tool_calls=total_tool_calls,
-                    total_duration_ms=int((time.time() - run_start) * 1000),
+                await interrupt_agent_run(
+                    emitter=emitter,
+                    session_cache=session_cache,
+                    stats=_run_stats(),
+                    duration_ms_factory=_run_duration_ms,
+                    current_step_id=current_step_id,
+                    reason="user_cancelled",
                 )
                 terminal_emitted = True
             except Exception as _emit_exc:  # noqa: BLE001 — 终态事件失败不能阻塞 cancel 传播
@@ -634,18 +642,14 @@ class StreamHandler:
                     accumulated_usage if accumulated_usage.input_tokens > 0 else None,
                 )
             try:
-                if current_step_id is not None:
-                    await session_cache.write_step_terminal(step_id=current_step_id, status="failed")
-                await emitter.run_failed(
+                await fail_agent_run(
+                    emitter=emitter,
+                    session_cache=session_cache,
+                    stats=_run_stats(),
+                    duration_ms_factory=_run_duration_ms,
+                    current_step_id=current_step_id,
                     error_code=type(e).__name__,
                     message=str(e),
-                )
-                await session_cache.write_session_status(
-                    run_id=run_id,
-                    status="error",
-                    total_steps=step,
-                    total_tool_calls=total_tool_calls,
-                    total_duration_ms=int((time.time() - run_start) * 1000),
                 )
                 terminal_emitted = True
             except Exception as _emit_exc:  # noqa: BLE001
@@ -659,12 +663,10 @@ class StreamHandler:
             # 兜底：极端路径（例如未匹配任何 except 又没走 try 终段）补一次终态
             if not terminal_emitted:
                 try:
-                    await session_cache.write_session_status(
-                        run_id=run_id,
-                        status="error",
-                        total_steps=step,
-                        total_tool_calls=total_tool_calls,
-                        total_duration_ms=int((time.time() - run_start) * 1000),
+                    await write_fallback_error_status(
+                        session_cache=session_cache,
+                        stats=_run_stats(),
+                        duration_ms_factory=_run_duration_ms,
                     )
                 except Exception as _exc:  # noqa: BLE001
                     logger.warning(f"finally 兜底 write_session_status 失败: {_exc}")
