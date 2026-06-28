@@ -6,6 +6,7 @@ spec §4.2。stream_round 把 litellm streaming response 消费成
 个 chunk 检查锁所有权（被踢则提前返回 finish_reason="cancelled"）。
 """
 
+from dataclasses import dataclass, field
 from typing import Optional
 
 import backoff
@@ -25,9 +26,196 @@ AGENT_LLM_MAX_RETRIES = 1
 _LLM_RETRYABLE_KEYWORDS = ("429", "rate", "503", "502", "timeout")
 
 
+@dataclass(frozen=True)
+class LLMStreamRequest:
+    conversation_id: str
+    task_id: str
+    should_use_reasoning: bool
+    thinking_block_id: str
+    text_block_id: str
+    run_id: Optional[str] = None
+    step_id: Optional[str] = None
+
+
+@dataclass
+class LLMStreamState:
+    reasoning_buf: str = ""
+    content_buf: str = ""
+    usage_data: Optional[Usage] = None
+    chunk_count: int = 0
+    finish_reason: str = "stop"
+    tool_calls_acc: dict[int, dict] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class LLMStreamOutcome:
+    reasoning_buf: str
+    content_buf: str
+    tool_calls: list[dict]
+    finish_reason: str
+    usage_data: Optional[Usage]
+
+
 def _is_llm_error_retryable(exc: Exception) -> bool:
     err = str(exc).lower()
     return any(kw in err for kw in _LLM_RETRYABLE_KEYWORDS)
+
+
+def extract_usage(chunk) -> Optional[Usage]:
+    if not hasattr(chunk, "usage") or not chunk.usage:
+        return None
+    return Usage(
+        input_tokens=chunk.usage.prompt_tokens or 0,
+        output_tokens=chunk.usage.completion_tokens or 0,
+    )
+
+
+def get_first_choice(chunk):
+    return chunk.choices[0] if chunk.choices else None
+
+
+def has_tool_call_delta(delta) -> bool:
+    return bool(hasattr(delta, "tool_calls") and delta.tool_calls)
+
+
+def accumulate_tool_calls(tool_calls_acc: dict[int, dict], delta) -> None:
+    if not has_tool_call_delta(delta):
+        return
+    for tool_call in delta.tool_calls:
+        idx = tool_call.index if hasattr(tool_call, "index") and tool_call.index is not None else 0
+        if idx not in tool_calls_acc:
+            tool_calls_acc[idx] = {"id": None, "name": None, "arguments": ""}
+        if tool_call.id:
+            tool_calls_acc[idx]["id"] = tool_call.id
+        if tool_call.function and tool_call.function.name:
+            tool_calls_acc[idx]["name"] = tool_call.function.name
+        if tool_call.function and tool_call.function.arguments:
+            tool_calls_acc[idx]["arguments"] += tool_call.function.arguments
+
+
+def extract_reasoning_delta(delta, should_use_reasoning: bool) -> str:
+    if not should_use_reasoning:
+        return ""
+    reasoning_delta = getattr(delta, "reasoning_content", None) or ""
+    if not reasoning_delta and hasattr(delta, "model_extra") and delta.model_extra:
+        reasoning_delta = delta.model_extra.get("reasoning_content", "") or ""
+    return reasoning_delta
+
+
+def extract_content_delta(delta, reasoning_delta: str) -> str:
+    content_delta = delta.content or ""
+    if reasoning_delta and content_delta == reasoning_delta:
+        return ""
+    return content_delta
+
+
+async def append_stream_delta(
+    *,
+    request: LLMStreamRequest,
+    chunk_type: str,
+    content: str,
+    block_id: str,
+) -> None:
+    await append_chunk(
+        request.conversation_id,
+        chunk_type,
+        content,
+        block_id,
+        run_id=request.run_id,
+        step_id=request.step_id,
+    )
+
+
+async def append_reasoning_and_content(
+    *,
+    request: LLMStreamRequest,
+    state: LLMStreamState,
+    reasoning_delta: str,
+    content_delta: str,
+) -> None:
+    if reasoning_delta:
+        state.reasoning_buf += reasoning_delta
+        await append_stream_delta(
+            request=request,
+            chunk_type="reasoning",
+            content=reasoning_delta,
+            block_id=request.thinking_block_id,
+        )
+    if content_delta:
+        state.content_buf += content_delta
+        await append_stream_delta(
+            request=request,
+            chunk_type="answering",
+            content=content_delta,
+            block_id=request.text_block_id,
+        )
+
+
+async def maybe_check_lock_owner(*, request: LLMStreamRequest, state: LLMStreamState) -> bool:
+    state.chunk_count += 1
+    if state.chunk_count % LOCK_CHECK_INTERVAL != 0:
+        return True
+    if await check_lock_owner(request.conversation_id, request.task_id):
+        return True
+    logger.info(f"流式调用被踢掉: conv_id={request.conversation_id}")
+    state.finish_reason = "cancelled"
+    return False
+
+
+def build_tool_calls_list(tool_calls_acc: dict[int, dict]) -> list[dict]:
+    return [tool_calls_acc[idx] for idx in sorted(tool_calls_acc.keys()) if tool_calls_acc[idx]["name"]]
+
+
+async def process_stream_choice(*, request: LLMStreamRequest, state: LLMStreamState, choice, chunk) -> bool:
+    delta = choice.delta
+    finish_reason = choice.finish_reason
+
+    accumulate_tool_calls(state.tool_calls_acc, delta)
+    if finish_reason == "tool_calls":
+        state.finish_reason = "tool_calls"
+        return True
+
+    if has_tool_call_delta(delta):
+        return True
+
+    reasoning_delta = extract_reasoning_delta(delta, request.should_use_reasoning)
+    content_delta = extract_content_delta(delta, reasoning_delta)
+    await append_reasoning_and_content(
+        request=request,
+        state=state,
+        reasoning_delta=reasoning_delta,
+        content_delta=content_delta,
+    )
+
+    usage_data = extract_usage(chunk)
+    if usage_data:
+        state.usage_data = usage_data
+    if finish_reason == "stop":
+        state.finish_reason = "stop"
+
+    return await maybe_check_lock_owner(request=request, state=state)
+
+
+async def consume_stream_round(response, request: LLMStreamRequest) -> LLMStreamOutcome:
+    state = LLMStreamState()
+    async for chunk in response:
+        choice = get_first_choice(chunk)
+        if choice is None:
+            usage_data = extract_usage(chunk)
+            if usage_data:
+                state.usage_data = usage_data
+            continue
+        should_continue = await process_stream_choice(request=request, state=state, choice=choice, chunk=chunk)
+        if not should_continue:
+            break
+
+    return LLMStreamOutcome(
+        reasoning_buf=state.reasoning_buf,
+        content_buf=state.content_buf,
+        tool_calls=build_tool_calls_list(state.tool_calls_acc),
+        finish_reason=state.finish_reason,
+        usage_data=state.usage_data,
+    )
 
 
 async def stream_round(
@@ -48,102 +236,25 @@ async def stream_round(
     run_id / step_id 透传给 reasoning / answering chunk，让 FE 把 token 流挂回
     agent_event 控制面对应的 step（spec §4.6）。两者均可为空（非 agent 路径）。
     """
-    reasoning_buf = ""
-    content_buf = ""
-    usage_data: Optional[Usage] = None
-    chunk_count = 0
-    finish_reason = "stop"
-
-    # tool_call 累积缓冲区（支持多个并行 tool_calls）
-    tool_calls_acc: dict[int, dict] = {}  # index → {"id", "name", "arguments"}
-
-    async for chunk in response:
-        choice = chunk.choices[0] if chunk.choices else None
-
-        if not choice:
-            if hasattr(chunk, "usage") and chunk.usage:
-                usage_data = Usage(
-                    input_tokens=chunk.usage.prompt_tokens or 0,
-                    output_tokens=chunk.usage.completion_tokens or 0,
-                )
-            continue
-
-        delta = choice.delta
-        fr = choice.finish_reason
-
-        # ===== tool_call 累积（支持多个）=====
-        if hasattr(delta, "tool_calls") and delta.tool_calls:
-            for tc in delta.tool_calls:
-                idx = tc.index if hasattr(tc, "index") and tc.index is not None else 0
-                if idx not in tool_calls_acc:
-                    tool_calls_acc[idx] = {"id": None, "name": None, "arguments": ""}
-                if tc.id:
-                    tool_calls_acc[idx]["id"] = tc.id
-                if tc.function and tc.function.name:
-                    tool_calls_acc[idx]["name"] = tc.function.name
-                if tc.function and tc.function.arguments:
-                    tool_calls_acc[idx]["arguments"] += tc.function.arguments
-
-        if fr == "tool_calls":
-            finish_reason = "tool_calls"
-            continue
-
-        if hasattr(delta, "tool_calls") and delta.tool_calls:
-            continue
-
-        # ===== reasoning + content =====
-        reasoning_delta = ""
-        if should_use_reasoning:
-            reasoning_delta = getattr(delta, "reasoning_content", None) or ""
-            if not reasoning_delta and hasattr(delta, "model_extra") and delta.model_extra:
-                reasoning_delta = delta.model_extra.get("reasoning_content", "") or ""
-
-        content_delta = delta.content or ""
-
-        if reasoning_delta and content_delta == reasoning_delta:
-            content_delta = ""
-
-        if reasoning_delta:
-            reasoning_buf += reasoning_delta
-            await append_chunk(
-                conversation_id,
-                "reasoning",
-                reasoning_delta,
-                thinking_block_id,
-                run_id=run_id,
-                step_id=step_id,
-            )
-
-        if content_delta:
-            content_buf += content_delta
-            await append_chunk(
-                conversation_id,
-                "answering",
-                content_delta,
-                text_block_id,
-                run_id=run_id,
-                step_id=step_id,
-            )
-
-        if hasattr(chunk, "usage") and chunk.usage:
-            usage_data = Usage(
-                input_tokens=chunk.usage.prompt_tokens or 0,
-                output_tokens=chunk.usage.completion_tokens or 0,
-            )
-
-        if fr == "stop":
-            finish_reason = "stop"
-
-        chunk_count += 1
-        if chunk_count % LOCK_CHECK_INTERVAL == 0:
-            if not await check_lock_owner(conversation_id, task_id):
-                logger.info(f"流式调用被踢掉: conv_id={conversation_id}")
-                finish_reason = "cancelled"
-                break
-
-    tool_calls_list = [tool_calls_acc[idx] for idx in sorted(tool_calls_acc.keys()) if tool_calls_acc[idx]["name"]]
-
-    return reasoning_buf, content_buf, tool_calls_list, finish_reason, usage_data
+    outcome = await consume_stream_round(
+        response,
+        LLMStreamRequest(
+            conversation_id=conversation_id,
+            task_id=task_id,
+            should_use_reasoning=should_use_reasoning,
+            thinking_block_id=thinking_block_id,
+            text_block_id=text_block_id,
+            run_id=run_id,
+            step_id=step_id,
+        ),
+    )
+    return (
+        outcome.reasoning_buf,
+        outcome.content_buf,
+        outcome.tool_calls,
+        outcome.finish_reason,
+        outcome.usage_data,
+    )
 
 
 @backoff.on_exception(
