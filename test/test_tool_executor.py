@@ -324,7 +324,7 @@ class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(digest_kwargs["tool_call_id"], "call-1")
         self.assertEqual(digest_kwargs["tool_name"], "web_search")
         self.assertEqual(digest_kwargs["status"], "success")
-        self.assertEqual(digest_kwargs["title"], "找到 1 条搜索结果")
+        self.assertEqual(digest_kwargs["title"], "搜索完成")
         self.assertEqual(digest_kwargs["source_refs"], ["ev-call-1-0"])
         self.assertLessEqual(len(digest_kwargs["key_findings"]), 5)
 

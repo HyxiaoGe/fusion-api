@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
-from app.services.stream.tool_execution_result import ToolExecutionRecord
+if TYPE_CHECKING:
+    from app.services.stream.tool_execution_result import ToolExecutionRecord
 
 
 def build_tool_result_digest(record: ToolExecutionRecord) -> dict[str, Any]:
     evidence_items = build_evidence_items(record)
     summary = _result_summary(record)
     status = _digest_status(record.result.status)
-    title = _safe_text(summary.get("title"), 80) or _default_title(record.tool_name, status, summary)
+    title = _digest_title(record.tool_name, status, summary)
 
     return {
         "tool_call_id": str(record.tool_call.get("id", "")),
@@ -83,6 +84,12 @@ def _default_title(tool_name: str, status: str, summary: dict[str, Any]) -> str:
     if status == "degraded":
         return f"{tool_name} 降级完成"
     return f"{tool_name} 未取得可用结果"
+
+
+def _digest_title(tool_name: str, status: str, summary: dict[str, Any]) -> str:
+    if status == "success" and tool_name == "web_search" and summary.get("kind") == "search":
+        return "搜索完成"
+    return _safe_text(summary.get("title"), 80) or _default_title(tool_name, status, summary)
 
 
 def _digest_summary(record: ToolExecutionRecord, status: str, summary: dict[str, Any]) -> str:
