@@ -60,46 +60,70 @@ class AgentLoopExecutionContext:
     completion_context: AgentLoopRunCompletionContext
 
 
+@dataclass(frozen=True)
+class AgentLoopExecutionParts:
+    run_id: str
+    run_start: float
+    state: AgentLoopState
+    network_budget: NetworkToolBudget
+    emitter: AgentEventEmitter
+
+
+def _build_execution_parts(
+    *,
+    request: AgentLoopExecutionRequest,
+    dependencies: AgentLoopDependencies,
+) -> AgentLoopExecutionParts:
+    run_id = request.trace_id or str(uuid.uuid4())
+    emitter = AgentEventEmitter(
+        run_id=run_id,
+        trace_id=run_id,
+        conversation_id=request.conversation_id,
+        redis_writer=dependencies.redis_writer,
+    )
+    return AgentLoopExecutionParts(
+        run_id=run_id,
+        run_start=dependencies.clock(),
+        state=AgentLoopState(),
+        network_budget=NetworkToolBudget(),
+        emitter=emitter,
+    )
+
+
 def _build_completion_context(
     *,
     request: AgentLoopExecutionRequest,
-    run_id: str,
-    emitter: AgentEventEmitter,
-    state: AgentLoopState,
+    parts: AgentLoopExecutionParts,
     dependencies: AgentLoopDependencies,
-    run_start: float,
 ) -> AgentLoopRunCompletionContext:
     def _run_duration_ms() -> int:
-        return int((dependencies.clock() - run_start) * 1000)
+        return int((dependencies.clock() - parts.run_start) * 1000)
 
     return AgentLoopRunCompletionContext(
         db=request.db,
         conversation_id=request.conversation_id,
         task_id=request.task_id,
-        run_id=run_id,
+        run_id=parts.run_id,
         model_id=request.model_id,
         assistant_message_id=request.assistant_message_id,
-        emitter=emitter,
+        emitter=parts.emitter,
         session_cache=dependencies.session_cache,
-        state=state,
+        state=parts.state,
         duration_ms_factory=_run_duration_ms,
     )
 
 
-def _build_runtime(
+def build_agent_loop_runtime(
     *,
     request: AgentLoopExecutionRequest,
     limits: AgentLoopLimits,
     dependencies: AgentLoopDependencies,
-    run_id: str,
-    run_start: float,
-    emitter: AgentEventEmitter,
-    network_budget: NetworkToolBudget,
+    parts: AgentLoopExecutionParts,
 ) -> AgentLoopRuntime:
     return AgentLoopRuntime(
         conversation_id=request.conversation_id,
         task_id=request.task_id,
-        run_id=run_id,
+        run_id=parts.run_id,
         user_id=request.user_id,
         model_id=request.model_id,
         provider=request.provider,
@@ -108,11 +132,11 @@ def _build_runtime(
         should_use_reasoning=request.call_config.should_use_reasoning,
         call_kwargs=request.call_config.call_kwargs,
         assistant_message_id=request.assistant_message_id,
-        run_start=run_start,
+        run_start=parts.run_start,
         limits=limits,
-        emitter=emitter,
+        emitter=parts.emitter,
         session_cache=dependencies.session_cache,
-        network_budget=network_budget,
+        network_budget=parts.network_budget,
         start_step_fn=dependencies.start_step_fn,
         complete_step_fn=dependencies.complete_step_fn,
         run_round_fn=dependencies.run_round_fn,
@@ -135,39 +159,24 @@ def build_agent_loop_execution(
     dependencies: AgentLoopDependencies,
 ) -> AgentLoopExecutionContext:
     """集中创建单次 agent loop 运行需要共享的 runtime 对象。"""
-    state = AgentLoopState()
-    network_budget = NetworkToolBudget()
-    run_id = request.trace_id or str(uuid.uuid4())
-    run_start = dependencies.clock()
-    emitter = AgentEventEmitter(
-        run_id=run_id,
-        trace_id=run_id,
-        conversation_id=request.conversation_id,
-        redis_writer=dependencies.redis_writer,
-    )
+    parts = _build_execution_parts(request=request, dependencies=dependencies)
     completion_context = _build_completion_context(
         request=request,
-        run_id=run_id,
-        emitter=emitter,
-        state=state,
+        parts=parts,
         dependencies=dependencies,
-        run_start=run_start,
     )
-    runtime = _build_runtime(
+    runtime = build_agent_loop_runtime(
         request=request,
         limits=limits,
         dependencies=dependencies,
-        run_id=run_id,
-        run_start=run_start,
-        emitter=emitter,
-        network_budget=network_budget,
+        parts=parts,
     )
     return AgentLoopExecutionContext(
-        run_id=run_id,
-        run_start=run_start,
-        state=state,
-        network_budget=network_budget,
-        emitter=emitter,
+        run_id=parts.run_id,
+        run_start=parts.run_start,
+        state=parts.state,
+        network_budget=parts.network_budget,
+        emitter=parts.emitter,
         runtime=runtime,
         completion_context=completion_context,
     )

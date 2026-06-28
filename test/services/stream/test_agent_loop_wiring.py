@@ -206,6 +206,84 @@ class AgentLoopWiringTests(unittest.TestCase):
         self.assertIs(lifecycle_call.dependencies.error_fn, error_fn)
         self.assertIs(lifecycle_call.dependencies.warning_fn, warning_fn)
 
+    def test_run_input_and_dependencies_expose_builder_helpers(self):
+        call_config = SimpleNamespace(
+            should_use_reasoning=False,
+            call_kwargs={},
+            announced_tools=[],
+        )
+        limits = AgentLoopLimits(max_steps=1, max_tool_calls=2, total_timeout_s=30)
+        run_input = AgentLoopRunInput(
+            conversation_id="conv-helper",
+            user_id="user-helper",
+            model_id="gpt-4",
+            litellm_model="openai/gpt-4",
+            litellm_kwargs={},
+            provider="openai",
+            raw_messages=[{"role": "user", "content": "hi"}],
+            has_vision=True,
+            file_ids=None,
+            original_message="hi",
+            assistant_message_id="msg-helper",
+            task_id="task-helper",
+            options={},
+            capabilities={},
+            trace_id=None,
+        )
+        redis_writer = object()
+
+        dependencies = AgentLoopWiringDependencies(
+            build_call_config_fn=lambda **_kwargs: call_config,
+            build_execution_fn=lambda **_kwargs: object(),
+            session_cache="session-cache",
+            redis_writer_factory=lambda: redis_writer,
+            start_step_fn=_unused_async,
+            complete_step_fn=_unused_async,
+            run_round_fn=_unused_async,
+            handle_tool_calls_round_fn=_unused_async,
+            run_limit_summary_step_fn=_unused_async,
+            llm_call_fn=_unused_async,
+            stream_round_fn=_unused_async,
+            execute_tools_fn=_unused_async,
+            persist_message_fn=_unused_sync,
+            log_round_summary_fn=lambda **_kwargs: None,
+            clock=lambda: 100.0,
+            append_chunk_fn=_unused_async,
+            start_agent_run_fn=_unused_async,
+            prepare_messages_fn=_unused_async,
+            run_agent_loop_fn=_unused_async,
+            finalize_completed_run_fn=_unused_async,
+            finalize_superseded_run_fn=_unused_async,
+            finalize_cancelled_run_fn=_unused_async,
+            finalize_failed_run_fn=_unused_async,
+            write_fallback_run_error_fn=_unused_async,
+            complete_agent_run_fn=_unused_async,
+            interrupt_agent_run_fn=_unused_async,
+            fail_agent_run_fn=_unused_async,
+            finalize_stream_fn=_unused_async,
+            write_fallback_error_status_fn=_unused_async,
+            info_fn=lambda _message: None,
+            error_fn=lambda _message: None,
+            warning_fn=lambda _message: None,
+        )
+
+        execution_request = run_input.to_execution_request(db="db-helper", call_config=call_config)
+        lifecycle_request = run_input.to_lifecycle_request(call_config=call_config, limits=limits)
+        execution_dependencies = dependencies.to_execution_dependencies()
+        lifecycle_dependencies = dependencies.to_lifecycle_dependencies()
+
+        self.assertEqual(execution_request.db, "db-helper")
+        self.assertEqual(execution_request.conversation_id, "conv-helper")
+        self.assertIs(execution_request.call_config, call_config)
+        self.assertEqual(lifecycle_request.raw_messages, [{"role": "user", "content": "hi"}])
+        self.assertTrue(lifecycle_request.has_vision)
+        self.assertIs(lifecycle_request.call_config, call_config)
+        self.assertEqual(lifecycle_request.limits, limits)
+        self.assertIs(execution_dependencies.redis_writer, redis_writer)
+        self.assertIs(execution_dependencies.session_cache, dependencies.session_cache)
+        self.assertIs(lifecycle_dependencies.run_agent_loop_fn, dependencies.run_agent_loop_fn)
+        self.assertIs(lifecycle_dependencies.finalize_stream_fn, dependencies.finalize_stream_fn)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,8 +7,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from app.services.stream.agent_loop_driver import AgentLoopExit
 from app.services.stream.agent_loop_execution import AgentLoopExecutionContext
+from app.services.stream.agent_loop_outcome import AgentLoopExit
 from app.services.stream.agent_loop_policy import AgentLoopLimits, map_run_terminal_state
 from app.services.stream.agent_loop_request_prep import AgentLoopCallConfig
 

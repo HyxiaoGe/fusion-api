@@ -3,8 +3,10 @@ from types import SimpleNamespace
 
 from app.services.stream.agent_loop_execution import (
     AgentLoopDependencies,
+    AgentLoopExecutionParts,
     AgentLoopExecutionRequest,
     build_agent_loop_execution,
+    build_agent_loop_runtime,
 )
 from app.services.stream.agent_loop_policy import AgentLoopLimits
 from app.services.stream.agent_loop_state import AgentLoopState
@@ -128,6 +130,52 @@ class AgentLoopExecutionTests(unittest.TestCase):
         self.assertNotEqual(execution.run_id, "None")
         self.assertEqual(execution.runtime.run_id, execution.run_id)
         self.assertEqual(execution.completion_context.run_id, execution.run_id)
+
+    def test_build_agent_loop_runtime_accepts_prebuilt_execution_parts(self):
+        call_kwargs = {"temperature": 0.1}
+        call_config = SimpleNamespace(
+            should_use_reasoning=True,
+            call_kwargs=call_kwargs,
+        )
+        request = AgentLoopExecutionRequest(
+            db="db",
+            conversation_id="conv-runtime",
+            user_id="user-runtime",
+            model_id="gpt-4",
+            litellm_model="openai/gpt-4",
+            litellm_kwargs={"metadata": {"trace": "x"}},
+            provider="openai",
+            assistant_message_id="msg-runtime",
+            task_id="task-runtime",
+            call_config=call_config,
+            trace_id="trace-runtime",
+        )
+        limits = AgentLoopLimits(max_steps=3, max_tool_calls=5, total_timeout_s=30)
+        dependencies = self._dependencies(clock=lambda: 100.0)
+        parts = AgentLoopExecutionParts(
+            run_id="run-runtime",
+            run_start=100.0,
+            state=AgentLoopState(),
+            network_budget=NetworkToolBudget(),
+            emitter=object(),
+        )
+
+        runtime = build_agent_loop_runtime(
+            request=request,
+            limits=limits,
+            dependencies=dependencies,
+            parts=parts,
+        )
+
+        self.assertEqual(runtime.run_id, "run-runtime")
+        self.assertEqual(runtime.run_start, 100.0)
+        self.assertEqual(runtime.conversation_id, "conv-runtime")
+        self.assertEqual(runtime.task_id, "task-runtime")
+        self.assertEqual(runtime.model_id, "gpt-4")
+        self.assertIs(runtime.call_kwargs, call_kwargs)
+        self.assertIs(runtime.emitter, parts.emitter)
+        self.assertIs(runtime.network_budget, parts.network_budget)
+        self.assertIs(runtime.session_cache, dependencies.session_cache)
 
 
 if __name__ == "__main__":

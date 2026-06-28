@@ -40,6 +40,41 @@ class AgentLoopRunInput:
     capabilities: dict | None
     trace_id: str | None
 
+    def to_execution_request(
+        self,
+        *,
+        db: Any,
+        call_config: AgentLoopCallConfig,
+    ) -> AgentLoopExecutionRequest:
+        return AgentLoopExecutionRequest(
+            db=db,
+            conversation_id=self.conversation_id,
+            user_id=self.user_id,
+            model_id=self.model_id,
+            litellm_model=self.litellm_model,
+            litellm_kwargs=self.litellm_kwargs,
+            provider=self.provider,
+            assistant_message_id=self.assistant_message_id,
+            task_id=self.task_id,
+            call_config=call_config,
+            trace_id=self.trace_id,
+        )
+
+    def to_lifecycle_request(
+        self,
+        *,
+        call_config: AgentLoopCallConfig,
+        limits: AgentLoopLimits,
+    ) -> AgentLoopLifecycleRequest:
+        return AgentLoopLifecycleRequest(
+            raw_messages=self.raw_messages,
+            has_vision=self.has_vision,
+            file_ids=self.file_ids,
+            original_message=self.original_message,
+            call_config=call_config,
+            limits=limits,
+        )
+
 
 @dataclass(frozen=True)
 class AgentLoopWiringDependencies:
@@ -76,6 +111,46 @@ class AgentLoopWiringDependencies:
     error_fn: LogFn
     warning_fn: LogFn
 
+    def to_execution_dependencies(self) -> AgentLoopDependencies:
+        return AgentLoopDependencies(
+            session_cache=self.session_cache,
+            redis_writer=self.redis_writer_factory(),
+            start_step_fn=self.start_step_fn,
+            complete_step_fn=self.complete_step_fn,
+            run_round_fn=self.run_round_fn,
+            handle_tool_calls_round_fn=self.handle_tool_calls_round_fn,
+            run_limit_summary_step_fn=self.run_limit_summary_step_fn,
+            llm_call_fn=self.llm_call_fn,
+            stream_round_fn=self.stream_round_fn,
+            execute_tools_fn=self.execute_tools_fn,
+            persist_message_fn=self.persist_message_fn,
+            log_round_summary_fn=self.log_round_summary_fn,
+            warning_fn=self.warning_fn,
+            clock=self.clock,
+        )
+
+    def to_lifecycle_dependencies(self) -> AgentLoopLifecycleDependencies:
+        return AgentLoopLifecycleDependencies(
+            append_chunk_fn=self.append_chunk_fn,
+            start_agent_run_fn=self.start_agent_run_fn,
+            prepare_messages_fn=self.prepare_messages_fn,
+            run_agent_loop_fn=self.run_agent_loop_fn,
+            finalize_completed_run_fn=self.finalize_completed_run_fn,
+            finalize_superseded_run_fn=self.finalize_superseded_run_fn,
+            finalize_cancelled_run_fn=self.finalize_cancelled_run_fn,
+            finalize_failed_run_fn=self.finalize_failed_run_fn,
+            write_fallback_run_error_fn=self.write_fallback_run_error_fn,
+            persist_message_fn=self.persist_message_fn,
+            complete_agent_run_fn=self.complete_agent_run_fn,
+            interrupt_agent_run_fn=self.interrupt_agent_run_fn,
+            fail_agent_run_fn=self.fail_agent_run_fn,
+            finalize_stream_fn=self.finalize_stream_fn,
+            write_fallback_error_status_fn=self.write_fallback_error_status_fn,
+            info_fn=self.info_fn,
+            error_fn=self.error_fn,
+            warning_fn=self.warning_fn,
+        )
+
 
 @dataclass(frozen=True)
 class AgentLoopLifecycleCall:
@@ -99,91 +174,12 @@ def build_agent_loop_lifecycle_call(
         capabilities=capabilities,
     )
     execution = dependencies.build_execution_fn(
-        request=_execution_request(run_input=run_input, db=db, call_config=call_config),
+        request=run_input.to_execution_request(db=db, call_config=call_config),
         limits=limits,
-        dependencies=_execution_dependencies(dependencies),
+        dependencies=dependencies.to_execution_dependencies(),
     )
     return AgentLoopLifecycleCall(
-        request=_lifecycle_request(run_input=run_input, call_config=call_config, limits=limits),
+        request=run_input.to_lifecycle_request(call_config=call_config, limits=limits),
         execution=execution,
-        dependencies=_lifecycle_dependencies(dependencies),
-    )
-
-
-def _execution_request(
-    *,
-    run_input: AgentLoopRunInput,
-    db: Any,
-    call_config: AgentLoopCallConfig,
-) -> AgentLoopExecutionRequest:
-    return AgentLoopExecutionRequest(
-        db=db,
-        conversation_id=run_input.conversation_id,
-        user_id=run_input.user_id,
-        model_id=run_input.model_id,
-        litellm_model=run_input.litellm_model,
-        litellm_kwargs=run_input.litellm_kwargs,
-        provider=run_input.provider,
-        assistant_message_id=run_input.assistant_message_id,
-        task_id=run_input.task_id,
-        call_config=call_config,
-        trace_id=run_input.trace_id,
-    )
-
-
-def _execution_dependencies(dependencies: AgentLoopWiringDependencies) -> AgentLoopDependencies:
-    return AgentLoopDependencies(
-        session_cache=dependencies.session_cache,
-        redis_writer=dependencies.redis_writer_factory(),
-        start_step_fn=dependencies.start_step_fn,
-        complete_step_fn=dependencies.complete_step_fn,
-        run_round_fn=dependencies.run_round_fn,
-        handle_tool_calls_round_fn=dependencies.handle_tool_calls_round_fn,
-        run_limit_summary_step_fn=dependencies.run_limit_summary_step_fn,
-        llm_call_fn=dependencies.llm_call_fn,
-        stream_round_fn=dependencies.stream_round_fn,
-        execute_tools_fn=dependencies.execute_tools_fn,
-        persist_message_fn=dependencies.persist_message_fn,
-        log_round_summary_fn=dependencies.log_round_summary_fn,
-        warning_fn=dependencies.warning_fn,
-        clock=dependencies.clock,
-    )
-
-
-def _lifecycle_request(
-    *,
-    run_input: AgentLoopRunInput,
-    call_config: AgentLoopCallConfig,
-    limits: AgentLoopLimits,
-) -> AgentLoopLifecycleRequest:
-    return AgentLoopLifecycleRequest(
-        raw_messages=run_input.raw_messages,
-        has_vision=run_input.has_vision,
-        file_ids=run_input.file_ids,
-        original_message=run_input.original_message,
-        call_config=call_config,
-        limits=limits,
-    )
-
-
-def _lifecycle_dependencies(dependencies: AgentLoopWiringDependencies) -> AgentLoopLifecycleDependencies:
-    return AgentLoopLifecycleDependencies(
-        append_chunk_fn=dependencies.append_chunk_fn,
-        start_agent_run_fn=dependencies.start_agent_run_fn,
-        prepare_messages_fn=dependencies.prepare_messages_fn,
-        run_agent_loop_fn=dependencies.run_agent_loop_fn,
-        finalize_completed_run_fn=dependencies.finalize_completed_run_fn,
-        finalize_superseded_run_fn=dependencies.finalize_superseded_run_fn,
-        finalize_cancelled_run_fn=dependencies.finalize_cancelled_run_fn,
-        finalize_failed_run_fn=dependencies.finalize_failed_run_fn,
-        write_fallback_run_error_fn=dependencies.write_fallback_run_error_fn,
-        persist_message_fn=dependencies.persist_message_fn,
-        complete_agent_run_fn=dependencies.complete_agent_run_fn,
-        interrupt_agent_run_fn=dependencies.interrupt_agent_run_fn,
-        fail_agent_run_fn=dependencies.fail_agent_run_fn,
-        finalize_stream_fn=dependencies.finalize_stream_fn,
-        write_fallback_error_status_fn=dependencies.write_fallback_error_status_fn,
-        info_fn=dependencies.info_fn,
-        error_fn=dependencies.error_fn,
-        warning_fn=dependencies.warning_fn,
+        dependencies=dependencies.to_lifecycle_dependencies(),
     )
