@@ -4,6 +4,7 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
+from app.services.stream import tool_call_lifecycle as lifecycle_module
 from app.services.stream.tool_call_lifecycle import execute_tool_with_lifecycle
 from app.services.tool_handlers.base import ToolResult
 
@@ -20,6 +21,76 @@ class RecordingEmitter:
 
 
 class ToolCallLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_tool_attempt_returns_success_result_and_measured_duration(self):
+        attempt_cls = getattr(lifecycle_module, "ToolLifecycleAttempt")
+        run_tool_attempt = getattr(lifecycle_module, "run_tool_attempt")
+        result = ToolResult(status="success")
+        target = object()
+        args = {"query": "redis"}
+        calls = []
+
+        async def execute(received_target, received_args):
+            calls.append((received_target, received_args))
+            return result
+
+        with patch("app.services.stream.tool_call_lifecycle.time.monotonic", side_effect=[100.0, 100.25]):
+            attempt = await run_tool_attempt(target=target, args=args, execute=execute)
+
+        self.assertEqual(attempt, attempt_cls(result=result, duration_ms=250, cancelled_error=None))
+        self.assertEqual(calls, [(target, args)])
+
+    async def test_run_tool_attempt_maps_exception_to_failed_result_without_raising(self):
+        run_tool_attempt = getattr(lifecycle_module, "run_tool_attempt")
+
+        async def execute(_target, _args):
+            raise ValueError("参数非法")
+
+        with patch("app.services.stream.tool_call_lifecycle.time.monotonic", side_effect=[200.0, 200.03]):
+            attempt = await run_tool_attempt(target=object(), args={}, execute=execute)
+
+        self.assertEqual(attempt.duration_ms, 30)
+        self.assertIsNone(attempt.cancelled_error)
+        self.assertEqual(attempt.result.status, "failed")
+        self.assertEqual(attempt.result.error_message, "ValueError: 参数非法")
+
+    async def test_complete_tool_lifecycle_sets_duration_and_emits_completed_once(self):
+        complete_tool_lifecycle = getattr(lifecycle_module, "complete_tool_lifecycle")
+        emitter = RecordingEmitter()
+        result = ToolResult(status="success")
+        summaries = []
+
+        def build_summary(received_result):
+            summaries.append(received_result)
+            return {"kind": "search"}
+
+        await complete_tool_lifecycle(
+            emitter=emitter,
+            tool_call_id="call-0",
+            tool_name="web_search",
+            result=result,
+            duration_ms=12,
+            result_summary_builder=build_summary,
+        )
+
+        self.assertEqual(result.duration_ms, 12)
+        self.assertEqual(summaries, [result])
+        self.assertEqual(
+            emitter.events,
+            [
+                (
+                    "completed",
+                    {
+                        "tool_call_id": "call-0",
+                        "tool_name": "web_search",
+                        "status": "success",
+                        "duration_ms": 12,
+                        "result_summary": {"kind": "search"},
+                        "error": None,
+                    },
+                )
+            ],
+        )
+
     async def test_execute_tool_with_lifecycle_emits_success_and_sets_measured_duration(self):
         emitter = RecordingEmitter()
         calls = []
@@ -113,6 +184,48 @@ class ToolCallLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     "duration_ms": 30,
                     "result_summary": {"kind": "search", "status": "failed"},
                     "error": "ValueError: 参数非法",
+                },
+            ),
+        )
+
+    async def test_execute_tool_with_lifecycle_sets_duration_on_returned_failed_result(self):
+        emitter = RecordingEmitter()
+        result = ToolResult(status="failed", error_message="reader-service 暂时不可用")
+        summaries = []
+
+        async def execute(_target, _args):
+            return result
+
+        def build_summary(received_result):
+            summaries.append(received_result)
+            return {"kind": "url_read", "status": received_result.status}
+
+        with patch("app.services.stream.tool_call_lifecycle.time.monotonic", side_effect=[25.0, 25.125]):
+            returned = await execute_tool_with_lifecycle(
+                tool_call_id="call-returned-failed",
+                tool_name="url_read",
+                args={"url": "https://example.com"},
+                target=object(),
+                execute=execute,
+                result_summary_builder=build_summary,
+                emitter=emitter,
+            )
+
+        self.assertIs(returned, result)
+        self.assertEqual(result.duration_ms, 125)
+        self.assertEqual(summaries, [result])
+        self.assertEqual(emitter.events[0][0], "started")
+        self.assertEqual(
+            emitter.events[1],
+            (
+                "completed",
+                {
+                    "tool_call_id": "call-returned-failed",
+                    "tool_name": "url_read",
+                    "status": "failed",
+                    "duration_ms": 125,
+                    "result_summary": {"kind": "url_read", "status": "failed"},
+                    "error": "reader-service 暂时不可用",
                 },
             ),
         )

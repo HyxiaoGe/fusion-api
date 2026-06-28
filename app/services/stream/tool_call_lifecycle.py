@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from app.services.tool_handlers.base import ToolResult
@@ -34,6 +35,14 @@ class ToolCallEmitter(Protocol):
 
 ToolExecutorFn = Callable[[Any, dict], Awaitable[ToolResult]]
 ResultSummaryBuilder = Callable[[ToolResult], dict]
+
+
+@dataclass(frozen=True)
+class ToolLifecycleAttempt:
+    result: ToolResult
+    duration_ms: int
+    cancelled_error: asyncio.CancelledError | None = None
+    from_exception: bool = False
 
 
 async def emit_tool_call_started(
@@ -73,6 +82,52 @@ async def emit_tool_call_result(
     )
 
 
+def measure_duration_ms(start_mono: float) -> int:
+    return int((time.monotonic() - start_mono) * 1000)
+
+
+async def run_tool_attempt(*, target: Any, args: dict, execute: ToolExecutorFn) -> ToolLifecycleAttempt:
+    start_mono = time.monotonic()
+    try:
+        result = await execute(target, args)
+    except asyncio.CancelledError as exc:
+        return ToolLifecycleAttempt(
+            result=_build_failed_result(exc),
+            duration_ms=measure_duration_ms(start_mono),
+            cancelled_error=exc,
+            from_exception=True,
+        )
+    except Exception as exc:
+        return ToolLifecycleAttempt(
+            result=_build_failed_result(exc),
+            duration_ms=measure_duration_ms(start_mono),
+            from_exception=True,
+        )
+    return ToolLifecycleAttempt(result=result, duration_ms=measure_duration_ms(start_mono))
+
+
+async def complete_tool_lifecycle(
+    *,
+    emitter: ToolCallEmitter,
+    tool_call_id: str,
+    tool_name: str,
+    result: ToolResult,
+    duration_ms: int,
+    result_summary_builder: ResultSummaryBuilder,
+    set_result_duration: bool = True,
+) -> None:
+    if set_result_duration and result.duration_ms is None:
+        result.duration_ms = duration_ms
+    await emit_tool_call_result(
+        emitter,
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        result=result,
+        duration_ms=duration_ms,
+        result_summary_builder=result_summary_builder,
+    )
+
+
 async def execute_tool_with_lifecycle(
     *,
     tool_call_id: str,
@@ -92,46 +147,19 @@ async def execute_tool_with_lifecycle(
         tool_name=tool_name,
         arguments=args,
     )
-    start_mono = time.monotonic()
-    try:
-        result = await execute(target, args)
-    except asyncio.CancelledError as exc:
-        duration_ms = int((time.monotonic() - start_mono) * 1000)
-        failed_result = _build_failed_result(exc)
-        await emit_tool_call_result(
-            emitter,
-            tool_call_id=tool_call_id,
-            tool_name=tool_name,
-            result=failed_result,
-            duration_ms=duration_ms,
-            result_summary_builder=result_summary_builder,
-        )
-        raise
-    except Exception as exc:
-        duration_ms = int((time.monotonic() - start_mono) * 1000)
-        failed_result = _build_failed_result(exc)
-        await emit_tool_call_result(
-            emitter,
-            tool_call_id=tool_call_id,
-            tool_name=tool_name,
-            result=failed_result,
-            duration_ms=duration_ms,
-            result_summary_builder=result_summary_builder,
-        )
-        return failed_result
-
-    duration_ms = int((time.monotonic() - start_mono) * 1000)
-    if result.duration_ms is None:
-        result.duration_ms = duration_ms
-    await emit_tool_call_result(
-        emitter,
+    attempt = await run_tool_attempt(target=target, args=args, execute=execute)
+    await complete_tool_lifecycle(
+        emitter=emitter,
         tool_call_id=tool_call_id,
         tool_name=tool_name,
-        result=result,
-        duration_ms=duration_ms,
+        result=attempt.result,
+        duration_ms=attempt.duration_ms,
         result_summary_builder=result_summary_builder,
+        set_result_duration=not attempt.from_exception,
     )
-    return result
+    if attempt.cancelled_error:
+        raise attempt.cancelled_error
+    return attempt.result
 
 
 def _build_failed_result(exc: BaseException) -> ToolResult:
