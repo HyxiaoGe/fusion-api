@@ -11,14 +11,8 @@ from app.core.logger import app_logger as logger
 from app.db.database import SessionLocal
 from app.services.agent import session_cache
 from app.services.stream.agent_loop_driver import run_agent_loop
-from app.services.stream.agent_loop_execution import (
-    AgentLoopDependencies,
-    AgentLoopExecutionRequest,
-    build_agent_loop_execution,
-)
+from app.services.stream.agent_loop_execution import build_agent_loop_execution
 from app.services.stream.agent_loop_lifecycle import (
-    AgentLoopLifecycleDependencies,
-    AgentLoopLifecycleRequest,
     run_agent_loop_lifecycle,
 )
 from app.services.stream.agent_loop_policy import AgentLoopLimits
@@ -32,6 +26,12 @@ from app.services.stream.agent_loop_run_completion import (
     finalize_failed_run,
     finalize_superseded_run,
     write_fallback_run_error,
+)
+from app.services.stream.agent_loop_wiring import (
+    AgentLoopLifecycleCall,
+    AgentLoopRunInput,
+    AgentLoopWiringDependencies,
+    build_agent_loop_lifecycle_call,
 )
 from app.services.stream.agent_round import run_agent_round
 from app.services.stream.limit_summary import run_limit_summary_step
@@ -79,6 +79,59 @@ def _log_agent_round_summary(
     )
 
 
+def _agent_loop_limits() -> AgentLoopLimits:
+    return AgentLoopLimits(
+        max_steps=AGENT_MAX_STEPS,
+        max_tool_calls=AGENT_MAX_TOOL_CALLS,
+        total_timeout_s=AGENT_TOTAL_TIMEOUT,
+    )
+
+
+def _agent_loop_wiring_dependencies() -> AgentLoopWiringDependencies:
+    return AgentLoopWiringDependencies(
+        build_call_config_fn=build_agent_loop_call_config,
+        build_execution_fn=build_agent_loop_execution,
+        session_cache=session_cache,
+        redis_writer_factory=AgentEventRedisWriter,
+        start_step_fn=start_agent_step,
+        complete_step_fn=complete_agent_step,
+        run_round_fn=run_agent_round,
+        handle_tool_calls_round_fn=handle_tool_calls_round,
+        run_limit_summary_step_fn=run_limit_summary_step,
+        llm_call_fn=llm_call_with_retry,
+        stream_round_fn=stream_round,
+        execute_tools_fn=execute_tools_parallel,
+        persist_message_fn=persist_message,
+        log_round_summary_fn=_log_agent_round_summary,
+        clock=time.time,
+        append_chunk_fn=append_chunk,
+        start_agent_run_fn=start_agent_run,
+        prepare_messages_fn=prepare_agent_loop_messages,
+        run_agent_loop_fn=run_agent_loop,
+        finalize_completed_run_fn=finalize_completed_run,
+        finalize_superseded_run_fn=finalize_superseded_run,
+        finalize_cancelled_run_fn=finalize_cancelled_run,
+        finalize_failed_run_fn=finalize_failed_run,
+        write_fallback_run_error_fn=write_fallback_run_error,
+        complete_agent_run_fn=complete_agent_run,
+        interrupt_agent_run_fn=interrupt_agent_run,
+        fail_agent_run_fn=fail_agent_run,
+        finalize_stream_fn=finalize_stream,
+        write_fallback_error_status_fn=write_fallback_error_status,
+        info_fn=logger.info,
+        error_fn=logger.error,
+        warning_fn=logger.warning,
+    )
+
+
+async def _run_agent_loop_lifecycle_call(lifecycle_call: AgentLoopLifecycleCall) -> None:
+    await run_agent_loop_lifecycle(
+        request=lifecycle_call.request,
+        execution=lifecycle_call.execution,
+        dependencies=lifecycle_call.dependencies,
+    )
+
+
 class StreamHandler:
     """流式处理器"""
 
@@ -100,92 +153,33 @@ class StreamHandler:
         capabilities: Optional[dict] = None,
         trace_id: Optional[str] = None,
     ) -> None:
-        """
-        后台任务：调用 LLM，chunk 写入 Redis Stream，完成后落库 PostgreSQL。
-        支持 Agent Loop：LLM 可多轮调用工具，直到自行决定 stop。
-        """
-        if options is None:
-            options = {}
-        if capabilities is None:
-            capabilities = {}
-
-        call_config = build_agent_loop_call_config(
+        """后台任务：调用 LLM，chunk 写入 Redis Stream，并由 agent loop 完成落库。"""
+        run_input = AgentLoopRunInput(
+            conversation_id=conversation_id,
+            user_id=user_id,
+            model_id=model_id,
+            litellm_model=litellm_model,
+            litellm_kwargs=litellm_kwargs,
             provider=provider,
+            raw_messages=raw_messages,
+            has_vision=has_vision,
+            file_ids=file_ids,
+            original_message=original_message,
+            assistant_message_id=assistant_message_id,
+            task_id=task_id,
             options=options,
             capabilities=capabilities,
+            trace_id=trace_id,
         )
 
         db = SessionLocal()
-
-        limits = AgentLoopLimits(
-            max_steps=AGENT_MAX_STEPS,
-            max_tool_calls=AGENT_MAX_TOOL_CALLS,
-            total_timeout_s=AGENT_TOTAL_TIMEOUT,
-        )
-        execution = build_agent_loop_execution(
-            request=AgentLoopExecutionRequest(
-                db=db,
-                conversation_id=conversation_id,
-                user_id=user_id,
-                model_id=model_id,
-                litellm_model=litellm_model,
-                litellm_kwargs=litellm_kwargs,
-                provider=provider,
-                assistant_message_id=assistant_message_id,
-                task_id=task_id,
-                call_config=call_config,
-                trace_id=trace_id,
-            ),
-            limits=limits,
-            dependencies=AgentLoopDependencies(
-                session_cache=session_cache,
-                redis_writer=AgentEventRedisWriter(),
-                start_step_fn=start_agent_step,
-                complete_step_fn=complete_agent_step,
-                run_round_fn=run_agent_round,
-                handle_tool_calls_round_fn=handle_tool_calls_round,
-                run_limit_summary_step_fn=run_limit_summary_step,
-                llm_call_fn=llm_call_with_retry,
-                stream_round_fn=stream_round,
-                execute_tools_fn=execute_tools_parallel,
-                persist_message_fn=persist_message,
-                log_round_summary_fn=_log_agent_round_summary,
-                warning_fn=logger.warning,
-                clock=time.time,
-            ),
-        )
-
         try:
-            await run_agent_loop_lifecycle(
-                request=AgentLoopLifecycleRequest(
-                    raw_messages=raw_messages,
-                    has_vision=has_vision,
-                    file_ids=file_ids,
-                    original_message=original_message,
-                    call_config=call_config,
-                    limits=limits,
-                ),
-                execution=execution,
-                dependencies=AgentLoopLifecycleDependencies(
-                    append_chunk_fn=append_chunk,
-                    start_agent_run_fn=start_agent_run,
-                    prepare_messages_fn=prepare_agent_loop_messages,
-                    run_agent_loop_fn=run_agent_loop,
-                    finalize_completed_run_fn=finalize_completed_run,
-                    finalize_superseded_run_fn=finalize_superseded_run,
-                    finalize_cancelled_run_fn=finalize_cancelled_run,
-                    finalize_failed_run_fn=finalize_failed_run,
-                    write_fallback_run_error_fn=write_fallback_run_error,
-                    persist_message_fn=persist_message,
-                    complete_agent_run_fn=complete_agent_run,
-                    interrupt_agent_run_fn=interrupt_agent_run,
-                    fail_agent_run_fn=fail_agent_run,
-                    finalize_stream_fn=finalize_stream,
-                    write_fallback_error_status_fn=write_fallback_error_status,
-                    info_fn=logger.info,
-                    error_fn=logger.error,
-                    warning_fn=logger.warning,
-                ),
+            lifecycle_call = build_agent_loop_lifecycle_call(
+                run_input=run_input,
+                db=db,
+                limits=_agent_loop_limits(),
+                dependencies=_agent_loop_wiring_dependencies(),
             )
+            await _run_agent_loop_lifecycle_call(lifecycle_call)
         finally:
             db.close()

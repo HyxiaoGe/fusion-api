@@ -620,6 +620,62 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
 
         self.mock_db.close.assert_called_once()
 
+    async def test_generate_to_redis_uses_runner_patched_agent_loop_dependencies(self):
+        """runner patch 路径必须继续流入 runtime/lifecycle 依赖。"""
+        captured = {}
+
+        async def _capture_lifecycle(**kwargs):
+            captured.update(kwargs)
+
+        patched_llm_call = AsyncMock()
+        patched_stream_round = AsyncMock()
+        patched_execute_tools = AsyncMock()
+        patched_persist_message = MagicMock()
+        patched_append_chunk = AsyncMock()
+        patched_finalize_stream = AsyncMock()
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch(
+                    "app.services.stream.runner.run_agent_loop_lifecycle",
+                    AsyncMock(side_effect=_capture_lifecycle),
+                )
+            )
+            stack.enter_context(patch("app.services.stream.runner.llm_call_with_retry", patched_llm_call))
+            stack.enter_context(patch("app.services.stream.runner.stream_round", patched_stream_round))
+            stack.enter_context(patch("app.services.stream.runner.execute_tools_parallel", patched_execute_tools))
+            stack.enter_context(patch("app.services.stream.runner.persist_message", patched_persist_message))
+            stack.enter_context(patch("app.services.stream.runner.append_chunk", patched_append_chunk))
+            stack.enter_context(patch("app.services.stream.runner.finalize_stream", patched_finalize_stream))
+
+            await self.handler.generate_to_redis(
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="gpt-4",
+                litellm_model="openai/gpt-4",
+                litellm_kwargs={},
+                provider="openai",
+                raw_messages=[{"role": "user", "content": "hi"}],
+                has_vision=False,
+                file_ids=None,
+                original_message="hi",
+                assistant_message_id="msg-1",
+                task_id="task-1",
+                options={"use_reasoning": False},
+                capabilities=None,
+                trace_id="trace-1",
+            )
+
+        execution = captured["execution"]
+        dependencies = captured["dependencies"]
+        self.assertIs(execution.runtime.llm_call_fn, patched_llm_call)
+        self.assertIs(execution.runtime.stream_round_fn, patched_stream_round)
+        self.assertIs(execution.runtime.execute_tools_fn, patched_execute_tools)
+        self.assertIs(execution.runtime.persist_message_fn, patched_persist_message)
+        self.assertIs(dependencies.append_chunk_fn, patched_append_chunk)
+        self.assertIs(dependencies.finalize_stream_fn, patched_finalize_stream)
+        self.assertIs(dependencies.persist_message_fn, patched_persist_message)
+
     async def test_cancelled_path(self):
         """CancelledError 路径：发 run_interrupted + status='interrupted'"""
 
