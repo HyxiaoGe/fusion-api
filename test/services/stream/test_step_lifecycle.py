@@ -178,7 +178,7 @@ class StepLifecycleTests(unittest.IsolatedAsyncioTestCase):
             [
                 call(
                     plan_id="plan-run-1",
-                    revision=7,
+                    revision=12,
                     item={
                         "id": "read",
                         "title": "读取关键来源",
@@ -191,7 +191,7 @@ class StepLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 call(
                     plan_id="plan-run-1",
-                    revision=8,
+                    revision=13,
                     item={
                         "id": "answer",
                         "title": "整理回答",
@@ -209,6 +209,67 @@ class StepLifecycleTests(unittest.IsolatedAsyncioTestCase):
             completed_steps=3,
             total_steps=None,
             completed_tool_calls=1,
+            max_tool_calls=20,
+        )
+
+    async def test_mark_tool_round_started_for_url_read_reverts_answer_and_runs_read(self):
+        emitter = Mock()
+        emitter.plan_step_updated = AsyncMock()
+        emitter.run_progress_updated = AsyncMock()
+        context = AgentStepContext(
+            step_id="step-3",
+            run_id="run-1",
+            step_number=3,
+            started_at=10.0,
+            thinking_block_id="blk_thinking",
+            text_block_id="blk_text",
+        )
+
+        await step_lifecycle_module.mark_tool_round_started(
+            context=context,
+            emitter=emitter,
+            tool_call_count=1,
+            tool_names=("url_read",),
+            completed_tool_calls=2,
+            max_tool_calls=20,
+        )
+
+        self.assertEqual(
+            emitter.plan_step_updated.await_args_list,
+            [
+                call(
+                    plan_id="plan-run-1",
+                    revision=24,
+                    item={
+                        "id": "answer",
+                        "title": "整理回答",
+                        "status": "pending",
+                        "kind": "answer",
+                        "tool_names": [],
+                        "evidence_item_ids": [],
+                    },
+                ),
+                call(
+                    plan_id="plan-run-1",
+                    revision=25,
+                    item={
+                        "id": "read",
+                        "title": "读取关键来源",
+                        "status": "running",
+                        "kind": "read",
+                        "summary": "正在读取 1 个关键来源",
+                        "tool_names": ["url_read"],
+                        "evidence_item_ids": [],
+                    },
+                ),
+            ],
+        )
+        emitter.run_progress_updated.assert_awaited_once_with(
+            phase="reading",
+            label="正在读取关键来源",
+            completed_steps=2,
+            total_steps=None,
+            completed_tool_calls=2,
             max_tool_calls=20,
         )
 
@@ -353,7 +414,7 @@ class StepLifecycleTests(unittest.IsolatedAsyncioTestCase):
                         "title": "查找资料",
                         "status": "completed",
                         "kind": "search",
-                        "summary": "完成 1 个工具调用",
+                        "summary": "完成 3 个工具调用",
                         "tool_names": ["web_search"],
                         "evidence_item_ids": [],
                     },
@@ -411,7 +472,7 @@ class StepLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         emitter.plan_step_updated.assert_awaited_once_with(
             plan_id="plan-run-1",
-            revision=9,
+            revision=19,
             item={
                 "id": "answer",
                 "title": "整理回答",
@@ -428,5 +489,54 @@ class StepLifecycleTests(unittest.IsolatedAsyncioTestCase):
             completed_steps=4,
             total_steps=None,
             completed_tool_calls=1,
+            max_tool_calls=20,
+        )
+
+    async def test_complete_agent_step_for_url_read_completes_read_without_reopening_search(self):
+        emitter = Mock()
+        emitter.step_completed = AsyncMock()
+        emitter.plan_step_updated = AsyncMock()
+        emitter.run_progress_updated = AsyncMock()
+        session_cache = Mock()
+        session_cache.write_step_completed = AsyncMock()
+        context = AgentStepContext(
+            step_id="step-3",
+            run_id="run-1",
+            step_number=3,
+            started_at=10.0,
+            thinking_block_id="blk_thinking",
+            text_block_id="blk_text",
+        )
+
+        await complete_agent_step(
+            context=context,
+            emitter=emitter,
+            session_cache=session_cache,
+            tool_names=("url_read",),
+            tool_call_count=1,
+            completed_tool_calls=3,
+            max_tool_calls=20,
+            clock=Mock(return_value=10.25),
+        )
+
+        emitter.plan_step_updated.assert_awaited_once_with(
+            plan_id="plan-run-1",
+            revision=26,
+            item={
+                "id": "read",
+                "title": "读取关键来源",
+                "status": "completed",
+                "kind": "read",
+                "summary": "已完成关键来源读取",
+                "tool_names": ["url_read"],
+                "evidence_item_ids": [],
+            },
+        )
+        emitter.run_progress_updated.assert_awaited_once_with(
+            phase="reading",
+            label="已完成关键来源读取",
+            completed_steps=2,
+            total_steps=None,
+            completed_tool_calls=3,
             max_tool_calls=20,
         )

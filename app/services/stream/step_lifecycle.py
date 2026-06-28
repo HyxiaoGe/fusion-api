@@ -43,13 +43,18 @@ def _make_block_id() -> str:
     return f"blk_{uuid.uuid4().hex[:12]}"
 
 
+PLAN_REVISION_WINDOW = 10
 PLAN_REV_UNDERSTAND_RUNNING = 2
 PLAN_REV_UNDERSTAND_COMPLETED = 3
-PLAN_REV_SEARCH_RUNNING = 4
-PLAN_REV_SEARCH_COMPLETED = 5
-PLAN_REV_READ_RUNNING = 6
-PLAN_REV_READ_COMPLETED = 7
-PLAN_REV_ANSWER_RUNNING = 8
+PLAN_REV_FOLLOWUP_READ_COMPLETED = 2
+PLAN_REV_FOLLOWUP_ANSWER_RUNNING = 3
+PLAN_REV_ANSWER_PENDING_FOR_TOOLS = 4
+PLAN_REV_FIRST_TOOL_RUNNING = 4
+PLAN_REV_FOLLOWUP_TOOL_RUNNING = 5
+PLAN_REV_FIRST_TOOL_COMPLETED = 5
+PLAN_REV_FOLLOWUP_TOOL_COMPLETED = 6
+PLAN_REV_FIRST_READ_RUNNING_AFTER_SEARCH = 6
+PLAN_REV_FOLLOWUP_READ_RUNNING_AFTER_SEARCH = 7
 PLAN_REV_ANSWER_COMPLETED = 9
 
 
@@ -130,27 +135,72 @@ async def mark_tool_round_started(
     context: AgentStepContext,
     emitter: AgentStepEmitter,
     tool_call_count: int,
+    tool_names: Sequence[str] = (),
     completed_tool_calls: int | None = None,
     max_tool_calls: int | None = None,
 ) -> None:
+    stage = _tool_stage(tool_names)
+    if context.step_number == 1:
+        await _emit_plan_step_update(
+            emitter=emitter,
+            run_id=context.run_id,
+            revision=_plan_revision(context.step_number, PLAN_REV_UNDERSTAND_COMPLETED),
+            item={
+                "id": "understand",
+                "title": "理解问题",
+                "status": "completed",
+                "kind": "reasoning",
+                "summary": "已完成问题理解",
+                "tool_names": [],
+                "evidence_item_ids": [],
+            },
+        )
+    else:
+        await _emit_plan_step_update(
+            emitter=emitter,
+            run_id=context.run_id,
+            revision=_plan_revision(context.step_number, PLAN_REV_ANSWER_PENDING_FOR_TOOLS),
+            item={
+                "id": "answer",
+                "title": "整理回答",
+                "status": "pending",
+                "kind": "answer",
+                "tool_names": [],
+                "evidence_item_ids": [],
+            },
+        )
+
+    if stage == "read":
+        await _emit_plan_step_update(
+            emitter=emitter,
+            run_id=context.run_id,
+            revision=_tool_running_revision(context.step_number),
+            item={
+                "id": "read",
+                "title": "读取关键来源",
+                "status": "running",
+                "kind": "read",
+                "summary": f"正在读取 {tool_call_count} 个关键来源",
+                "tool_names": list(tool_names),
+                "evidence_item_ids": [],
+            },
+        )
+        await _maybe_call_async(
+            emitter,
+            "run_progress_updated",
+            phase="reading",
+            label="正在读取关键来源",
+            completed_steps=2,
+            total_steps=None,
+            completed_tool_calls=completed_tool_calls,
+            max_tool_calls=max_tool_calls,
+        )
+        return
+
     await _emit_plan_step_update(
         emitter=emitter,
         run_id=context.run_id,
-        revision=PLAN_REV_UNDERSTAND_COMPLETED,
-        item={
-            "id": "understand",
-            "title": "理解问题",
-            "status": "completed",
-            "kind": "reasoning",
-            "summary": "已完成问题理解",
-            "tool_names": [],
-            "evidence_item_ids": [],
-        },
-    )
-    await _emit_plan_step_update(
-        emitter=emitter,
-        run_id=context.run_id,
-        revision=PLAN_REV_SEARCH_RUNNING,
+        revision=_tool_running_revision(context.step_number),
         item={
             "id": "search",
             "title": "查找资料",
@@ -185,7 +235,7 @@ async def _maybe_emit_plan_step_started(
         await _emit_plan_step_update(
             emitter=emitter,
             run_id=run_id,
-            revision=PLAN_REV_UNDERSTAND_RUNNING,
+            revision=_plan_revision(step_number, PLAN_REV_UNDERSTAND_RUNNING),
             item={
                 "id": "understand",
                 "title": "理解问题",
@@ -200,7 +250,7 @@ async def _maybe_emit_plan_step_started(
     await _emit_plan_step_update(
         emitter=emitter,
         run_id=run_id,
-        revision=PLAN_REV_READ_COMPLETED,
+        revision=_plan_revision(step_number, PLAN_REV_FOLLOWUP_READ_COMPLETED),
         item={
             "id": "read",
             "title": "读取关键来源",
@@ -214,7 +264,7 @@ async def _maybe_emit_plan_step_started(
     await _emit_plan_step_update(
         emitter=emitter,
         run_id=run_id,
-        revision=PLAN_REV_ANSWER_RUNNING,
+        revision=_plan_revision(step_number, PLAN_REV_FOLLOWUP_ANSWER_RUNNING),
         item={
             "id": "answer",
             "title": "整理回答",
@@ -246,16 +296,44 @@ async def _maybe_emit_plan_step_completed(
     max_tool_calls: int | None,
 ) -> None:
     if tool_call_count > 0:
+        stage = _tool_stage(tool_names)
+        if stage == "read":
+            await _emit_plan_step_update(
+                emitter=emitter,
+                run_id=context.run_id,
+                revision=_tool_completed_revision(context.step_number),
+                item={
+                    "id": "read",
+                    "title": "读取关键来源",
+                    "status": "completed",
+                    "kind": "read",
+                    "summary": "已完成关键来源读取",
+                    "tool_names": tool_names,
+                    "evidence_item_ids": [],
+                },
+            )
+            await _maybe_call_async(
+                emitter,
+                "run_progress_updated",
+                phase="reading",
+                label="已完成关键来源读取",
+                completed_steps=2,
+                total_steps=None,
+                completed_tool_calls=completed_tool_calls if completed_tool_calls is not None else tool_call_count,
+                max_tool_calls=max_tool_calls,
+            )
+            return
+
         await _emit_plan_step_update(
             emitter=emitter,
             run_id=context.run_id,
-            revision=PLAN_REV_SEARCH_COMPLETED,
+            revision=_tool_completed_revision(context.step_number),
             item={
                 "id": "search",
                 "title": "查找资料",
                 "status": "completed",
                 "kind": "search",
-                "summary": f"完成 {tool_call_count} 个工具调用",
+                "summary": f"完成 {_completed_tool_summary_count(tool_call_count, completed_tool_calls)} 个工具调用",
                 "tool_names": tool_names,
                 "evidence_item_ids": [],
             },
@@ -263,7 +341,7 @@ async def _maybe_emit_plan_step_completed(
         await _emit_plan_step_update(
             emitter=emitter,
             run_id=context.run_id,
-            revision=PLAN_REV_READ_RUNNING,
+            revision=_read_running_after_search_revision(context.step_number),
             item={
                 "id": "read",
                 "title": "读取关键来源",
@@ -290,7 +368,7 @@ async def _maybe_emit_plan_step_completed(
         await _emit_plan_step_update(
             emitter=emitter,
             run_id=context.run_id,
-            revision=PLAN_REV_UNDERSTAND_COMPLETED,
+            revision=_plan_revision(context.step_number, PLAN_REV_UNDERSTAND_COMPLETED),
             item={
                 "id": "understand",
                 "title": "理解问题",
@@ -305,7 +383,7 @@ async def _maybe_emit_plan_step_completed(
     await _emit_plan_step_update(
         emitter=emitter,
         run_id=context.run_id,
-        revision=PLAN_REV_ANSWER_COMPLETED,
+        revision=_plan_revision(context.step_number, PLAN_REV_ANSWER_COMPLETED),
         item={
             "id": "answer",
             "title": "整理回答",
@@ -326,6 +404,39 @@ async def _maybe_emit_plan_step_completed(
         completed_tool_calls=completed_tool_calls,
         max_tool_calls=max_tool_calls,
     )
+
+
+def _plan_revision(step_number: int, offset: int) -> int:
+    normalized_step = max(1, step_number)
+    return (normalized_step - 1) * PLAN_REVISION_WINDOW + offset
+
+
+def _tool_running_revision(step_number: int) -> int:
+    offset = PLAN_REV_FIRST_TOOL_RUNNING if step_number == 1 else PLAN_REV_FOLLOWUP_TOOL_RUNNING
+    return _plan_revision(step_number, offset)
+
+
+def _tool_completed_revision(step_number: int) -> int:
+    offset = PLAN_REV_FIRST_TOOL_COMPLETED if step_number == 1 else PLAN_REV_FOLLOWUP_TOOL_COMPLETED
+    return _plan_revision(step_number, offset)
+
+
+def _read_running_after_search_revision(step_number: int) -> int:
+    offset = PLAN_REV_FIRST_READ_RUNNING_AFTER_SEARCH if step_number == 1 else PLAN_REV_FOLLOWUP_READ_RUNNING_AFTER_SEARCH
+    return _plan_revision(step_number, offset)
+
+
+def _tool_stage(tool_names: Sequence[str]) -> str:
+    names = [tool_name for tool_name in tool_names if tool_name]
+    if names and all(tool_name == "url_read" for tool_name in names):
+        return "read"
+    return "search"
+
+
+def _completed_tool_summary_count(tool_call_count: int, completed_tool_calls: int | None) -> int:
+    if completed_tool_calls is not None:
+        return max(tool_call_count, completed_tool_calls)
+    return tool_call_count
 
 
 async def _emit_plan_step_update(

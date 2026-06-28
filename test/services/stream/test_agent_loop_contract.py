@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.schemas.chat import SearchBlock
 from app.services.stream import StreamHandler
+from app.services.stream.tool_execution_result import ToolExecutionRecord
 from app.services.tool_handlers.base import ToolResult
 
 
@@ -104,6 +105,8 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
 
         async def _capture_execute_tools(*args, **kwargs):
             result.tool_execute_calls.append({"args": args, **kwargs})
+            if callable(execute_tools_result):
+                return execute_tools_result(*args, **kwargs)
             return execute_tools_result or []
 
         async def _capture_and_execute_tools(*args, **kwargs):
@@ -350,9 +353,9 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 (4, "search", "running"),
                 (5, "search", "completed"),
                 (6, "read", "running"),
-                (7, "read", "completed"),
-                (8, "answer", "running"),
-                (9, "answer", "completed"),
+                (12, "read", "completed"),
+                (13, "answer", "running"),
+                (19, "answer", "completed"),
             ],
         )
         self.assertEqual(
@@ -382,6 +385,95 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.tool_execute_calls[0]["trace_id"], "run-contract")
         self.assertEqual(result.tool_execute_calls[0]["step_number"], 1)
         self.assertEqual(result.persist_calls[-1]["partial"], False)
+
+    async def test_multi_tool_round_plan_returns_from_answer_to_reading_for_url_read(self):
+        search_call = {"id": "tc-search", "name": "web_search", "arguments": '{"query":"OpenAI"}'}
+        url_read_call = {
+            "id": "tc-read",
+            "name": "url_read",
+            "arguments": '{"url":"https://example.com","reason":"核验来源"}',
+        }
+
+        def _make_record(tool_call):
+            handler = MagicMock()
+            handler.format_llm_context.return_value = f"{tool_call['name']} 工具上下文"
+            handler.build_content_block.return_value = None
+            return ToolExecutionRecord(
+                tool_call=tool_call,
+                result=ToolResult(status="success", data={}, duration_ms=12),
+                handler=handler,
+                block_id=f"blk-{tool_call['id']}",
+                log_id=f"log-{tool_call['id']}",
+            )
+
+        def _execute_tools(tool_calls, *_args, **_kwargs):
+            return [_make_record(tool_call) for tool_call in tool_calls]
+
+        result = await self._run_agent_contract(
+            rounds=[
+                ("需要搜索", "", [search_call], "tool_calls", None),
+                ("需要读取网页", "", [url_read_call], "tool_calls", None),
+                ("", "Final answer", [], "stop", None),
+            ],
+            execute_tools_result=_execute_tools,
+            options={"use_reasoning": True},
+            capabilities={"functionCalling": True, "deepThinking": True},
+        )
+
+        plan_updates = [
+            (
+                event["revision"],
+                event["item"]["id"],
+                event["item"]["status"],
+                event["item"].get("summary"),
+                event["item"].get("tool_names", []),
+            )
+            for event in result.events
+            if event["type"] == "plan_step_updated"
+        ]
+        self.assertEqual(
+            plan_updates,
+            [
+                (2, "understand", "running", None, []),
+                (3, "understand", "completed", "已完成问题理解", []),
+                (4, "search", "running", "正在执行 1 个工具调用", []),
+                (5, "search", "completed", "完成 1 个工具调用", ["web_search"]),
+                (6, "read", "running", "正在整理关键来源", []),
+                (12, "read", "completed", "已完成关键来源读取", []),
+                (13, "answer", "running", None, []),
+                (14, "answer", "pending", None, []),
+                (15, "read", "running", "正在读取 1 个关键来源", ["url_read"]),
+                (16, "read", "completed", "已完成关键来源读取", ["url_read"]),
+                (22, "read", "completed", "已完成关键来源读取", []),
+                (23, "answer", "running", None, []),
+                (29, "answer", "completed", "已完成回答整理", []),
+            ],
+        )
+        self.assertEqual(
+            [
+                (
+                    event["phase"],
+                    event["label"],
+                    event["completed_steps"],
+                    event["completed_tool_calls"],
+                    event["max_tool_calls"],
+                )
+                for event in result.events
+                if event["type"] == "run_progress_updated"
+            ],
+            [
+                ("planning", "正在理解问题", 0, 0, 20),
+                ("researching", "正在查找资料", 1, 0, 20),
+                ("reading", "正在读取关键来源", 2, 1, 20),
+                ("synthesizing", "正在整理回答", 3, 1, 20),
+                ("reading", "正在读取关键来源", 2, 1, 20),
+                ("reading", "已完成关键来源读取", 2, 2, 20),
+                ("synthesizing", "正在整理回答", 3, 2, 20),
+                ("answering", "已完成回答整理", 4, 2, 20),
+            ],
+        )
+        self.assertEqual([call["step_number"] for call in result.tool_execute_calls], [1, 2])
+        self.assertEqual([call["args"][0][0]["name"] for call in result.tool_execute_calls], ["web_search", "url_read"])
 
     async def test_redis_stream_contract_writes_done_terminal_entry(self):
         result = await self._run_agent_contract(

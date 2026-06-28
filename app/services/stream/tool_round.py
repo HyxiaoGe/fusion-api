@@ -128,6 +128,7 @@ async def update_tool_round_plan_started(request: ToolRoundRequest) -> None:
         context=request.step_context,
         emitter=request.emitter,
         tool_call_count=len(request.tool_calls),
+        tool_names=[tool_call["name"] for tool_call in request.tool_calls],
         completed_tool_calls=_completed_tool_calls_before_round(request),
         max_tool_calls=_max_tool_calls(request),
     )
