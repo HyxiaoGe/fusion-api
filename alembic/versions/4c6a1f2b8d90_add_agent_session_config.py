@@ -5,11 +5,13 @@ Revises: 3b4c8a7d2f10
 Create Date: 2026-06-28
 """
 
-from typing import Sequence, Union
+from collections.abc import Sequence
+from typing import Union
 
 import sqlalchemy as sa
-from alembic import op
 from sqlalchemy.dialects import postgresql
+
+from alembic import op
 
 revision: str = "4c6a1f2b8d90"
 down_revision: Union[str, Sequence[str], None] = "3b4c8a7d2f10"
