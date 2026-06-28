@@ -4,6 +4,9 @@ import unittest
 from app.schemas.chat import Usage
 from app.services.stream.limit_summary import (
     LIMIT_SUMMARY_PROMPT,
+    LimitSummaryStepRequest,
+    accumulate_summary_usage,
+    append_summary_content_blocks,
     build_limit_summary_call_kwargs,
     compute_summary_timeout,
     run_limit_summary_step,
@@ -51,6 +54,38 @@ class LimitSummaryHelpersTests(unittest.TestCase):
         )
 
         self.assertEqual(timeout, 10)
+
+    def test_accumulate_summary_usage_adds_usage_data(self):
+        result = accumulate_summary_usage(
+            Usage(input_tokens=2, output_tokens=3),
+            Usage(input_tokens=5, output_tokens=7),
+        )
+
+        self.assertEqual(result, Usage(input_tokens=7, output_tokens=10))
+
+    def test_accumulate_summary_usage_keeps_existing_usage_without_usage_data(self):
+        accumulated_usage = Usage(input_tokens=2, output_tokens=3)
+
+        result = accumulate_summary_usage(accumulated_usage, None)
+
+        self.assertIs(result, accumulated_usage)
+
+    def test_append_summary_content_blocks_adds_reasoning_and_text(self):
+        content_blocks = []
+
+        append_summary_content_blocks(
+            content_blocks=content_blocks,
+            reasoning_buf="推理",
+            content_buf="总结正文",
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+        )
+
+        self.assertEqual([block.type for block in content_blocks], ["thinking", "text"])
+        self.assertEqual(content_blocks[0].id, "blk-thinking")
+        self.assertEqual(content_blocks[0].thinking, "推理")
+        self.assertEqual(content_blocks[1].id, "blk-text")
+        self.assertEqual(content_blocks[1].text, "总结正文")
 
 
 class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
@@ -116,31 +151,37 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
             return 120.0
 
         outcome = await run_limit_summary_step(
-            conversation_id="conv-1",
-            task_id="task-1",
-            run_id="run-1",
-            step_number=4,
-            model_id="gpt-4",
-            provider="openai",
-            litellm_model="openai/gpt-4",
-            litellm_kwargs={"metadata": {"trace": "x"}},
-            messages=messages,
-            should_use_reasoning=True,
-            content_blocks=content_blocks,
-            call_kwargs={"tools": [{"function": {"name": "web_search"}}], "tool_choice": "auto", "temperature": 0.1},
-            accumulated_usage=accumulated_usage,
-            emitter=emitter,
-            session_cache=session_cache,
-            total_timeout_s=300,
-            run_start=100.0,
-            start_step_fn=start_step_fn,
-            complete_step_fn=complete_step_fn,
-            llm_call_fn=llm_call_fn,
-            stream_round_fn=stream_round_fn,
-            log_round_summary_fn=log_round_summary_fn,
-            warning_fn=warnings.append,
-            clock=clock,
-            on_step_started=marked_step_ids.append,
+            request=LimitSummaryStepRequest(
+                conversation_id="conv-1",
+                task_id="task-1",
+                run_id="run-1",
+                step_number=4,
+                model_id="gpt-4",
+                provider="openai",
+                litellm_model="openai/gpt-4",
+                litellm_kwargs={"metadata": {"trace": "x"}},
+                messages=messages,
+                should_use_reasoning=True,
+                content_blocks=content_blocks,
+                call_kwargs={
+                    "tools": [{"function": {"name": "web_search"}}],
+                    "tool_choice": "auto",
+                    "temperature": 0.1,
+                },
+                accumulated_usage=accumulated_usage,
+                emitter=emitter,
+                session_cache=session_cache,
+                total_timeout_s=300,
+                run_start=100.0,
+                start_step_fn=start_step_fn,
+                complete_step_fn=complete_step_fn,
+                llm_call_fn=llm_call_fn,
+                stream_round_fn=stream_round_fn,
+                log_round_summary_fn=log_round_summary_fn,
+                warning_fn=warnings.append,
+                clock=clock,
+                on_step_started=marked_step_ids.append,
+            ),
         )
 
         self.assertEqual(marked_step_ids, ["step-summary"])
@@ -216,31 +257,33 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         marked_step_ids = []
 
         outcome = await run_limit_summary_step(
-            conversation_id="conv-1",
-            task_id="task-1",
-            run_id="run-1",
-            step_number=5,
-            model_id="gpt-4",
-            provider="openai",
-            litellm_model="openai/gpt-4",
-            litellm_kwargs={},
-            messages=messages,
-            should_use_reasoning=False,
-            content_blocks=content_blocks,
-            call_kwargs={"tools": [], "tool_choice": "auto"},
-            accumulated_usage=accumulated_usage,
-            emitter=emitter,
-            session_cache=session_cache,
-            total_timeout_s=2,
-            run_start=0.0,
-            start_step_fn=start_step_fn,
-            complete_step_fn=complete_step_fn,
-            llm_call_fn=llm_call_fn,
-            stream_round_fn=stream_round_fn,
-            log_round_summary_fn=log_round_summary_fn,
-            warning_fn=warnings.append,
-            clock=lambda: 10.0,
-            on_step_started=marked_step_ids.append,
+            request=LimitSummaryStepRequest(
+                conversation_id="conv-1",
+                task_id="task-1",
+                run_id="run-1",
+                step_number=5,
+                model_id="gpt-4",
+                provider="openai",
+                litellm_model="openai/gpt-4",
+                litellm_kwargs={},
+                messages=messages,
+                should_use_reasoning=False,
+                content_blocks=content_blocks,
+                call_kwargs={"tools": [], "tool_choice": "auto"},
+                accumulated_usage=accumulated_usage,
+                emitter=emitter,
+                session_cache=session_cache,
+                total_timeout_s=2,
+                run_start=0.0,
+                start_step_fn=start_step_fn,
+                complete_step_fn=complete_step_fn,
+                llm_call_fn=llm_call_fn,
+                stream_round_fn=stream_round_fn,
+                log_round_summary_fn=log_round_summary_fn,
+                warning_fn=warnings.append,
+                clock=lambda: 10.0,
+                on_step_started=marked_step_ids.append,
+            ),
         )
 
         self.assertEqual(marked_step_ids, ["step-timeout"])
@@ -252,3 +295,68 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(warnings), 1)
         self.assertIn("触顶总结超出剩余预算", warnings[0])
         self.assertIn("conv_id=conv-1", warnings[0])
+
+    async def test_run_limit_summary_step_reraises_non_timeout_error(self):
+        messages = [{"role": "user", "content": "hi"}]
+        content_blocks = []
+        events = []
+
+        async def start_step_fn(*, emitter, session_cache, run_id, step_number, clock, on_step_started):
+            on_step_started("step-error")
+            events.append(("start", step_number))
+            return AgentStepContext(
+                step_id="step-error",
+                step_number=step_number,
+                started_at=100.0,
+                thinking_block_id="blk-thinking",
+                text_block_id="blk-text",
+            )
+
+        async def llm_call_fn(*_args, **_kwargs):
+            events.append(("llm",))
+            raise RuntimeError("upstream LLM 5xx")
+
+        async def stream_round_fn(*_args, **_kwargs):
+            events.append(("stream",))
+            return "", "", [], "stop", None
+
+        def log_round_summary_fn(**kwargs):
+            events.append(("log", kwargs))
+
+        async def complete_step_fn(**_kwargs):
+            events.append(("complete",))
+
+        with self.assertRaises(RuntimeError) as cm:
+            await run_limit_summary_step(
+                request=LimitSummaryStepRequest(
+                    conversation_id="conv-1",
+                    task_id="task-1",
+                    run_id="run-1",
+                    step_number=6,
+                    model_id="gpt-4",
+                    provider="openai",
+                    litellm_model="openai/gpt-4",
+                    litellm_kwargs={},
+                    messages=messages,
+                    should_use_reasoning=False,
+                    content_blocks=content_blocks,
+                    call_kwargs={"tools": [], "tool_choice": "auto"},
+                    accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+                    emitter=object(),
+                    session_cache=object(),
+                    total_timeout_s=300,
+                    run_start=0.0,
+                    start_step_fn=start_step_fn,
+                    complete_step_fn=complete_step_fn,
+                    llm_call_fn=llm_call_fn,
+                    stream_round_fn=stream_round_fn,
+                    log_round_summary_fn=log_round_summary_fn,
+                    warning_fn=None,
+                    clock=lambda: 10.0,
+                    on_step_started=lambda _step_id: None,
+                ),
+            )
+
+        self.assertIn("upstream LLM 5xx", str(cm.exception))
+        self.assertEqual([event[0] for event in events], ["start", "llm"])
+        self.assertEqual(content_blocks, [])

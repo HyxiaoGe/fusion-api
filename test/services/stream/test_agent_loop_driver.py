@@ -123,8 +123,9 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
 
         async def run_limit_summary_step_fn(**kwargs):
             summary_calls.append(kwargs)
-            kwargs["content_blocks"].append(TextBlock(type="text", id="summary-text", text="总结回答"))
-            kwargs["on_step_started"]("summary-step")
+            request = kwargs["request"]
+            request.content_blocks.append(TextBlock(type="text", id="summary-text", text="总结回答"))
+            request.on_step_started("summary-step")
             return LimitSummaryOutcome(accumulated_usage=Usage(input_tokens=11, output_tokens=13))
 
         outcome = await run_agent_loop(
@@ -146,7 +147,8 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.current_step_id, None)
         self.assertEqual(state.accumulated_usage, Usage(input_tokens=11, output_tokens=13))
         self.assertEqual(state.content_blocks[-1].text, "总结回答")
-        self.assertEqual(summary_calls[0]["step_number"], 9)
+        self.assertEqual(summary_calls[0]["request"].step_number, 9)
+        self.assertEqual(summary_calls[0]["request"].messages[0], {"role": "user", "content": "hi"})
 
     async def test_immediate_timeout_marks_timeout_and_runs_summary_step(self):
         state = AgentLoopState()
@@ -155,7 +157,7 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
 
         async def run_limit_summary_step_fn(**kwargs):
             summary_calls.append(kwargs)
-            kwargs["on_step_started"]("summary-timeout-step")
+            kwargs["request"].on_step_started("summary-timeout-step")
             return LimitSummaryOutcome(accumulated_usage=Usage(input_tokens=1, output_tokens=1))
 
         outcome = await run_agent_loop(
@@ -176,7 +178,7 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.finish_reason, "timeout")
         self.assertEqual(state.step, 1)
         self.assertEqual(state.current_step_id, None)
-        self.assertEqual(summary_calls[0]["step_number"], 1)
+        self.assertEqual(summary_calls[0]["request"].step_number, 1)
 
     async def test_tool_calls_round_delegates_and_continues_to_stop(self):
         state = AgentLoopState()

@@ -9,6 +9,7 @@ from app.services.stream.agent_loop_policy import check_agent_loop_limit
 from app.services.stream.agent_loop_runtime import AgentLoopRuntime
 from app.services.stream.agent_loop_state import AgentLoopState
 from app.services.stream.agent_round import AgentRoundResult
+from app.services.stream.limit_summary import LimitSummaryStepRequest
 from app.services.stream.round_completion import append_round_content_blocks, complete_text_response_step
 from app.services.stream.step_lifecycle import AgentStepContext
 
@@ -252,31 +253,33 @@ async def _run_limit_summary(
 ) -> None:
     step_number = state.next_step_number()
     summary_outcome = await runtime.run_limit_summary_step_fn(
-        conversation_id=runtime.conversation_id,
-        task_id=runtime.task_id,
-        run_id=runtime.run_id,
-        step_number=step_number,
-        model_id=runtime.model_id,
-        provider=runtime.provider,
-        litellm_model=runtime.litellm_model,
-        litellm_kwargs=runtime.litellm_kwargs,
-        messages=messages,
-        should_use_reasoning=runtime.should_use_reasoning,
-        content_blocks=state.content_blocks,
-        call_kwargs=runtime.call_kwargs,
-        accumulated_usage=state.accumulated_usage,
-        emitter=runtime.emitter,
-        session_cache=runtime.session_cache,
-        total_timeout_s=runtime.limits.total_timeout_s,
-        run_start=runtime.run_start,
-        start_step_fn=runtime.start_step_fn,
-        complete_step_fn=runtime.complete_step_fn,
-        llm_call_fn=runtime.llm_call_fn,
-        stream_round_fn=runtime.stream_round_fn,
-        log_round_summary_fn=runtime.log_round_summary_fn,
-        warning_fn=runtime.warning_fn,
-        clock=runtime.clock,
-        on_step_started=state.mark_current_step,
+        request=LimitSummaryStepRequest(
+            conversation_id=runtime.conversation_id,
+            task_id=runtime.task_id,
+            run_id=runtime.run_id,
+            step_number=step_number,
+            model_id=runtime.model_id,
+            provider=runtime.provider,
+            litellm_model=runtime.litellm_model,
+            litellm_kwargs=runtime.litellm_kwargs,
+            messages=messages,
+            should_use_reasoning=runtime.should_use_reasoning,
+            content_blocks=state.content_blocks,
+            call_kwargs=runtime.call_kwargs,
+            accumulated_usage=state.accumulated_usage,
+            emitter=runtime.emitter,
+            session_cache=runtime.session_cache,
+            total_timeout_s=runtime.limits.total_timeout_s,
+            run_start=runtime.run_start,
+            start_step_fn=runtime.start_step_fn,
+            complete_step_fn=runtime.complete_step_fn,
+            llm_call_fn=runtime.llm_call_fn,
+            stream_round_fn=runtime.stream_round_fn,
+            log_round_summary_fn=runtime.log_round_summary_fn,
+            warning_fn=runtime.warning_fn,
+            clock=runtime.clock,
+            on_step_started=state.mark_current_step,
+        ),
     )
     state.update_usage(summary_outcome.accumulated_usage)
     state.clear_current_step()
