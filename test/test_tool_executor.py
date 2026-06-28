@@ -6,7 +6,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.stream import tool_executor as tool_executor_module
 from app.services.stream.tool_execution_result import ToolExecutionRecord
-from app.services.stream.tool_executor import _should_retry_tool_result, execute_tools_parallel
+from app.services.stream.tool_executor import (
+    AgentEventCompositeWriter,
+    _should_retry_tool_result,
+    execute_tools_parallel,
+)
 from app.services.tool_handlers.base import ToolResult
 
 
@@ -16,6 +20,31 @@ class ToolRetryPolicyTests(unittest.TestCase):
         result = ToolResult(status="degraded", error_message="reader-service 暂时未返回内容")
 
         self.assertFalse(_should_retry_tool_result(result))
+
+
+class AgentEventCompositeWriterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_writes_redis_before_recorder(self):
+        calls = []
+
+        class RedisWriter:
+            async def append_chunk(self, conversation_id, chunk_type, payload):
+                calls.append(("redis", conversation_id, chunk_type, payload))
+
+        class Recorder:
+            def record_chunk(self, conversation_id, chunk_type, payload):
+                calls.append(("recorder", conversation_id, chunk_type, payload))
+
+        writer = AgentEventCompositeWriter(redis_writer=RedisWriter(), recorder=Recorder())
+
+        await writer.append_chunk("c1", "agent_event", {"type": "run_progress_updated"})
+
+        self.assertEqual(
+            calls,
+            [
+                ("redis", "c1", "agent_event", {"type": "run_progress_updated"}),
+                ("recorder", "c1", "agent_event", {"type": "run_progress_updated"}),
+            ],
+        )
 
 
 class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):
@@ -248,6 +277,63 @@ class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(handler.log.await_args.kwargs["message_id"], "assistant-1")
         self.assertEqual(handler.log.await_args.kwargs["trace_id"], "trace-1")
         self.assertEqual(handler.log.await_args.kwargs["step_number"], 2)
+
+    async def test_execute_tools_parallel_with_emitter_emits_tool_digest_and_evidence(self):
+        handler = MagicMock()
+        handler.tool_name = "web_search"
+        handler.execute = AsyncMock(
+            return_value=ToolResult(
+                status="success",
+                data={
+                    "sources": [
+                        {
+                            "title": "官方发布页",
+                            "url": "https://example.com/news",
+                            "description": "官方页面确认发布时间。",
+                            "content": "官方页面确认发布时间，并给出原始公告。",
+                        }
+                    ]
+                },
+            )
+        )
+        handler.log = AsyncMock()
+        handler._build_result_summary.return_value = {
+            "kind": "search",
+            "title": "找到 1 条搜索结果",
+            "count": 1,
+            "truncated": False,
+        }
+        emitter = AsyncMock()
+        tool_call = {"id": "call-1", "name": "web_search", "arguments": {"query": "redis stream"}}
+
+        with patch("app.services.tool_handlers.get_handler", return_value=handler):
+            await execute_tools_parallel(
+                [tool_call],
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="gpt-4",
+                provider="openai",
+                trace_id="trace-1",
+                step_number=2,
+                message_id="assistant-1",
+                emitter=emitter,
+            )
+
+        emitter.tool_result_digest.assert_awaited_once()
+        digest_kwargs = emitter.tool_result_digest.await_args.kwargs
+        self.assertEqual(digest_kwargs["tool_call_id"], "call-1")
+        self.assertEqual(digest_kwargs["tool_name"], "web_search")
+        self.assertEqual(digest_kwargs["status"], "success")
+        self.assertEqual(digest_kwargs["title"], "找到 1 条搜索结果")
+        self.assertEqual(digest_kwargs["source_refs"], ["ev-call-1-0"])
+        self.assertLessEqual(len(digest_kwargs["key_findings"]), 5)
+
+        emitter.evidence_item_upserted.assert_awaited_once()
+        evidence_kwargs = emitter.evidence_item_upserted.await_args.kwargs
+        self.assertEqual(evidence_kwargs["tool_call_id"], "call-1")
+        self.assertEqual(evidence_kwargs["evidence"]["id"], "ev-call-1-0")
+        self.assertEqual(evidence_kwargs["evidence"]["title"], "官方发布页")
+        self.assertEqual(evidence_kwargs["evidence"]["domain"], "example.com")
 
     async def test_execute_tools_parallel_uses_network_budget_normalized_args_for_handler_and_log(self):
         from app.services.stream.network_budget import NetworkToolBudget

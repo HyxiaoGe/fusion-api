@@ -5,7 +5,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
-from app.db.models import AgentSession
+from app.db.models import AgentProgressSnapshot, AgentSession
 from app.db.models import Conversation as ConversationModel
 from app.db.models import Message as MessageModel
 from app.db.repositories import ConversationRepository
@@ -149,6 +149,68 @@ class MessageRepositoryTests(unittest.TestCase):
             self.assertEqual(result.messages[0].agent_run.run_id, "run-new")
             self.assertEqual(result.messages[0].agent_run.status, "completed")
             self.assertIsNone(result.messages[0].agent_run.limit_reason)
+        finally:
+            db.close()
+            engine.dispose()
+
+    def test_get_by_id_attaches_latest_agent_progress_snapshot(self):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+        db = Session()
+        try:
+            conversation = ConversationModel(
+                id="conv-1",
+                user_id="user-1",
+                title="会话",
+                model_id="deepseek-chat",
+                created_at=datetime(2026, 6, 28, 10, 0, 0),
+                updated_at=datetime(2026, 6, 28, 10, 0, 0),
+            )
+            message = MessageModel(
+                id="msg-1",
+                conversation_id="conv-1",
+                role="assistant",
+                content=[{"type": "text", "id": "blk_1", "text": "回答"}],
+                model_id="deepseek-chat",
+                created_at=datetime(2026, 6, 28, 10, 0, 1),
+            )
+            run = AgentSession(
+                id="run-new",
+                conversation_id="conv-1",
+                message_id="msg-1",
+                user_id="user-1",
+                model_id="deepseek-chat",
+                provider="deepseek",
+                total_steps=1,
+                total_tool_calls=1,
+                status="completed",
+                created_at=datetime(2026, 6, 28, 10, 2, 0),
+            )
+            snapshot = AgentProgressSnapshot(
+                run_id="run-new",
+                conversation_id="conv-1",
+                message_id="msg-1",
+                user_id="user-1",
+                protocol_version=2,
+                state={
+                    "run_id": "run-new",
+                    "message_id": "msg-1",
+                    "status": "completed",
+                    "progress": {"phase": "answering", "label": "正在整理回答"},
+                    "plan": {"plan_id": "plan-run-new", "revision": 1, "items": []},
+                    "tool_digests": [],
+                    "evidence": [],
+                },
+            )
+            db.add_all([conversation, message, run, snapshot])
+            db.commit()
+
+            result = ConversationRepository(db).get_by_id("conv-1", "user-1")
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result.messages[0].agent_run.run_id, "run-new")
+            self.assertEqual(result.messages[0].agent_run.progress["plan"]["plan_id"], "plan-run-new")
         finally:
             db.close()
             engine.dispose()

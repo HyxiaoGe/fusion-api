@@ -31,6 +31,7 @@ class StepLifecycleTests(unittest.IsolatedAsyncioTestCase):
             context,
             AgentStepContext(
                 step_id="step-1",
+                run_id="run-1",
                 step_number=3,
                 started_at=10.5,
                 thinking_block_id="blk_thinking",
@@ -123,6 +124,35 @@ class StepLifecycleTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_start_agent_step_updates_progress_plan_when_emitter_supports_v2(self):
+        emitter = Mock()
+        emitter.step_started = AsyncMock(return_value="step-1")
+        emitter.plan_step_updated = AsyncMock()
+        session_cache = Mock()
+        session_cache.write_step_started = AsyncMock()
+
+        await start_agent_step(
+            emitter=emitter,
+            session_cache=session_cache,
+            run_id="run-1",
+            step_number=1,
+            clock=Mock(return_value=10.5),
+            block_id_factory=Mock(side_effect=["blk_thinking", "blk_text"]),
+        )
+
+        emitter.plan_step_updated.assert_awaited_once_with(
+            plan_id="plan-run-1",
+            revision=2,
+            item={
+                "id": "search",
+                "title": "查找资料",
+                "status": "running",
+                "kind": "search",
+                "tool_names": [],
+                "evidence_item_ids": [],
+            },
+        )
+
     async def test_complete_agent_step_emits_completed_before_cache_write_and_returns_duration(self):
         emitter = Mock()
         emitter.step_completed = AsyncMock()
@@ -133,6 +163,7 @@ class StepLifecycleTests(unittest.IsolatedAsyncioTestCase):
         order.attach_mock(session_cache.write_step_completed, "write_step_completed")
         context = AgentStepContext(
             step_id="step-1",
+            run_id="run-1",
             step_number=3,
             started_at=10.0,
             thinking_block_id="blk_thinking",
@@ -160,4 +191,51 @@ class StepLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     duration_ms=250,
                 ),
             ],
+        )
+
+    async def test_complete_agent_step_updates_progress_plan_when_emitter_supports_v2(self):
+        emitter = Mock()
+        emitter.step_completed = AsyncMock()
+        emitter.plan_step_updated = AsyncMock()
+        emitter.run_progress_updated = AsyncMock()
+        session_cache = Mock()
+        session_cache.write_step_completed = AsyncMock()
+        context = AgentStepContext(
+            step_id="step-1",
+            run_id="run-1",
+            step_number=1,
+            started_at=10.0,
+            thinking_block_id="blk_thinking",
+            text_block_id="blk_text",
+        )
+
+        await complete_agent_step(
+            context=context,
+            emitter=emitter,
+            session_cache=session_cache,
+            tool_names=("web_search",),
+            tool_call_count=1,
+            clock=Mock(return_value=10.25),
+        )
+
+        emitter.plan_step_updated.assert_awaited_once_with(
+            plan_id="plan-run-1",
+            revision=3,
+            item={
+                "id": "search",
+                "title": "查找资料",
+                "status": "completed",
+                "kind": "search",
+                "summary": "完成 1 个工具调用",
+                "tool_names": ["web_search"],
+                "evidence_item_ids": [],
+            },
+        )
+        emitter.run_progress_updated.assert_awaited_once_with(
+            phase="reading",
+            label="正在读取关键来源",
+            completed_steps=2,
+            total_steps=None,
+            completed_tool_calls=1,
+            max_tool_calls=None,
         )

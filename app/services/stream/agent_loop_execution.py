@@ -8,12 +8,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.services.agent.emitter import AgentEventEmitter
+from app.services.agent.progress_recorder import AgentProgressRecorder
 from app.services.stream.agent_loop_policy import AgentLoopLimits
 from app.services.stream.agent_loop_request_prep import AgentLoopCallConfig
 from app.services.stream.agent_loop_run_completion import AgentLoopRunCompletionContext
 from app.services.stream.agent_loop_runtime import AgentLoopRuntime
 from app.services.stream.agent_loop_state import AgentLoopState
 from app.services.stream.network_budget import NetworkToolBudget
+from app.services.stream.tool_executor import AgentEventCompositeWriter
 
 
 @dataclass(frozen=True)
@@ -75,11 +77,22 @@ def _build_execution_parts(
     dependencies: AgentLoopDependencies,
 ) -> AgentLoopExecutionParts:
     run_id = request.trace_id or str(uuid.uuid4())
+    progress_recorder = AgentProgressRecorder(
+        db=request.db,
+        run_id=run_id,
+        conversation_id=request.conversation_id,
+        message_id=request.assistant_message_id,
+        user_id=request.user_id,
+    )
+    event_writer = AgentEventCompositeWriter(
+        redis_writer=dependencies.redis_writer,
+        recorder=progress_recorder,
+    )
     emitter = AgentEventEmitter(
         run_id=run_id,
         trace_id=run_id,
         conversation_id=request.conversation_id,
-        redis_writer=dependencies.redis_writer,
+        redis_writer=event_writer,
     )
     return AgentLoopExecutionParts(
         run_id=run_id,

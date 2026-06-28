@@ -15,6 +15,7 @@ import backoff
 
 from app.core.logger import app_logger as logger
 from app.services.agent.emitter import AgentEventEmitter
+from app.services.agent.progress_digest import build_evidence_items, build_tool_result_digest
 from app.services.stream.tool_call_lifecycle import (
     emit_tool_call_result,
     emit_tool_call_started,
@@ -78,6 +79,19 @@ class AgentEventRedisWriter:
             json.dumps(payload, ensure_ascii=False),
             "",  # block_id 不适用于 agent_event chunk
         )
+
+
+class AgentEventCompositeWriter:
+    """agent_event 双写 adapter：先写 Redis，再旁路记录 progress snapshot。"""
+
+    def __init__(self, *, redis_writer: AgentEventRedisWriter, recorder=None) -> None:
+        self.redis_writer = redis_writer
+        self.recorder = recorder
+
+    async def append_chunk(self, conversation_id: str, chunk_type: str, payload: dict) -> None:
+        await self.redis_writer.append_chunk(conversation_id, chunk_type, payload)
+        if self.recorder is not None:
+            self.recorder.record_chunk(conversation_id, chunk_type, payload)
 
 
 @backoff.on_predicate(
@@ -234,6 +248,24 @@ async def log_tool_execution(
     )
 
 
+async def emit_progress_digest_events(
+    *,
+    request: ToolExecutionBatchRequest,
+    record: ToolExecutionRecord,
+) -> None:
+    if request.emitter is None:
+        return
+    try:
+        await request.emitter.tool_result_digest(**build_tool_result_digest(record))
+        for evidence in build_evidence_items(record):
+            await request.emitter.evidence_item_upserted(
+                tool_call_id=str(record.tool_call.get("id", "")),
+                evidence=evidence,
+            )
+    except Exception as error:  # noqa: BLE001 — v2 进度事件失败不能中断工具结果主链路
+        logger.warning(f"工具 digest 事件发送失败: tool={record.tool_name}, error={error}")
+
+
 async def execute_one_tool_call(request: ToolExecutionBatchRequest, tool_call: dict) -> ToolExecutionRecord:
     handler = resolve_tool_handler(tool_call["name"])
     ids = new_tool_execution_ids()
@@ -253,7 +285,9 @@ async def execute_one_tool_call(request: ToolExecutionBatchRequest, tool_call: d
         result = await execute_tool_handler(request=request, tool_call=tool_call, handler=handler, args=args)
 
     await log_tool_execution(request=request, handler=handler, ids=ids, result=result, args=args)
-    return build_tool_execution_record(tool_call=tool_call, result=result, handler=handler, ids=ids)
+    record = build_tool_execution_record(tool_call=tool_call, result=result, handler=handler, ids=ids)
+    await emit_progress_digest_events(request=request, record=record)
+    return record
 
 
 async def execute_tool_batch(

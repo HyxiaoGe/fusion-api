@@ -234,7 +234,17 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             result.event_types,
-            ["run_started", "step_started", "step_completed", "run_completed"],
+            [
+                "run_started",
+                "run_progress_updated",
+                "plan_snapshot",
+                "step_started",
+                "plan_step_updated",
+                "step_completed",
+                "plan_step_updated",
+                "run_progress_updated",
+                "run_completed",
+            ],
         )
         self.assertEqual(
             result.finalize_calls[-1],
@@ -294,12 +304,22 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             result.event_types,
             [
                 "run_started",
+                "run_progress_updated",
+                "plan_snapshot",
                 "step_started",
+                "plan_step_updated",
                 "tool_call_started",
                 "tool_call_completed",
+                "tool_result_digest",
+                "evidence_item_upserted",
                 "step_completed",
+                "plan_step_updated",
+                "run_progress_updated",
                 "step_started",
+                "plan_step_updated",
                 "step_completed",
+                "plan_step_updated",
+                "run_progress_updated",
                 "run_completed",
             ],
         )

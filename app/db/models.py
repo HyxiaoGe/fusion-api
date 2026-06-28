@@ -213,6 +213,32 @@ class AgentSession(Base):
     )
 
 
+class AgentProgressSnapshot(Base):
+    """Agent 可读进度 compact snapshot — 按 run_id 保存最新折叠状态"""
+
+    __tablename__ = "agent_progress_snapshots"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    run_id = Column(String, ForeignKey("agent_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    conversation_id = Column(
+        String,
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    message_id = Column(String, nullable=True, index=True)
+    user_id = Column(String, nullable=False, index=True)
+    protocol_version = Column(Integer, nullable=False, default=2)
+    state = Column(JSONB, nullable=False)
+    created_at = Column(DateTime, default=get_china_time, index=True)
+    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("run_id", name="uq_agent_progress_snapshots_run_id"),
+        Index("ix_agent_progress_message_updated", "conversation_id", "message_id", "updated_at"),
+    )
+
+
 class AgentStep(Base):
     """Agent 单步执行记录 — 每步工具调用完成后写入"""
 

@@ -1,4 +1,5 @@
 """agent_event 协议 — 10 个事件模型 + 共享 envelope."""
+
 from __future__ import annotations
 
 from typing import Annotated, Any, Literal
@@ -8,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class AgentEventBase(BaseModel):
     """所有 agent_event 的共享 envelope 字段."""
+
     model_config = ConfigDict(extra="forbid")
     type: str
     run_id: str
@@ -87,8 +89,97 @@ class RunCompleted(AgentEventBase):
     finish_reason: Literal["stop", "limit_reached", "incomplete"]
 
 
+AgentProgressPhase = Literal[
+    "planning", "thinking", "researching", "reading", "synthesizing", "answering", "recovering"
+]
+AgentPlanItemStatus = Literal["pending", "running", "completed", "failed", "skipped", "blocked"]
+AgentPlanItemKind = Literal["reasoning", "search", "read", "synthesis", "answer", "other"]
+
+
+class AgentPlanItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str
+    title: str
+    status: AgentPlanItemStatus
+    kind: AgentPlanItemKind
+    summary: str | None = None
+    tool_names: list[str] = Field(default_factory=list)
+    evidence_item_ids: list[str] = Field(default_factory=list)
+
+
+class AgentEvidenceItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str
+    kind: Literal["web", "file", "tool", "model"]
+    status: Literal["candidate", "used", "discarded"]
+    title: str
+    url: str | None = None
+    domain: str | None = None
+    claim: str
+    snippet: str | None = None
+    used_by_final_answer: bool = False
+
+
+class RunProgressUpdated(AgentEventBase):
+    type: Literal["run_progress_updated"]
+    protocol_version: Literal[2]
+    phase: AgentProgressPhase
+    label: str
+    completed_steps: int | None = None
+    total_steps: int | None = None
+    completed_tool_calls: int | None = None
+    max_tool_calls: int | None = None
+
+
+class PlanSnapshot(AgentEventBase):
+    type: Literal["plan_snapshot"]
+    protocol_version: Literal[2]
+    plan_id: str
+    revision: int
+    items: list[AgentPlanItem]
+
+
+class PlanStepUpdated(AgentEventBase):
+    type: Literal["plan_step_updated"]
+    protocol_version: Literal[2]
+    plan_id: str
+    revision: int
+    item: AgentPlanItem
+
+
+class ToolResultDigest(AgentEventBase):
+    type: Literal["tool_result_digest"]
+    protocol_version: Literal[2]
+    tool_name: str
+    status: Literal["success", "failed", "degraded", "interrupted"]
+    title: str
+    summary: str
+    key_findings: list[str] = Field(default_factory=list)
+    source_refs: list[str] = Field(default_factory=list)
+    truncated: bool = False
+
+
+class EvidenceItemUpserted(AgentEventBase):
+    type: Literal["evidence_item_upserted"]
+    protocol_version: Literal[2]
+    evidence: AgentEvidenceItem
+
+
 AnyAgentEvent = Annotated[
-    RunStarted | StepStarted | ToolCallStarted | ToolCallDelta | ToolCallCompleted
-    | StepCompleted | RunLimitReached | RunInterrupted | RunFailed | RunCompleted,
+    RunStarted
+    | StepStarted
+    | ToolCallStarted
+    | ToolCallDelta
+    | ToolCallCompleted
+    | StepCompleted
+    | RunLimitReached
+    | RunInterrupted
+    | RunFailed
+    | RunCompleted
+    | RunProgressUpdated
+    | PlanSnapshot
+    | PlanStepUpdated
+    | ToolResultDigest
+    | EvidenceItemUpserted,
     Field(discriminator="type"),
 ]

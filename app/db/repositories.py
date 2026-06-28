@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session, joinedload
 
-from app.db.models import AgentSession, ConversationFile, File, get_china_time
+from app.db.models import AgentProgressSnapshot, AgentSession, ConversationFile, File, get_china_time
 from app.db.models import Conversation as ConversationModel
 from app.db.models import Message as MessageModel
 from app.db.models import SocialAccount as SocialAccountModel
@@ -424,8 +424,7 @@ class ConversationRepository:
             [msg.id for msg in db_conversation.messages if msg.role == "assistant"],
         )
         messages = [
-            self._convert_message_to_schema(msg, agent_run=agent_runs.get(msg.id))
-            for msg in db_conversation.messages
+            self._convert_message_to_schema(msg, agent_run=agent_runs.get(msg.id)) for msg in db_conversation.messages
         ]
         return Conversation(
             id=db_conversation.id,
@@ -454,17 +453,31 @@ class ConversationRepository:
             .order_by(AgentSession.message_id.asc(), AgentSession.created_at.desc(), AgentSession.id.desc())
             .all()
         )
-        latest_by_message_id: dict[str, AgentRunSummary] = {}
+        latest_rows_by_message_id: dict[str, AgentSession] = {}
         for row in rows:
-            if not row.message_id or row.message_id in latest_by_message_id:
+            if not row.message_id or row.message_id in latest_rows_by_message_id:
                 continue
-            latest_by_message_id[row.message_id] = AgentRunSummary(
+            latest_rows_by_message_id[row.message_id] = row
+
+        run_ids = [row.id for row in latest_rows_by_message_id.values()]
+        snapshots = (
+            self.db.query(AgentProgressSnapshot).filter(AgentProgressSnapshot.run_id.in_(run_ids)).all()
+            if run_ids
+            else []
+        )
+        snapshots_by_run_id = {snapshot.run_id: snapshot for snapshot in snapshots}
+
+        latest_by_message_id: dict[str, AgentRunSummary] = {}
+        for message_id, row in latest_rows_by_message_id.items():
+            snapshot = snapshots_by_run_id.get(row.id)
+            latest_by_message_id[message_id] = AgentRunSummary(
                 run_id=row.id,
                 status=row.status,
                 config=row.run_config or {},
                 total_steps=row.total_steps or 0,
                 total_tool_calls=row.total_tool_calls or 0,
                 limit_reason=row.limit_reason if row.status == "limit_reached" else None,
+                progress=snapshot.state if snapshot else None,
             )
         return latest_by_message_id
 

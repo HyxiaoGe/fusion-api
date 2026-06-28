@@ -39,9 +39,14 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
     def _limits(self):
         return AgentLoopLimits(max_steps=3, max_tool_calls=5, total_timeout_s=30)
 
-    def _execution(self, *, call_config=None, limits=None):
+    def _execution(self, *, call_config=None, limits=None, redis_writer=None):
         call_config = call_config or self._call_config()
         limits = limits or self._limits()
+
+        class NoopWriter:
+            async def append_chunk(self, *_args, **_kwargs):
+                return None
+
         return build_agent_loop_execution(
             request=AgentLoopExecutionRequest(
                 db="db",
@@ -59,7 +64,7 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
             limits=limits,
             dependencies=ExecutionDependencies(
                 session_cache="session-cache",
-                redis_writer="redis-writer",
+                redis_writer=redis_writer or NoopWriter(),
                 start_step_fn=_unused_async,
                 complete_step_fn=_unused_async,
                 run_round_fn=_unused_async,
@@ -194,6 +199,44 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call_order[3][1], [{"role": "user", "content": "prepared"}])
         self.assertEqual(call_order[3][2], [initial_block])
         self.assertIs(call_order[4][1], execution.completion_context)
+
+    async def test_start_run_emits_initial_progress_and_plan_snapshot(self):
+        emitted = []
+
+        class CaptureWriter:
+            async def append_chunk(self, _conversation_id, chunk_type, payload):
+                if chunk_type == "agent_event":
+                    emitted.append(payload)
+
+        execution = self._execution(redis_writer=CaptureWriter())
+        call_config = self._call_config()
+        limits = self._limits()
+
+        async def start_agent_run_fn(**kwargs):
+            await kwargs["emitter"].run_started(
+                message_id=kwargs["message_id"],
+                model=kwargs["model_id"],
+                tools=kwargs["tools"],
+                config=kwargs["config"],
+            )
+
+        await run_agent_loop_lifecycle(
+            request=self._request(call_config=call_config, limits=limits),
+            execution=execution,
+            dependencies=self._dependencies(start_agent_run_fn=start_agent_run_fn),
+        )
+
+        types = [event["type"] for event in emitted]
+        self.assertEqual(types[:3], ["run_started", "run_progress_updated", "plan_snapshot"])
+        progress = emitted[1]
+        plan = emitted[2]
+        self.assertEqual(progress["phase"], "planning")
+        self.assertEqual(progress["label"], "正在理解问题")
+        self.assertEqual(progress["completed_steps"], 0)
+        self.assertEqual(progress["total_steps"], 4)
+        self.assertEqual(progress["max_tool_calls"], limits.max_tool_calls)
+        self.assertEqual(plan["plan_id"], "plan-run-life")
+        self.assertEqual([item["id"] for item in plan["items"]], ["understand", "search", "read", "answer"])
 
     async def test_lifecycle_passes_continuation_inputs_and_preserves_existing_blocks_first(self):
         call_order = []

@@ -11,6 +11,7 @@ from app.services.stream.agent_loop_execution import (
 from app.services.stream.agent_loop_policy import AgentLoopLimits
 from app.services.stream.agent_loop_state import AgentLoopState
 from app.services.stream.network_budget import NetworkToolBudget
+from app.services.stream.tool_executor import AgentEventCompositeWriter
 
 
 async def _unused_async(**_kwargs):
@@ -101,6 +102,46 @@ class AgentLoopExecutionTests(unittest.TestCase):
         self.assertEqual(execution.completion_context.assistant_message_id, "msg-1")
         self.assertEqual(execution.completion_context.session_cache, "session-cache")
         self.assertEqual(execution.completion_context.duration_ms_factory(), 2500)
+
+    def test_build_execution_context_wraps_redis_writer_with_progress_recorder(self):
+        call_config = SimpleNamespace(
+            should_use_reasoning=False,
+            call_kwargs={},
+        )
+
+        class RedisWriter:
+            async def append_chunk(self, conversation_id, chunk_type, payload):
+                return None
+
+        dependencies = self._dependencies(clock=lambda: 100.0)
+        dependencies = AgentLoopDependencies(
+            **{
+                **dependencies.__dict__,
+                "redis_writer": RedisWriter(),
+            }
+        )
+
+        execution = build_agent_loop_execution(
+            request=AgentLoopExecutionRequest(
+                db="db",
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="gpt-4",
+                litellm_model="openai/gpt-4",
+                litellm_kwargs={},
+                provider="openai",
+                assistant_message_id="msg-1",
+                task_id="task-1",
+                call_config=call_config,
+                trace_id="run-1",
+            ),
+            limits=AgentLoopLimits(max_steps=1, max_tool_calls=1, total_timeout_s=1),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(execution.emitter._writer, AgentEventCompositeWriter)
+        self.assertEqual(execution.emitter._writer.recorder.run_id, "run-1")
+        self.assertEqual(execution.emitter._writer.recorder.message_id, "msg-1")
 
     def test_build_execution_context_generates_run_id_when_trace_id_missing(self):
         call_config = SimpleNamespace(

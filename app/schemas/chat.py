@@ -144,6 +144,7 @@ class AgentRunSummary(BaseModel):
     total_steps: int = 0
     total_tool_calls: int = 0
     limit_reason: Optional[Literal["max_steps", "max_tool_calls", "timeout"]] = None
+    progress: Optional[Dict[str, Any]] = None
 
 
 # ============================================================
