@@ -108,8 +108,28 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
             order.append(("execute", tool_calls, conversation_id, user_id, model_id, provider, kwargs))
             return [record]
 
-        async def complete_step_fn(*, context, emitter, session_cache, tool_names, tool_call_count, clock):
-            order.append(("complete", tool_names, tool_call_count, clock(), "extra_body" in call_kwargs))
+        async def complete_step_fn(
+            *,
+            context,
+            emitter,
+            session_cache,
+            tool_names,
+            tool_call_count,
+            completed_tool_calls,
+            max_tool_calls,
+            clock,
+        ):
+            order.append(
+                (
+                    "complete",
+                    tool_names,
+                    tool_call_count,
+                    completed_tool_calls,
+                    max_tool_calls,
+                    clock(),
+                    "extra_body" in call_kwargs,
+                )
+            )
 
         def on_tools_executed(tool_call_count):
             order.append(("record", tool_call_count))
@@ -147,9 +167,91 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order[0], ("persist", True, ["blk_thinking"], None))
         self.assertEqual(order[2], ("record", 1))
         self.assertEqual(order[3], ("persist", True, ["blk_thinking", "blk_tool"], None))
-        self.assertEqual(order[4], ("complete", ["web_search"], 1, 10.5, True))
+        self.assertEqual(order[4], ("complete", ["web_search"], 1, None, None, 10.5, True))
         self.assertNotIn("extra_body", call_kwargs)
         self.assertEqual(messages[-1], {"role": "tool", "tool_call_id": "tc-1", "content": "LLM 可见工具上下文"})
+
+    async def test_handle_tool_calls_round_marks_plan_running_before_execute_tools(self):
+        tool_call = {"id": "tc-1", "name": "web_search", "arguments": '{"query":"x"}'}
+        handler = Mock()
+        handler.format_llm_context.return_value = "LLM 可见工具上下文"
+        handler.build_content_block.return_value = None
+        record = ToolExecutionRecord(
+            tool_call=tool_call,
+            result=ToolResult(status="success", duration_ms=12),
+            handler=handler,
+            block_id="blk_tool",
+            log_id="log-1",
+        )
+        order = []
+        original_mark_tool_round_started = getattr(tool_round_module, "mark_tool_round_started", None)
+
+        async def mark_tool_round_started(**kwargs):
+            order.append(
+                (
+                    "plan",
+                    kwargs["context"].run_id,
+                    kwargs["tool_call_count"],
+                    kwargs["completed_tool_calls"],
+                    kwargs["max_tool_calls"],
+                )
+            )
+
+        async def execute_tools_fn(*args, **kwargs):
+            order.append(("execute", kwargs["trace_id"], kwargs["network_budget"].max_tool_calls))
+            return [record]
+
+        async def complete_step_fn(**kwargs):
+            order.append(("complete", kwargs["tool_names"], kwargs["tool_call_count"]))
+
+        tool_round_module.mark_tool_round_started = mark_tool_round_started
+        try:
+            await handle_tool_calls_round(
+                request=tool_round_module.ToolRoundRequest(
+                    db="db",
+                    assistant_message_id="msg-1",
+                    conversation_id="conv-1",
+                    user_id="user-1",
+                    model_id="gpt-4",
+                    provider="openai",
+                    content_blocks=[],
+                    messages=[{"role": "user", "content": "hi"}],
+                    tool_calls=[tool_call],
+                    reasoning_buf="",
+                    should_use_reasoning=True,
+                    step_context=AgentStepContext(
+                        step_id="step-1",
+                        run_id="run-1",
+                        step_number=1,
+                        started_at=10.0,
+                        thinking_block_id="blk_thinking",
+                        text_block_id="blk_text",
+                    ),
+                    step_number=1,
+                    run_id="run-1",
+                    emitter=object(),
+                    session_cache=object(),
+                    network_budget=Mock(max_tool_calls=20, completed_tool_calls=0),
+                    call_kwargs={},
+                    persist_message_fn=Mock(),
+                    execute_tools_fn=execute_tools_fn,
+                    complete_step_fn=complete_step_fn,
+                )
+            )
+        finally:
+            if original_mark_tool_round_started is None:
+                delattr(tool_round_module, "mark_tool_round_started")
+            else:
+                tool_round_module.mark_tool_round_started = original_mark_tool_round_started
+
+        self.assertEqual(
+            order,
+            [
+                ("plan", "run-1", 1, 0, 20),
+                ("execute", "run-1", 20),
+                ("complete", ["web_search"], 1),
+            ],
+        )
 
     async def test_handle_tool_calls_round_preserves_order_and_mutates_state(self):
         tool_call = {"id": "tc-1", "name": "web_search", "arguments": '{"query":"x"}'}
@@ -206,7 +308,17 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
             )
             return [record]
 
-        async def complete_step_fn(*, context, emitter, session_cache, tool_names, tool_call_count, clock):
+        async def complete_step_fn(
+            *,
+            context,
+            emitter,
+            session_cache,
+            tool_names,
+            tool_call_count,
+            completed_tool_calls,
+            max_tool_calls,
+            clock,
+        ):
             order.append(
                 (
                     "complete",
@@ -215,6 +327,8 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
                     session_cache,
                     tool_names,
                     tool_call_count,
+                    completed_tool_calls,
+                    max_tool_calls,
                     clock(),
                     "extra_body" in call_kwargs,
                 )
@@ -263,7 +377,10 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(execute_kwargs["step_number"], 3)
         self.assertIs(execute_kwargs["emitter"], emitter)
         self.assertIs(execute_kwargs["network_budget"], network_budget)
-        self.assertEqual(order[4], ("complete", step_context, emitter, session_cache, ["web_search"], 1, 10.5, True))
+        self.assertEqual(
+            order[4],
+            ("complete", step_context, emitter, session_cache, ["web_search"], 1, None, None, 10.5, True),
+        )
         self.assertNotIn("extra_body", call_kwargs)
 
         self.assertEqual(len(content_blocks), 2)

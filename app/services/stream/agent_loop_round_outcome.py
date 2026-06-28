@@ -62,6 +62,8 @@ async def _complete_text_round(request: AgentRoundOutcomeRequest) -> None:
         emitter=request.runtime.emitter,
         session_cache=request.runtime.session_cache,
         complete_step_fn=request.runtime.complete_step_fn,
+        completed_tool_calls=request.state.total_tool_calls,
+        max_tool_calls=request.runtime.limits.max_tool_calls,
         clock=request.runtime.clock,
     )
     request.state.clear_current_step()

@@ -30,6 +30,8 @@ async def complete_text_response_step(
     emitter: AgentStepEmitter,
     session_cache: AgentStepSessionCache,
     complete_step_fn: CompleteStepFn,
+    completed_tool_calls: int | None = None,
+    max_tool_calls: int | None = None,
     clock: Callable[[], float] = time.time,
 ) -> int:
     return await complete_step_fn(
@@ -38,5 +40,7 @@ async def complete_text_response_step(
         session_cache=session_cache,
         tool_names=[],
         tool_call_count=0,
+        completed_tool_calls=completed_tool_calls,
+        max_tool_calls=max_tool_calls,
         clock=clock,
     )

@@ -242,8 +242,17 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 "plan_step_updated",
                 "step_completed",
                 "plan_step_updated",
+                "plan_step_updated",
                 "run_progress_updated",
                 "run_completed",
+            ],
+        )
+        self.assertEqual(
+            [(event["item"]["id"], event["item"]["status"]) for event in result.events if event["type"] == "plan_step_updated"],
+            [
+                ("understand", "running"),
+                ("understand", "completed"),
+                ("answer", "completed"),
             ],
         )
         self.assertEqual(
@@ -308,19 +317,62 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 "plan_snapshot",
                 "step_started",
                 "plan_step_updated",
+                "plan_step_updated",
+                "plan_step_updated",
+                "run_progress_updated",
                 "tool_call_started",
                 "tool_call_completed",
                 "tool_result_digest",
                 "evidence_item_upserted",
                 "step_completed",
                 "plan_step_updated",
+                "plan_step_updated",
                 "run_progress_updated",
                 "step_started",
                 "plan_step_updated",
+                "plan_step_updated",
+                "run_progress_updated",
                 "step_completed",
                 "plan_step_updated",
                 "run_progress_updated",
                 "run_completed",
+            ],
+        )
+        self.assertEqual(
+            [
+                (event["revision"], event["item"]["id"], event["item"]["status"])
+                for event in result.events
+                if event["type"] == "plan_step_updated"
+            ],
+            [
+                (2, "understand", "running"),
+                (3, "understand", "completed"),
+                (4, "search", "running"),
+                (5, "search", "completed"),
+                (6, "read", "running"),
+                (7, "read", "completed"),
+                (8, "answer", "running"),
+                (9, "answer", "completed"),
+            ],
+        )
+        self.assertEqual(
+            [
+                (
+                    event["phase"],
+                    event["label"],
+                    event["completed_steps"],
+                    event["completed_tool_calls"],
+                    event["max_tool_calls"],
+                )
+                for event in result.events
+                if event["type"] == "run_progress_updated"
+            ],
+            [
+                ("planning", "正在理解问题", 0, 0, 20),
+                ("researching", "正在查找资料", 1, 0, 20),
+                ("reading", "正在读取关键来源", 2, 1, 20),
+                ("synthesizing", "正在整理回答", 3, 1, 20),
+                ("answering", "已完成回答整理", 4, 1, 20),
             ],
         )
         self.assertEqual([event["sequence"] for event in result.events], list(range(len(result.events))))

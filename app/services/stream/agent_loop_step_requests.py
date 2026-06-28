@@ -43,6 +43,8 @@ def build_tool_round_request(
         execute_tools_fn=runtime.execute_tools_fn,
         complete_step_fn=runtime.complete_step_fn,
         on_tools_executed=state.record_executed_tool_calls,
+        completed_tool_calls=state.total_tool_calls,
+        max_tool_calls=runtime.limits.max_tool_calls,
         clock=runtime.clock,
     )
 

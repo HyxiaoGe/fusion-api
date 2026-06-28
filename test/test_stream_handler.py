@@ -347,8 +347,17 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                 "plan_step_updated",
                 "step_completed",
                 "plan_step_updated",
+                "plan_step_updated",
                 "run_progress_updated",
                 "run_completed",
+            ],
+        )
+        self.assertEqual(
+            [(e["item"]["id"], e["item"]["status"]) for e in events if e["type"] == "plan_step_updated"],
+            [
+                ("understand", "running"),
+                ("understand", "completed"),
+                ("answer", "completed"),
             ],
         )
         # sequence 严格连续。

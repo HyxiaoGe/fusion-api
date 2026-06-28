@@ -80,6 +80,8 @@ async def _start_next_step(
         session_cache=runtime.session_cache,
         run_id=runtime.run_id,
         step_number=step_number,
+        completed_tool_calls=state.total_tool_calls,
+        max_tool_calls=runtime.limits.max_tool_calls,
         clock=runtime.clock,
         on_step_started=state.mark_current_step,
     )

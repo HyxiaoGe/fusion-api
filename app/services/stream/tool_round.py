@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.schemas.chat import ThinkingBlock
-from app.services.stream.step_lifecycle import AgentStepContext
+from app.services.stream.step_lifecycle import AgentStepContext, mark_tool_round_started
 from app.services.stream.tool_execution_result import ToolExecutionRecord
 
 
@@ -42,6 +42,8 @@ class ToolRoundRequest:
     execute_tools_fn: Callable[..., Awaitable[list[ToolExecutionRecord]]]
     complete_step_fn: Callable[..., Awaitable[Any]]
     on_tools_executed: Callable[[int], None] | None = None
+    completed_tool_calls: int | None = None
+    max_tool_calls: int | None = None
     clock: Callable[[], float] = time.time
 
 
@@ -121,6 +123,16 @@ async def execute_tool_round_tools(request: ToolRoundRequest) -> list[ToolExecut
     return results
 
 
+async def update_tool_round_plan_started(request: ToolRoundRequest) -> None:
+    await mark_tool_round_started(
+        context=request.step_context,
+        emitter=request.emitter,
+        tool_call_count=len(request.tool_calls),
+        completed_tool_calls=_completed_tool_calls_before_round(request),
+        max_tool_calls=_max_tool_calls(request),
+    )
+
+
 def append_tool_round_messages(request: ToolRoundRequest, results: list[ToolExecutionRecord]) -> None:
     request.messages.append(
         build_assistant_tool_message(
@@ -153,6 +165,8 @@ async def complete_tool_round_step(request: ToolRoundRequest, results: list[Tool
         session_cache=request.session_cache,
         tool_names=tool_names,
         tool_call_count=len(results),
+        completed_tool_calls=_completed_tool_calls_after_round(request, len(results)),
+        max_tool_calls=_max_tool_calls(request),
         clock=request.clock,
     )
     return tool_names
@@ -162,6 +176,7 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
     append_tool_round_reasoning(request)
     persist_tool_round_checkpoint(request)
 
+    await update_tool_round_plan_started(request)
     results = await execute_tool_round_tools(request)
     append_tool_round_messages(request, results)
     persist_tool_round_checkpoint(request)
@@ -169,3 +184,22 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
     tool_names = await complete_tool_round_step(request, results)
     restore_reasoning_after_tool_decision(request.call_kwargs)
     return ToolRoundOutcome(tool_call_count=len(request.tool_calls), tool_names=tool_names)
+
+
+def _completed_tool_calls_before_round(request: ToolRoundRequest) -> int | None:
+    if request.completed_tool_calls is not None:
+        return request.completed_tool_calls
+    value = getattr(request.network_budget, "completed_tool_calls", None)
+    return value if isinstance(value, int) else None
+
+
+def _completed_tool_calls_after_round(request: ToolRoundRequest, executed_count: int) -> int | None:
+    before = _completed_tool_calls_before_round(request)
+    return before + executed_count if before is not None else None
+
+
+def _max_tool_calls(request: ToolRoundRequest) -> int | None:
+    if request.max_tool_calls is not None:
+        return request.max_tool_calls
+    value = getattr(request.network_budget, "max_tool_calls", None)
+    return value if isinstance(value, int) else None
