@@ -144,10 +144,39 @@ class StepLifecycleTests(unittest.IsolatedAsyncioTestCase):
             plan_id="plan-run-1",
             revision=2,
             item={
-                "id": "search",
-                "title": "查找资料",
+                "id": "understand",
+                "title": "理解问题",
                 "status": "running",
-                "kind": "search",
+                "kind": "reasoning",
+                "tool_names": [],
+                "evidence_item_ids": [],
+            },
+        )
+
+    async def test_start_agent_step_updates_answer_plan_for_followup_step(self):
+        emitter = Mock()
+        emitter.step_started = AsyncMock(return_value="step-2")
+        emitter.plan_step_updated = AsyncMock()
+        session_cache = Mock()
+        session_cache.write_step_started = AsyncMock()
+
+        await start_agent_step(
+            emitter=emitter,
+            session_cache=session_cache,
+            run_id="run-1",
+            step_number=2,
+            clock=Mock(return_value=10.5),
+            block_id_factory=Mock(side_effect=["blk_thinking", "blk_text"]),
+        )
+
+        emitter.plan_step_updated.assert_awaited_once_with(
+            plan_id="plan-run-1",
+            revision=4,
+            item={
+                "id": "answer",
+                "title": "整理回答",
+                "status": "running",
+                "kind": "answer",
                 "tool_names": [],
                 "evidence_item_ids": [],
             },
@@ -238,4 +267,43 @@ class StepLifecycleTests(unittest.IsolatedAsyncioTestCase):
             total_steps=None,
             completed_tool_calls=1,
             max_tool_calls=None,
+        )
+
+    async def test_complete_agent_step_without_tools_updates_answer_not_search(self):
+        emitter = Mock()
+        emitter.step_completed = AsyncMock()
+        emitter.plan_step_updated = AsyncMock()
+        emitter.run_progress_updated = AsyncMock()
+        session_cache = Mock()
+        session_cache.write_step_completed = AsyncMock()
+        context = AgentStepContext(
+            step_id="step-2",
+            run_id="run-1",
+            step_number=2,
+            started_at=10.0,
+            thinking_block_id="blk_thinking",
+            text_block_id="blk_text",
+        )
+
+        await complete_agent_step(
+            context=context,
+            emitter=emitter,
+            session_cache=session_cache,
+            tool_names=(),
+            tool_call_count=0,
+            clock=Mock(return_value=10.25),
+        )
+
+        emitter.plan_step_updated.assert_awaited_once_with(
+            plan_id="plan-run-1",
+            revision=5,
+            item={
+                "id": "answer",
+                "title": "整理回答",
+                "status": "completed",
+                "kind": "answer",
+                "summary": "已完成回答整理",
+                "tool_names": [],
+                "evidence_item_ids": [],
+            },
         )

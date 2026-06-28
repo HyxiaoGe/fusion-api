@@ -108,19 +108,31 @@ async def complete_agent_step(
 
 
 async def _maybe_emit_plan_step_started(*, emitter: AgentStepEmitter, run_id: str, step_number: int) -> None:
+    item = (
+        {
+            "id": "understand",
+            "title": "理解问题",
+            "status": "running",
+            "kind": "reasoning",
+            "tool_names": [],
+            "evidence_item_ids": [],
+        }
+        if step_number == 1
+        else {
+            "id": "answer",
+            "title": "整理回答",
+            "status": "running",
+            "kind": "answer",
+            "tool_names": [],
+            "evidence_item_ids": [],
+        }
+    )
     await _maybe_call_async(
         emitter,
         "plan_step_updated",
         plan_id=f"plan-{run_id}",
         revision=step_number * 2,
-        item={
-            "id": "search",
-            "title": "查找资料",
-            "status": "running",
-            "kind": "search",
-            "tool_names": [],
-            "evidence_item_ids": [],
-        },
+        item=item,
     )
 
 
@@ -131,12 +143,8 @@ async def _maybe_emit_plan_step_completed(
     tool_names: list[str],
     tool_call_count: int,
 ) -> None:
-    await _maybe_call_async(
-        emitter,
-        "plan_step_updated",
-        plan_id=f"plan-{context.run_id}",
-        revision=context.step_number * 2 + 1,
-        item={
+    item = (
+        {
             "id": "search",
             "title": "查找资料",
             "status": "completed",
@@ -144,7 +152,24 @@ async def _maybe_emit_plan_step_completed(
             "summary": f"完成 {tool_call_count} 个工具调用",
             "tool_names": tool_names,
             "evidence_item_ids": [],
-        },
+        }
+        if tool_call_count > 0
+        else {
+            "id": "answer",
+            "title": "整理回答",
+            "status": "completed",
+            "kind": "answer",
+            "summary": "已完成回答整理",
+            "tool_names": [],
+            "evidence_item_ids": [],
+        }
+    )
+    await _maybe_call_async(
+        emitter,
+        "plan_step_updated",
+        plan_id=f"plan-{context.run_id}",
+        revision=context.step_number * 2 + 1,
+        item=item,
     )
     await _maybe_call_async(
         emitter,
