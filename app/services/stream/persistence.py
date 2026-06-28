@@ -15,6 +15,8 @@ from app.schemas.chat import UrlBlock, Usage
 from app.services.security.url_policy import evaluate_url_policy
 from app.services.source_context import UntrustedSourceContext, format_untrusted_source_context
 
+URL_PATTERN = re.compile(r'https?://[^\s<>"\')\]]+')
+
 
 def persist_message(
     db,
@@ -54,78 +56,47 @@ def persist_message(
         db.rollback()
 
 
-def _append_url_read_tool(call_kwargs: dict) -> None:
+def extract_first_url(message: str) -> str | None:
+    urls_in_message = URL_PATTERN.findall(message)
+    return urls_in_message[0] if urls_in_message else None
+
+
+def ensure_url_read_tool(call_kwargs: dict) -> None:
     from app.ai.tools import URL_READ_TOOL
 
     if URL_READ_TOOL not in call_kwargs.get("tools", []):
         call_kwargs.setdefault("tools", []).append(URL_READ_TOOL)
 
 
-async def preprocess_url_in_message(
-    original_message: str,
-    supports_fc: bool,
-    call_kwargs: dict,
-) -> tuple[Optional[UrlBlock], Optional[dict], Optional[str]]:
-    """URL 路径 A：在 agent loop 之前自动抓取消息中的第一个 URL，注入不可信上下文。
+def resolve_reader_url(policy, detected_url: str) -> str:
+    return policy.normalized_url or detected_url
 
-    spec §4.4 的 inout 语义：
-    - 抓取成功：修改 call_kwargs 删 extra_body（对 volcengine 关闭 thinking）；
-      返回 (UrlBlock, system_msg, url) 让调用方 append/insert
-    - 抓取失败 / 消息无 URL：往 call_kwargs["tools"] 追加 URL_READ_TOOL，让 LLM 自决
-    - supports_fc=False：完全跳过，返回三个 None
 
-    返回 (url_read_block, url_context_msg, auto_detected_url):
-      url_read_block: 成功时返回的 UrlBlock，调用方 append 到 content_blocks
-      url_context_msg: 成功时返回的 system 消息，调用方插入 messages 倒数第二位
-      auto_detected_url: 检测到的第一个 URL（仅日志/调试，None 表示未检测到）
-    """
-    if not supports_fc:
-        return None, None, None
+async def read_url_for_context(*, policy, detected_url: str):
+    from app.services.external.reader_client import read_url
 
-    url_pattern = re.compile(r'https?://[^\s<>"\')\]]+')
-    urls_in_message = url_pattern.findall(original_message)
-
-    # 消息中无 URL：仍然把 URL_READ_TOOL 加入 tools，让 LLM 自决
-    if not urls_in_message:
-        _append_url_read_tool(call_kwargs)
-        return None, None, None
-
-    auto_detected_url = urls_in_message[0]
-    url_read_block_id = f"blk_{uuid.uuid4().hex[:12]}"
-    policy = evaluate_url_policy(auto_detected_url)
-    if not policy.allowed:
-        logger.info(f"URL 自动抓取被策略拒绝: reason={policy.reason}, url={policy.safe_log_url}")
-        _append_url_read_tool(call_kwargs)
-        return None, None, auto_detected_url
-
+    timeout = settings.READER_SERVICE_TIMEOUT
     try:
-        from app.services.external.reader_client import read_url
-
-        timeout = settings.READER_SERVICE_TIMEOUT
-        read_result = await asyncio.wait_for(
-            read_url(policy.normalized_url or auto_detected_url, timeout=timeout),
+        return await asyncio.wait_for(
+            read_url(resolve_reader_url(policy, detected_url), timeout=timeout),
             timeout=timeout,
         )
     except asyncio.TimeoutError:
         logger.warning(f"URL 自动抓取超时: url={policy.safe_log_url}")
-        read_result = None
+        return None
 
-    if not read_result:
-        # 抓取失败 → 追加 URL_READ_TOOL，让 LLM 自决
-        _append_url_read_tool(call_kwargs)
-        return None, None, auto_detected_url
 
-    # 抓取成功 → 注入 user role 不可信上下文 + 关闭 volcengine thinking + 返回 UrlBlock
+def build_url_context_message(*, read_result, policy, detected_url: str) -> dict:
     from app.services.tool_handlers.url_read import MAX_CONTENT_CHARS
 
-    url_context_msg = {
+    return {
         "role": "user",
         "content": format_untrusted_source_context(
             UntrustedSourceContext(
                 source_id="U1",
                 source_type="url_read",
                 title=read_result.title or "未知",
-                url=read_result.url or policy.normalized_url or auto_detected_url,
+                url=read_result.url or resolve_reader_url(policy, detected_url),
                 content=read_result.content,
                 provider="web",
             ),
@@ -133,15 +104,82 @@ async def preprocess_url_in_message(
         ),
     }
 
-    if "extra_body" in call_kwargs and call_kwargs["extra_body"].get("thinking", {}).get("type") == "disabled":
-        del call_kwargs["extra_body"]
 
-    url_read_block = UrlBlock(
+def build_url_read_block(*, read_result, policy, detected_url: str, block_id: str) -> UrlBlock:
+    return UrlBlock(
         type="url_read",
-        id=url_read_block_id,
-        url=read_result.url or policy.normalized_url or auto_detected_url,
+        id=block_id,
+        url=read_result.url or resolve_reader_url(policy, detected_url),
         title=read_result.title,
         favicon=read_result.favicon,
     )
 
-    return url_read_block, url_context_msg, auto_detected_url
+
+def remove_disabled_thinking(call_kwargs: dict) -> None:
+    if "extra_body" in call_kwargs and call_kwargs["extra_body"].get("thinking", {}).get("type") == "disabled":
+        del call_kwargs["extra_body"]
+
+
+def fallback_to_url_read_tool(call_kwargs: dict, detected_url: str | None = None):
+    ensure_url_read_tool(call_kwargs)
+    return None, None, detected_url
+
+
+def build_successful_url_preprocess_result(
+    *,
+    read_result,
+    policy,
+    detected_url: str,
+    block_id: str,
+    call_kwargs: dict,
+):
+    remove_disabled_thinking(call_kwargs)
+    return (
+        build_url_read_block(
+            read_result=read_result,
+            policy=policy,
+            detected_url=detected_url,
+            block_id=block_id,
+        ),
+        build_url_context_message(
+            read_result=read_result,
+            policy=policy,
+            detected_url=detected_url,
+        ),
+        detected_url,
+    )
+
+
+async def preprocess_url_in_message(
+    original_message: str,
+    supports_fc: bool,
+    call_kwargs: dict,
+) -> tuple[Optional[UrlBlock], Optional[dict], Optional[str]]:
+    """URL 路径 A：自动读取首个 URL，成功时注入不可信上下文，失败时交给 url_read 工具。"""
+    if not supports_fc:
+        return None, None, None
+
+    # 消息中无 URL：仍然把 URL_READ_TOOL 加入 tools，让 LLM 自决
+    auto_detected_url = extract_first_url(original_message)
+    if not auto_detected_url:
+        return fallback_to_url_read_tool(call_kwargs)
+
+    url_read_block_id = f"blk_{uuid.uuid4().hex[:12]}"
+    policy = evaluate_url_policy(auto_detected_url)
+    if not policy.allowed:
+        logger.info(f"URL 自动抓取被策略拒绝: reason={policy.reason}, url={policy.safe_log_url}")
+        return fallback_to_url_read_tool(call_kwargs, auto_detected_url)
+
+    read_result = await read_url_for_context(policy=policy, detected_url=auto_detected_url)
+    if not read_result:
+        # 抓取失败 → 追加 URL_READ_TOOL，让 LLM 自决
+        return fallback_to_url_read_tool(call_kwargs, auto_detected_url)
+
+    # 抓取成功 → 注入 user role 不可信上下文 + 关闭 volcengine thinking + 返回 UrlBlock
+    return build_successful_url_preprocess_result(
+        read_result=read_result,
+        policy=policy,
+        detected_url=auto_detected_url,
+        block_id=url_read_block_id,
+        call_kwargs=call_kwargs,
+    )
