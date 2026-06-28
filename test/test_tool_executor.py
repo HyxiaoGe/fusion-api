@@ -1,8 +1,10 @@
 """tool_executor 重试策略测试"""
 
+import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from app.services.stream import tool_executor as tool_executor_module
 from app.services.stream.tool_execution_result import ToolExecutionRecord
 from app.services.stream.tool_executor import _should_retry_tool_result, execute_tools_parallel
 from app.services.tool_handlers.base import ToolResult
@@ -17,6 +19,93 @@ class ToolRetryPolicyTests(unittest.TestCase):
 
 
 class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):
+    async def test_execute_tool_batch_accepts_request_and_preserves_log_context(self):
+        request_cls = getattr(tool_executor_module, "ToolExecutionBatchRequest")
+        execute_tool_batch = getattr(tool_executor_module, "execute_tool_batch")
+        handler = AsyncMock()
+        handler.tool_name = "web_search"
+        handler.execute.return_value = ToolResult(status="success", data={"items": []})
+        tool_call = {"id": "call-1", "name": "web_search", "arguments": {"query": "redis stream"}}
+
+        request = request_cls(
+            conversation_id="conv-1",
+            user_id="user-1",
+            model_id="gpt-4",
+            provider="openai",
+            trace_id="trace-1",
+            step_number=2,
+            message_id="assistant-1",
+            emitter=None,
+            network_budget=None,
+        )
+
+        with patch("app.services.tool_handlers.get_handler", return_value=handler):
+            records = await execute_tool_batch(request, [tool_call])
+
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertIsInstance(record, ToolExecutionRecord)
+        self.assertIs(record.tool_call, tool_call)
+        self.assertIs(record.handler, handler)
+        handler.execute.assert_awaited_once_with({"query": "redis stream"})
+        handler.log.assert_awaited_once()
+        self.assertEqual(handler.log.await_args.kwargs["message_id"], "assistant-1")
+        self.assertEqual(handler.log.await_args.kwargs["trace_id"], "trace-1")
+        self.assertEqual(handler.log.await_args.kwargs["step_number"], 2)
+        self.assertEqual(handler.log.await_args.kwargs["input_params"], {"query": "redis stream"})
+
+    async def test_execute_tool_batch_preserves_input_order_when_calls_complete_out_of_order(self):
+        request_cls = getattr(tool_executor_module, "ToolExecutionBatchRequest")
+        execute_tool_batch = getattr(tool_executor_module, "execute_tool_batch")
+        slow_handler = AsyncMock()
+        slow_handler.tool_name = "web_search"
+        slow_handler.execute.side_effect = lambda _args: ToolResult(status="success", data={"order": "slow"})
+        fast_handler = AsyncMock()
+        fast_handler.tool_name = "url_read"
+        fast_handler.execute.return_value = ToolResult(status="success", data={"order": "fast"})
+        slow_call = {"id": "call-slow", "name": "web_search", "arguments": {"query": "redis"}}
+        fast_call = {"id": "call-fast", "name": "url_read", "arguments": {"url": "https://example.com"}}
+        both_started = asyncio.Event()
+        started = []
+        completed = []
+
+        async def execute_one_tool_call(_request, tool_call):
+            started.append(tool_call["id"])
+            if len(started) == 2:
+                both_started.set()
+            if tool_call is slow_call:
+                await asyncio.wait_for(both_started.wait(), timeout=1)
+                await asyncio.sleep(0.01)
+                completed.append(tool_call["id"])
+                return ToolExecutionRecord(
+                    tool_call=slow_call,
+                    result=ToolResult(status="success", data={"order": "slow"}),
+                    handler=slow_handler,
+                    block_id="blk_slow",
+                    log_id="log_slow",
+                )
+            await asyncio.wait_for(both_started.wait(), timeout=1)
+            completed.append(tool_call["id"])
+            return ToolExecutionRecord(
+                tool_call=fast_call,
+                result=ToolResult(status="success", data={"order": "fast"}),
+                handler=fast_handler,
+                block_id="blk_fast",
+                log_id="log_fast",
+            )
+
+        request = request_cls(
+            conversation_id="conv-1",
+            user_id="user-1",
+            model_id="gpt-4",
+            provider="openai",
+        )
+        with patch("app.services.stream.tool_executor.execute_one_tool_call", side_effect=execute_one_tool_call):
+            records = await execute_tool_batch(request, [slow_call, fast_call])
+
+        self.assertEqual([record.tool_call for record in records], [slow_call, fast_call])
+        self.assertEqual(completed, ["call-fast", "call-slow"])
+
     async def test_execute_tools_parallel_returns_record_with_named_access_and_handler_helpers(self):
         """成功执行后返回命名记录，并通过记录方法委派 handler 格式化逻辑。"""
         handler = MagicMock()
@@ -77,6 +166,25 @@ class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.result.error_message, "未知工具: missing_tool")
         self.assertEqual(record.format_llm_context(), "工具未取得可用结果，不能把该工具结果作为依据。")
         self.assertIsNone(record.build_content_block())
+
+    async def test_execute_tools_parallel_unknown_handler_does_not_emit_events(self):
+        tool_call = {"id": "call-404", "name": "missing_tool", "arguments": {"query": "x"}}
+        emitter = AsyncMock()
+
+        with patch("app.services.tool_handlers.get_handler", return_value=None):
+            records = await execute_tools_parallel(
+                [tool_call],
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="gpt-4",
+                provider="openai",
+                message_id="assistant-1",
+                emitter=emitter,
+            )
+
+        self.assertEqual(records[0].result.status, "failed")
+        emitter.tool_call_started.assert_not_awaited()
+        emitter.tool_call_completed.assert_not_awaited()
 
     async def test_execute_tools_parallel_passes_message_id_to_handler_log(self):
         """工具调用日志必须关联最终 assistant message"""

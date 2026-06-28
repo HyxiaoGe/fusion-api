@@ -8,6 +8,7 @@ tool_call_started/completed 协议，并把 execute_tool_with_retry
 import asyncio
 import json
 import uuid
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import backoff
@@ -32,6 +33,25 @@ AGENT_TOOL_MAX_RETRIES = 1
 
 # 永久性错误关键字（不重试）
 _TOOL_PERMANENT_KEYWORDS = ("not_found", "invalid", "rate_limit", "400", "401", "403", "404")
+
+
+@dataclass(frozen=True)
+class ToolExecutionBatchRequest:
+    conversation_id: str
+    user_id: str
+    model_id: str
+    provider: str
+    trace_id: str | None = None
+    step_number: int | None = None
+    message_id: str | None = None
+    emitter: Optional[AgentEventEmitter] = None
+    network_budget: "NetworkToolBudget | None" = None
+
+
+@dataclass(frozen=True)
+class ToolExecutionIds:
+    block_id: str
+    log_id: str
 
 
 def _should_retry_tool_result(result) -> bool:
@@ -88,6 +108,162 @@ async def execute_tool_with_retry(handler, args: dict):
         return ToolResult(status="failed", error_message="工具调用超时")
 
 
+def new_tool_execution_ids() -> ToolExecutionIds:
+    return ToolExecutionIds(
+        block_id=f"blk_{uuid.uuid4().hex[:12]}",
+        log_id=str(uuid.uuid4()),
+    )
+
+
+def resolve_tool_handler(tool_name: str):
+    from app.services.tool_handlers import get_handler as _get_handler
+
+    return _get_handler(tool_name)
+
+
+def parse_tool_arguments(tool_call: dict) -> dict:
+    arguments = tool_call["arguments"]
+    if not isinstance(arguments, str):
+        return arguments
+    try:
+        return json.loads(arguments)
+    except json.JSONDecodeError:
+        return {}
+
+
+def prepare_tool_arguments(
+    *,
+    tool_name: str,
+    args: dict,
+    network_budget: "NetworkToolBudget | None",
+):
+    if network_budget is None:
+        return args, None
+    if tool_name == "web_search":
+        return network_budget.prepare_web_search_args(args)
+    if tool_name == "url_read":
+        return network_budget.prepare_url_read_args(args)
+    return args, None
+
+
+def build_tool_execution_record(
+    *,
+    tool_call: dict,
+    result,
+    handler,
+    ids: ToolExecutionIds,
+) -> ToolExecutionRecord:
+    return ToolExecutionRecord(
+        tool_call=tool_call,
+        result=result,
+        handler=handler,
+        block_id=ids.block_id,
+        log_id=ids.log_id,
+    )
+
+
+def build_unknown_tool_record(*, tool_call: dict, ids: ToolExecutionIds) -> ToolExecutionRecord:
+    from app.services.tool_handlers import ToolResult
+
+    logger.warning(f"未知的 tool_call: {tool_call['name']}")
+    return build_tool_execution_record(
+        tool_call=tool_call,
+        result=ToolResult(status="failed", error_message=f"未知工具: {tool_call['name']}"),
+        handler=None,
+        ids=ids,
+    )
+
+
+async def emit_budget_result(
+    *,
+    request: ToolExecutionBatchRequest,
+    tool_call: dict,
+    handler,
+    args: dict,
+    result,
+) -> None:
+    await emit_tool_call_started(
+        request.emitter,
+        tool_call_id=tool_call["id"],
+        tool_name=handler.tool_name,
+        arguments=args,
+    )
+    await emit_tool_call_result(
+        request.emitter,
+        tool_call_id=tool_call["id"],
+        tool_name=handler.tool_name,
+        result=result,
+        duration_ms=result.duration_ms or 0,
+        result_summary_builder=handler._build_result_summary,
+    )
+
+
+async def execute_tool_handler(*, request: ToolExecutionBatchRequest, tool_call: dict, handler, args: dict):
+    if request.emitter is None:
+        return await execute_tool_with_retry(handler, args)
+    return await execute_tool_with_lifecycle(
+        tool_call_id=tool_call["id"],
+        tool_name=handler.tool_name,
+        args=args,
+        target=handler,
+        execute=execute_tool_with_retry,
+        result_summary_builder=handler._build_result_summary,
+        emitter=request.emitter,
+    )
+
+
+async def log_tool_execution(
+    *,
+    request: ToolExecutionBatchRequest,
+    handler,
+    ids: ToolExecutionIds,
+    result,
+    args: dict,
+) -> None:
+    await handler.log(
+        log_id=ids.log_id,
+        conversation_id=request.conversation_id,
+        user_id=request.user_id,
+        model_id=request.model_id,
+        provider=request.provider,
+        result=result,
+        input_params=args,
+        trace_id=request.trace_id,
+        step_number=request.step_number,
+        message_id=request.message_id,
+    )
+
+
+async def execute_one_tool_call(request: ToolExecutionBatchRequest, tool_call: dict) -> ToolExecutionRecord:
+    handler = resolve_tool_handler(tool_call["name"])
+    ids = new_tool_execution_ids()
+    if not handler:
+        return build_unknown_tool_record(tool_call=tool_call, ids=ids)
+
+    args = parse_tool_arguments(tool_call)
+    args, budget_result = prepare_tool_arguments(
+        tool_name=tool_call["name"],
+        args=args,
+        network_budget=request.network_budget,
+    )
+    if budget_result is not None:
+        result = budget_result
+        await emit_budget_result(request=request, tool_call=tool_call, handler=handler, args=args, result=result)
+    else:
+        result = await execute_tool_handler(request=request, tool_call=tool_call, handler=handler, args=args)
+
+    await log_tool_execution(request=request, handler=handler, ids=ids, result=result, args=args)
+    return build_tool_execution_record(tool_call=tool_call, result=result, handler=handler, ids=ids)
+
+
+async def execute_tool_batch(
+    request: ToolExecutionBatchRequest,
+    tool_calls: list[dict],
+) -> list[ToolExecutionRecord]:
+    results = await asyncio.gather(*[execute_one_tool_call(request, tool_call) for tool_call in tool_calls])
+    return list(results)
+
+
 async def execute_tools_parallel(
     tool_calls: list[dict],
     conversation_id: str,
@@ -109,112 +285,15 @@ async def execute_tools_parallel(
 
     返回 ToolExecutionRecord 列表，调用方不再依赖裸 tuple 位置。
     """
-    from app.services.tool_handlers import ToolResult
-    from app.services.tool_handlers import get_handler as _get_handler
-
-    async def _run_one(tc: dict) -> ToolExecutionRecord:
-        handler = _get_handler(tc["name"])
-        block_id = f"blk_{uuid.uuid4().hex[:12]}"
-        log_id = str(uuid.uuid4())
-
-        if not handler:
-            logger.warning(f"未知的 tool_call: {tc['name']}")
-            result = ToolResult(status="failed", error_message=f"未知工具: {tc['name']}")
-            return ToolExecutionRecord(
-                tool_call=tc,
-                result=result,
-                handler=None,
-                block_id=block_id,
-                log_id=log_id,
-            )
-
-        # 解析参数
-        try:
-            args = json.loads(tc["arguments"]) if isinstance(tc["arguments"], str) else tc["arguments"]
-        except json.JSONDecodeError:
-            args = {}
-
-        budget_result = None
-        if network_budget is not None:
-            if tc["name"] == "web_search":
-                args, budget_result = network_budget.prepare_web_search_args(args)
-            elif tc["name"] == "url_read":
-                args, budget_result = network_budget.prepare_url_read_args(args)
-
-        if budget_result is not None:
-            result = budget_result
-            await emit_tool_call_started(
-                emitter,
-                tool_call_id=tc["id"],
-                tool_name=handler.tool_name,
-                arguments=args,
-            )
-            await emit_tool_call_result(
-                emitter,
-                tool_call_id=tc["id"],
-                tool_name=handler.tool_name,
-                result=result,
-                duration_ms=result.duration_ms or 0,
-                result_summary_builder=handler._build_result_summary,
-            )
-
-            await handler.log(
-                log_id=log_id,
-                conversation_id=conversation_id,
-                user_id=user_id,
-                model_id=model_id,
-                provider=provider,
-                result=result,
-                input_params=args,
-                trace_id=trace_id,
-                step_number=step_number,
-                message_id=message_id,
-            )
-            return ToolExecutionRecord(
-                tool_call=tc,
-                result=result,
-                handler=handler,
-                block_id=block_id,
-                log_id=log_id,
-            )
-
-        # ── emitter 路径 ──
-        # 生命周期模块只包 start/completed 与异常状态映射；重试、日志和记录构造仍留在这里。
-        if emitter is not None:
-            result = await execute_tool_with_lifecycle(
-                tool_call_id=tc["id"],
-                tool_name=handler.tool_name,
-                args=args,
-                target=handler,
-                execute=execute_tool_with_retry,
-                result_summary_builder=handler._build_result_summary,
-                emitter=emitter,
-            )
-        else:
-            # 兼容 emitter 缺省路径（不应在 generate_to_redis 内触发）
-            result = await execute_tool_with_retry(handler, args)
-
-        # 异步记录日志（tool_call_logs 路径不变）
-        await handler.log(
-            log_id=log_id,
-            conversation_id=conversation_id,
-            user_id=user_id,
-            model_id=model_id,
-            provider=provider,
-            result=result,
-            input_params=args,
-            trace_id=trace_id,
-            step_number=step_number,
-            message_id=message_id,
-        )
-
-        return ToolExecutionRecord(
-            tool_call=tc,
-            result=result,
-            handler=handler,
-            block_id=block_id,
-            log_id=log_id,
-        )
-
-    results = await asyncio.gather(*[_run_one(tc) for tc in tool_calls])
-    return list(results)
+    request = ToolExecutionBatchRequest(
+        conversation_id=conversation_id,
+        user_id=user_id,
+        model_id=model_id,
+        provider=provider,
+        trace_id=trace_id,
+        step_number=step_number,
+        message_id=message_id,
+        emitter=emitter,
+        network_budget=network_budget,
+    )
+    return await execute_tool_batch(request, tool_calls)
