@@ -12,6 +12,7 @@ from app.services.stream.agent_round import AgentRoundResult
 from app.services.stream.limit_summary import LimitSummaryStepRequest
 from app.services.stream.round_completion import append_round_content_blocks, complete_text_response_step
 from app.services.stream.step_lifecycle import AgentStepContext
+from app.services.stream.tool_round import ToolRoundRequest
 
 
 class AgentLoopExit(Enum):
@@ -207,29 +208,31 @@ async def _handle_tool_calls_round(
     round_result: AgentRoundResult,
 ) -> None:
     await runtime.handle_tool_calls_round_fn(
-        db=db,
-        assistant_message_id=runtime.assistant_message_id,
-        conversation_id=runtime.conversation_id,
-        user_id=runtime.user_id,
-        model_id=runtime.model_id,
-        provider=runtime.provider,
-        content_blocks=state.content_blocks,
-        messages=messages,
-        tool_calls=round_result.tool_calls,
-        reasoning_buf=round_result.reasoning_buf,
-        should_use_reasoning=runtime.should_use_reasoning,
-        step_context=step_context,
-        step_number=step_number,
-        run_id=runtime.run_id,
-        emitter=runtime.emitter,
-        session_cache=runtime.session_cache,
-        network_budget=runtime.network_budget,
-        call_kwargs=runtime.call_kwargs,
-        persist_message_fn=runtime.persist_message_fn,
-        execute_tools_fn=runtime.execute_tools_fn,
-        complete_step_fn=runtime.complete_step_fn,
-        on_tools_executed=state.record_executed_tool_calls,
-        clock=runtime.clock,
+        request=ToolRoundRequest(
+            db=db,
+            assistant_message_id=runtime.assistant_message_id,
+            conversation_id=runtime.conversation_id,
+            user_id=runtime.user_id,
+            model_id=runtime.model_id,
+            provider=runtime.provider,
+            content_blocks=state.content_blocks,
+            messages=messages,
+            tool_calls=round_result.tool_calls,
+            reasoning_buf=round_result.reasoning_buf,
+            should_use_reasoning=runtime.should_use_reasoning,
+            step_context=step_context,
+            step_number=step_number,
+            run_id=runtime.run_id,
+            emitter=runtime.emitter,
+            session_cache=runtime.session_cache,
+            network_budget=runtime.network_budget,
+            call_kwargs=runtime.call_kwargs,
+            persist_message_fn=runtime.persist_message_fn,
+            execute_tools_fn=runtime.execute_tools_fn,
+            complete_step_fn=runtime.complete_step_fn,
+            on_tools_executed=state.record_executed_tool_calls,
+            clock=runtime.clock,
+        ),
     )
     state.clear_current_step()
 

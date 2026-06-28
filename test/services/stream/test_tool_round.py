@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import Mock
 
 from app.schemas.chat import TextBlock
+from app.services.stream import tool_round as tool_round_module
 from app.services.stream.step_lifecycle import AgentStepContext
 from app.services.stream.tool_execution_result import ToolExecutionRecord
 from app.services.stream.tool_round import (
@@ -70,6 +71,85 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
         restore_reasoning_after_tool_decision(call_kwargs)
 
         self.assertNotIn("extra_body", call_kwargs)
+
+    async def test_handle_tool_calls_round_accepts_request_and_preserves_sequence(self):
+        request_cls = getattr(tool_round_module, "ToolRoundRequest")
+        tool_call = {"id": "tc-1", "name": "web_search", "arguments": '{"query":"x"}'}
+        content_block = TextBlock(type="text", id="blk_tool", text="工具摘要")
+        handler = Mock()
+        handler.format_llm_context.return_value = "LLM 可见工具上下文"
+        handler.build_content_block.return_value = content_block
+        record = ToolExecutionRecord(
+            tool_call=tool_call,
+            result=ToolResult(status="success", duration_ms=12),
+            handler=handler,
+            block_id="blk_tool",
+            log_id="log-1",
+        )
+        messages = [{"role": "user", "content": "hi"}]
+        content_blocks = []
+        call_kwargs = {"extra_body": {"thinking": {"type": "disabled"}}}
+        emitter = object()
+        session_cache = object()
+        network_budget = object()
+        step_context = AgentStepContext(
+            step_id="step-1",
+            step_number=3,
+            started_at=10.0,
+            thinking_block_id="blk_thinking",
+            text_block_id="blk_text",
+        )
+        order = []
+
+        def persist_message_fn(db, msg_id, conv_id, model_id, blocks, usage_data=None, partial=False):
+            order.append(("persist", partial, [getattr(block, "id", None) for block in blocks], usage_data))
+
+        async def execute_tools_fn(tool_calls, conversation_id, user_id, model_id, provider, **kwargs):
+            order.append(("execute", tool_calls, conversation_id, user_id, model_id, provider, kwargs))
+            return [record]
+
+        async def complete_step_fn(*, context, emitter, session_cache, tool_names, tool_call_count, clock):
+            order.append(("complete", tool_names, tool_call_count, clock(), "extra_body" in call_kwargs))
+
+        def on_tools_executed(tool_call_count):
+            order.append(("record", tool_call_count))
+
+        request = request_cls(
+            db="db",
+            assistant_message_id="msg-1",
+            conversation_id="conv-1",
+            user_id="user-1",
+            model_id="gpt-4",
+            provider="openai",
+            content_blocks=content_blocks,
+            messages=messages,
+            tool_calls=[tool_call],
+            reasoning_buf="需要搜索",
+            should_use_reasoning=True,
+            step_context=step_context,
+            step_number=3,
+            run_id="run-1",
+            emitter=emitter,
+            session_cache=session_cache,
+            network_budget=network_budget,
+            call_kwargs=call_kwargs,
+            persist_message_fn=persist_message_fn,
+            execute_tools_fn=execute_tools_fn,
+            complete_step_fn=complete_step_fn,
+            on_tools_executed=on_tools_executed,
+            clock=Mock(return_value=10.5),
+        )
+
+        outcome = await handle_tool_calls_round(request=request)
+
+        self.assertEqual(outcome, ToolRoundOutcome(tool_call_count=1, tool_names=["web_search"]))
+        self.assertEqual([entry[0] for entry in order], ["persist", "execute", "record", "persist", "complete"])
+        self.assertEqual(order[0], ("persist", True, ["blk_thinking"], None))
+        self.assertEqual(order[2], ("record", 1))
+        self.assertEqual(order[3], ("persist", True, ["blk_thinking", "blk_tool"], None))
+        self.assertEqual(order[4], ("complete", ["web_search"], 1, 10.5, True))
+        self.assertNotIn("extra_body", call_kwargs)
+        self.assertEqual(messages[-1], {"role": "tool", "tool_call_id": "tc-1", "content": "LLM 可见工具上下文"})
 
     async def test_handle_tool_calls_round_preserves_order_and_mutates_state(self):
         tool_call = {"id": "tc-1", "name": "web_search", "arguments": '{"query":"x"}'}
@@ -144,29 +224,31 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
             order.append(("record", tool_call_count))
 
         outcome = await handle_tool_calls_round(
-            db="db",
-            assistant_message_id="msg-1",
-            conversation_id="conv-1",
-            user_id="user-1",
-            model_id="gpt-4",
-            provider="openai",
-            content_blocks=content_blocks,
-            messages=messages,
-            tool_calls=[tool_call],
-            reasoning_buf="需要搜索",
-            should_use_reasoning=True,
-            step_context=step_context,
-            step_number=3,
-            run_id="run-1",
-            emitter=emitter,
-            session_cache=session_cache,
-            network_budget=network_budget,
-            call_kwargs=call_kwargs,
-            persist_message_fn=persist_message_fn,
-            execute_tools_fn=execute_tools_fn,
-            complete_step_fn=complete_step_fn,
-            on_tools_executed=on_tools_executed,
-            clock=Mock(return_value=10.5),
+            request=tool_round_module.ToolRoundRequest(
+                db="db",
+                assistant_message_id="msg-1",
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="gpt-4",
+                provider="openai",
+                content_blocks=content_blocks,
+                messages=messages,
+                tool_calls=[tool_call],
+                reasoning_buf="需要搜索",
+                should_use_reasoning=True,
+                step_context=step_context,
+                step_number=3,
+                run_id="run-1",
+                emitter=emitter,
+                session_cache=session_cache,
+                network_budget=network_budget,
+                call_kwargs=call_kwargs,
+                persist_message_fn=persist_message_fn,
+                execute_tools_fn=execute_tools_fn,
+                complete_step_fn=complete_step_fn,
+                on_tools_executed=on_tools_executed,
+                clock=Mock(return_value=10.5),
+            ),
         )
 
         self.assertEqual(outcome, ToolRoundOutcome(tool_call_count=1, tool_names=["web_search"]))

@@ -187,6 +187,13 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
         started_steps: list[int] = []
         tool_round_calls = []
         completed_steps: list[str] = []
+        call_kwargs = {}
+        emitter = DummyEmitter(limit_reasons=[])
+        session_cache = object()
+        network_budget = object()
+
+        def clock():
+            return 1.0
 
         async def start_step_fn(**kwargs):
             step_number = kwargs["step_number"]
@@ -222,34 +229,47 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
             )
 
         async def handle_tool_calls_round_fn(**kwargs):
-            tool_round_calls.append(kwargs)
-            kwargs["on_tools_executed"](len(kwargs["tool_calls"]))
-            kwargs["messages"].append({"role": "tool", "tool_call_id": "tc-1", "content": "搜索结果"})
+            request = kwargs["request"]
+            tool_round_calls.append(request)
+            request.on_tools_executed(len(request.tool_calls))
+            request.messages.append({"role": "tool", "tool_call_id": "tc-1", "content": "搜索结果"})
 
         async def complete_step_fn(**kwargs):
             completed_steps.append(kwargs["context"].step_id)
             return 25
 
+        runtime = _runtime(
+            start_step_fn=start_step_fn,
+            complete_step_fn=complete_step_fn,
+            run_round_fn=run_round_fn,
+            handle_tool_calls_round_fn=handle_tool_calls_round_fn,
+            call_kwargs=call_kwargs,
+            emitter=emitter,
+            session_cache=session_cache,
+            network_budget=network_budget,
+            clock=clock,
+        )
         outcome = await run_agent_loop(
             db="db",
             messages=messages,
             state=state,
-            runtime=_runtime(
-                start_step_fn=start_step_fn,
-                complete_step_fn=complete_step_fn,
-                run_round_fn=run_round_fn,
-                handle_tool_calls_round_fn=handle_tool_calls_round_fn,
-            ),
+            runtime=runtime,
         )
 
         self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
         self.assertEqual(started_steps, [1, 2])
         self.assertEqual(len(tool_round_calls), 1)
-        self.assertEqual(tool_round_calls[0]["db"], "db")
-        self.assertEqual(tool_round_calls[0]["step_number"], 1)
-        self.assertEqual(tool_round_calls[0]["tool_calls"], [tool_call])
-        self.assertEqual(tool_round_calls[0]["reasoning_buf"], "需要搜索")
-        self.assertIs(tool_round_calls[0]["messages"], messages)
+        self.assertEqual(tool_round_calls[0].db, "db")
+        self.assertEqual(tool_round_calls[0].step_number, 1)
+        self.assertEqual(tool_round_calls[0].tool_calls, [tool_call])
+        self.assertEqual(tool_round_calls[0].reasoning_buf, "需要搜索")
+        self.assertIs(tool_round_calls[0].messages, messages)
+        self.assertIs(tool_round_calls[0].content_blocks, state.content_blocks)
+        self.assertIs(tool_round_calls[0].call_kwargs, call_kwargs)
+        self.assertIs(tool_round_calls[0].emitter, emitter)
+        self.assertIs(tool_round_calls[0].session_cache, session_cache)
+        self.assertIs(tool_round_calls[0].network_budget, network_budget)
+        self.assertIs(tool_round_calls[0].clock, clock)
         self.assertEqual(completed_steps, ["step-2"])
         self.assertEqual(state.total_tool_calls, 1)
         self.assertEqual(state.step, 2)
