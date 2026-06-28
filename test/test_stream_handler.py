@@ -587,6 +587,39 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("reader-service", tool_context)
         self.assertNotIn("请基于你的知识回答", tool_context)
 
+    async def test_generate_to_redis_closes_db_when_lifecycle_raises(self):
+        """runner 外层必须负责 DB session 生命周期，即使 lifecycle 失败也要关闭。"""
+
+        async def _raise_lifecycle(**_kwargs):
+            raise RuntimeError("lifecycle boom")
+
+        with (
+            patch(
+                "app.services.stream.runner.run_agent_loop_lifecycle",
+                AsyncMock(side_effect=_raise_lifecycle),
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            await self.handler.generate_to_redis(
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="gpt-4",
+                litellm_model="openai/gpt-4",
+                litellm_kwargs={},
+                provider="openai",
+                raw_messages=[{"role": "user", "content": "hi"}],
+                has_vision=False,
+                file_ids=None,
+                original_message="hi",
+                assistant_message_id="msg-1",
+                task_id="task-1",
+                options={"use_reasoning": False},
+                capabilities=None,
+                trace_id="trace-1",
+            )
+
+        self.mock_db.close.assert_called_once()
+
     async def test_cancelled_path(self):
         """CancelledError 路径：发 run_interrupted + status='interrupted'"""
 
