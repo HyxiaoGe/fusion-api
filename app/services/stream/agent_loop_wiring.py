@@ -39,6 +39,9 @@ class AgentLoopRunInput:
     options: dict | None
     capabilities: dict | None
     trace_id: str | None
+    initial_content_blocks: list | None = None
+    extra_system_prompts: list[str] | None = None
+    preprocess_user_input: bool = True
 
     def to_execution_request(
         self,
@@ -73,6 +76,9 @@ class AgentLoopRunInput:
             original_message=self.original_message,
             call_config=call_config,
             limits=limits,
+            initial_content_blocks=self.initial_content_blocks or [],
+            extra_system_prompts=self.extra_system_prompts or [],
+            preprocess_user_input=self.preprocess_user_input,
         )
 
 

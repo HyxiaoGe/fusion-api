@@ -120,6 +120,45 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("文档正文", prepared.messages[3]["content"])
         self.assertEqual(call_config.announced_tools, ["web_search"])
 
+    async def test_prepare_messages_injects_extra_system_prompts_without_user_preprocess(self):
+        async def build_llm_messages_fn(_raw_messages, _has_vision, _repo, _user_system_prompt):
+            return [
+                {"role": "user", "content": "原问题"},
+                {"role": "assistant", "content": "旧回答"},
+            ]
+
+        async def should_not_preprocess_url(*_args, **_kwargs):
+            raise AssertionError("continuation 不应重新跑 URL 预处理")
+
+        def should_not_inject_file_content(*_args, **_kwargs):
+            raise AssertionError("continuation 不应重新跑文件预处理")
+
+        prepared = await prepare_agent_loop_messages(
+            db=object(),
+            user_id="user-1",
+            raw_messages=[],
+            has_vision=False,
+            file_ids=["file-1"],
+            original_message="https://example.com",
+            call_config=build_agent_loop_call_config(
+                provider="openai",
+                options={},
+                capabilities={"functionCalling": False},
+            ),
+            file_repo_factory=lambda _db: object(),
+            load_user_system_prompt_fn=lambda _db, _user_id: None,
+            build_llm_messages_fn=build_llm_messages_fn,
+            is_image_file_fn=lambda _file_id, _repo: False,
+            inject_file_content_fn=should_not_inject_file_content,
+            preprocess_url_in_message_fn=should_not_preprocess_url,
+            preprocess_user_input=False,
+            extra_system_prompts=["继续执行，不要重写前文"],
+        )
+
+        self.assertEqual(prepared.initial_content_blocks, [])
+        self.assertEqual(prepared.messages[0], {"role": "system", "content": "继续执行，不要重写前文"})
+        self.assertEqual(prepared.messages[1]["role"], "user")
+
 
 if __name__ == "__main__":
     unittest.main()

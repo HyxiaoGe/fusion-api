@@ -73,6 +73,7 @@ class RunFinalizerTests(unittest.IsolatedAsyncioTestCase):
                     model_id="gpt-4",
                     provider="openai",
                     message_id="msg-1",
+                    run_config={"max_steps": 8},
                 ),
                 call.run_started(
                     message_id="msg-1",
@@ -94,6 +95,7 @@ class RunFinalizerTests(unittest.IsolatedAsyncioTestCase):
             duration_ms_factory=duration_ms_factory,
             session_status="limit_reached",
             finish_reason="limit_reached",
+            limit_reason="max_steps",
         )
 
         self.assertEqual(
@@ -107,6 +109,7 @@ class RunFinalizerTests(unittest.IsolatedAsyncioTestCase):
                     total_steps=3,
                     total_tool_calls=2,
                     total_duration_ms=1234,
+                    limit_reason="max_steps",
                 ),
             ],
         )

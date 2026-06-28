@@ -65,6 +65,7 @@ async def finalize_completed_run(
         duration_ms_factory=context.duration_ms_factory,
         session_status=terminal_state.session_status,
         finish_reason=terminal_state.run_finish_reason,
+        limit_reason=context.state.limit_reason,
     )
     context.state.mark_terminal_emitted()
     await finalize_stream_fn(context.conversation_id, success=True, task_id=context.task_id)

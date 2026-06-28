@@ -19,6 +19,7 @@ async def write_session_started(
     model_id: str,
     provider: str,
     message_id: str | None = None,
+    run_config: dict | None = None,
 ) -> None:
     """run 启动时 UPSERT agent_sessions 行（status='running' 占位）。
 
@@ -37,7 +38,11 @@ async def write_session_started(
             existing.model_id = model_id
             existing.provider = provider
             existing.message_id = message_id
+            existing.run_config = run_config
             existing.status = "running"
+            existing.limit_reason = None
+            existing.error_message = None
+            existing.total_duration_ms = None
             existing.total_steps = 0
             existing.total_tool_calls = 0
             session.commit()
@@ -49,6 +54,7 @@ async def write_session_started(
             model_id=model_id,
             provider=provider,
             message_id=message_id,
+            run_config=run_config,
             status="running",  # 占位，终态由 write_session_status 更新
             total_steps=0,
             total_tool_calls=0,
@@ -115,7 +121,13 @@ async def write_step_terminal(*, step_id: str, status: str) -> None:
 
 
 async def write_session_status(
-    *, run_id: str, status: str, total_steps: int, total_tool_calls: int, total_duration_ms: int | None = None
+    *,
+    run_id: str,
+    status: str,
+    total_steps: int,
+    total_tool_calls: int,
+    total_duration_ms: int | None = None,
+    limit_reason: str | None = None,
 ) -> None:
     """run 终态写入 agent_sessions 行。
 
@@ -132,6 +144,7 @@ async def write_session_status(
         row.status = status
         row.total_steps = total_steps
         row.total_tool_calls = total_tool_calls
+        row.limit_reason = limit_reason if status == "limit_reached" else None
         if total_duration_ms is not None:
             row.total_duration_ms = total_duration_ms
         session.commit()

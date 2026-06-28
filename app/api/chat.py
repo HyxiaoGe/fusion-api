@@ -8,6 +8,7 @@ from app.core.redis import get_redis_pool, stream_chunks_key
 from app.db.models import User
 from app.schemas.chat import (
     ChatRequest,
+    ContinueAgentRunRequest,
     MessageUpdateRequest,
     SuggestedQuestionsRequest,
     TitleGenerationRequest,
@@ -142,6 +143,27 @@ def get_message_network_diagnostics(
         is_admin=bool(getattr(current_user, "is_superuser", False)),
     )
     return success(data=data, request_id=request.state.request_id)
+
+
+@router.post("/conversations/{conversation_id}/messages/{message_id}/continue")
+async def continue_agent_run(
+    conversation_id: str,
+    message_id: str,
+    continue_request: ContinueAgentRunRequest,
+    request: Request,
+    chat_service: ChatService = Depends(get_chat_service),
+    current_user: User = Depends(get_current_user),
+):
+    """继续执行已触顶的 agent run，续写同一条 assistant 消息。"""
+    if not continue_request.stream:
+        raise ApiException.bad_request("continue 仅支持流式响应")
+    return await chat_service.continue_agent_run(
+        conversation_id=conversation_id,
+        assistant_message_id=message_id,
+        user_id=current_user.id,
+        previous_run_id=continue_request.previous_run_id,
+        trace_id=request.state.request_id,
+    )
 
 
 @router.put("/conversations/{conversation_id}/messages/{message_id}")

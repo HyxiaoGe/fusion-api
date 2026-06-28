@@ -676,6 +676,49 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(dependencies.finalize_stream_fn, patched_finalize_stream)
         self.assertIs(dependencies.persist_message_fn, patched_persist_message)
 
+    async def test_generate_to_redis_passes_continuation_inputs_and_limits_override(self):
+        """continuation run 必须带旧内容、额外 system prompt，并使用恢复出的预算。"""
+        from app.services.stream.agent_loop_policy import AgentLoopLimits
+
+        captured = {}
+
+        async def _capture_lifecycle(**kwargs):
+            captured.update(kwargs)
+
+        limits = AgentLoopLimits(max_steps=4, max_tool_calls=7, total_timeout_s=90)
+
+        with patch(
+            "app.services.stream.runner.run_agent_loop_lifecycle",
+            AsyncMock(side_effect=_capture_lifecycle),
+        ):
+            await self.handler.generate_to_redis(
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="gpt-4",
+                litellm_model="openai/gpt-4",
+                litellm_kwargs={},
+                provider="openai",
+                raw_messages=[{"role": "user", "content": "hi"}],
+                has_vision=False,
+                file_ids=None,
+                original_message="",
+                assistant_message_id="msg-1",
+                task_id="task-1",
+                options={"use_reasoning": False},
+                capabilities=None,
+                trace_id="trace-1",
+                initial_content_blocks=["旧块"],
+                extra_system_prompts=["继续执行"],
+                preprocess_user_input=False,
+                limits=limits,
+            )
+
+        request = captured["request"]
+        self.assertEqual(request.initial_content_blocks, ["旧块"])
+        self.assertEqual(request.extra_system_prompts, ["继续执行"])
+        self.assertFalse(request.preprocess_user_input)
+        self.assertEqual(request.limits, limits)
+
     async def test_cancelled_path(self):
         """CancelledError 路径：发 run_interrupted + status='interrupted'"""
 

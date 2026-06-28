@@ -5,12 +5,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session, joinedload
 
+from app.db.models import AgentSession, ConversationFile, File, get_china_time
 from app.db.models import Conversation as ConversationModel
-from app.db.models import ConversationFile, File, get_china_time
 from app.db.models import Message as MessageModel
 from app.db.models import SocialAccount as SocialAccountModel
 from app.db.models import User as UserModel
 from app.schemas.chat import (
+    AgentRunSummary,
     Conversation,
     FileBlock,
     Message,
@@ -350,7 +351,12 @@ class ConversationRepository:
             logger.error(f"更新消息失败: {e}")
             return None
 
-    def _convert_message_to_schema(self, db_message: MessageModel) -> Message:
+    def _convert_message_to_schema(
+        self,
+        db_message: MessageModel,
+        *,
+        agent_run: AgentRunSummary | None = None,
+    ) -> Message:
         """将消息数据库模型转换为业务模型（JSONB → content blocks）"""
         content_blocks = []
         for block_data in db_message.content or []:
@@ -390,6 +396,7 @@ class ConversationRepository:
             model_id=db_message.model_id,
             usage=Usage(**db_message.usage) if db_message.usage else None,
             suggested_questions=db_message.suggested_questions or None,
+            agent_run=agent_run,
             created_at=db_message.created_at,
         )
 
@@ -412,7 +419,14 @@ class ConversationRepository:
 
     def _convert_to_schema(self, db_conversation: ConversationModel) -> Conversation:
         """将数据库模型转换为业务模型"""
-        messages = [self._convert_message_to_schema(msg) for msg in db_conversation.messages]
+        agent_runs = self._latest_agent_runs_for_messages(
+            db_conversation.id,
+            [msg.id for msg in db_conversation.messages if msg.role == "assistant"],
+        )
+        messages = [
+            self._convert_message_to_schema(msg, agent_run=agent_runs.get(msg.id))
+            for msg in db_conversation.messages
+        ]
         return Conversation(
             id=db_conversation.id,
             user_id=db_conversation.user_id,
@@ -422,6 +436,37 @@ class ConversationRepository:
             created_at=db_conversation.created_at,
             updated_at=db_conversation.updated_at,
         )
+
+    def _latest_agent_runs_for_messages(
+        self,
+        conversation_id: str,
+        message_ids: list[str],
+    ) -> dict[str, AgentRunSummary]:
+        if not self.db or not message_ids:
+            return {}
+
+        rows = (
+            self.db.query(AgentSession)
+            .filter(
+                AgentSession.conversation_id == conversation_id,
+                AgentSession.message_id.in_(message_ids),
+            )
+            .order_by(AgentSession.message_id.asc(), AgentSession.created_at.desc(), AgentSession.id.desc())
+            .all()
+        )
+        latest_by_message_id: dict[str, AgentRunSummary] = {}
+        for row in rows:
+            if not row.message_id or row.message_id in latest_by_message_id:
+                continue
+            latest_by_message_id[row.message_id] = AgentRunSummary(
+                run_id=row.id,
+                status=row.status,
+                config=row.run_config or {},
+                total_steps=row.total_steps or 0,
+                total_tool_calls=row.total_tool_calls or 0,
+                limit_reason=row.limit_reason if row.status == "limit_reached" else None,
+            )
+        return latest_by_message_id
 
 
 class FileRepository:

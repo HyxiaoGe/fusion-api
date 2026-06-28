@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from app.services.stream.agent_loop_execution import AgentLoopExecutionContext
@@ -25,6 +25,9 @@ class AgentLoopLifecycleRequest:
     original_message: str
     call_config: AgentLoopCallConfig
     limits: AgentLoopLimits
+    initial_content_blocks: list[Any] = field(default_factory=list)
+    extra_system_prompts: list[str] = field(default_factory=list)
+    preprocess_user_input: bool = True
 
 
 @dataclass(frozen=True)
@@ -75,6 +78,7 @@ async def _run_success_path(
 ) -> None:
     await _start_run(request=request, execution=execution, dependencies=dependencies)
     prepared_messages = await _prepare_messages(request=request, execution=execution, dependencies=dependencies)
+    execution.state.content_blocks.extend(request.initial_content_blocks)
     execution.state.content_blocks.extend(prepared_messages.initial_content_blocks)
 
     loop_outcome = await dependencies.run_agent_loop_fn(
@@ -130,6 +134,8 @@ async def _prepare_messages(
         file_ids=request.file_ids,
         original_message=request.original_message,
         call_config=request.call_config,
+        extra_system_prompts=request.extra_system_prompts,
+        preprocess_user_input=request.preprocess_user_input,
     )
 
 

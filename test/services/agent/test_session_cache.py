@@ -37,6 +37,44 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row.total_steps, 0)
             self.assertEqual(row.total_tool_calls, 0)
 
+    async def test_write_session_started_persists_run_config(self):
+        with patch("app.services.agent.session_cache.SessionLocal") as mock_sl:
+            session = MagicMock()
+            mock_sl.return_value.__enter__.return_value = session
+            session.get.return_value = None
+
+            await write_session_started(
+                run_id="r1",
+                conversation_id="c1",
+                user_id="u1",
+                model_id="gpt-4",
+                provider="openai",
+                message_id="msg-1",
+                run_config={"max_steps": 8, "max_tool_calls": 20, "timeout_s": 300},
+            )
+
+            row = session.add.call_args.args[0]
+            self.assertEqual(row.run_config, {"max_steps": 8, "max_tool_calls": 20, "timeout_s": 300})
+
+    async def test_write_session_started_updates_existing_run_config(self):
+        with patch("app.services.agent.session_cache.SessionLocal") as mock_sl:
+            session = MagicMock()
+            mock_sl.return_value.__enter__.return_value = session
+            existing = MagicMock()
+            session.get.return_value = existing
+
+            await write_session_started(
+                run_id="r1",
+                conversation_id="c1",
+                user_id="u1",
+                model_id="gpt-4",
+                provider="openai",
+                message_id="msg-1",
+                run_config={"max_steps": 4, "max_tool_calls": 7, "timeout_s": 90},
+            )
+
+            self.assertEqual(existing.run_config, {"max_steps": 4, "max_tool_calls": 7, "timeout_s": 90})
+
     async def test_write_session_started_upserts_existing_row(self):
         """同 run_id 二次调用：不 add 新行，而是更新已有 row 的字段并重置 totals"""
         with patch("app.services.agent.session_cache.SessionLocal") as mock_sl:
@@ -46,6 +84,9 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             existing = MagicMock()
             existing.total_steps = 5
             existing.total_tool_calls = 3
+            existing.total_duration_ms = 1234
+            existing.limit_reason = "max_steps"
+            existing.error_message = "旧错误"
             existing.status = "completed"
             session.get.return_value = existing
 
@@ -63,6 +104,9 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(existing.status, "running")
             self.assertEqual(existing.total_steps, 0)
             self.assertEqual(existing.total_tool_calls, 0)
+            self.assertIsNone(existing.total_duration_ms)
+            self.assertIsNone(existing.limit_reason)
+            self.assertIsNone(existing.error_message)
             session.commit.assert_called_once()
 
     async def test_write_session_started_inserts_when_no_existing_row(self):
@@ -212,6 +256,21 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
                 run_id="r1", status="completed", total_steps=2, total_tool_calls=3, total_duration_ms=12345
             )
             self.assertEqual(row.total_duration_ms, 12345)
+
+    async def test_write_session_status_persists_limit_reason(self):
+        with patch("app.services.agent.session_cache.SessionLocal") as mock_sl:
+            session = MagicMock()
+            mock_sl.return_value.__enter__.return_value = session
+            row = MagicMock()
+            session.get.return_value = row
+            await write_session_status(
+                run_id="r1",
+                status="limit_reached",
+                total_steps=2,
+                total_tool_calls=3,
+                limit_reason="max_steps",
+            )
+            self.assertEqual(row.limit_reason, "max_steps")
 
 
 if __name__ == "__main__":

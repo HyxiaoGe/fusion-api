@@ -886,7 +886,7 @@ Run:
 
 ```bash
 cd /Users/sean/code/fusion/fusion-ui
-npm test -- streamSlice.test.ts --runInBand
+npm test -- streamSlice.test.ts
 ```
 
 Expected: FAIL because `startStream` does not accept `staticBlocks`.
@@ -929,7 +929,7 @@ Run:
 
 ```bash
 cd /Users/sean/code/fusion/fusion-ui
-npm test -- streamSlice.test.ts --runInBand
+npm test -- streamSlice.test.ts
 ```
 
 Expected: PASS.
@@ -1226,7 +1226,7 @@ Run:
 
 ```bash
 cd /Users/sean/code/fusion/fusion-ui
-npm test -- chat.test.ts useContinueAgentRun.test.ts --runInBand
+npm test -- chat.test.ts useContinueAgentRun.test.ts
 ```
 
 Expected: PASS.
@@ -1356,7 +1356,7 @@ Run:
 
 ```bash
 cd /Users/sean/code/fusion/fusion-ui
-npm test -- RunBanner.test.tsx AssistantResponseStack.test.tsx \"page.test.tsx\" --runInBand
+npm test -- RunBanner.test.tsx AssistantResponseStack.test.tsx \"page.test.tsx\"
 ```
 
 Expected: PASS.
@@ -1414,8 +1414,7 @@ npm test -- \
   useContinueAgentRun.test.ts \
   RunBanner.test.tsx \
   AssistantResponseStack.test.tsx \
-  page.test.tsx \
-  --runInBand
+  page.test.tsx
 ```
 
 Expected: PASS.
@@ -1426,7 +1425,7 @@ Run:
 
 ```bash
 cd /Users/sean/code/fusion/fusion-ui
-npm test -- --runInBand
+npm test
 npm run lint
 npm run build
 git diff --check

@@ -131,6 +131,22 @@ class Usage(BaseModel):
 
 
 # ============================================================
+# Agent Run（消息级最新运行摘要）
+# ============================================================
+
+
+class AgentRunSummary(BaseModel):
+    """assistant 消息最近一次 agent run 摘要，用于前端恢复终态和继续执行入口"""
+
+    run_id: str
+    status: Literal["running", "completed", "limit_reached", "incomplete", "interrupted", "error"]
+    config: Dict[str, Any] = Field(default_factory=dict)
+    total_steps: int = 0
+    total_tool_calls: int = 0
+    limit_reason: Optional[Literal["max_steps", "max_tool_calls", "timeout"]] = None
+
+
+# ============================================================
 # Message（消息）
 # ============================================================
 
@@ -148,6 +164,8 @@ class Message(BaseModel):
     usage: Optional[Usage] = None
     # 仅 assistant 消息填充，持久化推荐问题
     suggested_questions: Optional[List[str]] = None
+    # 仅 assistant 消息填充，最近一次 agent run 摘要
+    agent_run: Optional[AgentRunSummary] = None
     created_at: datetime = Field(default_factory=datetime.now)
 
     class Config:
@@ -184,6 +202,11 @@ class ChatRequest(BaseModel):
     stream: bool = True  # 默认开启流式
     options: Optional[Dict[str, Any]] = None  # 扩展选项，如 use_reasoning
     file_ids: Optional[List[str]] = None  # 附带的文件 ID 列表
+
+
+class ContinueAgentRunRequest(BaseModel):
+    previous_run_id: Optional[str] = None
+    stream: bool = True
 
 
 class ChatResponse(BaseModel):

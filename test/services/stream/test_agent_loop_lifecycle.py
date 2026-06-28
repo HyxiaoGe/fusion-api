@@ -83,6 +83,9 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
             original_message="hi",
             call_config=call_config or self._call_config(),
             limits=limits or self._limits(),
+            initial_content_blocks=[],
+            extra_system_prompts=[],
+            preprocess_user_input=True,
         )
 
     def _dependencies(self, **overrides):
@@ -191,6 +194,54 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call_order[3][1], [{"role": "user", "content": "prepared"}])
         self.assertEqual(call_order[3][2], [initial_block])
         self.assertIs(call_order[4][1], execution.completion_context)
+
+    async def test_lifecycle_passes_continuation_inputs_and_preserves_existing_blocks_first(self):
+        call_order = []
+        execution = self._execution()
+        existing_block = TextBlock(type="text", id="txt-existing", text="旧回答")
+        prepared_block = TextBlock(type="text", id="txt-url", text="URL 摘要")
+
+        async def prepare_messages_fn(**kwargs):
+            call_order.append(
+                (
+                    "prepare",
+                    kwargs["extra_system_prompts"],
+                    kwargs["preprocess_user_input"],
+                )
+            )
+            return AgentLoopPreparedMessages(
+                messages=[{"role": "user", "content": "prepared"}],
+                initial_content_blocks=[prepared_block],
+            )
+
+        async def run_agent_loop_fn(**kwargs):
+            call_order.append(("run", list(kwargs["state"].content_blocks)))
+            return AgentLoopOutcome(exit=AgentLoopExit.COMPLETED)
+
+        request = self._request()
+        request = AgentLoopLifecycleRequest(
+            raw_messages=request.raw_messages,
+            has_vision=request.has_vision,
+            file_ids=request.file_ids,
+            original_message=request.original_message,
+            call_config=request.call_config,
+            limits=request.limits,
+            initial_content_blocks=[existing_block],
+            extra_system_prompts=["继续执行，不要重写前文"],
+            preprocess_user_input=False,
+        )
+
+        await run_agent_loop_lifecycle(
+            request=request,
+            execution=execution,
+            dependencies=self._dependencies(
+                prepare_messages_fn=prepare_messages_fn,
+                run_agent_loop_fn=run_agent_loop_fn,
+            ),
+        )
+
+        self.assertEqual(call_order[0], ("prepare", ["继续执行，不要重写前文"], False))
+        self.assertEqual(call_order[1], ("run", [existing_block, prepared_block]))
 
     async def test_superseded_path_finalizes_superseded_without_completed_finalize(self):
         call_order = []

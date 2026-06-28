@@ -106,6 +106,8 @@ async def prepare_agent_loop_messages(
     is_image_file_fn: Callable[[str, Any], bool] | None = None,
     inject_file_content_fn: Callable[[list[dict], str, dict[str, str]], list[dict]] | None = None,
     preprocess_url_in_message_fn: Callable[..., Awaitable[tuple[Any | None, dict | None, str | None]]] | None = None,
+    preprocess_user_input: bool = True,
+    extra_system_prompts: list[str] | None = None,
 ) -> AgentLoopPreparedMessages:
     file_repo_factory = file_repo_factory or FileRepository
     load_user_system_prompt_fn = load_user_system_prompt_fn or load_user_system_prompt
@@ -117,21 +119,26 @@ async def prepare_agent_loop_messages(
     file_repo = file_repo_factory(db)
     user_system_prompt = load_user_system_prompt_fn(db, user_id)
     messages = await build_llm_messages_fn(raw_messages, has_vision, file_repo, user_system_prompt)
-    messages = _inject_non_image_file_contents(
-        messages=messages,
-        file_ids=file_ids,
-        original_message=original_message,
-        file_repo=file_repo,
-        is_image_file_fn=is_image_file_fn,
-        inject_file_content_fn=inject_file_content_fn,
-    )
+    messages = inject_extra_system_prompts(messages, extra_system_prompts or [])
 
-    messages, initial_content_blocks = await _prepare_url_context(
-        messages=messages,
-        original_message=original_message,
-        call_config=call_config,
-        preprocess_url_in_message_fn=preprocess_url_in_message_fn,
-    )
+    if preprocess_user_input:
+        messages = _inject_non_image_file_contents(
+            messages=messages,
+            file_ids=file_ids,
+            original_message=original_message,
+            file_repo=file_repo,
+            is_image_file_fn=is_image_file_fn,
+            inject_file_content_fn=inject_file_content_fn,
+        )
+
+        messages, initial_content_blocks = await _prepare_url_context(
+            messages=messages,
+            original_message=original_message,
+            call_config=call_config,
+            preprocess_url_in_message_fn=preprocess_url_in_message_fn,
+        )
+    else:
+        initial_content_blocks = []
 
     messages = inject_tool_usage_contract(messages, call_config.call_kwargs)
     return AgentLoopPreparedMessages(
@@ -139,6 +146,17 @@ async def prepare_agent_loop_messages(
         initial_content_blocks=initial_content_blocks,
         final_tool_names=announced_tool_names_from_call_kwargs(call_config.call_kwargs),
     )
+
+
+def inject_extra_system_prompts(messages: list[dict], prompts: list[str]) -> list[dict]:
+    if not prompts:
+        return messages
+
+    insert_at = 0
+    while insert_at < len(messages) and messages[insert_at].get("role") == "system":
+        insert_at += 1
+    prompt_messages = [{"role": "system", "content": prompt} for prompt in prompts]
+    return [*messages[:insert_at], *prompt_messages, *messages[insert_at:]]
 
 
 def _inject_non_image_file_contents(

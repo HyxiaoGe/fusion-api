@@ -21,6 +21,10 @@ from app.schemas.chat import (
     Usage,
 )
 from app.schemas.response import ApiException
+from app.services.agent.continuation import (
+    CONTINUATION_SYSTEM_PROMPT,
+    build_continuation_context,
+)
 from app.services.chat.message_builder import (
     build_llm_messages,
     inject_file_content,
@@ -31,7 +35,8 @@ from app.services.conversation_service import ConversationService
 from app.services.file_service import is_image_mime
 from app.services.storage import get_storage
 from app.services.stream import StreamHandler, stream_redis_as_sse
-from app.services.stream_state_service import init_stream
+from app.services.stream.runner import _agent_loop_limits
+from app.services.stream_state_service import get_stream_meta, init_stream
 from app.services.task_manager import register_task
 
 
@@ -178,6 +183,77 @@ class ChatService:
                 conversation.id,
                 options,
             )
+
+    async def continue_agent_run(
+        self,
+        *,
+        conversation_id: str,
+        assistant_message_id: str,
+        user_id: str,
+        previous_run_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> StreamingResponse:
+        """基于最近一次 limit_reached run 续写同一条 assistant 消息。"""
+        conversation = self.conversation_service.get_conversation(conversation_id, user_id)
+        if not conversation:
+            raise ApiException.not_found("会话不存在或无权访问")
+
+        meta = await get_stream_meta(conversation_id)
+        if meta and meta.get("status") == "streaming":
+            raise ApiException.conflict("当前会话已有回答正在生成，请结束后再继续")
+
+        model_id = conversation.model_id
+        litellm_model, provider, litellm_kwargs = llm_manager.resolve_model(model_id)
+        capabilities = litellm_catalog.get_capabilities(model_id)
+        has_vision = capabilities.get("vision", False)
+
+        continuation = build_continuation_context(
+            self.db,
+            conversation_id=conversation_id,
+            message_id=assistant_message_id,
+            previous_run_id=previous_run_id,
+            default_limits=_agent_loop_limits(),
+        )
+
+        task_id = str(uuid_mod.uuid4())
+        await init_stream(conversation_id, str(user_id), model_id, assistant_message_id, task_id)
+
+        task = asyncio.create_task(
+            self.stream_handler.generate_to_redis(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                model_id=model_id,
+                litellm_model=litellm_model,
+                litellm_kwargs=litellm_kwargs,
+                provider=provider,
+                raw_messages=conversation.messages,
+                has_vision=has_vision,
+                file_ids=None,
+                original_message="",
+                assistant_message_id=assistant_message_id,
+                task_id=task_id,
+                options={},
+                capabilities=capabilities,
+                trace_id=trace_id,
+                initial_content_blocks=continuation.initial_content_blocks,
+                extra_system_prompts=[CONTINUATION_SYSTEM_PROMPT],
+                preprocess_user_input=False,
+                limits=continuation.limits,
+            )
+        )
+        register_task(conversation_id, task, task_id)
+
+        return StreamingResponse(
+            stream_redis_as_sse(
+                conversation_id=conversation_id,
+                message_id=assistant_message_id,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     def _get_or_create_conversation(
         self,

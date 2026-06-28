@@ -152,6 +152,10 @@ class StreamHandler:
         options: Optional[dict] = None,
         capabilities: Optional[dict] = None,
         trace_id: Optional[str] = None,
+        initial_content_blocks: Optional[list] = None,
+        extra_system_prompts: Optional[list[str]] = None,
+        preprocess_user_input: bool = True,
+        limits: Optional[AgentLoopLimits] = None,
     ) -> None:
         """后台任务：调用 LLM，chunk 写入 Redis Stream，并由 agent loop 完成落库。"""
         run_input = AgentLoopRunInput(
@@ -170,6 +174,9 @@ class StreamHandler:
             options=options,
             capabilities=capabilities,
             trace_id=trace_id,
+            initial_content_blocks=initial_content_blocks,
+            extra_system_prompts=extra_system_prompts,
+            preprocess_user_input=preprocess_user_input,
         )
 
         db = SessionLocal()
@@ -177,7 +184,7 @@ class StreamHandler:
             lifecycle_call = build_agent_loop_lifecycle_call(
                 run_input=run_input,
                 db=db,
-                limits=_agent_loop_limits(),
+                limits=limits or _agent_loop_limits(),
                 dependencies=_agent_loop_wiring_dependencies(),
             )
             await _run_agent_loop_lifecycle_call(lifecycle_call)

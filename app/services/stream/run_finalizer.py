@@ -56,6 +56,7 @@ class AgentRunSessionCache(Protocol):
         model_id: str,
         provider: str,
         message_id: str,
+        run_config: dict | None = None,
     ) -> None: ...
 
     async def write_step_terminal(self, *, step_id: str, status: StepTerminalStatus) -> None: ...
@@ -68,6 +69,7 @@ class AgentRunSessionCache(Protocol):
         total_steps: int,
         total_tool_calls: int,
         total_duration_ms: int | None = None,
+        limit_reason: str | None = None,
     ) -> None: ...
 
 
@@ -94,6 +96,7 @@ async def start_agent_run(
         model_id=model_id,
         provider=provider,
         message_id=message_id,
+        run_config=config,
     )
     await emitter.run_started(
         message_id=message_id,
@@ -111,6 +114,7 @@ async def complete_agent_run(
     duration_ms_factory: DurationMsFactory,
     session_status: AgentSessionStatus,
     finish_reason: RunCompletedFinishReason,
+    limit_reason: str | None = None,
 ) -> None:
     await emitter.run_completed(
         total_steps=stats.total_steps,
@@ -122,6 +126,7 @@ async def complete_agent_run(
         stats=stats,
         duration_ms_factory=duration_ms_factory,
         status=session_status,
+        limit_reason=limit_reason,
     )
 
 
@@ -186,11 +191,15 @@ async def _write_session_status(
     stats: AgentRunStats,
     duration_ms_factory: DurationMsFactory,
     status: TerminalSessionStatus,
+    limit_reason: str | None = None,
 ) -> None:
-    await session_cache.write_session_status(
-        run_id=stats.run_id,
-        status=status,
-        total_steps=stats.total_steps,
-        total_tool_calls=stats.total_tool_calls,
-        total_duration_ms=duration_ms_factory(),
-    )
+    kwargs = {
+        "run_id": stats.run_id,
+        "status": status,
+        "total_steps": stats.total_steps,
+        "total_tool_calls": stats.total_tool_calls,
+        "total_duration_ms": duration_ms_factory(),
+    }
+    if limit_reason is not None:
+        kwargs["limit_reason"] = limit_reason
+    await session_cache.write_session_status(**kwargs)

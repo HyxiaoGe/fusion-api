@@ -2,7 +2,7 @@ import os
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, Column, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import relationship
 
 from app.db.database import Base
@@ -194,6 +194,7 @@ class AgentSession(Base):
     user_id = Column(String, nullable=False, index=True)
     model_id = Column(String(100), nullable=False)
     provider = Column(String(50), nullable=False)
+    run_config = Column("config", JSONB, nullable=True)
 
     total_steps = Column(Integer, default=0)
     total_tool_calls = Column(Integer, default=0)
@@ -206,6 +207,10 @@ class AgentSession(Base):
     error_message = Column(Text, nullable=True)
 
     created_at = Column(DateTime, default=get_china_time, index=True)
+
+    __table_args__ = (
+        Index("ix_agent_sessions_conversation_message_created_at", "conversation_id", "message_id", "created_at"),
+    )
 
 
 class AgentStep(Base):

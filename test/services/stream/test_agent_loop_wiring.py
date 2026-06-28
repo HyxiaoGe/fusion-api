@@ -108,6 +108,9 @@ class AgentLoopWiringTests(unittest.TestCase):
             options=None,
             capabilities=None,
             trace_id="trace-wiring",
+            initial_content_blocks=["旧块"],
+            extra_system_prompts=["继续执行"],
+            preprocess_user_input=False,
         )
 
         lifecycle_call = build_agent_loop_lifecycle_call(
@@ -188,6 +191,9 @@ class AgentLoopWiringTests(unittest.TestCase):
         self.assertEqual(lifecycle_call.request.original_message, "hi")
         self.assertIs(lifecycle_call.request.call_config, call_config)
         self.assertEqual(lifecycle_call.request.limits, limits)
+        self.assertEqual(lifecycle_call.request.initial_content_blocks, ["旧块"])
+        self.assertEqual(lifecycle_call.request.extra_system_prompts, ["继续执行"])
+        self.assertFalse(lifecycle_call.request.preprocess_user_input)
         self.assertIs(lifecycle_call.dependencies.append_chunk_fn, append_chunk_fn)
         self.assertIs(lifecycle_call.dependencies.start_agent_run_fn, start_agent_run_fn)
         self.assertIs(lifecycle_call.dependencies.prepare_messages_fn, prepare_messages_fn)
@@ -229,6 +235,9 @@ class AgentLoopWiringTests(unittest.TestCase):
             options={},
             capabilities={},
             trace_id=None,
+            initial_content_blocks=["旧块"],
+            extra_system_prompts=["继续执行"],
+            preprocess_user_input=False,
         )
         redis_writer = object()
 
@@ -279,6 +288,9 @@ class AgentLoopWiringTests(unittest.TestCase):
         self.assertTrue(lifecycle_request.has_vision)
         self.assertIs(lifecycle_request.call_config, call_config)
         self.assertEqual(lifecycle_request.limits, limits)
+        self.assertEqual(lifecycle_request.initial_content_blocks, ["旧块"])
+        self.assertEqual(lifecycle_request.extra_system_prompts, ["继续执行"])
+        self.assertFalse(lifecycle_request.preprocess_user_input)
         self.assertIs(execution_dependencies.redis_writer, redis_writer)
         self.assertIs(execution_dependencies.session_cache, dependencies.session_cache)
         self.assertIs(lifecycle_dependencies.run_agent_loop_fn, dependencies.run_agent_loop_fn)
