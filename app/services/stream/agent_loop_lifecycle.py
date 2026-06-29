@@ -11,6 +11,7 @@ from app.services.stream.agent_loop_execution import AgentLoopExecutionContext
 from app.services.stream.agent_loop_outcome import AgentLoopExit
 from app.services.stream.agent_loop_policy import AgentLoopLimits, map_run_terminal_state
 from app.services.stream.agent_loop_request_prep import AgentLoopCallConfig
+from app.services.stream.agent_plan_builder import build_long_task_plan_items
 
 AsyncFn = Callable[..., Awaitable[Any]]
 PersistMessageFn = Callable[..., Any]
@@ -105,7 +106,12 @@ async def _start_run(
     dependencies: AgentLoopLifecycleDependencies,
 ) -> None:
     context = execution.completion_context
-    plan_items = _default_plan_items(request.call_config.announced_tools)
+    plan_items = build_long_task_plan_items(
+        original_message=request.original_message,
+        tools=request.call_config.announced_tools,
+        limits=request.limits,
+    )
+    execution.state.set_plan_items(plan_items)
     await dependencies.append_chunk_fn(context.conversation_id, "preparing", "", "")
     await dependencies.start_agent_run_fn(
         emitter=execution.emitter,
@@ -121,7 +127,7 @@ async def _start_run(
     )
     await execution.emitter.run_progress_updated(
         phase="planning",
-        label="正在理解问题",
+        label="正在制定执行计划",
         completed_steps=0,
         total_steps=len(plan_items),
         completed_tool_calls=0,
@@ -236,60 +242,3 @@ def _run_config(limits: AgentLoopLimits) -> dict:
         "max_tool_calls": limits.max_tool_calls,
         "timeout_s": limits.total_timeout_s,
     }
-
-
-def _default_plan_items(tools: list[str]) -> list[dict]:
-    if tools:
-        return [
-            {
-                "id": "understand",
-                "title": "理解问题",
-                "status": "running",
-                "kind": "reasoning",
-                "tool_names": [],
-                "evidence_item_ids": [],
-            },
-            {
-                "id": "search",
-                "title": "查找资料",
-                "status": "pending",
-                "kind": "search",
-                "tool_names": tools,
-                "evidence_item_ids": [],
-            },
-            {
-                "id": "read",
-                "title": "读取关键来源",
-                "status": "pending",
-                "kind": "read",
-                "tool_names": tools,
-                "evidence_item_ids": [],
-            },
-            {
-                "id": "answer",
-                "title": "整理回答",
-                "status": "pending",
-                "kind": "answer",
-                "tool_names": [],
-                "evidence_item_ids": [],
-            },
-        ]
-
-    return [
-        {
-            "id": "understand",
-            "title": "理解问题",
-            "status": "running",
-            "kind": "reasoning",
-            "tool_names": [],
-            "evidence_item_ids": [],
-        },
-        {
-            "id": "answer",
-            "title": "整理回答",
-            "status": "pending",
-            "kind": "answer",
-            "tool_names": [],
-            "evidence_item_ids": [],
-        },
-    ]

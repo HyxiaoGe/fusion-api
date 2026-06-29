@@ -371,7 +371,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 if event["type"] == "run_progress_updated"
             ],
             [
-                ("planning", "正在理解问题", 0, 0, 20),
+                ("planning", "正在制定执行计划", 0, 0, 20),
                 ("researching", "正在查找资料", 1, 0, 20),
                 ("reading", "正在读取关键来源", 2, 1, 20),
                 ("synthesizing", "正在整理回答", 3, 1, 20),
@@ -434,18 +434,18 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             plan_updates,
             [
-                (2, "understand", "running", None, []),
+                (2, "understand", "running", "围绕「hi」判断资料需求和回答路径", []),
                 (3, "understand", "completed", "已完成问题理解", []),
-                (4, "search", "running", "正在执行 1 个工具调用", []),
-                (5, "search", "completed", "完成 1 个工具调用", ["web_search"]),
-                (6, "read", "running", "正在整理关键来源", []),
-                (12, "read", "completed", "已完成关键来源读取", []),
-                (13, "answer", "running", None, []),
-                (14, "answer", "pending", None, []),
-                (15, "read", "running", "正在读取 1 个关键来源", ["url_read"]),
-                (16, "read", "completed", "已完成关键来源读取", ["url_read"]),
-                (22, "read", "completed", "已完成关键来源读取", []),
-                (23, "answer", "running", None, []),
+                (4, "search", "running", "正在执行 1 个工具调用 · 预算：最多 4 次搜索，每次 3-10 条结果", ["web_search"]),
+                (5, "search", "completed", "完成 1 个工具调用 · 预算：最多 4 次搜索，每次 3-10 条结果", ["web_search"]),
+                (6, "read", "running", "正在整理关键来源 · 预算：最多 5 个网页", []),
+                (12, "read", "completed", "已完成关键来源读取 · 预算：最多 5 个网页", []),
+                (13, "answer", "running", "基于可用依据给出结论、推荐和不确定性", []),
+                (14, "answer", "pending", "基于可用依据给出结论、推荐和不确定性", []),
+                (15, "read", "running", "正在读取 1 个关键来源 · 预算：最多 5 个网页", ["url_read"]),
+                (16, "read", "completed", "已完成关键来源读取 · 预算：最多 5 个网页", ["url_read"]),
+                (22, "read", "completed", "已完成关键来源读取 · 预算：最多 5 个网页", []),
+                (23, "answer", "running", "基于可用依据给出结论、推荐和不确定性", []),
                 (29, "answer", "completed", "已完成回答整理", []),
             ],
         )
@@ -459,10 +459,10 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                     event["max_tool_calls"],
                 )
                 for event in result.events
-                if event["type"] == "run_progress_updated"
-            ],
-            [
-                ("planning", "正在理解问题", 0, 0, 20),
+            if event["type"] == "run_progress_updated"
+        ],
+        [
+                ("planning", "正在制定执行计划", 0, 0, 20),
                 ("researching", "正在查找资料", 1, 0, 20),
                 ("reading", "正在读取关键来源", 2, 1, 20),
                 ("synthesizing", "正在整理回答", 3, 1, 20),

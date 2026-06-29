@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 import uuid
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from inspect import iscoroutinefunction
 from typing import Protocol
 
@@ -37,6 +37,7 @@ class AgentStepContext:
     thinking_block_id: str
     text_block_id: str
     run_id: str = ""
+    plan_items: dict[str, dict] = field(default_factory=dict)
 
 
 def _make_block_id() -> str:
@@ -66,6 +67,7 @@ async def start_agent_step(
     step_number: int,
     completed_tool_calls: int | None = None,
     max_tool_calls: int | None = None,
+    plan_items: dict[str, dict] | None = None,
     clock: Callable[[], float] = time.time,
     block_id_factory: Callable[[], str] = _make_block_id,
     on_step_started: Callable[[str], None] | None = None,
@@ -80,6 +82,7 @@ async def start_agent_step(
         step_number=step_number,
         completed_tool_calls=completed_tool_calls,
         max_tool_calls=max_tool_calls,
+        plan_items=plan_items,
     )
     await session_cache.write_step_started(
         run_id=run_id,
@@ -93,6 +96,7 @@ async def start_agent_step(
         started_at=started_at,
         thinking_block_id=block_id_factory(),
         text_block_id=block_id_factory(),
+        plan_items=_copy_plan_items(plan_items),
     )
 
 
@@ -145,29 +149,31 @@ async def mark_tool_round_started(
             emitter=emitter,
             run_id=context.run_id,
             revision=_plan_revision(context.step_number, PLAN_REV_UNDERSTAND_COMPLETED),
-            item={
-                "id": "understand",
-                "title": "理解问题",
-                "status": "completed",
-                "kind": "reasoning",
-                "summary": "已完成问题理解",
-                "tool_names": [],
-                "evidence_item_ids": [],
-            },
+            item=_plan_item_update(
+                context.plan_items,
+                item_id="understand",
+                title="理解问题",
+                status="completed",
+                kind="reasoning",
+                summary="已完成问题理解",
+                tool_names=[],
+                evidence_item_ids=[],
+            ),
         )
     else:
         await _emit_plan_step_update(
             emitter=emitter,
             run_id=context.run_id,
             revision=_plan_revision(context.step_number, PLAN_REV_ANSWER_PENDING_FOR_TOOLS),
-            item={
-                "id": "answer",
-                "title": "整理回答",
-                "status": "pending",
-                "kind": "answer",
-                "tool_names": [],
-                "evidence_item_ids": [],
-            },
+            item=_plan_item_update(
+                context.plan_items,
+                item_id="answer",
+                title="整理回答",
+                status="pending",
+                kind="answer",
+                tool_names=[],
+                evidence_item_ids=[],
+            ),
         )
 
     if stage == "read":
@@ -175,15 +181,16 @@ async def mark_tool_round_started(
             emitter=emitter,
             run_id=context.run_id,
             revision=_tool_running_revision(context.step_number),
-            item={
-                "id": "read",
-                "title": "读取关键来源",
-                "status": "running",
-                "kind": "read",
-                "summary": f"正在读取 {tool_call_count} 个关键来源",
-                "tool_names": list(tool_names),
-                "evidence_item_ids": [],
-            },
+            item=_plan_item_update(
+                context.plan_items,
+                item_id="read",
+                title="读取关键来源",
+                status="running",
+                kind="read",
+                summary=f"正在读取 {tool_call_count} 个关键来源",
+                tool_names=list(tool_names),
+                evidence_item_ids=[],
+            ),
         )
         await _maybe_call_async(
             emitter,
@@ -201,15 +208,16 @@ async def mark_tool_round_started(
         emitter=emitter,
         run_id=context.run_id,
         revision=_tool_running_revision(context.step_number),
-        item={
-            "id": "search",
-            "title": "查找资料",
-            "status": "running",
-            "kind": "search",
-            "summary": f"正在执行 {tool_call_count} 个工具调用",
-            "tool_names": [],
-            "evidence_item_ids": [],
-        },
+        item=_plan_item_update(
+            context.plan_items,
+            item_id="search",
+            title="查找资料",
+            status="running",
+            kind="search",
+            summary=f"正在执行 {tool_call_count} 个工具调用",
+            tool_names=list(tool_names),
+            evidence_item_ids=[],
+        ),
     )
     await _maybe_call_async(
         emitter,
@@ -230,20 +238,22 @@ async def _maybe_emit_plan_step_started(
     step_number: int,
     completed_tool_calls: int | None,
     max_tool_calls: int | None,
+    plan_items: dict[str, dict] | None = None,
 ) -> None:
     if step_number == 1:
         await _emit_plan_step_update(
             emitter=emitter,
             run_id=run_id,
             revision=_plan_revision(step_number, PLAN_REV_UNDERSTAND_RUNNING),
-            item={
-                "id": "understand",
-                "title": "理解问题",
-                "status": "running",
-                "kind": "reasoning",
-                "tool_names": [],
-                "evidence_item_ids": [],
-            },
+            item=_plan_item_update(
+                plan_items,
+                item_id="understand",
+                title="理解问题",
+                status="running",
+                kind="reasoning",
+                tool_names=[],
+                evidence_item_ids=[],
+            ),
         )
         return
 
@@ -251,28 +261,30 @@ async def _maybe_emit_plan_step_started(
         emitter=emitter,
         run_id=run_id,
         revision=_plan_revision(step_number, PLAN_REV_FOLLOWUP_READ_COMPLETED),
-        item={
-            "id": "read",
-            "title": "读取关键来源",
-            "status": "completed",
-            "kind": "read",
-            "summary": "已完成关键来源读取",
-            "tool_names": [],
-            "evidence_item_ids": [],
-        },
+        item=_plan_item_update(
+            plan_items,
+            item_id="read",
+            title="读取关键来源",
+            status="completed",
+            kind="read",
+            summary="已完成关键来源读取",
+            tool_names=[],
+            evidence_item_ids=[],
+        ),
     )
     await _emit_plan_step_update(
         emitter=emitter,
         run_id=run_id,
         revision=_plan_revision(step_number, PLAN_REV_FOLLOWUP_ANSWER_RUNNING),
-        item={
-            "id": "answer",
-            "title": "整理回答",
-            "status": "running",
-            "kind": "answer",
-            "tool_names": [],
-            "evidence_item_ids": [],
-        },
+        item=_plan_item_update(
+            plan_items,
+            item_id="answer",
+            title="整理回答",
+            status="running",
+            kind="answer",
+            tool_names=[],
+            evidence_item_ids=[],
+        ),
     )
     await _maybe_call_async(
         emitter,
@@ -302,15 +314,16 @@ async def _maybe_emit_plan_step_completed(
                 emitter=emitter,
                 run_id=context.run_id,
                 revision=_tool_completed_revision(context.step_number),
-                item={
-                    "id": "read",
-                    "title": "读取关键来源",
-                    "status": "completed",
-                    "kind": "read",
-                    "summary": "已完成关键来源读取",
-                    "tool_names": tool_names,
-                    "evidence_item_ids": [],
-                },
+                item=_plan_item_update(
+                    context.plan_items,
+                    item_id="read",
+                    title="读取关键来源",
+                    status="completed",
+                    kind="read",
+                    summary="已完成关键来源读取",
+                    tool_names=tool_names,
+                    evidence_item_ids=[],
+                ),
             )
             await _maybe_call_async(
                 emitter,
@@ -328,29 +341,31 @@ async def _maybe_emit_plan_step_completed(
             emitter=emitter,
             run_id=context.run_id,
             revision=_tool_completed_revision(context.step_number),
-            item={
-                "id": "search",
-                "title": "查找资料",
-                "status": "completed",
-                "kind": "search",
-                "summary": f"完成 {_completed_tool_summary_count(tool_call_count, completed_tool_calls)} 个工具调用",
-                "tool_names": tool_names,
-                "evidence_item_ids": [],
-            },
+            item=_plan_item_update(
+                context.plan_items,
+                item_id="search",
+                title="查找资料",
+                status="completed",
+                kind="search",
+                summary=f"完成 {_completed_tool_summary_count(tool_call_count, completed_tool_calls)} 个工具调用",
+                tool_names=tool_names,
+                evidence_item_ids=[],
+            ),
         )
         await _emit_plan_step_update(
             emitter=emitter,
             run_id=context.run_id,
             revision=_read_running_after_search_revision(context.step_number),
-            item={
-                "id": "read",
-                "title": "读取关键来源",
-                "status": "running",
-                "kind": "read",
-                "summary": "正在整理关键来源",
-                "tool_names": [],
-                "evidence_item_ids": [],
-            },
+            item=_plan_item_update(
+                context.plan_items,
+                item_id="read",
+                title="读取关键来源",
+                status="running",
+                kind="read",
+                summary="正在整理关键来源",
+                tool_names=[],
+                evidence_item_ids=[],
+            ),
         )
         await _maybe_call_async(
             emitter,
@@ -369,30 +384,32 @@ async def _maybe_emit_plan_step_completed(
             emitter=emitter,
             run_id=context.run_id,
             revision=_plan_revision(context.step_number, PLAN_REV_UNDERSTAND_COMPLETED),
-            item={
-                "id": "understand",
-                "title": "理解问题",
-                "status": "completed",
-                "kind": "reasoning",
-                "summary": "已完成问题理解",
-                "tool_names": [],
-                "evidence_item_ids": [],
-            },
+            item=_plan_item_update(
+                context.plan_items,
+                item_id="understand",
+                title="理解问题",
+                status="completed",
+                kind="reasoning",
+                summary="已完成问题理解",
+                tool_names=[],
+                evidence_item_ids=[],
+            ),
         )
 
     await _emit_plan_step_update(
         emitter=emitter,
         run_id=context.run_id,
         revision=_plan_revision(context.step_number, PLAN_REV_ANSWER_COMPLETED),
-        item={
-            "id": "answer",
-            "title": "整理回答",
-            "status": "completed",
-            "kind": "answer",
-            "summary": "已完成回答整理",
-            "tool_names": [],
-            "evidence_item_ids": [],
-        },
+        item=_plan_item_update(
+            context.plan_items,
+            item_id="answer",
+            title="整理回答",
+            status="completed",
+            kind="answer",
+            summary="已完成回答整理",
+            tool_names=[],
+            evidence_item_ids=[],
+        ),
     )
     await _maybe_call_async(
         emitter,
@@ -404,6 +421,58 @@ async def _maybe_emit_plan_step_completed(
         completed_tool_calls=completed_tool_calls,
         max_tool_calls=max_tool_calls,
     )
+
+
+def _copy_plan_items(plan_items: dict[str, dict] | None) -> dict[str, dict]:
+    return {str(item_id): dict(item) for item_id, item in (plan_items or {}).items()}
+
+
+def _plan_item_update(
+    plan_items: dict[str, dict] | None,
+    *,
+    item_id: str,
+    title: str,
+    status: str,
+    kind: str,
+    summary: str | None = None,
+    tool_names: list[str] | None = None,
+    evidence_item_ids: list[str] | None = None,
+) -> dict:
+    template = (plan_items or {}).get(item_id) or {}
+    item = {
+        "id": item_id,
+        "title": str(template.get("title") or title),
+        "status": status,
+        "kind": kind,
+        "tool_names": tool_names if tool_names is not None else list(template.get("tool_names") or []),
+        "evidence_item_ids": (
+            evidence_item_ids
+            if evidence_item_ids is not None
+            else list(template.get("evidence_item_ids") or [])
+        ),
+    }
+    merged_summary = _merge_plan_summary(template.get("summary"), summary)
+    if merged_summary:
+        item["summary"] = merged_summary
+    return item
+
+
+def _merge_plan_summary(template_summary: object, summary: str | None) -> str | None:
+    if not summary:
+        return template_summary if isinstance(template_summary, str) and template_summary else None
+    budget = _extract_budget(template_summary)
+    if budget:
+        return f"{summary} · 预算：{budget}"
+    return summary
+
+
+def _extract_budget(template_summary: object) -> str | None:
+    if not isinstance(template_summary, str):
+        return None
+    marker = "预算："
+    if marker not in template_summary:
+        return None
+    return template_summary.split(marker, 1)[1].strip() or None
 
 
 def _plan_revision(step_number: int, offset: int) -> int:

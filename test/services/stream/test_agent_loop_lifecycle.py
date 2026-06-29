@@ -220,8 +220,21 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 config=kwargs["config"],
             )
 
+        request = self._request(call_config=call_config, limits=limits)
+        request = AgentLoopLifecycleRequest(
+            raw_messages=request.raw_messages,
+            has_vision=request.has_vision,
+            file_ids=request.file_ids,
+            original_message="请查一下 2026 年暑期旅游哪里最火",
+            call_config=request.call_config,
+            limits=request.limits,
+            initial_content_blocks=request.initial_content_blocks,
+            extra_system_prompts=request.extra_system_prompts,
+            preprocess_user_input=request.preprocess_user_input,
+        )
+
         await run_agent_loop_lifecycle(
-            request=self._request(call_config=call_config, limits=limits),
+            request=request,
             execution=execution,
             dependencies=self._dependencies(start_agent_run_fn=start_agent_run_fn),
         )
@@ -231,12 +244,16 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         progress = emitted[1]
         plan = emitted[2]
         self.assertEqual(progress["phase"], "planning")
-        self.assertEqual(progress["label"], "正在理解问题")
+        self.assertEqual(progress["label"], "正在制定执行计划")
         self.assertEqual(progress["completed_steps"], 0)
         self.assertEqual(progress["total_steps"], 4)
         self.assertEqual(progress["max_tool_calls"], limits.max_tool_calls)
         self.assertEqual(plan["plan_id"], "plan-run-life")
         self.assertEqual([item["id"] for item in plan["items"]], ["understand", "search", "read", "answer"])
+        self.assertEqual(plan["items"][0]["title"], "制定执行计划")
+        self.assertEqual(plan["items"][1]["title"], "搜索：2026 年暑期旅游哪里最火")
+        self.assertEqual(plan["items"][1]["summary"], "工具：联网搜索；预算：最多 4 次搜索，每次 3-10 条结果")
+        self.assertEqual(plan["items"][2]["summary"], "必要时读取网页核验；预算：最多 5 个网页")
 
     async def test_lifecycle_passes_continuation_inputs_and_preserves_existing_blocks_first(self):
         call_order = []

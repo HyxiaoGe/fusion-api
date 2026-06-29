@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from inspect import Parameter, signature
+
 from app.services.stream.agent_loop_outcome import AgentLoopExit, AgentLoopOutcome
 from app.services.stream.agent_loop_policy import check_agent_loop_limit
 from app.services.stream.agent_loop_round_outcome import AgentRoundOutcomeRequest, handle_agent_round_outcome
@@ -75,18 +77,32 @@ async def _start_next_step(
     runtime: AgentLoopRuntime,
 ) -> tuple[int, AgentStepContext]:
     step_number = state.next_step_number()
-    step_context = await runtime.start_step_fn(
-        emitter=runtime.emitter,
-        session_cache=runtime.session_cache,
-        run_id=runtime.run_id,
-        step_number=step_number,
-        completed_tool_calls=state.total_tool_calls,
-        max_tool_calls=runtime.limits.max_tool_calls,
-        clock=runtime.clock,
-        on_step_started=state.mark_current_step,
-    )
+    start_step_kwargs = {
+        "emitter": runtime.emitter,
+        "session_cache": runtime.session_cache,
+        "run_id": runtime.run_id,
+        "step_number": step_number,
+        "completed_tool_calls": state.total_tool_calls,
+        "max_tool_calls": runtime.limits.max_tool_calls,
+        "clock": runtime.clock,
+        "on_step_started": state.mark_current_step,
+    }
+    if _accepts_keyword(runtime.start_step_fn, "plan_items"):
+        start_step_kwargs["plan_items"] = state.plan_items
+    step_context = await runtime.start_step_fn(**start_step_kwargs)
     state.mark_current_step(step_context.step_id)
     return step_number, step_context
+
+
+def _accepts_keyword(fn, keyword: str) -> bool:
+    try:
+        parameters = signature(fn).parameters
+    except (TypeError, ValueError):
+        return True
+
+    return keyword in parameters or any(
+        parameter.kind == Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
 
 
 async def _run_round(

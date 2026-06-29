@@ -21,6 +21,7 @@ class AgentLoopState:
     limit_reason: AgentLoopLimitReason | None = None
     unknown_terminated: bool = False
     terminal_emitted: bool = False
+    plan_items: dict[str, dict] = field(default_factory=dict)
 
     def next_step_number(self) -> int:
         self.step += 1
@@ -28,6 +29,9 @@ class AgentLoopState:
 
     def mark_current_step(self, step_id: str) -> None:
         self.current_step_id = step_id
+
+    def set_plan_items(self, items: list[dict]) -> None:
+        self.plan_items = {str(item.get("id")): dict(item) for item in items if item.get("id")}
 
     def clear_current_step(self) -> None:
         self.current_step_id = None

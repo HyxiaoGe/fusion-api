@@ -376,6 +376,80 @@ class StepLifecycleTests(unittest.IsolatedAsyncioTestCase):
             max_tool_calls=20,
         )
 
+    async def test_mark_tool_round_started_preserves_long_task_plan_title_and_budget(self):
+        emitter = Mock()
+        emitter.plan_step_updated = AsyncMock()
+        emitter.run_progress_updated = AsyncMock()
+        context = AgentStepContext(
+            step_id="step-1",
+            run_id="run-1",
+            step_number=1,
+            started_at=10.0,
+            thinking_block_id="blk_thinking",
+            text_block_id="blk_text",
+            plan_items={
+                "understand": {
+                    "id": "understand",
+                    "title": "制定执行计划",
+                    "status": "running",
+                    "kind": "reasoning",
+                    "summary": "围绕「AI 标准」判断资料需求和回答路径",
+                    "tool_names": [],
+                    "evidence_item_ids": [],
+                },
+                "search": {
+                    "id": "search",
+                    "title": "搜索：AI 标准",
+                    "status": "pending",
+                    "kind": "search",
+                    "summary": "工具：联网搜索；预算：最多 4 次搜索，每次 3-10 条结果",
+                    "tool_names": ["web_search"],
+                    "evidence_item_ids": [],
+                },
+            },
+        )
+
+        await step_lifecycle_module.mark_tool_round_started(
+            context=context,
+            emitter=emitter,
+            tool_call_count=2,
+            tool_names=("web_search",),
+            completed_tool_calls=0,
+            max_tool_calls=20,
+        )
+
+        self.assertEqual(
+            emitter.plan_step_updated.await_args_list,
+            [
+                call(
+                    plan_id="plan-run-1",
+                    revision=3,
+                    item={
+                        "id": "understand",
+                        "title": "制定执行计划",
+                        "status": "completed",
+                        "kind": "reasoning",
+                        "summary": "已完成问题理解",
+                        "tool_names": [],
+                        "evidence_item_ids": [],
+                    },
+                ),
+                call(
+                    plan_id="plan-run-1",
+                    revision=4,
+                    item={
+                        "id": "search",
+                        "title": "搜索：AI 标准",
+                        "status": "running",
+                        "kind": "search",
+                        "summary": "正在执行 2 个工具调用 · 预算：最多 4 次搜索，每次 3-10 条结果",
+                        "tool_names": ["web_search"],
+                        "evidence_item_ids": [],
+                    },
+                ),
+            ],
+        )
+
     async def test_complete_agent_step_updates_search_and_read_plan_when_emitter_supports_v2(self):
         emitter = Mock()
         emitter.step_completed = AsyncMock()
