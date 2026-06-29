@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -129,6 +130,7 @@ async def update_tool_round_plan_started(request: ToolRoundRequest) -> None:
         emitter=request.emitter,
         tool_call_count=len(request.tool_calls),
         tool_names=[tool_call["name"] for tool_call in request.tool_calls],
+        tool_arguments=_tool_arguments(request.tool_calls),
         completed_tool_calls=_completed_tool_calls_before_round(request),
         max_tool_calls=_max_tool_calls(request),
     )
@@ -204,3 +206,21 @@ def _max_tool_calls(request: ToolRoundRequest) -> int | None:
         return request.max_tool_calls
     value = getattr(request.network_budget, "max_tool_calls", None)
     return value if isinstance(value, int) else None
+
+
+def _tool_arguments(tool_calls: list[dict]) -> list[dict]:
+    arguments: list[dict] = []
+    for tool_call in tool_calls:
+        raw_arguments = tool_call.get("arguments", {})
+        if isinstance(raw_arguments, dict):
+            arguments.append(raw_arguments)
+            continue
+        if isinstance(raw_arguments, str):
+            try:
+                parsed = json.loads(raw_arguments)
+            except json.JSONDecodeError:
+                parsed = {}
+            arguments.append(parsed if isinstance(parsed, dict) else {})
+            continue
+        arguments.append({})
+    return arguments

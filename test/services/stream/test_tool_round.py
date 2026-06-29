@@ -193,6 +193,7 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
                     kwargs["context"].run_id,
                     kwargs["tool_call_count"],
                     kwargs["tool_names"],
+                    kwargs["tool_arguments"],
                     kwargs["completed_tool_calls"],
                     kwargs["max_tool_calls"],
                 )
@@ -248,7 +249,7 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             order,
             [
-                ("plan", "run-1", 1, ["web_search"], 0, 20),
+                ("plan", "run-1", 1, ["web_search"], [{"query": "x"}], 0, 20),
                 ("execute", "run-1", 20),
                 ("complete", ["web_search"], 1),
             ],

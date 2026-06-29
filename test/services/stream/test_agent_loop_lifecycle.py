@@ -200,7 +200,7 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call_order[3][2], [initial_block])
         self.assertIs(call_order[4][1], execution.completion_context)
 
-    async def test_start_run_emits_initial_progress_and_plan_snapshot(self):
+    async def test_start_run_emits_direct_plan_until_tools_are_actually_called(self):
         emitted = []
 
         class CaptureWriter:
@@ -225,7 +225,7 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
             raw_messages=request.raw_messages,
             has_vision=request.has_vision,
             file_ids=request.file_ids,
-            original_message="请查一下 2026 年暑期旅游哪里最火",
+            original_message="你好啊，你是谁",
             call_config=request.call_config,
             limits=request.limits,
             initial_content_blocks=request.initial_content_blocks,
@@ -246,14 +246,14 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(progress["phase"], "planning")
         self.assertEqual(progress["label"], "正在制定执行计划")
         self.assertEqual(progress["completed_steps"], 0)
-        self.assertEqual(progress["total_steps"], 4)
+        self.assertEqual(progress["total_steps"], 2)
         self.assertEqual(progress["max_tool_calls"], limits.max_tool_calls)
         self.assertEqual(plan["plan_id"], "plan-run-life")
-        self.assertEqual([item["id"] for item in plan["items"]], ["understand", "search", "read", "answer"])
+        self.assertEqual([item["id"] for item in plan["items"]], ["understand", "answer"])
         self.assertEqual(plan["items"][0]["title"], "制定执行计划")
-        self.assertEqual(plan["items"][1]["title"], "搜索：2026 年暑期旅游哪里最火")
-        self.assertEqual(plan["items"][1]["summary"], "工具：联网搜索；预算：最多 4 次搜索，每次 3-10 条结果")
-        self.assertEqual(plan["items"][2]["summary"], "必要时读取网页核验；预算：最多 5 个网页")
+        self.assertNotIn("搜索：", " ".join(item["title"] for item in plan["items"]))
+        self.assertNotIn("读取", " ".join(item["title"] for item in plan["items"]))
+        self.assertEqual(plan["items"][1]["summary"], "基于已有上下文直接回答，不使用联网工具")
 
     async def test_lifecycle_passes_continuation_inputs_and_preserves_existing_blocks_first(self):
         call_order = []

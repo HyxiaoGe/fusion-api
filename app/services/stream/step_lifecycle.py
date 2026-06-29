@@ -140,14 +140,15 @@ async def mark_tool_round_started(
     emitter: AgentStepEmitter,
     tool_call_count: int,
     tool_names: Sequence[str] = (),
+    tool_arguments: Sequence[dict] = (),
     completed_tool_calls: int | None = None,
     max_tool_calls: int | None = None,
 ) -> None:
     stage = _tool_stage(tool_names)
     if context.step_number == 1:
-        await _emit_plan_step_update(
+        await _emit_context_plan_step_update(
             emitter=emitter,
-            run_id=context.run_id,
+            context=context,
             revision=_plan_revision(context.step_number, PLAN_REV_UNDERSTAND_COMPLETED),
             item=_plan_item_update(
                 context.plan_items,
@@ -161,9 +162,9 @@ async def mark_tool_round_started(
             ),
         )
     else:
-        await _emit_plan_step_update(
+        await _emit_context_plan_step_update(
             emitter=emitter,
-            run_id=context.run_id,
+            context=context,
             revision=_plan_revision(context.step_number, PLAN_REV_ANSWER_PENDING_FOR_TOOLS),
             item=_plan_item_update(
                 context.plan_items,
@@ -171,15 +172,16 @@ async def mark_tool_round_started(
                 title="整理回答",
                 status="pending",
                 kind="answer",
+                summary=_answer_running_summary(max(completed_tool_calls or 0, tool_call_count)),
                 tool_names=[],
                 evidence_item_ids=[],
             ),
         )
 
     if stage == "read":
-        await _emit_plan_step_update(
+        await _emit_context_plan_step_update(
             emitter=emitter,
-            run_id=context.run_id,
+            context=context,
             revision=_tool_running_revision(context.step_number),
             item=_plan_item_update(
                 context.plan_items,
@@ -204,17 +206,17 @@ async def mark_tool_round_started(
         )
         return
 
-    await _emit_plan_step_update(
+    await _emit_context_plan_step_update(
         emitter=emitter,
-        run_id=context.run_id,
+        context=context,
         revision=_tool_running_revision(context.step_number),
         item=_plan_item_update(
             context.plan_items,
             item_id="search",
-            title="查找资料",
+            title=_search_running_title(tool_arguments, tool_call_count),
             status="running",
             kind="search",
-            summary=f"正在执行 {tool_call_count} 个工具调用",
+            summary=_search_running_summary(tool_arguments, tool_call_count),
             tool_names=list(tool_names),
             evidence_item_ids=[],
         ),
@@ -282,6 +284,7 @@ async def _maybe_emit_plan_step_started(
             title="整理回答",
             status="running",
             kind="answer",
+            summary=_answer_running_summary(completed_tool_calls),
             tool_names=[],
             evidence_item_ids=[],
         ),
@@ -310,9 +313,9 @@ async def _maybe_emit_plan_step_completed(
     if tool_call_count > 0:
         stage = _tool_stage(tool_names)
         if stage == "read":
-            await _emit_plan_step_update(
+            await _emit_context_plan_step_update(
                 emitter=emitter,
-                run_id=context.run_id,
+                context=context,
                 revision=_tool_completed_revision(context.step_number),
                 item=_plan_item_update(
                     context.plan_items,
@@ -337,9 +340,9 @@ async def _maybe_emit_plan_step_completed(
             )
             return
 
-        await _emit_plan_step_update(
+        await _emit_context_plan_step_update(
             emitter=emitter,
-            run_id=context.run_id,
+            context=context,
             revision=_tool_completed_revision(context.step_number),
             item=_plan_item_update(
                 context.plan_items,
@@ -352,9 +355,9 @@ async def _maybe_emit_plan_step_completed(
                 evidence_item_ids=[],
             ),
         )
-        await _emit_plan_step_update(
+        await _emit_context_plan_step_update(
             emitter=emitter,
-            run_id=context.run_id,
+            context=context,
             revision=_read_running_after_search_revision(context.step_number),
             item=_plan_item_update(
                 context.plan_items,
@@ -380,9 +383,9 @@ async def _maybe_emit_plan_step_completed(
         return
 
     if context.step_number == 1:
-        await _emit_plan_step_update(
+        await _emit_context_plan_step_update(
             emitter=emitter,
-            run_id=context.run_id,
+            context=context,
             revision=_plan_revision(context.step_number, PLAN_REV_UNDERSTAND_COMPLETED),
             item=_plan_item_update(
                 context.plan_items,
@@ -396,9 +399,9 @@ async def _maybe_emit_plan_step_completed(
             ),
         )
 
-    await _emit_plan_step_update(
+    await _emit_context_plan_step_update(
         emitter=emitter,
-        run_id=context.run_id,
+        context=context,
         revision=_plan_revision(context.step_number, PLAN_REV_ANSWER_COMPLETED),
         item=_plan_item_update(
             context.plan_items,
@@ -506,6 +509,64 @@ def _completed_tool_summary_count(tool_call_count: int, completed_tool_calls: in
     if completed_tool_calls is not None:
         return max(tool_call_count, completed_tool_calls)
     return tool_call_count
+
+
+def _search_running_title(tool_arguments: Sequence[dict], tool_call_count: int) -> str:
+    queries = _search_queries(tool_arguments)
+    if len(queries) == 1:
+        return f"搜索：{_truncate_plan_text(queries[0], 36)}"
+    if len(queries) > 1:
+        return f"搜索：{len(queries)} 个查询"
+    return "查找资料"
+
+
+def _search_running_summary(tool_arguments: Sequence[dict], tool_call_count: int) -> str:
+    queries = _search_queries(tool_arguments)
+    if queries:
+        visible_queries = [_truncate_plan_text(query, 36) for query in queries[:3]]
+        suffix = " 等" if len(queries) > 3 else ""
+        return f"正在搜索：{'、'.join(visible_queries)}{suffix}"
+    return f"正在执行 {tool_call_count} 个工具调用"
+
+
+def _search_queries(tool_arguments: Sequence[dict]) -> list[str]:
+    queries: list[str] = []
+    for arguments in tool_arguments:
+        if not isinstance(arguments, dict):
+            continue
+        query = arguments.get("query")
+        if isinstance(query, str) and query.strip():
+            queries.append(query.strip())
+    return queries
+
+
+def _truncate_plan_text(value: str, max_chars: int) -> str:
+    text = value.strip()
+    if len(text) <= max_chars:
+        return text
+    return f"{text[: max_chars - 1]}…"
+
+
+def _answer_running_summary(completed_tool_calls: int | None) -> str:
+    if completed_tool_calls and completed_tool_calls > 0:
+        return "基于可用依据给出结论、推荐和不确定性"
+    return "基于已有上下文直接回答，不使用联网工具"
+
+
+async def _emit_context_plan_step_update(
+    *,
+    emitter: AgentStepEmitter,
+    context: AgentStepContext,
+    revision: int,
+    item: dict,
+) -> None:
+    context.plan_items[str(item["id"])] = dict(item)
+    await _emit_plan_step_update(
+        emitter=emitter,
+        run_id=context.run_id,
+        revision=revision,
+        item=item,
+    )
 
 
 async def _emit_plan_step_update(

@@ -108,7 +108,7 @@ async def _start_run(
     context = execution.completion_context
     plan_items = build_long_task_plan_items(
         original_message=request.original_message,
-        tools=request.call_config.announced_tools,
+        tools=[],
         limits=request.limits,
     )
     execution.state.set_plan_items(plan_items)
