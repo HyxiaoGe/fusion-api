@@ -41,3 +41,29 @@ def test_web_search_digest_uses_tool_level_title_instead_of_first_source_title()
     assert digest["title"] == "搜索完成"
     assert digest["summary"] == "保留 6 条候选结果，供后续回答筛选。"
     assert digest["source_refs"] == ["ev-call-1-0", "ev-call-1-1"]
+
+
+def test_url_read_degraded_digest_does_not_expose_internal_service_names():
+    handler = SimpleNamespace(
+        _build_result_summary=lambda _result: {
+            "kind": "url_read",
+            "truncated": False,
+        }
+    )
+    record = SimpleNamespace(
+        tool_call={"id": "call-2", "name": "url_read"},
+        tool_name="url_read",
+        result=SimpleNamespace(
+            status="degraded",
+            data={"url": "https://example.com/a"},
+            error_message="reader-service 返回 HTTP 502，已降级跳过",
+        ),
+        handler=handler,
+    )
+
+    digest = build_tool_result_digest(record)
+
+    assert digest["title"] == "网页读取部分可用"
+    assert digest["summary"] == "网页暂时无法读取，已跳过该来源。"
+    assert "url_read" not in digest["title"]
+    assert "reader-service" not in digest["summary"]

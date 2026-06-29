@@ -76,6 +76,13 @@ def _digest_status(status: str) -> str:
 
 
 def _default_title(tool_name: str, status: str, summary: dict[str, Any]) -> str:
+    if tool_name == "url_read":
+        if status == "success":
+            return "网页读取完成"
+        if status == "degraded":
+            return "网页读取部分可用"
+        return "网页暂时无法读取"
+
     count = summary.get("count")
     if status == "success" and isinstance(count, int):
         return f"找到 {count} 条结果"
@@ -89,10 +96,19 @@ def _default_title(tool_name: str, status: str, summary: dict[str, Any]) -> str:
 def _digest_title(tool_name: str, status: str, summary: dict[str, Any]) -> str:
     if status == "success" and tool_name == "web_search" and summary.get("kind") == "search":
         return "搜索完成"
+    if tool_name == "url_read" and status != "success":
+        return _default_title(tool_name, status, summary)
     return _safe_text(summary.get("title"), 80) or _default_title(tool_name, status, summary)
 
 
 def _digest_summary(record: ToolExecutionRecord, status: str, summary: dict[str, Any]) -> str:
+    if record.tool_name == "url_read":
+        if status == "success":
+            return "已读取网页内容，供后续回答核验。"
+        if status == "interrupted":
+            return "网页读取已中断，未使用该来源。"
+        return "网页暂时无法读取，已跳过该来源。"
+
     if status == "success":
         count = summary.get("count")
         if isinstance(count, int):
