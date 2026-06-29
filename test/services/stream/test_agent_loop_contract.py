@@ -239,25 +239,13 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             result.event_types,
             [
                 "run_started",
-                "run_progress_updated",
-                "plan_snapshot",
                 "step_started",
-                "plan_step_updated",
                 "step_completed",
-                "plan_step_updated",
-                "plan_step_updated",
-                "run_progress_updated",
                 "run_completed",
             ],
         )
-        self.assertEqual(
-            [(event["item"]["id"], event["item"]["status"]) for event in result.events if event["type"] == "plan_step_updated"],
-            [
-                ("understand", "running"),
-                ("understand", "completed"),
-                ("answer", "completed"),
-            ],
-        )
+        self.assertEqual([event for event in result.events if event["type"].startswith("plan_")], [])
+        self.assertEqual([event for event in result.events if event["type"] == "run_progress_updated"], [])
         self.assertEqual(
             result.finalize_calls[-1],
             {
@@ -316,10 +304,8 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             result.event_types,
             [
                 "run_started",
-                "run_progress_updated",
-                "plan_snapshot",
                 "step_started",
-                "plan_step_updated",
+                "plan_snapshot",
                 "plan_step_updated",
                 "plan_step_updated",
                 "run_progress_updated",
@@ -348,7 +334,6 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 if event["type"] == "plan_step_updated"
             ],
             [
-                (2, "understand", "running"),
                 (3, "understand", "completed"),
                 (4, "search", "running"),
                 (5, "search", "completed"),
@@ -371,7 +356,6 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 if event["type"] == "run_progress_updated"
             ],
             [
-                ("planning", "正在制定执行计划", 0, 0, 20),
                 ("researching", "正在查找资料", 1, 0, 20),
                 ("reading", "正在读取关键来源", 2, 1, 20),
                 ("synthesizing", "正在整理回答", 3, 1, 20),
@@ -435,8 +419,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             plan_updates,
             [
-                (2, "understand", "制定执行计划", "running", "确认「hi」的目标和回答结构", []),
-                (3, "understand", "制定执行计划", "completed", "已完成问题理解", []),
+                (3, "understand", "理解问题", "completed", "已完成问题理解", []),
                 (4, "search", "搜索：OpenAI", "running", "正在搜索：OpenAI", ["web_search"]),
                 (5, "search", "搜索：OpenAI", "completed", "完成 1 个工具调用", ["web_search"]),
                 (6, "read", "读取关键来源", "running", "正在整理关键来源", []),
@@ -463,7 +446,6 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             if event["type"] == "run_progress_updated"
         ],
         [
-                ("planning", "正在制定执行计划", 0, 0, 20),
                 ("researching", "正在查找资料", 1, 0, 20),
                 ("reading", "正在读取关键来源", 2, 1, 20),
                 ("synthesizing", "正在整理回答", 3, 1, 20),

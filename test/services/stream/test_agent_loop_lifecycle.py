@@ -200,7 +200,7 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call_order[3][2], [initial_block])
         self.assertIs(call_order[4][1], execution.completion_context)
 
-    async def test_start_run_emits_direct_plan_until_tools_are_actually_called(self):
+    async def test_start_run_does_not_emit_plan_before_tools_are_called(self):
         emitted = []
 
         class CaptureWriter:
@@ -239,22 +239,8 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
             dependencies=self._dependencies(start_agent_run_fn=start_agent_run_fn),
         )
 
-        types = [event["type"] for event in emitted]
-        self.assertEqual(types[:3], ["run_started", "run_progress_updated", "plan_snapshot"])
-        progress = emitted[1]
-        plan = emitted[2]
-        self.assertEqual(progress["phase"], "planning")
-        self.assertEqual(progress["label"], "正在制定执行计划")
-        self.assertEqual(progress["completed_steps"], 0)
-        self.assertEqual(progress["total_steps"], 2)
-        self.assertEqual(progress["max_tool_calls"], limits.max_tool_calls)
-        self.assertEqual(plan["plan_id"], "plan-run-life")
-        self.assertEqual([item["id"] for item in plan["items"]], ["understand", "answer"])
-        self.assertEqual(plan["items"][0]["title"], "制定执行计划")
-        self.assertNotIn("搜索：", " ".join(item["title"] for item in plan["items"]))
-        self.assertNotIn("读取", " ".join(item["title"] for item in plan["items"]))
-        self.assertEqual(plan["items"][1]["summary"], "完成问题理解后，根据实际资料需求整理回答")
-        self.assertNotIn("不使用联网工具", plan["items"][1]["summary"])
+        self.assertEqual([event["type"] for event in emitted], ["run_started"])
+        self.assertEqual(execution.state.plan_items, {})
 
     async def test_lifecycle_passes_continuation_inputs_and_preserves_existing_blocks_first(self):
         call_order = []

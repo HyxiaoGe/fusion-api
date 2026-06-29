@@ -11,7 +11,6 @@ from app.services.stream.agent_loop_execution import AgentLoopExecutionContext
 from app.services.stream.agent_loop_outcome import AgentLoopExit
 from app.services.stream.agent_loop_policy import AgentLoopLimits, map_run_terminal_state
 from app.services.stream.agent_loop_request_prep import AgentLoopCallConfig
-from app.services.stream.agent_plan_builder import build_long_task_plan_items
 
 AsyncFn = Callable[..., Awaitable[Any]]
 PersistMessageFn = Callable[..., Any]
@@ -106,13 +105,6 @@ async def _start_run(
     dependencies: AgentLoopLifecycleDependencies,
 ) -> None:
     context = execution.completion_context
-    plan_items = build_long_task_plan_items(
-        original_message=request.original_message,
-        tools=[],
-        limits=request.limits,
-        tool_decision_pending=bool(request.call_config.announced_tools),
-    )
-    execution.state.set_plan_items(plan_items)
     await dependencies.append_chunk_fn(context.conversation_id, "preparing", "", "")
     await dependencies.start_agent_run_fn(
         emitter=execution.emitter,
@@ -125,19 +117,6 @@ async def _start_run(
         message_id=context.assistant_message_id,
         tools=request.call_config.announced_tools,
         config=_run_config(request.limits),
-    )
-    await execution.emitter.run_progress_updated(
-        phase="planning",
-        label="正在制定执行计划",
-        completed_steps=0,
-        total_steps=len(plan_items),
-        completed_tool_calls=0,
-        max_tool_calls=request.limits.max_tool_calls,
-    )
-    await execution.emitter.plan_snapshot(
-        plan_id=f"plan-{execution.run_id}",
-        revision=1,
-        items=plan_items,
     )
 
 

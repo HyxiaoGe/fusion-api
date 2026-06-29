@@ -66,6 +66,7 @@ async def _complete_text_round(request: AgentRoundOutcomeRequest) -> None:
         max_tool_calls=request.runtime.limits.max_tool_calls,
         clock=request.runtime.clock,
     )
+    _sync_plan_items(request)
     request.state.clear_current_step()
 
 
@@ -81,9 +82,18 @@ async def _handle_tool_calls_round(request: AgentRoundOutcomeRequest) -> None:
             round_result=request.round_result,
         ),
     )
+    _sync_plan_items(request)
     request.state.clear_current_step()
 
 
 async def _complete_unknown_round(request: AgentRoundOutcomeRequest) -> None:
     request.state.mark_unknown_terminated()
     await _complete_text_round(request)
+
+
+def _sync_plan_items(request: AgentRoundOutcomeRequest) -> None:
+    if not request.step_context.plan_items:
+        return
+    request.state.plan_items = {
+        str(item_id): dict(item) for item_id, item in request.step_context.plan_items.items()
+    }

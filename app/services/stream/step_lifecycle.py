@@ -145,6 +145,14 @@ async def mark_tool_round_started(
     max_tool_calls: int | None = None,
 ) -> None:
     stage = _tool_stage(tool_names)
+    await _ensure_tool_plan_initialized(
+        emitter=emitter,
+        context=context,
+        stage=stage,
+        tool_call_count=tool_call_count,
+        tool_names=tool_names,
+        tool_arguments=tool_arguments,
+    )
     if context.step_number == 1:
         await _emit_context_plan_step_update(
             emitter=emitter,
@@ -242,6 +250,9 @@ async def _maybe_emit_plan_step_started(
     max_tool_calls: int | None,
     plan_items: dict[str, dict] | None = None,
 ) -> None:
+    if not plan_items:
+        return
+
     if step_number == 1:
         await _emit_plan_step_update(
             emitter=emitter,
@@ -310,6 +321,9 @@ async def _maybe_emit_plan_step_completed(
     completed_tool_calls: int | None,
     max_tool_calls: int | None,
 ) -> None:
+    if not context.plan_items and tool_call_count <= 0:
+        return
+
     if tool_call_count > 0:
         stage = _tool_stage(tool_names)
         if stage == "read":
@@ -428,6 +442,89 @@ async def _maybe_emit_plan_step_completed(
 
 def _copy_plan_items(plan_items: dict[str, dict] | None) -> dict[str, dict]:
     return {str(item_id): dict(item) for item_id, item in (plan_items or {}).items()}
+
+
+async def _ensure_tool_plan_initialized(
+    *,
+    emitter: AgentStepEmitter,
+    context: AgentStepContext,
+    stage: str,
+    tool_call_count: int,
+    tool_names: Sequence[str],
+    tool_arguments: Sequence[dict],
+) -> None:
+    if context.plan_items:
+        return
+
+    items = _initial_tool_plan_items(
+        stage=stage,
+        tool_call_count=tool_call_count,
+        tool_names=tool_names,
+        tool_arguments=tool_arguments,
+    )
+    context.plan_items.update({str(item["id"]): dict(item) for item in items})
+    await _maybe_call_async(
+        emitter,
+        "plan_snapshot",
+        plan_id=f"plan-{context.run_id}",
+        revision=1,
+        items=items,
+    )
+
+
+def _initial_tool_plan_items(
+    *,
+    stage: str,
+    tool_call_count: int,
+    tool_names: Sequence[str],
+    tool_arguments: Sequence[dict],
+) -> list[dict]:
+    items = [
+        {
+            "id": "understand",
+            "title": "理解问题",
+            "status": "running",
+            "kind": "reasoning",
+            "summary": "判断资料需求和回答路径",
+            "tool_names": [],
+            "evidence_item_ids": [],
+        }
+    ]
+    if stage != "read":
+        items.append(
+            {
+                "id": "search",
+                "title": _search_running_title(tool_arguments, tool_call_count),
+                "status": "pending",
+                "kind": "search",
+                "summary": _search_running_summary(tool_arguments, tool_call_count),
+                "tool_names": list(tool_names),
+                "evidence_item_ids": [],
+            }
+        )
+    items.extend(
+        [
+            {
+                "id": "read",
+                "title": "读取关键来源",
+                "status": "pending",
+                "kind": "read",
+                "summary": "必要时读取关键来源核验",
+                "tool_names": list(tool_names),
+                "evidence_item_ids": [],
+            },
+            {
+                "id": "answer",
+                "title": "整理回答",
+                "status": "pending",
+                "kind": "answer",
+                "summary": "基于可用依据给出结论、推荐和不确定性",
+                "tool_names": [],
+                "evidence_item_ids": [],
+            },
+        ]
+    )
+    return items
 
 
 def _plan_item_update(
