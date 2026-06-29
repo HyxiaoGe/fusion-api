@@ -30,13 +30,14 @@ def build_long_task_plan_items(
     original_message: str,
     tools: list[str],
     limits: AgentLoopLimits,
+    tool_decision_pending: bool = False,
 ) -> list[dict]:
     """构建用户可见的 deterministic 执行计划。"""
     _ = limits
     focus = _build_focus(original_message, strip_search_prefix=bool(tools))
     if tools:
         return _network_plan_items(focus=focus, tools=tools)
-    return _direct_answer_plan_items(focus=focus)
+    return _direct_answer_plan_items(focus=focus, tool_decision_pending=tool_decision_pending)
 
 
 def _network_plan_items(*, focus: str, tools: list[str]) -> list[dict]:
@@ -80,7 +81,7 @@ def _network_plan_items(*, focus: str, tools: list[str]) -> list[dict]:
     ]
 
 
-def _direct_answer_plan_items(*, focus: str) -> list[dict]:
+def _direct_answer_plan_items(*, focus: str, tool_decision_pending: bool = False) -> list[dict]:
     return [
         {
             "id": "understand",
@@ -96,7 +97,7 @@ def _direct_answer_plan_items(*, focus: str) -> list[dict]:
             "title": "整理回答",
             "status": "pending",
             "kind": "answer",
-            "summary": "基于已有上下文直接回答，不使用联网工具",
+            "summary": _answer_plan_summary(tool_decision_pending=tool_decision_pending),
             "tool_names": [],
             "evidence_item_ids": [],
         },
@@ -127,3 +128,9 @@ def _search_budget_summary() -> str:
 
 def _read_budget_summary() -> str:
     return f"必要时读取网页核验；预算：最多 {MAX_URL_READ_CALLS} 个网页"
+
+
+def _answer_plan_summary(*, tool_decision_pending: bool) -> str:
+    if tool_decision_pending:
+        return "完成问题理解后，根据实际资料需求整理回答"
+    return "基于已有上下文直接回答，不使用联网工具"

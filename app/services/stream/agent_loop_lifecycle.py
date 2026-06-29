@@ -110,6 +110,7 @@ async def _start_run(
         original_message=request.original_message,
         tools=[],
         limits=request.limits,
+        tool_decision_pending=bool(request.call_config.announced_tools),
     )
     execution.state.set_plan_items(plan_items)
     await dependencies.append_chunk_fn(context.conversation_id, "preparing", "", "")

@@ -253,7 +253,8 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan["items"][0]["title"], "制定执行计划")
         self.assertNotIn("搜索：", " ".join(item["title"] for item in plan["items"]))
         self.assertNotIn("读取", " ".join(item["title"] for item in plan["items"]))
-        self.assertEqual(plan["items"][1]["summary"], "基于已有上下文直接回答，不使用联网工具")
+        self.assertEqual(plan["items"][1]["summary"], "完成问题理解后，根据实际资料需求整理回答")
+        self.assertNotIn("不使用联网工具", plan["items"][1]["summary"])
 
     async def test_lifecycle_passes_continuation_inputs_and_preserves_existing_blocks_first(self):
         call_order = []
