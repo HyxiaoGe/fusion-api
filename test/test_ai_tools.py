@@ -37,6 +37,20 @@ class AiToolSchemaTests(unittest.TestCase):
         self.assertIn("第二个互补搜索", description)
         self.assertIn("不要用中英文翻译或同义改写重复搜索同一意图", query_description)
 
+    def test_web_search_tool_description_guides_autonomous_natural_questions(self):
+        from app.ai.tools import build_web_search_tool
+
+        tool = build_web_search_tool()
+        description = tool["function"]["description"]
+
+        self.assertIn("即使用户没有说", description)
+        self.assertIn("使用方法", description)
+        self.assertIn("接入", description)
+        self.assertIn("互通", description)
+        self.assertIn("微信A2A互通怎么用？", description)
+        self.assertIn("纯闲聊", description)
+        self.assertIn("1+1", description)
+
     def test_url_read_schema_exposes_optional_reason(self):
         from app.ai.tools import URL_READ_TOOL
 

@@ -407,6 +407,10 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
 
         system_prompts = [m["content"] for m in captured_messages[0] if m.get("role") == "system"]
         contract = "\n".join(system_prompts)
+        self.assertIn("不要依据用户是否说了", contract)
+        self.assertIn("微信A2A互通怎么用？", contract)
+        self.assertIn("你好，你是谁？", contract)
+        self.assertIn("不应调用 web_search", contract)
         self.assertIn("必须调用 web_search", contract)
         self.assertIn("不要在思考过程或最终回答中声称", contract)
         self.assertIn("没有调用工具", contract)

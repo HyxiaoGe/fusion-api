@@ -121,7 +121,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call_config.announced_tools, ["web_search"])
 
     def test_tool_usage_contract_uses_centralized_prompt(self):
-        from app.ai.prompts.agent_loop import TOOL_USAGE_CONTRACT_PROMPT
+        from app.ai.prompts.agent_loop import NETWORK_DECISION_PROMPT, TOOL_USAGE_CONTRACT_PROMPT
         from app.services.stream.agent_loop_request_prep import inject_tool_usage_contract
 
         messages = [{"role": "user", "content": "OpenAI 最新公告"}]
@@ -130,8 +130,21 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         prepared = inject_tool_usage_contract(messages, call_kwargs)
 
         self.assertEqual(prepared[0], {"role": "system", "content": TOOL_USAGE_CONTRACT_PROMPT})
+        self.assertIn(NETWORK_DECISION_PROMPT, TOOL_USAGE_CONTRACT_PROMPT)
         self.assertIn("必须调用 web_search", TOOL_USAGE_CONTRACT_PROMPT)
         self.assertIn("没有调用工具", TOOL_USAGE_CONTRACT_PROMPT)
+
+    def test_tool_usage_contract_defines_autonomous_search_decision_matrix(self):
+        from app.ai.prompts.agent_loop import TOOL_USAGE_CONTRACT_PROMPT
+
+        self.assertIn("不要依据用户是否说了", TOOL_USAGE_CONTRACT_PROMPT)
+        self.assertIn("联网", TOOL_USAGE_CONTRACT_PROMPT)
+        self.assertIn("搜索", TOOL_USAGE_CONTRACT_PROMPT)
+        self.assertIn("微信A2A互通怎么用？", TOOL_USAGE_CONTRACT_PROMPT)
+        self.assertIn("OpenAI 最近发布了哪些产品更新？", TOOL_USAGE_CONTRACT_PROMPT)
+        self.assertIn("你好，你是谁？", TOOL_USAGE_CONTRACT_PROMPT)
+        self.assertIn("1+1等于几？", TOOL_USAGE_CONTRACT_PROMPT)
+        self.assertIn("不应调用 web_search", TOOL_USAGE_CONTRACT_PROMPT)
 
     async def test_prepare_messages_injects_extra_system_prompts_without_user_preprocess(self):
         async def build_llm_messages_fn(_raw_messages, _has_vision, _repo, _user_system_prompt):
