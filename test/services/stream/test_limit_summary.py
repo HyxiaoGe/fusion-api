@@ -87,6 +87,22 @@ class LimitSummaryHelpersTests(unittest.TestCase):
         self.assertEqual(content_blocks[1].id, "blk-text")
         self.assertEqual(content_blocks[1].text, "总结正文")
 
+    def test_append_summary_content_blocks_recovers_reasoning_only_as_text(self):
+        content_blocks = []
+
+        append_summary_content_blocks(
+            content_blocks=content_blocks,
+            reasoning_buf="总结正文",
+            content_buf="",
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+        )
+
+        self.assertEqual(len(content_blocks), 1)
+        self.assertEqual(content_blocks[0].type, "text")
+        self.assertEqual(content_blocks[0].id, "blk-text")
+        self.assertEqual(content_blocks[0].text, "总结正文")
+
 
 class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_limit_summary_step_appends_prompt_and_records_success(self):
