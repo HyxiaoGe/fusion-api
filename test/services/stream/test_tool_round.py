@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import Mock
 
-from app.schemas.chat import TextBlock
+from app.schemas.chat import SearchSource, TextBlock
 from app.services.stream import tool_round as tool_round_module
 from app.services.stream.step_lifecycle import AgentStepContext
 from app.services.stream.tool_execution_result import ToolExecutionRecord
@@ -411,3 +411,109 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
         )
         handler.format_llm_context.assert_called_once_with(record.result)
         handler.build_content_block.assert_called_once_with(record.result, "blk_tool", "log-1")
+
+    def test_append_tool_round_messages_adds_round_level_source_selection_guidance(self):
+        tool_call_1 = {"id": "tc-search-1", "name": "web_search", "arguments": '{"query":"news"}'}
+        tool_call_2 = {"id": "tc-search-2", "name": "web_search", "arguments": '{"query":"official"}'}
+        handler_1 = Mock()
+        handler_1.format_llm_context.return_value = "第一个搜索上下文"
+        handler_1.build_content_block.return_value = None
+        handler_2 = Mock()
+        handler_2.format_llm_context.return_value = "第二个搜索上下文"
+        handler_2.build_content_block.return_value = None
+
+        record_1 = ToolExecutionRecord(
+            tool_call=tool_call_1,
+            result=ToolResult(
+                status="success",
+                data={
+                    "query": "OpenAI GPT-5.6 Sol 发布 2026年6月 新闻",
+                    "sources": [
+                        SearchSource(
+                            title="Previewing GPT-5.6 Sol: a next-generation model | OpenAI",
+                            url="https://openai.com/index/previewing-gpt-5-6-sol",
+                            description="OpenAI official announcement.",
+                        ),
+                        SearchSource(
+                            title="不過，這次GPT-5.6 並未全面開放。應美國政府要求，OpenAI 先以 ...",
+                            url="https://threads.com/@kufutw/post/DaJ2_DLD8cS",
+                            description="Social repost.",
+                        ),
+                    ],
+                },
+            ),
+            handler=handler_1,
+            block_id="blk-search-1",
+            log_id="log-search-1",
+        )
+        record_2 = ToolExecutionRecord(
+            tool_call=tool_call_2,
+            result=ToolResult(
+                status="success",
+                data={
+                    "query": "OpenAI GPT-5.6 Sol 2026年6月 官方公告",
+                    "sources": [
+                        SearchSource(
+                            title="OpenAI releases powerful new GPT-5.6 model - Axios",
+                            url="https://axios.com/2026/06/26/openai-gpt-sol-terra-luna-trump",
+                            description="Axios reports on OpenAI GPT-5.6 release restrictions.",
+                        ),
+                        SearchSource(
+                            title="[PDF] GPT-5.6 Preview System Card - Deployment Safety Hub",
+                            url="https://deploymentsafety.openai.com/gpt-5-6-preview/gpt-5-6-preview.pdf",
+                            description="Official system card PDF.",
+                        ),
+                    ],
+                },
+            ),
+            handler=handler_2,
+            block_id="blk-search-2",
+            log_id="log-search-2",
+        )
+        messages = [{"role": "user", "content": "请搜索"}]
+
+        tool_round_module.append_tool_round_messages(
+            tool_round_module.ToolRoundRequest(
+                db="db",
+                assistant_message_id="msg-1",
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="gpt-4",
+                provider="openai",
+                content_blocks=[],
+                messages=messages,
+                tool_calls=[tool_call_1, tool_call_2],
+                reasoning_buf="",
+                should_use_reasoning=True,
+                step_context=AgentStepContext(
+                    step_id="step-1",
+                    run_id="run-1",
+                    step_number=1,
+                    started_at=10.0,
+                    thinking_block_id="blk_thinking",
+                    text_block_id="blk_text",
+                ),
+                step_number=1,
+                run_id="run-1",
+                emitter=object(),
+                session_cache=object(),
+                network_budget=object(),
+                call_kwargs={},
+                persist_message_fn=Mock(),
+                execute_tools_fn=Mock(),
+                complete_step_fn=Mock(),
+            ),
+            [record_1, record_2],
+        )
+
+        self.assertEqual(messages[1]["role"], "assistant")
+        self.assertEqual(messages[2]["tool_call_id"], "tc-search-1")
+        self.assertIn("第一个搜索上下文", messages[2]["content"])
+        self.assertIn("结构化来源选择建议", messages[2]["content"])
+        self.assertIn("Previewing GPT-5.6 Sol", messages[2]["content"])
+        self.assertIn("GPT-5.6 Preview System Card", messages[2]["content"])
+        self.assertIn("Axios", messages[2]["content"])
+        self.assertIn("低优先级候选", messages[2]["content"])
+        self.assertIn("threads.com", messages[2]["content"])
+        self.assertEqual(messages[3]["tool_call_id"], "tc-search-2")
+        self.assertEqual(messages[3]["content"], "第二个搜索上下文")

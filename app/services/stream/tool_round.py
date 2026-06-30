@@ -9,6 +9,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.schemas.chat import ThinkingBlock
+from app.services.source_candidate_ranker import (
+    SearchResultForRanking,
+    format_source_selection_guidance,
+    rank_search_sources,
+)
 from app.services.stream.step_lifecycle import AgentStepContext, mark_tool_round_started
 from app.services.stream.tool_execution_result import ToolExecutionRecord
 
@@ -145,8 +150,12 @@ def append_tool_round_messages(request: ToolRoundRequest, results: list[ToolExec
         )
     )
 
+    source_selection_guidance_by_tool_call_id = _build_source_selection_guidance_by_tool_call_id(results)
     for record in results:
         tool_context = record.format_llm_context()
+        source_selection_guidance = source_selection_guidance_by_tool_call_id.get(str(record.tool_call.get("id", "")))
+        if source_selection_guidance:
+            tool_context = f"{tool_context}\n\n{source_selection_guidance}"
         content_block = record.build_content_block()
         if content_block is not None:
             request.content_blocks.append(content_block)
@@ -206,6 +215,33 @@ def _max_tool_calls(request: ToolRoundRequest) -> int | None:
         return request.max_tool_calls
     value = getattr(request.network_budget, "max_tool_calls", None)
     return value if isinstance(value, int) else None
+
+
+def _build_source_selection_guidance_by_tool_call_id(results: list[ToolExecutionRecord]) -> dict[str, str]:
+    search_results: list[SearchResultForRanking] = []
+    for record in results:
+        if record.tool_name != "web_search" or record.result.status != "success":
+            continue
+        result_data = getattr(record.result, "data", None) or {}
+        sources = result_data.get("sources") or []
+        if not sources:
+            continue
+        tool_call_id = str(record.tool_call.get("id", ""))
+        search_results.append(
+            SearchResultForRanking(
+                tool_call_id=tool_call_id,
+                query=str(result_data.get("query") or ""),
+                sources=sources,
+            )
+        )
+
+    if not search_results:
+        return {}
+
+    guidance = format_source_selection_guidance(rank_search_sources(search_results))
+    if not guidance:
+        return {}
+    return {search_results[0].tool_call_id: guidance}
 
 
 def _tool_arguments(tool_calls: list[dict]) -> list[dict]:
