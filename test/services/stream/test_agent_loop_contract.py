@@ -313,6 +313,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 "tool_call_completed",
                 "tool_result_digest",
                 "evidence_item_upserted",
+                "evidence_item_upserted",
                 "step_completed",
                 "plan_step_updated",
                 "plan_step_updated",
@@ -443,9 +444,9 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                     event["max_tool_calls"],
                 )
                 for event in result.events
-            if event["type"] == "run_progress_updated"
-        ],
-        [
+                if event["type"] == "run_progress_updated"
+            ],
+            [
                 ("researching", "正在查找资料", 1, 0, 20),
                 ("reading", "正在读取关键来源", 2, 1, 20),
                 ("synthesizing", "正在整理回答", 3, 1, 20),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -11,11 +12,15 @@ from typing import Any
 from app.schemas.chat import ThinkingBlock
 from app.services.source_candidate_ranker import (
     SearchResultForRanking,
+    SourceSelectionPlan,
     format_source_selection_guidance,
     rank_search_sources,
 )
+from app.services.source_evidence_ledger import build_selected_source_evidence_item
 from app.services.stream.step_lifecycle import AgentStepContext, mark_tool_round_started
 from app.services.stream.tool_execution_result import ToolExecutionRecord
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -190,12 +195,31 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
 
     await update_tool_round_plan_started(request)
     results = await execute_tool_round_tools(request)
+    await emit_selected_source_evidence(request, results)
     append_tool_round_messages(request, results)
     persist_tool_round_checkpoint(request)
 
     tool_names = await complete_tool_round_step(request, results)
     restore_reasoning_after_tool_decision(request.call_kwargs)
     return ToolRoundOutcome(tool_call_count=len(request.tool_calls), tool_names=tool_names)
+
+
+async def emit_selected_source_evidence(request: ToolRoundRequest, results: list[ToolExecutionRecord]) -> None:
+    emit = getattr(request.emitter, "evidence_item_upserted", None)
+    if emit is None:
+        return
+    plan = _build_source_selection_plan(results)
+    if plan is None:
+        return
+
+    for candidate in plan.recommended:
+        try:
+            await emit(
+                tool_call_id=candidate.tool_call_id,
+                evidence=build_selected_source_evidence_item(candidate),
+            )
+        except Exception:
+            logger.warning("发送推荐深读 evidence 失败", exc_info=True)
 
 
 def _completed_tool_calls_before_round(request: ToolRoundRequest) -> int | None:
@@ -218,6 +242,25 @@ def _max_tool_calls(request: ToolRoundRequest) -> int | None:
 
 
 def _build_source_selection_guidance_by_tool_call_id(results: list[ToolExecutionRecord]) -> dict[str, str]:
+    first_search_tool_call_id = _first_successful_search_tool_call_id(results)
+    plan = _build_source_selection_plan(results)
+    if plan is None or not first_search_tool_call_id:
+        return {}
+
+    guidance = format_source_selection_guidance(plan)
+    if not guidance:
+        return {}
+    return {first_search_tool_call_id: guidance}
+
+
+def _first_successful_search_tool_call_id(results: list[ToolExecutionRecord]) -> str:
+    for record in results:
+        if record.tool_name == "web_search" and record.result.status == "success":
+            return str(record.tool_call.get("id", ""))
+    return ""
+
+
+def _build_source_selection_plan(results: list[ToolExecutionRecord]) -> SourceSelectionPlan | None:
     search_results: list[SearchResultForRanking] = []
     for record in results:
         if record.tool_name != "web_search" or record.result.status != "success":
@@ -236,12 +279,9 @@ def _build_source_selection_guidance_by_tool_call_id(results: list[ToolExecution
         )
 
     if not search_results:
-        return {}
+        return None
 
-    guidance = format_source_selection_guidance(rank_search_sources(search_results))
-    if not guidance:
-        return {}
-    return {search_results[0].tool_call_id: guidance}
+    return rank_search_sources(search_results)
 
 
 def _tool_arguments(tool_calls: list[dict]) -> list[dict]:

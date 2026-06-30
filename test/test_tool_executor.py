@@ -4,6 +4,7 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from app.services.source_evidence_ledger import stable_web_evidence_id
 from app.services.stream import tool_executor as tool_executor_module
 from app.services.stream.tool_execution_result import ToolExecutionRecord
 from app.services.stream.tool_executor import (
@@ -325,13 +326,14 @@ class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(digest_kwargs["tool_name"], "web_search")
         self.assertEqual(digest_kwargs["status"], "success")
         self.assertEqual(digest_kwargs["title"], "搜索完成")
-        self.assertEqual(digest_kwargs["source_refs"], ["ev-call-1-0"])
+        expected_evidence_id = stable_web_evidence_id("https://example.com/news", fallback="ev-call-1-0")
+        self.assertEqual(digest_kwargs["source_refs"], [expected_evidence_id])
         self.assertLessEqual(len(digest_kwargs["key_findings"]), 5)
 
         emitter.evidence_item_upserted.assert_awaited_once()
         evidence_kwargs = emitter.evidence_item_upserted.await_args.kwargs
         self.assertEqual(evidence_kwargs["tool_call_id"], "call-1")
-        self.assertEqual(evidence_kwargs["evidence"]["id"], "ev-call-1-0")
+        self.assertEqual(evidence_kwargs["evidence"]["id"], expected_evidence_id)
         self.assertEqual(evidence_kwargs["evidence"]["title"], "官方发布页")
         self.assertEqual(evidence_kwargs["evidence"]["domain"], "example.com")
 

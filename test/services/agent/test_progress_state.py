@@ -156,6 +156,62 @@ def test_evidence_upsert_cap_keeps_used_and_truncates_fields():
     assert kept_used["snippet"] == "s" * 180
 
 
+def test_evidence_upsert_cap_keeps_selected_and_read_success():
+    state = empty_progress_state(run_id="r1", message_id="m1")
+
+    for evidence in [
+        {
+            "id": "selected-id",
+            "kind": "web",
+            "status": "selected",
+            "title": "建议深读来源",
+            "url": "https://example.com/selected",
+            "domain": "example.com",
+            "claim": "建议深读：官方来源",
+        },
+        {
+            "id": "read-success-id",
+            "kind": "web",
+            "status": "read_success",
+            "title": "已深读来源",
+            "url": "https://example.com/read",
+            "domain": "example.com",
+            "claim": "已读取网页内容。",
+        },
+    ]:
+        state = apply_progress_event(
+            state,
+            {
+                "type": "evidence_item_upserted",
+                "protocol_version": 2,
+                "evidence": evidence,
+            },
+        )
+
+    for index in range(12):
+        state = apply_progress_event(
+            state,
+            {
+                "type": "evidence_item_upserted",
+                "protocol_version": 2,
+                "evidence": {
+                    "id": f"candidate-{index}",
+                    "kind": "web",
+                    "status": "candidate",
+                    "title": f"普通候选 {index}",
+                    "url": f"https://example.com/candidate-{index}",
+                    "domain": "example.com",
+                    "claim": "普通候选",
+                },
+            },
+        )
+
+    ids = [item["id"] for item in state["evidence"]]
+    assert len(ids) == 12
+    assert "selected-id" in ids
+    assert "read-success-id" in ids
+
+
 def test_terminal_v1_events_update_snapshot_status():
     state = empty_progress_state(run_id="r1", message_id="m1")
 

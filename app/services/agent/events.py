@@ -111,7 +111,7 @@ class AgentEvidenceItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str
     kind: Literal["web", "file", "tool", "model"]
-    status: Literal["candidate", "used", "discarded"]
+    status: Literal["candidate", "selected", "read_success", "read_degraded", "read_failed", "used", "discarded"]
     title: str
     url: str | None = None
     domain: str | None = None

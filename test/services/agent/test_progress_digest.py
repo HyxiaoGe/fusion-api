@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
-from app.services.agent.progress_digest import build_tool_result_digest
+from app.services.agent.progress_digest import build_evidence_items, build_tool_result_digest
+from app.services.source_evidence_ledger import stable_web_evidence_id
 
 
 def test_web_search_digest_uses_tool_level_title_instead_of_first_source_title():
@@ -40,7 +41,10 @@ def test_web_search_digest_uses_tool_level_title_instead_of_first_source_title()
 
     assert digest["title"] == "搜索完成"
     assert digest["summary"] == "保留 6 条候选结果，供后续回答筛选。"
-    assert digest["source_refs"] == ["ev-call-1-0", "ev-call-1-1"]
+    assert digest["source_refs"] == [
+        stable_web_evidence_id("https://163.com/news", fallback="ev-call-1-0"),
+        stable_web_evidence_id("https://example.com/chip", fallback="ev-call-1-1"),
+    ]
 
 
 def test_url_read_degraded_digest_does_not_expose_internal_service_names():
@@ -65,5 +69,39 @@ def test_url_read_degraded_digest_does_not_expose_internal_service_names():
 
     assert digest["title"] == "网页读取部分可用"
     assert digest["summary"] == "网页暂时无法读取，已跳过该来源。"
+    assert digest["source_refs"] == [stable_web_evidence_id("https://example.com/a", fallback="ev-call-2-url")]
     assert "url_read" not in digest["title"]
     assert "reader-service" not in digest["summary"]
+
+
+def test_url_read_success_builds_read_success_evidence():
+    record = SimpleNamespace(
+        tool_call={"id": "call-3", "name": "url_read"},
+        tool_name="url_read",
+        result=SimpleNamespace(
+            status="success",
+            data={
+                "url": "https://www.example.com/report?utm_source=feed",
+                "title": "Example Report",
+                "content": "报告正文",
+            },
+            error_message=None,
+        ),
+        handler=None,
+    )
+
+    evidence = build_evidence_items(record)
+
+    assert evidence == [
+        {
+            "id": stable_web_evidence_id("https://example.com/report", fallback="ev-call-3-url"),
+            "kind": "web",
+            "status": "read_success",
+            "title": "Example Report",
+            "url": "https://example.com/report",
+            "domain": "example.com",
+            "claim": "报告正文",
+            "snippet": "报告正文",
+            "used_by_final_answer": False,
+        }
+    ]

@@ -204,6 +204,28 @@ class AgentProgressV2EventModelTests(unittest.TestCase):
         self.assertEqual(ev.evidence.id, "ev-1")
         self.assertEqual(ev.evidence.kind, "web")
 
+    def test_evidence_item_upserted_accepts_read_lifecycle_status(self):
+        ev = EvidenceItemUpserted(
+            type="evidence_item_upserted",
+            protocol_version=2,
+            step_id="s1",
+            tool_call_id="tc1",
+            evidence={
+                "id": "ev-1",
+                "kind": "web",
+                "status": "read_success",
+                "title": "官方发布页",
+                "url": "https://example.com/news",
+                "domain": "example.com",
+                "claim": "官方发布页已读取。",
+                "snippet": "页面摘要。",
+                "used_by_final_answer": False,
+            },
+            **{k: v for k, v in self._common().items() if k not in {"step_id", "tool_call_id"}},
+        )
+
+        self.assertEqual(ev.evidence.status, "read_success")
+
 
 if __name__ == "__main__":
     unittest.main()

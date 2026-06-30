@@ -1,7 +1,8 @@
 import unittest
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 from app.schemas.chat import SearchSource, TextBlock
+from app.services.source_evidence_ledger import stable_web_evidence_id
 from app.services.stream import tool_round as tool_round_module
 from app.services.stream.step_lifecycle import AgentStepContext
 from app.services.stream.tool_execution_result import ToolExecutionRecord
@@ -517,3 +518,100 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("threads.com", messages[2]["content"])
         self.assertEqual(messages[3]["tool_call_id"], "tc-search-2")
         self.assertEqual(messages[3]["content"], "第二个搜索上下文")
+
+    async def test_handle_tool_calls_round_emits_selected_evidence_for_ranker_recommendations(self):
+        tool_call = {"id": "tc-search", "name": "web_search", "arguments": '{"query":"OpenAI GPT-5.6"}'}
+        handler = Mock()
+        handler.format_llm_context.return_value = "搜索上下文"
+        handler.build_content_block.return_value = None
+        record = ToolExecutionRecord(
+            tool_call=tool_call,
+            result=ToolResult(
+                status="success",
+                data={
+                    "query": "OpenAI GPT-5.6 官方公告",
+                    "sources": [
+                        SearchSource(
+                            title="Previewing GPT-5.6 Sol: a next-generation model | OpenAI",
+                            url="https://openai.com/index/previewing-gpt-5-6-sol?utm_source=feed",
+                            description="OpenAI official announcement.",
+                        ),
+                        SearchSource(
+                            title="社交平台转述",
+                            url="https://threads.com/@example/post/1",
+                            description="Social repost.",
+                        ),
+                    ],
+                },
+            ),
+            handler=handler,
+            block_id="blk-search",
+            log_id="log-search",
+        )
+        emitter = Mock()
+        emitter.evidence_item_upserted = AsyncMock()
+        original_mark_tool_round_started = getattr(tool_round_module, "mark_tool_round_started", None)
+
+        async def mark_tool_round_started(**kwargs):
+            return None
+
+        async def execute_tools_fn(*args, **kwargs):
+            return [record]
+
+        async def complete_step_fn(**kwargs):
+            return None
+
+        tool_round_module.mark_tool_round_started = mark_tool_round_started
+        try:
+            await handle_tool_calls_round(
+                request=tool_round_module.ToolRoundRequest(
+                    db="db",
+                    assistant_message_id="msg-1",
+                    conversation_id="conv-1",
+                    user_id="user-1",
+                    model_id="gpt-4",
+                    provider="openai",
+                    content_blocks=[],
+                    messages=[{"role": "user", "content": "请搜索"}],
+                    tool_calls=[tool_call],
+                    reasoning_buf="",
+                    should_use_reasoning=True,
+                    step_context=AgentStepContext(
+                        step_id="step-1",
+                        run_id="run-1",
+                        step_number=1,
+                        started_at=10.0,
+                        thinking_block_id="blk_thinking",
+                        text_block_id="blk_text",
+                    ),
+                    step_number=1,
+                    run_id="run-1",
+                    emitter=emitter,
+                    session_cache=object(),
+                    network_budget=object(),
+                    call_kwargs={},
+                    persist_message_fn=Mock(),
+                    execute_tools_fn=execute_tools_fn,
+                    complete_step_fn=complete_step_fn,
+                )
+            )
+        finally:
+            if original_mark_tool_round_started is None:
+                delattr(tool_round_module, "mark_tool_round_started")
+            else:
+                tool_round_module.mark_tool_round_started = original_mark_tool_round_started
+
+        emitter.evidence_item_upserted.assert_awaited()
+        selected_calls = [
+            call
+            for call in emitter.evidence_item_upserted.await_args_list
+            if call.kwargs["evidence"]["status"] == "selected"
+        ]
+        selected_events = [call.kwargs["evidence"] for call in selected_calls]
+        self.assertEqual(len(selected_events), 1)
+        self.assertEqual(selected_calls[0].kwargs["tool_call_id"], "tc-search")
+        self.assertEqual(
+            selected_events[0]["id"],
+            stable_web_evidence_id("https://openai.com/index/previewing-gpt-5-6-sol", fallback="unused"),
+        )
+        self.assertIn("建议深读", selected_events[0]["claim"])

@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
+from app.services.source_evidence_ledger import build_search_source_evidence_item, build_url_read_evidence_item
+
 if TYPE_CHECKING:
     from app.services.stream.tool_execution_result import ToolExecutionRecord
 
@@ -28,31 +30,25 @@ def build_tool_result_digest(record: ToolExecutionRecord) -> dict[str, Any]:
 
 
 def build_evidence_items(record: ToolExecutionRecord) -> list[dict[str, Any]]:
-    sources = _extract_sources(record)
     tool_call_id = str(record.tool_call.get("id", "tool"))
+    if record.tool_name == "url_read":
+        item = build_url_read_evidence_item(
+            record.result.data or {},
+            status=record.result.status,
+            tool_call_id=tool_call_id,
+        )
+        if item is None:
+            return []
+        url = item.get("url")
+        return [item] if not url or _is_public_url(url) else []
+
+    sources = _extract_sources(record)
     evidence = []
     for index, source in enumerate(sources[:12]):
         url = _source_value(source, "url")
         if url and not _is_public_url(url):
             continue
-        title = _safe_text(_source_value(source, "title"), 80) or "工具结果"
-        claim = _safe_text(
-            _source_value(source, "description") or _source_value(source, "content") or title,
-            120,
-        )
-        evidence.append(
-            {
-                "id": f"ev-{tool_call_id}-{index}",
-                "kind": "web",
-                "status": "candidate",
-                "title": title,
-                "url": url,
-                "domain": _domain(url),
-                "claim": claim,
-                "snippet": _safe_text(_source_value(source, "content") or _source_value(source, "description"), 180),
-                "used_by_final_answer": False,
-            }
-        )
+        evidence.append(build_search_source_evidence_item(source, tool_call_id=tool_call_id, source_index=index))
     return evidence
 
 
@@ -150,13 +146,6 @@ def _is_public_url(url: str) -> bool:
         return False
     host = parsed.hostname or ""
     return host not in {"localhost", "127.0.0.1", "::1"}
-
-
-def _domain(url: str | None) -> str | None:
-    if not url:
-        return None
-    parsed = urlparse(url)
-    return parsed.netloc or None
 
 
 def _safe_text(value: Any, max_chars: int) -> str:

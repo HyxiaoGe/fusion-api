@@ -146,10 +146,26 @@ def _cap_evidence(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if len(items) <= MAX_EVIDENCE_ITEMS:
         return items
 
-    used = [item for item in items if item.get("status") == "used" or item.get("used_by_final_answer")]
-    candidates = [item for item in items if item.get("status") != "used" and not item.get("used_by_final_answer")]
-    remaining_slots = max(MAX_EVIDENCE_ITEMS - len(used), 0)
-    return used + candidates[-remaining_slots:]
+    indexed_items = list(enumerate(items))
+    kept = sorted(
+        indexed_items,
+        key=lambda entry: (_evidence_priority(entry[1]), entry[0]),
+        reverse=True,
+    )[:MAX_EVIDENCE_ITEMS]
+    return [item for _, item in sorted(kept, key=lambda entry: entry[0])]
+
+
+def _evidence_priority(item: dict[str, Any]) -> int:
+    status = item.get("status")
+    if status == "used" or item.get("used_by_final_answer"):
+        return 5
+    if status == "read_success":
+        return 4
+    if status == "selected":
+        return 3
+    if status in {"read_degraded", "read_failed"}:
+        return 2
+    return 1
 
 
 def _terminal_status(event: dict[str, Any]) -> str:
