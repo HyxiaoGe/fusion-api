@@ -220,7 +220,22 @@ class WebSearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不要在最终回答中输出裸 URL", context)
         self.assertIn("不要在回答末尾追加参考链接列表", context)
 
-    def test_format_llm_context_injects_at_most_eight_search_sources(self):
+    def test_format_llm_context_uses_context_source_limit_from_budget(self):
+        from app.schemas.chat import SearchSource
+
+        sources = [SearchSource(title=f"R{i}", url=f"https://example.com/{i}", description=f"d{i}") for i in range(10)]
+        result = ToolResult(
+            status="success",
+            data={"sources": sources, "result_count": 10, "context_source_limit": 6},
+        )
+
+        context = self.handler.format_llm_context(result)
+
+        self.assertIn("[6] R5", context)
+        self.assertNotIn("[7] R6", context)
+        self.assertIn("仅前 6 条", context)
+
+    def test_format_llm_context_defaults_to_eight_when_budget_missing(self):
         from app.schemas.chat import SearchSource
 
         sources = [SearchSource(title=f"R{i}", url=f"https://example.com/{i}", description=f"d{i}") for i in range(10)]
@@ -278,6 +293,8 @@ class WebSearchHandlerTests(unittest.IsolatedAsyncioTestCase):
                 "requested_count": 8,
                 "actual_count": 1,
                 "context_source_count": 1,
+                "context_source_limit": 6,
+                "search_budget": "comparison",
                 "intent": "comparison",
                 "domains": ["a.com"],
                 "recency_days": 7,
@@ -290,6 +307,8 @@ class WebSearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(block.requested_count, 8)
         self.assertEqual(block.actual_count, 1)
         self.assertEqual(block.context_source_count, 1)
+        self.assertEqual(block.context_source_limit, 6)
+        self.assertEqual(block.search_budget, "comparison")
         self.assertEqual(block.intent, "comparison")
         self.assertEqual(block.domains, ["a.com"])
         self.assertEqual(block.recency_days, 7)

@@ -45,10 +45,6 @@ def build_web_search_tool() -> dict:
                             f"- 示例：'{year}年{month}月AI 视频生成最新进展' 而不是 'AI video generation'"
                         ),
                     },
-                    "count": {
-                        "type": "integer",
-                        "description": "期望返回的搜索结果数量，后端会限制在 3 到 10 条之间，默认 5 条。",
-                    },
                     "intent": {
                         "type": "string",
                         "enum": [

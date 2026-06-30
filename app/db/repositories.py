@@ -383,6 +383,15 @@ class ConversationRepository:
                         result_provider=block_data.get("result_provider"),
                         fallback_used=bool(block_data.get("fallback_used", False)),
                         provider_chain=block_data.get("provider_chain", []),
+                        requested_count=block_data.get("requested_count"),
+                        actual_count=block_data.get("actual_count"),
+                        context_source_count=block_data.get("context_source_count"),
+                        context_source_limit=block_data.get("context_source_limit"),
+                        search_budget=block_data.get("search_budget"),
+                        intent=block_data.get("intent"),
+                        domains=block_data.get("domains", []),
+                        recency_days=block_data.get("recency_days"),
+                        budget_limited=bool(block_data.get("budget_limited", False)),
                     )
                 )
             elif block_type == "url_read":

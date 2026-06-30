@@ -2,14 +2,14 @@ import unittest
 
 
 class AiToolSchemaTests(unittest.TestCase):
-    def test_web_search_schema_exposes_dynamic_network_options(self):
+    def test_web_search_schema_exposes_decision_options_but_not_count(self):
         from app.ai.tools import build_web_search_tool
 
         tool = build_web_search_tool()
         properties = tool["function"]["parameters"]["properties"]
 
         self.assertIn("query", properties)
-        self.assertIn("count", properties)
+        self.assertNotIn("count", properties)
         self.assertIn("intent", properties)
         self.assertIn("domains", properties)
         self.assertIn("recency_days", properties)

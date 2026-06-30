@@ -92,6 +92,8 @@ class SearchBlock(BaseModel):
     requested_count: Optional[int] = None
     actual_count: Optional[int] = None
     context_source_count: Optional[int] = None
+    context_source_limit: Optional[int] = None
+    search_budget: Optional[str] = None
     intent: Optional[str] = None
     domains: List[str] = Field(default_factory=list)
     recency_days: Optional[int] = None

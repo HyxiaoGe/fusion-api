@@ -5,24 +5,16 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from app.services.search_budget import SEARCH_BUDGETS_BY_INTENT, derive_search_budget
 from app.services.tool_handlers.base import ToolResult
 
-MIN_SEARCH_COUNT = 3
-DEFAULT_SEARCH_COUNT = 5
-MAX_SEARCH_COUNT = 10
 MAX_SEARCH_CALLS = 4
 MAX_URL_READ_CALLS = 5
 MAX_DOMAINS = 5
 MIN_RECENCY_DAYS = 1
 MAX_RECENCY_DAYS = 365
 
-SUPPORTED_SEARCH_INTENTS = {
-    "quick_fact",
-    "freshness",
-    "comparison",
-    "deep_research",
-    "official_source",
-}
+SUPPORTED_SEARCH_INTENTS = set(SEARCH_BUDGETS_BY_INTENT)
 
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 
@@ -36,15 +28,17 @@ class NetworkToolBudget:
 
     def prepare_web_search_args(self, args: dict) -> tuple[dict, ToolResult | None]:
         normalized = dict(args or {})
-        normalized["count"] = _clamp_int(
-            normalized.get("count"), DEFAULT_SEARCH_COUNT, MIN_SEARCH_COUNT, MAX_SEARCH_COUNT
-        )
 
         intent = _normalize_intent(normalized.get("intent"))
         if intent:
             normalized["intent"] = intent
         else:
             normalized.pop("intent", None)
+
+        search_budget = derive_search_budget(intent)
+        normalized["count"] = search_budget.requested_count
+        normalized["context_source_limit"] = search_budget.context_source_limit
+        normalized["search_budget"] = search_budget.name
 
         domains = _normalize_domains(normalized.get("domains"))
         if domains:
@@ -68,9 +62,14 @@ class NetworkToolBudget:
                     "query": normalized.get("query", ""),
                     "sources": [],
                     "result_count": 0,
-                    "requested_count": normalized.get("count", DEFAULT_SEARCH_COUNT),
+                    "requested_count": normalized.get("count", search_budget.requested_count),
                     "actual_count": 0,
                     "context_source_count": 0,
+                    "context_source_limit": normalized.get(
+                        "context_source_limit",
+                        search_budget.context_source_limit,
+                    ),
+                    "search_budget": normalized.get("search_budget", search_budget.name),
                     "intent": normalized.get("intent"),
                     "domains": normalized.get("domains", []),
                     "recency_days": normalized.get("recency_days"),

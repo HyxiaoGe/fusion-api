@@ -4,15 +4,17 @@ from app.services.stream.network_budget import NetworkToolBudget
 
 
 class NetworkToolBudgetTests(unittest.TestCase):
-    def test_web_search_defaults_count_to_five(self):
+    def test_web_search_uses_standard_budget_when_intent_missing(self):
         budget = NetworkToolBudget()
 
         args, degraded = budget.prepare_web_search_args({"query": "redis"})
 
         self.assertIsNone(degraded)
         self.assertEqual(args["count"], 5)
+        self.assertEqual(args["context_source_limit"], 5)
+        self.assertEqual(args["search_budget"], "standard")
 
-    def test_web_search_clamps_count_to_three_and_ten(self):
+    def test_web_search_ignores_model_supplied_count(self):
         budget = NetworkToolBudget()
 
         low_args, low_degraded = budget.prepare_web_search_args({"query": "redis", "count": 1})
@@ -20,34 +22,43 @@ class NetworkToolBudgetTests(unittest.TestCase):
 
         self.assertIsNone(low_degraded)
         self.assertIsNone(high_degraded)
-        self.assertEqual(low_args["count"], 3)
-        self.assertEqual(high_args["count"], 10)
+        self.assertEqual(low_args["count"], 5)
+        self.assertEqual(high_args["count"], 5)
+        self.assertEqual(low_args["search_budget"], "standard")
+        self.assertEqual(high_args["search_budget"], "standard")
+
+    def test_web_search_maps_supported_intents_to_search_budgets(self):
+        expected = {
+            "quick_fact": ("quick_fact", 3, 3),
+            "freshness": ("freshness", 5, 5),
+            "comparison": ("comparison", 8, 6),
+            "deep_research": ("deep_research", 10, 8),
+            "official_source": ("official_source", 5, 4),
+        }
+
+        for intent, (budget_name, requested_count, context_limit) in expected.items():
+            with self.subTest(intent=intent):
+                budget = NetworkToolBudget()
+
+                args, degraded = budget.prepare_web_search_args(
+                    {"query": "redis", "intent": intent, "count": 99}
+                )
+
+                self.assertIsNone(degraded)
+                self.assertEqual(args["intent"], intent)
+                self.assertEqual(args["search_budget"], budget_name)
+                self.assertEqual(args["count"], requested_count)
+                self.assertEqual(args["context_source_limit"], context_limit)
 
     def test_web_search_drops_unsupported_intent(self):
         budget = NetworkToolBudget()
 
-        args, degraded = budget.prepare_web_search_args({"query": "redis", "intent": "ignore-system"})
+        args, degraded = budget.prepare_web_search_args({"query": "redis", "intent": "ignore-system", "count": 10})
 
         self.assertIsNone(degraded)
         self.assertNotIn("intent", args)
-
-    def test_web_search_keeps_supported_spec_intents(self):
-        supported = [
-            "quick_fact",
-            "freshness",
-            "comparison",
-            "deep_research",
-            "official_source",
-        ]
-
-        for intent in supported:
-            with self.subTest(intent=intent):
-                budget = NetworkToolBudget()
-
-                args, degraded = budget.prepare_web_search_args({"query": "redis", "intent": intent})
-
-                self.assertIsNone(degraded)
-                self.assertEqual(args["intent"], intent)
+        self.assertEqual(args["count"], 5)
+        self.assertEqual(args["search_budget"], "standard")
 
     def test_web_search_keeps_at_most_five_plain_domains(self):
         budget = NetworkToolBudget()
