@@ -120,6 +120,19 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("文档正文", prepared.messages[3]["content"])
         self.assertEqual(call_config.announced_tools, ["web_search"])
 
+    def test_tool_usage_contract_uses_centralized_prompt(self):
+        from app.ai.prompts.agent_loop import TOOL_USAGE_CONTRACT_PROMPT
+        from app.services.stream.agent_loop_request_prep import inject_tool_usage_contract
+
+        messages = [{"role": "user", "content": "OpenAI 最新公告"}]
+        call_kwargs = {"tools": [{"type": "function", "function": {"name": "web_search"}}]}
+
+        prepared = inject_tool_usage_contract(messages, call_kwargs)
+
+        self.assertEqual(prepared[0], {"role": "system", "content": TOOL_USAGE_CONTRACT_PROMPT})
+        self.assertIn("必须调用 web_search", TOOL_USAGE_CONTRACT_PROMPT)
+        self.assertIn("没有调用工具", TOOL_USAGE_CONTRACT_PROMPT)
+
     async def test_prepare_messages_injects_extra_system_prompts_without_user_preprocess(self):
         async def build_llm_messages_fn(_raw_messages, _has_vision, _repo, _user_system_prompt):
             return [

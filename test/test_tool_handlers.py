@@ -220,6 +220,28 @@ class WebSearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不要在最终回答中输出裸 URL", context)
         self.assertIn("不要在回答末尾追加参考链接列表", context)
 
+    def test_format_llm_context_allows_targeted_url_read_after_search(self):
+        """搜索摘要不足时应允许模型继续深读少量高价值来源。"""
+        from app.schemas.chat import SearchSource
+
+        sources = [
+            SearchSource(
+                title="OpenAI 官方公告",
+                url="https://openai.com/index/example",
+                description="OpenAI 发布最新公告摘要",
+            )
+        ]
+        result = ToolResult(status="success", data={"sources": sources, "result_count": 1})
+
+        context = self.handler.format_llm_context(result)
+
+        self.assertNotIn("不要再发起搜索或输出任何工具调用指令", context)
+        self.assertIn("如果搜索摘要足够", context)
+        self.assertIn("url_read", context)
+        self.assertIn("官方公告", context)
+        self.assertIn("原文细节", context)
+        self.assertIn("少量高价值来源", context)
+
     def test_format_llm_context_uses_context_source_limit_from_budget(self):
         from app.schemas.chat import SearchSource
 
@@ -522,7 +544,9 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不要在回答末尾追加参考链接列表", context)
 
     async def test_execute_rejects_private_url_without_reader_call(self):
-        with patch("app.services.tool_handlers.url_read.read_url_with_diagnostics", new_callable=AsyncMock) as mock_read:
+        with patch(
+            "app.services.tool_handlers.url_read.read_url_with_diagnostics", new_callable=AsyncMock
+        ) as mock_read:
             result = await self.handler.execute({"url": "http://127.0.0.1/admin"})
 
         self.assertEqual(result.status, "degraded")
@@ -530,7 +554,9 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
         mock_read.assert_not_called()
 
     async def test_execute_rejects_sensitive_query_without_persisting_raw_url(self):
-        with patch("app.services.tool_handlers.url_read.read_url_with_diagnostics", new_callable=AsyncMock) as mock_read:
+        with patch(
+            "app.services.tool_handlers.url_read.read_url_with_diagnostics", new_callable=AsyncMock
+        ) as mock_read:
             result = await self.handler.execute({"url": "https://example.com/page?token=secret&safe=1"})
 
         self.assertEqual(result.status, "degraded")

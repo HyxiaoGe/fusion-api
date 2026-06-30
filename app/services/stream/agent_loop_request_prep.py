@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.ai.litellm_utils import merge_extra_body
+from app.ai.prompts.agent_loop import TOOL_USAGE_CONTRACT_PROMPT
 from app.ai.tools import build_web_search_tool
 from app.db.repositories import FileRepository
 from app.services.chat.message_builder import (
@@ -17,14 +18,6 @@ from app.services.chat.message_builder import (
 from app.services.stream.persistence import preprocess_url_in_message
 
 VOLCENGINE_PROVIDERS = {"volcengine"}
-
-_WEB_SEARCH_TOOL_CONTRACT_PROMPT = (
-    "【工具调用一致性规则】\n"
-    "如果你判断需要联网搜索，必须调用 web_search 工具，不能只在文字里说要搜索。\n"
-    "不要在思考过程或最终回答中声称「我将搜索」「正在搜索」「让我搜索一下」「根据搜索结果」等，"
-    "除非你已经实际调用工具并收到了工具结果。\n"
-    "没有调用工具时，请直接基于已有知识回答，并明确避免暗示已经联网或即将联网。"
-)
 
 
 @dataclass(frozen=True)
@@ -211,5 +204,5 @@ def inject_tool_usage_contract(messages: list[dict], call_kwargs: dict) -> list[
     insert_at = 0
     while insert_at < len(messages) and messages[insert_at].get("role") == "system":
         insert_at += 1
-    contract_msg = {"role": "system", "content": _WEB_SEARCH_TOOL_CONTRACT_PROMPT}
+    contract_msg = {"role": "system", "content": TOOL_USAGE_CONTRACT_PROMPT}
     return [*messages[:insert_at], contract_msg, *messages[insert_at:]]

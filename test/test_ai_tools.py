@@ -34,6 +34,19 @@ class AiToolSchemaTests(unittest.TestCase):
         self.assertIn("reason", properties)
         self.assertEqual(URL_READ_TOOL["function"]["parameters"]["required"], ["url"])
 
+    def test_url_read_schema_prioritizes_high_value_search_results(self):
+        from app.ai.tools import URL_READ_TOOL
+
+        description = URL_READ_TOOL["function"]["description"]
+
+        self.assertIn("官方来源", description)
+        self.assertIn("原文公告", description)
+        self.assertIn("高相关结果", description)
+        self.assertIn("视频", description)
+        self.assertIn("论坛", description)
+        self.assertIn("低相关结果", description)
+        self.assertIn("降权", description)
+
 
 if __name__ == "__main__":
     unittest.main()
