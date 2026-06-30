@@ -31,7 +31,7 @@ docker-compose up -d                     # Docker 启动
 5. **TDD 优先**：bugfix 和行为变更先补能失败的回归测试，再实现；已有测试不足时至少补覆盖核心行为的单测。
 6. **编码中**：遵守 [docs/ARCHITECTURE_RULES.md](docs/ARCHITECTURE_RULES.md)，参考 [docs/CODING_CONVENTIONS.md](docs/CODING_CONVENTIONS.md)，保持改动范围最小，不回滚无关用户改动。
 7. **禁止默认本地启动**：不得为调查或验收启动 `uvicorn`、本地 Docker 或其他 Fusion 服务；优先使用单元测试、ruff、CI、dev 日志和远端健康检查。只有用户明确要求本地启动时才可执行。
-8. **真实 Chrome 回归**：涉及登录态、联网回答、消息流、设置页或其他用户可见链路时，可在用户已登录 Chrome 中打开已部署 dev/prod 链接做补充回归；只验证关键路径、真实网络和可见异常，不用本地 Fusion 服务替代。
+8. **真实 Chrome 回归**：涉及登录态、联网回答、消息流、设置页或其他用户可见链路时，只能复用用户已经打开的、与任务匹配的 Chrome 标签做补充回归。**严禁打开新的 Chrome、新标签、新窗口、`about:blank`、isolated context，严禁使用会创建或切到独立浏览器目标的 DevTools/CDP 通道。**若没有可复用的匹配标签，必须停止并说明阻塞，不能自行新开页面；只验证关键路径、真实网络和可见异常，不用本地 Fusion 服务替代。
 9. **变更后验证**：运行与改动匹配的 pytest/ruff；涉及数据流、联网、Redis Stream、认证或部署逻辑时扩大回归范围并更新文档。
 10. **CI/CD 收尾**：按正常 Git 流程中文提交并包含 `Co-Authored-By`，push 后持续监控 GitHub Actions 和 dev 部署；失败时拉日志定位并修复。
 
