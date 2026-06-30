@@ -14,6 +14,55 @@ class NetworkToolBudgetTests(unittest.TestCase):
         self.assertEqual(args["context_source_limit"], 5)
         self.assertEqual(args["search_budget"], "standard")
 
+    def test_web_search_infers_official_source_budget_from_query(self):
+        budget = NetworkToolBudget()
+
+        args, degraded = budget.prepare_web_search_args({"query": "OpenAI GPT-5.6 Sol 2026年6月 官方公告"})
+
+        self.assertIsNone(degraded)
+        self.assertEqual(args["intent"], "official_source")
+        self.assertEqual(args["count"], 5)
+        self.assertEqual(args["context_source_limit"], 4)
+        self.assertEqual(args["search_budget"], "official_source")
+
+    def test_web_search_narrows_similar_followup_query(self):
+        budget = NetworkToolBudget()
+
+        first_args, first_degraded = budget.prepare_web_search_args(
+            {"query": "OpenAI GPT-5.6 Sol official announcement June 2026"}
+        )
+        second_args, second_degraded = budget.prepare_web_search_args(
+            {"query": "OpenAI GPT-5.6 Sol 2026年6月 官方公告"}
+        )
+
+        self.assertIsNone(first_degraded)
+        self.assertIsNone(second_degraded)
+        self.assertEqual(first_args["search_budget"], "official_source")
+        self.assertEqual(first_args["count"], 5)
+        self.assertEqual(first_args["context_source_limit"], 4)
+        self.assertEqual(second_args["intent"], "official_source")
+        self.assertEqual(second_args["search_budget"], "official_source_followup")
+        self.assertEqual(second_args["count"], 3)
+        self.assertEqual(second_args["context_source_limit"], 3)
+
+    def test_web_search_keeps_complementary_media_followup_broad(self):
+        budget = NetworkToolBudget()
+
+        official_args, official_degraded = budget.prepare_web_search_args(
+            {"query": "OpenAI GPT-5.6 Sol official announcement June 2026"}
+        )
+        media_args, media_degraded = budget.prepare_web_search_args(
+            {"query": "OpenAI GPT-5.6 Sol TechCrunch Reuters 权威媒体报道"}
+        )
+
+        self.assertIsNone(official_degraded)
+        self.assertIsNone(media_degraded)
+        self.assertEqual(official_args["search_budget"], "official_source")
+        self.assertEqual(media_args["intent"], "comparison")
+        self.assertEqual(media_args["search_budget"], "comparison")
+        self.assertEqual(media_args["count"], 8)
+        self.assertEqual(media_args["context_source_limit"], 6)
+
     def test_web_search_ignores_model_supplied_count(self):
         budget = NetworkToolBudget()
 
@@ -40,9 +89,7 @@ class NetworkToolBudgetTests(unittest.TestCase):
             with self.subTest(intent=intent):
                 budget = NetworkToolBudget()
 
-                args, degraded = budget.prepare_web_search_args(
-                    {"query": "redis", "intent": intent, "count": 99}
-                )
+                args, degraded = budget.prepare_web_search_args({"query": "redis", "intent": intent, "count": 99})
 
                 self.assertIsNone(degraded)
                 self.assertEqual(args["intent"], intent)

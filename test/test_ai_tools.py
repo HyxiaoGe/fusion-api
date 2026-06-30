@@ -25,6 +25,18 @@ class AiToolSchemaTests(unittest.TestCase):
         )
         self.assertEqual(tool["function"]["parameters"]["required"], ["query"])
 
+    def test_web_search_tool_description_avoids_duplicate_queries(self):
+        from app.ai.tools import build_web_search_tool
+
+        tool = build_web_search_tool()
+
+        description = tool["function"]["description"]
+        query_description = tool["function"]["parameters"]["properties"]["query"]["description"]
+
+        self.assertIn("默认只发起 1 次搜索", description)
+        self.assertIn("第二个互补搜索", description)
+        self.assertIn("不要用中英文翻译或同义改写重复搜索同一意图", query_description)
+
     def test_url_read_schema_exposes_optional_reason(self):
         from app.ai.tools import URL_READ_TOOL
 

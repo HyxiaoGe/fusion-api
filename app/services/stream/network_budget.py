@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from app.services.search_budget import SEARCH_BUDGETS_BY_INTENT, derive_search_budget
+from app.services.search_budget import derive_search_budget, resolve_search_intent
 from app.services.tool_handlers.base import ToolResult
 
 MAX_SEARCH_CALLS = 4
@@ -13,8 +13,6 @@ MAX_URL_READ_CALLS = 5
 MAX_DOMAINS = 5
 MIN_RECENCY_DAYS = 1
 MAX_RECENCY_DAYS = 365
-
-SUPPORTED_SEARCH_INTENTS = set(SEARCH_BUDGETS_BY_INTENT)
 
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 
@@ -25,17 +23,25 @@ class NetworkToolBudget:
 
     web_search_calls: int = 0
     url_read_calls: int = 0
+    web_search_queries: list[str] = field(default_factory=list)
+    web_search_intents: list[str | None] = field(default_factory=list)
 
     def prepare_web_search_args(self, args: dict) -> tuple[dict, ToolResult | None]:
         normalized = dict(args or {})
 
-        intent = _normalize_intent(normalized.get("intent"))
+        query = str(normalized.get("query") or "")
+        intent = resolve_search_intent(normalized.get("intent"), query)
         if intent:
             normalized["intent"] = intent
         else:
             normalized.pop("intent", None)
 
-        search_budget = derive_search_budget(intent)
+        search_budget = derive_search_budget(
+            intent,
+            query=query,
+            previous_queries=self.web_search_queries,
+            previous_intents=self.web_search_intents,
+        )
         normalized["count"] = search_budget.requested_count
         normalized["context_source_limit"] = search_budget.context_source_limit
         normalized["search_budget"] = search_budget.name
@@ -78,6 +84,8 @@ class NetworkToolBudget:
             )
 
         self.web_search_calls += 1
+        self.web_search_queries.append(query)
+        self.web_search_intents.append(intent)
         return normalized, None
 
     def prepare_url_read_args(self, args: dict) -> tuple[dict, ToolResult | None]:
@@ -103,15 +111,6 @@ def _clamp_int(value, default: int, minimum: int, maximum: int) -> int:
     except (TypeError, ValueError):
         parsed = default
     return max(minimum, min(maximum, parsed))
-
-
-def _normalize_intent(value) -> str | None:
-    if not isinstance(value, str):
-        return None
-    intent = value.strip().lower()
-    if intent in SUPPORTED_SEARCH_INTENTS:
-        return intent
-    return None
 
 
 def _normalize_domains(value) -> list[str]:
