@@ -45,6 +45,7 @@
 | EVAL11-07 | expected_tool_use=expected 但没有工具 | `tool_expectation_met=false` |
 | EVAL11-08 | 结果列表 | summary 正确统计 success/failure、by_model、by_scenario、failure_types |
 | EVAL11-09 | nonstream 成功 | 保持旧 JSONL 核心字段，并补齐新字段 |
+| EVAL11-10 | 回答正文包含 `<think>` 标签 | JSONL 标记 `reasoning_tag_leak`，summary 聚合质量标记 |
 
 ## Tasks
 
@@ -84,3 +85,10 @@
 - [ ] `.venv311/bin/python scripts/check_architecture.py`
 - [ ] commit + push，监控 GitHub Actions 和 dev deploy。
 - [ ] 部署后运行脚本 dry-run，确认已部署环境能列出模型和场景组合。
+
+### Task 6: 增加输出质量标记
+
+- [x] 为 `EvalResult` 增加 `quality_flags` 字段。
+- [x] 标记回答正文中的 `<think>` / `</think>` 泄漏。
+- [x] 在 summary 中聚合质量标记数量。
+- [x] 补充 reasoning 标签泄漏和 summary 聚合测试。

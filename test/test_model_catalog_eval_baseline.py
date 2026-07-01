@@ -90,6 +90,7 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
         self.assertIn("Fusion AI", row["answer_preview"])
         self.assertEqual(row["observed_tool_calls"], 0)
         self.assertTrue(row["tool_expectation_met"])
+        self.assertEqual(row["quality_flags"], [])
         self.assertIsNone(row["error"])
 
     def test_failure_result_jsonl_contains_error(self):
@@ -109,6 +110,7 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
         self.assertEqual(row["error"]["category"], "unknown_error")
         self.assertEqual(row["error"]["type"], "RuntimeError")
         self.assertIn("服务商暂时不可用", row["error"]["message"])
+        self.assertEqual(row["quality_flags"], [])
 
     def test_parse_sse_events_extracts_json_envelopes(self):
         events = baseline.parse_sse_events(
@@ -152,6 +154,24 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
         self.assertEqual(row["observed_tool_names"], ["web_search"])
         self.assertTrue(row["tool_expectation_met"])
         self.assertIn("最新消息", row["answer_preview"])
+        self.assertEqual(row["quality_flags"], [])
+
+    def test_stream_result_flags_reasoning_tag_leak(self):
+        scenario = baseline.select_scenarios(["basic_chat"])[0]
+        result = baseline.build_stream_result(
+            model={"modelId": "MiniMax-M2.7", "provider": "minimax", "name": "MiniMax M2.7"},
+            scenario=scenario,
+            elapsed_ms=1800,
+            events=[
+                {"chunk_type": "answering", "data": {"delta": "<think>用户问我能做什么</think>"}},
+                {"chunk_type": "answering", "data": {"delta": "我可以帮你整理信息。"}},
+            ],
+        )
+
+        row = json.loads(baseline.to_jsonl(result).strip())
+
+        self.assertTrue(row["success"])
+        self.assertIn("reasoning_tag_leak", row["quality_flags"])
 
     def test_stream_result_counts_repeated_tool_calls_without_duplicate_names(self):
         scenario = baseline.select_scenarios(["autonomous_search"])[0]
@@ -243,6 +263,20 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
         self.assertEqual(summary["failure_types"], {"timeout": 1})
         self.assertEqual(summary["by_model"]["deepseek-chat"]["success_count"], 1)
         self.assertEqual(summary["by_scenario"]["autonomous_search"]["failure_count"], 1)
+        self.assertEqual(summary["quality_flags"], {})
+
+    def test_build_summary_counts_quality_flags(self):
+        basic = baseline.select_scenarios(["basic_chat"])[0]
+        result = baseline.build_stream_result(
+            model={"modelId": "MiniMax-M2.7", "provider": "minimax", "name": "MiniMax M2.7"},
+            scenario=basic,
+            elapsed_ms=1800,
+            events=[{"chunk_type": "answering", "data": {"delta": "<think>思考</think>正文"}}],
+        )
+
+        summary = baseline.build_summary([result])
+
+        self.assertEqual(summary["quality_flags"], {"reasoning_tag_leak": 1})
 
 
 if __name__ == "__main__":

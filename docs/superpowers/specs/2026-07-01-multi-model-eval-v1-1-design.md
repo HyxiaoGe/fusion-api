@@ -58,6 +58,7 @@ v1.1 的目标是把脚本从“单问题 smoke”增强为“多场景、多模
 - `success`, `elapsed_ms`, `answer_preview`
 - `conversation_id`, `message_id`
 - `observed_tool_calls`, `observed_tool_names`, `tool_expectation_met`
+- `quality_flags`
 - `error`
 
 summary JSON 包含：
@@ -67,7 +68,18 @@ summary JSON 包含：
 - `by_model`
 - `by_scenario`
 - `failure_types`
+- `quality_flags`
 - `tool_expectation_mismatch_count`
+
+### 输出质量标记
+
+脚本的 `success` 只表示调用链路成功并返回了回答，不代表回答内容一定符合产品展示要求。为了避免多模型测验漏掉“可回答但体验不合格”的情况，JSONL 明细增加 `quality_flags` 字段，summary 同步聚合各类标记数量。
+
+当前最小版先覆盖稳定、可解释的规则：
+
+- `reasoning_tag_leak`：回答正文中出现 `<think>` 或 `</think>`，说明模型把内部思考标签暴露给用户。
+
+后续可继续加入 markdown 破损、空洞回答、拒答、语言不匹配等质量规则，但不在本轮引入 LLM 裁判。
 
 ## 失败分型
 
@@ -97,6 +109,7 @@ summary JSON 包含：
 ## 验收
 
 - 单元测试覆盖场景选择、SSE 解析、stream 成功/失败结果、summary 汇总、工具期望命中判断。
+- 单元测试覆盖 `quality_flags` 明细字段和 summary 聚合。
 - 目标测试和后端全量测试通过。
 - CI/CD 通过并部署 dev。
 - 部署后至少执行 dry-run，确认脚本能从已部署 `/api/models` 拉取当前模型和场景矩阵。

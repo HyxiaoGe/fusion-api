@@ -89,6 +89,7 @@ class EvalResult:
     observed_tool_calls: int
     observed_tool_names: list[str]
     tool_expectation_met: bool
+    quality_flags: list[str]
     error: dict[str, Any] | None
 
 
@@ -145,6 +146,13 @@ def _extract_answer_preview(response_payload: Mapping[str, Any], limit: int = 24
     return text[:limit]
 
 
+def _detect_quality_flags(answer_text: str) -> list[str]:
+    normalized = answer_text.lower()
+    if "<think" in normalized or "</think>" in normalized:
+        return ["reasoning_tag_leak"]
+    return []
+
+
 def _tool_expectation_met(expected_tool_use: str, observed_tool_calls: int) -> bool:
     if expected_tool_use == "expected":
         return observed_tool_calls > 0
@@ -164,6 +172,7 @@ def _base_result_fields(
     message_id: str = "",
     observed_tool_names: Sequence[str] | None = None,
     observed_tool_calls: int | None = None,
+    quality_flags: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     tool_names = list(observed_tool_names or [])
     tool_call_count = len(tool_names) if observed_tool_calls is None else observed_tool_calls
@@ -184,6 +193,7 @@ def _base_result_fields(
         "observed_tool_calls": tool_call_count,
         "observed_tool_names": tool_names,
         "tool_expectation_met": _tool_expectation_met(scenario.expected_tool_use, tool_call_count),
+        "quality_flags": list(quality_flags or []),
     }
 
 
@@ -197,15 +207,17 @@ def build_success_result(
 ) -> EvalResult:
     data = response_payload.get("data") or {}
     message = data.get("message") or {}
+    answer_preview = _extract_answer_preview(response_payload)
     return EvalResult(
         **_base_result_fields(
             model=model,
             scenario=scenario,
             transport=transport,
             elapsed_ms=elapsed_ms,
-            answer_preview=_extract_answer_preview(response_payload),
+            answer_preview=answer_preview,
             conversation_id=str(data.get("conversation_id") or response_payload.get("conversation_id") or ""),
             message_id=str(message.get("id") or response_payload.get("message_id") or ""),
+            quality_flags=_detect_quality_flags(answer_preview),
         ),
         success=True,
         error=None,
@@ -333,7 +345,8 @@ def build_stream_result(
             if event_type == "tool_call_started":
                 tool_names.append(str(data.get("tool_name") or ""))
 
-    answer_preview = "".join(answer_parts).strip().replace("\n", " ")[:240]
+    answer_text = "".join(answer_parts)
+    answer_preview = answer_text.strip().replace("\n", " ")[:240]
     observed_tool_names = _unique_in_order(tool_names)
     if not answer_preview:
         return build_failure_result(
@@ -358,6 +371,7 @@ def build_stream_result(
             message_id=message_id,
             observed_tool_names=observed_tool_names,
             observed_tool_calls=len(tool_names),
+            quality_flags=_detect_quality_flags(answer_text),
         ),
         success=True,
         error=None,
@@ -503,6 +517,7 @@ def build_summary(results: Sequence[EvalResult]) -> dict[str, Any]:
     by_model: dict[str, dict[str, Any]] = {}
     by_scenario: dict[str, dict[str, Any]] = {}
     failure_types: dict[str, int] = {}
+    quality_flags: dict[str, int] = {}
     mismatch_count = 0
     total_group = _empty_group()
 
@@ -515,6 +530,8 @@ def build_summary(results: Sequence[EvalResult]) -> dict[str, Any]:
         if result.error:
             category = str(result.error.get("category") or "unknown_error")
             failure_types[category] = failure_types.get(category, 0) + 1
+        for flag in result.quality_flags:
+            quality_flags[flag] = quality_flags.get(flag, 0) + 1
         if not result.tool_expectation_met:
             mismatch_count += 1
 
@@ -524,6 +541,7 @@ def build_summary(results: Sequence[EvalResult]) -> dict[str, Any]:
             "by_model": {key: _finalize_group(value) for key, value in by_model.items()},
             "by_scenario": {key: _finalize_group(value) for key, value in by_scenario.items()},
             "failure_types": failure_types,
+            "quality_flags": quality_flags,
             "tool_expectation_mismatch_count": mismatch_count,
         }
     )
