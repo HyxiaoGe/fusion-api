@@ -94,5 +94,21 @@
     "forbidden_read_domains": ["youtube.com", "threads.com"],
     "required_decision_reason_codes": ["official_original", "official_document"],
     "forbidden_internal_terms": ["url_read", "reader-service"]
+  },
+  {
+    "id": "search-failure-recovery-v1-3",
+    "category": "search_failure_recovery",
+    "question": "OpenAI 最近发布了哪些产品更新？",
+    "expected_tool_policy": "search",
+    "expected_surface": "evidence",
+    "requires_search_keywords": true,
+    "min_sources": 1,
+    "max_search_calls": 3,
+    "max_provider_search_calls": 3,
+    "max_repair_search_calls": 1,
+    "expected_search_actions": ["execute", "repair_search"],
+    "required_search_actions": ["repair_search"],
+    "forbidden_search_actions": ["redirect_to_read_alternative"],
+    "forbidden_internal_terms": ["url_read", "reader-service"]
   }
 ]

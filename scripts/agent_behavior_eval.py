@@ -26,13 +26,17 @@ OPTIONAL_BOOL_FIELDS = {"requires_search_keywords", "requires_console_clean"}
 OPTIONAL_NON_NEGATIVE_INT_FIELDS = {
     "max_duplicate_search_keywords",
     "max_provider_search_calls",
+    "max_repair_search_calls",
     "max_recommended_reads",
     "max_search_calls",
 }
 OPTIONAL_STRING_LIST_FIELDS = {
     "expected_search_budgets",
+    "expected_search_actions",
     "forbidden_read_domains",
+    "forbidden_search_actions",
     "required_decision_reason_codes",
+    "required_search_actions",
 }
 
 
@@ -168,9 +172,7 @@ def _check_search_context(sample: dict, observation: dict, issues: list[str]) ->
     if _is_non_negative_int(max_duplicate_keywords):
         duplicate_count = _duplicate_keyword_count(observation.get("search_keywords", []))
         if duplicate_count > max_duplicate_keywords:
-            issues.append(
-                f"搜索关键词重复次数过多: duplicate_count={duplicate_count} max={max_duplicate_keywords}"
-            )
+            issues.append(f"搜索关键词重复次数过多: duplicate_count={duplicate_count} max={max_duplicate_keywords}")
 
     max_recommended_reads = sample.get("max_recommended_reads")
     recommended_read_count = observation.get("recommended_read_count", 0)
@@ -186,7 +188,9 @@ def _check_search_context(sample: dict, observation: dict, issues: list[str]) ->
         actual_search_calls = _observed_int(
             observation,
             "search_call_count",
-            fallback=sum(1 for tool_name in _string_list(observation.get("tool_calls", [])) if tool_name == "web_search"),
+            fallback=sum(
+                1 for tool_name in _string_list(observation.get("tool_calls", [])) if tool_name == "web_search"
+            ),
         )
         if actual_search_calls > max_search_calls:
             issues.append(f"搜索调用次数过多: actual={actual_search_calls} max={max_search_calls}")
@@ -196,7 +200,9 @@ def _check_search_context(sample: dict, observation: dict, issues: list[str]) ->
         actual_provider_search_calls = _observed_int(
             observation,
             "provider_search_call_count",
-            fallback=sum(1 for tool_name in _string_list(observation.get("tool_calls", [])) if tool_name == "web_search"),
+            fallback=sum(
+                1 for tool_name in _string_list(observation.get("tool_calls", [])) if tool_name == "web_search"
+            ),
         )
         if actual_provider_search_calls > max_provider_search_calls:
             issues.append(
@@ -207,9 +213,30 @@ def _check_search_context(sample: dict, observation: dict, issues: list[str]) ->
     if expected_search_budgets:
         actual_search_budgets = _string_list(observation.get("search_budgets", []))
         if actual_search_budgets != expected_search_budgets:
-            issues.append(
-                f"搜索预算不符合预期: actual={actual_search_budgets} expected={expected_search_budgets}"
-            )
+            issues.append(f"搜索预算不符合预期: actual={actual_search_budgets} expected={expected_search_budgets}")
+
+    actual_search_actions = _string_list(observation.get("search_actions", []))
+    expected_search_actions = _string_list(sample.get("expected_search_actions", []))
+    if expected_search_actions and actual_search_actions != expected_search_actions:
+        issues.append(f"搜索动作不符合预期: actual={actual_search_actions} expected={expected_search_actions}")
+
+    required_search_actions = set(_string_list(sample.get("required_search_actions", [])))
+    if required_search_actions:
+        missing_search_actions = sorted(required_search_actions - set(actual_search_actions))
+        if missing_search_actions:
+            issues.append(f"缺少必需搜索动作: {', '.join(missing_search_actions)}")
+
+    forbidden_search_actions = set(_string_list(sample.get("forbidden_search_actions", [])))
+    if forbidden_search_actions:
+        blocked_search_actions = sorted(forbidden_search_actions & set(actual_search_actions))
+        if blocked_search_actions:
+            issues.append(f"包含禁止搜索动作: {', '.join(blocked_search_actions)}")
+
+    max_repair_search_calls = sample.get("max_repair_search_calls")
+    if _is_non_negative_int(max_repair_search_calls):
+        repair_search_calls = sum(1 for action in actual_search_actions if action == "repair_search")
+        if repair_search_calls > max_repair_search_calls:
+            issues.append(f"repair 搜索次数过多: actual={repair_search_calls} max={max_repair_search_calls}")
 
     forbidden_read_domains = {domain.lower() for domain in _string_list(sample.get("forbidden_read_domains", []))}
     if forbidden_read_domains:

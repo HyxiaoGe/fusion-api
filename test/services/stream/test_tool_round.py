@@ -413,6 +413,94 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
         handler.format_llm_context.assert_called_once_with(record.result)
         handler.build_content_block.assert_called_once_with(record.result, "blk_tool", "log-1")
 
+    async def test_handle_tool_calls_round_records_network_budget_feedback_with_source_plan(self):
+        tool_call = {"id": "tc-search", "name": "web_search", "arguments": '{"query":"OpenAI 2026 最新产品"}'}
+        handler = Mock()
+        handler.format_llm_context.return_value = "搜索上下文"
+        handler.build_content_block.return_value = None
+        record = ToolExecutionRecord(
+            tool_call=tool_call,
+            result=ToolResult(
+                status="success",
+                data={
+                    "query": "OpenAI 2026 最新产品",
+                    "sources": [
+                        SearchSource(
+                            title="OpenAI 官方公告",
+                            url="https://openai.com/index/product-update",
+                            description="OpenAI official announcement.",
+                        ),
+                        SearchSource(
+                            title="OpenAI 媒体报道",
+                            url="https://axios.com/openai-product-update",
+                            description="Axios report.",
+                        ),
+                    ],
+                },
+            ),
+            handler=handler,
+            block_id="blk-search",
+            log_id="log-search",
+        )
+        network_budget = Mock()
+        network_budget.record_tool_results = Mock()
+        original_mark_tool_round_started = getattr(tool_round_module, "mark_tool_round_started", None)
+
+        async def mark_tool_round_started(**kwargs):
+            return None
+
+        async def execute_tools_fn(*args, **kwargs):
+            return [record]
+
+        async def complete_step_fn(**kwargs):
+            return None
+
+        tool_round_module.mark_tool_round_started = mark_tool_round_started
+        try:
+            await handle_tool_calls_round(
+                request=tool_round_module.ToolRoundRequest(
+                    db="db",
+                    assistant_message_id="msg-1",
+                    conversation_id="conv-1",
+                    user_id="user-1",
+                    model_id="gpt-4",
+                    provider="openai",
+                    content_blocks=[],
+                    messages=[{"role": "user", "content": "请搜索"}],
+                    tool_calls=[tool_call],
+                    reasoning_buf="",
+                    should_use_reasoning=True,
+                    step_context=AgentStepContext(
+                        step_id="step-1",
+                        run_id="run-1",
+                        step_number=1,
+                        started_at=10.0,
+                        thinking_block_id="blk_thinking",
+                        text_block_id="blk_text",
+                    ),
+                    step_number=1,
+                    run_id="run-1",
+                    emitter=object(),
+                    session_cache=object(),
+                    network_budget=network_budget,
+                    call_kwargs={},
+                    persist_message_fn=Mock(),
+                    execute_tools_fn=execute_tools_fn,
+                    complete_step_fn=complete_step_fn,
+                )
+            )
+        finally:
+            if original_mark_tool_round_started is None:
+                delattr(tool_round_module, "mark_tool_round_started")
+            else:
+                tool_round_module.mark_tool_round_started = original_mark_tool_round_started
+
+        network_budget.record_tool_results.assert_called_once()
+        call_kwargs = network_budget.record_tool_results.call_args.kwargs
+        self.assertEqual(call_kwargs["results"], [record])
+        self.assertIsNotNone(call_kwargs["source_plan"])
+        self.assertEqual(call_kwargs["source_plan"].unique_source_count, 2)
+
     def test_append_tool_round_messages_adds_round_level_source_selection_guidance(self):
         tool_call_1 = {"id": "tc-search-1", "name": "web_search", "arguments": '{"query":"news"}'}
         tool_call_2 = {"id": "tc-search-2", "name": "web_search", "arguments": '{"query":"official"}'}
@@ -627,6 +715,52 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
             [decision["domain"] for decision in ledger["read_decisions"] if decision["action"] == "deprioritize"],
             ["youtube.com"],
         )
+
+    def test_search_read_decision_ledger_counts_repair_search_as_provider_search(self):
+        from app.services.search_read_decision_ledger import build_search_read_decision_ledger
+
+        tool_call = {"id": "tc-repair", "name": "web_search", "arguments": '{"query":"OpenAI 官方公告 2026"}'}
+        handler = Mock()
+        handler.format_llm_context.return_value = "搜索上下文"
+        handler.build_content_block.return_value = None
+        record = ToolExecutionRecord(
+            tool_call=tool_call,
+            result=ToolResult(
+                status="success",
+                data={
+                    "query": "OpenAI 官方公告 2026",
+                    "search_budget": "repair",
+                    "budget_decision": {
+                        "query": "OpenAI 官方公告 2026",
+                        "intent": "freshness",
+                        "action": "repair_search",
+                        "budget_name": "repair",
+                        "requested_count": 3,
+                        "context_source_limit": 3,
+                        "reason_code": "previous_search_no_results",
+                        "previous_query_count": 1,
+                        "planned_search_limit": 2,
+                    },
+                    "sources": [
+                        SearchSource(
+                            title="OpenAI 官方公告",
+                            url="https://openai.com/index/product-update",
+                            description="OpenAI official announcement.",
+                        )
+                    ],
+                },
+            ),
+            handler=handler,
+            block_id="blk-repair",
+            log_id="log-repair",
+        )
+
+        ledger = build_search_read_decision_ledger([record])
+
+        self.assertEqual(ledger["summary"]["provider_search_count"], 1)
+        self.assertEqual(ledger["summary"]["query_repair_count"], 1)
+        self.assertEqual(ledger["search_decisions"][0]["action"], "repair_search")
+        self.assertIn("previous_search_no_results", ledger["summary"]["decision_reason_codes"])
 
     async def test_handle_tool_calls_round_emits_selected_evidence_for_ranker_recommendations(self):
         tool_call = {"id": "tc-search", "name": "web_search", "arguments": '{"query":"OpenAI GPT-5.6"}'}

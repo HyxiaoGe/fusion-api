@@ -146,6 +146,15 @@ async def update_tool_round_plan_started(request: ToolRoundRequest) -> None:
 
 
 def append_tool_round_messages(request: ToolRoundRequest, results: list[ToolExecutionRecord]) -> None:
+    append_tool_round_messages_with_plan(request, results, source_plan=None)
+
+
+def append_tool_round_messages_with_plan(
+    request: ToolRoundRequest,
+    results: list[ToolExecutionRecord],
+    *,
+    source_plan: SourceSelectionPlan | None,
+) -> None:
     request.messages.append(
         build_assistant_tool_message(
             tool_calls=request.tool_calls,
@@ -154,7 +163,10 @@ def append_tool_round_messages(request: ToolRoundRequest, results: list[ToolExec
         )
     )
 
-    source_selection_guidance_by_tool_call_id = _build_source_selection_guidance_by_tool_call_id(results)
+    source_selection_guidance_by_tool_call_id = _build_source_selection_guidance_by_tool_call_id(
+        results,
+        source_plan=source_plan,
+    )
     for record in results:
         tool_context = record.format_llm_context()
         source_selection_guidance = source_selection_guidance_by_tool_call_id.get(str(record.tool_call.get("id", "")))
@@ -194,8 +206,10 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
 
     await update_tool_round_plan_started(request)
     results = await execute_tool_round_tools(request)
-    await emit_selected_source_evidence(request, results)
-    append_tool_round_messages(request, results)
+    source_plan = _build_source_selection_plan(results)
+    record_network_budget_feedback(request, results, source_plan=source_plan)
+    await emit_selected_source_evidence(request, results, source_plan=source_plan)
+    append_tool_round_messages_with_plan(request, results, source_plan=source_plan)
     persist_tool_round_checkpoint(request)
 
     tool_names = await complete_tool_round_step(request, results)
@@ -203,11 +217,16 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
     return ToolRoundOutcome(tool_call_count=len(request.tool_calls), tool_names=tool_names)
 
 
-async def emit_selected_source_evidence(request: ToolRoundRequest, results: list[ToolExecutionRecord]) -> None:
+async def emit_selected_source_evidence(
+    request: ToolRoundRequest,
+    results: list[ToolExecutionRecord],
+    *,
+    source_plan: SourceSelectionPlan | None = None,
+) -> None:
     emit = getattr(request.emitter, "evidence_item_upserted", None)
     if emit is None:
         return
-    plan = _build_source_selection_plan(results)
+    plan = source_plan if source_plan is not None else _build_source_selection_plan(results)
     if plan is None:
         return
 
@@ -219,6 +238,18 @@ async def emit_selected_source_evidence(request: ToolRoundRequest, results: list
             )
         except Exception:
             logger.warning("发送推荐深读 evidence 失败", exc_info=True)
+
+
+def record_network_budget_feedback(
+    request: ToolRoundRequest,
+    results: list[ToolExecutionRecord],
+    *,
+    source_plan: SourceSelectionPlan | None,
+) -> None:
+    record_tool_results = getattr(request.network_budget, "record_tool_results", None)
+    if not callable(record_tool_results):
+        return
+    record_tool_results(results=results, source_plan=source_plan)
 
 
 def _completed_tool_calls_before_round(request: ToolRoundRequest) -> int | None:
@@ -240,9 +271,13 @@ def _max_tool_calls(request: ToolRoundRequest) -> int | None:
     return value if isinstance(value, int) else None
 
 
-def _build_source_selection_guidance_by_tool_call_id(results: list[ToolExecutionRecord]) -> dict[str, str]:
+def _build_source_selection_guidance_by_tool_call_id(
+    results: list[ToolExecutionRecord],
+    *,
+    source_plan: SourceSelectionPlan | None = None,
+) -> dict[str, str]:
     target_search_tool_call_id = _last_successful_search_tool_call_id(results)
-    plan = _build_source_selection_plan(results)
+    plan = source_plan if source_plan is not None else _build_source_selection_plan(results)
     if plan is None or not target_search_tool_call_id:
         return {}
 

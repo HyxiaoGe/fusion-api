@@ -150,7 +150,11 @@ class WebSearchHandler(BaseToolHandler):
             )
 
     def build_content_block(self, result: ToolResult, block_id: str, log_id: str) -> SearchBlock | None:
-        if result.data.get("duplicate_search_skipped") or result.data.get("search_plan_limited"):
+        if (
+            result.data.get("duplicate_search_skipped")
+            or result.data.get("search_plan_limited")
+            or result.data.get("read_alternatives_available")
+        ):
             return None
 
         sources: List[SearchSource] = result.data.get("sources", [])
@@ -199,6 +203,15 @@ class WebSearchHandler(BaseToolHandler):
         )
 
     def format_llm_context(self, result: ToolResult) -> str:
+        if result.data.get("read_alternatives_available"):
+            query = result.data.get("query", "")
+            unread_count = result.data.get("unread_candidate_count", 0)
+            return (
+                f"本次搜索「{query}」没有执行：上一轮网页读取失败后，仍有 {unread_count} 个未读取的候选来源。"
+                "请不要马上继续搜索；应优先从前面的结构化来源选择建议中读取下一个高价值候选来源。"
+                "如果候选来源都不可用，再说明来源不可用并基于已有搜索摘要回答。"
+            )
+
         if result.data.get("search_plan_limited"):
             query = result.data.get("query", "")
             return (
@@ -260,6 +273,12 @@ class WebSearchHandler(BaseToolHandler):
         emitter.tool_call_completed 内部还会经 cap_and_truncate(1024) 兜底。
         """
         data = result.data or {}
+        if data.get("read_alternatives_available"):
+            return {
+                "kind": "search",
+                "title": "优先读取已有候选",
+                "truncated": False,
+            }
         if data.get("search_plan_limited"):
             return {
                 "kind": "search",

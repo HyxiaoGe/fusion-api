@@ -1,6 +1,77 @@
 import unittest
+from unittest.mock import Mock
 
+from app.schemas.chat import SearchSource
+from app.services.source_candidate_ranker import SearchResultForRanking, rank_search_sources
 from app.services.stream.network_budget import NetworkToolBudget
+from app.services.stream.tool_execution_result import ToolExecutionRecord
+from app.services.tool_handlers.base import ToolResult
+
+
+def _search_record(args: dict, *, status: str, sources: list[SearchSource] | None = None) -> ToolExecutionRecord:
+    handler = Mock()
+    handler.tool_name = "web_search"
+    return ToolExecutionRecord(
+        tool_call={"id": f"tc-search-{len(args.get('query', ''))}", "name": "web_search", "arguments": args},
+        result=ToolResult(
+            status=status,
+            data={
+                "query": args.get("query", ""),
+                "sources": sources or [],
+                "result_count": len(sources or []),
+                "search_budget": args.get("search_budget"),
+                "intent": args.get("intent"),
+                "budget_decision": args.get("budget_decision"),
+            },
+        ),
+        handler=handler,
+        block_id="blk-search",
+        log_id="log-search",
+    )
+
+
+def _url_read_record(url: str, *, status: str) -> ToolExecutionRecord:
+    handler = Mock()
+    handler.tool_name = "url_read"
+    return ToolExecutionRecord(
+        tool_call={"id": f"tc-read-{status}", "name": "url_read", "arguments": {"url": url}},
+        result=ToolResult(status=status, data={"url": url}),
+        handler=handler,
+        block_id="blk-read",
+        log_id="log-read",
+    )
+
+
+def _source_plan(urls: list[str]):
+    return rank_search_sources(
+        [
+            SearchResultForRanking(
+                tool_call_id="tc-search-plan",
+                query="OpenAI 2026 最新产品",
+                sources=[
+                    SearchSource(title=f"候选 {index}", url=url, description="可替代候选来源")
+                    for index, url in enumerate(urls, 1)
+                ],
+            )
+        ],
+        max_recommended=len(urls),
+    )
+
+
+def _source_plan_with_read_limit(urls: list[str], *, max_recommended: int):
+    return rank_search_sources(
+        [
+            SearchResultForRanking(
+                tool_call_id="tc-search-plan",
+                query="OpenAI 2026 最新产品",
+                sources=[
+                    SearchSource(title=f"候选 {index}", url=url, description="可替代候选来源")
+                    for index, url in enumerate(urls, 1)
+                ],
+            )
+        ],
+        max_recommended=max_recommended,
+    )
 
 
 class NetworkToolBudgetTests(unittest.TestCase):
@@ -91,6 +162,145 @@ class NetworkToolBudgetTests(unittest.TestCase):
         self.assertEqual(third_degraded.data["budget_decision"]["reason_code"], "planned_search_limit_reached")
         self.assertEqual(third_args["count"], 0)
         self.assertEqual(budget.web_search_calls, 2)
+
+    def test_empty_first_search_marks_next_search_as_repair(self):
+        budget = NetworkToolBudget()
+
+        first_args, first_degraded = budget.prepare_web_search_args({"query": "OpenAI 2026 最新产品"})
+        budget.record_tool_results([_search_record(first_args, status="degraded", sources=[])])
+        second_args, second_degraded = budget.prepare_web_search_args({"query": "OpenAI 官方公告 2026 最新"})
+
+        self.assertIsNone(first_degraded)
+        self.assertIsNone(second_degraded)
+        self.assertEqual(second_args["budget_decision"]["action"], "repair_search")
+        self.assertEqual(second_args["budget_decision"]["reason_code"], "previous_search_no_results")
+        self.assertLessEqual(second_args["count"], 3)
+        self.assertEqual(budget.web_search_calls, 2)
+
+    def test_weak_first_search_marks_next_search_as_repair(self):
+        budget = NetworkToolBudget()
+        weak_source = SearchSource(
+            title="社交转述",
+            url="https://threads.com/@example/post/1",
+            description="低优先级社交转述",
+        )
+
+        first_args, first_degraded = budget.prepare_web_search_args({"query": "OpenAI 2026 最新产品"})
+        budget.record_tool_results([_search_record(first_args, status="success", sources=[weak_source])])
+        second_args, second_degraded = budget.prepare_web_search_args({"query": "OpenAI 官方公告 2026 最新"})
+
+        self.assertIsNone(first_degraded)
+        self.assertIsNone(second_degraded)
+        self.assertEqual(second_args["budget_decision"]["action"], "repair_search")
+        self.assertEqual(second_args["budget_decision"]["reason_code"], "previous_search_weak_results")
+        self.assertLessEqual(second_args["count"], 3)
+
+    def test_repair_search_is_single_use_and_third_regular_search_is_limited(self):
+        budget = NetworkToolBudget()
+
+        first_args, _first_degraded = budget.prepare_web_search_args({"query": "OpenAI 2026 最新产品"})
+        budget.record_tool_results([_search_record(first_args, status="degraded", sources=[])])
+        second_args, second_degraded = budget.prepare_web_search_args({"query": "OpenAI 官方公告 2026 最新"})
+        budget.record_tool_results([_search_record(second_args, status="degraded", sources=[])])
+        third_args, third_degraded = budget.prepare_web_search_args({"query": "OpenAI 权威媒体 2026 最新"})
+
+        self.assertIsNone(second_degraded)
+        self.assertEqual(second_args["budget_decision"]["action"], "repair_search")
+        self.assertIsNotNone(third_degraded)
+        self.assertEqual(third_args["budget_decision"]["action"], "limit_planner")
+        self.assertEqual(third_args["budget_decision"]["reason_code"], "planned_search_limit_reached")
+        self.assertEqual(budget.web_search_calls, 2)
+
+    def test_pending_repair_takes_precedence_over_duplicate_search(self):
+        budget = NetworkToolBudget()
+
+        first_args, _first_degraded = budget.prepare_web_search_args({"query": "OpenAI 2026 最新产品"})
+        budget.record_tool_results([_search_record(first_args, status="degraded", sources=[])])
+        second_args, second_degraded = budget.prepare_web_search_args({"query": "OpenAI 2026 最新产品"})
+
+        self.assertIsNone(second_degraded)
+        self.assertEqual(second_args["budget_decision"]["action"], "repair_search")
+        self.assertEqual(second_args["budget_decision"]["reason_code"], "previous_search_no_results")
+        self.assertEqual(budget.web_search_calls, 2)
+
+    def test_read_failure_redirects_search_to_unread_candidate(self):
+        budget = NetworkToolBudget()
+        plan = _source_plan(
+            [
+                "https://openai.com/index/product-update",
+                "https://axios.com/openai-product-update",
+            ]
+        )
+
+        budget.record_tool_results(
+            [_url_read_record("https://openai.com/index/product-update", status="degraded")],
+            source_plan=plan,
+        )
+        args, degraded = budget.prepare_web_search_args({"query": "继续搜索同一问题"})
+
+        self.assertIsNotNone(degraded)
+        self.assertEqual(args["budget_decision"]["action"], "redirect_to_read_alternative")
+        self.assertEqual(args["budget_decision"]["reason_code"], "read_alternatives_available")
+        self.assertTrue(degraded.data["read_alternatives_available"])
+        self.assertEqual(args["count"], 0)
+        self.assertEqual(budget.web_search_calls, 0)
+
+    def test_read_success_after_failure_clears_read_alternative_redirect(self):
+        budget = NetworkToolBudget()
+        plan = _source_plan(
+            [
+                "https://openai.com/index/product-update",
+                "https://axios.com/openai-product-update",
+            ]
+        )
+
+        budget.record_tool_results(
+            [_url_read_record("https://openai.com/index/product-update", status="degraded")],
+            source_plan=plan,
+        )
+        budget.record_tool_results(
+            [_url_read_record("https://axios.com/openai-product-update", status="success")],
+            source_plan=plan,
+        )
+        args, degraded = budget.prepare_web_search_args({"query": "继续搜索同一问题"})
+
+        self.assertIsNone(degraded)
+        self.assertEqual(args["budget_decision"]["action"], "execute")
+        self.assertEqual(budget.web_search_calls, 1)
+
+    def test_read_failure_does_not_redirect_to_keep_candidate_only(self):
+        budget = NetworkToolBudget()
+        plan = _source_plan_with_read_limit(
+            [
+                "https://openai.com/index/product-update",
+                "https://axios.com/openai-product-update",
+            ],
+            max_recommended=1,
+        )
+
+        budget.record_tool_results(
+            [_url_read_record("https://openai.com/index/product-update", status="degraded")],
+            source_plan=plan,
+        )
+        args, degraded = budget.prepare_web_search_args({"query": "继续搜索同一问题"})
+
+        self.assertIsNone(degraded)
+        self.assertEqual(args["budget_decision"]["action"], "execute")
+        self.assertEqual(budget.web_search_calls, 1)
+
+    def test_read_failure_without_unread_candidates_does_not_redirect_search(self):
+        budget = NetworkToolBudget()
+        plan = _source_plan(["https://openai.com/index/product-update"])
+
+        budget.record_tool_results(
+            [_url_read_record("https://openai.com/index/product-update", status="degraded")],
+            source_plan=plan,
+        )
+        args, degraded = budget.prepare_web_search_args({"query": "继续搜索同一问题"})
+
+        self.assertIsNone(degraded)
+        self.assertEqual(args["budget_decision"]["action"], "execute")
+        self.assertEqual(budget.web_search_calls, 1)
 
     def test_chinese_year_query_infers_freshness_intent(self):
         budget = NetworkToolBudget()

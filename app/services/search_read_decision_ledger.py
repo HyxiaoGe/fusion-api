@@ -10,7 +10,7 @@ from typing import Any
 from app.services.source_candidate_ranker import SourceSelectionPlan
 from app.services.stream.tool_execution_result import ToolExecutionRecord
 
-PROVIDER_SEARCH_ACTIONS = {"execute", "narrow_followup"}
+PROVIDER_SEARCH_ACTIONS = {"execute", "narrow_followup", "repair_search"}
 
 
 def build_search_read_decision_ledger(
@@ -27,11 +27,16 @@ def build_search_read_decision_ledger(
         "search_decisions": search_decisions,
         "read_decisions": read_decisions,
         "summary": {
-            "executed_search_count": sum(1 for record in results if record.tool_name == "web_search" and record.result.status == "success"),
+            "executed_search_count": sum(
+                1 for record in results if record.tool_name == "web_search" and record.result.status == "success"
+            ),
             "provider_search_count": sum(
                 1 for decision in search_decisions if decision.get("action") in PROVIDER_SEARCH_ACTIONS
             ),
-            "recommended_read_count": sum(1 for decision in read_decisions if decision.get("action") == "recommend_read"),
+            "query_repair_count": sum(1 for decision in search_decisions if decision.get("action") == "repair_search"),
+            "recommended_read_count": sum(
+                1 for decision in read_decisions if decision.get("action") == "recommend_read"
+            ),
             "deprioritized_count": sum(1 for decision in read_decisions if decision.get("action") == "deprioritize"),
             "kept_candidate_count": sum(1 for decision in read_decisions if decision.get("action") == "keep_candidate"),
             "decision_reason_codes": reason_codes,

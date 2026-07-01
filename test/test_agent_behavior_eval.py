@@ -120,6 +120,36 @@ class AgentBehaviorEvalTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, f"{field} {message}"):
                         load_samples(path)
 
+    def test_load_samples_rejects_invalid_v1_3_recovery_fields(self):
+        from scripts.agent_behavior_eval import load_samples
+
+        base_sample = {
+            "id": "planner-v1-3",
+            "category": "search_failure_recovery",
+            "question": "OpenAI 最近发布了哪些产品更新？",
+            "expected_tool_policy": "search",
+            "expected_surface": "evidence",
+        }
+
+        cases = [
+            ("expected_search_actions", ["execute", 1], "必须是字符串数组"),
+            ("required_search_actions", "repair_search", "必须是字符串数组"),
+            ("forbidden_search_actions", ["redirect_to_read_alternative", None], "必须是字符串数组"),
+            ("max_repair_search_calls", True, "必须是非负整数"),
+            ("max_repair_search_calls", -1, "必须是非负整数"),
+        ]
+        for field, value, message in cases:
+            with self.subTest(field=field, value=value):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    path = Path(tmpdir) / "samples.json"
+                    sample = dict(base_sample)
+                    sample["id"] = f"planner-v1-3-{field}"
+                    sample[field] = value
+                    path.write_text(json.dumps([sample], ensure_ascii=False), encoding="utf-8")
+
+                    with self.assertRaisesRegex(ValueError, f"{field} {message}"):
+                        load_samples(path)
+
     def test_default_sample_file_covers_core_agent_behavior_matrix(self):
         from scripts.agent_behavior_eval import DEFAULT_SAMPLE_PATH, load_samples
 
@@ -135,6 +165,7 @@ class AgentBehaviorEvalTests(unittest.TestCase):
         self.assertIn("refresh-recovery-preserves-surface", ids)
         self.assertIn("console-error-regression", ids)
         self.assertIn("search-read-planner-dedup-and-read-limit", ids)
+        self.assertIn("search-failure-recovery-v1-3", ids)
 
     def test_identity_sample_blocks_upstream_identity_variants(self):
         from scripts.agent_behavior_eval import DEFAULT_SAMPLE_PATH, load_samples
@@ -339,6 +370,58 @@ class AgentBehaviorEvalTests(unittest.TestCase):
         self.assertIn("搜索预算不符合预期", joined_issues)
         self.assertIn("读取了禁止深读的域名", joined_issues)
         self.assertIn("缺少必需决策原因", joined_issues)
+
+    def test_score_observation_flags_v1_3_recovery_action_regressions(self):
+        from scripts.agent_behavior_eval import score_observation
+
+        sample = {
+            "id": "search-failure-recovery-v1-3",
+            "expected_tool_policy": "search",
+            "expected_surface": "evidence",
+            "expected_search_actions": ["execute", "repair_search"],
+            "required_search_actions": ["repair_search"],
+            "forbidden_search_actions": ["redirect_to_read_alternative"],
+            "max_repair_search_calls": 1,
+        }
+        observation = {
+            "answer_text": "基于搜索结果回答。",
+            "tool_calls": ["web_search", "web_search", "web_search"],
+            "surfaces": ["execution_process", "answer_evidence"],
+            "search_actions": ["execute", "repair_search", "repair_search", "redirect_to_read_alternative"],
+            "console_errors": [],
+        }
+
+        score = score_observation(sample, observation)
+
+        self.assertFalse(score["passed"])
+        joined_issues = "\n".join(score["issues"])
+        self.assertIn("搜索动作不符合预期", joined_issues)
+        self.assertIn("包含禁止搜索动作", joined_issues)
+        self.assertIn("repair 搜索次数过多", joined_issues)
+
+    def test_score_observation_passes_v1_3_recovery_action_sample(self):
+        from scripts.agent_behavior_eval import score_observation
+
+        sample = {
+            "id": "search-failure-recovery-v1-3",
+            "expected_tool_policy": "search",
+            "expected_surface": "evidence",
+            "expected_search_actions": ["execute", "repair_search"],
+            "required_search_actions": ["repair_search"],
+            "max_repair_search_calls": 1,
+        }
+        observation = {
+            "answer_text": "基于搜索结果回答。",
+            "tool_calls": ["web_search", "web_search"],
+            "surfaces": ["execution_process", "answer_evidence"],
+            "search_actions": ["execute", "repair_search"],
+            "console_errors": [],
+        }
+
+        score = score_observation(sample, observation)
+
+        self.assertTrue(score["passed"])
+        self.assertEqual(score["issues"], [])
 
     def test_write_dry_run_outputs_jsonl(self):
         from scripts.agent_behavior_eval import write_dry_run
