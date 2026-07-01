@@ -334,6 +334,89 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
         self.assertEqual(summary["tool_expectation_mismatch_count"], 0)
         self.assertEqual(summary["quality_flags"], {"expected_search_without_agent_tools": 1})
 
+    def test_build_summary_includes_actionable_quality_issues(self):
+        scenario = baseline.select_scenarios(["autonomous_search"])[0]
+        result = baseline.build_stream_result(
+            model={
+                "modelId": "gemini-3.1-pro-preview",
+                "provider": "google",
+                "name": "Gemini 3.1 Pro Preview",
+                "capabilities": {"functionCalling": True, "agentTools": True},
+            },
+            scenario=scenario,
+            elapsed_ms=20_286,
+            events=[
+                {"chunk_type": "agent_event", "data": {"type": "tool_call_started", "tool_name": "web_search"}},
+                {"chunk_type": "answering", "data": {"delta": "根据搜索结果回答。"}},
+            ],
+        )
+
+        summary = baseline.build_summary([result])
+
+        self.assertEqual(summary["quality_issue_count"], 1)
+        self.assertEqual(
+            summary["quality_issues"],
+            [
+                {
+                    "model_id": "gemini-3.1-pro-preview",
+                    "provider": "google",
+                    "scenario_id": "autonomous_search",
+                    "severity": "medium",
+                    "flags": ["expected_search_without_read"],
+                    "recommendations": ["搜索场景已触发联网但没有深读网页，建议降低搜索任务权重或强制读取关键来源。"],
+                }
+            ],
+        )
+
+    def test_build_summary_groups_quality_risk_by_model(self):
+        scenario = baseline.select_scenarios(["autonomous_search"])[0]
+        no_tools = baseline.build_stream_result(
+            model={
+                "modelId": "qwen-vl-max",
+                "provider": "qwen",
+                "name": "Qwen VL Max",
+                "capabilities": {"functionCalling": True, "agentTools": False},
+            },
+            scenario=scenario,
+            elapsed_ms=8941,
+            events=[{"chunk_type": "answering", "data": {"delta": "我直接回答。"}}],
+        )
+        slow = baseline.build_stream_result(
+            model={
+                "modelId": "kimi-k2.5",
+                "provider": "moonshot",
+                "name": "Kimi K2.5",
+                "capabilities": {"functionCalling": True, "agentTools": True},
+            },
+            scenario=scenario,
+            elapsed_ms=164_933,
+            events=[
+                {"chunk_type": "agent_event", "data": {"type": "tool_call_started", "tool_name": "web_search"}},
+                {"chunk_type": "agent_event", "data": {"type": "tool_call_started", "tool_name": "url_read"}},
+                {"chunk_type": "answering", "data": {"delta": "根据深读来源回答。"}},
+            ],
+        )
+
+        summary = baseline.build_summary([no_tools, slow])
+
+        self.assertEqual(
+            summary["quality_risk_by_model"],
+            {
+                "kimi-k2.5": {
+                    "flag_counts": {"slow_response": 1},
+                    "issue_count": 1,
+                    "provider": "moonshot",
+                    "severity_counts": {"medium": 1},
+                },
+                "qwen-vl-max": {
+                    "flag_counts": {"expected_search_without_agent_tools": 1},
+                    "issue_count": 1,
+                    "provider": "qwen",
+                    "severity_counts": {"medium": 1},
+                },
+            },
+        )
+
     def test_expected_search_without_read_is_quality_flag_not_mismatch(self):
         scenario = baseline.select_scenarios(["autonomous_search"])[0]
         result = baseline.build_stream_result(

@@ -30,6 +30,27 @@ SLOW_RESPONSE_THRESHOLDS_MS = {
     "long_answer": 60_000,
 }
 
+QUALITY_FLAG_POLICIES: dict[str, dict[str, str]] = {
+    "reasoning_tag_leak": {
+        "severity": "high",
+        "recommendation": "回答暴露内部思考标签，建议暂不作为默认模型或在渲染层兜底过滤。",
+    },
+    "expected_search_without_agent_tools": {
+        "severity": "medium",
+        "recommendation": "模型不支持 agent 工具，建议从实时搜索任务候选集中剔除或明确标注不可联网。",
+    },
+    "expected_search_without_read": {
+        "severity": "medium",
+        "recommendation": "搜索场景已触发联网但没有深读网页，建议降低搜索任务权重或强制读取关键来源。",
+    },
+    "slow_response": {
+        "severity": "medium",
+        "recommendation": "响应耗时超过场景阈值，建议在自动路由中降权或设置更短超时兜底。",
+    },
+}
+
+QUALITY_SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2}
+
 
 @dataclass(frozen=True)
 class EvalScenario:
@@ -598,11 +619,64 @@ def _finalize_group(group: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _quality_flag_severity(flag: str) -> str:
+    policy = QUALITY_FLAG_POLICIES.get(flag) or {}
+    return policy.get("severity") or "low"
+
+
+def _quality_flag_recommendation(flag: str) -> str:
+    policy = QUALITY_FLAG_POLICIES.get(flag) or {}
+    return policy.get("recommendation") or "质量标记未配置处理建议，需要人工复核。"
+
+
+def _highest_quality_severity(flags: Sequence[str]) -> str:
+    severity = "low"
+    for flag in flags:
+        candidate = _quality_flag_severity(flag)
+        if QUALITY_SEVERITY_RANK.get(candidate, 0) > QUALITY_SEVERITY_RANK.get(severity, 0):
+            severity = candidate
+    return severity
+
+
+def _build_quality_issue(result: EvalResult) -> dict[str, Any]:
+    return {
+        "model_id": result.model_id,
+        "provider": result.provider,
+        "scenario_id": result.scenario_id,
+        "severity": _highest_quality_severity(result.quality_flags),
+        "flags": list(result.quality_flags),
+        "recommendations": _unique_in_order(_quality_flag_recommendation(flag) for flag in result.quality_flags),
+    }
+
+
+def _record_quality_risk_by_model(
+    quality_risk_by_model: dict[str, dict[str, Any]],
+    result: EvalResult,
+    issue: Mapping[str, Any],
+) -> None:
+    model_risk = quality_risk_by_model.setdefault(
+        result.model_id,
+        {
+            "provider": result.provider,
+            "issue_count": 0,
+            "flag_counts": {},
+            "severity_counts": {},
+        },
+    )
+    model_risk["issue_count"] += 1
+    severity = str(issue.get("severity") or "low")
+    model_risk["severity_counts"][severity] = model_risk["severity_counts"].get(severity, 0) + 1
+    for flag in result.quality_flags:
+        model_risk["flag_counts"][flag] = model_risk["flag_counts"].get(flag, 0) + 1
+
+
 def build_summary(results: Sequence[EvalResult]) -> dict[str, Any]:
     by_model: dict[str, dict[str, Any]] = {}
     by_scenario: dict[str, dict[str, Any]] = {}
     failure_types: dict[str, int] = {}
     quality_flags: dict[str, int] = {}
+    quality_issues: list[dict[str, Any]] = []
+    quality_risk_by_model: dict[str, dict[str, Any]] = {}
     mismatch_count = 0
     total_group = _empty_group()
 
@@ -617,6 +691,10 @@ def build_summary(results: Sequence[EvalResult]) -> dict[str, Any]:
             failure_types[category] = failure_types.get(category, 0) + 1
         for flag in result.quality_flags:
             quality_flags[flag] = quality_flags.get(flag, 0) + 1
+        if result.quality_flags:
+            issue = _build_quality_issue(result)
+            quality_issues.append(issue)
+            _record_quality_risk_by_model(quality_risk_by_model, result, issue)
         if not result.tool_expectation_met:
             mismatch_count += 1
 
@@ -627,6 +705,9 @@ def build_summary(results: Sequence[EvalResult]) -> dict[str, Any]:
             "by_scenario": {key: _finalize_group(value) for key, value in by_scenario.items()},
             "failure_types": failure_types,
             "quality_flags": quality_flags,
+            "quality_issue_count": len(quality_issues),
+            "quality_issues": quality_issues,
+            "quality_risk_by_model": quality_risk_by_model,
             "tool_expectation_mismatch_count": mismatch_count,
         }
     )

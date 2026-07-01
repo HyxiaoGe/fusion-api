@@ -80,6 +80,15 @@ apply 模式运行时，脚本会向 stderr 输出每个条目的进度摘要，
 当前最小版先覆盖稳定、可解释的规则：
 
 - `reasoning_tag_leak`：回答正文中出现 `<think>` 或 `</think>`，说明模型把内部思考标签暴露给用户。
+- `expected_search_without_agent_tools`：实时搜索场景中模型不支持 agent 工具，说明不适合作为搜索任务候选。
+- `expected_search_without_read`：实时搜索场景中模型触发了搜索但未深读网页，说明依据可靠性需要降权或强制读取来源。
+- `slow_response`：成功回答但耗时超过场景阈值，说明自动路由时需要性能降权或超时兜底。
+
+summary 除了聚合 `quality_flags` 数量，还输出：
+
+- `quality_issue_count`：存在质量标记的结果条目数。
+- `quality_issues`：逐条列出模型、场景、严重级别、质量标记和处理建议。
+- `quality_risk_by_model`：按模型聚合 issue 数、flag 计数和严重级别计数，方便后续做模型降权、fallback 或 UI 标注。
 
 后续可继续加入 markdown 破损、空洞回答、拒答、语言不匹配等质量规则，但不在本轮引入 LLM 裁判。
 

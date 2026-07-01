@@ -52,40 +52,40 @@
 
 ### Task 1: 写 v1.1 失败测试
 
-- [ ] 在 `test/test_model_catalog_eval_baseline.py` 添加默认场景、场景筛选、未知场景、SSE 解析、summary 和 nonstream 兼容测试。
-- [ ] 运行 `.venv311/bin/python -m pytest test/test_model_catalog_eval_baseline.py -q`，确认新增测试因缺少 v1.1 API 失败。
+- [x] 在 `test/test_model_catalog_eval_baseline.py` 添加默认场景、场景筛选、未知场景、SSE 解析、summary 和 nonstream 兼容测试。
+- [x] 运行 `.venv311/bin/python -m pytest test/test_model_catalog_eval_baseline.py -q`，确认新增测试因缺少 v1.1 API 失败。
 
 ### Task 2: 实现场景矩阵和结果结构
 
-- [ ] 在 `scripts/model_catalog_eval_baseline.py` 增加 `EvalScenario` 和默认场景矩阵。
-- [ ] 扩展 `EvalResult` 字段，保持旧字段仍存在。
-- [ ] 实现 `select_scenarios`、`tool_expectation_met`、失败分型函数。
-- [ ] 运行目标测试确认相关用例通过。
+- [x] 在 `scripts/model_catalog_eval_baseline.py` 增加 `EvalScenario` 和默认场景矩阵。
+- [x] 扩展 `EvalResult` 字段，保持旧字段仍存在。
+- [x] 实现 `select_scenarios`、`tool_expectation_met`、失败分型函数。
+- [x] 运行目标测试确认相关用例通过。
 
 ### Task 3: 实现 stream transport
 
-- [ ] 实现 SSE 行解析，把 `data: [DONE]` 作为终止。
-- [ ] 从 `agent_event.tool_call_started/tool_call_completed` 统计工具名。
-- [ ] 从 `answering` delta 聚合回答摘要。
-- [ ] 从 `error` envelope 生成失败结果。
-- [ ] 运行目标测试确认 stream 用例通过。
+- [x] 实现 SSE 行解析，把 `data: [DONE]` 作为终止。
+- [x] 从 `agent_event.tool_call_started/tool_call_completed` 统计工具名。
+- [x] 从 `answering` delta 聚合回答摘要。
+- [x] 从 `error` envelope 生成失败结果。
+- [x] 运行目标测试确认 stream 用例通过。
 
 ### Task 4: 实现 summary 和 CLI
 
-- [ ] 实现 `build_summary` 和 `summary_to_json`。
-- [ ] 增加 `--transport`, `--scenarios`, `--summary-output`。
-- [ ] dry-run 输出模型和场景组合。
-- [ ] apply 模式按模型和场景运行，写 JSONL 和 summary。
+- [x] 实现 `build_summary` 和 summary JSON 输出。
+- [x] 增加 `--transport`, `--scenarios`, `--summary-output`。
+- [x] dry-run 输出模型和场景组合。
+- [x] apply 模式按模型和场景运行，写 JSONL 和 summary。
 
 ### Task 5: 验证和发布
 
-- [ ] `.venv/bin/python -m ruff format --check scripts/model_catalog_eval_baseline.py test/test_model_catalog_eval_baseline.py`
-- [ ] `.venv/bin/python -m ruff check .`
-- [ ] `.venv311/bin/python -m pytest test/test_model_catalog_eval_baseline.py -q`
-- [ ] `.venv311/bin/python -m pytest test/ -q`
-- [ ] `.venv311/bin/python scripts/check_architecture.py`
-- [ ] commit + push，监控 GitHub Actions 和 dev deploy。
-- [ ] 部署后运行脚本 dry-run，确认已部署环境能列出模型和场景组合。
+- [x] `.venv/bin/python -m ruff format --check scripts/model_catalog_eval_baseline.py test/test_model_catalog_eval_baseline.py`
+- [x] `.venv/bin/python -m ruff check .`
+- [x] `.venv311/bin/python -m pytest test/test_model_catalog_eval_baseline.py -q`
+- [x] `.venv311/bin/python -m pytest test/ -q`
+- [x] `.venv311/bin/python scripts/check_architecture.py`
+- [x] commit + push，监控 GitHub Actions 和 dev deploy。
+- [x] 部署后运行脚本 dry-run，确认已部署环境能列出模型和场景组合。
 
 ### Task 6: 增加输出质量标记
 
@@ -100,3 +100,10 @@
 - [x] CLI apply 模式每完成一项就追加写 JSONL。
 - [x] CLI apply 模式向 stderr 输出进度摘要。
 - [x] 补充成功项和失败项都会触发回调的测试。
+
+### Task 8: 增加质量风险报告
+
+- [x] 为 `quality_flags` 配置稳定的严重级别和处理建议。
+- [x] 在 summary 中输出 `quality_issue_count`、`quality_issues` 和 `quality_risk_by_model`。
+- [x] 补充逐条质量问题和按模型聚合风险测试。
+- [x] 运行 `.venv311/bin/python -m pytest test/test_model_catalog_eval_baseline.py -q` 确认通过。
