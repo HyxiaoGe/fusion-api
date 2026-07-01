@@ -22,6 +22,7 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
         expectation_by_id = {scenario.scenario_id: scenario.expected_tool_use for scenario in scenarios}
         self.assertEqual(expectation_by_id["autonomous_search"], "expected")
         self.assertEqual(expectation_by_id["no_search_simple"], "forbidden")
+        self.assertEqual(expectation_by_id["long_answer"], "forbidden")
 
     def test_select_scenarios_filters_in_requested_order(self):
         scenarios = baseline.select_scenarios(["autonomous_search", "basic_chat"])

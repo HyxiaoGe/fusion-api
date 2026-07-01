@@ -63,6 +63,7 @@ class AiToolSchemaTests(unittest.TestCase):
         self.assertIn("稳定背景", description)
         self.assertIn("历史原因", description)
         self.assertIn("iPhone 从 Lightning 换成 USB-C 的核心原因", description)
+        self.assertIn("价值、风险和落地建议", description)
 
     def test_url_read_schema_exposes_optional_reason(self):
         from app.ai.tools import URL_READ_TOOL

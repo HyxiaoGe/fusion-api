@@ -65,7 +65,7 @@ DEFAULT_SCENARIOS: tuple[EvalScenario, ...] = (
         scenario_id="long_answer",
         category="long_form",
         question="请用三段话说明 AI 编程助手在真实工程团队里的主要价值、风险和落地建议。",
-        expected_tool_use="optional",
+        expected_tool_use="forbidden",
     ),
 )
 

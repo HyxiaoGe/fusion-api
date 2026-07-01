@@ -413,6 +413,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不应调用 web_search", contract)
         self.assertIn("稳定背景、历史原因", contract)
         self.assertIn("iPhone 从 Lightning 换成 USB-C 的核心原因", contract)
+        self.assertIn("价值、风险和落地建议", contract)
         self.assertIn("必须调用 web_search", contract)
         self.assertIn("不要在思考过程或最终回答中声称", contract)
         self.assertIn("没有调用工具", contract)
