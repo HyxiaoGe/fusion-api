@@ -90,6 +90,36 @@ class AgentBehaviorEvalTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, f"{field} 必须是非负整数"):
                         load_samples(path)
 
+    def test_load_samples_rejects_invalid_v1_2_planner_fields(self):
+        from scripts.agent_behavior_eval import load_samples
+
+        base_sample = {
+            "id": "planner-v1-2",
+            "category": "search_read_planner",
+            "question": "OpenAI 最近发布了哪些产品更新？",
+            "expected_tool_policy": "search",
+            "expected_surface": "evidence",
+        }
+
+        cases = [
+            ("max_search_calls", -1, "必须是非负整数"),
+            ("max_provider_search_calls", True, "必须是非负整数"),
+            ("expected_search_budgets", ["freshness", 1], "必须是字符串数组"),
+            ("forbidden_read_domains", "youtube.com", "必须是字符串数组"),
+            ("required_decision_reason_codes", ["official_original", None], "必须是字符串数组"),
+        ]
+        for field, value, message in cases:
+            with self.subTest(field=field, value=value):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    path = Path(tmpdir) / "samples.json"
+                    sample = dict(base_sample)
+                    sample["id"] = f"planner-v1-2-{field}"
+                    sample[field] = value
+                    path.write_text(json.dumps([sample], ensure_ascii=False), encoding="utf-8")
+
+                    with self.assertRaisesRegex(ValueError, f"{field} {message}"):
+                        load_samples(path)
+
     def test_default_sample_file_covers_core_agent_behavior_matrix(self):
         from scripts.agent_behavior_eval import DEFAULT_SAMPLE_PATH, load_samples
 
@@ -274,6 +304,41 @@ class AgentBehaviorEvalTests(unittest.TestCase):
         self.assertFalse(score["passed"])
         self.assertIn("搜索关键词重复次数过多: duplicate_count=1 max=0", score["issues"])
         self.assertIn("推荐深读数量过多: actual=3 max=2", score["issues"])
+
+    def test_score_observation_flags_v1_2_planner_decision_regressions(self):
+        from scripts.agent_behavior_eval import score_observation
+
+        sample = {
+            "id": "search-read-planner-v1-2-decision-ledger",
+            "expected_tool_policy": "search",
+            "expected_surface": "evidence",
+            "max_search_calls": 2,
+            "max_provider_search_calls": 2,
+            "expected_search_budgets": ["freshness", "freshness_followup"],
+            "forbidden_read_domains": ["youtube.com"],
+            "required_decision_reason_codes": ["official_original"],
+        }
+        observation = {
+            "answer_text": "基于搜索结果回答。",
+            "tool_calls": ["web_search", "web_search", "web_search"],
+            "surfaces": ["execution_process", "answer_evidence"],
+            "search_call_count": 3,
+            "provider_search_call_count": 3,
+            "search_budgets": ["freshness", "standard", "standard"],
+            "read_domains": ["youtube.com"],
+            "decision_reason_codes": [],
+            "console_errors": [],
+        }
+
+        score = score_observation(sample, observation)
+
+        self.assertFalse(score["passed"])
+        joined_issues = "\n".join(score["issues"])
+        self.assertIn("搜索调用次数过多", joined_issues)
+        self.assertIn("provider 搜索次数过多", joined_issues)
+        self.assertIn("搜索预算不符合预期", joined_issues)
+        self.assertIn("读取了禁止深读的域名", joined_issues)
+        self.assertIn("缺少必需决策原因", joined_issues)
 
     def test_write_dry_run_outputs_jsonl(self):
         from scripts.agent_behavior_eval import write_dry_run

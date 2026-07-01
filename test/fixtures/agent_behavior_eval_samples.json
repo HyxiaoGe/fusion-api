@@ -77,5 +77,22 @@
     "max_duplicate_search_keywords": 0,
     "max_recommended_reads": 3,
     "forbidden_internal_terms": ["url_read", "reader-service"]
+  },
+  {
+    "id": "search-read-planner-v1-2-decision-ledger",
+    "category": "search_read_planner",
+    "question": "OpenAI 最近发布了哪些产品更新？",
+    "expected_tool_policy": "search",
+    "expected_surface": "evidence",
+    "requires_search_keywords": true,
+    "min_sources": 3,
+    "max_search_calls": 2,
+    "max_provider_search_calls": 2,
+    "max_duplicate_search_keywords": 0,
+    "max_recommended_reads": 3,
+    "expected_search_budgets": ["official_source", "official_source_followup"],
+    "forbidden_read_domains": ["youtube.com", "threads.com"],
+    "required_decision_reason_codes": ["official_original", "official_document"],
+    "forbidden_internal_terms": ["url_read", "reader-service"]
   }
 ]

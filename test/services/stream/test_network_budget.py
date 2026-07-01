@@ -25,6 +25,73 @@ class NetworkToolBudgetTests(unittest.TestCase):
         self.assertEqual(args["context_source_limit"], 4)
         self.assertEqual(args["search_budget"], "official_source")
 
+    def test_initial_search_records_budget_decision(self):
+        budget = NetworkToolBudget()
+
+        args, degraded = budget.prepare_web_search_args({"query": "OpenAI 最新公告 2026年7月"})
+
+        self.assertIsNone(degraded)
+        self.assertEqual(args["budget_decision"]["query"], "OpenAI 最新公告 2026年7月")
+        self.assertEqual(args["budget_decision"]["action"], "execute")
+        self.assertEqual(args["budget_decision"]["reason_code"], "initial_search")
+        self.assertEqual(args["budget_decision"]["budget_name"], args["search_budget"])
+        self.assertEqual(args["budget_decision"]["requested_count"], args["count"])
+        self.assertEqual(args["budget_decision"]["context_source_limit"], args["context_source_limit"])
+        self.assertEqual(args["budget_decision"]["previous_query_count"], 0)
+        self.assertEqual(args["budget_decision"]["planned_search_limit"], 2)
+
+    def test_similar_followup_records_narrow_followup_decision(self):
+        budget = NetworkToolBudget()
+
+        _first_args, first_degraded = budget.prepare_web_search_args(
+            {"query": "OpenAI GPT-5.6 Sol official announcement June 2026"}
+        )
+        second_args, second_degraded = budget.prepare_web_search_args(
+            {"query": "OpenAI GPT-5.6 Sol 2026年6月 官方公告"}
+        )
+
+        self.assertIsNone(first_degraded)
+        self.assertIsNone(second_degraded)
+        self.assertEqual(second_args["search_budget"], "official_source_followup")
+        self.assertEqual(second_args["budget_decision"]["action"], "narrow_followup")
+        self.assertEqual(second_args["budget_decision"]["reason_code"], "similar_followup")
+        self.assertEqual(second_args["budget_decision"]["budget_name"], "official_source_followup")
+        self.assertEqual(second_args["budget_decision"]["previous_query_count"], 1)
+        self.assertEqual(second_args["count"], 3)
+
+    def test_duplicate_search_records_skip_duplicate_decision(self):
+        budget = NetworkToolBudget()
+
+        _first_args, first_degraded = budget.prepare_web_search_args({"query": "OpenAI 最新公告 2026年7月"})
+        second_args, second_degraded = budget.prepare_web_search_args({"query": "OpenAI 最新公告 2026年7月"})
+
+        self.assertIsNone(first_degraded)
+        self.assertIsNotNone(second_degraded)
+        self.assertEqual(second_args["budget_decision"]["action"], "skip_duplicate")
+        self.assertEqual(second_args["budget_decision"]["reason_code"], "duplicate_query")
+        self.assertEqual(second_degraded.data["budget_decision"]["action"], "skip_duplicate")
+        self.assertEqual(second_degraded.data["budget_decision"]["reason_code"], "duplicate_query")
+        self.assertEqual(second_args["count"], 0)
+        self.assertEqual(budget.web_search_calls, 1)
+
+    def test_planner_limited_search_records_limit_decision(self):
+        budget = NetworkToolBudget()
+
+        first_args, first_degraded = budget.prepare_web_search_args({"query": "OpenAI 2026年产品更新 最新发布"})
+        second_args, second_degraded = budget.prepare_web_search_args({"query": "OpenAI 2026年最新新闻 媒体报道"})
+        third_args, third_degraded = budget.prepare_web_search_args({"query": "OpenAI GPT-5.6 Sol 预览 2026年7月"})
+
+        self.assertIsNone(first_degraded)
+        self.assertIsNone(second_degraded)
+        self.assertIsNotNone(third_degraded)
+        self.assertEqual(third_args["budget_decision"]["action"], "limit_planner")
+        self.assertEqual(third_args["budget_decision"]["reason_code"], "planned_search_limit_reached")
+        self.assertEqual(third_args["budget_decision"]["previous_query_count"], 2)
+        self.assertEqual(third_degraded.data["budget_decision"]["action"], "limit_planner")
+        self.assertEqual(third_degraded.data["budget_decision"]["reason_code"], "planned_search_limit_reached")
+        self.assertEqual(third_args["count"], 0)
+        self.assertEqual(budget.web_search_calls, 2)
+
     def test_chinese_year_query_infers_freshness_intent(self):
         budget = NetworkToolBudget()
 

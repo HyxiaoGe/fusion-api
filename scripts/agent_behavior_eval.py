@@ -23,7 +23,17 @@ VALID_TOOL_POLICIES = {"no_search", "search"}
 VALID_SURFACES = {"direct_answer", "evidence"}
 SEARCH_SURFACES = {"execution_process", "answer_evidence"}
 OPTIONAL_BOOL_FIELDS = {"requires_search_keywords", "requires_console_clean"}
-OPTIONAL_NON_NEGATIVE_INT_FIELDS = {"max_duplicate_search_keywords", "max_recommended_reads"}
+OPTIONAL_NON_NEGATIVE_INT_FIELDS = {
+    "max_duplicate_search_keywords",
+    "max_provider_search_calls",
+    "max_recommended_reads",
+    "max_search_calls",
+}
+OPTIONAL_STRING_LIST_FIELDS = {
+    "expected_search_budgets",
+    "forbidden_read_domains",
+    "required_decision_reason_codes",
+}
 
 
 def load_samples(path: Path = DEFAULT_SAMPLE_PATH) -> list[dict]:
@@ -68,6 +78,10 @@ def load_samples(path: Path = DEFAULT_SAMPLE_PATH) -> list[dict]:
         for field in OPTIONAL_NON_NEGATIVE_INT_FIELDS:
             if field in item and not _is_non_negative_int(item[field]):
                 raise ValueError(f"{field} 必须是非负整数: id={sample_id}")
+
+        for field in OPTIONAL_STRING_LIST_FIELDS:
+            if field in item and not _is_string_list(item[field]):
+                raise ValueError(f"{field} 必须是字符串数组: id={sample_id}")
 
         samples.append(item)
 
@@ -167,6 +181,50 @@ def _check_search_context(sample: dict, observation: dict, issues: list[str]) ->
     ):
         issues.append(f"推荐深读数量过多: actual={recommended_read_count} max={max_recommended_reads}")
 
+    max_search_calls = sample.get("max_search_calls")
+    if _is_non_negative_int(max_search_calls):
+        actual_search_calls = _observed_int(
+            observation,
+            "search_call_count",
+            fallback=sum(1 for tool_name in _string_list(observation.get("tool_calls", [])) if tool_name == "web_search"),
+        )
+        if actual_search_calls > max_search_calls:
+            issues.append(f"搜索调用次数过多: actual={actual_search_calls} max={max_search_calls}")
+
+    max_provider_search_calls = sample.get("max_provider_search_calls")
+    if _is_non_negative_int(max_provider_search_calls):
+        actual_provider_search_calls = _observed_int(
+            observation,
+            "provider_search_call_count",
+            fallback=sum(1 for tool_name in _string_list(observation.get("tool_calls", [])) if tool_name == "web_search"),
+        )
+        if actual_provider_search_calls > max_provider_search_calls:
+            issues.append(
+                f"provider 搜索次数过多: actual={actual_provider_search_calls} max={max_provider_search_calls}"
+            )
+
+    expected_search_budgets = _string_list(sample.get("expected_search_budgets", []))
+    if expected_search_budgets:
+        actual_search_budgets = _string_list(observation.get("search_budgets", []))
+        if actual_search_budgets != expected_search_budgets:
+            issues.append(
+                f"搜索预算不符合预期: actual={actual_search_budgets} expected={expected_search_budgets}"
+            )
+
+    forbidden_read_domains = {domain.lower() for domain in _string_list(sample.get("forbidden_read_domains", []))}
+    if forbidden_read_domains:
+        actual_read_domains = {domain.lower() for domain in _string_list(observation.get("read_domains", []))}
+        blocked_domains = sorted(actual_read_domains & forbidden_read_domains)
+        if blocked_domains:
+            issues.append(f"读取了禁止深读的域名: {', '.join(blocked_domains)}")
+
+    required_reason_codes = set(_string_list(sample.get("required_decision_reason_codes", [])))
+    if required_reason_codes:
+        actual_reason_codes = set(_string_list(observation.get("decision_reason_codes", [])))
+        missing_reason_codes = sorted(required_reason_codes - actual_reason_codes)
+        if missing_reason_codes:
+            issues.append(f"缺少必需决策原因: {', '.join(missing_reason_codes)}")
+
 
 def _check_forbidden_terms(sample: dict, observation: dict, output_text: str, issues: list[str]) -> None:
     answer_text = str(observation.get("answer_text", ""))
@@ -201,6 +259,15 @@ def _string_set(value) -> set[str]:
 
 def _is_non_negative_int(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_string_list(value) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) and item for item in value)
+
+
+def _observed_int(observation: dict, field_name: str, *, fallback: int) -> int:
+    value = observation.get(field_name)
+    return value if _is_non_negative_int(value) else fallback
 
 
 def _duplicate_keyword_count(value) -> int:

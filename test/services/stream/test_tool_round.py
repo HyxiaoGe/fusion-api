@@ -523,6 +523,110 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Axios", messages[3]["content"])
         self.assertIn("低优先级候选", messages[3]["content"])
         self.assertIn("threads.com", messages[3]["content"])
+        self.assertIn("未建议深读原因", messages[3]["content"])
+        self.assertIn("只有当推荐来源无法回答关键事实", messages[3]["content"])
+
+    def test_build_search_read_decision_ledger_summarizes_budget_and_read_decisions(self):
+        from app.services.search_read_decision_ledger import build_search_read_decision_ledger
+
+        tool_call_1 = {"id": "tc-search-1", "name": "web_search", "arguments": '{"query":"news"}'}
+        tool_call_2 = {"id": "tc-search-2", "name": "web_search", "arguments": '{"query":"official"}'}
+        handler = Mock()
+        handler.format_llm_context.return_value = "搜索上下文"
+        handler.build_content_block.return_value = None
+        record_1 = ToolExecutionRecord(
+            tool_call=tool_call_1,
+            result=ToolResult(
+                status="success",
+                data={
+                    "query": "OpenAI GPT-5.6 Sol 发布 2026年6月 新闻",
+                    "intent": "freshness",
+                    "search_budget": "freshness",
+                    "budget_decision": {
+                        "query": "OpenAI GPT-5.6 Sol 发布 2026年6月 新闻",
+                        "intent": "freshness",
+                        "action": "execute",
+                        "budget_name": "freshness",
+                        "requested_count": 5,
+                        "context_source_limit": 5,
+                        "reason_code": "initial_search",
+                        "previous_query_count": 0,
+                        "planned_search_limit": 2,
+                    },
+                    "sources": [
+                        SearchSource(
+                            title="Previewing GPT-5.6 Sol: a next-generation model | OpenAI",
+                            url="https://openai.com/index/previewing-gpt-5-6-sol",
+                            description="OpenAI official announcement.",
+                        ),
+                        SearchSource(
+                            title="OpenAI releases powerful new GPT-5.6 model - Axios",
+                            url="https://axios.com/2026/06/26/openai-gpt-sol-terra-luna-trump",
+                            description="Axios report.",
+                        ),
+                    ],
+                },
+            ),
+            handler=handler,
+            block_id="blk-search-1",
+            log_id="log-search-1",
+        )
+        record_2 = ToolExecutionRecord(
+            tool_call=tool_call_2,
+            result=ToolResult(
+                status="success",
+                data={
+                    "query": "OpenAI GPT-5.6 Sol 2026年6月 官方公告",
+                    "intent": "official_source",
+                    "search_budget": "official_source_followup",
+                    "budget_decision": {
+                        "query": "OpenAI GPT-5.6 Sol 2026年6月 官方公告",
+                        "intent": "official_source",
+                        "action": "narrow_followup",
+                        "budget_name": "official_source_followup",
+                        "requested_count": 3,
+                        "context_source_limit": 3,
+                        "reason_code": "similar_followup",
+                        "previous_query_count": 1,
+                        "planned_search_limit": 2,
+                    },
+                    "sources": [
+                        SearchSource(
+                            title="[PDF] GPT-5.6 Preview System Card - Deployment Safety Hub",
+                            url="https://deploymentsafety.openai.com/gpt-5-6-preview/gpt-5-6-preview.pdf",
+                            description="Official system card PDF.",
+                        ),
+                        SearchSource(
+                            title="GPT-5.6 解读视频",
+                            url="https://youtube.com/watch?v=abc",
+                            description="Video commentary.",
+                        ),
+                    ],
+                },
+            ),
+            handler=handler,
+            block_id="blk-search-2",
+            log_id="log-search-2",
+        )
+        plan = tool_round_module._build_source_selection_plan([record_1, record_2])
+
+        ledger = build_search_read_decision_ledger([record_1, record_2], source_plan=plan)
+
+        self.assertEqual(ledger["summary"]["executed_search_count"], 2)
+        self.assertEqual(ledger["summary"]["provider_search_count"], 2)
+        self.assertEqual(ledger["summary"]["recommended_read_count"], 3)
+        self.assertEqual(ledger["summary"]["deprioritized_count"], 1)
+        self.assertEqual(
+            [decision["reason_code"] for decision in ledger["search_decisions"]],
+            ["initial_search", "similar_followup"],
+        )
+        self.assertIn("official_original", ledger["summary"]["decision_reason_codes"])
+        self.assertIn("official_document", ledger["summary"]["decision_reason_codes"])
+        self.assertIn("low_priority_source_type", ledger["summary"]["decision_reason_codes"])
+        self.assertEqual(
+            [decision["domain"] for decision in ledger["read_decisions"] if decision["action"] == "deprioritize"],
+            ["youtube.com"],
+        )
 
     async def test_handle_tool_calls_round_emits_selected_evidence_for_ranker_recommendations(self):
         tool_call = {"id": "tc-search", "name": "web_search", "arguments": '{"query":"OpenAI GPT-5.6"}'}

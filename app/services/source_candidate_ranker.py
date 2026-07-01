@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -100,6 +101,13 @@ class RankedSourceCandidate:
 
 
 @dataclass(frozen=True)
+class SourceReadDecision:
+    candidate: RankedSourceCandidate
+    action: str
+    reason_code: str
+
+
+@dataclass(frozen=True)
 class SourceSelectionPlan:
     total_source_count: int
     unique_source_count: int
@@ -107,6 +115,8 @@ class SourceSelectionPlan:
     candidates: tuple[RankedSourceCandidate, ...]
     recommended: tuple[RankedSourceCandidate, ...]
     low_priority: tuple[RankedSourceCandidate, ...]
+    read_decisions: tuple[SourceReadDecision, ...]
+    decision_summary: dict[str, int]
     recommended_read_limit: int = 3
     not_recommended_count: int = 0
 
@@ -153,6 +163,7 @@ def rank_search_sources(
     recommended_limit = max(0, max_recommended)
     recommended = tuple(candidate for candidate in ranked if candidate.priority != "low")[:recommended_limit]
     low_priority = tuple(candidate for candidate in ranked if candidate.priority == "low")
+    read_decisions = _build_read_decisions(ranked, recommended)
     return SourceSelectionPlan(
         total_source_count=total_source_count,
         unique_source_count=len(ranked),
@@ -160,6 +171,8 @@ def rank_search_sources(
         candidates=ranked,
         recommended=recommended,
         low_priority=low_priority,
+        read_decisions=read_decisions,
+        decision_summary=_summarize_read_decisions(read_decisions),
         recommended_read_limit=recommended_limit,
         not_recommended_count=max(0, len(ranked) - len(recommended)),
     )
@@ -201,10 +214,14 @@ def format_source_selection_guidance(plan: SourceSelectionPlan) -> str:
             f"未建议深读：剩余 {plan.not_recommended_count} 条候选优先级低于已推荐来源，"
             "或仅作为搜索摘要候选保留。"
         )
+        reason_summary = _format_not_recommended_reason_summary(plan.read_decisions)
+        if reason_summary:
+            parts.append("未建议深读原因：")
+            parts.extend(reason_summary)
 
     parts.append(
         "执行规则：如果搜索摘要不足以回答，应优先对“建议优先深读”的少量来源调用 url_read；"
-        "不要为了形式读满所有搜索结果。"
+        "不要为了形式读满所有搜索结果；只有当推荐来源无法回答关键事实，才读取未推荐来源。"
     )
     return "\n".join(parts)
 
@@ -307,6 +324,72 @@ def _dedupe_candidates(drafts: list[_CandidateDraft]) -> list[_CandidateDraft]:
         if previous is None or (draft.score, -draft.source_order) > (previous.score, -previous.source_order):
             by_url[key] = draft
     return list(by_url.values())
+
+
+def _build_read_decisions(
+    candidates: tuple[RankedSourceCandidate, ...],
+    recommended: tuple[RankedSourceCandidate, ...],
+) -> tuple[SourceReadDecision, ...]:
+    recommended_urls = {candidate.url for candidate in recommended}
+    decisions: list[SourceReadDecision] = []
+    for candidate in candidates:
+        if candidate.url in recommended_urls:
+            decisions.append(
+                SourceReadDecision(
+                    candidate=candidate,
+                    action="recommend_read",
+                    reason_code=_recommended_reason_code(candidate),
+                )
+            )
+            continue
+        if candidate.priority == "low":
+            decisions.append(
+                SourceReadDecision(
+                    candidate=candidate,
+                    action="deprioritize",
+                    reason_code="low_priority_source_type",
+                )
+            )
+            continue
+        decisions.append(
+            SourceReadDecision(
+                candidate=candidate,
+                action="keep_candidate",
+                reason_code="outside_read_limit",
+            )
+        )
+    return tuple(decisions)
+
+
+def _recommended_reason_code(candidate: RankedSourceCandidate) -> str:
+    reasons = set(candidate.reasons)
+    if any("PDF" in reason or "技术报告" in reason for reason in reasons):
+        return "official_document"
+    if "官方原文优先" in reasons or ("官方来源" in reasons and ("原文公告" in reasons or "具体原文页面" in reasons)):
+        return "official_original"
+    if "权威媒体" in reasons:
+        return "authority_media"
+    return "high_relevance"
+
+
+def _summarize_read_decisions(decisions: tuple[SourceReadDecision, ...]) -> dict[str, int]:
+    counter: Counter[str] = Counter()
+    for decision in decisions:
+        counter[decision.action] += 1
+        counter[decision.reason_code] += 1
+    return dict(counter)
+
+
+def _format_not_recommended_reason_summary(decisions: tuple[SourceReadDecision, ...]) -> list[str]:
+    labels = {
+        "low_priority_source_type": "低优先级来源",
+        "outside_read_limit": "超过本轮推荐深读上限",
+        "covered_by_recommended_source": "被更高质量来源覆盖",
+    }
+    counter: Counter[str] = Counter(
+        decision.reason_code for decision in decisions if decision.action != "recommend_read"
+    )
+    return [f"- {label}：{counter[reason_code]} 条" for reason_code, label in labels.items() if counter[reason_code]]
 
 
 def _source_field(source: SearchSource | dict, field_name: str) -> str:

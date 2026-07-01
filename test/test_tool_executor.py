@@ -345,7 +345,7 @@ class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):
         handler.execute.return_value = ToolResult(status="success", data={"sources": []})
 
         with patch("app.services.tool_handlers.get_handler", return_value=handler):
-            await execute_tools_parallel(
+            results = await execute_tools_parallel(
                 [
                     {
                         "id": "call-1",
@@ -374,6 +374,8 @@ class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):
         }
         handler.execute.assert_awaited_once_with(normalized)
         self.assertEqual(handler.log.await_args.kwargs["input_params"], normalized)
+        self.assertEqual(results[0].result.data["budget_decision"]["action"], "execute")
+        self.assertEqual(results[0].result.data["budget_decision"]["reason_code"], "initial_search")
 
     async def test_execute_tools_parallel_returns_degraded_when_network_budget_exhausted_without_handler_execute(self):
         from app.services.stream.network_budget import NetworkToolBudget

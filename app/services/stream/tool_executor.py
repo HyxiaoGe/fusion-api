@@ -34,6 +34,7 @@ AGENT_TOOL_MAX_RETRIES = 1
 
 # 永久性错误关键字（不重试）
 _TOOL_PERMANENT_KEYWORDS = ("not_found", "invalid", "rate_limit", "400", "401", "403", "404")
+_INTERNAL_TOOL_ARG_KEYS = {"budget_decision"}
 
 
 @dataclass(frozen=True)
@@ -160,6 +161,18 @@ def prepare_tool_arguments(
     return args, None
 
 
+def strip_internal_tool_arguments(args: dict) -> dict:
+    if not any(key in args for key in _INTERNAL_TOOL_ARG_KEYS):
+        return args
+    return {key: value for key, value in args.items() if key not in _INTERNAL_TOOL_ARG_KEYS}
+
+
+def attach_internal_tool_metadata(result, args: dict) -> None:
+    budget_decision = args.get("budget_decision")
+    if isinstance(budget_decision, dict):
+        result.data.setdefault("budget_decision", budget_decision)
+
+
 def build_tool_execution_record(
     *,
     tool_call: dict,
@@ -278,13 +291,26 @@ async def execute_one_tool_call(request: ToolExecutionBatchRequest, tool_call: d
         args=args,
         network_budget=request.network_budget,
     )
+    executable_args = strip_internal_tool_arguments(args)
     if budget_result is not None:
         result = budget_result
-        await emit_budget_result(request=request, tool_call=tool_call, handler=handler, args=args, result=result)
+        await emit_budget_result(
+            request=request,
+            tool_call=tool_call,
+            handler=handler,
+            args=executable_args,
+            result=result,
+        )
     else:
-        result = await execute_tool_handler(request=request, tool_call=tool_call, handler=handler, args=args)
+        result = await execute_tool_handler(
+            request=request,
+            tool_call=tool_call,
+            handler=handler,
+            args=executable_args,
+        )
+    attach_internal_tool_metadata(result, args)
 
-    await log_tool_execution(request=request, handler=handler, ids=ids, result=result, args=args)
+    await log_tool_execution(request=request, handler=handler, ids=ids, result=result, args=executable_args)
     record = build_tool_execution_record(tool_call=tool_call, result=result, handler=handler, ids=ids)
     await emit_progress_digest_events(request=request, record=record)
     return record

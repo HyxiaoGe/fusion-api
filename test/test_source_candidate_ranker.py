@@ -154,6 +154,58 @@ class SourceCandidateRankerTests(unittest.TestCase):
         self.assertIn("threads.com", guidance)
         self.assertIn("不要为了形式读满所有搜索结果", guidance)
 
+    def test_source_selection_plan_records_read_decisions_for_all_candidates(self):
+        search_results = [
+            SearchResultForRanking(
+                tool_call_id="search-1",
+                query="OpenAI GPT-5.6 Sol 官方公告 2026年",
+                sources=self._rankable_sources(),
+            )
+        ]
+
+        plan = rank_search_sources(search_results, max_recommended=2)
+
+        self.assertEqual(len(plan.read_decisions), plan.unique_source_count)
+        self.assertEqual(
+            [decision.action for decision in plan.read_decisions[:2]],
+            ["recommend_read", "recommend_read"],
+        )
+        self.assertEqual(plan.decision_summary["recommend_read"], 2)
+        self.assertEqual(plan.decision_summary["outside_read_limit"], 1)
+        self.assertEqual(plan.decision_summary["low_priority_source_type"], 1)
+
+    def test_low_priority_sources_are_deprioritized_with_reason_code(self):
+        search_results = [
+            SearchResultForRanking(
+                tool_call_id="search-1",
+                query="OpenAI GPT-5.6 Sol 官方公告 2026年",
+                sources=self._rankable_sources(),
+            )
+        ]
+
+        plan = rank_search_sources(search_results, max_recommended=2)
+
+        low = next(decision for decision in plan.read_decisions if decision.candidate.domain == "youtube.com")
+        self.assertEqual(low.action, "deprioritize")
+        self.assertEqual(low.reason_code, "low_priority_source_type")
+
+    def test_guidance_summarizes_not_recommended_reason_codes(self):
+        search_results = [
+            SearchResultForRanking(
+                tool_call_id="search-1",
+                query="OpenAI GPT-5.6 Sol 官方公告 2026年",
+                sources=self._rankable_sources(),
+            )
+        ]
+        plan = rank_search_sources(search_results, max_recommended=2)
+
+        guidance = format_source_selection_guidance(plan)
+
+        self.assertIn("未建议深读原因", guidance)
+        self.assertIn("低优先级来源", guidance)
+        self.assertIn("超过本轮推荐深读上限", guidance)
+        self.assertIn("只有当推荐来源无法回答关键事实", guidance)
+
     def test_search_read_planner_recommends_one_read_for_quick_fact(self):
         from app.services.search_read_planner import build_search_read_plan
 

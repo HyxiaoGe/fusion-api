@@ -17,6 +17,19 @@ class SearchBudget:
     context_source_limit: int
 
 
+@dataclass(frozen=True)
+class SearchBudgetDecision:
+    query: str
+    intent: str | None
+    action: str
+    budget_name: str
+    requested_count: int
+    context_source_limit: int
+    reason_code: str
+    previous_query_count: int
+    planned_search_limit: int
+
+
 STANDARD_SEARCH_BUDGET = SearchBudget(name="standard", requested_count=5, context_source_limit=5)
 
 SEARCH_BUDGETS_BY_INTENT = {
