@@ -46,6 +46,7 @@
 | EVAL11-08 | 结果列表 | summary 正确统计 success/failure、by_model、by_scenario、failure_types |
 | EVAL11-09 | nonstream 成功 | 保持旧 JSONL 核心字段，并补齐新字段 |
 | EVAL11-10 | 回答正文包含 `<think>` 标签 | JSONL 标记 `reasoning_tag_leak`，summary 聚合质量标记 |
+| EVAL11-11 | 长批次逐项执行 | 每个条目完成后触发结果回调，CLI 可增量写 JSONL |
 
 ## Tasks
 
@@ -92,3 +93,10 @@
 - [x] 标记回答正文中的 `<think>` / `</think>` 泄漏。
 - [x] 在 summary 中聚合质量标记数量。
 - [x] 补充 reasoning 标签泄漏和 summary 聚合测试。
+
+### Task 7: 增加长批次保护
+
+- [x] 为 `run_eval` 增加逐项 `on_result` 回调。
+- [x] CLI apply 模式每完成一项就追加写 JSONL。
+- [x] CLI apply 模式向 stderr 输出进度摘要。
+- [x] 补充成功项和失败项都会触发回调的测试。

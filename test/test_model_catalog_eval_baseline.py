@@ -278,6 +278,42 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
 
         self.assertEqual(summary["quality_flags"], {"reasoning_tag_leak": 1})
 
+    def test_run_eval_calls_result_callback_after_each_item(self):
+        scenario = baseline.select_scenarios(["basic_chat"])[0]
+        models = [
+            {"modelId": "model-a", "provider": "mock", "name": "Model A"},
+            {"modelId": "model-b", "provider": "mock", "name": "Model B"},
+        ]
+        observed: list[baseline.EvalResult] = []
+        original_call_chat_send_stream = baseline.call_chat_send_stream
+
+        def fake_call_chat_send_stream(**kwargs):
+            model_id = kwargs["model_id"]
+            if model_id == "model-b":
+                raise TimeoutError("timeout")
+            return (
+                [{"chunk_type": "answering", "data": {"delta": f"{model_id} 回答"}}],
+                {"conversation_id": f"conv-{model_id}"},
+            )
+
+        baseline.call_chat_send_stream = fake_call_chat_send_stream
+        try:
+            results = baseline.run_eval(
+                base_url="http://fusion.local",
+                auth_token="token",
+                models=models,
+                scenarios=[scenario],
+                on_result=observed.append,
+            )
+        finally:
+            baseline.call_chat_send_stream = original_call_chat_send_stream
+
+        self.assertEqual([result.model_id for result in results], ["model-a", "model-b"])
+        self.assertEqual([result.model_id for result in observed], ["model-a", "model-b"])
+        self.assertTrue(observed[0].success)
+        self.assertFalse(observed[1].success)
+        self.assertEqual(observed[1].error["category"], "timeout")
+
 
 if __name__ == "__main__":
     unittest.main()

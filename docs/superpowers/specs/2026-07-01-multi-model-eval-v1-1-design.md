@@ -21,7 +21,7 @@ v1.1 的目标是把脚本从“单问题 smoke”增强为“多场景、多模
 - 支持按模型和场景筛选。
 - 支持 `stream` 和 `nonstream` 两种 transport，默认使用 `stream`。
 - 解析 SSE envelope，记录回答摘要、工具调用、错误、conversation/message id。
-- 输出 JSONL 明细。
+- 输出 JSONL 明细；apply 模式下每完成一个 `(model, scenario)` 就立即追加落盘，避免长批次中断后丢失全部结果。
 - 输出 summary JSON，按模型和场景汇总成功率、耗时、失败类型和工具期望命中情况。
 
 不包含：
@@ -71,6 +71,8 @@ summary JSON 包含：
 - `quality_flags`
 - `tool_expectation_mismatch_count`
 
+apply 模式运行时，脚本会向 stderr 输出每个条目的进度摘要，包括当前序号、模型、场景、成功/失败、耗时、工具调用数量和质量标记。stdout/stdout JSONL 仍保持机器可读。
+
 ### 输出质量标记
 
 脚本的 `success` 只表示调用链路成功并返回了回答，不代表回答内容一定符合产品展示要求。为了避免多模型测验漏掉“可回答但体验不合格”的情况，JSONL 明细增加 `quality_flags` 字段，summary 同步聚合各类标记数量。
@@ -110,6 +112,7 @@ summary JSON 包含：
 
 - 单元测试覆盖场景选择、SSE 解析、stream 成功/失败结果、summary 汇总、工具期望命中判断。
 - 单元测试覆盖 `quality_flags` 明细字段和 summary 聚合。
+- 单元测试覆盖每个测验条目完成后的 `on_result` 回调，支撑 CLI 增量落盘。
 - 目标测试和后端全量测试通过。
 - CI/CD 通过并部署 dev。
 - 部署后至少执行 dry-run，确认脚本能从已部署 `/api/models` 拉取当前模型和场景矩阵。

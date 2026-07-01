@@ -13,7 +13,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from uuid import uuid4
 
 import httpx
@@ -435,8 +435,15 @@ def run_eval(
     models: Iterable[Mapping[str, Any]],
     scenarios: Iterable[EvalScenario],
     transport: str = DEFAULT_TRANSPORT,
+    on_result: Callable[[EvalResult], None] | None = None,
 ) -> list[EvalResult]:
     results: list[EvalResult] = []
+
+    def record_result(result: EvalResult) -> None:
+        results.append(result)
+        if on_result:
+            on_result(result)
+
     for model in models:
         for scenario in scenarios:
             started = time.perf_counter()
@@ -449,7 +456,7 @@ def run_eval(
                         question=scenario.question,
                     )
                     elapsed_ms = int((time.perf_counter() - started) * 1000)
-                    results.append(
+                    record_result(
                         build_stream_result(
                             model=model,
                             scenario=scenario,
@@ -466,7 +473,7 @@ def run_eval(
                         question=scenario.question,
                     )
                     elapsed_ms = int((time.perf_counter() - started) * 1000)
-                    results.append(
+                    record_result(
                         build_success_result(
                             model=model,
                             scenario=scenario,
@@ -477,7 +484,7 @@ def run_eval(
                     )
             except Exception as exc:
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
-                results.append(
+                record_result(
                     build_failure_result(
                         model=model,
                         scenario=scenario,
@@ -487,6 +494,16 @@ def run_eval(
                     )
                 )
     return results
+
+
+def _format_eval_progress(result: EvalResult, completed: int, total: int) -> str:
+    status = "success" if result.success else f"failure:{(result.error or {}).get('category', 'unknown_error')}"
+    flags = ",".join(result.quality_flags) if result.quality_flags else "-"
+    tools = ",".join(result.observed_tool_names) if result.observed_tool_names else "-"
+    return (
+        f"[{completed}/{total}] {result.model_id}/{result.scenario_id} "
+        f"{status} {result.elapsed_ms}ms tools={result.observed_tool_calls}({tools}) flags={flags}"
+    )
 
 
 def _empty_group() -> dict[str, Any]:
@@ -606,19 +623,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.auth_token:
         raise RuntimeError("实际测验需要 --auth-token")
 
+    output_path = Path(args.output) if args.output else None
+    if output_path:
+        output_path.write_text("", encoding="utf-8")
+    total_items = len(selected) * len(scenarios)
+    completed_items = 0
+
+    def on_result(result: EvalResult) -> None:
+        nonlocal completed_items
+        completed_items += 1
+        line = to_jsonl(result)
+        if output_path:
+            with output_path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+        else:
+            print(line, end="", flush=True)
+        print(_format_eval_progress(result, completed_items, total_items), file=sys.stderr, flush=True)
+
     results = run_eval(
         base_url=args.base_url,
         auth_token=args.auth_token,
         models=selected,
         scenarios=scenarios,
         transport=args.transport,
+        on_result=on_result,
     )
 
-    content = "".join(to_jsonl(result) for result in results)
-    if args.output:
-        Path(args.output).write_text(content, encoding="utf-8")
-    else:
-        print(content, end="")
     summary_content = json.dumps(build_summary(results), ensure_ascii=False, indent=2, sort_keys=True)
     if args.summary_output:
         Path(args.summary_output).write_text(summary_content + "\n", encoding="utf-8")
