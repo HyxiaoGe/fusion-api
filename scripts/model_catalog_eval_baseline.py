@@ -154,6 +154,17 @@ def _detect_quality_flags(answer_text: str) -> list[str]:
     return []
 
 
+def _detect_eval_quality_flags(
+    *,
+    scenario: EvalScenario,
+    observed_tool_calls: int,
+    agent_tools_supported: bool,
+) -> list[str]:
+    if scenario.expected_tool_use == "expected" and not agent_tools_supported and observed_tool_calls == 0:
+        return ["expected_search_without_agent_tools"]
+    return []
+
+
 def _model_supports_agent_tools(model: Mapping[str, Any]) -> bool:
     capabilities = model.get("capabilities") or {}
     if not isinstance(capabilities, Mapping):
@@ -183,10 +194,26 @@ def _base_result_fields(
     observed_tool_names: Sequence[str] | None = None,
     observed_tool_calls: int | None = None,
     quality_flags: Sequence[str] | None = None,
+    include_eval_quality_flags: bool = True,
 ) -> dict[str, Any]:
     tool_names = list(observed_tool_names or [])
     tool_call_count = len(tool_names) if observed_tool_calls is None else observed_tool_calls
     agent_tools_supported = _model_supports_agent_tools(model)
+    eval_quality_flags = (
+        _detect_eval_quality_flags(
+            scenario=scenario,
+            observed_tool_calls=tool_call_count,
+            agent_tools_supported=agent_tools_supported,
+        )
+        if include_eval_quality_flags
+        else []
+    )
+    result_quality_flags = _unique_in_order(
+        [
+            *(quality_flags or []),
+            *eval_quality_flags,
+        ]
+    )
     return {
         "model_id": str(model.get("modelId") or ""),
         "provider": str(model.get("provider") or ""),
@@ -209,7 +236,7 @@ def _base_result_fields(
             tool_call_count,
             agent_tools_supported,
         ),
-        "quality_flags": list(quality_flags or []),
+        "quality_flags": result_quality_flags,
     }
 
 
@@ -278,6 +305,7 @@ def build_failure_result(
             message_id=message_id,
             observed_tool_names=observed_tool_names,
             observed_tool_calls=observed_tool_calls,
+            include_eval_quality_flags=False,
         ),
         success=False,
         error={"category": _classify_error(error), "type": type(error).__name__, "message": str(error)},

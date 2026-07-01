@@ -271,6 +271,7 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
 
         self.assertFalse(row["agent_tools_supported"])
         self.assertTrue(row["tool_expectation_met"])
+        self.assertEqual(row["quality_flags"], ["expected_search_without_agent_tools"])
 
     def test_build_summary_groups_results_and_failures(self):
         basic = baseline.select_scenarios(["basic_chat"])[0]
@@ -311,6 +312,25 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
         summary = baseline.build_summary([result])
 
         self.assertEqual(summary["quality_flags"], {"reasoning_tag_leak": 1})
+
+    def test_build_summary_counts_agent_tool_gap_flags(self):
+        scenario = baseline.select_scenarios(["autonomous_search"])[0]
+        result = baseline.build_stream_result(
+            model={
+                "modelId": "qwen-vl-max",
+                "provider": "qwen",
+                "name": "Qwen VL Max",
+                "capabilities": {"functionCalling": True, "agentTools": False},
+            },
+            scenario=scenario,
+            elapsed_ms=1200,
+            events=[{"chunk_type": "answering", "data": {"delta": "我无法联网。"}}],
+        )
+
+        summary = baseline.build_summary([result])
+
+        self.assertEqual(summary["tool_expectation_mismatch_count"], 0)
+        self.assertEqual(summary["quality_flags"], {"expected_search_without_agent_tools": 1})
 
     def test_run_eval_calls_result_callback_after_each_item(self):
         scenario = baseline.select_scenarios(["basic_chat"])[0]
