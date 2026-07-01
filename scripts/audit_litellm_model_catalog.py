@@ -73,6 +73,24 @@ def _entry_metadata(entry: Mapping[str, Any]) -> Mapping[str, Any]:
     return metadata if isinstance(metadata, Mapping) else {}
 
 
+def _entry_model_uuid(entry: Mapping[str, Any]) -> str:
+    value = _entry_model_info(entry).get("id")
+    return str(value) if value else ""
+
+
+def _entry_underlying_model(entry: Mapping[str, Any]) -> str:
+    params = entry.get("litellm_params") or {}
+    if not isinstance(params, Mapping):
+        return ""
+    value = params.get("model")
+    return str(value) if value else ""
+
+
+def _entry_litellm_provider(entry: Mapping[str, Any]) -> str:
+    value = _entry_model_info(entry).get("litellm_provider")
+    return str(value) if value else ""
+
+
 def extract_db_models(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """提取 LiteLLM 中可给 Fusion 前端展示的业务别名。"""
     models: list[dict[str, Any]] = []
@@ -83,7 +101,15 @@ def extract_db_models(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, An
         model_info = _entry_model_info(entry)
         if not bool(model_info.get("db_model")):
             continue
-        models.append({"model_name": model_name, "metadata": dict(_entry_metadata(entry))})
+        models.append(
+            {
+                "model_name": model_name,
+                "model_uuid": _entry_model_uuid(entry),
+                "underlying_model": _entry_underlying_model(entry),
+                "litellm_provider": _entry_litellm_provider(entry),
+                "metadata": dict(_entry_metadata(entry)),
+            }
+        )
     return models
 
 
@@ -107,6 +133,26 @@ def _missing_metadata_keys(metadata: Mapping[str, Any]) -> list[str]:
 
 def _has_required_metadata(metadata: Mapping[str, Any]) -> bool:
     return not _missing_metadata_keys(metadata)
+
+
+def _stable_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _db_model_duplicate_signature(model: Mapping[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(model.get("model_uuid") or ""),
+        str(model.get("underlying_model") or ""),
+        str(model.get("litellm_provider") or ""),
+        _stable_json(model.get("metadata") or {}),
+    )
+
+
+def _has_conflicting_duplicate_models(models: Sequence[Mapping[str, Any]]) -> bool:
+    if len(models) <= 1:
+        return False
+    signatures = {_db_model_duplicate_signature(model) for model in models}
+    return len(signatures) > 1
 
 
 def build_allowlist_sync_plan(
@@ -150,13 +196,16 @@ def audit_catalog(
 ) -> AuditReport:
     raw_db_models = extract_db_models(litellm_entries)
     db_models_by_name: dict[str, dict[str, Any]] = {}
-    duplicate_names: set[str] = set()
+    db_model_groups: dict[str, list[dict[str, Any]]] = {}
     for model in raw_db_models:
         model_name = model["model_name"]
+        db_model_groups.setdefault(model_name, []).append(model)
         if model_name in db_models_by_name:
-            duplicate_names.add(model_name)
             continue
         db_models_by_name[model_name] = model
+    duplicate_names = {
+        model_name for model_name, models in db_model_groups.items() if _has_conflicting_duplicate_models(models)
+    }
     db_models = list(db_models_by_name.values())
     db_model_names = [model["model_name"] for model in db_models]
     db_model_set = set(db_model_names)
@@ -176,7 +225,7 @@ def audit_catalog(
                 code="db_model_duplicate",
                 severity="warning",
                 model_name=model_name,
-                message=f"LiteLLM /model/info 中存在重复业务模型别名 {model_name}，巡检按唯一别名处理",
+                message=f"LiteLLM /model/info 中存在冲突的重复业务模型别名 {model_name}，巡检按第一条唯一别名处理",
             )
         )
 

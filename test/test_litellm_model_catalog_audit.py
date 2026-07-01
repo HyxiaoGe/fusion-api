@@ -10,11 +10,13 @@ def litellm_entry(
     *,
     db_model: bool = True,
     metadata: dict | None = None,
+    model_uuid: str | None = None,
+    underlying_model: str | None = None,
 ) -> dict:
     return {
         "model_name": model_name,
         "model_info": {
-            "id": f"uuid-{model_name}",
+            "id": model_uuid or f"uuid-{model_name}",
             "db_model": db_model,
             "metadata": metadata
             if metadata is not None
@@ -25,7 +27,7 @@ def litellm_entry(
                 "pricing": {"input": 0.001, "output": 0.002, "unit": "USD"},
             },
         },
-        "litellm_params": {"model": f"openai/{model_name}"},
+        "litellm_params": {"model": underlying_model or f"openai/{model_name}"},
     }
 
 
@@ -75,9 +77,30 @@ class ModelCatalogAuditTests(unittest.TestCase):
         self.assertEqual(plan.add, ["mimo-v2.5-pro"])
         self.assertEqual(plan.allowlist_after, ["deepseek-chat", "mimo-v2.5-pro"])
 
-    def test_duplicate_db_model_entries_are_warned_and_counted_once(self):
+    def test_identical_duplicate_db_model_entries_are_counted_once_without_warning(self):
         report = audit.audit_catalog(
             litellm_entries=[litellm_entry("deepseek-chat"), litellm_entry("deepseek-chat")],
+            fusion_models=[{"modelId": "deepseek-chat"}],
+            key_models=["deepseek-chat"],
+        )
+
+        self.assertEqual(report.summary["litellm_db_models"], 1)
+        self.assertFalse([issue for issue in report.issues if issue.code == "db_model_duplicate"])
+
+    def test_conflicting_duplicate_db_model_entries_are_warned_and_counted_once(self):
+        report = audit.audit_catalog(
+            litellm_entries=[
+                litellm_entry(
+                    "deepseek-chat",
+                    model_uuid="uuid-deepseek-chat-old",
+                    underlying_model="deepseek/deepseek-v3",
+                ),
+                litellm_entry(
+                    "deepseek-chat",
+                    model_uuid="uuid-deepseek-chat-new",
+                    underlying_model="deepseek/deepseek-v4-flash",
+                ),
+            ],
             fusion_models=[{"modelId": "deepseek-chat"}],
             key_models=["deepseek-chat"],
         )
