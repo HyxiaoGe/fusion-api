@@ -21,6 +21,15 @@ import httpx
 DEFAULT_FUSION_BASE_URL = "https://fusion.seanfield.org"
 DEFAULT_TRANSPORT = "stream"
 
+SLOW_RESPONSE_THRESHOLDS_MS = {
+    "basic_chat": 15_000,
+    "cn_factual": 20_000,
+    "coding_reasoning": 30_000,
+    "autonomous_search": 90_000,
+    "no_search_simple": 15_000,
+    "long_answer": 60_000,
+}
+
 
 @dataclass(frozen=True)
 class EvalScenario:
@@ -158,11 +167,24 @@ def _detect_eval_quality_flags(
     *,
     scenario: EvalScenario,
     observed_tool_calls: int,
+    observed_tool_names: Sequence[str],
     agent_tools_supported: bool,
+    elapsed_ms: int,
 ) -> list[str]:
+    flags: list[str] = []
     if scenario.expected_tool_use == "expected" and not agent_tools_supported and observed_tool_calls == 0:
-        return ["expected_search_without_agent_tools"]
-    return []
+        flags.append("expected_search_without_agent_tools")
+    if (
+        scenario.expected_tool_use == "expected"
+        and agent_tools_supported
+        and "web_search" in observed_tool_names
+        and "url_read" not in observed_tool_names
+    ):
+        flags.append("expected_search_without_read")
+    slow_threshold_ms = SLOW_RESPONSE_THRESHOLDS_MS.get(scenario.scenario_id)
+    if slow_threshold_ms is not None and elapsed_ms > slow_threshold_ms:
+        flags.append("slow_response")
+    return flags
 
 
 def _model_supports_agent_tools(model: Mapping[str, Any]) -> bool:
@@ -203,7 +225,9 @@ def _base_result_fields(
         _detect_eval_quality_flags(
             scenario=scenario,
             observed_tool_calls=tool_call_count,
+            observed_tool_names=tool_names,
             agent_tools_supported=agent_tools_supported,
+            elapsed_ms=elapsed_ms,
         )
         if include_eval_quality_flags
         else []

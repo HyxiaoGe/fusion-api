@@ -144,6 +144,7 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
             events=[
                 {"chunk_type": "agent_event", "data": {"type": "run_started", "message_id": "msg-1"}},
                 {"chunk_type": "agent_event", "data": {"type": "tool_call_started", "tool_name": "web_search"}},
+                {"chunk_type": "agent_event", "data": {"type": "tool_call_started", "tool_name": "url_read"}},
                 {"chunk_type": "answering", "data": {"delta": "最新消息如下。"}},
                 {"chunk_type": "agent_event", "data": {"type": "run_completed", "finish_reason": "stop"}},
             ],
@@ -156,8 +157,8 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
         self.assertEqual(row["scenario_id"], "autonomous_search")
         self.assertEqual(row["conversation_id"], "conv-1")
         self.assertEqual(row["message_id"], "msg-1")
-        self.assertEqual(row["observed_tool_calls"], 1)
-        self.assertEqual(row["observed_tool_names"], ["web_search"])
+        self.assertEqual(row["observed_tool_calls"], 2)
+        self.assertEqual(row["observed_tool_names"], ["web_search", "url_read"])
         self.assertTrue(row["tool_expectation_met"])
         self.assertIn("最新消息", row["answer_preview"])
         self.assertEqual(row["quality_flags"], [])
@@ -332,6 +333,52 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
 
         self.assertEqual(summary["tool_expectation_mismatch_count"], 0)
         self.assertEqual(summary["quality_flags"], {"expected_search_without_agent_tools": 1})
+
+    def test_expected_search_without_read_is_quality_flag_not_mismatch(self):
+        scenario = baseline.select_scenarios(["autonomous_search"])[0]
+        result = baseline.build_stream_result(
+            model={
+                "modelId": "doubao-seed-2-0-mini-260215",
+                "provider": "volcengine",
+                "name": "Doubao Mini",
+                "capabilities": {"functionCalling": True, "agentTools": True},
+            },
+            scenario=scenario,
+            elapsed_ms=3200,
+            events=[
+                {"chunk_type": "agent_event", "data": {"type": "tool_call_started", "tool_name": "web_search"}},
+                {"chunk_type": "answering", "data": {"delta": "根据搜索结果回答。"}},
+            ],
+        )
+
+        row = json.loads(baseline.to_jsonl(result).strip())
+
+        self.assertTrue(row["tool_expectation_met"])
+        self.assertEqual(row["observed_tool_names"], ["web_search"])
+        self.assertEqual(row["quality_flags"], ["expected_search_without_read"])
+
+    def test_slow_success_is_quality_flag(self):
+        scenario = baseline.select_scenarios(["autonomous_search"])[0]
+        result = baseline.build_stream_result(
+            model={
+                "modelId": "kimi-k2.5",
+                "provider": "moonshot",
+                "name": "Kimi K2.5",
+                "capabilities": {"functionCalling": True, "agentTools": True},
+            },
+            scenario=scenario,
+            elapsed_ms=90_001,
+            events=[
+                {"chunk_type": "agent_event", "data": {"type": "tool_call_started", "tool_name": "web_search"}},
+                {"chunk_type": "agent_event", "data": {"type": "tool_call_started", "tool_name": "url_read"}},
+                {"chunk_type": "answering", "data": {"delta": "根据深读来源回答。"}},
+            ],
+        )
+
+        row = json.loads(baseline.to_jsonl(result).strip())
+
+        self.assertTrue(row["success"])
+        self.assertEqual(row["quality_flags"], ["slow_response"])
 
     def test_run_eval_calls_result_callback_after_each_item(self):
         scenario = baseline.select_scenarios(["basic_chat"])[0]
