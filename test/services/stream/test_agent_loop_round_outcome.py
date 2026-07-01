@@ -1,6 +1,8 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
-from app.schemas.chat import Usage
+from app.schemas.chat import SearchBlock, SearchSourceSummary, SourceReference, Usage
 from app.services.stream.agent_loop_outcome import AgentLoopExit
 from app.services.stream.agent_loop_policy import AgentLoopLimits
 from app.services.stream.agent_loop_round_outcome import AgentRoundOutcomeRequest, handle_agent_round_outcome
@@ -95,6 +97,59 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completed_steps, ["step-stop"])
         self.assertEqual(state.current_step_id, None)
         self.assertEqual([block.type for block in state.content_blocks], ["thinking", "text"])
+
+    async def test_stop_round_marks_final_answer_used_evidence_before_completion(self):
+        state = AgentLoopState()
+        state.mark_current_step("step-used")
+        step_context = _step_context("step-used")
+        state.content_blocks.append(
+            SearchBlock(
+                type="search",
+                id="blk-search",
+                query="OpenAI 产品更新",
+                sources=[
+                    SearchSourceSummary(title="官方公告", url="https://openai.com/news/product"),
+                    SearchSourceSummary(title="媒体报道", url="https://example.com/media"),
+                ],
+                source_refs=[
+                    SourceReference(kind="search", title="官方公告", url="https://openai.com/news/product"),
+                    SourceReference(kind="search", title="媒体报道", url="https://example.com/media"),
+                ],
+                source_count=2,
+            )
+        )
+        emitter = SimpleNamespace(evidence_item_upserted=AsyncMock())
+        calls = []
+
+        async def complete_step_fn(**kwargs):
+            calls.append(("complete", kwargs["context"].step_id))
+
+        outcome = await handle_agent_round_outcome(
+            request=AgentRoundOutcomeRequest(
+                db="db",
+                messages=[{"role": "user", "content": "hi"}],
+                state=state,
+                runtime=_runtime(emitter=emitter, complete_step_fn=complete_step_fn),
+                step_number=1,
+                step_context=step_context,
+                round_result=AgentRoundResult(
+                    reasoning_buf="",
+                    content_buf="最终回答使用官方公告。[1]",
+                    tool_calls=[],
+                    finish_reason="stop",
+                    accumulated_usage=Usage(input_tokens=1, output_tokens=2),
+                ),
+            )
+        )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        self.assertEqual(calls, [("complete", "step-used")])
+        emitter.evidence_item_upserted.assert_awaited_once()
+        event = emitter.evidence_item_upserted.await_args.kwargs
+        self.assertIsNone(event["tool_call_id"])
+        self.assertEqual(event["evidence"]["status"], "used")
+        self.assertTrue(event["evidence"]["used_by_final_answer"])
+        self.assertEqual(event["evidence"]["url"], "https://openai.com/news/product")
 
     async def test_cancelled_round_appends_partial_blocks_and_returns_superseded(self):
         state = AgentLoopState()

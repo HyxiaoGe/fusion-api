@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from app.services.final_answer_evidence import build_used_final_answer_evidence
 from app.services.stream.agent_loop_outcome import AgentLoopExit, AgentLoopOutcome
 from app.services.stream.agent_loop_runtime import AgentLoopRuntime
 from app.services.stream.agent_loop_state import AgentLoopState
@@ -57,6 +58,7 @@ def _append_round_blocks(request: AgentRoundOutcomeRequest) -> None:
 
 async def _complete_text_round(request: AgentRoundOutcomeRequest) -> None:
     _append_round_blocks(request)
+    await _emit_final_answer_used_evidence(request)
     await complete_text_response_step(
         context=request.step_context,
         emitter=request.runtime.emitter,
@@ -89,6 +91,21 @@ async def _handle_tool_calls_round(request: AgentRoundOutcomeRequest) -> None:
 async def _complete_unknown_round(request: AgentRoundOutcomeRequest) -> None:
     request.state.mark_unknown_terminated()
     await _complete_text_round(request)
+
+
+async def _emit_final_answer_used_evidence(request: AgentRoundOutcomeRequest) -> None:
+    emit = getattr(request.runtime.emitter, "evidence_item_upserted", None)
+    if emit is None:
+        return
+    try:
+        evidence_items = build_used_final_answer_evidence(
+            content_blocks=request.state.content_blocks,
+            answer_text=request.round_result.content_buf,
+        )
+        for evidence in evidence_items:
+            await emit(tool_call_id=None, evidence=evidence)
+    except Exception as exc:  # noqa: BLE001 — used 判定不能阻断主回答完成
+        request.runtime.warning_fn(f"发送最终回答 used evidence 失败: {exc}")
 
 
 def _sync_plan_items(request: AgentRoundOutcomeRequest) -> None:
