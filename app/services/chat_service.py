@@ -35,6 +35,7 @@ from app.services.conversation_service import ConversationService
 from app.services.file_service import is_image_mime
 from app.services.storage import get_storage
 from app.services.stream import StreamHandler, stream_redis_as_sse
+from app.services.stream.agent_loop_request_prep import inject_no_tool_network_boundary
 from app.services.stream.runner import _agent_loop_limits
 from app.services.stream_state_service import get_stream_meta, init_stream
 from app.services.task_manager import register_task
@@ -175,6 +176,7 @@ class ChatService:
                     file_contents = self.file_repo.get_parsed_file_content(non_image_ids)
                     if file_contents:
                         lm_messages = inject_file_content(lm_messages, message, file_contents)
+            lm_messages = inject_no_tool_network_boundary(lm_messages, call_kwargs={})
             return await self._handle_non_stream(
                 litellm_model,
                 model_id,

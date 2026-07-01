@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.ai.litellm_utils import merge_extra_body
-from app.ai.prompts.agent_loop import TOOL_USAGE_CONTRACT_PROMPT
+from app.ai.prompts.agent_loop import NO_TOOL_NETWORK_BOUNDARY_PROMPT, TOOL_USAGE_CONTRACT_PROMPT
 from app.ai.tools import build_web_search_tool
 from app.db.repositories import FileRepository
 from app.services.chat.message_builder import (
@@ -136,6 +136,7 @@ async def prepare_agent_loop_messages(
         initial_content_blocks = []
 
     messages = inject_tool_usage_contract(messages, call_config.call_kwargs)
+    messages = inject_no_tool_network_boundary(messages, call_config.call_kwargs)
     return AgentLoopPreparedMessages(
         messages=messages,
         initial_content_blocks=initial_content_blocks,
@@ -208,3 +209,18 @@ def inject_tool_usage_contract(messages: list[dict], call_kwargs: dict) -> list[
         insert_at += 1
     contract_msg = {"role": "system", "content": TOOL_USAGE_CONTRACT_PROMPT}
     return [*messages[:insert_at], contract_msg, *messages[insert_at:]]
+
+
+def inject_no_tool_network_boundary(messages: list[dict], call_kwargs: dict) -> list[dict]:
+    """无联网工具模式下补一条 system 边界，避免模型把内部知识包装成实时搜索。"""
+    network_tool_names = {"web_search", "url_read"}
+    if network_tool_names.intersection(announced_tool_names_from_call_kwargs(call_kwargs)):
+        return messages
+    if any(msg.get("role") == "system" and "【无联网工具边界规则】" in str(msg.get("content", "")) for msg in messages):
+        return messages
+
+    insert_at = 0
+    while insert_at < len(messages) and messages[insert_at].get("role") == "system":
+        insert_at += 1
+    boundary_msg = {"role": "system", "content": NO_TOOL_NETWORK_BOUNDARY_PROMPT}
+    return [*messages[:insert_at], boundary_msg, *messages[insert_at:]]

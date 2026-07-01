@@ -101,6 +101,68 @@ class ChatServiceTests(unittest.TestCase):
         self.assertIs(result, updated_message)
         service.db.commit.assert_called_once()
 
+    def test_process_message_non_stream_injects_no_tool_network_boundary(self):
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = None
+        service = ChatService(db)
+        service.file_repo = MagicMock()
+        service.conversation_service = MagicMock()
+        service._get_or_create_conversation = MagicMock(
+            return_value=(
+                Conversation(
+                    id="conv-1",
+                    user_id="user-1",
+                    title="OpenAI 最近发布了什么模型？",
+                    model_id="qwen-vl-max",
+                    messages=[],
+                    created_at=datetime.now(),
+                    updated_at=datetime.now(),
+                ),
+                True,
+            )
+        )
+        mock_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="基于已有知识回答。"))],
+            usage=None,
+        )
+
+        with (
+            patch(
+                "app.services.chat_service.llm_manager.resolve_model",
+                return_value=("openai/qwen-vl-max", "qwen", {}),
+            ),
+            patch(
+                "app.services.chat_service.litellm_catalog.get_capabilities",
+                return_value={"functionCalling": True, "agentTools": False},
+            ),
+            patch(
+                "app.services.chat_service.build_llm_messages",
+                new=AsyncMock(
+                    return_value=[
+                        {"role": "system", "content": "日期 system"},
+                        {"role": "user", "content": "OpenAI 最近发布了什么模型？"},
+                    ]
+                ),
+            ),
+            patch("app.services.chat_service.litellm") as mock_litellm,
+        ):
+            mock_litellm.acompletion = AsyncMock(return_value=mock_response)
+            asyncio.run(
+                service.process_message(
+                    model_id="qwen-vl-max",
+                    message="OpenAI 最近发布了什么模型？",
+                    user_id="user-1",
+                    stream=False,
+                )
+            )
+
+        sent_messages = mock_litellm.acompletion.await_args.kwargs["messages"]
+        self.assertEqual([message["role"] for message in sent_messages[:3]], ["system", "system", "user"])
+        self.assertIn("日期 system", sent_messages[0]["content"])
+        self.assertIn("【无联网工具边界规则】", sent_messages[1]["content"])
+        self.assertIn("无法实时核验", sent_messages[1]["content"])
+        self.assertEqual(sent_messages[2]["content"], "OpenAI 最近发布了什么模型？")
+
     def test_generate_suggested_questions_limits_output_to_three(self):
         service = object.__new__(ChatService)
         service.db = MagicMock()

@@ -55,6 +55,40 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("tools", config.call_kwargs)
         self.assertNotIn("tool_choice", config.call_kwargs)
 
+    async def test_prepare_messages_injects_no_tool_network_boundary_when_agent_tools_disabled(self):
+        async def build_llm_messages_fn(_raw_messages, _has_vision, _repo, _user_system_prompt):
+            return [
+                {"role": "system", "content": "日期 system"},
+                {"role": "user", "content": "OpenAI 最近发布了什么模型？"},
+            ]
+
+        prepared = await prepare_agent_loop_messages(
+            db=object(),
+            user_id="user-1",
+            raw_messages=["raw"],
+            has_vision=False,
+            file_ids=None,
+            original_message="OpenAI 最近发布了什么模型？",
+            call_config=build_agent_loop_call_config(
+                provider="qwen",
+                options={},
+                capabilities={"functionCalling": True, "agentTools": False},
+            ),
+            file_repo_factory=lambda _db: object(),
+            load_user_system_prompt_fn=lambda _db, _user_id: None,
+            build_llm_messages_fn=build_llm_messages_fn,
+        )
+
+        self.assertEqual([message["role"] for message in prepared.messages], ["system", "system", "user"])
+        self.assertIn("日期 system", prepared.messages[0]["content"])
+        self.assertIn("【无联网工具边界规则】", prepared.messages[1]["content"])
+        self.assertIn("不要声称已经搜索", prepared.messages[1]["content"])
+        self.assertIn("无法实时核验", prepared.messages[1]["content"])
+        self.assertIn("普通稳定问题直接回答", prepared.messages[1]["content"])
+        self.assertNotIn("切换模型", prepared.messages[1]["content"])
+        self.assertNotIn("【工具调用一致性规则】", prepared.messages[1]["content"])
+        self.assertEqual(prepared.messages[2]["content"], "OpenAI 最近发布了什么模型？")
+
     async def test_prepare_messages_builds_llm_input_files_url_context_and_tool_contract(self):
         file_repo = FakeFileRepository()
         build_calls = []
@@ -128,6 +162,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([message["role"] for message in prepared.messages], ["system", "system", "user", "user"])
         self.assertIn("日期 system", prepared.messages[0]["content"])
         self.assertIn("【工具调用一致性规则】", prepared.messages[1]["content"])
+        self.assertNotIn("【无联网工具边界规则】", prepared.messages[1]["content"])
         self.assertIn("<web_context>", prepared.messages[2]["content"])
         self.assertIn("文档正文", prepared.messages[3]["content"])
         self.assertEqual(call_config.announced_tools, ["web_search"])
@@ -145,6 +180,20 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(NETWORK_DECISION_PROMPT, TOOL_USAGE_CONTRACT_PROMPT)
         self.assertIn("必须调用 web_search", TOOL_USAGE_CONTRACT_PROMPT)
         self.assertIn("没有调用工具", TOOL_USAGE_CONTRACT_PROMPT)
+
+    def test_no_tool_network_boundary_uses_centralized_prompt(self):
+        from app.ai.prompts.agent_loop import NO_TOOL_NETWORK_BOUNDARY_PROMPT
+        from app.services.stream.agent_loop_request_prep import inject_no_tool_network_boundary
+
+        messages = [{"role": "user", "content": "OpenAI 最近公告"}]
+        prepared = inject_no_tool_network_boundary(messages, call_kwargs={})
+
+        self.assertEqual(prepared[0], {"role": "system", "content": NO_TOOL_NETWORK_BOUNDARY_PROMPT})
+        self.assertIn("没有联网搜索或网页读取工具", NO_TOOL_NETWORK_BOUNDARY_PROMPT)
+        self.assertIn("不要声称已经搜索", NO_TOOL_NETWORK_BOUNDARY_PROMPT)
+        self.assertIn("无法实时核验", NO_TOOL_NETWORK_BOUNDARY_PROMPT)
+        self.assertIn("普通稳定问题直接回答", NO_TOOL_NETWORK_BOUNDARY_PROMPT)
+        self.assertNotIn("切换模型", NO_TOOL_NETWORK_BOUNDARY_PROMPT)
 
     def test_tool_usage_contract_defines_autonomous_search_decision_matrix(self):
         from app.ai.prompts.agent_loop import TOOL_USAGE_CONTRACT_PROMPT
@@ -195,7 +244,9 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(prepared.initial_content_blocks, [])
         self.assertEqual(prepared.messages[0], {"role": "system", "content": "继续执行，不要重写前文"})
-        self.assertEqual(prepared.messages[1]["role"], "user")
+        self.assertEqual(prepared.messages[1]["role"], "system")
+        self.assertIn("【无联网工具边界规则】", prepared.messages[1]["content"])
+        self.assertEqual(prepared.messages[2]["role"], "user")
 
 
 if __name__ == "__main__":
