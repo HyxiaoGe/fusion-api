@@ -117,6 +117,9 @@ jobs:
       - name: Record deploy start time
         run: echo "DEPLOY_START=$(date +%s)" >> "$GITHUB_ENV"
 
+      - name: Checkout smoke scripts
+        uses: actions/checkout@v6
+
       - name: Login to ACR
         run: |
           # 登录失败时重试退避（境内 ACR 通常稳定，保留重试作防御）
@@ -236,6 +239,15 @@ jobs:
                   raise SystemExit(f"auth JWKS check failed: http={response.status} url={url}")
           print(f"auth JWKS ok: {url}")
           PY
+
+      - name: Run deployment smoke
+        run: |
+          # scripts/deployment_smoke.py checks /health and /api/models/.
+          if ! python3 scripts/deployment_smoke.py --base-url http://127.0.0.1:8002; then
+            echo "fusion-api deployment smoke failed"
+            docker logs --tail=120 fusion-api || true
+            exit 1
+          fi
 
       - name: Cleanup old images
         if: always()

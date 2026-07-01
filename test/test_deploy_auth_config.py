@@ -17,6 +17,11 @@ class DeployAuthConfigTests(unittest.TestCase):
         self.assertIn("RESOLVED_AUTH_SERVICE_JWKS_URL", self.workflow)
         self.assertIn("auth JWKS ok", self.workflow)
 
+    def test_deploy_runs_api_surface_smoke_after_health(self):
+        self.assertIn("Run deployment smoke", self.workflow)
+        self.assertIn("python3 scripts/deployment_smoke.py --base-url http://127.0.0.1:8002", self.workflow)
+        self.assertIn("/api/models/", self.workflow)
+
     def test_ci_runs_tests_with_process_timeout_and_verbose_output(self):
         self.assertIn(
             "timeout 270s python -u -m unittest discover -s test -t . -v",
