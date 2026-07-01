@@ -128,6 +128,73 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
             step_id=None,
         )
 
+    async def test_consume_stream_round_strips_reasoning_tags_from_answering_content(self):
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-1",
+            task_id="task-1",
+            should_use_reasoning=False,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+        )
+        append_chunk = AsyncMock()
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            outcome = await llm_stream_module.consume_stream_round(
+                async_response(
+                    [make_chunk(delta=SimpleNamespace(content="<think>内部思考</think>可见正文"), finish_reason="stop")]
+                ),
+                request,
+            )
+
+        self.assertEqual(outcome.content_buf, "可见正文")
+        append_chunk.assert_awaited_once_with(
+            "conv-1",
+            "answering",
+            "可见正文",
+            "blk-text",
+            run_id=None,
+            step_id=None,
+        )
+
+    async def test_consume_stream_round_strips_split_reasoning_tags_before_emitting(self):
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-1",
+            task_id="task-1",
+            should_use_reasoning=False,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+        )
+        append_chunk = AsyncMock()
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            outcome = await llm_stream_module.consume_stream_round(
+                async_response(
+                    [
+                        make_chunk(delta=SimpleNamespace(content="<thi"), finish_reason=None),
+                        make_chunk(delta=SimpleNamespace(content="nk>内部"), finish_reason=None),
+                        make_chunk(delta=SimpleNamespace(content="思考</thi"), finish_reason=None),
+                        make_chunk(delta=SimpleNamespace(content="nk>可见正文"), finish_reason="stop"),
+                    ]
+                ),
+                request,
+            )
+
+        self.assertEqual(outcome.content_buf, "可见正文")
+        append_chunk.assert_awaited_once_with(
+            "conv-1",
+            "answering",
+            "可见正文",
+            "blk-text",
+            run_id=None,
+            step_id=None,
+        )
+
     async def test_consume_stream_round_cancels_when_lock_owner_is_lost_after_interval(self):
         request = llm_stream_module.LLMStreamRequest(
             conversation_id="conv-1",

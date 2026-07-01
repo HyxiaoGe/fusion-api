@@ -6,6 +6,7 @@ spec §4.2。stream_round 把 litellm streaming response 消费成
 个 chunk 检查锁所有权（被踢则提前返回 finish_reason="cancelled"）。
 """
 
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -25,6 +26,9 @@ AGENT_LLM_MAX_RETRIES = 1
 # 可重试的错误关键字
 _LLM_RETRYABLE_KEYWORDS = ("429", "rate", "503", "502", "timeout")
 
+_OPEN_THINK_TAG_RE = re.compile(r"<think\b[^>]*>", re.IGNORECASE)
+_CLOSE_THINK_TAG_RE = re.compile(r"</think\s*>", re.IGNORECASE)
+
 
 @dataclass(frozen=True)
 class LLMStreamRequest:
@@ -41,6 +45,7 @@ class LLMStreamRequest:
 class LLMStreamState:
     reasoning_buf: str = ""
     content_buf: str = ""
+    raw_content_buf: str = ""
     usage_data: Optional[Usage] = None
     chunk_count: int = 0
     finish_reason: str = "stop"
@@ -107,6 +112,56 @@ def extract_content_delta(delta, reasoning_delta: str) -> str:
     if reasoning_delta and content_delta == reasoning_delta:
         return ""
     return content_delta
+
+
+def _pending_open_think_tag_start(text: str) -> int | None:
+    search_end = len(text)
+    while True:
+        index = text.rfind("<", 0, search_end)
+        if index < 0:
+            return None
+        tail = text[index:].lower()
+        if "<think".startswith(tail) or (tail.startswith("<think") and ">" not in tail):
+            return index
+        search_end = index
+
+
+def strip_reasoning_tag_blocks(text: str) -> str:
+    """移除被错误写入正文通道的 <think>...</think> 片段。"""
+    output: list[str] = []
+    cursor = 0
+    while cursor < len(text):
+        open_match = _OPEN_THINK_TAG_RE.search(text, cursor)
+        if not open_match:
+            remainder = text[cursor:]
+            pending_start = _pending_open_think_tag_start(remainder)
+            output.append(remainder if pending_start is None else remainder[:pending_start])
+            break
+
+        output.append(text[cursor : open_match.start()])
+        close_match = _CLOSE_THINK_TAG_RE.search(text, open_match.end())
+        if not close_match:
+            break
+        cursor = close_match.end()
+    return "".join(output)
+
+
+def filter_reasoning_tag_content_delta(state: LLMStreamState, content_delta: str) -> str:
+    """基于完整原始正文重算可见正文，避免跨 chunk 的 <think> 前缀先泄漏。"""
+    if not content_delta:
+        return ""
+    state.raw_content_buf += content_delta
+    visible_content = strip_reasoning_tag_blocks(state.raw_content_buf)
+    if visible_content.startswith(state.content_buf):
+        return visible_content[len(state.content_buf) :]
+
+    common_prefix_length = 0
+    for left, right in zip(visible_content, state.content_buf):
+        if left != right:
+            break
+        common_prefix_length += 1
+    logger.warning("answering 内容过滤出现非单调输出，已保留可追加部分")
+    return visible_content[common_prefix_length:]
 
 
 async def append_stream_delta(
@@ -180,6 +235,7 @@ async def process_stream_choice(*, request: LLMStreamRequest, state: LLMStreamSt
 
     reasoning_delta = extract_reasoning_delta(delta, request.should_use_reasoning)
     content_delta = extract_content_delta(delta, reasoning_delta)
+    content_delta = filter_reasoning_tag_content_delta(state, content_delta)
     await append_reasoning_and_content(
         request=request,
         state=state,
