@@ -105,6 +105,10 @@ def _missing_metadata_keys(metadata: Mapping[str, Any]) -> list[str]:
     return missing
 
 
+def _has_required_metadata(metadata: Mapping[str, Any]) -> bool:
+    return not _missing_metadata_keys(metadata)
+
+
 def build_allowlist_sync_plan(
     *,
     db_model_names: Sequence[str],
@@ -144,12 +148,37 @@ def audit_catalog(
     fusion_models: Sequence[Mapping[str, Any]],
     key_models: Sequence[str] | None,
 ) -> AuditReport:
-    db_models = extract_db_models(litellm_entries)
+    raw_db_models = extract_db_models(litellm_entries)
+    db_models_by_name: dict[str, dict[str, Any]] = {}
+    duplicate_names: set[str] = set()
+    for model in raw_db_models:
+        model_name = model["model_name"]
+        if model_name in db_models_by_name:
+            duplicate_names.add(model_name)
+            continue
+        db_models_by_name[model_name] = model
+    db_models = list(db_models_by_name.values())
     db_model_names = [model["model_name"] for model in db_models]
     db_model_set = set(db_model_names)
+    eligible_db_model_names = [
+        model["model_name"]
+        for model in db_models
+        if model["model_name"] not in DEPRECATED_MODELS and _has_required_metadata(model["metadata"])
+    ]
+    eligible_db_model_set = set(eligible_db_model_names)
     fusion_model_ids = extract_fusion_model_ids(fusion_models)
     fusion_model_set = set(fusion_model_ids)
     issues: list[CatalogIssue] = []
+
+    for model_name in sorted(duplicate_names):
+        issues.append(
+            CatalogIssue(
+                code="db_model_duplicate",
+                severity="warning",
+                model_name=model_name,
+                message=f"LiteLLM /model/info 中存在重复业务模型别名 {model_name}，巡检按唯一别名处理",
+            )
+        )
 
     for model_id in fusion_model_ids:
         if model_id not in db_model_set:
@@ -162,7 +191,7 @@ def audit_catalog(
                 )
             )
 
-    for model_name in db_model_names:
+    for model_name in eligible_db_model_names:
         if model_name not in fusion_model_set:
             issues.append(
                 CatalogIssue(
@@ -185,7 +214,7 @@ def audit_catalog(
                 )
             )
 
-    sync_plan = build_allowlist_sync_plan(db_model_names=db_model_names, key_models=key_models)
+    sync_plan = build_allowlist_sync_plan(db_model_names=eligible_db_model_names, key_models=key_models)
     if key_models is not None:
         for model_name in sync_plan.add:
             issues.append(
@@ -206,7 +235,7 @@ def audit_catalog(
                 )
             )
         for model_name in key_models:
-            if model_name not in db_model_set and model_name not in DEPRECATED_MODELS:
+            if model_name not in eligible_db_model_set and model_name not in DEPRECATED_MODELS:
                 issues.append(
                     CatalogIssue(
                         code="key_extra_model",

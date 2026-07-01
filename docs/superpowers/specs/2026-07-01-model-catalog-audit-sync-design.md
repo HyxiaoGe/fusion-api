@@ -24,6 +24,7 @@ v1 覆盖：
 - 对比业务模型与 virtual key allowlist，发现 key 缺失和 key 多余模型。
 - 识别 LiteLLM 中已知退役模型。
 - 识别缺关键 metadata 的业务模型：`provider_key`、`provider_display`、`capabilities`、`pricing`。
+- 识别重复的 `db_model=true` 别名，报告时按唯一别名处理。
 - 输出 JSON 巡检报告，字段稳定，方便后续纳入 CI、Cron 或监控。
 - 可选 `--apply` 仅同步 Fusion virtual key allowlist；模型注册/删除仍由现有治理脚本执行。
 
@@ -72,10 +73,12 @@ v1 不覆盖：
 
 v1 只同步 virtual key allowlist：
 
-- 目标集合：LiteLLM 中所有 `db_model=true` 的业务模型。
+- 目标集合：LiteLLM 中 `db_model=true` 且关键 metadata 完整的业务模型。
 - 保留集合：allowlist 中非 Fusion 业务模型但也不属于已知退役模型的条目，避免误删别的服务共享 key 的模型。
 - 删除集合：allowlist 中的已知退役模型。
-- 新增集合：`db_model=true` 但 allowlist 缺失的模型。
+- 新增集合：metadata 完整的业务模型中 allowlist 缺失的模型。
+
+metadata 不完整的 `db_model=true` 别名只报告 warning，不自动加入 Fusion key。真实环境中可能存在 `chat-default`、`chat-premium`、`audio-structuring` 这类工具或其他服务别名，v1 不能把它们误判成用户可选模型。
 
 `--dry-run` 默认只输出报告和计划；`--apply` 才调用 LiteLLM `/key/update`。
 
@@ -90,6 +93,8 @@ v1 只同步 virtual key allowlist：
 | AUDIT-05 | db_model 缺 provider/pricing/capabilities metadata | `metadata_missing` warning |
 | AUDIT-06 | dry-run 序列化 | 不输出 master key / virtual key 等秘密 |
 | AUDIT-07 | apply | 只调用 `/key/update`，不注册或删除模型 |
+| AUDIT-08 | LiteLLM 返回重复 db_model 别名 | `db_model_duplicate` warning，summary 按唯一别名计数 |
+| AUDIT-09 | metadata 不完整且 Fusion 未展示的 db_model | 只 warning，不加入 sync_plan add |
 
 ## 验收
 

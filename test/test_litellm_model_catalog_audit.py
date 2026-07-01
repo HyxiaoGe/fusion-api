@@ -75,6 +75,36 @@ class ModelCatalogAuditTests(unittest.TestCase):
         self.assertEqual(plan.add, ["mimo-v2.5-pro"])
         self.assertEqual(plan.allowlist_after, ["deepseek-chat", "mimo-v2.5-pro"])
 
+    def test_duplicate_db_model_entries_are_warned_and_counted_once(self):
+        report = audit.audit_catalog(
+            litellm_entries=[litellm_entry("deepseek-chat"), litellm_entry("deepseek-chat")],
+            fusion_models=[{"modelId": "deepseek-chat"}],
+            key_models=["deepseek-chat"],
+        )
+
+        self.assertEqual(report.summary["litellm_db_models"], 1)
+        issue = [issue for issue in report.issues if issue.code == "db_model_duplicate"][0]
+        self.assertEqual(issue.severity, "warning")
+        self.assertEqual(issue.model_name, "deepseek-chat")
+
+    def test_hidden_incomplete_db_model_is_warning_not_sync_target(self):
+        report = audit.audit_catalog(
+            litellm_entries=[
+                litellm_entry("deepseek-chat"),
+                litellm_entry(
+                    "chat-default",
+                    metadata={"provider_display": "Google"},
+                ),
+            ],
+            fusion_models=[{"modelId": "deepseek-chat"}],
+            key_models=["deepseek-chat"],
+        )
+
+        self.assertNotIn("chat-default", report.sync_plan.add)
+        self.assertFalse([issue for issue in report.issues if issue.code == "key_missing_db_model"])
+        metadata_issue = [issue for issue in report.issues if issue.code == "metadata_missing"][0]
+        self.assertEqual(metadata_issue.model_name, "chat-default")
+
     def test_deprecated_key_model_is_error_and_sync_removes_it(self):
         report = audit.audit_catalog(
             litellm_entries=[litellm_entry("mimo-v2.5-pro")],

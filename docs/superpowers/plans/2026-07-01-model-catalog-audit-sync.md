@@ -4,7 +4,7 @@
 
 **Goal:** 增加模型目录巡检/同步 v1，输出 LiteLLM、Fusion `/api/models/`、Fusion virtual key allowlist 的一致性报告，并支持显式 apply 同步 allowlist。
 
-**Architecture:** 新增独立脚本 `scripts/audit_litellm_model_catalog.py`，复用 LiteLLM 管理 API 和 Fusion 公开 `/api/models/`，把巡检规则、同步计划和 I/O 分开。v1 只允许同步 virtual key allowlist，不自动注册或删除模型，避免把 provider 官方模型变更误应用到生产。
+**Architecture:** 新增独立脚本 `scripts/audit_litellm_model_catalog.py`，复用 LiteLLM 管理 API 和 Fusion 公开 `/api/models/`，把巡检规则、同步计划和 I/O 分开。v1 只允许同步 virtual key allowlist，不自动注册或删除模型；同步目标限定为 `db_model=true` 且关键 metadata 完整的业务别名，避免把工具/其他服务别名误加入 Fusion key。
 
 **Tech Stack:** Python 3.11, httpx, unittest/pytest, LiteLLM Proxy 管理 API, Fusion `/api/models/`。
 
@@ -27,11 +27,13 @@
 - `--apply` 只能同步 virtual key allowlist，不能调用 `/model/new` 或 `/model/delete`。
 - 报告包含 `summary`、`issues`、`sync_plan`。
 - 报告不能输出 master key、virtual key、provider API key。
-- `db_model=true` 是 Fusion 业务模型的唯一来源。
+- `db_model=true` 是 Fusion 业务模型的候选来源，但只有 metadata 完整的别名才进入自动同步目标。
+- 重复 `db_model=true` 别名必须报警，summary 按唯一别名统计。
 - Fusion `/api/models/` 展示模型必须是 LiteLLM 业务模型子集。
-- virtual key allowlist 缺少业务模型时给 `error`，同步计划加入 `add`。
+- virtual key allowlist 缺少 metadata 完整的业务模型时给 `error`，同步计划加入 `add`。
 - virtual key allowlist 含已知退役模型时给 `error`，同步计划加入 `remove`。
 - 业务模型缺 `provider_key`、`provider_display`、`capabilities` 或 `pricing` 时给 `warning`。
+- metadata 不完整且 Fusion 未展示的业务别名只给 `warning`，不加入 `sync_plan.add`。
 
 ## Test Matrix
 
@@ -44,6 +46,8 @@
 | AUDIT-05 | `test_missing_metadata_is_warning` |
 | AUDIT-06 | `test_serialize_report_does_not_include_secrets` |
 | AUDIT-07 | `test_apply_sync_only_updates_key_models` |
+| AUDIT-08 | `test_duplicate_db_model_entries_are_warned_and_counted_once` |
+| AUDIT-09 | `test_hidden_incomplete_db_model_is_warning_not_sync_target` |
 
 ## Tasks
 
