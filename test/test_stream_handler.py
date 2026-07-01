@@ -411,6 +411,8 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("微信A2A互通怎么用？", contract)
         self.assertIn("你好，你是谁？", contract)
         self.assertIn("不应调用 web_search", contract)
+        self.assertIn("稳定背景、历史原因", contract)
+        self.assertIn("iPhone 从 Lightning 换成 USB-C 的核心原因", contract)
         self.assertIn("必须调用 web_search", contract)
         self.assertIn("不要在思考过程或最终回答中声称", contract)
         self.assertIn("没有调用工具", contract)

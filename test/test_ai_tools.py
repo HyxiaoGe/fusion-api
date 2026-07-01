@@ -54,6 +54,16 @@ class AiToolSchemaTests(unittest.TestCase):
         self.assertIn("纯闲聊", description)
         self.assertIn("1+1", description)
 
+    def test_web_search_tool_description_keeps_stable_product_facts_offline(self):
+        from app.ai.tools import build_web_search_tool
+
+        tool = build_web_search_tool()
+        description = tool["function"]["description"]
+
+        self.assertIn("稳定背景", description)
+        self.assertIn("历史原因", description)
+        self.assertIn("iPhone 从 Lightning 换成 USB-C 的核心原因", description)
+
     def test_url_read_schema_exposes_optional_reason(self):
         from app.ai.tools import URL_READ_TOOL
 
