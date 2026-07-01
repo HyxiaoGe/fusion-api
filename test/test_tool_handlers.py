@@ -302,6 +302,44 @@ class WebSearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("官方来源、权威媒体、地区、时间范围", context)
         self.assertNotIn("搜索未取得可用结果", context)
 
+    def test_format_llm_context_plan_limited_reuses_existing_results(self):
+        result = ToolResult(
+            status="degraded",
+            data={
+                "sources": [],
+                "query": "OpenAI GPT-5.6 Sol 预览 2026年6月",
+                "search_plan_limited": True,
+            },
+        )
+
+        context = self.handler.format_llm_context(result)
+
+        self.assertIn("搜索计划已收敛", context)
+        self.assertIn("不要继续发起同类搜索", context)
+        self.assertIn("优先读取已经推荐的高价值来源", context)
+        self.assertNotIn("搜索未取得可用结果", context)
+
+    def test_build_content_block_skips_internal_search_control_results(self):
+        duplicate_result = ToolResult(
+            status="degraded",
+            data={
+                "query": "OpenAI 最新公告 2026年6月 新闻",
+                "sources": [],
+                "duplicate_search_skipped": True,
+            },
+        )
+        limited_result = ToolResult(
+            status="degraded",
+            data={
+                "query": "OpenAI GPT-5.6 Sol 预览 2026年6月",
+                "sources": [],
+                "search_plan_limited": True,
+            },
+        )
+
+        self.assertIsNone(self.handler.build_content_block(duplicate_result, "blk_dup", "log_dup"))
+        self.assertIsNone(self.handler.build_content_block(limited_result, "blk_limited", "log_limited"))
+
     def test_build_content_block(self):
         """构造 SearchBlock"""
         from app.schemas.chat import SearchSource

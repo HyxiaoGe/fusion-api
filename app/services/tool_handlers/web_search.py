@@ -149,7 +149,10 @@ class WebSearchHandler(BaseToolHandler):
                 },
             )
 
-    def build_content_block(self, result: ToolResult, block_id: str, log_id: str) -> SearchBlock:
+    def build_content_block(self, result: ToolResult, block_id: str, log_id: str) -> SearchBlock | None:
+        if result.data.get("duplicate_search_skipped") or result.data.get("search_plan_limited"):
+            return None
+
         sources: List[SearchSource] = result.data.get("sources", [])
         source_refs = [
             SourceReference(
@@ -196,6 +199,14 @@ class WebSearchHandler(BaseToolHandler):
         )
 
     def format_llm_context(self, result: ToolResult) -> str:
+        if result.data.get("search_plan_limited"):
+            query = result.data.get("query", "")
+            return (
+                f"本次搜索「{query}」没有执行：搜索计划已收敛，继续搜索会增加重复候选。"
+                "请不要继续发起同类搜索；优先读取已经推荐的高价值来源，"
+                "或基于前面搜索结果整理回答。"
+            )
+
         if result.data.get("duplicate_search_skipped"):
             query = result.data.get("query", "")
             return (
@@ -248,16 +259,29 @@ class WebSearchHandler(BaseToolHandler):
 
         emitter.tool_call_completed 内部还会经 cap_and_truncate(1024) 兜底。
         """
+        data = result.data or {}
+        if data.get("search_plan_limited"):
+            return {
+                "kind": "search",
+                "title": "搜索计划已收敛",
+                "truncated": False,
+            }
+        if data.get("duplicate_search_skipped"):
+            return {
+                "kind": "search",
+                "title": "重复搜索已跳过",
+                "truncated": False,
+            }
         if result.status != "success":
             return {"kind": "search", "truncated": False}
-        sources = (result.data or {}).get("sources") or []
+        sources = data.get("sources") or []
         first = sources[0] if sources else None
         return {
             "kind": "search",
             "title": getattr(first, "title", "") if first else "",
             "count": len(sources),
             "favicon": getattr(first, "favicon", None) if first else None,
-            "result_provider": result.data.get("result_provider"),
+            "result_provider": data.get("result_provider"),
             "truncated": False,
         }
 

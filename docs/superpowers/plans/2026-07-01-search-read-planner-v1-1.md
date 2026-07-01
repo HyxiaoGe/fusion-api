@@ -26,6 +26,8 @@
 | SRP-10 | official / comparison / deep research 搜索 | 最多推荐 3 个深读来源 |
 | SRP-11 | url_read 失败或降级 | evidence 记录读取状态，但 LLM 上下文和用户展示不泄漏 `reader-service` / `url_read` |
 | SRP-12 | 刷新已完成对话 | 搜索关键词、回答依据、执行过程摘要保持一致，无 running 残留 |
+| SRP-13 | 普通实时问题被模型机械扩成 3+ 次搜索 | 后端默认最多执行 2 次真实搜索；第三次返回 `search_plan_limited`，不消耗 provider，不进入回答依据 |
+| SRP-14 | deep_research 深度研究 | 最多执行 3 次真实搜索；第四次返回 `search_plan_limited` |
 
 ## File Map
 
@@ -131,3 +133,16 @@
   - SRP-05/SRP-07 multi-search/read-selection case.
   - Refresh completed conversation and check no running residue.
   - Record URL, expected, actual, console errors, refresh result.
+
+## Task 6: Post-Deploy Regression Tightening
+
+- [x] Add failing tests:
+  - normal realtime/product-update questions execute at most 2 provider searches.
+  - `deep_research` may execute the 3rd provider search, but the 4th is plan-limited.
+  - plan-limited search does not create answer-evidence content blocks.
+  - plan-limited search gives the LLM a reuse-existing-results instruction, not a generic search failure.
+- [x] Implement:
+  - `NetworkToolBudget` returns degraded `ToolResult` with `search_plan_limited=True`, `requested_count=0`, `context_source_limit=0`.
+  - `WebSearchHandler` hides duplicate/plan-limited control results from persisted answer-evidence blocks.
+  - Tool description states the third search is only for `deep_research`.
+- [ ] Verify targeted tests, full backend tests, CI/CD, and real Chrome regression again.

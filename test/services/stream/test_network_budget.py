@@ -101,6 +101,48 @@ class NetworkToolBudgetTests(unittest.TestCase):
         self.assertEqual(media_args["count"], 8)
         self.assertEqual(media_args["context_source_limit"], 6)
 
+    def test_third_non_deep_search_returns_plan_limited_without_provider_call(self):
+        budget = NetworkToolBudget()
+
+        first_args, first_degraded = budget.prepare_web_search_args({"query": "OpenAI 2026年产品更新 最新发布"})
+        second_args, second_degraded = budget.prepare_web_search_args({"query": "OpenAI 2026年最新新闻 媒体报道"})
+        third_args, third_degraded = budget.prepare_web_search_args({"query": "OpenAI GPT-5.6 Sol 预览 2026年6月"})
+
+        self.assertIsNone(first_degraded)
+        self.assertIsNone(second_degraded)
+        self.assertEqual(first_args["search_budget"], "official_source")
+        self.assertEqual(second_args["search_budget"], "comparison")
+        self.assertIsNotNone(third_degraded)
+        self.assertEqual(third_degraded.status, "degraded")
+        self.assertTrue(third_degraded.data["search_plan_limited"])
+        self.assertFalse(third_degraded.data["budget_limited"])
+        self.assertEqual(third_args["search_budget"], "planner_limited")
+        self.assertEqual(third_args["count"], 0)
+        self.assertEqual(third_args["context_source_limit"], 0)
+        self.assertEqual(budget.web_search_calls, 2)
+        self.assertEqual(
+            budget.web_search_queries,
+            ["OpenAI 2026年产品更新 最新发布", "OpenAI 2026年最新新闻 媒体报道"],
+        )
+
+    def test_deep_research_allows_third_effective_search(self):
+        budget = NetworkToolBudget()
+
+        first_args, first_degraded = budget.prepare_web_search_args({"query": "OpenAI 2026年 深入调研 技术报告"})
+        second_args, second_degraded = budget.prepare_web_search_args({"query": "OpenAI 2026年 官方公告"})
+        third_args, third_degraded = budget.prepare_web_search_args({"query": "OpenAI 2026年 权威媒体报道"})
+        fourth_args, fourth_degraded = budget.prepare_web_search_args({"query": "OpenAI GPT-5.6 Sol 预览 2026年6月"})
+
+        self.assertIsNone(first_degraded)
+        self.assertIsNone(second_degraded)
+        self.assertIsNone(third_degraded)
+        self.assertEqual(first_args["search_budget"], "deep_research")
+        self.assertEqual(third_args["search_budget"], "comparison")
+        self.assertIsNotNone(fourth_degraded)
+        self.assertTrue(fourth_degraded.data["search_plan_limited"])
+        self.assertEqual(fourth_args["search_budget"], "planner_limited")
+        self.assertEqual(budget.web_search_calls, 3)
+
     def test_web_search_ignores_model_supplied_count(self):
         budget = NetworkToolBudget()
 
@@ -186,12 +228,8 @@ class NetworkToolBudgetTests(unittest.TestCase):
         self.assertEqual(low_args["recency_days"], 1)
         self.assertEqual(high_args["recency_days"], 365)
 
-    def test_fifth_web_search_returns_degraded_without_consuming_handler(self):
-        budget = NetworkToolBudget()
-
-        for i in range(4):
-            _args, degraded = budget.prepare_web_search_args({"query": f"q{i}"})
-            self.assertIsNone(degraded)
+    def test_web_search_hard_cap_returns_degraded_without_consuming_handler(self):
+        budget = NetworkToolBudget(web_search_calls=4)
 
         args, degraded = budget.prepare_web_search_args({"query": "q4", "count": 8})
 

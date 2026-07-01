@@ -126,3 +126,32 @@ def test_duplicate_skipped_search_does_not_create_evidence_items():
     evidence = build_evidence_items(record)
 
     assert evidence == []
+
+
+def test_plan_limited_search_does_not_create_evidence_items_or_generic_title():
+    record = SimpleNamespace(
+        tool_call={"id": "call-5", "name": "web_search"},
+        tool_name="web_search",
+        result=SimpleNamespace(
+            status="degraded",
+            data={
+                "query": "OpenAI GPT-5.6 Sol 预览 2026年6月",
+                "sources": [],
+                "search_plan_limited": True,
+            },
+            error_message="搜索计划已收敛",
+        ),
+        handler=SimpleNamespace(
+            _build_result_summary=lambda result: {
+                "kind": "search",
+                "title": "搜索计划已收敛",
+                "truncated": False,
+            }
+        ),
+    )
+
+    digest = build_tool_result_digest(record)
+
+    assert digest["source_refs"] == []
+    assert digest["title"] == "搜索计划已收敛"
+    assert digest["summary"] == "搜索计划已收敛"

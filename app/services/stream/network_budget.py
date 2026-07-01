@@ -9,10 +9,13 @@ from app.services.search_budget import derive_search_budget, is_duplicate_search
 from app.services.tool_handlers.base import ToolResult
 
 MAX_SEARCH_CALLS = 4
+DEFAULT_PLANNED_SEARCH_CALLS = 2
+DEEP_RESEARCH_PLANNED_SEARCH_CALLS = 3
 MAX_URL_READ_CALLS = 5
 MAX_DOMAINS = 5
 MIN_RECENCY_DAYS = 1
 MAX_RECENCY_DAYS = 365
+DEEP_RESEARCH_INTENT = "deep_research"
 
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 
@@ -112,6 +115,33 @@ class NetworkToolBudget:
                 },
             )
 
+        planned_search_limit = _planned_search_call_limit(intent, self.web_search_intents)
+        if self.web_search_calls >= planned_search_limit:
+            normalized["count"] = 0
+            normalized["context_source_limit"] = 0
+            normalized["search_budget"] = "planner_limited"
+            return normalized, ToolResult(
+                status="degraded",
+                error_message="搜索计划已收敛",
+                data={
+                    "query": normalized.get("query", ""),
+                    "sources": [],
+                    "result_count": 0,
+                    "requested_count": 0,
+                    "actual_count": 0,
+                    "context_source_count": 0,
+                    "context_source_limit": 0,
+                    "search_budget": "planner_limited",
+                    "intent": normalized.get("intent"),
+                    "domains": normalized.get("domains", []),
+                    "recency_days": normalized.get("recency_days"),
+                    "budget_limited": False,
+                    "search_plan_limited": True,
+                    "planned_search_limit": planned_search_limit,
+                    "executed_search_count": self.web_search_calls,
+                },
+            )
+
         self.web_search_calls += 1
         self.web_search_queries.append(query)
         self.web_search_intents.append(intent)
@@ -172,3 +202,11 @@ def _extract_domain(value: str) -> str | None:
     if _DOMAIN_RE.match(raw):
         return raw
     return None
+
+
+def _planned_search_call_limit(intent: str | None, previous_intents: list[str | None]) -> int:
+    """控制真实 provider 搜索轮次，避免 LLM 机械扩写 query。"""
+
+    if intent == DEEP_RESEARCH_INTENT or DEEP_RESEARCH_INTENT in previous_intents:
+        return DEEP_RESEARCH_PLANNED_SEARCH_CALLS
+    return DEFAULT_PLANNED_SEARCH_CALLS

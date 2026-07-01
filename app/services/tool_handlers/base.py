@@ -88,7 +88,7 @@ class BaseToolHandler(ABC):
         """执行工具核心逻辑"""
 
     @abstractmethod
-    def build_content_block(self, result: ToolResult, block_id: str, log_id: str) -> ContentBlock:
+    def build_content_block(self, result: ToolResult, block_id: str, log_id: str) -> ContentBlock | None:
         """构造落库用的 content block"""
 
     @abstractmethod
