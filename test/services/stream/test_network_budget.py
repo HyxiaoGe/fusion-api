@@ -25,6 +25,44 @@ class NetworkToolBudgetTests(unittest.TestCase):
         self.assertEqual(args["context_source_limit"], 4)
         self.assertEqual(args["search_budget"], "official_source")
 
+    def test_chinese_year_query_infers_freshness_intent(self):
+        budget = NetworkToolBudget()
+
+        args, degraded = budget.prepare_web_search_args({"query": "SpaceX 估值 上市 2026年"})
+
+        self.assertIsNone(degraded)
+        self.assertEqual(args["intent"], "freshness")
+        self.assertEqual(args["count"], 5)
+        self.assertEqual(args["search_budget"], "freshness")
+
+    def test_second_similar_chinese_year_query_uses_followup_budget(self):
+        budget = NetworkToolBudget()
+
+        first_args, first_degraded = budget.prepare_web_search_args({"query": "SpaceX 估值 上市 2026年"})
+        second_args, second_degraded = budget.prepare_web_search_args({"query": "SpaceX IPO 估值 2026 最新"})
+
+        self.assertIsNone(first_degraded)
+        self.assertIsNone(second_degraded)
+        self.assertEqual(first_args["search_budget"], "freshness")
+        self.assertEqual(second_args["search_budget"], "freshness_followup")
+        self.assertEqual(second_args["count"], 3)
+        self.assertEqual(second_args["context_source_limit"], 3)
+
+    def test_duplicate_web_search_returns_degraded_without_consuming_provider_budget(self):
+        budget = NetworkToolBudget()
+
+        first_args, first_degraded = budget.prepare_web_search_args({"query": "OpenAI 最新公告 2026年6月 新闻"})
+        second_args, second_degraded = budget.prepare_web_search_args({"query": "OpenAI 最新公告 2026年6月 新闻"})
+
+        self.assertIsNone(first_degraded)
+        self.assertEqual(first_args["search_budget"], "official_source")
+        self.assertIsNotNone(second_degraded)
+        self.assertEqual(second_degraded.status, "degraded")
+        self.assertTrue(second_degraded.data["duplicate_search_skipped"])
+        self.assertEqual(second_args["search_budget"], "duplicate_skipped")
+        self.assertEqual(second_args["count"], 0)
+        self.assertEqual(budget.web_search_calls, 1)
+
     def test_web_search_narrows_similar_followup_query(self):
         budget = NetworkToolBudget()
 

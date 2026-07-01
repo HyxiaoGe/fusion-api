@@ -40,7 +40,7 @@ SUPPORTED_SEARCH_INTENTS = set(SEARCH_BUDGETS_BY_INTENT)
 
 _LATIN_TOKEN_RE = re.compile(r"[a-z0-9]+")
 _CJK_SEQUENCE_RE = re.compile(r"[\u4e00-\u9fff]+")
-_CURRENT_YEAR_RE = re.compile(r"\b20\d{2}\b")
+_CURRENT_YEAR_RE = re.compile(r"(?<!\d)20\d{2}(?!\d)")
 
 _COMPARISON_KEYWORDS = (
     "权威媒体",
@@ -116,6 +116,7 @@ _QUICK_FACT_KEYWORDS = (
 )
 
 _SIMILAR_FOLLOWUP_THRESHOLD = 0.55
+_DUPLICATE_SEARCH_THRESHOLD = 0.82
 
 
 def normalize_search_intent(value) -> str | None:
@@ -170,6 +171,36 @@ def derive_search_budget(
     ):
         return FOLLOWUP_SEARCH_BUDGETS_BY_NAME.get(base_budget.name, base_budget)
     return base_budget
+
+
+def is_duplicate_search_query(
+    query: str,
+    intent: str | None,
+    *,
+    previous_queries: Sequence[str],
+    previous_intents: Sequence[str | None],
+) -> bool:
+    """判断本次搜索是否与已执行搜索重复到应跳过真实 provider 调用。"""
+
+    normalized_query = _normalize_query_text(query)
+    if not normalized_query or not previous_queries:
+        return False
+
+    padded_intents: list[str | None] = list(previous_intents)
+    if len(padded_intents) < len(previous_queries):
+        padded_intents.extend([None] * (len(previous_queries) - len(padded_intents)))
+
+    for previous_query, previous_intent in zip(previous_queries, padded_intents):
+        normalized_previous = _normalize_query_text(previous_query)
+        if not normalized_previous:
+            continue
+        if normalized_query == normalized_previous:
+            return True
+        if previous_intent != intent:
+            continue
+        if _query_similarity(query, previous_query) >= _DUPLICATE_SEARCH_THRESHOLD:
+            return True
+    return False
 
 
 def _is_similar_followup_query(

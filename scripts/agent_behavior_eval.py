@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
+import unicodedata
 from pathlib import Path
 from typing import TextIO
 
@@ -21,6 +23,7 @@ VALID_TOOL_POLICIES = {"no_search", "search"}
 VALID_SURFACES = {"direct_answer", "evidence"}
 SEARCH_SURFACES = {"execution_process", "answer_evidence"}
 OPTIONAL_BOOL_FIELDS = {"requires_search_keywords", "requires_console_clean"}
+OPTIONAL_NON_NEGATIVE_INT_FIELDS = {"max_duplicate_search_keywords", "max_recommended_reads"}
 
 
 def load_samples(path: Path = DEFAULT_SAMPLE_PATH) -> list[dict]:
@@ -61,6 +64,10 @@ def load_samples(path: Path = DEFAULT_SAMPLE_PATH) -> list[dict]:
         for field in OPTIONAL_BOOL_FIELDS:
             if field in item and not isinstance(item[field], bool):
                 raise ValueError(f"{field} 必须是布尔值: id={sample_id}")
+
+        for field in OPTIONAL_NON_NEGATIVE_INT_FIELDS:
+            if field in item and not _is_non_negative_int(item[field]):
+                raise ValueError(f"{field} 必须是非负整数: id={sample_id}")
 
         samples.append(item)
 
@@ -143,6 +150,23 @@ def _check_search_context(sample: dict, observation: dict, issues: list[str]) ->
         if source_count < min_sources:
             issues.append(f"来源数量不足: actual={source_count} min={min_sources}")
 
+    max_duplicate_keywords = sample.get("max_duplicate_search_keywords")
+    if _is_non_negative_int(max_duplicate_keywords):
+        duplicate_count = _duplicate_keyword_count(observation.get("search_keywords", []))
+        if duplicate_count > max_duplicate_keywords:
+            issues.append(
+                f"搜索关键词重复次数过多: duplicate_count={duplicate_count} max={max_duplicate_keywords}"
+            )
+
+    max_recommended_reads = sample.get("max_recommended_reads")
+    recommended_read_count = observation.get("recommended_read_count", 0)
+    if (
+        _is_non_negative_int(max_recommended_reads)
+        and _is_non_negative_int(recommended_read_count)
+        and recommended_read_count > max_recommended_reads
+    ):
+        issues.append(f"推荐深读数量过多: actual={recommended_read_count} max={max_recommended_reads}")
+
 
 def _check_forbidden_terms(sample: dict, observation: dict, output_text: str, issues: list[str]) -> None:
     answer_text = str(observation.get("answer_text", ""))
@@ -173,6 +197,29 @@ def _string_list(value) -> list[str]:
 
 def _string_set(value) -> set[str]:
     return set(_string_list(value))
+
+
+def _is_non_negative_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _duplicate_keyword_count(value) -> int:
+    seen: set[str] = set()
+    duplicate_count = 0
+    for keyword in _string_list(value):
+        normalized = _normalize_search_keyword(keyword)
+        if not normalized:
+            continue
+        if normalized in seen:
+            duplicate_count += 1
+        else:
+            seen.add(normalized)
+    return duplicate_count
+
+
+def _normalize_search_keyword(keyword: str) -> str:
+    normalized = unicodedata.normalize("NFKC", keyword).casefold().strip()
+    return re.sub(r"\s+", " ", normalized)
 
 
 def main(argv: list[str] | None = None) -> int:

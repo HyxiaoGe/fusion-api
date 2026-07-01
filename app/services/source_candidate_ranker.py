@@ -81,6 +81,8 @@ class SearchResultForRanking:
     tool_call_id: str
     query: str
     sources: list[SearchSource | dict]
+    intent: str | None = None
+    search_budget: str | None = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +107,8 @@ class SourceSelectionPlan:
     candidates: tuple[RankedSourceCandidate, ...]
     recommended: tuple[RankedSourceCandidate, ...]
     low_priority: tuple[RankedSourceCandidate, ...]
+    recommended_read_limit: int = 3
+    not_recommended_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -146,7 +150,8 @@ def rank_search_sources(
         )
         for index, draft in enumerate(sorted(deduped, key=_sort_candidate), 1)
     )
-    recommended = tuple(candidate for candidate in ranked if candidate.priority != "low")[: max(0, max_recommended)]
+    recommended_limit = max(0, max_recommended)
+    recommended = tuple(candidate for candidate in ranked if candidate.priority != "low")[:recommended_limit]
     low_priority = tuple(candidate for candidate in ranked if candidate.priority == "low")
     return SourceSelectionPlan(
         total_source_count=total_source_count,
@@ -155,6 +160,8 @@ def rank_search_sources(
         candidates=ranked,
         recommended=recommended,
         low_priority=low_priority,
+        recommended_read_limit=recommended_limit,
+        not_recommended_count=max(0, len(ranked) - len(recommended)),
     )
 
 
@@ -174,6 +181,11 @@ def format_source_selection_guidance(plan: SourceSelectionPlan) -> str:
         parts.append("搜索关键词：")
         parts.extend(f"{index}. {query}" for index, query in enumerate(plan.search_queries, 1))
 
+    parts.append(
+        f"建议深读最多 {plan.recommended_read_limit} 个来源；"
+        "优先覆盖官方原文、技术报告、权威媒体或与问题高度相关的来源。"
+    )
+
     if plan.recommended:
         parts.append("建议优先深读：")
         for candidate in plan.recommended:
@@ -183,6 +195,12 @@ def format_source_selection_guidance(plan: SourceSelectionPlan) -> str:
         parts.append("低优先级候选：")
         for candidate in plan.low_priority[:MAX_LOW_PRIORITY_EXAMPLES]:
             parts.append(_format_candidate_line(candidate))
+
+    if plan.not_recommended_count:
+        parts.append(
+            f"未建议深读：剩余 {plan.not_recommended_count} 条候选优先级低于已推荐来源，"
+            "或仅作为搜索摘要候选保留。"
+        )
 
     parts.append(
         "执行规则：如果搜索摘要不足以回答，应优先对“建议优先深读”的少量来源调用 url_read；"

@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from app.services.search_budget import derive_search_budget, resolve_search_intent
+from app.services.search_budget import derive_search_budget, is_duplicate_search_query, resolve_search_intent
 from app.services.tool_handlers.base import ToolResult
 
 MAX_SEARCH_CALLS = 4
@@ -36,6 +36,41 @@ class NetworkToolBudget:
         else:
             normalized.pop("intent", None)
 
+        domains = _normalize_domains(normalized.get("domains"))
+        if domains:
+            normalized["domains"] = domains
+        else:
+            normalized.pop("domains", None)
+
+        if not domains and is_duplicate_search_query(
+            query,
+            intent,
+            previous_queries=self.web_search_queries,
+            previous_intents=self.web_search_intents,
+        ):
+            normalized["count"] = 0
+            normalized["context_source_limit"] = 0
+            normalized["search_budget"] = "duplicate_skipped"
+            return normalized, ToolResult(
+                status="degraded",
+                error_message="重复搜索已跳过",
+                data={
+                    "query": query,
+                    "sources": [],
+                    "result_count": 0,
+                    "requested_count": 0,
+                    "actual_count": 0,
+                    "context_source_count": 0,
+                    "context_source_limit": 0,
+                    "search_budget": "duplicate_skipped",
+                    "intent": intent,
+                    "domains": domains,
+                    "recency_days": normalized.get("recency_days"),
+                    "budget_limited": False,
+                    "duplicate_search_skipped": True,
+                },
+            )
+
         search_budget = derive_search_budget(
             intent,
             query=query,
@@ -45,12 +80,6 @@ class NetworkToolBudget:
         normalized["count"] = search_budget.requested_count
         normalized["context_source_limit"] = search_budget.context_source_limit
         normalized["search_budget"] = search_budget.name
-
-        domains = _normalize_domains(normalized.get("domains"))
-        if domains:
-            normalized["domains"] = domains
-        else:
-            normalized.pop("domains", None)
 
         if normalized.get("recency_days") is not None:
             normalized["recency_days"] = _clamp_int(

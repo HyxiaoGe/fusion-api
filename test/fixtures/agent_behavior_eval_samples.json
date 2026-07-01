@@ -65,5 +65,17 @@
     "requires_console_clean": true,
     "forbidden_answer_terms": ["Claude", "Anthropic", "ChatGPT", "OpenAI", "Gemini", "Google", "DeepSeek"],
     "forbidden_internal_terms": ["url_read", "reader-service", "web_search"]
+  },
+  {
+    "id": "search-read-planner-dedup-and-read-limit",
+    "category": "search_read_planner",
+    "question": "OpenAI 最近发布了哪些产品更新？",
+    "expected_tool_policy": "search",
+    "expected_surface": "evidence",
+    "requires_search_keywords": true,
+    "min_sources": 3,
+    "max_duplicate_search_keywords": 0,
+    "max_recommended_reads": 3,
+    "forbidden_internal_terms": ["url_read", "reader-service"]
   }
 ]

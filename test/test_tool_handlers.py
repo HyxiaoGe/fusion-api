@@ -284,6 +284,24 @@ class WebSearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("请基于你的知识回答", context)
         self.assertNotIn("web_search", context)
 
+    def test_format_llm_context_duplicate_search_skipped_reuses_previous_results(self):
+        result = ToolResult(
+            status="degraded",
+            data={
+                "sources": [],
+                "query": "OpenAI 最新公告 2026年6月 新闻",
+                "duplicate_search_skipped": True,
+            },
+        )
+
+        context = self.handler.format_llm_context(result)
+
+        self.assertIn("高度重复", context)
+        self.assertIn("已跳过真实搜索请求", context)
+        self.assertIn("前面已经返回的搜索结果", context)
+        self.assertIn("官方来源、权威媒体、地区、时间范围", context)
+        self.assertNotIn("搜索未取得可用结果", context)
+
     def test_build_content_block(self):
         """构造 SearchBlock"""
         from app.schemas.chat import SearchSource

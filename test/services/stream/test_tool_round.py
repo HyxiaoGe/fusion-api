@@ -429,6 +429,8 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
                 status="success",
                 data={
                     "query": "OpenAI GPT-5.6 Sol 发布 2026年6月 新闻",
+                    "intent": "freshness",
+                    "search_budget": "freshness",
                     "sources": [
                         SearchSource(
                             title="Previewing GPT-5.6 Sol: a next-generation model | OpenAI",
@@ -453,6 +455,8 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
                 status="success",
                 data={
                     "query": "OpenAI GPT-5.6 Sol 2026年6月 官方公告",
+                    "intent": "official_source",
+                    "search_budget": "official_source",
                     "sources": [
                         SearchSource(
                             title="OpenAI releases powerful new GPT-5.6 model - Axios",
@@ -509,15 +513,16 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(messages[1]["role"], "assistant")
         self.assertEqual(messages[2]["tool_call_id"], "tc-search-1")
-        self.assertIn("第一个搜索上下文", messages[2]["content"])
-        self.assertIn("结构化来源选择建议", messages[2]["content"])
-        self.assertIn("Previewing GPT-5.6 Sol", messages[2]["content"])
-        self.assertIn("GPT-5.6 Preview System Card", messages[2]["content"])
-        self.assertIn("Axios", messages[2]["content"])
-        self.assertIn("低优先级候选", messages[2]["content"])
-        self.assertIn("threads.com", messages[2]["content"])
+        self.assertEqual(messages[2]["content"], "第一个搜索上下文")
         self.assertEqual(messages[3]["tool_call_id"], "tc-search-2")
-        self.assertEqual(messages[3]["content"], "第二个搜索上下文")
+        self.assertIn("第二个搜索上下文", messages[3]["content"])
+        self.assertIn("结构化来源选择建议", messages[3]["content"])
+        self.assertIn("建议深读最多 3 个来源", messages[3]["content"])
+        self.assertIn("Previewing GPT-5.6 Sol", messages[3]["content"])
+        self.assertIn("GPT-5.6 Preview System Card", messages[3]["content"])
+        self.assertIn("Axios", messages[3]["content"])
+        self.assertIn("低优先级候选", messages[3]["content"])
+        self.assertIn("threads.com", messages[3]["content"])
 
     async def test_handle_tool_calls_round_emits_selected_evidence_for_ranker_recommendations(self):
         tool_call = {"id": "tc-search", "name": "web_search", "arguments": '{"query":"OpenAI GPT-5.6"}'}
@@ -615,3 +620,83 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
             stable_web_evidence_id("https://openai.com/index/previewing-gpt-5-6-sol", fallback="unused"),
         )
         self.assertIn("建议深读", selected_events[0]["claim"])
+
+    async def test_tool_round_selected_evidence_count_follows_quick_fact_read_limit(self):
+        tool_call = {"id": "tc-search", "name": "web_search", "arguments": '{"query":"OpenAI GPT-5.6 是什么"}'}
+        handler = Mock()
+        handler.format_llm_context.return_value = "搜索上下文"
+        handler.build_content_block.return_value = None
+        record = ToolExecutionRecord(
+            tool_call=tool_call,
+            result=ToolResult(
+                status="success",
+                data={
+                    "query": "OpenAI GPT-5.6 是什么 2026年",
+                    "intent": "quick_fact",
+                    "search_budget": "quick_fact",
+                    "sources": [
+                        SearchSource(
+                            title="Previewing GPT-5.6 Sol: a next-generation model | OpenAI",
+                            url="https://openai.com/index/previewing-gpt-5-6-sol",
+                            description="OpenAI official announcement.",
+                        ),
+                        SearchSource(
+                            title="[PDF] GPT-5.6 Preview System Card",
+                            url="https://deploymentsafety.openai.com/gpt-5-6-preview/gpt-5-6-preview.pdf",
+                            description="Official system card PDF.",
+                        ),
+                        SearchSource(
+                            title="OpenAI releases powerful new GPT-5.6 model - Axios",
+                            url="https://axios.com/2026/06/26/openai-gpt-sol-terra-luna-trump",
+                            description="Axios report.",
+                        ),
+                    ],
+                },
+            ),
+            handler=handler,
+            block_id="blk-search",
+            log_id="log-search",
+        )
+        emitter = Mock()
+        emitter.evidence_item_upserted = AsyncMock()
+
+        await tool_round_module.emit_selected_source_evidence(
+            tool_round_module.ToolRoundRequest(
+                db="db",
+                assistant_message_id="msg-1",
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="gpt-4",
+                provider="openai",
+                content_blocks=[],
+                messages=[{"role": "user", "content": "请搜索"}],
+                tool_calls=[tool_call],
+                reasoning_buf="",
+                should_use_reasoning=True,
+                step_context=AgentStepContext(
+                    step_id="step-1",
+                    run_id="run-1",
+                    step_number=1,
+                    started_at=10.0,
+                    thinking_block_id="blk_thinking",
+                    text_block_id="blk_text",
+                ),
+                step_number=1,
+                run_id="run-1",
+                emitter=emitter,
+                session_cache=object(),
+                network_budget=object(),
+                call_kwargs={},
+                persist_message_fn=Mock(),
+                execute_tools_fn=Mock(),
+                complete_step_fn=Mock(),
+            ),
+            [record],
+        )
+
+        selected_events = [
+            call.kwargs["evidence"]
+            for call in emitter.evidence_item_upserted.await_args_list
+            if call.kwargs["evidence"]["status"] == "selected"
+        ]
+        self.assertEqual(len(selected_events), 1)

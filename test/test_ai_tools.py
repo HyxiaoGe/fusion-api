@@ -35,6 +35,7 @@ class AiToolSchemaTests(unittest.TestCase):
 
         self.assertIn("默认只发起 1 次搜索", description)
         self.assertIn("第二个互补搜索", description)
+        self.assertIn("官方来源、权威媒体、地区、时间范围", description)
         self.assertIn("不要用中英文翻译或同义改写重复搜索同一意图", query_description)
 
     def test_web_search_tool_description_guides_autonomous_natural_questions(self):

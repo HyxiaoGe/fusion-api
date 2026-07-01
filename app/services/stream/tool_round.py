@@ -10,11 +10,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.schemas.chat import ThinkingBlock
+from app.services.search_read_planner import build_search_read_plan, format_search_read_plan_guidance
 from app.services.source_candidate_ranker import (
     SearchResultForRanking,
     SourceSelectionPlan,
-    format_source_selection_guidance,
-    rank_search_sources,
 )
 from app.services.source_evidence_ledger import build_selected_source_evidence_item
 from app.services.stream.step_lifecycle import AgentStepContext, mark_tool_round_started
@@ -242,22 +241,23 @@ def _max_tool_calls(request: ToolRoundRequest) -> int | None:
 
 
 def _build_source_selection_guidance_by_tool_call_id(results: list[ToolExecutionRecord]) -> dict[str, str]:
-    first_search_tool_call_id = _first_successful_search_tool_call_id(results)
+    target_search_tool_call_id = _last_successful_search_tool_call_id(results)
     plan = _build_source_selection_plan(results)
-    if plan is None or not first_search_tool_call_id:
+    if plan is None or not target_search_tool_call_id:
         return {}
 
-    guidance = format_source_selection_guidance(plan)
+    guidance = format_search_read_plan_guidance(plan)
     if not guidance:
         return {}
-    return {first_search_tool_call_id: guidance}
+    return {target_search_tool_call_id: guidance}
 
 
-def _first_successful_search_tool_call_id(results: list[ToolExecutionRecord]) -> str:
+def _last_successful_search_tool_call_id(results: list[ToolExecutionRecord]) -> str:
+    target = ""
     for record in results:
         if record.tool_name == "web_search" and record.result.status == "success":
-            return str(record.tool_call.get("id", ""))
-    return ""
+            target = str(record.tool_call.get("id", ""))
+    return target
 
 
 def _build_source_selection_plan(results: list[ToolExecutionRecord]) -> SourceSelectionPlan | None:
@@ -274,6 +274,8 @@ def _build_source_selection_plan(results: list[ToolExecutionRecord]) -> SourceSe
             SearchResultForRanking(
                 tool_call_id=tool_call_id,
                 query=str(result_data.get("query") or ""),
+                intent=result_data.get("intent"),
+                search_budget=result_data.get("search_budget"),
                 sources=sources,
             )
         )
@@ -281,7 +283,7 @@ def _build_source_selection_plan(results: list[ToolExecutionRecord]) -> SourceSe
     if not search_results:
         return None
 
-    return rank_search_sources(search_results)
+    return build_search_read_plan(search_results)
 
 
 def _tool_arguments(tool_calls: list[dict]) -> list[dict]:

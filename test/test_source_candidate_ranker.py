@@ -9,6 +9,30 @@ from app.services.source_candidate_ranker import (
 
 
 class SourceCandidateRankerTests(unittest.TestCase):
+    def _rankable_sources(self):
+        return [
+            SearchSource(
+                title="Previewing GPT-5.6 Sol: a next-generation model | OpenAI",
+                url="https://openai.com/index/previewing-gpt-5-6-sol",
+                description="OpenAI official announcement.",
+            ),
+            SearchSource(
+                title="[PDF] GPT-5.6 Preview System Card - Deployment Safety Hub",
+                url="https://deploymentsafety.openai.com/gpt-5-6-preview/gpt-5-6-preview.pdf",
+                description="Official system card PDF.",
+            ),
+            SearchSource(
+                title="OpenAI releases powerful new GPT-5.6 model - Axios",
+                url="https://axios.com/2026/06/26/openai-gpt-sol-terra-luna-trump",
+                description="Axios reports on OpenAI GPT-5.6 release restrictions.",
+            ),
+            SearchSource(
+                title="GPT-5.6 解读视频",
+                url="https://youtube.com/watch?v=abc",
+                description="A video commentary.",
+            ),
+        ]
+
     def test_rank_search_sources_deduplicates_and_recommends_high_value_sources(self):
         search_results = [
             SearchResultForRanking(
@@ -128,4 +152,93 @@ class SourceCandidateRankerTests(unittest.TestCase):
         self.assertIn("官方来源", guidance)
         self.assertIn("低优先级候选", guidance)
         self.assertIn("threads.com", guidance)
+        self.assertIn("不要为了形式读满所有搜索结果", guidance)
+
+    def test_search_read_planner_recommends_one_read_for_quick_fact(self):
+        from app.services.search_read_planner import build_search_read_plan
+
+        plan = build_search_read_plan(
+            [
+                SearchResultForRanking(
+                    tool_call_id="search-quick",
+                    query="OpenAI GPT-5.6 是什么 2026年",
+                    sources=self._rankable_sources(),
+                    intent="quick_fact",
+                    search_budget="quick_fact",
+                )
+            ]
+        )
+
+        self.assertEqual(plan.recommended_read_limit, 1)
+        self.assertEqual(len(plan.recommended), 1)
+
+    def test_search_read_planner_recommends_two_reads_for_freshness(self):
+        from app.services.search_read_planner import build_search_read_plan
+
+        plan = build_search_read_plan(
+            [
+                SearchResultForRanking(
+                    tool_call_id="search-fresh",
+                    query="OpenAI GPT-5.6 最新公告 2026年6月",
+                    sources=self._rankable_sources(),
+                    intent="freshness",
+                    search_budget="freshness",
+                )
+            ]
+        )
+
+        self.assertEqual(plan.recommended_read_limit, 2)
+        self.assertEqual(len(plan.recommended), 2)
+
+    def test_search_read_planner_recommends_three_reads_for_official_or_comparison(self):
+        from app.services.search_read_planner import build_search_read_plan
+
+        official_plan = build_search_read_plan(
+            [
+                SearchResultForRanking(
+                    tool_call_id="search-official",
+                    query="OpenAI GPT-5.6 官方公告 2026年6月",
+                    sources=self._rankable_sources(),
+                    intent="official_source",
+                    search_budget="official_source",
+                )
+            ]
+        )
+        comparison_plan = build_search_read_plan(
+            [
+                SearchResultForRanking(
+                    tool_call_id="search-media",
+                    query="OpenAI GPT-5.6 Reuters Axios 权威媒体报道",
+                    sources=self._rankable_sources(),
+                    intent="comparison",
+                    search_budget="comparison",
+                )
+            ]
+        )
+
+        self.assertEqual(official_plan.recommended_read_limit, 3)
+        self.assertEqual(len(official_plan.recommended), 3)
+        self.assertEqual(comparison_plan.recommended_read_limit, 3)
+        self.assertEqual(len(comparison_plan.recommended), 3)
+
+    def test_search_read_plan_guidance_explains_read_limit_and_unrecommended_candidates(self):
+        from app.services.search_read_planner import build_search_read_plan, format_search_read_plan_guidance
+
+        plan = build_search_read_plan(
+            [
+                SearchResultForRanking(
+                    tool_call_id="search-fresh",
+                    query="OpenAI GPT-5.6 最新公告 2026年6月",
+                    sources=self._rankable_sources(),
+                    intent="freshness",
+                    search_budget="freshness",
+                )
+            ]
+        )
+
+        guidance = format_search_read_plan_guidance(plan)
+
+        self.assertIn("搜索关键词", guidance)
+        self.assertIn("建议深读最多 2 个来源", guidance)
+        self.assertIn("未建议深读", guidance)
         self.assertIn("不要为了形式读满所有搜索结果", guidance)

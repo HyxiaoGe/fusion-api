@@ -61,6 +61,35 @@ class AgentBehaviorEvalTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "expected_tool_policy 非法"):
                 load_samples(path)
 
+    def test_load_samples_rejects_invalid_planner_limits(self):
+        from scripts.agent_behavior_eval import load_samples
+
+        base_sample = {
+            "id": "planner-limits",
+            "category": "search_read_planner",
+            "question": "OpenAI 最近发布了哪些产品更新？",
+            "expected_tool_policy": "search",
+            "expected_surface": "evidence",
+        }
+
+        cases = [
+            ("max_duplicate_search_keywords", -1),
+            ("max_duplicate_search_keywords", True),
+            ("max_recommended_reads", -1),
+            ("max_recommended_reads", "2"),
+        ]
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    path = Path(tmpdir) / "samples.json"
+                    sample = dict(base_sample)
+                    sample["id"] = f"planner-limits-{field}"
+                    sample[field] = value
+                    path.write_text(json.dumps([sample], ensure_ascii=False), encoding="utf-8")
+
+                    with self.assertRaisesRegex(ValueError, f"{field} 必须是非负整数"):
+                        load_samples(path)
+
     def test_default_sample_file_covers_core_agent_behavior_matrix(self):
         from scripts.agent_behavior_eval import DEFAULT_SAMPLE_PATH, load_samples
 
@@ -75,6 +104,7 @@ class AgentBehaviorEvalTests(unittest.TestCase):
         self.assertIn("url-read-failure-skipped", ids)
         self.assertIn("refresh-recovery-preserves-surface", ids)
         self.assertIn("console-error-regression", ids)
+        self.assertIn("search-read-planner-dedup-and-read-limit", ids)
 
     def test_identity_sample_blocks_upstream_identity_variants(self):
         from scripts.agent_behavior_eval import DEFAULT_SAMPLE_PATH, load_samples
@@ -215,6 +245,35 @@ class AgentBehaviorEvalTests(unittest.TestCase):
         self.assertIn("来源数量不足: actual=1 min=3", score["issues"])
         self.assertIn("输出包含内部实现词: url_read", score["issues"])
         self.assertIn("输出包含内部实现词: reader-service", score["issues"])
+
+    def test_score_observation_flags_duplicate_search_keywords_and_excess_recommended_reads(self):
+        from scripts.agent_behavior_eval import score_observation
+
+        sample = {
+            "id": "search-read-planner-dedup-and-read-limit",
+            "expected_tool_policy": "search",
+            "expected_surface": "evidence",
+            "requires_search_keywords": True,
+            "max_duplicate_search_keywords": 0,
+            "max_recommended_reads": 2,
+        }
+        observation = {
+            "answer_text": "基于搜索结果回答。",
+            "tool_calls": ["web_search"],
+            "surfaces": ["execution_process", "answer_evidence"],
+            "search_keywords": [
+                "OpenAI 最新公告 2026年6月 新闻",
+                "OpenAI 最新公告 2026年6月 新闻",
+            ],
+            "recommended_read_count": 3,
+            "console_errors": [],
+        }
+
+        score = score_observation(sample, observation)
+
+        self.assertFalse(score["passed"])
+        self.assertIn("搜索关键词重复次数过多: duplicate_count=1 max=0", score["issues"])
+        self.assertIn("推荐深读数量过多: actual=3 max=2", score["issues"])
 
     def test_write_dry_run_outputs_jsonl(self):
         from scripts.agent_behavior_eval import write_dry_run

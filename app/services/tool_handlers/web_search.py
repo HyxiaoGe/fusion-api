@@ -196,6 +196,14 @@ class WebSearchHandler(BaseToolHandler):
         )
 
     def format_llm_context(self, result: ToolResult) -> str:
+        if result.data.get("duplicate_search_skipped"):
+            query = result.data.get("query", "")
+            return (
+                f"本次搜索「{query}」与本轮已完成搜索高度重复，系统已跳过真实搜索请求。"
+                "请优先基于前面已经返回的搜索结果继续判断；"
+                "只有需要官方来源、权威媒体、地区、时间范围等互补维度时，才发起新的搜索。"
+            )
+
         sources: List[SearchSource] = result.data.get("sources", [])
         if not sources:
             return (

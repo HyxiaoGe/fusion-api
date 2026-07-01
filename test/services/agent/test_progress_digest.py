@@ -105,3 +105,24 @@ def test_url_read_success_builds_read_success_evidence():
             "used_by_final_answer": False,
         }
     ]
+
+
+def test_duplicate_skipped_search_does_not_create_evidence_items():
+    record = SimpleNamespace(
+        tool_call={"id": "call-4", "name": "web_search"},
+        tool_name="web_search",
+        result=SimpleNamespace(
+            status="degraded",
+            data={
+                "query": "OpenAI 最新公告 2026年6月 新闻",
+                "sources": [],
+                "duplicate_search_skipped": True,
+            },
+            error_message="重复搜索已跳过",
+        ),
+        handler=None,
+    )
+
+    evidence = build_evidence_items(record)
+
+    assert evidence == []
