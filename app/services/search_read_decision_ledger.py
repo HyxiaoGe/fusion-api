@@ -40,6 +40,9 @@ def build_search_read_decision_ledger(
             "deprioritized_count": sum(1 for decision in read_decisions if decision.get("action") == "deprioritize"),
             "kept_candidate_count": sum(1 for decision in read_decisions if decision.get("action") == "keep_candidate"),
             "decision_reason_codes": reason_codes,
+            "read_required": bool(getattr(source_plan, "read_required", False)),
+            "minimum_required_reads": int(getattr(source_plan, "minimum_required_reads", 0) or 0),
+            "read_required_reason": str(getattr(source_plan, "read_required_reason", "") or ""),
         },
     }
 

@@ -58,6 +58,7 @@ class EvalScenario:
     category: str
     question: str
     expected_tool_use: str
+    requires_source_read: bool = False
 
 
 DEFAULT_SCENARIOS: tuple[EvalScenario, ...] = (
@@ -84,6 +85,7 @@ DEFAULT_SCENARIOS: tuple[EvalScenario, ...] = (
         category="search",
         question="OpenAI 最近一次公开发布的新模型或模型更新是什么？请给出时间和依据。",
         expected_tool_use="expected",
+        requires_source_read=True,
     ),
     EvalScenario(
         scenario_id="no_search_simple",
@@ -110,6 +112,7 @@ class EvalResult:
     scenario_category: str
     question: str
     expected_tool_use: str
+    requires_source_read: bool
     transport: str
     success: bool
     elapsed_ms: int
@@ -197,6 +200,7 @@ def _detect_eval_quality_flags(
         flags.append("expected_search_without_agent_tools")
     if (
         scenario.expected_tool_use == "expected"
+        and scenario.requires_source_read
         and agent_tools_supported
         and "web_search" in observed_tool_names
         and "url_read" not in observed_tool_names
@@ -268,6 +272,7 @@ def _base_result_fields(
         "scenario_category": scenario.category,
         "question": scenario.question,
         "expected_tool_use": scenario.expected_tool_use,
+        "requires_source_read": scenario.requires_source_read,
         "transport": transport,
         "elapsed_ms": elapsed_ms,
         "answer_preview": answer_preview,

@@ -612,7 +612,8 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("低优先级候选", messages[3]["content"])
         self.assertIn("threads.com", messages[3]["content"])
         self.assertIn("未建议深读原因", messages[3]["content"])
-        self.assertIn("只有当推荐来源无法回答关键事实", messages[3]["content"])
+        self.assertIn("必须先读取至少 1 个建议优先深读来源", messages[3]["content"])
+        self.assertIn("回答当前事实结论前", messages[3]["content"])
 
     def test_build_search_read_decision_ledger_summarizes_budget_and_read_decisions(self):
         from app.services.search_read_decision_ledger import build_search_read_decision_ledger
@@ -704,6 +705,9 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ledger["summary"]["provider_search_count"], 2)
         self.assertEqual(ledger["summary"]["recommended_read_count"], 3)
         self.assertEqual(ledger["summary"]["deprioritized_count"], 1)
+        self.assertTrue(ledger["summary"]["read_required"])
+        self.assertEqual(ledger["summary"]["minimum_required_reads"], 1)
+        self.assertEqual(ledger["summary"]["read_required_reason"], "official_source_requires_verification")
         self.assertEqual(
             [decision["reason_code"] for decision in ledger["search_decisions"]],
             ["initial_search", "similar_followup"],

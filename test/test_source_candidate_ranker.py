@@ -223,6 +223,9 @@ class SourceCandidateRankerTests(unittest.TestCase):
 
         self.assertEqual(plan.recommended_read_limit, 1)
         self.assertEqual(len(plan.recommended), 1)
+        self.assertTrue(plan.read_required)
+        self.assertEqual(plan.minimum_required_reads, 1)
+        self.assertEqual(plan.read_required_reason, "quick_fact_requires_verification")
 
     def test_search_read_planner_recommends_two_reads_for_freshness(self):
         from app.services.search_read_planner import build_search_read_plan
@@ -241,6 +244,9 @@ class SourceCandidateRankerTests(unittest.TestCase):
 
         self.assertEqual(plan.recommended_read_limit, 2)
         self.assertEqual(len(plan.recommended), 2)
+        self.assertTrue(plan.read_required)
+        self.assertEqual(plan.minimum_required_reads, 1)
+        self.assertEqual(plan.read_required_reason, "freshness_requires_verification")
 
     def test_search_read_planner_recommends_three_reads_for_official_or_comparison(self):
         from app.services.search_read_planner import build_search_read_plan
@@ -272,6 +278,36 @@ class SourceCandidateRankerTests(unittest.TestCase):
         self.assertEqual(len(official_plan.recommended), 3)
         self.assertEqual(comparison_plan.recommended_read_limit, 3)
         self.assertEqual(len(comparison_plan.recommended), 3)
+        self.assertTrue(official_plan.read_required)
+        self.assertEqual(official_plan.minimum_required_reads, 1)
+        self.assertEqual(official_plan.read_required_reason, "official_source_requires_verification")
+        self.assertTrue(comparison_plan.read_required)
+        self.assertEqual(comparison_plan.minimum_required_reads, 1)
+        self.assertEqual(comparison_plan.read_required_reason, "comparison_requires_verification")
+
+    def test_search_read_planner_keeps_background_search_read_optional(self):
+        from app.services.search_read_planner import build_search_read_plan, format_search_read_plan_guidance
+
+        plan = build_search_read_plan(
+            [
+                SearchResultForRanking(
+                    tool_call_id="search-background",
+                    query="AI 编程助手 团队实践 案例",
+                    sources=self._rankable_sources(),
+                    intent=None,
+                    search_budget="standard",
+                )
+            ]
+        )
+
+        guidance = format_search_read_plan_guidance(plan)
+
+        self.assertEqual(plan.recommended_read_limit, 2)
+        self.assertFalse(plan.read_required)
+        self.assertEqual(plan.minimum_required_reads, 0)
+        self.assertEqual(plan.read_required_reason, "")
+        self.assertIn("如果搜索摘要不足以回答", guidance)
+        self.assertNotIn("必须先读取至少", guidance)
 
     def test_search_read_plan_guidance_explains_read_limit_and_unrecommended_candidates(self):
         from app.services.search_read_planner import build_search_read_plan, format_search_read_plan_guidance
@@ -292,5 +328,6 @@ class SourceCandidateRankerTests(unittest.TestCase):
 
         self.assertIn("搜索关键词", guidance)
         self.assertIn("建议深读最多 2 个来源", guidance)
+        self.assertIn("必须先读取至少 1 个建议优先深读来源", guidance)
         self.assertIn("未建议深读", guidance)
         self.assertIn("不要为了形式读满所有搜索结果", guidance)

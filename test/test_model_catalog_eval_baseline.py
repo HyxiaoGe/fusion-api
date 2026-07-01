@@ -440,6 +440,35 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
         self.assertEqual(row["observed_tool_names"], ["web_search"])
         self.assertEqual(row["quality_flags"], ["expected_search_without_read"])
 
+    def test_expected_search_without_read_is_not_flagged_when_scenario_does_not_require_read(self):
+        scenario = baseline.EvalScenario(
+            scenario_id="optional_search",
+            category="search",
+            question="找几个 AI 编程助手团队实践案例。",
+            expected_tool_use="expected",
+            requires_source_read=False,
+        )
+        result = baseline.build_stream_result(
+            model={
+                "modelId": "doubao-seed-2-0-mini-260215",
+                "provider": "volcengine",
+                "name": "Doubao Mini",
+                "capabilities": {"functionCalling": True, "agentTools": True},
+            },
+            scenario=scenario,
+            elapsed_ms=3200,
+            events=[
+                {"chunk_type": "agent_event", "data": {"type": "tool_call_started", "tool_name": "web_search"}},
+                {"chunk_type": "answering", "data": {"delta": "根据搜索摘要给出案例方向。"}},
+            ],
+        )
+
+        row = json.loads(baseline.to_jsonl(result).strip())
+
+        self.assertTrue(row["tool_expectation_met"])
+        self.assertFalse(row["requires_source_read"])
+        self.assertEqual(row["quality_flags"], [])
+
     def test_slow_success_is_quality_flag(self):
         scenario = baseline.select_scenarios(["autonomous_search"])[0]
         result = baseline.build_stream_result(

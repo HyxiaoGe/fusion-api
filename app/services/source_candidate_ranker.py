@@ -119,6 +119,9 @@ class SourceSelectionPlan:
     decision_summary: dict[str, int]
     recommended_read_limit: int = 3
     not_recommended_count: int = 0
+    read_required: bool = False
+    minimum_required_reads: int = 0
+    read_required_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -140,6 +143,9 @@ def rank_search_sources(
     search_results: list[SearchResultForRanking],
     *,
     max_recommended: int = 3,
+    read_required: bool = False,
+    minimum_required_reads: int = 0,
+    read_required_reason: str = "",
 ) -> SourceSelectionPlan:
     """对同一轮多个搜索结果做跨搜索去重和深读候选排序。"""
     total_source_count = sum(len(result.sources) for result in search_results)
@@ -164,6 +170,9 @@ def rank_search_sources(
     recommended = tuple(candidate for candidate in ranked if candidate.priority != "low")[:recommended_limit]
     low_priority = tuple(candidate for candidate in ranked if candidate.priority == "low")
     read_decisions = _build_read_decisions(ranked, recommended)
+    normalized_minimum_reads = 0
+    if read_required:
+        normalized_minimum_reads = min(len(recommended), max(0, minimum_required_reads))
     return SourceSelectionPlan(
         total_source_count=total_source_count,
         unique_source_count=len(ranked),
@@ -175,6 +184,9 @@ def rank_search_sources(
         decision_summary=_summarize_read_decisions(read_decisions),
         recommended_read_limit=recommended_limit,
         not_recommended_count=max(0, len(ranked) - len(recommended)),
+        read_required=read_required and normalized_minimum_reads > 0,
+        minimum_required_reads=normalized_minimum_reads,
+        read_required_reason=read_required_reason if read_required and normalized_minimum_reads > 0 else "",
     )
 
 
@@ -198,6 +210,11 @@ def format_source_selection_guidance(plan: SourceSelectionPlan) -> str:
         f"建议深读最多 {plan.recommended_read_limit} 个来源；"
         "优先覆盖官方原文、技术报告、权威媒体或与问题高度相关的来源。"
     )
+    if plan.read_required:
+        parts.append(
+            f"本轮属于需核验的当前/关键事实场景；回答事实结论前，"
+            f"必须先读取至少 {plan.minimum_required_reads} 个建议优先深读来源。"
+        )
 
     if plan.recommended:
         parts.append("建议优先深读：")
@@ -219,10 +236,17 @@ def format_source_selection_guidance(plan: SourceSelectionPlan) -> str:
             parts.append("未建议深读原因：")
             parts.extend(reason_summary)
 
-    parts.append(
-        "执行规则：如果搜索摘要不足以回答，应优先对“建议优先深读”的少量来源调用 url_read；"
-        "不要为了形式读满所有搜索结果；只有当推荐来源无法回答关键事实，才读取未推荐来源。"
-    )
+    if plan.read_required:
+        parts.append(
+            "执行规则：回答当前事实结论前，必须优先对“建议优先深读”的来源调用 url_read；"
+            "不要为了形式读满所有搜索结果；如果推荐来源不可用，再读取下一个高价值候选，"
+            "仍无法核验时必须降低结论确定性。"
+        )
+    else:
+        parts.append(
+            "执行规则：如果搜索摘要不足以回答，应优先对“建议优先深读”的少量来源调用 url_read；"
+            "不要为了形式读满所有搜索结果；只有当推荐来源无法回答关键事实，才读取未推荐来源。"
+        )
     return "\n".join(parts)
 
 
