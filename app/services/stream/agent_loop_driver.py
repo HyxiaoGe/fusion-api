@@ -48,6 +48,10 @@ async def run_agent_loop(
             continue
         if outcome.exit == AgentLoopExit.SUPERSEDED:
             return outcome
+        if outcome.exit == AgentLoopExit.SUMMARY_REQUIRED:
+            state.finish_reason = "empty_answer_summary"
+            await _run_limit_summary(state=state, runtime=runtime, messages=messages)
+            break
         break
 
     if state.limit_reason is not None:
@@ -100,9 +104,7 @@ def _accepts_keyword(fn, keyword: str) -> bool:
     except (TypeError, ValueError):
         return True
 
-    return keyword in parameters or any(
-        parameter.kind == Parameter.VAR_KEYWORD for parameter in parameters.values()
-    )
+    return keyword in parameters or any(parameter.kind == Parameter.VAR_KEYWORD for parameter in parameters.values())
 
 
 async def _run_round(

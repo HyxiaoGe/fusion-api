@@ -31,6 +31,9 @@ async def handle_agent_round_outcome(
 ) -> AgentLoopOutcome | None:
     finish_reason = request.round_result.finish_reason
     if finish_reason == "stop":
+        if _needs_empty_answer_summary(request):
+            await _complete_empty_round_before_summary(request)
+            return AgentLoopOutcome(exit=AgentLoopExit.SUMMARY_REQUIRED)
         await _complete_text_round(request)
         return AgentLoopOutcome(exit=AgentLoopExit.COMPLETED)
 
@@ -59,6 +62,34 @@ def _append_round_blocks(request: AgentRoundOutcomeRequest) -> None:
 async def _complete_text_round(request: AgentRoundOutcomeRequest) -> None:
     _append_round_blocks(request)
     await _emit_final_answer_used_evidence(request)
+    await complete_text_response_step(
+        context=request.step_context,
+        emitter=request.runtime.emitter,
+        session_cache=request.runtime.session_cache,
+        complete_step_fn=request.runtime.complete_step_fn,
+        completed_tool_calls=request.state.total_tool_calls,
+        max_tool_calls=request.runtime.limits.max_tool_calls,
+        clock=request.runtime.clock,
+    )
+    _sync_plan_items(request)
+    request.state.clear_current_step()
+
+
+def _needs_empty_answer_summary(request: AgentRoundOutcomeRequest) -> bool:
+    return (
+        request.state.total_tool_calls > 0
+        and not request.round_result.content_buf
+        and not request.round_result.reasoning_buf
+        and not request.round_result.tool_calls
+    )
+
+
+async def _complete_empty_round_before_summary(request: AgentRoundOutcomeRequest) -> None:
+    request.runtime.warning_fn(
+        "工具结果后模型返回空终态，切换到无工具收尾总结: "
+        f"conv_id={request.runtime.conversation_id} run_id={request.runtime.run_id} "
+        f"step={request.step_number} model_id={request.runtime.model_id}"
+    )
     await complete_text_response_step(
         context=request.step_context,
         emitter=request.runtime.emitter,
@@ -111,6 +142,4 @@ async def _emit_final_answer_used_evidence(request: AgentRoundOutcomeRequest) ->
 def _sync_plan_items(request: AgentRoundOutcomeRequest) -> None:
     if not request.step_context.plan_items:
         return
-    request.state.plan_items = {
-        str(item_id): dict(item) for item_id, item in request.step_context.plan_items.items()
-    }
+    request.state.plan_items = {str(item_id): dict(item) for item_id, item in request.step_context.plan_items.items()}

@@ -279,6 +279,83 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.content_blocks[0].text, "最终回答")
         self.assertEqual(messages[-1], {"role": "tool", "tool_call_id": "tc-1", "content": "搜索结果"})
 
+    async def test_empty_stop_after_tools_runs_summary_step(self):
+        state = AgentLoopState()
+        messages = [{"role": "user", "content": "hi"}]
+        tool_call = {"id": "tc-1", "name": "web_search", "arguments": '{"query":"x"}'}
+        started_steps: list[int] = []
+        completed_steps: list[str] = []
+        summary_calls = []
+
+        async def start_step_fn(**kwargs):
+            step_number = kwargs["step_number"]
+            started_steps.append(step_number)
+            context = AgentStepContext(
+                step_id=f"step-{step_number}",
+                step_number=step_number,
+                started_at=kwargs["clock"](),
+                thinking_block_id=f"thinking-{step_number}",
+                text_block_id=f"text-{step_number}",
+            )
+            kwargs["on_step_started"](context.step_id)
+            return context
+
+        async def run_round_fn(**kwargs):
+            if kwargs["step_number"] == 1:
+                return AgentRoundResult(
+                    reasoning_buf="需要搜索",
+                    content_buf="",
+                    tool_calls=[tool_call],
+                    finish_reason="tool_calls",
+                    accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+                )
+            return AgentRoundResult(
+                reasoning_buf="",
+                content_buf="",
+                tool_calls=[],
+                finish_reason="stop",
+                accumulated_usage=Usage(input_tokens=5, output_tokens=8),
+            )
+
+        async def handle_tool_calls_round_fn(**kwargs):
+            request = kwargs["request"]
+            request.on_tools_executed(len(request.tool_calls))
+            request.messages.append({"role": "tool", "tool_call_id": "tc-1", "content": "搜索结果"})
+
+        async def complete_step_fn(**kwargs):
+            completed_steps.append(kwargs["context"].step_id)
+
+        async def run_limit_summary_step_fn(**kwargs):
+            summary_calls.append(kwargs["request"])
+            request = kwargs["request"]
+            request.content_blocks.append(TextBlock(type="text", id="summary-text", text="总结回答"))
+            request.on_step_started("summary-step")
+            return LimitSummaryOutcome(accumulated_usage=Usage(input_tokens=9, output_tokens=13))
+
+        outcome = await run_agent_loop(
+            db="db",
+            messages=messages,
+            state=state,
+            runtime=_runtime(
+                start_step_fn=start_step_fn,
+                complete_step_fn=complete_step_fn,
+                run_round_fn=run_round_fn,
+                handle_tool_calls_round_fn=handle_tool_calls_round_fn,
+                run_limit_summary_step_fn=run_limit_summary_step_fn,
+            ),
+        )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        self.assertEqual(started_steps, [1, 2])
+        self.assertEqual(completed_steps, ["step-2"])
+        self.assertEqual(len(summary_calls), 1)
+        self.assertEqual(summary_calls[0].step_number, 3)
+        self.assertEqual(state.finish_reason, "empty_answer_summary")
+        self.assertEqual(state.accumulated_usage, Usage(input_tokens=9, output_tokens=13))
+        self.assertEqual([block.type for block in state.content_blocks], ["text"])
+        self.assertEqual(state.content_blocks[0].text, "总结回答")
+        self.assertEqual(state.current_step_id, None)
+
     async def test_unknown_tool_calls_without_tool_list_marks_incomplete_and_completes_step(self):
         state = AgentLoopState()
         completed_steps: list[str] = []

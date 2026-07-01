@@ -9,6 +9,7 @@ from enum import Enum
 class AgentLoopExit(Enum):
     COMPLETED = "completed"
     SUPERSEDED = "superseded"
+    SUMMARY_REQUIRED = "summary_required"
 
 
 @dataclass(frozen=True)
