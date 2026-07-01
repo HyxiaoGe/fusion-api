@@ -41,7 +41,7 @@ def _entry_to_card(alias: str, entry: Dict[str, Any]) -> Dict[str, Any]:
     """LiteLLM 单条 model_info → 前端模型卡片。"""
     metadata = entry.get("metadata") or {}
     underlying = entry.get("underlying") or ""
-    capabilities = metadata.get("capabilities") or {}
+    capabilities = litellm_catalog.normalize_capabilities(alias, metadata.get("capabilities") or {})
     pricing = metadata.get("pricing") or {}
 
     provider_key = _normalize_provider_key(metadata, underlying)
@@ -56,6 +56,7 @@ def _entry_to_card(alias: str, entry: Dict[str, Any]) -> Dict[str, Any]:
             "deepThinking": bool(capabilities.get("deepThinking", False)),
             "fileSupport": bool(capabilities.get("fileSupport", False)),
             "functionCalling": bool(capabilities.get("functionCalling", False)),
+            "agentTools": bool(capabilities.get("agentTools", False)),
             "vision": bool(capabilities.get("vision", False)),
             "webSearch": bool(capabilities.get("webSearch", False)),
         },

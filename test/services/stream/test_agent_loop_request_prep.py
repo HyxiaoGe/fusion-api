@@ -43,6 +43,18 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.announced_tools, ["web_search"])
         self.assertNotIn("extra_body", config.call_kwargs)
 
+    def test_build_call_config_disables_agent_tools_when_agent_tools_capability_is_false(self):
+        config = build_agent_loop_call_config(
+            provider="qwen",
+            options={},
+            capabilities={"functionCalling": True, "agentTools": False, "deepThinking": False},
+        )
+
+        self.assertFalse(config.supports_function_calling)
+        self.assertEqual(config.announced_tools, [])
+        self.assertNotIn("tools", config.call_kwargs)
+        self.assertNotIn("tool_choice", config.call_kwargs)
+
     async def test_prepare_messages_builds_llm_input_files_url_context_and_tool_contract(self):
         file_repo = FakeFileRepository()
         build_calls = []

@@ -88,6 +88,7 @@ class EvalResult:
     message_id: str
     observed_tool_calls: int
     observed_tool_names: list[str]
+    agent_tools_supported: bool
     tool_expectation_met: bool
     quality_flags: list[str]
     error: dict[str, Any] | None
@@ -153,8 +154,17 @@ def _detect_quality_flags(answer_text: str) -> list[str]:
     return []
 
 
-def _tool_expectation_met(expected_tool_use: str, observed_tool_calls: int) -> bool:
+def _model_supports_agent_tools(model: Mapping[str, Any]) -> bool:
+    capabilities = model.get("capabilities") or {}
+    if not isinstance(capabilities, Mapping):
+        return False
+    return bool(capabilities.get("agentTools", capabilities.get("functionCalling", False)))
+
+
+def _tool_expectation_met(expected_tool_use: str, observed_tool_calls: int, agent_tools_supported: bool) -> bool:
     if expected_tool_use == "expected":
+        if not agent_tools_supported:
+            return observed_tool_calls == 0
         return observed_tool_calls > 0
     if expected_tool_use == "forbidden":
         return observed_tool_calls == 0
@@ -176,6 +186,7 @@ def _base_result_fields(
 ) -> dict[str, Any]:
     tool_names = list(observed_tool_names or [])
     tool_call_count = len(tool_names) if observed_tool_calls is None else observed_tool_calls
+    agent_tools_supported = _model_supports_agent_tools(model)
     return {
         "model_id": str(model.get("modelId") or ""),
         "provider": str(model.get("provider") or ""),
@@ -192,7 +203,12 @@ def _base_result_fields(
         "message_id": message_id,
         "observed_tool_calls": tool_call_count,
         "observed_tool_names": tool_names,
-        "tool_expectation_met": _tool_expectation_met(scenario.expected_tool_use, tool_call_count),
+        "agent_tools_supported": agent_tools_supported,
+        "tool_expectation_met": _tool_expectation_met(
+            scenario.expected_tool_use,
+            tool_call_count,
+            agent_tools_supported,
+        ),
         "quality_flags": list(quality_flags or []),
     }
 

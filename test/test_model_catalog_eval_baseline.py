@@ -132,7 +132,12 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
     def test_stream_result_records_answer_and_tool_observation(self):
         scenario = baseline.select_scenarios(["autonomous_search"])[0]
         result = baseline.build_stream_result(
-            model={"modelId": "deepseek-chat", "provider": "deepseek", "name": "DeepSeek"},
+            model={
+                "modelId": "deepseek-chat",
+                "provider": "deepseek",
+                "name": "DeepSeek",
+                "capabilities": {"functionCalling": True, "agentTools": True},
+            },
             scenario=scenario,
             elapsed_ms=2500,
             events=[
@@ -176,7 +181,12 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
     def test_stream_result_counts_repeated_tool_calls_without_duplicate_names(self):
         scenario = baseline.select_scenarios(["autonomous_search"])[0]
         result = baseline.build_stream_result(
-            model={"modelId": "deepseek-chat", "provider": "deepseek", "name": "DeepSeek"},
+            model={
+                "modelId": "deepseek-chat",
+                "provider": "deepseek",
+                "name": "DeepSeek",
+                "capabilities": {"functionCalling": True, "agentTools": True},
+            },
             scenario=scenario,
             elapsed_ms=2500,
             events=[
@@ -228,7 +238,12 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
     def test_tool_expectation_flags_missing_expected_tool(self):
         scenario = baseline.select_scenarios(["autonomous_search"])[0]
         result = baseline.build_stream_result(
-            model={"modelId": "deepseek-chat", "provider": "deepseek", "name": "DeepSeek"},
+            model={
+                "modelId": "deepseek-chat",
+                "provider": "deepseek",
+                "name": "DeepSeek",
+                "capabilities": {"functionCalling": True, "agentTools": True},
+            },
             scenario=scenario,
             elapsed_ms=1000,
             events=[{"chunk_type": "answering", "data": {"delta": "我直接回答。"}}],
@@ -237,6 +252,25 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
         row = json.loads(baseline.to_jsonl(result).strip())
 
         self.assertFalse(row["tool_expectation_met"])
+
+    def test_tool_expectation_allows_no_tools_for_models_without_agent_tools(self):
+        scenario = baseline.select_scenarios(["autonomous_search"])[0]
+        result = baseline.build_stream_result(
+            model={
+                "modelId": "qwen-vl-max",
+                "provider": "qwen",
+                "name": "Qwen VL Max",
+                "capabilities": {"functionCalling": True, "agentTools": False},
+            },
+            scenario=scenario,
+            elapsed_ms=1000,
+            events=[{"chunk_type": "answering", "data": {"delta": "需要联网搜索。"}}],
+        )
+
+        row = json.loads(baseline.to_jsonl(result).strip())
+
+        self.assertFalse(row["agent_tools_supported"])
+        self.assertTrue(row["tool_expectation_met"])
 
     def test_build_summary_groups_results_and_failures(self):
         basic = baseline.select_scenarios(["basic_chat"])[0]

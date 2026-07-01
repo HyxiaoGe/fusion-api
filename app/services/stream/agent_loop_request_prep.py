@@ -61,7 +61,9 @@ def build_agent_loop_call_config(
     supports_thinking = bool(capabilities.get("deepThinking", False))
     should_use_reasoning = use_reasoning is True or (use_reasoning is None and supports_thinking)
 
-    supports_function_calling = bool(capabilities.get("functionCalling", False))
+    supports_function_calling = bool(capabilities.get("functionCalling", False)) and bool(
+        capabilities.get("agentTools", capabilities.get("functionCalling", False))
+    )
     call_kwargs: dict = {}
     if supports_function_calling:
         call_kwargs["tools"] = [build_web_search_tool_fn()]

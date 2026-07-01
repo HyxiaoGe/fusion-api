@@ -28,6 +28,10 @@ _LITELLM_API_KEY = os.environ.get("LITELLM_API_KEY", "")
 # 缓存生效时间——LiteLLM 模型变更频次低，60s 足够
 _CACHE_TTL_SECONDS = 60.0
 
+# 真实多模型回归中，这些模型即使具备通用 function calling，也不适合作为
+# Fusion 默认联网 agent 使用。后续可迁移到 PromptHub/LiteLLM metadata。
+AGENT_TOOLS_DISABLED_BY_DEFAULT = frozenset({"qwen-vl-max"})
+
 _cache_lock = threading.Lock()
 _cache_payload: Optional[Dict[str, Dict[str, Any]]] = None
 _cache_loaded_at: float = 0.0
@@ -96,7 +100,19 @@ def get_capabilities(alias: str) -> Dict[str, Any]:
     entry = get_model_entry(alias)
     if not entry:
         return {}
-    return dict(entry["metadata"].get("capabilities") or {})
+    return normalize_capabilities(alias, entry["metadata"].get("capabilities") or {})
+
+
+def normalize_capabilities(alias: str, capabilities: Dict[str, Any] | None) -> Dict[str, Any]:
+    """补齐 Fusion 运行时需要的派生能力位。"""
+    normalized = dict(capabilities or {})
+    function_calling = bool(normalized.get("functionCalling", False))
+    if "agentTools" in normalized:
+        normalized["agentTools"] = bool(normalized.get("agentTools"))
+        return normalized
+
+    normalized["agentTools"] = function_calling and alias not in AGENT_TOOLS_DISABLED_BY_DEFAULT
+    return normalized
 
 
 def get_underlying_provider(alias: str, fallback: str = "litellm") -> str:
