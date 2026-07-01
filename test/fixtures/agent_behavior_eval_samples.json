@@ -1,0 +1,69 @@
+[
+  {
+    "id": "identity-direct-answer",
+    "category": "identity",
+    "question": "你好，你是谁？",
+    "expected_tool_policy": "no_search",
+    "expected_surface": "direct_answer",
+    "forbidden_answer_terms": ["Claude", "Anthropic", "ChatGPT", "OpenAI", "Gemini", "Google", "DeepSeek"],
+    "forbidden_internal_terms": ["url_read", "reader-service", "web_search"]
+  },
+  {
+    "id": "simple-math-direct-answer",
+    "category": "stable_knowledge",
+    "question": "1+1等于几？",
+    "expected_tool_policy": "no_search",
+    "expected_surface": "direct_answer",
+    "forbidden_internal_terms": ["url_read", "reader-service", "web_search"]
+  },
+  {
+    "id": "realtime-product-feature-search",
+    "category": "freshness",
+    "question": "微信A2A互通怎么用？",
+    "expected_tool_policy": "search",
+    "expected_surface": "evidence",
+    "requires_search_keywords": true,
+    "min_sources": 3,
+    "forbidden_internal_terms": ["url_read", "reader-service"]
+  },
+  {
+    "id": "search-failure-degraded",
+    "category": "failure_degradation",
+    "question": "OpenAI 最近发布了哪些产品更新？",
+    "expected_tool_policy": "search",
+    "expected_surface": "evidence",
+    "requires_search_keywords": true,
+    "min_sources": 1,
+    "forbidden_internal_terms": ["reader-service"]
+  },
+  {
+    "id": "url-read-failure-skipped",
+    "category": "read_degradation",
+    "question": "微信A2A互通怎么用？",
+    "expected_tool_policy": "search",
+    "expected_surface": "evidence",
+    "requires_search_keywords": true,
+    "min_sources": 2,
+    "forbidden_internal_terms": ["url_read", "reader-service"]
+  },
+  {
+    "id": "refresh-recovery-preserves-surface",
+    "category": "refresh_recovery",
+    "question": "微信A2A互通怎么用？",
+    "expected_tool_policy": "search",
+    "expected_surface": "evidence",
+    "requires_search_keywords": true,
+    "min_sources": 3,
+    "forbidden_internal_terms": ["url_read", "reader-service"]
+  },
+  {
+    "id": "console-error-regression",
+    "category": "ui_error",
+    "question": "你好，你是谁？",
+    "expected_tool_policy": "no_search",
+    "expected_surface": "direct_answer",
+    "requires_console_clean": true,
+    "forbidden_answer_terms": ["Claude", "Anthropic", "ChatGPT", "OpenAI", "Gemini", "Google", "DeepSeek"],
+    "forbidden_internal_terms": ["url_read", "reader-service", "web_search"]
+  }
+]

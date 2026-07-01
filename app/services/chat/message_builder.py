@@ -10,7 +10,7 @@ LLM 消息构建模块
 import base64
 from typing import Dict, List, Optional
 
-from app.ai.prompts.agent_loop import build_current_date_system_prompt
+from app.ai.prompts.agent_loop import APP_IDENTITY_PROMPT, build_current_date_system_prompt
 from app.core.logger import app_logger as logger
 from app.db.repositories import FileRepository
 from app.services.file_service import is_image_mime
@@ -55,6 +55,7 @@ async def build_llm_messages(
     - thinking / search block 不传给 LLM（避免污染上下文）
     - 当 has_vision=True 时，图片 FileBlock 转为 base64 image_url 内容块
     - 历史消息中的图片仅保留最近 MAX_VISION_HISTORY_TURNS 轮
+    - 默认注入 Fusion 身份一致性规则，避免模型自称为上游供应商身份
     - 用户自定义 system_prompt 注入到 system 角色，仅作背景，不主动引用
     - 默认注入"当前日期"system 消息，避免模型凭训练数据猜年份
     """
@@ -74,6 +75,9 @@ async def build_llm_messages(
                 ),
             }
         )
+
+    # 注入产品身份约束（始终注入，并放在用户偏好之后，避免被个性化设置覆盖）
+    result.append({"role": "system", "content": APP_IDENTITY_PROMPT})
 
     # 计算最近 N 轮用户消息的起始索引，用于控制图片注入范围
     vision_cutoff_idx = 0
