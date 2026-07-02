@@ -161,6 +161,8 @@ class ChatServiceTests(unittest.TestCase):
         self.assertIn("日期 system", sent_messages[0]["content"])
         self.assertIn("【无联网工具边界规则】", sent_messages[1]["content"])
         self.assertIn("无法实时核验", sent_messages[1]["content"])
+        self.assertIn("不要把已有知识包装成最新事实", sent_messages[1]["content"])
+        self.assertIn("不要把缺少工具描述成系统故障", sent_messages[1]["content"])
         self.assertEqual(sent_messages[2]["content"], "OpenAI 最近发布了什么模型？")
         self.assertEqual(
             mock_litellm.acompletion.await_args.kwargs["extra_body"],

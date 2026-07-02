@@ -107,6 +107,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("【无联网工具边界规则】", prepared.messages[1]["content"])
         self.assertIn("不要声称已经搜索", prepared.messages[1]["content"])
         self.assertIn("无法实时核验", prepared.messages[1]["content"])
+        self.assertIn("不要把已有知识包装成最新事实", prepared.messages[1]["content"])
         self.assertIn("普通稳定问题直接回答", prepared.messages[1]["content"])
         self.assertNotIn("切换模型", prepared.messages[1]["content"])
         self.assertNotIn("【工具调用一致性规则】", prepared.messages[1]["content"])
@@ -251,6 +252,8 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("没有联网搜索或网页读取工具", NO_TOOL_NETWORK_BOUNDARY_PROMPT)
         self.assertIn("不要声称已经搜索", NO_TOOL_NETWORK_BOUNDARY_PROMPT)
         self.assertIn("无法实时核验", NO_TOOL_NETWORK_BOUNDARY_PROMPT)
+        self.assertIn("不要把已有知识包装成最新事实", NO_TOOL_NETWORK_BOUNDARY_PROMPT)
+        self.assertIn("不要把缺少工具描述成系统故障", NO_TOOL_NETWORK_BOUNDARY_PROMPT)
         self.assertIn("普通稳定问题直接回答", NO_TOOL_NETWORK_BOUNDARY_PROMPT)
         self.assertNotIn("切换模型", NO_TOOL_NETWORK_BOUNDARY_PROMPT)
 
