@@ -67,7 +67,20 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
     def test_success_result_jsonl_contains_required_fields(self):
         scenario = baseline.select_scenarios(["basic_chat"])[0]
         result = baseline.build_success_result(
-            model={"modelId": "deepseek-chat", "provider": "deepseek", "name": "DeepSeek"},
+            model={
+                "modelId": "deepseek-chat",
+                "provider": "deepseek",
+                "name": "DeepSeek",
+                "contextWindowTokens": 128000,
+                "maxOutputTokens": 8192,
+                "capabilities": {
+                    "functionCalling": True,
+                    "agentTools": True,
+                    "searchCapable": True,
+                    "webSearch": True,
+                    "vision": False,
+                },
+            },
             scenario=scenario,
             transport="nonstream",
             elapsed_ms=1234,
@@ -94,7 +107,109 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
         self.assertEqual(row["observed_tool_calls"], 0)
         self.assertTrue(row["tool_expectation_met"])
         self.assertEqual(row["quality_flags"], [])
+        self.assertEqual(
+            row["capability_contract"],
+            {
+                "agentTools": True,
+                "contextWindowTokens": 128000,
+                "functionCalling": True,
+                "longContext": True,
+                "maxOutputTokens": 8192,
+                "searchCapable": True,
+                "vision": False,
+                "webSearch": True,
+            },
+        )
         self.assertIsNone(row["error"])
+
+    def test_build_summary_includes_capability_contract_matrix(self):
+        scenario = baseline.select_scenarios(["basic_chat"])[0]
+        search_model = baseline.build_stream_result(
+            model={
+                "modelId": "deepseek-chat",
+                "provider": "deepseek",
+                "name": "DeepSeek",
+                "contextWindowTokens": 128000,
+                "maxOutputTokens": 8192,
+                "capabilities": {
+                    "functionCalling": True,
+                    "agentTools": True,
+                    "searchCapable": True,
+                    "webSearch": True,
+                    "vision": False,
+                },
+            },
+            scenario=scenario,
+            elapsed_ms=1200,
+            events=[{"chunk_type": "answering", "data": {"delta": "你好。"}}],
+        )
+        vision_model = baseline.build_stream_result(
+            model={
+                "modelId": "qwen-vl-max",
+                "provider": "qwen",
+                "name": "Qwen VL Max",
+                "contextWindowTokens": 32000,
+                "capabilities": {
+                    "functionCalling": True,
+                    "agentTools": False,
+                    "searchCapable": False,
+                    "webSearch": False,
+                    "vision": True,
+                },
+            },
+            scenario=scenario,
+            elapsed_ms=1400,
+            events=[{"chunk_type": "answering", "data": {"delta": "你好。"}}],
+        )
+
+        summary = baseline.build_summary([search_model, vision_model])
+
+        self.assertEqual(
+            summary["capability_contract"],
+            {
+                "model_count": 2,
+                "agent_tools_count": 1,
+                "function_calling_count": 2,
+                "long_context_count": 1,
+                "search_capable_count": 1,
+                "vision_count": 1,
+                "web_search_count": 1,
+                "missing_context_window_count": 0,
+                "models_by_capability": {
+                    "agent_tools": ["deepseek-chat"],
+                    "function_calling": ["deepseek-chat", "qwen-vl-max"],
+                    "long_context": ["deepseek-chat"],
+                    "search_capable": ["deepseek-chat"],
+                    "vision": ["qwen-vl-max"],
+                    "web_search": ["deepseek-chat"],
+                },
+            },
+        )
+
+    def test_dry_run_rows_include_capability_contract_snapshot(self):
+        rows = baseline.build_dry_run_rows(
+            models=[
+                {
+                    "modelId": "qwen-vl-max",
+                    "provider": "qwen",
+                    "health": {"status": "healthy"},
+                    "contextWindowTokens": 32000,
+                    "capabilities": {
+                        "functionCalling": True,
+                        "agentTools": False,
+                        "searchCapable": False,
+                        "webSearch": False,
+                        "vision": True,
+                    },
+                }
+            ],
+            scenarios=baseline.select_scenarios(["basic_chat"]),
+            transport="stream",
+        )
+
+        self.assertEqual(rows[0]["capability_contract"]["vision"], True)
+        self.assertEqual(rows[0]["capability_contract"]["searchCapable"], False)
+        self.assertEqual(rows[0]["capability_contract"]["longContext"], False)
 
     def test_failure_result_jsonl_contains_error(self):
         scenario = baseline.select_scenarios(["basic_chat"])[0]
@@ -281,7 +396,19 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
         basic = baseline.select_scenarios(["basic_chat"])[0]
         search = baseline.select_scenarios(["autonomous_search"])[0]
         success = baseline.build_stream_result(
-            model={"modelId": "deepseek-chat", "provider": "deepseek", "name": "DeepSeek"},
+            model={
+                "modelId": "deepseek-chat",
+                "provider": "deepseek",
+                "name": "DeepSeek",
+                "contextWindowTokens": 128000,
+                "capabilities": {
+                    "functionCalling": True,
+                    "agentTools": True,
+                    "searchCapable": True,
+                    "webSearch": True,
+                    "vision": False,
+                },
+            },
             scenario=basic,
             elapsed_ms=1000,
             events=[{"chunk_type": "answering", "data": {"delta": "你好。"}}],
@@ -388,7 +515,14 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
                 "modelId": "kimi-k2.5",
                 "provider": "moonshot",
                 "name": "Kimi K2.5",
-                "capabilities": {"functionCalling": True, "agentTools": True},
+                "contextWindowTokens": 200000,
+                "capabilities": {
+                    "functionCalling": True,
+                    "agentTools": True,
+                    "searchCapable": True,
+                    "webSearch": True,
+                    "vision": False,
+                },
             },
             scenario=scenario,
             elapsed_ms=164_933,
@@ -591,6 +725,9 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
         self.assertIn("2/2", report)
         self.assertIn("kimi-k2.5", report)
         self.assertIn("slow_response", report)
+        self.assertIn("能力契约快照", report)
+        self.assertIn("可联网模型", report)
+        self.assertIn("长上下文模型", report)
         self.assertIn("真实 Chrome 回归补充记录", report)
         self.assertIn("禁止新开 Chrome/标签", report)
         self.assertIn("conv-search", report)

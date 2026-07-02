@@ -52,7 +52,19 @@ class ChatCoreSurfaceTests(unittest.TestCase):
             self.main.app.dependency_overrides[gdb] = override_db
 
     def test_health_endpoint_stays_available(self):
-        response = self.client.get("/health")
+        class HealthySession:
+            def execute(self, statement):
+                return None
+
+            def close(self):
+                return None
+
+        original_session_local = self.main.SessionLocal
+        self.main.SessionLocal = HealthySession
+        try:
+            response = self.client.get("/health")
+        finally:
+            self.main.SessionLocal = original_session_local
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()

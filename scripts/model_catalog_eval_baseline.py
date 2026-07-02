@@ -21,6 +21,7 @@ import httpx
 
 DEFAULT_FUSION_BASE_URL = "https://fusion.seanfield.org"
 DEFAULT_TRANSPORT = "stream"
+LONG_CONTEXT_THRESHOLD_TOKENS = 128_000
 
 SLOW_RESPONSE_THRESHOLDS_MS = {
     "basic_chat": 15_000,
@@ -123,6 +124,7 @@ class EvalResult:
     observed_tool_calls: int
     observed_tool_names: list[str]
     agent_tools_supported: bool
+    capability_contract: dict[str, Any]
     tool_expectation_met: bool
     quality_flags: list[str]
     error: dict[str, Any] | None
@@ -213,11 +215,52 @@ def _detect_eval_quality_flags(
     return flags
 
 
-def _model_supports_agent_tools(model: Mapping[str, Any]) -> bool:
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _positive_int_or_none(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _capability_contract(model: Mapping[str, Any]) -> dict[str, Any]:
     capabilities = model.get("capabilities") or {}
     if not isinstance(capabilities, Mapping):
-        return False
-    return bool(capabilities.get("agentTools", capabilities.get("functionCalling", False)))
+        capabilities = {}
+
+    function_calling = _coerce_bool(capabilities.get("functionCalling", False))
+    agent_tools = _coerce_bool(capabilities.get("agentTools", function_calling))
+    search_capable = _coerce_bool(capabilities.get("searchCapable", agent_tools))
+    web_search = _coerce_bool(capabilities.get("webSearch", search_capable))
+    context_window_tokens = _positive_int_or_none(model.get("contextWindowTokens"))
+    max_output_tokens = _positive_int_or_none(model.get("maxOutputTokens"))
+
+    return {
+        "agentTools": agent_tools,
+        "contextWindowTokens": context_window_tokens,
+        "functionCalling": function_calling,
+        "longContext": bool(
+            context_window_tokens is not None and context_window_tokens >= LONG_CONTEXT_THRESHOLD_TOKENS
+        ),
+        "maxOutputTokens": max_output_tokens,
+        "searchCapable": search_capable,
+        "vision": _coerce_bool(capabilities.get("vision", False)),
+        "webSearch": web_search,
+    }
+
+
+def _model_supports_agent_tools(model: Mapping[str, Any]) -> bool:
+    return bool(_capability_contract(model)["agentTools"])
 
 
 def _tool_expectation_met(expected_tool_use: str, observed_tool_calls: int, agent_tools_supported: bool) -> bool:
@@ -282,6 +325,7 @@ def _base_result_fields(
         "observed_tool_calls": tool_call_count,
         "observed_tool_names": tool_names,
         "agent_tools_supported": agent_tools_supported,
+        "capability_contract": _capability_contract(model),
         "tool_expectation_met": _tool_expectation_met(
             scenario.expected_tool_use,
             tool_call_count,
@@ -490,6 +534,21 @@ def load_results_from_jsonl(path: str | Path) -> list[EvalResult]:
             raise ValueError(f"{path}:{line_number} 不是合法 JSONL 行") from exc
         if not isinstance(payload, dict):
             raise ValueError(f"{path}:{line_number} 必须是 JSON object")
+        if "capability_contract" not in payload:
+            agent_tools_supported = bool(payload.get("agent_tools_supported", False))
+            payload["capability_contract"] = _capability_contract(
+                {
+                    "modelId": payload.get("model_id"),
+                    "provider": payload.get("provider"),
+                    "name": payload.get("model_name"),
+                    "capabilities": {
+                        "agentTools": agent_tools_supported,
+                        "functionCalling": agent_tools_supported,
+                        "searchCapable": agent_tools_supported,
+                        "webSearch": agent_tools_supported,
+                    },
+                }
+            )
         results.append(EvalResult(**payload))
     return results
 
@@ -693,6 +752,51 @@ def _record_quality_risk_by_model(
         model_risk["flag_counts"][flag] = model_risk["flag_counts"].get(flag, 0) + 1
 
 
+def _build_capability_contract_summary(results: Sequence[EvalResult]) -> dict[str, Any]:
+    contracts_by_model: dict[str, Mapping[str, Any]] = {}
+    for result in results:
+        contracts_by_model.setdefault(result.model_id, result.capability_contract)
+
+    models_by_capability: dict[str, list[str]] = {
+        "agent_tools": [],
+        "function_calling": [],
+        "long_context": [],
+        "search_capable": [],
+        "vision": [],
+        "web_search": [],
+    }
+    missing_context_window_count = 0
+
+    for model_id, contract in contracts_by_model.items():
+        if contract.get("agentTools"):
+            models_by_capability["agent_tools"].append(model_id)
+        if contract.get("functionCalling"):
+            models_by_capability["function_calling"].append(model_id)
+        if contract.get("longContext"):
+            models_by_capability["long_context"].append(model_id)
+        if contract.get("searchCapable"):
+            models_by_capability["search_capable"].append(model_id)
+        if contract.get("vision"):
+            models_by_capability["vision"].append(model_id)
+        if contract.get("webSearch"):
+            models_by_capability["web_search"].append(model_id)
+        if contract.get("contextWindowTokens") is None:
+            missing_context_window_count += 1
+
+    sorted_models_by_capability = {key: sorted(value) for key, value in models_by_capability.items()}
+    return {
+        "model_count": len(contracts_by_model),
+        "agent_tools_count": len(sorted_models_by_capability["agent_tools"]),
+        "function_calling_count": len(sorted_models_by_capability["function_calling"]),
+        "long_context_count": len(sorted_models_by_capability["long_context"]),
+        "search_capable_count": len(sorted_models_by_capability["search_capable"]),
+        "vision_count": len(sorted_models_by_capability["vision"]),
+        "web_search_count": len(sorted_models_by_capability["web_search"]),
+        "missing_context_window_count": missing_context_window_count,
+        "models_by_capability": sorted_models_by_capability,
+    }
+
+
 def build_summary(results: Sequence[EvalResult]) -> dict[str, Any]:
     by_model: dict[str, dict[str, Any]] = {}
     by_scenario: dict[str, dict[str, Any]] = {}
@@ -732,6 +836,7 @@ def build_summary(results: Sequence[EvalResult]) -> dict[str, Any]:
             "quality_issues": quality_issues,
             "quality_risk_by_model": quality_risk_by_model,
             "tool_expectation_mismatch_count": mismatch_count,
+            "capability_contract": _build_capability_contract_summary(results),
         }
     )
     return summary
@@ -820,6 +925,23 @@ def build_markdown_report(
             f"| `{_markdown_cell(model_id)}` | `{item.get('success_count', 0)}/{item.get('total', 0)}` | `{item.get('avg_elapsed_ms', 0)}ms` |"
         )
 
+    capability_contract = summary.get("capability_contract") or {}
+    lines.extend(
+        [
+            "",
+            "## 能力契约快照",
+            "",
+            "| 能力 | 模型数 |",
+            "|---|---:|",
+            f"| 可联网模型 | `{capability_contract.get('search_capable_count', 0)}` |",
+            f"| 可调用工具模型 | `{capability_contract.get('agent_tools_count', 0)}` |",
+            f"| Function Calling 模型 | `{capability_contract.get('function_calling_count', 0)}` |",
+            f"| 视觉模型 | `{capability_contract.get('vision_count', 0)}` |",
+            f"| 长上下文模型 | `{capability_contract.get('long_context_count', 0)}` |",
+            f"| 缺少上下文窗口标注 | `{capability_contract.get('missing_context_window_count', 0)}` |",
+        ]
+    )
+
     lines.extend(["", "## 质量风险", ""])
     quality_issues = list(summary.get("quality_issues") or [])
     if quality_issues:
@@ -885,6 +1007,28 @@ def build_markdown_report(
     return "\n".join(lines) + "\n"
 
 
+def build_dry_run_rows(
+    *,
+    models: Sequence[Mapping[str, Any]],
+    scenarios: Sequence[EvalScenario],
+    transport: str,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "modelId": model.get("modelId"),
+            "provider": model.get("provider"),
+            "health": _model_health_status(model),
+            "scenario_id": scenario.scenario_id,
+            "scenario_category": scenario.category,
+            "expected_tool_use": scenario.expected_tool_use,
+            "transport": transport,
+            "capability_contract": _capability_contract(model),
+        }
+        for model in models
+        for scenario in scenarios
+    ]
+
+
 def _split_csv(value: str | None) -> list[str]:
     if not value:
         return []
@@ -940,19 +1084,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     scenarios = select_scenarios(_split_csv(args.scenarios))
 
     if not args.apply:
-        rows = [
-            {
-                "modelId": model.get("modelId"),
-                "provider": model.get("provider"),
-                "health": _model_health_status(model),
-                "scenario_id": scenario.scenario_id,
-                "scenario_category": scenario.category,
-                "expected_tool_use": scenario.expected_tool_use,
-                "transport": args.transport,
-            }
-            for model in selected
-            for scenario in scenarios
-        ]
+        rows = build_dry_run_rows(models=selected, scenarios=scenarios, transport=args.transport)
         print(
             json.dumps(
                 {"total": len(rows), "items": rows},
