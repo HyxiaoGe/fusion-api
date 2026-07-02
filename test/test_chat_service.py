@@ -167,6 +167,75 @@ class ChatServiceTests(unittest.TestCase):
             {"metadata": {"tags": ["app:fusion", "phase:chat_non_stream"]}},
         )
 
+    def test_process_message_non_stream_injects_no_vision_boundary_for_image_on_text_model(self):
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = None
+        service = ChatService(db)
+        service.file_repo = MagicMock()
+        service.file_repo.get_file_by_id.return_value = SimpleNamespace(
+            original_filename="chart.png",
+            mimetype="image/png",
+            thumbnail_key=None,
+        )
+        service.conversation_service = MagicMock()
+        service._get_or_create_conversation = MagicMock(
+            return_value=(
+                Conversation(
+                    id="conv-1",
+                    user_id="user-1",
+                    title="这张图里有什么？",
+                    model_id="qwen-vl-max",
+                    messages=[],
+                    created_at=datetime.now(),
+                    updated_at=datetime.now(),
+                ),
+                True,
+            )
+        )
+        mock_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="当前模型无法查看图片。"))],
+            usage=None,
+        )
+
+        with (
+            patch(
+                "app.services.chat_service.llm_manager.resolve_model",
+                return_value=("openai/qwen-vl-max", "qwen", {}),
+            ),
+            patch(
+                "app.services.chat_service.litellm_catalog.get_capabilities",
+                return_value={"functionCalling": True, "agentTools": False, "vision": False},
+            ),
+            patch(
+                "app.services.chat_service.build_llm_messages",
+                new=AsyncMock(
+                    return_value=[
+                        {"role": "system", "content": "日期 system"},
+                        {"role": "user", "content": "这张图里有什么？"},
+                    ]
+                ),
+            ),
+            patch("app.services.chat_service.litellm") as mock_litellm,
+        ):
+            mock_litellm.acompletion = AsyncMock(return_value=mock_response)
+            asyncio.run(
+                service.process_message(
+                    model_id="qwen-vl-max",
+                    message="这张图里有什么？",
+                    user_id="user-1",
+                    stream=False,
+                    file_ids=["image-1"],
+                )
+            )
+
+        sent_messages = mock_litellm.acompletion.await_args.kwargs["messages"]
+        self.assertEqual([message["role"] for message in sent_messages[:4]], ["system", "system", "system", "user"])
+        self.assertIn("日期 system", sent_messages[0]["content"])
+        self.assertIn("【无图片理解能力边界规则】", sent_messages[1]["content"])
+        self.assertIn("当前模型不能读取或理解图片附件", sent_messages[1]["content"])
+        self.assertIn("【无联网工具边界规则】", sent_messages[2]["content"])
+        self.assertEqual(sent_messages[3]["content"], "这张图里有什么？")
+
     def test_generate_suggested_questions_limits_output_to_three(self):
         service = object.__new__(ChatService)
         service.db = MagicMock()

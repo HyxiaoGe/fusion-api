@@ -112,6 +112,38 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("【工具调用一致性规则】", prepared.messages[1]["content"])
         self.assertEqual(prepared.messages[2]["content"], "OpenAI 最近发布了什么模型？")
 
+    async def test_prepare_messages_injects_no_vision_boundary_when_image_attached_to_text_model(self):
+        async def build_llm_messages_fn(_raw_messages, _has_vision, _repo, _user_system_prompt):
+            return [
+                {"role": "system", "content": "日期 system"},
+                {"role": "user", "content": "这张图里有什么？"},
+            ]
+
+        prepared = await prepare_agent_loop_messages(
+            db=object(),
+            user_id="user-1",
+            raw_messages=["raw"],
+            has_vision=False,
+            file_ids=["image-1"],
+            original_message="这张图里有什么？",
+            call_config=build_agent_loop_call_config(
+                provider="qwen",
+                options={},
+                capabilities={"functionCalling": True, "agentTools": False, "vision": False},
+            ),
+            file_repo_factory=lambda _db: object(),
+            load_user_system_prompt_fn=lambda _db, _user_id: None,
+            build_llm_messages_fn=build_llm_messages_fn,
+            is_image_file_fn=lambda file_id, _repo: file_id == "image-1",
+        )
+
+        self.assertEqual([message["role"] for message in prepared.messages], ["system", "system", "system", "user"])
+        self.assertIn("【无图片理解能力边界规则】", prepared.messages[1]["content"])
+        self.assertIn("当前模型不能读取或理解图片附件", prepared.messages[1]["content"])
+        self.assertIn("不要臆测图片内容", prepared.messages[1]["content"])
+        self.assertIn("【无联网工具边界规则】", prepared.messages[2]["content"])
+        self.assertEqual(prepared.messages[3]["content"], "这张图里有什么？")
+
     async def test_prepare_messages_builds_llm_input_files_url_context_and_tool_contract(self):
         file_repo = FakeFileRepository()
         build_calls = []
@@ -182,12 +214,16 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(inject_calls[0]["file_contents"], {"doc-1": "文档正文"})
         self.assertEqual([block.id for block in prepared.initial_content_blocks], ["url-block"])
         self.assertEqual(prepared.final_tool_names, ["web_search", "url_read"])
-        self.assertEqual([message["role"] for message in prepared.messages], ["system", "system", "user", "user"])
+        self.assertEqual(
+            [message["role"] for message in prepared.messages],
+            ["system", "system", "system", "user", "user"],
+        )
         self.assertIn("日期 system", prepared.messages[0]["content"])
-        self.assertIn("【工具调用一致性规则】", prepared.messages[1]["content"])
-        self.assertNotIn("【无联网工具边界规则】", prepared.messages[1]["content"])
-        self.assertIn("<web_context>", prepared.messages[2]["content"])
-        self.assertIn("文档正文", prepared.messages[3]["content"])
+        self.assertIn("【无图片理解能力边界规则】", prepared.messages[1]["content"])
+        self.assertIn("【工具调用一致性规则】", prepared.messages[2]["content"])
+        self.assertNotIn("【无联网工具边界规则】", prepared.messages[2]["content"])
+        self.assertIn("<web_context>", prepared.messages[3]["content"])
+        self.assertIn("文档正文", prepared.messages[4]["content"])
         self.assertEqual(call_config.announced_tools, ["web_search"])
 
     def test_tool_usage_contract_uses_centralized_prompt(self):

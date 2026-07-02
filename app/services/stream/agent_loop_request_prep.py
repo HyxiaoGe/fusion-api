@@ -7,7 +7,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.ai.litellm_utils import merge_extra_body
-from app.ai.prompts.agent_loop import NO_TOOL_NETWORK_BOUNDARY_PROMPT, TOOL_USAGE_CONTRACT_PROMPT
+from app.ai.prompts.agent_loop import (
+    NO_TOOL_NETWORK_BOUNDARY_PROMPT,
+    NO_VISION_FILE_BOUNDARY_PROMPT,
+    TOOL_USAGE_CONTRACT_PROMPT,
+)
 from app.ai.tools import build_web_search_tool
 from app.db.repositories import FileRepository
 from app.services.chat.message_builder import (
@@ -122,6 +126,11 @@ async def prepare_agent_loop_messages(
     messages = inject_extra_system_prompts(messages, extra_system_prompts or [])
 
     if preprocess_user_input:
+        has_image_attachment = _has_image_file(
+            file_ids=file_ids,
+            file_repo=file_repo,
+            is_image_file_fn=is_image_file_fn,
+        )
         messages = _inject_non_image_file_contents(
             messages=messages,
             file_ids=file_ids,
@@ -139,7 +148,10 @@ async def prepare_agent_loop_messages(
         )
     else:
         initial_content_blocks = []
+        has_image_attachment = False
 
+    if has_image_attachment and not has_vision:
+        messages = inject_no_vision_file_boundary(messages)
     messages = inject_tool_usage_contract(messages, call_config.call_kwargs)
     messages = inject_no_tool_network_boundary(messages, call_config.call_kwargs)
     return AgentLoopPreparedMessages(
@@ -158,6 +170,17 @@ def inject_extra_system_prompts(messages: list[dict], prompts: list[str]) -> lis
         insert_at += 1
     prompt_messages = [{"role": "system", "content": prompt} for prompt in prompts]
     return [*messages[:insert_at], *prompt_messages, *messages[insert_at:]]
+
+
+def _has_image_file(
+    *,
+    file_ids: list | None,
+    file_repo: Any,
+    is_image_file_fn: Callable[[str, Any], bool],
+) -> bool:
+    if not file_ids:
+        return False
+    return any(is_image_file_fn(fid, file_repo) for fid in file_ids)
 
 
 def _inject_non_image_file_contents(
@@ -228,4 +251,18 @@ def inject_no_tool_network_boundary(messages: list[dict], call_kwargs: dict) -> 
     while insert_at < len(messages) and messages[insert_at].get("role") == "system":
         insert_at += 1
     boundary_msg = {"role": "system", "content": NO_TOOL_NETWORK_BOUNDARY_PROMPT}
+    return [*messages[:insert_at], boundary_msg, *messages[insert_at:]]
+
+
+def inject_no_vision_file_boundary(messages: list[dict]) -> list[dict]:
+    """图片已附加但当前模型无 vision 时，给 LLM 明确能力边界，避免臆测图片内容。"""
+    if any(
+        msg.get("role") == "system" and "【无图片理解能力边界规则】" in str(msg.get("content", "")) for msg in messages
+    ):
+        return messages
+
+    insert_at = 0
+    while insert_at < len(messages) and messages[insert_at].get("role") == "system":
+        insert_at += 1
+    boundary_msg = {"role": "system", "content": NO_VISION_FILE_BOUNDARY_PROMPT}
     return [*messages[:insert_at], boundary_msg, *messages[insert_at:]]

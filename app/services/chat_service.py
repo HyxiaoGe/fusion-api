@@ -36,7 +36,7 @@ from app.services.conversation_service import ConversationService
 from app.services.file_service import is_image_mime
 from app.services.storage import get_storage
 from app.services.stream import StreamHandler, stream_redis_as_sse
-from app.services.stream.agent_loop_request_prep import inject_no_tool_network_boundary
+from app.services.stream.agent_loop_request_prep import inject_no_tool_network_boundary, inject_no_vision_file_boundary
 from app.services.stream.runner import _agent_loop_limits
 from app.services.stream_state_service import get_stream_meta, init_stream
 from app.services.task_manager import register_task
@@ -79,7 +79,7 @@ class ChatService:
         # 构造用户消息 content blocks
         user_content = [TextBlock(type="text", text=message)]
         if file_ids:
-            storage = get_storage()
+            storage = None
             for fid in file_ids:
                 file_info = self.file_repo.get_file_by_id(fid)
                 if file_info:
@@ -94,6 +94,7 @@ class ChatService:
                         from app.core.config import settings
 
                         try:
+                            storage = storage or get_storage()
                             thumb_url = await storage.get_url(
                                 file_info.thumbnail_key,
                                 expires=settings.MINIO_PRESIGN_EXPIRES,
@@ -172,7 +173,10 @@ class ChatService:
                 user_system_prompt=user_system_prompt,
             )
             if file_ids:
-                non_image_ids = [fid for fid in file_ids if not is_image_file(fid, self.file_repo)]
+                image_ids = [fid for fid in file_ids if is_image_file(fid, self.file_repo)]
+                non_image_ids = [fid for fid in file_ids if fid not in image_ids]
+                if image_ids and not has_vision:
+                    lm_messages = inject_no_vision_file_boundary(lm_messages)
                 if non_image_ids:
                     file_contents = self.file_repo.get_parsed_file_content(non_image_ids)
                     if file_contents:
