@@ -22,6 +22,14 @@ router = APIRouter()
 _COST_TIER_ORDER = {"low": 0, "mid": 1, "high": 2}
 
 
+def _positive_int_or_none(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
 def _normalize_provider_key(metadata: Dict[str, Any], underlying: str) -> str:
     """归一化 provider key（稳定 ASCII，给前端做分组用）。
 
@@ -51,6 +59,8 @@ def _entry_to_card(alias: str, entry: Dict[str, Any]) -> Dict[str, Any]:
         "provider": provider_key,
         "provider_display": metadata.get("provider_display") or provider_key,
         "knowledgeCutoff": metadata.get("knowledge_cutoff") or None,
+        "contextWindowTokens": _positive_int_or_none(entry.get("max_input_tokens")),
+        "maxOutputTokens": _positive_int_or_none(entry.get("max_output_tokens")),
         "capabilities": {
             "imageGen": bool(capabilities.get("imageGen", False)),
             "deepThinking": bool(capabilities.get("deepThinking", False)),

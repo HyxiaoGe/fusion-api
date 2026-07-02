@@ -64,6 +64,13 @@ def _require_non_empty_list(value: Any, label: str) -> list[Any]:
     return value
 
 
+def _require_optional_positive_int(value: Any, label: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise DeploymentSmokeError(f"{label} must be null or a positive integer")
+
+
 def validate_models_payload(payload: dict[str, Any]) -> None:
     code = payload.get("code")
     if code is not None and code != "SUCCESS":
@@ -84,6 +91,11 @@ def validate_models_payload(payload: dict[str, Any]) -> None:
         for key in ("modelId", "name", "provider", "enabled"):
             if key not in model_data or model_data.get(key) in ("", None):
                 raise DeploymentSmokeError(f"models[{index}].{key} is required")
+
+        for key in ("contextWindowTokens", "maxOutputTokens"):
+            if key not in model_data:
+                raise DeploymentSmokeError(f"models[{index}].{key} is required")
+            _require_optional_positive_int(model_data.get(key), f"models[{index}].{key}")
 
         capabilities = model_data.get("capabilities")
         if not isinstance(capabilities, dict):

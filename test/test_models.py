@@ -4,6 +4,40 @@ from app.api.models import _entry_to_card
 
 
 class ModelsApiTests(unittest.TestCase):
+    def test_entry_to_card_exposes_context_token_limits(self):
+        card = _entry_to_card(
+            "xiaomi/mimo-v2.5-pro",
+            {
+                "underlying": "xiaomi/mimo-v2.5-pro",
+                "max_input_tokens": 1_000_000,
+                "max_output_tokens": 32_768,
+                "metadata": {
+                    "provider_key": "xiaomi",
+                    "capabilities": {"functionCalling": True, "vision": False},
+                },
+            },
+        )
+
+        self.assertEqual(card["contextWindowTokens"], 1_000_000)
+        self.assertEqual(card["maxOutputTokens"], 32_768)
+
+    def test_entry_to_card_omits_invalid_context_token_limits(self):
+        card = _entry_to_card(
+            "unknown-model",
+            {
+                "underlying": "unknown/model",
+                "max_input_tokens": "not-a-number",
+                "max_output_tokens": 0,
+                "metadata": {
+                    "provider_key": "unknown",
+                    "capabilities": {"functionCalling": False},
+                },
+            },
+        )
+
+        self.assertIsNone(card["contextWindowTokens"])
+        self.assertIsNone(card["maxOutputTokens"])
+
     def test_entry_to_card_exposes_agent_tools_capability(self):
         card = _entry_to_card(
             "qwen-vl-max",
