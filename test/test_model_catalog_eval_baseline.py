@@ -18,6 +18,9 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
                 "coding_reasoning",
                 "autonomous_search",
                 "no_search_simple",
+                "vision_image_understanding",
+                "no_vision_image_boundary",
+                "long_context_contract",
                 "long_answer",
             ],
         )
@@ -25,6 +28,13 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
         self.assertEqual(expectation_by_id["autonomous_search"], "expected")
         self.assertEqual(expectation_by_id["no_search_simple"], "forbidden")
         self.assertEqual(expectation_by_id["long_answer"], "forbidden")
+
+        scenario_by_id = {scenario.scenario_id: scenario for scenario in scenarios}
+        self.assertEqual(scenario_by_id["vision_image_understanding"].required_capabilities, ("vision",))
+        self.assertEqual(scenario_by_id["vision_image_understanding"].attachment_kind, "vision_test_image")
+        self.assertEqual(scenario_by_id["no_vision_image_boundary"].excluded_capabilities, ("vision",))
+        self.assertEqual(scenario_by_id["no_vision_image_boundary"].attachment_kind, "vision_test_image")
+        self.assertEqual(scenario_by_id["long_context_contract"].required_capabilities, ("longContext",))
 
     def test_select_scenarios_filters_in_requested_order(self):
         scenarios = baseline.select_scenarios(["autonomous_search", "basic_chat"])
@@ -210,6 +220,83 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
         self.assertEqual(rows[0]["capability_contract"]["vision"], True)
         self.assertEqual(rows[0]["capability_contract"]["searchCapable"], False)
         self.assertEqual(rows[0]["capability_contract"]["longContext"], False)
+
+    def test_dry_run_rows_explain_ineligible_capability_scenarios(self):
+        rows = baseline.build_dry_run_rows(
+            models=[
+                {
+                    "modelId": "plain-model",
+                    "provider": "mock",
+                    "health": {"status": "healthy"},
+                    "capabilities": {
+                        "functionCalling": True,
+                        "agentTools": False,
+                        "searchCapable": False,
+                        "vision": False,
+                    },
+                },
+                {
+                    "modelId": "vision-model",
+                    "provider": "mock",
+                    "health": {"status": "healthy"},
+                    "capabilities": {
+                        "functionCalling": True,
+                        "agentTools": False,
+                        "searchCapable": False,
+                        "vision": True,
+                    },
+                },
+            ],
+            scenarios=baseline.select_scenarios(["vision_image_understanding", "no_vision_image_boundary"]),
+            transport="stream",
+        )
+
+        plain_vision = next(
+            row
+            for row in rows
+            if row["modelId"] == "plain-model" and row["scenario_id"] == "vision_image_understanding"
+        )
+        vision_no_boundary = next(
+            row for row in rows if row["modelId"] == "vision-model" and row["scenario_id"] == "no_vision_image_boundary"
+        )
+
+        self.assertFalse(plain_vision["eligible"])
+        self.assertIn("vision", plain_vision["skip_reason"])
+        self.assertEqual(plain_vision["required_capabilities"], ["vision"])
+        self.assertEqual(plain_vision["attachment_kind"], "vision_test_image")
+        self.assertFalse(vision_no_boundary["eligible"])
+        self.assertIn("vision", vision_no_boundary["skip_reason"])
+        self.assertEqual(vision_no_boundary["excluded_capabilities"], ["vision"])
+
+    def test_skipped_result_is_not_counted_as_failure(self):
+        scenario = baseline.select_scenarios(["vision_image_understanding"])[0]
+        result = baseline.build_skipped_result(
+            model={
+                "modelId": "plain-model",
+                "provider": "mock",
+                "name": "Plain Model",
+                "capabilities": {
+                    "functionCalling": True,
+                    "agentTools": False,
+                    "searchCapable": False,
+                    "vision": False,
+                },
+            },
+            scenario=scenario,
+            transport="stream",
+            skip_reason="missing required capabilities: vision",
+        )
+
+        row = json.loads(baseline.to_jsonl(result).strip())
+        summary = baseline.build_summary([result])
+
+        self.assertTrue(row["skipped"])
+        self.assertEqual(row["skip_reason"], "missing required capabilities: vision")
+        self.assertFalse(row["success"])
+        self.assertIsNone(row["error"])
+        self.assertEqual(summary["total"], 1)
+        self.assertEqual(summary["skipped_count"], 1)
+        self.assertEqual(summary["failure_count"], 0)
 
     def test_failure_result_jsonl_contains_error(self):
         scenario = baseline.select_scenarios(["basic_chat"])[0]
@@ -605,6 +692,62 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
         self.assertFalse(row["requires_source_read"])
         self.assertEqual(row["quality_flags"], [])
 
+    def test_expected_answer_missing_is_quality_flag(self):
+        scenario = baseline.select_scenarios(["vision_image_understanding"])[0]
+        result = baseline.build_stream_result(
+            model={
+                "modelId": "qwen-vl-max",
+                "provider": "qwen",
+                "name": "Qwen VL Max",
+                "capabilities": {"functionCalling": True, "agentTools": False, "vision": True},
+            },
+            scenario=scenario,
+            elapsed_ms=3200,
+            events=[{"chunk_type": "answering", "data": {"delta": "图片里有一个蓝色边框。"}}],
+        )
+
+        row = json.loads(baseline.to_jsonl(result).strip())
+
+        self.assertTrue(row["success"])
+        self.assertIn("expected_answer_missing", row["quality_flags"])
+
+    def test_no_vision_boundary_missing_is_quality_flag(self):
+        scenario = baseline.select_scenarios(["no_vision_image_boundary"])[0]
+        result = baseline.build_stream_result(
+            model={
+                "modelId": "deepseek-reasoner",
+                "provider": "deepseek",
+                "name": "DeepSeek Reasoner",
+                "capabilities": {"functionCalling": True, "agentTools": False, "vision": False},
+            },
+            scenario=scenario,
+            elapsed_ms=3200,
+            events=[{"chunk_type": "answering", "data": {"delta": "图片中写着 FUSION。"}}],
+        )
+
+        row = json.loads(baseline.to_jsonl(result).strip())
+
+        self.assertTrue(row["success"])
+        self.assertIn("missing_no_vision_boundary", row["quality_flags"])
+
+    def test_no_vision_boundary_accepts_explicit_limitation_answer(self):
+        scenario = baseline.select_scenarios(["no_vision_image_boundary"])[0]
+        result = baseline.build_stream_result(
+            model={
+                "modelId": "deepseek-reasoner",
+                "provider": "deepseek",
+                "name": "DeepSeek Reasoner",
+                "capabilities": {"functionCalling": True, "agentTools": False, "vision": False},
+            },
+            scenario=scenario,
+            elapsed_ms=3200,
+            events=[{"chunk_type": "answering", "data": {"delta": "当前模型无法读取或理解图片内容。"}}],
+        )
+
+        row = json.loads(baseline.to_jsonl(result).strip())
+
+        self.assertEqual(row["quality_flags"], [])
+
     def test_slow_success_is_quality_flag(self):
         scenario = baseline.select_scenarios(["autonomous_search"])[0]
         result = baseline.build_stream_result(
@@ -663,6 +806,81 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
         self.assertTrue(observed[0].success)
         self.assertFalse(observed[1].success)
         self.assertEqual(observed[1].error["category"], "timeout")
+
+    def test_run_eval_skips_ineligible_scenarios_without_calling_chat_api(self):
+        scenario = baseline.select_scenarios(["vision_image_understanding"])[0]
+        models = [
+            {
+                "modelId": "plain-model",
+                "provider": "mock",
+                "name": "Plain Model",
+                "capabilities": {"functionCalling": True, "agentTools": False, "vision": False},
+            }
+        ]
+        observed: list[baseline.EvalResult] = []
+        original_call_chat_send_stream = baseline.call_chat_send_stream
+
+        def fake_call_chat_send_stream(**kwargs):
+            raise AssertionError("ineligible scenario should be skipped before chat API call")
+
+        baseline.call_chat_send_stream = fake_call_chat_send_stream
+        try:
+            results = baseline.run_eval(
+                base_url="http://fusion.local",
+                auth_token="token",
+                models=models,
+                scenarios=[scenario],
+                on_result=observed.append,
+            )
+        finally:
+            baseline.call_chat_send_stream = original_call_chat_send_stream
+
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].skipped)
+        self.assertEqual(observed, results)
+
+    def test_run_eval_uploads_image_before_chat_for_attachment_scenarios(self):
+        scenario = baseline.select_scenarios(["vision_image_understanding"])[0]
+        model = {
+            "modelId": "qwen-vl-max",
+            "provider": "qwen",
+            "name": "Qwen VL Max",
+            "capabilities": {"functionCalling": True, "agentTools": False, "vision": True},
+        }
+        calls: list[tuple[str, dict]] = []
+        original_upload = baseline.upload_scenario_files
+        original_call_chat_send_stream = baseline.call_chat_send_stream
+
+        def fake_upload_scenario_files(**kwargs):
+            calls.append(("upload", kwargs))
+            return ["file-1"]
+
+        def fake_call_chat_send_stream(**kwargs):
+            calls.append(("chat", kwargs))
+            self.assertEqual(kwargs["file_ids"], ["file-1"])
+            self.assertEqual(kwargs["conversation_id"], calls[0][1]["conversation_id"])
+            return (
+                [{"chunk_type": "answering", "data": {"delta": "FUSION"}}],
+                {"conversation_id": kwargs["conversation_id"]},
+            )
+
+        baseline.upload_scenario_files = fake_upload_scenario_files
+        baseline.call_chat_send_stream = fake_call_chat_send_stream
+        try:
+            results = baseline.run_eval(
+                base_url="http://fusion.local",
+                auth_token="token",
+                models=[model],
+                scenarios=[scenario],
+            )
+        finally:
+            baseline.upload_scenario_files = original_upload
+            baseline.call_chat_send_stream = original_call_chat_send_stream
+
+        self.assertEqual([name for name, _ in calls], ["upload", "chat"])
+        self.assertTrue(results[0].success)
+        self.assertEqual(results[0].attached_file_count, 1)
+        self.assertEqual(results[0].attachment_kinds, ["vision_test_image"])
 
     def test_load_results_from_jsonl_round_trips_eval_result_rows(self):
         scenario = baseline.select_scenarios(["basic_chat"])[0]
@@ -728,6 +946,8 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
         self.assertIn("能力契约快照", report)
         self.assertIn("可联网模型", report)
         self.assertIn("长上下文模型", report)
+        self.assertIn("跳过", report)
+        self.assertIn("场景矩阵", report)
         self.assertIn("真实 Chrome 回归补充记录", report)
         self.assertIn("禁止新开 Chrome/标签", report)
         self.assertIn("conv-search", report)

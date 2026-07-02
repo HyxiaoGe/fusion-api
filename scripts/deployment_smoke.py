@@ -103,6 +103,20 @@ def validate_models_payload(payload: dict[str, Any]) -> None:
         for key in ("functionCalling", "agentTools", "searchCapable", "webSearch", "vision"):
             if key not in capabilities:
                 raise DeploymentSmokeError(f"models[{index}].capabilities.{key} is required")
+            if not isinstance(capabilities.get(key), bool):
+                raise DeploymentSmokeError(f"models[{index}].capabilities.{key} must be a boolean")
+        if capabilities["agentTools"] and not capabilities["functionCalling"]:
+            raise DeploymentSmokeError(
+                f"models[{index}].capabilities.agentTools cannot be true when functionCalling is false"
+            )
+        if capabilities["searchCapable"] != capabilities["agentTools"]:
+            raise DeploymentSmokeError(
+                f"models[{index}].capabilities.searchCapable must match agentTools runtime availability"
+            )
+        if capabilities["webSearch"] != capabilities["searchCapable"]:
+            raise DeploymentSmokeError(
+                f"models[{index}].capabilities.webSearch must match searchCapable compatibility alias"
+            )
 
 
 def run_smoke(base_url: str) -> dict[str, int | str]:
