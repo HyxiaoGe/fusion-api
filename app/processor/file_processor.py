@@ -1,10 +1,12 @@
-import asyncio
 import base64
 import io
 import os
 from typing import Any, Dict, List, Optional
 
-from app.ai.llm_observability import merge_openai_extra_body
+import litellm
+
+from app.ai.llm_manager import llm_manager
+from app.ai.llm_observability import merge_litellm_kwargs
 from app.ai.prompts import prompt_manager
 from app.core.logger import app_logger as logger
 
@@ -14,10 +16,10 @@ class FileProcessor:
 
     LOCAL_TEXT_PREVIEW_LIMIT = 6000
     PROMPT_TEXT_PREVIEW_LIMIT = 3000
+    VISION_MODEL_ID = "qwen-vl-max"
 
     def __init__(self):
-        self.model = "qwen-omni-turbo"
-        self.client = None
+        self.model = self.VISION_MODEL_ID
 
     async def process_files(
         self, file_paths: List[str], query: str = None, mime_types: Optional[List[str]] = None
@@ -257,11 +259,8 @@ class FileProcessor:
         return prompt_manager.format_prompt("file_analysis", query=query, file_content=file_content_text)
 
     async def _call_model(self, prompt: str, files_data: List[Dict[str, Any]]) -> str:
-        """使用通义千问视觉模型处理文件"""
+        """通过 LiteLLM Proxy 使用视觉模型处理文件。"""
         try:
-            if self.client is None:
-                raise RuntimeError("文件解析模型未配置")
-
             # 构建消息内容
             messages = [
                 {
@@ -289,21 +288,20 @@ class FileProcessor:
             # 添加完整的用户消息
             messages.append({"role": "user", "content": user_content})
 
-            # 调用API
-            stream_response = await asyncio.to_thread(
-                self.client.chat.completions.create,
-                model=self.model,
+            litellm_model, _, litellm_kwargs = llm_manager.resolve_model(self.model)
+
+            stream_response = await litellm.acompletion(
+                model=litellm_model,
                 messages=messages,
                 stream=True,
                 stream_options={"include_usage": True},
-                modalities=["text"],  # 只需要文本输出
-                extra_body=merge_openai_extra_body("file_processing"),
+                **merge_litellm_kwargs("file_processing", litellm_kwargs),
             )
 
             # 收集流式响应
             full_response = ""
             try:
-                for chunk in stream_response:
+                async for chunk in stream_response:
                     if hasattr(chunk, "choices") and len(chunk.choices) > 0:
                         delta = chunk.choices[0].delta
                         if hasattr(delta, "content") and delta.content:

@@ -47,8 +47,8 @@ LITELLM_MASTER_KEY = os.environ["LITELLM_MASTER_KEY"]
 # cost_tier 启发式分桶：根据 input/output 单价定档
 # 单位：USD per 1k tokens（fusion DB 里 pricing 字段就是这个）
 _COST_TIER_THRESHOLDS = [
-    ("low", 0.5),   # 输入价 <= 0.5/1k tokens
-    ("mid", 3.0),   # 输入价 <= 3/1k tokens
+    ("low", 0.5),  # 输入价 <= 0.5/1k tokens
+    ("mid", 3.0),  # 输入价 <= 3/1k tokens
     ("high", 1e9),  # 其他
 ]
 
@@ -58,7 +58,7 @@ _COST_TIER_THRESHOLDS = [
 _OPENAI_COMPATIBLE_PROVIDERS = {
     "qwen": {
         "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "api_key_env": "QWEN_API_KEY",
+        "api_key_env": "QWEN_COMPAT_KEY",
     },
     "doubao": {
         "api_base": "https://ark.cn-beijing.volces.com/api/v3",
