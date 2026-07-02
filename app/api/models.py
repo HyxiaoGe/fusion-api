@@ -57,6 +57,7 @@ def _entry_to_card(alias: str, entry: Dict[str, Any]) -> Dict[str, Any]:
             "fileSupport": bool(capabilities.get("fileSupport", False)),
             "functionCalling": bool(capabilities.get("functionCalling", False)),
             "agentTools": bool(capabilities.get("agentTools", False)),
+            "searchCapable": bool(capabilities.get("searchCapable", False)),
             "vision": bool(capabilities.get("vision", False)),
             "webSearch": bool(capabilities.get("webSearch", False)),
         },

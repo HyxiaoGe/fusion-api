@@ -46,6 +46,13 @@ def announced_tool_names_from_call_kwargs(call_kwargs: dict) -> list[str]:
     return ordered_names
 
 
+def supports_search_tools(capabilities: dict) -> bool:
+    function_calling = bool(capabilities.get("functionCalling", False))
+    if "searchCapable" in capabilities:
+        return function_calling and bool(capabilities.get("searchCapable"))
+    return function_calling and bool(capabilities.get("agentTools", capabilities.get("functionCalling", False)))
+
+
 def build_agent_loop_call_config(
     *,
     provider: str,
@@ -61,9 +68,7 @@ def build_agent_loop_call_config(
     supports_thinking = bool(capabilities.get("deepThinking", False))
     should_use_reasoning = use_reasoning is True or (use_reasoning is None and supports_thinking)
 
-    supports_function_calling = bool(capabilities.get("functionCalling", False)) and bool(
-        capabilities.get("agentTools", capabilities.get("functionCalling", False))
-    )
+    supports_function_calling = supports_search_tools(capabilities)
     call_kwargs: dict = {}
     if supports_function_calling:
         call_kwargs["tools"] = [build_web_search_tool_fn()]

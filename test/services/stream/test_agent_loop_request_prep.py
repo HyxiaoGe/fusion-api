@@ -55,6 +55,29 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("tools", config.call_kwargs)
         self.assertNotIn("tool_choice", config.call_kwargs)
 
+    def test_build_call_config_uses_search_capable_as_runtime_tool_contract(self):
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={},
+            capabilities={"functionCalling": True, "agentTools": False, "searchCapable": True},
+        )
+
+        self.assertTrue(config.supports_function_calling)
+        self.assertEqual(config.announced_tools, ["web_search"])
+        self.assertEqual(config.call_kwargs["tool_choice"], "auto")
+
+    def test_build_call_config_disables_tools_when_search_capable_is_false(self):
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={},
+            capabilities={"functionCalling": True, "agentTools": True, "webSearch": True, "searchCapable": False},
+        )
+
+        self.assertFalse(config.supports_function_calling)
+        self.assertEqual(config.announced_tools, [])
+        self.assertNotIn("tools", config.call_kwargs)
+        self.assertNotIn("tool_choice", config.call_kwargs)
+
     async def test_prepare_messages_injects_no_tool_network_boundary_when_agent_tools_disabled(self):
         async def build_llm_messages_fn(_raw_messages, _has_vision, _repo, _user_system_prompt):
             return [

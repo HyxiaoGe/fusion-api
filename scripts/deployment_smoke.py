@@ -88,6 +88,9 @@ def validate_models_payload(payload: dict[str, Any]) -> None:
         capabilities = model_data.get("capabilities")
         if not isinstance(capabilities, dict):
             raise DeploymentSmokeError(f"models[{index}].capabilities must be an object")
+        for key in ("functionCalling", "agentTools", "searchCapable", "webSearch", "vision"):
+            if key not in capabilities:
+                raise DeploymentSmokeError(f"models[{index}].capabilities.{key} is required")
 
 
 def run_smoke(base_url: str) -> dict[str, int | str]:
@@ -120,10 +123,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"deployment smoke failed: {exc}", file=sys.stderr)
         return 1
 
-    print(
-        "deployment smoke ok: "
-        f"health={result['health']} models={result['models']} providers={result['providers']}"
-    )
+    print(f"deployment smoke ok: health={result['health']} models={result['models']} providers={result['providers']}")
     return 0
 
 

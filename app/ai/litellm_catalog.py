@@ -107,11 +107,23 @@ def normalize_capabilities(alias: str, capabilities: Dict[str, Any] | None) -> D
     """补齐 Fusion 运行时需要的派生能力位。"""
     normalized = dict(capabilities or {})
     function_calling = bool(normalized.get("functionCalling", False))
-    if "agentTools" in normalized:
-        normalized["agentTools"] = bool(normalized.get("agentTools"))
-        return normalized
+    normalized["functionCalling"] = function_calling
+    normalized["vision"] = bool(normalized.get("vision", False))
+    normalized["deepThinking"] = bool(normalized.get("deepThinking", False))
+    normalized["fileSupport"] = bool(normalized.get("fileSupport", False))
+    normalized["imageGen"] = bool(normalized.get("imageGen", False))
 
-    normalized["agentTools"] = function_calling and alias not in AGENT_TOOLS_DISABLED_BY_DEFAULT
+    if "agentTools" in normalized:
+        requested_agent_tools = bool(normalized.get("agentTools"))
+    else:
+        requested_agent_tools = alias not in AGENT_TOOLS_DISABLED_BY_DEFAULT
+
+    agent_tools = function_calling and requested_agent_tools
+    normalized["agentTools"] = agent_tools
+    # searchCapable 是 Fusion 产品语义：后端会实际下发 web_search/url_read 工具。
+    normalized["searchCapable"] = agent_tools
+    # webSearch 保留给旧前端/脚本，但不再直接信任 metadata 旧字段。
+    normalized["webSearch"] = agent_tools
     return normalized
 
 

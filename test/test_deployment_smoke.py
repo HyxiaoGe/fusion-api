@@ -28,13 +28,44 @@ class DeploymentSmokeTests(unittest.TestCase):
                             "name": "DeepSeek",
                             "provider": "deepseek",
                             "enabled": True,
-                            "capabilities": {"agentTools": True, "webSearch": True},
+                            "capabilities": {
+                                "functionCalling": True,
+                                "agentTools": True,
+                                "searchCapable": True,
+                                "webSearch": True,
+                                "vision": False,
+                            },
                         }
                     ],
                     "providers": [{"id": "deepseek", "name": "DeepSeek", "order": 1}],
                 },
             }
         )
+
+    def test_validate_models_rejects_missing_search_capable_contract(self):
+        with self.assertRaisesRegex(DeploymentSmokeError, "searchCapable"):
+            validate_models_payload(
+                {
+                    "code": "SUCCESS",
+                    "data": {
+                        "models": [
+                            {
+                                "modelId": "deepseek-chat",
+                                "name": "DeepSeek",
+                                "provider": "deepseek",
+                                "enabled": True,
+                                "capabilities": {
+                                    "functionCalling": True,
+                                    "agentTools": True,
+                                    "webSearch": True,
+                                    "vision": False,
+                                },
+                            }
+                        ],
+                        "providers": [{"id": "deepseek", "name": "DeepSeek", "order": 1}],
+                    },
+                }
+            )
 
     def test_validate_models_rejects_missing_capabilities(self):
         with self.assertRaisesRegex(DeploymentSmokeError, "capabilities"):

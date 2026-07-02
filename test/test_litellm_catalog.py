@@ -12,6 +12,8 @@ class LiteLLMCatalogTests(unittest.TestCase):
 
         self.assertTrue(capabilities["functionCalling"])
         self.assertTrue(capabilities["agentTools"])
+        self.assertTrue(capabilities["searchCapable"])
+        self.assertTrue(capabilities["webSearch"])
 
     def test_normalize_capabilities_disables_known_non_agent_models_by_default(self):
         capabilities = litellm_catalog.normalize_capabilities(
@@ -21,6 +23,8 @@ class LiteLLMCatalogTests(unittest.TestCase):
 
         self.assertTrue(capabilities["functionCalling"])
         self.assertFalse(capabilities["agentTools"])
+        self.assertFalse(capabilities["searchCapable"])
+        self.assertFalse(capabilities["webSearch"])
 
     def test_normalize_capabilities_respects_explicit_agent_tools_false(self):
         capabilities = litellm_catalog.normalize_capabilities(
@@ -29,6 +33,27 @@ class LiteLLMCatalogTests(unittest.TestCase):
         )
 
         self.assertFalse(capabilities["agentTools"])
+        self.assertFalse(capabilities["searchCapable"])
+
+    def test_normalize_capabilities_never_enables_agent_tools_without_function_calling(self):
+        capabilities = litellm_catalog.normalize_capabilities(
+            "metadata-mismatch",
+            {"functionCalling": False, "agentTools": True, "webSearch": True},
+        )
+
+        self.assertFalse(capabilities["functionCalling"])
+        self.assertFalse(capabilities["agentTools"])
+        self.assertFalse(capabilities["searchCapable"])
+        self.assertFalse(capabilities["webSearch"])
+
+    def test_normalize_capabilities_preserves_vision_independent_of_search_tools(self):
+        capabilities = litellm_catalog.normalize_capabilities(
+            "vision-only",
+            {"functionCalling": False, "vision": True},
+        )
+
+        self.assertTrue(capabilities["vision"])
+        self.assertFalse(capabilities["searchCapable"])
 
 
 if __name__ == "__main__":
