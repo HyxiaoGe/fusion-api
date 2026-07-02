@@ -10,7 +10,6 @@ from typing import Optional
 
 from openai import AsyncOpenAI
 
-from app.ai.llm_observability import merge_openai_extra_body
 from app.core.config import settings
 from app.core.logger import app_logger as logger
 
@@ -63,10 +62,7 @@ async def fetch_trending_questions() -> Optional[list[dict]]:
                 model="kimi-k2.5",
                 messages=messages,
                 tools=tools,
-                extra_body=merge_openai_extra_body(
-                    "search_summary",
-                    {"thinking": {"type": "disabled"}},  # K2.5 使用 $web_search 必须禁用思考
-                ),
+                extra_body={"thinking": {"type": "disabled"}},  # K2.5 使用 $web_search 必须禁用思考
             )
 
             choice = response.choices[0]

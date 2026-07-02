@@ -163,8 +163,8 @@ class ChatServiceTests(unittest.TestCase):
         self.assertIn("无法实时核验", sent_messages[1]["content"])
         self.assertEqual(sent_messages[2]["content"], "OpenAI 最近发布了什么模型？")
         self.assertEqual(
-            mock_litellm.acompletion.await_args.kwargs["metadata"],
-            {"tags": ["app:fusion", "phase:chat_non_stream"]},
+            mock_litellm.acompletion.await_args.kwargs["extra_body"],
+            {"metadata": {"tags": ["app:fusion", "phase:chat_non_stream"]}},
         )
 
     def test_generate_suggested_questions_limits_output_to_three(self):
@@ -222,8 +222,8 @@ class ChatServiceTests(unittest.TestCase):
         self.assertEqual(questions, ["Follow-up A", "Follow-up B", "Follow-up C"])
         self.assertEqual(mock_litellm.acompletion.await_args.kwargs["max_tokens"], 512)
         self.assertEqual(
-            mock_litellm.acompletion.await_args.kwargs["metadata"],
-            {"tags": ["app:fusion", "phase:suggest_questions"]},
+            mock_litellm.acompletion.await_args.kwargs["extra_body"],
+            {"metadata": {"tags": ["app:fusion", "phase:suggest_questions"]}},
         )
 
     def test_generate_title_persists_title_to_database(self):
@@ -268,8 +268,8 @@ class ChatServiceTests(unittest.TestCase):
         self.assertEqual(title, "Fusion Chat")
         self.assertEqual(mock_litellm.acompletion.await_args.kwargs["max_tokens"], 128)
         self.assertEqual(
-            mock_litellm.acompletion.await_args.kwargs["metadata"],
-            {"tags": ["app:fusion", "phase:generate_title"]},
+            mock_litellm.acompletion.await_args.kwargs["extra_body"],
+            {"metadata": {"tags": ["app:fusion", "phase:generate_title"]}},
         )
         service.conversation_service.repo.update_title.assert_called_once_with("conv-1", "Fusion Chat")
         service.db.commit.assert_called_once()

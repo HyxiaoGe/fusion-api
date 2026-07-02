@@ -6,7 +6,7 @@ from app.services.external import kimi_search_service
 
 
 class KimiSearchServiceTests(unittest.IsolatedAsyncioTestCase):
-    async def test_fetch_trending_questions_attaches_search_summary_tags(self):
+    async def test_fetch_trending_questions_does_not_attach_proxy_tags_to_direct_moonshot_call(self):
         message = SimpleNamespace(
             content='[{"category": "news", "question": "今天有什么热点？"}]',
             tool_calls=None,
@@ -25,10 +25,7 @@ class KimiSearchServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, [{"category": "news", "question": "今天有什么热点？"}])
         self.assertEqual(
             client.chat.completions.create.await_args.kwargs["extra_body"],
-            {
-                "thinking": {"type": "disabled"},
-                "metadata": {"tags": ["app:fusion", "phase:search_summary"]},
-            },
+            {"thinking": {"type": "disabled"}},
         )
         client.close.assert_awaited_once()
 

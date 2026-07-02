@@ -294,8 +294,8 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(result, response)
         self.assertEqual(
-            call.await_args.kwargs["metadata"],
-            {"tags": ["app:fusion", "phase:chat_stream"]},
+            call.await_args.kwargs["extra_body"],
+            {"metadata": {"tags": ["app:fusion", "phase:chat_stream"]}},
         )
 
 

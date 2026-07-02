@@ -9,7 +9,6 @@ ALLOWED_LLM_PHASES = frozenset(
         "generate_title",
         "suggest_questions",
         "file_processing",
-        "search_summary",
     }
 )
 
@@ -23,11 +22,14 @@ def build_litellm_metadata(phase: str) -> dict[str, list[str]]:
 
 def merge_litellm_kwargs(phase: str, kwargs: Mapping[str, Any] | None = None) -> dict[str, Any]:
     merged = dict(kwargs or {})
-    merged["metadata"] = build_litellm_metadata(phase)
+    merged.pop("metadata", None)
+    merged["extra_body"] = merge_openai_extra_body(phase, merged.get("extra_body"))
     return merged
 
 
 def merge_openai_extra_body(phase: str, extra_body: Mapping[str, Any] | None = None) -> dict[str, Any]:
     merged = dict(extra_body or {})
-    merged["metadata"] = build_litellm_metadata(phase)
+    metadata = dict(merged.get("metadata") or {})
+    metadata["tags"] = build_litellm_metadata(phase)["tags"]
+    merged["metadata"] = metadata
     return merged
