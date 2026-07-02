@@ -4,6 +4,7 @@ import io
 import os
 from typing import Any, Dict, List, Optional
 
+from app.ai.llm_observability import merge_openai_extra_body
 from app.ai.prompts import prompt_manager
 from app.core.logger import app_logger as logger
 
@@ -296,6 +297,7 @@ class FileProcessor:
                 stream=True,
                 stream_options={"include_usage": True},
                 modalities=["text"],  # 只需要文本输出
+                extra_body=merge_openai_extra_body("file_processing"),
             )
 
             # 收集流式响应

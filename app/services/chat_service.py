@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.ai import litellm_catalog
 from app.ai.llm_manager import llm_manager
+from app.ai.llm_observability import merge_litellm_kwargs
 from app.ai.prompts import prompt_manager
 from app.core.logger import app_logger as logger
 from app.db.repositories import ConversationRepository, FileRepository
@@ -292,7 +293,7 @@ class ChatService:
             model=litellm_model,
             messages=messages,
             stream=False,
-            **litellm_kwargs,
+            **merge_litellm_kwargs("chat_non_stream", litellm_kwargs),
         )
 
         content_text = response.choices[0].message.content or ""
@@ -372,7 +373,7 @@ class ChatService:
                 stream=False,
                 max_tokens=self.TITLE_MAX_TOKENS,
                 timeout=self.UTILITY_LLM_TIMEOUT,
-                **litellm_kwargs,
+                **merge_litellm_kwargs("generate_title", litellm_kwargs),
             )
             raw = response.choices[0].message.content or ""
 
@@ -429,7 +430,7 @@ class ChatService:
                 stream=False,
                 max_tokens=self.SUGGESTED_QUESTIONS_MAX_TOKENS,
                 timeout=self.UTILITY_LLM_TIMEOUT,
-                **litellm_kwargs,
+                **merge_litellm_kwargs("suggest_questions", litellm_kwargs),
             )
             raw = response.choices[0].message.content or ""
             questions = ChatUtils.parse_questions(raw)[:3]

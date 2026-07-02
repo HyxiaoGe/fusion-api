@@ -1,5 +1,6 @@
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.processor.file_processor import FileProcessor
 
@@ -87,6 +88,23 @@ class FileProcessorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(result)
         logger.error.assert_called_once()
+
+    async def test_call_model_attaches_file_processing_tags(self):
+        processor = FileProcessor()
+        processor.client = MagicMock()
+        chunk = SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="图片描述"))])
+
+        with patch("app.processor.file_processor.asyncio.to_thread", new=AsyncMock(return_value=[chunk])) as to_thread:
+            result = await processor._call_model(
+                "请分析图片",
+                [{"mime_type": "image/png", "content": "base64-image"}],
+            )
+
+        self.assertEqual(result, "图片描述")
+        self.assertEqual(
+            to_thread.await_args.kwargs["extra_body"],
+            {"metadata": {"tags": ["app:fusion", "phase:file_processing"]}},
+        )
 
 
 if __name__ == "__main__":

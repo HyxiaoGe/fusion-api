@@ -13,6 +13,7 @@ from typing import Optional
 import backoff
 import litellm
 
+from app.ai.llm_observability import merge_litellm_kwargs
 from app.core.logger import app_logger as logger
 from app.schemas.chat import Usage
 from app.services.stream_state_service import append_chunk, check_lock_owner
@@ -334,11 +335,17 @@ async def llm_call_with_retry(
     可重试错误：429 / rate / 503 / 502 / timeout，固定 2s 间隔。
     其它错误立即抛出。重试逻辑由 @backoff.on_exception 装饰器实现。
     """
+    merged_call_kwargs = merge_litellm_kwargs(
+        "chat_stream",
+        {
+            **litellm_kwargs,
+            **call_kwargs,
+        },
+    )
     return await litellm.acompletion(
         model=litellm_model,
         messages=messages,
         stream=True,
         stream_options={"include_usage": True},
-        **litellm_kwargs,
-        **call_kwargs,
+        **merged_call_kwargs,
     )

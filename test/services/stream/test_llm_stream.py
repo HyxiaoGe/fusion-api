@@ -283,6 +283,21 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
             step_id="step-1",
         )
 
+    async def test_llm_call_with_retry_attaches_chat_stream_tags(self):
+        response = object()
+        with patch("app.services.stream.llm_stream.litellm.acompletion", new=AsyncMock(return_value=response)) as call:
+            result = await llm_stream_module.llm_call_with_retry(
+                "openai/deepseek-chat",
+                {"api_key": "test-key"},
+                [{"role": "user", "content": "hello"}],
+            )
+
+        self.assertIs(result, response)
+        self.assertEqual(
+            call.await_args.kwargs["metadata"],
+            {"tags": ["app:fusion", "phase:chat_stream"]},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
