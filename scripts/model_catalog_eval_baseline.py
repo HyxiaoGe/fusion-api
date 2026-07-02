@@ -12,6 +12,7 @@ import json
 import sys
 import time
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from uuid import uuid4
@@ -476,6 +477,23 @@ def to_jsonl(result: EvalResult) -> str:
     return json.dumps(asdict(result), ensure_ascii=False, sort_keys=True) + "\n"
 
 
+def load_results_from_jsonl(path: str | Path) -> list[EvalResult]:
+    """从 JSONL 回放 EvalResult，便于不重跑 LLM 直接生成报告。"""
+    results: list[EvalResult] = []
+    for line_number, raw_line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path}:{line_number} 不是合法 JSONL 行") from exc
+        if not isinstance(payload, dict):
+            raise ValueError(f"{path}:{line_number} 必须是 JSON object")
+        results.append(EvalResult(**payload))
+    return results
+
+
 def fetch_models(base_url: str, auth_token: str | None = None) -> list[dict[str, Any]]:
     headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
     response = httpx.get(f"{base_url.rstrip('/')}/api/models/", headers=headers, timeout=20.0)
@@ -719,6 +737,154 @@ def build_summary(results: Sequence[EvalResult]) -> dict[str, Any]:
     return summary
 
 
+def _markdown_cell(value: Any) -> str:
+    text = "" if value is None else str(value)
+    return text.replace("\n", " ").replace("|", "\\|")
+
+
+def _result_conversation_url(base_url: str, result: EvalResult) -> str:
+    if not result.conversation_id:
+        return ""
+    if result.conversation_id.startswith("http://") or result.conversation_id.startswith("https://"):
+        return result.conversation_id
+    return f"{base_url.rstrip('/')}/chat/{result.conversation_id}"
+
+
+def _format_quality_flags(flags: Sequence[str]) -> str:
+    return ", ".join(flags) if flags else "-"
+
+
+def _format_tool_names(names: Sequence[str]) -> str:
+    return ", ".join(names) if names else "-"
+
+
+def build_markdown_report(
+    results: Sequence[EvalResult],
+    summary: Mapping[str, Any],
+    *,
+    base_url: str,
+    generated_at: str | None = None,
+    source_label: str = "",
+) -> str:
+    """把全模型验收 JSONL/Summary 转成可交付 Markdown 报告。"""
+    generated = generated_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
+    success_count = int(summary.get("success_count") or 0)
+    total = int(summary.get("total") or 0)
+    failure_count = int(summary.get("failure_count") or 0)
+    mismatch_count = int(summary.get("tool_expectation_mismatch_count") or 0)
+    quality_issue_count = int(summary.get("quality_issue_count") or 0)
+
+    lines: list[str] = [
+        "# Fusion 全模型验收报告",
+        "",
+        "## 元信息",
+        "",
+        f"- 生成时间：`{_markdown_cell(generated)}`",
+        f"- 目标环境：`{_markdown_cell(base_url.rstrip('/'))}`",
+        f"- 数据来源：`{_markdown_cell(source_label or 'current run')}`",
+        f"- 总体结果：`{success_count}/{total}` 通过，失败 `{failure_count}`，工具契约不匹配 `{mismatch_count}`，质量风险 `{quality_issue_count}`",
+        "",
+        "## 自动验收总览",
+        "",
+        "| 维度 | 结果 |",
+        "|---|---|",
+        f"| 总用例 | `{total}` |",
+        f"| 成功 | `{success_count}` |",
+        f"| 失败 | `{failure_count}` |",
+        f"| 平均耗时 | `{summary.get('avg_elapsed_ms', 0)}ms` |",
+        f"| 工具契约不匹配 | `{mismatch_count}` |",
+        f"| 质量风险 | `{quality_issue_count}` |",
+        "",
+        "## 按场景统计",
+        "",
+        "| 场景 | 成功/总数 | 平均耗时 |",
+        "|---|---:|---:|",
+    ]
+
+    for scenario_id, item in sorted((summary.get("by_scenario") or {}).items()):
+        lines.append(
+            f"| `{_markdown_cell(scenario_id)}` | `{item.get('success_count', 0)}/{item.get('total', 0)}` | `{item.get('avg_elapsed_ms', 0)}ms` |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## 按模型统计",
+            "",
+            "| 模型 | 成功/总数 | 平均耗时 |",
+            "|---|---:|---:|",
+        ]
+    )
+    for model_id, item in sorted((summary.get("by_model") or {}).items()):
+        lines.append(
+            f"| `{_markdown_cell(model_id)}` | `{item.get('success_count', 0)}/{item.get('total', 0)}` | `{item.get('avg_elapsed_ms', 0)}ms` |"
+        )
+
+    lines.extend(["", "## 质量风险", ""])
+    quality_issues = list(summary.get("quality_issues") or [])
+    if quality_issues:
+        lines.extend(["| 模型 | 场景 | 严重度 | flags | 建议 |", "|---|---|---|---|---|"])
+        for issue in quality_issues:
+            lines.append(
+                "| "
+                f"`{_markdown_cell(issue.get('model_id'))}` | "
+                f"`{_markdown_cell(issue.get('scenario_id'))}` | "
+                f"`{_markdown_cell(issue.get('severity'))}` | "
+                f"`{_markdown_cell(', '.join(issue.get('flags') or []))}` | "
+                f"{_markdown_cell('；'.join(issue.get('recommendations') or []))} |"
+            )
+    else:
+        lines.append("- 无自动质量风险。")
+
+    lines.extend(
+        [
+            "",
+            "## 明细结果",
+            "",
+            "| 模型 | 场景 | 结果 | 耗时 | 工具 | flags | 对话 |",
+            "|---|---|---|---:|---|---|---|",
+        ]
+    )
+    for result in results:
+        status = "通过" if result.success else "失败"
+        conv_url = _result_conversation_url(base_url, result)
+        conv_cell = conv_url or result.conversation_id or "-"
+        lines.append(
+            "| "
+            f"`{_markdown_cell(result.model_id)}` | "
+            f"`{_markdown_cell(result.scenario_id)}` | "
+            f"{status} | "
+            f"`{result.elapsed_ms}ms` | "
+            f"`{_markdown_cell(_format_tool_names(result.observed_tool_names))}` | "
+            f"`{_markdown_cell(_format_quality_flags(result.quality_flags))}` | "
+            f"{_markdown_cell(conv_cell)} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## 真实 Chrome 回归补充记录",
+            "",
+            "- 只复用用户已打开且已登录的 Fusion Chrome 标签，禁止新开 Chrome/标签。",
+            "- 没有可复用标签时记录阻塞，不用本地服务或旧历史页替代结论。",
+            "",
+            "| 用例 | 输入/页面 | 预期 | 实际 | console error | 刷新后结果 | 结论 |",
+            "|---|---|---|---|---|---|---|",
+            "| 模型选择器 | `/chat/new` | 模型目录、能力标签、上传入口与 `/api/models/` 一致 |  |  |  |  |",
+            "| 实时搜索代表用例 | 新建真实对话 | 可联网模型展示搜索、读取、回答依据 |  |  |  |  |",
+            "| 非联网代表用例 | 新建真实对话 | 不展示工具过程，并说明实时能力边界 |  |  |  |  |",
+            "| 刷新恢复 | 已完成对话 URL | 正文、执行过程、回答依据按场景恢复 |  |  |  |  |",
+            "",
+            "## 推荐判定",
+            "",
+            "- 自动验收失败、工具契约不匹配或高严重度质量风险：不得作为推荐模型上线。",
+            "- 慢响应属于质量风险，优先进入模型标注/路由权重评估，不自动替换用户显式选择的模型。",
+            "- 新增、下线或能力标注调整后，应重新生成 JSONL、summary 和本报告。",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
 def _split_csv(value: str | None) -> list[str]:
     if not value:
         return []
@@ -738,11 +904,33 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--include-unhealthy", action="store_true")
     parser.add_argument("--output", default="", help="JSONL 输出文件；为空则输出到 stdout")
     parser.add_argument("--summary-output", default="", help="summary JSON 输出文件；为空则输出到 stderr")
+    parser.add_argument("--report-output", default="", help="Markdown 验收报告输出文件")
+    parser.add_argument("--from-jsonl", default="", help="从已有 JSONL 结果生成 summary/report，不重新请求 Fusion")
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv or sys.argv[1:])
+    if args.from_jsonl:
+        results = load_results_from_jsonl(args.from_jsonl)
+        summary = build_summary(results)
+        summary_content = json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True)
+        if args.summary_output:
+            Path(args.summary_output).write_text(summary_content + "\n", encoding="utf-8")
+        else:
+            print(summary_content, file=sys.stderr)
+        report = build_markdown_report(
+            results,
+            summary,
+            base_url=args.base_url,
+            source_label=args.from_jsonl,
+        )
+        if args.report_output:
+            Path(args.report_output).write_text(report, encoding="utf-8")
+        else:
+            print(report)
+        return 0
+
     models = fetch_models(args.base_url, args.auth_token or None)
     selected = select_models(
         models,
@@ -803,11 +991,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         on_result=on_result,
     )
 
-    summary_content = json.dumps(build_summary(results), ensure_ascii=False, indent=2, sort_keys=True)
+    summary = build_summary(results)
+    summary_content = json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True)
     if args.summary_output:
         Path(args.summary_output).write_text(summary_content + "\n", encoding="utf-8")
     else:
         print(summary_content, file=sys.stderr)
+    if args.report_output:
+        report = build_markdown_report(
+            results,
+            summary,
+            base_url=args.base_url,
+            source_label=str(output_path) if output_path else "stdout",
+        )
+        Path(args.report_output).write_text(report, encoding="utf-8")
     return 0
 
 

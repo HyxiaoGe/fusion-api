@@ -1,5 +1,7 @@
 import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from scripts import model_catalog_eval_baseline as baseline
 
@@ -527,6 +529,107 @@ class ModelCatalogEvalBaselineTests(unittest.TestCase):
         self.assertTrue(observed[0].success)
         self.assertFalse(observed[1].success)
         self.assertEqual(observed[1].error["category"], "timeout")
+
+    def test_load_results_from_jsonl_round_trips_eval_result_rows(self):
+        scenario = baseline.select_scenarios(["basic_chat"])[0]
+        result = baseline.build_stream_result(
+            model={"modelId": "deepseek-chat", "provider": "deepseek", "name": "DeepSeek"},
+            scenario=scenario,
+            elapsed_ms=1200,
+            events=[{"chunk_type": "answering", "data": {"delta": "你好。"}}],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output = Path(tmp_dir) / "results.jsonl"
+            output.write_text(baseline.to_jsonl(result), encoding="utf-8")
+
+            loaded = baseline.load_results_from_jsonl(output)
+
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].model_id, "deepseek-chat")
+        self.assertEqual(loaded[0].scenario_id, "basic_chat")
+        self.assertTrue(loaded[0].success)
+
+    def test_build_markdown_report_includes_gates_quality_and_manual_chrome_checklist(self):
+        basic = baseline.select_scenarios(["basic_chat"])[0]
+        search = baseline.select_scenarios(["autonomous_search"])[0]
+        success = baseline.build_stream_result(
+            model={"modelId": "deepseek-chat", "provider": "deepseek", "name": "DeepSeek"},
+            scenario=basic,
+            elapsed_ms=1000,
+            events=[{"chunk_type": "answering", "data": {"delta": "你好。"}}],
+            response_payload={"conversation_id": "conv-basic"},
+        )
+        slow_search = baseline.build_stream_result(
+            model={
+                "modelId": "kimi-k2.5",
+                "provider": "moonshot",
+                "name": "Kimi K2.5",
+                "capabilities": {"functionCalling": True, "agentTools": True},
+            },
+            scenario=search,
+            elapsed_ms=91_000,
+            events=[
+                {"chunk_type": "agent_event", "data": {"type": "tool_call_started", "tool_name": "web_search"}},
+                {"chunk_type": "agent_event", "data": {"type": "tool_call_started", "tool_name": "url_read"}},
+                {"chunk_type": "answering", "data": {"delta": "根据来源回答。"}},
+            ],
+            response_payload={"conversation_id": "conv-search"},
+        )
+        summary = baseline.build_summary([success, slow_search])
+
+        report = baseline.build_markdown_report(
+            [success, slow_search],
+            summary,
+            base_url="https://fusion.seanfield.org",
+            generated_at="2026-07-02T13:00:00Z",
+            source_label="model-eval.jsonl",
+        )
+
+        self.assertIn("# Fusion 全模型验收报告", report)
+        self.assertIn("https://fusion.seanfield.org", report)
+        self.assertIn("2/2", report)
+        self.assertIn("kimi-k2.5", report)
+        self.assertIn("slow_response", report)
+        self.assertIn("真实 Chrome 回归补充记录", report)
+        self.assertIn("禁止新开 Chrome/标签", report)
+        self.assertIn("conv-search", report)
+
+    def test_main_can_regenerate_markdown_report_from_jsonl_without_calling_remote_api(self):
+        scenario = baseline.select_scenarios(["basic_chat"])[0]
+        result = baseline.build_stream_result(
+            model={"modelId": "deepseek-chat", "provider": "deepseek", "name": "DeepSeek"},
+            scenario=scenario,
+            elapsed_ms=1200,
+            events=[{"chunk_type": "answering", "data": {"delta": "你好。"}}],
+            response_payload={"conversation_id": "conv-1"},
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            results_path = Path(tmp_dir) / "results.jsonl"
+            summary_path = Path(tmp_dir) / "summary.json"
+            report_path = Path(tmp_dir) / "report.md"
+            results_path.write_text(baseline.to_jsonl(result), encoding="utf-8")
+
+            exit_code = baseline.main(
+                [
+                    "--from-jsonl",
+                    str(results_path),
+                    "--summary-output",
+                    str(summary_path),
+                    "--report-output",
+                    str(report_path),
+                    "--base-url",
+                    "https://fusion.seanfield.org",
+                ]
+            )
+
+            report = report_path.read_text(encoding="utf-8")
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("# Fusion 全模型验收报告", report)
+        self.assertIn("deepseek-chat", report)
+        self.assertIn("conv-1", report)
 
 
 if __name__ == "__main__":
