@@ -10,7 +10,9 @@ from app.schemas.response import success
 from app.services.external import search_usage_client
 from app.services.external.search_usage_client import SearchUsageClientError
 from app.services.runtime_config_governance import (
+    activate_runtime_config_entry,
     build_runtime_config_snapshot,
+    create_runtime_config_entry,
     set_runtime_config_entry_active,
     validate_runtime_config_candidate,
 )
@@ -22,6 +24,14 @@ class RuntimeConfigValidateRequest(BaseModel):
     namespace: str
     key: str
     payload: dict[str, Any]
+
+
+class RuntimeConfigCreateRequest(BaseModel):
+    namespace: str
+    key: str
+    version: str
+    payload: dict[str, Any]
+    description: str | None = None
 
 
 class RuntimeConfigStatusRequest(BaseModel):
@@ -69,6 +79,30 @@ async def validate_runtime_config(
     _admin: UserModel = Depends(get_current_admin_user),
 ):
     return success(validate_runtime_config_candidate(request.namespace, request.key, request.payload))
+
+
+@router.post("/runtime-config")
+async def create_runtime_config(
+    request: RuntimeConfigCreateRequest,
+    _admin: UserModel = Depends(get_current_admin_user),
+):
+    return success(
+        create_runtime_config_entry(
+            namespace=request.namespace,
+            key=request.key,
+            version=request.version,
+            payload=request.payload,
+            description=request.description,
+        )
+    )
+
+
+@router.post("/runtime-config/{entry_id}/activate")
+async def activate_runtime_config(
+    entry_id: str,
+    _admin: UserModel = Depends(get_current_admin_user),
+):
+    return success(activate_runtime_config_entry(entry_id))
 
 
 @router.patch("/runtime-config/{entry_id}/status")

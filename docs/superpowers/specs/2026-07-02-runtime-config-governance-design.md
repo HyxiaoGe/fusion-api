@@ -12,7 +12,9 @@ v1 做后端治理闭环：
 2. 提供轻量 schema 校验，覆盖 `agent_strategy/default`、`model_presentation/default`、`prompt_template/*`。
 3. 提供 admin 只读诊断接口，列出当前有效版本、跳过的坏版本、所有配置条目的校验状态。
 4. 提供 admin 无写入校验接口，支持在写入前验证 payload。
-5. 提供 admin active 状态切换接口，便于禁用坏版本并触发缓存清理。
+5. 提供 admin 安全写入接口：校验通过才创建新版本，新版本默认 inactive，重复 `(namespace,key,version)` 直接拒绝。
+6. 提供 admin 安全激活接口：激活前复用 schema 校验，通过后关闭同一 `namespace/key` 的其它 active 版本并清理缓存。
+7. 保留 admin active 状态切换接口用于禁用坏版本；当请求启用版本时必须复用安全激活语义。
 
 ## 非目标
 
@@ -54,7 +56,27 @@ v1 做后端治理闭环：
 {"is_active": false}
 ```
 
-更新 `is_active`，清理 runtime config 缓存，返回该条目的最新校验状态。
+禁用条目时直接更新 `is_active` 并清理缓存；启用条目时复用安全激活流程，保证同一配置项只有一个 active 版本。
+
+### `POST /api/admin/runtime-config`
+
+请求：
+
+```json
+{
+  "namespace": "prompt_template",
+  "key": "generate_title",
+  "version": "2026-07-03.safe-write",
+  "payload": {"template": "标题 prompt"},
+  "description": "标题 prompt 小流量候选"
+}
+```
+
+创建一个校验通过的新版本。写入后 `is_active=false`，不会立刻影响聊天主链路。非法 payload 返回 `INVALID_PARAM` 且不写库；重复版本返回 `CONFLICT`。
+
+### `POST /api/admin/runtime-config/{entry_id}/activate`
+
+激活指定版本。激活前必须确认该条目当前 payload 校验通过；校验失败返回 `INVALID_PARAM` 且不改变任何 active 状态。激活成功后，同一 `namespace/key` 的其它版本会被置为 inactive，并清理 runtime config 缓存。
 
 ## 读取策略
 
@@ -71,5 +93,5 @@ v1 做后端治理闭环：
 ## 测试
 
 - 单测覆盖坏版本跳过、全坏回默认、schema 问题输出。
-- service 测试覆盖治理快照和 active 状态切换。
-- API 测试覆盖管理员鉴权、快照、validate 和 status patch。
+- service 测试覆盖治理快照、inactive 安全写入、非法 payload 不写入、重复版本冲突、单 active 激活、坏版本不可激活和 status=true 复用安全激活。
+- API 测试覆盖管理员鉴权、快照、validate、create、activate 和 status patch。

@@ -117,6 +117,61 @@ class RuntimeConfigGovernanceApiTests(unittest.TestCase):
         self.assertEqual(response.json()["data"], updated)
         patched.assert_called_once_with("row-1", False)
 
+    def test_runtime_config_create_writes_inactive_valid_version(self):
+        self._set_current_user(is_superuser=True)
+
+        created = {
+            "id": "new-row",
+            "namespace": "prompt_template",
+            "key": "generate_title",
+            "version": "2026-07-03.safe-write",
+            "is_active": False,
+            "valid": True,
+            "issues": [],
+        }
+
+        with patch("app.api.admin.create_runtime_config_entry", return_value=created) as patched:
+            response = self.client.post(
+                "/api/admin/runtime-config",
+                json={
+                    "namespace": "prompt_template",
+                    "key": "generate_title",
+                    "version": "2026-07-03.safe-write",
+                    "payload": {"template": "请生成短标题"},
+                    "description": "安全写入测试",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"], created)
+        patched.assert_called_once_with(
+            namespace="prompt_template",
+            key="generate_title",
+            version="2026-07-03.safe-write",
+            payload={"template": "请生成短标题"},
+            description="安全写入测试",
+        )
+
+    def test_runtime_config_activate_enforces_single_active_version(self):
+        self._set_current_user(is_superuser=True)
+
+        activated = {
+            "id": "row-1",
+            "namespace": "prompt_template",
+            "key": "generate_title",
+            "version": "2026-07-03.safe-write",
+            "is_active": True,
+            "valid": True,
+            "issues": [],
+        }
+
+        with patch("app.api.admin.activate_runtime_config_entry", return_value=activated) as patched:
+            response = self.client.post("/api/admin/runtime-config/row-1/activate")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"], activated)
+        patched.assert_called_once_with("row-1")
+
 
 if __name__ == "__main__":
     unittest.main()

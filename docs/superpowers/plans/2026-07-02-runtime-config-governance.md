@@ -4,7 +4,7 @@
 
 **Goal:** 给 runtime config 增加后端治理闭环，确保配置可查、可校验、可禁用并能安全回退。
 
-**Architecture:** 在 `app.core` 放轻量 schema 校验和主链路读取保护；在 `app.services` 放治理快照、校验和状态切换；`app.api.admin` 只做管理员路由和请求模型。
+**Architecture:** 在 `app.core` 放轻量 schema 校验和主链路读取保护；在 `app.services` 放治理快照、校验、安全写入和安全激活；`app.api.admin` 只做管理员路由和请求模型。
 
 **Tech Stack:** FastAPI、SQLAlchemy ORM、pytest/unittest、现有 `runtime_config_entries` 表。
 
@@ -52,7 +52,27 @@
 - [x] 实现 `PATCH /api/admin/runtime-config/{entry_id}/status`。
 - [x] 聚焦测试通过。
 
-### Task 4: 验证和发布
+### Task 4: 安全写入和安全激活
+
+**Files:**
+- Modify: `app/services/runtime_config_governance.py`
+- Modify: `app/api/admin.py`
+- Test: `test/test_runtime_config_governance.py`
+- Test: `test/test_runtime_config_governance_api.py`
+
+- [x] 写失败测试：创建新版本会先校验 payload，通过后写入 inactive 版本。
+- [x] 写失败测试：非法 payload 返回 `INVALID_PARAM`，不 add、不 commit。
+- [x] 写失败测试：重复 `(namespace,key,version)` 返回 `CONFLICT`，不写入。
+- [x] 写失败测试：激活版本时关闭同一 `namespace/key` 的旧 active 版本。
+- [x] 写失败测试：坏版本不可激活，旧 active 状态保持不变。
+- [x] 写失败测试：旧 `status=true` 入口复用安全激活语义。
+- [x] 实现 `create_runtime_config_entry()`。
+- [x] 实现 `activate_runtime_config_entry()`。
+- [x] 实现 `POST /api/admin/runtime-config`。
+- [x] 实现 `POST /api/admin/runtime-config/{entry_id}/activate`。
+- [x] 聚焦测试通过。
+
+### Task 5: 验证和发布
 
 **Files:**
 - Modify only files above and docs.
