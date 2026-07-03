@@ -13,6 +13,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.logger import app_logger as logger
+from app.core.runtime_config_schema import validate_runtime_config_payload
 from app.db.database import SessionLocal
 from app.db.models import RuntimeConfigEntry
 
@@ -66,12 +67,17 @@ def get_runtime_config_payload(
         "key": key,
         "source": "default",
         "version": "code-default",
+        "skipped_versions": [],
+        "validation_warnings": {},
     }
+    default_validation = validate_runtime_config_payload(namespace, key, default_copy)
+    should_validate_candidates = default_validation.valid
 
     session: Session | None = None
+    rows: list[RuntimeConfigEntry] = []
     try:
         session = session_factory()
-        row = (
+        rows = (
             session.query(RuntimeConfigEntry)
             .filter(
                 RuntimeConfigEntry.namespace == namespace,
@@ -79,7 +85,8 @@ def get_runtime_config_payload(
                 RuntimeConfigEntry.is_active.is_(True),
             )
             .order_by(RuntimeConfigEntry.updated_at.desc(), RuntimeConfigEntry.created_at.desc())
-            .first()
+            .limit(10)
+            .all()
         )
     except Exception as exc:
         logger.warning(f"runtime_config: load {namespace}/{key} failed: {exc}")
@@ -88,16 +95,41 @@ def get_runtime_config_payload(
         if session is not None:
             session.close()
 
-    if row is None or not isinstance(row.payload, dict):
-        return default_copy, default_meta
+    skipped_versions: list[str] = []
+    validation_warnings: dict[str, list[str]] = {}
+    for row in rows:
+        if not isinstance(row.payload, dict):
+            skipped_versions.append(row.version)
+            validation_warnings[row.version] = ["payload 必须是对象"]
+            continue
 
-    payload = deep_merge_config(default_copy, row.payload)
-    meta = {
-        "namespace": namespace,
-        "key": key,
-        "source": "db",
-        "version": row.version,
-    }
-    if use_cache:
-        _CACHE[cache_key] = (now, copy.deepcopy(payload), copy.deepcopy(meta))
-    return payload, meta
+        candidate_payload = deep_merge_config(default_copy, row.payload)
+        validation = validate_runtime_config_payload(namespace, key, candidate_payload)
+        if should_validate_candidates and not validation.valid:
+            skipped_versions.append(row.version)
+            validation_warnings[row.version] = validation.issues
+            logger.warning(
+                "runtime_config: skip invalid %s/%s@%s: %s",
+                namespace,
+                key,
+                row.version,
+                "; ".join(validation.issues),
+            )
+            continue
+
+        meta = {
+            "namespace": namespace,
+            "key": key,
+            "source": "db",
+            "version": row.version,
+            "skipped_versions": skipped_versions,
+            "validation_warnings": validation_warnings,
+        }
+        if use_cache:
+            _CACHE[cache_key] = (now, copy.deepcopy(candidate_payload), copy.deepcopy(meta))
+        return candidate_payload, meta
+
+    if skipped_versions:
+        default_meta["skipped_versions"] = skipped_versions
+        default_meta["validation_warnings"] = validation_warnings
+    return default_copy, default_meta

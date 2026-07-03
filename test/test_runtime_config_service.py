@@ -4,8 +4,13 @@ from uuid import UUID
 
 
 class _FakeQuery:
-    def __init__(self, row):
-        self.row = row
+    def __init__(self, rows):
+        if rows is None:
+            self.rows = []
+        elif isinstance(rows, list):
+            self.rows = rows
+        else:
+            self.rows = [rows]
 
     def filter(self, *args, **kwargs):
         return self
@@ -13,17 +18,23 @@ class _FakeQuery:
     def order_by(self, *args, **kwargs):
         return self
 
+    def limit(self, *args, **kwargs):
+        return self
+
     def first(self):
-        return self.row
+        return self.rows[0] if self.rows else None
+
+    def all(self):
+        return self.rows
 
 
 class _FakeSession:
-    def __init__(self, row):
-        self.row = row
+    def __init__(self, rows):
+        self.rows = rows
         self.closed = False
 
     def query(self, model):
-        return _FakeQuery(self.row)
+        return _FakeQuery(self.rows)
 
     def close(self):
         self.closed = True
@@ -163,6 +174,63 @@ class RuntimeConfigServiceTests(unittest.TestCase):
 
         self.assertEqual(refreshed_payload["value"], 2)
         self.assertEqual(refreshed_meta["version"], "v2")
+
+    def test_get_runtime_config_payload_skips_invalid_latest_active_candidate(self):
+        from app.services.runtime_config_service import get_runtime_config_payload
+
+        invalid_latest = SimpleNamespace(payload={"template": 123}, version="2026-07-03.bad")
+        valid_previous = SimpleNamespace(payload={"template": "有效模板"}, version="2026-07-02.good")
+        session = _FakeSession([invalid_latest, valid_previous])
+
+        payload, meta = get_runtime_config_payload(
+            "prompt_template",
+            "generate_title",
+            {"template": "默认模板"},
+            session_factory=lambda: session,
+        )
+
+        self.assertEqual(payload, {"template": "有效模板"})
+        self.assertEqual(meta["source"], "db")
+        self.assertEqual(meta["version"], "2026-07-02.good")
+        self.assertEqual(meta["skipped_versions"], ["2026-07-03.bad"])
+        self.assertTrue(any("template" in issue for issue in meta["validation_warnings"]["2026-07-03.bad"]))
+        self.assertTrue(session.closed)
+
+    def test_get_runtime_config_payload_returns_default_when_all_candidates_invalid(self):
+        from app.services.runtime_config_defaults import DEFAULT_MODEL_PRESENTATION_CONFIG
+        from app.services.runtime_config_service import get_runtime_config_payload
+
+        invalid_latest = SimpleNamespace(payload={"weights": "bad"}, version="2026-07-03.bad")
+
+        payload, meta = get_runtime_config_payload(
+            "model_presentation",
+            "default",
+            DEFAULT_MODEL_PRESENTATION_CONFIG,
+            session_factory=lambda: _FakeSession([invalid_latest]),
+        )
+
+        self.assertEqual(payload, DEFAULT_MODEL_PRESENTATION_CONFIG)
+        self.assertEqual(meta["source"], "default")
+        self.assertEqual(meta["skipped_versions"], ["2026-07-03.bad"])
+        self.assertIn("2026-07-03.bad", meta["validation_warnings"])
+
+    def test_validate_runtime_config_payload_reports_domain_specific_issues(self):
+        from app.core.runtime_config_schema import validate_runtime_config_payload
+
+        prompt_result = validate_runtime_config_payload("prompt_template", "generate_title", {"template": ""})
+        strategy_result = validate_runtime_config_payload("agent_strategy", "default", {"search": {}})
+        presentation_result = validate_runtime_config_payload(
+            "model_presentation",
+            "default",
+            {"weights": {}, "levels": {}, "copy": {}},
+        )
+
+        self.assertFalse(prompt_result.valid)
+        self.assertIn("template 必须是非空字符串", prompt_result.issues)
+        self.assertFalse(strategy_result.valid)
+        self.assertTrue(any("model_runtime" in issue for issue in strategy_result.issues))
+        self.assertFalse(presentation_result.valid)
+        self.assertTrue(any("weights.base" in issue for issue in presentation_result.issues))
 
 
 if __name__ == "__main__":
