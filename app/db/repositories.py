@@ -580,6 +580,15 @@ class FileRepository:
             logger.error(f"获取对话文件失败: {e}")
             return []
 
+    def is_file_linked_to_conversation(self, conversation_id: str, file_id: str) -> bool:
+        """确认文件是否已经关联到指定对话。"""
+        return (
+            self.db.query(ConversationFile)
+            .filter(ConversationFile.conversation_id == conversation_id, ConversationFile.file_id == file_id)
+            .first()
+            is not None
+        )
+
     def count_conversation_files(self, conversation_id: str) -> int:
         """计算对话关联的文件数量"""
         try:

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.schemas.chat import Conversation, Message, TextBlock
+from app.schemas.response import ApiException
 from app.services.chat_service import ChatService
 
 
@@ -175,10 +176,15 @@ class ChatServiceTests(unittest.TestCase):
         service = ChatService(db)
         service.file_repo = MagicMock()
         service.file_repo.get_file_by_id.return_value = SimpleNamespace(
+            id="image-1",
+            user_id="user-1",
             original_filename="chart.png",
             mimetype="image/png",
+            status="processed",
+            storage_key="conv-1/image-1/chart.png",
             thumbnail_key=None,
         )
+        service.file_repo.is_file_linked_to_conversation.return_value = True
         service.conversation_service = MagicMock()
         service._get_or_create_conversation = MagicMock(
             return_value=(
@@ -344,6 +350,125 @@ class ChatServiceTests(unittest.TestCase):
         )
         service.conversation_service.repo.update_title.assert_called_once_with("conv-1", "Fusion Chat")
         service.db.commit.assert_called_once()
+
+    def test_validate_message_files_accepts_processed_same_conversation_file(self):
+        service = object.__new__(ChatService)
+        service.file_repo = MagicMock()
+        file_record = SimpleNamespace(
+            id="file-1",
+            user_id="user-1",
+            original_filename="note.txt",
+            mimetype="text/plain",
+            status="processed",
+            storage_key="conv-1/file-1/note.txt",
+            thumbnail_key=None,
+        )
+        service.file_repo.get_file_by_id.return_value = file_record
+        service.file_repo.is_file_linked_to_conversation.return_value = True
+
+        result = service._validate_message_files(["file-1"], "user-1", "conv-1")
+
+        self.assertEqual(result, [file_record])
+        service.file_repo.get_file_by_id.assert_called_once_with("file-1", user_id="user-1")
+        service.file_repo.is_file_linked_to_conversation.assert_called_once_with("conv-1", "file-1")
+
+    def test_validate_message_files_rejects_other_user_file(self):
+        service = object.__new__(ChatService)
+        service.file_repo = MagicMock()
+        service.file_repo.get_file_by_id.return_value = None
+
+        with self.assertRaises(ApiException) as context:
+            service._validate_message_files(["file-1"], "user-1", "conv-1")
+
+        self.assertEqual(context.exception.code, "INVALID_PARAM")
+        self.assertEqual(context.exception.message, "文件不存在或无权访问")
+        service.file_repo.is_file_linked_to_conversation.assert_not_called()
+
+    def test_validate_message_files_rejects_same_user_file_from_other_conversation(self):
+        service = object.__new__(ChatService)
+        service.file_repo = MagicMock()
+        service.file_repo.get_file_by_id.return_value = SimpleNamespace(
+            id="file-2",
+            user_id="user-1",
+            original_filename="other.txt",
+            mimetype="text/plain",
+            status="processed",
+            storage_key="conv-2/file-2/other.txt",
+            thumbnail_key=None,
+        )
+        service.file_repo.is_file_linked_to_conversation.return_value = False
+
+        with self.assertRaises(ApiException) as context:
+            service._validate_message_files(["file-2"], "user-1", "conv-1")
+
+        self.assertEqual(context.exception.code, "INVALID_PARAM")
+        self.assertEqual(context.exception.message, "文件不属于当前会话")
+
+    def test_validate_message_files_rejects_unprocessed_non_image_file(self):
+        service = object.__new__(ChatService)
+        service.file_repo = MagicMock()
+        service.file_repo.get_file_by_id.return_value = SimpleNamespace(
+            id="file-3",
+            user_id="user-1",
+            original_filename="draft.pdf",
+            mimetype="application/pdf",
+            status="parsing",
+            storage_key="conv-1/file-3/draft.pdf",
+            thumbnail_key=None,
+        )
+        service.file_repo.is_file_linked_to_conversation.return_value = True
+
+        with self.assertRaises(ApiException) as context:
+            service._validate_message_files(["file-3"], "user-1", "conv-1")
+
+        self.assertEqual(context.exception.code, "INVALID_PARAM")
+        self.assertEqual(context.exception.message, "文件仍在处理，请稍后再发送")
+
+    def test_process_message_rejects_invalid_file_before_creating_message(self):
+        db = MagicMock()
+        service = ChatService(db)
+        service.file_repo = MagicMock()
+        service.file_repo.get_file_by_id.return_value = None
+        service.conversation_service = MagicMock()
+        service._get_or_create_conversation = MagicMock(
+            return_value=(
+                Conversation(
+                    id="conv-1",
+                    user_id="user-1",
+                    title="继续分析",
+                    model_id="qwen-max-latest",
+                    messages=[],
+                    created_at=datetime.now(),
+                    updated_at=datetime.now(),
+                ),
+                False,
+            )
+        )
+
+        with (
+            patch(
+                "app.services.chat_service.llm_manager.resolve_model",
+                return_value=("openai/qwen-max-latest", "qwen", {}),
+            ),
+            patch(
+                "app.services.chat_service.litellm_catalog.get_capabilities",
+                return_value={"functionCalling": False, "agentTools": False, "vision": False},
+            ),
+        ):
+            with self.assertRaises(ApiException):
+                asyncio.run(
+                    service.process_message(
+                        model_id="qwen-max-latest",
+                        message="继续分析",
+                        user_id="user-1",
+                        conversation_id="conv-1",
+                        stream=True,
+                        file_ids=["missing-file"],
+                    )
+                )
+
+        service.conversation_service.create_message.assert_not_called()
+        db.commit.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from app.ai import litellm_catalog
 from app.ai.llm_manager import llm_manager
 from app.ai.llm_observability import merge_litellm_kwargs
 from app.ai.prompts import prompt_manager
+from app.core.config import settings
 from app.core.logger import app_logger as logger
 from app.db.repositories import ConversationRepository, FileRepository
 from app.schemas.chat import (
@@ -34,7 +35,7 @@ from app.services.chat.message_builder import (
 )
 from app.services.chat.utils import ChatUtils
 from app.services.conversation_service import ConversationService
-from app.services.file_service import is_image_mime
+from app.services.file_service import FileService, is_image_mime
 from app.services.storage import get_storage
 from app.services.stream import StreamHandler, stream_redis_as_sse
 from app.services.stream.agent_loop_request_prep import inject_no_tool_network_boundary, inject_no_vision_file_boundary
@@ -56,6 +57,53 @@ class ChatService:
         self.conversation_service = ConversationService(db)
         self.file_repo = FileRepository(db)
         self.stream_handler = StreamHandler()
+
+    def _validate_message_files(self, file_ids: List[str], user_id: str, conversation_id: str) -> List[Any]:
+        """校验本次消息引用的文件，并按传入顺序返回文件记录。"""
+        validated_files: List[Any] = []
+        for file_id in file_ids:
+            file_info = self.file_repo.get_file_by_id(file_id, user_id=user_id)
+            if not file_info:
+                raise ApiException.bad_request("文件不存在或无权访问")
+
+            if not self.file_repo.is_file_linked_to_conversation(conversation_id, file_id):
+                raise ApiException.bad_request("文件不属于当前会话")
+
+            if is_image_mime(file_info.mimetype or ""):
+                if not getattr(file_info, "storage_key", None):
+                    raise ApiException.bad_request("图片文件不可用，请重新上传")
+            elif file_info.status != "processed":
+                raise ApiException.bad_request("文件仍在处理，请稍后再发送")
+
+            validated_files.append(file_info)
+        return validated_files
+
+    async def _build_file_block_from_record(self, file_info: Any) -> FileBlock:
+        """根据已校验文件记录构造消息内容块。"""
+        block_kwargs = {
+            "type": "file",
+            "file_id": file_info.id,
+            "filename": file_info.original_filename,
+            "mime_type": file_info.mimetype,
+        }
+        if is_image_mime(file_info.mimetype or ""):
+            if getattr(file_info, "thumbnail_key", None):
+                try:
+                    storage = get_storage()
+                    thumb_url = await storage.get_url(
+                        file_info.thumbnail_key,
+                        expires=settings.MINIO_PRESIGN_EXPIRES,
+                    )
+                    block_kwargs["thumbnail_url"] = FileService._sign_local_url(
+                        thumb_url,
+                        file_info.id,
+                        settings.MINIO_PRESIGN_EXPIRES,
+                    )
+                except Exception:
+                    logger.warning("图片缩略图 URL 构造失败: file_id=%s", file_info.id)
+            block_kwargs["width"] = getattr(file_info, "width", None)
+            block_kwargs["height"] = getattr(file_info, "height", None)
+        return FileBlock(**block_kwargs)
 
     async def process_message(
         self,
@@ -85,34 +133,11 @@ class ChatService:
         )
 
         # 构造用户消息 content blocks
-        user_content = [TextBlock(type="text", text=message)]
-        if file_ids:
-            storage = None
-            for fid in file_ids:
-                file_info = self.file_repo.get_file_by_id(fid)
-                if file_info:
-                    # 构造 FileBlock，图片文件附带缩略图信息
-                    block_kwargs = {
-                        "type": "file",
-                        "file_id": fid,
-                        "filename": file_info.original_filename,
-                        "mime_type": file_info.mimetype,
-                    }
-                    if is_image_mime(file_info.mimetype) and getattr(file_info, "thumbnail_key", None):
-                        from app.core.config import settings
+        validated_files = self._validate_message_files(file_ids or [], user_id, conversation.id)
 
-                        try:
-                            storage = storage or get_storage()
-                            thumb_url = await storage.get_url(
-                                file_info.thumbnail_key,
-                                expires=settings.MINIO_PRESIGN_EXPIRES,
-                            )
-                            block_kwargs["thumbnail_url"] = thumb_url
-                        except Exception:
-                            pass
-                        block_kwargs["width"] = getattr(file_info, "width", None)
-                        block_kwargs["height"] = getattr(file_info, "height", None)
-                    user_content.append(FileBlock(**block_kwargs))
+        user_content = [TextBlock(type="text", text=message)]
+        for file_info in validated_files:
+            user_content.append(await self._build_file_block_from_record(file_info))
 
         user_message = Message(role="user", content=user_content)
 
