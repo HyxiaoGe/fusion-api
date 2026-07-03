@@ -99,6 +99,7 @@ async def prepare_agent_loop_messages(
     *,
     db,
     user_id: str,
+    conversation_id: str | None = None,
     raw_messages: list,
     has_vision: bool,
     file_ids: list | None,
@@ -122,7 +123,14 @@ async def prepare_agent_loop_messages(
 
     file_repo = file_repo_factory(db)
     user_system_prompt = load_user_system_prompt_fn(db, user_id)
-    messages = await build_llm_messages_fn(raw_messages, has_vision, file_repo, user_system_prompt)
+    messages = await build_llm_messages_fn(
+        raw_messages,
+        has_vision,
+        file_repo,
+        user_system_prompt,
+        user_id=user_id,
+        conversation_id=conversation_id,
+    )
     messages = inject_extra_system_prompts(messages, extra_system_prompts or [])
 
     if preprocess_user_input:

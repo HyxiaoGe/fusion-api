@@ -126,6 +126,12 @@ class ChatServiceTests(unittest.TestCase):
             choices=[SimpleNamespace(message=SimpleNamespace(content="基于已有知识回答。"))],
             usage=None,
         )
+        build_messages_mock = AsyncMock(
+            return_value=[
+                {"role": "system", "content": "日期 system"},
+                {"role": "user", "content": "OpenAI 最近发布了什么模型？"},
+            ]
+        )
 
         with (
             patch(
@@ -138,12 +144,7 @@ class ChatServiceTests(unittest.TestCase):
             ),
             patch(
                 "app.services.chat_service.build_llm_messages",
-                new=AsyncMock(
-                    return_value=[
-                        {"role": "system", "content": "日期 system"},
-                        {"role": "user", "content": "OpenAI 最近发布了什么模型？"},
-                    ]
-                ),
+                new=build_messages_mock,
             ),
             patch("app.services.chat_service.litellm") as mock_litellm,
         ):
@@ -157,6 +158,14 @@ class ChatServiceTests(unittest.TestCase):
                 )
             )
 
+        build_messages_mock.assert_awaited_once_with(
+            service._get_or_create_conversation.return_value[0].messages,
+            has_vision=False,
+            file_repo=service.file_repo,
+            user_system_prompt=None,
+            user_id="user-1",
+            conversation_id="conv-1",
+        )
         sent_messages = mock_litellm.acompletion.await_args.kwargs["messages"]
         self.assertEqual([message["role"] for message in sent_messages[:3]], ["system", "system", "user"])
         self.assertIn("日期 system", sent_messages[0]["content"])
@@ -204,6 +213,12 @@ class ChatServiceTests(unittest.TestCase):
             choices=[SimpleNamespace(message=SimpleNamespace(content="当前模型无法查看图片。"))],
             usage=None,
         )
+        build_messages_mock = AsyncMock(
+            return_value=[
+                {"role": "system", "content": "日期 system"},
+                {"role": "user", "content": "这张图里有什么？"},
+            ]
+        )
 
         with (
             patch(
@@ -216,12 +231,7 @@ class ChatServiceTests(unittest.TestCase):
             ),
             patch(
                 "app.services.chat_service.build_llm_messages",
-                new=AsyncMock(
-                    return_value=[
-                        {"role": "system", "content": "日期 system"},
-                        {"role": "user", "content": "这张图里有什么？"},
-                    ]
-                ),
+                new=build_messages_mock,
             ),
             patch("app.services.chat_service.litellm") as mock_litellm,
         ):
@@ -236,6 +246,14 @@ class ChatServiceTests(unittest.TestCase):
                 )
             )
 
+        build_messages_mock.assert_awaited_once_with(
+            service._get_or_create_conversation.return_value[0].messages,
+            has_vision=False,
+            file_repo=service.file_repo,
+            user_system_prompt=None,
+            user_id="user-1",
+            conversation_id="conv-1",
+        )
         sent_messages = mock_litellm.acompletion.await_args.kwargs["messages"]
         self.assertEqual([message["role"] for message in sent_messages[:4]], ["system", "system", "system", "user"])
         self.assertIn("日期 system", sent_messages[0]["content"])
@@ -424,11 +442,33 @@ class ChatServiceTests(unittest.TestCase):
         self.assertEqual(context.exception.code, "INVALID_PARAM")
         self.assertEqual(context.exception.message, "文件仍在处理，请稍后再发送")
 
+    def test_validate_message_files_rejects_image_missing_storage_key(self):
+        service = object.__new__(ChatService)
+        service.file_repo = MagicMock()
+        service.file_repo.get_file_by_id.return_value = SimpleNamespace(
+            id="file-4",
+            user_id="user-1",
+            original_filename="chart.png",
+            mimetype="image/png",
+            status="processed",
+            storage_key=None,
+            thumbnail_key=None,
+        )
+        service.file_repo.is_file_linked_to_conversation.return_value = True
+
+        with self.assertRaises(ApiException) as context:
+            service._validate_message_files(["file-4"], "user-1", "conv-1")
+
+        self.assertEqual(context.exception.code, "INVALID_PARAM")
+        self.assertEqual(context.exception.message, "图片文件不可用，请重新上传")
+
     def test_process_message_rejects_invalid_file_before_creating_message(self):
         db = MagicMock()
         service = ChatService(db)
         service.file_repo = MagicMock()
         service.file_repo.get_file_by_id.return_value = None
+        service.stream_handler = MagicMock()
+        service.stream_handler.generate_to_redis = AsyncMock()
         service.conversation_service = MagicMock()
         service._get_or_create_conversation = MagicMock(
             return_value=(
@@ -454,7 +494,12 @@ class ChatServiceTests(unittest.TestCase):
                 "app.services.chat_service.litellm_catalog.get_capabilities",
                 return_value={"functionCalling": False, "agentTools": False, "vision": False},
             ),
+            patch("app.services.chat_service.init_stream", new=AsyncMock()) as init_stream_mock,
+            patch("app.services.chat_service.register_task") as register_task_mock,
+            patch("app.services.chat_service.asyncio.create_task") as create_task_mock,
+            patch("app.services.chat_service.litellm") as mock_litellm,
         ):
+            mock_litellm.acompletion = AsyncMock()
             with self.assertRaises(ApiException):
                 asyncio.run(
                     service.process_message(
@@ -469,6 +514,11 @@ class ChatServiceTests(unittest.TestCase):
 
         service.conversation_service.create_message.assert_not_called()
         db.commit.assert_not_called()
+        init_stream_mock.assert_not_awaited()
+        register_task_mock.assert_not_called()
+        create_task_mock.assert_not_called()
+        service.stream_handler.generate_to_redis.assert_not_called()
+        mock_litellm.acompletion.assert_not_called()
 
 
 if __name__ == "__main__":

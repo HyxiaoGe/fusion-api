@@ -204,6 +204,8 @@ class ChatService:
                 has_vision=has_vision,
                 file_repo=self.file_repo,
                 user_system_prompt=user_system_prompt,
+                user_id=user_id,
+                conversation_id=conversation.id,
             )
             if file_ids:
                 image_ids = [fid for fid in file_ids if is_image_file(fid, self.file_repo)]

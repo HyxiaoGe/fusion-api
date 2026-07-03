@@ -1,5 +1,6 @@
 import unittest
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.schemas.chat import FileBlock, Message, TextBlock
 from app.services.chat.message_builder import build_llm_messages
@@ -66,6 +67,7 @@ class MessageBuilderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("当前对话使用的具体模型以界面显示为准", result[1]["content"])
 
     async def test_build_llm_messages_injects_image_block_when_model_has_vision(self):
+        file_repo = object()
         messages = [
             Message(
                 role="user",
@@ -79,11 +81,23 @@ class MessageBuilderTests(unittest.IsolatedAsyncioTestCase):
         image_part = {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
         with patch(
             "app.services.chat.message_builder.file_block_to_image_part", new=AsyncMock(return_value=image_part)
-        ):
-            result = await build_llm_messages(messages, has_vision=True, file_repo=object())
+        ) as to_image_part:
+            result = await build_llm_messages(
+                messages,
+                has_vision=True,
+                file_repo=file_repo,
+                user_id="user-1",
+                conversation_id="conv-1",
+            )
 
         self.assertEqual(result[-1]["role"], "user")
         self.assertEqual(result[-1]["content"], [{"type": "text", "text": "看图回答"}, image_part])
+        to_image_part.assert_awaited_once_with(
+            messages[0].content[1],
+            file_repo,
+            user_id="user-1",
+            conversation_id="conv-1",
+        )
 
     async def test_build_llm_messages_does_not_inject_image_block_without_vision(self):
         messages = [
@@ -101,6 +115,122 @@ class MessageBuilderTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result[-1], {"role": "user", "content": "看图回答"})
         to_image_part.assert_not_called()
+
+    async def test_build_llm_messages_skips_historical_image_from_other_user(self):
+        class ScopedFileRepo:
+            def __init__(self):
+                self.calls = []
+
+            def get_file_by_id(self, file_id, user_id=None):
+                self.calls.append((file_id, user_id))
+                if user_id == "user-1":
+                    return None
+                return SimpleNamespace(
+                    id=file_id,
+                    user_id="user-2",
+                    mimetype="image/png",
+                    storage_key="conv-2/img-1.png",
+                )
+
+            def is_file_linked_to_conversation(self, conversation_id, file_id):
+                raise AssertionError("跨用户文件不应继续检查会话关联")
+
+        messages = [
+            Message(
+                role="user",
+                content=[
+                    TextBlock(type="text", text="历史图片"),
+                    FileBlock(type="file", file_id="img-1", filename="chart.png", mime_type="image/png"),
+                ],
+            )
+        ]
+        storage = SimpleNamespace(download=AsyncMock(return_value=b"private-image"))
+
+        with patch("app.services.chat.message_builder.get_storage", return_value=storage):
+            result = await build_llm_messages(
+                messages,
+                has_vision=True,
+                file_repo=ScopedFileRepo(),
+                user_id="user-1",
+                conversation_id="conv-1",
+            )
+
+        self.assertEqual(result[-1], {"role": "user", "content": "历史图片"})
+        storage.download.assert_not_awaited()
+
+    async def test_build_llm_messages_skips_historical_image_not_linked_to_conversation(self):
+        file_repo = MagicMock()
+        file_repo.get_file_by_id.return_value = SimpleNamespace(
+            id="img-2",
+            user_id="user-1",
+            mimetype="image/png",
+            storage_key="conv-2/img-2.png",
+        )
+        file_repo.is_file_linked_to_conversation.return_value = False
+        messages = [
+            Message(
+                role="user",
+                content=[
+                    TextBlock(type="text", text="历史图片"),
+                    FileBlock(type="file", file_id="img-2", filename="chart.png", mime_type="image/png"),
+                ],
+            )
+        ]
+        storage = SimpleNamespace(download=AsyncMock(return_value=b"private-image"))
+
+        with patch("app.services.chat.message_builder.get_storage", return_value=storage):
+            result = await build_llm_messages(
+                messages,
+                has_vision=True,
+                file_repo=file_repo,
+                user_id="user-1",
+                conversation_id="conv-1",
+            )
+
+        self.assertEqual(result[-1], {"role": "user", "content": "历史图片"})
+        file_repo.get_file_by_id.assert_called_once_with("img-2", user_id="user-1")
+        file_repo.is_file_linked_to_conversation.assert_called_once_with("conv-1", "img-2")
+        storage.download.assert_not_awaited()
+
+    async def test_build_llm_messages_injects_authorized_historical_image(self):
+        file_repo = MagicMock()
+        file_repo.get_file_by_id.return_value = SimpleNamespace(
+            id="img-3",
+            user_id="user-1",
+            mimetype="image/png",
+            storage_key="conv-1/img-3.png",
+        )
+        file_repo.is_file_linked_to_conversation.return_value = True
+        messages = [
+            Message(
+                role="user",
+                content=[
+                    TextBlock(type="text", text="看图回答"),
+                    FileBlock(type="file", file_id="img-3", filename="chart.png", mime_type="image/png"),
+                ],
+            )
+        ]
+        storage = SimpleNamespace(download=AsyncMock(return_value=b"image-bytes"))
+
+        with patch("app.services.chat.message_builder.get_storage", return_value=storage):
+            result = await build_llm_messages(
+                messages,
+                has_vision=True,
+                file_repo=file_repo,
+                user_id="user-1",
+                conversation_id="conv-1",
+            )
+
+        self.assertEqual(result[-1]["role"], "user")
+        self.assertEqual(result[-1]["content"][0], {"type": "text", "text": "看图回答"})
+        self.assertEqual(result[-1]["content"][1]["type"], "image_url")
+        self.assertEqual(
+            result[-1]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aW1hZ2UtYnl0ZXM=",
+        )
+        file_repo.get_file_by_id.assert_called_once_with("img-3", user_id="user-1")
+        file_repo.is_file_linked_to_conversation.assert_called_once_with("conv-1", "img-3")
+        storage.download.assert_awaited_once_with("conv-1/img-3.png")
 
 
 if __name__ == "__main__":

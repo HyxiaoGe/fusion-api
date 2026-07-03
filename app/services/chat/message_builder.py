@@ -20,11 +20,26 @@ from app.services.storage import get_storage
 MAX_VISION_HISTORY_TURNS = 3
 
 
-async def file_block_to_image_part(block, file_repo: FileRepository) -> Optional[dict]:
+async def file_block_to_image_part(
+    block,
+    file_repo: Optional[FileRepository],
+    *,
+    user_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+) -> Optional[dict]:
     """将图片 FileBlock 转为 LiteLLM image_url content part"""
     try:
-        file_record = file_repo.get_file_by_id(block.file_id)
-        if not file_record or not file_record.storage_key:
+        if not file_repo or not user_id or not conversation_id:
+            return None
+
+        file_record = file_repo.get_file_by_id(block.file_id, user_id=user_id)
+        if not file_record:
+            return None
+
+        if not file_repo.is_file_linked_to_conversation(conversation_id, block.file_id):
+            return None
+
+        if not is_image_mime(file_record.mimetype or "") or not file_record.storage_key:
             return None
 
         storage = get_storage()
@@ -46,8 +61,11 @@ async def file_block_to_image_part(block, file_repo: FileRepository) -> Optional
 async def build_llm_messages(
     messages,
     has_vision: bool = False,
-    file_repo: FileRepository = None,
+    file_repo: Optional[FileRepository] = None,
     user_system_prompt: Optional[str] = None,
+    *,
+    user_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
 ) -> List[dict]:
     """
     将 content blocks 消息列表转为 LLM 可消费的 dict 格式。
@@ -110,7 +128,12 @@ async def build_llm_messages(
                 # 图片 FileBlock → base64 image_url
                 mime = getattr(block, "mime_type", "")
                 if is_image_mime(mime):
-                    image_part = await file_block_to_image_part(block, file_repo)
+                    image_part = await file_block_to_image_part(
+                        block,
+                        file_repo,
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                    )
                     if image_part:
                         content_parts.append(image_part)
                         has_image = True

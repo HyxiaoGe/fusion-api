@@ -159,7 +159,16 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
             call_order.append(("start", kwargs["run_id"], kwargs["tools"], kwargs["config"]))
 
         async def prepare_messages_fn(**kwargs):
-            call_order.append(("prepare", kwargs["db"], kwargs["raw_messages"], kwargs["call_config"]))
+            call_order.append(
+                (
+                    "prepare",
+                    kwargs["db"],
+                    kwargs["raw_messages"],
+                    kwargs["call_config"],
+                    kwargs["user_id"],
+                    kwargs["conversation_id"],
+                )
+            )
             return AgentLoopPreparedMessages(
                 messages=[{"role": "user", "content": "prepared"}],
                 initial_content_blocks=[initial_block],
@@ -207,6 +216,8 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertIs(call_order[2][3], call_config)
+        self.assertEqual(call_order[2][4], "user-life")
+        self.assertEqual(call_order[2][5], "conv-life")
         self.assertEqual(call_order[3][1], [{"role": "user", "content": "prepared"}])
         self.assertEqual(call_order[3][2], [initial_block])
         self.assertIs(call_order[4][1], execution.completion_context)

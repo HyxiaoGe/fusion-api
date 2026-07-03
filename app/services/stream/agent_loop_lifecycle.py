@@ -130,6 +130,7 @@ async def _prepare_messages(
     return await dependencies.prepare_messages_fn(
         db=execution.completion_context.db,
         user_id=execution.runtime.user_id,
+        conversation_id=execution.completion_context.conversation_id,
         raw_messages=request.raw_messages,
         has_vision=request.has_vision,
         file_ids=request.file_ids,
