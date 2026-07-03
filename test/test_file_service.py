@@ -215,6 +215,53 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
         repo.get_by_id.assert_called_once_with("conv-missing", "user-1")
         self.service.file_repo.get_conversation_files.assert_not_called()
 
+    async def test_get_conversation_files_keeps_summary_when_thumbnail_url_fails(self):
+        conversation_file = SimpleNamespace(
+            file=SimpleNamespace(
+                id="file-1",
+                original_filename="photo.png",
+                mimetype="image/png",
+                size=12,
+                status="processed",
+                thumbnail_key="conv-1/file-1/thumb.png",
+                width=640,
+                height=480,
+                created_at=None,
+                processing_result=None,
+            )
+        )
+        self.service.file_repo.get_conversation_files.return_value = [conversation_file]
+        self.service.storage.get_url = AsyncMock(side_effect=RuntimeError("storage unavailable"))
+
+        result = await self.service.get_conversation_files("conv-1")
+
+        self.service.storage.get_url.assert_awaited_once_with(
+            "conv-1/file-1/thumb.png",
+            expires=settings.MINIO_PRESIGN_EXPIRES,
+        )
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["id"], "file-1")
+        self.assertIsNone(result[0]["thumbnail_url"])
+
+    async def test_get_files_by_user_does_not_surface_success_message_as_error(self):
+        file_record = SimpleNamespace(
+            id="file-3",
+            original_filename="report.pdf",
+            mimetype="application/pdf",
+            size=24,
+            status="processed",
+            thumbnail_key=None,
+            width=None,
+            height=None,
+            created_at=None,
+            processing_result={"status": "success", "message": "解析完成"},
+        )
+        self.service.file_repo.get_files_by_user_id.return_value = [file_record]
+
+        result = await self.service.get_files_by_user("user-1")
+
+        self.assertIsNone(result[0]["error_message"])
+
     async def test_get_conversation_files_uses_shared_summary_serializer(self):
         conversation_file = SimpleNamespace(
             file=SimpleNamespace(

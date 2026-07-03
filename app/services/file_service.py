@@ -357,9 +357,11 @@ class FileService:
         return created_at
 
     @staticmethod
-    def _extract_processing_error_message(processing_result: Any) -> Optional[str]:
+    def _extract_processing_error_message(file_status: Optional[str], processing_result: Any) -> Optional[str]:
         """从处理结果中提取用户可见错误信息。"""
         if not isinstance(processing_result, dict):
+            return None
+        if file_status != "error" and processing_result.get("status") != "error":
             return None
         return processing_result.get("message") or processing_result.get("error")
 
@@ -368,21 +370,29 @@ class FileService:
         thumbnail_key = getattr(file_obj, "thumbnail_key", None)
         thumbnail_url = None
         if thumbnail_key:
-            thumbnail_url = await self.storage.get_url(thumbnail_key, expires=settings.MINIO_PRESIGN_EXPIRES)
-            thumbnail_url = self._sign_local_url(thumbnail_url, file_obj.id, settings.MINIO_PRESIGN_EXPIRES)
+            try:
+                thumbnail_url = await self.storage.get_url(thumbnail_key, expires=settings.MINIO_PRESIGN_EXPIRES)
+                thumbnail_url = self._sign_local_url(thumbnail_url, file_obj.id, settings.MINIO_PRESIGN_EXPIRES)
+            except Exception as e:
+                logger.warning(f"文件缩略图 URL 构造失败: file_id={file_obj.id}, error={e}")
+
+        file_status = file_obj.status
 
         return {
             "id": file_obj.id,
             "filename": file_obj.original_filename,
             "mimetype": file_obj.mimetype,
             "size": file_obj.size,
-            "status": file_obj.status,
+            "status": file_status,
             "thumbnail_key": thumbnail_key,
             "thumbnail_url": thumbnail_url,
             "width": getattr(file_obj, "width", None),
             "height": getattr(file_obj, "height", None),
             "created_at": self._serialize_created_at(getattr(file_obj, "created_at", None)),
-            "error_message": self._extract_processing_error_message(getattr(file_obj, "processing_result", None)),
+            "error_message": self._extract_processing_error_message(
+                file_status,
+                getattr(file_obj, "processing_result", None),
+            ),
         }
 
     def get_file_status(self, file_id: str, user_id: str) -> Dict[str, Any]:
