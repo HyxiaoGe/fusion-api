@@ -34,6 +34,7 @@ docker-compose up -d                     # Docker 启动
 8. **真实 Chrome 回归**：涉及登录态、联网回答、消息流、设置页或其他用户可见链路时，只能复用用户已经打开的、与任务匹配的 Chrome 标签做补充回归。**严禁打开新的 Chrome、新标签、新窗口、`about:blank`、isolated context，严禁使用会创建或切到独立浏览器目标的 DevTools/CDP 通道。**若没有可复用的匹配标签，必须停止并说明阻塞，不能自行新开页面；只验证关键路径、真实网络和可见异常，不用本地 Fusion 服务替代。
 9. **变更后验证**：运行与改动匹配的 pytest/ruff；涉及数据流、联网、Redis Stream、认证或部署逻辑时扩大回归范围并更新文档。
 10. **CI/CD 收尾**：按正常 Git 流程中文提交并包含 `Co-Authored-By`，push 后持续监控 GitHub Actions 和 dev 部署；失败时拉日志定位并修复。
+11. **下一步建议必须查执行记录**：用户问“下一步”“接下来做什么”“还有什么优化”“还能怎么加强”时，必须先读 [docs/EXECUTION_LEDGER.md](docs/EXECUTION_LEDGER.md)，再查 `fusion-api` / `fusion-ui` 最近 `git log` 和相关 `docs/superpowers`。禁止凭 memory 或印象回答，禁止重复建议台账里已经完成的方向。可使用 repo skill `fusion-next-step`。
 
 ## 常见开发任务
 

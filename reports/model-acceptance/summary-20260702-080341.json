@@ -1,0 +1,260 @@
+{
+  "avg_elapsed_ms": 19494,
+  "by_model": {
+    "MiniMax-M2.7": {
+      "avg_elapsed_ms": 12899,
+      "failure_count": 0,
+      "success_count": 4,
+      "success_rate": 1.0,
+      "total": 4
+    },
+    "deepseek-chat": {
+      "avg_elapsed_ms": 10227,
+      "failure_count": 0,
+      "success_count": 4,
+      "success_rate": 1.0,
+      "total": 4
+    },
+    "deepseek-reasoner": {
+      "avg_elapsed_ms": 6755,
+      "failure_count": 0,
+      "success_count": 4,
+      "success_rate": 1.0,
+      "total": 4
+    },
+    "doubao-seed-2-0-lite-260215": {
+      "avg_elapsed_ms": 20859,
+      "failure_count": 0,
+      "success_count": 4,
+      "success_rate": 1.0,
+      "total": 4
+    },
+    "doubao-seed-2-0-mini-260215": {
+      "avg_elapsed_ms": 10697,
+      "failure_count": 0,
+      "success_count": 4,
+      "success_rate": 1.0,
+      "total": 4
+    },
+    "doubao-seed-2-0-pro-260215": {
+      "avg_elapsed_ms": 27911,
+      "failure_count": 0,
+      "success_count": 4,
+      "success_rate": 1.0,
+      "total": 4
+    },
+    "gemini-3.1-pro-preview": {
+      "avg_elapsed_ms": 49640,
+      "failure_count": 1,
+      "success_count": 3,
+      "success_rate": 0.75,
+      "total": 4
+    },
+    "grok-4.20-beta": {
+      "avg_elapsed_ms": 10298,
+      "failure_count": 0,
+      "success_count": 4,
+      "success_rate": 1.0,
+      "total": 4
+    },
+    "kimi-k2.5": {
+      "avg_elapsed_ms": 35446,
+      "failure_count": 0,
+      "success_count": 4,
+      "success_rate": 1.0,
+      "total": 4
+    },
+    "mimo-v2.5-pro": {
+      "avg_elapsed_ms": 26875,
+      "failure_count": 0,
+      "success_count": 4,
+      "success_rate": 1.0,
+      "total": 4
+    },
+    "mimo-v2.5-pro-ultraspeed": {
+      "avg_elapsed_ms": 8096,
+      "failure_count": 0,
+      "success_count": 4,
+      "success_rate": 1.0,
+      "total": 4
+    },
+    "qwen-max-latest": {
+      "avg_elapsed_ms": 19266,
+      "failure_count": 0,
+      "success_count": 4,
+      "success_rate": 1.0,
+      "total": 4
+    },
+    "qwen-vl-max": {
+      "avg_elapsed_ms": 7692,
+      "failure_count": 0,
+      "success_count": 4,
+      "success_rate": 1.0,
+      "total": 4
+    },
+    "qwen3.6-plus": {
+      "avg_elapsed_ms": 26248,
+      "failure_count": 0,
+      "success_count": 4,
+      "success_rate": 1.0,
+      "total": 4
+    }
+  },
+  "by_scenario": {
+    "autonomous_search": {
+      "avg_elapsed_ms": 50640,
+      "failure_count": 1,
+      "success_count": 13,
+      "success_rate": 0.9286,
+      "total": 14
+    },
+    "basic_chat": {
+      "avg_elapsed_ms": 6461,
+      "failure_count": 0,
+      "success_count": 14,
+      "success_rate": 1.0,
+      "total": 14
+    },
+    "coding_reasoning": {
+      "avg_elapsed_ms": 13641,
+      "failure_count": 0,
+      "success_count": 14,
+      "success_rate": 1.0,
+      "total": 14
+    },
+    "no_search_simple": {
+      "avg_elapsed_ms": 7232,
+      "failure_count": 0,
+      "success_count": 14,
+      "success_rate": 1.0,
+      "total": 14
+    }
+  },
+  "failure_count": 1,
+  "failure_types": {
+    "timeout": 1
+  },
+  "quality_flags": {
+    "expected_search_without_agent_tools": 2,
+    "slow_response": 3
+  },
+  "quality_issue_count": 5,
+  "quality_issues": [
+    {
+      "flags": [
+        "expected_search_without_agent_tools"
+      ],
+      "model_id": "deepseek-reasoner",
+      "provider": "deepseek",
+      "recommendations": [
+        "模型不支持 agent 工具，建议从实时搜索任务候选集中剔除或明确标注不可联网。"
+      ],
+      "scenario_id": "autonomous_search",
+      "severity": "medium"
+    },
+    {
+      "flags": [
+        "expected_search_without_agent_tools"
+      ],
+      "model_id": "qwen-vl-max",
+      "provider": "qwen",
+      "recommendations": [
+        "模型不支持 agent 工具，建议从实时搜索任务候选集中剔除或明确标注不可联网。"
+      ],
+      "scenario_id": "autonomous_search",
+      "severity": "medium"
+    },
+    {
+      "flags": [
+        "slow_response"
+      ],
+      "model_id": "gemini-3.1-pro-preview",
+      "provider": "google",
+      "recommendations": [
+        "响应耗时超过场景阈值，建议在自动路由中降权或设置更短超时兜底。"
+      ],
+      "scenario_id": "basic_chat",
+      "severity": "medium"
+    },
+    {
+      "flags": [
+        "slow_response"
+      ],
+      "model_id": "kimi-k2.5",
+      "provider": "moonshot",
+      "recommendations": [
+        "响应耗时超过场景阈值，建议在自动路由中降权或设置更短超时兜底。"
+      ],
+      "scenario_id": "autonomous_search",
+      "severity": "medium"
+    },
+    {
+      "flags": [
+        "slow_response"
+      ],
+      "model_id": "doubao-seed-2-0-pro-260215",
+      "provider": "doubao",
+      "recommendations": [
+        "响应耗时超过场景阈值，建议在自动路由中降权或设置更短超时兜底。"
+      ],
+      "scenario_id": "coding_reasoning",
+      "severity": "medium"
+    }
+  ],
+  "quality_risk_by_model": {
+    "deepseek-reasoner": {
+      "flag_counts": {
+        "expected_search_without_agent_tools": 1
+      },
+      "issue_count": 1,
+      "provider": "deepseek",
+      "severity_counts": {
+        "medium": 1
+      }
+    },
+    "doubao-seed-2-0-pro-260215": {
+      "flag_counts": {
+        "slow_response": 1
+      },
+      "issue_count": 1,
+      "provider": "doubao",
+      "severity_counts": {
+        "medium": 1
+      }
+    },
+    "gemini-3.1-pro-preview": {
+      "flag_counts": {
+        "slow_response": 1
+      },
+      "issue_count": 1,
+      "provider": "google",
+      "severity_counts": {
+        "medium": 1
+      }
+    },
+    "kimi-k2.5": {
+      "flag_counts": {
+        "slow_response": 1
+      },
+      "issue_count": 1,
+      "provider": "moonshot",
+      "severity_counts": {
+        "medium": 1
+      }
+    },
+    "qwen-vl-max": {
+      "flag_counts": {
+        "expected_search_without_agent_tools": 1
+      },
+      "issue_count": 1,
+      "provider": "qwen",
+      "severity_counts": {
+        "medium": 1
+      }
+    }
+  },
+  "success_count": 55,
+  "success_rate": 0.9821,
+  "tool_expectation_mismatch_count": 1,
+  "total": 56
+}
