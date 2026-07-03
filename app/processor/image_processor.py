@@ -11,7 +11,7 @@
 import io
 from typing import Any, Dict
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from app.core.logger import app_logger as logger
 
@@ -29,6 +29,7 @@ except ImportError:
 class ImageProcessor:
     """图片预处理管线"""
 
+    BAD_IMAGE_MESSAGE = "图片文件损坏或无法读取，请重新保存后再上传"
     # 处理后的长边最大值（兼容 Claude 1568px 建议）
     MAX_LONG_SIDE = 1568
     # 缩略图最大宽度
@@ -61,64 +62,67 @@ class ImageProcessor:
                 "height": int,           # 处理后高度
             }
         """
-        img = Image.open(io.BytesIO(data))
-        original_format = (img.format or "JPEG").upper()
-        logger.info(f"图片预处理开始: 原始格式={original_format}, 尺寸={img.size}")
+        try:
+            img = Image.open(io.BytesIO(data))
+            original_format = (img.format or "JPEG").upper()
+            logger.info(f"图片预处理开始: 原始格式={original_format}, 尺寸={img.size}")
 
-        # 1. 确定输出格式
-        output_format = self._resolve_output_format(img, original_format)
+            # 1. 确定输出格式
+            output_format = self._resolve_output_format(img, original_format)
 
-        # 2. EXIF 旋转修正（手机拍照经常带旋转信息）
-        img = ImageOps.exif_transpose(img) or img
+            # 2. EXIF 旋转修正（手机拍照经常带旋转信息）
+            img = ImageOps.exif_transpose(img) or img
 
-        # 3. 处理透明通道：JPEG 不支持 alpha，需转为 RGB
-        if output_format == "JPEG" and img.mode in ("RGBA", "LA", "P"):
-            background = Image.new("RGB", img.size, (255, 255, 255))
-            if img.mode == "P":
-                img = img.convert("RGBA")
-            background.paste(img, mask=img.split()[-1] if "A" in img.mode else None)
-            img = background
-        elif img.mode not in ("RGB", "RGBA", "L"):
-            img = img.convert("RGB")
+            # 3. 处理透明通道：JPEG 不支持 alpha，需转为 RGB
+            if output_format == "JPEG" and img.mode in ("RGBA", "LA", "P"):
+                background = Image.new("RGB", img.size, (255, 255, 255))
+                if img.mode == "P":
+                    img = img.convert("RGBA")
+                background.paste(img, mask=img.split()[-1] if "A" in img.mode else None)
+                img = background
+            elif img.mode not in ("RGB", "RGBA", "L"):
+                img = img.convert("RGB")
 
-        # 4. 长边缩放
-        img = self._resize_long_side(img, self.MAX_LONG_SIDE)
+            # 4. 长边缩放
+            img = self._resize_long_side(img, self.MAX_LONG_SIDE)
 
-        # 5. 编码处理图
-        processed_bytes = self._encode(img, output_format, self.JPEG_QUALITY)
+            # 5. 编码处理图
+            processed_bytes = self._encode(img, output_format, self.JPEG_QUALITY)
 
-        # 6. 若超 4MB，降低质量重新编码
-        if len(processed_bytes) > self.MAX_OUTPUT_SIZE and output_format == "JPEG":
-            logger.info(f"处理图超过 4MB ({len(processed_bytes)} bytes)，降低质量重新编码")
-            processed_bytes = self._encode(img, output_format, self.JPEG_QUALITY_FALLBACK)
+            # 6. 若超 4MB，降低质量重新编码
+            if len(processed_bytes) > self.MAX_OUTPUT_SIZE and output_format == "JPEG":
+                logger.info(f"处理图超过 4MB ({len(processed_bytes)} bytes)，降低质量重新编码")
+                processed_bytes = self._encode(img, output_format, self.JPEG_QUALITY_FALLBACK)
 
-        # 7. 生成缩略图
-        thumb = img.copy()
-        thumb_height = int(img.height * (self.THUMBNAIL_WIDTH / img.width))
-        thumb = thumb.resize((self.THUMBNAIL_WIDTH, thumb_height), Image.Resampling.LANCZOS)
-        thumbnail_bytes = self._encode(thumb, output_format, 75)
+            # 7. 生成缩略图
+            thumb = img.copy()
+            thumb_height = int(img.height * (self.THUMBNAIL_WIDTH / img.width))
+            thumb = thumb.resize((self.THUMBNAIL_WIDTH, thumb_height), Image.Resampling.LANCZOS)
+            thumbnail_bytes = self._encode(thumb, output_format, 75)
 
-        # MIME 类型映射
-        mime_map = {
-            "JPEG": "image/jpeg",
-            "PNG": "image/png",
-            "WEBP": "image/webp",
-            "GIF": "image/gif",
-        }
-        result_mime = mime_map.get(output_format, "image/jpeg")
+            # MIME 类型映射
+            mime_map = {
+                "JPEG": "image/jpeg",
+                "PNG": "image/png",
+                "WEBP": "image/webp",
+                "GIF": "image/gif",
+            }
+            result_mime = mime_map.get(output_format, "image/jpeg")
 
-        logger.info(
-            f"图片预处理完成: 输出格式={output_format}, 尺寸={img.size}, "
-            f"处理图={len(processed_bytes)} bytes, 缩略图={len(thumbnail_bytes)} bytes"
-        )
+            logger.info(
+                f"图片预处理完成: 输出格式={output_format}, 尺寸={img.size}, "
+                f"处理图={len(processed_bytes)} bytes, 缩略图={len(thumbnail_bytes)} bytes"
+            )
 
-        return {
-            "processed": processed_bytes,
-            "thumbnail": thumbnail_bytes,
-            "mime_type": result_mime,
-            "width": img.width,
-            "height": img.height,
-        }
+            return {
+                "processed": processed_bytes,
+                "thumbnail": thumbnail_bytes,
+                "mime_type": result_mime,
+                "width": img.width,
+                "height": img.height,
+            }
+        except (UnidentifiedImageError, OSError) as exc:
+            raise ValueError(self.BAD_IMAGE_MESSAGE) from exc
 
     def _resolve_output_format(self, img: Image.Image, original_format: str) -> str:
         """确定输出格式，保留 PNG 透明和 GIF 动画"""

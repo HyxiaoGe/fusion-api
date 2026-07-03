@@ -231,6 +231,29 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         self.assertEqual(len(args.args[0]), 1)
         self.assertEqual(args.args[0][0].filename, "note.txt")
 
+    def test_file_upload_value_error_returns_invalid_param(self):
+        self._enable_authenticated_overrides()
+        service = self._mock_file_service(
+            upload_files=AsyncMock(side_effect=ValueError("图片文件损坏或无法读取，请重新保存后再上传"))
+        )
+
+        response = self.client.post(
+            "/api/files/upload",
+            data={
+                "provider": "openai",
+                "model": "gpt-4.1",
+                "conversation_id": "conv-1",
+            },
+            files=[("files", ("broken.png", b"not-an-image", "image/png"))],
+        )
+
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["code"], "INVALID_PARAM")
+        self.assertEqual(body["message"], "图片文件损坏或无法读取，请重新保存后再上传")
+        self.assertIsNone(body["data"])
+        service.upload_files.assert_awaited_once()
+
     def test_file_status_returns_not_found_when_service_has_no_record(self):
         self._enable_authenticated_overrides()
         service = self._mock_file_service()
