@@ -117,25 +117,25 @@ async def get_file_content(
 
 
 @router.get("/")
-def get_user_files(
+async def get_user_files(
     request: Request,
     current_user: User = Depends(get_current_user),
     file_service: FileService = Depends(get_file_service),
 ):
     """获取当前用户的所有文件"""
-    files = file_service.get_files_by_user(current_user.id)
+    files = await file_service.get_files_by_user(current_user.id)
     return success(data={"files": files}, request_id=request.state.request_id)
 
 
 @router.get("/conversation/{conversation_id}")
-def get_conversation_files(
+async def get_conversation_files(
     conversation_id: str,
     request: Request,
     current_user: User = Depends(get_current_user),
     file_service: FileService = Depends(get_file_service),
 ):
     """获取对话关联的所有文件"""
-    files = file_service.get_conversation_files_for_user(conversation_id, current_user.id)
+    files = await file_service.get_conversation_files_for_user(conversation_id, current_user.id)
     if files is None:
         raise ApiException.not_found("对话不存在或无权访问")
     return success(data={"files": files}, request_id=request.state.request_id)

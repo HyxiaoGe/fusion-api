@@ -244,10 +244,23 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         self.assertEqual(body["message"], "文件不存在或无权访问")
         service.get_file_status.assert_called_once_with("file-404", user_id="user-123")
 
+    def test_user_files_use_authenticated_user_scope(self):
+        self._enable_authenticated_overrides()
+        service = self._mock_file_service()
+        service.get_files_by_user = AsyncMock(return_value=[{"id": "file-1"}])
+
+        response = self.client.get("/api/files/")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["code"], "SUCCESS")
+        self.assertEqual(body["data"]["files"], [{"id": "file-1"}])
+        service.get_files_by_user.assert_awaited_once_with("user-123")
+
     def test_conversation_files_require_authorized_conversation(self):
         self._enable_authenticated_overrides()
         service = self._mock_file_service()
-        service.get_conversation_files_for_user.return_value = None
+        service.get_conversation_files_for_user = AsyncMock(return_value=None)
 
         response = self.client.get("/api/files/conversation/conv-404")
 
@@ -255,12 +268,12 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         body = response.json()
         self.assertEqual(body["code"], "NOT_FOUND")
         self.assertEqual(body["message"], "对话不存在或无权访问")
-        service.get_conversation_files_for_user.assert_called_once_with("conv-404", "user-123")
+        service.get_conversation_files_for_user.assert_awaited_once_with("conv-404", "user-123")
 
     def test_conversation_files_use_authenticated_user_scope(self):
         self._enable_authenticated_overrides()
         service = self._mock_file_service()
-        service.get_conversation_files_for_user.return_value = [{"id": "file-1"}]
+        service.get_conversation_files_for_user = AsyncMock(return_value=[{"id": "file-1"}])
 
         response = self.client.get("/api/files/conversation/conv-1")
 
@@ -268,7 +281,7 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         body = response.json()
         self.assertEqual(body["code"], "SUCCESS")
         self.assertEqual(body["data"]["files"], [{"id": "file-1"}])
-        service.get_conversation_files_for_user.assert_called_once_with("conv-1", "user-123")
+        service.get_conversation_files_for_user.assert_awaited_once_with("conv-1", "user-123")
 
 
 if __name__ == "__main__":

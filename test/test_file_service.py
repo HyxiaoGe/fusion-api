@@ -1,7 +1,9 @@
 import unittest
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from app.core.config import settings
 from app.services.file_service import FileService
 
 
@@ -132,7 +134,88 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-    def test_get_conversation_files_uses_shared_summary_serializer(self):
+    async def test_get_conversation_files_includes_thumbnail_url_created_at_and_error_message(self):
+        created_at = datetime(2026, 7, 3, 10, 11, 12)
+        conversation_file = SimpleNamespace(
+            file=SimpleNamespace(
+                id="file-1",
+                original_filename="photo.png",
+                mimetype="image/png",
+                size=12,
+                status="error",
+                thumbnail_key="conv-1/file-1/thumb.png",
+                width=640,
+                height=480,
+                created_at=created_at,
+                processing_result={"status": "error", "message": "解析失败"},
+            )
+        )
+        self.service.file_repo.get_conversation_files.return_value = [conversation_file]
+        self.service.storage.get_url = AsyncMock(return_value="/files/file-1/thumb.png")
+
+        result = await self.service.get_conversation_files("conv-1")
+
+        self.service.storage.get_url.assert_awaited_once_with(
+            "conv-1/file-1/thumb.png",
+            expires=settings.MINIO_PRESIGN_EXPIRES,
+        )
+        self.assertEqual(len(result), 1)
+        summary = result[0]
+        self.assertTrue(summary["thumbnail_url"].startswith("/files/file-1/thumb.png?token="))
+        self.assertEqual(summary["created_at"], "2026-07-03T10:11:12")
+        self.assertEqual(summary["error_message"], "解析失败")
+
+    async def test_get_files_by_user_includes_summary_fields_without_thumbnail(self):
+        file_record = SimpleNamespace(
+            id="file-2",
+            original_filename="report.pdf",
+            mimetype="application/pdf",
+            size=24,
+            status="error",
+            thumbnail_key=None,
+            width=None,
+            height=None,
+            created_at="2026-07-03T11:12:13",
+            processing_result={"status": "error", "error": "解析超时"},
+        )
+        self.service.file_repo.get_files_by_user_id.return_value = [file_record]
+        self.service.storage.get_url = AsyncMock(return_value="/files/file-2/thumb.png")
+
+        result = await self.service.get_files_by_user("user-1")
+
+        self.service.storage.get_url.assert_not_awaited()
+        self.assertEqual(
+            result,
+            [
+                {
+                    "id": "file-2",
+                    "filename": "report.pdf",
+                    "mimetype": "application/pdf",
+                    "size": 24,
+                    "status": "error",
+                    "thumbnail_key": None,
+                    "thumbnail_url": None,
+                    "width": None,
+                    "height": None,
+                    "created_at": "2026-07-03T11:12:13",
+                    "error_message": "解析超时",
+                }
+            ],
+        )
+
+    async def test_get_conversation_files_for_user_returns_none_when_conversation_missing(self):
+        with patch("app.services.file_service.ConversationRepository") as repo_class:
+            repo = MagicMock()
+            repo.get_by_id.return_value = None
+            repo_class.return_value = repo
+
+            result = await self.service.get_conversation_files_for_user("conv-missing", "user-1")
+
+        self.assertIsNone(result)
+        repo.get_by_id.assert_called_once_with("conv-missing", "user-1")
+        self.service.file_repo.get_conversation_files.assert_not_called()
+
+    async def test_get_conversation_files_uses_shared_summary_serializer(self):
         conversation_file = SimpleNamespace(
             file=SimpleNamespace(
                 id="file-1",
@@ -143,11 +226,13 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
                 thumbnail_key=None,
                 width=None,
                 height=None,
+                created_at=None,
+                processing_result=None,
             )
         )
         self.service.file_repo.get_conversation_files.return_value = [conversation_file]
 
-        result = self.service.get_conversation_files("conv-1")
+        result = await self.service.get_conversation_files("conv-1")
 
         self.assertEqual(
             result,
@@ -159,13 +244,16 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
                     "size": 12,
                     "status": "processed",
                     "thumbnail_key": None,
+                    "thumbnail_url": None,
                     "width": None,
                     "height": None,
+                    "created_at": None,
+                    "error_message": None,
                 }
             ],
         )
 
-    def test_get_files_by_user_uses_shared_summary_serializer(self):
+    async def test_get_files_by_user_uses_shared_summary_serializer(self):
         file_record = SimpleNamespace(
             id="file-2",
             original_filename="report.pdf",
@@ -175,10 +263,12 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
             thumbnail_key=None,
             width=None,
             height=None,
+            created_at=None,
+            processing_result=None,
         )
         self.service.file_repo.get_files_by_user_id.return_value = [file_record]
 
-        result = self.service.get_files_by_user("user-1")
+        result = await self.service.get_files_by_user("user-1")
 
         self.assertEqual(
             result,
@@ -190,8 +280,11 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
                     "size": 24,
                     "status": "parsing",
                     "thumbnail_key": None,
+                    "thumbnail_url": None,
                     "width": None,
                     "height": None,
+                    "created_at": None,
+                    "error_message": None,
                 }
             ],
         )

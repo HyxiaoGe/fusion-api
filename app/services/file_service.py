@@ -350,17 +350,39 @@ class FileService:
             return f"请分析这个文件(文件名:{filename})的内容并提供详细摘要。"
 
     @staticmethod
-    def _serialize_file_summary(file_obj) -> Dict[str, Any]:
+    def _serialize_created_at(created_at: Any) -> Any:
+        """序列化文件创建时间，便于前端直接消费。"""
+        if hasattr(created_at, "isoformat"):
+            return created_at.isoformat()
+        return created_at
+
+    @staticmethod
+    def _extract_processing_error_message(processing_result: Any) -> Optional[str]:
+        """从处理结果中提取用户可见错误信息。"""
+        if not isinstance(processing_result, dict):
+            return None
+        return processing_result.get("message") or processing_result.get("error")
+
+    async def _serialize_file_summary(self, file_obj) -> Dict[str, Any]:
         """统一序列化文件列表摘要"""
+        thumbnail_key = getattr(file_obj, "thumbnail_key", None)
+        thumbnail_url = None
+        if thumbnail_key:
+            thumbnail_url = await self.storage.get_url(thumbnail_key, expires=settings.MINIO_PRESIGN_EXPIRES)
+            thumbnail_url = self._sign_local_url(thumbnail_url, file_obj.id, settings.MINIO_PRESIGN_EXPIRES)
+
         return {
             "id": file_obj.id,
             "filename": file_obj.original_filename,
             "mimetype": file_obj.mimetype,
             "size": file_obj.size,
             "status": file_obj.status,
-            "thumbnail_key": getattr(file_obj, "thumbnail_key", None),
+            "thumbnail_key": thumbnail_key,
+            "thumbnail_url": thumbnail_url,
             "width": getattr(file_obj, "width", None),
             "height": getattr(file_obj, "height", None),
+            "created_at": self._serialize_created_at(getattr(file_obj, "created_at", None)),
+            "error_message": self._extract_processing_error_message(getattr(file_obj, "processing_result", None)),
         }
 
     def get_file_status(self, file_id: str, user_id: str) -> Dict[str, Any]:
@@ -370,23 +392,25 @@ class FileService:
             return None
         return self._serialize_file_status(file)
 
-    def get_conversation_files(self, conversation_id: str) -> List[Dict[str, Any]]:
+    async def get_conversation_files(self, conversation_id: str) -> List[Dict[str, Any]]:
         """获取对话关联的所有文件信息"""
         files = self.file_repo.get_conversation_files(conversation_id)
-        return [self._serialize_file_summary(f.file) for f in files]
+        return [await self._serialize_file_summary(f.file) for f in files]
 
-    def get_conversation_files_for_user(self, conversation_id: str, user_id: str) -> Optional[List[Dict[str, Any]]]:
+    async def get_conversation_files_for_user(
+        self, conversation_id: str, user_id: str
+    ) -> Optional[List[Dict[str, Any]]]:
         """获取用户有权访问的对话文件列表"""
         conv_repo = ConversationRepository(self.db)
         conversation = conv_repo.get_by_id(conversation_id, user_id)
         if not conversation:
             return None
-        return self.get_conversation_files(conversation_id)
+        return await self.get_conversation_files(conversation_id)
 
-    def get_files_by_user(self, user_id: str) -> List[Dict[str, Any]]:
+    async def get_files_by_user(self, user_id: str) -> List[Dict[str, Any]]:
         """获取用户的所有文件"""
         files = self.file_repo.get_files_by_user_id(user_id)
-        return [self._serialize_file_summary(file) for file in files]
+        return [await self._serialize_file_summary(file) for file in files]
 
     @staticmethod
     def _serialize_file_status(file_obj) -> Dict[str, Any]:
