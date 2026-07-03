@@ -45,6 +45,8 @@ jobs:
       - name: Push CI/CD active metric
         if: github.ref == 'refs/heads/master'
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
+        env:
+          PUSHGW_AUTH: ${{ secrets.PUSHGW_BASIC_AUTH }}
         run: |
           $ProgressPreference = "SilentlyContinue"
           $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
@@ -59,7 +61,8 @@ jobs:
           $body = (($metrics -replace "`r`n", "`n").Trim() + "`n")
           $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
           try {
-            Invoke-WebRequest -UseBasicParsing -Method Post -Uri "http://192.168.1.11:9092/metrics/job/cicd_active/project_key/fusion-api/branch_key/master/environment_key/dev" -ContentType "text/plain; version=0.0.4" -Body $bytes -TimeoutSec 5 | Out-Null
+            # pushgateway 本体只绑 loopback,经 nginx 9094 鉴权反代推送(凭证在仓库 Secret PUSHGW_BASIC_AUTH)
+            Invoke-WebRequest -UseBasicParsing -Method Post -Uri "http://192.168.1.11:9094/metrics/job/cicd_active/project_key/fusion-api/branch_key/master/environment_key/dev" -ContentType "text/plain; version=0.0.4" -Headers @{ Authorization = "Basic $env:PUSHGW_AUTH" } -Body $bytes -TimeoutSec 5 | Out-Null
             Write-Host "CI/CD active metric pushed"
           } catch {
             Write-Host "CI/CD active metric push failed, ignored: $($_.Exception.Message)"
