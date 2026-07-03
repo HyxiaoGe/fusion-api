@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from uuid import NAMESPACE_URL, uuid5
 
 from app.ai.prompts.agent_loop import (
     APP_IDENTITY_PROMPT,
@@ -80,7 +81,7 @@ def iter_default_runtime_config_seed_rows() -> Iterator[dict]:
     """生成 runtime_config_entries v1 seed rows。"""
 
     yield {
-        "id": "runtime-config-agent-strategy-default-v1",
+        "id": _seed_id("agent_strategy", "default"),
         "namespace": "agent_strategy",
         "key": "default",
         "version": "2026-07-02.v1",
@@ -89,7 +90,7 @@ def iter_default_runtime_config_seed_rows() -> Iterator[dict]:
         "description": "Agent 搜索、深读、来源排序、工具上下文默认策略",
     }
     yield {
-        "id": "runtime-config-model-presentation-default-v1",
+        "id": _seed_id("model_presentation", "default"),
         "namespace": "model_presentation",
         "key": "default",
         "version": "2026-07-02.v1",
@@ -99,7 +100,7 @@ def iter_default_runtime_config_seed_rows() -> Iterator[dict]:
     }
     for key, template in DEFAULT_PROMPT_TEMPLATES.items():
         yield {
-            "id": f"runtime-config-prompt-template-{key.replace('_', '-')}-v1",
+            "id": _seed_id("prompt_template", key),
             "namespace": "prompt_template",
             "key": key,
             "version": "2026-07-02.v1",
@@ -107,6 +108,10 @@ def iter_default_runtime_config_seed_rows() -> Iterator[dict]:
             "is_active": True,
             "description": f"Prompt 模板：{key}",
         }
+
+
+def _seed_id(namespace: str, key: str, version: str = "2026-07-02.v1") -> str:
+    return str(uuid5(NAMESPACE_URL, f"fusion/runtime-config/{namespace}/{key}/{version}"))
 
 
 DEFAULT_AGENT_STRATEGY_CONFIG = {

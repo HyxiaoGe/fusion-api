@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from uuid import UUID
 
 
 class _FakeQuery:
@@ -50,6 +51,9 @@ class RuntimeConfigServiceTests(unittest.TestCase):
         for prompt_key in DEFAULT_PROMPT_TEMPLATES:
             self.assertIn(("prompt_template", prompt_key), row_keys)
         self.assertEqual(len(rows), 2 + len(DEFAULT_PROMPT_TEMPLATES))
+        self.assertEqual(len({row["id"] for row in rows}), len(rows))
+        for row in rows:
+            UUID(row["id"])
         self.assertTrue(all(row["version"] == "2026-07-02.v1" for row in rows))
         self.assertTrue(all(row["is_active"] is True for row in rows))
 
