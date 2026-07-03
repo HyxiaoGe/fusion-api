@@ -1,6 +1,7 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from app.schemas.chat import TextBlock
 from app.services.stream.agent_loop_driver import AgentLoopExit, AgentLoopOutcome
@@ -194,11 +195,50 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call_order[0], ("append", "conv-life", "preparing", "", ""))
         self.assertEqual(call_order[1][1], "run-life")
         self.assertEqual(call_order[1][2], ["web_search"])
-        self.assertEqual(call_order[1][3], {"max_steps": 3, "max_tool_calls": 5, "timeout_s": 30})
+        self.assertEqual(
+            call_order[1][3],
+            {
+                "max_steps": 3,
+                "max_tool_calls": 5,
+                "timeout_s": 30,
+                "runtime_config_versions": {
+                    "agent_strategy/default": "code-default",
+                },
+            },
+        )
         self.assertIs(call_order[2][3], call_config)
         self.assertEqual(call_order[3][1], [{"role": "user", "content": "prepared"}])
         self.assertEqual(call_order[3][2], [initial_block])
         self.assertIs(call_order[4][1], execution.completion_context)
+
+    async def test_start_run_records_runtime_config_versions(self):
+        configs = []
+
+        async def start_agent_run_fn(**kwargs):
+            configs.append(kwargs["config"])
+
+        with patch(
+            "app.services.stream.agent_loop_lifecycle.get_agent_strategy_config",
+            return_value=({"search": {}}, {"source": "db", "version": "agent-strategy-v7"}),
+            create=True,
+        ):
+            await run_agent_loop_lifecycle(
+                request=self._request(),
+                execution=self._execution(),
+                dependencies=self._dependencies(start_agent_run_fn=start_agent_run_fn),
+            )
+
+        self.assertEqual(
+            configs[0],
+            {
+                "max_steps": 3,
+                "max_tool_calls": 5,
+                "timeout_s": 30,
+                "runtime_config_versions": {
+                    "agent_strategy/default": "agent-strategy-v7",
+                },
+            },
+        )
 
     async def test_start_run_does_not_emit_plan_before_tools_are_called(self):
         emitted = []

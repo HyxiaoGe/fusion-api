@@ -269,6 +269,33 @@ class WebSearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("[9] R8", context)
         self.assertIn("仅前 8 条", context)
 
+    def test_format_llm_context_uses_configured_default_context_source_limit(self):
+        from app.schemas.chat import SearchSource
+        from app.services.tool_handlers import web_search as web_search_module
+
+        sources = [SearchSource(title=f"R{i}", url=f"https://example.com/{i}", description=f"d{i}") for i in range(10)]
+        result = ToolResult(status="success", data={"sources": sources, "result_count": 10})
+
+        with patch.object(
+            web_search_module,
+            "get_agent_strategy_config",
+            return_value=(
+                {
+                    "tool_context": {
+                        "max_context_sources": 3,
+                        "max_sources_per_domain": 2,
+                    }
+                },
+                {"source": "test"},
+            ),
+            create=True,
+        ):
+            context = self.handler.format_llm_context(result)
+
+        self.assertIn("[3] R2", context)
+        self.assertNotIn("[4] R3", context)
+        self.assertIn("仅前 3 条", context)
+
     def test_format_llm_context_empty_search_does_not_invite_unsourced_answer(self):
         """搜索未取得来源时，不能诱导模型把搜索当依据或直接兜底。"""
         result = ToolResult(
@@ -522,6 +549,43 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.status, "success")
         self.assertEqual(result.data["reason"], reason[:160])
+
+    async def test_execute_uses_configured_reason_length(self):
+        from app.services.external.reader_client import UrlReadResponse, UrlReadResult
+        from app.services.tool_handlers import url_read as url_read_module
+
+        mock_result = UrlReadResult(
+            url="https://example.com",
+            title="Example",
+            content="content",
+            favicon=None,
+            content_length=7,
+            fetch_ms=100,
+        )
+        reason = "需要核实官方原文细节" * 20
+        with patch.object(
+            url_read_module,
+            "get_agent_strategy_config",
+            return_value=(
+                {
+                    "tool_context": {
+                        "url_read_max_content_chars": 8000,
+                        "url_read_max_reason_chars": 20,
+                    }
+                },
+                {"source": "test"},
+            ),
+            create=True,
+        ):
+            with patch(
+                "app.services.tool_handlers.url_read.read_url_with_diagnostics",
+                new_callable=AsyncMock,
+                return_value=UrlReadResponse(result=mock_result),
+            ):
+                result = await self.handler.execute({"url": "https://example.com", "reason": reason})
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual(result.data["reason"], reason[:20])
 
     async def test_execute_empty_url_returns_degraded(self):
         """url 为空返回 degraded"""

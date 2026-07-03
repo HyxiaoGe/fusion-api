@@ -1,6 +1,8 @@
 import unittest
+from unittest.mock import patch
 
 from app.schemas.chat import SearchSource
+from app.services import source_candidate_ranker as source_candidate_ranker_module
 from app.services.source_candidate_ranker import (
     SearchResultForRanking,
     format_source_selection_guidance,
@@ -122,6 +124,64 @@ class SourceCandidateRankerTests(unittest.TestCase):
         self.assertEqual(by_domain["youtube.com"].priority, "low")
         self.assertIn("视频来源默认降权", by_domain["youtube.com"].reasons)
 
+    def test_rank_search_sources_uses_configured_authority_media_domain(self):
+        with patch.object(
+            source_candidate_ranker_module,
+            "get_agent_strategy_config",
+            return_value=(
+                {
+                    "source_ranker": {
+                        "authority_media_domains": ["example.com"],
+                        "low_priority_domains": [],
+                        "video_domains": [],
+                        "forum_domains": [],
+                        "max_low_priority_examples": 3,
+                        "weights": {
+                            "source_order_base": 22,
+                            "source_order_step": 2,
+                            "official": 38,
+                            "original": 22,
+                            "specific_original": 18,
+                            "official_original": 35,
+                            "pdf": 35,
+                            "authority_media": 36,
+                            "listing_penalty": 28,
+                            "video_penalty": 28,
+                            "forum_penalty": 24,
+                            "low_priority_penalty": 18,
+                            "relevance_per_term": 4,
+                            "relevance_max": 18,
+                        },
+                        "priority_thresholds": {
+                            "high": 60,
+                            "medium": 30,
+                        },
+                    }
+                },
+                {"source": "test"},
+            ),
+            create=True,
+        ):
+            plan = rank_search_sources(
+                [
+                    SearchResultForRanking(
+                        tool_call_id="search-config",
+                        query="example product announcement",
+                        sources=[
+                            SearchSource(
+                                title="Example reports product announcement",
+                                url="https://example.com/news/product-announcement",
+                                description="Example media report.",
+                            )
+                        ],
+                    )
+                ],
+                max_recommended=1,
+            )
+
+        self.assertEqual(plan.recommended[0].domain, "example.com")
+        self.assertIn("权威媒体", plan.recommended[0].reasons)
+
     def test_format_source_selection_guidance_explains_recommended_reads(self):
         search_results = [
             SearchResultForRanking(
@@ -226,6 +286,45 @@ class SourceCandidateRankerTests(unittest.TestCase):
         self.assertTrue(plan.read_required)
         self.assertEqual(plan.minimum_required_reads, 1)
         self.assertEqual(plan.read_required_reason, "quick_fact_requires_verification")
+
+    def test_search_read_planner_uses_configured_quick_fact_read_limit(self):
+        from app.services import search_read_planner as search_read_planner_module
+
+        with patch.object(
+            search_read_planner_module,
+            "get_agent_strategy_config",
+            return_value=(
+                {
+                    "read_planner": {
+                        "read_limits": {
+                            "quick_fact": 2,
+                            "standard": 2,
+                            "deep": 3,
+                        },
+                        "quick_budget_names": ["quick_fact"],
+                        "freshness_budget_names": ["freshness"],
+                        "deep_budget_names": ["deep_research"],
+                        "deep_intents": ["deep_research"],
+                    }
+                },
+                {"source": "test"},
+            ),
+            create=True,
+        ):
+            plan = search_read_planner_module.build_search_read_plan(
+                [
+                    SearchResultForRanking(
+                        tool_call_id="search-quick-config",
+                        query="OpenAI GPT-5.6 是什么 2026年",
+                        sources=self._rankable_sources(),
+                        intent="quick_fact",
+                        search_budget="quick_fact",
+                    )
+                ]
+            )
+
+        self.assertEqual(plan.recommended_read_limit, 2)
+        self.assertEqual(len(plan.recommended), 2)
 
     def test_search_read_planner_recommends_two_reads_for_freshness(self):
         from app.services.search_read_planner import build_search_read_plan

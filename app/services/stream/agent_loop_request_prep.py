@@ -8,9 +8,9 @@ from typing import Any
 
 from app.ai.litellm_utils import merge_extra_body
 from app.ai.prompts.agent_loop import (
-    NO_TOOL_NETWORK_BOUNDARY_PROMPT,
-    NO_VISION_FILE_BOUNDARY_PROMPT,
-    TOOL_USAGE_CONTRACT_PROMPT,
+    get_no_tool_network_boundary_prompt,
+    get_no_vision_file_boundary_prompt,
+    get_tool_usage_contract_prompt,
 )
 from app.ai.tools import build_web_search_tool
 from app.db.repositories import FileRepository
@@ -235,7 +235,7 @@ def inject_tool_usage_contract(messages: list[dict], call_kwargs: dict) -> list[
     insert_at = 0
     while insert_at < len(messages) and messages[insert_at].get("role") == "system":
         insert_at += 1
-    contract_msg = {"role": "system", "content": TOOL_USAGE_CONTRACT_PROMPT}
+    contract_msg = {"role": "system", "content": get_tool_usage_contract_prompt()}
     return [*messages[:insert_at], contract_msg, *messages[insert_at:]]
 
 
@@ -250,7 +250,7 @@ def inject_no_tool_network_boundary(messages: list[dict], call_kwargs: dict) -> 
     insert_at = 0
     while insert_at < len(messages) and messages[insert_at].get("role") == "system":
         insert_at += 1
-    boundary_msg = {"role": "system", "content": NO_TOOL_NETWORK_BOUNDARY_PROMPT}
+    boundary_msg = {"role": "system", "content": get_no_tool_network_boundary_prompt()}
     return [*messages[:insert_at], boundary_msg, *messages[insert_at:]]
 
 
@@ -264,5 +264,5 @@ def inject_no_vision_file_boundary(messages: list[dict]) -> list[dict]:
     insert_at = 0
     while insert_at < len(messages) and messages[insert_at].get("role") == "system":
         insert_at += 1
-    boundary_msg = {"role": "system", "content": NO_VISION_FILE_BOUNDARY_PROMPT}
+    boundary_msg = {"role": "system", "content": get_no_vision_file_boundary_prompt()}
     return [*messages[:insert_at], boundary_msg, *messages[insert_at:]]

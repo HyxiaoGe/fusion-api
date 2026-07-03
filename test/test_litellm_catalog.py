@@ -55,6 +55,17 @@ class LiteLLMCatalogTests(unittest.TestCase):
         self.assertTrue(capabilities["vision"])
         self.assertFalse(capabilities["searchCapable"])
 
+    def test_normalize_capabilities_uses_runtime_disabled_agent_tool_aliases(self):
+        capabilities = litellm_catalog.normalize_capabilities(
+            "deepseek-chat",
+            {"functionCalling": True},
+            agent_tools_disabled_aliases={"deepseek-chat"},
+        )
+
+        self.assertTrue(capabilities["functionCalling"])
+        self.assertFalse(capabilities["agentTools"])
+        self.assertFalse(capabilities["searchCapable"])
+
 
 if __name__ == "__main__":
     unittest.main()

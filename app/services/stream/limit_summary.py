@@ -8,10 +8,12 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from app.ai.prompts.agent_loop import LIMIT_SUMMARY_PROMPT as _LIMIT_SUMMARY_PROMPT
+from app.ai.prompts.agent_loop import get_limit_summary_prompt
 from app.core.logger import app_logger as logger
 from app.schemas.chat import TextBlock, ThinkingBlock, Usage
 
-LIMIT_SUMMARY_PROMPT = "你已达到工具调用上限，请基于已收集的信息给出最终回答。不要再调用任何工具。"
+LIMIT_SUMMARY_PROMPT = _LIMIT_SUMMARY_PROMPT
 
 
 @dataclass(frozen=True)
@@ -64,7 +66,7 @@ def compute_summary_timeout(*, total_timeout_s: int, run_start: float, clock: Ca
 
 
 def append_limit_summary_prompt(messages: list[dict]) -> None:
-    messages.append({"role": "system", "content": LIMIT_SUMMARY_PROMPT})
+    messages.append({"role": "system", "content": get_limit_summary_prompt()})
 
 
 async def call_limit_summary_round(

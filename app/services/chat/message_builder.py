@@ -10,7 +10,7 @@ LLM 消息构建模块
 import base64
 from typing import Dict, List, Optional
 
-from app.ai.prompts.agent_loop import APP_IDENTITY_PROMPT, build_current_date_system_prompt
+from app.ai.prompts.agent_loop import build_current_date_system_prompt, get_app_identity_prompt
 from app.core.logger import app_logger as logger
 from app.db.repositories import FileRepository
 from app.services.file_service import is_image_mime
@@ -77,7 +77,7 @@ async def build_llm_messages(
         )
 
     # 注入产品身份约束（始终注入，并放在用户偏好之后，避免被个性化设置覆盖）
-    result.append({"role": "system", "content": APP_IDENTITY_PROMPT})
+    result.append({"role": "system", "content": get_app_identity_prompt()})
 
     # 计算最近 N 轮用户消息的起始索引，用于控制图片注入范围
     vision_cutoff_idx = 0

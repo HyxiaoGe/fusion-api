@@ -9,6 +9,7 @@ import re
 import uuid
 from typing import Optional
 
+from app.ai.tools import build_url_read_tool
 from app.core.config import settings
 from app.core.logger import app_logger as logger
 from app.schemas.chat import UrlBlock, Usage
@@ -62,10 +63,16 @@ def extract_first_url(message: str) -> str | None:
 
 
 def ensure_url_read_tool(call_kwargs: dict) -> None:
-    from app.ai.tools import URL_READ_TOOL
+    tools = call_kwargs.setdefault("tools", [])
+    if not any(_tool_name(tool) == "url_read" for tool in tools):
+        tools.append(build_url_read_tool())
 
-    if URL_READ_TOOL not in call_kwargs.get("tools", []):
-        call_kwargs.setdefault("tools", []).append(URL_READ_TOOL)
+
+def _tool_name(tool: dict) -> str | None:
+    function = tool.get("function") if isinstance(tool, dict) else None
+    if isinstance(function, dict) and function.get("name"):
+        return str(function["name"])
+    return None
 
 
 def resolve_reader_url(policy, detected_url: str) -> str:

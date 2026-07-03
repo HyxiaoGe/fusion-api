@@ -6,6 +6,7 @@ import time
 
 from app.core.config import settings
 from app.schemas.chat import SourceReference, UrlBlock
+from app.services.agent_strategy_config import get_agent_strategy_config
 from app.services.external.reader_client import read_url_with_diagnostics
 from app.services.security.url_policy import evaluate_url_policy
 from app.services.source_context import UntrustedSourceContext, format_untrusted_source_context
@@ -143,8 +144,7 @@ class UrlReadHandler(BaseToolHandler):
 
         if not content:
             unavailable_message = (
-                "网页未读取成功，不能把该网页作为依据；"
-                "如需回答，请说明该来源不可用，或仅基于其他可用信息回答。"
+                "网页未读取成功，不能把该网页作为依据；如需回答，请说明该来源不可用，或仅基于其他可用信息回答。"
             )
             return format_untrusted_source_context(
                 UntrustedSourceContext(
@@ -160,8 +160,9 @@ class UrlReadHandler(BaseToolHandler):
 
         # 截断过长的内容
         truncated = False
-        if len(content) > MAX_CONTENT_CHARS:
-            content = content[:MAX_CONTENT_CHARS]
+        max_content_chars = _tool_context_int("url_read_max_content_chars", MAX_CONTENT_CHARS)
+        if len(content) > max_content_chars:
+            content = content[:max_content_chars]
             truncated = True
 
         if truncated:
@@ -176,7 +177,7 @@ class UrlReadHandler(BaseToolHandler):
                 content=content,
                 provider="web",
             ),
-            max_chars=MAX_CONTENT_CHARS + 100,
+            max_chars=max_content_chars + 100,
         )
 
     def _build_result_summary(self, result: ToolResult) -> dict:
@@ -203,4 +204,12 @@ def _normalize_reason(value) -> str | None:
     reason = value.strip()
     if not reason:
         return None
-    return reason[:MAX_REASON_CHARS]
+    return reason[: _tool_context_int("url_read_max_reason_chars", MAX_REASON_CHARS)]
+
+
+def _tool_context_int(key: str, fallback: int) -> int:
+    try:
+        strategy_config, _meta = get_agent_strategy_config()
+        return max(1, int((strategy_config.get("tool_context") or {}).get(key, fallback)))
+    except (TypeError, ValueError):
+        return fallback

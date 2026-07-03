@@ -24,13 +24,10 @@ from app.core.logger import app_logger as logger
 
 _LITELLM_BASE_URL = os.environ.get("LITELLM_PROXY_URL", "http://litellm-proxy:4000").rstrip("/")
 _LITELLM_API_KEY = os.environ.get("LITELLM_API_KEY", "")
+_DEFAULT_AGENT_TOOLS_DISABLED_ALIASES = {"qwen-vl-max"}
 
 # 缓存生效时间——LiteLLM 模型变更频次低，60s 足够
 _CACHE_TTL_SECONDS = 60.0
-
-# 真实多模型回归中，这些模型即使具备通用 function calling，也不适合作为
-# Fusion 默认联网 agent 使用。后续可迁移到 PromptHub/LiteLLM metadata。
-AGENT_TOOLS_DISABLED_BY_DEFAULT = frozenset({"qwen-vl-max"})
 
 _cache_lock = threading.Lock()
 _cache_payload: Optional[Dict[str, Dict[str, Any]]] = None
@@ -95,15 +92,28 @@ def get_model_entry(alias: str) -> Optional[Dict[str, Any]]:
     return _ensure_loaded().get(alias)
 
 
-def get_capabilities(alias: str) -> Dict[str, Any]:
+def get_capabilities(
+    alias: str,
+    *,
+    agent_tools_disabled_aliases: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> Dict[str, Any]:
     """读 capabilities (vision/functionCalling/...)，不存在时返回空 dict。"""
     entry = get_model_entry(alias)
     if not entry:
         return {}
-    return normalize_capabilities(alias, entry["metadata"].get("capabilities") or {})
+    return normalize_capabilities(
+        alias,
+        entry["metadata"].get("capabilities") or {},
+        agent_tools_disabled_aliases=agent_tools_disabled_aliases,
+    )
 
 
-def normalize_capabilities(alias: str, capabilities: Dict[str, Any] | None) -> Dict[str, Any]:
+def normalize_capabilities(
+    alias: str,
+    capabilities: Dict[str, Any] | None,
+    *,
+    agent_tools_disabled_aliases: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> Dict[str, Any]:
     """补齐 Fusion 运行时需要的派生能力位。"""
     normalized = dict(capabilities or {})
     function_calling = bool(normalized.get("functionCalling", False))
@@ -116,7 +126,8 @@ def normalize_capabilities(alias: str, capabilities: Dict[str, Any] | None) -> D
     if "agentTools" in normalized:
         requested_agent_tools = bool(normalized.get("agentTools"))
     else:
-        requested_agent_tools = alias not in AGENT_TOOLS_DISABLED_BY_DEFAULT
+        disabled_aliases = set(agent_tools_disabled_aliases or _DEFAULT_AGENT_TOOLS_DISABLED_ALIASES)
+        requested_agent_tools = alias not in disabled_aliases
 
     agent_tools = function_calling and requested_agent_tools
     normalized["agentTools"] = agent_tools

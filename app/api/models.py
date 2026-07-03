@@ -15,6 +15,8 @@ from fastapi import APIRouter, Request
 
 from app.ai import litellm_catalog, litellm_health
 from app.schemas.response import success
+from app.services.agent_strategy_config import get_agent_tools_disabled_aliases
+from app.services.model_presentation import build_model_capability_presentation
 
 router = APIRouter()
 
@@ -49,11 +51,15 @@ def _entry_to_card(alias: str, entry: Dict[str, Any]) -> Dict[str, Any]:
     """LiteLLM 单条 model_info → 前端模型卡片。"""
     metadata = entry.get("metadata") or {}
     underlying = entry.get("underlying") or ""
-    capabilities = litellm_catalog.normalize_capabilities(alias, metadata.get("capabilities") or {})
+    capabilities = litellm_catalog.normalize_capabilities(
+        alias,
+        metadata.get("capabilities") or {},
+        agent_tools_disabled_aliases=get_agent_tools_disabled_aliases(),
+    )
     pricing = metadata.get("pricing") or {}
 
     provider_key = _normalize_provider_key(metadata, underlying)
-    return {
+    card = {
         "modelId": alias,
         "name": metadata.get("display_name") or alias,
         "provider": provider_key,
@@ -83,6 +89,8 @@ def _entry_to_card(alias: str, entry: Dict[str, Any]) -> Dict[str, Any]:
         "cost_tier": metadata.get("cost_tier") or "mid",
         "recommended_for": list(metadata.get("recommended_for") or []),
     }
+    card["capabilityPresentation"] = build_model_capability_presentation(card)
+    return card
 
 
 def _collect_providers(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

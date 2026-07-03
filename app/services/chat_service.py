@@ -23,9 +23,10 @@ from app.schemas.chat import (
 )
 from app.schemas.response import ApiException
 from app.services.agent.continuation import (
-    CONTINUATION_SYSTEM_PROMPT,
     build_continuation_context,
+    get_continuation_system_prompt,
 )
+from app.services.agent_strategy_config import get_agent_tools_disabled_aliases
 from app.services.chat.message_builder import (
     build_llm_messages,
     inject_file_content,
@@ -40,6 +41,13 @@ from app.services.stream.agent_loop_request_prep import inject_no_tool_network_b
 from app.services.stream.runner import _agent_loop_limits
 from app.services.stream_state_service import get_stream_meta, init_stream
 from app.services.task_manager import register_task
+
+
+def _get_model_capabilities(model_id: str) -> dict[str, Any]:
+    return litellm_catalog.get_capabilities(
+        model_id,
+        agent_tools_disabled_aliases=get_agent_tools_disabled_aliases(),
+    )
 
 
 class ChatService:
@@ -68,7 +76,7 @@ class ChatService:
         litellm_model, provider, litellm_kwargs = llm_manager.resolve_model(model_id)
 
         # 模型能力来自 LiteLLM metadata（vision / functionCalling 影响消息构造和工具开关）
-        capabilities = litellm_catalog.get_capabilities(model_id)
+        capabilities = _get_model_capabilities(model_id)
         has_vision = capabilities.get("vision", False)
 
         # 获取或创建会话
@@ -211,7 +219,7 @@ class ChatService:
 
         model_id = conversation.model_id
         litellm_model, provider, litellm_kwargs = llm_manager.resolve_model(model_id)
-        capabilities = litellm_catalog.get_capabilities(model_id)
+        capabilities = _get_model_capabilities(model_id)
         has_vision = capabilities.get("vision", False)
 
         continuation = build_continuation_context(
@@ -243,7 +251,7 @@ class ChatService:
                 capabilities=capabilities,
                 trace_id=trace_id,
                 initial_content_blocks=continuation.initial_content_blocks,
-                extra_system_prompts=[CONTINUATION_SYSTEM_PROMPT],
+                extra_system_prompts=[get_continuation_system_prompt()],
                 preprocess_user_input=False,
                 limits=continuation.limits,
             )

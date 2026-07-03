@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.services.agent_strategy_config import get_agent_strategy_config
 from app.services.stream.agent_loop_execution import AgentLoopExecutionContext
 from app.services.stream.agent_loop_outcome import AgentLoopExit
 from app.services.stream.agent_loop_policy import AgentLoopLimits, map_run_terminal_state
@@ -217,8 +218,12 @@ async def _write_fallback(
 
 
 def _run_config(limits: AgentLoopLimits) -> dict:
+    _strategy_config, strategy_meta = get_agent_strategy_config()
     return {
         "max_steps": limits.max_steps,
         "max_tool_calls": limits.max_tool_calls,
         "timeout_s": limits.total_timeout_s,
+        "runtime_config_versions": {
+            "agent_strategy/default": strategy_meta.get("version", "code-default"),
+        },
     }

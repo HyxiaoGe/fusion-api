@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import re
 
+from app.services.agent_strategy_config import get_agent_strategy_config
 from app.services.source_candidate_ranker import (
     SearchResultForRanking,
     SourceSelectionPlan,
@@ -69,7 +70,9 @@ _YEAR_RE = re.compile(r"(?<!\d)20\d{2}(?!\d)")
 def build_search_read_plan(search_results: list[SearchResultForRanking]) -> SourceSelectionPlan:
     """构造本轮搜索后的读源建议计划。"""
 
-    recommended_limit = _recommended_read_limit(search_results)
+    strategy_config, _meta = get_agent_strategy_config()
+    read_planner_config = _read_planner_config(strategy_config)
+    recommended_limit = _recommended_read_limit(search_results, read_planner_config=read_planner_config)
     read_required, reason = _read_required(search_results)
     return rank_search_sources(
         search_results,
@@ -86,22 +89,30 @@ def format_search_read_plan_guidance(plan: SourceSelectionPlan) -> str:
     return format_source_selection_guidance(plan)
 
 
-def _recommended_read_limit(search_results: list[SearchResultForRanking]) -> int:
+def _recommended_read_limit(search_results: list[SearchResultForRanking], *, read_planner_config: dict) -> int:
     if not search_results:
         return 0
 
     intents = {result.intent for result in search_results if result.intent}
     budgets = {result.search_budget for result in search_results if result.search_budget}
+    read_limits = read_planner_config.get("read_limits") or {}
+    quick_limit = _read_limit(read_limits, "quick_fact", QUICK_FACT_READ_LIMIT)
+    standard_limit = _read_limit(read_limits, "standard", STANDARD_READ_LIMIT)
+    deep_limit = _read_limit(read_limits, "deep", DEEP_READ_LIMIT)
+    quick_budget_names = set(read_planner_config.get("quick_budget_names") or _QUICK_BUDGET_NAMES)
+    freshness_budget_names = set(read_planner_config.get("freshness_budget_names") or _FRESHNESS_BUDGET_NAMES)
+    deep_budget_names = set(read_planner_config.get("deep_budget_names") or _DEEP_BUDGET_NAMES)
+    deep_intents = set(read_planner_config.get("deep_intents") or _DEEP_INTENTS)
 
-    if intents & _DEEP_INTENTS or budgets & _DEEP_BUDGET_NAMES:
-        return DEEP_READ_LIMIT
-    if budgets & _FRESHNESS_BUDGET_NAMES:
-        return STANDARD_READ_LIMIT
-    if budgets and budgets <= _QUICK_BUDGET_NAMES:
-        return QUICK_FACT_READ_LIMIT
+    if intents & deep_intents or budgets & deep_budget_names:
+        return deep_limit
+    if budgets & freshness_budget_names:
+        return standard_limit
+    if budgets and budgets <= quick_budget_names:
+        return quick_limit
     if intents == {"quick_fact"}:
-        return QUICK_FACT_READ_LIMIT
-    return STANDARD_READ_LIMIT
+        return quick_limit
+    return standard_limit
 
 
 def _read_required(search_results: list[SearchResultForRanking]) -> tuple[bool, str]:
@@ -129,3 +140,14 @@ def _read_required(search_results: list[SearchResultForRanking]) -> tuple[bool, 
             return True, reason
 
     return False, ""
+
+
+def _read_planner_config(strategy_config: dict | None) -> dict:
+    return (strategy_config or {}).get("read_planner") or {}
+
+
+def _read_limit(read_limits: dict, key: str, fallback: int) -> int:
+    try:
+        return max(0, int(read_limits.get(key, fallback)))
+    except (TypeError, ValueError):
+        return fallback

@@ -6,6 +6,7 @@ import json
 import re
 from dataclasses import asdict, dataclass, field
 
+from app.services.agent_strategy_config import get_agent_strategy_config
 from app.services.search_budget import (
     SearchBudgetDecision,
     derive_search_budget,
@@ -46,22 +47,27 @@ class NetworkToolBudget:
     attempted_read_urls: set[str] = field(default_factory=set)
 
     def prepare_web_search_args(self, args: dict) -> tuple[dict, ToolResult | None]:
+        strategy_config, _meta = get_agent_strategy_config()
+        network_config = _network_config(strategy_config)
         normalized = dict(args or {})
 
         query = str(normalized.get("query") or "")
-        intent = resolve_search_intent(normalized.get("intent"), query)
+        intent = resolve_search_intent(normalized.get("intent"), query, strategy_config=strategy_config)
         if intent:
             normalized["intent"] = intent
         else:
             normalized.pop("intent", None)
 
-        domains = _normalize_domains(normalized.get("domains"))
+        max_domains = _network_int(network_config, "max_domains", MAX_DOMAINS)
+        domains = _normalize_domains(normalized.get("domains"), max_domains=max_domains)
         if domains:
             normalized["domains"] = domains
         else:
             normalized.pop("domains", None)
 
-        planned_search_limit = _planned_search_call_limit(intent, self.web_search_intents)
+        planned_search_limit = _planned_search_call_limit(
+            intent, self.web_search_intents, network_config=network_config
+        )
         previous_query_count = len(self.web_search_queries)
 
         repair_reason_code = self._consume_search_repair_reason_code()
@@ -112,6 +118,7 @@ class NetworkToolBudget:
                 intent,
                 previous_queries=self.web_search_queries,
                 previous_intents=self.web_search_intents,
+                strategy_config=strategy_config,
             )
         ):
             normalized["count"] = 0
@@ -155,10 +162,15 @@ class NetworkToolBudget:
             query=query,
             previous_queries=self.web_search_queries,
             previous_intents=self.web_search_intents,
+            strategy_config=strategy_config,
         )
         if repair_reason_code:
-            normalized["count"] = REPAIR_SEARCH_COUNT
-            normalized["context_source_limit"] = REPAIR_CONTEXT_SOURCE_LIMIT
+            normalized["count"] = _network_int(network_config, "repair_search_count", REPAIR_SEARCH_COUNT)
+            normalized["context_source_limit"] = _network_int(
+                network_config,
+                "repair_context_source_limit",
+                REPAIR_CONTEXT_SOURCE_LIMIT,
+            )
             normalized["search_budget"] = "repair"
         else:
             normalized["count"] = search_budget.requested_count
@@ -166,8 +178,9 @@ class NetworkToolBudget:
             normalized["search_budget"] = search_budget.name
 
         effective_planned_search_limit = planned_search_limit
+        max_search_calls = _network_int(network_config, "max_search_calls", MAX_SEARCH_CALLS)
         if repair_reason_code and self.web_search_calls >= planned_search_limit:
-            effective_planned_search_limit = min(MAX_SEARCH_CALLS, self.web_search_calls + 1)
+            effective_planned_search_limit = min(max_search_calls, self.web_search_calls + 1)
         decision = _search_budget_decision(
             query=query,
             intent=intent,
@@ -184,12 +197,12 @@ class NetworkToolBudget:
         if normalized.get("recency_days") is not None:
             normalized["recency_days"] = _clamp_int(
                 normalized.get("recency_days"),
-                MIN_RECENCY_DAYS,
-                MIN_RECENCY_DAYS,
-                MAX_RECENCY_DAYS,
+                _network_int(network_config, "min_recency_days", MIN_RECENCY_DAYS),
+                _network_int(network_config, "min_recency_days", MIN_RECENCY_DAYS),
+                _network_int(network_config, "max_recency_days", MAX_RECENCY_DAYS),
             )
 
-        if self.web_search_calls >= MAX_SEARCH_CALLS:
+        if self.web_search_calls >= max_search_calls:
             decision = _search_budget_decision(
                 query=str(normalized.get("query") or ""),
                 intent=normalized.get("intent"),
@@ -273,8 +286,11 @@ class NetworkToolBudget:
         return normalized, None
 
     def prepare_url_read_args(self, args: dict) -> tuple[dict, ToolResult | None]:
+        strategy_config, _meta = get_agent_strategy_config()
+        network_config = _network_config(strategy_config)
         normalized = dict(args or {})
-        if self.url_read_calls >= MAX_URL_READ_CALLS:
+        max_url_read_calls = _network_int(network_config, "max_url_read_calls", MAX_URL_READ_CALLS)
+        if self.url_read_calls >= max_url_read_calls:
             return normalized, ToolResult(
                 status="degraded",
                 error_message="url_read 已达到本轮联网预算",
@@ -314,7 +330,11 @@ class NetworkToolBudget:
         if result.status != "success" or result_count == 0:
             self._set_pending_search_repair("previous_search_no_results")
             return
-        if result_count < WEAK_SEARCH_RESULT_THRESHOLD:
+        strategy_config, _meta = get_agent_strategy_config()
+        weak_threshold = _network_int(
+            _network_config(strategy_config), "weak_search_result_threshold", WEAK_SEARCH_RESULT_THRESHOLD
+        )
+        if result_count < weak_threshold:
             self._set_pending_search_repair("previous_search_weak_results")
             return
         self.pending_search_repair_reason_code = None
@@ -370,7 +390,7 @@ def _clamp_int(value, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, parsed))
 
 
-def _normalize_domains(value) -> list[str]:
+def _normalize_domains(value, *, max_domains: int = MAX_DOMAINS) -> list[str]:
     if not isinstance(value, list):
         return []
 
@@ -384,7 +404,7 @@ def _normalize_domains(value) -> list[str]:
             continue
         seen.add(domain)
         domains.append(domain)
-        if len(domains) >= MAX_DOMAINS:
+        if len(domains) >= max_domains:
             break
     return domains
 
@@ -402,12 +422,17 @@ def _extract_domain(value: str) -> str | None:
     return None
 
 
-def _planned_search_call_limit(intent: str | None, previous_intents: list[str | None]) -> int:
+def _planned_search_call_limit(
+    intent: str | None,
+    previous_intents: list[str | None],
+    *,
+    network_config: dict | None = None,
+) -> int:
     """控制真实 provider 搜索轮次，避免 LLM 机械扩写 query。"""
 
     if intent == DEEP_RESEARCH_INTENT or DEEP_RESEARCH_INTENT in previous_intents:
-        return DEEP_RESEARCH_PLANNED_SEARCH_CALLS
-    return DEFAULT_PLANNED_SEARCH_CALLS
+        return _network_int(network_config, "deep_research_planned_search_calls", DEEP_RESEARCH_PLANNED_SEARCH_CALLS)
+    return _network_int(network_config, "default_planned_search_calls", DEFAULT_PLANNED_SEARCH_CALLS)
 
 
 def _allowed_search_action(budget_name: str) -> str:
@@ -458,6 +483,17 @@ def _result_count(data: dict) -> int:
     except (TypeError, ValueError):
         sources = data.get("sources")
         return len(sources) if isinstance(sources, list) else 0
+
+
+def _network_config(strategy_config: dict | None) -> dict:
+    return (strategy_config or {}).get("network") or {}
+
+
+def _network_int(network_config: dict | None, key: str, fallback: int) -> int:
+    try:
+        return max(0, int((network_config or {}).get(key, fallback)))
+    except (TypeError, ValueError):
+        return fallback
 
 
 def _record_url(record, result) -> str:

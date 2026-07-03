@@ -9,6 +9,8 @@ import re
 from dataclasses import dataclass
 from typing import Sequence
 
+from app.services.agent_strategy_config import get_agent_strategy_config
+
 
 @dataclass(frozen=True)
 class SearchBudget:
@@ -132,38 +134,45 @@ _SIMILAR_FOLLOWUP_THRESHOLD = 0.55
 _DUPLICATE_SEARCH_THRESHOLD = 0.82
 
 
-def normalize_search_intent(value) -> str | None:
+def normalize_search_intent(value, *, strategy_config: dict | None = None) -> str | None:
     if not isinstance(value, str):
         return None
     intent = value.strip().lower()
-    if intent in SUPPORTED_SEARCH_INTENTS:
+    if intent in _supported_search_intents(strategy_config):
         return intent
     return None
 
 
-def resolve_search_intent(value, query: str | None = None) -> str | None:
+def resolve_search_intent(value, query: str | None = None, *, strategy_config: dict | None = None) -> str | None:
     """优先使用模型显式 intent，否则从 query 里做保守推断。"""
 
-    explicit_intent = normalize_search_intent(value)
+    explicit_intent = normalize_search_intent(value, strategy_config=strategy_config)
     if explicit_intent:
         return explicit_intent
-    return infer_search_intent(query or "")
+    return infer_search_intent(query or "", strategy_config=strategy_config)
 
 
-def infer_search_intent(query: str) -> str | None:
+def infer_search_intent(query: str, *, strategy_config: dict | None = None) -> str | None:
     normalized = _normalize_query_text(query)
     if not normalized:
         return None
 
-    if _contains_any(normalized, _COMPARISON_KEYWORDS):
+    keywords = _search_config(strategy_config).get("intent_keywords", {})
+    comparison_keywords = tuple(keywords.get("comparison") or _COMPARISON_KEYWORDS)
+    official_source_keywords = tuple(keywords.get("official_source") or _OFFICIAL_SOURCE_KEYWORDS)
+    deep_research_keywords = tuple(keywords.get("deep_research") or _DEEP_RESEARCH_KEYWORDS)
+    freshness_keywords = tuple(keywords.get("freshness") or _FRESHNESS_KEYWORDS)
+    quick_fact_keywords = tuple(keywords.get("quick_fact") or _QUICK_FACT_KEYWORDS)
+
+    if _contains_any(normalized, comparison_keywords):
         return "comparison"
-    if _contains_any(normalized, _OFFICIAL_SOURCE_KEYWORDS):
+    if _contains_any(normalized, official_source_keywords):
         return "official_source"
-    if _contains_any(normalized, _DEEP_RESEARCH_KEYWORDS):
+    if _contains_any(normalized, deep_research_keywords):
         return "deep_research"
-    if _contains_any(normalized, _FRESHNESS_KEYWORDS) or _CURRENT_YEAR_RE.search(normalized):
+    if _contains_any(normalized, freshness_keywords) or _CURRENT_YEAR_RE.search(normalized):
         return "freshness"
-    if _contains_any(normalized, _QUICK_FACT_KEYWORDS) and len(_query_tokens(normalized)) <= 8:
+    if _contains_any(normalized, quick_fact_keywords) and len(_query_tokens(normalized)) <= 8:
         return "quick_fact"
     return None
 
@@ -174,15 +183,27 @@ def derive_search_budget(
     query: str | None = None,
     previous_queries: Sequence[str] = (),
     previous_intents: Sequence[str | None] = (),
+    strategy_config: dict | None = None,
 ) -> SearchBudget:
-    base_budget = SEARCH_BUDGETS_BY_INTENT.get(intent, STANDARD_SEARCH_BUDGET) if intent else STANDARD_SEARCH_BUDGET
+    search_config = _search_config(strategy_config)
+    standard_budget = _budget_from_config(search_config.get("standard_budget"), STANDARD_SEARCH_BUDGET)
+    budgets_by_intent = {
+        name: _budget_from_config(payload, SEARCH_BUDGETS_BY_INTENT.get(name, standard_budget))
+        for name, payload in (search_config.get("budgets_by_intent") or {}).items()
+    }
+    followup_budgets_by_name = {
+        name: _budget_from_config(payload, FOLLOWUP_SEARCH_BUDGETS_BY_NAME.get(name, standard_budget))
+        for name, payload in (search_config.get("followup_budgets_by_name") or {}).items()
+    }
+    base_budget = budgets_by_intent.get(intent, standard_budget) if intent else standard_budget
     if _is_similar_followup_query(
         query or "",
         intent,
         previous_queries=previous_queries,
         previous_intents=previous_intents,
+        strategy_config=strategy_config,
     ):
-        return FOLLOWUP_SEARCH_BUDGETS_BY_NAME.get(base_budget.name, base_budget)
+        return followup_budgets_by_name.get(base_budget.name, base_budget)
     return base_budget
 
 
@@ -192,6 +213,7 @@ def is_duplicate_search_query(
     *,
     previous_queries: Sequence[str],
     previous_intents: Sequence[str | None],
+    strategy_config: dict | None = None,
 ) -> bool:
     """判断本次搜索是否与已执行搜索重复到应跳过真实 provider 调用。"""
 
@@ -211,7 +233,8 @@ def is_duplicate_search_query(
             return True
         if previous_intent != intent:
             continue
-        if _query_similarity(query, previous_query) >= _DUPLICATE_SEARCH_THRESHOLD:
+        threshold = _threshold("duplicate_search", _DUPLICATE_SEARCH_THRESHOLD, strategy_config)
+        if _query_similarity(query, previous_query) >= threshold:
             return True
     return False
 
@@ -222,6 +245,7 @@ def _is_similar_followup_query(
     *,
     previous_queries: Sequence[str],
     previous_intents: Sequence[str | None],
+    strategy_config: dict | None = None,
 ) -> bool:
     if not query or not previous_queries:
         return False
@@ -233,7 +257,8 @@ def _is_similar_followup_query(
     for previous_query, previous_intent in zip(previous_queries, padded_intents):
         if previous_intent != intent:
             continue
-        if _query_similarity(query, previous_query) >= _SIMILAR_FOLLOWUP_THRESHOLD:
+        threshold = _threshold("similar_followup", _SIMILAR_FOLLOWUP_THRESHOLD, strategy_config)
+        if _query_similarity(query, previous_query) >= threshold:
             return True
     return False
 
@@ -256,6 +281,40 @@ def _query_tokens(query: str) -> set[str]:
             continue
         tokens.update(sequence[index : index + 2] for index in range(len(sequence) - 1))
     return tokens
+
+
+def _search_config(strategy_config: dict | None = None) -> dict:
+    if strategy_config is None:
+        strategy_config, _meta = get_agent_strategy_config()
+    return strategy_config.get("search") or {}
+
+
+def _supported_search_intents(strategy_config: dict | None = None) -> set[str]:
+    search_config = _search_config(strategy_config)
+    configured = search_config.get("budgets_by_intent")
+    if isinstance(configured, dict) and configured:
+        return set(configured)
+    return SUPPORTED_SEARCH_INTENTS
+
+
+def _budget_from_config(value, fallback: SearchBudget) -> SearchBudget:
+    if not isinstance(value, dict):
+        return fallback
+    try:
+        return SearchBudget(
+            name=str(value.get("name") or fallback.name),
+            requested_count=max(0, int(value.get("requested_count", fallback.requested_count))),
+            context_source_limit=max(0, int(value.get("context_source_limit", fallback.context_source_limit))),
+        )
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _threshold(name: str, fallback: float, strategy_config: dict | None = None) -> float:
+    try:
+        return float((_search_config(strategy_config).get("thresholds") or {}).get(name, fallback))
+    except (TypeError, ValueError):
+        return fallback
 
 
 def _normalize_query_text(query: str) -> str:

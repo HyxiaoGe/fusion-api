@@ -8,19 +8,18 @@ from typing import Any
 from pydantic import TypeAdapter
 from sqlalchemy.orm import Session
 
+from app.ai.prompts.agent_loop import (
+    CONTINUATION_SYSTEM_PROMPT as _CONTINUATION_SYSTEM_PROMPT,
+)
+from app.ai.prompts.agent_loop import get_continuation_system_prompt
 from app.db.models import AgentSession
 from app.db.models import Message as MessageModel
 from app.schemas.chat import ContentBlock
 from app.schemas.response import ApiException
 from app.services.stream.agent_loop_policy import AgentLoopLimits
 
-CONTINUATION_SYSTEM_PROMPT = (
-    "你正在继续上一轮因运行上限而停止的回答。请基于已有对话、已有回答和已有工具结果继续补充，"
-    "不要重写或总结已完成的部分。若需要更多资料，可以继续调用可用工具。"
-    "输出应自然衔接在上一段回答之后。"
-)
-
 _CONTENT_BLOCKS_ADAPTER = TypeAdapter(list[ContentBlock])
+CONTINUATION_SYSTEM_PROMPT = _CONTINUATION_SYSTEM_PROMPT
 
 
 @dataclass(frozen=True)
@@ -39,7 +38,7 @@ def inject_continuation_prompt(messages: list[dict]) -> list[dict]:
     insert_at = 0
     while insert_at < len(messages) and messages[insert_at].get("role") == "system":
         insert_at += 1
-    prompt = {"role": "system", "content": CONTINUATION_SYSTEM_PROMPT}
+    prompt = {"role": "system", "content": get_continuation_system_prompt()}
     return [*messages[:insert_at], prompt, *messages[insert_at:]]
 
 

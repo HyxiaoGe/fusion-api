@@ -9,6 +9,7 @@ from app.ai.prompts.templates import (
     GENERATE_SUGGESTED_QUESTIONS_PROMPT,
     GENERATE_TITLE_PROMPT,
 )
+from app.core.runtime_config import get_runtime_config_payload
 
 
 class PromptManager:
@@ -27,7 +28,14 @@ class PromptManager:
         """获取指定名称的提示词模板"""
         if template_name not in self._templates:
             raise ValueError(f"未找到提示词模板: {template_name}")
-        return self._templates[template_name]
+        fallback = self._templates[template_name]
+        payload, _meta = get_runtime_config_payload(
+            "prompt_template",
+            template_name,
+            {"template": fallback},
+        )
+        template = payload.get("template")
+        return template if isinstance(template, str) and template else fallback
 
     def format_prompt(self, template_name: str, **kwargs) -> str:
         """使用提供的参数格式化提示词模板"""

@@ -151,6 +151,27 @@ class PromptExample(Base):
     expires_at = Column(DateTime, nullable=True)
 
 
+class RuntimeConfigEntry(Base):
+    """运行时配置条目 — 用于产品策略、Agent 策略和 Prompt 资产。"""
+
+    __tablename__ = "runtime_config_entries"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    namespace = Column(String(80), nullable=False, index=True)
+    key = Column(String(120), nullable=False, index=True)
+    version = Column(String(80), nullable=False)
+    payload = Column(JSONB, nullable=False)
+    is_active = Column(Boolean, nullable=False, server_default="true", default=True, index=True)
+    description = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=get_china_time, index=True)
+    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("namespace", "key", "version", name="uq_runtime_config_namespace_key_version"),
+        Index("ix_runtime_config_active_lookup", "namespace", "key", "is_active", "updated_at"),
+    )
+
+
 class ToolCallLog(Base):
     """工具调用统计日志"""
 

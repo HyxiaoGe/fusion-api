@@ -20,6 +20,10 @@ class ModelsApiTests(unittest.TestCase):
 
         self.assertEqual(card["contextWindowTokens"], 1_000_000)
         self.assertEqual(card["maxOutputTokens"], 32_768)
+        self.assertIn("capabilityPresentation", card)
+        self.assertGreaterEqual(card["capabilityPresentation"]["score"], 70)
+        self.assertTrue(any(label["text"] == "可联网" for label in card["capabilityPresentation"]["labels"]))
+        self.assertIn("可按问题需要自主联网", card["capabilityPresentation"]["tooltip"])
 
     def test_entry_to_card_omits_invalid_context_token_limits(self):
         card = _entry_to_card(

@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from app.core.runtime_config import get_runtime_config_payload
+
 CHINA_TZ = timezone(timedelta(hours=8))
 
 
@@ -83,6 +85,14 @@ NO_VISION_FILE_BOUNDARY_PROMPT = (
     "如果用户的问题不依赖图片内容，则直接回答文字问题，不需要主动解释图片能力。"
 )
 
+LIMIT_SUMMARY_PROMPT = "你已达到工具调用上限，请基于已收集的信息给出最终回答。不要再调用任何工具。"
+
+CONTINUATION_SYSTEM_PROMPT = (
+    "你正在继续上一轮因运行上限而停止的回答。请基于已有对话、已有回答和已有工具结果继续补充，"
+    "不要重写或总结已完成的部分。若需要更多资料，可以继续调用可用工具。"
+    "输出应自然衔接在上一段回答之后。"
+)
+
 
 SEARCH_CONTEXT_OPENING = "以下是从网络搜索获取的参考信息，请结合这些信息回答用户的问题。"
 
@@ -112,3 +122,41 @@ URL_READ_TOOL_DESCRIPTION = (
     "- 不确定具体的 URL 地址\n"
     "- 需要搜索信息而非读取特定网页（应使用 web_search）"
 )
+
+
+def get_runtime_prompt_template(name: str, fallback: str) -> str:
+    payload, _meta = get_runtime_config_payload(
+        "prompt_template",
+        name,
+        {"template": fallback},
+    )
+    template = payload.get("template")
+    return template if isinstance(template, str) and template else fallback
+
+
+def get_app_identity_prompt() -> str:
+    return get_runtime_prompt_template("app_identity", APP_IDENTITY_PROMPT)
+
+
+def get_tool_usage_contract_prompt() -> str:
+    return get_runtime_prompt_template("tool_usage_contract", TOOL_USAGE_CONTRACT_PROMPT)
+
+
+def get_no_tool_network_boundary_prompt() -> str:
+    return get_runtime_prompt_template("no_tool_network_boundary", NO_TOOL_NETWORK_BOUNDARY_PROMPT)
+
+
+def get_no_vision_file_boundary_prompt() -> str:
+    return get_runtime_prompt_template("no_vision_file_boundary", NO_VISION_FILE_BOUNDARY_PROMPT)
+
+
+def get_url_read_tool_description() -> str:
+    return get_runtime_prompt_template("url_read_tool_description", URL_READ_TOOL_DESCRIPTION)
+
+
+def get_limit_summary_prompt() -> str:
+    return get_runtime_prompt_template("limit_summary", LIMIT_SUMMARY_PROMPT)
+
+
+def get_continuation_system_prompt() -> str:
+    return get_runtime_prompt_template("continuation_system", CONTINUATION_SYSTEM_PROMPT)

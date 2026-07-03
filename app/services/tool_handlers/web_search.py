@@ -16,6 +16,7 @@ from app.ai.prompts.agent_loop import (
     SEARCH_CONTEXT_TRUST_BOUNDARY,
 )
 from app.schemas.chat import SearchBlock, SearchSource, SearchSourceSummary, SourceReference
+from app.services.agent_strategy_config import get_agent_strategy_config
 from app.services.external.search_client import search_web
 from app.services.source_context import UntrustedSourceContext, format_untrusted_source_context
 from app.services.tool_handlers.base import BaseToolHandler, ToolResult
@@ -319,14 +320,22 @@ def _extract_provider_metadata(sources: List[SearchSource]) -> dict:
 
 
 def _normalize_context_source_limit(value) -> int:
+    tool_context = _tool_context_config()
+    max_context_sources = _tool_context_int(tool_context, "max_context_sources", MAX_CONTEXT_SOURCES)
     try:
         parsed = int(value)
     except (TypeError, ValueError):
-        parsed = MAX_CONTEXT_SOURCES
-    return max(1, min(MAX_CONTEXT_SOURCES, parsed))
+        parsed = max_context_sources
+    return max(1, min(max_context_sources, parsed))
 
 
 def _post_process_sources(sources: List[SearchSource], intent: Optional[str], domains: list[str]) -> List[SearchSource]:
+    tool_context = _tool_context_config()
+    max_sources_per_domain = _tool_context_int(
+        tool_context,
+        "max_sources_per_domain",
+        DEFAULT_MAX_SOURCES_PER_DOMAIN,
+    )
     relax_domain_limit = intent == "official_source" or _has_single_domain_filter(domains)
     seen_urls: set[str] = set()
     seen_domain_titles: set[tuple[str, str]] = set()
@@ -347,7 +356,7 @@ def _post_process_sources(sources: List[SearchSource], intent: Optional[str], do
         if (
             not relax_domain_limit
             and normalized_domain
-            and domain_counts.get(normalized_domain, 0) >= DEFAULT_MAX_SOURCES_PER_DOMAIN
+            and domain_counts.get(normalized_domain, 0) >= max_sources_per_domain
         ):
             continue
 
@@ -444,3 +453,15 @@ def _copy_source_with_url(source: SearchSource, url: str) -> SearchSource:
     if not url or source.url == url:
         return source
     return source.model_copy(update={"url": url})
+
+
+def _tool_context_config() -> dict:
+    strategy_config, _meta = get_agent_strategy_config()
+    return strategy_config.get("tool_context") or {}
+
+
+def _tool_context_int(tool_context: dict, key: str, fallback: int) -> int:
+    try:
+        return max(1, int(tool_context.get(key, fallback)))
+    except (TypeError, ValueError):
+        return fallback

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from app.schemas.chat import SearchSource
+from app.services.agent_strategy_config import get_agent_strategy_config
 
 MAX_LOW_PRIORITY_EXAMPLES = 3
 TRACKING_QUERY_PARAMS = {
@@ -148,8 +149,10 @@ def rank_search_sources(
     read_required_reason: str = "",
 ) -> SourceSelectionPlan:
     """对同一轮多个搜索结果做跨搜索去重和深读候选排序。"""
+    strategy_config, _meta = get_agent_strategy_config()
+    ranker_config = _ranker_config(strategy_config)
     total_source_count = sum(len(result.sources) for result in search_results)
-    drafts = _build_candidate_drafts(search_results)
+    drafts = _build_candidate_drafts(search_results, ranker_config=ranker_config)
     deduped = _dedupe_candidates(drafts)
     ranked = tuple(
         RankedSourceCandidate(
@@ -228,8 +231,7 @@ def format_source_selection_guidance(plan: SourceSelectionPlan) -> str:
 
     if plan.not_recommended_count:
         parts.append(
-            f"未建议深读：剩余 {plan.not_recommended_count} 条候选优先级低于已推荐来源，"
-            "或仅作为搜索摘要候选保留。"
+            f"未建议深读：剩余 {plan.not_recommended_count} 条候选优先级低于已推荐来源，或仅作为搜索摘要候选保留。"
         )
         reason_summary = _format_not_recommended_reason_summary(plan.read_decisions)
         if reason_summary:
@@ -250,13 +252,26 @@ def format_source_selection_guidance(plan: SourceSelectionPlan) -> str:
     return "\n".join(parts)
 
 
-def _build_candidate_drafts(search_results: list[SearchResultForRanking]) -> list[_CandidateDraft]:
+def _build_candidate_drafts(
+    search_results: list[SearchResultForRanking],
+    *,
+    ranker_config: dict,
+) -> list[_CandidateDraft]:
     drafts: list[_CandidateDraft] = []
     source_order = 0
     for result in search_results:
         for source_index, source in enumerate(result.sources, 1):
             source_order += 1
-            drafts.append(_score_source(source, result.query, result.tool_call_id, source_index, source_order))
+            drafts.append(
+                _score_source(
+                    source,
+                    result.query,
+                    result.tool_call_id,
+                    source_index,
+                    source_order,
+                    ranker_config=ranker_config,
+                )
+            )
     return drafts
 
 
@@ -266,6 +281,8 @@ def _score_source(
     tool_call_id: str,
     source_index: int,
     source_order: int,
+    *,
+    ranker_config: dict,
 ) -> _CandidateDraft:
     source_url = _source_field(source, "url")
     source_description = _source_field(source, "description")
@@ -276,55 +293,59 @@ def _score_source(
     text_lower = text.lower()
     query_terms = _tokenize(query)
     domain_tokens = set(_tokenize(domain.replace(".", " ")))
-    score = max(0, 22 - source_index * 2)
+    weights = _weights(ranker_config)
+    score = max(
+        0,
+        _weight(weights, "source_order_base", 22) - source_index * _weight(weights, "source_order_step", 2),
+    )
     reasons: list[str] = []
     is_low_priority = False
 
     is_official = _is_official_source(domain_tokens, query_terms)
-    is_authority_media = _is_authority_media(domain)
+    is_authority_media = _is_authority_media(domain, ranker_config)
     if is_official:
-        score += 38
+        score += _weight(weights, "official", 38)
         reasons.append("官方来源")
     if _has_original_signal(text_lower, canonical_url, is_official, is_authority_media):
-        score += 22
+        score += _weight(weights, "original", 22)
         reasons.append("原文公告")
     has_specific_original = _has_specific_original_signal(text_lower, canonical_url)
     is_pdf = _is_pdf(canonical_url, title)
     if has_specific_original:
-        score += 18
+        score += _weight(weights, "specific_original", 18)
         reasons.append("具体原文页面")
     if is_official and has_specific_original and not is_pdf and not _is_news_listing(text_lower, canonical_url):
-        score += 35
+        score += _weight(weights, "official_original", 35)
         reasons.append("官方原文优先")
     if is_pdf:
-        score += 35
+        score += _weight(weights, "pdf", 35)
         reasons.append("官方 PDF/技术报告" if "官方来源" in reasons else "PDF/技术报告")
     if is_authority_media:
-        score += 36
+        score += _weight(weights, "authority_media", 36)
         reasons.append("权威媒体")
     if _is_news_listing(text_lower, canonical_url):
-        score -= 28
+        score -= _weight(weights, "listing_penalty", 28)
         reasons.append("聚合页降权")
 
-    relevance_score = _relevance_score(query_terms, text_lower)
+    relevance_score = _relevance_score(query_terms, text_lower, ranker_config=ranker_config)
     if relevance_score:
         score += relevance_score
         reasons.append("高相关")
 
-    if _is_video_source(domain, title):
-        score -= 28
+    if _is_video_source(domain, title, ranker_config):
+        score -= _weight(weights, "video_penalty", 28)
         reasons.append("视频来源默认降权")
         is_low_priority = True
-    elif _is_forum_source(domain):
-        score -= 24
+    elif _is_forum_source(domain, ranker_config):
+        score -= _weight(weights, "forum_penalty", 24)
         reasons.append("社交/论坛来源默认降权")
         is_low_priority = True
-    elif domain in LOW_PRIORITY_DOMAINS:
-        score -= 18
+    elif domain in _domain_set(ranker_config, "low_priority_domains", LOW_PRIORITY_DOMAINS):
+        score -= _weight(weights, "low_priority_penalty", 18)
         reasons.append("低相关来源默认降权")
         is_low_priority = True
 
-    priority = _priority(score, is_low_priority)
+    priority = _priority(score, is_low_priority, ranker_config)
     return _CandidateDraft(
         title=title,
         url=source_url,
@@ -530,31 +551,60 @@ def _is_pdf(url: str, title: str) -> bool:
     return lowered_url.endswith(".pdf") or "[pdf]" in lowered_title or "system card" in lowered_title
 
 
-def _is_authority_media(domain: str) -> bool:
-    return domain in AUTHORITY_MEDIA_DOMAINS
+def _is_authority_media(domain: str, ranker_config: dict) -> bool:
+    return domain in _domain_set(ranker_config, "authority_media_domains", AUTHORITY_MEDIA_DOMAINS)
 
 
-def _is_video_source(domain: str, title: str) -> bool:
+def _is_video_source(domain: str, title: str, ranker_config: dict) -> bool:
     title_lower = (title or "").lower()
-    return domain in VIDEO_DOMAINS or "youtube" in title_lower or "视频" in title_lower or "video" in title_lower
+    return (
+        domain in _domain_set(ranker_config, "video_domains", VIDEO_DOMAINS)
+        or "youtube" in title_lower
+        or "视频" in title_lower
+        or "video" in title_lower
+    )
 
 
-def _is_forum_source(domain: str) -> bool:
-    return domain in FORUM_DOMAINS
+def _is_forum_source(domain: str, ranker_config: dict) -> bool:
+    return domain in _domain_set(ranker_config, "forum_domains", FORUM_DOMAINS)
 
 
-def _relevance_score(query_terms: set[str], text_lower: str) -> int:
+def _relevance_score(query_terms: set[str], text_lower: str, *, ranker_config: dict) -> int:
     if not query_terms:
         return 0
     matched = sum(1 for term in query_terms if term in text_lower)
-    return min(18, matched * 4)
+    weights = _weights(ranker_config)
+    return min(_weight(weights, "relevance_max", 18), matched * _weight(weights, "relevance_per_term", 4))
 
 
-def _priority(score: int, is_low_priority: bool) -> str:
+def _priority(score: int, is_low_priority: bool, ranker_config: dict) -> str:
     if is_low_priority:
         return "low"
-    if score >= 60:
+    thresholds = ranker_config.get("priority_thresholds") or {}
+    if score >= _weight(thresholds, "high", 60):
         return "high"
-    if score >= 30:
+    if score >= _weight(thresholds, "medium", 30):
         return "medium"
     return "low"
+
+
+def _ranker_config(strategy_config: dict | None) -> dict:
+    return (strategy_config or {}).get("source_ranker") or {}
+
+
+def _weights(ranker_config: dict) -> dict:
+    return ranker_config.get("weights") or {}
+
+
+def _weight(weights: dict, key: str, fallback: int) -> int:
+    try:
+        return int(weights.get(key, fallback))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _domain_set(ranker_config: dict, key: str, fallback: set[str]) -> set[str]:
+    configured = ranker_config.get(key)
+    if isinstance(configured, list):
+        return {str(domain).strip().lower() for domain in configured if str(domain).strip()}
+    return set(fallback)
