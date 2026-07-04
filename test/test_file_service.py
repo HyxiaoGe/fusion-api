@@ -21,6 +21,7 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
         self.service.file_repo = MagicMock()
         self.service.file_processor = MagicMock()
         self.service.file_processor.process_files = AsyncMock()
+        self.service.storage.exists = AsyncMock(return_value=True)
 
     async def test_parse_file_marks_processed_only_after_success(self):
         self.service.file_repo.get_file_by_id.return_value = SimpleNamespace(
@@ -242,6 +243,47 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["id"], "file-1")
         self.assertIsNone(result[0]["thumbnail_url"])
+
+    async def test_get_conversation_files_omits_thumbnail_when_storage_object_missing(self):
+        conversation_file = SimpleNamespace(
+            file=SimpleNamespace(
+                id="file-1",
+                original_filename="photo.png",
+                mimetype="image/png",
+                size=12,
+                status="processed",
+                thumbnail_key="conv-1/file-1/thumbnail.jpg",
+                width=640,
+                height=480,
+                created_at=None,
+                processing_result=None,
+            )
+        )
+        self.service.file_repo.get_conversation_files.return_value = [conversation_file]
+        self.service.storage.exists = AsyncMock(return_value=False)
+        self.service.storage.get_url = AsyncMock(return_value="/files/file-1/thumb.png")
+
+        result = await self.service.get_conversation_files("conv-1")
+
+        self.service.storage.exists.assert_awaited_once_with("conv-1/file-1/thumbnail.jpg")
+        self.service.storage.get_url.assert_not_awaited()
+        self.assertEqual(len(result), 1)
+        self.assertIsNone(result[0]["thumbnail_url"])
+
+    async def test_get_file_url_returns_none_when_storage_object_missing(self):
+        self.service.file_repo.get_file_by_id.return_value = SimpleNamespace(
+            id="file-1",
+            thumbnail_key="conv-1/file-1/thumbnail.jpg",
+            storage_key="conv-1/file-1/processed.jpg",
+        )
+        self.service.storage.exists = AsyncMock(return_value=False)
+        self.service.storage.get_url = AsyncMock(return_value="/files/file-1/thumb.png")
+
+        result = await self.service.get_file_url("file-1", "user-1", "thumbnail")
+
+        self.service.storage.exists.assert_awaited_once_with("conv-1/file-1/thumbnail.jpg")
+        self.service.storage.get_url.assert_not_awaited()
+        self.assertIsNone(result)
 
     async def test_get_files_by_user_does_not_surface_success_message_as_error(self):
         file_record = SimpleNamespace(

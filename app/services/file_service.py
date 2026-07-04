@@ -242,6 +242,10 @@ class FileService:
         if not key:
             return None
 
+        if not await self._storage_object_exists(key):
+            logger.warning("文件实体缺失，跳过 URL 签发: file_id=%s, variant=%s, key=%s", file_id, variant, key)
+            return None
+
         url = await self.storage.get_url(key, expires=settings.MINIO_PRESIGN_EXPIRES)
         return self._sign_local_url(url, file_id, settings.MINIO_PRESIGN_EXPIRES)
 
@@ -371,8 +375,11 @@ class FileService:
         thumbnail_url = None
         if thumbnail_key:
             try:
-                thumbnail_url = await self.storage.get_url(thumbnail_key, expires=settings.MINIO_PRESIGN_EXPIRES)
-                thumbnail_url = self._sign_local_url(thumbnail_url, file_obj.id, settings.MINIO_PRESIGN_EXPIRES)
+                if await self._storage_object_exists(thumbnail_key):
+                    thumbnail_url = await self.storage.get_url(thumbnail_key, expires=settings.MINIO_PRESIGN_EXPIRES)
+                    thumbnail_url = self._sign_local_url(thumbnail_url, file_obj.id, settings.MINIO_PRESIGN_EXPIRES)
+                else:
+                    logger.warning("文件缩略图实体缺失: file_id=%s, key=%s", file_obj.id, thumbnail_key)
             except Exception as e:
                 logger.warning(f"文件缩略图 URL 构造失败: file_id={file_obj.id}, error={e}")
 
@@ -431,6 +438,14 @@ class FileService:
             "processing_result": file_obj.processing_result,
             "thumbnail_url": None,  # 前端会单独请求 URL
         }
+
+    async def _storage_object_exists(self, key: str) -> bool:
+        """检查存储实体是否存在，避免给丢失文件签发无效 URL。"""
+        try:
+            return await self.storage.exists(key)
+        except Exception as e:
+            logger.warning("文件实体存在性检查失败: key=%s, error=%s", key, e)
+            return False
 
     async def delete_file(self, file_id: str, user_id: str) -> bool:
         """删除文件，并验证用户权限"""

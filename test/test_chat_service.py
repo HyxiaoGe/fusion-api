@@ -390,6 +390,29 @@ class ChatServiceTests(unittest.TestCase):
         service.file_repo.get_file_by_id.assert_called_once_with("file-1", user_id="user-1")
         service.file_repo.is_file_linked_to_conversation.assert_called_once_with("conv-1", "file-1")
 
+    def test_build_file_block_omits_thumbnail_url_when_storage_object_missing(self):
+        service = object.__new__(ChatService)
+        file_record = SimpleNamespace(
+            id="file-1",
+            original_filename="diagram.png",
+            mimetype="image/png",
+            thumbnail_key="conv-1/file-1/thumbnail.jpg",
+            width=640,
+            height=480,
+        )
+        storage = SimpleNamespace(
+            exists=AsyncMock(return_value=False),
+            get_url=AsyncMock(return_value="/files/file-1/thumb.png"),
+        )
+
+        with patch("app.services.chat_service.get_storage", return_value=storage):
+            block = asyncio.run(service._build_file_block_from_record(file_record))
+
+        storage.exists.assert_awaited_once_with("conv-1/file-1/thumbnail.jpg")
+        storage.get_url.assert_not_awaited()
+        self.assertIsNone(block.thumbnail_url)
+        self.assertEqual(block.file_id, "file-1")
+
     def test_validate_message_files_rejects_other_user_file(self):
         service = object.__new__(ChatService)
         service.file_repo = MagicMock()

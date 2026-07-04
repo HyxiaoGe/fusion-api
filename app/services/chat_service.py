@@ -90,15 +90,18 @@ class ChatService:
             if getattr(file_info, "thumbnail_key", None):
                 try:
                     storage = get_storage()
-                    thumb_url = await storage.get_url(
-                        file_info.thumbnail_key,
-                        expires=settings.MINIO_PRESIGN_EXPIRES,
-                    )
-                    block_kwargs["thumbnail_url"] = FileService._sign_local_url(
-                        thumb_url,
-                        file_info.id,
-                        settings.MINIO_PRESIGN_EXPIRES,
-                    )
+                    if await storage.exists(file_info.thumbnail_key):
+                        thumb_url = await storage.get_url(
+                            file_info.thumbnail_key,
+                            expires=settings.MINIO_PRESIGN_EXPIRES,
+                        )
+                        block_kwargs["thumbnail_url"] = FileService._sign_local_url(
+                            thumb_url,
+                            file_info.id,
+                            settings.MINIO_PRESIGN_EXPIRES,
+                        )
+                    else:
+                        logger.warning("图片缩略图实体缺失: file_id=%s, key=%s", file_info.id, file_info.thumbnail_key)
                 except Exception:
                     logger.warning("图片缩略图 URL 构造失败: file_id=%s", file_info.id)
             block_kwargs["width"] = getattr(file_info, "width", None)
