@@ -169,6 +169,10 @@ jobs:
           # dev 中 auth-service 只在 Docker 网络内暴露，未发布宿主机 8100。
           # 显式覆盖旧 .env 里的宿主机地址，避免 fusion-api JWKS/userinfo 校验连到不可达地址。
           export AUTH_SERVICE_INTERNAL_BASE_URL="http://auth-service:8100"
+          mkdir -p ./fusion-api/storage/files
+          if docker container inspect fusion-api >/dev/null 2>&1; then
+            docker cp fusion-api:/app/storage/files/. ./fusion-api/storage/files/ 2>/dev/null || true
+          fi
           cat > docker-compose.fusion-api-ghcr.yml <<'EOF'
           services:
             fusion-api:
@@ -180,11 +184,14 @@ jobs:
                 - "8002:8000"
               volumes:
                 - ./fusion-api/logs:/app/logs
+                - ./fusion-api/storage/files:/app/storage/files
               environment:
                 - DATABASE_URL=${DATABASE_URL}
                 - SERVER_HOST=${SERVER_HOST}
                 - FRONTEND_URL=${FRONTEND_URL}
                 - CORS_ORIGINS=${CORS_ORIGINS}
+                - STORAGE_BACKEND=${STORAGE_BACKEND:-local}
+                - FILE_STORAGE_PATH=/app/storage/files
                 - AUTH_SERVICE_BASE_URL=${AUTH_SERVICE_BASE_URL}
                 - AUTH_SERVICE_JWKS_URL=${AUTH_SERVICE_JWKS_URL}
                 - AUTH_SERVICE_CLIENT_ID=${AUTH_SERVICE_CLIENT_ID}
@@ -231,6 +238,17 @@ jobs:
             docker logs --tail=120 fusion-api || true
             exit 1
           fi
+
+          docker inspect fusion-api --format '{{range .Mounts}}{{println .Destination}}{{end}}' | grep -qx '/app/storage/files'
+          docker exec fusion-api python - <<'PY'
+          from app.core.config import settings
+
+          if settings.FILE_STORAGE_PATH != "/app/storage/files":
+              raise SystemExit(f"file storage path mismatch: {settings.FILE_STORAGE_PATH}")
+          if settings.STORAGE_BACKEND != "local":
+              raise SystemExit(f"file storage backend mismatch: {settings.STORAGE_BACKEND}")
+          print("file storage mount ok: /app/storage/files")
+          PY
 
           docker exec fusion-api python - <<'PY'
           from app.core.config import settings

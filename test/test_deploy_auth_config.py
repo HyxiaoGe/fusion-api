@@ -22,6 +22,19 @@ class DeployAuthConfigTests(unittest.TestCase):
         self.assertIn("python3 scripts/deployment_smoke.py --base-url http://127.0.0.1:8002", self.workflow)
         self.assertIn("/api/models/", self.workflow)
 
+    def test_deploy_mounts_persistent_file_storage(self):
+        self.assertIn("mkdir -p ./fusion-api/storage/files", self.workflow)
+        self.assertIn("./fusion-api/storage/files:/app/storage/files", self.workflow)
+        self.assertIn("FILE_STORAGE_PATH=/app/storage/files", self.workflow)
+
+    def test_deploy_preserves_container_files_before_recreate(self):
+        self.assertIn("docker cp fusion-api:/app/storage/files/.", self.workflow)
+        self.assertIn("./fusion-api/storage/files/", self.workflow)
+
+    def test_deploy_verifies_persistent_file_storage_after_restart(self):
+        self.assertIn("file storage mount ok", self.workflow)
+        self.assertIn('settings.FILE_STORAGE_PATH != "/app/storage/files"', self.workflow)
+
     def test_ci_runs_tests_with_process_timeout_and_verbose_output(self):
         self.assertIn(
             "timeout 270s python -u -m unittest discover -s test -t . -v",
