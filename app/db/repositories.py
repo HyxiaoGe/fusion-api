@@ -1,6 +1,7 @@
 import logging
 import re
 import uuid
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session, joinedload
@@ -597,6 +598,23 @@ class FileRepository:
             logger.error(f"计算对话文件数量失败: {e}")
             return 0
 
+    def get_stale_uploading_files(self, conversation_id: str, cutoff: datetime) -> List[File]:
+        """获取指定对话里超过直传窗口仍未完成的文件。"""
+        try:
+            return (
+                self.db.query(File)
+                .join(ConversationFile, ConversationFile.file_id == File.id)
+                .filter(
+                    ConversationFile.conversation_id == conversation_id,
+                    File.status == "uploading",
+                    File.created_at < cutoff,
+                )
+                .all()
+            )
+        except Exception as e:
+            logger.error(f"查询过期上传文件失败: {e}")
+            return []
+
     def get_file_by_id(self, file_id: str, user_id: Optional[str] = None) -> Optional[File]:
         """根据ID获取文件，可选择按user_id过滤"""
         query = self.db.query(File).filter(File.id == file_id)
@@ -632,11 +650,13 @@ class FileRepository:
     def delete_file(self, file_id: str, user_id: str) -> bool:
         """删除文件记录"""
         try:
-            result = self.db.query(File).filter(File.id == file_id, File.user_id == user_id).delete()
-            if result > 0:
-                self.db.commit()
-                return True
-            return False
+            file = self.db.query(File).filter(File.id == file_id, File.user_id == user_id).first()
+            if not file:
+                return False
+            self.db.query(ConversationFile).filter(ConversationFile.file_id == file_id).delete()
+            self.db.delete(file)
+            self.db.commit()
+            return True
         except Exception as e:
             self.db.rollback()
             logger.error(f"删除文件失败: {e}")

@@ -256,6 +256,92 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         self.assertIsNone(body["data"])
         service.upload_files.assert_awaited_once()
 
+    def test_file_direct_upload_init_routes_to_file_service(self):
+        self._enable_authenticated_overrides()
+        service = self._mock_file_service(
+            create_direct_upload=AsyncMock(
+                return_value={
+                    "file_id": "file-1",
+                    "upload_url": "https://oss.example.com/conv-1/file-1/original/photo.png",
+                    "method": "PUT",
+                    "headers": {"Content-Type": "image/png"},
+                    "expires_in": 600,
+                }
+            )
+        )
+
+        response = self.client.post(
+            "/api/files/upload/init",
+            json={
+                "provider": "qwen",
+                "model": "qwen-vl-max",
+                "conversation_id": "conv-1",
+                "filename": "photo.png",
+                "mimetype": "image/png",
+                "size": 123,
+            },
+        )
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual(body["code"], "SUCCESS")
+        self.assertEqual(body["data"]["upload"]["file_id"], "file-1")
+        self.assertEqual(
+            body["data"]["upload"]["upload_url"], "https://oss.example.com/conv-1/file-1/original/photo.png"
+        )
+        service.create_direct_upload.assert_awaited_once_with(
+            user_id="user-123",
+            conversation_id="conv-1",
+            provider="qwen",
+            model="qwen-vl-max",
+            filename="photo.png",
+            mimetype="image/png",
+            size=123,
+        )
+
+    def test_file_direct_upload_init_disabled_returns_fallback_code(self):
+        self._enable_authenticated_overrides()
+        self._mock_file_service(create_direct_upload=AsyncMock(side_effect=NotImplementedError("disabled")))
+
+        response = self.client.post(
+            "/api/files/upload/init",
+            json={
+                "provider": "qwen",
+                "model": "qwen-vl-max",
+                "conversation_id": "conv-1",
+                "filename": "photo.png",
+                "mimetype": "image/png",
+                "size": 123,
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["code"], "DIRECT_UPLOAD_DISABLED")
+        self.assertEqual(body["message"], "当前存储后端未开启直传上传")
+        self.assertIsNone(body["data"])
+
+    def test_file_direct_upload_complete_routes_to_file_service(self):
+        self._enable_authenticated_overrides()
+        service = self._mock_file_service(
+            complete_direct_upload=AsyncMock(
+                return_value={
+                    "file_id": "file-1",
+                    "thumbnail_url": "https://oss.example.com/conv-1/file-1/thumbnail.jpg",
+                    "status": "processed",
+                }
+            )
+        )
+
+        response = self.client.post("/api/files/upload/complete", json={"file_id": "file-1"})
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["code"], "SUCCESS")
+        self.assertEqual(body["data"]["file"]["file_id"], "file-1")
+        self.assertEqual(body["data"]["file"]["status"], "processed")
+        service.complete_direct_upload.assert_awaited_once_with("file-1", "user-123")
+
     def test_timeout_middleware_uses_longer_budget_for_file_upload(self):
         middleware = self.main.TimeoutMiddleware(lambda scope, receive, send: None, timeout_seconds=10)
         captured = {}
@@ -272,6 +358,32 @@ class ChatCoreSurfaceTests(unittest.TestCase):
                 "type": "http",
                 "method": "POST",
                 "path": "/api/files/upload",
+                "headers": [],
+            }
+        )
+
+        with patch.object(self.main.asyncio, "wait_for", side_effect=fake_wait_for):
+            response = asyncio.run(middleware.dispatch(request, call_next))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured["timeout"], self.main.settings.FILE_UPLOAD_TIMEOUT_SECONDS)
+
+    def test_timeout_middleware_uses_longer_budget_for_direct_upload_complete(self):
+        middleware = self.main.TimeoutMiddleware(lambda scope, receive, send: None, timeout_seconds=10)
+        captured = {}
+
+        async def call_next(_request):
+            return Response("ok")
+
+        async def fake_wait_for(awaitable, timeout):
+            captured["timeout"] = timeout
+            return await awaitable
+
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/files/upload/complete",
                 "headers": [],
             }
         )

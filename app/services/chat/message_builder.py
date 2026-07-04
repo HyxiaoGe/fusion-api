@@ -14,7 +14,7 @@ from app.ai.prompts.agent_loop import build_current_date_system_prompt, get_app_
 from app.core.logger import app_logger as logger
 from app.db.repositories import FileRepository
 from app.services.file_service import is_image_mime
-from app.services.storage import get_storage
+from app.services.storage import get_storage_for_backend
 
 # 历史消息中保留图片的最大轮数（避免 token 爆炸）
 MAX_VISION_HISTORY_TURNS = 3
@@ -42,7 +42,7 @@ async def file_block_to_image_part(
         if not is_image_mime(file_record.mimetype or "") or not file_record.storage_key:
             return None
 
-        storage = get_storage()
+        storage = get_storage_for_backend(getattr(file_record, "storage_backend", None))
         image_data = await storage.download(file_record.storage_key)
         b64 = base64.b64encode(image_data).decode()
         mime = file_record.mimetype or "image/jpeg"

@@ -36,7 +36,7 @@ from app.services.chat.message_builder import (
 from app.services.chat.utils import ChatUtils
 from app.services.conversation_service import ConversationService
 from app.services.file_service import FileService, is_image_mime
-from app.services.storage import get_storage
+from app.services.storage import get_storage_for_backend
 from app.services.stream import StreamHandler, stream_redis_as_sse
 from app.services.stream.agent_loop_request_prep import inject_no_tool_network_boundary, inject_no_vision_file_boundary
 from app.services.stream.runner import _agent_loop_limits
@@ -70,7 +70,7 @@ class ChatService:
                 raise ApiException.bad_request("文件不属于当前会话")
 
             if is_image_mime(file_info.mimetype or ""):
-                if not getattr(file_info, "storage_key", None):
+                if file_info.status != "processed" or not getattr(file_info, "storage_key", None):
                     raise ApiException.bad_request("图片文件不可用，请重新上传")
             elif file_info.status != "processed":
                 raise ApiException.bad_request("文件仍在处理，请稍后再发送")
@@ -89,7 +89,7 @@ class ChatService:
         if is_image_mime(file_info.mimetype or ""):
             if getattr(file_info, "thumbnail_key", None):
                 try:
-                    storage = get_storage()
+                    storage = get_storage_for_backend(getattr(file_info, "storage_backend", None))
                     if await storage.exists(file_info.thumbnail_key):
                         thumb_url = await storage.get_url(
                             file_info.thumbnail_key,

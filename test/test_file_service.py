@@ -18,10 +18,17 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
         self._storage_patcher.start()
         self.service = FileService(MagicMock())
         self._storage_patcher.stop()
+        self._storage_for_backend_patcher = patch(
+            "app.services.file_service.get_storage_for_backend",
+            return_value=self.service.storage,
+        )
+        self._storage_for_backend_patcher.start()
+        self.addCleanup(self._storage_for_backend_patcher.stop)
         self.service.file_repo = MagicMock()
         self.service.file_processor = MagicMock()
         self.service.file_processor.process_files = AsyncMock()
         self.service.storage.exists = AsyncMock(return_value=True)
+        self.service.file_repo.get_stale_uploading_files.return_value = []
 
     async def test_parse_file_marks_processed_only_after_success(self):
         self.service.file_repo.get_file_by_id.return_value = SimpleNamespace(
@@ -285,6 +292,28 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
         self.service.storage.get_url.assert_not_awaited()
         self.assertIsNone(result)
 
+    async def test_get_file_url_uses_file_storage_backend_for_historical_local_file(self):
+        self.service.file_repo.get_file_by_id.return_value = SimpleNamespace(
+            id="file-local",
+            storage_backend="local",
+            thumbnail_key="conv-1/file-local/thumbnail.jpg",
+            storage_key="conv-1/file-local/processed.jpg",
+        )
+        local_storage = MagicMock()
+        local_storage.exists = AsyncMock(return_value=True)
+        local_storage.get_url = AsyncMock(return_value="/api/files/file-local/content?variant=thumbnail")
+
+        with patch("app.services.file_service.get_storage_for_backend", return_value=local_storage) as get_backend:
+            result = await self.service.get_file_url("file-local", "user-1", "thumbnail")
+
+        get_backend.assert_called_once_with("local")
+        local_storage.exists.assert_awaited_once_with("conv-1/file-local/thumbnail.jpg")
+        local_storage.get_url.assert_awaited_once_with(
+            "conv-1/file-local/thumbnail.jpg",
+            expires=settings.MINIO_PRESIGN_EXPIRES,
+        )
+        self.assertTrue(result.startswith("/api/files/file-local/content?variant=thumbnail&token="))
+
     async def test_get_files_by_user_does_not_surface_success_message_as_error(self):
         file_record = SimpleNamespace(
             id="file-3",
@@ -377,6 +406,202 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
                 }
             ],
         )
+
+    async def test_create_direct_upload_creates_uploading_record_and_signed_put_url(self):
+        self.service.storage.get_upload_url = AsyncMock(
+            return_value={
+                "url": "https://oss.example.com/conv-1/file-1/original/photo.png?signature=1",
+                "method": "PUT",
+                "headers": {"Content-Type": "image/png"},
+                "expires_in": 600,
+            }
+        )
+        self.service.file_repo.count_conversation_files.return_value = 0
+
+        with (
+            patch("app.services.file_service.uuid.uuid4", return_value="file-1"),
+            patch("app.services.file_service.ConversationRepository") as repo_class,
+        ):
+            conv_repo = MagicMock()
+            conv_repo.get_by_id.return_value = SimpleNamespace(id="conv-1")
+            repo_class.return_value = conv_repo
+
+            result = await self.service.create_direct_upload(
+                user_id="user-1",
+                conversation_id="conv-1",
+                provider="qwen",
+                model="qwen-vl-max",
+                filename="photo.png",
+                mimetype="image/png",
+                size=123,
+            )
+
+        self.service.storage.get_upload_url.assert_awaited_once_with(
+            "conv-1/file-1/original/photo.png",
+            content_type="image/png",
+            expires=settings.MINIO_PRESIGN_EXPIRES,
+        )
+        self.service.file_repo.create_file.assert_called_once_with(
+            {
+                "id": "file-1",
+                "user_id": "user-1",
+                "filename": "file-1_photo.png",
+                "original_filename": "photo.png",
+                "mimetype": "image/png",
+                "size": 123,
+                "path": "conv-1/file-1/original/photo.png",
+                "status": "uploading",
+                "processing_result": None,
+                "storage_key": "conv-1/file-1/original/photo.png",
+                "thumbnail_key": None,
+                "storage_backend": settings.STORAGE_BACKEND,
+                "width": None,
+                "height": None,
+            }
+        )
+        self.service.file_repo.link_file_to_conversation.assert_called_once_with("conv-1", "file-1")
+        self.assertEqual(
+            result,
+            {
+                "file_id": "file-1",
+                "upload_url": "https://oss.example.com/conv-1/file-1/original/photo.png?signature=1",
+                "method": "PUT",
+                "headers": {"Content-Type": "image/png"},
+                "expires_in": 600,
+            },
+        )
+
+    async def test_create_direct_upload_cleans_stale_uploading_records_before_counting_quota(self):
+        stale_file = SimpleNamespace(
+            id="stale-file",
+            user_id="user-1",
+            storage_backend=settings.STORAGE_BACKEND,
+            storage_key="conv-1/stale-file/original/old.png",
+            thumbnail_key=None,
+            path="conv-1/stale-file/original/old.png",
+        )
+        self.service.file_repo.get_stale_uploading_files.return_value = [stale_file]
+        self.service.file_repo.count_conversation_files.return_value = 0
+        self.service.storage.delete = AsyncMock(return_value=True)
+        self.service.storage.get_upload_url = AsyncMock(
+            return_value={
+                "url": "https://oss.example.com/conv-1/file-2/original/photo.png?signature=1",
+                "method": "PUT",
+                "headers": {"Content-Type": "image/png"},
+                "expires_in": 600,
+            }
+        )
+
+        with (
+            patch("app.services.file_service.uuid.uuid4", return_value="file-2"),
+            patch("app.services.file_service.ConversationRepository") as repo_class,
+            patch("app.services.file_service.get_storage_for_backend", return_value=self.service.storage),
+        ):
+            conv_repo = MagicMock()
+            conv_repo.get_by_id.return_value = SimpleNamespace(id="conv-1")
+            repo_class.return_value = conv_repo
+
+            await self.service.create_direct_upload(
+                user_id="user-1",
+                conversation_id="conv-1",
+                provider="qwen",
+                model="qwen-vl-max",
+                filename="photo.png",
+                mimetype="image/png",
+                size=123,
+            )
+
+        self.service.file_repo.get_stale_uploading_files.assert_called_once()
+        self.service.storage.delete.assert_awaited_once_with("conv-1/stale-file/original/old.png")
+        self.service.file_repo.delete_file.assert_called_once_with("stale-file", "user-1")
+        self.service.file_repo.count_conversation_files.assert_called_once_with("conv-1")
+
+    async def test_complete_direct_upload_processes_image_from_uploaded_object(self):
+        self.service.file_repo.get_file_by_id.return_value = SimpleNamespace(
+            id="file-1",
+            user_id="user-1",
+            original_filename="photo.png",
+            filename="file-1_photo.png",
+            mimetype="image/png",
+            size=123,
+            path="conv-1/file-1/original/photo.png",
+            storage_key="conv-1/file-1/original/photo.png",
+            storage_backend=settings.STORAGE_BACKEND,
+            status="uploading",
+        )
+        self.service.storage.exists = AsyncMock(return_value=True)
+        self.service.storage.get_size = AsyncMock(return_value=321)
+        self.service.storage.download = AsyncMock(return_value=b"original-image")
+        self.service.storage.upload = AsyncMock()
+        self.service.storage.get_url = AsyncMock(return_value="https://oss.example.com/conv-1/file-1/thumbnail.jpg")
+        self.service.image_processor.process = AsyncMock(
+            return_value={
+                "processed": b"processed-image",
+                "thumbnail": b"thumbnail-image",
+                "mime_type": "image/jpeg",
+                "width": 640,
+                "height": 480,
+            }
+        )
+
+        result = await self.service.complete_direct_upload("file-1", "user-1")
+
+        self.service.storage.exists.assert_awaited_once_with("conv-1/file-1/original/photo.png")
+        self.service.storage.get_size.assert_awaited_once_with("conv-1/file-1/original/photo.png")
+        self.service.storage.download.assert_awaited_once_with("conv-1/file-1/original/photo.png")
+        self.service.image_processor.process.assert_awaited_once_with(b"original-image", "image/png")
+        self.service.file_repo.update_file.assert_called_once_with(
+            file_id="file-1",
+            updates={
+                "status": "processed",
+                "mimetype": "image/jpeg",
+                "storage_key": "conv-1/file-1/processed.jpg",
+                "thumbnail_key": "conv-1/file-1/thumbnail.jpg",
+                "width": 640,
+                "height": 480,
+                "size": 321,
+                "processing_result": None,
+            },
+        )
+        self.assertEqual(
+            result,
+            {
+                "file_id": "file-1",
+                "thumbnail_url": result["thumbnail_url"],
+                "status": "processed",
+                "filename": "photo.png",
+                "mimetype": "image/jpeg",
+                "size": 321,
+            },
+        )
+        self.assertTrue(result["thumbnail_url"].startswith("https://oss.example.com/conv-1/file-1/thumbnail.jpg"))
+
+    async def test_complete_direct_upload_rejects_oversized_object_before_download(self):
+        self.service.file_repo.get_file_by_id.return_value = SimpleNamespace(
+            id="file-large",
+            user_id="user-1",
+            original_filename="large.png",
+            filename="file-large_large.png",
+            mimetype="image/png",
+            size=123,
+            path="conv-1/file-large/original/large.png",
+            storage_key="conv-1/file-large/original/large.png",
+            storage_backend=settings.STORAGE_BACKEND,
+            status="uploading",
+        )
+        self.service.storage.exists = AsyncMock(return_value=True)
+        self.service.storage.get_size = AsyncMock(return_value=settings.MAX_FILE_SIZE + 1)
+        self.service.storage.download = AsyncMock()
+        self.service.storage.delete = AsyncMock(return_value=True)
+
+        with patch("app.services.file_service.get_storage_for_backend", return_value=self.service.storage):
+            with self.assertRaises(ValueError):
+                await self.service.complete_direct_upload("file-large", "user-1")
+
+        self.service.storage.get_size.assert_awaited_once_with("conv-1/file-large/original/large.png")
+        self.service.storage.download.assert_not_awaited()
+        self.service.storage.delete.assert_awaited_once_with("conv-1/file-large/original/large.png")
+        self.service.file_repo.delete_file.assert_called_once_with("file-large", "user-1")
 
 
 if __name__ == "__main__":

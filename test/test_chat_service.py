@@ -396,6 +396,7 @@ class ChatServiceTests(unittest.TestCase):
             id="file-1",
             original_filename="diagram.png",
             mimetype="image/png",
+            storage_backend="local",
             thumbnail_key="conv-1/file-1/thumbnail.jpg",
             width=640,
             height=480,
@@ -405,9 +406,10 @@ class ChatServiceTests(unittest.TestCase):
             get_url=AsyncMock(return_value="/files/file-1/thumb.png"),
         )
 
-        with patch("app.services.chat_service.get_storage", return_value=storage):
+        with patch("app.services.chat_service.get_storage_for_backend", return_value=storage) as get_backend:
             block = asyncio.run(service._build_file_block_from_record(file_record))
 
+        get_backend.assert_called_once_with("local")
         storage.exists.assert_awaited_once_with("conv-1/file-1/thumbnail.jpg")
         storage.get_url.assert_not_awaited()
         self.assertIsNone(block.thumbnail_url)
@@ -481,6 +483,26 @@ class ChatServiceTests(unittest.TestCase):
 
         with self.assertRaises(ApiException) as context:
             service._validate_message_files(["file-4"], "user-1", "conv-1")
+
+        self.assertEqual(context.exception.code, "INVALID_PARAM")
+        self.assertEqual(context.exception.message, "图片文件不可用，请重新上传")
+
+    def test_validate_message_files_rejects_unprocessed_image_even_with_storage_key(self):
+        service = object.__new__(ChatService)
+        service.file_repo = MagicMock()
+        service.file_repo.get_file_by_id.return_value = SimpleNamespace(
+            id="file-5",
+            user_id="user-1",
+            original_filename="uploading.png",
+            mimetype="image/png",
+            status="uploading",
+            storage_key="conv-1/file-5/original/uploading.png",
+            thumbnail_key=None,
+        )
+        service.file_repo.is_file_linked_to_conversation.return_value = True
+
+        with self.assertRaises(ApiException) as context:
+            service._validate_message_files(["file-5"], "user-1", "conv-1")
 
         self.assertEqual(context.exception.code, "INVALID_PARAM")
         self.assertEqual(context.exception.message, "图片文件不可用，请重新上传")

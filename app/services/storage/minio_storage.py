@@ -77,6 +77,16 @@ class MinIOStorageBackend(StorageBackend):
                 raise FileNotFoundError(f"文件不存在: {key}")
             raise
 
+    async def get_size(self, key: str) -> int:
+        """通过 HEAD 获取 MinIO 对象大小"""
+        try:
+            response = self.s3_client.head_object(Bucket=self.bucket, Key=key)
+            return int(response["ContentLength"])
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "NoSuchKey":
+                raise FileNotFoundError(f"文件不存在: {key}")
+            raise
+
     async def get_url(self, key: str, expires: int = 3600) -> str:
         """生成 MinIO presigned URL"""
         url = self.s3_client.generate_presigned_url(

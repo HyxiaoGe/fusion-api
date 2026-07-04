@@ -26,6 +26,7 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
         self.timeout_seconds = timeout_seconds
         self.route_timeouts = {
             ("POST", "/api/files/upload"): settings.FILE_UPLOAD_TIMEOUT_SECONDS,
+            ("POST", "/api/files/upload/complete"): settings.FILE_UPLOAD_TIMEOUT_SECONDS,
         }
         if route_timeouts:
             self.route_timeouts.update(route_timeouts)

@@ -11,6 +11,7 @@ from app.core.revocation import is_user_access_revoked
 from app.core.security import jwt_validator
 from app.db.models import User
 from app.db.repositories import UserRepository
+from app.schemas.files import DirectUploadCompleteRequest, DirectUploadInitRequest
 from app.schemas.response import ApiException, success
 from app.services.file_service import FileService
 
@@ -55,6 +56,50 @@ async def upload_files(
     """上传文件到指定对话"""
     results = await file_service.upload_files(files, current_user.id, conversation_id, provider, model)
     return success(data={"files": results}, message="上传成功", request_id=request.state.request_id)
+
+
+@router.post("/upload/init", status_code=201)
+async def init_direct_upload(
+    payload: DirectUploadInitRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    file_service: FileService = Depends(get_file_service),
+):
+    """初始化浏览器直传上传。"""
+    try:
+        upload = await file_service.create_direct_upload(
+            user_id=current_user.id,
+            conversation_id=payload.conversation_id,
+            provider=payload.provider,
+            model=payload.model,
+            filename=payload.filename,
+            mimetype=payload.mimetype,
+            size=payload.size,
+        )
+    except NotImplementedError:
+        raise ApiException("DIRECT_UPLOAD_DISABLED", "当前存储后端未开启直传上传", 400)
+    except ValueError as e:
+        raise ApiException.bad_request(str(e))
+
+    return success(data={"upload": upload}, message="上传初始化成功", request_id=request.state.request_id)
+
+
+@router.post("/upload/complete")
+async def complete_direct_upload(
+    payload: DirectUploadCompleteRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    file_service: FileService = Depends(get_file_service),
+):
+    """确认浏览器直传完成，并接入文件处理管线。"""
+    try:
+        file = await file_service.complete_direct_upload(payload.file_id, current_user.id)
+    except FileNotFoundError:
+        raise ApiException.not_found("文件不存在或无权访问")
+    except ValueError as e:
+        raise ApiException.bad_request(str(e))
+
+    return success(data={"file": file}, message="上传完成", request_id=request.state.request_id)
 
 
 @router.get("/{file_id}/url")

@@ -33,8 +33,12 @@ class DeployAuthConfigTests(unittest.TestCase):
         self.assertNotIn("docker cp fusion-api:/app/storage/files/.", self.workflow)
 
     def test_deploy_verifies_persistent_file_storage_after_restart(self):
-        self.assertIn("file storage mount ok", self.workflow)
+        self.assertIn("file storage backend ok", self.workflow)
         self.assertIn('settings.FILE_STORAGE_PATH != "/app/storage/files"', self.workflow)
+        self.assertIn("OSS_ACCESS_KEY_SECRET", self.workflow)
+        self.assertIn("DIRECT_UPLOAD_STALE_SECONDS=${DIRECT_UPLOAD_STALE_SECONDS:-1800}", self.workflow)
+        self.assertIn("Access-Control-Request-Method", self.workflow)
+        self.assertIn("oss cors PUT method is not allowed", self.workflow)
 
     def test_ci_runs_tests_with_process_timeout_and_verbose_output(self):
         self.assertIn(

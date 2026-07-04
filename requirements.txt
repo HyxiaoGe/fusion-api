@@ -37,5 +37,6 @@ redis[hiredis]>=5.0.0,<6.0.0
 fakeredis[lua]>=2.30.0  # 测试用：原生支持 Lua eval，替代手工 FakeRedis mock
 apscheduler>=3.10.0,<4.0.0
 boto3>=1.34.0
+oss2>=2.18.0
 Pillow>=10.0.0
 pillow-heif>=0.15.0

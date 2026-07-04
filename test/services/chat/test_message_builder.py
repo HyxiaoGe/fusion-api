@@ -189,7 +189,7 @@ class MessageBuilderTests(unittest.IsolatedAsyncioTestCase):
         ]
         storage = SimpleNamespace(download=AsyncMock(return_value=b"private-image"))
 
-        with patch("app.services.chat.message_builder.get_storage", return_value=storage):
+        with patch("app.services.chat.message_builder.get_storage_for_backend", return_value=storage) as get_backend:
             result = await build_llm_messages(
                 messages,
                 has_vision=True,
@@ -199,6 +199,7 @@ class MessageBuilderTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result[-1], {"role": "user", "content": "历史图片"})
+        get_backend.assert_not_called()
         storage.download.assert_not_awaited()
 
     async def test_build_llm_messages_skips_historical_image_not_linked_to_conversation(self):
@@ -221,7 +222,7 @@ class MessageBuilderTests(unittest.IsolatedAsyncioTestCase):
         ]
         storage = SimpleNamespace(download=AsyncMock(return_value=b"private-image"))
 
-        with patch("app.services.chat.message_builder.get_storage", return_value=storage):
+        with patch("app.services.chat.message_builder.get_storage_for_backend", return_value=storage) as get_backend:
             result = await build_llm_messages(
                 messages,
                 has_vision=True,
@@ -233,6 +234,7 @@ class MessageBuilderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[-1], {"role": "user", "content": "历史图片"})
         file_repo.get_file_by_id.assert_called_once_with("img-2", user_id="user-1")
         file_repo.is_file_linked_to_conversation.assert_called_once_with("conv-1", "img-2")
+        get_backend.assert_not_called()
         storage.download.assert_not_awaited()
 
     async def test_build_llm_messages_injects_authorized_historical_image(self):
@@ -255,7 +257,7 @@ class MessageBuilderTests(unittest.IsolatedAsyncioTestCase):
         ]
         storage = SimpleNamespace(download=AsyncMock(return_value=b"image-bytes"))
 
-        with patch("app.services.chat.message_builder.get_storage", return_value=storage):
+        with patch("app.services.chat.message_builder.get_storage_for_backend", return_value=storage) as get_backend:
             result = await build_llm_messages(
                 messages,
                 has_vision=True,
@@ -273,7 +275,44 @@ class MessageBuilderTests(unittest.IsolatedAsyncioTestCase):
         )
         file_repo.get_file_by_id.assert_called_once_with("img-3", user_id="user-1")
         file_repo.is_file_linked_to_conversation.assert_called_once_with("conv-1", "img-3")
+        get_backend.assert_called_once_with(None)
         storage.download.assert_awaited_once_with("conv-1/img-3.png")
+
+    async def test_build_llm_messages_uses_file_storage_backend_for_historical_image(self):
+        file_repo = MagicMock()
+        file_repo.get_file_by_id.return_value = SimpleNamespace(
+            id="img-local",
+            user_id="user-1",
+            mimetype="image/png",
+            storage_backend="local",
+            storage_key="conv-1/img-local.png",
+        )
+        file_repo.is_file_linked_to_conversation.return_value = True
+        messages = [
+            Message(
+                role="user",
+                content=[
+                    TextBlock(type="text", text="看历史图"),
+                    FileBlock(type="file", file_id="img-local", filename="chart.png", mime_type="image/png"),
+                ],
+            )
+        ]
+        local_storage = SimpleNamespace(download=AsyncMock(return_value=b"local-image"))
+
+        with patch(
+            "app.services.chat.message_builder.get_storage_for_backend", return_value=local_storage
+        ) as get_backend:
+            result = await build_llm_messages(
+                messages,
+                has_vision=True,
+                file_repo=file_repo,
+                user_id="user-1",
+                conversation_id="conv-1",
+            )
+
+        get_backend.assert_called_once_with("local")
+        local_storage.download.assert_awaited_once_with("conv-1/img-local.png")
+        self.assertEqual(result[-1]["content"][1]["image_url"]["url"], "data:image/png;base64,bG9jYWwtaW1hZ2U=")
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     FILE_STORAGE_PATH: str = os.getenv("FILE_STORAGE_PATH", "./storage/files")
     MAX_FILE_SIZE: int = 10 * 1024 * 1024  # 10MB
     FILE_UPLOAD_TIMEOUT_SECONDS: int = int(os.getenv("FILE_UPLOAD_TIMEOUT_SECONDS", "60"))
+    DIRECT_UPLOAD_STALE_SECONDS: int = int(os.getenv("DIRECT_UPLOAD_STALE_SECONDS", "1800"))
     ALLOWED_FILE_TYPES: List[str] = [
         "image/jpeg",
         "image/png",
@@ -42,7 +43,7 @@ class Settings(BaseSettings):
         "text/csv",
     ]
 
-    # 存储后端配置（"local" 或 "minio"）
+    # 存储后端配置（"local"、"minio" 或 "oss"）
     STORAGE_BACKEND: str = os.getenv("STORAGE_BACKEND", "local")
     MINIO_ENDPOINT: str = os.getenv("MINIO_ENDPOINT", "")
     MINIO_ACCESS_KEY: str = os.getenv("MINIO_ACCESS_KEY", "")
@@ -50,6 +51,11 @@ class Settings(BaseSettings):
     MINIO_BUCKET: str = os.getenv("MINIO_BUCKET", "fusion-files")
     MINIO_USE_SSL: bool = os.getenv("MINIO_USE_SSL", "false").lower() == "true"
     MINIO_PRESIGN_EXPIRES: int = int(os.getenv("MINIO_PRESIGN_EXPIRES", "3600"))
+    OSS_ENDPOINT: str = os.getenv("OSS_ENDPOINT", "")
+    OSS_ACCESS_KEY_ID: str = os.getenv("OSS_ACCESS_KEY_ID", "")
+    OSS_ACCESS_KEY_SECRET: str = os.getenv("OSS_ACCESS_KEY_SECRET", "")
+    OSS_BUCKET: str = os.getenv("OSS_BUCKET", "")
+    OSS_USE_SSL: bool = os.getenv("OSS_USE_SSL", "true").lower() == "true"
 
     # Github OAuth
     GITHUB_CLIENT_ID: Optional[str] = None

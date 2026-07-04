@@ -197,6 +197,19 @@ jobs:
                 - CORS_ORIGINS=${CORS_ORIGINS}
                 - STORAGE_BACKEND=${STORAGE_BACKEND:-local}
                 - FILE_STORAGE_PATH=/app/storage/files
+                - FILE_UPLOAD_TIMEOUT_SECONDS=${FILE_UPLOAD_TIMEOUT_SECONDS:-60}
+                - DIRECT_UPLOAD_STALE_SECONDS=${DIRECT_UPLOAD_STALE_SECONDS:-1800}
+                - MINIO_ENDPOINT=${MINIO_ENDPOINT:-}
+                - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-}
+                - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-}
+                - MINIO_BUCKET=${MINIO_BUCKET:-fusion-files}
+                - MINIO_USE_SSL=${MINIO_USE_SSL:-false}
+                - MINIO_PRESIGN_EXPIRES=${MINIO_PRESIGN_EXPIRES:-3600}
+                - OSS_ENDPOINT=${OSS_ENDPOINT:-}
+                - OSS_ACCESS_KEY_ID=${OSS_ACCESS_KEY_ID:-}
+                - OSS_ACCESS_KEY_SECRET=${OSS_ACCESS_KEY_SECRET:-}
+                - OSS_BUCKET=${OSS_BUCKET:-}
+                - OSS_USE_SSL=${OSS_USE_SSL:-true}
                 - AUTH_SERVICE_BASE_URL=${AUTH_SERVICE_BASE_URL}
                 - AUTH_SERVICE_JWKS_URL=${AUTH_SERVICE_JWKS_URL}
                 - AUTH_SERVICE_CLIENT_ID=${AUTH_SERVICE_CLIENT_ID}
@@ -246,13 +259,63 @@ jobs:
 
           docker inspect fusion-api --format '{{range .Mounts}}{{println .Destination}}{{end}}' | grep -qx '/app/storage/files'
           docker exec fusion-api python - <<'PY'
+          import asyncio
+          import urllib.request
+
           from app.core.config import settings
 
-          if settings.FILE_STORAGE_PATH != "/app/storage/files":
+          if settings.STORAGE_BACKEND == "local" and settings.FILE_STORAGE_PATH != "/app/storage/files":
               raise SystemExit(f"file storage path mismatch: {settings.FILE_STORAGE_PATH}")
-          if settings.STORAGE_BACKEND != "local":
-              raise SystemExit(f"file storage backend mismatch: {settings.STORAGE_BACKEND}")
-          print("file storage mount ok: /app/storage/files")
+          if settings.STORAGE_BACKEND == "oss":
+              missing = [
+                  name for name, value in {
+                      "OSS_ENDPOINT": settings.OSS_ENDPOINT,
+                      "OSS_ACCESS_KEY_ID": settings.OSS_ACCESS_KEY_ID,
+                      "OSS_ACCESS_KEY_SECRET": settings.OSS_ACCESS_KEY_SECRET,
+                      "OSS_BUCKET": settings.OSS_BUCKET,
+                  }.items()
+                  if not value
+              ]
+              if missing:
+                  raise SystemExit(f"oss storage config missing: {', '.join(missing)}")
+              from app.services.storage.oss_storage import OSSStorageBackend
+
+              storage = OSSStorageBackend(
+                  endpoint=settings.OSS_ENDPOINT,
+                  access_key_id=settings.OSS_ACCESS_KEY_ID,
+                  access_key_secret=settings.OSS_ACCESS_KEY_SECRET,
+                  bucket=settings.OSS_BUCKET,
+                  use_ssl=settings.OSS_USE_SSL,
+              )
+              upload = asyncio.run(
+                  storage.get_upload_url(
+                      "health/cors-preflight.txt",
+                      content_type="text/plain",
+                      expires=60,
+                  )
+              )
+              origin = settings.FRONTEND_URL.rstrip("/")
+              request = urllib.request.Request(
+                  upload["url"],
+                  method="OPTIONS",
+                  headers={
+                      "Origin": origin,
+                      "Access-Control-Request-Method": "PUT",
+                      "Access-Control-Request-Headers": "content-type",
+                  },
+              )
+              with urllib.request.urlopen(request, timeout=10) as response:
+                  headers = response.headers
+              allow_origin = headers.get("Access-Control-Allow-Origin", "")
+              allow_methods = headers.get("Access-Control-Allow-Methods", "")
+              allow_headers = headers.get("Access-Control-Allow-Headers", "")
+              if allow_origin not in {"*", origin}:
+                  raise SystemExit("oss cors origin is not allowed")
+              if "PUT" not in allow_methods.upper():
+                  raise SystemExit("oss cors PUT method is not allowed")
+              if "*" not in allow_headers and "CONTENT-TYPE" not in allow_headers.upper():
+                  raise SystemExit("oss cors Content-Type header is not allowed")
+          print(f"file storage backend ok: {settings.STORAGE_BACKEND}")
           PY
 
           docker exec fusion-api python - <<'PY'

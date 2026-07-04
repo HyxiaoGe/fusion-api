@@ -51,6 +51,22 @@ class StorageBackend(ABC):
         """
         ...
 
+    async def get_upload_url(self, key: str, content_type: str, expires: int = 3600) -> dict:
+        """
+        获取浏览器直传 URL。
+
+        默认后端不支持直传；对象存储后端可覆盖该方法。
+        """
+        raise NotImplementedError("当前存储后端不支持直传上传")
+
+    async def get_size(self, key: str) -> int:
+        """
+        获取文件大小。
+
+        默认实现通过下载后计算长度；对象存储后端应覆盖为 HEAD 元数据查询。
+        """
+        return len(await self.download(key))
+
     @abstractmethod
     async def delete(self, key: str) -> bool:
         """

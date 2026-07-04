@@ -43,6 +43,13 @@ class LocalStorageBackend(StorageBackend):
         async with aiofiles.open(full_path, "rb") as f:
             return await f.read()
 
+    async def get_size(self, key: str) -> int:
+        """获取本地文件大小"""
+        full_path = self._full_path(key)
+        if not os.path.exists(full_path):
+            raise FileNotFoundError(f"文件不存在: {key}")
+        return os.path.getsize(full_path)
+
     async def get_url(self, key: str, expires: int = 3600) -> str:
         """返回本地文件的 API 访问路径（通过后端代理）"""
         # 本地模式通过 API 端点代理访问，不需要 presigned URL

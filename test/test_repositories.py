@@ -5,10 +5,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
-from app.db.models import AgentProgressSnapshot, AgentSession
+from app.db.models import AgentProgressSnapshot, AgentSession, ConversationFile, File
 from app.db.models import Conversation as ConversationModel
 from app.db.models import Message as MessageModel
-from app.db.repositories import ConversationRepository
+from app.db.models import User as UserModel
+from app.db.repositories import ConversationRepository, FileRepository
 
 
 class MessageRepositoryTests(unittest.TestCase):
@@ -41,6 +42,49 @@ class MessageRepositoryTests(unittest.TestCase):
         self.assertEqual(search_block.result_provider, "brave")
         self.assertTrue(search_block.fallback_used)
         self.assertEqual(search_block.provider_chain, ["firecrawl", "brave"])
+
+    def test_delete_file_requires_owner_and_removes_conversation_link(self):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+        db = Session()
+        try:
+            user = UserModel(id="user-1", username="user-1")
+            other_user = UserModel(id="user-2", username="user-2")
+            conversation = ConversationModel(
+                id="conv-1",
+                user_id="user-1",
+                title="会话",
+                model_id="qwen",
+                created_at=datetime(2026, 7, 4, 10, 0, 0),
+                updated_at=datetime(2026, 7, 4, 10, 0, 0),
+            )
+            file = File(
+                id="file-1",
+                user_id="user-1",
+                filename="file-1_photo.png",
+                original_filename="photo.png",
+                mimetype="image/png",
+                size=12,
+                path="conv-1/file-1/processed.jpg",
+                status="processed",
+            )
+            link = ConversationFile(conversation_id="conv-1", file_id="file-1")
+            db.add_all([user, other_user, conversation, file, link])
+            db.commit()
+
+            repo = FileRepository(db)
+
+            self.assertFalse(repo.delete_file("file-1", "user-2"))
+            self.assertIsNotNone(db.query(File).filter(File.id == "file-1").first())
+            self.assertIsNotNone(db.query(ConversationFile).filter(ConversationFile.file_id == "file-1").first())
+
+            self.assertTrue(repo.delete_file("file-1", "user-1"))
+            self.assertIsNone(db.query(File).filter(File.id == "file-1").first())
+            self.assertIsNone(db.query(ConversationFile).filter(ConversationFile.file_id == "file-1").first())
+        finally:
+            db.close()
+            engine.dispose()
 
     def test_get_by_id_attaches_latest_agent_run_summary_to_assistant_message(self):
         engine = create_engine("sqlite:///:memory:")
