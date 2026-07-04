@@ -1,12 +1,14 @@
 import importlib
+import asyncio
 import os
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 os.environ["DATABASE_URL"] = "sqlite:///./fusion-test.db"
 os.environ["SERVER_HOST"] = "http://dev.example:8002"
@@ -253,6 +255,58 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         self.assertEqual(body["message"], "图片文件损坏或无法读取，请重新保存后再上传")
         self.assertIsNone(body["data"])
         service.upload_files.assert_awaited_once()
+
+    def test_timeout_middleware_uses_longer_budget_for_file_upload(self):
+        middleware = self.main.TimeoutMiddleware(lambda scope, receive, send: None, timeout_seconds=10)
+        captured = {}
+
+        async def call_next(_request):
+            return Response("ok")
+
+        async def fake_wait_for(awaitable, timeout):
+            captured["timeout"] = timeout
+            return await awaitable
+
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/files/upload",
+                "headers": [],
+            }
+        )
+
+        with patch.object(self.main.asyncio, "wait_for", side_effect=fake_wait_for):
+            response = asyncio.run(middleware.dispatch(request, call_next))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured["timeout"], self.main.settings.FILE_UPLOAD_TIMEOUT_SECONDS)
+
+    def test_timeout_middleware_keeps_default_budget_for_normal_routes(self):
+        middleware = self.main.TimeoutMiddleware(lambda scope, receive, send: None, timeout_seconds=10)
+        captured = {}
+
+        async def call_next(_request):
+            return Response("ok")
+
+        async def fake_wait_for(awaitable, timeout):
+            captured["timeout"] = timeout
+            return await awaitable
+
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/health",
+                "headers": [],
+            }
+        )
+
+        with patch.object(self.main.asyncio, "wait_for", side_effect=fake_wait_for):
+            response = asyncio.run(middleware.dispatch(request, call_next))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured["timeout"], 10)
 
     def test_file_status_returns_not_found_when_service_has_no_record(self):
         self._enable_authenticated_overrides()

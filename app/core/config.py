@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     # 文件存储配置
     FILE_STORAGE_PATH: str = os.getenv("FILE_STORAGE_PATH", "./storage/files")
     MAX_FILE_SIZE: int = 10 * 1024 * 1024  # 10MB
+    FILE_UPLOAD_TIMEOUT_SECONDS: int = int(os.getenv("FILE_UPLOAD_TIMEOUT_SECONDS", "60"))
     ALLOWED_FILE_TYPES: List[str] = [
         "image/jpeg",
         "image/png",

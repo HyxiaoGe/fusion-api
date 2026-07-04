@@ -21,14 +21,24 @@ from app.services.storage import init_storage
 
 # 超时中间件
 class TimeoutMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, timeout_seconds: int = 10):
+    def __init__(self, app, timeout_seconds: int = 10, route_timeouts: dict[tuple[str, str], int] | None = None):
         super().__init__(app)
         self.timeout_seconds = timeout_seconds
+        self.route_timeouts = {
+            ("POST", "/api/files/upload"): settings.FILE_UPLOAD_TIMEOUT_SECONDS,
+        }
+        if route_timeouts:
+            self.route_timeouts.update(route_timeouts)
+
+    def _resolve_timeout_seconds(self, request: Request) -> int:
+        key = (request.method.upper(), request.scope.get("path", ""))
+        return self.route_timeouts.get(key, self.timeout_seconds)
 
     async def dispatch(self, request: Request, call_next):
         start_time = time.time()
+        timeout_seconds = self._resolve_timeout_seconds(request)
         try:
-            response = await asyncio.wait_for(call_next(request), timeout=self.timeout_seconds)
+            response = await asyncio.wait_for(call_next(request), timeout=timeout_seconds)
             # 添加处理时间头
             process_time = time.time() - start_time
             response.headers["X-Process-Time"] = str(process_time)
@@ -39,7 +49,7 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
                 status_code=408,
                 content={
                     "code": "REQUEST_TIMEOUT",
-                    "message": f"请求超时，处理时间超过{self.timeout_seconds}秒",
+                    "message": f"请求超时，处理时间超过{timeout_seconds}秒",
                     "data": None,
                     "request_id": getattr(request.state, "request_id", generate_request_id()),
                 },
