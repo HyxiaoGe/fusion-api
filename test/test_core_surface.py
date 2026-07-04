@@ -262,7 +262,7 @@ class ChatCoreSurfaceTests(unittest.TestCase):
             create_direct_upload=AsyncMock(
                 return_value={
                     "file_id": "file-1",
-                    "upload_url": "https://oss.example.com/conv-1/file-1/original/photo.png",
+                    "upload_url": "https://oss.example.com/files/v1/users/user-123/conversations/conv-1/files/file-1/original",
                     "method": "PUT",
                     "headers": {"Content-Type": "image/png"},
                     "expires_in": 600,
@@ -287,7 +287,8 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         self.assertEqual(body["code"], "SUCCESS")
         self.assertEqual(body["data"]["upload"]["file_id"], "file-1")
         self.assertEqual(
-            body["data"]["upload"]["upload_url"], "https://oss.example.com/conv-1/file-1/original/photo.png"
+            body["data"]["upload"]["upload_url"],
+            "https://oss.example.com/files/v1/users/user-123/conversations/conv-1/files/file-1/original",
         )
         service.create_direct_upload.assert_awaited_once_with(
             user_id="user-123",
@@ -327,7 +328,7 @@ class ChatCoreSurfaceTests(unittest.TestCase):
             complete_direct_upload=AsyncMock(
                 return_value={
                     "file_id": "file-1",
-                    "thumbnail_url": "https://oss.example.com/conv-1/file-1/thumbnail.jpg",
+                    "thumbnail_url": "https://oss.example.com/files/v1/users/user-123/conversations/conv-1/files/file-1/thumbnail.jpg",
                     "status": "processed",
                 }
             )

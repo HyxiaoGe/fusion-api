@@ -12,7 +12,7 @@ class StorageBackend(ABC):
         上传文件到存储后端。
 
         Args:
-            key: 存储键（如 "conv_id/file_id/processed.jpg"）
+            key: 存储键（如 "files/v1/users/{user_id}/conversations/{conversation_id}/files/{file_id}/processed.jpg"）
             data: 文件二进制内容
             content_type: MIME 类型
 

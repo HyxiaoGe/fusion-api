@@ -1,10 +1,14 @@
 import unittest
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from app.core.config import settings
 from app.services.file_service import FileService
+
+ORIGINAL_KEY = "files/v1/users/user-1/conversations/conv-1/files/file-1/original"
+PROCESSED_KEY = "files/v1/users/user-1/conversations/conv-1/files/file-1/processed.jpg"
+THUMBNAIL_KEY = "files/v1/users/user-1/conversations/conv-1/files/file-1/thumbnail.jpg"
 
 
 class FileServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -410,7 +414,7 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_create_direct_upload_creates_uploading_record_and_signed_put_url(self):
         self.service.storage.get_upload_url = AsyncMock(
             return_value={
-                "url": "https://oss.example.com/conv-1/file-1/original/photo.png?signature=1",
+                "url": f"https://oss.example.com/{ORIGINAL_KEY}?signature=1",
                 "method": "PUT",
                 "headers": {"Content-Type": "image/png"},
                 "expires_in": 600,
@@ -437,10 +441,11 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.service.storage.get_upload_url.assert_awaited_once_with(
-            "conv-1/file-1/original/photo.png",
+            ORIGINAL_KEY,
             content_type="image/png",
             expires=settings.MINIO_PRESIGN_EXPIRES,
         )
+        self.assertNotIn("photo.png", self.service.storage.get_upload_url.await_args.args[0])
         self.service.file_repo.create_file.assert_called_once_with(
             {
                 "id": "file-1",
@@ -449,10 +454,10 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
                 "original_filename": "photo.png",
                 "mimetype": "image/png",
                 "size": 123,
-                "path": "conv-1/file-1/original/photo.png",
+                "path": ORIGINAL_KEY,
                 "status": "uploading",
                 "processing_result": None,
-                "storage_key": "conv-1/file-1/original/photo.png",
+                "storage_key": ORIGINAL_KEY,
                 "thumbnail_key": None,
                 "storage_backend": settings.STORAGE_BACKEND,
                 "width": None,
@@ -464,7 +469,7 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
             result,
             {
                 "file_id": "file-1",
-                "upload_url": "https://oss.example.com/conv-1/file-1/original/photo.png?signature=1",
+                "upload_url": f"https://oss.example.com/{ORIGINAL_KEY}?signature=1",
                 "method": "PUT",
                 "headers": {"Content-Type": "image/png"},
                 "expires_in": 600,
@@ -476,16 +481,16 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
             id="stale-file",
             user_id="user-1",
             storage_backend=settings.STORAGE_BACKEND,
-            storage_key="conv-1/stale-file/original/old.png",
+            storage_key="files/v1/users/user-1/conversations/conv-1/files/stale-file/original",
             thumbnail_key=None,
-            path="conv-1/stale-file/original/old.png",
+            path="files/v1/users/user-1/conversations/conv-1/files/stale-file/original",
         )
         self.service.file_repo.get_stale_uploading_files.return_value = [stale_file]
         self.service.file_repo.count_conversation_files.return_value = 0
         self.service.storage.delete = AsyncMock(return_value=True)
         self.service.storage.get_upload_url = AsyncMock(
             return_value={
-                "url": "https://oss.example.com/conv-1/file-2/original/photo.png?signature=1",
+                "url": "https://oss.example.com/files/v1/users/user-1/conversations/conv-1/files/file-2/original?signature=1",
                 "method": "PUT",
                 "headers": {"Content-Type": "image/png"},
                 "expires_in": 600,
@@ -512,7 +517,9 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.service.file_repo.get_stale_uploading_files.assert_called_once()
-        self.service.storage.delete.assert_awaited_once_with("conv-1/stale-file/original/old.png")
+        self.service.storage.delete.assert_awaited_once_with(
+            "files/v1/users/user-1/conversations/conv-1/files/stale-file/original"
+        )
         self.service.file_repo.delete_file.assert_called_once_with("stale-file", "user-1")
         self.service.file_repo.count_conversation_files.assert_called_once_with("conv-1")
 
@@ -524,8 +531,8 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
             filename="file-1_photo.png",
             mimetype="image/png",
             size=123,
-            path="conv-1/file-1/original/photo.png",
-            storage_key="conv-1/file-1/original/photo.png",
+            path=ORIGINAL_KEY,
+            storage_key=ORIGINAL_KEY,
             storage_backend=settings.STORAGE_BACKEND,
             status="uploading",
         )
@@ -533,7 +540,7 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
         self.service.storage.get_size = AsyncMock(return_value=321)
         self.service.storage.download = AsyncMock(return_value=b"original-image")
         self.service.storage.upload = AsyncMock()
-        self.service.storage.get_url = AsyncMock(return_value="https://oss.example.com/conv-1/file-1/thumbnail.jpg")
+        self.service.storage.get_url = AsyncMock(return_value=f"https://oss.example.com/{THUMBNAIL_KEY}")
         self.service.image_processor.process = AsyncMock(
             return_value={
                 "processed": b"processed-image",
@@ -546,17 +553,17 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
 
         result = await self.service.complete_direct_upload("file-1", "user-1")
 
-        self.service.storage.exists.assert_awaited_once_with("conv-1/file-1/original/photo.png")
-        self.service.storage.get_size.assert_awaited_once_with("conv-1/file-1/original/photo.png")
-        self.service.storage.download.assert_awaited_once_with("conv-1/file-1/original/photo.png")
+        self.service.storage.exists.assert_awaited_once_with(ORIGINAL_KEY)
+        self.service.storage.get_size.assert_awaited_once_with(ORIGINAL_KEY)
+        self.service.storage.download.assert_awaited_once_with(ORIGINAL_KEY)
         self.service.image_processor.process.assert_awaited_once_with(b"original-image", "image/png")
         self.service.file_repo.update_file.assert_called_once_with(
             file_id="file-1",
             updates={
                 "status": "processed",
                 "mimetype": "image/jpeg",
-                "storage_key": "conv-1/file-1/processed.jpg",
-                "thumbnail_key": "conv-1/file-1/thumbnail.jpg",
+                "storage_key": PROCESSED_KEY,
+                "thumbnail_key": THUMBNAIL_KEY,
                 "width": 640,
                 "height": 480,
                 "size": 321,
@@ -574,7 +581,36 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
                 "size": 321,
             },
         )
-        self.assertTrue(result["thumbnail_url"].startswith("https://oss.example.com/conv-1/file-1/thumbnail.jpg"))
+        self.assertTrue(result["thumbnail_url"].startswith(f"https://oss.example.com/{THUMBNAIL_KEY}"))
+
+    def test_conversation_id_from_key_requires_current_storage_schema(self):
+        self.assertEqual(FileService._conversation_id_from_key(ORIGINAL_KEY), "conv-1")
+
+        with self.assertRaises(ValueError):
+            FileService._conversation_id_from_key("conv-1/file-1/original/photo.png")
+
+    async def test_delete_storage_objects_deletes_original_processed_and_thumbnail_objects(self):
+        file_obj = SimpleNamespace(
+            id="file-1",
+            user_id="user-1",
+            storage_backend=settings.STORAGE_BACKEND,
+            path=ORIGINAL_KEY,
+            storage_key=PROCESSED_KEY,
+            thumbnail_key=THUMBNAIL_KEY,
+        )
+        self.service.storage.delete = AsyncMock(return_value=True)
+
+        await self.service._delete_storage_objects(file_obj)
+
+        self.service.storage.delete.assert_has_awaits(
+            [
+                call(PROCESSED_KEY),
+                call(THUMBNAIL_KEY),
+                call(ORIGINAL_KEY),
+            ],
+            any_order=True,
+        )
+        self.assertEqual(self.service.storage.delete.await_count, 3)
 
     async def test_complete_direct_upload_rejects_oversized_object_before_download(self):
         self.service.file_repo.get_file_by_id.return_value = SimpleNamespace(
@@ -584,8 +620,8 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
             filename="file-large_large.png",
             mimetype="image/png",
             size=123,
-            path="conv-1/file-large/original/large.png",
-            storage_key="conv-1/file-large/original/large.png",
+            path="files/v1/users/user-1/conversations/conv-1/files/file-large/original",
+            storage_key="files/v1/users/user-1/conversations/conv-1/files/file-large/original",
             storage_backend=settings.STORAGE_BACKEND,
             status="uploading",
         )
@@ -598,9 +634,13 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 await self.service.complete_direct_upload("file-large", "user-1")
 
-        self.service.storage.get_size.assert_awaited_once_with("conv-1/file-large/original/large.png")
+        self.service.storage.get_size.assert_awaited_once_with(
+            "files/v1/users/user-1/conversations/conv-1/files/file-large/original"
+        )
         self.service.storage.download.assert_not_awaited()
-        self.service.storage.delete.assert_awaited_once_with("conv-1/file-large/original/large.png")
+        self.service.storage.delete.assert_awaited_once_with(
+            "files/v1/users/user-1/conversations/conv-1/files/file-large/original"
+        )
         self.service.file_repo.delete_file.assert_called_once_with("file-large", "user-1")
 
 

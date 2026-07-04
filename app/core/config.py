@@ -24,6 +24,7 @@ class Settings(BaseSettings):
 
     # 文件存储配置
     FILE_STORAGE_PATH: str = os.getenv("FILE_STORAGE_PATH", "./storage/files")
+    FILE_STORAGE_KEY_PREFIX: str = os.getenv("FILE_STORAGE_KEY_PREFIX", "files/v1")
     MAX_FILE_SIZE: int = 10 * 1024 * 1024  # 10MB
     FILE_UPLOAD_TIMEOUT_SECONDS: int = int(os.getenv("FILE_UPLOAD_TIMEOUT_SECONDS", "60"))
     DIRECT_UPLOAD_STALE_SECONDS: int = int(os.getenv("DIRECT_UPLOAD_STALE_SECONDS", "1800"))

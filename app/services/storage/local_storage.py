@@ -53,13 +53,15 @@ class LocalStorageBackend(StorageBackend):
     async def get_url(self, key: str, expires: int = 3600) -> str:
         """返回本地文件的 API 访问路径（通过后端代理）"""
         # 本地模式通过 API 端点代理访问，不需要 presigned URL
-        # 从 key 中提取 file_id（格式：{conv_id}/{file_id}/{variant}.ext）
         parts = key.split("/")
-        if len(parts) >= 2:
-            file_id = parts[1]
-            variant = "thumbnail"
-            if len(parts) >= 3 and "processed" in parts[2]:
-                variant = "processed"
+        for index in range(len(parts) - 3, -1, -1):
+            if parts[index] != "files":
+                continue
+            file_id = parts[index + 1]
+            variant_name = parts[index + 2]
+            if not file_id:
+                continue
+            variant = "processed" if variant_name.startswith("processed") else "thumbnail"
             return f"{self.base_url_prefix}/{file_id}/content?variant={variant}"
         return f"{self.base_url_prefix}/content/{key}"
 

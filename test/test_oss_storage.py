@@ -5,6 +5,8 @@ from unittest.mock import patch
 
 from app.services.storage.oss_storage import OSSStorageBackend
 
+UPLOAD_KEY = "files/v1/users/user-1/conversations/conv-1/files/file-1/original"
+
 
 class OSSStorageBackendTests(unittest.IsolatedAsyncioTestCase):
     async def test_get_upload_url_signs_put_with_content_type_header(self):
@@ -48,11 +50,11 @@ class OSSStorageBackendTests(unittest.IsolatedAsyncioTestCase):
             )
 
             result = await backend.get_upload_url(
-                "conv-1/file-1/original/photo.png",
+                UPLOAD_KEY,
                 content_type="image/png",
                 expires=600,
             )
-            size = await backend.get_size("conv-1/file-1/original/photo.png")
+            size = await backend.get_size(UPLOAD_KEY)
 
         self.assertEqual(calls["auth"], ("access-key-id", "access-key-secret"))
         self.assertEqual(calls["bucket"][1:], ("https://oss-cn-shenzhen.aliyuncs.com", "fusion-file"))
@@ -60,13 +62,13 @@ class OSSStorageBackendTests(unittest.IsolatedAsyncioTestCase):
             calls["sign_url"],
             {
                 "method": "PUT",
-                "key": "conv-1/file-1/original/photo.png",
+                "key": UPLOAD_KEY,
                 "expires": 600,
                 "headers": {"Content-Type": "image/png"},
                 "slash_safe": True,
             },
         )
-        self.assertEqual(calls["head_object"], "conv-1/file-1/original/photo.png")
+        self.assertEqual(calls["head_object"], UPLOAD_KEY)
         self.assertEqual(size, 123)
         self.assertEqual(
             result,

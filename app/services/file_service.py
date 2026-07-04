@@ -134,9 +134,15 @@ class FileService:
                 logger.warning("清理过期直传文件失败: file_id=%s, error=%s", getattr(stale_file, "id", None), e)
 
     @staticmethod
-    def _original_storage_key(conversation_id: str, file_id: str, safe_filename: str) -> str:
+    def _file_storage_root(user_id: str, conversation_id: str, file_id: str) -> str:
+        prefix_parts = [part for part in settings.FILE_STORAGE_KEY_PREFIX.strip("/").split("/") if part]
+        parts = [*prefix_parts, "users", user_id, "conversations", conversation_id, "files", file_id]
+        return "/".join(parts)
+
+    @classmethod
+    def _original_storage_key(cls, user_id: str, conversation_id: str, file_id: str) -> str:
         """直传原文件对象 key。"""
-        return f"{conversation_id}/{file_id}/original/{safe_filename}"
+        return f"{cls._file_storage_root(user_id, conversation_id, file_id)}/original"
 
     async def upload_files(
         self, files: List[UploadFile], user_id: str, conversation_id: str, provider: str, model: str
@@ -178,7 +184,7 @@ class FileService:
 
                 if is_image_mime(mime_type):
                     # 图片走预处理管线
-                    result = await self._process_and_store_image(content, mime_type, conversation_id, file_id)
+                    result = await self._process_and_store_image(content, mime_type, user_id, conversation_id, file_id)
                     storage_key = result["storage_key"]
                     thumbnail_key = result["thumbnail_key"]
                     thumbnail_url = result["thumbnail_url"]
@@ -190,7 +196,7 @@ class FileService:
                 else:
                     # 非图片文件：沿用现有流程写入存储
                     file_path_local = os.path.join(conversation_dir, f"{file_id}_{safe_filename}")
-                    storage_key = f"{conversation_id}/{file_id}/{safe_filename}"
+                    storage_key = self._original_storage_key(user_id, conversation_id, file_id)
 
                     await self.storage.upload(storage_key, content, mime_type)
 
@@ -258,7 +264,7 @@ class FileService:
 
         file_id = str(uuid.uuid4())
         safe_filename = self._safe_filename(filename)
-        original_key = self._original_storage_key(conversation_id, file_id, safe_filename)
+        original_key = self._original_storage_key(user_id, conversation_id, file_id)
         upload = await self.storage.get_upload_url(
             original_key,
             content_type=mimetype,
@@ -302,7 +308,10 @@ class FileService:
             return await self._build_upload_result_from_file(file)
 
         original_key = file.path or file.storage_key
-        if not original_key or not await self._storage_object_exists(original_key):
+        if not original_key:
+            raise ValueError("文件尚未上传完成，请稍后重试")
+        conversation_id = self._conversation_id_from_key(original_key)
+        if not await self._storage_object_exists(original_key):
             raise ValueError("文件尚未上传完成，请稍后重试")
 
         actual_size = await self.storage.get_size(original_key)
@@ -314,9 +323,7 @@ class FileService:
         content = await self.storage.download(original_key)
 
         if is_image_mime(file.mimetype):
-            result = await self._process_and_store_image(
-                content, file.mimetype, self._conversation_id_from_key(original_key), file_id
-            )
+            result = await self._process_and_store_image(content, file.mimetype, user_id, conversation_id, file_id)
             updates = {
                 "status": "processed",
                 "mimetype": result["mime_type"],
@@ -332,7 +339,7 @@ class FileService:
             return await self._build_upload_result_from_file(file, thumbnail_url=result["thumbnail_url"])
 
         file_path = await self._write_direct_upload_temp_file(
-            conversation_id=self._conversation_id_from_key(original_key),
+            conversation_id=conversation_id,
             file_id=file_id,
             safe_filename=self._safe_filename(file.original_filename),
             content=content,
@@ -352,7 +359,23 @@ class FileService:
     @staticmethod
     def _conversation_id_from_key(key: str) -> str:
         """从对象 key 取会话 ID。"""
-        return key.split("/", 1)[0]
+        prefix_parts = [part for part in settings.FILE_STORAGE_KEY_PREFIX.strip("/").split("/") if part]
+        parts = key.split("/")
+        offset = len(prefix_parts)
+        matches_prefix = parts[:offset] == prefix_parts if offset else True
+        has_current_shape = (
+            matches_prefix
+            and len(parts) >= offset + 7
+            and parts[offset] == "users"
+            and bool(parts[offset + 1])
+            and parts[offset + 2] == "conversations"
+            and bool(parts[offset + 3])
+            and parts[offset + 4] == "files"
+            and bool(parts[offset + 5])
+        )
+        if not has_current_shape:
+            raise ValueError("文件对象 key 不符合当前存储结构，请重新上传")
+        return parts[offset + 3]
 
     async def _write_direct_upload_temp_file(
         self,
@@ -388,7 +411,7 @@ class FileService:
         }
 
     async def _process_and_store_image(
-        self, content: bytes, mime_type: str, conversation_id: str, file_id: str
+        self, content: bytes, mime_type: str, user_id: str, conversation_id: str, file_id: str
     ) -> Dict[str, Any]:
         """图片预处理 + 存储处理图和缩略图"""
         # Pillow 预处理
@@ -404,8 +427,9 @@ class FileService:
         ext = ext_map.get(processed["mime_type"], ".jpg")
 
         # 存储键
-        storage_key = f"{conversation_id}/{file_id}/processed{ext}"
-        thumbnail_key = f"{conversation_id}/{file_id}/thumbnail{ext}"
+        storage_root = self._file_storage_root(user_id, conversation_id, file_id)
+        storage_key = f"{storage_root}/processed{ext}"
+        thumbnail_key = f"{storage_root}/thumbnail{ext}"
 
         # 上传到存储后端
         await self.storage.upload(storage_key, processed["processed"], processed["mime_type"])
@@ -656,7 +680,7 @@ class FileService:
         if thumbnail_key:
             await storage.delete(thumbnail_key)
             deleted_keys.add(thumbnail_key)
-        # 兼容旧数据：path 可能是本地绝对路径，也可能是原始对象 key。
+        # path 可能是本地临时文件，也可能是原始对象 key。
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
         elif file_path and file_path not in deleted_keys:
