@@ -159,6 +159,7 @@ jobs:
       - name: Pull and restart fusion-api
         run: |
           cd ~/project/fusion
+          set -o pipefail
           n=0
           until docker pull ${{ env.IMAGE_NAME }}:${{ github.sha }}; do
             n=$((n+1))
@@ -171,7 +172,11 @@ jobs:
           export AUTH_SERVICE_INTERNAL_BASE_URL="http://auth-service:8100"
           mkdir -p ./fusion-api/storage/files
           if docker container inspect fusion-api >/dev/null 2>&1; then
-            docker cp fusion-api:/app/storage/files/. ./fusion-api/storage/files/ 2>/dev/null || true
+            if docker inspect fusion-api --format '{{range .Mounts}}{{println .Destination}}{{end}}' | grep -qx '/app/storage/files'; then
+              echo "file storage already mounted; skip container file migration"
+            elif docker exec fusion-api sh -lc 'test -d /app/storage/files'; then
+              docker exec fusion-api sh -lc 'tar -C /app/storage/files -cf - .' | tar -C ./fusion-api/storage/files -xf -
+            fi
           fi
           cat > docker-compose.fusion-api-ghcr.yml <<'EOF'
           services:

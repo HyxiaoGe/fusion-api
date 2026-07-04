@@ -28,8 +28,9 @@ class DeployAuthConfigTests(unittest.TestCase):
         self.assertIn("FILE_STORAGE_PATH=/app/storage/files", self.workflow)
 
     def test_deploy_preserves_container_files_before_recreate(self):
-        self.assertIn("docker cp fusion-api:/app/storage/files/.", self.workflow)
-        self.assertIn("./fusion-api/storage/files/", self.workflow)
+        self.assertIn("tar -C /app/storage/files -cf - .", self.workflow)
+        self.assertIn("tar -C ./fusion-api/storage/files -xf -", self.workflow)
+        self.assertNotIn("docker cp fusion-api:/app/storage/files/.", self.workflow)
 
     def test_deploy_verifies_persistent_file_storage_after_restart(self):
         self.assertIn("file storage mount ok", self.workflow)
