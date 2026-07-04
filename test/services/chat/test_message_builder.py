@@ -99,6 +99,49 @@ class MessageBuilderTests(unittest.IsolatedAsyncioTestCase):
             conversation_id="conv-1",
         )
 
+    async def test_build_llm_messages_keeps_recent_image_context_for_followup_turn(self):
+        file_repo = object()
+        messages = [
+            Message(
+                role="user",
+                content=[
+                    TextBlock(type="text", text="解释这张图片"),
+                    FileBlock(type="file", file_id="img-1", filename="diagram.png", mime_type="image/png"),
+                ],
+            ),
+            Message(
+                role="assistant",
+                content=[TextBlock(type="text", text="这是一张 CI/CD 监控平台示意图。")],
+            ),
+            Message(
+                role="user",
+                content=[TextBlock(type="text", text="那这个平台适合做哪些真实产品功能？")],
+            ),
+        ]
+
+        image_part = {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+        with patch(
+            "app.services.chat.message_builder.file_block_to_image_part", new=AsyncMock(return_value=image_part)
+        ) as to_image_part:
+            result = await build_llm_messages(
+                messages,
+                has_vision=True,
+                file_repo=file_repo,
+                user_id="user-1",
+                conversation_id="conv-1",
+            )
+
+        self.assertEqual(result[-3]["role"], "user")
+        self.assertEqual(result[-3]["content"], [{"type": "text", "text": "解释这张图片"}, image_part])
+        self.assertEqual(result[-2], {"role": "assistant", "content": "这是一张 CI/CD 监控平台示意图。"})
+        self.assertEqual(result[-1], {"role": "user", "content": "那这个平台适合做哪些真实产品功能？"})
+        to_image_part.assert_awaited_once_with(
+            messages[0].content[1],
+            file_repo,
+            user_id="user-1",
+            conversation_id="conv-1",
+        )
+
     async def test_build_llm_messages_does_not_inject_image_block_without_vision(self):
         messages = [
             Message(
