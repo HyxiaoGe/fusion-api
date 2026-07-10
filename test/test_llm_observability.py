@@ -57,6 +57,28 @@ class LLMObservabilityTests(unittest.TestCase):
             },
         )
 
+    def test_merge_litellm_kwargs_adds_prompt_version_fields_without_high_cardinality_tags(self):
+        merged = merge_litellm_kwargs(
+            "generate_title",
+            {},
+            prompt_metadata={
+                "prompt_slug": "generate-title",
+                "prompt_version": "1.2.3",
+                "prompt_revision": "a" * 64,
+                "ignored": "secret",
+            },
+        )
+
+        self.assertEqual(
+            merged["extra_body"]["metadata"],
+            {
+                "tags": ["app:fusion", "phase:generate_title"],
+                "prompt_slug": "generate-title",
+                "prompt_version": "1.2.3",
+                "prompt_revision": "a" * 64,
+            },
+        )
+
     def test_unknown_phase_is_rejected(self):
         with self.assertRaises(ValueError):
             build_litellm_metadata("conversation-123")

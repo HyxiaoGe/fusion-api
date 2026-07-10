@@ -128,6 +128,15 @@ class Settings(BaseSettings):
     # reader-service 内部默认等待 Jina 10s；调用方保留更长余量，避免冷抓取或文档站读取提前断开。
     READER_SERVICE_TIMEOUT: float = float(os.getenv("READER_SERVICE_TIMEOUT", "20"))
 
+    # PromptHub bundle 后台同步；disabled 不发出请求，聊天热路径始终只读本地 LKG。
+    PROMPTHUB_SYNC_MODE: str = os.getenv("PROMPTHUB_SYNC_MODE", "disabled").lower()
+    PROMPTHUB_BASE_URL: str = os.getenv("PROMPTHUB_BASE_URL", "")
+    PROMPTHUB_API_KEY: str = os.getenv("PROMPTHUB_API_KEY", "")
+    PROMPTHUB_PROJECT_SLUG: str = os.getenv("PROMPTHUB_PROJECT_SLUG", "fusion")
+    PROMPTHUB_REQUEST_TIMEOUT_SECONDS: float = float(os.getenv("PROMPTHUB_REQUEST_TIMEOUT_SECONDS", "3"))
+    PROMPTHUB_SYNC_INTERVAL_SECONDS: int = int(os.getenv("PROMPTHUB_SYNC_INTERVAL_SECONDS", "300"))
+    PROMPTHUB_SYNC_ON_STARTUP: bool = os.getenv("PROMPTHUB_SYNC_ON_STARTUP", "true").lower() == "true"
+
     # 文档站点开关（生产关掉减少攻击面）
     ENABLE_DOCS: bool = True
 

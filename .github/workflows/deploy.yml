@@ -157,9 +157,17 @@ jobs:
             alembic upgrade head
 
       - name: Pull and restart fusion-api
+        env:
+          DEPLOY_PROMPTHUB_API_KEY: ${{ secrets.PROMPTHUB_API_KEY }}
+          DEPLOY_PROMPTHUB_SYNC_MODE: ${{ vars.PROMPTHUB_SYNC_MODE || 'disabled' }}
         run: |
           cd ~/project/fusion
           set -o pipefail
+          set -a
+          source .env
+          set +a
+          export PROMPTHUB_API_KEY="${DEPLOY_PROMPTHUB_API_KEY:-}"
+          export PROMPTHUB_SYNC_MODE="${DEPLOY_PROMPTHUB_SYNC_MODE:-disabled}"
           n=0
           until docker pull ${{ env.IMAGE_NAME }}:${{ github.sha }}; do
             n=$((n+1))
@@ -223,6 +231,13 @@ jobs:
                 - MOONSHOT_API_KEY=${MOONSHOT_API_KEY:-}
                 - LITELLM_PROXY_URL=${LITELLM_PROXY_URL:-http://litellm-proxy:4000}
                 - LITELLM_API_KEY=${LITELLM_API_KEY:-}
+                - PROMPTHUB_SYNC_MODE=${PROMPTHUB_SYNC_MODE:-disabled}
+                - PROMPTHUB_BASE_URL=${PROMPTHUB_BASE_URL:-http://prompthub-backend:8000}
+                - PROMPTHUB_API_KEY=${PROMPTHUB_API_KEY:-}
+                - PROMPTHUB_PROJECT_SLUG=${PROMPTHUB_PROJECT_SLUG:-fusion}
+                - PROMPTHUB_REQUEST_TIMEOUT_SECONDS=${PROMPTHUB_REQUEST_TIMEOUT_SECONDS:-3}
+                - PROMPTHUB_SYNC_INTERVAL_SECONDS=${PROMPTHUB_SYNC_INTERVAL_SECONDS:-300}
+                - PROMPTHUB_SYNC_ON_STARTUP=${PROMPTHUB_SYNC_ON_STARTUP:-true}
                 - ENABLE_DOCS=false
               deploy:
                 resources:
@@ -232,13 +247,18 @@ jobs:
               networks:
                 - postgres_default
                 - middleware_default
+                - fusion-prompthub
 
           networks:
             postgres_default:
               external: true
             middleware_default:
               external: true
+            fusion-prompthub:
+              external: true
           EOF
+          docker network inspect fusion-prompthub >/dev/null 2>&1 \
+            || docker network create fusion-prompthub >/dev/null
           docker compose -f docker-compose.fusion-api-ghcr.yml up -d
 
       - name: Verify health
@@ -258,7 +278,7 @@ jobs:
           fi
 
           docker inspect fusion-api --format '{{range .Mounts}}{{println .Destination}}{{end}}' | grep -qx '/app/storage/files'
-          docker exec fusion-api python - <<'PY'
+          docker exec -i fusion-api python - <<'PY'
           import asyncio
           import urllib.request
 
@@ -318,7 +338,7 @@ jobs:
           print(f"file storage backend ok: {settings.STORAGE_BACKEND}")
           PY
 
-          docker exec fusion-api python - <<'PY'
+          docker exec -i fusion-api python - <<'PY'
           from app.core.config import settings
           import urllib.request
 
@@ -327,6 +347,93 @@ jobs:
               if response.status != 200:
                   raise SystemExit(f"auth JWKS check failed: http={response.status} url={url}")
           print(f"auth JWKS ok: {url}")
+          PY
+
+          docker exec -i fusion-api python - <<'PY'
+          import asyncio
+          import json
+          import re
+          import urllib.error
+          import urllib.request
+
+          from app.core.config import settings
+
+          raw_mode = settings.PROMPTHUB_SYNC_MODE
+          mode = getattr(raw_mode, "value", raw_mode).strip().lower()
+          if mode == "disabled":
+              print("PromptHub bundle smoke skipped: sync mode is disabled")
+              raise SystemExit(0)
+          if mode not in {"shadow", "apply"}:
+              raise SystemExit(f"unsupported PromptHub sync mode: {mode}")
+
+          base_url = settings.PROMPTHUB_BASE_URL.rstrip("/")
+          project_slug = settings.PROMPTHUB_PROJECT_SLUG
+          api_key = settings.PROMPTHUB_API_KEY
+          if not base_url or not project_slug or not api_key:
+              raise SystemExit("PromptHub bundle smoke config is incomplete")
+
+          url = f"{base_url}/api/v1/projects/by-slug/{project_slug}/prompts/published"
+          request = urllib.request.Request(
+              url,
+              headers={"Authorization": f"Bearer {api_key}"},
+          )
+          try:
+              with urllib.request.urlopen(
+                  request,
+                  timeout=settings.PROMPTHUB_REQUEST_TIMEOUT_SECONDS,
+              ) as response:
+                  status = response.status
+                  body = json.load(response)
+          except urllib.error.HTTPError as exc:
+              raise SystemExit(f"PromptHub bundle smoke failed: HTTP {exc.code}") from None
+          except urllib.error.URLError as exc:
+              raise SystemExit(f"PromptHub bundle smoke failed: {exc.reason}") from None
+
+          if status != 200 or body.get("code") != 0:
+              raise SystemExit("PromptHub bundle smoke returned an invalid response")
+          data = body.get("data")
+          if not isinstance(data, dict):
+              raise SystemExit("PromptHub bundle smoke data is missing")
+          prompts = data.get("prompts")
+          revision = data.get("revision")
+          if not isinstance(prompts, list) or len(prompts) != 11:
+              count = len(prompts) if isinstance(prompts, list) else "invalid"
+              raise SystemExit(f"PromptHub bundle smoke prompt count mismatch: {count}")
+          if not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{64}", revision) is None:
+              raise SystemExit("PromptHub bundle smoke revision is invalid")
+
+          from app.db.database import SessionLocal
+          from app.db.models import RuntimeConfigEntry
+          from app.services.prompthub_sync_service import sync_prompthub_bundle
+
+          sync_result = asyncio.run(sync_prompthub_bundle())
+          if sync_result.get("status") != "success" or sync_result.get("revision") != revision:
+              raise SystemExit("PromptHub sync did not persist the fetched revision")
+
+          session = SessionLocal()
+          try:
+              rows = (
+                  session.query(RuntimeConfigEntry)
+                  .filter(
+                      RuntimeConfigEntry.namespace == "prompt_bundle",
+                      RuntimeConfigEntry.key == "fusion",
+                  )
+                  .all()
+              )
+          finally:
+              session.close()
+          matching = [row for row in rows if row.version == revision]
+          active = [row for row in rows if row.is_active]
+          if len(matching) != 1:
+              raise SystemExit("PromptHub synced revision is missing or duplicated")
+          if mode == "shadow" and matching[0].is_active:
+              raise SystemExit("PromptHub shadow revision must remain inactive")
+          if mode == "apply" and (not matching[0].is_active or len(active) != 1):
+              raise SystemExit("PromptHub apply revision was not atomically activated")
+          print(
+              "PromptHub bundle smoke passed: "
+              f"mode={mode} prompts={len(prompts)} revision={revision[:12]}... persisted=true"
+          )
           PY
 
       - name: Run deployment smoke

@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 class _FakeQuery:
@@ -48,6 +49,119 @@ class _FakeSession:
 
 
 class RuntimeConfigGovernanceTests(unittest.TestCase):
+    def test_apply_mode_rejects_new_or_activated_legacy_prompt_template(self):
+        from app.schemas.response import ApiException
+        from app.services.runtime_config_governance import (
+            activate_runtime_config_entry,
+            create_runtime_config_entry,
+        )
+
+        row = SimpleNamespace(
+            id="prompt-row",
+            namespace="prompt_template",
+            key="generate_title",
+            version="legacy-v2",
+            payload={"template": "标题：{content}"},
+            is_active=False,
+        )
+        session = _FakeSession([row])
+
+        with patch("app.services.runtime_config_governance.settings.PROMPTHUB_SYNC_MODE", "apply"):
+            with self.assertRaises(ApiException):
+                create_runtime_config_entry(
+                    namespace="prompt_template",
+                    key="generate_title",
+                    version="legacy-v3",
+                    payload={"template": "标题：{content}"},
+                    session_factory=lambda: session,
+                )
+            with self.assertRaises(ApiException):
+                activate_runtime_config_entry("prompt-row", session_factory=lambda: session)
+
+        self.assertFalse(row.is_active)
+        self.assertFalse(session.committed)
+
+    def test_prompt_bundle_namespace_is_read_only_for_generic_admin_mutations(self):
+        from app.schemas.response import ApiException
+        from app.services.runtime_config_governance import (
+            activate_runtime_config_entry,
+            create_runtime_config_entry,
+            set_runtime_config_entry_active,
+        )
+
+        row = SimpleNamespace(
+            id="bundle-row",
+            namespace="prompt_bundle",
+            key="fusion",
+            version="a" * 64,
+            payload={"schema_version": 1},
+            is_active=True,
+        )
+        session = _FakeSession([row])
+
+        with self.assertRaises(ApiException):
+            create_runtime_config_entry(
+                namespace="prompt_bundle",
+                key="fusion",
+                version="b" * 64,
+                payload={"schema_version": 1},
+                session_factory=lambda: session,
+            )
+        with self.assertRaises(ApiException):
+            activate_runtime_config_entry("bundle-row", session_factory=lambda: session)
+        with self.assertRaises(ApiException):
+            set_runtime_config_entry_active("bundle-row", False, session_factory=lambda: session)
+
+        self.assertTrue(row.is_active)
+        self.assertFalse(session.committed)
+
+    def test_corrupted_prompt_bundle_entry_is_reported_invalid(self):
+        from app.services.runtime_config_governance import _serialize_runtime_config_entry
+
+        row = SimpleNamespace(
+            id="bundle-row",
+            namespace="prompt_bundle",
+            key="fusion",
+            version="a" * 64,
+            payload={"schema_version": 0, "revision": "a" * 64},
+            is_active=True,
+            description="损坏 LKG",
+            created_at=None,
+            updated_at=None,
+        )
+
+        serialized = _serialize_runtime_config_entry(row, None)
+
+        self.assertFalse(serialized["valid"])
+        self.assertIn("Prompt bundle LKG", serialized["issues"][0])
+
+    def test_apply_snapshot_reports_prompthub_as_effective_prompt_source(self):
+        from app.services.runtime_config_governance import build_runtime_config_snapshot
+
+        bundle = {
+            "revision": "c" * 64,
+            "prompts": {
+                "generate_title": {
+                    "version": "1.2.3",
+                    "content": "标题：{content}",
+                }
+            },
+        }
+        with patch(
+            "app.services.runtime_config_governance.get_active_prompt_bundle_payload",
+            return_value=bundle,
+        ):
+            snapshot = build_runtime_config_snapshot(session_factory=lambda: _FakeSession([]))
+
+        entry = next(
+            item
+            for item in snapshot["effective"]
+            if (item["namespace"], item["key"]) == ("prompt_template", "generate_title")
+        )
+        self.assertEqual(entry["source"], "prompthub")
+        self.assertEqual(entry["version"], "1.2.3")
+        self.assertEqual(entry["prompt_revision"], "c" * 64)
+
     def test_build_runtime_config_snapshot_reports_entries_and_effective_versions(self):
         from app.services.runtime_config_governance import build_runtime_config_snapshot
 

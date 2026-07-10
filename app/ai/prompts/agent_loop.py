@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from app.core.prompt_bundle import resolve_prompt_template
 from app.core.runtime_config import get_runtime_config_payload
 
 CHINA_TZ = timezone(timedelta(hours=8))
@@ -125,13 +126,11 @@ URL_READ_TOOL_DESCRIPTION = (
 
 
 def get_runtime_prompt_template(name: str, fallback: str) -> str:
-    payload, _meta = get_runtime_config_payload(
-        "prompt_template",
+    return resolve_prompt_template(
         name,
-        {"template": fallback},
+        fallback,
+        legacy_loader=get_runtime_config_payload,
     )
-    template = payload.get("template")
-    return template if isinstance(template, str) and template else fallback
 
 
 def get_app_identity_prompt() -> str:

@@ -9,6 +9,7 @@ from app.ai.prompts.templates import (
     GENERATE_SUGGESTED_QUESTIONS_PROMPT,
     GENERATE_TITLE_PROMPT,
 )
+from app.core.prompt_bundle import resolve_prompt_template, resolve_prompt_template_with_metadata
 from app.core.runtime_config import get_runtime_config_payload
 
 
@@ -29,19 +30,32 @@ class PromptManager:
         if template_name not in self._templates:
             raise ValueError(f"未找到提示词模板: {template_name}")
         fallback = self._templates[template_name]
-        payload, _meta = get_runtime_config_payload(
-            "prompt_template",
+        return resolve_prompt_template(
             template_name,
-            {"template": fallback},
+            fallback,
+            legacy_loader=get_runtime_config_payload,
         )
-        template = payload.get("template")
-        return template if isinstance(template, str) and template else fallback
 
     def format_prompt(self, template_name: str, **kwargs) -> str:
         """使用提供的参数格式化提示词模板"""
         template = self.get_template(template_name)
         try:
             return template.format(**kwargs)
+        except KeyError as e:
+            raise ValueError(f"格式化提示词模板时缺少参数: {e}")
+
+    def format_prompt_with_metadata(self, template_name: str, **kwargs) -> tuple[str, dict]:
+        """格式化 Prompt，并返回其 slug/version/revision 观测字段。"""
+
+        if template_name not in self._templates:
+            raise ValueError(f"未找到提示词模板: {template_name}")
+        template, metadata = resolve_prompt_template_with_metadata(
+            template_name,
+            self._templates[template_name],
+            legacy_loader=get_runtime_config_payload,
+        )
+        try:
+            return template.format(**kwargs), metadata
         except KeyError as e:
             raise ValueError(f"格式化提示词模板时缺少参数: {e}")
 

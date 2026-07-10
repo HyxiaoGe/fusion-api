@@ -318,7 +318,13 @@ class ChatServiceTests(unittest.TestCase):
         self.assertEqual(mock_litellm.acompletion.await_args.kwargs["max_tokens"], 512)
         self.assertEqual(
             mock_litellm.acompletion.await_args.kwargs["extra_body"],
-            {"metadata": {"tags": ["app:fusion", "phase:suggest_questions"]}},
+            {
+                "metadata": {
+                    "tags": ["app:fusion", "phase:suggest_questions"],
+                    "prompt_slug": "generate-suggested-questions",
+                    "prompt_version": "code-default",
+                }
+            },
         )
 
     def test_generate_title_persists_title_to_database(self):
@@ -364,7 +370,13 @@ class ChatServiceTests(unittest.TestCase):
         self.assertEqual(mock_litellm.acompletion.await_args.kwargs["max_tokens"], 128)
         self.assertEqual(
             mock_litellm.acompletion.await_args.kwargs["extra_body"],
-            {"metadata": {"tags": ["app:fusion", "phase:generate_title"]}},
+            {
+                "metadata": {
+                    "tags": ["app:fusion", "phase:generate_title"],
+                    "prompt_slug": "generate-title",
+                    "prompt_version": "code-default",
+                }
+            },
         )
         service.conversation_service.repo.update_title.assert_called_once_with("conv-1", "Fusion Chat")
         service.db.commit.assert_called_once()

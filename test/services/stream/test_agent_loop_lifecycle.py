@@ -251,6 +251,27 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_start_run_records_active_prompt_bundle_revision(self):
+        configs = []
+
+        async def start_agent_run_fn(**kwargs):
+            configs.append(kwargs["config"])
+
+        with patch(
+            "app.services.stream.agent_loop_lifecycle.get_active_prompt_bundle_revision",
+            return_value="b" * 64,
+        ):
+            await run_agent_loop_lifecycle(
+                request=self._request(),
+                execution=self._execution(),
+                dependencies=self._dependencies(start_agent_run_fn=start_agent_run_fn),
+            )
+
+        self.assertEqual(
+            configs[0]["runtime_config_versions"]["prompt_bundle/fusion"],
+            "b" * 64,
+        )
+
     async def test_start_run_does_not_emit_plan_before_tools_are_called(self):
         emitted = []
 

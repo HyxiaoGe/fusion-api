@@ -14,6 +14,8 @@ from typing import Any
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
+from app.core.prompt_bundle import get_active_prompt_bundle_payload, validate_stored_bundle_payload
 from app.core.runtime_config import (
     SessionFactory,
     clear_runtime_config_cache,
@@ -24,6 +26,7 @@ from app.core.runtime_config_schema import validate_runtime_config_payload
 from app.db.database import SessionLocal
 from app.db.models import RuntimeConfigEntry
 from app.schemas.response import ApiException
+from app.services.prompthub_sync_service import get_prompthub_sync_diagnostics
 from app.services.runtime_config_defaults import (
     DEFAULT_AGENT_STRATEGY_CONFIG,
     DEFAULT_MODEL_PRESENTATION_CONFIG,
@@ -39,10 +42,18 @@ def build_runtime_config_snapshot(
 
     entries = _load_runtime_config_entries(session_factory)
     defaults = get_runtime_config_defaults()
+    prompt_bundle = get_active_prompt_bundle_payload()
     return {
         "generated_at": datetime.now(UTC).isoformat(),
+        "prompt_sync": get_prompthub_sync_diagnostics(),
         "effective": [
-            _build_effective_entry(namespace, key, default_payload, session_factory=session_factory)
+            _build_effective_entry(
+                namespace,
+                key,
+                default_payload,
+                session_factory=session_factory,
+                prompt_bundle=prompt_bundle,
+            )
             for (namespace, key), default_payload in defaults.items()
         ],
         "entries": [_serialize_runtime_config_entry(row, defaults.get((row.namespace, row.key))) for row in entries],
@@ -77,6 +88,8 @@ def create_runtime_config_entry(
     session_factory: SessionFactory = SessionLocal,
 ) -> dict[str, Any]:
     """创建一个已校验但默认不生效的 runtime config 版本。"""
+
+    _reject_runtime_prompt_mutation(namespace)
 
     session: Session | None = None
     try:
@@ -135,6 +148,7 @@ def activate_runtime_config_entry(
         row = session.query(RuntimeConfigEntry).filter(RuntimeConfigEntry.id == entry_id).first()
         if row is None:
             raise ApiException.not_found("运行时配置不存在")
+        _reject_runtime_prompt_mutation(row.namespace)
 
         defaults = get_runtime_config_defaults()
         serialized = _serialize_runtime_config_entry(row, defaults.get((row.namespace, row.key)))
@@ -184,6 +198,7 @@ def set_runtime_config_entry_active(
         row = session.query(RuntimeConfigEntry).filter(RuntimeConfigEntry.id == entry_id).first()
         if row is None:
             raise ApiException.not_found("运行时配置不存在")
+        _reject_runtime_prompt_mutation(row.namespace)
         row.is_active = is_active
         session.commit()
         session.refresh(row)
@@ -193,6 +208,13 @@ def set_runtime_config_entry_active(
     finally:
         if session is not None:
             session.close()
+
+
+def _reject_runtime_prompt_mutation(namespace: str) -> None:
+    if namespace == "prompt_bundle":
+        raise ApiException.conflict("prompt_bundle 是 PromptHub 同步服务的只读保留域")
+    if settings.PROMPTHUB_SYNC_MODE == "apply" and namespace == "prompt_template":
+        raise ApiException.conflict("PromptHub apply 模式下禁止新建或激活旧 prompt_template")
 
 
 def get_runtime_config_defaults() -> dict[tuple[str, str], dict[str, Any]]:
@@ -232,7 +254,23 @@ def _build_effective_entry(
     default_payload: dict[str, Any],
     *,
     session_factory: SessionFactory,
+    prompt_bundle: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if namespace == "prompt_template" and prompt_bundle is not None:
+        prompt = prompt_bundle.get("prompts", {}).get(key)
+        if isinstance(prompt, dict):
+            return {
+                "namespace": namespace,
+                "key": key,
+                "source": "prompthub",
+                "version": prompt["version"],
+                "prompt_revision": prompt_bundle["revision"],
+                "valid": True,
+                "issues": [],
+                "skipped_versions": [],
+                "validation_warnings": {},
+                "payload": {"template": prompt["content"]},
+            }
     payload, meta = get_runtime_config_payload(
         namespace,
         key,
@@ -258,21 +296,28 @@ def _serialize_runtime_config_entry(
     row: RuntimeConfigEntry,
     default_payload: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    if isinstance(row.payload, dict):
+    if row.namespace == "prompt_bundle":
+        valid = validate_stored_bundle_payload(row.payload)
+        issues = [] if valid else ["Prompt bundle LKG 结构、版本或 checksum 无效"]
+    elif isinstance(row.payload, dict):
         candidate_payload = (
             deep_merge_config(default_payload, row.payload) if default_payload is not None else row.payload
         )
         validation = validate_runtime_config_payload(row.namespace, row.key, candidate_payload)
+        valid = validation.valid
+        issues = validation.issues
     else:
         validation = validate_runtime_config_payload(row.namespace, row.key, row.payload)
+        valid = validation.valid
+        issues = validation.issues
     return {
         "id": row.id,
         "namespace": row.namespace,
         "key": row.key,
         "version": row.version,
         "is_active": row.is_active,
-        "valid": validation.valid,
-        "issues": validation.issues,
+        "valid": valid,
+        "issues": issues,
         "description": row.description,
         "created_at": _isoformat(row.created_at),
         "updated_at": _isoformat(row.updated_at),

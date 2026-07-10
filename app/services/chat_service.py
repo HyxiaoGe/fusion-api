@@ -407,7 +407,10 @@ class ChatService:
         fallback_title = seed_text[:30] + "..." if len(seed_text) > 30 else seed_text
 
         try:
-            prompt = prompt_manager.format_prompt("generate_title", content=seed_text)
+            prompt, prompt_metadata = prompt_manager.format_prompt_with_metadata(
+                "generate_title",
+                content=seed_text,
+            )
             litellm_model, _, litellm_kwargs = self._resolve_utility_model(conversation.model_id)
             response = await litellm.acompletion(
                 model=litellm_model,
@@ -415,7 +418,11 @@ class ChatService:
                 stream=False,
                 max_tokens=self.TITLE_MAX_TOKENS,
                 timeout=self.UTILITY_LLM_TIMEOUT,
-                **merge_litellm_kwargs("generate_title", litellm_kwargs),
+                **merge_litellm_kwargs(
+                    "generate_title",
+                    litellm_kwargs,
+                    prompt_metadata=prompt_metadata,
+                ),
             )
             raw = response.choices[0].message.content or ""
 
@@ -461,7 +468,7 @@ class ChatService:
             return ["有什么我可以帮您解答的问题吗？", "您想了解更多哪方面的信息？", "还有其他我能帮助您的事情吗？"]
 
         try:
-            prompt = prompt_manager.format_prompt(
+            prompt, prompt_metadata = prompt_manager.format_prompt_with_metadata(
                 "generate_suggested_questions",
                 content=dialog_content,
             )
@@ -472,7 +479,11 @@ class ChatService:
                 stream=False,
                 max_tokens=self.SUGGESTED_QUESTIONS_MAX_TOKENS,
                 timeout=self.UTILITY_LLM_TIMEOUT,
-                **merge_litellm_kwargs("suggest_questions", litellm_kwargs),
+                **merge_litellm_kwargs(
+                    "suggest_questions",
+                    litellm_kwargs,
+                    prompt_metadata=prompt_metadata,
+                ),
             )
             raw = response.choices[0].message.content or ""
             questions = ChatUtils.parse_questions(raw)[:3]

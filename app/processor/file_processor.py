@@ -54,9 +54,9 @@ class FileProcessor:
                 }
 
             # 构造提示信息
-            prompt = self._build_prompt(query, files_data)
+            prompt, prompt_metadata = self._build_prompt_with_metadata(query, files_data)
             # 调用模型
-            response = await self._call_model(prompt, files_data)
+            response = await self._call_model(prompt, files_data, prompt_metadata=prompt_metadata)
 
             return {"content": response, "model": self.model}
 
@@ -241,6 +241,16 @@ class FileProcessor:
 
     def _build_prompt(self, query: str, files_data: List[Dict[str, Any]]) -> str:
         """构建模型提示"""
+        prompt, _metadata = self._build_prompt_with_metadata(query, files_data)
+        return prompt
+
+    def _build_prompt_with_metadata(
+        self,
+        query: str,
+        files_data: List[Dict[str, Any]],
+    ) -> tuple[str, dict]:
+        """构建模型提示并携带 Prompt 版本观测字段。"""
+
         # 准备文件内容
         file_content_text = ""
         for i, file in enumerate(files_data):
@@ -256,9 +266,19 @@ class FileProcessor:
                 file_content_text += f"文件内容:\n{text}\n\n"
 
         # 使用提示词管理器构建提示
-        return prompt_manager.format_prompt("file_analysis", query=query, file_content=file_content_text)
+        return prompt_manager.format_prompt_with_metadata(
+            "file_analysis",
+            query=query,
+            file_content=file_content_text,
+        )
 
-    async def _call_model(self, prompt: str, files_data: List[Dict[str, Any]]) -> str:
+    async def _call_model(
+        self,
+        prompt: str,
+        files_data: List[Dict[str, Any]],
+        *,
+        prompt_metadata: Dict[str, Any] | None = None,
+    ) -> str:
         """通过 LiteLLM Proxy 使用视觉模型处理文件。"""
         try:
             # 构建消息内容
@@ -295,7 +315,11 @@ class FileProcessor:
                 messages=messages,
                 stream=True,
                 stream_options={"include_usage": True},
-                **merge_litellm_kwargs("file_processing", litellm_kwargs),
+                **merge_litellm_kwargs(
+                    "file_processing",
+                    litellm_kwargs,
+                    prompt_metadata=prompt_metadata,
+                ),
             )
 
             # 收集流式响应
