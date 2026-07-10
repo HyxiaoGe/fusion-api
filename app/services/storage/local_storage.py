@@ -50,19 +50,38 @@ class LocalStorageBackend(StorageBackend):
             raise FileNotFoundError(f"文件不存在: {key}")
         return os.path.getsize(full_path)
 
+    @staticmethod
+    def _variant_from_filename(filename: str) -> str | None:
+        """从受支持的衍生文件名中提取访问变体。"""
+        variant, separator, extension = filename.partition(".")
+        if not separator or not extension or variant not in {"processed", "thumbnail"}:
+            return None
+        return variant
+
+    @staticmethod
+    def _segments_are_safe(parts: list[str]) -> bool:
+        """确保 URL 解析所需的对象 key 段有效。"""
+        return all(part not in {"", ".", ".."} for part in parts)
+
     async def get_url(self, key: str, expires: int = 3600) -> str:
         """返回本地文件的 API 访问路径（通过后端代理）"""
         # 本地模式通过 API 端点代理访问，不需要 presigned URL
         parts = key.split("/")
-        for index in range(len(parts) - 3, -1, -1):
-            if parts[index] != "files":
-                continue
-            file_id = parts[index + 1]
-            variant_name = parts[index + 2]
-            if not file_id:
-                continue
-            variant = "processed" if variant_name.startswith("processed") else "thumbnail"
+        variant = self._variant_from_filename(parts[-1]) if parts else None
+        is_current_key = (
+            len(parts) >= 8
+            and self._segments_are_safe(parts)
+            and parts[-7] == "users"
+            and parts[-5] == "conversations"
+            and parts[-3] == "files"
+            and variant is not None
+        )
+        is_legacy_key = len(parts) == 3 and self._segments_are_safe(parts) and variant is not None
+
+        if is_current_key or is_legacy_key:
+            file_id = parts[-2]
             return f"{self.base_url_prefix}/{file_id}/content?variant={variant}"
+
         return f"{self.base_url_prefix}/content/{key}"
 
     async def delete(self, key: str) -> bool:

@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from datetime import datetime
 from types import SimpleNamespace
@@ -5,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from app.core.config import settings
 from app.services.file_service import FileService
+from app.services.storage.local_storage import LocalStorageBackend
 
 ORIGINAL_KEY = "files/v1/users/user-1/conversations/conv-1/files/file-1/original"
 PROCESSED_KEY = "files/v1/users/user-1/conversations/conv-1/files/file-1/processed.jpg"
@@ -318,6 +320,27 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(result.startswith("/api/files/file-local/content?variant=thumbnail&token="))
 
+    async def test_get_file_url_and_content_support_legacy_key_with_real_local_storage_backend(self):
+        legacy_key = "conv-1/file-local/thumbnail.jpg"
+        self.service.file_repo.get_file_by_id.return_value = SimpleNamespace(
+            id="file-local",
+            storage_backend="local",
+            thumbnail_key=legacy_key,
+            storage_key="conv-1/file-local/processed.jpg",
+            mimetype="image/jpeg",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            local_storage = LocalStorageBackend(temp_dir)
+            await local_storage.upload(legacy_key, b"thumbnail", "image/jpeg")
+
+            with patch("app.services.file_service.get_storage_for_backend", return_value=local_storage):
+                result = await self.service.get_file_url("file-local", "user-1", "thumbnail")
+                content = await self.service.get_file_content("file-local", "user-1", "thumbnail")
+
+        self.assertTrue(result.startswith("/api/files/file-local/content?variant=thumbnail&token="))
+        self.assertEqual(content, (b"thumbnail", "image/jpeg"))
+
     async def test_get_files_by_user_does_not_surface_success_message_as_error(self):
         file_record = SimpleNamespace(
             id="file-3",
@@ -588,6 +611,27 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(ValueError):
             FileService._conversation_id_from_key("conv-1/file-1/original/photo.png")
+
+    async def test_complete_direct_upload_rejects_legacy_key_before_storage_access(self):
+        legacy_key = "conv-1/file-legacy/original.png"
+        self.service.file_repo.get_file_by_id.return_value = SimpleNamespace(
+            id="file-legacy",
+            user_id="user-1",
+            path=legacy_key,
+            storage_key=legacy_key,
+            storage_backend="local",
+            status="uploading",
+        )
+        self.service.storage.exists = AsyncMock(return_value=True)
+        self.service.storage.get_size = AsyncMock(return_value=123)
+        self.service.storage.download = AsyncMock(return_value=b"original-image")
+
+        with self.assertRaisesRegex(ValueError, "文件对象 key 不符合当前存储结构"):
+            await self.service.complete_direct_upload("file-legacy", "user-1")
+
+        self.service.storage.exists.assert_not_awaited()
+        self.service.storage.get_size.assert_not_awaited()
+        self.service.storage.download.assert_not_awaited()
 
     async def test_delete_storage_objects_deletes_original_processed_and_thumbnail_objects(self):
         file_obj = SimpleNamespace(
