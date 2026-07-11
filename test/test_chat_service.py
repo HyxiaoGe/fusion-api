@@ -6,10 +6,411 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.schemas.chat import Conversation, Message, TextBlock
 from app.schemas.response import ApiException
-from app.services.chat_service import ChatService
+from app.services.chat_service import ChatService, _require_stream_initialized
+from app.services.stream_state_service import StreamInitResult
+
+
+def _populated_query(db):
+    query = db.query.return_value
+    query.populate_existing.return_value = query
+    return query
 
 
 class ChatServiceTests(unittest.TestCase):
+    def test_stop_guard_init_failure_returns_explicit_retryable_message(self):
+        with self.assertRaises(ApiException) as raised:
+            _require_stream_initialized(
+                StreamInitResult(
+                    ok=False,
+                    error_code="stream_stop_in_progress",
+                    message="当前生成正在停止，请稍后重试",
+                )
+            )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.code, "STREAM_UNAVAILABLE")
+        self.assertEqual(raised.exception.message, "当前生成正在停止，请稍后重试")
+
+    def test_persist_stream_partial_before_stop_rejects_other_user_or_message(self):
+        service = ChatService(MagicMock())
+        service.conversation_service = MagicMock()
+
+        with self.assertRaises(ApiException) as other_user:
+            service.persist_stream_partial_before_stop(
+                conversation_id="conv-1",
+                user_id="user-1",
+                message_id="msg-1",
+                partial_content=[TextBlock(type="text", id="answer-1", text="半截")],
+                stream_meta={"status": "streaming", "user_id": "user-2", "message_id": "msg-1", "model": "gpt-4"},
+            )
+        self.assertEqual(other_user.exception.status_code, 404)
+
+        service.conversation_service.get_conversation.return_value = SimpleNamespace(id="conv-1")
+        with self.assertRaises(ApiException) as wrong_message:
+            service.persist_stream_partial_before_stop(
+                conversation_id="conv-1",
+                user_id="user-1",
+                message_id="msg-old",
+                partial_content=[TextBlock(type="text", id="answer-1", text="半截")],
+                stream_meta={"status": "streaming", "user_id": "user-1", "message_id": "msg-new", "model": "gpt-4"},
+            )
+        self.assertEqual(wrong_message.exception.status_code, 409)
+
+    def test_persist_stream_partial_before_stop_rejects_unowned_conversation(self):
+        service = ChatService(MagicMock())
+        service.conversation_service = MagicMock()
+        service.conversation_service.get_conversation.return_value = None
+
+        with self.assertRaises(ApiException) as raised:
+            service.persist_stream_partial_before_stop(
+                conversation_id="conv-hidden",
+                user_id="user-1",
+                message_id="msg-1",
+                partial_content=[TextBlock(type="text", id="answer-1", text="半截")],
+                stream_meta={"status": "streaming", "user_id": "user-1", "message_id": "msg-1", "model": "gpt-4"},
+            )
+
+        self.assertEqual(raised.exception.status_code, 404)
+
+    def test_persist_stream_partial_before_stop_updates_existing_assistant(self):
+        db = MagicMock()
+        existing = SimpleNamespace(
+            id="msg-1",
+            conversation_id="conv-1",
+            role="assistant",
+            content=[],
+            model_id="gpt-old",
+        )
+        _populated_query(db).filter.return_value.first.return_value = existing
+        service = ChatService(db)
+        service.conversation_service = MagicMock()
+        service.conversation_service.get_conversation.return_value = SimpleNamespace(id="conv-1")
+        partial = [TextBlock(type="text", id="answer-1", text="半截回答")]
+
+        persisted = service.persist_stream_partial_before_stop(
+            conversation_id="conv-1",
+            user_id="user-1",
+            message_id="msg-1",
+            partial_content=partial,
+            stream_meta={"status": "streaming", "user_id": "user-1", "message_id": "msg-1", "model": "gpt-4"},
+        )
+
+        self.assertTrue(persisted)
+        self.assertEqual(existing.content, [partial[0].model_dump()])
+        self.assertEqual(existing.model_id, "gpt-old")
+        db.add.assert_not_called()
+        db.commit.assert_called_once()
+
+    def test_persist_stream_partial_before_stop_acquires_advisory_lock_before_query(self):
+        db = MagicMock()
+        db.get_bind.return_value = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+        existing = SimpleNamespace(
+            id="msg-1",
+            conversation_id="conv-1",
+            role="assistant",
+            content=[],
+            model_id="gpt-old",
+        )
+        _populated_query(db).filter.return_value.first.return_value = existing
+        service = ChatService(db)
+        service.conversation_service = MagicMock()
+        service.conversation_service.get_conversation.return_value = SimpleNamespace(id="conv-1")
+
+        service.persist_stream_partial_before_stop(
+            conversation_id="conv-1",
+            user_id="user-1",
+            message_id="msg-1",
+            partial_content=[TextBlock(type="text", id="answer-1", text="半截回答")],
+            stream_meta={
+                "status": "streaming",
+                "user_id": "user-1",
+                "message_id": "msg-1",
+                "model": "gpt-4",
+            },
+        )
+
+        method_names = [call[0] for call in db.mock_calls]
+        self.assertLess(method_names.index("execute"), method_names.index("query"))
+        db.query.return_value.populate_existing.assert_called_once_with()
+
+    def test_persist_stream_partial_before_stop_locks_before_conversation_ownership_load(self):
+        calls = []
+        db = MagicMock()
+        existing = SimpleNamespace(
+            id="msg-1",
+            conversation_id="conv-1",
+            role="assistant",
+            content=[],
+            model_id="gpt-4",
+        )
+        _populated_query(db).filter.return_value.first.return_value = existing
+        service = ChatService(db)
+        service.conversation_service = MagicMock()
+
+        def load_conversation(*_args):
+            calls.append("conversation")
+            return SimpleNamespace(id="conv-1")
+
+        service.conversation_service.get_conversation.side_effect = load_conversation
+
+        def acquire_lock(*_args):
+            calls.append("lock")
+
+        with patch("app.services.chat_service.acquire_message_persistence_lock", side_effect=acquire_lock):
+            service.persist_stream_partial_before_stop(
+                conversation_id="conv-1",
+                user_id="user-1",
+                message_id="msg-1",
+                partial_content=[TextBlock(type="text", id="answer-1", text="半截回答")],
+                stream_meta={
+                    "status": "streaming",
+                    "user_id": "user-1",
+                    "message_id": "msg-1",
+                    "model": "gpt-4",
+                },
+            )
+
+        self.assertEqual(calls[:2], ["lock", "conversation"])
+
+    def test_persist_stream_partial_refreshes_stale_identity_before_merge(self):
+        refreshed_full = [{"type": "text", "id": "answer-1", "text": "完整回答"}]
+        existing = SimpleNamespace(
+            id="msg-1",
+            conversation_id="conv-1",
+            role="assistant",
+            content=[{"type": "text", "id": "answer-1", "text": "锁前旧快照"}],
+            model_id="gpt-4",
+        )
+        db = MagicMock()
+        query = db.query.return_value
+
+        def populate_existing():
+            existing.content = refreshed_full.copy()
+            return query
+
+        query.populate_existing.side_effect = populate_existing
+        query.filter.return_value.first.return_value = existing
+        service = ChatService(db)
+        service.conversation_service = MagicMock()
+        service.conversation_service.get_conversation.return_value = SimpleNamespace(id="conv-1")
+
+        service.persist_stream_partial_before_stop(
+            conversation_id="conv-1",
+            user_id="user-1",
+            message_id="msg-1",
+            partial_content=[TextBlock(type="text", id="answer-1", text="完整")],
+            stream_meta={
+                "status": "streaming",
+                "user_id": "user-1",
+                "message_id": "msg-1",
+                "model": "gpt-4",
+            },
+        )
+
+        self.assertEqual(existing.content, refreshed_full)
+
+    def test_persist_stream_partial_before_stop_role_conflict_rolls_back_transaction_lock(self):
+        db = MagicMock()
+        db.get_bind.return_value = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+        _populated_query(db).filter.return_value.first.return_value = SimpleNamespace(
+            id="msg-1",
+            conversation_id="conv-1",
+            role="user",
+            content=[],
+        )
+        service = ChatService(db)
+        service.conversation_service = MagicMock()
+        service.conversation_service.get_conversation.return_value = SimpleNamespace(id="conv-1")
+
+        with self.assertRaises(ApiException) as raised:
+            service.persist_stream_partial_before_stop(
+                conversation_id="conv-1",
+                user_id="user-1",
+                message_id="msg-1",
+                partial_content=[TextBlock(type="text", id="answer-1", text="半截回答")],
+                stream_meta={
+                    "status": "streaming",
+                    "user_id": "user-1",
+                    "message_id": "msg-1",
+                    "model": "gpt-4",
+                },
+            )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        db.execute.assert_called_once()
+        db.rollback.assert_called_once()
+        db.commit.assert_not_called()
+
+    def test_persist_stream_partial_before_stop_keeps_existing_text_when_incoming_is_its_prefix(self):
+        complete_content = [
+            {"type": "text", "id": "answer-1", "text": "后台已经落库的更完整回答，不应被 stop partial 截断"}
+        ]
+        db = MagicMock()
+        existing = SimpleNamespace(
+            id="msg-1",
+            conversation_id="conv-1",
+            role="assistant",
+            content=complete_content.copy(),
+            model_id="gpt-4",
+        )
+        _populated_query(db).filter.return_value.first.return_value = existing
+        service = ChatService(db)
+        service.conversation_service = MagicMock()
+        service.conversation_service.get_conversation.return_value = SimpleNamespace(id="conv-1")
+
+        persisted = service.persist_stream_partial_before_stop(
+            conversation_id="conv-1",
+            user_id="user-1",
+            message_id="msg-1",
+            partial_content=[TextBlock(type="text", id="answer-1", text="后台已经落库")],
+            stream_meta={
+                "status": "streaming",
+                "user_id": "user-1",
+                "message_id": "msg-1",
+                "model": "gpt-4",
+            },
+        )
+
+        self.assertTrue(persisted)
+        self.assertEqual(existing.content, complete_content)
+        db.commit.assert_called_once()
+
+    def test_persist_stream_partial_before_stop_merges_existing_search_and_incoming_text(self):
+        search_block = {
+            "type": "search",
+            "id": "search-1",
+            "query": "Fusion",
+            "sources": [{"title": "来源", "url": "https://example.com"}],
+        }
+        db = MagicMock()
+        existing = SimpleNamespace(
+            id="msg-1",
+            conversation_id="conv-1",
+            role="assistant",
+            content=[search_block],
+            model_id="gpt-4",
+        )
+        _populated_query(db).filter.return_value.first.return_value = existing
+        service = ChatService(db)
+        service.conversation_service = MagicMock()
+        service.conversation_service.get_conversation.return_value = SimpleNamespace(id="conv-1")
+        partial = TextBlock(type="text", id="answer-1", text="搜索后的回答")
+
+        persisted = service.persist_stream_partial_before_stop(
+            conversation_id="conv-1",
+            user_id="user-1",
+            message_id="msg-1",
+            partial_content=[partial],
+            stream_meta={
+                "status": "streaming",
+                "user_id": "user-1",
+                "message_id": "msg-1",
+                "model": "gpt-4",
+            },
+        )
+
+        self.assertTrue(persisted)
+        self.assertEqual(existing.content, [search_block, partial.model_dump()])
+        db.commit.assert_called_once()
+
+    def test_serialized_finalizer_and_stop_writes_preserve_the_winning_complete_content(self):
+        from app.services.stream.persistence import persist_message
+
+        db = MagicMock()
+        existing = SimpleNamespace(
+            id="msg-1",
+            conversation_id="conv-1",
+            role="assistant",
+            content=[],
+            usage=None,
+            model_id="gpt-4",
+        )
+        query = db.query.return_value
+        query.populate_existing.return_value = query
+        query.filter_by.return_value.first.return_value = existing
+        query.filter.return_value.first.return_value = existing
+        service = ChatService(db)
+        service.conversation_service = MagicMock()
+        service.conversation_service.get_conversation.return_value = SimpleNamespace(id="conv-1")
+        stream_meta = {
+            "status": "streaming",
+            "user_id": "user-1",
+            "message_id": "msg-1",
+            "model": "gpt-4",
+        }
+
+        # finalizer 先提交时，后获得锁的 stop 会重新查询并按前缀保留完整内容。
+        full = TextBlock(type="text", id="answer-1", text="完整回答")
+        persist_message(db, "msg-1", "conv-1", "gpt-4", [full], partial=False)
+        service.persist_stream_partial_before_stop(
+            conversation_id="conv-1",
+            user_id="user-1",
+            message_id="msg-1",
+            partial_content=[TextBlock(type="text", id="answer-1", text="完整")],
+            stream_meta=stream_meta,
+        )
+        self.assertEqual(existing.content, [full.model_dump()])
+
+        # stop 先提交时，后获得锁的正常 complete 仍完整覆盖 partial。
+        existing.content = []
+        service.persist_stream_partial_before_stop(
+            conversation_id="conv-1",
+            user_id="user-1",
+            message_id="msg-1",
+            partial_content=[TextBlock(type="text", id="answer-1", text="半截")],
+            stream_meta=stream_meta,
+        )
+        final = TextBlock(type="text", id="answer-1", text="最终完整回答")
+        persist_message(db, "msg-1", "conv-1", "gpt-4", [final], partial=False)
+        self.assertEqual(existing.content, [final.model_dump()])
+
+    def test_persist_stream_partial_before_stop_skips_non_streaming_meta(self):
+        db = MagicMock()
+        service = ChatService(db)
+        service.conversation_service = MagicMock()
+
+        persisted = service.persist_stream_partial_before_stop(
+            conversation_id="conv-1",
+            user_id="user-1",
+            message_id="msg-1",
+            partial_content=[TextBlock(type="text", id="answer-1", text="较短 partial")],
+            stream_meta={
+                "status": "done",
+                "user_id": "user-1",
+                "message_id": "msg-1",
+                "model": "gpt-4",
+            },
+        )
+
+        self.assertFalse(persisted)
+        db.query.assert_not_called()
+        db.commit.assert_not_called()
+
+    def test_persist_stream_partial_before_stop_creates_assistant_with_stream_model(self):
+        db = MagicMock()
+        _populated_query(db).filter.return_value.first.return_value = None
+        service = ChatService(db)
+        service.conversation_service = MagicMock()
+        service.conversation_service.get_conversation.return_value = SimpleNamespace(id="conv-1")
+        partial = [TextBlock(type="text", id="answer-1", text="半截回答")]
+
+        persisted = service.persist_stream_partial_before_stop(
+            conversation_id="conv-1",
+            user_id="user-1",
+            message_id="msg-1",
+            partial_content=partial,
+            stream_meta={"status": "streaming", "user_id": "user-1", "message_id": "msg-1", "model": "gpt-4"},
+        )
+
+        self.assertTrue(persisted)
+        created = db.add.call_args.args[0]
+        self.assertEqual(created.id, "msg-1")
+        self.assertEqual(created.conversation_id, "conv-1")
+        self.assertEqual(created.role, "assistant")
+        self.assertEqual(created.model_id, "gpt-4")
+        self.assertEqual(created.content, [partial[0].model_dump()])
+        db.commit.assert_called_once()
+
     def test_build_recent_dialog_content_prefers_latest_user_assistant_pair(self):
         service = object.__new__(ChatService)
         conversation = Conversation(

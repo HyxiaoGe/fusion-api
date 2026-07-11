@@ -785,7 +785,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.session_statuses[-1]["status"], "interrupted")
         self.assertEqual(self.session_statuses[-1]["total_steps"], 1)
         self.assertEqual(persist_calls[-1]["block_types"], ["text"])
-        self.assertEqual(persist_calls[-1]["partial"], False)
+        self.assertEqual(persist_calls[-1]["partial"], True)
         self.finalize_mock.assert_awaited_with(
             "conv-1",
             success=False,

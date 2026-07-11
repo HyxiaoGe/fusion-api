@@ -36,6 +36,7 @@ def persist_run_message(
     context: AgentLoopRunCompletionContext,
     persist_message_fn: PersistMessageFn,
     only_if_content: bool = False,
+    partial: bool = False,
 ) -> None:
     if only_if_content and not context.state.content_blocks:
         return
@@ -47,6 +48,7 @@ def persist_run_message(
         context.model_id,
         context.state.content_blocks,
         context.state.final_usage(),
+        partial,
     )
 
 
@@ -58,7 +60,7 @@ async def finalize_completed_run(
     complete_agent_run_fn: TerminalRunFn,
     finalize_stream_fn: FinalizeStreamFn,
 ) -> None:
-    persist_run_message(context=context, persist_message_fn=persist_message_fn)
+    persist_run_message(context=context, persist_message_fn=persist_message_fn, partial=False)
     await complete_agent_run_fn(
         emitter=context.emitter,
         session_cache=context.session_cache,
@@ -80,7 +82,7 @@ async def finalize_superseded_run(
     interrupt_agent_run_fn: TerminalRunFn,
     finalize_stream_fn: FinalizeStreamFn,
 ) -> None:
-    persist_run_message(context=context, persist_message_fn=persist_message_fn)
+    persist_run_message(context=context, persist_message_fn=persist_message_fn, partial=True)
     await interrupt_agent_run_fn(
         emitter=context.emitter,
         session_cache=context.session_cache,
@@ -106,7 +108,12 @@ async def finalize_cancelled_run(
     finalize_stream_fn: FinalizeStreamFn,
     warning_fn: WarningFn,
 ) -> None:
-    persist_run_message(context=context, persist_message_fn=persist_message_fn, only_if_content=True)
+    persist_run_message(
+        context=context,
+        persist_message_fn=persist_message_fn,
+        only_if_content=True,
+        partial=True,
+    )
     try:
         await interrupt_agent_run_fn(
             emitter=context.emitter,
@@ -133,7 +140,12 @@ async def finalize_failed_run(
     finalize_stream_fn: FinalizeStreamFn,
     warning_fn: WarningFn,
 ) -> None:
-    persist_run_message(context=context, persist_message_fn=persist_message_fn, only_if_content=True)
+    persist_run_message(
+        context=context,
+        persist_message_fn=persist_message_fn,
+        only_if_content=True,
+        partial=True,
+    )
     try:
         await fail_agent_run_fn(
             emitter=context.emitter,

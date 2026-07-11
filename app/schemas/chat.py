@@ -212,6 +212,12 @@ class ContinueAgentRunRequest(BaseModel):
     stream: bool = True
 
 
+class StopStreamRequest(BaseModel):
+    """停止流前由客户端提交的当前可见助手内容；空数组兼容旧客户端。"""
+
+    partial_content: List[ContentBlock] = Field(default_factory=list)
+
+
 class ChatResponse(BaseModel):
     """非流式响应结构（流式走 SSE，不走这个）"""
 

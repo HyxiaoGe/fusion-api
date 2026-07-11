@@ -112,6 +112,89 @@ class TestStreamStateService(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await check_lock_owner("conv-1", "task-1"))
         self.assertFalse(await check_lock_owner("conv-1", "task-other"))
 
+    async def test_cancel_stream_rejects_replaced_task_with_same_message_id(self):
+        from app.services.stream_state_service import cancel_stream, init_stream
+
+        await init_stream("conv-cancel-race", "user-1", "gpt-4", "msg-shared", "task-old")
+        await init_stream("conv-cancel-race", "user-1", "gpt-4", "msg-shared", "task-new")
+
+        cancelled = await cancel_stream(
+            "conv-cancel-race",
+            "msg-shared",
+            expected_task_id="task-old",
+        )
+
+        self.assertFalse(cancelled)
+        self.assertEqual(await self.fake_redis.get("stream:lock:conv-cancel-race"), "task-new")
+        meta = await self.fake_redis.hgetall("stream:meta:conv-cancel-race")
+        self.assertEqual(meta["status"], "streaming")
+        self.assertEqual(meta["task_id"], "task-new")
+        entries = await self.fake_redis.xrange("stream:chunks:conv-cancel-race")
+        self.assertEqual([entry[1]["type"] for entry in entries], ["start"])
+
+    async def test_stop_claim_blocks_continuation_init_until_guard_is_released(self):
+        from app.core.redis import stream_stop_guard_key
+        from app.services.stream_state_service import (
+            append_chunk,
+            claim_stream_stop,
+            init_stream,
+            release_stream_stop_guard,
+        )
+
+        await init_stream("conv-stop-guard", "user-1", "gpt-4", "msg-shared", "task-old")
+
+        self.assertTrue(await claim_stream_stop("conv-stop-guard", "msg-shared", "task-old"))
+        appended = await append_chunk(
+            "conv-stop-guard",
+            "answering",
+            "guard 期间仍可追加",
+            "answer-1",
+            task_id="task-old",
+        )
+        self.assertIsNotNone(appended)
+        blocked = await init_stream(
+            "conv-stop-guard",
+            "user-1",
+            "gpt-4",
+            "msg-shared",
+            "task-new",
+            stream_mode="continuation",
+        )
+
+        self.assertFalse(blocked.ok)
+        self.assertEqual(blocked.error_code, "stream_stop_in_progress")
+        self.assertEqual(await self.fake_redis.get("stream:lock:conv-stop-guard"), "task-old")
+        meta = await self.fake_redis.hgetall("stream:meta:conv-stop-guard")
+        self.assertEqual(meta["task_id"], "task-old")
+        self.assertEqual(await self.fake_redis.get(stream_stop_guard_key("conv-stop-guard")), "task-old")
+        entries = await self.fake_redis.xrange("stream:chunks:conv-stop-guard")
+        self.assertEqual([entry[1]["type"] for entry in entries], ["start", "answering"])
+
+        self.assertFalse(await release_stream_stop_guard("conv-stop-guard", "task-new"))
+        self.assertEqual(await self.fake_redis.get(stream_stop_guard_key("conv-stop-guard")), "task-old")
+        self.assertTrue(await release_stream_stop_guard("conv-stop-guard", "task-old"))
+        resumed = await init_stream(
+            "conv-stop-guard",
+            "user-1",
+            "gpt-4",
+            "msg-shared",
+            "task-new",
+            stream_mode="continuation",
+        )
+        self.assertTrue(resumed.ok)
+        self.assertEqual(await self.fake_redis.get("stream:lock:conv-stop-guard"), "task-new")
+
+    async def test_stop_claim_rejects_old_task_without_creating_guard(self):
+        from app.core.redis import stream_stop_guard_key
+        from app.services.stream_state_service import claim_stream_stop, init_stream
+
+        await init_stream("conv-old-claim", "user-1", "gpt-4", "msg-shared", "task-new")
+
+        claimed = await claim_stream_stop("conv-old-claim", "msg-shared", "task-old")
+
+        self.assertFalse(claimed)
+        self.assertFalse(await self.fake_redis.exists(stream_stop_guard_key("conv-old-claim")))
+
     async def test_read_stream_chunks_yields_entries(self):
         from app.services.stream_state_service import append_chunk, finalize_stream, init_stream, read_stream_chunks
 
@@ -184,10 +267,11 @@ class TestStreamStateService(unittest.IsolatedAsyncioTestCase):
                     await self.backing.eval(script, numkeys, *args)
                     await self.backing.eval(
                         LUA_INIT_STREAM,
-                        3,
+                        4,
                         "stream:lock:conv-race",
                         "stream:chunks:conv-race",
                         "stream:meta:conv-race",
+                        "stream:stop_guard:conv-race",
                         "task-new",
                         "user-new",
                         "model-new",

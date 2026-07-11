@@ -1,11 +1,12 @@
 -- cancel_stream.lua
--- 原子取消流：检查 meta 状态和 message_id 防止误杀新一轮
+-- 原子取消流：检查 meta 状态、message_id 和 task_id 防止误杀新一轮
 --
 -- KEYS[1]: lock_key
 -- KEYS[2]: stream_key
 -- KEYS[3]: meta_key
 -- ARGV[1]: done_ttl
 -- ARGV[2]: message_id (可选，为空则不校验)
+-- ARGV[3]: task_id (可选，为空则不校验)
 --
 -- 返回: 1 已取消, 0 跳过
 
@@ -14,11 +15,20 @@ local stream_key = KEYS[2]
 local meta_key = KEYS[3]
 local done_ttl = tonumber(ARGV[1])
 local expected_msg_id = ARGV[2]
+local expected_task_id = ARGV[3]
 
 -- 只有 streaming 状态才执行取消
 local status = redis.call("HGET", meta_key, "status")
 if status ~= "streaming" then
     return 0
+end
+
+-- 同一 assistant message_id 可被 continuation 复用，需继续校验 task_id。
+if expected_task_id and expected_task_id ~= "" then
+    local current_task_id = redis.call("HGET", meta_key, "task_id")
+    if current_task_id ~= expected_task_id then
+        return 0
+    end
 end
 
 -- 如果传了 message_id，校验是否匹配（防止取消旧流时误杀新流）

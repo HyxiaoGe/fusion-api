@@ -19,16 +19,20 @@ from app.core.redis import (
     LOCK_TTL,
     LUA_APPEND_STREAM,
     LUA_CANCEL_STREAM,
+    LUA_CLAIM_STREAM_STOP,
     LUA_CLEANUP_STREAM_INIT,
     LUA_FINALIZE_STREAM,
     LUA_INIT_STREAM,
     LUA_INSPECT_STREAM,
+    LUA_RELEASE_STREAM_STOP_GUARD,
     STREAM_CHUNK_TTL,
     STREAM_DONE_TTL,
+    STREAM_STOP_GUARD_TTL,
     get_redis_pool,
     stream_chunks_key,
     stream_lock_key,
     stream_meta_key,
+    stream_stop_guard_key,
 )
 
 # ──────────────────────────────────────────────
@@ -99,12 +103,13 @@ async def init_stream(
             message="Redis 不可用",
         )
     try:
-        await redis.eval(
+        result = await redis.eval(
             LUA_INIT_STREAM,
-            3,
+            4,
             stream_lock_key(conversation_id),
             stream_chunks_key(conversation_id),
             stream_meta_key(conversation_id),
+            stream_stop_guard_key(conversation_id),
             task_id,
             user_id,
             model,
@@ -115,6 +120,14 @@ async def init_stream(
             str(STREAM_CHUNK_TTL),
             stream_mode,
         )
+
+        if not result:
+            logger.info("Stream 初始化被 stop guard 拒绝: conv_id=%s", conversation_id)
+            return StreamInitResult(
+                ok=False,
+                error_code="stream_stop_in_progress",
+                message="当前生成正在停止，请稍后重试",
+            )
 
         logger.debug(f"Stream 初始化: conv_id={conversation_id}, msg_id={message_id}")
         _clear_append_failures(conversation_id, task_id)
@@ -243,13 +256,18 @@ async def finalize_stream(
         return False
 
 
-async def cancel_stream(conversation_id: str, message_id: str = "") -> bool:
+async def cancel_stream(
+    conversation_id: str,
+    message_id: str = "",
+    expected_task_id: str = "",
+) -> bool:
     """
     跨 worker 取消流：删除 lock + 写 error entry + 更新 meta。
 
     使用 Lua 脚本原子执行：
     - 仅当 meta 状态为 streaming 时才取消
-    - 如果传了 message_id，还要校验匹配（防止误杀新一轮的流）
+    - 如果传了 message_id，还要校验匹配
+    - 如果传了 expected_task_id，还要校验当前任务归属，防止误杀复用同一消息的新 continuation
     """
     redis = get_redis_pool()
     if not redis:
@@ -263,14 +281,55 @@ async def cancel_stream(conversation_id: str, message_id: str = "") -> bool:
             stream_meta_key(conversation_id),
             str(STREAM_DONE_TTL),
             message_id or "",
+            expected_task_id or "",
         )
         if result:
             logger.info(f"流已通过 Redis 取消: conv_id={conversation_id}")
         else:
-            logger.debug(f"cancel_stream 跳过（非 streaming 状态）: conv_id={conversation_id}")
+            logger.debug(f"cancel_stream 跳过（CAS 不匹配或流已结束）: conv_id={conversation_id}")
         return bool(result)
     except Exception as e:
         logger.warning(f"取消流失败: {e}")
+        return False
+
+
+async def claim_stream_stop(conversation_id: str, message_id: str, expected_task_id: str) -> bool:
+    """原子占有当前 task 的 stop 权，并阻止新流初始化。"""
+    redis = get_redis_pool()
+    if not redis or not message_id or not expected_task_id:
+        return False
+    try:
+        result = await redis.eval(
+            LUA_CLAIM_STREAM_STOP,
+            3,
+            stream_lock_key(conversation_id),
+            stream_meta_key(conversation_id),
+            stream_stop_guard_key(conversation_id),
+            message_id,
+            expected_task_id,
+            str(STREAM_STOP_GUARD_TTL),
+        )
+        return bool(result)
+    except Exception as error:
+        logger.warning("占有 stop guard 失败: conv_id=%s, error=%s", conversation_id, error)
+        return False
+
+
+async def release_stream_stop_guard(conversation_id: str, expected_task_id: str) -> bool:
+    """按 task_id CAS 释放 stop guard。"""
+    redis = get_redis_pool()
+    if not redis or not expected_task_id:
+        return False
+    try:
+        result = await redis.eval(
+            LUA_RELEASE_STREAM_STOP_GUARD,
+            1,
+            stream_stop_guard_key(conversation_id),
+            expected_task_id,
+        )
+        return bool(result)
+    except Exception as error:
+        logger.warning("释放 stop guard 失败: conv_id=%s, error=%s", conversation_id, error)
         return False
 
 

@@ -16,6 +16,7 @@ from app.core.logger import app_logger as logger
 from app.db.repositories import ConversationRepository, FileRepository
 from app.schemas.chat import (
     ChatResponse,
+    ContentBlock,
     Conversation,
     FileBlock,
     Message,
@@ -39,6 +40,7 @@ from app.services.file_service import FileService, is_image_mime
 from app.services.storage import get_storage_for_backend
 from app.services.stream import StreamHandler, stream_redis_as_sse
 from app.services.stream.agent_loop_request_prep import inject_no_tool_network_boundary, inject_no_vision_file_boundary
+from app.services.stream.persistence import acquire_message_persistence_lock, merge_partial_content_blocks
 from app.services.stream.runner import _agent_loop_limits
 from app.services.stream_state_service import StreamInitResult, finalize_stream, get_stream_meta, init_stream
 from app.services.task_manager import register_task
@@ -53,7 +55,9 @@ def _require_stream_initialized(result: StreamInitResult) -> None:
         result.message,
     )
     raise ApiException.service_unavailable(
-        "生成服务暂时不可用，请稍后重试",
+        result.message
+        if result.error_code == "stream_stop_in_progress" and result.message
+        else "生成服务暂时不可用，请稍后重试",
         code=ErrorCode.STREAM_UNAVAILABLE,
     )
 
@@ -91,6 +95,64 @@ class ChatService:
 
             validated_files.append(file_info)
         return validated_files
+
+    def persist_stream_partial_before_stop(
+        self,
+        *,
+        conversation_id: str,
+        user_id: str,
+        message_id: str,
+        partial_content: List[ContentBlock],
+        stream_meta: Dict[str, str],
+    ) -> bool:
+        """在 stop 冻结流程中持久化客户端已确认展示的 partial blocks。"""
+        if not partial_content:
+            return False
+        if stream_meta.get("status") != "streaming":
+            return False
+        if stream_meta.get("user_id") != str(user_id):
+            raise ApiException.not_found("无进行中的流")
+        if not message_id or stream_meta.get("message_id") != message_id:
+            raise ApiException.conflict("当前生成已被新请求取代")
+
+        from app.db.models import Message as MessageModel
+
+        serialized_content = [block.model_dump() for block in partial_content]
+        try:
+            acquire_message_persistence_lock(self.db, message_id)
+            conversation = self.conversation_service.get_conversation(conversation_id, str(user_id))
+            if not conversation:
+                raise ApiException.not_found("会话不存在或无权访问")
+
+            existing = (
+                self.db.query(MessageModel)
+                .populate_existing()
+                .filter(
+                    MessageModel.id == message_id,
+                    MessageModel.conversation_id == conversation_id,
+                )
+                .first()
+            )
+            if existing and existing.role != "assistant":
+                raise ApiException.conflict("目标消息不是助手消息")
+
+            if existing:
+                existing.content = merge_partial_content_blocks(existing.content or [], serialized_content)
+            else:
+                self.db.add(
+                    MessageModel(
+                        id=message_id,
+                        conversation_id=conversation_id,
+                        role="assistant",
+                        content=serialized_content,
+                        model_id=stream_meta.get("model") or conversation.model_id,
+                    )
+                )
+            self.db.commit()
+            return True
+        except Exception:
+            self.db.rollback()
+            raise
 
     async def _build_file_block_from_record(self, file_info: Any) -> FileBlock:
         """根据已校验文件记录构造消息内容块。"""

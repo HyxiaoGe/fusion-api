@@ -79,6 +79,7 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([call[0] for call in calls], ["persist", "complete", "finalize"])
         self.assertEqual(calls[0][1][:4], ("db", "msg-1", "conv-1", "gpt-4"))
         self.assertEqual(calls[0][1][5], Usage(input_tokens=3, output_tokens=5))
+        self.assertFalse(calls[0][1][6])
         self.assertEqual(calls[1][1]["session_status"], "completed")
         self.assertEqual(calls[1][1]["finish_reason"], "stop")
         self.assertEqual(calls[2], ("finalize", ("conv-1",), {"success": True, "task_id": "task-1"}))
@@ -108,6 +109,7 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual([call[0] for call in calls], ["persist", "interrupt", "finalize"])
+        self.assertTrue(calls[0][1][6])
         self.assertEqual(calls[1][1]["current_step_id"], "step-1")
         self.assertEqual(calls[1][1]["reason"], "superseded")
         self.assertEqual(
@@ -146,6 +148,7 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual([call[0] for call in calls], ["persist", "finalize"])
+        self.assertTrue(calls[0][1][6])
         self.assertIn("emit run_interrupted 失败: emit down", warnings)
         self.assertEqual(
             calls[1],
@@ -180,6 +183,7 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual([call[0] for call in calls], ["persist", "finalize"])
+        self.assertTrue(calls[0][1][6])
         self.assertIn("emit run_failed 失败: emit failed down", warnings)
         self.assertEqual(
             calls[1],

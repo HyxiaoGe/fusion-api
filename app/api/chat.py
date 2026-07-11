@@ -11,6 +11,7 @@ from app.schemas.chat import (
     ChatRequest,
     ContinueAgentRunRequest,
     MessageUpdateRequest,
+    StopStreamRequest,
     SuggestedQuestionsRequest,
     TitleGenerationRequest,
 )
@@ -18,7 +19,7 @@ from app.schemas.response import ApiException, ErrorCode, success
 from app.services.chat_service import ChatService
 from app.services.network_diagnostics_service import NetworkDiagnosticsService
 from app.services.stream import stream_redis_as_sse
-from app.services.stream_state_service import cancel_stream
+from app.services.stream_state_service import cancel_stream, claim_stream_stop, release_stream_stop_guard
 from app.services.task_manager import cancel_task
 
 router = APIRouter()
@@ -323,10 +324,56 @@ async def reconnect_stream(
 async def stop_stream(
     conv_id: str,
     request: Request,
+    stop_request: StopStreamRequest | None = None,
     message_id: str = Query(default="", description="要取消的消息 ID，防止误杀新一轮流"),
+    chat_service: ChatService = Depends(get_chat_service),
     current_user: User = Depends(get_current_user),
 ):
-    """用户手动停止流生成"""
-    local_cancelled = cancel_task(conv_id)
-    redis_cancelled = await cancel_stream(conv_id, message_id)
-    return success(data={"cancelled": local_cancelled or redis_cancelled}, request_id=request.state.request_id)
+    """占有并冻结当前流后，持久化客户端已展示的 partial。"""
+    partial_content = stop_request.partial_content if stop_request else []
+    if stop_request is not None:
+        _, meta = await _read_stream_meta_strict(conv_id)
+        if not meta:
+            raise ApiException.not_found("无进行中的流")
+        if meta.get("user_id") != str(current_user.id):
+            raise ApiException.not_found("无进行中的流")
+        expected_task_id = meta.get("task_id", "")
+        claimed = await claim_stream_stop(conv_id, message_id, expected_task_id)
+        if not claimed:
+            return success(data={"cancelled": False}, request_id=request.state.request_id)
+        try:
+            # 先冻结旧任务，避免其自然 complete 落库后又被 ORM 旧快照 partial 截短。
+            redis_cancelled = await cancel_stream(conv_id, message_id, expected_task_id)
+            if not redis_cancelled:
+                # Redis 命令可能已执行但响应丢失；在 guard 内严格复核同一任务是否已取消。
+                _, post_cancel_meta = await _read_stream_meta_strict(conv_id)
+                redis_cancelled = bool(
+                    post_cancel_meta
+                    and post_cancel_meta.get("status") == "cancelled"
+                    and post_cancel_meta.get("user_id") == str(current_user.id)
+                    and post_cancel_meta.get("message_id") == message_id
+                    and post_cancel_meta.get("task_id") == expected_task_id
+                )
+            if not redis_cancelled:
+                return success(data={"cancelled": False}, request_id=request.state.request_id)
+
+            cancel_task(conv_id, expected_task_id)
+            if partial_content:
+                chat_service.persist_stream_partial_before_stop(
+                    conversation_id=conv_id,
+                    user_id=str(current_user.id),
+                    message_id=message_id,
+                    partial_content=partial_content,
+                    stream_meta=meta,
+                )
+            return success(
+                data={"cancelled": True},
+                request_id=request.state.request_id,
+            )
+        finally:
+            await release_stream_stop_guard(conv_id, expected_task_id)
+    else:
+        # 旧客户端无 partial body 时保持原有取消顺序与兼容行为。
+        local_cancelled = cancel_task(conv_id)
+        redis_cancelled = await cancel_stream(conv_id, message_id)
+        return success(data={"cancelled": local_cancelled or redis_cancelled}, request_id=request.state.request_id)

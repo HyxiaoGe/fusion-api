@@ -44,9 +44,11 @@ def get_task(conversation_id: str) -> Optional[asyncio.Task]:
     return entry[0] if entry else None
 
 
-def cancel_task(conversation_id: str) -> bool:
-    """主动取消任务（用户手动 stop）"""
+def cancel_task(conversation_id: str, expected_task_id: str = "") -> bool:
+    """主动取消任务；传 task_id 时仅取消仍归属该次生成的任务。"""
     entry = _tasks.get(conversation_id)
+    if entry and expected_task_id and entry[1] != expected_task_id:
+        return False
     if entry and not entry[0].done():
         entry[0].cancel()
         return True

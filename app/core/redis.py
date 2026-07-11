@@ -20,6 +20,7 @@ _redis_pool: aioredis.Redis | None = None
 STREAM_CHUNK_TTL = 600  # 流进行中 TTL（10 分钟）
 STREAM_DONE_TTL = 60  # 流结束后 TTL（60 秒，供断线重连最后窗口）
 LOCK_TTL = 600  # 互斥锁 TTL
+STREAM_STOP_GUARD_TTL = 60  # stop 请求异常退出后的兜底释放窗口
 
 
 def stream_chunks_key(conversation_id: str) -> str:
@@ -35,6 +36,11 @@ def stream_meta_key(conversation_id: str) -> str:
 def stream_lock_key(conversation_id: str) -> str:
     """Redis String key：流的互斥锁"""
     return f"stream:lock:{conversation_id}"
+
+
+def stream_stop_guard_key(conversation_id: str) -> str:
+    """Redis String key：stop partial 落库期间阻止新流初始化。"""
+    return f"stream:stop_guard:{conversation_id}"
 
 
 async def init_redis() -> None:
@@ -87,7 +93,9 @@ def _load_lua(name: str) -> str:
 LUA_FINALIZE_STREAM = _load_lua("finalize_stream")
 LUA_RELEASE_LOCK = _load_lua("release_lock")
 LUA_CANCEL_STREAM = _load_lua("cancel_stream")
+LUA_CLAIM_STREAM_STOP = _load_lua("claim_stream_stop")
 LUA_INIT_STREAM = _load_lua("init_stream")
 LUA_CLEANUP_STREAM_INIT = _load_lua("cleanup_stream_init")
 LUA_INSPECT_STREAM = _load_lua("inspect_stream")
 LUA_APPEND_STREAM = _load_lua("append_stream")
+LUA_RELEASE_STREAM_STOP_GUARD = _load_lua("release_stream_stop_guard")
