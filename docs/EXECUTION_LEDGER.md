@@ -29,6 +29,7 @@
 | PromptHub 正式迁移 | 已完成 | PromptHub published bundle / project-bound service token；Fusion 完整 LKG、`disabled -> shadow -> apply`、版本观测、管理保留域和部署持久化 smoke |
 | Redis Stream 故障与并发隔离 | 已完成一轮 | `fusion-api` commit `363233f`；原子初始化/追加/检查/终态、task/message fencing、fail-fast 与 Redis 就绪检查 |
 | 流式续传统一与页面恢复 | 已完成 P2 收尾 | `fusion-api` commits `70f391d`, `6d05512`, `18fb967` / `fusion-ui` commits `d4f66a9`, `765974c`；普通发送、Agent continuation 与页面恢复统一有限重连、安全游标、原子停止、部分输出持久化和取消终态收敛 |
+| 生产性能基线 | 已完成首轮 | `docs/performance/2026-07-11-production-baseline.md`；API 单核约 145 RPS，公网 HTTP/2 P95 2.38 s，真实 SSE 1→3→5 并发 9/9 成功并完成零残留清理 |
 
 ## 不要重复建议
 
@@ -55,6 +56,7 @@
 
 | 日期 | 仓库 | commit | 内容 | 验证 |
 |---|---|---|---|---|
+| 2026-07-11 | `fusion-api` | 本次提交 | 生产性能首轮基线与可复用 HTTP/SSE runner：一次性认证、脱敏结果、阶梯门禁、会话/令牌/agent step 精确清理 | runner `12 passed`、Ruff、format、compileall、生产确认 guard；API/源站/公网分层压测；真实生产 SSE 1→3→5 并发 9/9 成功；关键容器无重启/OOM，数据库恢复测试前计数 |
 | 2026-07-11 | `fusion-api` / `fusion-ui` | `api:70f391d+6d05512+18fb967 / ui:d4f66a9+765974c` | 流式可靠性 P2：显式 `initial/continuation` 模式、严格 Redis 状态判定、共享可恢复流执行器、页面刷新恢复、stop guard/task CAS、部分输出原子持久化与取消终态收敛 | 前端 `985 tests`、`npm run build`、目标文件 ESLint；后端 `857 tests + 69 subtests`、Ruff、架构检查；GitHub Actions 与部署后真实登录态 Chrome 新会话回归纳入发布门禁 |
 | 2026-07-11 | `fusion-api` / `fusion-ui` | `api:363233f / ui:e7d596d` | 流式可靠性 P1：自适应追赶、发送自动重连、Redis fail-fast/就绪检查、孤儿流终态和 task/message fencing；真实回归补齐标题模型输出预算 | 前端 `944 tests`、`npm run build`、目标文件 ESLint；后端 `806 tests + 69 subtests`、Ruff、架构检查；GitHub Actions 与部署后真实登录态 Chrome 新会话回归 |
 | 2026-07-10 | `prompthub` / `fusion-api` | `prompthub:70b371f / api:PromptHub 接入提交` | 11 个业务 Prompt 迁入 PromptHub：published bundle、只读服务令牌、完整本地 LKG、shadow/apply 切换、版本观测与回滚门禁 | PromptHub SDK `70 passed`、backend Ruff/架构/Alembic 单 head；Fusion `741 tests OK`、Ruff/架构；CI/CD、真实 dev shadow/apply 与登录态 Chrome 回归 |
