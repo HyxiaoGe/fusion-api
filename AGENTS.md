@@ -9,7 +9,7 @@
 以下启动命令仅供人工本地开发参考。AI 协作者默认不得启动本地 Fusion 服务；调查、验收优先使用测试、CI、远端 dev 日志/状态和已有运行服务。
 
 ```bash
-pip install -r requirements.txt          # 安装依赖
+pip install -r requirements-dev.txt      # 安装本地开发与测试依赖
 uvicorn main:app --reload                # 开发服务器
 python -m pytest test/                   # 运行测试
 python -m ruff check . && python -m ruff format --check .  # 代码检查
