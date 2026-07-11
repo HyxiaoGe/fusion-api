@@ -8,31 +8,88 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 SafeCode = Annotated[str, Field(pattern=r"^[a-z0-9:_-]{1,80}$")]
+SafeCount = Annotated[int, Field(ge=0, le=1_000_000_000)]
+SafeMilliseconds = Annotated[float, Field(ge=0, le=86_400_000)]
+SafeSeconds = Annotated[float, Field(ge=0, le=2_678_400)]
+SafeThroughput = Annotated[float, Field(ge=0, le=1_000_000_000)]
+SafeRate = Annotated[float, Field(ge=0, le=1)]
 
 
 class PerformanceStageSummary(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["http", "sse"]
+    scenario: SafeCode | None = None
+    kind: Literal["http", "sse", "recovery", "stop", "soak"]
     concurrency: int = Field(ge=1, le=10000)
-    requests: int | None = Field(default=None, ge=0)
-    flows: int | None = Field(default=None, ge=0)
-    successful: int | None = Field(default=None, ge=0)
-    failed: int | None = Field(default=None, ge=0)
-    requests_per_second: float | None = Field(default=None, ge=0)
-    rps: float | None = Field(default=None, ge=0)
-    p50_ms: float | None = Field(default=None, ge=0)
-    p90_ms: float | None = Field(default=None, ge=0)
-    p95_ms: float | None = Field(default=None, ge=0)
-    p99_ms: float | None = Field(default=None, ge=0)
-    max_ms: float | None = Field(default=None, ge=0)
-    p50_ttft_ms: float | None = Field(default=None, ge=0)
-    p95_ttft_ms: float | None = Field(default=None, ge=0)
-    p99_ttft_ms: float | None = Field(default=None, ge=0)
-    p95_total_ms: float | None = Field(default=None, ge=0)
-    error_rate: float | None = Field(default=None, ge=0, le=1)
-    timeout_rate: float | None = Field(default=None, ge=0, le=1)
-    error_frames: int | None = Field(default=None, ge=0)
+    duration_seconds: SafeSeconds | None = None
+    elapsed_seconds: SafeSeconds | None = None
+    cadence_seconds: SafeSeconds | None = None
+    window_seconds: SafeSeconds | None = None
+    total: SafeCount | None = None
+    requests: SafeCount | None = None
+    flows: SafeCount | None = None
+    flows_with_output: SafeCount | None = None
+    successful: SafeCount | None = None
+    failed: SafeCount | None = None
+    success_rate: SafeRate | None = None
+    requests_per_second: SafeThroughput | None = None
+    rps: SafeThroughput | None = None
+    p50_ms: SafeMilliseconds | None = None
+    p90_ms: SafeMilliseconds | None = None
+    p95_ms: SafeMilliseconds | None = None
+    p99_ms: SafeMilliseconds | None = None
+    max_ms: SafeMilliseconds | None = None
+    p50_ttft_ms: SafeMilliseconds | None = None
+    p95_ttft_ms: SafeMilliseconds | None = None
+    p99_ttft_ms: SafeMilliseconds | None = None
+    p95_total_ms: SafeMilliseconds | None = None
+    error_rate: SafeRate | None = None
+    timeout_rate: SafeRate | None = None
+    error_frames: SafeCount | None = None
+    output_chunks: SafeCount | None = None
+    reasoning_chunks: SafeCount | None = None
+    answering_chunks: SafeCount | None = None
+    visible_chars: SafeCount | None = None
+    reasoning_visible_chars: SafeCount | None = None
+    answering_visible_chars: SafeCount | None = None
+    approx_tokens: SafeCount | None = None
+    first_output_p50_ms: SafeMilliseconds | None = None
+    first_output_p95_ms: SafeMilliseconds | None = None
+    first_output_max_ms: SafeMilliseconds | None = None
+    chunk_interval_count: SafeCount | None = None
+    chunk_interval_p50_ms: SafeMilliseconds | None = None
+    chunk_interval_p95_ms: SafeMilliseconds | None = None
+    chunk_interval_max_ms: SafeMilliseconds | None = None
+    output_window_p50_ms: SafeMilliseconds | None = None
+    output_window_p95_ms: SafeMilliseconds | None = None
+    output_window_max_ms: SafeMilliseconds | None = None
+    tokens_per_second: SafeThroughput | None = None
+    tokens_per_second_p50: SafeThroughput | None = None
+    tokens_per_second_p95: SafeThroughput | None = None
+    tokens_per_second_max: SafeThroughput | None = None
+    initial_events: SafeCount | None = None
+    recovered_events: SafeCount | None = None
+    duplicate_events: SafeCount | None = None
+    lost_events: SafeCount | None = None
+    ordering_errors: SafeCount | None = None
+    recovery_latency_ms: SafeMilliseconds | None = None
+    recovery_latency_p50_ms: SafeMilliseconds | None = None
+    recovery_latency_p95_ms: SafeMilliseconds | None = None
+    recovery_latency_max_ms: SafeMilliseconds | None = None
+    stop_attempted: bool | None = None
+    cancelled: bool | None = None
+    persistence_verified: bool | None = None
+    stop_attempts: SafeCount | None = None
+    cancelled_count: SafeCount | None = None
+    persistence_verified_count: SafeCount | None = None
+    stop_latency_ms: SafeMilliseconds | None = None
+    stop_latency_p50_ms: SafeMilliseconds | None = None
+    stop_latency_p95_ms: SafeMilliseconds | None = None
+    stop_latency_max_ms: SafeMilliseconds | None = None
+    executed_ticks: SafeCount | None = None
+    skipped_ticks: SafeCount | None = None
+    window_count: SafeCount | None = None
+    consecutive_failures: SafeCount | None = None
 
 
 class PerformanceCleanupSummary(BaseModel):

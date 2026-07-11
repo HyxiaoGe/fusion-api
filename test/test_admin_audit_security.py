@@ -2,7 +2,10 @@ import json
 import unittest
 from types import SimpleNamespace
 
+from pydantic import ValidationError
+
 from app.db.models import AgentSession, ToolCallLog
+from app.schemas.admin_audit import PerformanceStageSummary
 from app.services.admin_audit_sanitizer import mask_email, sanitize_admin_value
 from app.services.admin_audit_service import AdminAuditService
 
@@ -155,6 +158,88 @@ class AdminAuditSanitizerTests(unittest.TestCase):
         self.assertNotIn("private-path", serialized)
         self.assertNotIn("private-resolved-prompt", serialized)
         self.assertNotIn("private-response", serialized)
+
+
+class PerformanceStageSummaryTests(unittest.TestCase):
+    def test_accepts_safe_l1_to_l4_aggregate_fields(self):
+        stage = PerformanceStageSummary.model_validate(
+            {
+                "scenario": "disconnect_reconnect",
+                "kind": "recovery",
+                "concurrency": 5,
+                "duration_seconds": 1800,
+                "success_rate": 0.98,
+                "total": 50,
+                "successful": 49,
+                "failed": 1,
+                "duplicate_events": 0,
+                "lost_events": 0,
+                "ordering_errors": 0,
+                "executed_ticks": 1800,
+                "skipped_ticks": 2,
+                "flows_with_output": 49,
+                "output_chunks": 900,
+                "reasoning_chunks": 200,
+                "answering_chunks": 700,
+                "visible_chars": 12000,
+                "approx_tokens": 6000,
+                "first_output_p50_ms": 300,
+                "first_output_p95_ms": 900,
+                "chunk_interval_p50_ms": 40,
+                "chunk_interval_p95_ms": 120,
+                "chunk_interval_max_ms": 400,
+                "tokens_per_second": 18.5,
+                "tokens_per_second_p50": 17.5,
+                "tokens_per_second_p95": 23.5,
+                "recovery_latency_ms": 220,
+                "recovery_latency_p95_ms": 500,
+                "stop_latency_ms": 80,
+                "stop_latency_p95_ms": 160,
+            }
+        )
+
+        self.assertEqual(stage.scenario, "disconnect_reconnect")
+        self.assertEqual(stage.kind, "recovery")
+        self.assertEqual(stage.success_rate, 0.98)
+        self.assertEqual(stage.chunk_interval_p95_ms, 120)
+        self.assertEqual(stage.lost_events, 0)
+
+    def test_accepts_all_safe_stage_kinds_and_preserves_old_http_payload(self):
+        for kind in ("http", "sse", "recovery", "stop", "soak"):
+            with self.subTest(kind=kind):
+                self.assertEqual(PerformanceStageSummary(kind=kind, concurrency=1).kind, kind)
+
+        legacy = PerformanceStageSummary.model_validate(
+            {
+                "kind": "http",
+                "concurrency": 10,
+                "requests": 100,
+                "successful": 100,
+                "failed": 0,
+                "requests_per_second": 120.5,
+                "p50_ms": 20,
+                "p95_ms": 60,
+                "error_rate": 0,
+            }
+        )
+        self.assertEqual(legacy.requests, 100)
+        self.assertIsNone(legacy.scenario)
+
+    def test_rejects_identifiers_content_extra_fields_and_invalid_ranges(self):
+        invalid_payloads = [
+            {"kind": "recovery", "concurrency": 1, "scenario": "user@example.com"},
+            {"kind": "unknown", "concurrency": 1},
+            {"kind": "soak", "concurrency": 1, "success_rate": 1.01},
+            {"kind": "sse", "concurrency": 1, "duplicate_events": -1},
+            {"kind": "stop", "concurrency": 1, "stop_latency_ms": -0.1},
+            {"kind": "http", "concurrency": 1, "conversation_id": "private-id"},
+            {"kind": "sse", "concurrency": 1, "message": "private body"},
+            {"kind": "sse", "concurrency": 1, "content": "private body"},
+        ]
+
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload), self.assertRaises(ValidationError):
+                PerformanceStageSummary.model_validate(payload)
 
 
 if __name__ == "__main__":

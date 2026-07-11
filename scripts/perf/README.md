@@ -12,25 +12,11 @@
 - auth-service 暂无删除账号的公开接口，一次性账号会保留。可用结果中的 `run_id` 精确重建账号邮箱：`fusion-perf+<run_id>@seanfield.org`，由运维在压测后删除；日志和结果不会输出完整邮箱。
 - runner 会从 `agent_event.run_started` 提取非凭据的 `agent_run_ids` / `agent_trace_ids`。error frame 只计数，不保存或输出 frame 内容。
 
-## 压测后 SQL 清理顺序
+## 压测后数据清理
 
-runner 会先通过 Fusion API 按清单逐个删除 conversation；外键级联会清理 `agent_sessions` 和 `agent_progress_snapshots`。`agent_steps.trace_id` 当前没有指向 `agent_sessions` 的外键，因此需要在 API 清理成功后，用脱敏结果中的 `agent_trace_ids` 做第二步精确清理：
+runner 会先通过 Fusion API 按清单删除 conversation；当前迁移已为新的 `agent_steps.trace_id` 写入增加 `NOT VALID` 级联外键，因此删除会话会级联清理本轮新建的 `agent_sessions`、`agent_steps` 与 progress snapshot，不再需要手工按 trace ID 删除。
 
-```sql
-BEGIN;
-
-SELECT trace_id, count(*)
-FROM agent_steps
-WHERE trace_id = ANY(:agent_trace_ids)
-GROUP BY trace_id;
-
-DELETE FROM agent_steps
-WHERE trace_id = ANY(:agent_trace_ids);
-
-COMMIT;
-```
-
-必须使用数据库驱动的数组参数绑定，不要把 ID 拼接进 SQL。删除后再次执行相同 `SELECT`，结果应为空。最后再到 auth-service 数据库按 `fusion-perf+<run_id>@seanfield.org` 精确删除一次性账号；不要使用宽泛的 `LIKE 'fusion-perf%'` 批量删除。
+auth-service 暂无公开删号接口。runner 吊销全部 refresh token 后，仍必须由运维按 `run_id` 重建唯一邮箱 `fusion-perf+<run_id>@seanfield.org`，在 Fusion/auth 两库中先查询确认，再用邮箱与用户 ID 双条件精确删除一次性用户、refresh token 和 login log。禁止使用宽泛的 `LIKE 'fusion-perf%'` 批量删除。最后复查本轮用户、token、登录记录、conversation、Agent run/step 均为 0，并对比测试前后的全局计数。
 
 ## 使用
 
@@ -50,3 +36,25 @@ python -m scripts.perf.runner --mode http --confirm-production
 ```
 
 退出码 `2` 表示触发硬停止门禁、清理不完整或参数错误。不要把 stdout/stderr 重定向到包含环境变量或 shell trace 的日志中。
+
+## L1-L4 完整生产流程
+
+`full_runner.py` 覆盖登录/模型/会话读链路、短/长 SSE、断线恢复、停止生成和 30 分钟稳态。生产运行强制使用审查后的并发上限、1800 秒 soak 和 Prometheus 资源硬门禁。Prometheus 仅绑定在生产主机 loopback 时，可先建立本地端口转发：
+
+```bash
+ssh -N -L 19999:127.0.0.1:9999 dev
+```
+
+然后执行：
+
+```bash
+.venv311/bin/python -m scripts.perf.full_runner \
+  --model-id deepseek-chat \
+  --prometheus-url http://127.0.0.1:19999 \
+  --confirm-production \
+  --output docs/performance/YYYY-MM-DD-full-production-run-import.json
+```
+
+完整 runner 在每个阶梯后检查容器重启/OOM、Redis rejected/evicted、API 内存、PostgreSQL 连接和主机可用内存；监控不可用时 fail closed。L4 每个 tick 同样执行硬门禁。结果会先经过管理员压测导入 schema 校验，只保留聚合指标；账号、token、conversation/message ID、游标和模型正文不会写入文件。
+
+最终窗口资源报告可通过 `scripts.perf.prometheus_report` 从 Prometheus `query_range` 生成；查询窗口最多 2 小时、最多 1000 个点、单响应最多 2 MiB。
