@@ -37,12 +37,39 @@ class CIContainerContractTest(unittest.TestCase):
     def test_windows_workflow_tests_ephemeral_production_container(self) -> None:
         workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
         build_job = workflow[workflow.index("  build:") : workflow.index("  deploy-dev:")]
+        script = (ROOT / "scripts/ci/run_windows_container_ci.ps1").read_text(encoding="utf-8")
 
-        self.assertIn("docker build --target production", build_job)
-        self.assertIn("pip install --default-timeout=30 --no-cache-dir -r requirements-ci.txt", build_job)
-        self.assertIn("python scripts/check_architecture.py", build_job)
-        self.assertIn("ruff check .", build_job)
-        self.assertIn("python -u -m unittest discover -s test -t . -v", build_job)
+        self.assertIn("run_windows_container_ci.ps1", build_job)
+        self.assertIn('"build", "--target", "production"', script)
+        self.assertIn("pip install --default-timeout=30 --no-cache-dir -r requirements-ci.txt", script)
+        self.assertIn("python scripts/check_architecture.py", script)
+        self.assertIn("ruff check .", script)
+        self.assertIn("python -u -m unittest discover -s test -t . -v", script)
+
+    def test_windows_ci_script_records_stages_and_cleans_container(self) -> None:
+        script = (ROOT / "scripts/ci/run_windows_container_ci.ps1").read_text(encoding="utf-8")
+
+        for stage in ("docker-build", "ci-dependencies", "architecture", "ruff", "unit-tests"):
+            self.assertIn(stage, script)
+        self.assertIn("ConvertTo-Json", script)
+        self.assertIn("-Encoding utf8", script)
+        self.assertIn("finally", script)
+        self.assertIn('$ErrorActionPreference = "Continue"', script)
+        self.assertIn("docker container inspect", script)
+        self.assertIn("docker rm -f", script)
+        self.assertIn("exit $failureExitCode", script)
+
+    def test_windows_workflow_publishes_summary_and_failure_logs(self) -> None:
+        workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
+        build_job = workflow[workflow.index("  build:") : workflow.index("  deploy-dev:")]
+
+        self.assertIn("scripts\\ci\\run_windows_container_ci.ps1", build_job)
+        self.assertIn("image-push", build_job)
+        self.assertIn("GITHUB_STEP_SUMMARY", build_job)
+        self.assertIn("if: always()", build_job)
+        self.assertIn("actions/upload-artifact@v4", build_job)
+        self.assertIn("retention-days: 7", build_job)
+        self.assertIn("_ci-logs", build_job)
 
 
 if __name__ == "__main__":
