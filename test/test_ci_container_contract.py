@@ -68,6 +68,7 @@ class CIContainerContractTest(unittest.TestCase):
         self.assertIn("GITHUB_STEP_SUMMARY", build_job)
         self.assertIn("[System.Collections.ArrayList]::new()", build_job)
         self.assertIn("foreach ($stage in $parsedStages)", build_job)
+        self.assertIn("('Runner: `{0}`' -f '${{ runner.name }}')", build_job)
         self.assertIn("if: always()", build_job)
         self.assertIn("actions/upload-artifact@v4", build_job)
         self.assertIn("retention-days: 7", build_job)
