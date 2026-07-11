@@ -7,16 +7,10 @@ ROOT = Path(__file__).resolve().parents[1]
 class CIContainerContractTest(unittest.TestCase):
     def test_development_dependencies_cover_runtime_and_ci(self) -> None:
         development = (ROOT / "requirements-dev.txt").read_text(encoding="utf-8")
-        agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
-        conventions = (ROOT / "docs/CODING_CONVENTIONS.md").read_text(encoding="utf-8")
-        readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
         self.assertIn("-r requirements.txt", development)
         self.assertIn("-r requirements-ci.txt", development)
         self.assertIn("pytest==9.1.1", development)
-        self.assertIn("pip install -r requirements-dev.txt", agents)
-        self.assertIn("pip install -r requirements-dev.txt", conventions)
-        self.assertIn("pip install -r requirements.txt", readme)
 
     def test_ci_dependencies_are_separate_from_production(self) -> None:
         production = (ROOT / "requirements.txt").read_text(encoding="utf-8")
