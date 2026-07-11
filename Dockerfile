@@ -1,25 +1,37 @@
-FROM python:3.12-slim
+# syntax=docker/dockerfile:1.7
+
+FROM python:3.12-slim AS dependencies
 
 WORKDIR /app
 
-# 安装必要的系统依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    libpq-dev \
     gcc \
     git \
-    && apt-get clean \
+    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# 安装依赖
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt ./
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
 
-# 添加应用代码
+FROM dependencies AS ci-dependencies
+
+COPY requirements-ci.txt ./
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements-ci.txt
+
+FROM ci-dependencies AS ci
+
 COPY . .
 
-# 暴露端口
+FROM python:3.12-slim AS production
+
+WORKDIR /app
+
+COPY --from=dependencies /usr/local /usr/local
+COPY . .
+
 EXPOSE 8000
 
-# 启动命令（使用4个工作进程，移除热重载以提高生产环境性能）
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]

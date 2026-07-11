@@ -76,22 +76,63 @@ jobs:
           docker version
           docker ps
 
-      - name: Build Docker image
+      - name: Test and build Docker image
+        timeout-minutes: 10
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
-          docker build -t "%IMAGE_NAME%:%GITHUB_SHA%" .
+          $ErrorActionPreference = "Stop"
+          $runnerKey = '${{ runner.name }}' -replace '[^A-Za-z0-9_.-]', '-'
+          if (-not $runnerKey) { $runnerKey = "runner" }
+          $builder = "fusion-api-ci-$runnerKey"
+          $image = "${env:IMAGE_NAME}:${env:GITHUB_SHA}"
+          $ciImage = "fusion-api-ci:${env:GITHUB_SHA}"
 
-      - name: Architecture check in image
-        run: |
-          docker run --rm "%IMAGE_NAME%:%GITHUB_SHA%" python scripts/check_architecture.py
+          cmd /c "docker buildx inspect $builder >NUL 2>NUL"
+          if ($LASTEXITCODE -ne 0) {
+            docker buildx create --name $builder --driver docker-container --use
+            if ($LASTEXITCODE -ne 0) {
+              cmd /c "docker buildx inspect $builder >NUL 2>NUL"
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+          }
+          docker buildx use $builder
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          docker buildx inspect --builder $builder --bootstrap
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Lint in image
-        run: |
-          docker run --rm "%IMAGE_NAME%:%GITHUB_SHA%" sh -lc "timeout 180s python -m pip install --default-timeout=30 --no-cache-dir ruff && ruff check ."
+          $ciArgs = @(
+            "buildx", "build",
+            "--builder", $builder,
+            "--target", "ci",
+            "--no-cache-filter", "ci",
+            "--load",
+            "--progress", "plain",
+            "--provenance=false",
+            "-t", $ciImage,
+            "."
+          )
+          docker @ciArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Run tests
-        timeout-minutes: 5
-        run: |
-          docker run --rm "%IMAGE_NAME%:%GITHUB_SHA%" sh -lc "timeout 270s python -u -m unittest discover -s test -t . -v"
+          docker run --rm $ciImage python scripts/check_architecture.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          docker run --rm $ciImage ruff check .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          docker run --rm $ciImage sh -lc "timeout 270s python -u -m unittest discover -s test -t . -v"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $productionArgs = @(
+            "buildx", "build",
+            "--builder", $builder,
+            "--target", "production",
+            "--load",
+            "--progress", "plain",
+            "--provenance=false",
+            "-t", $image,
+            "."
+          )
+          docker @productionArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Login to ACR
         uses: docker/login-action@v3
@@ -107,6 +148,7 @@ jobs:
         if: always()
         run: |
           docker image rm "%IMAGE_NAME%:%GITHUB_SHA%" 2>NUL
+          docker image rm "fusion-api-ci:%GITHUB_SHA%" 2>NUL
           docker builder prune --filter "until=72h" -f
 
   deploy-dev:

@@ -6,6 +6,7 @@ class DeployAuthConfigTests(unittest.TestCase):
     def setUp(self):
         root = Path(__file__).resolve().parents[1]
         self.workflow = (root / ".github" / "workflows" / "deploy.yml").read_text()
+        self.ci_requirements = (root / "requirements-ci.txt").read_text()
 
     def test_deploy_dev_overrides_auth_internal_base_to_docker_dns(self):
         self.assertIn(
@@ -46,11 +47,10 @@ class DeployAuthConfigTests(unittest.TestCase):
             self.workflow,
         )
 
-    def test_ci_lint_install_has_process_and_network_timeouts(self):
-        self.assertIn(
-            "timeout 180s python -m pip install --default-timeout=30 --no-cache-dir ruff",
-            self.workflow,
-        )
+    def test_ci_lint_is_preinstalled_in_ci_image(self):
+        self.assertIn("ruff==", self.ci_requirements)
+        self.assertIn("docker run --rm $ciImage ruff check .", self.workflow)
+        self.assertNotIn("python -m pip install", self.workflow)
 
     def test_windows_acr_login_uses_docker_login_action(self):
         self.assertIn("uses: docker/login-action@v3", self.workflow)
