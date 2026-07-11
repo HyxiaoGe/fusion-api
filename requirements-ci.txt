@@ -1,5 +1,3 @@
--r requirements.txt
-
 # 仅在 CI 和测试中使用，不进入生产镜像。
 fakeredis[lua]>=2.30.0
 ruff==0.12.2
