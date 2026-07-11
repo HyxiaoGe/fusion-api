@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import re
 import socket
 import sys
 import threading
@@ -198,6 +199,11 @@ def normalize_http_stage(stage: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in stage.items() if key in _STAGE_FIELDS and value is not None}
 
 
+def _normalize_stop_reason(reason: str) -> str:
+    normalized = re.sub(r"[^a-z0-9:_-]+", "_", reason.lower()).strip("_")
+    return normalized[:80] or "unknown_error"
+
+
 def build_import_payload(
     *,
     run_id: str,
@@ -220,7 +226,7 @@ def build_import_payload(
         "safe_summary": {
             "stages": safe_stages,
             "stopped": stopped,
-            "stop_reasons": stop_reasons,
+            "stop_reasons": list(dict.fromkeys(_normalize_stop_reason(reason) for reason in stop_reasons)),
             "cleanup": cleanup,
             "resources": resources,
         },
@@ -750,7 +756,7 @@ def _soak_stage(
         execute_tick,
         policy=policy,
         on_window=on_window,
-        hard_stop=resource_guard.check if resource_guard is not None else None,
+        hard_stop=_resource_hard_stop(resource_guard) if resource_guard is not None else None,
     )
     windows = result.windows
     total_samples = sum(window.samples for window in windows)
@@ -778,6 +784,15 @@ def _soak_stage(
         "consecutive_failures": max((window.peak_consecutive_failures for window in windows), default=0),
     }
     return stage, list(result.stop_reasons)
+
+
+def _resource_hard_stop(resource_guard: ResourceGuard):
+    """适配 run_soak 的窗口回调契约，同时保持资源门禁本身无参数。"""
+
+    def check(_window):
+        return resource_guard.check()
+
+    return check
 
 
 def _progress(stage: str, data: dict[str, Any]) -> None:

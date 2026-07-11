@@ -6,6 +6,7 @@ from scripts.perf.core import CleanupManifest
 from scripts.perf.full_runner import (
     CapturingLoginClient,
     _cleanup_full,
+    _resource_hard_stop,
     _with_cache_bypass_nonce,
     build_import_payload,
     extract_run_started_message_id,
@@ -43,6 +44,22 @@ class FakeCleanupClient:
 
 
 class FullRunnerTests(unittest.TestCase):
+    def test_resource_hard_stop_adapts_window_callback_to_zero_argument_guard(self):
+        class FakeGuard:
+            def __init__(self):
+                self.calls = 0
+
+            def check(self):
+                self.calls += 1
+                return ["resource:api_restart"]
+
+        guard = FakeGuard()
+
+        callback = _resource_hard_stop(guard)
+
+        self.assertEqual(callback(object()), ["resource:api_restart"])
+        self.assertEqual(guard.calls, 1)
+
     def test_cache_bypass_nonce_is_unique_per_conversation_and_not_requested_in_output(self):
         prompt = "请生成一段长回答。"
 
@@ -190,6 +207,21 @@ class FullRunnerTests(unittest.TestCase):
             "content",
         ):
             self.assertNotIn(forbidden, serialized)
+
+    def test_import_payload_normalizes_exception_stop_reason_to_schema_safe_lowercase(self):
+        payload = build_import_payload(
+            run_id="perf-20260712-safe",
+            model_id="deepseek-chat",
+            stages=[],
+            stopped=True,
+            stop_reasons=["hard_stop_exception:TypeError"],
+            cleanup={"conversations_deleted": 0, "tokens_revoked": 0, "errors": []},
+            resources={},
+            started_at="2026-07-12T00:00:00Z",
+            finished_at="2026-07-12T00:00:01Z",
+        )
+
+        self.assertEqual(payload["safe_summary"]["stop_reasons"], ["hard_stop_exception:typeerror"])
 
     def test_production_and_soak_arguments_are_guarded(self):
         base = {
