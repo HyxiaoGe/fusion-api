@@ -1,5 +1,6 @@
 import json
 import unittest
+from unittest.mock import patch
 
 from pydantic import ValidationError
 
@@ -13,10 +14,11 @@ from scripts.perf.resource_guard import (
 
 
 class FakePrometheusClient:
-    def __init__(self, values, *, missing=None, error=None):
+    def __init__(self, values, *, missing=None, error=None, failures_before_success=None):
         self.values = dict(values)
         self.missing = set(missing or [])
         self.error = error
+        self.failures_before_success = dict(failures_before_success or {})
         self.calls = []
         self.names_by_query = {query: name for name, query in build_resource_queries().items()}
 
@@ -25,6 +27,10 @@ class FakePrometheusClient:
         self.calls.append((prometheus_url, name, timeout_seconds))
         if self.error is not None:
             raise self.error
+        remaining_failures = self.failures_before_success.get(name, 0)
+        if remaining_failures > 0:
+            self.failures_before_success[name] = remaining_failures - 1
+            raise MonitoringUnavailable("private transient missing sample")
         if name in self.missing:
             raise MonitoringUnavailable("private upstream error")
         return float(self.values[name])
@@ -177,6 +183,34 @@ class ResourceGuardTests(unittest.TestCase):
         invalid_total_guard = ResourceGuard(invalid_total_client, "http://127.0.0.1:9090")
         invalid_total_client.values["host_total_memory_mib"] = 0
         self.assertEqual(invalid_total_guard.check(), ["resource:monitoring_unavailable"])
+
+    def test_transient_single_metric_missing_sample_retries_then_succeeds(self):
+        client = FakePrometheusClient(healthy_values())
+        guard = ResourceGuard(client, "http://127.0.0.1:9090")
+        client.failures_before_success["api_memory_mib"] = 1
+        calls_before = sum(name == "api_memory_mib" for _, name, _ in client.calls)
+
+        with patch("scripts.perf.resource_guard.time.sleep") as sleep:
+            reasons = guard.check()
+
+        calls_after = sum(name == "api_memory_mib" for _, name, _ in client.calls)
+        self.assertEqual(reasons, [])
+        self.assertEqual(calls_after - calls_before, 2)
+        sleep.assert_called_once()
+
+    def test_single_metric_retry_exhaustion_still_fails_closed(self):
+        client = FakePrometheusClient(healthy_values())
+        guard = ResourceGuard(client, "http://127.0.0.1:9090")
+        client.failures_before_success["api_memory_mib"] = 3
+        calls_before = sum(name == "api_memory_mib" for _, name, _ in client.calls)
+
+        with patch("scripts.perf.resource_guard.time.sleep") as sleep:
+            reasons = guard.check()
+
+        calls_after = sum(name == "api_memory_mib" for _, name, _ in client.calls)
+        self.assertEqual(reasons, ["resource:monitoring_unavailable"])
+        self.assertEqual(calls_after - calls_before, 3)
+        self.assertEqual(sleep.call_count, 2)
 
     def test_summary_shape_forbids_queries_and_arbitrary_payload(self):
         guard = ResourceGuard(FakePrometheusClient(healthy_values()), "http://127.0.0.1:9090")

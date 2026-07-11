@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 import urllib.parse
 import urllib.request
 from typing import Any, Protocol
@@ -133,6 +134,8 @@ _BASELINE_METRICS = tuple(
     + [f"{component}_oom_events" for component in _CONTAINERS]
     + ["redis_rejected_connections", "redis_evicted_keys"]
 )
+_QUERY_MAX_ATTEMPTS = 3
+_QUERY_RETRY_BACKOFF_SECONDS = 0.05
 
 
 class ResourceGuard:
@@ -174,16 +177,26 @@ class ResourceGuard:
     def _collect(self, metric_names: tuple[str, ...] | list[str]) -> dict[str, float]:
         values: dict[str, float] = {}
         for name in metric_names:
-            value = self._client.query_scalar(
-                self._prometheus_url,
-                self._queries[name],
-                timeout_seconds=self._timeout_seconds,
-            )
-            numeric = float(value)
-            if not math.isfinite(numeric) or numeric < 0:
-                raise MonitoringUnavailable("Prometheus 返回非有限值")
-            values[name] = numeric
+            values[name] = self._query_metric(name)
         return values
+
+    def _query_metric(self, name: str) -> float:
+        for attempt in range(_QUERY_MAX_ATTEMPTS):
+            try:
+                value = self._client.query_scalar(
+                    self._prometheus_url,
+                    self._queries[name],
+                    timeout_seconds=self._timeout_seconds,
+                )
+                numeric = float(value)
+                if not math.isfinite(numeric) or numeric < 0:
+                    raise MonitoringUnavailable("Prometheus 返回非有限值")
+                return numeric
+            except Exception as exc:  # noqa: BLE001 — 最终只暴露固定安全原因码
+                if attempt == _QUERY_MAX_ATTEMPTS - 1:
+                    raise MonitoringUnavailable("Prometheus 查询重试耗尽") from exc
+                time.sleep(_QUERY_RETRY_BACKOFF_SECONDS * (attempt + 1))
+        raise MonitoringUnavailable("Prometheus 查询重试耗尽")
 
     def check(self) -> list[str]:
         """返回安全硬停原因列表；监控不可用时 fail closed。"""
