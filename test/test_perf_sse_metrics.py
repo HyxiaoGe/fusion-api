@@ -1,6 +1,5 @@
 import json
-
-import pytest
+import unittest
 
 from scripts.perf.sse_metrics import SSEFlowMetrics, estimate_approx_tokens, summarize_sse_stage
 
@@ -169,11 +168,20 @@ def test_empty_stage_is_explicit_and_contains_no_samples():
 def test_timestamps_must_be_monotonic():
     metrics = SSEFlowMetrics(started_at_ms=100)
 
-    with pytest.raises(ValueError, match="时间戳不能早于"):
+    with unittest.TestCase().assertRaisesRegex(ValueError, "时间戳不能早于"):
         metrics.observe_envelope(_delta("answering", "x"), observed_at_ms=99)
 
     metrics.observe_envelope(_delta("answering", "x"), observed_at_ms=120)
-    with pytest.raises(ValueError, match="时间戳必须单调"):
+    with unittest.TestCase().assertRaisesRegex(ValueError, "时间戳必须单调"):
         metrics.observe_envelope(_delta("answering", "y"), observed_at_ms=119)
-    with pytest.raises(ValueError, match="完成时间不能早于"):
+    with unittest.TestCase().assertRaisesRegex(ValueError, "完成时间不能早于"):
         metrics.build_summary(finished_at_ms=119)
+
+
+def load_tests(_loader, _tests, _pattern):
+    """让仓库的 unittest discover CI 执行本模块的函数式用例。"""
+    suite = unittest.TestSuite()
+    for name, value in sorted(globals().items()):
+        if name.startswith("test_") and callable(value):
+            suite.addTest(unittest.FunctionTestCase(value, description=name))
+    return suite
