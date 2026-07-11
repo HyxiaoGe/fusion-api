@@ -4,11 +4,80 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi.responses import StreamingResponse
 
-from app.api.chat import reconnect_stream
+from app.api.chat import get_stream_status_endpoint, reconnect_stream
 from app.schemas.response import ApiException
 
 
 class ChatStreamReconnectTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _request():
+        return SimpleNamespace(state=SimpleNamespace(request_id="req-1"))
+
+    async def test_status_returns_recoverable_503_when_redis_pool_is_missing(self):
+        with patch("app.api.chat.get_redis_pool", return_value=None):
+            with self.assertRaises(ApiException) as raised:
+                await get_stream_status_endpoint(
+                    "conv-1",
+                    request=self._request(),
+                    current_user=SimpleNamespace(id="user-1"),
+                )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.code, "STREAM_RECONNECT_UNAVAILABLE")
+
+    async def test_status_returns_recoverable_503_when_redis_read_fails(self):
+        redis = SimpleNamespace(
+            ping=AsyncMock(return_value=True),
+            hgetall=AsyncMock(side_effect=RuntimeError("temporary redis error")),
+        )
+        with patch("app.api.chat.get_redis_pool", return_value=redis):
+            with self.assertRaises(ApiException) as raised:
+                await get_stream_status_endpoint(
+                    "conv-1",
+                    request=self._request(),
+                    current_user=SimpleNamespace(id="user-1"),
+                )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.code, "STREAM_RECONNECT_UNAVAILABLE")
+
+    async def test_status_returns_recoverable_503_when_last_cursor_read_fails(self):
+        redis = SimpleNamespace(
+            ping=AsyncMock(return_value=True),
+            hgetall=AsyncMock(return_value={"user_id": "user-1", "status": "streaming", "stream_mode": "continuation"}),
+            xrevrange=AsyncMock(side_effect=RuntimeError("temporary redis error")),
+        )
+        with patch("app.api.chat.get_redis_pool", return_value=redis):
+            with self.assertRaises(ApiException) as raised:
+                await get_stream_status_endpoint(
+                    "conv-1",
+                    request=self._request(),
+                    current_user=SimpleNamespace(id="user-1"),
+                )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.code, "STREAM_RECONNECT_UNAVAILABLE")
+
+    async def test_status_keeps_real_missing_and_other_users_hidden_as_not_found(self):
+        redis = SimpleNamespace(
+            ping=AsyncMock(return_value=True),
+            hgetall=AsyncMock(side_effect=[{}, {"user_id": "user-2", "status": "streaming"}]),
+        )
+        with patch("app.api.chat.get_redis_pool", return_value=redis):
+            missing = await get_stream_status_endpoint(
+                "conv-missing",
+                request=self._request(),
+                current_user=SimpleNamespace(id="user-1"),
+            )
+            hidden = await get_stream_status_endpoint(
+                "conv-hidden",
+                request=self._request(),
+                current_user=SimpleNamespace(id="user-1"),
+            )
+
+        self.assertEqual(missing.data, {"status": "not_found"})
+        self.assertEqual(hidden.data, {"status": "not_found"})
+
     async def test_reconnect_returns_recoverable_503_when_redis_pool_is_missing(self):
         with patch("app.api.chat.get_redis_pool", return_value=None):
             with self.assertRaises(ApiException) as raised:

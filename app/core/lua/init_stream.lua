@@ -1,12 +1,13 @@
 -- 原子初始化一轮 Redis Stream。
 -- KEYS: lock, chunks, meta
--- ARGV: task_id, user_id, model, message_id, conversation_id, started_at, lock_ttl, stream_ttl
+-- ARGV: task_id, user_id, model, message_id, conversation_id, started_at, lock_ttl, stream_ttl, stream_mode
 
 local lock_key = KEYS[1]
 local stream_key = KEYS[2]
 local meta_key = KEYS[3]
 local task_id = ARGV[1]
 local stream_ttl = tonumber(ARGV[8])
+local stream_mode = ARGV[9] or "initial"
 
 redis.call("DEL", stream_key, meta_key)
 redis.call(
@@ -18,7 +19,8 @@ redis.call(
     "message_id", ARGV[4],
     "conversation_id", ARGV[5],
     "started_at", ARGV[6],
-    "task_id", task_id
+    "task_id", task_id,
+    "stream_mode", stream_mode
 )
 redis.call("EXPIRE", meta_key, stream_ttl)
 redis.call("SET", lock_key, task_id, "EX", tonumber(ARGV[7]))

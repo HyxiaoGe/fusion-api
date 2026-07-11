@@ -12,7 +12,7 @@
 import json
 import time
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Literal, Optional
 
 from app.core.logger import app_logger as logger
 from app.core.redis import (
@@ -87,6 +87,8 @@ async def init_stream(
     model: str,
     message_id: str,
     task_id: str,
+    *,
+    stream_mode: Literal["initial", "continuation"] = "initial",
 ) -> StreamInitResult:
     """流开始时初始化 Redis Stream 和 Meta"""
     redis = get_redis_pool()
@@ -111,6 +113,7 @@ async def init_stream(
             str(int(time.time())),
             str(LOCK_TTL),
             str(STREAM_CHUNK_TTL),
+            stream_mode,
         )
 
         logger.debug(f"Stream 初始化: conv_id={conversation_id}, msg_id={message_id}")
@@ -290,7 +293,10 @@ async def get_stream_meta(conversation_id: str) -> Optional[dict]:
         return None
     try:
         meta = await redis.hgetall(stream_meta_key(conversation_id))
-        return meta if meta else None
+        if not meta:
+            return None
+        meta.setdefault("stream_mode", "initial")
+        return meta
     except Exception as e:
         logger.warning(f"查询 stream meta 失败: {e}")
         return None

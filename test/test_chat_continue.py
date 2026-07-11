@@ -59,6 +59,7 @@ class ChatContinueTests(unittest.IsolatedAsyncioTestCase):
 
         init_stream_mock.assert_awaited_once()
         self.assertEqual(init_stream_mock.await_args.args[3], "msg-1")
+        self.assertEqual(init_stream_mock.await_args.kwargs["stream_mode"], "continuation")
         register_task_mock.assert_called_once()
         self.assertIs(register_task_mock.call_args.args[1], task)
         self.assertEqual(response.media_type, "text/event-stream")

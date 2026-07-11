@@ -18,10 +18,33 @@ from app.schemas.response import ApiException, ErrorCode, success
 from app.services.chat_service import ChatService
 from app.services.network_diagnostics_service import NetworkDiagnosticsService
 from app.services.stream import stream_redis_as_sse
-from app.services.stream_state_service import cancel_stream, get_stream_meta
+from app.services.stream_state_service import cancel_stream
 from app.services.task_manager import cancel_task
 
 router = APIRouter()
+
+
+def _stream_reconnect_unavailable() -> ApiException:
+    return ApiException.service_unavailable(
+        "流式连接暂时不可用，请稍后重试",
+        code=ErrorCode.STREAM_RECONNECT_UNAVAILABLE,
+    )
+
+
+async def _read_stream_meta_strict(conv_id: str):
+    """严格读取重连元数据：仅真实缺失返回空，Redis 故障统一抛可重试 503。"""
+    redis = get_redis_pool()
+    if redis is None:
+        raise _stream_reconnect_unavailable()
+    try:
+        await redis.ping()
+        meta = await redis.hgetall(stream_meta_key(conv_id))
+    except Exception as error:
+        logger.warning("读取重连流状态失败: conv_id=%s, error=%s", conv_id, error)
+        raise _stream_reconnect_unavailable() from error
+    if meta:
+        meta.setdefault("stream_mode", "initial")
+    return redis, meta
 
 
 @router.post("/send")
@@ -240,26 +263,34 @@ async def get_stream_status_endpoint(
     current_user: User = Depends(get_current_user),
 ):
     """查询流状态"""
-    meta = await get_stream_meta(conv_id)
+    redis, meta = await _read_stream_meta_strict(conv_id)
     if not meta:
         return success(data={"status": "not_found"}, request_id=request.state.request_id)
     if meta.get("user_id") != str(current_user.id):
         return success(data={"status": "not_found"}, request_id=request.state.request_id)
+    stream_mode = meta.get("stream_mode", "initial")
     if meta["status"] == "streaming":
-        redis = get_redis_pool()
         last_entry_id = "0"
-        if redis:
-            try:
-                entries = await redis.xrevrange(stream_chunks_key(conv_id), count=1)
-                if entries:
-                    last_entry_id = entries[0][0]
-            except Exception:
-                pass
+        try:
+            entries = await redis.xrevrange(stream_chunks_key(conv_id), count=1)
+            if entries:
+                last_entry_id = entries[0][0]
+        except Exception as error:
+            logger.warning("读取流末尾游标失败: conv_id=%s, error=%s", conv_id, error)
+            raise _stream_reconnect_unavailable() from error
         return success(
-            data={"status": "streaming", "last_entry_id": last_entry_id, "message_id": meta.get("message_id")},
+            data={
+                "status": "streaming",
+                "last_entry_id": last_entry_id,
+                "message_id": meta.get("message_id"),
+                "stream_mode": stream_mode,
+            },
             request_id=request.state.request_id,
         )
-    return success(data={"status": meta["status"]}, request_id=request.state.request_id)
+    return success(
+        data={"status": meta["status"], "stream_mode": stream_mode},
+        request_id=request.state.request_id,
+    )
 
 
 @router.get("/stream/{conv_id}")
@@ -269,21 +300,7 @@ async def reconnect_stream(
     current_user: User = Depends(get_current_user),
 ):
     """断线重连端点：从 Redis Stream 的断点续读 SSE"""
-    redis = get_redis_pool()
-    if redis is None:
-        raise ApiException.service_unavailable(
-            "流式连接暂时不可用，请稍后重试",
-            code=ErrorCode.STREAM_RECONNECT_UNAVAILABLE,
-        )
-    try:
-        await redis.ping()
-        meta = await redis.hgetall(stream_meta_key(conv_id))
-    except Exception as error:
-        logger.warning("读取重连流状态失败: conv_id=%s, error=%s", conv_id, error)
-        raise ApiException.service_unavailable(
-            "流式连接暂时不可用，请稍后重试",
-            code=ErrorCode.STREAM_RECONNECT_UNAVAILABLE,
-        ) from error
+    _, meta = await _read_stream_meta_strict(conv_id)
     if not meta or meta.get("user_id") != str(current_user.id):
         raise ApiException.not_found("无进行中的流")
 

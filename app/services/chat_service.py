@@ -314,6 +314,7 @@ class ChatService:
             model_id,
             assistant_message_id,
             task_id,
+            stream_mode="continuation",
         )
         _require_stream_initialized(init_result)
 

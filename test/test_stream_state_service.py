@@ -41,10 +41,27 @@ class TestStreamStateService(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(meta["user_id"], "user-1")
         self.assertEqual(meta["message_id"], "msg-1")
         self.assertEqual(meta["task_id"], "task-1")
+        self.assertEqual(meta["stream_mode"], "initial")
 
         entries = await self.fake_redis.xrange("stream:chunks:conv-1")
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0][1]["type"], "start")
+
+    async def test_init_stream_records_continuation_mode(self):
+        from app.services.stream_state_service import init_stream
+
+        result = await init_stream(
+            "conv-continuation",
+            "user-1",
+            "gpt-4",
+            "msg-1",
+            "task-1",
+            stream_mode="continuation",
+        )
+
+        self.assertTrue(result.ok)
+        meta = await self.fake_redis.hgetall("stream:meta:conv-continuation")
+        self.assertEqual(meta["stream_mode"], "continuation")
 
     async def test_append_chunk_writes_to_stream(self):
         from app.services.stream_state_service import append_chunk, init_stream
@@ -266,12 +283,58 @@ class TestStreamStateService(unittest.IsolatedAsyncioTestCase):
 
         from app.api.chat import get_stream_status_endpoint
 
-        response = await get_stream_status_endpoint(
-            "conv-orphan",
-            request=SimpleNamespace(state=SimpleNamespace(request_id="req-1")),
-            current_user=SimpleNamespace(id="user-orphan"),
+        with patch("app.api.chat.get_redis_pool", return_value=self.fake_redis):
+            response = await get_stream_status_endpoint(
+                "conv-orphan",
+                request=SimpleNamespace(state=SimpleNamespace(request_id="req-1")),
+                current_user=SimpleNamespace(id="user-orphan"),
+            )
+        self.assertEqual(response.data, {"status": "error", "stream_mode": "initial"})
+
+    async def test_stream_status_returns_mode_and_defaults_legacy_meta_to_initial(self):
+        from app.api.chat import get_stream_status_endpoint
+
+        await self.fake_redis.hset(
+            "stream:meta:conv-legacy",
+            mapping={
+                "status": "done",
+                "user_id": "user-legacy",
+                "message_id": "msg-legacy",
+            },
         )
-        self.assertEqual(response.data, {"status": "error"})
+
+        with patch("app.api.chat.get_redis_pool", return_value=self.fake_redis):
+            response = await get_stream_status_endpoint(
+                "conv-legacy",
+                request=SimpleNamespace(state=SimpleNamespace(request_id="req-legacy")),
+                current_user=SimpleNamespace(id="user-legacy"),
+            )
+
+        self.assertEqual(response.data, {"status": "done", "stream_mode": "initial"})
+
+    async def test_stream_status_returns_continuation_mode_for_active_stream(self):
+        from app.api.chat import get_stream_status_endpoint
+        from app.services.stream_state_service import init_stream
+
+        await init_stream(
+            "conv-continuation-status",
+            "user-continuation",
+            "model",
+            "msg-continuation",
+            "task-continuation",
+            stream_mode="continuation",
+        )
+
+        with patch("app.api.chat.get_redis_pool", return_value=self.fake_redis):
+            response = await get_stream_status_endpoint(
+                "conv-continuation-status",
+                request=SimpleNamespace(state=SimpleNamespace(request_id="req-continuation")),
+                current_user=SimpleNamespace(id="user-continuation"),
+            )
+
+        self.assertEqual(response.data["status"], "streaming")
+        self.assertEqual(response.data["message_id"], "msg-continuation")
+        self.assertEqual(response.data["stream_mode"], "continuation")
 
     async def test_old_reader_reports_replaced_without_mutating_new_stream(self):
         from app.services.stream_state_service import init_stream, read_stream_chunks
