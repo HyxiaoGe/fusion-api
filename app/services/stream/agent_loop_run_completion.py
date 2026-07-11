@@ -8,7 +8,8 @@ from typing import Any
 
 from app.services.stream.agent_loop_policy import AgentRunTerminalState
 from app.services.stream.agent_loop_state import AgentLoopState
-from app.services.stream_state_service import StreamWriteTerminalError
+from app.services.stream.run_finalizer import InterruptedStatusWriteError
+from app.services.stream_state_service import StreamOwnershipLostError, StreamWriteTerminalError
 
 PersistMessageFn = Callable[..., Any]
 FinalizeStreamFn = Callable[..., Awaitable[Any]]
@@ -123,6 +124,11 @@ async def finalize_cancelled_run(
             current_step_id=context.state.current_step_id,
             reason="user_cancelled",
         )
+        context.state.mark_terminal_emitted()
+    except InterruptedStatusWriteError:
+        raise
+    except StreamOwnershipLostError as emit_exc:
+        warning_fn(f"emit run_interrupted ownership lost，外部 stop 已接管流终态: {emit_exc}")
         context.state.mark_terminal_emitted()
     except StreamWriteTerminalError:
         raise

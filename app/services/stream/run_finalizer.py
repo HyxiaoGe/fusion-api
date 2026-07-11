@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
 from app.services.stream.agent_loop_policy import AgentSessionStatus, RunCompletedFinishReason
+from app.services.stream_state_service import StreamOwnershipLostError, StreamWriteTerminalError
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,10 @@ StepTerminalStatus = Literal["failed", "interrupted"]
 ErrorSessionStatus = Literal["error"]
 InterruptedSessionStatus = Literal["interrupted"]
 TerminalSessionStatus = AgentSessionStatus | ErrorSessionStatus | InterruptedSessionStatus
+
+
+class InterruptedStatusWriteError(RuntimeError):
+    """run_interrupted 收尾时 session status 未能写入。"""
 
 
 class AgentRunEmitter(Protocol):
@@ -141,13 +146,30 @@ async def interrupt_agent_run(
 ) -> None:
     if current_step_id is not None:
         await session_cache.write_step_terminal(step_id=current_step_id, status="interrupted")
-    await emitter.run_interrupted(reason=reason)
-    await _write_session_status(
-        session_cache=session_cache,
-        stats=stats,
-        duration_ms_factory=duration_ms_factory,
-        status="interrupted",
-    )
+
+    emitter_error: BaseException | None = None
+    try:
+        await emitter.run_interrupted(reason=reason)
+    except BaseException as error:  # 保留 CancelledError 与 Stream terminal 的原始优先级
+        emitter_error = error
+
+    try:
+        await _write_session_status(
+            session_cache=session_cache,
+            stats=stats,
+            duration_ms_factory=duration_ms_factory,
+            status="interrupted",
+        )
+    except BaseException as status_error:
+        if isinstance(emitter_error, StreamWriteTerminalError) and not isinstance(
+            emitter_error,
+            StreamOwnershipLostError,
+        ):
+            raise emitter_error from status_error
+        raise InterruptedStatusWriteError("写入 interrupted session status 失败") from status_error
+
+    if emitter_error is not None:
+        raise emitter_error
 
 
 async def fail_agent_run(

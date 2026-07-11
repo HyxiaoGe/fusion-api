@@ -172,6 +172,94 @@ class RunFinalizerTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_interrupt_agent_run_writes_session_status_when_emitter_loses_ownership(self):
+        from app.services.stream_state_service import StreamOwnershipLostError
+
+        emitter, cache, order = self._deps()
+        duration_ms_factory = self._duration_factory(order)
+        emitter.run_interrupted.side_effect = StreamOwnershipLostError("ownership lost")
+
+        with self.assertRaises(StreamOwnershipLostError):
+            await interrupt_agent_run(
+                emitter=emitter,
+                session_cache=cache,
+                stats=self._stats(),
+                duration_ms_factory=duration_ms_factory,
+                current_step_id="step-1",
+                reason="user_cancelled",
+            )
+
+        cache.write_step_terminal.assert_awaited_once_with(step_id="step-1", status="interrupted")
+        cache.write_session_status.assert_awaited_once_with(
+            run_id="run-1",
+            status="interrupted",
+            total_steps=3,
+            total_tool_calls=2,
+            total_duration_ms=1234,
+        )
+
+    async def test_interrupt_agent_run_preserves_non_ownership_terminal_when_status_write_also_fails(self):
+        from app.services.stream_state_service import StreamWriteUnavailableError
+
+        emitter, cache, order = self._deps()
+        emitter_error = StreamWriteUnavailableError("stream down")
+        status_error = RuntimeError("status down")
+        emitter.run_interrupted.side_effect = emitter_error
+        cache.write_session_status.side_effect = status_error
+
+        with self.assertRaises(StreamWriteUnavailableError) as raised:
+            await interrupt_agent_run(
+                emitter=emitter,
+                session_cache=cache,
+                stats=self._stats(),
+                duration_ms_factory=self._duration_factory(order),
+                current_step_id=None,
+                reason="user_cancelled",
+            )
+
+        self.assertIs(raised.exception, emitter_error)
+        self.assertIs(raised.exception.__cause__, status_error)
+
+    async def test_interrupt_agent_run_raises_status_error_when_ownership_and_status_both_fail(self):
+        from app.services.stream.run_finalizer import InterruptedStatusWriteError
+        from app.services.stream_state_service import StreamOwnershipLostError
+
+        emitter, cache, order = self._deps()
+        emitter.run_interrupted.side_effect = StreamOwnershipLostError("ownership lost")
+        status_error = RuntimeError("status down")
+        cache.write_session_status.side_effect = status_error
+
+        with self.assertRaises(InterruptedStatusWriteError) as raised:
+            await interrupt_agent_run(
+                emitter=emitter,
+                session_cache=cache,
+                stats=self._stats(),
+                duration_ms_factory=self._duration_factory(order),
+                current_step_id=None,
+                reason="user_cancelled",
+            )
+
+        self.assertIs(raised.exception.__cause__, status_error)
+
+    async def test_interrupt_agent_run_raises_status_error_when_emitter_succeeds_but_status_fails(self):
+        from app.services.stream.run_finalizer import InterruptedStatusWriteError
+
+        emitter, cache, order = self._deps()
+        status_error = RuntimeError("status down")
+        cache.write_session_status.side_effect = status_error
+
+        with self.assertRaises(InterruptedStatusWriteError) as raised:
+            await interrupt_agent_run(
+                emitter=emitter,
+                session_cache=cache,
+                stats=self._stats(),
+                duration_ms_factory=self._duration_factory(order),
+                current_step_id=None,
+                reason="user_cancelled",
+            )
+
+        self.assertIs(raised.exception.__cause__, status_error)
+
     async def test_fail_agent_run_writes_failed_step_and_error_status(self):
         emitter, cache, order = self._deps()
         duration_ms_factory = self._duration_factory(order)

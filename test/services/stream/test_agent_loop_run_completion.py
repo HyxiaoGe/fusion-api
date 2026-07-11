@@ -29,6 +29,80 @@ def _context(state: AgentLoopState | None = None) -> AgentLoopRunCompletionConte
 
 
 class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_finalize_cancelled_treats_ownership_lost_as_external_stop_terminal(self):
+        from app.services.stream_state_service import StreamOwnershipLostError
+
+        state = AgentLoopState()
+        ctx = _context(state)
+        finalized = []
+        warnings = []
+
+        async def interrupt_agent_run_fn(**_kwargs):
+            raise StreamOwnershipLostError("ownership lost")
+
+        async def finalize_stream_fn(*args, **kwargs):
+            finalized.append((args, kwargs))
+            return False
+
+        await finalize_cancelled_run(
+            context=ctx,
+            persist_message_fn=lambda *_args: None,
+            interrupt_agent_run_fn=interrupt_agent_run_fn,
+            finalize_stream_fn=finalize_stream_fn,
+            warning_fn=warnings.append,
+        )
+
+        self.assertTrue(state.terminal_emitted)
+        self.assertEqual(
+            finalized,
+            [(("conv-1",), {"success": False, "error_msg": "用户中止", "task_id": "task-1"})],
+        )
+        self.assertIn("外部 stop 已接管流终态", warnings[0])
+
+    async def test_finalize_cancelled_still_raises_other_stream_terminal_errors(self):
+        from app.services.stream_state_service import StreamWriteUnavailableError
+
+        finalized = []
+
+        async def interrupt_agent_run_fn(**_kwargs):
+            raise StreamWriteUnavailableError("redis down")
+
+        async def finalize_stream_fn(*_args, **_kwargs):
+            finalized.append(True)
+
+        with self.assertRaises(StreamWriteUnavailableError):
+            await finalize_cancelled_run(
+                context=_context(),
+                persist_message_fn=lambda *_args: None,
+                interrupt_agent_run_fn=interrupt_agent_run_fn,
+                finalize_stream_fn=finalize_stream_fn,
+                warning_fn=lambda _message: None,
+            )
+
+        self.assertEqual(finalized, [])
+
+    async def test_finalize_cancelled_does_not_swallow_interrupted_status_write_error(self):
+        from app.services.stream.run_finalizer import InterruptedStatusWriteError
+
+        finalized = []
+
+        async def interrupt_agent_run_fn(**_kwargs):
+            raise InterruptedStatusWriteError("status write failed")
+
+        async def finalize_stream_fn(*_args, **_kwargs):
+            finalized.append(True)
+
+        with self.assertRaises(InterruptedStatusWriteError):
+            await finalize_cancelled_run(
+                context=_context(),
+                persist_message_fn=lambda *_args: None,
+                interrupt_agent_run_fn=interrupt_agent_run_fn,
+                finalize_stream_fn=finalize_stream_fn,
+                warning_fn=lambda _message: None,
+            )
+
+        self.assertEqual(finalized, [])
+
     async def test_finalize_failed_does_not_swallow_stream_ownership_lost(self):
         from app.services.stream_state_service import StreamOwnershipLostError
 
