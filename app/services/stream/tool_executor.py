@@ -22,7 +22,7 @@ from app.services.stream.tool_call_lifecycle import (
     execute_tool_with_lifecycle,
 )
 from app.services.stream.tool_execution_result import ToolExecutionRecord
-from app.services.stream_state_service import append_chunk
+from app.services.stream_state_service import StreamWriteTerminalError, append_chunk
 
 if TYPE_CHECKING:
     from app.services.stream.network_budget import NetworkToolBudget
@@ -67,18 +67,19 @@ def _should_retry_tool_result(result) -> bool:
 
 class AgentEventRedisWriter:
     """把 emitter 的 (conv_id, chunk_type, payload:dict) 调用转成
-    stream_state_service.append_chunk(conv_id, chunk_type, content:str, block_id:str)。
+    stream_state_service.append_chunk(conv_id, chunk_type, content, block_id, task_id=task_id)。
 
     Task 9 引入的 adapter — emitter 不直接知道 stream_state_service 的接口形态，
     通过本 adapter 桥接：payload JSON 序列化进 content 字段，block_id 留空。
     """
 
-    async def append_chunk(self, conversation_id: str, chunk_type: str, payload: dict) -> None:
+    async def append_chunk(self, conversation_id: str, task_id: str, chunk_type: str, payload: dict) -> None:
         await append_chunk(
             conversation_id,
             chunk_type,
             json.dumps(payload, ensure_ascii=False),
             "",  # block_id 不适用于 agent_event chunk
+            task_id=task_id,
         )
 
 
@@ -89,8 +90,8 @@ class AgentEventCompositeWriter:
         self.redis_writer = redis_writer
         self.recorder = recorder
 
-    async def append_chunk(self, conversation_id: str, chunk_type: str, payload: dict) -> None:
-        await self.redis_writer.append_chunk(conversation_id, chunk_type, payload)
+    async def append_chunk(self, conversation_id: str, task_id: str, chunk_type: str, payload: dict) -> None:
+        await self.redis_writer.append_chunk(conversation_id, task_id, chunk_type, payload)
         if self.recorder is not None:
             self.recorder.record_chunk(conversation_id, chunk_type, payload)
 
@@ -275,7 +276,9 @@ async def emit_progress_digest_events(
                 tool_call_id=str(record.tool_call.get("id", "")),
                 evidence=evidence,
             )
-    except Exception as error:  # noqa: BLE001 — v2 进度事件失败不能中断工具结果主链路
+    except StreamWriteTerminalError:
+        raise
+    except Exception as error:  # noqa: BLE001 — v2 非关键进度事件失败不能中断工具结果主链路
         logger.warning(f"工具 digest 事件发送失败: tool={record.tool_name}, error={error}")
 
 

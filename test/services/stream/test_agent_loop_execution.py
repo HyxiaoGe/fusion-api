@@ -110,7 +110,7 @@ class AgentLoopExecutionTests(unittest.TestCase):
         )
 
         class RedisWriter:
-            async def append_chunk(self, conversation_id, chunk_type, payload):
+            async def append_chunk(self, conversation_id, task_id, chunk_type, payload):
                 return None
 
         dependencies = self._dependencies(clock=lambda: 100.0)

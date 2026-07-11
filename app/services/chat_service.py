@@ -22,7 +22,7 @@ from app.schemas.chat import (
     TextBlock,
     Usage,
 )
-from app.schemas.response import ApiException
+from app.schemas.response import ApiException, ErrorCode
 from app.services.agent.continuation import (
     build_continuation_context,
     get_continuation_system_prompt,
@@ -40,8 +40,22 @@ from app.services.storage import get_storage_for_backend
 from app.services.stream import StreamHandler, stream_redis_as_sse
 from app.services.stream.agent_loop_request_prep import inject_no_tool_network_boundary, inject_no_vision_file_boundary
 from app.services.stream.runner import _agent_loop_limits
-from app.services.stream_state_service import get_stream_meta, init_stream
+from app.services.stream_state_service import StreamInitResult, finalize_stream, get_stream_meta, init_stream
 from app.services.task_manager import register_task
+
+
+def _require_stream_initialized(result: StreamInitResult) -> None:
+    if result.ok:
+        return
+    logger.error(
+        "Redis Stream 初始化失败，拒绝启动生成: code=%s, error=%s",
+        result.error_code,
+        result.message,
+    )
+    raise ApiException.service_unavailable(
+        "生成服务暂时不可用，请稍后重试",
+        code=ErrorCode.STREAM_UNAVAILABLE,
+    )
 
 
 def _get_model_capabilities(model_id: str) -> dict[str, Any]:
@@ -148,9 +162,6 @@ class ChatService:
         if is_new_conversation:
             self.conversation_service.save_conversation(conversation)
         self.conversation_service.create_message(user_message, conversation.id)
-        self.db.commit()
-
-        conversation.messages.append(user_message)
 
         if stream:
             # 预分配 assistant 消息 ID 和 task ID
@@ -159,7 +170,40 @@ class ChatService:
 
             # 先初始化 Redis Stream（清除旧数据 + 写 start 标记），
             # 必须在 SSE 读取器启动之前完成，否则读取器会读到上一轮残留数据
-            await init_stream(conversation.id, str(user_id), model_id, assistant_message_id, task_id)
+            try:
+                init_result = await init_stream(
+                    conversation.id,
+                    str(user_id),
+                    model_id,
+                    assistant_message_id,
+                    task_id,
+                )
+            except Exception:
+                self.db.rollback()
+                raise
+            if not init_result.ok:
+                self.db.rollback()
+            _require_stream_initialized(init_result)
+
+            try:
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                finalized = await finalize_stream(
+                    conversation.id,
+                    success=False,
+                    error_msg="消息持久化失败",
+                    task_id=task_id,
+                    error_code="generation_init_failed",
+                )
+                if not finalized:
+                    logger.error(
+                        "数据库提交失败后的 Redis Stream CAS 收尾失败: conv_id=%s, task_id=%s",
+                        conversation.id,
+                        task_id,
+                    )
+                raise
+            conversation.messages.append(user_message)
 
             # 启动后台生成任务（独立于 HTTP 连接生命周期）
             # 图片 base64 编码等耗时操作在后台任务中完成，不阻塞 SSE 首字节
@@ -189,6 +233,7 @@ class ChatService:
                 stream_redis_as_sse(
                     conversation_id=conversation.id,
                     message_id=assistant_message_id,
+                    task_id=task_id,
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -197,6 +242,8 @@ class ChatService:
                 },
             )
         else:
+            self.db.commit()
+            conversation.messages.append(user_message)
             # 非流式模式：同步构建消息（含图片 base64）
             from app.db.models import User as UserModel
 
@@ -261,7 +308,14 @@ class ChatService:
         )
 
         task_id = str(uuid_mod.uuid4())
-        await init_stream(conversation_id, str(user_id), model_id, assistant_message_id, task_id)
+        init_result = await init_stream(
+            conversation_id,
+            str(user_id),
+            model_id,
+            assistant_message_id,
+            task_id,
+        )
+        _require_stream_initialized(init_result)
 
         task = asyncio.create_task(
             self.stream_handler.generate_to_redis(
@@ -292,6 +346,7 @@ class ChatService:
             stream_redis_as_sse(
                 conversation_id=conversation_id,
                 message_id=assistant_message_id,
+                task_id=task_id,
             ),
             media_type="text/event-stream",
             headers={

@@ -86,11 +86,11 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
             [
                 (
                     ("conv-1", "reasoning", "想一想", "blk-thinking"),
-                    {"run_id": "run-1", "step_id": "step-1"},
+                    {"task_id": "task-1", "run_id": "run-1", "step_id": "step-1"},
                 ),
                 (
                     ("conv-1", "answering", "答案", "blk-text"),
-                    {"run_id": "run-1", "step_id": "step-1"},
+                    {"task_id": "task-1", "run_id": "run-1", "step_id": "step-1"},
                 ),
             ],
         )
@@ -124,6 +124,7 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
             "reasoning",
             "推理",
             "blk-thinking",
+            task_id="task-1",
             run_id=None,
             step_id=None,
         )
@@ -155,6 +156,7 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
             "answering",
             "可见正文",
             "blk-text",
+            task_id="task-1",
             run_id=None,
             step_id=None,
         )
@@ -191,6 +193,7 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
             "answering",
             "可见正文",
             "blk-text",
+            task_id="task-1",
             run_id=None,
             step_id=None,
         )
@@ -279,6 +282,7 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
             "answering",
             "答案",
             "blk-text",
+            task_id="task-1",
             run_id="run-1",
             step_id="step-1",
         )

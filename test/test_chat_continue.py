@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.schemas.response import ApiException
 from app.services.chat_service import ChatService
+from app.services.stream_state_service import StreamInitResult
 
 
 class ChatContinueTests(unittest.IsolatedAsyncioTestCase):
@@ -33,7 +34,10 @@ class ChatContinueTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch("app.services.chat_service.build_continuation_context", return_value=continuation_context),
             patch("app.services.chat_service.get_stream_meta", new=AsyncMock(return_value=None)),
-            patch("app.services.chat_service.init_stream", new=AsyncMock()) as init_stream_mock,
+            patch(
+                "app.services.chat_service.init_stream",
+                new=AsyncMock(return_value=StreamInitResult(ok=True)),
+            ) as init_stream_mock,
             patch("app.services.chat_service.register_task") as register_task_mock,
             patch("app.services.chat_service.asyncio.create_task") as create_task_mock,
         ):
@@ -91,6 +95,59 @@ class ChatContinueTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertEqual(raised.exception.status_code, 409)
+
+    async def test_continue_agent_run_fails_before_starting_generation_when_stream_init_fails(self):
+        service = ChatService(MagicMock())
+        service.conversation_service.get_conversation = MagicMock(
+            return_value=SimpleNamespace(
+                id="conv-1",
+                user_id="user-1",
+                model_id="deepseek-chat",
+                messages=[],
+            )
+        )
+        continuation_context = SimpleNamespace(
+            initial_content_blocks=[],
+            limits=SimpleNamespace(max_steps=8, max_tool_calls=20, total_timeout_s=300),
+        )
+
+        with (
+            patch(
+                "app.services.chat_service.llm_manager.resolve_model",
+                return_value=("deepseek/deepseek-chat", "deepseek", {}),
+            ),
+            patch(
+                "app.services.chat_service.litellm_catalog.get_capabilities",
+                return_value={"functionCalling": True},
+            ),
+            patch("app.services.chat_service.build_continuation_context", return_value=continuation_context),
+            patch("app.services.chat_service.get_stream_meta", new=AsyncMock(return_value=None)),
+            patch(
+                "app.services.chat_service.init_stream",
+                new=AsyncMock(
+                    return_value=StreamInitResult(
+                        ok=False,
+                        error_code="stream_init_failed",
+                        message="初始化失败",
+                    )
+                ),
+            ),
+            patch("app.services.chat_service.register_task") as register_task_mock,
+            patch("app.services.chat_service.asyncio.create_task") as create_task_mock,
+        ):
+            with self.assertRaises(ApiException) as raised:
+                await service.continue_agent_run(
+                    conversation_id="conv-1",
+                    assistant_message_id="msg-1",
+                    user_id="user-1",
+                    previous_run_id="run-old",
+                    trace_id="trace-1",
+                )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.code, "STREAM_UNAVAILABLE")
+        create_task_mock.assert_not_called()
+        register_task_mock.assert_not_called()
 
     async def test_continue_agent_run_route_requires_streaming(self):
         from app.api.chat import continue_agent_run

@@ -1,6 +1,7 @@
 import asyncio
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,11 +13,13 @@ from app.ai import litellm_cleanup, litellm_health
 from app.api import admin, auth, chat, files, models, prompts
 from app.core.config import settings
 from app.core.logger import app_logger
-from app.core.redis import close_redis, init_redis
+from app.core.redis import close_redis, get_redis_pool, init_redis
 from app.db.database import SessionLocal
 from app.schemas.response import ApiException, generate_request_id
 from app.services.scheduler_service import start_scheduler, stop_scheduler
 from app.services.storage import init_storage
+
+ASIA_SHANGHAI = timezone(timedelta(hours=8))
 
 
 # 超时中间件
@@ -116,32 +119,46 @@ app.add_middleware(
 # 健康检查端点（Railway需要）
 @app.get("/health")
 async def health_check():
-    """健康检查端点，Railway用来判断应用是否正常运行"""
+    """就绪检查：数据库和 Redis 都可用时才允许实例接流量。"""
+    database_status = "unavailable"
+    redis_status = "unavailable"
+    errors: list[str] = []
+    db = None
     try:
-        from datetime import datetime
-
         from sqlalchemy import text
 
-        # 简单的数据库连接测试
         db = SessionLocal()
         db.execute(text("SELECT 1"))
-        db.close()
-
-        return {
-            "status": "healthy",
-            "timestamp": datetime.now().isoformat(),
-            "database": "connected",
-            "service": "fusion-api",
-            "version": settings.APP_VERSION,
-        }
+        database_status = "connected"
     except Exception as e:
-        app_logger.error(f"健康检查失败: {e}")
-        return {
-            "status": "unhealthy",
-            "error": str(e),
-            "timestamp": datetime.now().isoformat(),
-            "service": "fusion-api",
-        }
+        errors.append(f"database: {e}")
+    finally:
+        if db is not None:
+            db.close()
+
+    try:
+        redis = get_redis_pool()
+        if redis is None:
+            raise RuntimeError("连接池未初始化")
+        await redis.ping()
+        redis_status = "connected"
+    except Exception as e:
+        errors.append(f"redis: {e}")
+
+    payload = {
+        "status": "healthy" if not errors else "unhealthy",
+        "timestamp": datetime.now(ASIA_SHANGHAI).isoformat(),
+        "database": database_status,
+        "redis": redis_status,
+        "service": "fusion-api",
+        "version": settings.APP_VERSION,
+    }
+    if errors:
+        app_logger.error(f"就绪检查失败: {'; '.join(errors)}")
+        payload["error"] = "; ".join(errors)
+        return JSONResponse(status_code=503, content=payload)
+
+    return payload
 
 
 @app.exception_handler(ApiException)

@@ -577,6 +577,136 @@ class ChatServiceTests(unittest.TestCase):
         service.stream_handler.generate_to_redis.assert_not_called()
         mock_litellm.acompletion.assert_not_called()
 
+    def test_process_message_fails_before_starting_generation_when_stream_init_fails(self):
+        from app.services.stream_state_service import StreamInitResult
+
+        db = MagicMock()
+        service = ChatService(db)
+        service.file_repo = MagicMock()
+        service.stream_handler = MagicMock()
+        service.stream_handler.generate_to_redis = AsyncMock()
+        service.conversation_service = MagicMock()
+        service._get_or_create_conversation = MagicMock(
+            return_value=(
+                Conversation(
+                    id="conv-redis-down",
+                    user_id="user-1",
+                    title="Redis 故障",
+                    model_id="qwen-max-latest",
+                    messages=[],
+                    created_at=datetime.now(),
+                    updated_at=datetime.now(),
+                ),
+                False,
+            )
+        )
+
+        with (
+            patch(
+                "app.services.chat_service.llm_manager.resolve_model",
+                return_value=("openai/qwen-max-latest", "qwen", {}),
+            ),
+            patch(
+                "app.services.chat_service.litellm_catalog.get_capabilities",
+                return_value={"functionCalling": False, "agentTools": False, "vision": False},
+            ),
+            patch(
+                "app.services.chat_service.init_stream",
+                new=AsyncMock(
+                    return_value=StreamInitResult(
+                        ok=False,
+                        error_code="redis_unavailable",
+                        message="Redis 不可用",
+                    )
+                ),
+            ),
+            patch("app.services.chat_service.register_task") as register_task_mock,
+            patch("app.services.chat_service.asyncio.create_task") as create_task_mock,
+        ):
+            with self.assertRaises(ApiException) as raised:
+                asyncio.run(
+                    service.process_message(
+                        model_id="qwen-max-latest",
+                        message="不要调用模型",
+                        user_id="user-1",
+                        conversation_id="conv-redis-down",
+                        stream=True,
+                    )
+                )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.code, "STREAM_UNAVAILABLE")
+        db.commit.assert_not_called()
+        db.rollback.assert_called_once()
+        create_task_mock.assert_not_called()
+        register_task_mock.assert_not_called()
+        service.stream_handler.generate_to_redis.assert_not_called()
+
+    def test_process_message_records_cas_finalize_failure_when_db_commit_fails(self):
+        from app.services.stream_state_service import StreamInitResult
+
+        db = MagicMock()
+        db.commit.side_effect = RuntimeError("database unavailable")
+        service = ChatService(db)
+        service.file_repo = MagicMock()
+        service.stream_handler = MagicMock()
+        service.stream_handler.generate_to_redis = AsyncMock()
+        service.conversation_service = MagicMock()
+        service._get_or_create_conversation = MagicMock(
+            return_value=(
+                Conversation(
+                    id="conv-commit-fail",
+                    user_id="user-1",
+                    title="提交失败",
+                    model_id="qwen-max-latest",
+                    messages=[],
+                    created_at=datetime.now(),
+                    updated_at=datetime.now(),
+                ),
+                False,
+            )
+        )
+
+        with (
+            patch(
+                "app.services.chat_service.llm_manager.resolve_model",
+                return_value=("openai/qwen-max-latest", "qwen", {}),
+            ),
+            patch(
+                "app.services.chat_service.litellm_catalog.get_capabilities",
+                return_value={"functionCalling": False, "agentTools": False, "vision": False},
+            ),
+            patch(
+                "app.services.chat_service.init_stream",
+                new=AsyncMock(return_value=StreamInitResult(ok=True)),
+            ),
+            patch(
+                "app.services.chat_service.finalize_stream",
+                new=AsyncMock(return_value=False),
+            ) as finalize_mock,
+            patch("app.services.chat_service.logger.error") as error_log,
+            patch("app.services.chat_service.register_task") as register_task_mock,
+            patch("app.services.chat_service.asyncio.create_task") as create_task_mock,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+                asyncio.run(
+                    service.process_message(
+                        model_id="qwen-max-latest",
+                        message="不要启动模型",
+                        user_id="user-1",
+                        conversation_id="conv-commit-fail",
+                        stream=True,
+                    )
+                )
+
+        db.rollback.assert_called_once()
+        finalize_mock.assert_awaited_once()
+        error_log.assert_called_once()
+        self.assertIn("CAS 收尾失败", error_log.call_args.args[0])
+        create_task_mock.assert_not_called()
+        register_task_mock.assert_not_called()
+        service.stream_handler.generate_to_redis.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

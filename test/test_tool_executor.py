@@ -54,8 +54,8 @@ class AgentEventCompositeWriterTests(unittest.IsolatedAsyncioTestCase):
         calls = []
 
         class RedisWriter:
-            async def append_chunk(self, conversation_id, chunk_type, payload):
-                calls.append(("redis", conversation_id, chunk_type, payload))
+            async def append_chunk(self, conversation_id, task_id, chunk_type, payload):
+                calls.append(("redis", conversation_id, task_id, chunk_type, payload))
 
         class Recorder:
             def record_chunk(self, conversation_id, chunk_type, payload):
@@ -63,18 +63,66 @@ class AgentEventCompositeWriterTests(unittest.IsolatedAsyncioTestCase):
 
         writer = AgentEventCompositeWriter(redis_writer=RedisWriter(), recorder=Recorder())
 
-        await writer.append_chunk("c1", "agent_event", {"type": "run_progress_updated"})
+        await writer.append_chunk("c1", "task-1", "agent_event", {"type": "run_progress_updated"})
 
         self.assertEqual(
             calls,
             [
-                ("redis", "c1", "agent_event", {"type": "run_progress_updated"}),
+                ("redis", "c1", "task-1", "agent_event", {"type": "run_progress_updated"}),
                 ("recorder", "c1", "agent_event", {"type": "run_progress_updated"}),
             ],
         )
 
 
 class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):
+    async def test_progress_digest_does_not_swallow_stream_ownership_lost(self):
+        from app.services.stream.tool_executor import emit_progress_digest_events
+        from app.services.stream_state_service import StreamOwnershipLostError
+
+        emitter = AsyncMock()
+        emitter.tool_result_digest.side_effect = StreamOwnershipLostError("ownership lost")
+        request = tool_executor_module.ToolExecutionBatchRequest(
+            conversation_id="conv-1",
+            user_id="user-1",
+            model_id="gpt-4",
+            provider="openai",
+            emitter=emitter,
+        )
+        record = ToolExecutionRecord(
+            tool_call={"id": "call-1", "name": "web_search", "arguments": {}},
+            result=ToolResult(status="success", data={"sources": []}),
+            handler=MagicMock(tool_name="web_search"),
+            block_id="blk-1",
+            log_id="log-1",
+        )
+
+        with self.assertRaises(StreamOwnershipLostError):
+            await emit_progress_digest_events(request=request, record=record)
+
+    async def test_progress_digest_does_not_swallow_stream_write_unavailable(self):
+        from app.services.stream.tool_executor import emit_progress_digest_events
+        from app.services.stream_state_service import StreamWriteUnavailableError
+
+        emitter = AsyncMock()
+        emitter.tool_result_digest.side_effect = StreamWriteUnavailableError("Redis write failed")
+        request = tool_executor_module.ToolExecutionBatchRequest(
+            conversation_id="conv-1",
+            user_id="user-1",
+            model_id="gpt-4",
+            provider="openai",
+            emitter=emitter,
+        )
+        record = ToolExecutionRecord(
+            tool_call={"id": "call-1", "name": "web_search", "arguments": {}},
+            result=ToolResult(status="success", data={"sources": []}),
+            handler=MagicMock(tool_name="web_search"),
+            block_id="blk-1",
+            log_id="log-1",
+        )
+
+        with self.assertRaises(StreamWriteUnavailableError):
+            await emit_progress_digest_events(request=request, record=record)
+
     async def test_execute_tool_batch_accepts_request_and_preserves_log_context(self):
         request_cls = getattr(tool_executor_module, "ToolExecutionBatchRequest")
         execute_tool_batch = getattr(tool_executor_module, "execute_tool_batch")

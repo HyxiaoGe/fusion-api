@@ -18,6 +18,7 @@ from app.services.source_candidate_ranker import (
 from app.services.source_evidence_ledger import build_selected_source_evidence_item
 from app.services.stream.step_lifecycle import AgentStepContext, mark_tool_round_started
 from app.services.stream.tool_execution_result import ToolExecutionRecord
+from app.services.stream_state_service import StreamWriteTerminalError
 
 logger = logging.getLogger(__name__)
 
@@ -236,6 +237,8 @@ async def emit_selected_source_evidence(
                 tool_call_id=candidate.tool_call_id,
                 evidence=build_selected_source_evidence_item(candidate),
             )
+        except StreamWriteTerminalError:
+            raise
         except Exception:
             logger.warning("发送推荐深读 evidence 失败", exc_info=True)
 

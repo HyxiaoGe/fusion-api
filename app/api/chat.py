@@ -4,7 +4,8 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.api.deps import get_chat_service, get_current_user, get_network_diagnostics_service
-from app.core.redis import get_redis_pool, stream_chunks_key
+from app.core.logger import app_logger as logger
+from app.core.redis import get_redis_pool, stream_chunks_key, stream_meta_key
 from app.db.models import User
 from app.schemas.chat import (
     ChatRequest,
@@ -13,7 +14,7 @@ from app.schemas.chat import (
     SuggestedQuestionsRequest,
     TitleGenerationRequest,
 )
-from app.schemas.response import ApiException, success
+from app.schemas.response import ApiException, ErrorCode, success
 from app.services.chat_service import ChatService
 from app.services.network_diagnostics_service import NetworkDiagnosticsService
 from app.services.stream import stream_redis_as_sse
@@ -268,14 +269,34 @@ async def reconnect_stream(
     current_user: User = Depends(get_current_user),
 ):
     """断线重连端点：从 Redis Stream 的断点续读 SSE"""
-    meta = await get_stream_meta(conv_id)
+    redis = get_redis_pool()
+    if redis is None:
+        raise ApiException.service_unavailable(
+            "流式连接暂时不可用，请稍后重试",
+            code=ErrorCode.STREAM_RECONNECT_UNAVAILABLE,
+        )
+    try:
+        await redis.ping()
+        meta = await redis.hgetall(stream_meta_key(conv_id))
+    except Exception as error:
+        logger.warning("读取重连流状态失败: conv_id=%s, error=%s", conv_id, error)
+        raise ApiException.service_unavailable(
+            "流式连接暂时不可用，请稍后重试",
+            code=ErrorCode.STREAM_RECONNECT_UNAVAILABLE,
+        ) from error
     if not meta or meta.get("user_id") != str(current_user.id):
         raise ApiException.not_found("无进行中的流")
 
     message_id = meta.get("message_id", "")
+    task_id = meta.get("task_id", "")
 
     return StreamingResponse(
-        stream_redis_as_sse(conv_id, message_id, last_entry_id),
+        stream_redis_as_sse(
+            conversation_id=conv_id,
+            message_id=message_id,
+            task_id=task_id,
+            last_entry_id=last_entry_id,
+        ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

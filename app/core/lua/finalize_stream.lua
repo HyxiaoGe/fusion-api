@@ -22,7 +22,9 @@ local done_ttl = tonumber(ARGV[4])
 -- 检查锁：必须严格匹配当前 task_id 才允许写入
 -- lock 不存在（false）或 value 不匹配 → 一律跳过
 local current = redis.call("GET", lock_key)
-if current ~= task_id then
+local meta_task_id = redis.call("HGET", meta_key, "task_id")
+local status = redis.call("HGET", meta_key, "status")
+if current ~= task_id or meta_task_id ~= task_id or status ~= "streaming" then
     return 0
 end
 

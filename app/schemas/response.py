@@ -26,6 +26,8 @@ class ErrorCode(str, Enum):
     FILE_TOO_LARGE = "FILE_TOO_LARGE"
     FILE_TYPE_NOT_ALLOWED = "FILE_TYPE_NOT_ALLOWED"
     STREAM_NOT_FOUND = "STREAM_NOT_FOUND"
+    STREAM_UNAVAILABLE = "STREAM_UNAVAILABLE"
+    STREAM_RECONNECT_UNAVAILABLE = "STREAM_RECONNECT_UNAVAILABLE"
     GENERATION_FAILED = "GENERATION_FAILED"
 
 
@@ -79,3 +81,11 @@ class ApiException(Exception):
     @classmethod
     def internal_error(cls, message: str = "服务器内部错误") -> "ApiException":
         return cls(ErrorCode.INTERNAL_ERROR, message, 500)
+
+    @classmethod
+    def service_unavailable(
+        cls,
+        message: str = "服务暂时不可用",
+        code: ErrorCode = ErrorCode.INTERNAL_ERROR,
+    ) -> "ApiException":
+        return cls(code, message, 503)

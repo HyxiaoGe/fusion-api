@@ -12,6 +12,7 @@ from app.services.stream.agent_loop_step_requests import build_tool_round_reques
 from app.services.stream.agent_round import AgentRoundResult
 from app.services.stream.round_completion import append_round_content_blocks, complete_text_response_step
 from app.services.stream.step_lifecycle import AgentStepContext
+from app.services.stream_state_service import StreamWriteTerminalError
 
 
 @dataclass(frozen=True)
@@ -135,7 +136,9 @@ async def _emit_final_answer_used_evidence(request: AgentRoundOutcomeRequest) ->
         )
         for evidence in evidence_items:
             await emit(tool_call_id=None, evidence=evidence)
-    except Exception as exc:  # noqa: BLE001 — used 判定不能阻断主回答完成
+    except StreamWriteTerminalError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — 非写入故障的 used 判定不能阻断主回答完成
         request.runtime.warning_fn(f"发送最终回答 used evidence 失败: {exc}")
 
 

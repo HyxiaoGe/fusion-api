@@ -177,6 +177,7 @@ async def append_stream_delta(
         chunk_type,
         content,
         block_id,
+        task_id=request.task_id,
         run_id=request.run_id,
         step_id=request.step_id,
     )

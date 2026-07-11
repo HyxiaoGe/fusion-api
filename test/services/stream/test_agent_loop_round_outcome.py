@@ -66,6 +66,44 @@ def _step_context(step_id="step-outcome"):
 
 
 class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_final_answer_evidence_does_not_swallow_stream_write_unavailable(self):
+        from app.services.stream_state_service import StreamWriteUnavailableError
+
+        state = AgentLoopState()
+        state.mark_current_step("step-write-failed")
+        state.content_blocks.append(
+            SearchBlock(
+                type="search",
+                id="blk-search",
+                query="Redis",
+                sources=[SearchSourceSummary(title="官方文档", url="https://redis.io/docs")],
+                source_refs=[SourceReference(kind="search", title="官方文档", url="https://redis.io/docs")],
+                source_count=1,
+            )
+        )
+        emitter = SimpleNamespace(
+            evidence_item_upserted=AsyncMock(side_effect=StreamWriteUnavailableError("Redis write failed"))
+        )
+
+        with self.assertRaises(StreamWriteUnavailableError):
+            await handle_agent_round_outcome(
+                request=AgentRoundOutcomeRequest(
+                    db="db",
+                    messages=[{"role": "user", "content": "hi"}],
+                    state=state,
+                    runtime=_runtime(emitter=emitter, complete_step_fn=AsyncMock()),
+                    step_number=1,
+                    step_context=_step_context("step-write-failed"),
+                    round_result=AgentRoundResult(
+                        reasoning_buf="",
+                        content_buf="参考官方文档。[1]",
+                        tool_calls=[],
+                        finish_reason="stop",
+                        accumulated_usage=Usage(input_tokens=1, output_tokens=2),
+                    ),
+                )
+            )
+
     async def test_stop_round_appends_blocks_completes_step_and_returns_completed(self):
         state = AgentLoopState()
         state.mark_current_step("step-stop")

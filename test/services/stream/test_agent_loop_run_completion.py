@@ -29,6 +29,29 @@ def _context(state: AgentLoopState | None = None) -> AgentLoopRunCompletionConte
 
 
 class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_finalize_failed_does_not_swallow_stream_ownership_lost(self):
+        from app.services.stream_state_service import StreamOwnershipLostError
+
+        finalized = []
+
+        async def fail_agent_run_fn(**_kwargs):
+            raise StreamOwnershipLostError("ownership lost")
+
+        async def finalize_stream_fn(*_args, **_kwargs):
+            finalized.append(True)
+
+        with self.assertRaises(StreamOwnershipLostError):
+            await finalize_failed_run(
+                context=_context(),
+                error=ValueError("LLM failed"),
+                persist_message_fn=lambda *_args: None,
+                fail_agent_run_fn=fail_agent_run_fn,
+                finalize_stream_fn=finalize_stream_fn,
+                warning_fn=lambda _message: None,
+            )
+
+        self.assertEqual(finalized, [])
+
     async def test_finalize_completed_persists_then_completes_then_finalizes_success(self):
         state = AgentLoopState()
         state.content_blocks.append(TextBlock(type="text", id="txt-1", text="回答"))

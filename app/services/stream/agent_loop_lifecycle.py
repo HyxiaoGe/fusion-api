@@ -107,7 +107,13 @@ async def _start_run(
     dependencies: AgentLoopLifecycleDependencies,
 ) -> None:
     context = execution.completion_context
-    await dependencies.append_chunk_fn(context.conversation_id, "preparing", "", "")
+    await dependencies.append_chunk_fn(
+        context.conversation_id,
+        "preparing",
+        "",
+        "",
+        task_id=context.task_id,
+    )
     await dependencies.start_agent_run_fn(
         emitter=execution.emitter,
         session_cache=context.session_cache,

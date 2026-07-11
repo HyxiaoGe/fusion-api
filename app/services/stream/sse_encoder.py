@@ -57,6 +57,7 @@ def entry_to_sse_envelope(entry_fields: dict) -> dict:
 async def stream_redis_as_sse(
     conversation_id: str,
     message_id: str,
+    task_id: str,
     last_entry_id: str = "0",
 ) -> AsyncGenerator[str, None]:
     """SSE 读取器：从 Redis Stream 读 chunk，按 spec §4.6 顶层 envelope 输出。
@@ -79,7 +80,12 @@ async def stream_redis_as_sse(
         yield "data: [DONE]\n\n"
         return
 
-    async for chunk in read_stream_chunks(conversation_id, last_entry_id):
+    async for chunk in read_stream_chunks(
+        conversation_id,
+        last_entry_id,
+        expected_message_id=message_id,
+        expected_task_id=task_id,
+    ):
         entry_id = chunk.pop("entry_id")
         chunk_type = chunk.get("type", "")
 

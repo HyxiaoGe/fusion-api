@@ -6,18 +6,23 @@
 2. 读端：SSE 端点调用，从 Redis Stream 消费 chunk 推送给客户端
 3. 元数据：记录流状态供 /stream-status 查询
 
-Redis 不可用时所有写操作静默降级。
+初始化失败会显式返回，流式追加连续失败会中止生成，避免继续消耗模型资源。
 """
 
 import json
 import time
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, Optional
 
 from app.core.logger import app_logger as logger
 from app.core.redis import (
     LOCK_TTL,
+    LUA_APPEND_STREAM,
     LUA_CANCEL_STREAM,
+    LUA_CLEANUP_STREAM_INIT,
     LUA_FINALIZE_STREAM,
+    LUA_INIT_STREAM,
+    LUA_INSPECT_STREAM,
     STREAM_CHUNK_TTL,
     STREAM_DONE_TTL,
     get_redis_pool,
@@ -30,6 +35,51 @@ from app.core.redis import (
 # 写端（后台任务调用）
 # ──────────────────────────────────────────────
 
+STREAM_APPEND_MAX_CONSECUTIVE_FAILURES = 3
+_append_failure_counts: dict[tuple[str, str], int] = {}
+
+
+@dataclass(frozen=True)
+class StreamInitResult:
+    ok: bool
+    error_code: str | None = None
+    message: str | None = None
+
+
+class StreamWriteTerminalError(RuntimeError):
+    """当前生成必须立即终止的 Stream 写入错误。"""
+
+
+class StreamWriteUnavailableError(StreamWriteTerminalError):
+    """Redis Stream 连续写入失败，生成侧应立即终止。"""
+
+
+class StreamOwnershipLostError(StreamWriteTerminalError):
+    """当前 task 已被替代或终结，不再拥有 Stream 写入权。"""
+
+
+def _append_failure_key(conversation_id: str, task_id: str) -> tuple[str, str]:
+    return conversation_id, task_id
+
+
+def _clear_append_failures(conversation_id: str, task_id: str) -> None:
+    _append_failure_counts.pop(_append_failure_key(conversation_id, task_id), None)
+
+
+def _record_append_failure(conversation_id: str, task_id: str, message: str) -> None:
+    failure_key = _append_failure_key(conversation_id, task_id)
+    failure_count = _append_failure_counts.get(failure_key, 0) + 1
+    _append_failure_counts[failure_key] = failure_count
+    logger.warning(
+        "追加 chunk 失败: conv_id=%s, consecutive_failures=%s, error=%s",
+        conversation_id,
+        failure_count,
+        message,
+    )
+    if failure_count >= STREAM_APPEND_MAX_CONSECUTIVE_FAILURES:
+        _append_failure_counts.pop(failure_key, None)
+        raise StreamWriteUnavailableError(f"Redis Stream 连续写入失败 {failure_count} 次，已终止生成")
+
 
 async def init_stream(
     conversation_id: str,
@@ -37,42 +87,53 @@ async def init_stream(
     model: str,
     message_id: str,
     task_id: str,
-) -> None:
+) -> StreamInitResult:
     """流开始时初始化 Redis Stream 和 Meta"""
     redis = get_redis_pool()
     if not redis:
-        return
+        return StreamInitResult(
+            ok=False,
+            error_code="redis_unavailable",
+            message="Redis 不可用",
+        )
     try:
-        # 写 meta
-        await redis.hset(
-            stream_meta_key(conversation_id),
-            mapping={
-                "status": "streaming",
-                "user_id": user_id,
-                "model": model,
-                "started_at": str(int(time.time())),
-                "message_id": message_id,
-                "conversation_id": conversation_id,
-            },
-        )
-        await redis.expire(stream_meta_key(conversation_id), STREAM_CHUNK_TTL)
-
-        # 写 lock
-        await redis.set(stream_lock_key(conversation_id), task_id, ex=LOCK_TTL)
-
-        # 清除上一轮的 Stream 数据，避免新轮次读到旧内容
-        await redis.delete(stream_chunks_key(conversation_id))
-
-        # 初始化 Stream（写一条 start 标记）
-        await redis.xadd(
+        await redis.eval(
+            LUA_INIT_STREAM,
+            3,
+            stream_lock_key(conversation_id),
             stream_chunks_key(conversation_id),
-            {"type": "start", "content": ""},
+            stream_meta_key(conversation_id),
+            task_id,
+            user_id,
+            model,
+            message_id,
+            conversation_id,
+            str(int(time.time())),
+            str(LOCK_TTL),
+            str(STREAM_CHUNK_TTL),
         )
-        await redis.expire(stream_chunks_key(conversation_id), STREAM_CHUNK_TTL)
 
         logger.debug(f"Stream 初始化: conv_id={conversation_id}, msg_id={message_id}")
+        _clear_append_failures(conversation_id, task_id)
+        return StreamInitResult(ok=True)
     except Exception as e:
         logger.warning(f"Stream 初始化失败: {e}")
+        try:
+            await redis.eval(
+                LUA_CLEANUP_STREAM_INIT,
+                3,
+                stream_lock_key(conversation_id),
+                stream_chunks_key(conversation_id),
+                stream_meta_key(conversation_id),
+                task_id,
+            )
+        except Exception as cleanup_error:
+            logger.warning(f"清理失败的 Stream 初始化状态失败: {cleanup_error}")
+        return StreamInitResult(
+            ok=False,
+            error_code="stream_init_failed",
+            message="Redis Stream 初始化失败",
+        )
 
 
 async def append_chunk(
@@ -80,6 +141,8 @@ async def append_chunk(
     chunk_type: str,
     content: str,
     block_id: str,
+    *,
+    task_id: str,
     **extras: Any,
 ) -> Optional[str]:
     """追加一个 chunk 到 Redis Stream。
@@ -91,6 +154,7 @@ async def append_chunk(
     """
     redis = get_redis_pool()
     if not redis:
+        _record_append_failure(conversation_id, task_id, "Redis 不可用")
         return None
     try:
         fields: dict[str, str] = {"type": chunk_type, "content": content, "block_id": block_id}
@@ -98,12 +162,27 @@ async def append_chunk(
             if v is None:
                 continue
             fields[k] = v if isinstance(v, str) else str(v)
-        entry_id = await redis.xadd(stream_chunks_key(conversation_id), fields)
-        # 刷新 TTL
-        await redis.expire(stream_chunks_key(conversation_id), STREAM_CHUNK_TTL)
+        field_args = [item for pair in fields.items() for item in pair]
+        result = await redis.eval(
+            LUA_APPEND_STREAM,
+            3,
+            stream_lock_key(conversation_id),
+            stream_chunks_key(conversation_id),
+            stream_meta_key(conversation_id),
+            task_id,
+            str(STREAM_CHUNK_TTL),
+            *field_args,
+        )
+        if not result or int(result[0]) != 1:
+            _clear_append_failures(conversation_id, task_id)
+            raise StreamOwnershipLostError(f"Stream 写入权已失效: conv_id={conversation_id}, task_id={task_id}")
+        entry_id = str(result[1])
+        _clear_append_failures(conversation_id, task_id)
         return entry_id
+    except StreamOwnershipLostError:
+        raise
     except Exception as e:
-        logger.warning(f"追加 chunk 失败: {e}")
+        _record_append_failure(conversation_id, task_id, str(e))
         return None
 
 
@@ -114,7 +193,7 @@ async def finalize_stream(
     task_id: str = "",
     error_code: str = "",
     error_data: Optional[dict[str, Any]] = None,
-) -> None:
+) -> bool:
     """
     流结束时调用，写 done/error 标记，更新 meta，缩短 TTL，释放锁。
 
@@ -125,9 +204,10 @@ async def finalize_stream(
     JSON 编码到 entry_content，供 stream_redis_as_sse 解析后挂到 SSE chunk 的
     顶级 error 字段，前端 chat.ts 据此显示结构化错误卡片 + CTA。
     """
+    _clear_append_failures(conversation_id, task_id)
     redis = get_redis_pool()
     if not redis:
-        return
+        return False
     try:
         entry_type = "done" if success else "error"
         if success:
@@ -154,8 +234,10 @@ async def finalize_stream(
 
         if not result:
             logger.debug(f"finalize 跳过（Lua 原子检查）：锁不匹配 conv_id={conversation_id}")
+        return bool(result)
     except Exception as e:
         logger.warning(f"finalize stream 失败: {e}")
+        return False
 
 
 async def cancel_stream(conversation_id: str, message_id: str = "") -> bool:
@@ -219,9 +301,54 @@ async def get_stream_meta(conversation_id: str) -> Optional[dict]:
 # ──────────────────────────────────────────────
 
 
+def _terminal_error_fields(*, code: str, message: str, reason: str) -> dict[str, str]:
+    return {
+        "type": "error",
+        "content": json.dumps(
+            {
+                "code": code,
+                "message": message,
+                "data": {"reason": reason},
+            },
+            ensure_ascii=False,
+        ),
+        "block_id": "",
+    }
+
+
+async def _inspect_stream_state(
+    redis: Any,
+    conversation_id: str,
+    *,
+    expected_message_id: str,
+    expected_task_id: str,
+) -> tuple[str, str]:
+    fields = _terminal_error_fields(
+        code="stream_interrupted",
+        message="生成连接已中断，请重试",
+        reason="orphaned_stream",
+    )
+    result = await redis.eval(
+        LUA_INSPECT_STREAM,
+        3,
+        stream_lock_key(conversation_id),
+        stream_chunks_key(conversation_id),
+        stream_meta_key(conversation_id),
+        expected_message_id,
+        expected_task_id,
+        fields["content"],
+        str(int(time.time())),
+        str(STREAM_DONE_TTL),
+    )
+    return str(result[0]), str(result[1])
+
+
 async def read_stream_chunks(
     conversation_id: str,
     last_entry_id: str = "0",
+    *,
+    expected_message_id: str,
+    expected_task_id: str,
 ) -> AsyncIterator[dict]:
     """
     异步生成器，从 Redis Stream 读取 chunk 并 yield。
@@ -243,6 +370,67 @@ async def read_stream_chunks(
 
     while time.time() < deadline:
         try:
+            state, terminal_entry_id = await _inspect_stream_state(
+                redis,
+                conversation_id,
+                expected_message_id=expected_message_id,
+                expected_task_id=expected_task_id,
+            )
+        except Exception as e:
+            logger.warning(f"检查流状态失败: {e}")
+            yield {
+                "entry_id": current_id if current_id != "0" else "0-0",
+                **_terminal_error_fields(
+                    code="redis_read_failed",
+                    message="生成连接暂时中断，请重试",
+                    reason="redis_liveness_check_failed",
+                ),
+            }
+            return
+
+        if state == "replaced":
+            yield {
+                "entry_id": current_id if current_id != "0" else "0-0",
+                **_terminal_error_fields(
+                    code="stream_interrupted",
+                    message="当前生成已被新请求取代，请重试",
+                    reason="stream_replaced",
+                ),
+            }
+            return
+        if state == "missing":
+            yield {
+                "entry_id": current_id if current_id != "0" else "0-0",
+                **_terminal_error_fields(
+                    code="stream_interrupted",
+                    message="生成连接已中断，请重试",
+                    reason="orphaned_stream",
+                ),
+            }
+            return
+        if state == "orphaned":
+            yield {
+                "entry_id": terminal_entry_id or "0-0",
+                **_terminal_error_fields(
+                    code="stream_interrupted",
+                    message="生成连接已中断，请重试",
+                    reason="orphaned_stream",
+                ),
+            }
+            return
+        if state == "terminal":
+            try:
+                remaining = await redis.xrange(key, min=current_id, count=100)
+                for entry_id, fields in remaining:
+                    if entry_id == current_id:
+                        continue
+                    current_id = entry_id
+                    yield {"entry_id": entry_id, **fields}
+            except Exception:
+                pass
+            return
+
+        try:
             results = await redis.xread(
                 {key: current_id},
                 block=5000,
@@ -250,24 +438,49 @@ async def read_stream_chunks(
             )
         except Exception as e:
             logger.warning(f"XREAD 失败: {e}")
+            yield {
+                "entry_id": current_id if current_id != "0" else "0-0",
+                **_terminal_error_fields(
+                    code="redis_read_failed",
+                    message="生成连接暂时中断，请重试",
+                    reason="redis_read_failed",
+                ),
+            }
             return
 
         if not results:
-            # 超时没有新数据，检查流是否已结束
-            meta = await get_stream_meta(conversation_id)
-            if meta and meta.get("status") in ("done", "error", "cancelled"):
-                # 把剩余 entry 全部读完
-                try:
-                    remaining = await redis.xrange(key, min=current_id, count=100)
-                    for entry_id, fields in remaining:
-                        if entry_id == current_id:
-                            continue
-                        current_id = entry_id
-                        yield {"entry_id": entry_id, **fields}
-                except Exception:
-                    pass
-                return
             continue
+
+        try:
+            post_read_state, _ = await _inspect_stream_state(
+                redis,
+                conversation_id,
+                expected_message_id=expected_message_id,
+                expected_task_id=expected_task_id,
+            )
+        except Exception as e:
+            logger.warning(f"读取后校验流状态失败: {e}")
+            post_read_state = "read_failed"
+        if post_read_state == "replaced":
+            yield {
+                "entry_id": current_id if current_id != "0" else "0-0",
+                **_terminal_error_fields(
+                    code="stream_interrupted",
+                    message="当前生成已被新请求取代，请重试",
+                    reason="stream_replaced",
+                ),
+            }
+            return
+        if post_read_state == "read_failed":
+            yield {
+                "entry_id": current_id if current_id != "0" else "0-0",
+                **_terminal_error_fields(
+                    code="redis_read_failed",
+                    message="生成连接暂时中断，请重试",
+                    reason="redis_liveness_check_failed",
+                ),
+            }
+            return
 
         for _stream_key, entries in results:
             for entry_id, fields in entries:
@@ -275,3 +488,12 @@ async def read_stream_chunks(
                 yield {"entry_id": entry_id, **fields}
                 if fields.get("type") in ("done", "error"):
                     return
+
+    yield {
+        "entry_id": current_id if current_id != "0" else "0-0",
+        **_terminal_error_fields(
+            code="stream_interrupted",
+            message="生成等待超时，请重试",
+            reason="stream_deadline_exceeded",
+        ),
+    }

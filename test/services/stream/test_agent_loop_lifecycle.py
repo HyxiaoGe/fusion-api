@@ -152,8 +152,8 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         execution = self._execution(call_config=call_config, limits=limits)
         initial_block = TextBlock(type="text", id="txt-initial", text="初始块")
 
-        async def append_chunk_fn(conversation_id, chunk_type, content, block_id):
-            call_order.append(("append", conversation_id, chunk_type, content, block_id))
+        async def append_chunk_fn(conversation_id, chunk_type, content, block_id, *, task_id):
+            call_order.append(("append", conversation_id, task_id, chunk_type, content, block_id))
 
         async def start_agent_run_fn(**kwargs):
             call_order.append(("start", kwargs["run_id"], kwargs["tools"], kwargs["config"]))
@@ -201,7 +201,7 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
             [item[0] for item in call_order],
             ["append", "start", "prepare", "run", "completed", "fallback"],
         )
-        self.assertEqual(call_order[0], ("append", "conv-life", "preparing", "", ""))
+        self.assertEqual(call_order[0], ("append", "conv-life", "task-life", "preparing", "", ""))
         self.assertEqual(call_order[1][1], "run-life")
         self.assertEqual(call_order[1][2], ["web_search"])
         self.assertEqual(
@@ -276,7 +276,7 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         emitted = []
 
         class CaptureWriter:
-            async def append_chunk(self, _conversation_id, chunk_type, payload):
+            async def append_chunk(self, _conversation_id, _task_id, chunk_type, payload):
                 if chunk_type == "agent_event":
                     emitted.append(payload)
 

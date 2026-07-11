@@ -8,6 +8,7 @@ from typing import Any
 
 from app.services.stream.agent_loop_policy import AgentRunTerminalState
 from app.services.stream.agent_loop_state import AgentLoopState
+from app.services.stream_state_service import StreamWriteTerminalError
 
 PersistMessageFn = Callable[..., Any]
 FinalizeStreamFn = Callable[..., Awaitable[Any]]
@@ -116,7 +117,9 @@ async def finalize_cancelled_run(
             reason="user_cancelled",
         )
         context.state.mark_terminal_emitted()
-    except Exception as emit_exc:  # noqa: BLE001 — 终态事件失败不能阻塞 cancel 传播
+    except StreamWriteTerminalError:
+        raise
+    except Exception as emit_exc:  # noqa: BLE001 — 非 Stream 写终止错误不能阻塞 cancel 传播
         warning_fn(f"emit run_interrupted 失败: {emit_exc}")
     await finalize_stream_fn(context.conversation_id, success=False, error_msg="用户中止", task_id=context.task_id)
 
@@ -142,6 +145,8 @@ async def finalize_failed_run(
             message=str(error),
         )
         context.state.mark_terminal_emitted()
+    except StreamWriteTerminalError:
+        raise
     except Exception as emit_exc:  # noqa: BLE001
         warning_fn(f"emit run_failed 失败: {emit_exc}")
     await finalize_stream_fn(context.conversation_id, success=False, error_msg=str(error), task_id=context.task_id)

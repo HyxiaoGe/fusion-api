@@ -62,16 +62,68 @@ class ChatCoreSurfaceTests(unittest.TestCase):
                 return None
 
         original_session_local = self.main.SessionLocal
+        original_get_redis_pool = self.main.get_redis_pool
         self.main.SessionLocal = HealthySession
+        self.main.get_redis_pool = lambda: SimpleNamespace(ping=AsyncMock(return_value=True))
         try:
             response = self.client.get("/health")
         finally:
             self.main.SessionLocal = original_session_local
+            self.main.get_redis_pool = original_get_redis_pool
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["status"], "healthy")
         self.assertEqual(payload["service"], "fusion-api")
+        self.assertEqual(payload["redis"], "connected")
+        self.assertTrue(payload["timestamp"].endswith("+08:00"))
+
+    def test_health_returns_503_when_redis_is_unavailable(self):
+        class HealthySession:
+            def execute(self, statement):
+                return None
+
+            def close(self):
+                return None
+
+        original_session_local = self.main.SessionLocal
+        original_get_redis_pool = self.main.get_redis_pool
+        self.main.SessionLocal = HealthySession
+        self.main.get_redis_pool = lambda: None
+        try:
+            response = self.client.get("/health")
+        finally:
+            self.main.SessionLocal = original_session_local
+            self.main.get_redis_pool = original_get_redis_pool
+
+        self.assertEqual(response.status_code, 503)
+        payload = response.json()
+        self.assertEqual(payload["status"], "unhealthy")
+        self.assertEqual(payload["database"], "connected")
+        self.assertEqual(payload["redis"], "unavailable")
+
+    def test_health_returns_503_when_database_is_unavailable(self):
+        class BrokenSession:
+            def execute(self, statement):
+                raise RuntimeError("database down")
+
+            def close(self):
+                return None
+
+        original_session_local = self.main.SessionLocal
+        original_get_redis_pool = self.main.get_redis_pool
+        self.main.SessionLocal = BrokenSession
+        self.main.get_redis_pool = lambda: SimpleNamespace(ping=AsyncMock(return_value=True))
+        try:
+            response = self.client.get("/health")
+        finally:
+            self.main.SessionLocal = original_session_local
+            self.main.get_redis_pool = original_get_redis_pool
+
+        self.assertEqual(response.status_code, 503)
+        payload = response.json()
+        self.assertEqual(payload["database"], "unavailable")
+        self.assertEqual(payload["redis"], "connected")
 
     def test_openapi_exposes_shared_auth_surface(self):
         response = self.client.get("/openapi.json")

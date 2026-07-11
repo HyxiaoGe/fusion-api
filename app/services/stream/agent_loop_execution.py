@@ -92,6 +92,7 @@ def _build_execution_parts(
         run_id=run_id,
         trace_id=run_id,
         conversation_id=request.conversation_id,
+        task_id=request.task_id,
         redis_writer=event_writer,
     )
     return AgentLoopExecutionParts(

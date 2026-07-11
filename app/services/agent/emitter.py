@@ -19,21 +19,36 @@ class _RedisWriter(Protocol):
 
     本仓库目前没有具体实现：Task 9 (stream_handler) 会提供一个 adapter，
     把 (conv_id, chunk_type, payload: dict) 桥接到现有
-    stream_state_service.append_chunk(conv_id, chunk_type, content: str, block_id: str)
+    stream_state_service.append_chunk(conv_id, chunk_type, content, block_id, task_id=task_id)
     （payload JSON 序列化进 content，block_id 留空）。
     单元测试用 unittest.mock.AsyncMock 满足此 Protocol。
     """
 
-    async def append_chunk(self, conversation_id: str, chunk_type: str, payload: dict[str, Any]) -> None: ...
+    async def append_chunk(
+        self,
+        conversation_id: str,
+        task_id: str,
+        chunk_type: str,
+        payload: dict[str, Any],
+    ) -> None: ...
 
 
 class AgentEventEmitter:
     """单 run 内发 agent_event；并发安全；维护 step 上下文。"""
 
-    def __init__(self, *, run_id: str, trace_id: str, conversation_id: str, redis_writer: _RedisWriter) -> None:
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        trace_id: str,
+        conversation_id: str,
+        task_id: str,
+        redis_writer: _RedisWriter,
+    ) -> None:
         self._run_id = run_id
         self._trace_id = trace_id
         self._conv_id = conversation_id
+        self._task_id = task_id
         self._writer = redis_writer
         self._sequence = 0
         self._current_step_id: str | None = None
@@ -51,7 +66,7 @@ class AgentEventEmitter:
             event.sequence = self._sequence
             event.ts = time.time()
             payload = event.model_dump(mode="json")
-            await self._writer.append_chunk(self._conv_id, "agent_event", payload)
+            await self._writer.append_chunk(self._conv_id, self._task_id, "agent_event", payload)
             self._sequence += 1
 
     def _envelope(self, *, tool_call_id: str | None = None, step_id: Any = _USE_CURRENT_STEP) -> dict[str, Any]:
