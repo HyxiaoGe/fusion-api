@@ -37,6 +37,6 @@
 - [x] 后端目标测试、全量 pytest、Ruff、架构检查和 Alembic 单 head。
 - [x] 前端目标 Vitest、全量 Vitest、ESLint 和生产 build。
 - [x] 安全复核响应不含凭据、路径、签名 token 和 raw provider payload。
-- [ ] 分仓中文提交并 push，监控 CI/CD、迁移、部署 health/smoke。
-- [ ] 复用已打开的真实 Fusion 管理员 Chrome 标签，以新建普通用户数据完成生产双轨验收。
-- [ ] 通过页面导入 2026-07-11 首轮生产压测基线，并验证清理后的聊天不存在但汇总可见。
+- [x] 分仓中文提交并 push，监控 CI/CD、迁移、部署 health/smoke。
+- [x] 复用已打开的真实 Fusion 管理员 Chrome 标签，以新建普通用户数据完成生产双轨验收。
+- [x] 通过页面导入 2026-07-11 首轮生产压测基线，并验证清理后的聊天不存在但汇总可见。
