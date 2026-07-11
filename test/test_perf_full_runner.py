@@ -6,6 +6,7 @@ from scripts.perf.core import CleanupManifest
 from scripts.perf.full_runner import (
     CapturingLoginClient,
     _cleanup_full,
+    _with_cache_bypass_nonce,
     build_import_payload,
     extract_run_started_message_id,
     normalize_http_stage,
@@ -42,6 +43,18 @@ class FakeCleanupClient:
 
 
 class FullRunnerTests(unittest.TestCase):
+    def test_cache_bypass_nonce_is_unique_per_conversation_and_not_requested_in_output(self):
+        prompt = "请生成一段长回答。"
+
+        first = _with_cache_bypass_nonce(prompt, "conversation-one")
+        second = _with_cache_bypass_nonce(prompt, "conversation-two")
+
+        self.assertNotEqual(first, second)
+        self.assertIn("conversation-one", first)
+        self.assertIn("conversation-two", second)
+        self.assertIn("无需复述", first)
+        self.assertTrue(first.startswith(prompt))
+
     def test_extracts_message_id_only_from_run_started_agent_event(self):
         self.assertEqual(
             extract_run_started_message_id(

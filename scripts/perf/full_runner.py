@@ -392,7 +392,13 @@ def _run_new_flow(
 ) -> LiveFlow:
     conversation_id = conversation_id or str(uuid.uuid4())
     manifest.add_conversation(conversation_id)
-    payload = _chat_payload(manifest.run_id, conversation_id, model_id, max_tokens, prompt)
+    payload = _chat_payload(
+        manifest.run_id,
+        conversation_id,
+        model_id,
+        max_tokens,
+        _with_cache_bypass_nonce(prompt, conversation_id),
+    )
     started_ms = _now_ms()
     try:
         with client.open_sse(join_url(target_url, "/api/chat/send"), payload, token) as response:
@@ -407,6 +413,12 @@ def _run_new_flow(
         metrics = SSEFlowMetrics(started_at_ms=started)
         metrics.build_summary(finished_at_ms=started)
         return LiveFlow(metrics, 0.0, False, False, 0, type(error).__name__, (), ())
+
+
+def _with_cache_bypass_nonce(prompt: str, conversation_id: str) -> str:
+    """为每条压测会话注入唯一标识，避免并发生成命中上游 prompt cache。"""
+
+    return f"{prompt}\n\n内部压测标识（无需复述）：{conversation_id}"
 
 
 def _run_sse_stage(
