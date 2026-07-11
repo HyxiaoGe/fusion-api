@@ -5,7 +5,8 @@ from pathlib import Path
 class DeployAuthConfigTests(unittest.TestCase):
     def setUp(self):
         root = Path(__file__).resolve().parents[1]
-        self.workflow = (root / ".github" / "workflows" / "deploy.yml").read_text()
+        self.workflow = (root / ".github" / "workflows" / "deploy.yml").read_text(encoding="utf-8")
+        self.ci_requirements = (root / "requirements-ci.txt").read_text(encoding="utf-8")
 
     def test_deploy_dev_overrides_auth_internal_base_to_docker_dns(self):
         self.assertIn(
@@ -47,8 +48,9 @@ class DeployAuthConfigTests(unittest.TestCase):
         )
 
     def test_ci_lint_install_has_process_and_network_timeouts(self):
+        self.assertIn("ruff==", self.ci_requirements)
         self.assertIn(
-            "timeout 180s python -m pip install --default-timeout=30 --no-cache-dir ruff",
+            "timeout 300s python -m pip install --default-timeout=30 --no-cache-dir -r requirements-ci.txt",
             self.workflow,
         )
 

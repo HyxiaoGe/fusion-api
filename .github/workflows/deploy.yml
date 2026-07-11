@@ -76,22 +76,18 @@ jobs:
           docker version
           docker ps
 
-      - name: Build Docker image
+      - name: Test and build Docker image
+        timeout-minutes: 10
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
-          docker build -t "%IMAGE_NAME%:%GITHUB_SHA%" .
+          $ErrorActionPreference = "Stop"
+          $image = "${env:IMAGE_NAME}:${env:GITHUB_SHA}"
 
-      - name: Architecture check in image
-        run: |
-          docker run --rm "%IMAGE_NAME%:%GITHUB_SHA%" python scripts/check_architecture.py
+          docker build --target production -t $image .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Lint in image
-        run: |
-          docker run --rm "%IMAGE_NAME%:%GITHUB_SHA%" sh -lc "timeout 180s python -m pip install --default-timeout=30 --no-cache-dir ruff && ruff check ."
-
-      - name: Run tests
-        timeout-minutes: 5
-        run: |
-          docker run --rm "%IMAGE_NAME%:%GITHUB_SHA%" sh -lc "timeout 270s python -u -m unittest discover -s test -t . -v"
+          docker run --rm $image sh -lc "timeout 300s python -m pip install --default-timeout=30 --no-cache-dir -r requirements-ci.txt && python scripts/check_architecture.py && ruff check . && timeout 270s python -u -m unittest discover -s test -t . -v"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Login to ACR
         uses: docker/login-action@v3
