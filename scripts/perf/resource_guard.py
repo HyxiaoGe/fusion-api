@@ -113,7 +113,7 @@ def build_resource_queries() -> dict[str, str]:
         label = f'name="{container_name}"'
         queries[f"{component}_start_time"] = f"max(container_start_time_seconds{{{label}}})"
         queries[f"{component}_oom_events"] = f"sum(container_oom_events_total{{{label}}})"
-        queries[f"{component}_cpu_percent"] = f"sum(rate(container_cpu_usage_seconds_total{{{label}}}[2m])) * 100"
+        queries[f"{component}_cpu_percent"] = f"sum(rate(container_cpu_usage_seconds_total{{{label}}}[5m])) * 100"
         queries[f"{component}_memory_mib"] = f"max(container_memory_working_set_bytes{{{label}}}) / {mib}"
     queries.update(
         {
@@ -121,7 +121,7 @@ def build_resource_queries() -> dict[str, str]:
             "redis_rejected_connections": "sum(redis_rejected_connections_total)",
             "redis_evicted_keys": "sum(redis_evicted_keys_total)",
             "nginx_connections": "sum(nginx_connections_active)",
-            "host_cpu_percent": '100 * (1 - avg(rate(node_cpu_seconds_total{mode="idle"}[2m])))',
+            "host_cpu_percent": '100 * (1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])))',
             "host_available_memory_mib": f"min(node_memory_MemAvailable_bytes) / {mib}",
             "host_total_memory_mib": f"min(node_memory_MemTotal_bytes) / {mib}",
         }
@@ -134,8 +134,8 @@ _BASELINE_METRICS = tuple(
     + [f"{component}_oom_events" for component in _CONTAINERS]
     + ["redis_rejected_connections", "redis_evicted_keys"]
 )
-_QUERY_MAX_ATTEMPTS = 3
-_QUERY_RETRY_BACKOFF_SECONDS = 0.05
+_QUERY_MAX_ATTEMPTS = 5
+_QUERY_RETRY_BACKOFF_SECONDS = 0.1
 
 
 class ResourceGuard:
@@ -195,7 +195,7 @@ class ResourceGuard:
             except Exception as exc:  # noqa: BLE001 — 最终只暴露固定安全原因码
                 if attempt == _QUERY_MAX_ATTEMPTS - 1:
                     raise MonitoringUnavailable("Prometheus 查询重试耗尽") from exc
-                time.sleep(_QUERY_RETRY_BACKOFF_SECONDS * (attempt + 1))
+                time.sleep(_QUERY_RETRY_BACKOFF_SECONDS * (2**attempt))
         raise MonitoringUnavailable("Prometheus 查询重试耗尽")
 
     def check(self) -> list[str]:

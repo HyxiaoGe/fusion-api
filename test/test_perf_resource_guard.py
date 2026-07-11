@@ -61,7 +61,7 @@ class PrometheusQueryUrlTests(unittest.TestCase):
     def test_builds_canonical_encoded_instant_query_url(self):
         url = build_prometheus_query_url(
             "https://monitor.example/prometheus/",
-            'sum(rate(container_cpu_usage_seconds_total{name="fusion-api"}[2m])) * 100',
+            'sum(rate(container_cpu_usage_seconds_total{name="fusion-api"}[5m])) * 100',
         )
 
         self.assertTrue(url.startswith("https://monitor.example/prometheus/api/v1/query?query="))
@@ -201,7 +201,7 @@ class ResourceGuardTests(unittest.TestCase):
     def test_single_metric_retry_exhaustion_still_fails_closed(self):
         client = FakePrometheusClient(healthy_values())
         guard = ResourceGuard(client, "http://127.0.0.1:9090")
-        client.failures_before_success["api_memory_mib"] = 3
+        client.failures_before_success["api_memory_mib"] = 5
         calls_before = sum(name == "api_memory_mib" for _, name, _ in client.calls)
 
         with patch("scripts.perf.resource_guard.time.sleep") as sleep:
@@ -209,8 +209,12 @@ class ResourceGuardTests(unittest.TestCase):
 
         calls_after = sum(name == "api_memory_mib" for _, name, _ in client.calls)
         self.assertEqual(reasons, ["resource:monitoring_unavailable"])
-        self.assertEqual(calls_after - calls_before, 3)
-        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(calls_after - calls_before, 5)
+        self.assertEqual(sleep.call_count, 4)
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list],
+            [0.1, 0.2, 0.4, 0.8],
+        )
 
     def test_summary_shape_forbids_queries_and_arbitrary_payload(self):
         guard = ResourceGuard(FakePrometheusClient(healthy_values()), "http://127.0.0.1:9090")
