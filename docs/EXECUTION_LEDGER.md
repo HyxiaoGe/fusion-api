@@ -30,6 +30,7 @@
 | Redis Stream 故障与并发隔离 | 已完成一轮 | `fusion-api` commit `363233f`；原子初始化/追加/检查/终态、task/message fencing、fail-fast 与 Redis 就绪检查 |
 | 流式续传统一与页面恢复 | 已完成 P2 收尾 | `fusion-api` commits `70f391d`, `6d05512`, `18fb967` / `fusion-ui` commits `d4f66a9`, `765974c`；普通发送、Agent continuation 与页面恢复统一有限重连、安全游标、原子停止、部分输出持久化和取消终态收敛 |
 | 生产性能基线 | 已完成首轮 | `docs/performance/2026-07-11-production-baseline.md`；API 单核约 145 RPS，公网 HTTP/2 P95 2.38 s，真实 SSE 1→3→5 并发 9/9 成功并完成零残留清理 |
+| 生产完整性能矩阵 | 已完成 L1-L4 | `docs/performance/2026-07-12-production-full-matrix.md`；L1 600/600、L2 28/28、L3 恢复 9/9 + 停止/持久化 9/9、L4 30 分钟 60/60；0 重启/OOM，测试数据零残留，管理员页面导入并刷新持久化 |
 | 管理员审计中心 | 已完成 v1 | `fusion-api` commit `1ec0f01`、`fusion-ui` commits `f2517ca` / `5e47692`；全局用户/对话、消息、Agent/tool、文件元数据、压测留存和访问审计；`docs/acceptance/2026-07-11-admin-audit-center-v1.md` |
 
 ## 不要重复建议
@@ -57,6 +58,7 @@
 
 | 日期 | 仓库 | commit | 内容 | 验证 |
 |---|---|---|---|---|
+| 2026-07-12 | `fusion-api` / `fusion-ui` | `api:7b24bda+56699e2+18047c4+ad8252e+2852f80+d4733d6 / ui:ef6817c` | 生产 L1-L4 完整压测：安全 runner、HTTP/SSE/恢复/停止/30 分钟稳态、资源硬门禁、管理员导入协议；并修复并发首次鉴权、Prometheus 缺样本、prompt cache 假场景和 L4 回调契约 | 后端 `954 passed + 87 subtests` 及最终目标测试、前端 `1018 tests` + build；Actions `29163183361` / `29161977007`；生产最终运行 `perf-20260711-182155-ca9da746`，L1 600/600、L2 28/28、L3 18/18、L4 60/60，数据库恢复基线，真实登录态 Chrome 导入/刷新/console 0 错误 |
 | 2026-07-11 | `fusion-api` / `fusion-ui` | `api:1ec0f01 / ui:f2517ca+5e47692` | 管理员审计中心 v1：跨用户只读检索、消息/Agent/tool/文件元数据安全投影、压测汇总留存、访问审计、点击劫持防护与 hydration 收敛 | 后端 `893 passed + 69 subtests`、Ruff、架构检查、Alembic 单 head；前端 `1017 tests`、ESLint、build；Actions `29153889249` / `29154128135` / `29154607305`；生产迁移、权限 200/403、真实新数据、文件/工具、压测导入与清理后保留、刷新恢复、console 0 新错误 |
 | 2026-07-11 | `fusion-api` | 本次提交 | 生产性能首轮基线与可复用 HTTP/SSE runner：一次性认证、脱敏结果、阶梯门禁、会话/令牌/agent step 精确清理 | runner `12 passed`、Ruff、format、compileall、生产确认 guard；API/源站/公网分层压测；真实生产 SSE 1→3→5 并发 9/9 成功；关键容器无重启/OOM，数据库恢复测试前计数 |
 | 2026-07-11 | `fusion-api` / `fusion-ui` | `api:70f391d+6d05512+18fb967 / ui:d4f66a9+765974c` | 流式可靠性 P2：显式 `initial/continuation` 模式、严格 Redis 状态判定、共享可恢复流执行器、页面刷新恢复、stop guard/task CAS、部分输出原子持久化与取消终态收敛 | 前端 `985 tests`、`npm run build`、目标文件 ESLint；后端 `857 tests + 69 subtests`、Ruff、架构检查；GitHub Actions 与部署后真实登录态 Chrome 新会话回归纳入发布门禁 |
