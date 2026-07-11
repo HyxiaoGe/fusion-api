@@ -1,0 +1,72 @@
+{
+  "run_id": "perf-20260711-093213-37c7d9cf",
+  "environment": "production",
+  "model_id": "deepseek-chat",
+  "status": "completed",
+  "schema_version": 1,
+  "safe_summary": {
+    "stages": [
+      {
+        "kind": "sse",
+        "concurrency": 1,
+        "flows": 1,
+        "successful": 1,
+        "failed": 0,
+        "p50_ttft_ms": 2386.6,
+        "p95_ttft_ms": 2386.6,
+        "p95_total_ms": 4373.32,
+        "error_frames": 0
+      },
+      {
+        "kind": "sse",
+        "concurrency": 3,
+        "flows": 3,
+        "successful": 3,
+        "failed": 0,
+        "p50_ttft_ms": 1577.62,
+        "p95_ttft_ms": 1581.35,
+        "p95_total_ms": 1581.61,
+        "error_frames": 0
+      },
+      {
+        "kind": "sse",
+        "concurrency": 5,
+        "flows": 5,
+        "successful": 5,
+        "failed": 0,
+        "p50_ttft_ms": 1435.9,
+        "p95_ttft_ms": 1441.32,
+        "p95_total_ms": 1466.89,
+        "error_frames": 0
+      }
+    ],
+    "stopped": false,
+    "stop_reasons": [],
+    "cleanup": {
+      "conversations_deleted": 9,
+      "tokens_revoked": 2,
+      "users_deleted": 1,
+      "agent_steps_deleted": 9,
+      "errors": []
+    },
+    "resources": {
+      "api": {
+        "cpu_percent": 18.56,
+        "memory_mib": 238.4,
+        "restarts": 0,
+        "oom": false
+      },
+      "postgres": {
+        "cpu_percent": 7.05,
+        "restarts": 0,
+        "oom": false
+      },
+      "redis": {
+        "rejected_connections": 0,
+        "evicted_keys": 0,
+        "restarts": 0,
+        "oom": false
+      }
+    }
+  }
+}

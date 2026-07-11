@@ -69,6 +69,11 @@ class Conversation(Base):
     )
     files = relationship("ConversationFile", back_populates="conversation", cascade="all, delete-orphan")
 
+    __table_args__ = (
+        Index("ix_conversations_updated_id", "updated_at", "id"),
+        Index("ix_conversations_user_updated_id", "user_id", "updated_at", "id"),
+    )
+
 
 class File(Base):
     __tablename__ = "files"
@@ -136,6 +141,8 @@ class Message(Base):
 
     conversation = relationship("Conversation", back_populates="messages")
 
+    __table_args__ = (Index("ix_messages_conversation_created_id", "conversation_id", "created_at", "id"),)
+
 
 class PromptExample(Base):
     """动态示例问题（由 Kimi $web_search 定时生成）"""
@@ -198,6 +205,12 @@ class ToolCallLog(Base):
 
     created_at = Column(DateTime, default=get_china_time, index=True)
 
+    __table_args__ = (
+        Index("ix_tool_call_logs_conversation_created_id", "conversation_id", "created_at", "id"),
+        Index("ix_tool_call_logs_user_created_id", "user_id", "created_at", "id"),
+        Index("ix_tool_call_logs_trace_step_created_id", "trace_id", "step_number", "created_at", "id"),
+    )
+
 
 class AgentSession(Base):
     """Agent 执行会话记录 — 一次 Agent Loop 一条"""
@@ -231,6 +244,8 @@ class AgentSession(Base):
 
     __table_args__ = (
         Index("ix_agent_sessions_conversation_message_created_at", "conversation_id", "message_id", "created_at"),
+        Index("ix_agent_sessions_conversation_created_id", "conversation_id", "created_at", "id"),
+        Index("ix_agent_sessions_user_created_id", "user_id", "created_at", "id"),
     )
 
 
@@ -266,7 +281,7 @@ class AgentStep(Base):
     __tablename__ = "agent_steps"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    trace_id = Column(String, nullable=False, index=True)
+    trace_id = Column(String, ForeignKey("agent_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
     step_number = Column(Integer, nullable=False)
 
     status = Column(
@@ -281,3 +296,56 @@ class AgentStep(Base):
     created_at = Column(DateTime, default=get_china_time)
 
     __table_args__ = (UniqueConstraint("trace_id", "step_number", name="uq_trace_step"),)
+
+
+class AdminAuditEvent(Base):
+    """管理员内容审计事件，只记录安全元数据，不复制用户正文。"""
+
+    __tablename__ = "admin_audit_events"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    admin_user_id = Column(String, nullable=False)
+    admin_snapshot = Column(JSONB, nullable=False)
+    action = Column(String(80), nullable=False)
+    resource_type = Column(String(40), nullable=False)
+    resource_id = Column(String, nullable=True)
+    target_user_id = Column(String, nullable=True)
+    request_id = Column(String, nullable=False)
+    reason = Column(String(300), nullable=True)
+    extra_metadata = Column("metadata", JSONB, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), default=get_china_time, nullable=False)
+
+    __table_args__ = (
+        Index("ix_admin_audit_events_created_id", "created_at", "id"),
+        Index("ix_admin_audit_events_admin_created_id", "admin_user_id", "created_at", "id"),
+        Index("ix_admin_audit_events_target_created_id", "target_user_id", "created_at", "id"),
+        Index(
+            "ix_admin_audit_events_resource_created_id",
+            "resource_type",
+            "resource_id",
+            "created_at",
+            "id",
+        ),
+    )
+
+
+class PerformanceRun(Base):
+    """管理员显式导入的脱敏压测汇总。"""
+
+    __tablename__ = "performance_runs"
+
+    run_id = Column(String, primary_key=True)
+    environment = Column(String(30), nullable=False)
+    model_id = Column(String(100), nullable=True)
+    status = Column(String(30), nullable=False)
+    schema_version = Column(Integer, nullable=False, default=1)
+    safe_summary = Column(JSONB, nullable=False)
+    imported_by_user_id = Column(String, nullable=False)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=get_china_time, nullable=False)
+
+    __table_args__ = (
+        Index("ix_performance_runs_created_id", "created_at", "run_id"),
+        Index("ix_performance_runs_environment_created_id", "environment", "created_at", "run_id"),
+    )

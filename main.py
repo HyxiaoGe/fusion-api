@@ -10,7 +10,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.ai import litellm_cleanup, litellm_health
-from app.api import admin, auth, chat, files, models, prompts
+from app.api import admin, admin_audit, auth, chat, files, models, prompts
 from app.core.config import settings
 from app.core.logger import app_logger
 from app.core.redis import close_redis, get_redis_pool, init_redis
@@ -97,6 +97,15 @@ async def add_request_id(request: Request, call_next):
     request.state.request_id = generate_request_id()
     response = await call_next(request)
     response.headers["X-Request-ID"] = request.state.request_id
+    return response
+
+
+@app.middleware("http")
+async def prevent_admin_audit_caching(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/api/admin/audit"):
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["Pragma"] = "no-cache"
     return response
 
 
@@ -230,6 +239,7 @@ app.include_router(models.router, prefix="/api/models", tags=["models"])
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(prompts.router, prefix="/api/prompts", tags=["prompts"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
+app.include_router(admin_audit.router, prefix="/api/admin/audit", tags=["admin-audit"])
 
 if __name__ == "__main__":
     import uvicorn
