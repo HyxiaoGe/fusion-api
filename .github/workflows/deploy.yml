@@ -109,19 +109,26 @@ jobs:
             duration_seconds = [math]::Round(($finished - $started).TotalSeconds, 2)
             log_file = "_ci-logs\image-push.log"
           }
-          $stages = @()
-          if (Test-Path "_ci-logs\stages.json") { $stages = @(Get-Content "_ci-logs\stages.json" -Raw | ConvertFrom-Json) }
-          @($stages) + @($result) | ConvertTo-Json -Depth 4 | Out-File "_ci-logs\stages.json" -Encoding utf8
+          $stages = [System.Collections.ArrayList]::new()
+          if (Test-Path "_ci-logs\stages.json") {
+            $parsedStages = Get-Content "_ci-logs\stages.json" -Raw | ConvertFrom-Json
+            foreach ($stage in $parsedStages) { [void]$stages.Add($stage) }
+          }
+          [void]$stages.Add($result)
+          $stages.ToArray() | ConvertTo-Json -Depth 4 | Out-File "_ci-logs\stages.json" -Encoding utf8
           exit $exitCode
 
       - name: Write CI build summary
         if: always()
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
-          $stages = @()
-          if (Test-Path "_ci-logs\stages.json") { $stages = @(Get-Content "_ci-logs\stages.json" -Raw | ConvertFrom-Json) }
+          $stages = [System.Collections.ArrayList]::new()
+          if (Test-Path "_ci-logs\stages.json") {
+            $parsedStages = Get-Content "_ci-logs\stages.json" -Raw | ConvertFrom-Json
+            foreach ($stage in $parsedStages) { [void]$stages.Add($stage) }
+          }
           if (-not ($stages | Where-Object name -eq "image-push")) {
-            $stages += [pscustomobject]@{ name="image-push"; display_name="Push Docker image"; status="skipped"; exit_code=$null; duration_seconds=0; log_file=$null }
+            [void]$stages.Add([pscustomobject]@{ name="image-push"; display_name="Push Docker image"; status="skipped"; exit_code=$null; duration_seconds=0; log_file=$null })
           }
           $lines = @("## Windows CI build summary", "", "Runner: `${{ runner.name }}`", "", "| Stage | Status | Duration (s) | Exit code |", "|---|---:|---:|---:|")
           foreach ($stage in $stages) {

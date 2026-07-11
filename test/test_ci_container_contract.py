@@ -66,6 +66,8 @@ class CIContainerContractTest(unittest.TestCase):
         self.assertIn("scripts\\ci\\run_windows_container_ci.ps1", build_job)
         self.assertIn("image-push", build_job)
         self.assertIn("GITHUB_STEP_SUMMARY", build_job)
+        self.assertIn("[System.Collections.ArrayList]::new()", build_job)
+        self.assertIn("foreach ($stage in $parsedStages)", build_job)
         self.assertIn("if: always()", build_job)
         self.assertIn("actions/upload-artifact@v4", build_job)
         self.assertIn("retention-days: 7", build_job)
