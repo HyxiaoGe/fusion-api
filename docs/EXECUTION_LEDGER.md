@@ -33,6 +33,7 @@
 | 生产完整性能矩阵 | 已完成 L1-L4 | `docs/performance/2026-07-12-production-full-matrix.md`；L1 600/600、L2 28/28、L3 恢复 9/9 + 停止/持久化 9/9、L4 30 分钟 60/60；0 重启/OOM，测试数据零残留，管理员页面导入并刷新持久化 |
 | 管理员审计中心 | 已完成 v1 | `fusion-api` commit `1ec0f01`、`fusion-ui` commits `f2517ca` / `5e47692`；全局用户/对话、消息、Agent/tool、文件元数据、压测留存和访问审计；`docs/acceptance/2026-07-11-admin-audit-center-v1.md` |
 | 管理员压测审计详情 | 已完成 v1.1 | `fusion-api` commit `64d3452`、`fusion-ui` commit `2e3d857`；列表与详情安全契约分离、存量脏数据安全降级、L1-L4/资源/清理结果结构化详情、按需请求、响应式布局和管理页 no-store；生产登录态 Chrome 验收通过 |
+| 管理员审计安全与身份展示 | 已完成 v1.2 | `fusion-api` commit `d036d89`、`fusion-ui` commit `9d1075d`；审计内容严格白名单投影、签名 URL/令牌脱敏、历史 schema 安全降级、用户昵称/用户名/ID 三元组、详情竞态隔离、Agent/tool 独立分页、压测指标语义与管理页 CSP 收紧；对抗式复审及生产登录态 Chrome 验收通过 |
 
 ## 不要重复建议
 
@@ -59,6 +60,7 @@
 
 | 日期 | 仓库 | commit | 内容 | 验证 |
 |---|---|---|---|---|
+| 2026-07-12 | `fusion-api` / `fusion-ui` | `api:d036d89 / ui:9d1075d` | 管理员审计中心 v1.2 安全与展示收尾：严格投影消息/文件/工具/Agent 数据，统一敏感参数脱敏和历史 schema 降级；同名用户补充唯一用户名与用户 ID，修复详情竞态、独立分页、压测语义与 CSP 导航边界 | 独立对抗式复审关闭签名 URL、客户端导航 CSP、错误分类和刷新竞态问题且无新增 P0/P1；后端 `968 passed + 98 subtests`、Ruff、架构检查，前端 `1036 tests`、目标 ESLint、build；Actions `29179213390` / `29179194679`；生产镜像 commit 对齐且 0 重启/OOM，真实登录态 Chrome 验证用户三元组、用户详情、对话消息/Agent/tool、压测 v2、刷新清空详情和访问审计，console 0 错误警告 |
 | 2026-07-12 | `fusion-api` / `fusion-ui` | `api:64d3452 / ui:2e3d857` | 管理员审计中心 v1.1：压测列表收敛为元数据安全投影，详情重新校验脱敏协议；前端按需展示 L1-L4、资源快照和清理结果，完善错误/空态、北京时间、窄屏布局与 no-store | 后端 `961 passed + 87 subtests`、Ruff、架构检查；前端 `1026 tests`、目标 ESLint、build；Actions `29177299252` / `29177299457`；生产镜像 commit 对齐且 0 重启/OOM，真实登录态 Chrome 验证详情展开/收起/刷新恢复、窄屏无横向溢出、console 0 错误警告，详情访问审计已落库 |
 | 2026-07-12 | `fusion-api` / `fusion-ui` | `api:7b24bda+56699e2+18047c4+ad8252e+2852f80+d4733d6 / ui:ef6817c` | 生产 L1-L4 完整压测：安全 runner、HTTP/SSE/恢复/停止/30 分钟稳态、资源硬门禁、管理员导入协议；并修复并发首次鉴权、Prometheus 缺样本、prompt cache 假场景和 L4 回调契约 | 后端 `954 passed + 87 subtests` 及最终目标测试、前端 `1018 tests` + build；Actions `29163183361` / `29161977007`；生产最终运行 `perf-20260711-182155-ca9da746`，L1 600/600、L2 28/28、L3 18/18、L4 60/60，数据库恢复基线，真实登录态 Chrome 导入/刷新/console 0 错误 |
 | 2026-07-11 | `fusion-api` / `fusion-ui` | `api:1ec0f01 / ui:f2517ca+5e47692` | 管理员审计中心 v1：跨用户只读检索、消息/Agent/tool/文件元数据安全投影、压测汇总留存、访问审计、点击劫持防护与 hydration 收敛 | 后端 `893 passed + 69 subtests`、Ruff、架构检查、Alembic 单 head；前端 `1017 tests`、ESLint、build；Actions `29153889249` / `29154128135` / `29154607305`；生产迁移、权限 200/403、真实新数据、文件/工具、压测导入与清理后保留、刷新恢复、console 0 新错误 |
