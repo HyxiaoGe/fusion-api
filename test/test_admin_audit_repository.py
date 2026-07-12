@@ -198,6 +198,7 @@ class AdminAuditRepositoryTests(unittest.TestCase):
 
         self.assertEqual(set(users), {"user-1"})
         self.assertEqual(users["user-1"].username, "alice")
+        self.assertFalse(hasattr(users["user-1"], "email"))
         self.assertFalse(hasattr(users["user-1"], "system_prompt"))
 
 
