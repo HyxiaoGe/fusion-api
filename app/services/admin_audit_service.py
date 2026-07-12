@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import math
 import re
 import uuid
 from typing import Any
 
 from pydantic import ValidationError
 
+from app.ai import litellm_catalog, litellm_health
+from app.core.logger import app_logger as logger
 from app.db.admin_audit_repository import AdminAuditRepository, page_payload
 from app.db.models import AdminAuditEvent, AgentStep, File, Message, PerformanceRun, ToolCallLog, User
 from app.schemas.admin_audit import (
@@ -15,11 +18,14 @@ from app.schemas.admin_audit import (
     AdminAuditEventItem,
     AdminAuditEventMetadata,
     AdminAuditSearchSummary,
+    AdminModelOperationsItem,
+    AdminModelPerformanceSummary,
     AdminPerformanceRunImport,
     PerformanceSafeSummary,
 )
 from app.schemas.response import ApiException, ErrorCode
 from app.services.admin_audit_sanitizer import mask_email, sanitize_admin_value
+from app.services.agent_strategy_config import get_agent_tools_disabled_aliases
 
 
 class AdminAuditService:
@@ -696,6 +702,264 @@ class AdminAuditService:
             metadata={"page": page, "page_size": page_size},
         )
         return page_payload(items, total, page, page_size)
+
+    @staticmethod
+    def _positive_int(value: Any) -> int | None:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    @staticmethod
+    def _safe_catalog_text(value: Any, *, max_chars: int) -> str:
+        sanitized, _ = sanitize_admin_value(value if isinstance(value, str) else "", max_string_chars=max_chars)
+        return sanitized[:max_chars]
+
+    @classmethod
+    def _catalog_projection(
+        cls,
+        model_id: str,
+        entry: dict[str, Any],
+        agent_tools_disabled_aliases: set[str] | list[str] | tuple[str, ...],
+    ) -> dict[str, Any]:
+        metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+        provider = metadata.get("provider_key")
+        if not isinstance(provider, str) or not provider.strip():
+            provider = entry.get("litellm_provider")
+        if not isinstance(provider, str) or not provider.strip():
+            provider = "litellm"
+        provider = cls._safe_catalog_text(provider.strip().lower(), max_chars=100)
+        if not re.fullmatch(r"[a-z0-9._:-]+", provider):
+            provider = "litellm"
+        provider_display = cls._safe_catalog_text(metadata.get("provider_display") or provider, max_chars=200)
+        capabilities = litellm_catalog.normalize_capabilities(
+            model_id,
+            metadata.get("capabilities") if isinstance(metadata.get("capabilities"), dict) else {},
+            agent_tools_disabled_aliases=agent_tools_disabled_aliases,
+        )
+        recommended = metadata.get("recommended_for") if isinstance(metadata.get("recommended_for"), list) else []
+        health = litellm_health.get_health(model_id)
+        health_error = cls._safe_catalog_text(health.get("error"), max_chars=300) or None
+
+        return {
+            "name": cls._safe_catalog_text(metadata.get("display_name") or model_id, max_chars=300),
+            "catalog_status": "active",
+            "catalog_source": "litellm_model_info",
+            "provider": provider,
+            "provider_display": provider_display,
+            "description": cls._safe_catalog_text(metadata.get("description"), max_chars=1000),
+            "knowledge_cutoff": cls._safe_catalog_text(metadata.get("knowledge_cutoff"), max_chars=100) or None,
+            "context_window_tokens": cls._positive_int(entry.get("max_input_tokens")),
+            "max_output_tokens": cls._positive_int(entry.get("max_output_tokens")),
+            "capabilities": {
+                key: bool(capabilities.get(key, False))
+                for key in (
+                    "imageGen",
+                    "deepThinking",
+                    "fileSupport",
+                    "functionCalling",
+                    "agentTools",
+                    "searchCapable",
+                    "vision",
+                    "webSearch",
+                )
+            },
+            "health": {
+                "status": health.get("status") if health.get("status") in {"healthy", "unhealthy"} else "unknown",
+                "error": health_error,
+                "checked_at": (
+                    health.get("checked_at")
+                    if isinstance(health.get("checked_at"), (int, float))
+                    and math.isfinite(float(health["checked_at"]))
+                    and health["checked_at"] >= 0
+                    else None
+                ),
+            },
+            "cost_tier": cls._safe_catalog_text(metadata.get("cost_tier"), max_chars=30) or None,
+            "recommended_for": [
+                cls._safe_catalog_text(value, max_chars=100) for value in recommended[:50] if isinstance(value, str)
+            ],
+        }
+
+    @classmethod
+    def _model_performance_summary(cls, row: Any) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return AdminModelPerformanceSummary(
+            run_id=row.run_id,
+            environment=row.environment,
+            status=row.status,
+            started_at=row.started_at,
+            finished_at=row.finished_at,
+            created_at=row.created_at,
+        ).model_dump()
+
+    @classmethod
+    def _model_operations_item(
+        cls,
+        model_id: str,
+        catalog_entry: dict[str, Any] | None,
+        stats: dict[str, Any] | None,
+        agent_tools_disabled_aliases: set[str] | list[str] | tuple[str, ...],
+        missing_catalog_status: str = "historical",
+        catalog_availability: str = "available",
+    ) -> dict[str, Any]:
+        usage = stats or {}
+        catalog_fields = (
+            cls._catalog_projection(model_id, catalog_entry, agent_tools_disabled_aliases)
+            if catalog_entry is not None
+            else {"name": model_id, "catalog_status": missing_catalog_status}
+        )
+        item = AdminModelOperationsItem(
+            model_id=model_id,
+            **catalog_fields,
+            catalog_availability=catalog_availability,
+            conversation_count=usage.get("conversation_count", 0),
+            user_count=usage.get("user_count", 0),
+            assistant_message_count=usage.get("assistant_message_count", 0),
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+            last_used_at=usage.get("last_used_at"),
+            agent_run_count=usage.get("agent_run_count", 0),
+            agent_error_count=usage.get("agent_error_count", 0),
+            latest_performance_run=cls._model_performance_summary(usage.get("latest_performance_run")),
+        )
+        return item.model_dump()
+
+    def list_models(
+        self,
+        *,
+        admin: User,
+        request_id: str,
+        reason: str | None,
+        page: int,
+        page_size: int,
+        query: str | None = None,
+        catalog_status: str | None = None,
+        provider: str | None = None,
+        health_status: str | None = None,
+    ) -> dict[str, Any]:
+        raw_catalog = litellm_catalog.list_aliases()
+        catalog_availability = litellm_catalog.get_cache_status().get("availability", "degraded")
+        if catalog_availability not in {"available", "degraded"}:
+            catalog_availability = "degraded"
+        invalid_model_ids: set[Any] = set()
+        catalog: dict[str, dict[str, Any]] = {}
+        for raw_model_id, entry in raw_catalog.items():
+            if not entry.get("db_model"):
+                continue
+            model_id = self._safe_model_id(raw_model_id)
+            if model_id is None:
+                invalid_model_ids.add(raw_model_id)
+                continue
+            catalog[model_id] = entry
+        agent_tools_disabled_aliases = get_agent_tools_disabled_aliases() if catalog else set()
+        raw_stats = self.repository.list_model_operation_stats()
+        stats: dict[str, dict[str, Any]] = {}
+        for raw_model_id, model_stats in raw_stats.items():
+            model_id = self._safe_model_id(raw_model_id)
+            if model_id is None:
+                invalid_model_ids.add(raw_model_id)
+                continue
+            stats[model_id] = model_stats
+        if invalid_model_ids:
+            logger.warning(f"admin model operations excluded invalid model ids: count={len(invalid_model_ids)}")
+        missing_catalog_status = "unknown" if catalog_availability == "degraded" else "historical"
+        model_ids = set(catalog) | set(stats)
+        items = [
+            self._model_operations_item(
+                model_id,
+                catalog.get(model_id),
+                stats.get(model_id),
+                agent_tools_disabled_aliases,
+                missing_catalog_status,
+                catalog_availability,
+            )
+            for model_id in model_ids
+        ]
+        if query and query.strip():
+            needle = query.strip().casefold()
+            items = [
+                item
+                for item in items
+                if needle
+                in " ".join(
+                    str(item.get(key) or "") for key in ("model_id", "name", "provider", "provider_display")
+                ).casefold()
+            ]
+        if catalog_status:
+            items = [item for item in items if item["catalog_status"] == catalog_status]
+        if provider:
+            normalized_provider = provider.strip().casefold()
+            items = [item for item in items if item["provider"] and item["provider"].casefold() == normalized_provider]
+        if health_status:
+            items = [item for item in items if item["health"]["status"] == health_status]
+        status_order = {"active": 0, "unknown": 1, "historical": 2}
+        items.sort(key=lambda item: (status_order[item["catalog_status"]], item["model_id"]))
+        total = len(items)
+        start = (page - 1) * page_size
+        self._record(
+            admin=admin,
+            action="admin.audit.models.list",
+            resource_type="model",
+            request_id=request_id,
+            reason=reason,
+            metadata={"page": page, "page_size": page_size, "query": query, "status": catalog_status},
+        )
+        result = page_payload(items[start : start + page_size], total, page, page_size)
+        result["excluded_invalid_model_count"] = len(invalid_model_ids)
+        result["catalog_availability"] = catalog_availability
+        return result
+
+    def get_model(
+        self,
+        model_id: str,
+        *,
+        admin: User,
+        request_id: str,
+        reason: str | None,
+    ) -> dict[str, Any]:
+        normalized_model_id = self._safe_model_id(model_id)
+        if normalized_model_id is None:
+            raise ApiException.bad_request("模型 ID 无效")
+        model_id = normalized_model_id
+        entry = litellm_catalog.get_model_entry(model_id)
+        catalog_availability = litellm_catalog.get_cache_status().get("availability", "degraded")
+        if catalog_availability not in {"available", "degraded"}:
+            catalog_availability = "degraded"
+        catalog_entry = entry if entry and entry.get("db_model") else None
+        stats = self.repository.list_model_operation_stats([model_id]).get(model_id)
+        if catalog_entry is None and stats is None:
+            raise ApiException.not_found("模型不存在")
+        agent_tools_disabled_aliases = get_agent_tools_disabled_aliases() if catalog_entry is not None else set()
+        missing_catalog_status = "unknown" if catalog_availability == "degraded" else "historical"
+        item = self._model_operations_item(
+            model_id,
+            catalog_entry,
+            stats,
+            agent_tools_disabled_aliases,
+            missing_catalog_status,
+            catalog_availability,
+        )
+        self._record(
+            admin=admin,
+            action="admin.audit.model.view",
+            resource_type="model",
+            resource_id=model_id,
+            request_id=request_id,
+            reason=reason,
+        )
+        return item
+
+    @staticmethod
+    def _safe_model_id(value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        if value != normalized or not normalized or len(normalized) > 200 or re.search(r"[\x00-\x1f\x7f]", normalized):
+            return None
+        return normalized
 
     @classmethod
     def _audit_event_item(cls, event: AdminAuditEvent, target_user: User | None) -> dict[str, Any]:

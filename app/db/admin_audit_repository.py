@@ -6,7 +6,7 @@ import math
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Integer, cast, func, or_
+from sqlalchemy import Integer, case, cast, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -394,6 +394,116 @@ class AdminAuditRepository:
             return {}
         rows = self.db.query(User.id, User.username, User.nickname).filter(User.id.in_(normalized_ids)).all()
         return {str(row.id): row for row in rows}
+
+    def list_model_operation_stats(self, model_ids: list[str] | None = None) -> dict[str, dict[str, Any]]:
+        """批量聚合模型运营指标，不按模型逐条查询。"""
+        normalized_ids = sorted(set(model_ids or []))
+
+        def restrict(query: Any, column: Any) -> Any:
+            query = query.filter(column.isnot(None), column != "")
+            return query.filter(column.in_(normalized_ids)) if normalized_ids else query
+
+        stats: dict[str, dict[str, Any]] = {}
+
+        def item(model_id: str) -> dict[str, Any]:
+            return stats.setdefault(
+                str(model_id),
+                {
+                    "conversation_count": 0,
+                    "user_count": 0,
+                    "assistant_message_count": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "last_used_at": None,
+                    "agent_run_count": 0,
+                    "agent_error_count": 0,
+                    "latest_performance_run": None,
+                },
+            )
+
+        conversation_query = self.db.query(
+            Conversation.model_id,
+            func.count(Conversation.id),
+            func.count(func.distinct(Conversation.user_id)),
+            func.max(Conversation.updated_at),
+        ).group_by(Conversation.model_id)
+        for model_id, conversation_count, user_count, last_conversation_at in restrict(
+            conversation_query, Conversation.model_id
+        ).all():
+            current = item(model_id)
+            current["conversation_count"] = conversation_count or 0
+            current["user_count"] = user_count or 0
+            current["last_used_at"] = last_conversation_at
+
+        message_query = (
+            self.db.query(
+                Message.model_id,
+                func.count(Message.id),
+                func.sum(cast(Message.usage["input_tokens"].as_string(), Integer)),
+                func.sum(cast(Message.usage["output_tokens"].as_string(), Integer)),
+                func.max(Message.created_at),
+            )
+            .filter(Message.role == "assistant")
+            .group_by(Message.model_id)
+        )
+        for model_id, message_count, input_tokens, output_tokens, last_message_at in restrict(
+            message_query, Message.model_id
+        ).all():
+            current = item(model_id)
+            current["assistant_message_count"] = message_count or 0
+            current["input_tokens"] = input_tokens or 0
+            current["output_tokens"] = output_tokens or 0
+            current["last_used_at"] = self._latest_datetime(current["last_used_at"], last_message_at)
+
+        agent_query = self.db.query(
+            AgentSession.model_id,
+            func.count(AgentSession.id),
+            func.sum(case((AgentSession.status == "error", 1), else_=0)),
+            func.max(AgentSession.created_at),
+        ).group_by(AgentSession.model_id)
+        for model_id, run_count, error_count, last_agent_at in restrict(agent_query, AgentSession.model_id).all():
+            current = item(model_id)
+            current["agent_run_count"] = run_count or 0
+            current["agent_error_count"] = error_count or 0
+            current["last_used_at"] = self._latest_datetime(current["last_used_at"], last_agent_at)
+
+        performance_ranked_query = self.db.query(
+            PerformanceRun.run_id,
+            PerformanceRun.environment,
+            PerformanceRun.model_id,
+            PerformanceRun.status,
+            PerformanceRun.started_at,
+            PerformanceRun.finished_at,
+            PerformanceRun.created_at,
+            func.row_number()
+            .over(
+                partition_by=PerformanceRun.model_id,
+                order_by=(PerformanceRun.created_at.desc(), PerformanceRun.run_id.desc()),
+            )
+            .label("row_number"),
+        )
+        performance_ranked = restrict(performance_ranked_query, PerformanceRun.model_id).subquery()
+        performance_query = self.db.query(
+            performance_ranked.c.run_id,
+            performance_ranked.c.environment,
+            performance_ranked.c.model_id,
+            performance_ranked.c.status,
+            performance_ranked.c.started_at,
+            performance_ranked.c.finished_at,
+            performance_ranked.c.created_at,
+        ).filter(performance_ranked.c.row_number == 1)
+        for row in performance_query.all():
+            current = item(row.model_id)
+            current["latest_performance_run"] = row
+        return stats
+
+    @staticmethod
+    def _latest_datetime(left: datetime | None, right: datetime | None) -> datetime | None:
+        if left is None:
+            return right
+        if right is None:
+            return left
+        return max(left, right)
 
     def list_audit_events(
         self,

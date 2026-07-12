@@ -2,6 +2,9 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+
+from app.schemas.response import ApiException
 from app.services.admin_audit_service import AdminAuditService
 
 
@@ -97,3 +100,19 @@ def test_audit_event_list_batches_target_users_and_preserves_historical_snapshot
     }
     assert result["items"][1]["target_user_id"] == "deleted-user"
     assert result["items"][1]["target_user"] is None
+
+
+def test_model_detail_rejects_control_character_id_before_catalog_or_database_access():
+    repository = Mock()
+    service = AdminAuditService(repository)
+
+    with pytest.raises(ApiException) as exc_info:
+        service.get_model(
+            "bad\nmodel",
+            admin=SimpleNamespace(id="admin-1", username="root", email="root@example.com"),
+            request_id="request-invalid-model",
+            reason=None,
+        )
+
+    assert exc_info.value.status_code == 400
+    repository.list_model_operation_stats.assert_not_called()

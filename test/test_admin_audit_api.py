@@ -382,6 +382,242 @@ class AdminAuditApiTests(unittest.TestCase):
 
         self.assertEqual(self.db.query(PerformanceRun).count(), 1)
 
+    def test_model_operations_list_and_detail_merge_catalog_with_real_history_safely(self):
+        from unittest.mock import patch
+
+        from app.db.models import AdminAuditEvent, AgentSession, Conversation, Message, PerformanceRun
+
+        created = datetime(2026, 7, 12, 12, 0, 0)
+        self.db.add_all(
+            [
+                Message(
+                    id="msg-model-active",
+                    conversation_id="conv-1",
+                    role="assistant",
+                    content=[{"type": "text", "text": "active"}],
+                    model_id="deepseek-chat",
+                    usage={"input_tokens": 1_500_000_000, "output_tokens": 20},
+                    created_at=created,
+                ),
+                Conversation(
+                    id="conv-retired",
+                    user_id="user-1",
+                    title="历史模型对话",
+                    model_id="retired/model-v1",
+                    created_at=created,
+                    updated_at=created,
+                ),
+                Message(
+                    id="msg-model-retired",
+                    conversation_id="conv-retired",
+                    role="assistant",
+                    content=[{"type": "text", "text": "retired"}],
+                    model_id="retired/model-v1",
+                    usage={"input_tokens": 30, "output_tokens": 40},
+                    created_at=created,
+                ),
+                PerformanceRun(
+                    run_id="perf-model-retired",
+                    environment="production",
+                    model_id="retired/model-v1",
+                    status="completed",
+                    schema_version=2,
+                    safe_summary={
+                        "stages": [{"kind": "sse", "concurrency": 1, "p95_ttft_ms": 250}],
+                    },
+                    imported_by_user_id="admin-1",
+                    created_at=created,
+                ),
+            ]
+        )
+        self.db.commit()
+        self.db.add(
+            AgentSession(
+                id="run-model-retired",
+                conversation_id="conv-retired",
+                message_id="msg-model-retired",
+                user_id="user-1",
+                model_id="retired/model-v1",
+                provider="legacy",
+                status="error",
+                error_message="provider-private-error",
+                total_duration_ms=4321,
+                created_at=created,
+            )
+        )
+        self.db.commit()
+        catalog = {
+            "deepseek-chat": {
+                "underlying": "openai/provider-private-model",
+                "db_model": True,
+                "max_input_tokens": 64000,
+                "max_output_tokens": 8192,
+                "metadata": {
+                    "display_name": "DeepSeek Chat",
+                    "provider_key": "deepseek",
+                    "provider_display": "DeepSeek",
+                    "description": "通用模型",
+                    "knowledge_cutoff": "2025-01",
+                    "capabilities": {"functionCalling": True, "vision": False},
+                    "pricing": {"input": 1.2, "output": 2.4, "unit": "USD"},
+                    "cost_tier": "low",
+                    "recommended_for": ["general"],
+                    "api_key": "catalog-private-key",
+                },
+            },
+            "catalog-only": {
+                "underlying": "openai/catalog-only-private-underlying",
+                "litellm_provider": "deepseek",
+                "db_model": True,
+                "max_input_tokens": 32000,
+                "max_output_tokens": 4096,
+                "metadata": {"display_name": "Catalog Only"},
+            },
+            "wildcard/*": {"underlying": "openai/*", "db_model": False, "metadata": {}},
+        }
+        health = {"status": "healthy", "error": None, "checked_at": 1783857600.0}
+
+        with (
+            patch("app.services.admin_audit_service.litellm_catalog.list_aliases", return_value=catalog),
+            patch(
+                "app.services.admin_audit_service.litellm_catalog.get_model_entry",
+                side_effect=lambda model_id: catalog.get(model_id),
+            ),
+            patch("app.services.admin_audit_service.litellm_health.get_health", return_value=health),
+            patch(
+                "app.services.admin_audit_service.litellm_catalog.get_cache_status",
+                return_value={"availability": "available", "has_cache": True},
+            ),
+            patch(
+                "app.services.admin_audit_service.get_agent_tools_disabled_aliases",
+                create=True,
+                return_value={"deepseek-chat"},
+            ) as disabled_aliases,
+        ):
+            listed = self.client.get("/api/admin/audit/models?page_size=100")
+            self.assertEqual(disabled_aliases.call_count, 1)
+            filtered = self.client.get(
+                "/api/admin/audit/models?page_size=100&provider=%20DeepSeek%20&health_status=healthy"
+            )
+            unknown_health = self.client.get("/api/admin/audit/models?page_size=100&health_status=unknown")
+            active_detail = self.client.get("/api/admin/audit/models/deepseek-chat")
+            retired_detail = self.client.get("/api/admin/audit/models/retired/model-v1")
+            missing = self.client.get("/api/admin/audit/models/missing/model")
+
+        with (
+            patch("app.services.admin_audit_service.litellm_catalog.list_aliases", return_value={}),
+            patch("app.services.admin_audit_service.litellm_catalog.get_model_entry", return_value=None),
+            patch(
+                "app.services.admin_audit_service.litellm_catalog.get_cache_status",
+                return_value={"availability": "degraded", "has_cache": False},
+            ),
+            patch("app.services.admin_audit_service.get_agent_tools_disabled_aliases") as outage_disabled_aliases,
+        ):
+            catalog_unavailable = self.client.get("/api/admin/audit/models?page_size=100")
+            degraded_detail = self.client.get("/api/admin/audit/models/retired/model-v1")
+
+        self.assertEqual(listed.status_code, 200)
+        items = {item["model_id"]: item for item in listed.json()["data"]["items"]}
+        self.assertEqual(set(items), {"catalog-only", "deepseek-chat", "retired/model-v1"})
+        active = items["deepseek-chat"]
+        self.assertEqual(active["catalog_status"], "active")
+        self.assertEqual(active["catalog_availability"], "available")
+        self.assertEqual(active["assistant_message_count"], 1)
+        self.assertEqual(active["input_tokens"], 1_500_000_000)
+        self.assertEqual(active["output_tokens"], 20)
+        self.assertFalse(active["capabilities"]["agentTools"])
+        self.assertNotIn("pricing", active)
+        self.assertEqual(listed.json()["data"]["catalog_availability"], "available")
+        self.assertIsNone(items["catalog-only"]["cost_tier"])
+        retired = items["retired/model-v1"]
+        self.assertEqual(retired["catalog_status"], "historical")
+        self.assertEqual(retired["conversation_count"], 1)
+        self.assertEqual(retired["user_count"], 1)
+        self.assertEqual(retired["agent_run_count"], 1)
+        self.assertEqual(retired["agent_error_count"], 1)
+        self.assertEqual(set(retired["capabilities"].values()), {False})
+        self.assertEqual(retired["latest_performance_run"]["source"], "admin_imported_performance_run")
+        self.assertEqual(retired["latest_performance_run"]["run_id"], "perf-model-retired")
+        self.assertNotIn("safe_summary", retired["latest_performance_run"])
+        self.assertEqual(
+            retired["metric_scope"]["assistant_messages_and_tokens"],
+            "persisted_assistant_messages",
+        )
+        self.assertEqual(active_detail.status_code, 200)
+        self.assertEqual(active_detail.json()["data"]["catalog_source"], "litellm_model_info")
+        self.assertEqual(retired_detail.status_code, 200)
+        self.assertEqual(retired_detail.json()["data"]["model_id"], "retired/model-v1")
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(filtered.status_code, 200)
+        self.assertEqual(
+            [item["model_id"] for item in filtered.json()["data"]["items"]],
+            ["catalog-only", "deepseek-chat"],
+        )
+        self.assertEqual(
+            [item["model_id"] for item in unknown_health.json()["data"]["items"]],
+            ["retired/model-v1"],
+        )
+        self.assertEqual(catalog_unavailable.status_code, 200)
+        unavailable_items = catalog_unavailable.json()["data"]["items"]
+        self.assertEqual({item["model_id"] for item in unavailable_items}, {"deepseek-chat", "retired/model-v1"})
+        self.assertEqual({item["catalog_status"] for item in unavailable_items}, {"unknown"})
+        self.assertEqual({item["health"]["status"] for item in unavailable_items}, {"unknown"})
+        self.assertEqual(catalog_unavailable.json()["data"]["catalog_availability"], "degraded")
+        self.assertEqual(degraded_detail.status_code, 200)
+        self.assertEqual(degraded_detail.json()["data"]["catalog_status"], "unknown")
+        self.assertEqual(degraded_detail.json()["data"]["catalog_availability"], "degraded")
+        outage_disabled_aliases.assert_not_called()
+        serialized = listed.text + retired_detail.text
+        for forbidden in (
+            "provider-private-model",
+            "catalog-private-key",
+            "provider-private-error",
+            "total_duration_ms",
+            "tool_duration",
+            "latency",
+            "litellm_params",
+        ):
+            self.assertNotIn(forbidden, serialized)
+        actions = {
+            event.action
+            for event in self.db.query(AdminAuditEvent).filter(AdminAuditEvent.resource_type == "model").all()
+        }
+        self.assertEqual(actions, {"admin.audit.models.list", "admin.audit.model.view"})
+
+    def test_model_operations_excludes_invalid_historical_ids_without_breaking_list(self):
+        from unittest.mock import patch
+
+        from app.db.models import Conversation
+
+        invalid_ids = ["x" * 201, "bad\nmodel", " padded-model "]
+        self.db.add_all(
+            [
+                Conversation(
+                    id=f"conv-invalid-{index}",
+                    user_id="user-1",
+                    title="异常历史模型",
+                    model_id=model_id,
+                    created_at=datetime(2026, 7, 12, 12, 0, 0),
+                    updated_at=datetime(2026, 7, 12, 12, 0, 0),
+                )
+                for index, model_id in enumerate(invalid_ids)
+            ]
+        )
+        self.db.commit()
+
+        with patch("app.services.admin_audit_service.litellm_catalog.list_aliases", return_value={}):
+            listed = self.client.get("/api/admin/audit/models?page_size=100")
+            too_long = self.client.get(f"/api/admin/audit/models/{'x' * 201}")
+            padded = self.client.get("/api/admin/audit/models/%20padded-model%20")
+
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.json()["data"]["excluded_invalid_model_count"], 3)
+        self.assertEqual([item["model_id"] for item in listed.json()["data"]["items"]], ["deepseek-chat"])
+        self.assertNotIn(invalid_ids[0], listed.text)
+        self.assertNotIn(invalid_ids[1], listed.text)
+        self.assertEqual(too_long.status_code, 400)
+        self.assertEqual(padded.status_code, 400)
+
     def test_performance_schema_v2_round_trip_preserves_all_safe_sections(self):
         payload = {
             "run_id": "perf-20260712-schema-v2",

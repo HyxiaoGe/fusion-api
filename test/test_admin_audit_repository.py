@@ -15,6 +15,7 @@ from app.db.models import (
     ConversationFile,
     File,
     Message,
+    PerformanceRun,
     ToolCallLog,
     User,
 )
@@ -200,6 +201,86 @@ class AdminAuditRepositoryTests(unittest.TestCase):
         self.assertEqual(users["user-1"].username, "alice")
         self.assertFalse(hasattr(users["user-1"], "email"))
         self.assertFalse(hasattr(users["user-1"], "system_prompt"))
+
+    def test_model_operations_stats_batch_real_usage_agent_errors_and_latest_performance(self):
+        newer = datetime(2026, 7, 12, 12, 0, 0)
+        self.db.add(
+            AgentSession(
+                id="run-error",
+                conversation_id="conv-1",
+                message_id="msg-assistant",
+                user_id="user-1",
+                model_id="deepseek-chat",
+                provider="deepseek",
+                status="error",
+                error_message="private provider error",
+                total_duration_ms=999,
+                created_at=newer,
+            )
+        )
+        self.db.add_all(
+            [
+                PerformanceRun(
+                    run_id="perf-old",
+                    environment="production",
+                    model_id="deepseek-chat",
+                    status="completed",
+                    schema_version=2,
+                    safe_summary={"stages": []},
+                    imported_by_user_id="admin-1",
+                    created_at=datetime(2026, 7, 11, 13, 0, 0),
+                ),
+                PerformanceRun(
+                    run_id="perf-new",
+                    environment="production",
+                    model_id="deepseek-chat",
+                    status="completed",
+                    schema_version=2,
+                    safe_summary={"stages": []},
+                    imported_by_user_id="admin-1",
+                    created_at=newer,
+                ),
+                PerformanceRun(
+                    run_id="perf-only",
+                    environment="production",
+                    model_id="retired/perf-only",
+                    status="completed",
+                    schema_version=2,
+                    safe_summary={"stages": []},
+                    imported_by_user_id="admin-1",
+                    created_at=newer,
+                ),
+            ]
+        )
+        self.db.commit()
+
+        statements = []
+
+        def count_selects(_connection, _cursor, statement, _parameters, _context, _executemany):
+            if statement.lstrip().upper().startswith("SELECT"):
+                statements.append(statement)
+
+        event.listen(self.engine, "before_cursor_execute", count_selects)
+        try:
+            stats = AdminAuditRepository(self.db).list_model_operation_stats()
+        finally:
+            event.remove(self.engine, "before_cursor_execute", count_selects)
+
+        self.assertEqual(set(stats), {"deepseek-chat", "retired/perf-only"})
+        deepseek = stats["deepseek-chat"]
+        self.assertEqual(deepseek["conversation_count"], 1)
+        self.assertEqual(deepseek["user_count"], 1)
+        self.assertEqual(deepseek["assistant_message_count"], 1)
+        self.assertEqual(deepseek["input_tokens"], 12)
+        self.assertEqual(deepseek["output_tokens"], 8)
+        self.assertEqual(deepseek["agent_run_count"], 2)
+        self.assertEqual(deepseek["agent_error_count"], 1)
+        self.assertEqual(deepseek["last_used_at"], newer)
+        self.assertEqual(deepseek["latest_performance_run"].run_id, "perf-new")
+        self.assertNotIn("latency", deepseek)
+        self.assertEqual(stats["retired/perf-only"]["latest_performance_run"].run_id, "perf-only")
+        self.assertEqual(len(statements), 4)
+        self.assertIn("row_number", statements[-1].lower())
 
 
 if __name__ == "__main__":

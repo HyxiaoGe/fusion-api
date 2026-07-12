@@ -28,10 +28,13 @@ _DEFAULT_AGENT_TOOLS_DISABLED_ALIASES = {"qwen-vl-max"}
 
 # 缓存生效时间——LiteLLM 模型变更频次低，60s 足够
 _CACHE_TTL_SECONDS = 60.0
+_FAILED_FETCH_BACKOFF_SECONDS = float(os.environ.get("LITELLM_CATALOG_FAILURE_BACKOFF_SECONDS", "30"))
 
 _cache_lock = threading.Lock()
 _cache_payload: Optional[Dict[str, Dict[str, Any]]] = None
 _cache_loaded_at: float = 0.0
+_cache_last_attempt_at: float | None = None
+_cache_last_attempt_failed = False
 
 
 def _fetch_catalog() -> Dict[str, Dict[str, Any]]:
@@ -71,19 +74,26 @@ def _fetch_catalog() -> Dict[str, Dict[str, Any]]:
 
 def _ensure_loaded() -> Dict[str, Dict[str, Any]]:
     """返回当前缓存内容，过期时同步刷新。"""
-    global _cache_payload, _cache_loaded_at
+    global _cache_payload, _cache_loaded_at, _cache_last_attempt_at, _cache_last_attempt_failed
     now = time.monotonic()
     with _cache_lock:
         if _cache_payload is not None and now - _cache_loaded_at < _CACHE_TTL_SECONDS:
             return _cache_payload
+        if _cache_last_attempt_at is not None and now - _cache_last_attempt_at < _FAILED_FETCH_BACKOFF_SECONDS:
+            return _cache_payload or {}
         # 缓存过期/未加载——拉一次
+        _cache_last_attempt_at = now
         payload = _fetch_catalog()
         # 拉空时不覆盖旧缓存（避免短暂网络抖动把 chat 链路打瘸）
         if payload:
             _cache_payload = payload
             _cache_loaded_at = now
+            _cache_last_attempt_failed = False
         elif _cache_payload is None:
             _cache_payload = {}
+            _cache_last_attempt_failed = True
+        else:
+            _cache_last_attempt_failed = True
         return _cache_payload
 
 
@@ -161,9 +171,20 @@ def list_aliases() -> Dict[str, Dict[str, Any]]:
     return dict(_ensure_loaded())
 
 
+def get_cache_status() -> dict[str, Any]:
+    """返回不含错误正文的目录可用状态。"""
+    with _cache_lock:
+        return {
+            "availability": "degraded" if _cache_last_attempt_failed else "available",
+            "has_cache": bool(_cache_payload),
+        }
+
+
 def invalidate() -> None:
     """主动清缓存（测试用 / 模型变更后）。"""
-    global _cache_payload, _cache_loaded_at
+    global _cache_payload, _cache_loaded_at, _cache_last_attempt_at, _cache_last_attempt_failed
     with _cache_lock:
         _cache_payload = None
         _cache_loaded_at = 0.0
+        _cache_last_attempt_at = None
+        _cache_last_attempt_failed = False

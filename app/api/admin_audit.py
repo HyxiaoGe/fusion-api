@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Header, Query, Request
 
@@ -212,6 +213,48 @@ def list_events(
         created_to=created_to,
     )
     return success(data=data, request_id=request.state.request_id)
+
+
+@router.get("/models")
+def list_models(
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+    q: str | None = Query(None, max_length=200),
+    catalog_status: Literal["active", "historical", "unknown"] | None = None,
+    provider: str | None = Query(None, max_length=100),
+    health_status: Literal["healthy", "unhealthy", "unknown"] | None = None,
+    reason: str | None = Header(None, alias="X-Admin-Audit-Reason", max_length=300),
+    service: AdminAuditService = Depends(get_admin_audit_service),
+    auditor: User = Depends(get_conversation_auditor),
+):
+    return success(
+        data=service.list_models(
+            admin=auditor,
+            **_context(request, reason),
+            page=page,
+            page_size=page_size,
+            query=q,
+            catalog_status=catalog_status,
+            provider=provider,
+            health_status=health_status,
+        ),
+        request_id=request.state.request_id,
+    )
+
+
+@router.get("/models/{model_id:path}")
+def get_model(
+    model_id: str,
+    request: Request,
+    reason: str | None = Header(None, alias="X-Admin-Audit-Reason", max_length=300),
+    service: AdminAuditService = Depends(get_admin_audit_service),
+    auditor: User = Depends(get_conversation_auditor),
+):
+    return success(
+        data=service.get_model(model_id, admin=auditor, **_context(request, reason)),
+        request_id=request.state.request_id,
+    )
 
 
 @router.post("/performance-runs/import")
