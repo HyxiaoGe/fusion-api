@@ -618,6 +618,128 @@ class AdminAuditApiTests(unittest.TestCase):
         self.assertEqual(too_long.status_code, 400)
         self.assertEqual(padded.status_code, 400)
 
+    def test_model_provider_options_ignore_current_filters_and_pagination_with_stable_deduplication(self):
+        from unittest.mock import patch
+
+        catalog = {
+            "alpha-model": {
+                "db_model": True,
+                "litellm_provider": "alpha",
+                "metadata": {"provider_key": "alpha", "provider_display": "Zulu Provider"},
+            },
+            "zeta-model-a": {
+                "db_model": True,
+                "litellm_provider": "zeta",
+                "metadata": {"provider_key": "zeta", "provider_display": "Alpha Provider"},
+            },
+            "zeta-model-b": {
+                "db_model": True,
+                "litellm_provider": "zeta",
+                "metadata": {"provider_key": "zeta", "provider_display": "Omega Provider"},
+            },
+            "gamma-model": {
+                "db_model": True,
+                "litellm_provider": "gamma",
+                "metadata": {},
+            },
+        }
+
+        with (
+            patch("app.services.admin_audit_service.litellm_catalog.list_aliases", return_value=catalog),
+            patch(
+                "app.services.admin_audit_service.litellm_catalog.get_cache_status",
+                return_value={"availability": "available", "has_cache": True},
+            ),
+            patch(
+                "app.services.admin_audit_service.litellm_health.get_health",
+                side_effect=lambda model_id: {
+                    "status": "healthy" if model_id == "alpha-model" else "unhealthy",
+                    "error": None,
+                    "checked_at": 1783857600.0,
+                },
+            ),
+            patch(
+                "app.services.admin_audit_service.get_agent_tools_disabled_aliases",
+                return_value=set(),
+            ),
+        ):
+            active_filtered = self.client.get(
+                "/api/admin/audit/models?page=1&page_size=1&q=alpha-model"
+                "&provider=alpha&catalog_status=active&health_status=healthy"
+            )
+            historical_filtered = self.client.get(
+                "/api/admin/audit/models?page=1&page_size=1&q=deepseek"
+                "&provider=alpha&catalog_status=historical&health_status=healthy"
+            )
+
+        expected_options = [
+            {"value": "zeta", "label": "Alpha Provider"},
+            {"value": "gamma", "label": "gamma"},
+            {"value": "alpha", "label": "Zulu Provider"},
+        ]
+        self.assertEqual(active_filtered.status_code, 200)
+        self.assertEqual(
+            [item["model_id"] for item in active_filtered.json()["data"]["items"]],
+            ["alpha-model"],
+        )
+        self.assertEqual(active_filtered.json()["data"]["provider_options"], expected_options)
+        self.assertEqual(historical_filtered.status_code, 200)
+        self.assertEqual(historical_filtered.json()["data"]["items"], [])
+        self.assertEqual(historical_filtered.json()["data"]["provider_options"], expected_options)
+
+    def test_model_provider_options_disambiguate_casefold_colliding_labels_deterministically(self):
+        from unittest.mock import patch
+
+        catalog = {
+            "provider-b-model": {
+                "db_model": True,
+                "litellm_provider": "provider-b",
+                "metadata": {"provider_key": "provider-b", "provider_display": "shared provider"},
+            },
+            "unique-model": {
+                "db_model": True,
+                "litellm_provider": "unique",
+                "metadata": {"provider_key": "unique", "provider_display": "Unique Provider"},
+            },
+            "provider-a-model": {
+                "db_model": True,
+                "litellm_provider": "provider-a",
+                "metadata": {"provider_key": "provider-a", "provider_display": "Shared Provider"},
+            },
+        }
+        reversed_catalog = dict(reversed(list(catalog.items())))
+
+        with (
+            patch(
+                "app.services.admin_audit_service.litellm_catalog.list_aliases",
+                side_effect=[catalog, reversed_catalog],
+            ),
+            patch(
+                "app.services.admin_audit_service.litellm_catalog.get_cache_status",
+                return_value={"availability": "available", "has_cache": True},
+            ),
+            patch(
+                "app.services.admin_audit_service.litellm_health.get_health",
+                return_value={"status": "healthy", "error": None, "checked_at": 1783857600.0},
+            ),
+            patch(
+                "app.services.admin_audit_service.get_agent_tools_disabled_aliases",
+                return_value=set(),
+            ),
+        ):
+            first = self.client.get("/api/admin/audit/models?page_size=1&provider=provider-a")
+            second = self.client.get("/api/admin/audit/models?page_size=1&provider=provider-b")
+
+        expected_options = [
+            {"value": "provider-a", "label": "Shared Provider（provider-a）"},
+            {"value": "provider-b", "label": "shared provider（provider-b）"},
+            {"value": "unique", "label": "Unique Provider"},
+        ]
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.json()["data"]["provider_options"], expected_options)
+        self.assertEqual(second.json()["data"]["provider_options"], expected_options)
+
     def test_performance_schema_v2_round_trip_preserves_all_safe_sections(self):
         payload = {
             "run_id": "perf-20260712-schema-v2",

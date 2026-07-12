@@ -878,6 +878,7 @@ class AdminAuditService:
             )
             for model_id in model_ids
         ]
+        provider_options = self._model_provider_options(items)
         if query and query.strip():
             needle = query.strip().casefold()
             items = [
@@ -910,6 +911,7 @@ class AdminAuditService:
         result = page_payload(items[start : start + page_size], total, page, page_size)
         result["excluded_invalid_model_count"] = len(invalid_model_ids)
         result["catalog_availability"] = catalog_availability
+        result["provider_options"] = provider_options
         return result
 
     def get_model(
@@ -960,6 +962,50 @@ class AdminAuditService:
         if value != normalized or not normalized or len(normalized) > 200 or re.search(r"[\x00-\x1f\x7f]", normalized):
             return None
         return normalized
+
+    @staticmethod
+    def _model_provider_options(items: list[dict[str, Any]]) -> list[dict[str, str]]:
+        """从未筛选、未分页的模型全集生成稳定的提供商选项。"""
+        candidates: dict[str, set[str]] = {}
+        for item in items:
+            provider = item.get("provider")
+            if not isinstance(provider, str) or not provider.strip():
+                continue
+            value = provider.strip()
+            display = item.get("provider_display")
+            label = display.strip() if isinstance(display, str) and display.strip() else value
+            candidates.setdefault(value, set()).add(label)
+
+        options: list[dict[str, str]] = []
+        for value, labels in candidates.items():
+            label = min(
+                labels,
+                key=lambda candidate: (
+                    candidate == value,
+                    candidate.casefold(),
+                    candidate,
+                ),
+            )
+            options.append({"value": value, "label": label})
+
+        options_by_label: dict[str, list[dict[str, str]]] = {}
+        for option in options:
+            options_by_label.setdefault(option["label"].casefold(), []).append(option)
+        for colliding_options in options_by_label.values():
+            if len(colliding_options) < 2:
+                continue
+            for option in colliding_options:
+                option["label"] = f"{option['label']}（{option['value']}）"
+
+        options.sort(
+            key=lambda option: (
+                option["label"].casefold(),
+                option["label"],
+                option["value"].casefold(),
+                option["value"],
+            )
+        )
+        return options
 
     @classmethod
     def _audit_event_item(cls, event: AdminAuditEvent, target_user: User | None) -> dict[str, Any]:
