@@ -2,8 +2,6 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-import pytest
-
 from app.schemas.response import ApiException
 from app.services.admin_audit_service import AdminAuditService
 
@@ -106,13 +104,16 @@ def test_model_detail_rejects_control_character_id_before_catalog_or_database_ac
     repository = Mock()
     service = AdminAuditService(repository)
 
-    with pytest.raises(ApiException) as exc_info:
+    try:
         service.get_model(
             "bad\nmodel",
             admin=SimpleNamespace(id="admin-1", username="root", email="root@example.com"),
             request_id="request-invalid-model",
             reason=None,
         )
+    except ApiException as exc:
+        assert exc.status_code == 400
+    else:
+        raise AssertionError("控制字符模型 ID 应被拒绝")
 
-    assert exc_info.value.status_code == 400
     repository.list_model_operation_stats.assert_not_called()
