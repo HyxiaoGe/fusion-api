@@ -125,6 +125,92 @@ class AdminAuditApiTests(unittest.TestCase):
         self.assertIn("admin.audit.messages.list", actions)
         self.assertNotIn("message-secret", events_response.text)
 
+    def test_audit_events_include_target_user_summary_and_keep_deleted_target_id(self):
+        from app.db.models import AdminAuditEvent
+
+        created = datetime(2026, 7, 11, 12, 0, 0)
+        self.db.add_all(
+            [
+                AdminAuditEvent(
+                    id="event-live-target",
+                    admin_user_id="historical-admin-id",
+                    admin_snapshot={
+                        "id": "historical-admin-id",
+                        "username": "historical-admin",
+                        "email_masked": "h***@example.com",
+                        "email": "historical-admin-private@example.com",
+                        "unknown_pii": "historical-admin-id-card",
+                    },
+                    action="admin.audit.user.view",
+                    resource_type="user",
+                    resource_id="user-1",
+                    target_user_id="user-1",
+                    request_id="request-live-target",
+                    extra_metadata={
+                        "page": 1,
+                        "query": {
+                            "present": True,
+                            "length": 17,
+                            "raw": "alice-private@example.com",
+                        },
+                        "customer_email": "customer-private@example.com",
+                        "future_secret": "future-private-value",
+                    },
+                    created_at=created,
+                ),
+                AdminAuditEvent(
+                    id="event-deleted-target",
+                    admin_user_id="historical-admin-id",
+                    admin_snapshot={"id": "historical-admin-id", "username": "historical-admin"},
+                    action="admin.audit.user.view",
+                    resource_type="user",
+                    resource_id="deleted-user",
+                    target_user_id="deleted-user",
+                    request_id="request-deleted-target",
+                    extra_metadata={},
+                    created_at=created,
+                ),
+            ]
+        )
+        self.db.commit()
+
+        response = self.client.get("/api/admin/audit/events?page_size=100")
+
+        self.assertEqual(response.status_code, 200)
+        events = {item["id"]: item for item in response.json()["data"]["items"]}
+        self.assertEqual(
+            events["event-live-target"]["target_user"],
+            {
+                "id": "user-1",
+                "username": "alice",
+                "nickname": "Alice",
+                "email_masked": "al***@example.com",
+            },
+        )
+        self.assertEqual(events["event-live-target"]["admin_snapshot"]["username"], "historical-admin")
+        self.assertEqual(
+            events["event-live-target"]["admin_snapshot"],
+            {
+                "id": "historical-admin-id",
+                "username": "historical-admin",
+                "email_masked": "h***@example.com",
+            },
+        )
+        self.assertEqual(
+            events["event-live-target"]["metadata"],
+            {"page": 1, "query": {"present": True, "length": 17}},
+        )
+        for sentinel in (
+            "historical-admin-private@example.com",
+            "historical-admin-id-card",
+            "alice-private@example.com",
+            "customer-private@example.com",
+            "future-private-value",
+        ):
+            self.assertNotIn(sentinel, response.text)
+        self.assertEqual(events["event-deleted-target"]["target_user_id"], "deleted-user")
+        self.assertIsNone(events["event-deleted-target"]["target_user"])
+
     def test_message_route_serialization_never_returns_unapproved_block_or_credential_fields(self):
         from app.db.models import Message
 

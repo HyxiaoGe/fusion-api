@@ -387,6 +387,16 @@ class AdminAuditRepository:
             self.db.flush()
         return event
 
+    def get_users_by_ids(self, user_ids: list[str]) -> dict[str, Any]:
+        """用单次 IN 查询读取审计展示所需的最小用户身份字段。"""
+        normalized_ids = sorted(set(user_ids))
+        if not normalized_ids:
+            return {}
+        rows = (
+            self.db.query(User.id, User.username, User.nickname, User.email).filter(User.id.in_(normalized_ids)).all()
+        )
+        return {str(row.id): row for row in rows}
+
     def list_audit_events(
         self,
         *,

@@ -10,7 +10,14 @@ from pydantic import ValidationError
 
 from app.db.admin_audit_repository import AdminAuditRepository, page_payload
 from app.db.models import AdminAuditEvent, AgentStep, File, Message, PerformanceRun, ToolCallLog, User
-from app.schemas.admin_audit import AdminPerformanceRunImport, PerformanceSafeSummary
+from app.schemas.admin_audit import (
+    AdminAuditAdminSnapshot,
+    AdminAuditEventItem,
+    AdminAuditEventMetadata,
+    AdminAuditSearchSummary,
+    AdminPerformanceRunImport,
+    PerformanceSafeSummary,
+)
 from app.schemas.response import ApiException, ErrorCode
 from app.services.admin_audit_sanitizer import mask_email, sanitize_admin_value
 
@@ -690,24 +697,78 @@ class AdminAuditService:
         )
         return page_payload(items, total, page, page_size)
 
-    @staticmethod
-    def _audit_event_item(event: AdminAuditEvent) -> dict[str, Any]:
-        metadata, _ = sanitize_admin_value(event.extra_metadata or {})
-        snapshot, _ = sanitize_admin_value(event.admin_snapshot or {})
+    @classmethod
+    def _audit_event_item(cls, event: AdminAuditEvent, target_user: User | None) -> dict[str, Any]:
         reason, _ = sanitize_admin_value(event.reason or "", max_string_chars=300)
-        return {
-            "id": event.id,
-            "admin_user_id": event.admin_user_id,
-            "admin_snapshot": snapshot,
-            "action": event.action,
-            "resource_type": event.resource_type,
-            "resource_id": event.resource_id,
-            "target_user_id": event.target_user_id,
-            "request_id": event.request_id,
-            "reason": reason or None,
-            "metadata": metadata,
-            "created_at": event.created_at,
-        }
+        item = AdminAuditEventItem(
+            id=event.id,
+            admin_user_id=event.admin_user_id,
+            admin_snapshot=cls._admin_snapshot_projection(event.admin_snapshot),
+            action=event.action,
+            resource_type=event.resource_type,
+            resource_id=event.resource_id,
+            target_user_id=event.target_user_id,
+            target_user=cls._user_summary(target_user),
+            request_id=event.request_id,
+            reason=reason or None,
+            metadata=cls._audit_metadata_projection(event.extra_metadata),
+            created_at=event.created_at,
+        )
+        payload = item.model_dump()
+        payload["admin_snapshot"] = item.admin_snapshot.model_dump(exclude_none=True)
+        payload["metadata"] = item.metadata.model_dump(exclude_none=True)
+        return payload
+
+    @staticmethod
+    def _admin_snapshot_projection(value: Any) -> AdminAuditAdminSnapshot:
+        raw = value if isinstance(value, dict) else {}
+        projected: dict[str, Any] = {}
+        for key in ("id", "username", "email_masked"):
+            if key not in raw:
+                continue
+            sanitized, _ = sanitize_admin_value(raw[key], max_string_chars=320)
+            try:
+                candidate = AdminAuditAdminSnapshot.model_validate({key: sanitized})
+            except ValidationError:
+                continue
+            projected[key] = getattr(candidate, key)
+        return AdminAuditAdminSnapshot.model_validate(projected)
+
+    @staticmethod
+    def _audit_search_summary(value: Any) -> AdminAuditSearchSummary | None:
+        if isinstance(value, str):
+            return AdminAuditSearchSummary(present=bool(value), length=len(value))
+        if not isinstance(value, dict):
+            return None
+        present = value.get("present")
+        length = value.get("length")
+        if not isinstance(present, bool) or isinstance(length, bool) or not isinstance(length, int):
+            return None
+        try:
+            return AdminAuditSearchSummary(present=present, length=length)
+        except ValidationError:
+            return None
+
+    @classmethod
+    def _audit_metadata_projection(cls, value: Any) -> AdminAuditEventMetadata:
+        raw = value if isinstance(value, dict) else {}
+        projected: dict[str, Any] = {}
+        search_keys = {"q", "query"}
+        allowed_keys = set(AdminAuditEventMetadata.model_fields) - search_keys
+        for key in allowed_keys:
+            if key not in raw:
+                continue
+            sanitized, _ = sanitize_admin_value(raw[key], max_string_chars=300)
+            try:
+                candidate = AdminAuditEventMetadata.model_validate({key: sanitized})
+            except ValidationError:
+                continue
+            projected[key] = getattr(candidate, key)
+        for key in search_keys:
+            summary = cls._audit_search_summary(raw.get(key))
+            if summary is not None:
+                projected[key] = summary
+        return AdminAuditEventMetadata.model_validate(projected)
 
     def list_audit_events(
         self,
@@ -718,7 +779,9 @@ class AdminAuditService:
         **filters: Any,
     ) -> dict[str, Any]:
         rows, total = self.repository.list_audit_events(**filters)
-        items = [self._audit_event_item(row) for row in rows]
+        target_user_ids = sorted({row.target_user_id for row in rows if row.target_user_id})
+        target_users = self.repository.get_users_by_ids(target_user_ids) if target_user_ids else {}
+        items = [self._audit_event_item(row, target_users.get(row.target_user_id)) for row in rows]
         self._record(
             admin=admin,
             action="admin.audit.events.list",

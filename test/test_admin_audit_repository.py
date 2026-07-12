@@ -191,6 +191,15 @@ class AdminAuditRepositoryTests(unittest.TestCase):
         self.assertEqual(files[0].original_filename, "visible.png")
         self.assertEqual(file_total, 1)
 
+    def test_get_users_by_ids_returns_existing_users_in_one_batch_and_omits_deleted_ids(self):
+        repo = AdminAuditRepository(self.db)
+
+        users = repo.get_users_by_ids(["deleted-user", "user-1"])
+
+        self.assertEqual(set(users), {"user-1"})
+        self.assertEqual(users["user-1"].username, "alice")
+        self.assertFalse(hasattr(users["user-1"], "system_prompt"))
+
 
 if __name__ == "__main__":
     unittest.main()

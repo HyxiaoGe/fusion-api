@@ -160,3 +160,76 @@ class AdminPerformanceRunImport(BaseModel):
 class AdminPageParams(BaseModel):
     page: int = Field(default=1, ge=1)
     page_size: int = Field(default=25, ge=1, le=100)
+
+
+class AdminAuditUserSummary(BaseModel):
+    """审计事件目标用户的当前可读身份摘要。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    username: str
+    nickname: str | None = None
+    email_masked: str | None = None
+
+
+class AdminAuditAdminSnapshot(BaseModel):
+    """审计发生时管理员身份的严格快照投影。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str | None = Field(default=None, max_length=200)
+    username: str | None = Field(default=None, max_length=200)
+    email_masked: str | None = Field(
+        default=None,
+        max_length=320,
+        pattern=r"^(?:\*{3}|.{1,2}\*{3}@[^@\s]+)$",
+    )
+
+
+class AdminAuditSearchSummary(BaseModel):
+    """搜索条件只保留是否存在与长度，不返回原文。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    present: bool
+    length: SafeCount
+
+
+class AdminAuditEventMetadata(BaseModel):
+    """审计事件允许下发的有限元数据。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    page: int | None = Field(default=None, ge=1, le=1_000_000_000)
+    page_size: int | None = Field(default=None, ge=1, le=100)
+    environment: SafeCode | None = None
+    schema_version: int | None = Field(default=None, ge=1, le=1_000_000)
+    status: SafeCode | None = None
+    has_tools: bool | None = None
+    has_files: bool | None = None
+    created_from: datetime | None = None
+    created_to: datetime | None = None
+    model_id: str | None = Field(default=None, max_length=100, pattern=r"^[A-Za-z0-9._:/-]+$")
+    source: str | None = Field(default=None, max_length=100, pattern=r"^[A-Za-z0-9._:/-]+$")
+    q: AdminAuditSearchSummary | None = None
+    query: AdminAuditSearchSummary | None = None
+
+
+class AdminAuditEventItem(BaseModel):
+    """管理员访问审计事件的安全返回协议。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    admin_user_id: str
+    admin_snapshot: AdminAuditAdminSnapshot
+    action: str
+    resource_type: str
+    resource_id: str | None = None
+    target_user_id: str | None = None
+    target_user: AdminAuditUserSummary | None = None
+    request_id: str
+    reason: str | None = None
+    metadata: AdminAuditEventMetadata
+    created_at: datetime
