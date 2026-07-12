@@ -448,8 +448,17 @@ class AdminAuditRepository:
         environment: str | None = None,
         status: str | None = None,
         model_id: str | None = None,
-    ) -> tuple[list[PerformanceRun], int]:
-        query = self.db.query(PerformanceRun)
+    ) -> tuple[list[Any], int]:
+        query = self.db.query(
+            PerformanceRun.run_id,
+            PerformanceRun.environment,
+            PerformanceRun.model_id,
+            PerformanceRun.status,
+            PerformanceRun.schema_version,
+            PerformanceRun.started_at,
+            PerformanceRun.finished_at,
+            PerformanceRun.created_at,
+        )
         if environment:
             query = query.filter(PerformanceRun.environment == environment)
         if status:

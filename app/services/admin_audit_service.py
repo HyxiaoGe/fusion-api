@@ -5,9 +5,11 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+from pydantic import ValidationError
+
 from app.db.admin_audit_repository import AdminAuditRepository, page_payload
 from app.db.models import AdminAuditEvent, AgentStep, File, Message, PerformanceRun, ToolCallLog, User
-from app.schemas.admin_audit import AdminPerformanceRunImport
+from app.schemas.admin_audit import AdminPerformanceRunImport, PerformanceSafeSummary
 from app.schemas.response import ApiException, ErrorCode
 from app.services.admin_audit_sanitizer import mask_email, sanitize_admin_value
 
@@ -572,16 +574,40 @@ class AdminAuditService:
         )
 
     @staticmethod
-    def _performance_item(run: PerformanceRun) -> dict[str, Any]:
-        summary, _ = sanitize_admin_value(run.safe_summary, max_string_chars=2000, max_list_items=100)
+    def _safe_performance_summary(value: Any) -> dict[str, Any]:
+        try:
+            summary_source = PerformanceSafeSummary.model_validate(value).model_dump(exclude_none=True)
+        except ValidationError:
+            summary_source = PerformanceSafeSummary(
+                stopped=True,
+                stop_reasons=["invalid_safe_summary"],
+            ).model_dump(exclude_none=True)
+        summary, _ = sanitize_admin_value(summary_source, max_string_chars=2000, max_list_items=100)
+        return summary
+
+    @classmethod
+    def _performance_item(cls, run: PerformanceRun) -> dict[str, Any]:
         return {
             "run_id": run.run_id,
             "environment": run.environment,
             "model_id": run.model_id,
             "status": run.status,
             "schema_version": run.schema_version,
-            "safe_summary": summary,
+            "safe_summary": cls._safe_performance_summary(run.safe_summary),
             "imported_by_user_id": run.imported_by_user_id,
+            "started_at": run.started_at,
+            "finished_at": run.finished_at,
+            "created_at": run.created_at,
+        }
+
+    @staticmethod
+    def _performance_list_item(run: Any) -> dict[str, Any]:
+        return {
+            "run_id": run.run_id,
+            "environment": run.environment,
+            "model_id": run.model_id,
+            "status": run.status,
+            "schema_version": run.schema_version,
             "started_at": run.started_at,
             "finished_at": run.finished_at,
             "created_at": run.created_at,
@@ -620,7 +646,7 @@ class AdminAuditService:
         **filters: Any,
     ) -> dict[str, Any]:
         rows, total = self.repository.list_performance_runs(**filters)
-        items = [self._performance_item(row) for row in rows]
+        items = [self._performance_list_item(row) for row in rows]
         self._record(
             admin=admin,
             action="admin.audit.performance_runs.list",

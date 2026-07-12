@@ -187,6 +187,181 @@ class AdminAuditApiTests(unittest.TestCase):
 
         self.assertEqual(self.db.query(PerformanceRun).count(), 1)
 
+    def test_performance_schema_v2_round_trip_preserves_all_safe_sections(self):
+        payload = {
+            "run_id": "perf-20260712-schema-v2",
+            "environment": "production",
+            "model_id": "deepseek-chat",
+            "status": "stopped",
+            "schema_version": 2,
+            "safe_summary": {
+                "stages": [
+                    {
+                        "scenario": "conversation_list",
+                        "kind": "http",
+                        "concurrency": 25,
+                        "duration_seconds": 60,
+                        "total": 100,
+                        "successful": 99,
+                        "failed": 1,
+                        "requests_per_second": 12.5,
+                        "p50_ms": 90,
+                        "p95_ms": 180,
+                        "p99_ms": 220,
+                        "error_rate": 0.01,
+                    },
+                    {
+                        "scenario": "sse_short",
+                        "kind": "sse",
+                        "concurrency": 8,
+                        "flows": 8,
+                        "flows_with_output": 8,
+                        "output_chunks": 96,
+                        "visible_chars": 2048,
+                        "approx_tokens": 512,
+                        "first_output_p95_ms": 450,
+                        "chunk_interval_p95_ms": 80,
+                        "output_window_p95_ms": 2500,
+                        "tokens_per_second_p95": 42,
+                    },
+                    {
+                        "scenario": "disconnect_reconnect",
+                        "kind": "recovery",
+                        "concurrency": 4,
+                        "initial_events": 40,
+                        "recovered_events": 40,
+                        "duplicate_events": 0,
+                        "lost_events": 0,
+                        "ordering_errors": 0,
+                        "recovery_latency_p95_ms": 320,
+                    },
+                    {
+                        "scenario": "stop_stream",
+                        "kind": "stop",
+                        "concurrency": 3,
+                        "stop_attempted": True,
+                        "cancelled": True,
+                        "persistence_verified": True,
+                        "stop_attempts": 3,
+                        "cancelled_count": 3,
+                        "persistence_verified_count": 3,
+                        "stop_latency_p95_ms": 210,
+                    },
+                    {
+                        "scenario": "soak",
+                        "kind": "soak",
+                        "concurrency": 2,
+                        "cadence_seconds": 30,
+                        "window_seconds": 300,
+                        "executed_ticks": 10,
+                        "skipped_ticks": 0,
+                        "window_count": 2,
+                        "consecutive_failures": 0,
+                    },
+                ],
+                "stopped": True,
+                "stop_reasons": ["resource:api_memory"],
+                "cleanup": {
+                    "conversations_deleted": 8,
+                    "tokens_revoked": 2,
+                    "users_deleted": 1,
+                    "agent_steps_deleted": 5,
+                    "errors": ["token_revoke_failed"],
+                },
+                "resources": {
+                    "api": {"cpu_percent": 88.5, "memory_mib": 920, "restarts": 0, "oom": False},
+                    "postgres": {"connections": 24, "restarts": 0},
+                    "redis": {"connections": 12, "rejected_connections": 0, "evicted_keys": 0},
+                    "host": {"cpu_percent": 62, "memory_mib": 4096, "memory_percent": 64},
+                    "nginx": {"connections": 16},
+                    "litellm": {"cpu_percent": 35, "memory_mib": 512},
+                },
+                "rps": 12.5,
+                "p50_ms": 90,
+                "p90_ms": 150,
+                "p95_ms": 180,
+                "p99_ms": 220,
+                "max_ms": 310,
+                "ttft_ms": 450,
+                "error_rate": 0.01,
+            },
+            "started_at": "2026-07-12T12:00:00+08:00",
+            "finished_at": "2026-07-12T12:10:00+08:00",
+        }
+
+        imported = self.client.post("/api/admin/audit/performance-runs/import", json=payload)
+        from app.db.admin_audit_repository import AdminAuditRepository
+
+        rows, _ = AdminAuditRepository(self.db).list_performance_runs(page=1, page_size=25)
+        listed = self.client.get("/api/admin/audit/performance-runs")
+        detail = self.client.get("/api/admin/audit/performance-runs/perf-20260712-schema-v2")
+
+        self.assertEqual(imported.status_code, 200)
+        self.assertFalse(hasattr(rows[0], "safe_summary"))
+        self.assertFalse(hasattr(rows[0], "imported_by_user_id"))
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(detail.status_code, 200)
+        list_item = listed.json()["data"]["items"][0]
+        self.assertNotIn("safe_summary", list_item)
+        self.assertNotIn("imported_by_user_id", list_item)
+        data = detail.json()["data"]
+        self.assertEqual(data["schema_version"], 2)
+        self.assertEqual(data["imported_by_user_id"], "admin-1")
+        self.assertEqual(data["safe_summary"], payload["safe_summary"])
+        self.assertEqual(
+            [stage["kind"] for stage in data["safe_summary"]["stages"]],
+            ["http", "sse", "recovery", "stop", "soak"],
+        )
+        from app.db.models import AdminAuditEvent
+
+        actions = {
+            event.action
+            for event in self.db.query(AdminAuditEvent)
+            .filter(AdminAuditEvent.resource_id == "perf-20260712-schema-v2")
+            .all()
+        }
+        self.assertIn("admin.audit.performance_run.view", actions)
+
+    def test_performance_reads_degrade_invalid_stored_summary_without_leaking_values(self):
+        from app.db.models import PerformanceRun
+
+        self.db.add(
+            PerformanceRun(
+                run_id="perf-invalid-stored-summary",
+                environment="production",
+                status="completed",
+                schema_version=2,
+                safe_summary={
+                    "stages": [],
+                    "conversation_id": "private-conversation-id",
+                    "agent_run_ids": ["private-agent-run-id"],
+                    "message": "private-message-body",
+                },
+                imported_by_user_id="admin-1",
+            )
+        )
+        self.db.commit()
+
+        detail = self.client.get("/api/admin/audit/performance-runs/perf-invalid-stored-summary")
+        listed = self.client.get("/api/admin/audit/performance-runs")
+
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(listed.status_code, 200)
+        expected_summary = {
+            "stages": [],
+            "stopped": True,
+            "stop_reasons": ["invalid_safe_summary"],
+            "cleanup": {"conversations_deleted": 0, "tokens_revoked": 0, "errors": []},
+        }
+        self.assertEqual(detail.json()["data"]["safe_summary"], expected_summary)
+        list_item = listed.json()["data"]["items"][0]
+        self.assertNotIn("safe_summary", list_item)
+        self.assertNotIn("imported_by_user_id", list_item)
+        serialized = detail.text + listed.text
+        self.assertNotIn("private-conversation-id", serialized)
+        self.assertNotIn("private-agent-run-id", serialized)
+        self.assertNotIn("private-message-body", serialized)
+
     def test_performance_import_rejects_unsafe_payload_shape(self):
         response = self.client.post(
             "/api/admin/audit/performance-runs/import",
