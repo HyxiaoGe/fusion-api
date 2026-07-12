@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from typing import Any
 
@@ -207,17 +208,178 @@ class AdminAuditService:
         return target_user_id
 
     @staticmethod
-    def _message_item(message: Message) -> dict[str, Any]:
-        content, _ = sanitize_admin_value(message.content or [])
-        usage, _ = sanitize_admin_value(message.usage) if message.usage else (None, [])
-        questions, _ = sanitize_admin_value(message.suggested_questions) if message.suggested_questions else (None, [])
+    def _error_projection(error_message: Any, status: Any = None) -> dict[str, str] | None:
+        raw_error = error_message if isinstance(error_message, str) else ""
+        normalized = raw_error.lower()
+        if re.search(
+            r"(?<![\w-])(?:401|403)(?![\w-])|\b(?:unauthorized|forbidden|credentials?)\b",
+            normalized,
+        ):
+            return {"type": "authentication_failed", "message": "上游服务认证失败"}
+        if re.search(
+            r"(?<![\w-])429(?![\w-])|\brate(?:[ _-]+)limit(?:ed|ing)?\b|\btoo many requests\b|频率限制",
+            normalized,
+        ):
+            return {"type": "rate_limited", "message": "上游服务请求过于频繁"}
+        if re.search(r"\b(?:timeout|timed out|deadline exceeded)\b|超时", normalized):
+            return {"type": "timeout", "message": "上游服务响应超时"}
+        if re.search(r"\b(?:cancelled|canceled|interrupted|aborted)\b|中断|取消", normalized):
+            return {"type": "cancelled", "message": "执行已中断"}
+        if re.search(
+            r"(?<![\w-])(?:502|503|504)(?![\w-])|\b(?:connection|unavailable|network)\b|连接",
+            normalized,
+        ):
+            return {"type": "upstream_unavailable", "message": "上游服务暂时不可用"}
+        if raw_error or str(status or "").lower() in {"failed", "error"}:
+            return {"type": "execution_failed", "message": "执行失败"}
+        return None
+
+    @staticmethod
+    def _source_projection(value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        allowed = ("kind", "title", "url", "favicon", "status", "tool_call_log_id")
+        return [
+            {key: source[key] for key in allowed if isinstance(source.get(key), str)}
+            for source in value[:20]
+            if isinstance(source, dict)
+        ]
+
+    @staticmethod
+    def _string_fields(value: dict[str, Any], keys: tuple[str, ...]) -> dict[str, str]:
+        return {key: value[key] for key in keys if isinstance(value.get(key), str)}
+
+    @staticmethod
+    def _count_fields(value: dict[str, Any], keys: tuple[str, ...]) -> dict[str, int]:
+        return {
+            key: item
+            for key in keys
+            if isinstance((item := value.get(key)), int) and not isinstance(item, bool) and 0 <= item <= 1_000_000_000
+        }
+
+    @staticmethod
+    def _bool_fields(value: dict[str, Any], keys: tuple[str, ...]) -> dict[str, bool]:
+        return {key: value[key] for key in keys if isinstance(value.get(key), bool)}
+
+    @staticmethod
+    def _string_list_fields(value: dict[str, Any], keys: tuple[str, ...]) -> dict[str, list[str]]:
+        result: dict[str, list[str]] = {}
+        for key in keys:
+            raw_items = value.get(key)
+            if isinstance(raw_items, list):
+                result[key] = [item for item in raw_items[:20] if isinstance(item, str)]
+        return result
+
+    @classmethod
+    def _content_block_projection(cls, raw_block: Any) -> dict[str, Any]:
+        if not isinstance(raw_block, dict):
+            return {"type": "unknown", "content_hidden": True}
+        block_type = raw_block.get("type") if isinstance(raw_block.get("type"), str) else "unknown"
+        common = {"type": block_type, **cls._string_fields(raw_block, ("id",))}
+        if block_type == "text":
+            projection = {**common, **cls._string_fields(raw_block, ("text",))}
+        elif block_type == "thinking":
+            projection = {**common, **cls._string_fields(raw_block, ("thinking",))}
+        elif block_type == "file":
+            projection = {
+                **common,
+                **cls._string_fields(raw_block, ("file_id", "filename", "mime_type", "status")),
+                **cls._count_fields(raw_block, ("width", "height")),
+            }
+        elif block_type == "search":
+            projection = {
+                **common,
+                **cls._string_fields(
+                    raw_block,
+                    (
+                        "query",
+                        "tool_call_log_id",
+                        "status",
+                        "requested_provider",
+                        "result_provider",
+                        "search_budget",
+                        "intent",
+                    ),
+                ),
+                **cls._count_fields(
+                    raw_block,
+                    (
+                        "source_count",
+                        "requested_count",
+                        "actual_count",
+                        "context_source_count",
+                        "context_source_limit",
+                        "recency_days",
+                    ),
+                ),
+                **cls._bool_fields(raw_block, ("fallback_used", "budget_limited")),
+                **cls._string_list_fields(raw_block, ("provider_chain", "domains")),
+                "sources": cls._source_projection(raw_block.get("sources")),
+                "source_refs": cls._source_projection(raw_block.get("source_refs")),
+            }
+            error = cls._error_projection(raw_block.get("error_message"), raw_block.get("status"))
+            if error:
+                projection.update({"error_type": error["type"], "error_message": error["message"]})
+        elif block_type == "url_read":
+            projection = {
+                **common,
+                **cls._string_fields(raw_block, ("url", "title", "favicon", "tool_call_log_id", "status")),
+                **cls._count_fields(raw_block, ("source_count",)),
+                "source_refs": cls._source_projection(raw_block.get("source_refs")),
+            }
+            error = cls._error_projection(raw_block.get("error_message"), raw_block.get("status"))
+            if error:
+                projection.update({"error_type": error["type"], "error_message": error["message"]})
+        else:
+            projection = {
+                "type": block_type,
+                **cls._string_fields(raw_block, ("id", "status")),
+                "content_hidden": True,
+            }
+        sanitized, _ = sanitize_admin_value(
+            projection,
+            max_string_chars=4000,
+            max_list_items=20,
+            max_dict_items=40,
+            max_depth=5,
+            max_nodes=300,
+        )
+        return sanitized
+
+    @classmethod
+    def _message_content_projection(cls, value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        return [cls._content_block_projection(block) for block in value[:100]]
+
+    @staticmethod
+    def _usage_projection(value: Any) -> dict[str, int] | None:
+        if not isinstance(value, dict):
+            return None
+        usage = {
+            key: item
+            for key in ("input_tokens", "output_tokens", "total_tokens")
+            if isinstance((item := value.get(key)), int) and not isinstance(item, bool) and 0 <= item <= 1_000_000_000
+        }
+        return usage or None
+
+    @staticmethod
+    def _questions_projection(value: Any) -> list[str] | None:
+        if not isinstance(value, list):
+            return None
+        questions = [item for item in value[:10] if isinstance(item, str)]
+        sanitized, _ = sanitize_admin_value(questions, max_string_chars=500, max_list_items=10, max_nodes=20)
+        return sanitized or None
+
+    @classmethod
+    def _message_item(cls, message: Message) -> dict[str, Any]:
         return {
             "id": message.id,
             "role": message.role,
-            "content": content,
+            "content": cls._message_content_projection(message.content),
             "model_id": message.model_id,
-            "usage": usage,
-            "suggested_questions": questions,
+            "usage": cls._usage_projection(message.usage),
+            "suggested_questions": cls._questions_projection(message.suggested_questions),
             "created_at": message.created_at,
         }
 
@@ -246,8 +408,8 @@ class AdminAuditService:
         )
         return page_payload(items, total, page, page_size)
 
-    @staticmethod
-    def _tool_item(tool: ToolCallLog) -> dict[str, Any]:
+    @classmethod
+    def _tool_item(cls, tool: ToolCallLog) -> dict[str, Any]:
         raw_arguments = tool.input_params if isinstance(tool.input_params, dict) else {}
         raw_output = tool.output_data if isinstance(tool.output_data, dict) else {}
         if tool.tool_name == "web_search":
@@ -305,16 +467,16 @@ class AdminAuditService:
             output_projection = {}
         arguments, input_fields = sanitize_admin_value(argument_projection, max_string_chars=1000, max_list_items=30)
         result, output_fields = sanitize_admin_value(output_projection, max_string_chars=1000, max_list_items=30)
-        error, error_fields = sanitize_admin_value(tool.error_message or "", max_string_chars=1000)
+        error = cls._error_projection(tool.error_message, tool.status)
         redacted = sorted(
-            [f"arguments.{field}" for field in input_fields]
-            + [f"result_preview.{field}" for field in output_fields]
-            + [f"error.{field}" for field in error_fields]
+            [f"arguments.{field}" for field in input_fields] + [f"result_preview.{field}" for field in output_fields]
         )
         if raw_arguments and not argument_projection:
             redacted.append("arguments")
         if raw_output and not output_projection:
             redacted.append("result_preview")
+        if tool.error_message:
+            redacted.append("error")
         return {
             "id": tool.id,
             "message_id": tool.message_id,
@@ -327,7 +489,7 @@ class AdminAuditService:
             "provider": tool.provider,
             "arguments": arguments,
             "result_preview": result,
-            "error": error or None,
+            "error": error,
             "redacted_fields": redacted,
             "created_at": tool.created_at,
         }
@@ -380,7 +542,7 @@ class AdminAuditService:
             if key in raw_config
         }
         config, _ = sanitize_admin_value(config_projection, max_string_chars=1000, max_list_items=30)
-        error, _ = sanitize_admin_value(session.error_message or "", max_string_chars=1000)
+        error = self._error_projection(session.error_message, session.status)
         progress = self._progress_projection(row["snapshot"].state) if row["snapshot"] else None
         tools_by_step: dict[int | None, list[ToolCallLog]] = {}
         for tool in row["tool_calls"]:
@@ -397,7 +559,7 @@ class AdminAuditService:
             "total_duration_ms": session.total_duration_ms,
             "status": session.status,
             "limit_reason": session.limit_reason,
-            "error": error or None,
+            "error": error,
             "created_at": session.created_at,
             "progress": progress,
             "steps": [self._step_item(step, tools_by_step.get(step.step_number, [])) for step in row["steps"]],
@@ -574,14 +736,21 @@ class AdminAuditService:
         )
 
     @staticmethod
-    def _safe_performance_summary(value: Any) -> dict[str, Any]:
-        try:
-            summary_source = PerformanceSafeSummary.model_validate(value).model_dump(exclude_none=True)
-        except ValidationError:
-            summary_source = PerformanceSafeSummary(
-                stopped=True,
-                stop_reasons=["invalid_safe_summary"],
-            ).model_dump(exclude_none=True)
+    def _safe_performance_summary(value: Any, schema_version: int) -> dict[str, Any]:
+        if schema_version not in {1, 2}:
+            stop_reason = "unsupported_schema_version"
+        else:
+            try:
+                summary_source = PerformanceSafeSummary.model_validate(value).model_dump(exclude_none=True)
+            except ValidationError:
+                stop_reason = "invalid_safe_summary"
+            else:
+                summary, _ = sanitize_admin_value(summary_source, max_string_chars=2000, max_list_items=100)
+                return summary
+        summary_source = PerformanceSafeSummary(
+            stopped=True,
+            stop_reasons=[stop_reason],
+        ).model_dump(exclude_none=True)
         summary, _ = sanitize_admin_value(summary_source, max_string_chars=2000, max_list_items=100)
         return summary
 
@@ -593,7 +762,7 @@ class AdminAuditService:
             "model_id": run.model_id,
             "status": run.status,
             "schema_version": run.schema_version,
-            "safe_summary": cls._safe_performance_summary(run.safe_summary),
+            "safe_summary": cls._safe_performance_summary(run.safe_summary, run.schema_version),
             "imported_by_user_id": run.imported_by_user_id,
             "started_at": run.started_at,
             "finished_at": run.finished_at,

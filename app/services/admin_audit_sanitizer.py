@@ -72,6 +72,8 @@ _JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{
 _OPENAI_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b")
 _GITHUB_KEY_RE = re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b")
 _AWS_ACCESS_KEY_RE = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
+_GOOGLE_API_KEY_RE = re.compile(r"\bAIza[A-Za-z0-9_-]{35}\b")
+_SLACK_TOKEN_RE = re.compile(r"\bxox[A-Za-z0-9]-[A-Za-z0-9-]{8,}\b")
 _PEM_PRIVATE_KEY_RE = re.compile(
     r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
     re.DOTALL,
@@ -119,12 +121,9 @@ def _sanitize_url(value: str, path: str, redacted_fields: set[str]) -> str:
         redacted_fields.add(f"{path}.userinfo")
 
     query_items = []
-    for key, item_value in parse_qsl(parsed.query, keep_blank_values=True):
-        if _is_sensitive_query_key(key):
-            query_items.append((key, REDACTED))
-            redacted_fields.add(f"{path}.query.{key}")
-        else:
-            query_items.append((key, item_value))
+    for key, _ in parse_qsl(parsed.query, keep_blank_values=True):
+        query_items.append((key, REDACTED))
+        redacted_fields.add(f"{path}.query.{key}")
     return urlunsplit((parsed.scheme, netloc, parsed.path, urlencode(query_items, doseq=True), ""))
 
 
@@ -137,6 +136,8 @@ def _sanitize_string(value: str, path: str, redacted_fields: set[str], max_strin
         _OPENAI_KEY_RE,
         _GITHUB_KEY_RE,
         _AWS_ACCESS_KEY_RE,
+        _GOOGLE_API_KEY_RE,
+        _SLACK_TOKEN_RE,
         _PEM_PRIVATE_KEY_RE,
     ):
         sanitized, count = pattern.subn(REDACTED, sanitized)

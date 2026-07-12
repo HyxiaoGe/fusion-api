@@ -125,6 +125,103 @@ class AdminAuditApiTests(unittest.TestCase):
         self.assertIn("admin.audit.messages.list", actions)
         self.assertNotIn("message-secret", events_response.text)
 
+    def test_message_route_serialization_never_returns_unapproved_block_or_credential_fields(self):
+        from app.db.models import Message
+
+        google_key = "AIza" + "C" * 35
+        slack_token = "xox" + "b-123456789012-123456789012-route-secret-token"
+        self.db.add(
+            Message(
+                id="msg-route-security",
+                conversation_id="conv-1",
+                role="assistant",
+                content=[
+                    {"type": "text", "id": "text-route", "text": f"google={google_key} slack={slack_token}"},
+                    {
+                        "type": "file",
+                        "id": "file-route",
+                        "file_id": "file-1",
+                        "filename": "report.pdf",
+                        "mime_type": "application/pdf",
+                        "thumbnail_url": "https://storage.example/thumb?token=thumbnail-route-sentinel",
+                        "storage_key": "storage-route-sentinel",
+                        "path": "/path-route-sentinel",
+                    },
+                    {
+                        "type": "search",
+                        "id": "search-route",
+                        "query": "Fusion",
+                        "status": "success",
+                        "sources": [
+                            {
+                                "title": "GCS 文件",
+                                "url": (
+                                    "https://storage.googleapis.com/private-bucket/report.pdf"
+                                    "?X-Goog-Algorithm=GOOG4-RSA-SHA256"
+                                    "&X-Goog-Credential=gcs-route-credential"
+                                    "&X-Goog-Signature=gcs-route-signature"
+                                    "&download=route-report.pdf"
+                                ),
+                            }
+                        ],
+                        "provider_payload": {"content": "provider-route-sentinel"},
+                    },
+                    {
+                        "type": "future_private_block",
+                        "id": "unknown-route",
+                        "status": "streaming",
+                        "payload": "unknown-route-sentinel",
+                    },
+                ],
+                usage={"input_tokens": 1, "output_tokens": 2, "provider_payload": "usage-route-sentinel"},
+                suggested_questions=[f"继续使用 {google_key}", f"继续使用 {slack_token}"],
+                created_at=datetime(2026, 7, 11, 12, 1, 0),
+            )
+        )
+        self.db.commit()
+
+        response = self.client.get("/api/admin/audit/conversations/conv-1/messages")
+
+        self.assertEqual(response.status_code, 200)
+        item = next(row for row in response.json()["data"]["items"] if row["id"] == "msg-route-security")
+        unknown = next(block for block in item["content"] if block["type"] == "future_private_block")
+        search = next(block for block in item["content"] if block["type"] == "search")
+        self.assertEqual(
+            unknown,
+            {
+                "type": "future_private_block",
+                "id": "unknown-route",
+                "status": "streaming",
+                "content_hidden": True,
+            },
+        )
+        projected_gcs_url = search["sources"][0]["url"]
+        self.assertIn("storage.googleapis.com/private-bucket/report.pdf", projected_gcs_url)
+        self.assertIn("X-Goog-Algorithm", projected_gcs_url)
+        self.assertIn("X-Goog-Credential", projected_gcs_url)
+        self.assertIn("X-Goog-Signature", projected_gcs_url)
+        self.assertIn("download", projected_gcs_url)
+        serialized = json.dumps(item, ensure_ascii=False)
+        for sentinel in (
+            "thumbnail_url",
+            "thumbnail-route-sentinel",
+            "storage_key",
+            "storage-route-sentinel",
+            '"path"',
+            "path-route-sentinel",
+            "provider_payload",
+            "provider-route-sentinel",
+            "usage-route-sentinel",
+            "unknown-route-sentinel",
+            "GOOG4-RSA-SHA256",
+            "gcs-route-credential",
+            "gcs-route-signature",
+            "route-report.pdf",
+            google_key,
+            slack_token,
+        ):
+            self.assertNotIn(sentinel, serialized)
+
     def test_audit_metadata_does_not_store_search_text_or_secret_reason(self):
         response = self.client.get(
             "/api/admin/audit/users?q=alice%40example.com",
@@ -370,6 +467,51 @@ class AdminAuditApiTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 422)
+
+    def test_performance_import_rejects_unsupported_schema_version(self):
+        response = self.client.post(
+            "/api/admin/audit/performance-runs/import",
+            json={
+                "run_id": "perf-unsupported-schema-import",
+                "environment": "production",
+                "schema_version": 99,
+                "safe_summary": {"p95_ms": 120},
+            },
+        )
+
+        self.assertEqual(response.status_code, 422)
+
+    def test_performance_detail_degrades_historical_unknown_schema_without_interpreting_summary(self):
+        from app.db.models import PerformanceRun
+
+        self.db.add(
+            PerformanceRun(
+                run_id="perf-historical-schema-99",
+                environment="production",
+                status="completed",
+                schema_version=99,
+                safe_summary={
+                    "p95_ms": 120,
+                    "stages": [{"kind": "http", "concurrency": 1, "successful": 1}],
+                },
+                imported_by_user_id="admin-1",
+            )
+        )
+        self.db.commit()
+
+        detail = self.client.get("/api/admin/audit/performance-runs/perf-historical-schema-99")
+
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(
+            detail.json()["data"]["safe_summary"],
+            {
+                "stages": [],
+                "stopped": True,
+                "stop_reasons": ["unsupported_schema_version"],
+                "cleanup": {"conversations_deleted": 0, "tokens_revoked": 0, "errors": []},
+            },
+        )
+        self.assertNotIn("p95_ms", detail.json()["data"]["safe_summary"])
 
     def test_performance_import_rejects_identifiers_and_content_even_for_direct_api_call(self):
         response = self.client.post(

@@ -151,7 +151,7 @@ class AdminPerformanceRunImport(BaseModel):
     environment: str = Field(pattern=r"^[a-z0-9_-]{1,30}$")
     model_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9._:/-]{1,100}$")
     status: str = Field(default="completed", pattern=r"^[a-z0-9_-]{1,30}$")
-    schema_version: int = Field(default=1, ge=1, le=100)
+    schema_version: Literal[1, 2] = 1
     safe_summary: PerformanceSafeSummary
     started_at: datetime | None = None
     finished_at: datetime | None = None
