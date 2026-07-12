@@ -80,14 +80,16 @@ def test_audit_event_list_batches_target_users_and_preserves_historical_snapshot
         "id": "user-1",
         "username": "alice",
         "nickname": "Alice",
-        "email_masked": "al***@example.com",
     }
     assert result["items"][0]["admin_snapshot"]["username"] == "historical-admin"
     assert result["items"][0]["admin_snapshot"] == {
         "id": "admin-old-id",
         "username": "historical-admin",
-        "email_masked": "h***@example.com",
     }
+    assert "email" not in result["items"][0]["admin_snapshot"]
+    assert "email_masked" not in result["items"][0]["admin_snapshot"]
+    assert "email" not in result["items"][0]["target_user"]
+    assert "email_masked" not in result["items"][0]["target_user"]
     assert result["items"][0]["metadata"] == {
         "page": 1,
         "model_id": "gpt-5",

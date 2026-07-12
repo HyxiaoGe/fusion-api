@@ -170,7 +170,6 @@ class AdminAuditUserSummary(BaseModel):
     id: str
     username: str
     nickname: str | None = None
-    email_masked: str | None = None
 
 
 class AdminAuditAdminSnapshot(BaseModel):
@@ -180,11 +179,6 @@ class AdminAuditAdminSnapshot(BaseModel):
 
     id: str | None = Field(default=None, max_length=200)
     username: str | None = Field(default=None, max_length=200)
-    email_masked: str | None = Field(
-        default=None,
-        max_length=320,
-        pattern=r"^(?:\*{3}|.{1,2}\*{3}@[^@\s]+)$",
-    )
 
 
 class AdminAuditSearchSummary(BaseModel):

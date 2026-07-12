@@ -708,7 +708,7 @@ class AdminAuditService:
             resource_type=event.resource_type,
             resource_id=event.resource_id,
             target_user_id=event.target_user_id,
-            target_user=cls._user_summary(target_user),
+            target_user=cls._audit_target_user_summary(target_user),
             request_id=event.request_id,
             reason=reason or None,
             metadata=cls._audit_metadata_projection(event.extra_metadata),
@@ -723,7 +723,7 @@ class AdminAuditService:
     def _admin_snapshot_projection(value: Any) -> AdminAuditAdminSnapshot:
         raw = value if isinstance(value, dict) else {}
         projected: dict[str, Any] = {}
-        for key in ("id", "username", "email_masked"):
+        for key in ("id", "username"):
             if key not in raw:
                 continue
             sanitized, _ = sanitize_admin_value(raw[key], max_string_chars=320)
@@ -733,6 +733,16 @@ class AdminAuditService:
                 continue
             projected[key] = getattr(candidate, key)
         return AdminAuditAdminSnapshot.model_validate(projected)
+
+    @staticmethod
+    def _audit_target_user_summary(user: User | None) -> dict[str, Any] | None:
+        if user is None:
+            return None
+        return {
+            "id": user.id,
+            "username": user.username,
+            "nickname": user.nickname,
+        }
 
     @staticmethod
     def _audit_search_summary(value: Any) -> AdminAuditSearchSummary | None:

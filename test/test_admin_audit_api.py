@@ -184,7 +184,6 @@ class AdminAuditApiTests(unittest.TestCase):
                 "id": "user-1",
                 "username": "alice",
                 "nickname": "Alice",
-                "email_masked": "al***@example.com",
             },
         )
         self.assertEqual(events["event-live-target"]["admin_snapshot"]["username"], "historical-admin")
@@ -193,7 +192,6 @@ class AdminAuditApiTests(unittest.TestCase):
             {
                 "id": "historical-admin-id",
                 "username": "historical-admin",
-                "email_masked": "h***@example.com",
             },
         )
         self.assertEqual(
@@ -210,6 +208,20 @@ class AdminAuditApiTests(unittest.TestCase):
             self.assertNotIn(sentinel, response.text)
         self.assertEqual(events["event-deleted-target"]["target_user_id"], "deleted-user")
         self.assertIsNone(events["event-deleted-target"]["target_user"])
+        for event in events.values():
+            self.assertNotIn("email", event["admin_snapshot"])
+            self.assertNotIn("email_masked", event["admin_snapshot"])
+            if event["target_user"] is not None:
+                self.assertNotIn("email", event["target_user"])
+                self.assertNotIn("email_masked", event["target_user"])
+
+        persisted_list_event = (
+            self.db.query(AdminAuditEvent)
+            .filter(AdminAuditEvent.action == "admin.audit.events.list")
+            .order_by(AdminAuditEvent.created_at.desc())
+            .first()
+        )
+        self.assertIn("email_masked", persisted_list_event.admin_snapshot)
 
     def test_message_route_serialization_never_returns_unapproved_block_or_credential_fields(self):
         from app.db.models import Message

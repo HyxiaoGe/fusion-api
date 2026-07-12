@@ -392,9 +392,7 @@ class AdminAuditRepository:
         normalized_ids = sorted(set(user_ids))
         if not normalized_ids:
             return {}
-        rows = (
-            self.db.query(User.id, User.username, User.nickname, User.email).filter(User.id.in_(normalized_ids)).all()
-        )
+        rows = self.db.query(User.id, User.username, User.nickname).filter(User.id.in_(normalized_ids)).all()
         return {str(row.id): row for row in rows}
 
     def list_audit_events(
