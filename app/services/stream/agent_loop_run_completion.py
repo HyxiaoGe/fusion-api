@@ -30,6 +30,7 @@ class AgentLoopRunCompletionContext:
     session_cache: Any
     state: AgentLoopState
     duration_ms_factory: DurationMsFactory
+    assistant_message_sequence: int | None = None
 
 
 def persist_run_message(
@@ -42,6 +43,9 @@ def persist_run_message(
     if only_if_content and not context.state.content_blocks and context.state.final_usage() is None:
         return
 
+    persistence_kwargs = (
+        {"sequence": context.assistant_message_sequence} if context.assistant_message_sequence is not None else {}
+    )
     persist_message_fn(
         context.db,
         context.assistant_message_id,
@@ -50,6 +54,7 @@ def persist_run_message(
         context.state.content_blocks,
         context.state.final_usage(),
         partial,
+        **persistence_kwargs,
     )
 
 

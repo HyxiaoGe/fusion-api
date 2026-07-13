@@ -4,9 +4,16 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
-from app.db.models import AgentProgressSnapshot, AgentSession, ConversationFile, File, get_china_time
+from app.db.models import (
+    AgentProgressSnapshot,
+    AgentSession,
+    ConversationFile,
+    File,
+    message_order_sequence,
+)
 from app.db.models import Conversation as ConversationModel
 from app.db.models import Message as MessageModel
 from app.db.models import SocialAccount as SocialAccountModel
@@ -23,6 +30,7 @@ from app.schemas.chat import (
     UrlBlock,
     Usage,
 )
+from app.utils.time import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +113,7 @@ class ConversationRepository:
             for msg in conversation.messages:
                 db_message = MessageModel(
                     id=msg.id,
+                    sequence=msg.sequence,
                     role=msg.role,
                     content=[block.model_dump() for block in msg.content],
                     model_id=msg.model_id,
@@ -135,7 +144,7 @@ class ConversationRepository:
             # 仅更新对话元数据，不触碰消息（消息通过 create_message() 单独写入）
             db_conversation.title = conversation.title
             db_conversation.model_id = conversation.model_id
-            db_conversation.updated_at = get_china_time()
+            db_conversation.updated_at = utc_now()
 
             self.db.flush()
             return self._convert_to_schema(db_conversation)
@@ -147,7 +156,7 @@ class ConversationRepository:
     def update_title(self, conversation_id: str, title: str) -> None:
         """仅更新会话标题"""
         self.db.query(ConversationModel).filter(ConversationModel.id == conversation_id).update(
-            {"title": title, "updated_at": get_china_time()}
+            {"title": title, "updated_at": utc_now()}
         )
         self.db.flush()
 
@@ -298,6 +307,7 @@ class ConversationRepository:
             db_message = MessageModel(
                 id=message.id,
                 conversation_id=conversation_id,
+                sequence=message.sequence,
                 role=message.role,
                 content=[block.model_dump() for block in message.content],
                 model_id=message.model_id,
@@ -310,7 +320,7 @@ class ConversationRepository:
             # 同步刷新 conversation.updated_at，让 sidebar 排序正确反映最近活跃对话
             db_conversation = self.db.query(ConversationModel).filter(ConversationModel.id == conversation_id).first()
             if db_conversation:
-                db_conversation.updated_at = get_china_time()
+                db_conversation.updated_at = utc_now()
 
             self.db.flush()
             self.db.refresh(db_message)
@@ -319,6 +329,14 @@ class ConversationRepository:
             self.db.rollback()
             logger.error(f"创建消息失败: {e}")
             raise
+
+    def reserve_message_sequence_pair(self) -> tuple[int, int]:
+        """用 PostgreSQL 全局 sequence 原子预留 user/assistant 顺序号。"""
+        dialect_name = getattr(getattr(self.db.get_bind(), "dialect", None), "name", None)
+        if dialect_name != "postgresql":
+            raise RuntimeError("消息顺序号仅支持 PostgreSQL 数据库 sequence")
+        user_sequence = int(self.db.execute(select(message_order_sequence.next_value())).scalar_one())
+        return user_sequence, user_sequence + 1
 
     def get_message_by_id(self, message_id: str) -> Optional[Message]:
         """根据ID获取消息"""
@@ -401,6 +419,7 @@ class ConversationRepository:
 
         return Message(
             id=db_message.id,
+            sequence=db_message.sequence,
             role=db_message.role,
             content=content_blocks,
             model_id=db_message.model_id,
@@ -418,7 +437,11 @@ class ConversationRepository:
                 MessageModel.conversation_id == conversation_id,
                 MessageModel.role == "assistant",
             )
-            .order_by(MessageModel.created_at.desc())
+            .order_by(
+                MessageModel.sequence.desc().nullslast(),
+                MessageModel.created_at.desc(),
+                MessageModel.id.desc(),
+            )
             .first()
         )
 

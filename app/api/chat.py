@@ -61,6 +61,8 @@ async def send_message(
         message=chat_request.message,
         user_id=current_user.id,
         conversation_id=chat_request.conversation_id,
+        user_message_id=chat_request.user_message_id,
+        assistant_message_id=chat_request.assistant_message_id,
         stream=chat_request.stream,
         options=chat_request.options,
         file_ids=chat_request.file_ids,

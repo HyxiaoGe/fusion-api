@@ -52,6 +52,7 @@ class ToolRoundRequest:
     persist_message_fn: Callable[..., Any]
     execute_tools_fn: Callable[..., Awaitable[list[ToolExecutionRecord]]]
     complete_step_fn: Callable[..., Awaitable[Any]]
+    assistant_message_sequence: int | None = None
     on_tools_executed: Callable[[int], None] | None = None
     completed_tool_calls: int | None = None
     max_tool_calls: int | None = None
@@ -106,6 +107,9 @@ def append_tool_round_reasoning(request: ToolRoundRequest) -> None:
 
 
 def persist_tool_round_checkpoint(request: ToolRoundRequest) -> None:
+    persistence_kwargs = (
+        {"sequence": request.assistant_message_sequence} if request.assistant_message_sequence is not None else {}
+    )
     request.persist_message_fn(
         request.db,
         request.assistant_message_id,
@@ -113,6 +117,7 @@ def persist_tool_round_checkpoint(request: ToolRoundRequest) -> None:
         request.model_id,
         request.content_blocks,
         partial=True,
+        **persistence_kwargs,
     )
 
 

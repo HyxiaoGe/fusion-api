@@ -39,6 +39,7 @@ class AgentLoopRunInput:
     options: dict | None
     capabilities: dict | None
     trace_id: str | None
+    assistant_message_sequence: int | None = None
     initial_content_blocks: list | None = None
     extra_system_prompts: list[str] | None = None
     preprocess_user_input: bool = True
@@ -58,6 +59,7 @@ class AgentLoopRunInput:
             litellm_kwargs=self.litellm_kwargs,
             provider=self.provider,
             assistant_message_id=self.assistant_message_id,
+            assistant_message_sequence=self.assistant_message_sequence,
             task_id=self.task_id,
             call_config=call_config,
             trace_id=self.trace_id,

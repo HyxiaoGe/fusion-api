@@ -49,6 +49,7 @@ class AgentLoopExecutionRequest:
     task_id: str
     call_config: AgentLoopCallConfig
     trace_id: str | None
+    assistant_message_sequence: int | None = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +121,7 @@ def _build_completion_context(
         run_id=parts.run_id,
         model_id=request.model_id,
         assistant_message_id=request.assistant_message_id,
+        assistant_message_sequence=request.assistant_message_sequence,
         emitter=parts.emitter,
         session_cache=dependencies.session_cache,
         state=parts.state,
@@ -146,6 +148,7 @@ def build_agent_loop_runtime(
         should_use_reasoning=request.call_config.should_use_reasoning,
         call_kwargs=request.call_config.call_kwargs,
         assistant_message_id=request.assistant_message_id,
+        assistant_message_sequence=request.assistant_message_sequence,
         run_start=parts.run_start,
         limits=limits,
         emitter=parts.emitter,

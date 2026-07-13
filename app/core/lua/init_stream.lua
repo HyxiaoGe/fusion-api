@@ -1,6 +1,6 @@
 -- 原子初始化一轮 Redis Stream。
 -- KEYS: lock, chunks, meta, stop_guard
--- ARGV: task_id, user_id, model, message_id, conversation_id, started_at, lock_ttl, stream_ttl, stream_mode
+-- ARGV: task_id, user_id, model, message_id, conversation_id, started_at, lock_ttl, stream_ttl, stream_mode, message_sequence
 
 local lock_key = KEYS[1]
 local stream_key = KEYS[2]
@@ -28,6 +28,9 @@ redis.call(
     "task_id", task_id,
     "stream_mode", stream_mode
 )
+if ARGV[10] and ARGV[10] ~= "" then
+    redis.call("HSET", meta_key, "message_sequence", ARGV[10])
+end
 redis.call("EXPIRE", meta_key, stream_ttl)
 redis.call("SET", lock_key, task_id, "EX", tonumber(ARGV[7]))
 redis.call("XADD", stream_key, "*", "type", "start", "content", "", "block_id", "")

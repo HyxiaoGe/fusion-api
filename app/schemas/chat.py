@@ -1,9 +1,11 @@
 # app/schemas/chat.py
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional, Union
-from uuid import uuid4
+from uuid import RFC_4122, UUID, uuid4
 
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+
+from app.utils.time import utc_now
 
 # ============================================================
 # Content Blocks（消息内容块）
@@ -193,6 +195,7 @@ class AgentRunSummary(BaseModel):
 
 class Message(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
+    sequence: Optional[int] = None
     role: Literal["user", "assistant"]
     # content 为 content blocks 数组
     # user 消息示例：[TextBlock, FileBlock]
@@ -206,7 +209,7 @@ class Message(BaseModel):
     suggested_questions: Optional[List[str]] = None
     # 仅 assistant 消息填充，最近一次 agent run 摘要
     agent_run: Optional[AgentRunSummary] = None
-    created_at: datetime = Field(default_factory=datetime.now)
+    created_at: datetime = Field(default_factory=utc_now)
 
     class Config:
         from_attributes = True
@@ -223,8 +226,8 @@ class Conversation(BaseModel):
     model_id: str
     title: str
     messages: List[Message] = []
-    created_at: datetime = Field(default_factory=datetime.now)
-    updated_at: datetime = Field(default_factory=datetime.now)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
     class Config:
         from_attributes = True
@@ -239,9 +242,34 @@ class ChatRequest(BaseModel):
     model_id: str  # 替换原来的 provider + model 两个字段
     message: str  # 用户输入的文本
     conversation_id: Optional[str] = None
+    user_message_id: Optional[str] = None
+    assistant_message_id: Optional[str] = None
     stream: bool = True  # 默认开启流式
     options: Optional[Dict[str, Any]] = None  # 扩展选项，如 use_reasoning
     file_ids: Optional[List[str]] = None  # 附带的文件 ID 列表
+
+    @field_validator("user_message_id", "assistant_message_id")
+    @classmethod
+    def validate_message_uuid4(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            parsed = UUID(value)
+        except (TypeError, ValueError, AttributeError) as error:
+            raise ValueError("消息 ID 必须是合法 UUIDv4") from error
+        if parsed.version != 4 or parsed.variant != RFC_4122 or str(parsed) != value.lower():
+            raise ValueError("消息 ID 必须是合法 UUIDv4")
+        return value
+
+    @model_validator(mode="after")
+    def validate_distinct_message_ids(self) -> "ChatRequest":
+        if (
+            self.user_message_id is not None
+            and self.assistant_message_id is not None
+            and self.user_message_id.lower() == self.assistant_message_id.lower()
+        ):
+            raise ValueError("user_message_id 与 assistant_message_id 必须不同")
+        return self
 
 
 class ContinueAgentRunRequest(BaseModel):
@@ -261,7 +289,7 @@ class ChatResponse(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     conversation_id: str
     message: Message
-    created_at: datetime = Field(default_factory=datetime.now)
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 # ============================================================

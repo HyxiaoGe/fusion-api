@@ -2,10 +2,27 @@ import os
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Sequence,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import relationship
+from sqlalchemy.sql.functions import next_value
 
 from app.db.database import Base
+from app.utils.time import utc_now
 
 # 生产环境（PostgreSQL）使用 JSONB 以获得更好的查询性能；
 # 测试环境（SQLite）回退到通用 JSON 类型
@@ -18,6 +35,15 @@ else:
 
 def get_china_time():
     return datetime.now(timezone(timedelta(hours=8)))
+
+
+message_order_sequence = Sequence("message_order_sequence", start=1, increment=2)
+
+
+@compiles(next_value, "sqlite")
+def _compile_next_value_for_sqlite(element, compiler, **kwargs):
+    """SQLite 测试库没有 sequence；生产 PostgreSQL 仍编译为 nextval。"""
+    return "NULL"
 
 
 class User(Base):
@@ -60,12 +86,21 @@ class Conversation(Base):
     title = Column(String, nullable=False)
     # model_id 对应 model_sources 表中的 model_id，支持中途切换模型
     model_id = Column(String, nullable=False)
-    created_at = Column(DateTime, default=get_china_time)
-    updated_at = Column(DateTime, default=get_china_time, onupdate=get_china_time)
+    created_at = Column(DateTime(timezone=True), default=utc_now, server_default=func.now(), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=utc_now,
+        server_default=func.now(),
+        onupdate=utc_now,
+        nullable=False,
+    )
 
     user = relationship("User", back_populates="conversations")
     messages = relationship(
-        "Message", back_populates="conversation", cascade="all, delete-orphan", order_by="Message.created_at"
+        "Message",
+        back_populates="conversation",
+        cascade="all, delete-orphan",
+        order_by="(Message.sequence.asc().nullsfirst(), Message.created_at.asc(), Message.id.asc())",
     )
     files = relationship("ConversationFile", back_populates="conversation", cascade="all, delete-orphan")
 
@@ -119,6 +154,12 @@ class Message(Base):
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     conversation_id = Column(String, ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False)
+    # 新消息使用全局数据库 sequence；旧数据保留 NULL，避免用不可信时间戳伪造顺序。
+    sequence = Column(
+        BigInteger,
+        nullable=True,
+        server_default=message_order_sequence.next_value(),
+    )
     role = Column(String, nullable=False)  # 'user' | 'assistant'
 
     # content blocks 数组，结构示例：
@@ -137,11 +178,14 @@ class Message(Base):
     # 结构: ["问题1", "问题2", "问题3"]
     suggested_questions = Column(JSONB, nullable=True)
 
-    created_at = Column(DateTime, default=get_china_time)
+    created_at = Column(DateTime(timezone=True), default=utc_now, server_default=func.now(), nullable=False)
 
     conversation = relationship("Conversation", back_populates="messages")
 
-    __table_args__ = (Index("ix_messages_conversation_created_id", "conversation_id", "created_at", "id"),)
+    __table_args__ = (
+        Index("ix_messages_conversation_created_id", "conversation_id", "created_at", "id"),
+        Index("ux_messages_sequence", "sequence", unique=True),
+    )
 
 
 class PromptExample(Base):

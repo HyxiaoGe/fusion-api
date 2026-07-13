@@ -148,10 +148,12 @@ class ChatService:
             if existing:
                 existing.content = merge_partial_content_blocks(existing.content or [], serialized_content)
             else:
+                reserved_sequence = stream_meta.get("message_sequence")
                 self.db.add(
                     MessageModel(
                         id=message_id,
                         conversation_id=conversation_id,
+                        sequence=int(reserved_sequence) if reserved_sequence else None,
                         role="assistant",
                         content=serialized_content,
                         model_id=stream_meta.get("model") or conversation.model_id,
@@ -199,6 +201,8 @@ class ChatService:
         message: str,
         user_id: str,
         conversation_id: Optional[str] = None,
+        user_message_id: Optional[str] = None,
+        assistant_message_id: Optional[str] = None,
         stream: bool = True,
         options: Optional[Dict[str, Any]] = None,
         file_ids: Optional[List[str]] = None,
@@ -227,7 +231,14 @@ class ChatService:
         for file_info in validated_files:
             user_content.append(await self._build_file_block_from_record(file_info))
 
-        user_message = Message(role="user", content=user_content)
+        user_sequence, assistant_sequence = self.conversation_service.reserve_message_sequence_pair()
+        user_message = Message(
+            id=user_message_id or str(uuid_mod.uuid4()),
+            role="user",
+            content=user_content,
+            sequence=user_sequence,
+        )
+        assistant_message_id = assistant_message_id or str(uuid_mod.uuid4())
 
         # 持久化会话（包括前端传了 ID 但数据库不存在的情况）
         if is_new_conversation:
@@ -236,7 +247,6 @@ class ChatService:
 
         if stream:
             # 预分配 assistant 消息 ID 和 task ID
-            assistant_message_id = str(uuid_mod.uuid4())
             task_id = str(uuid_mod.uuid4())
 
             # 先初始化 Redis Stream（清除旧数据 + 写 start 标记），
@@ -248,6 +258,7 @@ class ChatService:
                     model_id,
                     assistant_message_id,
                     task_id,
+                    message_sequence=assistant_sequence,
                 )
             except Exception:
                 self.db.rollback()
@@ -291,6 +302,7 @@ class ChatService:
                     file_ids=file_ids,
                     original_message=message,
                     assistant_message_id=assistant_message_id,
+                    assistant_message_sequence=assistant_sequence,
                     task_id=task_id,
                     options=options,
                     capabilities=capabilities,
@@ -345,6 +357,8 @@ class ChatService:
                 lm_messages,
                 conversation.id,
                 options,
+                assistant_message_id,
+                assistant_sequence,
             )
 
     async def continue_agent_run(
@@ -386,6 +400,7 @@ class ChatService:
             assistant_message_id,
             task_id,
             stream_mode="continuation",
+            message_sequence=continuation.assistant_message.sequence,
         )
         _require_stream_initialized(init_result)
 
@@ -402,6 +417,7 @@ class ChatService:
                 file_ids=None,
                 original_message="",
                 assistant_message_id=assistant_message_id,
+                assistant_message_sequence=continuation.assistant_message.sequence,
                 task_id=task_id,
                 options={},
                 capabilities=capabilities,
@@ -456,6 +472,8 @@ class ChatService:
         messages: List[dict],
         conversation_id: str,
         options: dict,
+        assistant_message_id: str | None = None,
+        assistant_message_sequence: int | None = None,
     ) -> ChatResponse:
         """处理非流式响应（LiteLLM Proxy 自己管 health / 重试）。"""
         controlled_call_kwargs = dict(litellm_kwargs)
@@ -496,12 +514,16 @@ class ChatService:
             ),
         )
 
-        assistant_message = Message(
-            role="assistant",
-            content=[TextBlock(type="text", text=content_text)],
-            model_id=model_id,
-            usage=usage_data,
-        )
+        assistant_message_kwargs: dict[str, Any] = {
+            "sequence": assistant_message_sequence,
+            "role": "assistant",
+            "content": [TextBlock(type="text", text=content_text)],
+            "model_id": model_id,
+            "usage": usage_data,
+        }
+        if assistant_message_id is not None:
+            assistant_message_kwargs["id"] = assistant_message_id
+        assistant_message = Message(**assistant_message_kwargs)
         self.conversation_service.create_message(assistant_message, conversation_id)
         self.db.commit()
 

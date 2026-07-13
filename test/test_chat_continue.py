@@ -19,9 +19,11 @@ class ChatContinueTests(unittest.IsolatedAsyncioTestCase):
         )
         service.conversation_service.get_conversation = MagicMock(return_value=conversation)
         continuation_context = SimpleNamespace(
+            assistant_message=SimpleNamespace(sequence=42),
             initial_content_blocks=[],
             limits=SimpleNamespace(max_steps=8, max_tool_calls=20, total_timeout_s=300),
         )
+        service.stream_handler.generate_to_redis = AsyncMock()
 
         with (
             patch(
@@ -60,6 +62,11 @@ class ChatContinueTests(unittest.IsolatedAsyncioTestCase):
         init_stream_mock.assert_awaited_once()
         self.assertEqual(init_stream_mock.await_args.args[3], "msg-1")
         self.assertEqual(init_stream_mock.await_args.kwargs["stream_mode"], "continuation")
+        self.assertEqual(init_stream_mock.await_args.kwargs["message_sequence"], 42)
+        self.assertEqual(
+            service.stream_handler.generate_to_redis.call_args.kwargs["assistant_message_sequence"],
+            42,
+        )
         register_task_mock.assert_called_once()
         self.assertIs(register_task_mock.call_args.args[1], task)
         self.assertEqual(response.media_type, "text/event-stream")
@@ -108,6 +115,7 @@ class ChatContinueTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         continuation_context = SimpleNamespace(
+            assistant_message=SimpleNamespace(sequence=42),
             initial_content_blocks=[],
             limits=SimpleNamespace(max_steps=8, max_tool_calls=20, total_timeout_s=300),
         )

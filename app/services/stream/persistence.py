@@ -18,6 +18,7 @@ from app.core.logger import app_logger as logger
 from app.schemas.chat import UrlBlock, Usage
 from app.services.security.url_policy import evaluate_url_policy
 from app.services.source_context import UntrustedSourceContext, format_untrusted_source_context
+from app.utils.time import utc_now
 
 URL_PATTERN = re.compile(r'https?://[^\s<>"\')\]]+')
 
@@ -86,6 +87,8 @@ def persist_message(
     content_blocks: list,
     usage_data: Optional[Usage] = None,
     partial: bool = False,
+    *,
+    sequence: int | None = None,
 ) -> None:
     """
     将 assistant 消息写入 PostgreSQL。
@@ -100,6 +103,11 @@ def persist_message(
         existing = db.query(MessageModel).populate_existing().filter_by(id=assistant_message_id).first()
         serialized_content = [block.model_dump() for block in content_blocks]
         if existing:
+            if sequence is not None:
+                if existing.sequence is None:
+                    existing.sequence = sequence
+                elif existing.sequence != sequence:
+                    raise ValueError("assistant 消息顺序号与预留值不一致")
             existing.content = (
                 merge_partial_content_blocks(existing.content or [], serialized_content)
                 if partial
@@ -111,10 +119,12 @@ def persist_message(
             db_message = MessageModel(
                 id=assistant_message_id,
                 conversation_id=conversation_id,
+                sequence=sequence,
                 role="assistant",
                 content=serialized_content,
                 model_id=model_id,
                 usage=usage_data.model_dump() if usage_data else None,
+                created_at=utc_now(),
             )
             db.add(db_message)
         db.commit()

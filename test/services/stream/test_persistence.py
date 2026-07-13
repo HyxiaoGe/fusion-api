@@ -39,6 +39,25 @@ class MessagePersistenceAdvisoryLockTests(unittest.TestCase):
 
 
 class PersistMessageMonotonicTests(unittest.TestCase):
+    def test_new_assistant_persists_reserved_sequence_and_utc_aware_time(self):
+        db = MagicMock()
+        db.get_bind.return_value = SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))
+        _populated_query(db).filter_by.return_value.first.return_value = None
+
+        persist_message(
+            db,
+            "msg-1",
+            "conv-1",
+            "gpt-4",
+            [TextBlock(type="text", id="answer-1", text="回答")],
+            sequence=2,
+        )
+
+        persisted = db.add.call_args.args[0]
+        self.assertEqual(persisted.sequence, 2)
+        self.assertIsNotNone(persisted.created_at.tzinfo)
+        self.assertEqual(persisted.created_at.utcoffset().total_seconds(), 0)
+
     def test_persist_message_acquires_advisory_lock_before_query(self):
         db = MagicMock()
         db.get_bind.return_value = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))

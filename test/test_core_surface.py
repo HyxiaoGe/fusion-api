@@ -164,6 +164,8 @@ class ChatCoreSurfaceTests(unittest.TestCase):
             "model_id": "gpt-4.1",
             "message": "hello",
             "conversation_id": "conv-1",
+            "user_message_id": "11111111-1111-4111-8111-111111111111",
+            "assistant_message_id": "22222222-2222-4222-8222-222222222222",
             "stream": False,
             "options": {"temperature": 0.3},
             "file_ids": ["file-1"],
@@ -193,6 +195,8 @@ class ChatCoreSurfaceTests(unittest.TestCase):
             message="hello",
             user_id="user-123",
             conversation_id="conv-1",
+            user_message_id="11111111-1111-4111-8111-111111111111",
+            assistant_message_id="22222222-2222-4222-8222-222222222222",
             stream=False,
             options={"temperature": 0.3},
             file_ids=["file-1"],
@@ -227,6 +231,8 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         self.assertTrue(response.headers["content-type"].startswith("text/event-stream"))
         self.assertIn("data: hello", response.text)
         service.process_message.assert_awaited_once()
+        self.assertIsNone(service.process_message.await_args.kwargs["user_message_id"])
+        self.assertIsNone(service.process_message.await_args.kwargs["assistant_message_id"])
 
     def test_get_conversations_uses_authenticated_user_id(self):
         self._enable_authenticated_overrides()

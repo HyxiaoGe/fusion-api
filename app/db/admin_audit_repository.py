@@ -302,7 +302,11 @@ class AdminAuditRepository:
         query = self.db.query(Message).filter(Message.conversation_id == conversation_id)
         total = query.count()
         rows = (
-            query.order_by(Message.created_at.asc(), Message.id.asc())
+            query.order_by(
+                Message.sequence.asc().nullsfirst(),
+                Message.created_at.asc(),
+                Message.id.asc(),
+            )
             .offset(self._offset(page, page_size))
             .limit(page_size)
             .all()

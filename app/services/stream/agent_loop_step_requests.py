@@ -23,6 +23,7 @@ def build_tool_round_request(
     return ToolRoundRequest(
         db=db,
         assistant_message_id=runtime.assistant_message_id,
+        assistant_message_sequence=runtime.assistant_message_sequence,
         conversation_id=runtime.conversation_id,
         user_id=runtime.user_id,
         model_id=runtime.model_id,

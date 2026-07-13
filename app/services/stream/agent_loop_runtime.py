@@ -39,3 +39,4 @@ class AgentLoopRuntime:
     log_round_summary_fn: Callable[..., None]
     warning_fn: Callable[[str], None]
     clock: Callable[[], float]
+    assistant_message_sequence: int | None = None

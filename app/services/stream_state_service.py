@@ -93,6 +93,7 @@ async def init_stream(
     task_id: str,
     *,
     stream_mode: Literal["initial", "continuation"] = "initial",
+    message_sequence: int | None = None,
 ) -> StreamInitResult:
     """流开始时初始化 Redis Stream 和 Meta"""
     redis = get_redis_pool()
@@ -119,6 +120,7 @@ async def init_stream(
             str(LOCK_TTL),
             str(STREAM_CHUNK_TTL),
             stream_mode,
+            str(message_sequence) if message_sequence is not None else "",
         )
 
         if not result:

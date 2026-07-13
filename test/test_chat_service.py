@@ -3,6 +3,7 @@ import unittest
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
 
 from app.schemas.chat import Conversation, Message, TextBlock
 from app.schemas.response import ApiException
@@ -510,6 +511,7 @@ class ChatServiceTests(unittest.TestCase):
         service = ChatService(db)
         service.file_repo = MagicMock()
         service.conversation_service = MagicMock()
+        service.conversation_service.reserve_message_sequence_pair.return_value = (1, 2)
         service._get_or_create_conversation = MagicMock(
             return_value=(
                 Conversation(
@@ -556,6 +558,8 @@ class ChatServiceTests(unittest.TestCase):
                     model_id="qwen-vl-max",
                     message="OpenAI 最近发布了什么模型？",
                     user_id="user-1",
+                    user_message_id="11111111-1111-4111-8111-111111111111",
+                    assistant_message_id="22222222-2222-4222-8222-222222222222",
                     stream=False,
                 )
             )
@@ -580,6 +584,87 @@ class ChatServiceTests(unittest.TestCase):
             mock_litellm.acompletion.await_args.kwargs["extra_body"],
             {"metadata": {"tags": ["app:fusion", "phase:chat_non_stream"]}},
         )
+        persisted_messages = [call.args[0] for call in service.conversation_service.create_message.call_args_list]
+        self.assertEqual([message.sequence for message in persisted_messages], [1, 2])
+        self.assertEqual(
+            [message.id for message in persisted_messages],
+            [
+                "11111111-1111-4111-8111-111111111111",
+                "22222222-2222-4222-8222-222222222222",
+            ],
+        )
+
+    def test_process_message_stream_passes_reserved_assistant_sequence_to_stream_paths(self):
+        from app.services.stream_state_service import StreamInitResult
+
+        db = MagicMock()
+        service = ChatService(db)
+        service.file_repo = MagicMock()
+        service.stream_handler = MagicMock()
+        service.stream_handler.generate_to_redis = AsyncMock()
+        service.conversation_service = MagicMock()
+        service.conversation_service.reserve_message_sequence_pair.return_value = (41, 42)
+        service._get_or_create_conversation = MagicMock(
+            return_value=(
+                Conversation(
+                    id="conv-stream",
+                    user_id="user-1",
+                    title="流式顺序",
+                    model_id="qwen-max-latest",
+                    messages=[],
+                ),
+                False,
+            )
+        )
+        created_coroutines = []
+
+        def close_created_coroutine(coroutine):
+            created_coroutines.append(coroutine)
+            coroutine.close()
+            return MagicMock()
+
+        with (
+            patch(
+                "app.services.chat_service.llm_manager.resolve_model",
+                return_value=("openai/qwen-max-latest", "qwen", {}),
+            ),
+            patch(
+                "app.services.chat_service.litellm_catalog.get_capabilities",
+                return_value={"functionCalling": False, "agentTools": False, "vision": False},
+            ),
+            patch(
+                "app.services.chat_service.init_stream",
+                new=AsyncMock(return_value=StreamInitResult(ok=True)),
+            ) as init_stream_mock,
+            patch("app.services.chat_service.asyncio.create_task", side_effect=close_created_coroutine),
+            patch("app.services.chat_service.register_task"),
+        ):
+            asyncio.run(
+                service.process_message(
+                    model_id="qwen-max-latest",
+                    message="验证顺序",
+                    user_id="user-1",
+                    conversation_id="conv-stream",
+                    user_message_id="33333333-3333-4333-8333-333333333333",
+                    assistant_message_id="44444444-4444-4444-8444-444444444444",
+                    stream=True,
+                )
+            )
+
+        persisted_user = service.conversation_service.create_message.call_args.args[0]
+        self.assertEqual(persisted_user.id, "33333333-3333-4333-8333-333333333333")
+        self.assertEqual(persisted_user.sequence, 41)
+        self.assertEqual(init_stream_mock.await_args.args[3], "44444444-4444-4444-8444-444444444444")
+        self.assertEqual(init_stream_mock.await_args.kwargs["message_sequence"], 42)
+        self.assertEqual(
+            service.stream_handler.generate_to_redis.call_args.kwargs["assistant_message_id"],
+            "44444444-4444-4444-8444-444444444444",
+        )
+        self.assertEqual(
+            service.stream_handler.generate_to_redis.call_args.kwargs["assistant_message_sequence"],
+            42,
+        )
+        self.assertEqual(len(created_coroutines), 1)
 
     def test_handle_non_stream_applies_controlled_max_tokens(self):
         service = object.__new__(ChatService)
@@ -696,6 +781,7 @@ class ChatServiceTests(unittest.TestCase):
         )
         service.file_repo.is_file_linked_to_conversation.return_value = True
         service.conversation_service = MagicMock()
+        service.conversation_service.reserve_message_sequence_pair.return_value = (1, 2)
         service._get_or_create_conversation = MagicMock(
             return_value=(
                 Conversation(
@@ -762,6 +848,10 @@ class ChatServiceTests(unittest.TestCase):
         self.assertIn("当前模型不能读取或理解图片附件", sent_messages[1]["content"])
         self.assertIn("【无联网工具边界规则】", sent_messages[2]["content"])
         self.assertEqual(sent_messages[3]["content"], "这张图里有什么？")
+        generated_messages = [call.args[0] for call in service.conversation_service.create_message.call_args_list]
+        self.assertEqual(len(generated_messages), 2)
+        self.assertEqual([UUID(message.id).version for message in generated_messages], [4, 4])
+        self.assertNotEqual(generated_messages[0].id, generated_messages[1].id)
 
     def test_generate_suggested_questions_limits_output_to_three(self):
         service = object.__new__(ChatService)
@@ -1087,6 +1177,7 @@ class ChatServiceTests(unittest.TestCase):
         service.stream_handler = MagicMock()
         service.stream_handler.generate_to_redis = AsyncMock()
         service.conversation_service = MagicMock()
+        service.conversation_service.reserve_message_sequence_pair.return_value = (1, 2)
         service._get_or_create_conversation = MagicMock(
             return_value=(
                 Conversation(
@@ -1153,6 +1244,7 @@ class ChatServiceTests(unittest.TestCase):
         service.stream_handler = MagicMock()
         service.stream_handler.generate_to_redis = AsyncMock()
         service.conversation_service = MagicMock()
+        service.conversation_service.reserve_message_sequence_pair.return_value = (1, 2)
         service._get_or_create_conversation = MagicMock(
             return_value=(
                 Conversation(

@@ -76,3 +76,7 @@ class ConversationService:
     def create_message(self, message: Message, conversation_id: str) -> Message:
         """创建新消息"""
         return self.repo.create_message(message, conversation_id)
+
+    def reserve_message_sequence_pair(self) -> tuple[int, int]:
+        """为同一轮 user/assistant 消息预留稳定顺序号。"""
+        return self.repo.reserve_message_sequence_pair()
