@@ -13,6 +13,7 @@ from app.ai.prompts.agent_loop import LIMIT_SUMMARY_PROMPT as _LIMIT_SUMMARY_PRO
 from app.ai.prompts.agent_loop import get_limit_summary_prompt
 from app.core.logger import app_logger as logger
 from app.schemas.chat import TextBlock, ThinkingBlock, Usage
+from app.services.chat.context_manager import ContextManagementError, ContextPlan, prepare_context
 
 LIMIT_SUMMARY_PROMPT = _LIMIT_SUMMARY_PROMPT
 
@@ -71,15 +72,15 @@ def append_limit_summary_prompt(messages: list[dict]) -> None:
     messages.append({"role": "system", "content": get_limit_summary_prompt()})
 
 
-async def call_limit_summary_round(
+def _create_limit_summary_observation(
     *,
     request: LimitSummaryStepRequest,
-    thinking_block_id: str,
-    text_block_id: str,
+    context_plan: ContextPlan,
     step_id: str,
-) -> LimitSummaryRoundResult:
-    final_call_kwargs = build_limit_summary_call_kwargs(request.call_kwargs)
-    observation = create_llm_round_observation(
+    call_kwargs: dict,
+    estimator_status: str | None = None,
+) -> Any:
+    return create_llm_round_observation(
         conversation_id=request.conversation_id,
         run_id=request.run_id,
         round_index=request.step_number,
@@ -88,16 +89,54 @@ async def call_limit_summary_round(
         model_id=request.model_id,
         provider=request.provider,
         litellm_model=request.litellm_model,
-        messages=request.messages,
-        call_kwargs=final_call_kwargs,
+        messages=context_plan.messages,
+        call_kwargs=call_kwargs,
         assistant_message_id=request.assistant_message_id,
+        context_management=context_plan.telemetry(),
+        estimated_prompt_tokens=context_plan.estimated_tokens_after,
+        estimator_status=estimator_status,
+    )
+
+
+async def call_limit_summary_round(
+    *,
+    request: LimitSummaryStepRequest,
+    thinking_block_id: str,
+    text_block_id: str,
+    step_id: str,
+) -> LimitSummaryRoundResult:
+    final_call_kwargs = build_limit_summary_call_kwargs(request.call_kwargs)
+    try:
+        context_plan = await prepare_context(
+            messages=request.messages,
+            model_id=request.model_id,
+            litellm_model=request.litellm_model,
+            call_kwargs=final_call_kwargs,
+        )
+    except ContextManagementError as error:
+        observation = _create_limit_summary_observation(
+            request=request,
+            context_plan=error.plan,
+            step_id=step_id,
+            call_kwargs=final_call_kwargs,
+            estimator_status="context_manager_error",
+        )
+        observation.start()
+        await observation.finish_error(error)
+        raise
+    effective_messages = context_plan.messages
+    observation = _create_limit_summary_observation(
+        request=request,
+        context_plan=context_plan,
+        step_id=step_id,
+        call_kwargs=final_call_kwargs,
     )
     observation.start()
     try:
         response = await request.llm_call_fn(
             request.litellm_model,
             request.litellm_kwargs,
-            request.messages,
+            effective_messages,
             **final_call_kwargs,
         )
         response = observation.wrap_response(response)

@@ -4,10 +4,15 @@
 `{chunk_type, data}` envelope，包含 `id:` 行供断线重连使用。
 """
 
+import asyncio
 import json
+from contextlib import suppress
 from typing import AsyncGenerator
 
 from app.services.stream_state_service import read_stream_chunks
+
+SSE_HEARTBEAT_INTERVAL_SECONDS = 15.0
+_HEARTBEAT = object()
 
 
 def entry_to_sse_envelope(entry_fields: dict) -> dict:
@@ -54,6 +59,47 @@ def entry_to_sse_envelope(entry_fields: dict) -> dict:
     return {"chunk_type": chunk_type, "data": data}
 
 
+async def _read_chunks_with_heartbeat(
+    conversation_id: str,
+    last_entry_id: str,
+    *,
+    expected_message_id: str,
+    expected_task_id: str,
+) -> AsyncGenerator[dict | object, None]:
+    """等待同一个 Redis 迭代器；空闲时仅发 keepalive，不取消底层读取。"""
+    iterator = read_stream_chunks(
+        conversation_id,
+        last_entry_id,
+        expected_message_id=expected_message_id,
+        expected_task_id=expected_task_id,
+    ).__aiter__()
+    pending = asyncio.create_task(anext(iterator))
+    try:
+        while True:
+            done, _ = await asyncio.wait({pending}, timeout=SSE_HEARTBEAT_INTERVAL_SECONDS)
+            if not done:
+                yield _HEARTBEAT
+                continue
+            try:
+                chunk = pending.result()
+            except StopAsyncIteration:
+                return
+            pending = asyncio.create_task(anext(iterator))
+            yield chunk
+    finally:
+        if pending.done():
+            with suppress(asyncio.CancelledError, StopAsyncIteration, Exception):
+                pending.result()
+        else:
+            pending.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending
+        close = getattr(iterator, "aclose", None)
+        if close is not None:
+            with suppress(asyncio.CancelledError, Exception):
+                await close()
+
+
 async def stream_redis_as_sse(
     conversation_id: str,
     message_id: str,
@@ -80,20 +126,28 @@ async def stream_redis_as_sse(
         yield "data: [DONE]\n\n"
         return
 
-    async for chunk in read_stream_chunks(
+    chunks = _read_chunks_with_heartbeat(
         conversation_id,
         last_entry_id,
         expected_message_id=message_id,
         expected_task_id=task_id,
-    ):
-        entry_id = chunk.pop("entry_id")
-        chunk_type = chunk.get("type", "")
+    )
+    try:
+        async for chunk in chunks:
+            if chunk is _HEARTBEAT:
+                yield ": keepalive\n\n"
+                continue
 
-        # 跳过内部 start 标记
-        if chunk_type == "start":
-            continue
+            entry_id = chunk.pop("entry_id")
+            chunk_type = chunk.get("type", "")
 
-        envelope = entry_to_sse_envelope(chunk)
-        yield f"id: {entry_id}\ndata: {json.dumps(envelope, ensure_ascii=False)}\n\n"
+            # 跳过内部 start 标记
+            if chunk_type == "start":
+                continue
+
+            envelope = entry_to_sse_envelope(chunk)
+            yield f"id: {entry_id}\ndata: {json.dumps(envelope, ensure_ascii=False)}\n\n"
+    finally:
+        await chunks.aclose()
 
     yield "data: [DONE]\n\n"

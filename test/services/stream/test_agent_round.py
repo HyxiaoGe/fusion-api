@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.schemas.chat import Usage
+from app.services.chat.context_manager import ContextBudgetExceededError, ContextPlan
 from app.services.stream.agent_round import accumulate_usage, collect_agent_round_stream, run_agent_round
 from app.services.stream.step_lifecycle import AgentStepContext
 
@@ -24,6 +25,67 @@ class AgentRoundUsageTests(unittest.TestCase):
 
 
 class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
+    async def test_context_budget_error_is_observed_before_llm_call(self):
+        step_context = AgentStepContext(
+            step_id="step-budget",
+            step_number=1,
+            started_at=100.0,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+        )
+        plan = ContextPlan(
+            messages=[{"role": "user", "content": "过长正文"}],
+            status="required_context_over_budget",
+            context_window_tokens=100,
+            context_window_source="test",
+            context_window_status="known",
+            estimated_tokens_before=120,
+            estimated_tokens_after=120,
+        )
+        error = ContextBudgetExceededError(plan)
+        observation = MagicMock()
+        observation.finish_error = AsyncMock()
+        llm_call = AsyncMock()
+
+        with (
+            patch(
+                "app.services.stream.agent_round.prepare_context",
+                new=AsyncMock(side_effect=error),
+            ),
+            patch(
+                "app.services.stream.agent_round.create_llm_round_observation",
+                return_value=observation,
+            ) as create_observation,
+        ):
+            with self.assertRaises(ContextBudgetExceededError):
+                await run_agent_round(
+                    conversation_id="conv-1",
+                    task_id="task-1",
+                    run_id="run-1",
+                    step_number=1,
+                    model_id="gpt-4",
+                    provider="openai",
+                    litellm_model="openai/gpt-4",
+                    litellm_kwargs={},
+                    messages=plan.messages,
+                    should_use_reasoning=False,
+                    call_kwargs={},
+                    accumulated_usage=Usage(input_tokens=0, output_tokens=0),
+                    step_context=step_context,
+                    llm_call_fn=llm_call,
+                    stream_round_fn=AsyncMock(),
+                    log_round_summary_fn=lambda **_kwargs: None,
+                )
+
+        llm_call.assert_not_awaited()
+        observation.start.assert_called_once_with()
+        observation.finish_error.assert_awaited_once_with(error)
+        self.assertEqual(create_observation.call_args.kwargs["estimator_status"], "context_manager_error")
+        self.assertEqual(
+            create_observation.call_args.kwargs["context_management"]["context_management_status"],
+            "required_context_over_budget",
+        )
+
     async def test_run_agent_round_records_only_current_round_usage(self):
         step_context = AgentStepContext(
             step_id="step-obs",
@@ -43,10 +105,21 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
         async def stream_round_fn(*_args, **_kwargs):
             return "", "正文", [], "stop", Usage(input_tokens=11, output_tokens=13)
 
-        with patch(
-            "app.services.stream.agent_round.create_llm_round_observation",
-            return_value=observation,
-        ) as create_observation:
+        context_plan = MagicMock(
+            messages=[{"role": "user", "content": "有效快照"}],
+            estimated_tokens_after=8,
+        )
+        context_plan.telemetry.return_value = {"context_management_status": "trimmed"}
+        with (
+            patch(
+                "app.services.stream.agent_round.create_llm_round_observation",
+                return_value=observation,
+            ) as create_observation,
+            patch(
+                "app.services.stream.agent_round.prepare_context",
+                new=AsyncMock(return_value=context_plan),
+            ),
+        ):
             result = await run_agent_round(
                 conversation_id="conv-1",
                 task_id="task-1",
@@ -69,11 +142,71 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.accumulated_usage, Usage(input_tokens=16, output_tokens=20))
         self.assertEqual(create_observation.call_args.kwargs["round_kind"], "agent")
         self.assertEqual(create_observation.call_args.kwargs["round_index"], 2)
+        self.assertEqual(create_observation.call_args.kwargs["messages"], context_plan.messages)
+        self.assertEqual(
+            create_observation.call_args.kwargs["context_management"],
+            {"context_management_status": "trimmed"},
+        )
+        self.assertEqual(create_observation.call_args.kwargs["estimated_prompt_tokens"], 8)
         observation.start.assert_called_once_with()
         observation.finish_success.assert_awaited_once_with(
             usage=Usage(input_tokens=11, output_tokens=13),
             finish_reason="stop",
         )
+
+    async def test_run_agent_round_sends_effective_snapshot_without_mutating_canonical(self):
+        canonical = [
+            {"role": "user", "content": "旧问题"},
+            {"role": "assistant", "content": "旧回答"},
+            {"role": "user", "content": "最新问题"},
+        ]
+        effective = [canonical[-1]]
+        step_context = AgentStepContext(
+            step_id="step-context",
+            step_number=1,
+            started_at=100.0,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+        )
+        observed_messages = []
+
+        async def llm_call_fn(_model, _kwargs, messages, **_call_kwargs):
+            observed_messages.extend(messages)
+            return "response"
+
+        async def stream_round_fn(*_args, **_kwargs):
+            return "", "正文", [], "stop", None
+
+        context_plan = MagicMock(messages=effective, estimated_tokens_after=10)
+        context_plan.telemetry.return_value = {"context_management_status": "trimmed"}
+
+        with patch(
+            "app.services.stream.agent_round.prepare_context",
+            new=AsyncMock(return_value=context_plan),
+        ) as prepare:
+            await run_agent_round(
+                conversation_id="conv-1",
+                task_id="task-1",
+                run_id="run-1",
+                step_number=1,
+                model_id="gpt-4",
+                provider="openai",
+                litellm_model="openai/gpt-4",
+                litellm_kwargs={},
+                messages=canonical,
+                should_use_reasoning=False,
+                call_kwargs={},
+                accumulated_usage=Usage(input_tokens=0, output_tokens=0),
+                step_context=step_context,
+                llm_call_fn=llm_call_fn,
+                stream_round_fn=stream_round_fn,
+                log_round_summary_fn=lambda **_kwargs: None,
+            )
+
+        prepare.assert_awaited_once()
+        self.assertEqual(observed_messages, effective)
+        self.assertEqual(len(canonical), 3)
+        self.assertEqual(canonical[0]["content"], "旧问题")
 
     async def test_run_agent_round_records_error_without_swallowing_it(self):
         step_context = AgentStepContext(

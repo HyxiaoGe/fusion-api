@@ -22,6 +22,19 @@ _ESTIMATE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm-c
 _ESTIMATE_ADMISSION = BoundedSemaphore(value=2)
 _ESTIMATE_TIMEOUT_SECONDS = 5.0
 _BACKGROUND_LOG_TASKS: set[asyncio.Task[None]] = set()
+_CONTEXT_MANAGEMENT_FIELDS = {
+    "context_management_status",
+    "context_management_context_window_tokens",
+    "context_management_context_window_source",
+    "context_management_context_window_status",
+    "context_management_trigger_tokens",
+    "context_management_target_tokens",
+    "context_management_estimated_tokens_before",
+    "context_management_estimated_tokens_after",
+    "context_management_removed_turns",
+    "context_management_removed_tool_transactions",
+    "context_management_removed_messages",
+}
 
 
 @dataclass(frozen=True)
@@ -167,6 +180,9 @@ class LLMRoundObservation:
         token_estimator: Callable[[str, list[dict], dict], int] = estimate_prompt_tokens,
         context_window_resolver: Callable[[str], tuple[int | None, str, str]] = resolve_context_window,
         run_context_in_thread: bool = True,
+        estimated_prompt_tokens: int | None = None,
+        estimator_status: str | None = None,
+        context_management: dict[str, Any] | None = None,
     ):
         self.metadata = metadata
         self.litellm_model = litellm_model
@@ -176,6 +192,11 @@ class LLMRoundObservation:
         self.token_estimator = token_estimator
         self.context_window_resolver = context_window_resolver
         self.run_context_in_thread = run_context_in_thread
+        self.estimated_prompt_tokens = estimated_prompt_tokens
+        self.estimator_status = estimator_status
+        self.context_management = {
+            key: value for key, value in (context_management or {}).items() if key in _CONTEXT_MANAGEMENT_FIELDS
+        }
         self.started_at: float | None = None
         self.first_text_delta_at: float | None = None
         self._context_result = self._resolve_window()
@@ -185,6 +206,15 @@ class LLMRoundObservation:
 
     def start(self) -> None:
         self.started_at = self.clock()
+        if self.estimator_status is not None:
+            self._context_result = self._with_estimate(
+                self.estimated_prompt_tokens,
+                self.estimator_status,
+            )
+            return
+        if self.estimated_prompt_tokens is not None:
+            self._context_result = self._with_estimate(self.estimated_prompt_tokens, "reused_context_manager")
+            return
         if self.run_context_in_thread:
             if not _ESTIMATE_ADMISSION.acquire(blocking=False):
                 self._context_result = self._with_estimate(None, "skipped_overload")
@@ -376,6 +406,7 @@ class LLMRoundObservation:
             "finish_reason": finish_reason,
             "outcome": outcome,
             "error_type": error_type,
+            **self.context_management,
         }
 
 
@@ -408,6 +439,9 @@ def create_llm_round_observation(
     messages: list[dict],
     call_kwargs: dict,
     assistant_message_id: str | None = None,
+    estimated_prompt_tokens: int | None = None,
+    estimator_status: str | None = None,
+    context_management: dict[str, Any] | None = None,
 ) -> LLMRoundObservation:
     return LLMRoundObservation(
         metadata=RoundMetadata(
@@ -423,4 +457,7 @@ def create_llm_round_observation(
         litellm_model=litellm_model,
         messages=messages,
         call_kwargs=call_kwargs,
+        estimated_prompt_tokens=estimated_prompt_tokens,
+        estimator_status=estimator_status,
+        context_management=context_management,
     )

@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.schemas.chat import Usage
+from app.services.chat.context_manager import prepare_context as prepare_context_real
 from app.services.stream.limit_summary import (
     LIMIT_SUMMARY_PROMPT,
     LimitSummaryStepRequest,
@@ -106,6 +107,92 @@ class LimitSummaryHelpersTests(unittest.TestCase):
 
 
 class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
+    async def test_limit_summary_uses_real_budgeted_snapshot_and_keeps_tail_system_prompt(self):
+        messages = [
+            {"role": "user", "content": "a" * 100},
+            {"role": "assistant", "content": "b" * 100},
+            {"role": "user", "content": "最新问题"},
+        ]
+        sent_messages = []
+
+        def estimator(_model, candidate, _kwargs):
+            return sum(
+                min(len(message.get("content") or ""), 10)
+                if message.get("role") == "system"
+                else len(message.get("content") or "")
+                for message in candidate
+            )
+
+        async def budgeted_prepare(**kwargs):
+            return await prepare_context_real(
+                **kwargs,
+                window_resolver=lambda _model: (100, "test", "known"),
+                token_estimator=estimator,
+                run_in_thread=False,
+                use_fast_path=False,
+            )
+
+        async def start_step_fn(**_kwargs):
+            return AgentStepContext(
+                step_id="step-summary",
+                step_number=2,
+                started_at=100.0,
+                thinking_block_id="blk-thinking",
+                text_block_id="blk-text",
+            )
+
+        async def llm_call_fn(_model, _kwargs, call_messages, **_call_kwargs):
+            sent_messages.extend(call_messages)
+            return "response"
+
+        async def stream_round_fn(*_args, **_kwargs):
+            return "", "总结", [], "stop", None
+
+        request = LimitSummaryStepRequest(
+            conversation_id="conv-1",
+            task_id="task-1",
+            run_id="run-1",
+            step_number=2,
+            model_id="gpt-4",
+            provider="openai",
+            litellm_model="openai/gpt-4",
+            litellm_kwargs={},
+            messages=messages,
+            should_use_reasoning=False,
+            content_blocks=[],
+            call_kwargs={},
+            accumulated_usage=Usage(input_tokens=0, output_tokens=0),
+            emitter=object(),
+            session_cache=object(),
+            total_timeout_s=300,
+            run_start=100.0,
+            start_step_fn=start_step_fn,
+            complete_step_fn=AsyncMock(),
+            llm_call_fn=llm_call_fn,
+            stream_round_fn=stream_round_fn,
+            log_round_summary_fn=lambda **_kwargs: None,
+            clock=lambda: 120.0,
+        )
+        observation = MagicMock()
+        observation.finish_success = AsyncMock()
+        observation.finish_error = AsyncMock()
+        observation.wrap_response.side_effect = lambda response: response
+
+        with (
+            patch("app.services.stream.limit_summary.prepare_context", new=budgeted_prepare),
+            patch(
+                "app.services.stream.limit_summary.create_llm_round_observation",
+                return_value=observation,
+            ),
+        ):
+            await run_limit_summary_step(request=request)
+
+        self.assertEqual([message["role"] for message in sent_messages], ["user", "system"])
+        self.assertEqual(sent_messages[0]["content"], "最新问题")
+        self.assertEqual(sent_messages[-1]["content"], LIMIT_SUMMARY_PROMPT)
+        self.assertEqual(len(messages), 4)
+        self.assertEqual(messages[-1]["content"], LIMIT_SUMMARY_PROMPT)
+
     async def test_limit_summary_records_independent_round_observation(self):
         messages = []
         observation = MagicMock()
@@ -154,15 +241,31 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
             clock=lambda: 120.0,
         )
 
-        with patch(
-            "app.services.stream.limit_summary.create_llm_round_observation",
-            return_value=observation,
-        ) as create_observation:
+        context_plan = MagicMock(
+            messages=[{"role": "system", "content": LIMIT_SUMMARY_PROMPT}],
+            estimated_tokens_after=12,
+        )
+        context_plan.telemetry.return_value = {"context_management_status": "trimmed"}
+        with (
+            patch(
+                "app.services.stream.limit_summary.create_llm_round_observation",
+                return_value=observation,
+            ) as create_observation,
+            patch(
+                "app.services.stream.limit_summary.prepare_context",
+                new=AsyncMock(return_value=context_plan),
+            ),
+        ):
             outcome = await run_limit_summary_step(request=request)
 
         self.assertEqual(outcome.accumulated_usage, Usage(input_tokens=7, output_tokens=10))
         self.assertEqual(create_observation.call_args.kwargs["round_kind"], "limit_summary")
         self.assertEqual(create_observation.call_args.kwargs["round_index"], 2)
+        self.assertEqual(create_observation.call_args.kwargs["messages"], context_plan.messages)
+        self.assertEqual(
+            create_observation.call_args.kwargs["context_management"],
+            {"context_management_status": "trimmed"},
+        )
         observation.start.assert_called_once_with()
         observation.finish_success.assert_awaited_once_with(
             usage=Usage(input_tokens=5, output_tokens=7),

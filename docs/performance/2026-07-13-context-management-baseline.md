@@ -7,9 +7,11 @@
 - 生产库持久化的 `messages.usage.input_tokens` 不能直接当作“单次上下文长度”。Agent 回复会累计多个 LLM round 的 prompt token；现有高值主要由 Agent 多轮调用产生，而不是长对话历史。
 - 当前可观测性不足：没有保存每个 LLM round 的 prompt token、模型窗口、预算占用比例和上下文组成，因而无法从生产数据准确回答“某次请求用了窗口的多少”。
 - 当前模型目录也不足以直接驱动预算：生产 `/api/models/` 返回 14 个模型，只有 4 个带 `contextWindowTokens`，其余 10 个为空。
-- 在设计 Context Manager 前，应先补最小请求级可观测性，再执行真实模型阶梯实验；否则容易用累计 Agent usage 误判单次 Context，或用理论窗口替代真实供应商行为。
+- 后续真实 Kimi K2.5 阶梯证明：5K、10K、20K、40K 冷输入与 40K 多轮早/中/近 canary 可通过；到窗口 60% 时后端仍成功完成，但客户端在长 TTFT 空窗期丢失 SSE，暴露了缺少 heartbeat 的独立链路问题。
+- 第二阶段已实现 Token-aware Context Manager：已知窗口在 85% 触发、裁剪至 75% 目标，保持 canonical 历史不变，并按完整历史 turn 与同一用户轮内工具事务做原子淘汰。
+- 这仍不是跨会话 Memory，也没有引入向量召回或 LLM rolling summary；当前解决的是单次请求 Context 预算与长 TTFT 流连接稳定性。
 
-本轮没有调用真实 LLM、没有写入生产数据、没有读取消息正文或用户身份，也没有修改业务行为。
+初始调研阶段没有调用真实 LLM、没有写入生产数据或读取消息正文。第二阶段使用专用随机数据执行了受费用门禁约束的生产阶梯，具体结果与清理边界见文末。
 
 ## 调研范围与方法
 
@@ -231,7 +233,7 @@ Loki 与 `agent_sessions` 最近 30 天聚合结果（北京时间 2026-06-13 09
 - 记录真实 per-round prompt token、TTFT、总耗时、召回结果和错误。
 - Agent 与无工具普通对话分开测试，避免累计 usage 混淆。
 
-该实验会创建生产会话并产生真实模型费用，本轮报告阶段没有执行。
+该实验会创建生产会话并产生真实模型费用；第二阶段已经按该门禁执行。
 
 ## 第一阶段实施状态
 
@@ -245,14 +247,75 @@ OBS-01 与 REP-01 已进入代码门禁：
 
 本阶段覆盖主聊天流式调用与触顶总结；标题、推荐问题、文件解析等非主聊天辅助调用不纳入 round telemetry。
 
-## 决策建议
+## 第二阶段：生产阶梯结果
 
-Context 管理问题已经在代码层确定性复现，但生产用户影响尚未被真实长对话数据证明。建议按以下顺序推进：
+### 评测门禁
 
-1. 请求级 Context 可观测性。
-2. 4K 确定性失败测试。
-3. 真实模型无工具阶梯与 Agent 阶梯。
-4. 根据结果设计 Token-aware Context Manager。
-5. 最后再评估 rolling summary、工具/文件摘要恢复和跨会话 Memory。
+- 模型：`kimi-k2.5`，生产目录窗口 `262,144`。
+- 固定 `disable_tools=true`、`use_reasoning=false`，输出硬上限 `1,024` Token。
+- 串行执行；任何工具事件、第二 LLM round、SSE error、canary miss、round telemetry 缺失/重复、资源异常、费用不足或清理失败立即停止。
+- 每档执行前预留完整 planned input + 1,024 output 费用；Loki 缺失时仍按保守上界计费，不把已经发生的请求记成 0。
+- 报告只保留长度、hash、命中布尔值与指标，不保存 filler、canary 原文、回答正文、邮箱、Token 或会话 ID。
 
-不要先恢复历史自动 Memory。当前最明确的问题是单会话 Context 缺少预算和治理，而不是跨会话召回能力不足。
+### 冷输入基线
+
+| 档位 | 真实 Prompt Token | 客户端首输出 | 总耗时 | Completion Token | 召回 |
+|---:|---:|---:|---:|---:|---|
+| 5K | 5,090 | 6.34 s | 6.92 s | 242 | early/middle/recent 全命中 |
+| 10K | 9,736 | 20.97 s | 21.76 s | 421 | early/middle/recent 全命中 |
+| 20K | 19,062 | 6.84 s | 7.24 s | 190 | early/middle/recent 全命中 |
+| 40K | 37,692 | 15.28 s | 15.71 s | 476 | early/middle/recent 全命中 |
+
+这组单样本只能证明功能可达，不能把 10K 偶发高 TTFT 解释成单调性能退化；要形成统计结论仍需每档重复采样。
+
+### 多轮累计基线
+
+| 累计档位 | 真实 Prompt Token | 客户端首输出 | 后端首模型文本 | Completion Token | 结果 |
+|---:|---:|---:|---:|---:|---|
+| 5K | 5,092 | 7.36 s | 1.97 s | 222 | 通过 |
+| 10K | 9,768 | 3.85 s | 1.79 s | 86 | 通过 |
+| 20K | 19,099 | 3.00 s | 2.59 s | 23 | 通过 |
+| 40K | 37,752 | 12.30 s | 4.70 s | 464 | 早期 5K、中间 20K、最近 40K canary 全命中 |
+
+第一次 40K 多轮请求把“早期/中间/最近”当前值与历史值同时放入最终问题，造成歧义并触发假阴性；runner 已改为显式引用 canary 所属轮次，重跑后全部命中。`--start-case` 只允许独立会话档位，拒绝绕过多轮前置历史。
+
+### 窗口 60% 暴露的真实链路问题
+
+`window-60` 的后端 LLM round 实际成功：
+
+- `round_prompt_tokens=146,989`，约占已知窗口 56.1%。
+- 服务端首个模型文本 delta 为 51.86 s，总耗时 62.12 s，completion 375。
+- 无工具调用、只有一个 Agent round，API/PostgreSQL/Redis/Nginx/LiteLLM 无重启、OOM、Redis reject 或 eviction。
+- 客户端只收到开头 Agent 事件，未收到正文与 `[DONE]`；连接在长时间无字节期间结束。
+
+证据表明问题不在模型是否完成，而在 SSE 长 TTFT 空窗期缺少链路保活。协议层已增加每 15 秒一个 SSE comment heartbeat；它不带 `id:`、不推进重连 cursor，也不取消或重建底层 Redis iterator。该修复部署后必须从 `window-60` 继续验证 60%、80% 与真实裁剪档位。
+
+### 试跑与清理
+
+- `128` output Token 试跑在 5K 就耗尽内部推理预算，未产生可见答案；因此硬上限调整为 1,024，仍受单次费用上限覆盖。
+- 三次试跑的 run id 分别为 `perf-20260713-043443-fbb3c1be`、`perf-20260713-043629-48be46fa`、`perf-20260713-044103-c8ada47f`。
+- 各次对话均已删除、refresh Token 均已撤销，cleanup 无错误；认证服务没有压测账号删除/禁用 API，因此专用账号**不会被删除或禁用**，账号行会永久保留。runner 已增加独立的 `--allow-account-residue` 明示门禁，并在结果中输出 `account_cleanup_supported=false` 与 `account_rows_retained`，避免把撤销 Token 误报为账号清理。
+
+## 第二阶段：Context Manager 实现
+
+### 运行策略
+
+1. 只使用缓存目录中可信的正整数 `max_input_tokens`；未知窗口保持原行为并记录 `bypass_unknown_window`。
+2. 已知窗口先用不复制正文的保守上界判断短输入；接近预算才进入最多两个并发的专用 tokenizer 线程。
+3. Tokenizer 忙、超时或异常时 fail-closed，返回 `context_estimation_unavailable`，不再把未经校验的长输入发给供应商。
+4. 达到窗口 85% 时，从最旧完整 user turn 开始淘汰；同一最新 user 下有多轮工具时，可继续原子淘汰旧的完整 `assistant.tool_calls + 全部匹配 tool results`，最新工具事务强制保留。
+5. 候选裁剪使用二分定位，避免逐轮完整重 Tokenize 的近 O(n²) 放大；最终复估必须低于 75% 目标，或至少回到 85% 触发线内。
+6. 所有 system、最新 user、最新工具事务、当前图片/文件正文保持原样；强制内容仍超预算时返回 `context_budget_exceeded`，不做字符串截断。
+7. canonical messages 与数据库历史不改，只把 effective snapshot 传给当前 LLM round；普通 Agent、后续工具 round、limit summary、continuation 与 `stream=false` 均覆盖。
+
+### 自动化证明
+
+- 真实 4K fixture：原始约 5.6K，裁剪后低于 75% 目标；固定 system 与最新 user/assistant 保留，最旧 marker 消失，canonical 14 条消息不变。
+- 历史 turn、并行工具结果、同一 user 下连续工具事务均按原子组裁剪，无 orphan tool result。
+- estimator error、timeout、admission overload 均 fail-closed；`CancelledError` 继续传播。
+- limit summary 真实组合测试证明尾部 summary system prompt 不会被裁掉；budget error 会写脱敏 round telemetry，并以结构化 SSE error code 收尾。
+- SSE heartbeat 覆盖长空闲后继续收 chunk、快路径不产生多余 heartbeat、客户端关闭会取消 pending reader。
+
+## 当前决策
+
+本轮不引入跨会话 Memory。现有证据支持先完成部署后的 60%/80%/90% 裁剪阶梯与真实登录态 Chrome 回归，再把统计型重复采样作为独立性能任务；这能把“预算治理正确性”与“各供应商长 Context 性能画像”分开。

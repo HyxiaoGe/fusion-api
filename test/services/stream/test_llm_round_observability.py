@@ -12,6 +12,45 @@ from app.services.chat.message_builder import build_llm_messages
 
 
 class LLMRoundObservabilityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_context_management_metadata_is_allowlisted_and_reuses_estimate(self):
+        from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata
+
+        estimator_calls = []
+        observation = LLMRoundObservation(
+            metadata=RoundMetadata(
+                conversation_id="conv-1",
+                run_id="run-1",
+                round_index=1,
+                step_id="step-1",
+                round_kind="agent",
+                model_id="small-model",
+                provider="test",
+            ),
+            litellm_model="test/small-model",
+            messages=[{"role": "user", "content": "正文不可出现在日志"}],
+            call_kwargs={},
+            token_estimator=lambda *_args: estimator_calls.append(1) or 999,
+            context_window_resolver=lambda _model_id: (100, "catalog", "known"),
+            run_context_in_thread=False,
+            estimated_prompt_tokens=70,
+            context_management={
+                "context_management_status": "trimmed",
+                "context_management_removed_turns": 2,
+                "context_management_private_prompt": "不可泄露",
+            },
+        )
+
+        observation.start()
+        await observation.finish_success(usage=None, finish_reason="stop")
+        await observation.wait_for_log()
+
+        self.assertEqual(estimator_calls, [])
+        self.assertEqual(observation.last_payload["estimated_prompt_tokens"], 70)
+        self.assertEqual(observation.last_payload["estimator_status"], "reused_context_manager")
+        self.assertEqual(observation.last_payload["context_management_status"], "trimmed")
+        self.assertEqual(observation.last_payload["context_management_removed_turns"], 2)
+        self.assertNotIn("context_management_private_prompt", observation.last_payload)
+
     async def test_4k_over_budget_metrics_are_observed_without_trimming_claim(self):
         from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata
 

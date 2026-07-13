@@ -152,6 +152,7 @@ async def finalize_failed_run(
         only_if_content=True,
         partial=True,
     )
+    structured_error_code = _safe_structured_error_code(error)
     try:
         await fail_agent_run_fn(
             emitter=context.emitter,
@@ -159,7 +160,7 @@ async def finalize_failed_run(
             stats=context.state.run_stats(context.run_id),
             duration_ms_factory=context.duration_ms_factory,
             current_step_id=context.state.current_step_id,
-            error_code=type(error).__name__,
+            error_code=structured_error_code or type(error).__name__,
             message=str(error),
         )
         context.state.mark_terminal_emitted()
@@ -167,7 +168,23 @@ async def finalize_failed_run(
         raise
     except Exception as emit_exc:  # noqa: BLE001
         warning_fn(f"emit run_failed 失败: {emit_exc}")
-    await finalize_stream_fn(context.conversation_id, success=False, error_msg=str(error), task_id=context.task_id)
+    finalize_kwargs = {
+        "success": False,
+        "error_msg": str(error),
+        "task_id": context.task_id,
+    }
+    if structured_error_code:
+        finalize_kwargs["error_code"] = structured_error_code
+    await finalize_stream_fn(context.conversation_id, **finalize_kwargs)
+
+
+def _safe_structured_error_code(error: Exception) -> str:
+    candidate = getattr(error, "error_code", None)
+    if not isinstance(candidate, str) or not 1 <= len(candidate) <= 64:
+        return ""
+    if not all(char.isascii() and (char.isalnum() or char == "_") for char in candidate):
+        return ""
+    return candidate
 
 
 async def write_fallback_run_error(

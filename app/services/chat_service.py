@@ -29,6 +29,11 @@ from app.services.agent.continuation import (
     get_continuation_system_prompt,
 )
 from app.services.agent_strategy_config import get_agent_tools_disabled_aliases
+from app.services.chat.context_manager import (
+    ContextBudgetExceededError,
+    ContextEstimationUnavailableError,
+    prepare_context,
+)
 from app.services.chat.message_builder import (
     build_llm_messages,
     inject_file_content,
@@ -457,11 +462,23 @@ class ChatService:
         max_tokens = normalize_controlled_max_tokens(options.get("max_tokens"))
         if max_tokens is not None:
             controlled_call_kwargs["max_tokens"] = max_tokens
+        final_call_kwargs = merge_litellm_kwargs("chat_non_stream", controlled_call_kwargs)
+        try:
+            context_plan = await prepare_context(
+                messages=messages,
+                model_id=model_id,
+                litellm_model=litellm_model,
+                call_kwargs=final_call_kwargs,
+            )
+        except ContextBudgetExceededError as error:
+            raise ApiException.bad_request(str(error)) from error
+        except ContextEstimationUnavailableError as error:
+            raise ApiException.service_unavailable(str(error)) from error
         response = await litellm.acompletion(
             model=litellm_model,
-            messages=messages,
+            messages=context_plan.messages,
             stream=False,
-            **merge_litellm_kwargs("chat_non_stream", controlled_call_kwargs),
+            **final_call_kwargs,
         )
 
         content_text = response.choices[0].message.content or ""

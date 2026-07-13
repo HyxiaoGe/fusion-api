@@ -265,6 +265,31 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(state.terminal_emitted)
 
+    async def test_finalize_failed_preserves_safe_structured_context_error_code(self):
+        class ContextError(RuntimeError):
+            error_code = "context_budget_exceeded"
+
+        calls = []
+
+        async def fail_agent_run_fn(**kwargs):
+            calls.append(("fail", kwargs))
+
+        async def finalize_stream_fn(*args, **kwargs):
+            calls.append(("finalize", args, kwargs))
+
+        await finalize_failed_run(
+            context=_context(),
+            error=ContextError("请缩短输入"),
+            persist_message_fn=lambda *_args: None,
+            fail_agent_run_fn=fail_agent_run_fn,
+            finalize_stream_fn=finalize_stream_fn,
+            warning_fn=lambda _message: None,
+        )
+
+        self.assertEqual(calls[0][1]["error_code"], "context_budget_exceeded")
+        self.assertEqual(calls[1][2]["error_code"], "context_budget_exceeded")
+        self.assertEqual(calls[1][2]["error_msg"], "请缩短输入")
+
     async def test_write_fallback_run_error_skips_when_terminal_already_emitted(self):
         state = AgentLoopState()
         state.mark_terminal_emitted()

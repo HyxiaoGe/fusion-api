@@ -589,7 +589,14 @@ class ChatServiceTests(unittest.TestCase):
             usage=None,
         )
 
-        with patch("app.services.chat_service.litellm.acompletion", new=AsyncMock(return_value=mock_response)) as call:
+        context_plan = MagicMock(messages=[{"role": "user", "content": "有效问题"}])
+        with (
+            patch("app.services.chat_service.litellm.acompletion", new=AsyncMock(return_value=mock_response)) as call,
+            patch(
+                "app.services.chat_service.prepare_context",
+                new=AsyncMock(return_value=context_plan),
+            ) as prepare,
+        ):
             asyncio.run(
                 service._handle_non_stream(
                     "litellm_proxy/model-1",
@@ -602,6 +609,9 @@ class ChatServiceTests(unittest.TestCase):
             )
 
         self.assertEqual(call.await_args.kwargs["max_tokens"], 4096)
+        self.assertEqual(call.await_args.kwargs["messages"], context_plan.messages)
+        self.assertEqual(prepare.await_args.kwargs["model_id"], "model-1")
+        self.assertEqual(prepare.await_args.kwargs["litellm_model"], "litellm_proxy/model-1")
 
     def test_handle_non_stream_ignores_invalid_max_tokens(self):
         service = object.__new__(ChatService)

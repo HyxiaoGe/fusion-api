@@ -8,6 +8,7 @@ from typing import Any
 
 from app.ai.llm_round_observability import create_llm_round_observation
 from app.schemas.chat import Usage
+from app.services.chat.context_manager import ContextManagementError, ContextPlan, prepare_context
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,38 @@ class AgentRoundResult:
 
 
 StreamRoundResult = tuple[str, str, list[dict], str, Usage | None]
+
+
+def _create_agent_round_observation(
+    *,
+    context_plan: ContextPlan,
+    conversation_id: str,
+    run_id: str,
+    step_number: int,
+    step_id: str,
+    model_id: str,
+    provider: str,
+    litellm_model: str,
+    call_kwargs: dict,
+    assistant_message_id: str | None,
+    estimator_status: str | None = None,
+) -> Any:
+    return create_llm_round_observation(
+        conversation_id=conversation_id,
+        run_id=run_id,
+        round_index=step_number,
+        step_id=step_id,
+        round_kind="agent",
+        model_id=model_id,
+        provider=provider,
+        litellm_model=litellm_model,
+        messages=context_plan.messages,
+        call_kwargs=call_kwargs,
+        assistant_message_id=assistant_message_id,
+        context_management=context_plan.telemetry(),
+        estimated_prompt_tokens=context_plan.estimated_tokens_after,
+        estimator_status=estimator_status,
+    )
 
 
 def accumulate_usage(accumulated_usage: Usage, usage_data: Usage | None) -> Usage:
@@ -110,16 +143,40 @@ async def run_agent_round(
     log_round_summary_fn: Callable[..., None],
     assistant_message_id: str | None = None,
 ) -> AgentRoundResult:
-    observation = create_llm_round_observation(
+    try:
+        context_plan = await prepare_context(
+            messages=messages,
+            model_id=model_id,
+            litellm_model=litellm_model,
+            call_kwargs=call_kwargs,
+        )
+    except ContextManagementError as error:
+        observation = _create_agent_round_observation(
+            context_plan=error.plan,
+            conversation_id=conversation_id,
+            run_id=run_id,
+            step_number=step_number,
+            step_id=step_context.step_id,
+            model_id=model_id,
+            provider=provider,
+            litellm_model=litellm_model,
+            call_kwargs=call_kwargs,
+            assistant_message_id=assistant_message_id,
+            estimator_status="context_manager_error",
+        )
+        observation.start()
+        await observation.finish_error(error)
+        raise
+    effective_messages = context_plan.messages
+    observation = _create_agent_round_observation(
+        context_plan=context_plan,
         conversation_id=conversation_id,
         run_id=run_id,
-        round_index=step_number,
+        step_number=step_number,
         step_id=step_context.step_id,
-        round_kind="agent",
         model_id=model_id,
         provider=provider,
         litellm_model=litellm_model,
-        messages=messages,
         call_kwargs=call_kwargs,
         assistant_message_id=assistant_message_id,
     )
@@ -131,7 +188,7 @@ async def run_agent_round(
             run_id=run_id,
             litellm_model=litellm_model,
             litellm_kwargs=litellm_kwargs,
-            messages=messages,
+            messages=effective_messages,
             should_use_reasoning=should_use_reasoning,
             call_kwargs=call_kwargs,
             step_context=step_context,
