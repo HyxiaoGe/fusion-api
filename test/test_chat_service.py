@@ -580,6 +580,52 @@ class ChatServiceTests(unittest.TestCase):
             {"metadata": {"tags": ["app:fusion", "phase:chat_non_stream"]}},
         )
 
+    def test_handle_non_stream_applies_controlled_max_tokens(self):
+        service = object.__new__(ChatService)
+        service.db = MagicMock()
+        service.conversation_service = MagicMock()
+        mock_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="回答"))],
+            usage=None,
+        )
+
+        with patch("app.services.chat_service.litellm.acompletion", new=AsyncMock(return_value=mock_response)) as call:
+            asyncio.run(
+                service._handle_non_stream(
+                    "litellm_proxy/model-1",
+                    "model-1",
+                    {},
+                    [{"role": "user", "content": "问题"}],
+                    "conv-1",
+                    {"max_tokens": 9999},
+                )
+            )
+
+        self.assertEqual(call.await_args.kwargs["max_tokens"], 4096)
+
+    def test_handle_non_stream_ignores_invalid_max_tokens(self):
+        service = object.__new__(ChatService)
+        service.db = MagicMock()
+        service.conversation_service = MagicMock()
+        mock_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="回答"))],
+            usage=None,
+        )
+
+        with patch("app.services.chat_service.litellm.acompletion", new=AsyncMock(return_value=mock_response)) as call:
+            asyncio.run(
+                service._handle_non_stream(
+                    "litellm_proxy/model-1",
+                    "model-1",
+                    {},
+                    [{"role": "user", "content": "问题"}],
+                    "conv-1",
+                    {"max_tokens": True},
+                )
+            )
+
+        self.assertNotIn("max_tokens", call.await_args.kwargs)
+
     def test_process_message_non_stream_injects_no_vision_boundary_for_image_on_text_model(self):
         db = MagicMock()
         db.query.return_value.filter.return_value.first.return_value = None

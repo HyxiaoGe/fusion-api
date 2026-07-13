@@ -17,6 +17,40 @@ class FakeFileRepository:
 
 
 class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
+    def test_build_call_config_applies_controlled_max_tokens(self):
+        for raw_value, expected in ((1, 1), (1024, 1024), (9999, 4096)):
+            with self.subTest(raw_value=raw_value):
+                config = build_agent_loop_call_config(
+                    provider="openai",
+                    options={"max_tokens": raw_value},
+                    capabilities={"functionCalling": False},
+                )
+
+                self.assertEqual(config.call_kwargs["max_tokens"], expected)
+
+    def test_build_call_config_ignores_invalid_max_tokens(self):
+        for raw_value in (True, False, 0, -1, 1.5, "1024", None):
+            with self.subTest(raw_value=raw_value):
+                config = build_agent_loop_call_config(
+                    provider="openai",
+                    options={"max_tokens": raw_value},
+                    capabilities={"functionCalling": False},
+                )
+
+                self.assertNotIn("max_tokens", config.call_kwargs)
+
+    def test_build_call_config_can_disable_supported_tools(self):
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={"disable_tools": True},
+            capabilities={"functionCalling": True, "searchCapable": True},
+        )
+
+        self.assertFalse(config.supports_function_calling)
+        self.assertEqual(config.announced_tools, [])
+        self.assertNotIn("tools", config.call_kwargs)
+        self.assertNotIn("tool_choice", config.call_kwargs)
+
     def test_build_call_config_enables_tools_and_volcengine_reasoning_compat(self):
         config = build_agent_loop_call_config(
             provider="volcengine",

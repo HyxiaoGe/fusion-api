@@ -22,6 +22,7 @@ from app.services.chat.message_builder import (
 from app.services.stream.persistence import preprocess_url_in_message
 
 VOLCENGINE_PROVIDERS = {"volcengine"}
+MAX_CONTROLLED_OUTPUT_TOKENS = 4096
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,13 @@ def supports_search_tools(capabilities: dict) -> bool:
     return function_calling and bool(capabilities.get("agentTools", capabilities.get("functionCalling", False)))
 
 
+def normalize_controlled_max_tokens(value: Any) -> int | None:
+    """只接受受控的正整数输出上限，拒绝 bool 与隐式类型转换。"""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return min(value, MAX_CONTROLLED_OUTPUT_TOKENS)
+
+
 def build_agent_loop_call_config(
     *,
     provider: str,
@@ -72,8 +80,12 @@ def build_agent_loop_call_config(
     supports_thinking = bool(capabilities.get("deepThinking", False))
     should_use_reasoning = use_reasoning is True or (use_reasoning is None and supports_thinking)
 
-    supports_function_calling = supports_search_tools(capabilities)
+    tools_disabled = options.get("disable_tools") is True
+    supports_function_calling = supports_search_tools(capabilities) and not tools_disabled
     call_kwargs: dict = {}
+    max_tokens = normalize_controlled_max_tokens(options.get("max_tokens"))
+    if max_tokens is not None:
+        call_kwargs["max_tokens"] = max_tokens
     if supports_function_calling:
         call_kwargs["tools"] = [build_web_search_tool_fn()]
         call_kwargs["tool_choice"] = "auto"

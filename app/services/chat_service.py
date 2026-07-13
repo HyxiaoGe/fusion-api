@@ -39,7 +39,11 @@ from app.services.conversation_service import ConversationService
 from app.services.file_service import FileService, is_image_mime
 from app.services.storage import get_storage_for_backend
 from app.services.stream import StreamHandler, stream_redis_as_sse
-from app.services.stream.agent_loop_request_prep import inject_no_tool_network_boundary, inject_no_vision_file_boundary
+from app.services.stream.agent_loop_request_prep import (
+    inject_no_tool_network_boundary,
+    inject_no_vision_file_boundary,
+    normalize_controlled_max_tokens,
+)
 from app.services.stream.persistence import acquire_message_persistence_lock, merge_partial_content_blocks
 from app.services.stream.runner import _agent_loop_limits
 from app.services.stream_state_service import StreamInitResult, finalize_stream, get_stream_meta, init_stream
@@ -449,11 +453,15 @@ class ChatService:
         options: dict,
     ) -> ChatResponse:
         """处理非流式响应（LiteLLM Proxy 自己管 health / 重试）。"""
+        controlled_call_kwargs = dict(litellm_kwargs)
+        max_tokens = normalize_controlled_max_tokens(options.get("max_tokens"))
+        if max_tokens is not None:
+            controlled_call_kwargs["max_tokens"] = max_tokens
         response = await litellm.acompletion(
             model=litellm_model,
             messages=messages,
             stream=False,
-            **merge_litellm_kwargs("chat_non_stream", litellm_kwargs),
+            **merge_litellm_kwargs("chat_non_stream", controlled_call_kwargs),
         )
 
         content_text = response.choices[0].message.content or ""
