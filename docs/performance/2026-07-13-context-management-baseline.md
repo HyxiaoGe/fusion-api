@@ -316,6 +316,32 @@ OBS-01 与 REP-01 已进入代码门禁：
 - limit summary 真实组合测试证明尾部 summary system prompt 不会被裁掉；budget error 会写脱敏 round telemetry，并以结构化 SSE error code 收尾。
 - SSE heartbeat 覆盖长空闲后继续收 chunk、快路径不产生多余 heartbeat、客户端关闭会取消 pending reader。
 
+## 部署后生产闭环
+
+### 60% / 80% / 90% 阶梯
+
+最终生产运行：`perf-20260713-051915-9512b94b`，从 `window-60` 独立续跑，四档全部完成，实际费用 `$0.564035`。
+
+| case_id | Context Manager | 精确估算 before → after | 真实 Prompt Token | 客户端首输出 | 服务端首模型文本 | 总耗时 | 裁剪 | 结果 |
+|---|---|---:|---:|---:|---:|---:|---|---|
+| `window-60` | `no_op` | 157,959 → 157,959 | 146,989 | 61.55 s | 49.67 s | 61.87 s | 0 turn / 0 message | early/middle/recent 全命中，收到 `[DONE]` |
+| `window-80` | `no_op` | 210,383 → 210,383 | 195,888 | 86.90 s | 79.08 s | 87.36 s | 0 turn / 0 message | early/middle/recent 全命中，收到 `[DONE]` |
+| `managed-seed` | `no_op` | 40,682 → 40,682 | 37,758 | 15.93 s | 10.76 s | 15.90 s | 0 turn / 0 message | 种子轮完成 |
+| `managed-trim-90` | `trimmed` | 232,305 → 192,280 | 178,988 | 62.64 s | 57.38 s | 62.91 s | 1 turn / 2 messages | early/middle/recent 全命中，收到 `[DONE]` |
+
+`window-60` 在超过 60 秒的客户端连接期间持续收到 heartbeat，最终正文和 `[DONE]` 均到达，证明此前“模型完成但客户端断流”的链路缺口已经闭合。`managed-trim-90` 则证明生产请求达到 85% 触发线后，最旧完整 turn 被原子移除，effective snapshot 回到 75% 目标以内，最新请求和三个 canary 仍完整可用。
+
+资源门禁全程通过：API/PostgreSQL/Redis/Nginx/LiteLLM 均为 0 restart、0 OOM；Redis rejected connections/evicted keys 均为 0。最终删除 3 个测试会话并撤销 2 个 Token，cleanup 无错误；认证服务限制导致 1 个专用账号行保留，结果已明确记录。
+
+### 真实登录态 Chrome 回归
+
+| case_id | 输入 | 页面 URL | 预期 | 实际 | network/API | console error | 刷新后结果 | 结论 | 证据 |
+|---|---|---|---|---|---|---|---|---|---|
+| `CTX-UI-01` | `CTX-MGR-20260713-B1` 短消息 | `https://fusion.seanfield.org/chat/868bee65-2e50-4a3f-b3e5-eb538394c859` | 发送后立即显示用户消息并进入流式状态 | 用户消息即时出现，侧栏出现“正在输出”，随后生成完成并自动生成标题 | 新会话创建、SSE 完成、持久化成功 | 发送/完成前 0 error | 不适用 | 通过 | DOM 同时出现用户消息、`正在准备回答`、最终回答与正式会话 URL |
+| `CTX-UI-02` | 刷新同一新会话 | 同上 | 用户消息、回答和标题恢复 | 三者全部恢复，无 loading 残留 | 历史详情读取成功 | 刷新时出现 1 条 React production error `#418`，页面随后正常恢复 | 用户消息、回答、标题均保留 | 功能通过；记录非阻断 UI hydration 残留 | 刷新后 DOM 保留 `CTX-MGR-20260713-B1` 与最终回答 |
+
+React `#418` 发生在前端 hydration 阶段，本次只发布后端且用户路径没有功能损失，因此不作为 Context Manager 发布阻断；它作为独立前端可观测问题保留，不把 console 误报为 0。
+
 ## 当前决策
 
-本轮不引入跨会话 Memory。现有证据支持先完成部署后的 60%/80%/90% 裁剪阶梯与真实登录态 Chrome 回归，再把统计型重复采样作为独立性能任务；这能把“预算治理正确性”与“各供应商长 Context 性能画像”分开。
+本轮不引入跨会话 Memory。Token 预算感知的 Context Manager、长 TTFT SSE heartbeat、自动化用例、CI/CD、60%/80%/90% 真实生产阶梯与登录态 Chrome 回归均已闭环；统计型重复采样继续与“预算治理正确性”分离，不影响本阶段结论。
