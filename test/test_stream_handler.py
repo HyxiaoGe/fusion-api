@@ -342,10 +342,16 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
             [
                 "run_started",
                 "step_started",
+                "context_status_updated",
+                "context_status_updated",
                 "step_completed",
                 "run_completed",
             ],
         )
+        context_events = [event for event in events if event["type"] == "context_status_updated"]
+        self.assertEqual([event["phase"] for event in context_events], ["estimated", "final"])
+        self.assertEqual([event["round_index"] for event in context_events], [1, 1])
+        self.assertEqual([event["message_id"] for event in context_events], ["msg-1", "msg-1"])
         self.assertEqual([e for e in events if e["type"].startswith("plan_")], [])
         self.assertEqual([e for e in events if e["type"] == "run_progress_updated"], [])
         # sequence 严格连续。
@@ -778,9 +784,13 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
             [
                 "run_started",
                 "step_started",
+                "context_status_updated",
+                "context_status_updated",
                 "run_interrupted",
             ],
         )
+        context_events = [event for event in events if event["type"] == "context_status_updated"]
+        self.assertEqual([event["phase"] for event in context_events], ["estimated", "final"])
         self.assertEqual(events[-1]["reason"], "superseded")
         self.assertEqual(self.session_statuses[-1]["status"], "interrupted")
         self.assertEqual(self.session_statuses[-1]["total_steps"], 1)

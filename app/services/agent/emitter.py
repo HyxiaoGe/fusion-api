@@ -52,6 +52,7 @@ class AgentEventEmitter:
         self._writer = redis_writer
         self._sequence = 0
         self._current_step_id: str | None = None
+        self._message_id: str | None = None
         self._lock = asyncio.Lock()
 
     async def _emit(self, event: ev.AgentEventBase) -> None:
@@ -100,6 +101,7 @@ class AgentEventEmitter:
                 **self._envelope(step_id=None),
             )
         )
+        self._message_id = message_id
 
     async def step_started(self, *, step_number: int) -> str:
         step_id = str(uuid.uuid4())
@@ -296,5 +298,40 @@ class AgentEventEmitter:
                 protocol_version=2,
                 evidence=evidence,
                 **self._envelope(tool_call_id=tool_call_id),
+            )
+        )
+
+    async def context_status_updated(
+        self,
+        *,
+        phase: str,
+        status: str,
+        round_index: int,
+        window_tokens: int | None,
+        estimated_tokens_before: int | None,
+        estimated_tokens_after: int | None,
+        actual_prompt_tokens: int | None,
+        removed_turns: int,
+        removed_messages: int,
+        removed_tool_transactions: int,
+    ) -> None:
+        if self._message_id is None:
+            raise RuntimeError("context_status_updated 必须在 run_started 之后发送")
+        await self._emit(
+            ev.ContextStatusUpdated(
+                type="context_status_updated",
+                protocol_version=2,
+                message_id=self._message_id,
+                phase=phase,
+                status=status,
+                round_index=round_index,
+                window_tokens=window_tokens,
+                estimated_tokens_before=estimated_tokens_before,
+                estimated_tokens_after=estimated_tokens_after,
+                actual_prompt_tokens=actual_prompt_tokens,
+                removed_turns=removed_turns,
+                removed_messages=removed_messages,
+                removed_tool_transactions=removed_tool_transactions,
+                **self._envelope(),
             )
         )

@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional, Union
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 # ============================================================
 # Content Blocks（消息内容块）
@@ -125,11 +125,48 @@ ContentBlock = Union[TextBlock, ThinkingBlock, FileBlock, SearchBlock, UrlBlock]
 # ============================================================
 
 
+ContextStatus = Literal[
+    "bypass_unknown_window",
+    "no_op_fast_path",
+    "no_op",
+    "trimmed",
+    "trimmed_required_above_target",
+    "required_context_over_budget",
+    "estimator_unavailable",
+]
+
+
+class ContextUsage(BaseModel):
+    """最后一次 LLM 调用的安全上下文状态，不包含消息正文或内部来源。"""
+
+    status: ContextStatus
+    round_index: Optional[int] = Field(default=None, ge=1)
+    window_tokens: Optional[int] = Field(default=None, ge=0)
+    estimated_tokens_before: Optional[int] = Field(default=None, ge=0)
+    estimated_tokens_after: Optional[int] = Field(default=None, ge=0)
+    actual_prompt_tokens: Optional[int] = Field(default=None, ge=0)
+    removed_turns: int = Field(default=0, ge=0)
+    removed_messages: int = Field(default=0, ge=0)
+    removed_tool_transactions: int = Field(default=0, ge=0)
+
+
 class Usage(BaseModel):
     """Token 消耗统计，仅 assistant 消息携带"""
 
     input_tokens: int = 0
     output_tokens: int = 0
+    context: Optional[ContextUsage] = None
+
+    @field_validator("context", mode="before")
+    @classmethod
+    def discard_invalid_context(cls, value):
+        """坏的新增字段不能拖垮旧会话详情；保留原有 token usage。"""
+        if value is None or isinstance(value, ContextUsage):
+            return value
+        try:
+            return ContextUsage.model_validate(value)
+        except (ValidationError, TypeError, ValueError):
+            return None
 
 
 # ============================================================

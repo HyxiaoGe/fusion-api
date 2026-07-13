@@ -13,6 +13,65 @@ from app.db.repositories import ConversationRepository, FileRepository
 
 
 class MessageRepositoryTests(unittest.TestCase):
+    def test_convert_message_restores_nested_context_and_accepts_legacy_usage(self):
+        current = MessageModel(
+            id="msg-current",
+            conversation_id="conv-1",
+            role="assistant",
+            content=[{"type": "text", "id": "answer-1", "text": "回答"}],
+            usage={
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "context": {
+                    "status": "trimmed",
+                    "window_tokens": 1000,
+                    "estimated_tokens_before": 900,
+                    "estimated_tokens_after": 700,
+                    "actual_prompt_tokens": 690,
+                    "removed_turns": 1,
+                    "removed_messages": 2,
+                    "removed_tool_transactions": 0,
+                },
+            },
+            created_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
+        )
+        legacy = MessageModel(
+            id="msg-legacy",
+            conversation_id="conv-1",
+            role="assistant",
+            content=[{"type": "text", "id": "answer-2", "text": "旧回答"}],
+            usage={"input_tokens": 12, "output_tokens": 8},
+            created_at=datetime(2026, 7, 12, tzinfo=timezone.utc),
+        )
+        repo = ConversationRepository(None)
+
+        current_message = repo._convert_message_to_schema(current)
+        legacy_message = repo._convert_message_to_schema(legacy)
+
+        self.assertEqual(current_message.usage.context.actual_prompt_tokens, 690)
+        self.assertEqual(current_message.usage.input_tokens, 100)
+        self.assertIsNone(legacy_message.usage.context)
+
+    def test_convert_message_discards_corrupt_context_but_keeps_tokens(self):
+        db_message = MessageModel(
+            id="msg-corrupt",
+            conversation_id="conv-1",
+            role="assistant",
+            content=[{"type": "text", "id": "answer-1", "text": "回答"}],
+            usage={
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "context": {"status": "unknown-future", "window_tokens": -1},
+            },
+            created_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
+        )
+
+        message = ConversationRepository(None)._convert_message_to_schema(db_message)
+
+        self.assertEqual(message.usage.input_tokens, 100)
+        self.assertEqual(message.usage.output_tokens, 20)
+        self.assertIsNone(message.usage.context)
+
     def test_convert_message_preserves_search_provider_metadata(self):
         """从 JSONB 重建 SearchBlock 时保留搜索提供方元信息"""
         db_message = MessageModel(

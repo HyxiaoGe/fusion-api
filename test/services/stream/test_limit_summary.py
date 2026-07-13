@@ -2,7 +2,8 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.schemas.chat import Usage
+from app.schemas.chat import ContextUsage, Usage
+from app.services.chat.context_manager import ContextPlan
 from app.services.chat.context_manager import prepare_context as prepare_context_real
 from app.services.stream.limit_summary import (
     LIMIT_SUMMARY_PROMPT,
@@ -107,6 +108,77 @@ class LimitSummaryHelpersTests(unittest.TestCase):
 
 
 class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
+    async def test_limit_summary_replaces_previous_round_context_with_final_summary_round(self):
+        emitter = AsyncMock()
+        context_updates = []
+
+        async def start_step_fn(**_kwargs):
+            return AgentStepContext(
+                step_id="step-summary",
+                step_number=4,
+                started_at=100.0,
+                thinking_block_id="blk-thinking",
+                text_block_id="blk-text",
+            )
+
+        request = LimitSummaryStepRequest(
+            conversation_id="conv-1",
+            task_id="task-1",
+            run_id="run-1",
+            step_number=4,
+            model_id="gpt-4",
+            provider="openai",
+            litellm_model="openai/gpt-4",
+            litellm_kwargs={},
+            messages=[],
+            should_use_reasoning=False,
+            content_blocks=[],
+            call_kwargs={},
+            accumulated_usage=Usage(input_tokens=100, output_tokens=20),
+            emitter=emitter,
+            session_cache=object(),
+            total_timeout_s=300,
+            run_start=100.0,
+            start_step_fn=start_step_fn,
+            complete_step_fn=AsyncMock(),
+            llm_call_fn=AsyncMock(return_value="response"),
+            stream_round_fn=AsyncMock(return_value=("", "总结", [], "stop", Usage(input_tokens=70, output_tokens=10))),
+            log_round_summary_fn=lambda **_kwargs: None,
+            clock=lambda: 120.0,
+            on_context_updated=context_updates.append,
+        )
+        plan = ContextPlan(
+            messages=[{"role": "system", "content": "总结"}],
+            status="trimmed",
+            context_window_tokens=1000,
+            context_window_source="registry",
+            context_window_status="known",
+            estimated_tokens_before=900,
+            estimated_tokens_after=700,
+            removed_turns=1,
+            removed_messages=2,
+        )
+
+        with patch("app.services.stream.limit_summary.prepare_context", new=AsyncMock(return_value=plan)):
+            outcome = await run_limit_summary_step(request=request)
+
+        self.assertEqual(outcome.accumulated_usage, Usage(input_tokens=170, output_tokens=30))
+        self.assertEqual(
+            outcome.context,
+            ContextUsage(
+                status="trimmed",
+                round_index=4,
+                window_tokens=1000,
+                estimated_tokens_before=900,
+                estimated_tokens_after=700,
+                actual_prompt_tokens=70,
+                removed_turns=1,
+                removed_messages=2,
+            ),
+        )
+        self.assertEqual(context_updates[-1], outcome.context)
+        self.assertEqual(emitter.context_status_updated.await_args_list[-1].kwargs["phase"], "final")
+
     async def test_limit_summary_uses_real_budgeted_snapshot_and_keeps_tail_system_prompt(self):
         messages = [
             {"role": "user", "content": "a" * 100},

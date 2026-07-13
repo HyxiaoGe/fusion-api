@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from app.schemas.chat import TextBlock, Usage
+from app.schemas.chat import ContextUsage, TextBlock, Usage
 from app.services.stream.agent_loop_run_completion import (
     AgentLoopRunCompletionContext,
     finalize_cancelled_run,
@@ -29,6 +29,38 @@ def _context(state: AgentLoopState | None = None) -> AgentLoopRunCompletionConte
 
 
 class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_run_persists_context_even_without_visible_content(self):
+        state = AgentLoopState()
+        state.update_context(
+            ContextUsage(
+                status="required_context_over_budget",
+                round_index=1,
+                window_tokens=100,
+                estimated_tokens_before=120,
+                estimated_tokens_after=120,
+            )
+        )
+        calls = []
+
+        async def fail_agent_run_fn(**_kwargs):
+            return None
+
+        async def finalize_stream_fn(*_args, **_kwargs):
+            return None
+
+        await finalize_failed_run(
+            context=_context(state),
+            error=ValueError("context failed"),
+            persist_message_fn=lambda *args: calls.append(args),
+            fail_agent_run_fn=fail_agent_run_fn,
+            finalize_stream_fn=finalize_stream_fn,
+            warning_fn=lambda _message: None,
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][5].context.status, "required_context_over_budget")
+        self.assertTrue(calls[0][6])
+
     async def test_finalize_cancelled_treats_ownership_lost_as_external_stop_terminal(self):
         from app.services.stream_state_service import StreamOwnershipLostError
 

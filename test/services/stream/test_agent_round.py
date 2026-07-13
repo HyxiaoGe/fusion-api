@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.schemas.chat import Usage
+from app.schemas.chat import ContextUsage, Usage
 from app.services.chat.context_manager import ContextBudgetExceededError, ContextPlan
 from app.services.stream.agent_round import accumulate_usage, collect_agent_round_stream, run_agent_round
 from app.services.stream.step_lifecycle import AgentStepContext
@@ -25,6 +25,176 @@ class AgentRoundUsageTests(unittest.TestCase):
 
 
 class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_agent_round_emits_estimated_and_final_context_status(self):
+        emitter = AsyncMock()
+        step_context = AgentStepContext(
+            step_id="step-context",
+            step_number=2,
+            started_at=100.0,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+        )
+        context_plan = ContextPlan(
+            messages=[{"role": "user", "content": "有效快照"}],
+            status="trimmed",
+            context_window_tokens=100_000,
+            context_window_source="registry",
+            context_window_status="known",
+            estimated_tokens_before=90_000,
+            estimated_tokens_after=70_000,
+            removed_turns=1,
+            removed_messages=2,
+            removed_tool_transactions=0,
+        )
+
+        async def stream_round_fn(*_args, **_kwargs):
+            return "", "正文", [], "stop", Usage(input_tokens=69_500, output_tokens=10)
+
+        with patch(
+            "app.services.stream.agent_round.prepare_context",
+            new=AsyncMock(return_value=context_plan),
+        ):
+            result = await run_agent_round(
+                conversation_id="conv-1",
+                task_id="task-1",
+                run_id="run-1",
+                step_number=2,
+                model_id="gpt-4",
+                provider="openai",
+                litellm_model="openai/gpt-4",
+                litellm_kwargs={},
+                messages=[{"role": "user", "content": "问题"}],
+                should_use_reasoning=False,
+                call_kwargs={},
+                accumulated_usage=Usage(input_tokens=10, output_tokens=5),
+                step_context=step_context,
+                llm_call_fn=AsyncMock(return_value="response"),
+                stream_round_fn=stream_round_fn,
+                log_round_summary_fn=lambda **_kwargs: None,
+                emitter=emitter,
+            )
+
+        self.assertEqual(result.accumulated_usage, Usage(input_tokens=69_510, output_tokens=15))
+        self.assertEqual(
+            result.context,
+            ContextUsage(
+                status="trimmed",
+                round_index=2,
+                window_tokens=100_000,
+                estimated_tokens_before=90_000,
+                estimated_tokens_after=70_000,
+                actual_prompt_tokens=69_500,
+                removed_turns=1,
+                removed_messages=2,
+                removed_tool_transactions=0,
+            ),
+        )
+        self.assertEqual(emitter.context_status_updated.await_count, 2)
+        first = emitter.context_status_updated.await_args_list[0].kwargs
+        final = emitter.context_status_updated.await_args_list[1].kwargs
+        self.assertEqual(first["phase"], "estimated")
+        self.assertIsNone(first["actual_prompt_tokens"])
+        self.assertEqual(final["phase"], "final")
+        self.assertEqual(final["actual_prompt_tokens"], 69_500)
+
+    async def test_context_budget_error_emits_safe_error_status(self):
+        emitter = AsyncMock()
+        context_updates = []
+        step_context = AgentStepContext(
+            step_id="step-budget",
+            step_number=1,
+            started_at=100.0,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+        )
+        plan = ContextPlan(
+            messages=[{"role": "user", "content": "不可泄露的过长正文"}],
+            status="required_context_over_budget",
+            context_window_tokens=100,
+            context_window_source="private-source",
+            context_window_status="known",
+            estimated_tokens_before=120,
+            estimated_tokens_after=120,
+        )
+
+        with patch(
+            "app.services.stream.agent_round.prepare_context",
+            new=AsyncMock(side_effect=ContextBudgetExceededError(plan)),
+        ):
+            with self.assertRaises(ContextBudgetExceededError):
+                await run_agent_round(
+                    conversation_id="conv-1",
+                    task_id="task-1",
+                    run_id="run-1",
+                    step_number=1,
+                    model_id="gpt-4",
+                    provider="openai",
+                    litellm_model="openai/gpt-4",
+                    litellm_kwargs={},
+                    messages=plan.messages,
+                    should_use_reasoning=False,
+                    call_kwargs={},
+                    accumulated_usage=Usage(),
+                    step_context=step_context,
+                    llm_call_fn=AsyncMock(),
+                    stream_round_fn=AsyncMock(),
+                    log_round_summary_fn=lambda **_kwargs: None,
+                    emitter=emitter,
+                    on_context_updated=context_updates.append,
+                )
+
+        payload = emitter.context_status_updated.await_args.kwargs
+        self.assertEqual(payload["phase"], "error")
+        self.assertEqual(payload["status"], "required_context_over_budget")
+        self.assertNotIn("messages", payload)
+        self.assertNotIn("context_window_source", payload)
+        self.assertEqual(context_updates[-1].status, "required_context_over_budget")
+
+    async def test_llm_failure_keeps_estimated_context_for_failed_finalization(self):
+        emitter = AsyncMock()
+        context_updates = []
+        plan = ContextPlan(
+            messages=[{"role": "user", "content": "问题"}],
+            status="no_op_fast_path",
+            context_window_tokens=128_000,
+            context_window_source="registry",
+            context_window_status="known",
+        )
+        step_context = AgentStepContext(
+            step_id="step-failure",
+            step_number=3,
+            started_at=100.0,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+        )
+
+        with patch("app.services.stream.agent_round.prepare_context", new=AsyncMock(return_value=plan)):
+            with self.assertRaises(RuntimeError):
+                await run_agent_round(
+                    conversation_id="conv-1",
+                    task_id="task-1",
+                    run_id="run-1",
+                    step_number=3,
+                    model_id="gpt-4",
+                    provider="openai",
+                    litellm_model="openai/gpt-4",
+                    litellm_kwargs={},
+                    messages=plan.messages,
+                    should_use_reasoning=False,
+                    call_kwargs={},
+                    accumulated_usage=Usage(),
+                    step_context=step_context,
+                    llm_call_fn=AsyncMock(side_effect=RuntimeError("provider failed")),
+                    stream_round_fn=AsyncMock(),
+                    log_round_summary_fn=lambda **_kwargs: None,
+                    emitter=emitter,
+                    on_context_updated=context_updates.append,
+                )
+
+        self.assertEqual(context_updates[-1].round_index, 3)
+        self.assertEqual(context_updates[-1].status, "no_op_fast_path")
+        self.assertIsNone(context_updates[-1].actual_prompt_tokens)
+
     async def test_context_budget_error_is_observed_before_llm_call(self):
         step_context = AgentStepContext(
             step_id="step-budget",

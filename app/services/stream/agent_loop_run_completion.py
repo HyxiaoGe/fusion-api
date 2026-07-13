@@ -39,7 +39,7 @@ def persist_run_message(
     only_if_content: bool = False,
     partial: bool = False,
 ) -> None:
-    if only_if_content and not context.state.content_blocks:
+    if only_if_content and not context.state.content_blocks and context.state.final_usage() is None:
         return
 
     persist_message_fn(

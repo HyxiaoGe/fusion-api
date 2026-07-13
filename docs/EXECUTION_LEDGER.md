@@ -32,6 +32,7 @@
 | 生产性能基线 | 已完成首轮 | `docs/performance/2026-07-11-production-baseline.md`；API 单核约 145 RPS，公网 HTTP/2 P95 2.38 s，真实 SSE 1→3→5 并发 9/9 成功并完成零残留清理 |
 | 生产完整性能矩阵 | 已完成 L1-L4 | `docs/performance/2026-07-12-production-full-matrix.md`；L1 600/600、L2 28/28、L3 恢复 9/9 + 停止/持久化 9/9、L4 30 分钟 60/60；0 重启/OOM，测试数据零残留，管理员页面导入并刷新持久化 |
 | 长对话上下文预算管理 | 已完成第一阶段 | `fusion-api` commits `f5152be`, `b721edd`, `fc6ad22`；已知模型窗口按 85% 触发、75% 目标裁剪最旧完整 turn/工具事务，未知窗口保持兼容，估算失败 fail-closed；15 秒 SSE heartbeat；`docs/performance/2026-07-13-context-management-baseline.md`；生产 60%/80%/90% 阶梯与登录态 Chrome 刷新恢复通过 |
+| 对话上下文状态展示 | 已完成 v1 | `fusion-api` / `fusion-ui` 本次提交；以最后一次 LLM round 为口径推送 `context_status_updated` v2，并在 assistant `usage.context` 中持久化可刷新快照；前端展示本轮实际/预计 Token、上下文窗口、剩余比例和自动裁剪明细，未知窗口、旧历史、失败状态与重连均安全降级 |
 | 管理员审计中心 | 已完成 v1 | `fusion-api` commit `1ec0f01`、`fusion-ui` commits `f2517ca` / `5e47692`；全局用户/对话、消息、Agent/tool、文件元数据、压测留存和访问审计；`docs/acceptance/2026-07-11-admin-audit-center-v1.md` |
 | 管理员压测审计详情 | 已完成 v1.1 | `fusion-api` commit `64d3452`、`fusion-ui` commit `2e3d857`；列表与详情安全契约分离、存量脏数据安全降级、L1-L4/资源/清理结果结构化详情、按需请求、响应式布局和管理页 no-store；生产登录态 Chrome 验收通过 |
 | 管理员审计安全与身份展示 | 已完成 v1.2 | `fusion-api` commit `d036d89`、`fusion-ui` commit `9d1075d`；审计内容严格白名单投影、签名 URL/令牌脱敏、历史 schema 安全降级、用户昵称/用户名/ID 三元组、详情竞态隔离、Agent/tool 独立分页、压测指标语义与管理页 CSP 收紧；对抗式复审及生产登录态 Chrome 验收通过 |
@@ -64,6 +65,7 @@
 
 | 日期 | 仓库 | commit | 内容 | 验证 |
 |---|---|---|---|---|
+| 2026-07-13 | `fusion-api` / `fusion-ui` | 本次提交 | 对话上下文状态 v1：单轮上下文安全事件、失败/停止快照与 JSONB 刷新恢复；输入区紧凑剩余比例入口、实际/预计 Token、裁剪说明、暗色/窄屏/键盘与中英文支持 | 对抗式复审关闭累计 Token 误用、历史回退、按钮闪烁和错误态误导；后端 Ruff、架构检查、全量 `996 tests`；前端全量 `1118 tests`、目标 ESLint、production build |
 | 2026-07-13 | `fusion-api` | `f5152be+b721edd+fc6ad22` | 长对话上下文治理第一阶段：单轮上下文遥测、生成约束、Token 预算感知 Context Manager、完整 turn/工具事务原子裁剪、结构化错误、SSE heartbeat 与安全生产阶梯 runner | 对抗式复审无剩余 P0/P1；Ruff、架构检查、全量 `983 tests`；Actions `29218910325` / `29224101606` / `29225925681`；生产运行 `perf-20260713-051915-9512b94b` 四档全通过，90% 档从 232,305 裁到 192,280、移除 1 turn/2 messages，费用 `$0.564035`、资源 0 restart/OOM、会话/Token 清理成功且如实记录 1 个账号行残留；真实登录态 Chrome 新会话 `868bee65-2e50-4a3f-b3e5-eb538394c859` 即时渲染/流式完成/标题/刷新恢复通过，刷新记录 1 条非阻断 React `#418` hydration error |
 | 2026-07-12 | `fusion-api` / `fusion-ui` | `api:5624241+1a2b456 / ui:3097c6b` | 管理员模型运营中心 v1：只读 current/history/unknown 模型视图、健康与能力、持久化用量、Agent/压测摘要、详情 URL、模型到对话联动；目录失败退避、脏 ID 降级和安全投影 | 独立对抗式复审无阻断；后端 `977 passed + 98 subtests`、Ruff、架构检查，前端 `1085 tests`、ESLint、build；Actions `29190231438` / `29190141564`；生产真实登录态 Chrome 验证 19 个模型、历史/当前详情、模型筛选 18 条对话、浏览器返回与刷新恢复，console 0；`%2F` 生产探测受 Browser Control 限制并已如实记录 |
 | 2026-07-12 | `fusion-ui` | `402644d` | 管理员审计中心 v1.4：补齐对话创建/更新时间；将 Tab、用户详情、用户筛选对话、对话详情和压测详情接入 URL/history，并修复手动筛选 URL 漂移、旧压测深链、焦点恢复与约 1200px 宽度回退 | 独立对抗式复审无 P0-P2；目标 `38 tests`、全量 `1056 tests`、ESLint、build；Actions `29186419597`；生产镜像 commit 对齐且 0 重启/OOM，真实登录态 Chrome 验证用户详情/用户对话/对话详情 URL，后退序列恢复 `1` 条用户对话与用户列表，日期北京时间展示，用户详情和压测详情刷新恢复，深链关闭不退出管理中心，console 0 错误警告 |

@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from app.schemas.chat import TextBlock, Usage
+from app.schemas.chat import ContextUsage, TextBlock, Usage
 from app.services.stream.persistence import persist_message
 
 
@@ -177,6 +177,54 @@ class PersistMessageMonotonicTests(unittest.TestCase):
         self.assertEqual(existing.content, [final[0].model_dump()])
         self.assertEqual(existing.usage, usage.model_dump())
         db.commit.assert_called_once()
+
+    def test_full_completion_persists_nested_context_status(self):
+        existing = SimpleNamespace(content=[], usage=None)
+        db = MagicMock()
+        _populated_query(db).filter_by.return_value.first.return_value = existing
+        context = ContextUsage(
+            status="trimmed",
+            window_tokens=258_000,
+            estimated_tokens_before=230_000,
+            estimated_tokens_after=190_000,
+            actual_prompt_tokens=189_000,
+            removed_turns=1,
+            removed_messages=2,
+            removed_tool_transactions=0,
+        )
+
+        persist_message(
+            db,
+            "msg-1",
+            "conv-1",
+            "kimi-k2.5",
+            [TextBlock(type="text", id="answer-1", text="完成")],
+            usage_data=Usage(input_tokens=240_000, output_tokens=100, context=context),
+            partial=False,
+        )
+
+        self.assertEqual(existing.usage["input_tokens"], 240_000)
+        self.assertEqual(existing.usage["context"]["actual_prompt_tokens"], 189_000)
+        self.assertEqual(existing.usage["context"]["removed_turns"], 1)
+
+    def test_failed_partial_persists_context_usage_without_overwriting_content(self):
+        existing = SimpleNamespace(content=[], usage=None)
+        db = MagicMock()
+        _populated_query(db).filter_by.return_value.first.return_value = existing
+        context = ContextUsage(status="estimator_unavailable", round_index=1, window_tokens=128_000)
+
+        persist_message(
+            db,
+            "msg-1",
+            "conv-1",
+            "gpt-4",
+            [],
+            usage_data=Usage(input_tokens=0, output_tokens=0, context=context),
+            partial=True,
+        )
+
+        self.assertEqual(existing.content, [])
+        self.assertEqual(existing.usage["context"]["status"], "estimator_unavailable")
 
 
 if __name__ == "__main__":

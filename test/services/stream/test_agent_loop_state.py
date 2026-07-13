@@ -1,6 +1,6 @@
 import unittest
 
-from app.schemas.chat import TextBlock, Usage
+from app.schemas.chat import ContextUsage, TextBlock, Usage
 from app.services.stream.agent_loop_state import AgentLoopState
 
 
@@ -50,6 +50,19 @@ class AgentLoopStateTests(unittest.TestCase):
         state = AgentLoopState()
 
         self.assertIsNone(state.final_usage())
+
+    def test_final_usage_keeps_accumulated_tokens_and_last_round_context(self):
+        state = AgentLoopState(accumulated_usage=Usage(input_tokens=100, output_tokens=20))
+        first = ContextUsage(status="no_op", window_tokens=1000, actual_prompt_tokens=40)
+        last = ContextUsage(status="trimmed", window_tokens=1000, actual_prompt_tokens=70, removed_turns=1)
+
+        state.update_context(first)
+        state.update_context(last)
+
+        final = state.final_usage()
+        self.assertEqual(final.input_tokens, 100)
+        self.assertEqual(final.output_tokens, 20)
+        self.assertEqual(final.context, last)
 
 
 if __name__ == "__main__":

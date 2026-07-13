@@ -240,8 +240,18 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             [
                 "run_started",
                 "step_started",
+                "context_status_updated",
+                "context_status_updated",
                 "step_completed",
                 "run_completed",
+            ],
+        )
+        context_events = [event for event in result.events if event["type"] == "context_status_updated"]
+        self.assertEqual(
+            [(event["phase"], event["round_index"], event["message_id"]) for event in context_events],
+            [
+                ("estimated", 1, "msg-contract"),
+                ("final", 1, "msg-contract"),
             ],
         )
         self.assertEqual([event for event in result.events if event["type"].startswith("plan_")], [])
@@ -305,6 +315,8 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             [
                 "run_started",
                 "step_started",
+                "context_status_updated",
+                "context_status_updated",
                 "plan_snapshot",
                 "plan_step_updated",
                 "plan_step_updated",
@@ -322,10 +334,22 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 "plan_step_updated",
                 "plan_step_updated",
                 "run_progress_updated",
+                "context_status_updated",
+                "context_status_updated",
                 "step_completed",
                 "plan_step_updated",
                 "run_progress_updated",
                 "run_completed",
+            ],
+        )
+        context_events = [event for event in result.events if event["type"] == "context_status_updated"]
+        self.assertEqual(
+            [(event["phase"], event["round_index"], event["message_id"]) for event in context_events],
+            [
+                ("estimated", 1, "msg-contract"),
+                ("final", 1, "msg-contract"),
+                ("estimated", 2, "msg-contract"),
+                ("final", 2, "msg-contract"),
             ],
         )
         self.assertEqual(

@@ -9,6 +9,7 @@ from threading import BoundedSemaphore
 from typing import Any, Callable
 
 from app.ai.llm_round_observability import estimate_prompt_tokens, resolve_context_window
+from app.schemas.chat import ContextUsage
 
 DEFAULT_TRIGGER_RATIO = 0.85
 DEFAULT_TARGET_RATIO = 0.75
@@ -34,6 +35,25 @@ class ContextPlan:
     removed_turns: int = 0
     removed_tool_transactions: int = 0
     removed_messages: int = 0
+
+    def to_usage_context(
+        self,
+        *,
+        actual_prompt_tokens: int | None = None,
+        round_index: int | None = None,
+    ) -> ContextUsage:
+        """返回可发给客户端并持久化的安全字段白名单。"""
+        return ContextUsage(
+            status=self.status,
+            round_index=round_index,
+            window_tokens=self.context_window_tokens,
+            estimated_tokens_before=self.estimated_tokens_before,
+            estimated_tokens_after=self.estimated_tokens_after,
+            actual_prompt_tokens=actual_prompt_tokens,
+            removed_turns=self.removed_turns,
+            removed_messages=self.removed_messages,
+            removed_tool_transactions=self.removed_tool_transactions,
+        )
 
     def telemetry(self) -> dict[str, Any]:
         """返回不包含消息正文的单轮观测字段。"""

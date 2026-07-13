@@ -4,6 +4,8 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock
 
+from pydantic import ValidationError
+
 from app.services.agent.emitter import AgentEventEmitter
 
 
@@ -140,6 +142,67 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[1]["protocol_version"], 2)
         self.assertIsNone(events[1]["step_id"])
         self.assertEqual(events[2]["type"], "plan_snapshot")
+
+    async def test_context_status_update_is_safe_and_replayable(self):
+        writer = AsyncMock()
+        em = AgentEventEmitter(
+            run_id="r1", trace_id="trace-1", conversation_id="c1", task_id="task-1", redis_writer=writer
+        )
+        await em.run_started(message_id="msg-1", model="gpt", tools=[], config={})
+        await em.step_started(step_number=1)
+
+        await em.context_status_updated(
+            phase="final",
+            status="trimmed",
+            round_index=1,
+            window_tokens=258_000,
+            estimated_tokens_before=220_000,
+            estimated_tokens_after=180_000,
+            actual_prompt_tokens=179_500,
+            removed_turns=2,
+            removed_messages=5,
+            removed_tool_transactions=1,
+        )
+
+        payload = writer.append_chunk.call_args_list[-1].args[3]
+        self.assertEqual(payload["type"], "context_status_updated")
+        self.assertEqual(payload["protocol_version"], 2)
+        self.assertEqual(payload["phase"], "final")
+        self.assertEqual(payload["message_id"], "msg-1")
+        self.assertEqual(payload["round_index"], 1)
+        self.assertEqual(payload["window_tokens"], 258_000)
+        self.assertEqual(payload["actual_prompt_tokens"], 179_500)
+        self.assertEqual(payload["sequence"], 2)
+        self.assertIsNotNone(payload["step_id"])
+        self.assertNotIn("messages", payload)
+        self.assertNotIn("context_window_source", payload)
+
+    async def test_context_status_rejects_unknown_status_and_negative_numbers(self):
+        writer = AsyncMock()
+        em = AgentEventEmitter(
+            run_id="r1",
+            trace_id="trace-1",
+            conversation_id="c1",
+            task_id="task-1",
+            redis_writer=writer,
+        )
+        await em.run_started(message_id="msg-1", model="gpt", tools=[], config={})
+
+        with self.assertRaises(ValidationError):
+            await em.context_status_updated(
+                phase="final",
+                status="private-future-status",
+                round_index=1,
+                window_tokens=-1,
+                estimated_tokens_before=None,
+                estimated_tokens_after=None,
+                actual_prompt_tokens=None,
+                removed_turns=0,
+                removed_messages=0,
+                removed_tool_transactions=0,
+            )
+
+        self.assertEqual(writer.append_chunk.await_count, 1)
 
     async def test_step_level_v2_events_inherit_current_step(self):
         writer = AsyncMock()

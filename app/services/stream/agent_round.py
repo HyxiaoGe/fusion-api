@@ -7,8 +7,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.ai.llm_round_observability import create_llm_round_observation
-from app.schemas.chat import Usage
+from app.schemas.chat import ContextUsage, Usage
 from app.services.chat.context_manager import ContextManagementError, ContextPlan, prepare_context
+from app.services.stream.context_status import build_context_usage, emit_context_status
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,7 @@ class AgentRoundResult:
     tool_calls: list[dict]
     finish_reason: str
     accumulated_usage: Usage
+    context: ContextUsage | None = None
 
 
 StreamRoundResult = tuple[str, str, list[dict], str, Usage | None]
@@ -142,6 +144,8 @@ async def run_agent_round(
     stream_round_fn: Callable[..., Awaitable[StreamRoundResult]],
     log_round_summary_fn: Callable[..., None],
     assistant_message_id: str | None = None,
+    emitter: Any | None = None,
+    on_context_updated: Callable[[ContextUsage], None] | None = None,
 ) -> AgentRoundResult:
     try:
         context_plan = await prepare_context(
@@ -151,6 +155,10 @@ async def run_agent_round(
             call_kwargs=call_kwargs,
         )
     except ContextManagementError as error:
+        error_context = build_context_usage(error.plan, round_index=step_number)
+        if on_context_updated is not None:
+            on_context_updated(error_context)
+        await emit_context_status(emitter, phase="error", context=error_context)
         observation = _create_agent_round_observation(
             context_plan=error.plan,
             conversation_id=conversation_id,
@@ -168,6 +176,10 @@ async def run_agent_round(
         await observation.finish_error(error)
         raise
     effective_messages = context_plan.messages
+    estimated_context = build_context_usage(context_plan, round_index=step_number)
+    if on_context_updated is not None:
+        on_context_updated(estimated_context)
+    await emit_context_status(emitter, phase="estimated", context=estimated_context)
     observation = _create_agent_round_observation(
         context_plan=context_plan,
         conversation_id=conversation_id,
@@ -200,6 +212,10 @@ async def run_agent_round(
         await observation.finish_error(exc)
         raise
     reasoning_buf, content_buf, tool_calls, finish_reason, usage_data = stream_result
+    final_context = build_context_usage(context_plan, usage_data, round_index=step_number)
+    if on_context_updated is not None:
+        on_context_updated(final_context)
+    await emit_context_status(emitter, phase="final", context=final_context)
     await observation.finish_success(usage=usage_data, finish_reason=finish_reason)
     log_agent_round_summary(
         conversation_id=conversation_id,
@@ -216,4 +232,5 @@ async def run_agent_round(
         tool_calls=tool_calls,
         finish_reason=finish_reason,
         accumulated_usage=accumulate_usage(accumulated_usage, usage_data),
+        context=final_context,
     )

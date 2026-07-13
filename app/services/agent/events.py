@@ -6,6 +6,8 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.chat import ContextStatus
+
 
 class AgentEventBase(BaseModel):
     """所有 agent_event 的共享 envelope 字段."""
@@ -165,6 +167,24 @@ class EvidenceItemUpserted(AgentEventBase):
     evidence: AgentEvidenceItem
 
 
+class ContextStatusUpdated(AgentEventBase):
+    """单轮 LLM 上下文状态；字段严格白名单，不携带 prompt 或内部来源。"""
+
+    type: Literal["context_status_updated"]
+    protocol_version: Literal[2]
+    message_id: str
+    phase: Literal["estimated", "final", "error"]
+    status: ContextStatus
+    round_index: int = Field(ge=1)
+    window_tokens: int | None = Field(default=None, ge=0)
+    estimated_tokens_before: int | None = Field(default=None, ge=0)
+    estimated_tokens_after: int | None = Field(default=None, ge=0)
+    actual_prompt_tokens: int | None = Field(default=None, ge=0)
+    removed_turns: int = Field(default=0, ge=0)
+    removed_messages: int = Field(default=0, ge=0)
+    removed_tool_transactions: int = Field(default=0, ge=0)
+
+
 AnyAgentEvent = Annotated[
     RunStarted
     | StepStarted
@@ -180,6 +200,7 @@ AnyAgentEvent = Annotated[
     | PlanSnapshot
     | PlanStepUpdated
     | ToolResultDigest
-    | EvidenceItemUpserted,
+    | EvidenceItemUpserted
+    | ContextStatusUpdated,
     Field(discriminator="type"),
 ]

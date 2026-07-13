@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.schemas.chat import Conversation, Message, TextBlock
 from app.schemas.response import ApiException
+from app.services.chat.context_manager import ContextPlan
 from app.services.chat_service import ChatService, _require_stream_initialized
 from app.services.stream_state_service import StreamInitResult
 
@@ -612,6 +613,49 @@ class ChatServiceTests(unittest.TestCase):
         self.assertEqual(call.await_args.kwargs["messages"], context_plan.messages)
         self.assertEqual(prepare.await_args.kwargs["model_id"], "model-1")
         self.assertEqual(prepare.await_args.kwargs["litellm_model"], "litellm_proxy/model-1")
+
+    def test_handle_non_stream_persists_last_round_context_with_actual_prompt_tokens(self):
+        service = object.__new__(ChatService)
+        service.db = MagicMock()
+        service.conversation_service = MagicMock()
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="回答"))],
+            usage=SimpleNamespace(prompt_tokens=690, completion_tokens=10),
+        )
+        plan = ContextPlan(
+            messages=[{"role": "user", "content": "有效问题"}],
+            status="trimmed",
+            context_window_tokens=1000,
+            context_window_source="registry",
+            context_window_status="known",
+            estimated_tokens_before=900,
+            estimated_tokens_after=700,
+            removed_turns=1,
+            removed_messages=2,
+        )
+
+        with (
+            patch("app.services.chat_service.litellm.acompletion", new=AsyncMock(return_value=response)),
+            patch("app.services.chat_service.prepare_context", new=AsyncMock(return_value=plan)),
+        ):
+            result = asyncio.run(
+                service._handle_non_stream(
+                    "litellm_proxy/model-1",
+                    "model-1",
+                    {},
+                    [{"role": "user", "content": "问题"}],
+                    "conv-1",
+                    {},
+                )
+            )
+
+        usage = result.message.usage
+        self.assertEqual(usage.input_tokens, 690)
+        self.assertEqual(usage.context.round_index, 1)
+        self.assertEqual(usage.context.actual_prompt_tokens, 690)
+        self.assertEqual(usage.context.removed_turns, 1)
+        persisted = service.conversation_service.create_message.call_args.args[0]
+        self.assertEqual(persisted.usage.context, usage.context)
 
     def test_handle_non_stream_ignores_invalid_max_tokens(self):
         service = object.__new__(ChatService)

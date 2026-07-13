@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.schemas.chat import Usage
+from app.schemas.chat import ContextUsage, Usage
 from app.services.stream.agent_loop_policy import AgentLoopLimitReason
 from app.services.stream.run_finalizer import AgentRunStats
 
@@ -14,6 +14,7 @@ from app.services.stream.run_finalizer import AgentRunStats
 class AgentLoopState:
     content_blocks: list[Any] = field(default_factory=list)
     accumulated_usage: Usage = field(default_factory=lambda: Usage(input_tokens=0, output_tokens=0))
+    last_context: ContextUsage | None = None
     step: int = 0
     total_tool_calls: int = 0
     current_step_id: str | None = None
@@ -42,10 +43,18 @@ class AgentLoopState:
     def update_usage(self, usage: Usage) -> None:
         self.accumulated_usage = usage
 
+    def update_context(self, context: ContextUsage | None) -> None:
+        if context is not None:
+            self.last_context = context
+
     def final_usage(self) -> Usage | None:
-        if self.accumulated_usage.input_tokens <= 0:
+        if self.accumulated_usage.input_tokens <= 0 and self.last_context is None:
             return None
-        return self.accumulated_usage
+        return Usage(
+            input_tokens=self.accumulated_usage.input_tokens,
+            output_tokens=self.accumulated_usage.output_tokens,
+            context=self.last_context,
+        )
 
     def mark_unknown_terminated(self) -> None:
         self.unknown_terminated = True

@@ -482,12 +482,19 @@ class ChatService:
         )
 
         content_text = response.choices[0].message.content or ""
-        usage_data = None
+        input_tokens = 0
+        output_tokens = 0
         if response.usage:
-            usage_data = Usage(
-                input_tokens=response.usage.prompt_tokens or 0,
-                output_tokens=response.usage.completion_tokens or 0,
-            )
+            input_tokens = response.usage.prompt_tokens or 0
+            output_tokens = response.usage.completion_tokens or 0
+        usage_data = Usage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            context=context_plan.to_usage_context(
+                actual_prompt_tokens=input_tokens if input_tokens > 0 else None,
+                round_index=1,
+            ),
+        )
 
         assistant_message = Message(
             role="assistant",

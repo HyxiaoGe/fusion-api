@@ -133,9 +133,12 @@ async def _run_round(
         stream_round_fn=runtime.stream_round_fn,
         log_round_summary_fn=runtime.log_round_summary_fn,
         assistant_message_id=runtime.assistant_message_id,
+        emitter=runtime.emitter,
+        on_context_updated=state.update_context,
     )
     state.finish_reason = round_result.finish_reason
     state.update_usage(round_result.accumulated_usage)
+    state.update_context(round_result.context)
     return round_result
 
 
@@ -149,4 +152,5 @@ async def _run_limit_summary(
         request=build_limit_summary_step_request(state=state, runtime=runtime, messages=messages),
     )
     state.update_usage(summary_outcome.accumulated_usage)
+    state.update_context(summary_outcome.context)
     state.clear_current_step()

@@ -12,8 +12,9 @@ from app.ai.llm_round_observability import create_llm_round_observation
 from app.ai.prompts.agent_loop import LIMIT_SUMMARY_PROMPT as _LIMIT_SUMMARY_PROMPT
 from app.ai.prompts.agent_loop import get_limit_summary_prompt
 from app.core.logger import app_logger as logger
-from app.schemas.chat import TextBlock, ThinkingBlock, Usage
+from app.schemas.chat import ContextUsage, TextBlock, ThinkingBlock, Usage
 from app.services.chat.context_manager import ContextManagementError, ContextPlan, prepare_context
+from app.services.stream.context_status import build_context_usage, emit_context_status
 
 LIMIT_SUMMARY_PROMPT = _LIMIT_SUMMARY_PROMPT
 
@@ -21,6 +22,7 @@ LIMIT_SUMMARY_PROMPT = _LIMIT_SUMMARY_PROMPT
 @dataclass(frozen=True)
 class LimitSummaryOutcome:
     accumulated_usage: Usage
+    context: ContextUsage | None = None
 
 
 @dataclass(frozen=True)
@@ -28,6 +30,7 @@ class LimitSummaryRoundResult:
     reasoning_buf: str
     content_buf: str
     usage_data: Usage | None
+    context: ContextUsage | None = None
 
 
 @dataclass(frozen=True)
@@ -57,6 +60,7 @@ class LimitSummaryStepRequest:
     warning_fn: Callable[[str], None] | None = None
     clock: Callable[[], float] = time.time
     on_step_started: Callable[[str], None] | None = None
+    on_context_updated: Callable[[ContextUsage], None] | None = None
     assistant_message_id: str | None = None
 
 
@@ -114,6 +118,10 @@ async def call_limit_summary_round(
             call_kwargs=final_call_kwargs,
         )
     except ContextManagementError as error:
+        error_context = build_context_usage(error.plan, round_index=request.step_number)
+        if request.on_context_updated is not None:
+            request.on_context_updated(error_context)
+        await emit_context_status(request.emitter, phase="error", context=error_context)
         observation = _create_limit_summary_observation(
             request=request,
             context_plan=error.plan,
@@ -125,6 +133,10 @@ async def call_limit_summary_round(
         await observation.finish_error(error)
         raise
     effective_messages = context_plan.messages
+    estimated_context = build_context_usage(context_plan, round_index=request.step_number)
+    if request.on_context_updated is not None:
+        request.on_context_updated(estimated_context)
+    await emit_context_status(request.emitter, phase="estimated", context=estimated_context)
     observation = _create_limit_summary_observation(
         request=request,
         context_plan=context_plan,
@@ -153,6 +165,10 @@ async def call_limit_summary_round(
     except BaseException as exc:
         await observation.finish_error(exc)
         raise
+    final_context = build_context_usage(context_plan, usage_data, round_index=request.step_number)
+    if request.on_context_updated is not None:
+        request.on_context_updated(final_context)
+    await emit_context_status(request.emitter, phase="final", context=final_context)
     await observation.finish_success(usage=usage_data, finish_reason=finish_reason)
     request.log_round_summary_fn(
         conversation_id=request.conversation_id,
@@ -169,6 +185,7 @@ async def call_limit_summary_round(
         reasoning_buf=reasoning_buf,
         content_buf=content_buf,
         usage_data=usage_data,
+        context=final_context,
     )
 
 
@@ -290,4 +307,4 @@ async def run_limit_summary_step(
         complete_step_fn=request.complete_step_fn,
         clock=request.clock,
     )
-    return LimitSummaryOutcome(accumulated_usage=next_usage)
+    return LimitSummaryOutcome(accumulated_usage=next_usage, context=round_result.context)

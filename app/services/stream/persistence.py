@@ -89,7 +89,8 @@ def persist_message(
 ) -> None:
     """
     将 assistant 消息写入 PostgreSQL。
-    partial=True 时增量更新 content blocks（checkpoint），不写 usage。
+    partial=True 时增量更新 content blocks（checkpoint）；若传入 usage，
+    同步保存已产生的累计 Token 与最后上下文快照，供失败/中止后恢复。
     partial=False 时写入完整数据（最终落库）。
     """
     try:
@@ -104,7 +105,7 @@ def persist_message(
                 if partial
                 else serialized_content
             )
-            if usage_data and not partial:
+            if usage_data:
                 existing.usage = usage_data.model_dump()
         else:
             db_message = MessageModel(
@@ -113,7 +114,7 @@ def persist_message(
                 role="assistant",
                 content=serialized_content,
                 model_id=model_id,
-                usage=usage_data.model_dump() if usage_data and not partial else None,
+                usage=usage_data.model_dump() if usage_data else None,
             )
             db.add(db_message)
         db.commit()
