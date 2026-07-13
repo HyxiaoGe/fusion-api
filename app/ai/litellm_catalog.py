@@ -102,6 +102,22 @@ def get_model_entry(alias: str) -> Optional[Dict[str, Any]]:
     return _ensure_loaded().get(alias)
 
 
+def get_cached_model_entry(alias: str) -> tuple[Optional[Dict[str, Any]], str]:
+    """只读现有缓存，不触发网络刷新，供请求热路径的旁路观测使用。"""
+    if not _cache_lock.acquire(blocking=False):
+        return None, "busy"
+    try:
+        if _cache_payload is None or (_cache_last_attempt_failed and not _cache_payload):
+            return None, "unavailable"
+        entry = _cache_payload.get(alias)
+        if entry is None:
+            return None, "missing"
+        is_stale = _cache_last_attempt_failed or time.monotonic() - _cache_loaded_at >= _CACHE_TTL_SECONDS
+        return dict(entry), "stale" if is_stale else "known"
+    finally:
+        _cache_lock.release()
+
+
 def get_capabilities(
     alias: str,
     *,

@@ -132,6 +132,7 @@ async def _run_round(
         llm_call_fn=runtime.llm_call_fn,
         stream_round_fn=runtime.stream_round_fn,
         log_round_summary_fn=runtime.log_round_summary_fn,
+        assistant_message_id=runtime.assistant_message_id,
     )
     state.finish_reason = round_result.finish_reason
     state.update_usage(round_result.accumulated_usage)

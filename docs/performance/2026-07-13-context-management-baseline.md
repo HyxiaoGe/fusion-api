@@ -233,6 +233,18 @@ Loki 与 `agent_sessions` 最近 30 天聚合结果（北京时间 2026-06-13 09
 
 该实验会创建生产会话并产生真实模型费用，本轮报告阶段没有执行。
 
+## 第一阶段实施状态
+
+OBS-01 与 REP-01 已进入代码门禁：
+
+- 普通流式 Agent round 与 `limit_summary` round 都会输出一条 `LLM_ROUND_CONTEXT` 单行 JSON，真实 Usage 固定使用 `usage_scope=llm_round`，不复用 Agent 累计值。
+- 日志记录消息/角色/内容类型/工具数量、估算与真实 Prompt Token、模型窗口来源和状态、预算占用、完成 Token、总耗时、finish reason 与错误类型；不记录 Prompt、URL、文件名、图片 Base64、工具参数/结果或异常正文。
+- `first_model_text_delta_ms` 表示从 LLM 调用开始到收到首个原始 reasoning/content delta 的服务端时延，不冒充浏览器收到首字的用户 TTFT；真实 SSE 用户 TTFT 仍由客户端压测口径记录。
+- Token 估算使用独立单线程执行器，最多准入两个任务；过载时标记 `skipped_overload`，不让可观测性阻塞聊天事件循环。模型窗口只非阻塞读取已有 LiteLLM 目录缓存，并区分 `known/stale/busy/missing/unavailable/invalid`。
+- 4K 自动化用例真实经过 `build_llm_messages()` 保留 12/12 条历史，再用 LiteLLM tokenizer 证明约 5.6K 输入超过 4,096；当前阶段只固化风险和可观测性，不声称已经裁剪。
+
+本阶段覆盖主聊天流式调用与触顶总结；标题、推荐问题、文件解析等非主聊天辅助调用不纳入 round telemetry。
+
 ## 决策建议
 
 Context 管理问题已经在代码层确定性复现，但生产用户影响尚未被真实长对话数据证明。建议按以下顺序推进：

@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from app.ai.llm_round_observability import create_llm_round_observation
 from app.schemas.chat import Usage
 
 
@@ -43,6 +44,7 @@ async def collect_agent_round_stream(
     step_context: Any,
     llm_call_fn: Callable[..., Awaitable[Any]],
     stream_round_fn: Callable[..., Awaitable[StreamRoundResult]],
+    observation: Any | None = None,
 ) -> StreamRoundResult:
     response = await llm_call_fn(
         litellm_model,
@@ -50,6 +52,8 @@ async def collect_agent_round_stream(
         messages,
         **call_kwargs,
     )
+    if observation is not None:
+        response = observation.wrap_response(response)
     return await stream_round_fn(
         response,
         conversation_id,
@@ -104,21 +108,42 @@ async def run_agent_round(
     llm_call_fn: Callable[..., Awaitable[Any]],
     stream_round_fn: Callable[..., Awaitable[StreamRoundResult]],
     log_round_summary_fn: Callable[..., None],
+    assistant_message_id: str | None = None,
 ) -> AgentRoundResult:
-    stream_result = await collect_agent_round_stream(
+    observation = create_llm_round_observation(
         conversation_id=conversation_id,
-        task_id=task_id,
         run_id=run_id,
+        round_index=step_number,
+        step_id=step_context.step_id,
+        round_kind="agent",
+        model_id=model_id,
+        provider=provider,
         litellm_model=litellm_model,
-        litellm_kwargs=litellm_kwargs,
         messages=messages,
-        should_use_reasoning=should_use_reasoning,
         call_kwargs=call_kwargs,
-        step_context=step_context,
-        llm_call_fn=llm_call_fn,
-        stream_round_fn=stream_round_fn,
+        assistant_message_id=assistant_message_id,
     )
+    observation.start()
+    try:
+        stream_result = await collect_agent_round_stream(
+            conversation_id=conversation_id,
+            task_id=task_id,
+            run_id=run_id,
+            litellm_model=litellm_model,
+            litellm_kwargs=litellm_kwargs,
+            messages=messages,
+            should_use_reasoning=should_use_reasoning,
+            call_kwargs=call_kwargs,
+            step_context=step_context,
+            llm_call_fn=llm_call_fn,
+            stream_round_fn=stream_round_fn,
+            observation=observation,
+        )
+    except BaseException as exc:
+        await observation.finish_error(exc)
+        raise
     reasoning_buf, content_buf, tool_calls, finish_reason, usage_data = stream_result
+    await observation.finish_success(usage=usage_data, finish_reason=finish_reason)
     log_agent_round_summary(
         conversation_id=conversation_id,
         run_id=run_id,

@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.schemas.chat import Usage
 from app.services.stream.agent_round import accumulate_usage, collect_agent_round_stream, run_agent_round
@@ -23,6 +24,100 @@ class AgentRoundUsageTests(unittest.TestCase):
 
 
 class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_agent_round_records_only_current_round_usage(self):
+        step_context = AgentStepContext(
+            step_id="step-obs",
+            step_number=2,
+            started_at=100.0,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+        )
+        observation = MagicMock()
+        observation.finish_success = AsyncMock()
+        observation.finish_error = AsyncMock()
+        observation.wrap_response.side_effect = lambda response: response
+
+        async def llm_call_fn(*_args, **_kwargs):
+            return "response"
+
+        async def stream_round_fn(*_args, **_kwargs):
+            return "", "正文", [], "stop", Usage(input_tokens=11, output_tokens=13)
+
+        with patch(
+            "app.services.stream.agent_round.create_llm_round_observation",
+            return_value=observation,
+        ) as create_observation:
+            result = await run_agent_round(
+                conversation_id="conv-1",
+                task_id="task-1",
+                run_id="run-1",
+                step_number=2,
+                model_id="gpt-4",
+                provider="openai",
+                litellm_model="openai/gpt-4",
+                litellm_kwargs={},
+                messages=[{"role": "user", "content": "你好"}],
+                should_use_reasoning=False,
+                call_kwargs={},
+                accumulated_usage=Usage(input_tokens=5, output_tokens=7),
+                step_context=step_context,
+                llm_call_fn=llm_call_fn,
+                stream_round_fn=stream_round_fn,
+                log_round_summary_fn=lambda **_kwargs: None,
+            )
+
+        self.assertEqual(result.accumulated_usage, Usage(input_tokens=16, output_tokens=20))
+        self.assertEqual(create_observation.call_args.kwargs["round_kind"], "agent")
+        self.assertEqual(create_observation.call_args.kwargs["round_index"], 2)
+        observation.start.assert_called_once_with()
+        observation.finish_success.assert_awaited_once_with(
+            usage=Usage(input_tokens=11, output_tokens=13),
+            finish_reason="stop",
+        )
+
+    async def test_run_agent_round_records_error_without_swallowing_it(self):
+        step_context = AgentStepContext(
+            step_id="step-error",
+            step_number=1,
+            started_at=100.0,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+        )
+        observation = MagicMock()
+        observation.finish_success = AsyncMock()
+        observation.finish_error = AsyncMock()
+        error = RuntimeError("provider echoed private prompt")
+
+        async def llm_call_fn(*_args, **_kwargs):
+            raise error
+
+        with patch(
+            "app.services.stream.agent_round.create_llm_round_observation",
+            return_value=observation,
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                await run_agent_round(
+                    conversation_id="conv-1",
+                    task_id="task-1",
+                    run_id="run-1",
+                    step_number=1,
+                    model_id="gpt-4",
+                    provider="openai",
+                    litellm_model="openai/gpt-4",
+                    litellm_kwargs={},
+                    messages=[],
+                    should_use_reasoning=False,
+                    call_kwargs={},
+                    accumulated_usage=Usage(input_tokens=0, output_tokens=0),
+                    step_context=step_context,
+                    llm_call_fn=llm_call_fn,
+                    stream_round_fn=AsyncMock(),
+                    log_round_summary_fn=lambda **_kwargs: None,
+                )
+
+        self.assertIs(raised.exception, error)
+        observation.finish_error.assert_awaited_once_with(error)
+
     async def test_collect_agent_round_stream_calls_llm_then_streams_with_step_ids(self):
         messages = [{"role": "user", "content": "你好"}]
         step_context = AgentStepContext(

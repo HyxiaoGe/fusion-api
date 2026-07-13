@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from app.ai.llm_round_observability import create_llm_round_observation
 from app.ai.prompts.agent_loop import LIMIT_SUMMARY_PROMPT as _LIMIT_SUMMARY_PROMPT
 from app.ai.prompts.agent_loop import get_limit_summary_prompt
 from app.core.logger import app_logger as logger
@@ -55,6 +56,7 @@ class LimitSummaryStepRequest:
     warning_fn: Callable[[str], None] | None = None
     clock: Callable[[], float] = time.time
     on_step_started: Callable[[str], None] | None = None
+    assistant_message_id: str | None = None
 
 
 def build_limit_summary_call_kwargs(call_kwargs: dict) -> dict:
@@ -77,22 +79,42 @@ async def call_limit_summary_round(
     step_id: str,
 ) -> LimitSummaryRoundResult:
     final_call_kwargs = build_limit_summary_call_kwargs(request.call_kwargs)
-    response = await request.llm_call_fn(
-        request.litellm_model,
-        request.litellm_kwargs,
-        request.messages,
-        **final_call_kwargs,
-    )
-    reasoning_buf, content_buf, _, _, usage_data = await request.stream_round_fn(
-        response,
-        request.conversation_id,
-        request.task_id,
-        request.should_use_reasoning,
-        thinking_block_id,
-        text_block_id,
+    observation = create_llm_round_observation(
+        conversation_id=request.conversation_id,
         run_id=request.run_id,
+        round_index=request.step_number,
         step_id=step_id,
+        round_kind="limit_summary",
+        model_id=request.model_id,
+        provider=request.provider,
+        litellm_model=request.litellm_model,
+        messages=request.messages,
+        call_kwargs=final_call_kwargs,
+        assistant_message_id=request.assistant_message_id,
     )
+    observation.start()
+    try:
+        response = await request.llm_call_fn(
+            request.litellm_model,
+            request.litellm_kwargs,
+            request.messages,
+            **final_call_kwargs,
+        )
+        response = observation.wrap_response(response)
+        reasoning_buf, content_buf, _, finish_reason, usage_data = await request.stream_round_fn(
+            response,
+            request.conversation_id,
+            request.task_id,
+            request.should_use_reasoning,
+            thinking_block_id,
+            text_block_id,
+            run_id=request.run_id,
+            step_id=step_id,
+        )
+    except BaseException as exc:
+        await observation.finish_error(exc)
+        raise
+    await observation.finish_success(usage=usage_data, finish_reason=finish_reason)
     request.log_round_summary_fn(
         conversation_id=request.conversation_id,
         run_id=request.run_id,

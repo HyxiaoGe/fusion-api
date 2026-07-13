@@ -81,4 +81,5 @@ def build_limit_summary_step_request(
         warning_fn=runtime.warning_fn,
         clock=runtime.clock,
         on_step_started=state.mark_current_step,
+        assistant_message_id=runtime.assistant_message_id,
     )

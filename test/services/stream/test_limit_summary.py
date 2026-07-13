@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.schemas.chat import Usage
 from app.services.stream.limit_summary import (
@@ -105,6 +106,69 @@ class LimitSummaryHelpersTests(unittest.TestCase):
 
 
 class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
+    async def test_limit_summary_records_independent_round_observation(self):
+        messages = []
+        observation = MagicMock()
+        observation.finish_success = AsyncMock()
+        observation.finish_error = AsyncMock()
+        observation.wrap_response.side_effect = lambda response: response
+
+        async def llm_call_fn(*_args, **_kwargs):
+            return "response"
+
+        async def stream_round_fn(*_args, **_kwargs):
+            return "", "总结", [], "cancelled", Usage(input_tokens=5, output_tokens=7)
+
+        async def start_step_fn(**_kwargs):
+            return AgentStepContext(
+                step_id="step-summary",
+                step_number=2,
+                started_at=100.0,
+                thinking_block_id="blk-thinking",
+                text_block_id="blk-text",
+            )
+
+        request = LimitSummaryStepRequest(
+            conversation_id="conv-1",
+            task_id="task-1",
+            run_id="run-1",
+            step_number=2,
+            model_id="gpt-4",
+            provider="openai",
+            litellm_model="openai/gpt-4",
+            litellm_kwargs={},
+            messages=messages,
+            should_use_reasoning=False,
+            content_blocks=[],
+            call_kwargs={},
+            accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+            emitter=object(),
+            session_cache=object(),
+            total_timeout_s=300,
+            run_start=100.0,
+            start_step_fn=start_step_fn,
+            complete_step_fn=AsyncMock(),
+            llm_call_fn=llm_call_fn,
+            stream_round_fn=stream_round_fn,
+            log_round_summary_fn=lambda **_kwargs: None,
+            clock=lambda: 120.0,
+        )
+
+        with patch(
+            "app.services.stream.limit_summary.create_llm_round_observation",
+            return_value=observation,
+        ) as create_observation:
+            outcome = await run_limit_summary_step(request=request)
+
+        self.assertEqual(outcome.accumulated_usage, Usage(input_tokens=7, output_tokens=10))
+        self.assertEqual(create_observation.call_args.kwargs["round_kind"], "limit_summary")
+        self.assertEqual(create_observation.call_args.kwargs["round_index"], 2)
+        observation.start.assert_called_once_with()
+        observation.finish_success.assert_awaited_once_with(
+            usage=Usage(input_tokens=5, output_tokens=7),
+            finish_reason="cancelled",
+        )
+
     async def test_run_limit_summary_step_appends_prompt_and_records_success(self):
         messages = [{"role": "user", "content": "hi"}]
         content_blocks = []
