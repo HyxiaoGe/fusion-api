@@ -32,12 +32,56 @@ def validate_runtime_config_payload(
 
     if namespace == "prompt_template":
         _require_non_empty_string(payload, "template", issues)
+    elif namespace == "ui_prompt_catalog" and key == "home":
+        _validate_ui_prompt_catalog(payload, issues)
     elif namespace == "agent_strategy" and key == "default":
         _validate_agent_strategy(payload, issues)
     elif namespace == "model_presentation" and key == "default":
         _validate_model_presentation(payload, issues)
 
     return RuntimeConfigValidationResult(valid=not issues, issues=issues)
+
+
+def _validate_ui_prompt_catalog(payload: dict[str, Any], issues: list[str]) -> None:
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        issues.append("items 必须是非空数组")
+        return
+
+    seen_ids: set[str] = set()
+    for index, item in enumerate(items):
+        prefix = f"items[{index}]"
+        if not isinstance(item, dict):
+            issues.append(f"{prefix} 必须是对象")
+            continue
+
+        for field in ("id", "title", "content", "category", "icon_key", "tone"):
+            _require_non_empty_string(item, field, issues, prefix=prefix)
+
+        description = item.get("description")
+        if not isinstance(description, str):
+            issues.append(f"{prefix}.description 必须是字符串")
+
+        kind = item.get("kind")
+        if kind not in {"starter", "template"}:
+            issues.append(f"{prefix}.kind 必须是 starter 或 template")
+
+        item_id = item.get("id")
+        if isinstance(item_id, str) and item_id:
+            if item_id in seen_ids:
+                issues.append(f"{prefix}.id 不能重复")
+            seen_ids.add(item_id)
+
+        sort_order = item.get("sort_order")
+        if not isinstance(sort_order, int) or isinstance(sort_order, bool):
+            issues.append(f"{prefix}.sort_order 必须是整数")
+
+        if not isinstance(item.get("enabled"), bool):
+            issues.append(f"{prefix}.enabled 必须是布尔值")
+
+        capabilities = item.get("required_capabilities")
+        if not isinstance(capabilities, list) or not all(isinstance(value, str) for value in capabilities):
+            issues.append(f"{prefix}.required_capabilities 必须是字符串数组")
 
 
 def _validate_agent_strategy(payload: dict[str, Any], issues: list[str]) -> None:

@@ -2,9 +2,17 @@
 from fastapi import APIRouter, Query, Request
 
 from app.schemas.response import success
+from app.services.prompt_catalog_service import get_home_prompt_catalog
 from app.services.prompt_examples_service import get_prompt_examples
 
 router = APIRouter()
+
+
+@router.get("/templates")
+async def get_templates(request: Request):
+    """获取首页任务卡和系统提示词模板目录。"""
+
+    return success(data=get_home_prompt_catalog(), request_id=request.state.request_id)
 
 
 @router.get("/examples")

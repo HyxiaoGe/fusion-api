@@ -59,13 +59,22 @@ class RuntimeConfigServiceTests(unittest.TestCase):
 
         self.assertIn(("agent_strategy", "default"), row_keys)
         self.assertIn(("model_presentation", "default"), row_keys)
+        self.assertIn(("ui_prompt_catalog", "home"), row_keys)
         for prompt_key in DEFAULT_PROMPT_TEMPLATES:
             self.assertIn(("prompt_template", prompt_key), row_keys)
-        self.assertEqual(len(rows), 2 + len(DEFAULT_PROMPT_TEMPLATES))
+        self.assertEqual(len(rows), 3 + len(DEFAULT_PROMPT_TEMPLATES))
         self.assertEqual(len({row["id"] for row in rows}), len(rows))
         for row in rows:
             UUID(row["id"])
-        self.assertTrue(all(row["version"] == "2026-07-02.v1" for row in rows))
+        versions = {(row["namespace"], row["key"]): row["version"] for row in rows}
+        self.assertEqual(versions[("ui_prompt_catalog", "home")], "2026-07-14.v1")
+        self.assertTrue(
+            all(
+                version == "2026-07-02.v1"
+                for key, version in versions.items()
+                if key != ("ui_prompt_catalog", "home")
+            )
+        )
         self.assertTrue(all(row["is_active"] is True for row in rows))
 
     def test_get_runtime_config_payload_returns_default_when_db_unavailable(self):
@@ -224,6 +233,11 @@ class RuntimeConfigServiceTests(unittest.TestCase):
             "default",
             {"weights": {}, "levels": {}, "copy": {}},
         )
+        catalog_result = validate_runtime_config_payload(
+            "ui_prompt_catalog",
+            "home",
+            {"items": [{"id": "broken", "kind": "starter"}]},
+        )
 
         self.assertFalse(prompt_result.valid)
         self.assertIn("template 必须是非空字符串", prompt_result.issues)
@@ -231,6 +245,8 @@ class RuntimeConfigServiceTests(unittest.TestCase):
         self.assertTrue(any("model_runtime" in issue for issue in strategy_result.issues))
         self.assertFalse(presentation_result.valid)
         self.assertTrue(any("weights.base" in issue for issue in presentation_result.issues))
+        self.assertFalse(catalog_result.valid)
+        self.assertTrue(any("items[0].title" in issue for issue in catalog_result.issues))
 
 
 if __name__ == "__main__":
