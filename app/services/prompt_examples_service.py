@@ -31,6 +31,7 @@ DEFAULT_EXAMPLES = [
     {"category": "general", "question": "帮我润色这段产品介绍"},
     {"category": "general", "question": "写一封正式的商务邮件"},
     {"category": "general", "question": "解释一下量子计算的基本原理"},
+    {"category": "tech", "question": "对比 PostgreSQL 和 MongoDB 适用场景"},
 ]
 
 
