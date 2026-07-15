@@ -34,6 +34,32 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
         last_args = writer.append_chunk.call_args_list[-1].args
         self.assertEqual(last_args[3]["step_id"], step_id)
 
+    async def test_tool_call_started_url_read_arguments_use_strict_allowlist(self):
+        writer = AsyncMock()
+        em = AgentEventEmitter(run_id="r1", trace_id="r1", conversation_id="c1", task_id="task-1", redis_writer=writer)
+
+        await em.tool_call_started(
+            tool_call_id="t1",
+            tool_name="url_read",
+            arguments={
+                "url": "https://example.com/page?token=secret",
+                "reason": "  核实原文  ",
+                "api_key": "secret-key",
+                "nested": {"secret": "value"},
+            },
+        )
+
+        payload = writer.append_chunk.await_args.args[3]
+        self.assertEqual(
+            payload["arguments"],
+            {
+                "url": "https://example.com/page",
+                "reason": "核实原文",
+                "url_policy_reason": "sensitive_query",
+            },
+        )
+        self.assertNotIn("secret", str(payload["arguments"]))
+
     async def test_step_completed_clears_step_context(self):
         writer = AsyncMock()
         em = AgentEventEmitter(run_id="r1", trace_id="r1", conversation_id="c1", task_id="task-1", redis_writer=writer)

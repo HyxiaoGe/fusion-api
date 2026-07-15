@@ -68,11 +68,13 @@ class AiToolSchemaTests(unittest.TestCase):
     def test_url_read_schema_exposes_optional_reason(self):
         from app.ai.tools import URL_READ_TOOL
 
-        properties = URL_READ_TOOL["function"]["parameters"]["properties"]
+        parameters = URL_READ_TOOL["function"]["parameters"]
+        properties = parameters["properties"]
 
         self.assertIn("url", properties)
         self.assertIn("reason", properties)
-        self.assertEqual(URL_READ_TOOL["function"]["parameters"]["required"], ["url"])
+        self.assertEqual(parameters["required"], ["url"])
+        self.assertFalse(parameters["additionalProperties"])
 
     def test_url_read_schema_prioritizes_high_value_search_results(self):
         from app.ai.tools import URL_READ_TOOL

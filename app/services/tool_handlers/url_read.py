@@ -6,6 +6,7 @@ import time
 
 from app.core.config import settings
 from app.schemas.chat import SourceReference, UrlBlock
+from app.services.agent.sanitizer import URL_READ_REASON_MAX_CHARS, sanitize_url_read_arguments
 from app.services.agent_strategy_config import get_agent_strategy_config
 from app.services.external.reader_client import read_url_with_diagnostics
 from app.services.security.url_policy import evaluate_url_policy
@@ -14,7 +15,7 @@ from app.services.tool_handlers.base import BaseToolHandler, ToolResult
 
 # 注入 LLM 上下文时的最大字符数（约 4000 token）
 MAX_CONTENT_CHARS = 8000
-MAX_REASON_CHARS = 160
+MAX_REASON_CHARS = URL_READ_REASON_MAX_CHARS
 
 
 class UrlReadHandler(BaseToolHandler):
@@ -27,22 +28,41 @@ class UrlReadHandler(BaseToolHandler):
         return "url_read"
 
     def sanitize_input_params_for_log(self, input_params: dict) -> dict:
-        safe_params = dict(input_params or {})
-        url = safe_params.get("url")
-        if isinstance(url, str):
+        return sanitize_url_read_arguments(input_params)
+
+    def sanitize_output_data_for_log(self, result: ToolResult) -> dict:
+        data = result.data if isinstance(result.data, dict) else {}
+        safe_output = {}
+        raw_url = data.get("safe_log_url") or data.get("url")
+        if isinstance(raw_url, str):
             try:
-                policy = evaluate_url_policy(url)
+                safe_output["url"] = evaluate_url_policy(raw_url).safe_log_url or ""
             except Exception:
-                safe_params["url"] = ""
-                safe_params["url_policy_reason"] = "invalid_url"
-                return safe_params
-            safe_params["url"] = policy.safe_log_url or ""
-            if not policy.allowed:
-                safe_params["url_policy_reason"] = policy.reason
-        return safe_params
+                safe_output["url"] = ""
+
+        for key in ("failure_kind", "degraded_reason"):
+            value = data.get(key)
+            if isinstance(value, str):
+                safe_output[key] = value[:80]
+        for key in ("retryable", "budget_limited"):
+            value = data.get(key)
+            if isinstance(value, bool):
+                safe_output[key] = value
+        for key in (
+            "upstream_status",
+            "attempts",
+            "reader_duration_ms",
+            "content_length",
+            "reader_fetch_ms",
+        ):
+            value = data.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                safe_output[key] = value
+        return safe_output
 
     async def execute(self, args: dict) -> ToolResult:
-        url = args.get("url", "").strip()
+        raw_url = args.get("url", "")
+        url = raw_url.strip() if isinstance(raw_url, str) else ""
         reason = _normalize_reason(args.get("reason"))
         if not url:
             return ToolResult(
@@ -50,7 +70,19 @@ class UrlReadHandler(BaseToolHandler):
                 error_message="url 为空",
                 data={"url": url, "reason": reason},
             )
-        policy = evaluate_url_policy(url)
+        try:
+            policy = evaluate_url_policy(url)
+        except Exception:
+            return ToolResult(
+                status="degraded",
+                error_message="链接格式无效，已跳过读取",
+                data={
+                    "url": "",
+                    "safe_log_url": None,
+                    "degraded_reason": "invalid_url",
+                    "reason": reason,
+                },
+            )
         if not policy.allowed:
             return ToolResult(
                 status="degraded",
@@ -77,13 +109,16 @@ class UrlReadHandler(BaseToolHandler):
                 return ToolResult(
                     status="degraded",
                     duration_ms=duration_ms,
-                    error_message=failure.message if failure else "reader-service 暂时未返回内容，已跳过网页读取",
+                    error_message=failure.message if failure else "网页暂时无法读取，已跳过该来源",
                     data={
                         "url": policy.safe_log_url or policy.normalized_url or "",
                         "safe_log_url": policy.safe_log_url,
                         "reason": reason,
                         "failure_kind": failure.kind if failure else "empty_result",
-                        "failure_detail": failure.detail if failure else None,
+                        "retryable": failure.retryable if failure else False,
+                        "upstream_status": failure.upstream_status if failure else None,
+                        "attempts": failure.attempts if failure else 1,
+                        "reader_duration_ms": failure.reader_duration_ms if failure else None,
                     },
                 )
 
@@ -97,16 +132,26 @@ class UrlReadHandler(BaseToolHandler):
                     "favicon": result.favicon,
                     "content_length": result.content_length,
                     "reader_fetch_ms": result.fetch_ms,
+                    "attempts": result.attempts,
                     "reason": reason,
                 },
             )
-        except Exception as e:
+        except Exception:
             duration_ms = int((time.monotonic() - start) * 1000)
             return ToolResult(
-                status="failed",
+                status="degraded",
                 duration_ms=duration_ms,
-                error_message=str(e),
-                data={"url": url, "reason": reason},
+                error_message="网页读取发生异常，已跳过该来源",
+                data={
+                    "url": policy.safe_log_url or "",
+                    "safe_log_url": policy.safe_log_url,
+                    "reason": reason,
+                    "failure_kind": "unknown",
+                    "retryable": False,
+                    "upstream_status": None,
+                    "attempts": 1,
+                    "reader_duration_ms": None,
+                },
             )
 
     def build_content_block(self, result: ToolResult, block_id: str, log_id: str) -> UrlBlock:

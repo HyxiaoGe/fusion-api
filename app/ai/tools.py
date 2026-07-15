@@ -117,6 +117,7 @@ def build_url_read_tool() -> dict:
                     },
                 },
                 "required": ["url"],
+                "additionalProperties": False,
             },
         },
     }

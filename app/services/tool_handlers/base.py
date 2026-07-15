@@ -110,6 +110,7 @@ class BaseToolHandler(ABC):
     ) -> None:
         """异步记录 ToolCallLog"""
         safe_input_params = self.sanitize_input_params_for_log(input_params)
+        safe_output_data = self.sanitize_output_data_for_log(result)
         task = asyncio.create_task(
             log_tool_call(
                 log_id=log_id,
@@ -122,7 +123,7 @@ class BaseToolHandler(ABC):
                 model_id=model_id,
                 provider=provider,
                 input_params=safe_input_params,
-                output_data=_serialize_for_json(result.data),
+                output_data=_serialize_for_json(safe_output_data),
                 error_message=result.error_message,
                 trace_id=trace_id,
                 step_number=step_number,
@@ -133,6 +134,10 @@ class BaseToolHandler(ABC):
     def sanitize_input_params_for_log(self, input_params: dict) -> dict:
         """子类可覆盖以清理即将持久化的工具入参。"""
         return input_params
+
+    def sanitize_output_data_for_log(self, result: ToolResult) -> dict:
+        """子类可覆盖以限制即将持久化的工具输出。"""
+        return result.data
 
     async def execute_with_emitter(
         self,

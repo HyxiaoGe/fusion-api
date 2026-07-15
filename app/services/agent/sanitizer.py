@@ -1,4 +1,5 @@
 """arguments 脱敏 hook + result_summary 截断."""
+
 from __future__ import annotations
 
 import copy
@@ -6,6 +7,8 @@ import json
 from typing import Any
 
 from app.services.security.url_policy import evaluate_url_policy
+
+URL_READ_REASON_MAX_CHARS = 160
 
 
 def sanitize_arguments(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -15,23 +18,34 @@ def sanitize_arguments(tool_name: str, arguments: dict[str, Any]) -> dict[str, A
     url_read 的 URL 需要在这里先清理，不能等到 handler 执行后再处理。
     """
     if tool_name == "url_read":
-        return _sanitize_url_read_arguments(arguments)
+        return sanitize_url_read_arguments(arguments)
     return arguments
 
 
-def _sanitize_url_read_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
-    sanitized = dict(arguments or {})
-    url = sanitized.get("url")
+def sanitize_url_read_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    """严格白名单化 url_read 参数，供 SSE 与 ToolCallLog 共用。"""
+    source = arguments if isinstance(arguments, dict) else {}
+    sanitized: dict[str, Any] = {}
+    url = source.get("url")
     if isinstance(url, str):
         try:
             policy = evaluate_url_policy(url)
         except Exception:
             sanitized["url"] = ""
             sanitized["url_policy_reason"] = "invalid_url"
-            return sanitized
-        sanitized["url"] = policy.safe_log_url or ""
-        if not policy.allowed:
-            sanitized["url_policy_reason"] = policy.reason
+        else:
+            sanitized["url"] = policy.safe_log_url or ""
+            if not policy.allowed:
+                sanitized["url_policy_reason"] = policy.reason
+    elif url is not None:
+        sanitized["url"] = ""
+        sanitized["url_policy_reason"] = "invalid_url"
+
+    reason = source.get("reason")
+    if isinstance(reason, str):
+        normalized_reason = reason.strip()
+        if normalized_reason:
+            sanitized["reason"] = normalized_reason[:URL_READ_REASON_MAX_CHARS]
     return sanitized
 
 
@@ -89,10 +103,7 @@ def cap_and_truncate(payload: dict[str, Any], max_bytes: int = 1024) -> dict[str
         return out
 
     # Phase 2: 按体积从大到小删嵌套 container
-    container_keys = [
-        k for k, v in out.items()
-        if isinstance(v, (dict, list)) and k != "truncated"
-    ]
+    container_keys = [k for k, v in out.items() if isinstance(v, (dict, list)) and k != "truncated"]
     container_keys.sort(key=lambda k: _utf8_size({k: out[k]}), reverse=True)
     for k in container_keys:
         del out[k]

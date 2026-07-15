@@ -121,31 +121,45 @@ def persist_tool_round_checkpoint(request: ToolRoundRequest) -> None:
     )
 
 
-async def execute_tool_round_tools(request: ToolRoundRequest) -> list[ToolExecutionRecord]:
-    results = await request.execute_tools_fn(
-        request.tool_calls,
-        request.conversation_id,
-        request.user_id,
-        request.model_id,
-        request.provider,
-        trace_id=request.run_id,
-        step_number=request.step_number,
-        message_id=request.assistant_message_id,
-        emitter=request.emitter,
-        network_budget=request.network_budget,
+async def execute_tool_round_tools(
+    request: ToolRoundRequest,
+    *,
+    selected_tool_calls: list[dict] | None = None,
+) -> list[ToolExecutionRecord]:
+    executed_tool_calls = (
+        _select_tool_calls_within_limit(request)[0] if selected_tool_calls is None else selected_tool_calls
     )
-    if request.on_tools_executed is not None:
-        request.on_tools_executed(len(request.tool_calls))
-    return results
+    if not executed_tool_calls:
+        if request.on_tools_executed is not None:
+            request.on_tools_executed(0)
+        return []
+
+    try:
+        return await request.execute_tools_fn(
+            executed_tool_calls,
+            request.conversation_id,
+            request.user_id,
+            request.model_id,
+            request.provider,
+            trace_id=request.run_id,
+            step_number=request.step_number,
+            message_id=request.assistant_message_id,
+            emitter=request.emitter,
+            network_budget=request.network_budget,
+        )
+    finally:
+        if request.on_tools_executed is not None:
+            request.on_tools_executed(len(executed_tool_calls))
 
 
-async def update_tool_round_plan_started(request: ToolRoundRequest) -> None:
+async def update_tool_round_plan_started(request: ToolRoundRequest, *, tool_calls: list[dict] | None = None) -> None:
+    planned_tool_calls = request.tool_calls if tool_calls is None else tool_calls
     await mark_tool_round_started(
         context=request.step_context,
         emitter=request.emitter,
-        tool_call_count=len(request.tool_calls),
-        tool_names=[tool_call["name"] for tool_call in request.tool_calls],
-        tool_arguments=_tool_arguments(request.tool_calls),
+        tool_call_count=len(planned_tool_calls),
+        tool_names=[tool_call["name"] for tool_call in planned_tool_calls],
+        tool_arguments=_tool_arguments(planned_tool_calls),
         completed_tool_calls=_completed_tool_calls_before_round(request),
         max_tool_calls=_max_tool_calls(request),
     )
@@ -160,6 +174,8 @@ def append_tool_round_messages_with_plan(
     results: list[ToolExecutionRecord],
     *,
     source_plan: SourceSelectionPlan | None,
+    missing_result_tool_calls: list[dict] | None = None,
+    not_executed_tool_calls: list[dict] | None = None,
 ) -> None:
     request.messages.append(
         build_assistant_tool_message(
@@ -173,33 +189,65 @@ def append_tool_round_messages_with_plan(
         results,
         source_plan=source_plan,
     )
-    for record in results:
-        tool_context = record.format_llm_context()
-        source_selection_guidance = source_selection_guidance_by_tool_call_id.get(str(record.tool_call.get("id", "")))
-        if source_selection_guidance:
-            tool_context = f"{tool_context}\n\n{source_selection_guidance}"
-        content_block = record.build_content_block()
-        if content_block is not None:
-            request.content_blocks.append(content_block)
+    records_by_id = {str(record.tool_call.get("id", "")): record for record in results}
+    missing_result_ids = {str(tool_call.get("id", "")) for tool_call in missing_result_tool_calls or []}
+    not_executed_ids = {str(tool_call.get("id", "")) for tool_call in not_executed_tool_calls or []}
 
-        request.messages.append(
-            {
-                "role": "tool",
-                "tool_call_id": record.tool_call["id"],
-                "content": tool_context,
-            }
-        )
+    for tool_call in request.tool_calls:
+        tool_call_id = str(tool_call.get("id", ""))
+        record = records_by_id.get(tool_call_id)
+        if record is not None:
+            tool_context = record.format_llm_context()
+            source_selection_guidance = source_selection_guidance_by_tool_call_id.get(tool_call_id)
+            if source_selection_guidance:
+                tool_context = f"{tool_context}\n\n{source_selection_guidance}"
+            content_block = record.build_content_block()
+            if content_block is not None:
+                request.content_blocks.append(content_block)
+            request.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": tool_context,
+                }
+            )
+            continue
+
+        if tool_call_id in missing_result_ids:
+            request.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": _format_missing_tool_result_context(),
+                }
+            )
+            continue
+
+        if tool_call_id in not_executed_ids:
+            request.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": _format_not_executed_tool_context(),
+                }
+            )
 
 
-async def complete_tool_round_step(request: ToolRoundRequest, results: list[ToolExecutionRecord]) -> list[str]:
+async def complete_tool_round_step(
+    request: ToolRoundRequest,
+    results: list[ToolExecutionRecord],
+    *,
+    executed_count: int | None = None,
+) -> list[str]:
     tool_names = [record.tool_name for record in results]
+    actual_count = len(results) if executed_count is None else executed_count
     await request.complete_step_fn(
         context=request.step_context,
         emitter=request.emitter,
         session_cache=request.session_cache,
         tool_names=tool_names,
-        tool_call_count=len(results),
-        completed_tool_calls=_completed_tool_calls_after_round(request, len(results)),
+        tool_call_count=actual_count,
+        completed_tool_calls=_completed_tool_calls_after_round(request, actual_count),
         max_tool_calls=_max_tool_calls(request),
         clock=request.clock,
     )
@@ -210,17 +258,31 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
     append_tool_round_reasoning(request)
     persist_tool_round_checkpoint(request)
 
-    await update_tool_round_plan_started(request)
-    results = await execute_tool_round_tools(request)
+    selected_tool_calls = _select_tool_calls_within_limit(request)
+    if selected_tool_calls[0]:
+        await update_tool_round_plan_started(request, tool_calls=selected_tool_calls[0])
+    raw_results = await execute_tool_round_tools(request, selected_tool_calls=selected_tool_calls[0])
+    results, missing_result_tool_calls = _reconcile_tool_execution_results(
+        selected_tool_calls=selected_tool_calls[0],
+        results=raw_results,
+        run_id=request.run_id,
+    )
     source_plan = _build_source_selection_plan(results)
     record_network_budget_feedback(request, results, source_plan=source_plan)
     await emit_selected_source_evidence(request, results, source_plan=source_plan)
-    append_tool_round_messages_with_plan(request, results, source_plan=source_plan)
+    append_tool_round_messages_with_plan(
+        request,
+        results,
+        source_plan=source_plan,
+        missing_result_tool_calls=missing_result_tool_calls,
+        not_executed_tool_calls=selected_tool_calls[1],
+    )
     persist_tool_round_checkpoint(request)
 
-    tool_names = await complete_tool_round_step(request, results)
+    executed_count = len(selected_tool_calls[0])
+    tool_names = await complete_tool_round_step(request, results, executed_count=executed_count)
     restore_reasoning_after_tool_decision(request.call_kwargs)
-    return ToolRoundOutcome(tool_call_count=len(request.tool_calls), tool_names=tool_names)
+    return ToolRoundOutcome(tool_call_count=executed_count, tool_names=tool_names)
 
 
 async def emit_selected_source_evidence(
@@ -277,6 +339,89 @@ def _max_tool_calls(request: ToolRoundRequest) -> int | None:
         return request.max_tool_calls
     value = getattr(request.network_budget, "max_tool_calls", None)
     return value if isinstance(value, int) else None
+
+
+def _select_tool_calls_within_limit(request: ToolRoundRequest) -> tuple[list[dict], list[dict]]:
+    completed_tool_calls = _completed_tool_calls_before_round(request)
+    max_tool_calls = _max_tool_calls(request)
+    if completed_tool_calls is None or max_tool_calls is None:
+        return request.tool_calls, []
+
+    remaining_capacity = max(0, max_tool_calls - completed_tool_calls)
+    executed_tool_calls = request.tool_calls[:remaining_capacity]
+    not_executed_tool_calls = request.tool_calls[remaining_capacity:]
+    if not_executed_tool_calls:
+        logger.info(
+            "工具调用批次受全局上限截断: "
+            f"run_id={request.run_id}, completed={completed_tool_calls}, max={max_tool_calls}, "
+            f"requested={len(request.tool_calls)}, executed={len(executed_tool_calls)}, "
+            f"not_executed={len(not_executed_tool_calls)}"
+        )
+    return executed_tool_calls, not_executed_tool_calls
+
+
+def _reconcile_tool_execution_results(
+    *,
+    selected_tool_calls: list[dict],
+    results: list[ToolExecutionRecord],
+    run_id: str,
+) -> tuple[list[ToolExecutionRecord], list[dict]]:
+    selected_ids = {str(tool_call.get("id", "")) for tool_call in selected_tool_calls}
+    records_by_id: dict[str, ToolExecutionRecord] = {}
+    duplicate_count = 0
+    extra_count = 0
+
+    for record in results:
+        tool_call_id = str(record.tool_call.get("id", ""))
+        if tool_call_id not in selected_ids:
+            extra_count += 1
+            continue
+        if tool_call_id in records_by_id:
+            duplicate_count += 1
+            continue
+        records_by_id[tool_call_id] = record
+
+    reconciled_results: list[ToolExecutionRecord] = []
+    missing_result_tool_calls: list[dict] = []
+    for tool_call in selected_tool_calls:
+        record = records_by_id.get(str(tool_call.get("id", "")))
+        if record is None:
+            missing_result_tool_calls.append(tool_call)
+            continue
+        reconciled_results.append(record)
+
+    if missing_result_tool_calls or duplicate_count or extra_count:
+        logger.warning(
+            "工具执行结果与提交批次不一致: "
+            f"run_id={run_id}, selected={len(selected_tool_calls)}, returned={len(results)}, "
+            f"accepted={len(reconciled_results)}, missing={len(missing_result_tool_calls)}, "
+            f"duplicate={duplicate_count}, extra={extra_count}"
+        )
+
+    return reconciled_results, missing_result_tool_calls
+
+
+def _format_missing_tool_result_context() -> str:
+    return json.dumps(
+        {
+            "status": "failed",
+            "reason": "execution_result_missing",
+            "message": "工具执行未返回可用记录，本次结果不能作为事实依据。",
+        },
+        ensure_ascii=False,
+    )
+
+
+def _format_not_executed_tool_context() -> str:
+    return json.dumps(
+        {
+            "status": "not_executed",
+            "reason": "limit_reached",
+            "limit_reason": "max_tool_calls",
+            "message": "Agent 工具调用额度已耗尽，本次调用未执行，不能将其视为事实依据。",
+        },
+        ensure_ascii=False,
+    )
 
 
 def _build_source_selection_guidance_by_tool_call_id(

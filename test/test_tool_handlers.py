@@ -514,6 +514,7 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
             favicon="https://favicon.example.com",
             content_length=35,
             fetch_ms=500,
+            attempts=2,
         )
         with patch(
             "app.services.tool_handlers.url_read.read_url_with_diagnostics",
@@ -526,6 +527,7 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.data["title"], "Example")
         self.assertIn("Hello world", result.data["content"])
         self.assertEqual(result.data["reader_fetch_ms"], 500)
+        self.assertEqual(result.data["attempts"], 2)
 
     async def test_execute_truncates_reason_to_result_data(self):
         """url_read 保留并截断读取原因"""
@@ -592,14 +594,25 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
         result = await self.handler.execute({"url": ""})
         self.assertEqual(result.status, "degraded")
 
+    async def test_execute_malformed_url_stays_degraded_without_raw_value(self):
+        result = await self.handler.execute({"url": "http://[::1"})
+
+        self.assertEqual(result.status, "degraded")
+        self.assertEqual(result.data["degraded_reason"], "invalid_url")
+        self.assertEqual(result.data["url"], "")
+        self.assertNotIn("http://[::1", str(result.data))
+
     async def test_execute_failure_returns_degraded(self):
         """读取失败走工具降级，不阻断对话"""
         from app.services.external.reader_client import UrlReadFailure, UrlReadResponse
 
         failure = UrlReadFailure(
             kind="timeout",
-            message="reader-service 读取超时，已降级跳过",
-            detail="TimeoutException: timeout",
+            message="网页读取超时，已跳过该来源",
+            retryable=True,
+            upstream_status=None,
+            attempts=2,
+            reader_duration_ms=18000,
         )
         with patch(
             "app.services.tool_handlers.url_read.read_url_with_diagnostics",
@@ -609,11 +622,43 @@ class UrlReadHandlerTests(unittest.IsolatedAsyncioTestCase):
             result = await self.handler.execute({"url": "https://example.com"})
 
         self.assertEqual(result.status, "degraded")
-        self.assertEqual(result.error_message, "reader-service 读取超时，已降级跳过")
+        self.assertEqual(result.error_message, "网页读取超时，已跳过该来源")
         self.assertEqual(result.data["failure_kind"], "timeout")
-        self.assertEqual(result.data["failure_detail"], "TimeoutException: timeout")
+        self.assertTrue(result.data["retryable"])
+        self.assertIsNone(result.data["upstream_status"])
+        self.assertEqual(result.data["attempts"], 2)
+        self.assertEqual(result.data["reader_duration_ms"], 18000)
+        self.assertNotIn("failure_detail", result.data)
         self.assertEqual(result.data["safe_log_url"], "https://example.com")
         mock_read.assert_awaited_once_with("https://example.com", timeout=20.0)
+
+    async def test_execute_unexpected_reader_error_stays_degraded_and_safe(self):
+        with patch(
+            "app.services.tool_handlers.url_read.read_url_with_diagnostics",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("token=secret https://example.com/private"),
+        ):
+            result = await self.handler.execute({"url": "https://example.com/page"})
+
+        self.assertEqual(result.status, "degraded")
+        self.assertEqual(result.data["failure_kind"], "unknown")
+        self.assertEqual(result.data["url"], "https://example.com/page")
+        self.assertNotIn("secret", result.error_message)
+        self.assertNotIn("private", str(result.data))
+
+    async def test_execute_empty_reader_response_uses_local_safe_message(self):
+        from app.services.external.reader_client import UrlReadResponse
+
+        with patch(
+            "app.services.tool_handlers.url_read.read_url_with_diagnostics",
+            new_callable=AsyncMock,
+            return_value=UrlReadResponse(result=None),
+        ):
+            result = await self.handler.execute({"url": "https://example.com/page"})
+
+        self.assertEqual(result.status, "degraded")
+        self.assertEqual(result.error_message, "网页暂时无法读取，已跳过该来源")
+        self.assertNotIn("reader-service", result.error_message)
 
     def test_format_llm_context_truncates_long_content(self):
         """超长内容会被截断"""
@@ -834,7 +879,12 @@ class ToolHandlerLogTests(unittest.IsolatedAsyncioTestCase):
                 model_id="model-1",
                 provider="provider-1",
                 result=result,
-                input_params={"url": "https://example.com/page?token=secret&safe=1", "reason": "核实原文"},
+                input_params={
+                    "url": "https://example.com/page?token=secret&safe=1",
+                    "reason": f"  {'核实原文' * 50}  ",
+                    "api_key": "secret-key",
+                    "nested": {"token": "secret"},
+                },
                 trace_id="trace-1",
                 step_number=1,
                 message_id="assistant-1",
@@ -842,9 +892,140 @@ class ToolHandlerLogTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
 
         input_params = mock_log_tool_call.await_args.kwargs["input_params"]
+        self.assertEqual(set(input_params), {"url", "reason", "url_policy_reason"})
         self.assertEqual(input_params["url"], "https://example.com/page")
-        self.assertEqual(input_params["reason"], "核实原文")
+        self.assertEqual(len(input_params["reason"]), 160)
+        self.assertEqual(input_params["reason"], input_params["reason"].strip())
+        self.assertEqual(input_params["url_policy_reason"], "sensitive_query")
+        self.assertNotIn("api_key", input_params)
+        self.assertNotIn("nested", input_params)
         self.assertNotIn("token", str(input_params))
+
+    async def test_url_read_log_drops_non_string_reason(self):
+        from app.services.tool_handlers.base import ToolResult
+        from app.services.tool_handlers.url_read import UrlReadHandler
+
+        handler = UrlReadHandler()
+        with patch(
+            "app.services.tool_handlers.base.log_tool_call",
+            new_callable=AsyncMock,
+        ) as mock_log_tool_call:
+            await handler.log(
+                log_id="log-1",
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="model-1",
+                provider="provider-1",
+                result=ToolResult(status="degraded"),
+                input_params={
+                    "url": "https://example.com",
+                    "reason": {"token": "secret"},
+                },
+            )
+            await asyncio.sleep(0)
+
+        self.assertEqual(
+            mock_log_tool_call.await_args.kwargs["input_params"],
+            {"url": "https://example.com"},
+        )
+
+    async def test_url_read_log_whitelists_success_output_metadata(self):
+        from app.services.tool_handlers.base import ToolResult
+        from app.services.tool_handlers.url_read import UrlReadHandler
+
+        handler = UrlReadHandler()
+        result = ToolResult(
+            status="success",
+            data={
+                "url": "https://example.com/page?token=secret",
+                "title": "私密标题",
+                "content": "不得进入日志的网页正文",
+                "favicon": "https://example.com/favicon.ico",
+                "content_length": 100,
+                "reader_fetch_ms": 9000,
+                "attempts": 2,
+                "reason": "核实原文",
+            },
+        )
+
+        with patch(
+            "app.services.tool_handlers.base.log_tool_call",
+            new_callable=AsyncMock,
+        ) as mock_log_tool_call:
+            await handler.log(
+                log_id="log-1",
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="model-1",
+                provider="provider-1",
+                result=result,
+                input_params={"url": "https://example.com/page?token=secret"},
+            )
+            await asyncio.sleep(0)
+
+        output_data = mock_log_tool_call.await_args.kwargs["output_data"]
+        self.assertEqual(
+            output_data,
+            {
+                "url": "https://example.com/page",
+                "content_length": 100,
+                "reader_fetch_ms": 9000,
+                "attempts": 2,
+            },
+        )
+        self.assertNotIn("secret", str(output_data))
+        self.assertNotIn("正文", str(output_data))
+        self.assertNotIn("私密标题", str(output_data))
+
+    async def test_url_read_log_whitelists_failure_output_metadata(self):
+        from app.services.tool_handlers.base import ToolResult
+        from app.services.tool_handlers.url_read import UrlReadHandler
+
+        handler = UrlReadHandler()
+        result = ToolResult(
+            status="degraded",
+            data={
+                "url": "https://example.com/page",
+                "safe_log_url": "https://example.com/page",
+                "failure_kind": "rate_limited",
+                "retryable": True,
+                "upstream_status": 429,
+                "attempts": 2,
+                "reader_duration_ms": 18200,
+                "failure_detail": "token=secret https://example.com/private",
+            },
+            error_message="网页读取请求暂时受限，已跳过该来源",
+        )
+
+        with patch(
+            "app.services.tool_handlers.base.log_tool_call",
+            new_callable=AsyncMock,
+        ) as mock_log_tool_call:
+            await handler.log(
+                log_id="log-1",
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="model-1",
+                provider="provider-1",
+                result=result,
+                input_params={"url": "https://example.com/page?token=secret"},
+            )
+            await asyncio.sleep(0)
+
+        output_data = mock_log_tool_call.await_args.kwargs["output_data"]
+        self.assertEqual(
+            output_data,
+            {
+                "url": "https://example.com/page",
+                "failure_kind": "rate_limited",
+                "retryable": True,
+                "upstream_status": 429,
+                "attempts": 2,
+                "reader_duration_ms": 18200,
+            },
+        )
+        self.assertNotIn("secret", str(output_data))
+        self.assertNotIn("failure_detail", output_data)
 
     async def test_url_read_log_sanitize_is_best_effort_for_malformed_url(self):
         from app.services.tool_handlers.base import ToolResult

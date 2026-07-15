@@ -1,4 +1,5 @@
 """sanitizer 单元测试"""
+
 import json
 import unittest
 
@@ -25,6 +26,33 @@ class SanitizeArgumentsTests(unittest.TestCase):
 
         self.assertEqual(sanitized["url"], "")
         self.assertEqual(sanitized["url_policy_reason"], "invalid_url")
+
+    def test_url_read_whitelists_fields_and_normalizes_reason(self):
+        args = {
+            "url": "https://example.com/page?token=secret&safe=1",
+            "reason": f"  {'核实原文' * 50}  ",
+            "api_key": "secret-key",
+            "nested": {"token": "secret"},
+        }
+
+        sanitized = sanitize_arguments("url_read", args)
+
+        self.assertEqual(set(sanitized), {"url", "reason", "url_policy_reason"})
+        self.assertEqual(sanitized["url"], "https://example.com/page")
+        self.assertEqual(sanitized["url_policy_reason"], "sensitive_query")
+        self.assertEqual(len(sanitized["reason"]), 160)
+        self.assertEqual(sanitized["reason"], sanitized["reason"].strip())
+        self.assertNotIn("api_key", sanitized)
+        self.assertNotIn("nested", sanitized)
+        self.assertNotIn("secret", str(sanitized))
+
+    def test_url_read_drops_non_string_reason(self):
+        sanitized = sanitize_arguments(
+            "url_read",
+            {"url": "https://example.com", "reason": {"token": "secret"}},
+        )
+
+        self.assertEqual(sanitized, {"url": "https://example.com"})
 
     def test_unknown_tool_pass_through(self):
         args = {"x": 1}
