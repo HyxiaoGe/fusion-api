@@ -6,6 +6,7 @@ spec §4.2。stream_round 把 litellm streaming response 消费成
 个 chunk 检查锁所有权（被踢则提前返回 finish_reason="cancelled"）。
 """
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Optional
@@ -29,6 +30,22 @@ _LLM_RETRYABLE_KEYWORDS = ("429", "rate", "503", "502", "timeout")
 
 _OPEN_THINK_TAG_RE = re.compile(r"<think\b[^>]*>", re.IGNORECASE)
 _CLOSE_THINK_TAG_RE = re.compile(r"</think\s*>", re.IGNORECASE)
+
+_DSML_TOOL_CALLS_OPEN = "<｜｜DSML｜｜tool_calls>"
+_DSML_TOOL_CALLS_CLOSE = "</｜｜DSML｜｜tool_calls>"
+_DSML_DISTINCT_PREFIX = "<｜｜DSML"
+_DSML_INVOKE_RE = re.compile(
+    r'<｜｜DSML｜｜invoke\s+name="(?P<name>[A-Za-z0-9_.:-]+)">'
+    r"(?P<body>.*?)"
+    r"</｜｜DSML｜｜invoke>",
+    re.DOTALL,
+)
+_DSML_PARAMETER_RE = re.compile(
+    r'<｜｜DSML｜｜parameter\s+name="(?P<name>[^"]+)"\s+string="(?P<is_string>true|false)">'
+    r"(?P<value>.*?)"
+    r"</｜｜DSML｜｜parameter>",
+    re.DOTALL | re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -147,12 +164,86 @@ def strip_reasoning_tag_blocks(text: str) -> str:
     return "".join(output)
 
 
+def strip_pending_dsml_tool_protocol(text: str) -> str:
+    """隐藏 DSML 工具协议及末尾尚未收全的跨 chunk 前缀。"""
+    marker_index = text.find(_DSML_TOOL_CALLS_OPEN)
+    if marker_index >= 0:
+        return text[:marker_index]
+
+    pending_start = _pending_dsml_tool_protocol_start(text)
+    return text if pending_start is None else text[:pending_start]
+
+
+def _pending_dsml_tool_protocol_start(text: str) -> int | None:
+    max_prefix_length = min(len(text), len(_DSML_TOOL_CALLS_OPEN) - 1)
+    for prefix_length in range(max_prefix_length, 0, -1):
+        if text.endswith(_DSML_TOOL_CALLS_OPEN[:prefix_length]):
+            return len(text) - prefix_length
+    return None
+
+
+def _decode_dsml_parameter(value: str, *, is_string: bool):
+    if is_string:
+        return value
+    try:
+        return json.loads(value.strip())
+    except (json.JSONDecodeError, TypeError):
+        return value.strip()
+
+
+def parse_dsml_tool_calls(text: str, *, id_prefix: str) -> list[dict]:
+    """把兼容模型误写进正文通道的 DSML 工具协议还原为标准 tool_calls。"""
+    candidate = strip_reasoning_tag_blocks(text).lstrip()
+    if not candidate.startswith(_DSML_TOOL_CALLS_OPEN):
+        return []
+
+    close_index = candidate.find(_DSML_TOOL_CALLS_CLOSE, len(_DSML_TOOL_CALLS_OPEN))
+    if close_index < 0:
+        return []
+    protocol_end = close_index + len(_DSML_TOOL_CALLS_CLOSE)
+    if candidate[protocol_end:].strip():
+        return []
+    protocol_body = candidate[len(_DSML_TOOL_CALLS_OPEN) : close_index]
+    calls: list[dict] = []
+    invoke_cursor = 0
+    for call_index, invoke_match in enumerate(_DSML_INVOKE_RE.finditer(protocol_body), 1):
+        if protocol_body[invoke_cursor : invoke_match.start()].strip():
+            return []
+        arguments = {}
+        parameter_cursor = 0
+        for parameter_match in _DSML_PARAMETER_RE.finditer(invoke_match.group("body")):
+            if invoke_match.group("body")[parameter_cursor : parameter_match.start()].strip():
+                return []
+            parameter_name = parameter_match.group("name")
+            if parameter_name in arguments:
+                return []
+            arguments[parameter_name] = _decode_dsml_parameter(
+                parameter_match.group("value"),
+                is_string=parameter_match.group("is_string").lower() == "true",
+            )
+            parameter_cursor = parameter_match.end()
+        if invoke_match.group("body")[parameter_cursor:].strip():
+            return []
+        calls.append(
+            {
+                "id": f"dsml-{id_prefix}-{call_index}",
+                "name": invoke_match.group("name"),
+                "arguments": json.dumps(arguments, ensure_ascii=False),
+            }
+        )
+        invoke_cursor = invoke_match.end()
+    if protocol_body[invoke_cursor:].strip():
+        return []
+    return calls
+
+
 def filter_reasoning_tag_content_delta(state: LLMStreamState, content_delta: str) -> str:
     """基于完整原始正文重算可见正文，避免跨 chunk 的 <think> 前缀先泄漏。"""
     if not content_delta:
         return ""
     state.raw_content_buf += content_delta
     visible_content = strip_reasoning_tag_blocks(state.raw_content_buf)
+    visible_content = strip_pending_dsml_tool_protocol(visible_content)
     if visible_content.startswith(state.content_buf):
         return visible_content[len(state.content_buf) :]
 
@@ -267,10 +358,45 @@ async def consume_stream_round(response, request: LLMStreamRequest) -> LLMStream
         if not should_continue:
             break
 
+    visible_content = strip_reasoning_tag_blocks(state.raw_content_buf)
+    marker_index = visible_content.find(_DSML_TOOL_CALLS_OPEN)
+    pending_start = _pending_dsml_tool_protocol_start(visible_content) if marker_index < 0 else None
+    has_malformed_protocol = marker_index >= 0
+    if marker_index < 0 and pending_start is not None:
+        pending_candidate = visible_content[pending_start:]
+        has_malformed_protocol = pending_candidate.startswith(_DSML_DISTINCT_PREFIX)
+        if not has_malformed_protocol:
+            pending_delta = visible_content[len(state.content_buf) :]
+            await append_reasoning_and_content(
+                request=request,
+                state=state,
+                reasoning_delta="",
+                content_delta=pending_delta,
+            )
+
+    tool_calls = build_tool_calls_list(state.tool_calls_acc)
+    if not tool_calls:
+        raw_id_prefix = request.step_id or request.task_id
+        id_prefix = re.sub(r"[^A-Za-z0-9_-]+", "-", raw_id_prefix).strip("-") or "round"
+        tool_calls = parse_dsml_tool_calls(state.raw_content_buf, id_prefix=id_prefix)
+        if tool_calls:
+            logger.warning(
+                "检测到正文通道中的 DSML 工具协议，已转换为标准工具调用: "
+                f"conv_id={request.conversation_id} step_id={request.step_id} calls={len(tool_calls)}"
+            )
+            state.finish_reason = "tool_calls"
+            has_malformed_protocol = False
+        elif has_malformed_protocol:
+            logger.warning(
+                "检测到无法完整解析的 DSML 工具协议，已拒绝写入与执行: "
+                f"conv_id={request.conversation_id} step_id={request.step_id}"
+            )
+            state.finish_reason = "tool_protocol_error"
+
     return LLMStreamOutcome(
         reasoning_buf=state.reasoning_buf,
         content_buf=state.content_buf,
-        tool_calls=build_tool_calls_list(state.tool_calls_acc),
+        tool_calls=tool_calls,
         finish_reason=state.finish_reason,
         usage_data=state.usage_data,
     )

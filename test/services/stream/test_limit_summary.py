@@ -121,6 +121,216 @@ class LimitSummaryHelpersTests(unittest.TestCase):
 
 
 class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
+    async def test_no_progress_summary_removes_conflicting_tool_usage_contract_before_call(self):
+        sent_messages = []
+
+        async def start_step_fn(**_kwargs):
+            return AgentStepContext(
+                step_id="step-summary",
+                step_number=3,
+                started_at=100.0,
+                thinking_block_id="blk-thinking",
+                text_block_id="blk-text",
+            )
+
+        async def prepare_context_fn(**kwargs):
+            return ContextPlan(
+                messages=list(kwargs["messages"]),
+                status="no_op",
+                context_window_tokens=1000,
+                context_window_source="test",
+                context_window_status="known",
+                estimated_tokens_before=100,
+                estimated_tokens_after=100,
+            )
+
+        async def llm_call_fn(_model, _kwargs, messages, **_call_kwargs):
+            sent_messages.extend(messages)
+            return "response"
+
+        request = LimitSummaryStepRequest(
+            conversation_id="conv-1",
+            task_id="task-1",
+            run_id="run-1",
+            step_number=3,
+            model_id="deepseek-chat",
+            provider="deepseek",
+            litellm_model="deepseek/deepseek-v4-flash",
+            litellm_kwargs={},
+            messages=[
+                {
+                    "role": "system",
+                    "content": "【工具调用一致性规则】需要联网时必须调用 web_search。",
+                },
+                {"role": "user", "content": "北京周末天气如何？"},
+            ],
+            should_use_reasoning=True,
+            content_blocks=[],
+            call_kwargs={"tools": [{"function": {"name": "web_search"}}], "tool_choice": "auto"},
+            accumulated_usage=Usage(input_tokens=0, output_tokens=0),
+            emitter=AsyncMock(),
+            session_cache=object(),
+            total_timeout_s=300,
+            run_start=100.0,
+            start_step_fn=start_step_fn,
+            complete_step_fn=AsyncMock(),
+            llm_call_fn=llm_call_fn,
+            stream_round_fn=AsyncMock(return_value=("", "最终答复", [], "stop", None)),
+            log_round_summary_fn=lambda **_kwargs: None,
+            clock=lambda: 120.0,
+            summary_finish_reason="no_progress_summary",
+        )
+
+        with patch("app.services.stream.limit_summary.prepare_context", new=prepare_context_fn):
+            await run_limit_summary_step(request=request)
+
+        system_text = "\n".join(
+            str(message.get("content", "")) for message in sent_messages if message.get("role") == "system"
+        )
+        self.assertNotIn("【工具调用一致性规则】", system_text)
+        self.assertIn("现有搜索已不再产生新的有效信息", system_text)
+
+    async def test_no_progress_summary_retries_once_when_model_returns_tool_protocol(self):
+        content_blocks = []
+        warnings = []
+
+        async def start_step_fn(**_kwargs):
+            return AgentStepContext(
+                step_id="step-summary",
+                step_number=3,
+                started_at=100.0,
+                thinking_block_id="blk-thinking",
+                text_block_id="blk-text",
+            )
+
+        async def prepare_context_fn(**kwargs):
+            return ContextPlan(
+                messages=list(kwargs["messages"]),
+                status="no_op",
+                context_window_tokens=1000,
+                context_window_source="test",
+                context_window_status="known",
+                estimated_tokens_before=100,
+                estimated_tokens_after=100,
+            )
+
+        stream_round_fn = AsyncMock(
+            side_effect=[
+                (
+                    "内部工具规划",
+                    "",
+                    [{"id": "dsml-step-summary-1", "name": "web_search", "arguments": "{}"}],
+                    "tool_calls",
+                    Usage(input_tokens=5, output_tokens=7),
+                ),
+                ("", "最终答复", [], "stop", Usage(input_tokens=3, output_tokens=4)),
+            ]
+        )
+        llm_call_fn = AsyncMock(side_effect=["response-1", "response-2"])
+        request = LimitSummaryStepRequest(
+            conversation_id="conv-1",
+            task_id="task-1",
+            run_id="run-1",
+            step_number=3,
+            model_id="deepseek-chat",
+            provider="deepseek",
+            litellm_model="deepseek/deepseek-v4-flash",
+            litellm_kwargs={},
+            messages=[{"role": "user", "content": "北京周末天气如何？"}],
+            should_use_reasoning=True,
+            content_blocks=content_blocks,
+            call_kwargs={"tools": [{"function": {"name": "web_search"}}], "tool_choice": "auto"},
+            accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+            emitter=AsyncMock(),
+            session_cache=object(),
+            total_timeout_s=300,
+            run_start=100.0,
+            start_step_fn=start_step_fn,
+            complete_step_fn=AsyncMock(),
+            llm_call_fn=llm_call_fn,
+            stream_round_fn=stream_round_fn,
+            log_round_summary_fn=lambda **_kwargs: None,
+            warning_fn=warnings.append,
+            clock=lambda: 120.0,
+            summary_finish_reason="no_progress_summary",
+        )
+
+        with patch("app.services.stream.limit_summary.prepare_context", new=prepare_context_fn):
+            outcome = await run_limit_summary_step(request=request)
+
+        self.assertEqual(llm_call_fn.await_count, 2)
+        self.assertEqual(outcome.accumulated_usage, Usage(input_tokens=10, output_tokens=14))
+        self.assertEqual([block.type for block in content_blocks], ["text"])
+        self.assertEqual(content_blocks[0].text, "最终答复")
+        self.assertNotIn("内部工具规划", content_blocks[0].text)
+        self.assertTrue(any("工具协议" in warning for warning in warnings))
+        self.assertTrue(any("不要输出任何工具调用" in str(message.get("content", "")) for message in request.messages))
+
+    async def test_no_progress_summary_uses_safe_fallback_after_repeated_tool_protocol(self):
+        content_blocks = []
+
+        async def start_step_fn(**_kwargs):
+            return AgentStepContext(
+                step_id="step-summary",
+                step_number=3,
+                started_at=100.0,
+                thinking_block_id="blk-thinking",
+                text_block_id="blk-text",
+            )
+
+        async def prepare_context_fn(**kwargs):
+            return ContextPlan(
+                messages=list(kwargs["messages"]),
+                status="no_op",
+                context_window_tokens=1000,
+                context_window_source="test",
+                context_window_status="known",
+                estimated_tokens_before=100,
+                estimated_tokens_after=100,
+            )
+
+        tool_protocol_result = (
+            "内部工具规划",
+            "",
+            [{"id": "dsml-step-summary-1", "name": "web_search", "arguments": "{}"}],
+            "tool_calls",
+            None,
+        )
+        request = LimitSummaryStepRequest(
+            conversation_id="conv-1",
+            task_id="task-1",
+            run_id="run-1",
+            step_number=3,
+            model_id="deepseek-chat",
+            provider="deepseek",
+            litellm_model="deepseek/deepseek-v4-flash",
+            litellm_kwargs={},
+            messages=[{"role": "user", "content": "北京周末天气如何？"}],
+            should_use_reasoning=True,
+            content_blocks=content_blocks,
+            call_kwargs={"tools": [{"function": {"name": "web_search"}}], "tool_choice": "auto"},
+            accumulated_usage=Usage(input_tokens=0, output_tokens=0),
+            emitter=AsyncMock(),
+            session_cache=object(),
+            total_timeout_s=300,
+            run_start=100.0,
+            start_step_fn=start_step_fn,
+            complete_step_fn=AsyncMock(),
+            llm_call_fn=AsyncMock(side_effect=["response-1", "response-2"]),
+            stream_round_fn=AsyncMock(side_effect=[tool_protocol_result, tool_protocol_result]),
+            log_round_summary_fn=lambda **_kwargs: None,
+            clock=lambda: 120.0,
+            summary_finish_reason="no_progress_summary",
+        )
+
+        with patch("app.services.stream.limit_summary.prepare_context", new=prepare_context_fn):
+            await run_limit_summary_step(request=request)
+
+        self.assertEqual([block.type for block in content_blocks], ["text"])
+        self.assertIn("未能生成可靠的最终答复", content_blocks[0].text)
+        self.assertNotIn("内部工具规划", content_blocks[0].text)
+        self.assertNotIn("DSML", content_blocks[0].text)
+
     async def test_limit_summary_replaces_previous_round_context_with_final_summary_round(self):
         emitter = AsyncMock()
         context_updates = []
