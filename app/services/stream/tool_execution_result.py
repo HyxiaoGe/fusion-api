@@ -31,11 +31,13 @@ class ToolExecutionRecord:
         """返回 LLM tool_call 中声明的工具名，保持 step 统计语义不变。"""
         return str(self.tool_call.get("name", ""))
 
-    def format_llm_context(self) -> str:
+    def format_llm_context(self, *, citation_numbers: list[int] | None = None) -> str:
         """格式化注入下一轮 LLM 的工具上下文。"""
         if self.handler is None:
             return TOOL_RESULT_UNAVAILABLE_CONTEXT
-        return self.handler.format_llm_context(self.result)
+        if citation_numbers is None or not getattr(self.handler, "supports_run_level_citations", False):
+            return self.handler.format_llm_context(self.result)
+        return self.handler.format_llm_context(self.result, citation_numbers=citation_numbers)
 
     def build_content_block(self) -> ContentBlock | None:
         """构造可落库的工具结果 content block。"""

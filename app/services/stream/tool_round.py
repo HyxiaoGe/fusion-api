@@ -15,7 +15,7 @@ from app.services.source_candidate_ranker import (
     SearchResultForRanking,
     SourceSelectionPlan,
 )
-from app.services.source_evidence_ledger import build_selected_source_evidence_item
+from app.services.source_evidence_ledger import build_selected_source_evidence_item, canonicalize_evidence_url
 from app.services.stream.step_lifecycle import AgentStepContext, mark_tool_round_started
 from app.services.stream.tool_execution_result import ToolExecutionRecord
 from app.services.stream_state_service import StreamWriteTerminalError
@@ -190,6 +190,7 @@ def append_tool_round_messages_with_plan(
         results,
         source_plan=source_plan,
     )
+    citation_registry = _build_search_citation_registry(request.content_blocks)
     records_by_id = {str(record.tool_call.get("id", "")): record for record in results}
     missing_result_ids = {str(tool_call.get("id", "")) for tool_call in missing_result_tool_calls or []}
     not_executed_ids = {str(tool_call.get("id", "")) for tool_call in not_executed_tool_calls or []}
@@ -198,7 +199,8 @@ def append_tool_round_messages_with_plan(
         tool_call_id = str(tool_call.get("id", ""))
         record = records_by_id.get(tool_call_id)
         if record is not None:
-            tool_context = record.format_llm_context()
+            citation_numbers = _assign_search_citation_numbers(citation_registry, record)
+            tool_context = record.format_llm_context(citation_numbers=citation_numbers)
             source_selection_guidance = source_selection_guidance_by_tool_call_id.get(tool_call_id)
             if source_selection_guidance:
                 tool_context = f"{tool_context}\n\n{source_selection_guidance}"
@@ -232,6 +234,65 @@ def append_tool_round_messages_with_plan(
                     "content": _format_not_executed_tool_context(),
                 }
             )
+
+
+def _build_search_citation_registry(content_blocks: list[Any]) -> dict[str, int]:
+    search_blocks = [block for block in content_blocks if _value(block, "type") == "search"]
+    use_source_refs = any(_value(block, "source_refs") for block in search_blocks)
+    registry: dict[str, int] = {}
+
+    for block in search_blocks:
+        sources = (_value(block, "source_refs") or []) if use_source_refs else (_value(block, "sources") or [])
+        for source in sources:
+            if use_source_refs:
+                if _value(source, "kind") not in {None, "", "search"}:
+                    continue
+                if _value(source, "status") not in {None, "", "success"}:
+                    continue
+            key = _citation_source_key(source)
+            if key and key not in registry:
+                registry[key] = len(registry) + 1
+    return registry
+
+
+def _assign_search_citation_numbers(
+    registry: dict[str, int],
+    record: ToolExecutionRecord,
+) -> list[int] | None:
+    if record.tool_name != "web_search":
+        return None
+    result_data = _value(record.result, "data") or {}
+    sources = _value(result_data, "sources") or []
+    if not sources:
+        return None
+
+    numbers: list[int] = []
+    next_number = max(registry.values(), default=0) + 1
+    for source_index, source in enumerate(sources, 1):
+        key = _citation_source_key(source) or f"{record.tool_call.get('id', '')}:{source_index}"
+        citation_number = registry.get(key)
+        if citation_number is None:
+            citation_number = next_number
+            next_number += 1
+            registry[key] = citation_number
+        numbers.append(citation_number)
+    return numbers
+
+
+def _citation_source_key(source: Any) -> str:
+    raw_url = str(_value(source, "url") or "").strip()
+    canonical_url = canonicalize_evidence_url(raw_url)
+    if canonical_url:
+        return canonical_url
+    if raw_url:
+        return raw_url
+    return str(_value(source, "title") or "").strip()
+
+
+def _value(value: Any, key: str) -> Any:
+    if isinstance(value, dict):
+        return value.get(key)
+    return getattr(value, key, None)
 
 
 async def complete_tool_round_step(

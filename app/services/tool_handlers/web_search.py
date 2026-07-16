@@ -44,6 +44,8 @@ TRACKING_QUERY_PARAMS = {
 
 
 class WebSearchHandler(BaseToolHandler):
+    supports_run_level_citations = True
+
     @property
     def tool_name(self) -> str:
         return "web_search"
@@ -203,7 +205,12 @@ class WebSearchHandler(BaseToolHandler):
             budget_limited=bool(result.data.get("budget_limited", False)),
         )
 
-    def format_llm_context(self, result: ToolResult) -> str:
+    def format_llm_context(
+        self,
+        result: ToolResult,
+        *,
+        citation_numbers: list[int] | None = None,
+    ) -> str:
         if result.data.get("read_alternatives_available"):
             query = result.data.get("query", "")
             unread_count = result.data.get("unread_candidate_count", 0)
@@ -244,14 +251,15 @@ class WebSearchHandler(BaseToolHandler):
         if len(sources) > len(context_sources):
             parts.append(f"搜索返回 {len(sources)} 条结果，仅前 {len(context_sources)} 条注入上下文。\n")
 
-        for i, source in enumerate(context_sources, 1):
-            parts.append(f"[{i}] {source.title}")
+        for source_index, source in enumerate(context_sources):
+            citation_number = _citation_number(citation_numbers, source_index)
+            parts.append(f"[{citation_number}] {source.title}")
             parts.append(f"    来源: {source.url}")
             content = source.content or source.description
             parts.append(
                 format_untrusted_source_context(
                     UntrustedSourceContext(
-                        source_id=f"S{i}",
+                        source_id=f"S{citation_number}",
                         source_type="search",
                         title=source.title,
                         url=source.url,
@@ -327,6 +335,14 @@ def _normalize_context_source_limit(value) -> int:
     except (TypeError, ValueError):
         parsed = max_context_sources
     return max(1, min(max_context_sources, parsed))
+
+
+def _citation_number(citation_numbers: list[int] | None, source_index: int) -> int:
+    if citation_numbers is not None and source_index < len(citation_numbers):
+        candidate = citation_numbers[source_index]
+        if isinstance(candidate, int) and candidate > 0:
+            return candidate
+    return source_index + 1
 
 
 def _post_process_sources(sources: List[SearchSource], intent: Optional[str], domains: list[str]) -> List[SearchSource]:

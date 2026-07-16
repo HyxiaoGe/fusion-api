@@ -71,6 +71,8 @@ def _task_done_callback(task: asyncio.Task):
 class BaseToolHandler(ABC):
     """所有 tool handler 的抽象基类"""
 
+    supports_run_level_citations = False
+
     @property
     @abstractmethod
     def tool_name(self) -> str:
@@ -90,7 +92,12 @@ class BaseToolHandler(ABC):
         """构造落库用的 content block"""
 
     @abstractmethod
-    def format_llm_context(self, result: ToolResult) -> str:
+    def format_llm_context(
+        self,
+        result: ToolResult,
+        *,
+        citation_numbers: list[int] | None = None,
+    ) -> str:
         """格式化注入第二轮 LLM 的上下文文本"""
 
     # ---- 共享能力 ----

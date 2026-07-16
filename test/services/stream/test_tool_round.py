@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import AsyncMock, Mock
 
-from app.schemas.chat import SearchSource, TextBlock
+from app.schemas.chat import SearchBlock, SearchSource, SearchSourceSummary, SourceReference, TextBlock
 from app.services.source_evidence_ledger import stable_web_evidence_id
 from app.services.stream import tool_round as tool_round_module
 from app.services.stream.step_lifecycle import AgentStepContext
@@ -628,6 +628,88 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("未建议深读原因", messages[3]["content"])
         self.assertIn("必须先读取至少 1 个建议优先深读来源", messages[3]["content"])
         self.assertIn("回答当前事实结论前", messages[3]["content"])
+
+    def test_append_tool_round_messages_keeps_citations_unique_across_search_rounds(self):
+        from app.services.tool_handlers.web_search import WebSearchHandler
+
+        previous_refs = [
+            SourceReference(kind="search", title=f"第一轮来源 {index}", url=f"https://first.example.com/{index}")
+            for index in range(1, 6)
+        ]
+        previous_block = SearchBlock(
+            type="search",
+            id="blk-previous",
+            query="第一轮搜索",
+            sources=[SearchSourceSummary(title=ref.title, url=ref.url) for ref in previous_refs],
+            source_refs=previous_refs,
+            source_count=len(previous_refs),
+        )
+        tool_call = {"id": "tc-search-next", "name": "web_search", "arguments": '{"query":"第二轮搜索"}'}
+        record = ToolExecutionRecord(
+            tool_call=tool_call,
+            result=ToolResult(
+                status="success",
+                data={
+                    "query": "第二轮搜索",
+                    "sources": [
+                        SearchSource(
+                            title="第一轮重复来源",
+                            url="https://first.example.com/2",
+                            description="重复来源应复用原编号",
+                        ),
+                        SearchSource(
+                            title="第二轮新增来源",
+                            url="https://second.example.com/new",
+                            description="新增来源应继续编号",
+                        ),
+                    ],
+                },
+            ),
+            handler=WebSearchHandler(),
+            block_id="blk-next",
+            log_id="log-next",
+        )
+        messages = [{"role": "user", "content": "请继续搜索"}]
+        content_blocks = [previous_block]
+
+        tool_round_module.append_tool_round_messages(
+            tool_round_module.ToolRoundRequest(
+                db="db",
+                assistant_message_id="msg-1",
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="gpt-4",
+                provider="openai",
+                content_blocks=content_blocks,
+                messages=messages,
+                tool_calls=[tool_call],
+                reasoning_buf="",
+                should_use_reasoning=True,
+                step_context=AgentStepContext(
+                    step_id="step-2",
+                    run_id="run-1",
+                    step_number=2,
+                    started_at=10.0,
+                    thinking_block_id="blk-thinking",
+                    text_block_id="blk-text",
+                ),
+                step_number=2,
+                run_id="run-1",
+                emitter=object(),
+                session_cache=object(),
+                network_budget=object(),
+                call_kwargs={},
+                persist_message_fn=Mock(),
+                execute_tools_fn=Mock(),
+                complete_step_fn=Mock(),
+            ),
+            [record],
+        )
+
+        context = messages[-1]["content"]
+        self.assertIn("[2] 第一轮重复来源", context)
+        self.assertIn("[6] 第二轮新增来源", context)
+        self.assertNotIn("[1] 第一轮重复来源", context)
 
     def test_build_search_read_decision_ledger_summarizes_budget_and_read_decisions(self):
         from app.services.search_read_decision_ledger import build_search_read_decision_ledger

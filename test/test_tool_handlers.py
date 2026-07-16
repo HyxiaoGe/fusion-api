@@ -269,6 +269,22 @@ class WebSearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("[9] R8", context)
         self.assertIn("仅前 8 条", context)
 
+    def test_format_llm_context_uses_run_level_citation_numbers(self):
+        from app.schemas.chat import SearchSource
+
+        sources = [
+            SearchSource(title="北京官方天气", url="https://weather.example.com/beijing", description="北京天气"),
+            SearchSource(title="北京徒步提醒", url="https://travel.example.com/hiking", description="徒步提醒"),
+        ]
+        result = ToolResult(status="success", data={"sources": sources, "result_count": 2})
+
+        context = self.handler.format_llm_context(result, citation_numbers=[6, 7])
+
+        self.assertIn("[6] 北京官方天气", context)
+        self.assertIn('source_id="S6"', context)
+        self.assertIn("[7] 北京徒步提醒", context)
+        self.assertNotIn("[1] 北京官方天气", context)
+
     def test_format_llm_context_uses_configured_default_context_source_limit(self):
         from app.schemas.chat import SearchSource
         from app.services.tool_handlers import web_search as web_search_module

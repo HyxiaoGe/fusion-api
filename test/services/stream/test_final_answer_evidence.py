@@ -37,9 +37,10 @@ class FinalAnswerEvidenceTests(unittest.TestCase):
             answer_text="答案引用官方公告。[1]",
         )
 
-        self.assertEqual([item["id"] for item in used], [
-            stable_web_evidence_id("https://openai.com/news/product", fallback="unused")
-        ])
+        self.assertEqual(
+            [item["id"] for item in used],
+            [stable_web_evidence_id("https://openai.com/news/product", fallback="unused")],
+        )
         self.assertEqual(used[0]["status"], "used")
         self.assertTrue(used[0]["used_by_final_answer"])
 
@@ -57,6 +58,21 @@ class FinalAnswerEvidenceTests(unittest.TestCase):
         )
 
         self.assertEqual([item["url"] for item in used], ["https://example.com/media"])
+
+    def test_maps_run_level_citation_to_later_search_block(self):
+        from app.services.final_answer_evidence import build_used_final_answer_evidence
+
+        first_refs = [search_ref(f"第一轮来源 {index}", f"https://first.example.com/{index}") for index in range(1, 6)]
+        second_refs = [
+            search_ref(f"第二轮来源 {index}", f"https://second.example.com/{index}") for index in range(1, 6)
+        ]
+
+        used = build_used_final_answer_evidence(
+            content_blocks=[search_block(first_refs), search_block(second_refs)],
+            answer_text="北京周末天气以第二轮第 4 条为准。[9]",
+        )
+
+        self.assertEqual([item["url"] for item in used], ["https://second.example.com/4"])
 
     def test_marks_exact_url_mention_as_used(self):
         from app.services.final_answer_evidence import build_used_final_answer_evidence

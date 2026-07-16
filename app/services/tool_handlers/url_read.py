@@ -182,7 +182,12 @@ class UrlReadHandler(BaseToolHandler):
             reason=result.data.get("reason"),
         )
 
-    def format_llm_context(self, result: ToolResult) -> str:
+    def format_llm_context(
+        self,
+        result: ToolResult,
+        *,
+        citation_numbers: list[int] | None = None,
+    ) -> str:
         url = result.data.get("url", "")
         title = result.data.get("title", "")
         content = result.data.get("content", "")
