@@ -1,12 +1,22 @@
 import unittest
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from app.ai.prompts.agent_loop import build_current_date_system_prompt
 from app.schemas.chat import FileBlock, Message, TextBlock
 from app.services.chat.message_builder import build_llm_messages
 
 
 class MessageBuilderTests(unittest.IsolatedAsyncioTestCase):
+    def test_current_date_prompt_includes_relative_date_anchors(self):
+        prompt = build_current_date_system_prompt(datetime(2026, 7, 16, 9, 0, tzinfo=timezone(timedelta(hours=8))))
+
+        self.assertIn("明天是 2026年7月17日（星期五）", prompt)
+        self.assertIn("本周六是 2026年7月18日（星期六）", prompt)
+        self.assertIn("本周日是 2026年7月19日（星期日）", prompt)
+        self.assertIn("搜索词与最终答案中的日期、星期必须一致", prompt)
+
     async def test_build_llm_messages_injects_fusion_identity_after_user_preferences(self):
         messages = [
             Message(

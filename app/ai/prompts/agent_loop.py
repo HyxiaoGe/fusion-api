@@ -17,16 +17,35 @@ def build_current_date_system_prompt(now: datetime | None = None) -> str:
     """为 LLM 注入当前真实日期，避免模型凭训练 cutoff 猜年份。"""
     current = now or datetime.now(CHINA_TZ)
     weekday_cn = ["一", "二", "三", "四", "五", "六", "日"][current.weekday()]
+    tomorrow = current.date() + timedelta(days=1)
+    week_start = current.date() - timedelta(days=current.weekday())
+    this_saturday = week_start + timedelta(days=5)
+    this_sunday = week_start + timedelta(days=6)
+    next_saturday = this_saturday + timedelta(days=7)
+    next_sunday = this_sunday + timedelta(days=7)
     forbidden_years = ", ".join(str(y) for y in range(current.year - 3, current.year))
     return (
         f"【当前真实日期】{current.year}年{current.month}月{current.day}日（星期{weekday_cn}），"
         f"北京时间 {current.strftime('%H:%M')}。\n\n"
+        f"【相对日期锚点】\n"
+        f"- 明天是 {_format_date_with_weekday(tomorrow)}。\n"
+        f"- 本周六是 {_format_date_with_weekday(this_saturday)}，"
+        f"本周日是 {_format_date_with_weekday(this_sunday)}。\n"
+        f"- 下周六是 {_format_date_with_weekday(next_saturday)}，"
+        f"下周日是 {_format_date_with_weekday(next_sunday)}。\n\n"
         f"硬性规则：\n"
         f"1. 涉及『最新』『当前』『目前』等时效性问题，必须基于上述日期作答。\n"
         f"2. **生成搜索关键词时，年份必须使用 {current.year} 或更晚，"
         f"严禁使用 {forbidden_years} 等过去年份**。\n"
-        f"3. 不要相信训练数据中的『当前年份』印象——你的训练 cutoff 早于现在。"
+        f"3. 不要相信训练数据中的『当前年份』印象——你的训练 cutoff 早于现在。\n"
+        f"4. 用户使用『今天』『明天』『本周末』『下周末』等相对日期时，"
+        f"必须先按上述锚点换算；搜索词与最终答案中的日期、星期必须一致。"
     )
+
+
+def _format_date_with_weekday(value) -> str:
+    weekday_cn = ["一", "二", "三", "四", "五", "六", "日"][value.weekday()]
+    return f"{value.year}年{value.month}月{value.day}日（星期{weekday_cn}）"
 
 
 APP_IDENTITY_PROMPT = (
