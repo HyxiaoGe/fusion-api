@@ -67,6 +67,8 @@ def build_policy(**overrides):
         "allowed_credential_refs": frozenset({"DASHSCOPE_API_KEY"}),
         "connect_timeout_seconds": 1.0,
         "call_timeout_seconds": 2.0,
+        "idempotent_max_attempts": 2,
+        "retry_backoff_seconds": 0,
         "max_discovery_pages": 2,
         "max_discovered_tools": 3,
         "max_tool_description_chars": 100,
@@ -92,6 +94,161 @@ def build_config(**overrides):
 
 
 class McpClientManagerTests(unittest.TestCase):
+    def test_idempotent_discovery_retries_once_after_nested_transient_timeout(self):
+        request = httpx.Request("POST", "https://dashscope.aliyuncs.com/api/v1/mcps/WebSearch/mcp")
+        wrapped_timeout = RuntimeError("sdk transport failed")
+        wrapped_timeout.__cause__ = httpx.ConnectTimeout("connect timeout", request=request)
+
+        class FlakyDiscoverySession(FakeSession):
+            def __init__(self):
+                super().__init__(
+                    tools=[SimpleNamespace(name="search", description="搜索", inputSchema={"type": "object"})]
+                )
+                self.list_attempts = 0
+
+            async def list_tools(self, cursor=None):
+                self.list_attempts += 1
+                if self.list_attempts == 1:
+                    raise wrapped_timeout
+                return await super().list_tools(cursor)
+
+        session = FlakyDiscoverySession()
+        connector = FakeConnector(session)
+        manager = McpClientManager(
+            policy=build_policy(),
+            connector=connector,
+            environ={"DASHSCOPE_API_KEY": "test-secret"},
+        )
+
+        tools = asyncio.run(manager.list_tools(build_config()))
+
+        self.assertEqual([tool["name"] for tool in tools], ["search"])
+        self.assertEqual(session.list_attempts, 2)
+        self.assertEqual(len(connector.connections), 2)
+
+    def test_idempotent_discovery_retries_once_after_protocol_error(self):
+        class FlakyProtocolSession(FakeSession):
+            def __init__(self):
+                super().__init__(
+                    tools=[SimpleNamespace(name="search", description="搜索", inputSchema={"type": "object"})]
+                )
+                self.list_attempts = 0
+
+            async def list_tools(self, cursor=None):
+                self.list_attempts += 1
+                if self.list_attempts == 1:
+                    raise RuntimeError("transient protocol failure")
+                return await super().list_tools(cursor)
+
+        session = FlakyProtocolSession()
+        connector = FakeConnector(session)
+        manager = McpClientManager(
+            policy=build_policy(),
+            connector=connector,
+            environ={"DASHSCOPE_API_KEY": "test-secret"},
+        )
+
+        tools = asyncio.run(manager.list_tools(build_config()))
+
+        self.assertEqual([tool["name"] for tool in tools], ["search"])
+        self.assertEqual(session.list_attempts, 2)
+        self.assertEqual(len(connector.connections), 2)
+
+    def test_idempotent_discovery_retries_exception_group_remote_protocol_error(self):
+        class FlakyRemoteProtocolSession(FakeSession):
+            def __init__(self):
+                super().__init__(
+                    tools=[SimpleNamespace(name="search", description="搜索", inputSchema={"type": "object"})]
+                )
+                self.list_attempts = 0
+
+            async def list_tools(self, cursor=None):
+                self.list_attempts += 1
+                if self.list_attempts == 1:
+                    raise ExceptionGroup("task group cleanup", [httpx.RemoteProtocolError("peer closed")])
+                return await super().list_tools(cursor)
+
+        session = FlakyRemoteProtocolSession()
+        connector = FakeConnector(session)
+        manager = McpClientManager(
+            policy=build_policy(),
+            connector=connector,
+            environ={"DASHSCOPE_API_KEY": "test-secret"},
+        )
+
+        tools = asyncio.run(manager.list_tools(build_config()))
+
+        self.assertEqual([tool["name"] for tool in tools], ["search"])
+        self.assertEqual(session.list_attempts, 2)
+        self.assertEqual(len(connector.connections), 2)
+
+    def test_idempotent_discovery_stops_after_second_transient_failure(self):
+        class AlwaysFailingDiscoverySession(FakeSession):
+            def __init__(self):
+                super().__init__()
+                self.list_attempts = 0
+
+            async def list_tools(self, cursor=None):
+                self.list_attempts += 1
+                raise RuntimeError("transient protocol failure")
+
+        session = AlwaysFailingDiscoverySession()
+        connector = FakeConnector(session)
+        manager = McpClientManager(
+            policy=build_policy(),
+            connector=connector,
+            environ={"DASHSCOPE_API_KEY": "test-secret"},
+        )
+
+        with self.assertRaises(McpClientError) as raised:
+            asyncio.run(manager.list_tools(build_config()))
+
+        self.assertEqual(raised.exception.code, "protocol_error")
+        self.assertEqual(raised.exception.safe_message, "MCP 协议交互失败")
+        self.assertEqual(session.list_attempts, 2)
+        self.assertEqual(len(connector.connections), 2)
+
+    def test_tool_execution_never_retries_transient_failure(self):
+        request = httpx.Request("POST", "https://dashscope.aliyuncs.com/api/v1/mcps/WebSearch/mcp")
+
+        class FailingToolSession(FakeSession):
+            def __init__(self):
+                super().__init__()
+                self.call_attempts = 0
+
+            async def call_tool(self, name, arguments, read_timeout_seconds=None):
+                self.call_attempts += 1
+                raise httpx.ReadTimeout("read timeout", request=request)
+
+        session = FailingToolSession()
+        connector = FakeConnector(session)
+        manager = McpClientManager(
+            policy=build_policy(),
+            connector=connector,
+            environ={"DASHSCOPE_API_KEY": "test-secret"},
+        )
+
+        with self.assertRaises(McpClientError) as raised:
+            asyncio.run(manager.call_tool(build_config(allowed_tools=["search"]), "search", {"query": "Fusion"}))
+
+        self.assertEqual(raised.exception.code, "call_timeout")
+        self.assertEqual(session.call_attempts, 1)
+        self.assertEqual(len(connector.connections), 1)
+
+    def test_non_retryable_discovery_error_is_not_retried(self):
+        connector = FakeConnector(FakeSession(tools=[SimpleNamespace(name="bad name", inputSchema={})]))
+        manager = McpClientManager(
+            policy=build_policy(),
+            connector=connector,
+            environ={"DASHSCOPE_API_KEY": "test-secret"},
+        )
+
+        with self.assertRaises(McpClientError) as raised:
+            asyncio.run(manager.list_tools(build_config()))
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+        self.assertEqual(len(connector.connections), 1)
+
     def test_bearer_credential_strips_crlf_before_building_header(self):
         connector = FakeConnector(FakeSession())
         manager = McpClientManager(

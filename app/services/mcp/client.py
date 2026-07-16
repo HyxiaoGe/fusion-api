@@ -28,6 +28,8 @@ _sdk_transport_logger.disabled = True
 
 _TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.:/-]+$")
 _AUTH_NAME_PATTERN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+_IDEMPOTENT_OPERATIONS = frozenset({"initialize", "tools_list"})
+_RETRYABLE_ERROR_CODES = frozenset({"connect_timeout", "call_timeout", "network_error", "protocol_error"})
 _FORBIDDEN_AUTH_HEADERS = {
     "accept",
     "connection",
@@ -51,6 +53,8 @@ class McpClientPolicy:
     allowed_credential_refs: frozenset[str]
     connect_timeout_seconds: float = 5.0
     call_timeout_seconds: float = 15.0
+    idempotent_max_attempts: int = 2
+    retry_backoff_seconds: float = 0.25
     max_discovery_pages: int = 5
     max_discovered_tools: int = 50
     max_tool_description_chars: int = 2_000
@@ -256,40 +260,63 @@ class McpClientManager:
 
     async def _run(self, config: McpConnectionConfig, operation_name: str, operation):
         started_at = time.perf_counter()
-        try:
-            connection = self._resolve_connection(config)
-            async with self.connector.connect(
-                endpoint_url=connection.endpoint_url,
-                headers=connection.headers,
-                query_params=connection.query_params,
-                connect_timeout_seconds=self.policy.connect_timeout_seconds,
-                call_timeout_seconds=self.policy.call_timeout_seconds,
-            ) as session:
-                async with asyncio.timeout(self.policy.connect_timeout_seconds):
-                    await session.initialize()
-                result = await operation(session)
-                logger.info(
-                    "MCP 操作完成 server_id=%s provider=%s operation=%s duration_ms=%s",
+        max_attempts = max(1, self.policy.idempotent_max_attempts) if operation_name in _IDEMPOTENT_OPERATIONS else 1
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                connection = self._resolve_connection(config)
+                async with self.connector.connect(
+                    endpoint_url=connection.endpoint_url,
+                    headers=connection.headers,
+                    query_params=connection.query_params,
+                    connect_timeout_seconds=self.policy.connect_timeout_seconds,
+                    call_timeout_seconds=self.policy.call_timeout_seconds,
+                ) as session:
+                    async with asyncio.timeout(self.policy.connect_timeout_seconds):
+                        await session.initialize()
+                    result = await operation(session)
+                    logger.info(
+                        "MCP 操作完成 server_id=%s provider=%s operation=%s attempt=%s duration_ms=%s",
+                        config.server_id,
+                        config.provider,
+                        operation_name,
+                        attempt,
+                        int((time.perf_counter() - started_at) * 1_000),
+                    )
+                    return result
+            except McpClientError as exc:
+                error = exc
+            except Exception as exc:
+                error = _classify_exception(exc, operation_name)
+
+            if attempt < max_attempts and error.code in _RETRYABLE_ERROR_CODES:
+                logger.warning(
+                    "MCP 操作重试 server_id=%s provider=%s operation=%s attempt=%s/%s error_code=%s",
                     config.server_id,
                     config.provider,
                     operation_name,
-                    int((time.perf_counter() - started_at) * 1_000),
+                    attempt,
+                    max_attempts,
+                    error.code,
                 )
-                return result
-        except McpClientError as exc:
-            error = exc
-        except Exception as exc:
-            error = _classify_exception(exc, operation_name)
+                retry_delay = max(0.0, self.policy.retry_backoff_seconds) * (2 ** (attempt - 1))
+                if retry_delay:
+                    await asyncio.sleep(retry_delay)
+                continue
 
-        logger.warning(
-            "MCP 操作失败 server_id=%s provider=%s operation=%s error_code=%s duration_ms=%s",
-            config.server_id,
-            config.provider,
-            operation_name,
-            error.code,
-            int((time.perf_counter() - started_at) * 1_000),
-        )
-        raise error from None
+            logger.warning(
+                "MCP 操作失败 server_id=%s provider=%s operation=%s attempt=%s/%s error_code=%s duration_ms=%s",
+                config.server_id,
+                config.provider,
+                operation_name,
+                attempt,
+                max_attempts,
+                error.code,
+                int((time.perf_counter() - started_at) * 1_000),
+            )
+            raise error from None
+
+        raise RuntimeError("MCP operation attempt loop exhausted")
 
     async def _list_tools(self, session: McpSession) -> list[dict[str, Any]]:
         tools: list[dict[str, Any]] = []
@@ -433,16 +460,24 @@ def _classify_exception(exc: Exception, operation_name: str) -> McpClientError:
         if operation_name == "initialize":
             return McpClientError("connect_timeout", "连接 MCP 服务超时")
         return McpClientError("call_timeout", "MCP 服务调用超时")
-    if any(isinstance(error, (httpx.NetworkError, httpx.LocalProtocolError)) for error in errors):
+    if any(isinstance(error, (httpx.NetworkError, httpx.ProtocolError)) for error in errors):
         return McpClientError("network_error", "无法连接 MCP 服务")
     return McpClientError("protocol_error", "MCP 协议交互失败")
 
 
-def _iter_exceptions(exc: BaseException):
+def _iter_exceptions(exc: BaseException, seen: set[int] | None = None):
+    seen = set() if seen is None else seen
+    if id(exc) in seen:
+        return
+    seen.add(id(exc))
     yield exc
     if isinstance(exc, BaseExceptionGroup):
         for nested in exc.exceptions:
-            yield from _iter_exceptions(nested)
+            yield from _iter_exceptions(nested, seen)
+    if exc.__cause__ is not None:
+        yield from _iter_exceptions(exc.__cause__, seen)
+    elif exc.__context__ is not None and not exc.__suppress_context__:
+        yield from _iter_exceptions(exc.__context__, seen)
 
 
 def _normalize_json_payload(value: Any) -> Any:
