@@ -5,6 +5,8 @@ from pathlib import Path
 class DeployAuthConfigTests(unittest.TestCase):
     def setUp(self):
         root = Path(__file__).resolve().parents[1]
+        self.app_config = (root / "app" / "core" / "config.py").read_text(encoding="utf-8")
+        self.env_example = (root / ".env.example").read_text(encoding="utf-8")
         self.workflow = (root / ".github" / "workflows" / "deploy.yml").read_text(encoding="utf-8")
         self.ci_requirements = (root / "requirements-ci.txt").read_text(encoding="utf-8")
 
@@ -65,3 +67,42 @@ class DeployAuthConfigTests(unittest.TestCase):
             """printf '%s' "${ACR_PASSWORD}" | docker login""",
             self.workflow,
         )
+
+    def test_deploy_passes_mcp_policy_and_credentials_without_erasing_server_env(self):
+        self.assertIn("DEPLOY_DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}", self.workflow)
+        self.assertIn("DEPLOY_AMAP_MCP_API_KEY: ${{ secrets.AMAP_MCP_API_KEY }}", self.workflow)
+        self.assertIn(
+            'export DASHSCOPE_API_KEY="${DEPLOY_DASHSCOPE_API_KEY:-${DASHSCOPE_API_KEY:-}}"',
+            self.workflow,
+        )
+        self.assertIn(
+            'export AMAP_MCP_API_KEY="${DEPLOY_AMAP_MCP_API_KEY:-${AMAP_MCP_API_KEY:-}}"',
+            self.workflow,
+        )
+        self.assertIn(
+            'export MCP_ALLOWED_HOSTS="${DEPLOY_MCP_ALLOWED_HOSTS:-${MCP_ALLOWED_HOSTS:-learn.microsoft.com,dashscope.aliyuncs.com,mcp.amap.com}}"',
+            self.workflow,
+        )
+        for variable in (
+            "MCP_ALLOWED_HOSTS",
+            "MCP_ALLOWED_CREDENTIAL_REFS",
+            "MCP_CONNECT_TIMEOUT_SECONDS",
+            "MCP_CALL_TIMEOUT_SECONDS",
+            "MCP_ADMIN_OPERATION_TIMEOUT_SECONDS",
+            "MCP_MAX_DISCOVERY_PAGES",
+            "MCP_MAX_DISCOVERED_TOOLS",
+            "MCP_MAX_TOOL_DESCRIPTION_CHARS",
+            "MCP_MAX_TOOL_SCHEMA_BYTES",
+            "MCP_MAX_RESPONSE_BYTES",
+            "DASHSCOPE_API_KEY",
+            "AMAP_MCP_API_KEY",
+        ):
+            self.assertIn(f"- {variable}=${{{variable}", self.workflow)
+        self.assertNotIn("echo ${DASHSCOPE_API_KEY}", self.workflow)
+        self.assertNotIn("echo ${AMAP_MCP_API_KEY}", self.workflow)
+
+    def test_mcp_default_hosts_include_public_no_auth_acceptance_server(self):
+        default_hosts = "learn.microsoft.com,dashscope.aliyuncs.com,mcp.amap.com"
+        self.assertIn(f'"{default_hosts}"', self.app_config)
+        self.assertIn(f"MCP_ALLOWED_HOSTS={default_hosts}", self.env_example)
+        self.assertIn(f"MCP_ALLOWED_HOSTS:-{default_hosts}", self.workflow)

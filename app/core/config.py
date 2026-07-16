@@ -105,6 +105,14 @@ class Settings(BaseSettings):
         base = (self.AUTH_SERVICE_INTERNAL_BASE_URL or self.AUTH_SERVICE_BASE_URL).rstrip("/")
         return f"{base}/auth/userinfo"
 
+    @property
+    def RESOLVED_MCP_ALLOWED_HOSTS(self) -> List[str]:
+        return list(dict.fromkeys(host.strip().lower() for host in self.MCP_ALLOWED_HOSTS.split(",") if host.strip()))
+
+    @property
+    def RESOLVED_MCP_ALLOWED_CREDENTIAL_REFS(self) -> List[str]:
+        return list(dict.fromkeys(ref.strip() for ref in self.MCP_ALLOWED_CREDENTIAL_REFS.split(",") if ref.strip()))
+
     POSTGRES_SERVER: str = os.getenv("POSTGRES_SERVER", "localhost")
     POSTGRES_USER: str = os.getenv("POSTGRES_USER", "postgres")
 
@@ -127,6 +135,24 @@ class Settings(BaseSettings):
     READER_SERVICE_URL: str = os.getenv("READER_SERVICE_URL", "http://reader-service:8091")
     # reader-service 内部默认等待 Jina 10s；调用方保留更长余量，避免冷抓取或文档站读取提前断开。
     READER_SERVICE_TIMEOUT: float = float(os.getenv("READER_SERVICE_TIMEOUT", "20"))
+
+    # 远程 MCP Client：仅允许精确配置的 HTTPS 主机和凭证环境变量引用。
+    MCP_ALLOWED_HOSTS: str = os.getenv(
+        "MCP_ALLOWED_HOSTS",
+        "learn.microsoft.com,dashscope.aliyuncs.com,mcp.amap.com",
+    )
+    MCP_ALLOWED_CREDENTIAL_REFS: str = os.getenv(
+        "MCP_ALLOWED_CREDENTIAL_REFS",
+        "DASHSCOPE_API_KEY,AMAP_MCP_API_KEY",
+    )
+    MCP_CONNECT_TIMEOUT_SECONDS: float = float(os.getenv("MCP_CONNECT_TIMEOUT_SECONDS", "5"))
+    MCP_CALL_TIMEOUT_SECONDS: float = float(os.getenv("MCP_CALL_TIMEOUT_SECONDS", "15"))
+    MCP_ADMIN_OPERATION_TIMEOUT_SECONDS: int = int(os.getenv("MCP_ADMIN_OPERATION_TIMEOUT_SECONDS", "25"))
+    MCP_MAX_DISCOVERY_PAGES: int = int(os.getenv("MCP_MAX_DISCOVERY_PAGES", "5"))
+    MCP_MAX_DISCOVERED_TOOLS: int = int(os.getenv("MCP_MAX_DISCOVERED_TOOLS", "50"))
+    MCP_MAX_TOOL_DESCRIPTION_CHARS: int = int(os.getenv("MCP_MAX_TOOL_DESCRIPTION_CHARS", "2000"))
+    MCP_MAX_TOOL_SCHEMA_BYTES: int = int(os.getenv("MCP_MAX_TOOL_SCHEMA_BYTES", "32768"))
+    MCP_MAX_RESPONSE_BYTES: int = int(os.getenv("MCP_MAX_RESPONSE_BYTES", "262144"))
 
     # PromptHub bundle 后台同步；disabled 不发出请求，聊天热路径始终只读本地 LKG。
     PROMPTHUB_SYNC_MODE: str = os.getenv("PROMPTHUB_SYNC_MODE", "disabled").lower()

@@ -11,11 +11,14 @@ from sqlalchemy.orm import Session
 from app.core.security import get_current_user  # noqa: F401 — re-export
 from app.db.admin_audit_repository import AdminAuditRepository
 from app.db.database import get_db  # noqa: F401 — re-export
+from app.db.mcp_server_repository import McpServerRepository
 from app.db.models import User as UserModel
 from app.db.repositories import UserRepository
 from app.services.admin_audit_service import AdminAuditService
 from app.services.chat_service import ChatService
 from app.services.file_service import FileService
+from app.services.mcp.runtime import get_mcp_client_manager
+from app.services.mcp.server_service import McpServerService
 from app.services.network_diagnostics_service import NetworkDiagnosticsService
 
 
@@ -37,6 +40,10 @@ def get_user_repo(db: Session = Depends(get_db)) -> UserRepository:
 
 def get_admin_audit_service(db: Session = Depends(get_db)) -> AdminAuditService:
     return AdminAuditService(AdminAuditRepository(db))
+
+
+def get_mcp_server_service(db: Session = Depends(get_db)) -> McpServerService:
+    return McpServerService(McpServerRepository(db), get_mcp_client_manager())
 
 
 def get_current_admin_user(

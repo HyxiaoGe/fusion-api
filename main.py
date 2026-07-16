@@ -10,12 +10,13 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.ai import litellm_cleanup, litellm_health
-from app.api import admin, admin_audit, auth, chat, files, models, prompts
+from app.api import admin, admin_audit, admin_mcp, auth, chat, files, models, prompts
 from app.core.config import settings
 from app.core.logger import app_logger
 from app.core.redis import close_redis, get_redis_pool, init_redis
 from app.db.database import SessionLocal
 from app.schemas.response import ApiException, generate_request_id
+from app.services.mcp.runtime import get_mcp_client_manager
 from app.services.scheduler_service import start_scheduler, stop_scheduler
 from app.services.storage import init_storage
 
@@ -36,6 +37,9 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
 
     def _resolve_timeout_seconds(self, request: Request) -> int:
         key = (request.method.upper(), request.scope.get("path", ""))
+        path = key[1]
+        if path.startswith("/api/admin/mcp/servers/") and path.endswith(("/test", "/tools/refresh")):
+            return settings.MCP_ADMIN_OPERATION_TIMEOUT_SECONDS
         return self.route_timeouts.get(key, self.timeout_seconds)
 
     async def dispatch(self, request: Request, call_next):
@@ -74,6 +78,7 @@ async def lifespan(app: FastAPI):
 
     await litellm_health.stop()
     await litellm_cleanup.close_async_clients()
+    await get_mcp_client_manager().close()
     await stop_scheduler()
     await close_redis()
     app_logger.info("应用关闭完成")
@@ -103,7 +108,7 @@ async def add_request_id(request: Request, call_next):
 @app.middleware("http")
 async def prevent_admin_audit_caching(request: Request, call_next):
     response = await call_next(request)
-    if request.url.path.startswith("/api/admin/audit"):
+    if request.url.path.startswith(("/api/admin/audit", "/api/admin/mcp")):
         response.headers["Cache-Control"] = "private, no-store"
         response.headers["Pragma"] = "no-cache"
     return response
@@ -240,6 +245,7 @@ app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(prompts.router, prefix="/api/prompts", tags=["prompts"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 app.include_router(admin_audit.router, prefix="/api/admin/audit", tags=["admin-audit"])
+app.include_router(admin_mcp.router, prefix="/api/admin/mcp", tags=["admin-mcp"])
 
 if __name__ == "__main__":
     import uvicorn

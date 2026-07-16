@@ -6,6 +6,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     ForeignKey,
@@ -16,6 +17,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import relationship
@@ -29,8 +31,11 @@ from app.utils.time import utc_now
 _db_url = os.getenv("DATABASE_URL", "")
 if _db_url.startswith("postgresql"):
     from sqlalchemy.dialects.postgresql import JSONB
+
+    JSON_EMPTY_SERVER_DEFAULT = text("'[]'::jsonb")
 else:
     JSONB = JSON  # type: ignore[misc,assignment]
+    JSON_EMPTY_SERVER_DEFAULT = text("'[]'")
 
 
 def get_china_time():
@@ -220,6 +225,55 @@ class RuntimeConfigEntry(Base):
     __table_args__ = (
         UniqueConstraint("namespace", "key", "version", name="uq_runtime_config_namespace_key_version"),
         Index("ix_runtime_config_active_lookup", "namespace", "key", "is_active", "updated_at"),
+    )
+
+
+class McpServer(Base):
+    """管理员维护的远程 MCP 服务配置，不保存凭证原文。"""
+
+    __tablename__ = "mcp_servers"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    name = Column(String(120), nullable=False)
+    provider = Column(String(80), nullable=False, index=True)
+    endpoint_url = Column(String(2048), nullable=False)
+    transport = Column(String(32), nullable=False, default="streamable_http", server_default="streamable_http")
+    auth_type = Column(String(20), nullable=False, default="none", server_default="none")
+    auth_name = Column(String(128), nullable=True)
+    credential_ref = Column(String(128), nullable=True)
+    config_version = Column(Integer, nullable=False, default=1, server_default="1")
+    is_enabled = Column(Boolean, nullable=False, default=False, server_default="false", index=True)
+    allowed_tools = Column(JSONB, nullable=False, default=list, server_default=JSON_EMPTY_SERVER_DEFAULT)
+    discovered_tools = Column(JSONB, nullable=False, default=list, server_default=JSON_EMPTY_SERVER_DEFAULT)
+    health_status = Column(String(20), nullable=False, default="disabled", server_default="disabled", index=True)
+    last_checked_at = Column(DateTime(timezone=True), nullable=True)
+    last_error_code = Column(String(80), nullable=True)
+    last_error_message = Column(String(300), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now, server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        server_default=func.now(),
+        onupdate=utc_now,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("name", name="uq_mcp_servers_name"),
+        CheckConstraint("transport = 'streamable_http'", name="ck_mcp_servers_transport"),
+        CheckConstraint("auth_type IN ('none', 'bearer', 'header', 'query')", name="ck_mcp_servers_auth_type"),
+        CheckConstraint(
+            "health_status IN ('unknown', 'healthy', 'unhealthy', 'disabled')",
+            name="ck_mcp_servers_health_status",
+        ),
+        CheckConstraint(
+            "(auth_type = 'none' AND auth_name IS NULL AND credential_ref IS NULL) OR "
+            "(auth_type = 'bearer' AND auth_name IS NULL AND credential_ref IS NOT NULL) OR "
+            "(auth_type IN ('header', 'query') AND auth_name IS NOT NULL AND credential_ref IS NOT NULL)",
+            name="ck_mcp_servers_auth_shape",
+        ),
+        Index("ix_mcp_servers_provider_enabled", "provider", "is_enabled"),
+        Index("ix_mcp_servers_health_updated", "health_status", "updated_at"),
     )
 
 
