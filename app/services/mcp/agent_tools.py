@@ -16,8 +16,14 @@ from app.core.config import settings
 from app.core.logger import app_logger as logger
 from app.db.database import SessionLocal
 from app.db.mcp_server_repository import McpServerRepository
+from app.services.mcp.amap_product_tools import (
+    AMAP_PRODUCT_DEFINITIONS,
+    AMAP_PRODUCT_REMOTE_DEPENDENCIES,
+    AmapProductToolHandler,
+    build_amap_product_binding,
+)
 from app.services.mcp.client import McpClientError, McpClientManager
-from app.services.mcp.provider_profiles import tool_is_allowed_for_endpoint
+from app.services.mcp.provider_profiles import is_official_amap_endpoint, tool_is_allowed_for_endpoint
 from app.services.mcp.runtime import get_mcp_client_manager
 from app.services.mcp.server_service import MCP_TOOL_UNAVAILABLE_MESSAGE, McpServerService
 from app.services.mcp.tool_contract import (
@@ -173,7 +179,7 @@ class McpAgentToolBinding:
 @dataclass(frozen=True)
 class McpAgentToolSet:
     definitions: list[dict[str, Any]]
-    handlers: dict[str, "McpAgentToolHandler"]
+    handlers: dict[str, BaseToolHandler]
     audit_bindings: list[dict[str, Any]]
 
 
@@ -331,82 +337,78 @@ class McpAgentToolRunBudget:
         async with self._lock:
             return self._used_by_server.get(server_id, 0) >= self._max_calls_per_server
 
+    async def remaining(self, server_id: str) -> int:
+        """只读返回本次 run 对指定服务尚可尝试的真实调用次数。"""
+        async with self._lock:
+            used = self._used_by_server.get(server_id, 0)
+            return max(0, self._max_calls_per_server - used)
 
-class McpAgentToolHandler(BaseToolHandler):
-    """运行级 MCP handler；不进入进程全局工具注册表。"""
 
-    supports_automatic_retry = False
+class McpAgentRemoteExecutor:
+    """复用单服务预算、授权复核、并发与熔断执行一次真实 MCP 调用。"""
 
     def __init__(
         self,
         *,
-        binding: McpAgentToolBinding,
+        server_id: str,
         client_manager: McpClientManager,
-        session_factory: Callable[[], Any] = SessionLocal,
-        repository_factory: Callable[[Any], McpServerRepository] = McpServerRepository,
-        concurrency_limiter: McpAgentToolConcurrencyLimiter = _DEFAULT_CONCURRENCY_LIMITER,
-        circuit_breaker: McpAgentServerCircuitBreaker = _DEFAULT_CIRCUIT_BREAKER,
+        session_factory: Callable[[], Any],
+        repository_factory: Callable[[Any], McpServerRepository],
+        concurrency_limiter: McpAgentToolConcurrencyLimiter,
+        circuit_breaker: McpAgentServerCircuitBreaker,
         run_budget: McpAgentToolRunBudget,
-        max_llm_context_bytes: int = 12_000,
-    ):
-        self.binding = binding
+    ) -> None:
+        self.server_id = server_id
         self.client_manager = client_manager
         self.session_factory = session_factory
         self.repository_factory = repository_factory
         self.concurrency_limiter = concurrency_limiter
         self.circuit_breaker = circuit_breaker
         self.run_budget = run_budget
-        self.max_llm_context_bytes = max_llm_context_bytes
-
-    @property
-    def tool_name(self) -> str:
-        return self.binding.alias
-
-    @property
-    def sse_event_prefix(self) -> str:
-        return "mcp"
 
     async def is_run_budget_exhausted(self) -> bool:
-        return await self.run_budget.is_exhausted(self.binding.server_id)
+        return await self.run_budget.is_exhausted(self.server_id)
 
-    async def execute(self, args: dict) -> ToolResult:
-        started_at = time.monotonic()
+    async def remaining_run_budget(self) -> int:
+        return await self.run_budget.remaining(self.server_id)
+
+    async def call(
+        self,
+        remote_tool_name: str,
+        expected_definition_sha256: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
         permit: _McpCircuitPermit | None = None
         try:
-            permit = await self.circuit_breaker.try_acquire(self.binding.server_id)
+            permit = await self.circuit_breaker.try_acquire(self.server_id)
             if permit is None:
                 logger.warning(
                     "MCP 服务熔断拒绝 server_id=%s state=open error_code=server_circuit_open",
-                    self.binding.server_id,
+                    self.server_id,
                 )
-                return self._failed_result(started_at, error_code="server_circuit_open")
-            async with self.concurrency_limiter.acquire(self.binding.server_id):
-                # 排队后复核熔断状态与管理员授权；本地失败不消耗 run budget。
+                raise McpClientError("server_circuit_open", MCP_AGENT_TOOL_ERROR_MESSAGE)
+            async with self.concurrency_limiter.acquire(self.server_id):
                 if not await self.circuit_breaker.is_active(permit):
                     permit = None
                     logger.warning(
                         "MCP 服务熔断拒绝 server_id=%s state=open error_code=server_circuit_open",
-                        self.binding.server_id,
+                        self.server_id,
                     )
-                    return self._failed_result(started_at, error_code="server_circuit_open")
-                config = self._resolve_authorized_call()
+                    raise McpClientError("server_circuit_open", MCP_AGENT_TOOL_ERROR_MESSAGE)
+                config = self._resolve_authorized_call(
+                    remote_tool_name,
+                    expected_definition_sha256,
+                )
                 self.client_manager.validate_runtime_configuration(config)
-                if not await self.run_budget.try_consume(self.binding.server_id):
+                if not await self.run_budget.try_consume(self.server_id):
                     await self.circuit_breaker.release_without_result(permit)
                     permit = None
-                    return self._failed_result(
-                        started_at,
-                        error_code="server_run_budget_exhausted",
-                    )
+                    raise McpClientError("server_run_budget_exhausted", MCP_AGENT_TOOL_ERROR_MESSAGE)
                 try:
-                    payload = await self.client_manager.call_tool(
-                        config,
-                        self.binding.remote_tool_name,
-                        args,
-                    )
+                    payload = await self.client_manager.call_tool(config, remote_tool_name, arguments)
                 except McpClientError as error:
                     if error.code in _LOCAL_NO_NETWORK_ERROR_CODES:
-                        await self.run_budget.refund(self.binding.server_id)
+                        await self.run_budget.refund(self.server_id)
                     await self.circuit_breaker.record_failure(permit, error.code)
                     permit = None
                     raise
@@ -420,8 +422,63 @@ class McpAgentToolHandler(BaseToolHandler):
                     raise
                 await self.circuit_breaker.record_success(permit)
                 permit = None
-            normalized_payload = _normalize_mcp_payload(payload)
-            safe_payload = _sanitize_external_payload(normalized_payload)
+            return _sanitize_external_payload(_normalize_mcp_payload(payload))
+        finally:
+            if permit is not None:
+                await self.circuit_breaker.release_without_result(permit)
+
+    def _resolve_authorized_call(
+        self,
+        remote_tool_name: str,
+        expected_definition_sha256: str,
+    ):
+        db = self.session_factory()
+        try:
+            service = McpServerService(self.repository_factory(db), self.client_manager)
+            return service.resolve_authorized_tool_call(
+                self.server_id,
+                remote_tool_name,
+                expected_definition_sha256=expected_definition_sha256,
+            )
+        finally:
+            db.close()
+
+
+class McpAgentToolHandler(BaseToolHandler):
+    """运行级 MCP handler；不进入进程全局工具注册表。"""
+
+    supports_automatic_retry = False
+
+    def __init__(
+        self,
+        *,
+        binding: McpAgentToolBinding,
+        remote_executor: McpAgentRemoteExecutor,
+        max_llm_context_bytes: int = 12_000,
+    ):
+        self.binding = binding
+        self.remote_executor = remote_executor
+        self.max_llm_context_bytes = max_llm_context_bytes
+
+    @property
+    def tool_name(self) -> str:
+        return self.binding.alias
+
+    @property
+    def sse_event_prefix(self) -> str:
+        return "mcp"
+
+    async def is_run_budget_exhausted(self) -> bool:
+        return await self.remote_executor.is_run_budget_exhausted()
+
+    async def execute(self, args: dict) -> ToolResult:
+        started_at = time.monotonic()
+        try:
+            safe_payload = await self.remote_executor.call(
+                self.binding.remote_tool_name,
+                self.binding.definition_sha256,
+                args,
+            )
             payload_bytes = len(canonical_json_bytes(safe_payload))
             return ToolResult(
                 status="success",
@@ -450,21 +507,6 @@ class McpAgentToolHandler(BaseToolHandler):
                 type(error).__name__,
             )
             return self._failed_result(started_at, error_code="internal_error")
-        finally:
-            if permit is not None:
-                await self.circuit_breaker.release_without_result(permit)
-
-    def _resolve_authorized_call(self):
-        db = self.session_factory()
-        try:
-            service = McpServerService(self.repository_factory(db), self.client_manager)
-            return service.resolve_authorized_tool_call(
-                self.binding.server_id,
-                self.binding.remote_tool_name,
-                expected_definition_sha256=self.binding.definition_sha256,
-            )
-        finally:
-            db.close()
 
     def build_content_block(self, result: ToolResult, block_id: str, log_id: str):
         """MVP 不持久化任意 MCP 返回内容。"""
@@ -558,10 +600,31 @@ def load_mcp_agent_tools(
     )
     rows = sorted(repository_factory(db).list_enabled(), key=lambda row: str(row.id))
     definitions: list[dict[str, Any]] = []
-    handlers: dict[str, McpAgentToolHandler] = {}
+    handlers: dict[str, BaseToolHandler] = {}
     audit_bindings: list[dict[str, Any]] = []
+    official_amap_rows = [row for row in rows if is_official_amap_endpoint(str(row.endpoint_url))]
 
     for row in rows:
+        remote_executor = McpAgentRemoteExecutor(
+            server_id=str(row.id),
+            client_manager=resolved_client,
+            session_factory=session_factory,
+            repository_factory=repository_factory,
+            concurrency_limiter=concurrency_limiter,
+            circuit_breaker=resolved_circuit_breaker,
+            run_budget=run_budget,
+        )
+        if is_official_amap_endpoint(str(row.endpoint_url)):
+            if len(official_amap_rows) == 1:
+                _append_amap_product_tools(
+                    row=row,
+                    definitions=definitions,
+                    handlers=handlers,
+                    audit_bindings=audit_bindings,
+                    remote_executor=remote_executor,
+                    limits=resolved_limits,
+                )
+            continue
         for snapshot in _iter_authorized_snapshots(row):
             if len(definitions) >= resolved_limits.max_tools:
                 break
@@ -576,12 +639,7 @@ def load_mcp_agent_tools(
             definitions.append(definition)
             handlers[alias] = McpAgentToolHandler(
                 binding=binding,
-                client_manager=resolved_client,
-                session_factory=session_factory,
-                repository_factory=repository_factory,
-                concurrency_limiter=concurrency_limiter,
-                circuit_breaker=resolved_circuit_breaker,
-                run_budget=run_budget,
+                remote_executor=remote_executor,
                 max_llm_context_bytes=resolved_limits.max_llm_context_bytes,
             )
             audit_bindings.append(binding.to_audit_dict())
@@ -591,6 +649,46 @@ def load_mcp_agent_tools(
         handlers=handlers,
         audit_bindings=audit_bindings,
     )
+
+
+def _append_amap_product_tools(
+    *,
+    row: Any,
+    definitions: list[dict[str, Any]],
+    handlers: dict[str, BaseToolHandler],
+    audit_bindings: list[dict[str, Any]],
+    remote_executor: McpAgentRemoteExecutor,
+    limits: McpAgentToolLimits,
+) -> None:
+    snapshots = {snapshot["name"]: snapshot for snapshot in _iter_authorized_snapshots(row)}
+    orchestration_lock = asyncio.Lock()
+    for product_definition in AMAP_PRODUCT_DEFINITIONS:
+        product_name = product_definition["function"]["name"]
+        dependency_names = AMAP_PRODUCT_REMOTE_DEPENDENCIES[product_name]
+        if not dependency_names.issubset(snapshots):
+            continue
+        if len(definitions) >= limits.max_tools:
+            return
+        definition = json.loads(json.dumps(product_definition, ensure_ascii=False))
+        if len(canonical_json_bytes([*definitions, definition])) > limits.max_definition_bytes:
+            continue
+        dependency_hashes = {
+            name: agent_tool_definition_sha256(row, snapshots[name]) for name in sorted(dependency_names)
+        }
+        binding = build_amap_product_binding(
+            row=row,
+            product_name=product_name,
+            dependency_hashes=dependency_hashes,
+        )
+        definitions.append(definition)
+        handlers[product_name] = AmapProductToolHandler(
+            binding=binding,
+            remote_executor=remote_executor,
+            dependency_hashes=dependency_hashes,
+            orchestration_lock=orchestration_lock,
+            max_llm_context_bytes=limits.max_llm_context_bytes,
+        )
+        audit_bindings.append(binding.to_audit_dict())
 
 
 def _iter_authorized_snapshots(row) -> list[dict[str, Any]]:

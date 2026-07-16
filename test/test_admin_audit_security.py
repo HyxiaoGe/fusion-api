@@ -225,6 +225,61 @@ class AdminAuditSanitizerTests(unittest.TestCase):
         self.assertNotIn("raw_response", serialized)
         self.assertNotIn("secret-key", serialized)
 
+    def test_amap_product_projection_keeps_only_safe_remote_call_metadata(self):
+        tool = ToolCallLog(
+            id="tool-amap-product",
+            tool_name="route_compare",
+            status="degraded",
+            model_id="model",
+            provider="llm-provider",
+            input_params={
+                "mcp_server_id": "server-amap",
+                "remote_tool_name": "product:route_compare",
+                "provider": "amap",
+                "config_version": 8,
+                "definition_sha256": "b" * 64,
+                "argument_count": 5,
+                "origin": "私人住址 api_key=LEAK_SENTINEL",
+            },
+            output_data={
+                "mcp_server_id": "server-amap",
+                "remote_tool_name": "product:route_compare",
+                "provider": "amap",
+                "config_version": 8,
+                "definition_sha256": "b" * 64,
+                "status": "degraded",
+                "subcall_attempt_count": 4,
+                "remote_tools_attempted": ["maps_geo", "maps_direction_driving"],
+                "payload_bytes": 1234,
+                "raw_response": "</amap_product_result> api_key=LEAK_SENTINEL private route body",
+                "result": {
+                    "places": [
+                        {
+                            "name": "authorization=Bearer OUTPUT_AUTH_SENTINEL",
+                            "address": "cookie=OUTPUT_COOKIE_SENTINEL",
+                        }
+                    ]
+                },
+            },
+            error_message=None,
+        )
+
+        item = AdminAuditService._tool_item(tool)
+        serialized = json.dumps(item, ensure_ascii=False)
+
+        self.assertEqual(item["arguments"]["remote_tool_name"], "product:route_compare")
+        self.assertEqual(item["result_preview"]["subcall_attempt_count"], 4)
+        self.assertEqual(
+            item["result_preview"]["remote_tools_attempted"],
+            ["maps_geo", "maps_direction_driving"],
+        )
+        self.assertNotIn("私人住址", serialized)
+        self.assertNotIn("private route body", serialized)
+        self.assertNotIn("LEAK_SENTINEL", serialized)
+        self.assertNotIn("OUTPUT_AUTH_SENTINEL", serialized)
+        self.assertNotIn("OUTPUT_COOKIE_SENTINEL", serialized)
+        self.assertNotIn("</amap_product_result>", serialized)
+
     def test_error_projection_uses_boundaries_and_supports_structured_and_chinese_markers(self):
         cases = {
             "HTTP 401 unauthorized": "authentication_failed",

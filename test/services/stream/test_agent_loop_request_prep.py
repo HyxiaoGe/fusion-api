@@ -142,6 +142,30 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(config.dynamic_tool_handlers["mcp_microsoft_docs_a1b2c3d4"], handler)
         self.assertEqual(config.tool_bindings, [binding])
 
+    def test_build_call_config_injects_stable_amap_product_tool_without_false_network_boundary(self):
+        product_tool = {
+            "type": "function",
+            "function": {
+                "name": "local_place_search",
+                "parameters": {"type": "object", "additionalProperties": False},
+            },
+        }
+        handler = object()
+
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={},
+            capabilities={"functionCalling": True, "agentTools": True, "searchCapable": False},
+            additional_tools=[product_tool],
+            dynamic_tool_handlers={"local_place_search": handler},
+            tool_bindings=[{"alias": "local_place_search", "server_id": "amap-1"}],
+        )
+        messages = [{"role": "user", "content": "搜索民治附近的咖啡店"}]
+
+        self.assertEqual(config.announced_tools, ["local_place_search"])
+        self.assertIs(config.dynamic_tool_handlers["local_place_search"], handler)
+        self.assertIs(inject_no_tool_network_boundary(messages, config.call_kwargs), messages)
+
     def test_build_call_config_respects_explicit_agent_tools_capability_for_mcp(self):
         mcp_tool = {
             "type": "function",

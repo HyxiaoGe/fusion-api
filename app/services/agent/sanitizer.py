@@ -7,6 +7,7 @@ import json
 import re
 from typing import Any
 
+from app.services.mcp.amap_product_tools import AMAP_PRODUCT_TOOL_NAMES
 from app.services.security.url_policy import evaluate_url_policy
 
 URL_READ_REASON_MAX_CHARS = 160
@@ -25,6 +26,14 @@ _SENSITIVE_KEY_PARTS = frozenset(
         "token",
     }
 )
+_INLINE_CREDENTIAL_VALUE = r'"(?:\\.|[^"\\])+"|\'(?:\\.|[^\'\\])+\'|[a-z0-9._~+/=-]{4,}'
+_INLINE_CREDENTIAL_PATTERN = re.compile(
+    rf"(?P<key_prefix>\b(?:api[ _-]*key|client[ _-]*secret|password|access[ _-]*token|token|cookie|session[ _-]*id)\s*[:=]\s*)"
+    rf"(?P<key_value>{_INLINE_CREDENTIAL_VALUE})"
+    rf"|(?P<auth_prefix>\b(?:proxy[ _-]*authorization|authorization)\s*[:=]\s*(?:(?:bearer|basic|token)\s+)?)"
+    rf"(?P<auth_value>{_INLINE_CREDENTIAL_VALUE})",
+    re.IGNORECASE,
+)
 
 
 def sanitize_arguments(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -35,21 +44,31 @@ def sanitize_arguments(tool_name: str, arguments: dict[str, Any]) -> dict[str, A
     """
     if tool_name == "url_read":
         return sanitize_url_read_arguments(arguments)
+    if tool_name in AMAP_PRODUCT_TOOL_NAMES:
+        return sanitize_external_tool_arguments(arguments, redact_inline_credentials=True)
     if tool_name.startswith("mcp_"):
         return sanitize_external_tool_arguments(arguments)
     return arguments
 
 
-def sanitize_external_tool_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+def sanitize_external_tool_arguments(
+    arguments: dict[str, Any],
+    *,
+    redact_inline_credentials: bool = False,
+) -> dict[str, Any]:
     """MCP 参数进入事件或日志前递归脱敏，并限制序列化体积。"""
     source = arguments if isinstance(arguments, dict) else {}
-    sanitized = _sanitize_external_value(source, depth=0)
+    sanitized = _sanitize_external_value(
+        source,
+        depth=0,
+        redact_inline_credentials=redact_inline_credentials,
+    )
     if not isinstance(sanitized, dict):
         return {}
     return cap_and_truncate(sanitized, max_bytes=EXTERNAL_TOOL_ARGUMENT_MAX_BYTES)
 
 
-def _sanitize_external_value(value: Any, *, depth: int) -> Any:
+def _sanitize_external_value(value: Any, *, depth: int, redact_inline_credentials: bool) -> Any:
     if depth >= 8:
         return "[内容已省略]"
     if isinstance(value, dict):
@@ -60,15 +79,41 @@ def _sanitize_external_value(value: Any, *, depth: int) -> Any:
             if any(part in normalized_key for part in _SENSITIVE_KEY_PARTS):
                 sanitized[key] = "[已脱敏]"
             else:
-                sanitized[key] = _sanitize_external_value(item, depth=depth + 1)
+                sanitized[key] = _sanitize_external_value(
+                    item,
+                    depth=depth + 1,
+                    redact_inline_credentials=redact_inline_credentials,
+                )
         return sanitized
     if isinstance(value, list):
-        return [_sanitize_external_value(item, depth=depth + 1) for item in value[:64]]
+        return [
+            _sanitize_external_value(
+                item,
+                depth=depth + 1,
+                redact_inline_credentials=redact_inline_credentials,
+            )
+            for item in value[:64]
+        ]
     if isinstance(value, tuple):
-        return [_sanitize_external_value(item, depth=depth + 1) for item in value[:64]]
+        return [
+            _sanitize_external_value(
+                item,
+                depth=depth + 1,
+                redact_inline_credentials=redact_inline_credentials,
+            )
+            for item in value[:64]
+        ]
     if value is None or isinstance(value, (bool, int, float)):
         return value
-    return str(value)[:1_024]
+    text = str(value)[:20_000]
+    if redact_inline_credentials:
+        text = _INLINE_CREDENTIAL_PATTERN.sub(_redact_inline_credential_match, text)
+    return text[:1_024]
+
+
+def _redact_inline_credential_match(match: re.Match[str]) -> str:
+    prefix = match.group("key_prefix") or match.group("auth_prefix") or ""
+    return f"{prefix}[已脱敏]"
 
 
 def sanitize_url_read_arguments(arguments: dict[str, Any]) -> dict[str, Any]:

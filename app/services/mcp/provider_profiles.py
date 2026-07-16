@@ -45,6 +45,14 @@ def endpoint_tool_allowlist(endpoint_url: str) -> frozenset[str] | None:
     return None
 
 
+def is_official_amap_endpoint(endpoint_url: str) -> bool:
+    try:
+        hostname = (urlsplit(endpoint_url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    return hostname == AMAP_MCP_HOST
+
+
 def tool_is_allowed_for_endpoint(endpoint_url: str, tool_name: str) -> bool:
     allowlist = endpoint_tool_allowlist(endpoint_url)
     return allowlist is None or tool_name in allowlist

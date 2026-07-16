@@ -60,6 +60,33 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("secret", str(payload["arguments"]))
 
+    async def test_tool_call_started_amap_product_redacts_inline_credentials_before_redis(self):
+        writer = AsyncMock()
+        em = AgentEventEmitter(run_id="r1", trace_id="r1", conversation_id="c1", task_id="task-1", redis_writer=writer)
+
+        await em.tool_call_started(
+            tool_call_id="t1",
+            tool_name="local_place_search",
+            arguments={
+                "query": "api key: 如何申请地图服务",
+                "near": (
+                    "民治 api_key=LEAK_SENTINEL authorization=Bearer BEARER_SENTINEL "
+                    "Proxy-Authorization: Token PROXY_SENTINEL cookie=COOKIE_SENTINEL "
+                    "access_token=ACCESS_SENTINEL session_id=SESSION_SENTINEL"
+                ),
+            },
+        )
+
+        payload = writer.append_chunk.await_args.args[3]
+        serialized = str(payload["arguments"])
+        self.assertEqual(payload["arguments"]["query"], "api key: 如何申请地图服务")
+        self.assertNotIn("LEAK_SENTINEL", serialized)
+        self.assertNotIn("BEARER_SENTINEL", serialized)
+        self.assertNotIn("PROXY_SENTINEL", serialized)
+        self.assertNotIn("COOKIE_SENTINEL", serialized)
+        self.assertNotIn("ACCESS_SENTINEL", serialized)
+        self.assertNotIn("SESSION_SENTINEL", serialized)
+
     async def test_step_completed_clears_step_context(self):
         writer = AsyncMock()
         em = AgentEventEmitter(run_id="r1", trace_id="r1", conversation_id="c1", task_id="task-1", redis_writer=writer)

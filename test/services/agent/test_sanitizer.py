@@ -76,6 +76,48 @@ class SanitizeArgumentsTests(unittest.TestCase):
         self.assertLessEqual(len(serialized.encode("utf-8")), 4096)
         self.assertEqual(args["api_key"], "secret-key")
 
+    def test_amap_product_tool_uses_external_argument_sanitizer(self):
+        args = {
+            "query": "咖啡",
+            "near": "民治地铁站",
+            "api_key": "must-not-leak",
+            "notes": "x" * 5000,
+        }
+
+        sanitized = sanitize_arguments("local_place_search", args)
+        serialized = json.dumps(sanitized, ensure_ascii=False)
+
+        self.assertIn("民治地铁站", serialized)
+        self.assertNotIn("must-not-leak", serialized)
+        self.assertLessEqual(len(serialized.encode("utf-8")), 4096)
+
+    def test_amap_product_tool_redacts_inline_credentials_but_preserves_normal_question(self):
+        args = {
+            "query": "api key: 如何申请地图服务",
+            "near": "民治 api_key=LEAK_SENTINEL",
+            "origin": "authorization=Bearer BEARER_SENTINEL 深圳北站",
+            "destination": "client-secret: SECRET_SENTINEL 深圳市民中心",
+            "nested": [
+                "Proxy-Authorization: Basic PROXY_SENTINEL",
+                "cookie=COOKIE_SENTINEL",
+                "access_token=ACCESS_SENTINEL",
+                "session_id=SESSION_SENTINEL",
+            ],
+        }
+
+        sanitized = sanitize_arguments("route_compare", args)
+        serialized = json.dumps(sanitized, ensure_ascii=False)
+
+        self.assertEqual(sanitized["query"], "api key: 如何申请地图服务")
+        self.assertNotIn("LEAK_SENTINEL", serialized)
+        self.assertNotIn("BEARER_SENTINEL", serialized)
+        self.assertNotIn("SECRET_SENTINEL", serialized)
+        self.assertNotIn("PROXY_SENTINEL", serialized)
+        self.assertNotIn("COOKIE_SENTINEL", serialized)
+        self.assertNotIn("ACCESS_SENTINEL", serialized)
+        self.assertNotIn("SESSION_SENTINEL", serialized)
+        self.assertIn("[已脱敏]", serialized)
+
 
 class CapAndTruncateTests(unittest.TestCase):
     def test_under_limit_unchanged(self):

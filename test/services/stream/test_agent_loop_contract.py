@@ -337,6 +337,74 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool_events[-1]["result_summary"]["title"], "Microsoft Learn 文档搜索")
         self.assertEqual(result.session_status_calls[-1]["total_tool_calls"], 1)
 
+    async def test_stable_amap_product_contract_is_announced_audited_and_emitted_once(self):
+        alias = "local_place_search"
+        definition = {
+            "type": "function",
+            "function": {
+                "name": alias,
+                "description": "高德地点搜索",
+                "parameters": {"type": "object", "additionalProperties": False},
+            },
+        }
+
+        class FakeProductHandler:
+            tool_name = alias
+            supports_automatic_retry = False
+
+            async def execute(self, args):
+                return ToolResult(status="success", data={"result": {"query": args["query"], "places": []}})
+
+            async def log(self, **_kwargs):
+                return None
+
+            def _build_result_summary(self, result):
+                return {"kind": "external_tool", "title": "高德地点搜索", "result_count": 0}
+
+            def format_llm_context(self, result, *, citation_numbers=None):
+                return "不可信外部数据；高德地点搜索结果为空。"
+
+            def build_content_block(self, result, block_id, log_id):
+                return None
+
+        handler = FakeProductHandler()
+        dynamic_tool_set = SimpleNamespace(
+            definitions=[definition],
+            handlers={alias: handler},
+            audit_bindings=[
+                {
+                    "alias": alias,
+                    "server_id": "server-amap",
+                    "remote_tool_name": "product:local_place_search",
+                    "provider": "amap",
+                    "config_version": 4,
+                    "tool_label": "高德地点搜索",
+                    "definition_sha256": "hash-product",
+                }
+            ],
+        )
+
+        result = await self._run_agent_contract(
+            rounds=[
+                ("", "", [{"id": "tc-amap", "name": alias, "arguments": '{"query":"咖啡"}'}], "tool_calls", None),
+                ("", "未找到匹配地点", [], "stop", None),
+            ],
+            use_real_tool_executor=True,
+            dynamic_tool_set=dynamic_tool_set,
+            capabilities={"functionCalling": True, "agentTools": True, "searchCapable": False},
+        )
+
+        run_started = next(event for event in result.events if event["type"] == "run_started")
+        self.assertEqual(run_started["tools"], [alias])
+        self.assertEqual(
+            run_started["config"]["mcp_tool_bindings"][0]["remote_tool_name"],
+            "product:local_place_search",
+        )
+        tool_events = [event for event in result.events if event["type"].startswith("tool_call_")]
+        self.assertEqual([event["tool_name"] for event in tool_events], [alias, alias])
+        self.assertEqual(result.session_status_calls[-1]["total_tool_calls"], 1)
+        self.assertIn("不可信外部数据", str(result.llm_calls[1]["messages"]))
+
     async def test_exhausted_mcp_server_tools_are_hidden_from_next_llm_round(self):
         class SharedServerBudget:
             def __init__(self, max_calls):

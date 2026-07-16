@@ -19,6 +19,7 @@ from app.services.chat.message_builder import (
     inject_file_content,
     is_image_file,
 )
+from app.services.mcp.amap_product_tools import AMAP_PRODUCT_TOOL_NAMES
 from app.services.stream.persistence import preprocess_url_in_message
 
 VOLCENGINE_PROVIDERS = {"volcengine"}
@@ -110,11 +111,7 @@ def build_agent_loop_call_config(
         tools.append(build_web_search_tool_fn())
     provided_handlers = dynamic_tool_handlers or {}
     if supports_dynamic_tools:
-        tools.extend(
-            tool
-            for tool in (additional_tools or [])
-            if _tool_definition_name(tool).startswith("mcp_") and _tool_definition_name(tool) in provided_handlers
-        )
+        tools.extend(tool for tool in (additional_tools or []) if _tool_definition_name(tool) in provided_handlers)
     if tools:
         call_kwargs["tools"] = tools
         call_kwargs["tool_choice"] = "auto"
@@ -301,7 +298,11 @@ def inject_no_tool_network_boundary(messages: list[dict], call_kwargs: dict) -> 
     """无联网工具模式下补一条 system 边界，避免模型把内部知识包装成实时搜索。"""
     announced_tools = set(announced_tool_names_from_call_kwargs(call_kwargs))
     network_tool_names = {"web_search", "url_read"}
-    if network_tool_names.intersection(announced_tools) or any(name.startswith("mcp_") for name in announced_tools):
+    if (
+        network_tool_names.intersection(announced_tools)
+        or AMAP_PRODUCT_TOOL_NAMES.intersection(announced_tools)
+        or any(name.startswith("mcp_") for name in announced_tools)
+    ):
         return messages
     if any(msg.get("role") == "system" and "【无联网工具边界规则】" in str(msg.get("content", "")) for msg in messages):
         return messages

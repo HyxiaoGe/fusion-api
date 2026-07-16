@@ -65,6 +65,36 @@ class DynamicToolExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(records[0].result.status, "failed")
         handler.execute.assert_awaited_once()
 
+    async def test_stable_amap_product_tool_reuses_single_product_lifecycle(self):
+        handler = MagicMock()
+        handler.tool_name = "local_place_search"
+        handler.supports_automatic_retry = False
+        handler.execute = AsyncMock(return_value=ToolResult(status="success", data={"result": {"places": []}}))
+        handler.log = AsyncMock()
+        handler._build_result_summary.return_value = {
+            "kind": "external_tool",
+            "title": "高德地点搜索",
+            "result_count": 0,
+            "truncated": False,
+        }
+        emitter = AsyncMock()
+
+        records = await execute_tools_parallel(
+            [{"id": "call-amap", "name": "local_place_search", "arguments": {"query": "咖啡"}}],
+            "conv-1",
+            "user-1",
+            "model-1",
+            "openai",
+            emitter=emitter,
+            tool_handlers={"local_place_search": handler},
+        )
+
+        self.assertEqual(records[0].tool_name, "local_place_search")
+        handler.execute.assert_awaited_once_with({"query": "咖啡"})
+        emitter.tool_call_started.assert_awaited_once()
+        emitter.tool_call_completed.assert_awaited_once()
+        self.assertEqual(emitter.tool_call_completed.await_args.kwargs["tool_name"], "local_place_search")
+
 
 class WebSearchRedirectPresentationTests(unittest.TestCase):
     def test_read_alternative_redirect_has_safe_context_without_search_block(self):

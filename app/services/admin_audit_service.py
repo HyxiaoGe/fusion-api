@@ -26,6 +26,7 @@ from app.schemas.admin_audit import (
 from app.schemas.response import ApiException, ErrorCode
 from app.services.admin_audit_sanitizer import mask_email, sanitize_admin_value
 from app.services.agent_strategy_config import get_agent_tools_disabled_aliases
+from app.services.mcp.amap_product_tools import AMAP_PRODUCT_TOOL_NAMES
 
 
 class AdminAuditService:
@@ -475,7 +476,7 @@ class AdminAuditService:
                 )
                 if key in raw_output
             }
-        elif tool.tool_name.startswith("mcp_"):
+        elif tool.tool_name.startswith("mcp_") or tool.tool_name in AMAP_PRODUCT_TOOL_NAMES:
             binding_fields = (
                 "mcp_server_id",
                 "remote_tool_name",
@@ -488,7 +489,14 @@ class AdminAuditService:
             }
             output_projection = {
                 key: raw_output[key]
-                for key in (*binding_fields, "status", "payload_bytes", "error_code")
+                for key in (
+                    *binding_fields,
+                    "status",
+                    "payload_bytes",
+                    "error_code",
+                    "subcall_attempt_count",
+                    "remote_tools_attempted",
+                )
                 if key in raw_output
             }
         else:
