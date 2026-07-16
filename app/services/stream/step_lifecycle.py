@@ -214,6 +214,34 @@ async def mark_tool_round_started(
         )
         return
 
+    if stage == "tool":
+        await _emit_context_plan_step_update(
+            emitter=emitter,
+            context=context,
+            revision=_tool_running_revision(context.step_number),
+            item=_plan_item_update(
+                context.plan_items,
+                item_id="tool",
+                title="调用外部工具",
+                status="running",
+                kind="other",
+                summary=f"正在调用 {tool_call_count} 个外部工具",
+                tool_names=list(tool_names),
+                evidence_item_ids=[],
+            ),
+        )
+        await _maybe_call_async(
+            emitter,
+            "run_progress_updated",
+            phase="researching",
+            label="正在调用外部工具",
+            completed_steps=1,
+            total_steps=None,
+            completed_tool_calls=completed_tool_calls,
+            max_tool_calls=max_tool_calls,
+        )
+        return
+
     await _emit_context_plan_step_update(
         emitter=emitter,
         context=context,
@@ -267,6 +295,49 @@ async def _maybe_emit_plan_step_started(
                 tool_names=[],
                 evidence_item_ids=[],
             ),
+        )
+        return
+
+    if "tool" in plan_items:
+        await _emit_plan_step_update(
+            emitter=emitter,
+            run_id=run_id,
+            revision=_plan_revision(step_number, PLAN_REV_FOLLOWUP_READ_COMPLETED),
+            item=_plan_item_update(
+                plan_items,
+                item_id="tool",
+                title="调用外部工具",
+                status="completed",
+                kind="other",
+                summary="已完成外部工具调用",
+                tool_names=[],
+                evidence_item_ids=[],
+            ),
+        )
+        await _emit_plan_step_update(
+            emitter=emitter,
+            run_id=run_id,
+            revision=_plan_revision(step_number, PLAN_REV_FOLLOWUP_ANSWER_RUNNING),
+            item=_plan_item_update(
+                plan_items,
+                item_id="answer",
+                title="整理回答",
+                status="running",
+                kind="answer",
+                summary=_answer_running_summary(completed_tool_calls),
+                tool_names=[],
+                evidence_item_ids=[],
+            ),
+        )
+        await _maybe_call_async(
+            emitter,
+            "run_progress_updated",
+            phase="synthesizing",
+            label="正在整理工具结果",
+            completed_steps=2,
+            total_steps=None,
+            completed_tool_calls=completed_tool_calls,
+            max_tool_calls=max_tool_calls,
         )
         return
 
@@ -350,6 +421,34 @@ async def _maybe_emit_plan_step_completed(
                 completed_steps=2,
                 total_steps=None,
                 completed_tool_calls=completed_tool_calls if completed_tool_calls is not None else tool_call_count,
+                max_tool_calls=max_tool_calls,
+            )
+            return
+
+        if stage == "tool":
+            await _emit_context_plan_step_update(
+                emitter=emitter,
+                context=context,
+                revision=_tool_completed_revision(context.step_number),
+                item=_plan_item_update(
+                    context.plan_items,
+                    item_id="tool",
+                    title="调用外部工具",
+                    status="completed",
+                    kind="other",
+                    summary=f"完成 {_completed_tool_summary_count(tool_call_count, completed_tool_calls)} 个工具调用",
+                    tool_names=tool_names,
+                    evidence_item_ids=[],
+                ),
+            )
+            await _maybe_call_async(
+                emitter,
+                "run_progress_updated",
+                phase="synthesizing",
+                label="正在整理工具结果",
+                completed_steps=2,
+                total_steps=None,
+                completed_tool_calls=(completed_tool_calls if completed_tool_calls is not None else tool_call_count),
                 max_tool_calls=max_tool_calls,
             )
             return
@@ -490,6 +589,30 @@ def _initial_tool_plan_items(
             "evidence_item_ids": [],
         }
     ]
+    if stage == "tool":
+        items.extend(
+            [
+                {
+                    "id": "tool",
+                    "title": "调用外部工具",
+                    "status": "pending",
+                    "kind": "other",
+                    "summary": f"准备调用 {tool_call_count} 个外部工具",
+                    "tool_names": list(tool_names),
+                    "evidence_item_ids": [],
+                },
+                {
+                    "id": "answer",
+                    "title": "整理回答",
+                    "status": "pending",
+                    "kind": "answer",
+                    "summary": "基于工具结果给出结论和必要说明",
+                    "tool_names": [],
+                    "evidence_item_ids": [],
+                },
+            ]
+        )
+        return items
     if stage != "read":
         items.append(
             {
@@ -546,9 +669,7 @@ def _plan_item_update(
         "kind": kind,
         "tool_names": tool_names if tool_names is not None else list(template.get("tool_names") or []),
         "evidence_item_ids": (
-            evidence_item_ids
-            if evidence_item_ids is not None
-            else list(template.get("evidence_item_ids") or [])
+            evidence_item_ids if evidence_item_ids is not None else list(template.get("evidence_item_ids") or [])
         ),
     }
     merged_summary = _merge_plan_summary(template.get("summary"), summary)
@@ -591,15 +712,21 @@ def _tool_completed_revision(step_number: int) -> int:
 
 
 def _read_running_after_search_revision(step_number: int) -> int:
-    offset = PLAN_REV_FIRST_READ_RUNNING_AFTER_SEARCH if step_number == 1 else PLAN_REV_FOLLOWUP_READ_RUNNING_AFTER_SEARCH
+    offset = (
+        PLAN_REV_FIRST_READ_RUNNING_AFTER_SEARCH if step_number == 1 else PLAN_REV_FOLLOWUP_READ_RUNNING_AFTER_SEARCH
+    )
     return _plan_revision(step_number, offset)
 
 
 def _tool_stage(tool_names: Sequence[str]) -> str:
     names = [tool_name for tool_name in tool_names if tool_name]
+    if not names:
+        return "search"
     if names and all(tool_name == "url_read" for tool_name in names):
         return "read"
-    return "search"
+    if names and all(tool_name in {"web_search", "url_read"} for tool_name in names):
+        return "search"
+    return "tool"
 
 
 def _completed_tool_summary_count(tool_call_count: int, completed_tool_calls: int | None) -> int:

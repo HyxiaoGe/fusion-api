@@ -154,6 +154,9 @@ class Settings(BaseSettings):
     MCP_MAX_TOOL_DESCRIPTION_CHARS: int = int(os.getenv("MCP_MAX_TOOL_DESCRIPTION_CHARS", "2000"))
     MCP_MAX_TOOL_SCHEMA_BYTES: int = int(os.getenv("MCP_MAX_TOOL_SCHEMA_BYTES", "32768"))
     MCP_MAX_RESPONSE_BYTES: int = int(os.getenv("MCP_MAX_RESPONSE_BYTES", "262144"))
+    MCP_MAX_TOOL_CALLS_PER_SERVER_PER_RUN: int = int(os.getenv("MCP_MAX_TOOL_CALLS_PER_SERVER_PER_RUN", "8"))
+    MCP_SERVER_CIRCUIT_FAILURE_THRESHOLD: int = int(os.getenv("MCP_SERVER_CIRCUIT_FAILURE_THRESHOLD", "3"))
+    MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS: float = float(os.getenv("MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS", "30"))
 
     # PromptHub bundle 后台同步；disabled 不发出请求，聊天热路径始终只读本地 LKG。
     PROMPTHUB_SYNC_MODE: str = os.getenv("PROMPTHUB_SYNC_MODE", "disabled").lower()

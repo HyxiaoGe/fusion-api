@@ -20,6 +20,7 @@ class AgentRoundResult:
     finish_reason: str
     accumulated_usage: Usage
     context: ContextUsage | None = None
+    announced_tool_names: frozenset[str] | None = None
 
 
 StreamRoundResult = tuple[str, str, list[dict], str, Usage | None]
@@ -64,6 +65,16 @@ def accumulate_usage(accumulated_usage: Usage, usage_data: Usage | None) -> Usag
         input_tokens=accumulated_usage.input_tokens + usage_data.input_tokens,
         output_tokens=accumulated_usage.output_tokens + usage_data.output_tokens,
     )
+
+
+def _announced_tool_names(call_kwargs: dict) -> frozenset[str]:
+    names: set[str] = set()
+    for tool in call_kwargs.get("tools", []) or []:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        name = function.get("name") if isinstance(function, dict) else None
+        if name:
+            names.add(str(name))
+    return frozenset(names)
 
 
 async def collect_agent_round_stream(
@@ -233,4 +244,5 @@ async def run_agent_round(
         finish_reason=finish_reason,
         accumulated_usage=accumulate_usage(accumulated_usage, usage_data),
         context=final_context,
+        announced_tool_names=_announced_tool_names(call_kwargs),
     )

@@ -475,6 +475,22 @@ class AdminAuditService:
                 )
                 if key in raw_output
             }
+        elif tool.tool_name.startswith("mcp_"):
+            binding_fields = (
+                "mcp_server_id",
+                "remote_tool_name",
+                "provider",
+                "config_version",
+                "definition_sha256",
+            )
+            argument_projection = {
+                key: raw_arguments[key] for key in (*binding_fields, "argument_count") if key in raw_arguments
+            }
+            output_projection = {
+                key: raw_output[key]
+                for key in (*binding_fields, "status", "payload_bytes", "error_code")
+                if key in raw_output
+            }
         else:
             argument_projection = {}
             output_projection = {}

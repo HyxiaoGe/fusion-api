@@ -58,6 +58,24 @@ class SanitizeArgumentsTests(unittest.TestCase):
         args = {"x": 1}
         self.assertEqual(sanitize_arguments("future_tool", args), args)
 
+    def test_mcp_tool_redacts_sensitive_fields_and_caps_event_arguments(self):
+        args = {
+            "query": "Microsoft Learn",
+            "api_key": "secret-key",
+            "nested": {"authorization": "Bearer secret", "notes": "x" * 5000},
+            "items": [{"password": "secret-password"}],
+        }
+
+        sanitized = sanitize_arguments("mcp_docs_a1b2c3d4", args)
+
+        serialized = json.dumps(sanitized, ensure_ascii=False)
+        self.assertIn("Microsoft Learn", serialized)
+        self.assertNotIn("secret-key", serialized)
+        self.assertNotIn("Bearer secret", serialized)
+        self.assertNotIn("secret-password", serialized)
+        self.assertLessEqual(len(serialized.encode("utf-8")), 4096)
+        self.assertEqual(args["api_key"], "secret-key")
+
 
 class CapAndTruncateTests(unittest.TestCase):
     def test_under_limit_unchanged(self):

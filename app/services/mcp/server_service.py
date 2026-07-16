@@ -9,6 +9,8 @@ from app.db.mcp_server_repository import McpServerRepository
 from app.schemas.mcp import McpServerCreate, McpServerStatusRequest, McpServerUpdate
 from app.schemas.response import ApiException
 from app.services.mcp.client import McpClientError, McpClientManager, McpConnectionConfig
+from app.services.mcp.provider_profiles import endpoint_tool_allowlist, tool_is_allowed_for_endpoint
+from app.services.mcp.tool_contract import agent_tool_definition_sha256, is_valid_tool_snapshot
 from app.utils.time import utc_now
 
 _CONNECTION_IDENTITY_FIELDS = {
@@ -19,6 +21,7 @@ _CONNECTION_IDENTITY_FIELDS = {
     "auth_name",
     "credential_ref",
 }
+MCP_TOOL_UNAVAILABLE_MESSAGE = "外部工具暂时不可用"
 
 
 class McpServerService:
@@ -78,7 +81,11 @@ class McpServerService:
             changes.update(self._reset_connection_state(row.is_enabled))
         else:
             allowed_tools = changes.get("allowed_tools", row.allowed_tools or [])
-            self._ensure_allowed_subset(allowed_tools, row.discovered_tools or [])
+            self._ensure_allowed_subset(
+                allowed_tools,
+                row.discovered_tools or [],
+                endpoint_url=candidate["endpoint_url"],
+            )
         try:
             return self.repository.update(row, changes)
         except IntegrityError:
@@ -125,7 +132,11 @@ class McpServerService:
             return self._save_remote_failure(row.id, expected_version, exc)
 
         discovered_names = {tool["name"] for tool in tools}
-        allowed_tools = [name for name in (row.allowed_tools or []) if name in discovered_names]
+        allowed_tools = [
+            name
+            for name in (row.allowed_tools or [])
+            if name in discovered_names and tool_is_allowed_for_endpoint(row.endpoint_url, name)
+        ]
         return self._save_remote_result(
             row.id,
             expected_version,
@@ -137,6 +148,46 @@ class McpServerService:
                 "last_error_code": None,
                 "last_error_message": None,
             },
+        )
+
+    def resolve_authorized_tool_call(
+        self,
+        server_id: str,
+        tool_name: str,
+        *,
+        expected_definition_sha256: str | None = None,
+    ) -> McpConnectionConfig:
+        """调用前重新校验服务状态与工具授权，失败时只返回固定安全错误。"""
+
+        row = self.repository.get(server_id)
+        if row is None or not row.is_enabled:
+            raise McpClientError("tool_not_allowed", MCP_TOOL_UNAVAILABLE_MESSAGE)
+        if not tool_is_allowed_for_endpoint(row.endpoint_url, tool_name):
+            raise McpClientError("tool_not_allowed", MCP_TOOL_UNAVAILABLE_MESSAGE)
+
+        allowed_tools = set(row.allowed_tools or [])
+        matching_snapshots = [
+            tool
+            for tool in (row.discovered_tools or [])
+            if is_valid_tool_snapshot(tool) and tool.get("name") == tool_name
+        ]
+        if tool_name not in allowed_tools or len(matching_snapshots) != 1:
+            raise McpClientError("tool_not_allowed", MCP_TOOL_UNAVAILABLE_MESSAGE)
+        if (
+            expected_definition_sha256 is not None
+            and agent_tool_definition_sha256(row, matching_snapshots[0]) != expected_definition_sha256
+        ):
+            raise McpClientError("tool_definition_changed", MCP_TOOL_UNAVAILABLE_MESSAGE)
+
+        config = self._to_connection_config(row)
+        return McpConnectionConfig(
+            server_id=config.server_id,
+            provider=config.provider,
+            endpoint_url=config.endpoint_url,
+            auth_type=config.auth_type,
+            auth_name=config.auth_name,
+            credential_ref=config.credential_ref,
+            allowed_tools=[tool_name],
         )
 
     def _save_remote_failure(self, server_id: str, expected_version: int, error: McpClientError):
@@ -198,10 +249,18 @@ class McpServerService:
             raise ApiException.conflict("MCP 服务名称已存在")
 
     @staticmethod
-    def _ensure_allowed_subset(allowed_tools: list[str], discovered_tools: list[dict[str, Any]]) -> None:
+    def _ensure_allowed_subset(
+        allowed_tools: list[str],
+        discovered_tools: list[dict[str, Any]],
+        *,
+        endpoint_url: str,
+    ) -> None:
         discovered_names = {tool.get("name") for tool in discovered_tools}
         if any(tool not in discovered_names for tool in allowed_tools):
             raise ApiException.bad_request("allowed_tools 只能选择已发现工具")
+        endpoint_allowlist = endpoint_tool_allowlist(endpoint_url)
+        if endpoint_allowlist is not None and any(tool not in endpoint_allowlist for tool in allowed_tools):
+            raise ApiException.bad_request("高德 MCP 仅允许已批准的只读工具")
 
     @staticmethod
     def _build_candidate(row, changes: dict[str, Any]) -> dict[str, Any]:

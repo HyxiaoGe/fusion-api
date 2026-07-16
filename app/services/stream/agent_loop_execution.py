@@ -166,6 +166,7 @@ def build_agent_loop_runtime(
         log_round_summary_fn=dependencies.log_round_summary_fn,
         warning_fn=dependencies.warning_fn,
         clock=dependencies.clock,
+        dynamic_tool_handlers=getattr(request.call_config, "dynamic_tool_handlers", {}),
     )
 
 

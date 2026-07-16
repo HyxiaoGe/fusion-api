@@ -120,6 +120,10 @@ async def _run_round(
     step_number: int,
     step_context: AgentStepContext,
 ) -> AgentRoundResult:
+    call_kwargs = await _filter_exhausted_dynamic_tools(
+        call_kwargs=runtime.call_kwargs,
+        dynamic_tool_handlers=runtime.dynamic_tool_handlers,
+    )
     round_result = await runtime.run_round_fn(
         conversation_id=runtime.conversation_id,
         task_id=runtime.task_id,
@@ -131,7 +135,7 @@ async def _run_round(
         litellm_kwargs=runtime.litellm_kwargs,
         messages=messages,
         should_use_reasoning=runtime.should_use_reasoning,
-        call_kwargs=runtime.call_kwargs,
+        call_kwargs=call_kwargs,
         accumulated_usage=state.accumulated_usage,
         step_context=step_context,
         llm_call_fn=runtime.llm_call_fn,
@@ -145,6 +149,40 @@ async def _run_round(
     state.update_usage(round_result.accumulated_usage)
     state.update_context(round_result.context)
     return round_result
+
+
+async def _filter_exhausted_dynamic_tools(
+    *,
+    call_kwargs: dict,
+    dynamic_tool_handlers: dict[str, object],
+) -> dict:
+    """在下一轮模型调用前隐藏已耗尽单服务预算的动态工具。"""
+
+    if not dynamic_tool_handlers or not call_kwargs.get("tools"):
+        return call_kwargs
+
+    exhausted_aliases: set[str] = set()
+    for alias, handler in dynamic_tool_handlers.items():
+        is_exhausted = getattr(handler, "is_run_budget_exhausted", None)
+        if is_exhausted is not None and await is_exhausted():
+            exhausted_aliases.add(alias)
+    if not exhausted_aliases:
+        return call_kwargs
+
+    filtered_tools = []
+    for tool in call_kwargs["tools"]:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        tool_name = function.get("name") if isinstance(function, dict) else None
+        if tool_name not in exhausted_aliases:
+            filtered_tools.append(tool)
+
+    filtered_call_kwargs = dict(call_kwargs)
+    if filtered_tools:
+        filtered_call_kwargs["tools"] = filtered_tools
+    else:
+        filtered_call_kwargs.pop("tools", None)
+        filtered_call_kwargs.pop("tool_choice", None)
+    return filtered_call_kwargs
 
 
 async def _run_limit_summary(

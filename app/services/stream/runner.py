@@ -10,6 +10,7 @@ from typing import Optional
 from app.core.logger import app_logger as logger
 from app.db.database import SessionLocal
 from app.services.agent import session_cache
+from app.services.mcp.agent_tools import load_mcp_agent_tools
 from app.services.stream.agent_loop_driver import run_agent_loop
 from app.services.stream.agent_loop_execution import build_agent_loop_execution
 from app.services.stream.agent_loop_lifecycle import (
@@ -121,6 +122,7 @@ def _agent_loop_wiring_dependencies() -> AgentLoopWiringDependencies:
         info_fn=logger.info,
         error_fn=logger.error,
         warning_fn=logger.warning,
+        load_dynamic_tools_fn=load_mcp_agent_tools,
     )
 
 

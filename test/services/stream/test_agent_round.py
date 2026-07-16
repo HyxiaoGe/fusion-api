@@ -75,6 +75,7 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result.accumulated_usage, Usage(input_tokens=69_510, output_tokens=15))
+        self.assertEqual(result.announced_tool_names, frozenset())
         self.assertEqual(
             result.context,
             ContextUsage(
@@ -573,6 +574,7 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.tool_calls, [{"id": "tool-1"}])
         self.assertEqual(result.finish_reason, "tool_calls")
         self.assertEqual(result.accumulated_usage, Usage(input_tokens=7, output_tokens=10))
+        self.assertEqual(result.announced_tool_names, frozenset({"web_search"}))
         self.assertEqual([event[0] for event in events], ["llm", "stream", "log"])
         self.assertEqual(
             events[0],

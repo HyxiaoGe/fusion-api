@@ -71,6 +71,7 @@ class AgentLoopStepRequestTests(unittest.TestCase):
             tool_calls=[{"id": "tc-1", "name": "web_search", "arguments": "{}"}],
             finish_reason="tool_calls",
             accumulated_usage=Usage(input_tokens=3, output_tokens=4),
+            announced_tool_names=frozenset({"web_search"}),
         )
         runtime = _runtime()
 
@@ -96,6 +97,7 @@ class AgentLoopStepRequestTests(unittest.TestCase):
         self.assertIs(request.network_budget, runtime.network_budget)
         self.assertEqual(request.tool_calls, round_result.tool_calls)
         self.assertEqual(request.reasoning_buf, "需要工具")
+        self.assertEqual(request.announced_tool_names, frozenset({"web_search"}))
         self.assertIs(request.on_tools_executed.__self__, state)
         self.assertIs(request.on_tools_executed.__func__, state.record_executed_tool_calls.__func__)
 

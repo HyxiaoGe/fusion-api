@@ -95,6 +95,9 @@ class DeployAuthConfigTests(unittest.TestCase):
             "MCP_MAX_TOOL_DESCRIPTION_CHARS",
             "MCP_MAX_TOOL_SCHEMA_BYTES",
             "MCP_MAX_RESPONSE_BYTES",
+            "MCP_MAX_TOOL_CALLS_PER_SERVER_PER_RUN",
+            "MCP_SERVER_CIRCUIT_FAILURE_THRESHOLD",
+            "MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS",
             "DASHSCOPE_API_KEY",
             "AMAP_MCP_API_KEY",
         ):
@@ -107,6 +110,19 @@ class DeployAuthConfigTests(unittest.TestCase):
         self.assertIn("MCP_ADMIN_OPERATION_TIMEOUT_SECONDS=35", self.env_example)
         self.assertIn("MCP_IDEMPOTENT_TOTAL_TIMEOUT_SECONDS:-12", self.workflow)
         self.assertIn("MCP_ADMIN_OPERATION_TIMEOUT_SECONDS:-35", self.workflow)
+
+    def test_mcp_per_server_run_budget_is_configured_and_deployed(self):
+        self.assertIn("MCP_MAX_TOOL_CALLS_PER_SERVER_PER_RUN: int = int(os.getenv(", self.app_config)
+        self.assertIn("MCP_MAX_TOOL_CALLS_PER_SERVER_PER_RUN=8", self.env_example)
+        self.assertIn("MCP_MAX_TOOL_CALLS_PER_SERVER_PER_RUN:-8", self.workflow)
+
+    def test_mcp_server_circuit_breaker_is_configured_and_deployed(self):
+        self.assertIn("MCP_SERVER_CIRCUIT_FAILURE_THRESHOLD: int = int(os.getenv(", self.app_config)
+        self.assertIn("MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS: float = float(os.getenv(", self.app_config)
+        self.assertIn("MCP_SERVER_CIRCUIT_FAILURE_THRESHOLD=3", self.env_example)
+        self.assertIn("MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS=30", self.env_example)
+        self.assertIn("MCP_SERVER_CIRCUIT_FAILURE_THRESHOLD:-3", self.workflow)
+        self.assertIn("MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS:-30", self.workflow)
 
     def test_mcp_default_hosts_include_public_no_auth_acceptance_server(self):
         default_hosts = "learn.microsoft.com,dashscope.aliyuncs.com,mcp.amap.com"

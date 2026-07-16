@@ -3,6 +3,7 @@ import unittest
 from app.schemas.chat import TextBlock
 from app.services.stream.agent_loop_request_prep import (
     build_agent_loop_call_config,
+    inject_no_tool_network_boundary,
     prepare_agent_loop_messages,
 )
 
@@ -111,6 +112,89 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.announced_tools, [])
         self.assertNotIn("tools", config.call_kwargs)
         self.assertNotIn("tool_choice", config.call_kwargs)
+
+    def test_build_call_config_injects_mcp_tools_for_function_calling_model_without_search(self):
+        mcp_tool = {
+            "type": "function",
+            "function": {
+                "name": "mcp_microsoft_docs_a1b2c3d4",
+                "description": "搜索 Microsoft Learn 文档",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            },
+        }
+        handler = object()
+        binding = {"alias": "mcp_microsoft_docs_a1b2c3d4", "server_id": "server-1"}
+
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={},
+            capabilities={"functionCalling": True, "searchCapable": False},
+            additional_tools=[mcp_tool],
+            dynamic_tool_handlers={"mcp_microsoft_docs_a1b2c3d4": handler},
+            tool_bindings=[binding],
+        )
+
+        self.assertFalse(config.supports_function_calling)
+        self.assertTrue(config.supports_dynamic_tools)
+        self.assertEqual(config.announced_tools, ["mcp_microsoft_docs_a1b2c3d4"])
+        self.assertEqual(config.call_kwargs["tools"], [mcp_tool])
+        self.assertEqual(config.call_kwargs["tool_choice"], "auto")
+        self.assertIs(config.dynamic_tool_handlers["mcp_microsoft_docs_a1b2c3d4"], handler)
+        self.assertEqual(config.tool_bindings, [binding])
+
+    def test_build_call_config_respects_explicit_agent_tools_capability_for_mcp(self):
+        mcp_tool = {
+            "type": "function",
+            "function": {"name": "mcp_docs_a1b2c3d4", "parameters": {"type": "object"}},
+        }
+
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={},
+            capabilities={"functionCalling": True, "agentTools": False, "searchCapable": False},
+            additional_tools=[mcp_tool],
+            dynamic_tool_handlers={"mcp_docs_a1b2c3d4": object()},
+            tool_bindings=[{"alias": "mcp_docs_a1b2c3d4"}],
+        )
+
+        self.assertFalse(config.supports_dynamic_tools)
+        self.assertEqual(config.dynamic_tool_handlers, {})
+        self.assertEqual(config.tool_bindings, [])
+        self.assertNotIn("tools", config.call_kwargs)
+
+    def test_build_call_config_disable_tools_blocks_mcp_tools_too(self):
+        mcp_tool = {
+            "type": "function",
+            "function": {"name": "mcp_docs_a1b2c3d4", "parameters": {"type": "object"}},
+        }
+
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={"disable_tools": True},
+            capabilities={"functionCalling": True, "searchCapable": True},
+            additional_tools=[mcp_tool],
+            dynamic_tool_handlers={"mcp_docs_a1b2c3d4": object()},
+            tool_bindings=[{"alias": "mcp_docs_a1b2c3d4"}],
+        )
+
+        self.assertFalse(config.supports_function_calling)
+        self.assertFalse(config.supports_dynamic_tools)
+        self.assertEqual(config.dynamic_tool_handlers, {})
+        self.assertEqual(config.tool_bindings, [])
+        self.assertNotIn("tools", config.call_kwargs)
+
+    def test_mcp_tool_prevents_false_no_network_boundary(self):
+        messages = [{"role": "user", "content": "查一下 Microsoft Learn"}]
+        call_kwargs = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "mcp_microsoft_docs_a1b2c3d4", "parameters": {"type": "object"}},
+                }
+            ]
+        }
+
+        self.assertIs(inject_no_tool_network_boundary(messages, call_kwargs), messages)
 
     async def test_prepare_messages_injects_no_tool_network_boundary_when_agent_tools_disabled(self):
         async def build_llm_messages_fn(

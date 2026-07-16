@@ -251,6 +251,53 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_start_run_records_safe_mcp_tool_binding_snapshot(self):
+        configs = []
+        call_config = SimpleNamespace(
+            should_use_reasoning=False,
+            call_kwargs={},
+            announced_tools=["mcp_docs_a1b2c3d4"],
+            tool_bindings=[
+                {
+                    "alias": "mcp_docs_a1b2c3d4",
+                    "server_id": "server-1",
+                    "remote_tool_name": "microsoft_docs_search",
+                    "provider": "microsoft",
+                    "config_version": 7,
+                    "tool_label": "Microsoft Learn 文档搜索",
+                    "definition_sha256": "abc123",
+                    "endpoint_url": "https://secret.invalid/mcp",
+                    "credential_ref": "MCP_SECRET",
+                }
+            ],
+        )
+
+        async def start_agent_run_fn(**kwargs):
+            configs.append(kwargs["config"])
+
+        await run_agent_loop_lifecycle(
+            request=self._request(call_config=call_config),
+            execution=self._execution(call_config=call_config),
+            dependencies=self._dependencies(start_agent_run_fn=start_agent_run_fn),
+        )
+
+        self.assertEqual(
+            configs[0]["mcp_tool_bindings"],
+            [
+                {
+                    "alias": "mcp_docs_a1b2c3d4",
+                    "server_id": "server-1",
+                    "remote_tool_name": "microsoft_docs_search",
+                    "provider": "microsoft",
+                    "config_version": 7,
+                    "tool_label": "Microsoft Learn 文档搜索",
+                    "definition_sha256": "abc123",
+                }
+            ],
+        )
+        self.assertNotIn("endpoint_url", str(configs[0]))
+        self.assertNotIn("credential_ref", str(configs[0]))
+
     async def test_start_run_records_active_prompt_bundle_revision(self):
         configs = []
 

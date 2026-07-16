@@ -124,7 +124,7 @@ async def _start_run(
         provider=execution.runtime.provider,
         message_id=context.assistant_message_id,
         tools=request.call_config.announced_tools,
-        config=_run_config(request.limits),
+        config=_run_config(request.limits, request.call_config),
     )
 
 
@@ -225,7 +225,7 @@ async def _write_fallback(
     )
 
 
-def _run_config(limits: AgentLoopLimits) -> dict:
+def _run_config(limits: AgentLoopLimits, call_config: AgentLoopCallConfig | None = None) -> dict:
     _strategy_config, strategy_meta = get_agent_strategy_config()
     runtime_config_versions = {
         "agent_strategy/default": strategy_meta.get("version", "code-default"),
@@ -233,9 +233,28 @@ def _run_config(limits: AgentLoopLimits) -> dict:
     prompt_revision = get_active_prompt_bundle_revision()
     if prompt_revision is not None:
         runtime_config_versions["prompt_bundle/fusion"] = prompt_revision
-    return {
+    config = {
         "max_steps": limits.max_steps,
         "max_tool_calls": limits.max_tool_calls,
         "timeout_s": limits.total_timeout_s,
         "runtime_config_versions": runtime_config_versions,
     }
+    binding_fields = (
+        "alias",
+        "server_id",
+        "remote_tool_name",
+        "provider",
+        "config_version",
+        "tool_label",
+        "definition_sha256",
+    )
+    bindings = []
+    for binding in getattr(call_config, "tool_bindings", []) or []:
+        if not isinstance(binding, dict):
+            continue
+        safe_binding = {field: binding[field] for field in binding_fields if field in binding}
+        if safe_binding.get("alias"):
+            bindings.append(safe_binding)
+    if bindings:
+        config["mcp_tool_bindings"] = bindings
+    return config
