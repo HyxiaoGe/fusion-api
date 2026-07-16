@@ -86,7 +86,18 @@ NO_VISION_FILE_BOUNDARY_PROMPT = (
     "如果用户的问题不依赖图片内容，则直接回答文字问题，不需要主动解释图片能力。"
 )
 
-LIMIT_SUMMARY_PROMPT = "你已达到工具调用上限，请基于已收集的信息给出最终回答。不要再调用任何工具。"
+SUMMARY_NON_DISCLOSURE_PROMPT = (
+    "最终回答应直接面向用户，不要向用户提及内部停止原因、搜索策略或处理过程；对于尚未核实的信息明确说明不确定性。"
+)
+
+LIMIT_SUMMARY_PROMPT = (
+    f"你已达到工具调用上限，请基于已收集的信息给出最终回答。不要再调用任何工具。\n\n{SUMMARY_NON_DISCLOSURE_PROMPT}"
+)
+
+NO_PROGRESS_SUMMARY_PROMPT = (
+    "现有搜索已不再产生新的有效信息，请基于已收集的信息直接给出最终回答。不要再调用任何工具。\n\n"
+    f"{SUMMARY_NON_DISCLOSURE_PROMPT}"
+)
 
 CONTINUATION_SYSTEM_PROMPT = (
     "你正在继续上一轮因运行上限而停止的回答。请基于已有对话、已有回答和已有工具结果继续补充，"

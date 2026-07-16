@@ -49,8 +49,13 @@ async def run_agent_loop(
         if outcome.exit == AgentLoopExit.SUPERSEDED:
             return outcome
         if outcome.exit == AgentLoopExit.SUMMARY_REQUIRED:
-            state.finish_reason = "empty_answer_summary"
-            await _run_limit_summary(state=state, runtime=runtime, messages=messages)
+            state.finish_reason = outcome.summary_finish_reason or "empty_answer_summary"
+            await _run_limit_summary(
+                state=state,
+                runtime=runtime,
+                messages=messages,
+                summary_finish_reason=outcome.summary_finish_reason or "limit_summary",
+            )
             break
         break
 
@@ -147,9 +152,15 @@ async def _run_limit_summary(
     state: AgentLoopState,
     runtime: AgentLoopRuntime,
     messages: list[dict],
+    summary_finish_reason: str = "limit_summary",
 ) -> None:
     summary_outcome = await runtime.run_limit_summary_step_fn(
-        request=build_limit_summary_step_request(state=state, runtime=runtime, messages=messages),
+        request=build_limit_summary_step_request(
+            state=state,
+            runtime=runtime,
+            messages=messages,
+            summary_finish_reason=summary_finish_reason,
+        ),
     )
     state.update_usage(summary_outcome.accumulated_usage)
     state.update_context(summary_outcome.context)

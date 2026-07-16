@@ -10,7 +10,11 @@ from typing import Any
 
 from app.ai.llm_round_observability import create_llm_round_observation
 from app.ai.prompts.agent_loop import LIMIT_SUMMARY_PROMPT as _LIMIT_SUMMARY_PROMPT
-from app.ai.prompts.agent_loop import get_limit_summary_prompt
+from app.ai.prompts.agent_loop import (
+    NO_PROGRESS_SUMMARY_PROMPT,
+    SUMMARY_NON_DISCLOSURE_PROMPT,
+    get_limit_summary_prompt,
+)
 from app.core.logger import app_logger as logger
 from app.schemas.chat import ContextUsage, TextBlock, ThinkingBlock, Usage
 from app.services.chat.context_manager import ContextManagementError, ContextPlan, prepare_context
@@ -62,6 +66,7 @@ class LimitSummaryStepRequest:
     on_step_started: Callable[[str], None] | None = None
     on_context_updated: Callable[[ContextUsage], None] | None = None
     assistant_message_id: str | None = None
+    summary_finish_reason: str = "limit_summary"
 
 
 def build_limit_summary_call_kwargs(call_kwargs: dict) -> dict:
@@ -72,8 +77,18 @@ def compute_summary_timeout(*, total_timeout_s: int, run_start: float, clock: Ca
     return max(10, total_timeout_s - (clock() - run_start))
 
 
-def append_limit_summary_prompt(messages: list[dict]) -> None:
-    messages.append({"role": "system", "content": get_limit_summary_prompt()})
+def append_limit_summary_prompt(
+    messages: list[dict],
+    *,
+    summary_finish_reason: str = "limit_summary",
+) -> None:
+    if summary_finish_reason == "no_progress_summary":
+        prompt = NO_PROGRESS_SUMMARY_PROMPT
+    else:
+        prompt = get_limit_summary_prompt()
+        if SUMMARY_NON_DISCLOSURE_PROMPT not in prompt:
+            prompt = f"{prompt}\n\n{SUMMARY_NON_DISCLOSURE_PROMPT}"
+    messages.append({"role": "system", "content": prompt})
 
 
 def _create_limit_summary_observation(
@@ -176,7 +191,7 @@ async def call_limit_summary_round(
         step_number=request.step_number,
         model_id=request.model_id,
         provider=request.provider,
-        finish_reason="limit_summary",
+        finish_reason=request.summary_finish_reason,
         tool_calls_count=0,
         reasoning_buf=reasoning_buf,
         content_buf=content_buf,
@@ -275,7 +290,10 @@ async def run_limit_summary_step(
 ) -> LimitSummaryOutcome:
     summary_context = await start_limit_summary_step(request=request)
 
-    append_limit_summary_prompt(request.messages)
+    append_limit_summary_prompt(
+        request.messages,
+        summary_finish_reason=request.summary_finish_reason,
+    )
     thinking_block_id = summary_context.thinking_block_id
     text_block_id = summary_context.text_block_id
     remaining = compute_summary_timeout(

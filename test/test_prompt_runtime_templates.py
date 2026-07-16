@@ -82,7 +82,9 @@ class PromptRuntimeTemplatesTests(unittest.TestCase):
         ):
             limit_summary.append_limit_summary_prompt(messages)
 
-        self.assertEqual(messages, [{"role": "system", "content": "运行时触顶总结规则"}])
+        content = messages[-1]["content"]
+        self.assertIn("运行时触顶总结规则", content)
+        self.assertIn("不要向用户提及", content)
 
     def test_continuation_injects_runtime_prompt(self):
         from app.services.agent import continuation

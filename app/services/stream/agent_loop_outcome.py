@@ -16,3 +16,4 @@ class AgentLoopExit(Enum):
 class AgentLoopOutcome:
     exit: AgentLoopExit
     error_msg: str | None = None
+    summary_finish_reason: str | None = None

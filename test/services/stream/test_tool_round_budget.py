@@ -22,13 +22,19 @@ def _tool_calls(count: int) -> list[dict]:
     ]
 
 
-def _record(tool_call: dict) -> ToolExecutionRecord:
+def _record(
+    tool_call: dict,
+    *,
+    status: str = "success",
+    search_budget: str | None = None,
+) -> ToolExecutionRecord:
     handler = Mock()
     handler.format_llm_context.return_value = f"已执行 {tool_call['id']}"
     handler.build_content_block.return_value = None
+    data = {"search_budget": search_budget} if search_budget is not None else {}
     return ToolExecutionRecord(
         tool_call=tool_call,
-        result=ToolResult(status="success"),
+        result=ToolResult(status=status, data=data),
         handler=handler,
         block_id=f"blk-{tool_call['id']}",
         log_id=f"log-{tool_call['id']}",
@@ -82,6 +88,54 @@ def _request(
 
 
 class ToolRoundBudgetTests(IsolatedAsyncioTestCase):
+    async def test_same_batch_marks_two_budget_stopped_search_results_as_no_progress(self):
+        tool_calls = _tool_calls(2)
+        execute_tools_fn = AsyncMock(
+            return_value=[
+                _record(tool_calls[0], status="degraded", search_budget="planner_limited"),
+                _record(tool_calls[1], status="degraded", search_budget="duplicate_skipped"),
+            ]
+        )
+        request = _request(
+            tool_calls=tool_calls,
+            completed_tool_calls=0,
+            max_tool_calls=20,
+            execute_tools_fn=execute_tools_fn,
+        )
+
+        with patch("app.services.stream.tool_round.mark_tool_round_started", new=AsyncMock()):
+            outcome = await handle_tool_calls_round(request=request)
+
+        state = AgentLoopState()
+        state.record_no_progress_search_results(outcome.no_progress_search_results)
+        self.assertEqual(outcome.no_progress_search_results, (True, True))
+        self.assertTrue(state.should_summarize_no_progress_search())
+
+    async def test_successful_search_resets_no_progress_results_in_same_batch(self):
+        tool_calls = _tool_calls(3)
+        execute_tools_fn = AsyncMock(
+            return_value=[
+                _record(tool_calls[0], status="degraded", search_budget="planner_limited"),
+                _record(tool_calls[1], status="success", search_budget="normal"),
+                _record(tool_calls[2], status="degraded", search_budget="duplicate_skipped"),
+            ]
+        )
+        request = _request(
+            tool_calls=tool_calls,
+            completed_tool_calls=0,
+            max_tool_calls=20,
+            execute_tools_fn=execute_tools_fn,
+        )
+
+        with patch("app.services.stream.tool_round.mark_tool_round_started", new=AsyncMock()):
+            outcome = await handle_tool_calls_round(request=request)
+
+        state = AgentLoopState()
+        state.record_no_progress_search_results(outcome.no_progress_search_results)
+        self.assertEqual(outcome.no_progress_search_results, (True, False, True))
+        self.assertEqual(state.consecutive_no_progress_search_results, 1)
+        self.assertFalse(state.should_summarize_no_progress_search())
+
     async def test_excess_batch_executes_only_remaining_capacity_and_completes_protocol(self):
         tool_calls = _tool_calls(5)
         executed_record = _record(tool_calls[0])
@@ -103,7 +157,14 @@ class ToolRoundBudgetTests(IsolatedAsyncioTestCase):
         with patch("app.services.stream.tool_round.mark_tool_round_started", new=AsyncMock()) as mark_started:
             outcome = await handle_tool_calls_round(request=request)
 
-        self.assertEqual(outcome, ToolRoundOutcome(tool_call_count=1, tool_names=["web_search"]))
+        self.assertEqual(
+            outcome,
+            ToolRoundOutcome(
+                tool_call_count=1,
+                tool_names=["web_search"],
+                no_progress_search_results=(False,),
+            ),
+        )
         self.assertEqual(execute_tools_fn.await_args.args[0], [tool_calls[0]])
         on_tools_executed.assert_called_once_with(1)
         self.assertEqual(state.total_tool_calls, 20)
@@ -303,7 +364,14 @@ class ToolRoundBudgetTests(IsolatedAsyncioTestCase):
         ):
             outcome = await handle_tool_calls_round(request=request)
 
-        self.assertEqual(outcome, ToolRoundOutcome(tool_call_count=1, tool_names=["web_search"]))
+        self.assertEqual(
+            outcome,
+            ToolRoundOutcome(
+                tool_call_count=1,
+                tool_names=["web_search"],
+                no_progress_search_results=(False,),
+            ),
+        )
         self.assertEqual(network_budget.record_tool_results.call_args.kwargs["results"], [selected_record])
         self.assertEqual(emit_evidence.await_args.args[1], [selected_record])
         tool_messages = request.messages[2:]

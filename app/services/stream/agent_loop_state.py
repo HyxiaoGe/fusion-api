@@ -9,6 +9,8 @@ from app.schemas.chat import ContextUsage, Usage
 from app.services.stream.agent_loop_policy import AgentLoopLimitReason
 from app.services.stream.run_finalizer import AgentRunStats
 
+NO_PROGRESS_SEARCH_SUMMARY_THRESHOLD = 2
+
 
 @dataclass
 class AgentLoopState:
@@ -23,6 +25,7 @@ class AgentLoopState:
     unknown_terminated: bool = False
     terminal_emitted: bool = False
     plan_items: dict[str, dict] = field(default_factory=dict)
+    consecutive_no_progress_search_results: int = 0
 
     def next_step_number(self) -> int:
         self.step += 1
@@ -39,6 +42,16 @@ class AgentLoopState:
 
     def record_executed_tool_calls(self, tool_call_count: int) -> None:
         self.total_tool_calls += tool_call_count
+
+    def record_no_progress_search_results(self, results: tuple[bool, ...]) -> None:
+        for is_no_progress_search in results:
+            if is_no_progress_search:
+                self.consecutive_no_progress_search_results += 1
+            else:
+                self.consecutive_no_progress_search_results = 0
+
+    def should_summarize_no_progress_search(self) -> bool:
+        return self.consecutive_no_progress_search_results >= NO_PROGRESS_SEARCH_SUMMARY_THRESHOLD
 
     def update_usage(self, usage: Usage) -> None:
         self.accumulated_usage = usage

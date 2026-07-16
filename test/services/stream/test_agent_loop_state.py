@@ -32,6 +32,30 @@ class AgentLoopStateTests(unittest.TestCase):
         self.assertEqual(state.run_stats("run-1").total_steps, 1)
         self.assertEqual(state.run_stats("run-1").total_tool_calls, 2)
 
+    def test_two_consecutive_no_progress_search_results_request_summary_across_rounds(self):
+        state = AgentLoopState()
+
+        state.record_no_progress_search_results((True,))
+        self.assertFalse(state.should_summarize_no_progress_search())
+
+        state.record_no_progress_search_results((True,))
+        self.assertTrue(state.should_summarize_no_progress_search())
+
+    def test_one_no_progress_search_result_does_not_request_summary(self):
+        state = AgentLoopState()
+
+        state.record_no_progress_search_results((True,))
+
+        self.assertFalse(state.should_summarize_no_progress_search())
+
+    def test_progress_result_resets_no_progress_search_streak(self):
+        state = AgentLoopState()
+
+        state.record_no_progress_search_results((True, False, True))
+
+        self.assertEqual(state.consecutive_no_progress_search_results, 1)
+        self.assertFalse(state.should_summarize_no_progress_search())
+
     def test_usage_content_and_terminal_mutations_are_explicit(self):
         state = AgentLoopState()
         block = TextBlock(type="text", id="blk-1", text="answer")

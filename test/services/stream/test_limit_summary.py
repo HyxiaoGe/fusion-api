@@ -9,6 +9,7 @@ from app.services.stream.limit_summary import (
     LIMIT_SUMMARY_PROMPT,
     LimitSummaryStepRequest,
     accumulate_summary_usage,
+    append_limit_summary_prompt,
     append_summary_content_blocks,
     build_limit_summary_call_kwargs,
     compute_summary_timeout,
@@ -18,6 +19,18 @@ from app.services.stream.step_lifecycle import AgentStepContext
 
 
 class LimitSummaryHelpersTests(unittest.TestCase):
+    def test_no_progress_summary_uses_neutral_prompt_without_limit_language(self):
+        messages = []
+
+        append_limit_summary_prompt(messages, summary_finish_reason="no_progress_summary")
+
+        content = messages[-1]["content"]
+        self.assertIn("现有搜索已不再产生新的有效信息", content)
+        self.assertIn("不要向用户提及", content)
+        self.assertNotIn("工具调用上限", content)
+        self.assertNotIn("额度", content)
+        self.assertNotIn("预算", content)
+
     def test_build_limit_summary_call_kwargs_copies_and_removes_tool_controls(self):
         tools = [{"function": {"name": "web_search"}}]
         call_kwargs = {
@@ -268,6 +281,7 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
     async def test_limit_summary_records_independent_round_observation(self):
         messages = []
         observation = MagicMock()
+        log_round_summary_fn = MagicMock()
         observation.finish_success = AsyncMock()
         observation.finish_error = AsyncMock()
         observation.wrap_response.side_effect = lambda response: response
@@ -309,8 +323,9 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
             complete_step_fn=AsyncMock(),
             llm_call_fn=llm_call_fn,
             stream_round_fn=stream_round_fn,
-            log_round_summary_fn=lambda **_kwargs: None,
+            log_round_summary_fn=log_round_summary_fn,
             clock=lambda: 120.0,
+            summary_finish_reason="no_progress_summary",
         )
 
         context_plan = MagicMock(
@@ -343,6 +358,7 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
             usage=Usage(input_tokens=5, output_tokens=7),
             finish_reason="cancelled",
         )
+        self.assertEqual(log_round_summary_fn.call_args.kwargs["finish_reason"], "no_progress_summary")
 
     async def test_run_limit_summary_step_appends_prompt_and_records_success(self):
         messages = [{"role": "user", "content": "hi"}]

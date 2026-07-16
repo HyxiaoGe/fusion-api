@@ -3,12 +3,13 @@ from dataclasses import dataclass
 
 from app.schemas.chat import TextBlock, Usage
 from app.services.stream.agent_loop_driver import AgentLoopExit, run_agent_loop
-from app.services.stream.agent_loop_policy import AgentLoopLimits
+from app.services.stream.agent_loop_policy import AgentLoopLimits, map_run_terminal_state
 from app.services.stream.agent_loop_runtime import AgentLoopRuntime
 from app.services.stream.agent_loop_state import AgentLoopState
 from app.services.stream.agent_round import AgentRoundResult
 from app.services.stream.limit_summary import LimitSummaryOutcome
 from app.services.stream.step_lifecycle import AgentStepContext
+from app.services.stream.tool_round import ToolRoundOutcome
 
 
 @dataclass
@@ -63,6 +64,87 @@ def _runtime(**overrides):
 
 
 class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
+    async def test_two_no_progress_search_results_run_one_summary_without_limit_event(self):
+        state = AgentLoopState()
+        emitter = DummyEmitter(limit_reasons=[])
+        started_steps: list[int] = []
+        tool_round_calls = 0
+        summary_calls = []
+
+        async def start_step_fn(**kwargs):
+            started_steps.append(kwargs["step_number"])
+            context = AgentStepContext(
+                step_id=f"step-{kwargs['step_number']}",
+                step_number=kwargs["step_number"],
+                started_at=kwargs["clock"](),
+                thinking_block_id=f"thinking-{kwargs['step_number']}",
+                text_block_id=f"text-{kwargs['step_number']}",
+            )
+            kwargs["on_step_started"](context.step_id)
+            return context
+
+        async def run_round_fn(**_kwargs):
+            step_number = len(started_steps)
+            return AgentRoundResult(
+                reasoning_buf="继续搜索",
+                content_buf="",
+                tool_calls=[
+                    {
+                        "id": f"tc-{step_number}",
+                        "name": "web_search",
+                        "arguments": f'{{"query":"x-{step_number}"}}',
+                    },
+                ],
+                finish_reason="tool_calls",
+                accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+            )
+
+        async def handle_tool_calls_round_fn(**kwargs):
+            nonlocal tool_round_calls
+            tool_round_calls += 1
+            request = kwargs["request"]
+            request.on_tools_executed(1)
+            return ToolRoundOutcome(
+                tool_call_count=1,
+                tool_names=["web_search"],
+                no_progress_search_results=(True,),
+            )
+
+        async def run_limit_summary_step_fn(**kwargs):
+            summary_calls.append(kwargs["request"])
+            request = kwargs["request"]
+            request.content_blocks.append(TextBlock(type="text", id="summary-text", text="根据已有结果总结"))
+            request.on_step_started("summary-step")
+            return LimitSummaryOutcome(accumulated_usage=Usage(input_tokens=5, output_tokens=8))
+
+        outcome = await run_agent_loop(
+            db="db",
+            messages=[{"role": "user", "content": "hi"}],
+            state=state,
+            runtime=_runtime(
+                emitter=emitter,
+                start_step_fn=start_step_fn,
+                run_round_fn=run_round_fn,
+                handle_tool_calls_round_fn=handle_tool_calls_round_fn,
+                run_limit_summary_step_fn=run_limit_summary_step_fn,
+            ),
+        )
+
+        terminal_state = map_run_terminal_state(
+            unknown_terminated=state.unknown_terminated,
+            limit_reason=state.limit_reason,
+        )
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        self.assertEqual(started_steps, [1, 2])
+        self.assertEqual(tool_round_calls, 2)
+        self.assertEqual(len(summary_calls), 1)
+        self.assertEqual(summary_calls[0].summary_finish_reason, "no_progress_summary")
+        self.assertEqual(emitter.limit_reasons, [])
+        self.assertIsNone(state.limit_reason)
+        self.assertEqual(state.finish_reason, "no_progress_summary")
+        self.assertEqual(terminal_state.session_status, "completed")
+        self.assertEqual(terminal_state.run_finish_reason, "stop")
+
     async def test_stop_round_completes_text_step_and_returns_completed(self):
         state = AgentLoopState()
         started_steps: list[int] = []

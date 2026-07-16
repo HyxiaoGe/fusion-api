@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 class ToolRoundOutcome:
     tool_call_count: int
     tool_names: list[str]
+    no_progress_search_results: tuple[bool, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -282,7 +283,14 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
     executed_count = len(selected_tool_calls[0])
     tool_names = await complete_tool_round_step(request, results, executed_count=executed_count)
     restore_reasoning_after_tool_decision(request.call_kwargs)
-    return ToolRoundOutcome(tool_call_count=executed_count, tool_names=tool_names)
+    return ToolRoundOutcome(
+        tool_call_count=executed_count,
+        tool_names=tool_names,
+        no_progress_search_results=_classify_no_progress_search_results(
+            selected_tool_calls=selected_tool_calls[0],
+            results=results,
+        ),
+    )
 
 
 async def emit_selected_source_evidence(
@@ -399,6 +407,25 @@ def _reconcile_tool_execution_results(
         )
 
     return reconciled_results, missing_result_tool_calls
+
+
+def _classify_no_progress_search_results(
+    *,
+    selected_tool_calls: list[dict],
+    results: list[ToolExecutionRecord],
+) -> tuple[bool, ...]:
+    records_by_id = {str(record.tool_call.get("id", "")): record for record in results}
+    return tuple(
+        _is_no_progress_search_result(records_by_id.get(str(tool_call.get("id", ""))))
+        for tool_call in selected_tool_calls
+    )
+
+
+def _is_no_progress_search_result(record: ToolExecutionRecord | None) -> bool:
+    if record is None or record.tool_name != "web_search" or record.result.status == "success":
+        return False
+    data = record.result.data if isinstance(record.result.data, dict) else {}
+    return data.get("search_budget") in {"planner_limited", "duplicate_skipped"}
 
 
 def _format_missing_tool_result_context() -> str:

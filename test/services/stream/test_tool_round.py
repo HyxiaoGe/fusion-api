@@ -163,7 +163,14 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
 
         outcome = await handle_tool_calls_round(request=request)
 
-        self.assertEqual(outcome, ToolRoundOutcome(tool_call_count=1, tool_names=["web_search"]))
+        self.assertEqual(
+            outcome,
+            ToolRoundOutcome(
+                tool_call_count=1,
+                tool_names=["web_search"],
+                no_progress_search_results=(False,),
+            ),
+        )
         self.assertEqual([entry[0] for entry in order], ["persist", "execute", "record", "persist", "complete"])
         self.assertEqual(order[0], ("persist", True, ["blk_thinking"], None))
         self.assertEqual(order[2], ("record", 1))
@@ -368,7 +375,14 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        self.assertEqual(outcome, ToolRoundOutcome(tool_call_count=1, tool_names=["web_search"]))
+        self.assertEqual(
+            outcome,
+            ToolRoundOutcome(
+                tool_call_count=1,
+                tool_names=["web_search"],
+                no_progress_search_results=(False,),
+            ),
+        )
         self.assertEqual([entry[0] for entry in order], ["persist", "execute", "record", "persist", "complete"])
         self.assertEqual(order[0], ("persist", "msg-1", "conv-1", "gpt-4", True, ["blk_thinking"], None))
         self.assertEqual(order[2], ("record", 1))

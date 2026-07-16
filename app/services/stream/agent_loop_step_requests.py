@@ -55,6 +55,7 @@ def build_limit_summary_step_request(
     state: AgentLoopState,
     runtime: AgentLoopRuntime,
     messages: list[dict],
+    summary_finish_reason: str = "limit_summary",
 ) -> LimitSummaryStepRequest:
     return LimitSummaryStepRequest(
         conversation_id=runtime.conversation_id,
@@ -84,4 +85,5 @@ def build_limit_summary_step_request(
         on_step_started=state.mark_current_step,
         on_context_updated=state.update_context,
         assistant_message_id=runtime.assistant_message_id,
+        summary_finish_reason=summary_finish_reason,
     )
