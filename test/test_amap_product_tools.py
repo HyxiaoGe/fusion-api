@@ -132,7 +132,7 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
         handler, executor = build_handler(
             "local_place_search",
             {
-                "maps_geo": [mcp_payload({"geocodes": [{"location": "114.031,22.616", "city": "深圳市"}]})],
+                "maps_geo": [mcp_payload({"results": [{"location": "114.031,22.616", "city": "深圳市"}]})],
                 "maps_around_search": [
                     mcp_payload(
                         {
@@ -188,10 +188,22 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "success")
         self.assertEqual(executor.calls[1][2]["location"], "114.031,22.616")
 
-    async def test_geocode_without_geocodes_list_fails_closed(self):
+    async def test_geocode_without_supported_candidate_list_ignores_metadata_location_and_fails_closed(self):
         handler, executor = build_handler(
             "local_place_search",
-            {"maps_geo": [mcp_payload({"metadata": {"location": "114.031,22.616", "city": "深圳市"}})]},
+            {
+                "maps_geo": [
+                    mcp_payload(
+                        {
+                            "metadata": {
+                                "location": "114.031,22.616",
+                                "city": "深圳市",
+                                "results": [{"location": "114.031,22.616", "city": "深圳市"}],
+                            }
+                        }
+                    )
+                ]
+            },
         )
 
         result = await handler.execute({"query": "烤肉", "near": "民治地铁站"})
@@ -199,6 +211,73 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.data["error_code"], "invalid_response")
         self.assertEqual([call[0] for call in executor.calls], ["maps_geo"])
+
+    async def test_nested_metadata_pois_are_ignored(self):
+        handler, _executor = build_handler(
+            "local_place_search",
+            {
+                "maps_text_search": [
+                    mcp_payload(
+                        {
+                            "metadata": {
+                                "pois": [
+                                    {
+                                        "id": "polluted-poi",
+                                        "name": "不应展示的地点",
+                                        "location": "114.031,22.616",
+                                    }
+                                ]
+                            }
+                        }
+                    )
+                ]
+            },
+        )
+
+        result = await handler.execute({"query": "咖啡"})
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual(result.data["result"]["places"], [])
+        self.assertEqual(result.data["result"]["result_count"], 0)
+
+    async def test_results_candidates_apply_same_ambiguity_and_city_conflict_rules(self):
+        cases = (
+            (
+                {"query": "烤肉", "near": "民治"},
+                [
+                    {"location": "116.407,39.904", "city": "北京市"},
+                    {"location": "114.031,22.616", "city": "深圳市"},
+                ],
+            ),
+            (
+                {"query": "烤肉", "near": "民治", "city": "深圳"},
+                [
+                    {"location": "114.031,22.616", "city": "深圳市"},
+                    {"location": "114.057,22.543", "city": "深圳市"},
+                ],
+            ),
+            (
+                {"query": "烤肉", "near": "民治", "city": "深圳"},
+                [
+                    {"location": "114.031,22.616", "city": "深圳市"},
+                    {"location": "114.031,22.616", "city": "深圳市"},
+                ],
+            ),
+            (
+                {"query": "烤肉", "near": "民治", "city": "深圳"},
+                [{"location": "121.473,31.230", "city": "上海市"}],
+            ),
+        )
+        for args, candidates in cases:
+            handler, executor = build_handler(
+                "local_place_search",
+                {"maps_geo": [mcp_payload({"results": candidates})]},
+            )
+            with self.subTest(args=args, candidates=candidates):
+                result = await handler.execute(args)
+                self.assertEqual(result.status, "failed")
+                self.assertEqual(result.data["error_code"], "invalid_response")
+                self.assertEqual([call[0] for call in executor.calls], ["maps_geo"])
 
     async def test_geocode_city_selects_one_candidate_and_ambiguous_candidates_fail_closed(self):
         handler, executor = build_handler(
@@ -349,14 +428,17 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
             "route_compare",
             {
                 "maps_geo": [
-                    mcp_payload({"geocodes": [{"location": "114.031,22.616", "city": "深圳市"}]}),
-                    mcp_payload({"geocodes": [{"location": "114.057,22.543", "city": "深圳市"}]}),
+                    mcp_payload({"results": [{"location": "114.031,22.616", "city": "深圳市"}]}),
+                    mcp_payload({"results": [{"location": "114.057,22.543", "city": "深圳市"}]}),
                 ],
-                "maps_direction_driving": [
-                    mcp_payload({"route": {"paths": [{"distance": "16000", "duration": "1500"}]}})
-                ],
+                "maps_direction_driving": [mcp_payload({"paths": [{"distance": "16000", "duration": "1500"}]})],
                 "maps_direction_transit_integrated": [
-                    mcp_payload({"route": {"transits": [{"distance": "15000", "duration": "2700", "segments": []}]}})
+                    mcp_payload(
+                        {
+                            "distance": "15000",
+                            "transits": [{"duration": "2700", "segments": [{}, {}]}],
+                        }
+                    )
                 ],
                 "maps_direction_walking": [
                     mcp_payload({"route": {"paths": [{"distance": "13000", "duration": "10800"}]}})
@@ -389,6 +471,12 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [route["mode"] for route in result.data["result"]["routes"]], ["driving", "transit", "walking"]
         )
+        routes = {route["mode"]: route for route in result.data["result"]["routes"]}
+        self.assertEqual(routes["driving"]["distance_m"], 16000)
+        self.assertEqual(routes["driving"]["duration_s"], 1500)
+        self.assertEqual(routes["transit"]["distance_m"], 15000)
+        self.assertEqual(routes["transit"]["duration_s"], 2700)
+        self.assertEqual(routes["transit"]["transfers"], 1)
 
     async def test_transit_uses_geocode_cities_while_input_cities_only_disambiguate_geo(self):
         handler, executor = build_handler(
@@ -611,6 +699,67 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.data["error_code"], "invalid_response")
         self.assertEqual(len(executor.calls), 3)
+
+    async def test_nested_metadata_route_lists_are_ignored_and_stop_next_mode(self):
+        handler, executor = build_handler(
+            "route_compare",
+            {
+                "maps_geo": [
+                    mcp_payload({"results": [{"location": "114.031,22.616", "city": "深圳市"}]}),
+                    mcp_payload({"results": [{"location": "114.057,22.543", "city": "深圳市"}]}),
+                ],
+                "maps_direction_driving": [
+                    mcp_payload(
+                        {
+                            "metadata": {
+                                "paths": [{"distance": "16000", "duration": "1500"}],
+                                "transits": [{"distance": "15000", "duration": "2700"}],
+                            }
+                        }
+                    )
+                ],
+                "maps_direction_walking": [mcp_payload({"paths": [{"distance": "13000"}]})],
+            },
+        )
+
+        result = await handler.execute(
+            {"origin": "民治地铁站", "destination": "深圳市民中心", "modes": ["driving", "walking"]}
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.data["error_code"], "invalid_response")
+        self.assertEqual(len(executor.calls), 3)
+        self.assertNotIn("maps_direction_walking", [call[0] for call in executor.calls])
+
+    async def test_route_parser_rejects_cross_mode_shapes(self):
+        cases = (
+            (
+                "transit",
+                mcp_payload({"paths": [{"distance": "15000", "duration": "2700"}]}),
+                "maps_direction_transit_integrated",
+            ),
+            (
+                "driving",
+                mcp_payload({"transits": [{"distance": "16000", "duration": "1500"}]}),
+                "maps_direction_driving",
+            ),
+        )
+        for mode, route_payload, remote_tool in cases:
+            handler, executor = build_handler(
+                "route_compare",
+                {
+                    "maps_geo": [
+                        mcp_payload({"results": [{"location": "114.031,22.616", "city": "深圳市"}]}),
+                        mcp_payload({"results": [{"location": "114.057,22.543", "city": "深圳市"}]}),
+                    ],
+                    remote_tool: [route_payload],
+                },
+            )
+            with self.subTest(mode=mode):
+                result = await handler.execute({"origin": "民治地铁站", "destination": "深圳市民中心", "modes": [mode]})
+                self.assertEqual(result.status, "failed")
+                self.assertEqual(result.data["error_code"], "invalid_response")
+                self.assertEqual([call[0] for call in executor.calls], ["maps_geo", "maps_geo", remote_tool])
 
     async def test_transit_without_safe_city_is_unavailable_without_remote_transit_call(self):
         handler, executor = build_handler(

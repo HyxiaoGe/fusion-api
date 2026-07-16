@@ -576,20 +576,22 @@ def _extract_geo(
     requested_city: str | None,
 ) -> dict[str, Any] | None:
     candidates: list[dict[str, Any]] = []
-    for node in _walk_nodes(payload):
-        if not isinstance(node, dict) or not isinstance(node.get("geocodes"), list):
-            continue
-        for candidate in node["geocodes"][:20]:
-            if not isinstance(candidate, dict):
+    for node in _structured_data_roots(payload):
+        for list_key in ("geocodes", "results"):
+            raw_candidates = node.get(list_key)
+            if not isinstance(raw_candidates, list):
                 continue
-            location = _safe_coordinate(candidate.get("location"))
-            if not location:
-                continue
-            result: dict[str, Any] = {"label": _redact_product_text(label)[:120], "location": location}
-            city = _first_text(candidate, ("city", "cityname", "province"), 40)
-            if city:
-                result["city"] = city
-            candidates.append(result)
+            for candidate in raw_candidates[:20]:
+                if not isinstance(candidate, dict):
+                    continue
+                location = _safe_coordinate(candidate.get("location"))
+                if not location:
+                    continue
+                result: dict[str, Any] = {"label": _redact_product_text(label)[:120], "location": location}
+                city = _first_text(candidate, ("city", "cityname", "province"), 40)
+                if city:
+                    result["city"] = city
+                candidates.append(result)
     if len(candidates) == 1:
         candidate = candidates[0]
         if requested_city and candidate.get("city") and not _city_matches(requested_city, candidate.get("city")):
@@ -617,9 +619,13 @@ def _city_matches(requested: str, candidate: Any) -> bool:
 
 def _extract_places(payload: Any, *, limit: int) -> list[dict[str, Any]]:
     candidates: list[Any] = []
-    for node in _walk_nodes(payload):
-        if isinstance(node, dict) and isinstance(node.get("pois"), list):
-            candidates = node["pois"]
+    for root in _structured_data_roots(payload):
+        if isinstance(root.get("pois"), list):
+            candidates = root["pois"]
+            break
+        explicit_result = root.get("result")
+        if isinstance(explicit_result, dict) and isinstance(explicit_result.get("pois"), list):
+            candidates = explicit_result["pois"]
             break
     places: list[dict[str, Any]] = []
     for raw in candidates[: min(limit, 10)]:
@@ -651,19 +657,28 @@ def _extract_places(payload: Any, *, limit: int) -> list[dict[str, Any]]:
 
 def _extract_route(payload: Any, mode: str) -> dict[str, Any] | None:
     candidate = None
-    for node in _walk_nodes(payload):
-        if not isinstance(node, dict):
-            continue
-        for key in ("paths", "transits"):
-            values = node.get(key)
+    candidate_container = None
+    route_list_key = "transits" if mode == "transit" else "paths"
+    for root in _structured_data_roots(payload):
+        containers = [root]
+        explicit_route = root.get("route")
+        if isinstance(explicit_route, dict):
+            containers.append(explicit_route)
+        for node in containers:
+            values = node.get(route_list_key)
             if isinstance(values, list) and values and isinstance(values[0], dict):
                 candidate = values[0]
+                candidate_container = node
+            if candidate is not None:
                 break
         if candidate is not None:
             break
     if not isinstance(candidate, dict):
         return None
-    distance = _safe_int(candidate.get("distance"))
+    distance_value = candidate.get("distance")
+    if distance_value is None and isinstance(candidate_container, dict):
+        distance_value = candidate_container.get("distance")
+    distance = _safe_int(distance_value)
     duration = _safe_int(candidate.get("duration"))
     if distance is None and duration is None:
         return None
@@ -684,17 +699,16 @@ def _extract_route(payload: Any, mode: str) -> dict[str, Any] | None:
     return route
 
 
-def _walk_nodes(value: Any, *, max_nodes: int = 1_000):
-    stack = [value]
-    seen = 0
-    while stack and seen < max_nodes:
-        node = stack.pop()
-        seen += 1
-        yield node
-        if isinstance(node, dict):
-            stack.extend(reversed(list(node.values())[:100]))
-        elif isinstance(node, list):
-            stack.extend(reversed(node[:100]))
+def _structured_data_roots(payload: Any):
+    """只读取 MCP text item 的 structured_data 根对象，拒绝任意树搜索。"""
+    if not isinstance(payload, dict) or not isinstance(payload.get("content"), list):
+        return
+    for item in payload["content"][:100]:
+        if not isinstance(item, dict) or item.get("type") != "text":
+            continue
+        root = item.get("structured_data")
+        if isinstance(root, dict):
+            yield root
 
 
 def _safe_coordinate(value: Any) -> str | None:
