@@ -95,6 +95,22 @@ def build_config(**overrides):
 
 
 class McpClientManagerTests(unittest.TestCase):
+    def test_non_json_arguments_are_invalid_without_opening_connector(self):
+        connector = FakeConnector(FakeSession())
+        manager = McpClientManager(
+            policy=build_policy(),
+            connector=connector,
+            environ={"DASHSCOPE_API_KEY": "test-secret"},
+        )
+
+        for arguments in ({"value": float("nan")}, {"value": float("inf")}, {"value": object()}):
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(McpClientError) as raised:
+                    asyncio.run(manager.call_tool(build_config(allowed_tools=["search"]), "search", arguments))
+                self.assertEqual(raised.exception.code, "invalid_arguments")
+
+        self.assertEqual(connector.connections, [])
+
     def test_idempotent_discovery_retries_once_after_nested_transient_timeout(self):
         request = httpx.Request("POST", "https://dashscope.aliyuncs.com/api/v1/mcps/WebSearch/mcp")
         wrapped_timeout = RuntimeError("sdk transport failed")
@@ -355,6 +371,44 @@ class McpClientManagerTests(unittest.TestCase):
         self.assertEqual(raised.exception.safe_message, "MCP 服务鉴权失败")
         self.assertNotIn(secret, str(raised.exception))
 
+    def test_http_429_maps_to_safe_rate_limited_error_without_retry_or_raw_response(self):
+        secret = "amap-secret-response"
+        request = httpx.Request("POST", "https://mcp.amap.com/mcp")
+        response = httpx.Response(429, text=f"quota exceeded: {secret}", request=request)
+        http_error = httpx.HTTPStatusError(
+            f"429 upstream body={secret}",
+            request=request,
+            response=response,
+        )
+
+        class RateLimitedSession(FakeSession):
+            def __init__(self):
+                super().__init__()
+                self.call_attempts = 0
+
+            async def call_tool(self, name, arguments, read_timeout_seconds=None):
+                self.call_attempts += 1
+                raise http_error
+
+        session = RateLimitedSession()
+        manager = McpClientManager(
+            policy=build_policy(allowed_hosts=frozenset({"mcp.amap.com"})),
+            connector=FakeConnector(session),
+            environ={"DASHSCOPE_API_KEY": "credential-secret"},
+        )
+        config = build_config(
+            endpoint_url="https://mcp.amap.com/mcp",
+            allowed_tools=["search"],
+        )
+
+        with self.assertRaises(McpClientError) as raised:
+            asyncio.run(manager.call_tool(config, "search", {"keywords": "民治烤肉"}))
+
+        self.assertEqual(raised.exception.code, "rate_limited")
+        self.assertEqual(raised.exception.safe_message, "MCP 服务请求过于频繁")
+        self.assertNotIn(secret, str(raised.exception))
+        self.assertEqual(session.call_attempts, 1)
+
     def test_redirect_is_blocked_and_classified_without_following_target(self):
         request = httpx.Request("POST", "https://dashscope.aliyuncs.com/mcp")
         response = httpx.Response(307, headers={"location": "http://127.0.0.1/internal"}, request=request)
@@ -427,6 +481,32 @@ class McpClientManagerTests(unittest.TestCase):
         self.assertEqual(connection["endpoint_url"], build_config().endpoint_url)
         self.assertEqual(connection["query_params"], {"api_key": "query-secret"})
         self.assertEqual(connection["headers"], {})
+
+    def test_amap_missing_query_credential_fails_before_network_without_secret_detail(self):
+        connector = FakeConnector(FakeSession())
+        manager = McpClientManager(
+            policy=build_policy(
+                allowed_hosts=frozenset({"mcp.amap.com"}),
+                allowed_credential_refs=frozenset({"AMAP_MCP_API_KEY"}),
+            ),
+            connector=connector,
+            environ={},
+        )
+        config = build_config(
+            provider="amap",
+            endpoint_url="https://mcp.amap.com/mcp",
+            auth_type="query",
+            auth_name="key",
+            credential_ref="AMAP_MCP_API_KEY",
+        )
+
+        with self.assertRaises(McpClientError) as raised:
+            asyncio.run(manager.test_connection(config))
+
+        self.assertEqual(raised.exception.code, "credential_unavailable")
+        self.assertEqual(raised.exception.safe_message, "MCP 凭证不可用")
+        self.assertNotIn("AMAP_MCP_API_KEY", str(raised.exception))
+        self.assertEqual(connector.connections, [])
 
     def test_query_transport_keeps_secret_out_of_httpx_log_and_response_url(self):
         secret = "query-secret"

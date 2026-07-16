@@ -16,6 +16,35 @@ from app.services.tool_handlers.base import ToolResult
 
 
 class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
+    def test_unannounced_calls_do_not_consume_global_tool_capacity(self):
+        stale_call = {"id": "tc-stale", "name": "mcp_maps_search"}
+        search_call = {"id": "tc-search", "name": "web_search"}
+        read_call = {"id": "tc-read", "name": "url_read"}
+        request = Mock(
+            tool_calls=[stale_call, search_call, read_call],
+            announced_tool_names=frozenset({"web_search", "url_read"}),
+            completed_tool_calls=19,
+            max_tool_calls=20,
+            network_budget=object(),
+            run_id="run-limit",
+        )
+
+        with self.assertLogs("app.services.stream.tool_round", level="WARNING") as captured:
+            announced, unavailable = tool_round_module._partition_tool_calls_by_announcement(request)
+        selected, global_limit_not_executed = tool_round_module._select_tool_calls_within_limit(
+            request,
+            announced,
+        )
+
+        self.assertEqual(announced, [search_call, read_call])
+        self.assertEqual(unavailable, [stale_call])
+        self.assertEqual(selected, [search_call])
+        self.assertEqual(global_limit_not_executed, [read_call])
+        logs = "\n".join(captured.output)
+        self.assertIn("run_id=run-limit requested=3 announced=2 unavailable=1", logs)
+        self.assertNotIn("mcp_maps_search", logs)
+        self.assertNotIn("tc-stale", logs)
+
     def test_build_assistant_tool_message_preserves_tool_calls_and_reasoning(self):
         tool_calls = [
             {"id": "tc-1", "name": "web_search", "arguments": '{"query":"x"}'},

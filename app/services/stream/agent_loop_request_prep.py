@@ -31,6 +31,9 @@ class AgentLoopCallConfig:
     supports_function_calling: bool
     call_kwargs: dict
     announced_tools: list[str]
+    supports_dynamic_tools: bool = False
+    dynamic_tool_handlers: dict[str, Any] = field(default_factory=dict)
+    tool_bindings: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -51,11 +54,23 @@ def announced_tool_names_from_call_kwargs(call_kwargs: dict) -> list[str]:
     return ordered_names
 
 
+def _tool_definition_name(tool: dict) -> str:
+    function = tool.get("function") if isinstance(tool, dict) else None
+    return str(function.get("name", "")) if isinstance(function, dict) else ""
+
+
 def supports_search_tools(capabilities: dict) -> bool:
     function_calling = bool(capabilities.get("functionCalling", False))
     if "searchCapable" in capabilities:
         return function_calling and bool(capabilities.get("searchCapable"))
     return function_calling and bool(capabilities.get("agentTools", capabilities.get("functionCalling", False)))
+
+
+def supports_dynamic_agent_tools(capabilities: dict) -> bool:
+    """显式拒绝 agentTools 的模型不得绕过兼容性门禁加载动态工具。"""
+    return bool(capabilities.get("functionCalling", False)) and bool(
+        capabilities.get("agentTools", capabilities.get("functionCalling", False))
+    )
 
 
 def normalize_controlled_max_tokens(value: Any) -> int | None:
@@ -72,6 +87,9 @@ def build_agent_loop_call_config(
     capabilities: dict | None,
     volcengine_providers: set[str] | frozenset[str] = frozenset(VOLCENGINE_PROVIDERS),
     build_web_search_tool_fn: Callable[[], dict] = build_web_search_tool,
+    additional_tools: list[dict] | None = None,
+    dynamic_tool_handlers: dict[str, Any] | None = None,
+    tool_bindings: list[dict[str, Any]] | None = None,
 ) -> AgentLoopCallConfig:
     options = options or {}
     capabilities = capabilities or {}
@@ -82,21 +100,41 @@ def build_agent_loop_call_config(
 
     tools_disabled = options.get("disable_tools") is True
     supports_function_calling = supports_search_tools(capabilities) and not tools_disabled
+    supports_dynamic_tools = supports_dynamic_agent_tools(capabilities) and not tools_disabled
     call_kwargs: dict = {}
     max_tokens = normalize_controlled_max_tokens(options.get("max_tokens"))
     if max_tokens is not None:
         call_kwargs["max_tokens"] = max_tokens
+    tools: list[dict] = []
     if supports_function_calling:
-        call_kwargs["tools"] = [build_web_search_tool_fn()]
+        tools.append(build_web_search_tool_fn())
+    provided_handlers = dynamic_tool_handlers or {}
+    if supports_dynamic_tools:
+        tools.extend(
+            tool
+            for tool in (additional_tools or [])
+            if _tool_definition_name(tool).startswith("mcp_") and _tool_definition_name(tool) in provided_handlers
+        )
+    if tools:
+        call_kwargs["tools"] = tools
         call_kwargs["tool_choice"] = "auto"
         if should_use_reasoning and provider in volcengine_providers:
             merge_extra_body(call_kwargs, {"thinking": {"type": "disabled"}})
 
+    announced_tools = announced_tool_names_from_call_kwargs(call_kwargs)
+    announced_tool_set = set(announced_tools)
+    active_handlers = {name: handler for name, handler in provided_handlers.items() if name in announced_tool_set}
+    active_bindings = [
+        binding for binding in (tool_bindings or []) if str(binding.get("alias", "")) in announced_tool_set
+    ]
     return AgentLoopCallConfig(
         should_use_reasoning=should_use_reasoning,
         supports_function_calling=supports_function_calling,
         call_kwargs=call_kwargs,
-        announced_tools=announced_tool_names_from_call_kwargs(call_kwargs),
+        announced_tools=announced_tools,
+        supports_dynamic_tools=bool(active_handlers),
+        dynamic_tool_handlers=active_handlers,
+        tool_bindings=active_bindings,
     )
 
 
@@ -261,8 +299,9 @@ def inject_tool_usage_contract(messages: list[dict], call_kwargs: dict) -> list[
 
 def inject_no_tool_network_boundary(messages: list[dict], call_kwargs: dict) -> list[dict]:
     """无联网工具模式下补一条 system 边界，避免模型把内部知识包装成实时搜索。"""
+    announced_tools = set(announced_tool_names_from_call_kwargs(call_kwargs))
     network_tool_names = {"web_search", "url_read"}
-    if network_tool_names.intersection(announced_tool_names_from_call_kwargs(call_kwargs)):
+    if network_tool_names.intersection(announced_tools) or any(name.startswith("mcp_") for name in announced_tools):
         return messages
     if any(msg.get("role") == "system" and "【无联网工具边界规则】" in str(msg.get("content", "")) for msg in messages):
         return messages

@@ -464,6 +464,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                     log_id="log_aaa",
                 ),
             ],
+            capabilities={"functionCalling": True, "searchCapable": True},
         )
 
         events = self._agent_events()
@@ -519,6 +520,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                     AsyncMock(side_effect=_capture_execute),
                 ),
             ],
+            capabilities={"functionCalling": True, "searchCapable": True},
         )
 
         self.assertGreaterEqual(len(order), 2)
@@ -550,6 +552,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                         log_id="log_aaa",
                     )
                 ],
+                capabilities={"functionCalling": True, "searchCapable": True},
             )
 
         self.assertIn("content block boom", str(cm.exception))
@@ -590,8 +593,14 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                 patch(
                     "app.services.stream.runner.llm_call_with_retry",
                     AsyncMock(side_effect=_capture_llm_call),
-                )
+                ),
+                patch(
+                    "app.services.external.reader_client.read_url",
+                    AsyncMock(return_value=None),
+                ),
             ],
+            capabilities={"functionCalling": True},
+            original_message="请读取 https://example.com",
         )
 
         self.assertGreaterEqual(len(captured_messages), 2)
@@ -878,6 +887,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                         log_id="log_aaa",
                     ),
                 ],
+                capabilities={"functionCalling": True, "searchCapable": True},
             )
 
         events = self._agent_events()
@@ -992,6 +1002,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                         AsyncMock(side_effect=_hang_on_summary),
                     ),
                 ],
+                capabilities={"functionCalling": True, "searchCapable": True},
             )
 
         events = self._agent_events()

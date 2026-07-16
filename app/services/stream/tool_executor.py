@@ -8,8 +8,9 @@ tool_call_started/completed 协议，并把 execute_tool_with_retry
 import asyncio
 import json
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import backoff
 
@@ -48,6 +49,7 @@ class ToolExecutionBatchRequest:
     message_id: str | None = None
     emitter: Optional[AgentEventEmitter] = None
     network_budget: "NetworkToolBudget | None" = None
+    tool_handlers: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -124,6 +126,16 @@ async def execute_tool_with_retry(handler, args: dict):
         return ToolResult(status="failed", error_message="工具调用超时")
 
 
+async def execute_tool_once(handler, args: dict):
+    """有副作用或不具备幂等保证的工具只执行一次，但仍保留统一超时。"""
+    from app.services.tool_handlers import ToolResult
+
+    try:
+        return await asyncio.wait_for(handler.execute(args), timeout=AGENT_TOOL_TIMEOUT)
+    except asyncio.TimeoutError:
+        return ToolResult(status="failed", error_message="工具调用超时")
+
+
 def new_tool_execution_ids() -> ToolExecutionIds:
     return ToolExecutionIds(
         block_id=f"blk_{uuid.uuid4().hex[:12]}",
@@ -131,7 +143,9 @@ def new_tool_execution_ids() -> ToolExecutionIds:
     )
 
 
-def resolve_tool_handler(tool_name: str):
+def resolve_tool_handler(tool_name: str, tool_handlers: Mapping[str, Any] | None = None):
+    if tool_handlers and tool_name in tool_handlers:
+        return tool_handlers[tool_name]
     from app.services.tool_handlers import get_handler as _get_handler
 
     return _get_handler(tool_name)
@@ -227,14 +241,17 @@ async def emit_budget_result(
 
 
 async def execute_tool_handler(*, request: ToolExecutionBatchRequest, tool_call: dict, handler, args: dict):
+    executor = (
+        execute_tool_once if getattr(handler, "supports_automatic_retry", True) is False else execute_tool_with_retry
+    )
     if request.emitter is None:
-        return await execute_tool_with_retry(handler, args)
+        return await executor(handler, args)
     return await execute_tool_with_lifecycle(
         tool_call_id=tool_call["id"],
         tool_name=handler.tool_name,
         args=args,
         target=handler,
-        execute=execute_tool_with_retry,
+        execute=executor,
         result_summary_builder=handler._build_result_summary,
         emitter=request.emitter,
     )
@@ -283,7 +300,7 @@ async def emit_progress_digest_events(
 
 
 async def execute_one_tool_call(request: ToolExecutionBatchRequest, tool_call: dict) -> ToolExecutionRecord:
-    handler = resolve_tool_handler(tool_call["name"])
+    handler = resolve_tool_handler(tool_call["name"], request.tool_handlers)
     ids = new_tool_execution_ids()
     if not handler:
         return build_unknown_tool_record(tool_call=tool_call, ids=ids)
@@ -338,6 +355,7 @@ async def execute_tools_parallel(
     message_id: str | None = None,
     emitter: Optional[AgentEventEmitter] = None,
     network_budget: "NetworkToolBudget | None" = None,
+    tool_handlers: Mapping[str, Any] | None = None,
 ) -> list[ToolExecutionRecord]:
     """
     并行执行所有 tool_calls。
@@ -358,5 +376,6 @@ async def execute_tools_parallel(
         message_id=message_id,
         emitter=emitter,
         network_budget=network_budget,
+        tool_handlers=tool_handlers,
     )
     return await execute_tool_batch(request, tool_calls)

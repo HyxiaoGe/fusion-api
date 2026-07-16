@@ -46,6 +46,10 @@ _DSML_PARAMETER_RE = re.compile(
     r"</｜｜DSML｜｜parameter>",
     re.DOTALL | re.IGNORECASE,
 )
+_MCP_ALIAS_PREFIX = "mcp_"
+_MCP_ALIAS_TOKEN_LENGTH = 43
+_MCP_ALIAS_RE = re.compile(rf"{_MCP_ALIAS_PREFIX}[A-Za-z0-9_-]{{{_MCP_ALIAS_TOKEN_LENGTH}}}")
+_MCP_ALIAS_PARTIAL_RE = re.compile(rf"{_MCP_ALIAS_PREFIX}[A-Za-z0-9_-]+$")
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,7 @@ class LLMStreamRequest:
 @dataclass
 class LLMStreamState:
     reasoning_buf: str = ""
+    raw_reasoning_buf: str = ""
     content_buf: str = ""
     raw_content_buf: str = ""
     usage_data: Optional[Usage] = None
@@ -174,6 +179,47 @@ def strip_pending_dsml_tool_protocol(text: str) -> str:
     return text if pending_start is None else text[:pending_start]
 
 
+def _pending_mcp_alias_start(text: str) -> int | None:
+    max_suffix_length = min(len(text), len(_MCP_ALIAS_PREFIX) + _MCP_ALIAS_TOKEN_LENGTH - 1)
+    for suffix_length in range(max_suffix_length, 0, -1):
+        suffix = text[-suffix_length:]
+        if _MCP_ALIAS_PREFIX.startswith(suffix):
+            return len(text) - suffix_length
+        if (
+            suffix.startswith(_MCP_ALIAS_PREFIX)
+            and len(suffix) < len(_MCP_ALIAS_PREFIX) + _MCP_ALIAS_TOKEN_LENGTH
+            and all(char.isalnum() or char in {"_", "-"} for char in suffix[len(_MCP_ALIAS_PREFIX) :])
+        ):
+            return len(text) - suffix_length
+    return None
+
+
+def sanitize_internal_mcp_aliases(text: str, *, final: bool = False) -> str:
+    """内部运行级 MCP alias 不得进入用户可见 reasoning/answering。"""
+    visible_source = text
+    if not final:
+        pending_start = _pending_mcp_alias_start(text)
+        if pending_start is not None:
+            visible_source = text[:pending_start]
+    sanitized = _MCP_ALIAS_RE.sub("外部工具", visible_source)
+    if final:
+        sanitized = _MCP_ALIAS_PARTIAL_RE.sub("外部工具", sanitized)
+    return sanitized
+
+
+def _visible_delta(visible_text: str, emitted_text: str, *, channel: str) -> str:
+    if visible_text.startswith(emitted_text):
+        return visible_text[len(emitted_text) :]
+
+    common_prefix_length = 0
+    for left, right in zip(visible_text, emitted_text):
+        if left != right:
+            break
+        common_prefix_length += 1
+    logger.warning(f"{channel} 内容过滤出现非单调输出，已保留可追加部分")
+    return visible_text[common_prefix_length:]
+
+
 def _pending_dsml_tool_protocol_start(text: str) -> int | None:
     max_prefix_length = min(len(text), len(_DSML_TOOL_CALLS_OPEN) - 1)
     for prefix_length in range(max_prefix_length, 0, -1):
@@ -244,16 +290,29 @@ def filter_reasoning_tag_content_delta(state: LLMStreamState, content_delta: str
     state.raw_content_buf += content_delta
     visible_content = strip_reasoning_tag_blocks(state.raw_content_buf)
     visible_content = strip_pending_dsml_tool_protocol(visible_content)
-    if visible_content.startswith(state.content_buf):
-        return visible_content[len(state.content_buf) :]
+    visible_content = sanitize_internal_mcp_aliases(visible_content)
+    return _visible_delta(visible_content, state.content_buf, channel="answering")
 
-    common_prefix_length = 0
-    for left, right in zip(visible_content, state.content_buf):
-        if left != right:
-            break
-        common_prefix_length += 1
-    logger.warning("answering 内容过滤出现非单调输出，已保留可追加部分")
-    return visible_content[common_prefix_length:]
+
+def filter_internal_mcp_reasoning_delta(state: LLMStreamState, reasoning_delta: str) -> str:
+    if not reasoning_delta:
+        return ""
+    state.raw_reasoning_buf += reasoning_delta
+    visible_reasoning = sanitize_internal_mcp_aliases(state.raw_reasoning_buf)
+    return _visible_delta(visible_reasoning, state.reasoning_buf, channel="reasoning")
+
+
+async def flush_pending_internal_mcp_aliases(*, request: LLMStreamRequest, state: LLMStreamState) -> None:
+    final_reasoning = sanitize_internal_mcp_aliases(state.raw_reasoning_buf, final=True)
+    final_content = strip_reasoning_tag_blocks(state.raw_content_buf)
+    final_content = strip_pending_dsml_tool_protocol(final_content)
+    final_content = sanitize_internal_mcp_aliases(final_content, final=True)
+    await append_reasoning_and_content(
+        request=request,
+        state=state,
+        reasoning_delta=_visible_delta(final_reasoning, state.reasoning_buf, channel="reasoning"),
+        content_delta=_visible_delta(final_content, state.content_buf, channel="answering"),
+    )
 
 
 async def append_stream_delta(
@@ -326,8 +385,9 @@ async def process_stream_choice(*, request: LLMStreamRequest, state: LLMStreamSt
     if has_tool_call_delta(delta):
         return True
 
-    reasoning_delta = extract_reasoning_delta(delta, request.should_use_reasoning)
-    content_delta = extract_content_delta(delta, reasoning_delta)
+    raw_reasoning_delta = extract_reasoning_delta(delta, request.should_use_reasoning)
+    content_delta = extract_content_delta(delta, raw_reasoning_delta)
+    reasoning_delta = filter_internal_mcp_reasoning_delta(state, raw_reasoning_delta)
     content_delta = filter_reasoning_tag_content_delta(state, content_delta)
     await append_reasoning_and_content(
         request=request,
@@ -358,6 +418,8 @@ async def consume_stream_round(response, request: LLMStreamRequest) -> LLMStream
         if not should_continue:
             break
 
+    await flush_pending_internal_mcp_aliases(request=request, state=state)
+
     visible_content = strip_reasoning_tag_blocks(state.raw_content_buf)
     marker_index = visible_content.find(_DSML_TOOL_CALLS_OPEN)
     pending_start = _pending_dsml_tool_protocol_start(visible_content) if marker_index < 0 else None
@@ -366,7 +428,8 @@ async def consume_stream_round(response, request: LLMStreamRequest) -> LLMStream
         pending_candidate = visible_content[pending_start:]
         has_malformed_protocol = pending_candidate.startswith(_DSML_DISTINCT_PREFIX)
         if not has_malformed_protocol:
-            pending_delta = visible_content[len(state.content_buf) :]
+            safe_visible_content = sanitize_internal_mcp_aliases(visible_content, final=True)
+            pending_delta = safe_visible_content[len(state.content_buf) :]
             await append_reasoning_and_content(
                 request=request,
                 state=state,

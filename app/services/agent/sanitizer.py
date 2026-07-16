@@ -4,11 +4,27 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from typing import Any
 
 from app.services.security.url_policy import evaluate_url_policy
 
 URL_READ_REASON_MAX_CHARS = 160
+EXTERNAL_TOOL_ARGUMENT_MAX_BYTES = 4096
+_SENSITIVE_KEY_PARTS = frozenset(
+    {
+        "apikey",
+        "authorization",
+        "bearer",
+        "credential",
+        "cookie",
+        "password",
+        "privatekey",
+        "secret",
+        "sessionid",
+        "token",
+    }
+)
 
 
 def sanitize_arguments(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -19,7 +35,40 @@ def sanitize_arguments(tool_name: str, arguments: dict[str, Any]) -> dict[str, A
     """
     if tool_name == "url_read":
         return sanitize_url_read_arguments(arguments)
+    if tool_name.startswith("mcp_"):
+        return sanitize_external_tool_arguments(arguments)
     return arguments
+
+
+def sanitize_external_tool_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    """MCP 参数进入事件或日志前递归脱敏，并限制序列化体积。"""
+    source = arguments if isinstance(arguments, dict) else {}
+    sanitized = _sanitize_external_value(source, depth=0)
+    if not isinstance(sanitized, dict):
+        return {}
+    return cap_and_truncate(sanitized, max_bytes=EXTERNAL_TOOL_ARGUMENT_MAX_BYTES)
+
+
+def _sanitize_external_value(value: Any, *, depth: int) -> Any:
+    if depth >= 8:
+        return "[内容已省略]"
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for raw_key, item in list(value.items())[:64]:
+            key = str(raw_key)[:128]
+            normalized_key = re.sub(r"[^a-z0-9]", "", key.lower())
+            if any(part in normalized_key for part in _SENSITIVE_KEY_PARTS):
+                sanitized[key] = "[已脱敏]"
+            else:
+                sanitized[key] = _sanitize_external_value(item, depth=depth + 1)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_external_value(item, depth=depth + 1) for item in value[:64]]
+    if isinstance(value, tuple):
+        return [_sanitize_external_value(item, depth=depth + 1) for item in value[:64]]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return str(value)[:1_024]
 
 
 def sanitize_url_read_arguments(arguments: dict[str, Any]) -> dict[str, Any]:

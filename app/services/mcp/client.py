@@ -213,6 +213,11 @@ class McpClientManager:
         if auth_type == "header" and auth_name.lower() in _FORBIDDEN_AUTH_HEADERS:
             raise McpClientError("invalid_auth", "MCP 鉴权配置无效")
 
+    def validate_runtime_configuration(self, config: McpConnectionConfig) -> None:
+        """调用前确认部署凭据可解析，但不返回或记录凭据内容。"""
+
+        self._resolve_connection(config)
+
     async def test_connection(self, config: McpConnectionConfig) -> None:
         async def operation(_session: McpSession) -> None:
             return None
@@ -233,7 +238,10 @@ class McpClientManager:
     ) -> dict[str, Any]:
         if not _TOOL_NAME_PATTERN.fullmatch(tool_name) or tool_name not in config.allowed_tools:
             raise McpClientError("tool_not_allowed", "MCP 工具未获授权")
-        normalized_arguments = _normalize_json_payload(arguments)
+        try:
+            normalized_arguments = _normalize_json_payload(arguments)
+        except McpClientError:
+            raise McpClientError("invalid_arguments", "MCP 工具参数无效") from None
         if (
             not isinstance(normalized_arguments, dict)
             or len(_json_bytes(normalized_arguments)) > self.policy.max_response_bytes
@@ -474,6 +482,8 @@ def _classify_exception(exc: Exception, operation_name: str) -> McpClientError:
     for error in errors:
         if isinstance(error, httpx.HTTPStatusError):
             status_code = error.response.status_code
+            if status_code == 429:
+                return McpClientError("rate_limited", "MCP 服务请求过于频繁")
             if status_code in {401, 403}:
                 return McpClientError("auth_failed", "MCP 服务鉴权失败")
             if status_code in {301, 302, 303, 307, 308}:

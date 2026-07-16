@@ -58,6 +58,8 @@ class ToolRoundRequest:
     completed_tool_calls: int | None = None
     max_tool_calls: int | None = None
     clock: Callable[[], float] = time.time
+    tool_handlers: dict[str, Any] | None = None
+    announced_tool_names: frozenset[str] | None = None
 
 
 def build_assistant_tool_message(
@@ -127,14 +129,25 @@ async def execute_tool_round_tools(
     *,
     selected_tool_calls: list[dict] | None = None,
 ) -> list[ToolExecutionRecord]:
-    executed_tool_calls = (
-        _select_tool_calls_within_limit(request)[0] if selected_tool_calls is None else selected_tool_calls
-    )
+    if selected_tool_calls is None:
+        announced_tool_calls, _ = _partition_tool_calls_by_announcement(request)
+        executed_tool_calls = _select_tool_calls_within_limit(request, announced_tool_calls)[0]
+    else:
+        executed_tool_calls = selected_tool_calls
     if not executed_tool_calls:
         if request.on_tools_executed is not None:
             request.on_tools_executed(0)
         return []
 
+    execute_kwargs = {
+        "trace_id": request.run_id,
+        "step_number": request.step_number,
+        "message_id": request.assistant_message_id,
+        "emitter": request.emitter,
+        "network_budget": request.network_budget,
+    }
+    if request.tool_handlers:
+        execute_kwargs["tool_handlers"] = request.tool_handlers
     try:
         return await request.execute_tools_fn(
             executed_tool_calls,
@@ -142,11 +155,7 @@ async def execute_tool_round_tools(
             request.user_id,
             request.model_id,
             request.provider,
-            trace_id=request.run_id,
-            step_number=request.step_number,
-            message_id=request.assistant_message_id,
-            emitter=request.emitter,
-            network_budget=request.network_budget,
+            **execute_kwargs,
         )
     finally:
         if request.on_tools_executed is not None:
@@ -177,6 +186,7 @@ def append_tool_round_messages_with_plan(
     source_plan: SourceSelectionPlan | None,
     missing_result_tool_calls: list[dict] | None = None,
     not_executed_tool_calls: list[dict] | None = None,
+    unavailable_tool_calls: list[dict] | None = None,
 ) -> None:
     request.messages.append(
         build_assistant_tool_message(
@@ -194,6 +204,7 @@ def append_tool_round_messages_with_plan(
     records_by_id = {str(record.tool_call.get("id", "")): record for record in results}
     missing_result_ids = {str(tool_call.get("id", "")) for tool_call in missing_result_tool_calls or []}
     not_executed_ids = {str(tool_call.get("id", "")) for tool_call in not_executed_tool_calls or []}
+    unavailable_ids = {str(tool_call.get("id", "")) for tool_call in unavailable_tool_calls or []}
 
     for tool_call in request.tool_calls:
         tool_call_id = str(tool_call.get("id", ""))
@@ -232,6 +243,16 @@ def append_tool_round_messages_with_plan(
                     "role": "tool",
                     "tool_call_id": tool_call["id"],
                     "content": _format_not_executed_tool_context(),
+                }
+            )
+            continue
+
+        if tool_call_id in unavailable_ids:
+            request.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": _format_unavailable_tool_context(),
                 }
             )
 
@@ -320,7 +341,8 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
     append_tool_round_reasoning(request)
     persist_tool_round_checkpoint(request)
 
-    selected_tool_calls = _select_tool_calls_within_limit(request)
+    announced_tool_calls, unavailable_tool_calls = _partition_tool_calls_by_announcement(request)
+    selected_tool_calls = _select_tool_calls_within_limit(request, announced_tool_calls)
     if selected_tool_calls[0]:
         await update_tool_round_plan_started(request, tool_calls=selected_tool_calls[0])
     raw_results = await execute_tool_round_tools(request, selected_tool_calls=selected_tool_calls[0])
@@ -338,6 +360,7 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
         source_plan=source_plan,
         missing_result_tool_calls=missing_result_tool_calls,
         not_executed_tool_calls=selected_tool_calls[1],
+        unavailable_tool_calls=unavailable_tool_calls,
     )
     persist_tool_round_checkpoint(request)
 
@@ -410,20 +433,46 @@ def _max_tool_calls(request: ToolRoundRequest) -> int | None:
     return value if isinstance(value, int) else None
 
 
-def _select_tool_calls_within_limit(request: ToolRoundRequest) -> tuple[list[dict], list[dict]]:
+def _partition_tool_calls_by_announcement(request: ToolRoundRequest) -> tuple[list[dict], list[dict]]:
+    if request.announced_tool_names is None:
+        return request.tool_calls, []
+
+    announced_tool_calls: list[dict] = []
+    unavailable_tool_calls: list[dict] = []
+    for tool_call in request.tool_calls:
+        if tool_call.get("name") in request.announced_tool_names:
+            announced_tool_calls.append(tool_call)
+        else:
+            unavailable_tool_calls.append(tool_call)
+    if unavailable_tool_calls:
+        logger.warning(
+            "模型返回本轮未公告工具调用: run_id=%s requested=%s announced=%s unavailable=%s",
+            request.run_id,
+            len(request.tool_calls),
+            len(announced_tool_calls),
+            len(unavailable_tool_calls),
+        )
+    return announced_tool_calls, unavailable_tool_calls
+
+
+def _select_tool_calls_within_limit(
+    request: ToolRoundRequest,
+    tool_calls: list[dict] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    candidate_tool_calls = request.tool_calls if tool_calls is None else tool_calls
     completed_tool_calls = _completed_tool_calls_before_round(request)
     max_tool_calls = _max_tool_calls(request)
     if completed_tool_calls is None or max_tool_calls is None:
-        return request.tool_calls, []
+        return candidate_tool_calls, []
 
     remaining_capacity = max(0, max_tool_calls - completed_tool_calls)
-    executed_tool_calls = request.tool_calls[:remaining_capacity]
-    not_executed_tool_calls = request.tool_calls[remaining_capacity:]
+    executed_tool_calls = candidate_tool_calls[:remaining_capacity]
+    not_executed_tool_calls = candidate_tool_calls[remaining_capacity:]
     if not_executed_tool_calls:
         logger.info(
             "工具调用批次受全局上限截断: "
             f"run_id={request.run_id}, completed={completed_tool_calls}, max={max_tool_calls}, "
-            f"requested={len(request.tool_calls)}, executed={len(executed_tool_calls)}, "
+            f"requested={len(candidate_tool_calls)}, executed={len(executed_tool_calls)}, "
             f"not_executed={len(not_executed_tool_calls)}"
         )
     return executed_tool_calls, not_executed_tool_calls
@@ -507,6 +556,17 @@ def _format_not_executed_tool_context() -> str:
             "reason": "limit_reached",
             "limit_reason": "max_tool_calls",
             "message": "Agent 工具调用额度已耗尽，本次调用未执行，不能将其视为事实依据。",
+        },
+        ensure_ascii=False,
+    )
+
+
+def _format_unavailable_tool_context() -> str:
+    return json.dumps(
+        {
+            "status": "not_executed",
+            "reason": "tool_not_announced_this_round",
+            "message": "该工具本轮不可用，本次调用未执行，不能作为事实依据；请停止重复调用。",
         },
         ensure_ascii=False,
     )

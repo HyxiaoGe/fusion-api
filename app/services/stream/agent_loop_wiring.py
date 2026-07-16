@@ -15,7 +15,7 @@ from app.services.stream.agent_loop_lifecycle import (
     AgentLoopLifecycleRequest,
 )
 from app.services.stream.agent_loop_policy import AgentLoopLimits
-from app.services.stream.agent_loop_request_prep import AgentLoopCallConfig
+from app.services.stream.agent_loop_request_prep import AgentLoopCallConfig, supports_dynamic_agent_tools
 
 AsyncFn = Callable[..., Awaitable[Any]]
 PersistMessageFn = Callable[..., Any]
@@ -118,6 +118,7 @@ class AgentLoopWiringDependencies:
     info_fn: LogFn
     error_fn: LogFn
     warning_fn: LogFn
+    load_dynamic_tools_fn: Callable[[Any], Any] | None = None
 
     def to_execution_dependencies(self) -> AgentLoopDependencies:
         return AgentLoopDependencies(
@@ -176,10 +177,19 @@ def build_agent_loop_lifecycle_call(
 ) -> AgentLoopLifecycleCall:
     options = {} if run_input.options is None else run_input.options
     capabilities = {} if run_input.capabilities is None else run_input.capabilities
+    should_load_dynamic_tools = (
+        supports_dynamic_agent_tools(capabilities)
+        and options.get("disable_tools") is not True
+        and dependencies.load_dynamic_tools_fn is not None
+    )
+    dynamic_tool_set = dependencies.load_dynamic_tools_fn(db) if should_load_dynamic_tools else None
     call_config = dependencies.build_call_config_fn(
         provider=run_input.provider,
         options=options,
         capabilities=capabilities,
+        additional_tools=list(getattr(dynamic_tool_set, "definitions", []) or []),
+        dynamic_tool_handlers=dict(getattr(dynamic_tool_set, "handlers", {}) or {}),
+        tool_bindings=list(getattr(dynamic_tool_set, "audit_bindings", []) or []),
     )
     execution = dependencies.build_execution_fn(
         request=run_input.to_execution_request(db=db, call_config=call_config),

@@ -14,6 +14,16 @@ class McpServerRepository:
     def list_all(self) -> list[McpServer]:
         return self.db.query(McpServer).order_by(McpServer.created_at.desc(), McpServer.id.desc()).all()
 
+    def list_enabled(self) -> list[McpServer]:
+        """按稳定顺序返回启用的 MCP 服务，供运行级工具目录构建。"""
+
+        return (
+            self.db.query(McpServer)
+            .filter(McpServer.is_enabled.is_(True))
+            .order_by(McpServer.created_at.asc(), McpServer.id.asc())
+            .all()
+        )
+
     def get(self, server_id: str) -> McpServer | None:
         return (
             self.db.query(McpServer).execution_options(populate_existing=True).filter(McpServer.id == server_id).first()

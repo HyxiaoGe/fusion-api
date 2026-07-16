@@ -24,6 +24,12 @@ class AgentLoopWiringTests(unittest.TestCase):
             should_use_reasoning=True,
             call_kwargs={"tools": ["web_search"]},
             announced_tools=["web_search"],
+            dynamic_tool_handlers={"mcp_docs_alias": "handler"},
+        )
+        dynamic_tool_set = SimpleNamespace(
+            definitions=[{"type": "function", "function": {"name": "mcp_docs_alias"}}],
+            handlers={"mcp_docs_alias": "handler"},
+            audit_bindings=[{"alias": "mcp_docs_alias", "server_id": "server-1"}],
         )
         fake_execution = SimpleNamespace(run_id="run-wiring")
         redis_writer = object()
@@ -74,6 +80,10 @@ class AgentLoopWiringTests(unittest.TestCase):
             captured["call_config_kwargs"] = kwargs
             return call_config
 
+        def load_dynamic_tools_fn(db):
+            captured["dynamic_tools_db"] = db
+            return dynamic_tool_set
+
         def build_execution_fn(**kwargs):
             captured["execution_kwargs"] = kwargs
             return fake_execution
@@ -106,7 +116,7 @@ class AgentLoopWiringTests(unittest.TestCase):
             assistant_message_id="msg-wiring",
             task_id="task-wiring",
             options=None,
-            capabilities=None,
+            capabilities={"functionCalling": True},
             trace_id="trace-wiring",
             initial_content_blocks=["旧块"],
             extra_system_prompts=["继续执行"],
@@ -150,6 +160,7 @@ class AgentLoopWiringTests(unittest.TestCase):
                 info_fn=info_fn,
                 error_fn=error_fn,
                 warning_fn=warning_fn,
+                load_dynamic_tools_fn=load_dynamic_tools_fn,
             ),
         )
 
@@ -158,9 +169,13 @@ class AgentLoopWiringTests(unittest.TestCase):
             {
                 "provider": "openai",
                 "options": {},
-                "capabilities": {},
+                "capabilities": {"functionCalling": True},
+                "additional_tools": dynamic_tool_set.definitions,
+                "dynamic_tool_handlers": dynamic_tool_set.handlers,
+                "tool_bindings": dynamic_tool_set.audit_bindings,
             },
         )
+        self.assertEqual(captured["dynamic_tools_db"], "db-wiring")
         self.assertTrue(captured["redis_writer_factory_called"])
         execution_request = captured["execution_kwargs"]["request"]
         execution_dependencies = captured["execution_kwargs"]["dependencies"]

@@ -23,6 +23,49 @@ class ToolRetryPolicyTests(unittest.TestCase):
         self.assertFalse(_should_retry_tool_result(result))
 
 
+class DynamicToolExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_scoped_handler_is_resolved_without_global_registration(self):
+        handler = AsyncMock()
+        handler.tool_name = "mcp_docs_a1b2c3d4"
+        handler.supports_automatic_retry = False
+        handler.execute.return_value = ToolResult(status="success", data={"text": "结果"})
+        handler._build_result_summary.return_value = {
+            "kind": "external_tool",
+            "title": "Microsoft Learn 文档搜索",
+            "truncated": False,
+        }
+
+        records = await execute_tools_parallel(
+            [{"id": "call-mcp", "name": "mcp_docs_a1b2c3d4", "arguments": {"query": "MCP"}}],
+            "conv-1",
+            "user-1",
+            "model-1",
+            "openai",
+            tool_handlers={"mcp_docs_a1b2c3d4": handler},
+        )
+
+        self.assertEqual(records[0].tool_name, "mcp_docs_a1b2c3d4")
+        handler.execute.assert_awaited_once_with({"query": "MCP"})
+
+    async def test_mcp_handler_failure_is_never_automatically_retried(self):
+        handler = AsyncMock()
+        handler.tool_name = "mcp_calendar_a1b2c3d4"
+        handler.supports_automatic_retry = False
+        handler.execute.return_value = ToolResult(status="failed", error_message="MCP 工具暂时不可用")
+
+        records = await execute_tools_parallel(
+            [{"id": "call-mcp", "name": "mcp_calendar_a1b2c3d4", "arguments": {"title": "聚餐"}}],
+            "conv-1",
+            "user-1",
+            "model-1",
+            "openai",
+            tool_handlers={"mcp_calendar_a1b2c3d4": handler},
+        )
+
+        self.assertEqual(records[0].result.status, "failed")
+        handler.execute.assert_awaited_once()
+
+
 class WebSearchRedirectPresentationTests(unittest.TestCase):
     def test_read_alternative_redirect_has_safe_context_without_search_block(self):
         from app.services.tool_handlers.web_search import WebSearchHandler

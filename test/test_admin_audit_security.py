@@ -180,6 +180,51 @@ class AdminAuditSanitizerTests(unittest.TestCase):
         self.assertIn("error", unknown["redacted_fields"])
         self.assertNotIn("xoxb-", json.dumps(unknown))
 
+    def test_mcp_tool_projection_keeps_safe_error_code_without_internal_payload(self):
+        mcp_tool = ToolCallLog(
+            id="tool-mcp",
+            tool_name="mcp_internal_alias",
+            status="failed",
+            model_id="model",
+            provider="llm-provider",
+            input_params={
+                "mcp_server_id": "server-amap",
+                "remote_tool_name": "maps_text_search",
+                "provider": "amap",
+                "config_version": 7,
+                "definition_sha256": "a" * 64,
+                "argument_count": 3,
+                "endpoint_url": "https://mcp.amap.com/private?key=secret",
+                "api_key": "secret-key",
+                "keywords": "民治烤肉",
+            },
+            output_data={
+                "mcp_server_id": "server-amap",
+                "remote_tool_name": "maps_text_search",
+                "provider": "amap",
+                "config_version": 7,
+                "definition_sha256": "a" * 64,
+                "status": "failed",
+                "payload_bytes": None,
+                "error_code": "rate_limited",
+                "raw_response": "quota response with secret-key",
+            },
+            error_message="MCP 工具暂时不可用",
+        )
+
+        item = AdminAuditService._tool_item(mcp_tool)
+        serialized = json.dumps(item, ensure_ascii=False)
+
+        self.assertEqual(item["arguments"]["mcp_server_id"], "server-amap")
+        self.assertEqual(item["arguments"]["remote_tool_name"], "maps_text_search")
+        self.assertEqual(item["result_preview"]["error_code"], "rate_limited")
+        self.assertEqual(item["result_preview"]["status"], "failed")
+        self.assertNotIn("endpoint_url", serialized)
+        self.assertNotIn("api_key", serialized)
+        self.assertNotIn("民治烤肉", serialized)
+        self.assertNotIn("raw_response", serialized)
+        self.assertNotIn("secret-key", serialized)
+
     def test_error_projection_uses_boundaries_and_supports_structured_and_chinese_markers(self):
         cases = {
             "HTTP 401 unauthorized": "authentication_failed",

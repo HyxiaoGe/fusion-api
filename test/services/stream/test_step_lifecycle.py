@@ -321,6 +321,47 @@ class StepLifecycleTests(unittest.IsolatedAsyncioTestCase):
             max_tool_calls=20,
         )
 
+    async def test_mcp_tool_round_uses_generic_tool_plan_instead_of_search_plan(self):
+        emitter = Mock()
+        emitter.plan_snapshot = AsyncMock()
+        emitter.plan_step_updated = AsyncMock()
+        emitter.run_progress_updated = AsyncMock()
+        context = AgentStepContext(
+            step_id="step-mcp",
+            run_id="run-mcp",
+            step_number=1,
+            started_at=10.0,
+            thinking_block_id="blk_thinking",
+            text_block_id="blk_text",
+        )
+
+        await step_lifecycle_module.mark_tool_round_started(
+            context=context,
+            emitter=emitter,
+            tool_call_count=1,
+            tool_names=("mcp_microsoft_docs_a1b2c3d4",),
+            tool_arguments=({"query": "MCP authorization"},),
+            completed_tool_calls=0,
+            max_tool_calls=20,
+        )
+
+        snapshot_items = emitter.plan_snapshot.await_args.kwargs["items"]
+        self.assertEqual([item["id"] for item in snapshot_items], ["understand", "tool", "answer"])
+        self.assertEqual(snapshot_items[1]["kind"], "other")
+        self.assertEqual(snapshot_items[1]["title"], "调用外部工具")
+        last_update = emitter.plan_step_updated.await_args_list[-1].kwargs["item"]
+        self.assertEqual(last_update["id"], "tool")
+        self.assertEqual(last_update["kind"], "other")
+        self.assertEqual(last_update["summary"], "正在调用 1 个外部工具")
+        emitter.run_progress_updated.assert_awaited_once_with(
+            phase="researching",
+            label="正在调用外部工具",
+            completed_steps=1,
+            total_steps=None,
+            completed_tool_calls=0,
+            max_tool_calls=20,
+        )
+
     async def test_complete_agent_step_emits_completed_before_cache_write_and_returns_duration(self):
         emitter = Mock()
         emitter.step_completed = AsyncMock()

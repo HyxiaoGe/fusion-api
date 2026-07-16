@@ -72,6 +72,7 @@ class BaseToolHandler(ABC):
     """所有 tool handler 的抽象基类"""
 
     supports_run_level_citations = False
+    supports_automatic_retry = True
 
     @property
     @abstractmethod

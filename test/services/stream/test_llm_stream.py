@@ -34,6 +34,54 @@ async def async_response(chunks):
 
 
 class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_consume_stream_round_redacts_split_internal_mcp_alias_from_reasoning_and_answer(self):
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-mcp",
+            task_id="task-mcp",
+            should_use_reasoning=True,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+        )
+        alias = "mcp__Kk9Rl3y2tic_MqcwCyHgNX8oGM-5DtPdWal8L1leVU"
+        reasoning = f"调用 {alias} 获取官方资料。"
+        answer = f"结果来自 {alias}，下面给出结论。"
+        append_chunk = AsyncMock()
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            outcome = await llm_stream_module.consume_stream_round(
+                async_response(
+                    [
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content=reasoning[:15]),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content=reasoning[15:]),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content=answer[:18], reasoning_content=None),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content=answer[18:], reasoning_content=None),
+                            finish_reason="stop",
+                        ),
+                    ]
+                ),
+                request,
+            )
+
+        self.assertEqual(outcome.reasoning_buf, "调用 外部工具 获取官方资料。")
+        self.assertEqual(outcome.content_buf, "结果来自 外部工具，下面给出结论。")
+        emitted = "".join(call.args[2] for call in append_chunk.await_args_list)
+        self.assertNotIn(alias, emitted)
+        self.assertNotIn("mcp_", emitted)
+        self.assertEqual(emitted, "调用 外部工具 获取官方资料。结果来自 外部工具，下面给出结论。")
+
     async def test_consume_stream_round_hides_mixed_prefix_dsml_without_executing_ambiguous_protocol(self):
         request = llm_stream_module.LLMStreamRequest(
             conversation_id="conv-1",
@@ -332,6 +380,33 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
             run_id=None,
             step_id=None,
         )
+
+    async def test_consume_stream_round_dedupes_mirrored_reasoning_before_mcp_alias_redaction(self):
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-mcp-mirrored",
+            task_id="task-mcp-mirrored",
+            should_use_reasoning=True,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+        )
+        alias = "mcp__Kk9Rl3y2tic_MqcwCyHgNX8oGM-5DtPdWal8L1leVU"
+        mirrored = f"调用 {alias} 获取资料"
+        delta = SimpleNamespace(content=mirrored, reasoning_content=mirrored)
+        append_chunk = AsyncMock()
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            outcome = await llm_stream_module.consume_stream_round(
+                async_response([make_chunk(delta=delta, finish_reason="stop")]),
+                request,
+            )
+
+        self.assertEqual(outcome.reasoning_buf, "调用 外部工具 获取资料")
+        self.assertEqual(outcome.content_buf, "")
+        append_chunk.assert_awaited_once()
+        self.assertEqual(append_chunk.await_args.args[1], "reasoning")
 
     async def test_consume_stream_round_strips_reasoning_tags_from_answering_content(self):
         request = llm_stream_module.LLMStreamRequest(

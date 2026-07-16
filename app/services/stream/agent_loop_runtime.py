@@ -40,3 +40,4 @@ class AgentLoopRuntime:
     warning_fn: Callable[[str], None]
     clock: Callable[[], float]
     assistant_message_sequence: int | None = None
+    dynamic_tool_handlers: dict[str, Any] | None = None
