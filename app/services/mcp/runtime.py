@@ -13,6 +13,7 @@ def get_mcp_client_manager() -> McpClientManager:
         allowed_credential_refs=frozenset(settings.RESOLVED_MCP_ALLOWED_CREDENTIAL_REFS),
         connect_timeout_seconds=max(0.1, settings.MCP_CONNECT_TIMEOUT_SECONDS),
         call_timeout_seconds=max(0.1, settings.MCP_CALL_TIMEOUT_SECONDS),
+        idempotent_total_timeout_seconds=max(0.1, settings.MCP_IDEMPOTENT_TOTAL_TIMEOUT_SECONDS),
         max_discovery_pages=max(1, settings.MCP_MAX_DISCOVERY_PAGES),
         max_discovered_tools=max(1, settings.MCP_MAX_DISCOVERED_TOOLS),
         max_tool_description_chars=max(1, settings.MCP_MAX_TOOL_DESCRIPTION_CHARS),

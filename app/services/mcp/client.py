@@ -54,6 +54,7 @@ class McpClientPolicy:
     connect_timeout_seconds: float = 5.0
     call_timeout_seconds: float = 15.0
     idempotent_max_attempts: int = 2
+    idempotent_total_timeout_seconds: float = 12.0
     retry_backoff_seconds: float = 0.25
     max_discovery_pages: int = 5
     max_discovered_tools: int = 50
@@ -260,21 +261,23 @@ class McpClientManager:
 
     async def _run(self, config: McpConnectionConfig, operation_name: str, operation):
         started_at = time.perf_counter()
-        max_attempts = max(1, self.policy.idempotent_max_attempts) if operation_name in _IDEMPOTENT_OPERATIONS else 1
+        is_idempotent = operation_name in _IDEMPOTENT_OPERATIONS
+        max_attempts = max(1, self.policy.idempotent_max_attempts) if is_idempotent else 1
 
-        for attempt in range(1, max_attempts + 1):
-            try:
-                connection = self._resolve_connection(config)
-                async with self.connector.connect(
-                    endpoint_url=connection.endpoint_url,
-                    headers=connection.headers,
-                    query_params=connection.query_params,
-                    connect_timeout_seconds=self.policy.connect_timeout_seconds,
-                    call_timeout_seconds=self.policy.call_timeout_seconds,
-                ) as session:
-                    async with asyncio.timeout(self.policy.connect_timeout_seconds):
-                        await session.initialize()
-                    result = await operation(session)
+        async def run_attempts():
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    connection = self._resolve_connection(config)
+                    async with self.connector.connect(
+                        endpoint_url=connection.endpoint_url,
+                        headers=connection.headers,
+                        query_params=connection.query_params,
+                        connect_timeout_seconds=self.policy.connect_timeout_seconds,
+                        call_timeout_seconds=self.policy.call_timeout_seconds,
+                    ) as session:
+                        async with asyncio.timeout(self.policy.connect_timeout_seconds):
+                            await session.initialize()
+                        result = await operation(session)
                     logger.info(
                         "MCP 操作完成 server_id=%s provider=%s operation=%s attempt=%s duration_ms=%s",
                         config.server_id,
@@ -284,39 +287,61 @@ class McpClientManager:
                         int((time.perf_counter() - started_at) * 1_000),
                     )
                     return result
-            except McpClientError as exc:
-                error = exc
-            except Exception as exc:
-                error = _classify_exception(exc, operation_name)
+                except McpClientError as exc:
+                    error = exc
+                except Exception as exc:
+                    error = _classify_exception(exc, operation_name)
 
-            if attempt < max_attempts and error.code in _RETRYABLE_ERROR_CODES:
+                if attempt < max_attempts and error.code in _RETRYABLE_ERROR_CODES:
+                    logger.warning(
+                        "MCP 操作重试 server_id=%s provider=%s operation=%s attempt=%s/%s error_code=%s",
+                        config.server_id,
+                        config.provider,
+                        operation_name,
+                        attempt,
+                        max_attempts,
+                        error.code,
+                    )
+                    retry_delay = max(0.0, self.policy.retry_backoff_seconds) * (2 ** (attempt - 1))
+                    if retry_delay:
+                        await asyncio.sleep(retry_delay)
+                    continue
+
                 logger.warning(
-                    "MCP 操作重试 server_id=%s provider=%s operation=%s attempt=%s/%s error_code=%s",
+                    "MCP 操作失败 server_id=%s provider=%s operation=%s attempt=%s/%s error_code=%s duration_ms=%s",
                     config.server_id,
                     config.provider,
                     operation_name,
                     attempt,
                     max_attempts,
                     error.code,
+                    int((time.perf_counter() - started_at) * 1_000),
                 )
-                retry_delay = max(0.0, self.policy.retry_backoff_seconds) * (2 ** (attempt - 1))
-                if retry_delay:
-                    await asyncio.sleep(retry_delay)
-                continue
+                raise error from None
 
+            raise RuntimeError("MCP operation attempt loop exhausted")
+
+        if not is_idempotent:
+            return await run_attempts()
+
+        try:
+            async with asyncio.timeout(max(0.1, self.policy.idempotent_total_timeout_seconds)):
+                return await run_attempts()
+        except TimeoutError:
+            error = (
+                McpClientError("connect_timeout", "连接 MCP 服务超时")
+                if operation_name == "initialize"
+                else McpClientError("call_timeout", "MCP 服务调用超时")
+            )
             logger.warning(
-                "MCP 操作失败 server_id=%s provider=%s operation=%s attempt=%s/%s error_code=%s duration_ms=%s",
+                "MCP 操作总预算耗尽 server_id=%s provider=%s operation=%s error_code=%s duration_ms=%s",
                 config.server_id,
                 config.provider,
                 operation_name,
-                attempt,
-                max_attempts,
                 error.code,
                 int((time.perf_counter() - started_at) * 1_000),
             )
             raise error from None
-
-        raise RuntimeError("MCP operation attempt loop exhausted")
 
     async def _list_tools(self, session: McpSession) -> list[dict[str, Any]]:
         tools: list[dict[str, Any]] = []

@@ -453,6 +453,32 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(captured["timeout"], self.main.settings.FILE_UPLOAD_TIMEOUT_SECONDS)
 
+    def test_timeout_middleware_uses_coordinated_budget_for_mcp_admin_operation(self):
+        middleware = self.main.TimeoutMiddleware(lambda scope, receive, send: None, timeout_seconds=10)
+        captured = {}
+
+        async def call_next(_request):
+            return Response("ok")
+
+        async def fake_wait_for(awaitable, timeout):
+            captured["timeout"] = timeout
+            return await awaitable
+
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/admin/mcp/servers/server-1/tools/refresh",
+                "headers": [],
+            }
+        )
+
+        with patch.object(self.main.asyncio, "wait_for", side_effect=fake_wait_for):
+            response = asyncio.run(middleware.dispatch(request, call_next))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured["timeout"], 35)
+
     def test_timeout_middleware_keeps_default_budget_for_normal_routes(self):
         middleware = self.main.TimeoutMiddleware(lambda scope, receive, send: None, timeout_seconds=10)
         captured = {}

@@ -88,6 +88,7 @@ class DeployAuthConfigTests(unittest.TestCase):
             "MCP_ALLOWED_CREDENTIAL_REFS",
             "MCP_CONNECT_TIMEOUT_SECONDS",
             "MCP_CALL_TIMEOUT_SECONDS",
+            "MCP_IDEMPOTENT_TOTAL_TIMEOUT_SECONDS",
             "MCP_ADMIN_OPERATION_TIMEOUT_SECONDS",
             "MCP_MAX_DISCOVERY_PAGES",
             "MCP_MAX_DISCOVERED_TOOLS",
@@ -100,6 +101,12 @@ class DeployAuthConfigTests(unittest.TestCase):
             self.assertIn(f"- {variable}=${{{variable}", self.workflow)
         self.assertNotIn("echo ${DASHSCOPE_API_KEY}", self.workflow)
         self.assertNotIn("echo ${AMAP_MCP_API_KEY}", self.workflow)
+
+    def test_mcp_timeout_defaults_keep_client_budget_inside_admin_request_budget(self):
+        self.assertIn("MCP_IDEMPOTENT_TOTAL_TIMEOUT_SECONDS=12", self.env_example)
+        self.assertIn("MCP_ADMIN_OPERATION_TIMEOUT_SECONDS=35", self.env_example)
+        self.assertIn("MCP_IDEMPOTENT_TOTAL_TIMEOUT_SECONDS:-12", self.workflow)
+        self.assertIn("MCP_ADMIN_OPERATION_TIMEOUT_SECONDS:-35", self.workflow)
 
     def test_mcp_default_hosts_include_public_no_auth_acceptance_server(self):
         default_hosts = "learn.microsoft.com,dashscope.aliyuncs.com,mcp.amap.com"

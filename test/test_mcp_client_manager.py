@@ -68,6 +68,7 @@ def build_policy(**overrides):
         "connect_timeout_seconds": 1.0,
         "call_timeout_seconds": 2.0,
         "idempotent_max_attempts": 2,
+        "idempotent_total_timeout_seconds": 2.0,
         "retry_backoff_seconds": 0,
         "max_discovery_pages": 2,
         "max_discovered_tools": 3,
@@ -205,6 +206,35 @@ class McpClientManagerTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "protocol_error")
         self.assertEqual(raised.exception.safe_message, "MCP 协议交互失败")
+        self.assertEqual(session.list_attempts, 2)
+        self.assertEqual(len(connector.connections), 2)
+
+    def test_idempotent_discovery_total_budget_returns_safe_error(self):
+        class BudgetedDiscoverySession(FakeSession):
+            def __init__(self):
+                super().__init__()
+                self.list_attempts = 0
+
+            async def list_tools(self, cursor=None):
+                self.list_attempts += 1
+                if self.list_attempts == 1:
+                    raise RuntimeError("transient protocol failure")
+                await asyncio.sleep(0.2)
+                return await super().list_tools(cursor)
+
+        session = BudgetedDiscoverySession()
+        connector = FakeConnector(session)
+        manager = McpClientManager(
+            policy=build_policy(idempotent_total_timeout_seconds=0.02),
+            connector=connector,
+            environ={"DASHSCOPE_API_KEY": "test-secret"},
+        )
+
+        with self.assertRaises(McpClientError) as raised:
+            asyncio.run(manager.list_tools(build_config()))
+
+        self.assertEqual(raised.exception.code, "call_timeout")
+        self.assertEqual(raised.exception.safe_message, "MCP 服务调用超时")
         self.assertEqual(session.list_attempts, 2)
         self.assertEqual(len(connector.connections), 2)
 
