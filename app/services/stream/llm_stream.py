@@ -61,6 +61,7 @@ class LLMStreamRequest:
     text_block_id: str
     run_id: Optional[str] = None
     step_id: Optional[str] = None
+    defer_output: bool = False
 
 
 @dataclass
@@ -342,20 +343,22 @@ async def append_reasoning_and_content(
 ) -> None:
     if reasoning_delta:
         state.reasoning_buf += reasoning_delta
-        await append_stream_delta(
-            request=request,
-            chunk_type="reasoning",
-            content=reasoning_delta,
-            block_id=request.thinking_block_id,
-        )
+        if not request.defer_output:
+            await append_stream_delta(
+                request=request,
+                chunk_type="reasoning",
+                content=reasoning_delta,
+                block_id=request.thinking_block_id,
+            )
     if content_delta:
         state.content_buf += content_delta
-        await append_stream_delta(
-            request=request,
-            chunk_type="answering",
-            content=content_delta,
-            block_id=request.text_block_id,
-        )
+        if not request.defer_output:
+            await append_stream_delta(
+                request=request,
+                chunk_type="answering",
+                content=content_delta,
+                block_id=request.text_block_id,
+            )
 
 
 async def maybe_check_lock_owner(*, request: LLMStreamRequest, state: LLMStreamState) -> bool:
@@ -474,6 +477,7 @@ async def stream_round(
     text_block_id: str,
     run_id: Optional[str] = None,
     step_id: Optional[str] = None,
+    defer_output: bool = False,
 ) -> tuple[str, str, list[dict], str, Optional[Usage]]:
     """
     通用 LLM 流式响应处理。
@@ -493,6 +497,7 @@ async def stream_round(
             text_block_id=text_block_id,
             run_id=run_id,
             step_id=step_id,
+            defer_output=defer_output,
         ),
     )
     return (

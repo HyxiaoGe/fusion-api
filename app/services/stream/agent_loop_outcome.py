@@ -10,6 +10,7 @@ class AgentLoopExit(Enum):
     COMPLETED = "completed"
     SUPERSEDED = "superseded"
     SUMMARY_REQUIRED = "summary_required"
+    PRODUCT_RESULT_READY = "product_result_ready"
 
 
 @dataclass(frozen=True)

@@ -1,7 +1,15 @@
 import unittest
 from unittest.mock import AsyncMock, Mock
 
-from app.schemas.chat import SearchBlock, SearchSource, SearchSourceSummary, SourceReference, TextBlock
+from app.schemas.chat import (
+    PlaceResult,
+    PlaceResultsBlock,
+    SearchBlock,
+    SearchSource,
+    SearchSourceSummary,
+    SourceReference,
+    TextBlock,
+)
 from app.services.source_evidence_ledger import stable_web_evidence_id
 from app.services.stream import tool_round as tool_round_module
 from app.services.stream.step_lifecycle import AgentStepContext
@@ -12,10 +20,232 @@ from app.services.stream.tool_round import (
     handle_tool_calls_round,
     restore_reasoning_after_tool_decision,
 )
+from app.services.stream_state_service import StreamWriteTerminalError
 from app.services.tool_handlers.base import ToolResult
 
 
 class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
+    def _build_product_round_request(self, *, event_error=None):
+        block = PlaceResultsBlock(
+            type="place_results",
+            id="blk-place",
+            schema_version=1,
+            provider="amap",
+            query="烤肉",
+            status="success",
+            result_count=1,
+            places=[PlaceResult(provider_place_id="poi-1", name="民治烤肉店")],
+            tool_call_log_id="log-place",
+        )
+        tool_call = {"id": "tc-place", "name": "local_place_search", "arguments": '{"query":"烤肉"}'}
+        handler = Mock()
+        handler.format_llm_context.return_value = "地点上下文"
+        handler.build_content_block.return_value = block
+        record = ToolExecutionRecord(
+            tool_call=tool_call,
+            result=ToolResult(status="success"),
+            handler=handler,
+            block_id="blk-place",
+            log_id="log-place",
+        )
+        order = []
+        persisted = []
+        emitter = AsyncMock()
+
+        async def emit_product_event(*, tool_call_id, content_block):
+            order.append(("emit", tool_call_id, content_block))
+            if event_error is not None:
+                raise event_error
+
+        emitter.content_block_upserted.side_effect = emit_product_event
+
+        def persist_message_fn(db, msg_id, conv_id, model_id, blocks, usage_data=None, partial=False):
+            snapshot = list(blocks)
+            persisted.append(snapshot)
+            order.append(("persist", partial, snapshot))
+
+        async def execute_tools_fn(*args, **kwargs):
+            order.append(("execute",))
+            return [record]
+
+        async def complete_step_fn(**kwargs):
+            order.append(("complete",))
+
+        request = tool_round_module.ToolRoundRequest(
+            db="db",
+            assistant_message_id="msg-1",
+            conversation_id="conv-1",
+            user_id="user-1",
+            model_id="gpt-4",
+            provider="openai",
+            content_blocks=[],
+            messages=[{"role": "user", "content": "请推荐烤肉店"}],
+            tool_calls=[tool_call],
+            reasoning_buf="",
+            should_use_reasoning=True,
+            step_context=AgentStepContext(
+                step_id="step-1",
+                run_id="run-1",
+                step_number=1,
+                started_at=10.0,
+                thinking_block_id="blk-thinking",
+                text_block_id="blk-text",
+            ),
+            step_number=1,
+            run_id="run-1",
+            emitter=emitter,
+            session_cache=object(),
+            network_budget=Mock(max_tool_calls=20, completed_tool_calls=0),
+            call_kwargs={},
+            persist_message_fn=persist_message_fn,
+            execute_tools_fn=execute_tools_fn,
+            complete_step_fn=complete_step_fn,
+        )
+        return request, order, persisted, block, handler
+
+    async def test_product_result_block_is_built_once_then_appended_and_emitted_as_same_object(self):
+        block = PlaceResultsBlock(
+            type="place_results",
+            id="blk-place",
+            schema_version=1,
+            provider="amap",
+            query="烤肉",
+            near="民治地铁站",
+            status="success",
+            result_count=1,
+            places=[PlaceResult(provider_place_id="poi-1", name="民治烤肉店")],
+            limitations=["不包含实时排队信息"],
+            tool_call_log_id="log-place",
+        )
+        handler = Mock()
+        handler.format_llm_context.return_value = "地点上下文"
+        handler.build_content_block.return_value = block
+        record = ToolExecutionRecord(
+            tool_call={"id": "tc-place", "name": "local_place_search", "arguments": '{"query":"烤肉"}'},
+            result=ToolResult(status="success"),
+            handler=handler,
+            block_id="blk-place",
+            log_id="log-place",
+        )
+        emitter = AsyncMock()
+        request = Mock(
+            content_blocks=[],
+            messages=[],
+            emitter=emitter,
+            tool_calls=[record.tool_call],
+            reasoning_buf="",
+            should_use_reasoning=False,
+        )
+
+        built = tool_round_module.build_tool_round_content_blocks([record])
+        tool_round_module.append_tool_round_messages_with_plan(
+            request,
+            [record],
+            source_plan=None,
+            built_content_blocks=built,
+        )
+        await tool_round_module.emit_product_result_blocks(
+            request,
+            [record],
+            built_content_blocks=built,
+        )
+
+        emitter.content_block_upserted.assert_awaited_once_with(tool_call_id="tc-place", content_block=block)
+        self.assertIs(request.content_blocks[0], block)
+        handler.build_content_block.assert_called_once_with(record.result, "blk-place", "log-place")
+
+    async def test_non_terminal_product_event_failure_keeps_built_block_for_persistence(self):
+        block = PlaceResultsBlock(
+            type="place_results",
+            id="blk-place",
+            schema_version=1,
+            provider="amap",
+            query="烤肉",
+            status="success",
+            result_count=0,
+            places=[],
+            tool_call_log_id="log-place",
+        )
+        handler = Mock()
+        handler.build_content_block.return_value = block
+        record = ToolExecutionRecord(
+            tool_call={"id": "tc-place", "name": "local_place_search", "arguments": "{}"},
+            result=ToolResult(status="success"),
+            handler=handler,
+            block_id="blk-place",
+            log_id="log-place",
+        )
+        emitter = AsyncMock()
+        emitter.content_block_upserted.side_effect = RuntimeError("临时写入失败")
+        request = Mock(emitter=emitter)
+        built = tool_round_module.build_tool_round_content_blocks([record])
+
+        with self.assertLogs("app.services.stream.tool_round", level="WARNING"):
+            await tool_round_module.emit_product_result_blocks(
+                request,
+                [record],
+                built_content_blocks=built,
+            )
+
+        self.assertIs(built["tc-place"], block)
+
+    async def test_terminal_product_event_failure_stops_round(self):
+        block = PlaceResultsBlock(
+            type="place_results",
+            id="blk-place",
+            schema_version=1,
+            provider="amap",
+            query="烤肉",
+            status="success",
+            result_count=0,
+            places=[],
+        )
+        handler = Mock()
+        handler.build_content_block.return_value = block
+        record = ToolExecutionRecord(
+            tool_call={"id": "tc-place", "name": "local_place_search", "arguments": "{}"},
+            result=ToolResult(status="success"),
+            handler=handler,
+            block_id="blk-place",
+            log_id="log-place",
+        )
+        emitter = AsyncMock()
+        emitter.content_block_upserted.side_effect = StreamWriteTerminalError("写入已终止")
+        built = tool_round_module.build_tool_round_content_blocks([record])
+
+        with self.assertRaises(StreamWriteTerminalError):
+            await tool_round_module.emit_product_result_blocks(
+                Mock(emitter=emitter),
+                [record],
+                built_content_blocks=built,
+            )
+
+    async def test_handle_product_result_checkpoints_before_event_and_completes_after_event(self):
+        request, order, persisted, block, handler = self._build_product_round_request()
+
+        outcome = await handle_tool_calls_round(request=request)
+
+        self.assertEqual([item[0] for item in order], ["persist", "execute", "persist", "emit", "complete"])
+        self.assertIs(persisted[-1][-1], block)
+        self.assertIs(order[3][2], block)
+        self.assertEqual(outcome.tool_names, ["local_place_search"])
+        self.assertEqual(outcome.product_result_count, 1)
+        handler.build_content_block.assert_called_once()
+
+    async def test_terminal_product_event_failure_happens_after_partial_checkpoint(self):
+        request, order, persisted, block, handler = self._build_product_round_request(
+            event_error=StreamWriteTerminalError("写入已终止")
+        )
+
+        with self.assertRaises(StreamWriteTerminalError):
+            await handle_tool_calls_round(request=request)
+
+        self.assertEqual([item[0] for item in order], ["persist", "execute", "persist", "emit"])
+        self.assertIs(persisted[-1][-1], block)
+        self.assertIs(request.content_blocks[-1], block)
+        self.assertEqual(request.messages[-1], {"role": "tool", "tool_call_id": "tc-place", "content": "地点上下文"})
+        handler.build_content_block.assert_called_once()
+
     def test_unannounced_calls_do_not_consume_global_tool_capacity(self):
         stale_call = {"id": "tc-stale", "name": "mcp_maps_search"}
         search_call = {"id": "tc-search", "name": "web_search"}

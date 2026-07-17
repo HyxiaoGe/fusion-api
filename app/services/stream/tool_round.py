@@ -28,6 +28,7 @@ class ToolRoundOutcome:
     tool_call_count: int
     tool_names: list[str]
     no_progress_search_results: tuple[bool, ...] = ()
+    product_result_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -187,6 +188,7 @@ def append_tool_round_messages_with_plan(
     missing_result_tool_calls: list[dict] | None = None,
     not_executed_tool_calls: list[dict] | None = None,
     unavailable_tool_calls: list[dict] | None = None,
+    built_content_blocks: dict[str, Any] | None = None,
 ) -> None:
     request.messages.append(
         build_assistant_tool_message(
@@ -215,7 +217,11 @@ def append_tool_round_messages_with_plan(
             source_selection_guidance = source_selection_guidance_by_tool_call_id.get(tool_call_id)
             if source_selection_guidance:
                 tool_context = f"{tool_context}\n\n{source_selection_guidance}"
-            content_block = record.build_content_block()
+            content_block = (
+                built_content_blocks[tool_call_id]
+                if built_content_blocks is not None and tool_call_id in built_content_blocks
+                else record.build_content_block()
+            )
             if content_block is not None:
                 request.content_blocks.append(content_block)
             request.messages.append(
@@ -354,6 +360,7 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
     source_plan = _build_source_selection_plan(results)
     record_network_budget_feedback(request, results, source_plan=source_plan)
     await emit_selected_source_evidence(request, results, source_plan=source_plan)
+    built_content_blocks = build_tool_round_content_blocks(results)
     append_tool_round_messages_with_plan(
         request,
         results,
@@ -361,8 +368,10 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
         missing_result_tool_calls=missing_result_tool_calls,
         not_executed_tool_calls=selected_tool_calls[1],
         unavailable_tool_calls=unavailable_tool_calls,
+        built_content_blocks=built_content_blocks,
     )
     persist_tool_round_checkpoint(request)
+    await emit_product_result_blocks(request, results, built_content_blocks=built_content_blocks)
 
     executed_count = len(selected_tool_calls[0])
     tool_names = await complete_tool_round_step(request, results, executed_count=executed_count)
@@ -374,7 +383,37 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
             selected_tool_calls=selected_tool_calls[0],
             results=results,
         ),
+        product_result_count=sum(
+            _value(block, "type") in {"place_results", "route_results"} for block in built_content_blocks.values()
+        ),
     )
+
+
+def build_tool_round_content_blocks(results: list[ToolExecutionRecord]) -> dict[str, Any]:
+    """每条工具结果只构造一次 content block，供 checkpoint 与事件共同复用。"""
+    return {str(record.tool_call.get("id", "")): record.build_content_block() for record in results}
+
+
+async def emit_product_result_blocks(
+    request: ToolRoundRequest,
+    results: list[ToolExecutionRecord],
+    *,
+    built_content_blocks: dict[str, Any],
+) -> None:
+    """checkpoint 成功后发送同一产品结果块；非终止写入失败不影响后续回答。"""
+    emit = getattr(request.emitter, "content_block_upserted", None)
+    if emit is None:
+        return
+    for record in results:
+        tool_call_id = str(record.tool_call.get("id", ""))
+        content_block = built_content_blocks.get(tool_call_id)
+        if content_block is not None and _value(content_block, "type") in {"place_results", "route_results"}:
+            try:
+                await emit(tool_call_id=tool_call_id, content_block=content_block)
+            except StreamWriteTerminalError:
+                raise
+            except Exception:
+                logger.warning("发送产品结果 content block 事件失败", exc_info=True)
 
 
 async def emit_selected_source_evidence(

@@ -34,6 +34,43 @@ async def async_response(chunks):
 
 
 class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_consume_stream_round_defers_all_model_output_for_product_result_guard(self):
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-product",
+            task_id="task-product",
+            should_use_reasoning=True,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+            run_id="run-product",
+            step_id="step-product",
+            defer_output=True,
+        )
+        append_chunk = AsyncMock()
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            outcome = await llm_stream_module.consume_stream_round(
+                async_response(
+                    [
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content="核对路线事实"),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content="方便停车，驾车更合适。", reasoning_content=None),
+                            finish_reason="stop",
+                        ),
+                    ]
+                ),
+                request,
+            )
+
+        self.assertEqual(outcome.reasoning_buf, "核对路线事实")
+        self.assertEqual(outcome.content_buf, "方便停车，驾车更合适。")
+        append_chunk.assert_not_awaited()
+
     async def test_consume_stream_round_redacts_split_internal_mcp_alias_from_reasoning_and_answer(self):
         request = llm_stream_module.LLMStreamRequest(
             conversation_id="conv-mcp",

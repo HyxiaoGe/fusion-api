@@ -1,7 +1,8 @@
 import unittest
 from dataclasses import dataclass
+from unittest.mock import AsyncMock, patch
 
-from app.schemas.chat import TextBlock, Usage
+from app.schemas.chat import PlaceResult, PlaceResultsBlock, TextBlock, Usage
 from app.services.stream.agent_loop_driver import AgentLoopExit, run_agent_loop
 from app.services.stream.agent_loop_policy import AgentLoopLimits, map_run_terminal_state
 from app.services.stream.agent_loop_runtime import AgentLoopRuntime
@@ -64,6 +65,248 @@ def _runtime(**overrides):
 
 
 class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
+    async def test_product_result_allows_sequential_multi_intent_tools_before_grounded_completion(self):
+        state = AgentLoopState()
+        started_steps: list[int] = []
+        llm_steps: list[int] = []
+        defer_output_flags: list[bool] = []
+        tool_calls = [
+            {"id": "tc-cafe", "name": "local_place_search", "arguments": '{"query":"咖啡店"}'},
+            {"id": "tc-pool", "name": "local_place_search", "arguments": '{"query":"桌球"}'},
+        ]
+
+        async def start_step_fn(**kwargs):
+            started_steps.append(kwargs["step_number"])
+            context = AgentStepContext(
+                step_id=f"step-{kwargs['step_number']}",
+                step_number=kwargs["step_number"],
+                started_at=kwargs["clock"](),
+                thinking_block_id=f"thinking-{kwargs['step_number']}",
+                text_block_id=f"text-{kwargs['step_number']}",
+            )
+            kwargs["on_step_started"](context.step_id)
+            return context
+
+        async def run_round_fn(**kwargs):
+            llm_steps.append(kwargs["step_number"])
+            defer_output_flags.append(bool(kwargs.get("defer_output")))
+            step_number = kwargs["step_number"]
+            if step_number <= 2:
+                return AgentRoundResult(
+                    reasoning_buf="先查咖啡店，再查附近桌球" if step_number == 1 else "继续完成桌球意图",
+                    content_buf="",
+                    tool_calls=[tool_calls[step_number - 1]],
+                    finish_reason="tool_calls",
+                    accumulated_usage=Usage(input_tokens=step_number * 2, output_tokens=step_number * 3),
+                    output_deferred=bool(kwargs.get("defer_output")),
+                )
+            return AgentRoundResult(
+                reasoning_buf="模型可能生成未验证组合距离",
+                content_buf="模型自由文本：两家店步行五分钟。",
+                tool_calls=[],
+                finish_reason="stop",
+                accumulated_usage=Usage(input_tokens=7, output_tokens=9),
+                output_deferred=bool(kwargs.get("defer_output")),
+            )
+
+        async def handle_tool_calls_round_fn(**kwargs):
+            request = kwargs["request"]
+            request.on_tools_executed(1)
+            tool_call = request.tool_calls[0]
+            query = "咖啡店" if tool_call["id"] == "tc-cafe" else "桌球"
+            name = "示例咖啡" if tool_call["id"] == "tc-cafe" else "示例桌球馆"
+            request.content_blocks.append(
+                PlaceResultsBlock(
+                    type="place_results",
+                    schema_version=1,
+                    provider="amap",
+                    query=query,
+                    status="success",
+                    result_count=1,
+                    places=[PlaceResult(name=name)],
+                )
+            )
+            return ToolRoundOutcome(
+                tool_call_count=1,
+                tool_names=["local_place_search"],
+                product_result_count=1,
+            )
+
+        append_chunk = AsyncMock()
+        with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
+            outcome = await run_agent_loop(
+                db=object(),
+                messages=[{"role": "user", "content": "附近咖啡"}],
+                state=state,
+                runtime=_runtime(
+                    start_step_fn=start_step_fn,
+                    complete_step_fn=AsyncMock(),
+                    run_round_fn=run_round_fn,
+                    handle_tool_calls_round_fn=handle_tool_calls_round_fn,
+                ),
+            )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        self.assertEqual(llm_steps, [1, 2, 3])
+        self.assertEqual(started_steps, [1, 2, 3])
+        self.assertEqual(defer_output_flags, [False, True, True])
+        grounded_answer = append_chunk.await_args.args[2]
+        self.assertIn("示例咖啡", grounded_answer)
+        self.assertIn("示例桌球馆", grounded_answer)
+        self.assertNotIn("步行五分钟", grounded_answer)
+        self.assertEqual(state.total_tool_calls, 2)
+        self.assertEqual(state.accumulated_usage, Usage(input_tokens=7, output_tokens=9))
+        self.assertEqual([block.type for block in state.content_blocks], ["place_results", "place_results", "text"])
+
+    async def test_existing_product_result_defers_next_round_model_output(self):
+        state = AgentLoopState(
+            content_blocks=[
+                PlaceResultsBlock(
+                    type="place_results",
+                    schema_version=1,
+                    provider="amap",
+                    query="咖啡",
+                    status="success",
+                    result_count=1,
+                    places=[PlaceResult(name="示例咖啡")],
+                )
+            ]
+        )
+
+        async def start_step_fn(**kwargs):
+            context = AgentStepContext(
+                step_id="step-product-final",
+                step_number=kwargs["step_number"],
+                started_at=kwargs["clock"](),
+                thinking_block_id="thinking-product-final",
+                text_block_id="text-product-final",
+            )
+            kwargs["on_step_started"](context.step_id)
+            return context
+
+        async def run_round_fn(**kwargs):
+            self.assertTrue(kwargs["defer_output"])
+            return AgentRoundResult(
+                reasoning_buf="",
+                content_buf="最终回答",
+                tool_calls=[],
+                finish_reason="stop",
+                accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+            )
+
+        outcome = await run_agent_loop(
+            db=object(),
+            messages=[{"role": "user", "content": "附近咖啡"}],
+            state=state,
+            runtime=_runtime(
+                start_step_fn=start_step_fn,
+                complete_step_fn=AsyncMock(),
+                run_round_fn=run_round_fn,
+            ),
+        )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+
+    async def test_product_result_limit_uses_grounded_completion_without_limit_summary(self):
+        cases = (
+            {
+                "name": "max_steps",
+                "step": 8,
+                "tool_calls": 1,
+                "limits": AgentLoopLimits(max_steps=8, max_tool_calls=20, total_timeout_s=300),
+                "clock": 1.0,
+                "finish_reason": "tool_calls",
+            },
+            {
+                "name": "max_tool_calls",
+                "step": 1,
+                "tool_calls": 20,
+                "limits": AgentLoopLimits(max_steps=8, max_tool_calls=20, total_timeout_s=300),
+                "clock": 1.0,
+                "finish_reason": "tool_calls",
+            },
+            {
+                "name": "timeout",
+                "step": 1,
+                "tool_calls": 1,
+                "limits": AgentLoopLimits(max_steps=8, max_tool_calls=20, total_timeout_s=30),
+                "clock": 31.0,
+                "finish_reason": "timeout",
+            },
+        )
+
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                state = AgentLoopState(
+                    content_blocks=[
+                        PlaceResultsBlock(
+                            type="place_results",
+                            schema_version=1,
+                            provider="amap",
+                            query="咖啡店",
+                            status="success",
+                            result_count=1,
+                            places=[PlaceResult(name="真实咖啡店")],
+                        )
+                    ],
+                    step=case["step"],
+                    total_tool_calls=case["tool_calls"],
+                )
+                emitter = DummyEmitter(limit_reasons=[])
+                started_steps: list[int] = []
+
+                async def start_step_fn(**kwargs):
+                    started_steps.append(kwargs["step_number"])
+                    context = AgentStepContext(
+                        step_id=f"step-{kwargs['step_number']}",
+                        step_number=kwargs["step_number"],
+                        started_at=kwargs["clock"](),
+                        thinking_block_id=f"thinking-{kwargs['step_number']}",
+                        text_block_id=f"text-{kwargs['step_number']}",
+                    )
+                    kwargs["on_step_started"](context.step_id)
+                    return context
+
+                async def unsafe_limit_summary(**kwargs):
+                    request = kwargs["request"]
+                    request.content_blocks.append(TextBlock(type="text", id="unsafe", text="停车肯定方便"))
+                    request.on_step_started("unsafe-summary")
+                    return LimitSummaryOutcome(accumulated_usage=Usage(input_tokens=9, output_tokens=9))
+
+                summary = AsyncMock(side_effect=unsafe_limit_summary)
+                append_chunk = AsyncMock()
+                with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
+                    outcome = await run_agent_loop(
+                        db=object(),
+                        messages=[{"role": "user", "content": "咖啡店和附近桌球"}],
+                        state=state,
+                        runtime=_runtime(
+                            emitter=emitter,
+                            limits=case["limits"],
+                            clock=lambda value=case["clock"]: value,
+                            start_step_fn=start_step_fn,
+                            complete_step_fn=AsyncMock(),
+                            run_limit_summary_step_fn=summary,
+                        ),
+                    )
+
+                summary.assert_not_awaited()
+                self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+                self.assertEqual(emitter.limit_reasons, [case["name"]])
+                self.assertEqual(state.limit_reason, case["name"])
+                self.assertEqual(state.finish_reason, case["finish_reason"])
+                terminal_state = map_run_terminal_state(
+                    unknown_terminated=state.unknown_terminated,
+                    limit_reason=state.limit_reason,
+                )
+                self.assertEqual(terminal_state.run_finish_reason, "limit_reached")
+                self.assertEqual(terminal_state.session_status, "limit_reached")
+                grounded_answer = append_chunk.await_args.args[2]
+                self.assertIn("真实咖啡店", grounded_answer)
+                self.assertNotIn("停车肯定方便", grounded_answer)
+                self.assertEqual([block.type for block in state.content_blocks], ["place_results", "text"])
+                self.assertEqual(started_steps, [case["step"] + 1])
+
     async def test_two_no_progress_search_results_run_one_summary_without_limit_event(self):
         state = AgentLoopState()
         emitter = DummyEmitter(limit_reasons=[])

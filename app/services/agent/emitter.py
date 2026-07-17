@@ -55,7 +55,7 @@ class AgentEventEmitter:
         self._message_id: str | None = None
         self._lock = asyncio.Lock()
 
-    async def _emit(self, event: ev.AgentEventBase) -> None:
+    async def _emit(self, event: ev.AgentEventBase, *, max_payload_bytes: int | None = None) -> None:
         """在 lock 内原子分配 sequence + ts，再 dump + write，最后递增。
 
         依赖 Pydantic v2 默认行为：模型字段可赋值且不重新校验
@@ -67,6 +67,8 @@ class AgentEventEmitter:
             event.sequence = self._sequence
             event.ts = time.time()
             payload = event.model_dump(mode="json")
+            if max_payload_bytes is not None and len(event.model_dump_json().encode("utf-8")) > max_payload_bytes:
+                raise ValueError("agent_event 超过允许的体积上限")
             await self._writer.append_chunk(self._conv_id, self._task_id, "agent_event", payload)
             self._sequence += 1
 
@@ -299,6 +301,17 @@ class AgentEventEmitter:
                 evidence=evidence,
                 **self._envelope(tool_call_id=tool_call_id),
             )
+        )
+
+    async def content_block_upserted(self, *, tool_call_id: str, content_block: Any) -> None:
+        await self._emit(
+            ev.ContentBlockUpserted(
+                type="content_block_upserted",
+                protocol_version=2,
+                content_block=content_block,
+                **self._envelope(tool_call_id=tool_call_id),
+            ),
+            max_payload_bytes=65_536,
         )
 
     async def context_status_updated(

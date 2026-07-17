@@ -23,6 +23,8 @@ from app.schemas.chat import (
     Conversation,
     FileBlock,
     Message,
+    PlaceResultsBlock,
+    RouteResultsBlock,
     SearchBlock,
     SearchSourceSummary,
     TextBlock,
@@ -415,6 +417,10 @@ class ConversationRepository:
                 )
             elif block_type == "url_read":
                 content_blocks.append(UrlBlock(**block_data))
+            elif block_type == "place_results":
+                content_blocks.append(PlaceResultsBlock(**block_data))
+            elif block_type == "route_results":
+                content_blocks.append(RouteResultsBlock(**block_data))
             # 未知类型跳过，保持前向兼容
 
         return Message(

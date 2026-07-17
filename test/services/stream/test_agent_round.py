@@ -25,6 +25,52 @@ class AgentRoundUsageTests(unittest.TestCase):
 
 
 class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_agent_round_marks_and_forwards_deferred_output(self):
+        step_context = AgentStepContext(
+            step_id="step-product",
+            step_number=2,
+            started_at=100.0,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+        )
+        received_kwargs = {}
+
+        async def stream_round_fn(*_args, **kwargs):
+            received_kwargs.update(kwargs)
+            return "", "模型自由文本", [], "stop", None
+
+        context_plan = MagicMock(
+            messages=[{"role": "tool", "content": "结构化地点结果"}],
+            estimated_tokens_after=10,
+        )
+        context_plan.telemetry.return_value = {"context_management_status": "no_op"}
+        with patch(
+            "app.services.stream.agent_round.prepare_context",
+            new=AsyncMock(return_value=context_plan),
+        ):
+            result = await run_agent_round(
+                conversation_id="conv-product",
+                task_id="task-product",
+                run_id="run-product",
+                step_number=2,
+                model_id="gpt-4",
+                provider="openai",
+                litellm_model="openai/gpt-4",
+                litellm_kwargs={},
+                messages=context_plan.messages,
+                should_use_reasoning=False,
+                call_kwargs={},
+                accumulated_usage=Usage(),
+                step_context=step_context,
+                llm_call_fn=AsyncMock(return_value="response"),
+                stream_round_fn=stream_round_fn,
+                log_round_summary_fn=lambda **_kwargs: None,
+                defer_output=True,
+            )
+
+        self.assertTrue(received_kwargs["defer_output"])
+        self.assertTrue(result.output_deferred)
+
     async def test_run_agent_round_emits_estimated_and_final_context_status(self):
         emitter = AsyncMock()
         step_context = AgentStepContext(

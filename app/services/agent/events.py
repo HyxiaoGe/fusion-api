@@ -6,7 +6,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.schemas.chat import ContextStatus
+from app.schemas.chat import ContextStatus, ProductResultBlock
 
 
 class AgentEventBase(BaseModel):
@@ -167,6 +167,14 @@ class EvidenceItemUpserted(AgentEventBase):
     evidence: AgentEvidenceItem
 
 
+class ContentBlockUpserted(AgentEventBase):
+    """将完整、严格白名单的产品结果块增量发送给前端。"""
+
+    type: Literal["content_block_upserted"]
+    protocol_version: Literal[2]
+    content_block: ProductResultBlock
+
+
 class ContextStatusUpdated(AgentEventBase):
     """单轮 LLM 上下文状态；字段严格白名单，不携带 prompt 或内部来源。"""
 
@@ -201,6 +209,7 @@ AnyAgentEvent = Annotated[
     | PlanStepUpdated
     | ToolResultDigest
     | EvidenceItemUpserted
+    | ContentBlockUpserted
     | ContextStatusUpdated,
     Field(discriminator="type"),
 ]

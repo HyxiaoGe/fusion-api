@@ -1,9 +1,10 @@
 # app/schemas/chat.py
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional, Union
+from urllib.parse import parse_qs, urlsplit
 from uuid import RFC_4122, UUID, uuid4
 
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from app.utils.time import utc_now
 
@@ -118,8 +119,173 @@ class UrlBlock(BaseModel):
     reason: Optional[str] = None
 
 
+class PlacePhoto(BaseModel):
+    """地点图片；只接受高德官方 HTTPS 域名，避免把上游任意 URL 带给前端。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(max_length=2048)
+    title: Optional[str] = Field(default=None, max_length=120)
+
+    @field_validator("url")
+    @classmethod
+    def validate_official_photo_url(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        hostname = (parsed.hostname or "").lower()
+        if (
+            parsed.scheme != "https"
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port not in {None, 443}
+            or parsed.fragment
+            or not _is_amap_official_hostname(hostname)
+        ):
+            raise ValueError("地点图片必须使用高德官方 HTTPS 地址")
+        return value
+
+
+class PlaceResult(BaseModel):
+    """与供应商无关的单个地点结果。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider_place_id: Optional[str] = Field(default=None, max_length=160)
+    name: str = Field(min_length=1, max_length=120)
+    address: Optional[str] = Field(default=None, max_length=240)
+    district: Optional[str] = Field(default=None, max_length=120)
+    category: Optional[str] = Field(default=None, max_length=160)
+    distance_m: Optional[int] = Field(default=None, ge=0, le=10_000_000)
+    photos: List[PlacePhoto] = Field(default_factory=list, max_length=1)
+    rating: Optional[float] = Field(default=None, ge=0, le=5)
+    reference_cost_yuan: Optional[float] = Field(default=None, ge=0, le=1_000_000)
+    platform_url: Optional[str] = Field(default=None, max_length=2048)
+    business_area: Optional[str] = Field(default=None, max_length=120)
+    open_hours: Optional[str] = Field(default=None, max_length=240)
+    detail_status: Literal["enriched", "unavailable", "budget_limited", "not_requested"] = "not_requested"
+
+    @field_validator("platform_url")
+    @classmethod
+    def validate_platform_url(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        parsed = urlsplit(value)
+        query = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+        if (
+            parsed.scheme != "https"
+            or (parsed.hostname or "").lower() != "uri.amap.com"
+            or parsed.path != "/marker"
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port not in {None, 443}
+            or parsed.fragment
+            or set(query) != {"poiid", "src", "callnative"}
+            or any(len(items) != 1 for items in query.values())
+            or not query["poiid"][0]
+            or query["src"] != ["fusion"]
+            or query["callnative"] != ["0"]
+        ):
+            raise ValueError("地点跳转地址不符合高德官方 URI 契约")
+        return value
+
+
+class PlaceResultsBlock(BaseModel):
+    """地点搜索产品结果块。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["place_results"]
+    id: str = Field(default_factory=lambda: f"blk_{uuid4().hex[:12]}", max_length=160)
+    schema_version: Literal[1]
+    provider: str = Field(min_length=1, max_length=40)
+    query: str = Field(min_length=1, max_length=80)
+    near: Optional[str] = Field(default=None, max_length=120)
+    status: Literal["success", "degraded"]
+    result_count: int = Field(ge=0, le=5)
+    places: List[PlaceResult] = Field(default_factory=list, max_length=5)
+    limitations: List[str] = Field(default_factory=list, max_length=8)
+    tool_call_log_id: str = Field(default="", max_length=160)
+
+    @model_validator(mode="after")
+    def validate_result_count(self):
+        if self.result_count != len(self.places):
+            raise ValueError("result_count 必须等于 places 数量")
+        return self
+
+    @field_validator("limitations")
+    @classmethod
+    def validate_limitations(cls, value: List[str]) -> List[str]:
+        if any(not item.strip() or len(item) > 240 for item in value):
+            raise ValueError("limitations 单项不能为空且不能超过 240 字符")
+        return value
+
+
+class RouteEndpoint(BaseModel):
+    """路线端点的安全展示字段，不包含坐标。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: str = Field(min_length=1, max_length=120)
+    city: Optional[str] = Field(default=None, max_length=40)
+
+
+class RouteOption(BaseModel):
+    """单种出行方式的路线摘要。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["driving", "transit", "walking", "bicycling"]
+    distance_m: Optional[int] = Field(default=None, ge=0, le=100_000_000)
+    duration_s: Optional[int] = Field(default=None, ge=0, le=10_000_000)
+    summary: Optional[str] = Field(default=None, max_length=160)
+    toll_yuan: Optional[float] = Field(default=None, ge=0, le=1_000_000)
+    transfers: Optional[int] = Field(default=None, ge=0, le=100)
+
+
+class RouteResultsBlock(BaseModel):
+    """路线对比产品结果块。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["route_results"]
+    id: str = Field(default_factory=lambda: f"blk_{uuid4().hex[:12]}", max_length=160)
+    schema_version: Literal[1]
+    provider: str = Field(min_length=1, max_length=40)
+    status: Literal["success", "degraded"]
+    origin: RouteEndpoint
+    destination: RouteEndpoint
+    routes: List[RouteOption] = Field(default_factory=list, min_length=1, max_length=3)
+    unavailable_modes: List[Literal["driving", "transit", "walking", "bicycling"]] = Field(
+        default_factory=list,
+        max_length=3,
+    )
+    limitations: List[str] = Field(default_factory=list, max_length=8)
+    tool_call_log_id: str = Field(default="", max_length=160)
+
+    @field_validator("limitations")
+    @classmethod
+    def validate_limitations(cls, value: List[str]) -> List[str]:
+        if any(not item.strip() or len(item) > 240 for item in value):
+            raise ValueError("limitations 单项不能为空且不能超过 240 字符")
+        return value
+
+
+def _is_amap_official_hostname(hostname: str) -> bool:
+    return hostname in {"amap.com", "autonavi.com"} or hostname.endswith((".amap.com", ".autonavi.com"))
+
+
+ProductResultBlock = Union[PlaceResultsBlock, RouteResultsBlock]
+
+
 # content block 的联合类型，后续扩展直接在此添加
-ContentBlock = Union[TextBlock, ThinkingBlock, FileBlock, SearchBlock, UrlBlock]
+ContentBlock = Union[
+    TextBlock,
+    ThinkingBlock,
+    FileBlock,
+    SearchBlock,
+    UrlBlock,
+    PlaceResultsBlock,
+    RouteResultsBlock,
+]
 
 
 # ============================================================

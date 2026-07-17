@@ -10,10 +10,11 @@ from app.services.stream.agent_loop_runtime import AgentLoopRuntime
 from app.services.stream.agent_loop_state import AgentLoopState
 from app.services.stream.agent_loop_step_requests import build_tool_round_request
 from app.services.stream.agent_round import AgentRoundResult
+from app.services.stream.product_result_answer import build_grounded_product_answer
 from app.services.stream.round_completion import append_round_content_blocks, complete_text_response_step
 from app.services.stream.step_lifecycle import AgentStepContext
 from app.services.stream.tool_round import ToolRoundOutcome
-from app.services.stream_state_service import StreamWriteTerminalError
+from app.services.stream_state_service import StreamWriteTerminalError, append_chunk
 
 
 @dataclass(frozen=True)
@@ -44,18 +45,15 @@ async def handle_agent_round_outcome(
         return AgentLoopOutcome(exit=AgentLoopExit.SUPERSEDED, error_msg="被新请求取代")
 
     if finish_reason == "tool_calls" and request.round_result.tool_calls:
-        if await _handle_tool_calls_round(request):
-            return AgentLoopOutcome(
-                exit=AgentLoopExit.SUMMARY_REQUIRED,
-                summary_finish_reason="no_progress_summary",
-            )
-        return None
+        return await _handle_tool_calls_round(request)
 
     await _complete_unknown_round(request)
     return AgentLoopOutcome(exit=AgentLoopExit.COMPLETED)
 
 
 def _append_round_blocks(request: AgentRoundOutcomeRequest) -> None:
+    if request.round_result.output_deferred:
+        return
     append_round_content_blocks(
         request.state.content_blocks,
         request.round_result.reasoning_buf,
@@ -66,6 +64,7 @@ def _append_round_blocks(request: AgentRoundOutcomeRequest) -> None:
 
 
 async def _complete_text_round(request: AgentRoundOutcomeRequest) -> None:
+    request = await _replace_deferred_product_answer(request)
     _append_round_blocks(request)
     await _emit_final_answer_used_evidence(request)
     await complete_text_response_step(
@@ -81,7 +80,48 @@ async def _complete_text_round(request: AgentRoundOutcomeRequest) -> None:
     request.state.clear_current_step()
 
 
+async def _replace_deferred_product_answer(
+    request: AgentRoundOutcomeRequest,
+) -> AgentRoundOutcomeRequest:
+    if not request.round_result.output_deferred:
+        return request
+    answer = (
+        build_grounded_product_answer(request.state.content_blocks)
+        or "已展示地图服务返回的结构化结果，请以卡片信息为准。"
+    )
+    if answer:
+        await append_chunk(
+            request.runtime.conversation_id,
+            "answering",
+            answer,
+            request.step_context.text_block_id,
+            task_id=request.runtime.task_id,
+            run_id=request.runtime.run_id,
+            step_id=request.step_context.step_id,
+        )
+    return AgentRoundOutcomeRequest(
+        db=request.db,
+        messages=request.messages,
+        state=request.state,
+        runtime=request.runtime,
+        step_number=request.step_number,
+        step_context=request.step_context,
+        round_result=AgentRoundResult(
+            reasoning_buf="",
+            content_buf=answer,
+            tool_calls=request.round_result.tool_calls,
+            finish_reason=request.round_result.finish_reason,
+            accumulated_usage=request.round_result.accumulated_usage,
+            context=request.round_result.context,
+            announced_tool_names=request.round_result.announced_tool_names,
+            output_deferred=False,
+        ),
+    )
+
+
 def _needs_empty_answer_summary(request: AgentRoundOutcomeRequest) -> bool:
+    if request.round_result.output_deferred:
+        return False
     return (
         request.state.total_tool_calls > 0
         and not request.round_result.content_buf
@@ -109,7 +149,7 @@ async def _complete_empty_round_before_summary(request: AgentRoundOutcomeRequest
     request.state.clear_current_step()
 
 
-async def _handle_tool_calls_round(request: AgentRoundOutcomeRequest) -> bool:
+async def _handle_tool_calls_round(request: AgentRoundOutcomeRequest) -> AgentLoopOutcome | None:
     outcome = await request.runtime.handle_tool_calls_round_fn(
         request=build_tool_round_request(
             db=request.db,
@@ -125,6 +165,8 @@ async def _handle_tool_calls_round(request: AgentRoundOutcomeRequest) -> bool:
         request.state.record_no_progress_search_results(outcome.no_progress_search_results)
     _sync_plan_items(request)
     request.state.clear_current_step()
+    if isinstance(outcome, ToolRoundOutcome) and outcome.product_result_count > 0:
+        return None
     should_summarize = request.state.should_summarize_no_progress_search()
     if should_summarize:
         request.runtime.warning_fn(
@@ -132,7 +174,11 @@ async def _handle_tool_calls_round(request: AgentRoundOutcomeRequest) -> bool:
             f"conv_id={request.runtime.conversation_id} run_id={request.runtime.run_id} "
             f"step={request.step_number} finish_reason=no_progress_summary"
         )
-    return should_summarize
+        return AgentLoopOutcome(
+            exit=AgentLoopExit.SUMMARY_REQUIRED,
+            summary_finish_reason="no_progress_summary",
+        )
+    return None
 
 
 async def _complete_unknown_round(request: AgentRoundOutcomeRequest) -> None:

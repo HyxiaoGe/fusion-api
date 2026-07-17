@@ -19,7 +19,7 @@ from app.services.chat.message_builder import (
     inject_file_content,
     is_image_file,
 )
-from app.services.mcp.amap_product_tools import AMAP_PRODUCT_TOOL_NAMES
+from app.services.mcp.amap_product_tools import AMAP_FACT_BOUNDARY_SYSTEM_PROMPT, AMAP_PRODUCT_TOOL_NAMES
 from app.services.stream.persistence import preprocess_url_in_message
 
 VOLCENGINE_PROVIDERS = {"volcengine"}
@@ -208,6 +208,7 @@ async def prepare_agent_loop_messages(
     if has_image_attachment and not has_vision:
         messages = inject_no_vision_file_boundary(messages)
     messages = inject_tool_usage_contract(messages, call_config.call_kwargs)
+    messages = inject_amap_fact_boundary(messages, call_config.call_kwargs)
     messages = inject_no_tool_network_boundary(messages, call_config.call_kwargs)
     return AgentLoopPreparedMessages(
         messages=messages,
@@ -292,6 +293,21 @@ def inject_tool_usage_contract(messages: list[dict], call_kwargs: dict) -> list[
         insert_at += 1
     contract_msg = {"role": "system", "content": get_tool_usage_contract_prompt()}
     return [*messages[:insert_at], contract_msg, *messages[insert_at:]]
+
+
+def inject_amap_fact_boundary(messages: list[dict], call_kwargs: dict) -> list[dict]:
+    """高德产品工具启用时前置通用事实边界，不提升任何外部结果为 system 内容。"""
+    announced_tools = set(announced_tool_names_from_call_kwargs(call_kwargs))
+    if not AMAP_PRODUCT_TOOL_NAMES.intersection(announced_tools):
+        return messages
+    if any(msg.get("role") == "system" and "【高德事实边界规则】" in str(msg.get("content", "")) for msg in messages):
+        return messages
+
+    insert_at = 0
+    while insert_at < len(messages) and messages[insert_at].get("role") == "system":
+        insert_at += 1
+    boundary_msg = {"role": "system", "content": AMAP_FACT_BOUNDARY_SYSTEM_PROMPT}
+    return [*messages[:insert_at], boundary_msg, *messages[insert_at:]]
 
 
 def inject_no_tool_network_boundary(messages: list[dict], call_kwargs: dict) -> list[dict]:

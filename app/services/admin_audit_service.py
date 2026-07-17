@@ -23,6 +23,7 @@ from app.schemas.admin_audit import (
     AdminPerformanceRunImport,
     PerformanceSafeSummary,
 )
+from app.schemas.chat import PlaceResultsBlock, RouteResultsBlock
 from app.schemas.response import ApiException, ErrorCode
 from app.services.admin_audit_sanitizer import mask_email, sanitize_admin_value
 from app.services.agent_strategy_config import get_agent_tools_disabled_aliases
@@ -344,6 +345,8 @@ class AdminAuditService:
             error = cls._error_projection(raw_block.get("error_message"), raw_block.get("status"))
             if error:
                 projection.update({"error_type": error["type"], "error_message": error["message"]})
+        elif block_type in {"place_results", "route_results"}:
+            projection = cls._product_result_projection(raw_block, block_type=block_type)
         else:
             projection = {
                 "type": block_type,
@@ -359,6 +362,92 @@ class AdminAuditService:
             max_nodes=300,
         )
         return sanitized
+
+    @classmethod
+    def _product_result_projection(cls, raw_block: dict[str, Any], *, block_type: str) -> dict[str, Any]:
+        """按公开产品块契约重建审计投影，绝不透传供应商原始字段。"""
+        common = {
+            **cls._string_fields(raw_block, ("type", "id", "provider", "status", "tool_call_log_id")),
+            **cls._count_fields(raw_block, ("schema_version",)),
+            **cls._string_list_fields(raw_block, ("limitations",)),
+        }
+        try:
+            if block_type == "place_results":
+                safe_places = []
+                for raw_place in raw_block.get("places", [])[:5]:
+                    if not isinstance(raw_place, dict):
+                        continue
+                    safe_place = {
+                        **cls._string_fields(
+                            raw_place,
+                            (
+                                "provider_place_id",
+                                "name",
+                                "address",
+                                "district",
+                                "category",
+                                "platform_url",
+                                "business_area",
+                                "open_hours",
+                                "detail_status",
+                            ),
+                        ),
+                        **cls._count_fields(raw_place, ("distance_m",)),
+                    }
+                    for numeric_key in ("rating", "reference_cost_yuan"):
+                        numeric_value = raw_place.get(numeric_key)
+                        if isinstance(numeric_value, (int, float)) and not isinstance(numeric_value, bool):
+                            safe_place[numeric_key] = numeric_value
+                    photos = []
+                    for raw_photo in raw_place.get("photos", [])[:1]:
+                        if isinstance(raw_photo, dict):
+                            photos.append(cls._string_fields(raw_photo, ("url", "title")))
+                    safe_place["photos"] = photos
+                    safe_places.append(safe_place)
+                model = PlaceResultsBlock.model_validate(
+                    {
+                        **common,
+                        **cls._string_fields(raw_block, ("query", "near")),
+                        **cls._count_fields(raw_block, ("result_count",)),
+                        "places": safe_places,
+                    }
+                )
+            else:
+
+                def endpoint(value: Any) -> dict[str, str]:
+                    return cls._string_fields(value, ("label", "city")) if isinstance(value, dict) else {}
+
+                safe_routes = []
+                for raw_route in raw_block.get("routes", [])[:3]:
+                    if not isinstance(raw_route, dict):
+                        continue
+                    safe_route: dict[str, Any] = {
+                        **cls._string_fields(raw_route, ("mode", "summary")),
+                        **cls._count_fields(raw_route, ("distance_m", "duration_s", "transfers")),
+                    }
+                    toll = raw_route.get("toll_yuan")
+                    if isinstance(toll, (int, float)) and not isinstance(toll, bool):
+                        safe_route["toll_yuan"] = toll
+                    safe_routes.append(safe_route)
+                model = RouteResultsBlock.model_validate(
+                    {
+                        **common,
+                        "origin": endpoint(raw_block.get("origin")),
+                        "destination": endpoint(raw_block.get("destination")),
+                        "routes": safe_routes,
+                        "unavailable_modes": cls._string_list_fields(
+                            raw_block,
+                            ("unavailable_modes",),
+                        ).get("unavailable_modes", []),
+                    }
+                )
+        except (ValidationError, TypeError, ValueError):
+            return {
+                "type": block_type,
+                **cls._string_fields(raw_block, ("id", "status")),
+                "content_hidden": True,
+            }
+        return model.model_dump(mode="json", exclude_none=True)
 
     @classmethod
     def _message_content_projection(cls, value: Any) -> list[dict[str, Any]]:

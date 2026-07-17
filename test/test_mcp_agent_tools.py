@@ -242,6 +242,7 @@ class McpAgentToolCatalogTests(unittest.TestCase):
             "maps_geo",
             "maps_text_search",
             "maps_around_search",
+            "maps_search_detail",
             "maps_direction_driving",
             "maps_direction_transit_integrated",
             "maps_direction_walking",
@@ -806,6 +807,7 @@ class McpAgentToolHandlerTests(unittest.IsolatedAsyncioTestCase):
             "maps_geo",
             "maps_text_search",
             "maps_around_search",
+            "maps_search_detail",
             "maps_direction_driving",
             "maps_direction_transit_integrated",
             "maps_direction_walking",
@@ -848,7 +850,7 @@ class McpAgentToolHandlerTests(unittest.IsolatedAsyncioTestCase):
         local_result = await local.execute({"query": "咖啡", "near": "民治地铁站"})
         route_result = await route.execute({"origin": "民治", "destination": "市民中心"})
 
-        self.assertEqual(local_result.status, "success")
+        self.assertEqual(local_result.status, "degraded")
         self.assertEqual(local_result.data["subcall_attempt_count"], 2)
         self.assertEqual([call[1] for call in client.calls], ["maps_geo", "maps_around_search"])
         self.assertEqual(route_result.data["error_code"], "server_run_budget_exhausted")

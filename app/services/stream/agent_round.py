@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from inspect import Parameter, signature
 from typing import Any
 
 from app.ai.llm_round_observability import create_llm_round_observation
@@ -21,6 +22,7 @@ class AgentRoundResult:
     accumulated_usage: Usage
     context: ContextUsage | None = None
     announced_tool_names: frozenset[str] | None = None
+    output_deferred: bool = False
 
 
 StreamRoundResult = tuple[str, str, list[dict], str, Usage | None]
@@ -91,6 +93,7 @@ async def collect_agent_round_stream(
     llm_call_fn: Callable[..., Awaitable[Any]],
     stream_round_fn: Callable[..., Awaitable[StreamRoundResult]],
     observation: Any | None = None,
+    defer_output: bool = False,
 ) -> StreamRoundResult:
     response = await llm_call_fn(
         litellm_model,
@@ -100,6 +103,9 @@ async def collect_agent_round_stream(
     )
     if observation is not None:
         response = observation.wrap_response(response)
+    stream_kwargs = {"run_id": run_id, "step_id": step_context.step_id}
+    if defer_output and _accepts_keyword(stream_round_fn, "defer_output"):
+        stream_kwargs["defer_output"] = True
     return await stream_round_fn(
         response,
         conversation_id,
@@ -107,9 +113,16 @@ async def collect_agent_round_stream(
         should_use_reasoning,
         step_context.thinking_block_id,
         step_context.text_block_id,
-        run_id=run_id,
-        step_id=step_context.step_id,
+        **stream_kwargs,
     )
+
+
+def _accepts_keyword(fn: Callable[..., Any], keyword: str) -> bool:
+    try:
+        parameters = signature(fn).parameters
+    except (TypeError, ValueError):
+        return True
+    return keyword in parameters or any(parameter.kind == Parameter.VAR_KEYWORD for parameter in parameters.values())
 
 
 def log_agent_round_summary(
@@ -157,6 +170,7 @@ async def run_agent_round(
     assistant_message_id: str | None = None,
     emitter: Any | None = None,
     on_context_updated: Callable[[ContextUsage], None] | None = None,
+    defer_output: bool = False,
 ) -> AgentRoundResult:
     try:
         context_plan = await prepare_context(
@@ -218,6 +232,7 @@ async def run_agent_round(
             llm_call_fn=llm_call_fn,
             stream_round_fn=stream_round_fn,
             observation=observation,
+            defer_output=defer_output,
         )
     except BaseException as exc:
         await observation.finish_error(exc)
@@ -245,4 +260,5 @@ async def run_agent_round(
         accumulated_usage=accumulate_usage(accumulated_usage, usage_data),
         context=final_context,
         announced_tool_names=_announced_tool_names(call_kwargs),
+        output_deferred=defer_output and _accepts_keyword(stream_round_fn, "defer_output"),
     )

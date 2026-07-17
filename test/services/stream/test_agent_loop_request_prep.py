@@ -3,6 +3,7 @@ import unittest
 from app.schemas.chat import TextBlock
 from app.services.stream.agent_loop_request_prep import (
     build_agent_loop_call_config,
+    inject_amap_fact_boundary,
     inject_no_tool_network_boundary,
     prepare_agent_loop_messages,
 )
@@ -18,6 +19,91 @@ class FakeFileRepository:
 
 
 class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
+    def test_amap_fact_boundary_is_generic_system_prompt_and_preserves_multi_tool_message_order(self):
+        messages = [
+            {"role": "system", "content": "基础系统提示"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "tc-place", "type": "function", "function": {"name": "local_place_search"}},
+                    {"id": "tc-route", "type": "function", "function": {"name": "route_compare"}},
+                    {"id": "tc-search", "type": "function", "function": {"name": "web_search"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc-place", "content": "民治星巴克地点原始数据"},
+            {"role": "tool", "tool_call_id": "tc-route", "content": "深圳北站路线原始数据"},
+            {"role": "tool", "tool_call_id": "tc-search", "content": "普通搜索上下文"},
+        ]
+        call_kwargs = {
+            "tools": [
+                {"type": "function", "function": {"name": "local_place_search"}},
+                {"type": "function", "function": {"name": "route_compare"}},
+                {"type": "function", "function": {"name": "web_search"}},
+            ]
+        }
+
+        prepared = inject_amap_fact_boundary(messages, call_kwargs)
+
+        self.assertEqual(
+            [message["role"] for message in prepared],
+            ["system", "system", "assistant", "tool", "tool", "tool"],
+        )
+        self.assertEqual(
+            [message["tool_call_id"] for message in prepared[3:]],
+            ["tc-place", "tc-route", "tc-search"],
+        )
+        boundary = prepared[1]["content"]
+        self.assertIn("【高德事实边界规则】", boundary)
+        self.assertIn("只能来自对应 result.places 或 result.routes 中实际返回的字段", boundary)
+        self.assertIn("禁止使用常识、品牌印象、店名词义或训练知识", boundary)
+        self.assertIn("环境、安静度、座位、出品、通常营业时间、公园步道", boundary)
+        self.assertIn("rating 只能称为评分或综合评分", boundary)
+        self.assertIn("不得解释为环境、安静度或服务评分", boundary)
+        self.assertIn("不得根据品牌、店名或综合评分", boundary)
+        self.assertIn("适合聊天、适合三人、品牌稳定或出品稳定", boundary)
+        self.assertIn("不得在正文或括号中补充估计", boundary)
+        self.assertIn("结果为 0 条时，不得根据常识推荐任何有名称的地点", boundary)
+        self.assertIn("reference_cost_yuan", boundary)
+        self.assertIn("只能原样称为高德参考消费", boundary)
+        self.assertIn("不得评价为便宜、实惠或性价比高", boundary)
+        self.assertIn("允许依据实际返回的 rating 或 open_hours 做有限排序或说明", boundary)
+        self.assertIn("必须明确所依据的字段", boundary)
+        self.assertIn("不得把排序或说明改写成未返回属性", boundary)
+        self.assertIn("不得推断实时排队、预约、空位", boundary)
+        self.assertIn("地点之间的时间或距离", boundary)
+        self.assertIn("路线选择或比较只能基于实际返回的 duration_s、distance_m、transfers 等字段", boundary)
+        self.assertIn("允许说明最快、最慢、换乘次数或距离远近", boundary)
+        self.assertIn("必须明确依据的返回字段", boundary)
+        self.assertIn("停车位、停车难度、停车费、公交票价或成本", boundary)
+        self.assertIn("当前路况、周六路况、等车时间、环保或免费", boundary)
+        self.assertIn("不得声称路线耗时包含或不包含停车及其他未返回构成", boundary)
+        self.assertIn("未返回的路线属性只能说明无法从本次高德结果确认", boundary)
+        self.assertNotIn("民治星巴克", boundary)
+        self.assertNotIn("深圳北站", boundary)
+
+    def test_amap_fact_boundary_is_deduplicated(self):
+        call_kwargs = {"tools": [{"type": "function", "function": {"name": "local_place_search"}}]}
+
+        prepared = inject_amap_fact_boundary([{"role": "user", "content": "找咖啡店"}], call_kwargs)
+        prepared = inject_amap_fact_boundary(prepared, call_kwargs)
+
+        boundaries = [
+            message
+            for message in prepared
+            if message.get("role") == "system" and "【高德事实边界规则】" in str(message.get("content", ""))
+        ]
+        self.assertEqual(len(boundaries), 1)
+
+    def test_non_amap_tools_do_not_inject_amap_fact_boundary(self):
+        messages = [{"role": "user", "content": "深圳天气"}]
+        call_kwargs = {"tools": [{"type": "function", "function": {"name": "web_search"}}]}
+
+        prepared = inject_amap_fact_boundary(messages, call_kwargs)
+
+        self.assertIs(prepared, messages)
+        self.assertFalse(any("【高德事实边界规则】" in str(message.get("content", "")) for message in prepared))
+
     def test_build_call_config_applies_controlled_max_tokens(self):
         for raw_value, expected in ((1, 1), (1024, 1024), (9999, 4096)):
             with self.subTest(raw_value=raw_value):

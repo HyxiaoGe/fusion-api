@@ -11,6 +11,7 @@ from app.services.stream.agent_loop_runtime import AgentLoopRuntime
 from app.services.stream.agent_loop_state import AgentLoopState
 from app.services.stream.agent_loop_step_requests import build_limit_summary_step_request
 from app.services.stream.agent_round import AgentRoundResult
+from app.services.stream.product_result_answer import has_product_result_blocks
 from app.services.stream.step_lifecycle import AgentStepContext
 
 
@@ -48,6 +49,14 @@ async def run_agent_loop(
             continue
         if outcome.exit == AgentLoopExit.SUPERSEDED:
             return outcome
+        if outcome.exit == AgentLoopExit.PRODUCT_RESULT_READY:
+            await _complete_product_result_without_llm(
+                db=db,
+                messages=messages,
+                state=state,
+                runtime=runtime,
+            )
+            break
         if outcome.exit == AgentLoopExit.SUMMARY_REQUIRED:
             state.finish_reason = outcome.summary_finish_reason or "empty_answer_summary"
             await _run_limit_summary(
@@ -60,9 +69,52 @@ async def run_agent_loop(
         break
 
     if state.limit_reason is not None:
-        await _run_limit_summary(state=state, runtime=runtime, messages=messages)
+        if has_product_result_blocks(state.content_blocks):
+            limit_finish_reason = state.finish_reason
+            try:
+                await _complete_product_result_without_llm(
+                    db=db,
+                    messages=messages,
+                    state=state,
+                    runtime=runtime,
+                )
+            finally:
+                state.finish_reason = limit_finish_reason
+        else:
+            await _run_limit_summary(state=state, runtime=runtime, messages=messages)
 
     return AgentLoopOutcome(exit=AgentLoopExit.COMPLETED)
+
+
+async def _complete_product_result_without_llm(
+    *,
+    db,
+    messages: list[dict],
+    state: AgentLoopState,
+    runtime: AgentLoopRuntime,
+) -> None:
+    """产品结果块本身已足够收尾，不再消耗一轮模型调用。"""
+    step_number, step_context = await _start_next_step(state=state, runtime=runtime)
+    state.finish_reason = "stop"
+    await handle_agent_round_outcome(
+        request=AgentRoundOutcomeRequest(
+            db=db,
+            messages=messages,
+            state=state,
+            runtime=runtime,
+            step_number=step_number,
+            step_context=step_context,
+            round_result=AgentRoundResult(
+                reasoning_buf="",
+                content_buf="",
+                tool_calls=[],
+                finish_reason="stop",
+                accumulated_usage=state.accumulated_usage,
+                context=state.last_context,
+                output_deferred=True,
+            ),
+        )
+    )
 
 
 async def _stop_if_limit_reached(*, state: AgentLoopState, runtime: AgentLoopRuntime) -> bool:
@@ -124,7 +176,7 @@ async def _run_round(
         call_kwargs=runtime.call_kwargs,
         dynamic_tool_handlers=runtime.dynamic_tool_handlers,
     )
-    round_result = await runtime.run_round_fn(
+    run_round_kwargs = dict(
         conversation_id=runtime.conversation_id,
         task_id=runtime.task_id,
         run_id=runtime.run_id,
@@ -145,6 +197,12 @@ async def _run_round(
         emitter=runtime.emitter,
         on_context_updated=state.update_context,
     )
+    if has_product_result_blocks(state.content_blocks) and _accepts_keyword(
+        runtime.run_round_fn,
+        "defer_output",
+    ):
+        run_round_kwargs["defer_output"] = True
+    round_result = await runtime.run_round_fn(**run_round_kwargs)
     state.finish_reason = round_result.finish_reason
     state.update_usage(round_result.accumulated_usage)
     state.update_context(round_result.context)
