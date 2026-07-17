@@ -95,6 +95,47 @@ class DynamicToolExecutionTests(unittest.IsolatedAsyncioTestCase):
         emitter.tool_call_completed.assert_awaited_once()
         self.assertEqual(emitter.tool_call_completed.await_args.kwargs["tool_name"], "local_place_search")
 
+    async def test_amap_route_runs_before_place_calls_and_results_keep_model_order(self):
+        request = tool_executor_module.ToolExecutionBatchRequest(
+            conversation_id="conv-1",
+            user_id="user-1",
+            model_id="deepseek-chat",
+            provider="deepseek",
+        )
+        place_first = {"id": "call-place-1", "name": "local_place_search", "arguments": {"query": "咖啡"}}
+        route = {
+            "id": "call-route",
+            "name": "route_compare",
+            "arguments": {"origin": "民治地铁站", "destination": "深圳市民中心"},
+        }
+        place_second = {
+            "id": "call-place-2",
+            "name": "local_place_search",
+            "arguments": {"query": "安静的咖啡店"},
+        }
+        started = []
+
+        async def execute_one_tool_call(_request, tool_call):
+            started.append(tool_call["id"])
+            await asyncio.sleep(0)
+            handler = MagicMock(tool_name=tool_call["name"])
+            return ToolExecutionRecord(
+                tool_call=tool_call,
+                result=ToolResult(status="success", data={}),
+                handler=handler,
+                block_id=f"blk-{tool_call['id']}",
+                log_id=f"log-{tool_call['id']}",
+            )
+
+        with patch("app.services.stream.tool_executor.execute_one_tool_call", side_effect=execute_one_tool_call):
+            records = await tool_executor_module.execute_tool_batch(request, [place_first, route, place_second])
+
+        self.assertEqual(started, ["call-route", "call-place-1", "call-place-2"])
+        self.assertEqual(
+            [record.tool_call["id"] for record in records],
+            ["call-place-1", "call-route", "call-place-2"],
+        )
+
 
 class WebSearchRedirectPresentationTests(unittest.TestCase):
     def test_read_alternative_redirect_has_safe_context_without_search_block(self):

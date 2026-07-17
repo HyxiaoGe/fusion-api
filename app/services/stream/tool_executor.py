@@ -36,6 +36,10 @@ AGENT_TOOL_MAX_RETRIES = 1
 # 永久性错误关键字（不重试）
 _TOOL_PERMANENT_KEYWORDS = ("not_found", "invalid", "rate_limit", "400", "401", "403", "404")
 _INTERNAL_TOOL_ARG_KEYS = {"budget_decision"}
+_AMAP_PRODUCT_EXECUTION_PRIORITY = {
+    "route_compare": 0,
+    "local_place_search": 1,
+}
 
 
 @dataclass(frozen=True)
@@ -340,8 +344,43 @@ async def execute_tool_batch(
     request: ToolExecutionBatchRequest,
     tool_calls: list[dict],
 ) -> list[ToolExecutionRecord]:
-    results = await asyncio.gather(*[execute_one_tool_call(request, tool_call) for tool_call in tool_calls])
-    return list(results)
+    indexed_calls = list(enumerate(tool_calls))
+    amap_product_calls = [
+        (index, tool_call)
+        for index, tool_call in indexed_calls
+        if tool_call.get("name") in _AMAP_PRODUCT_EXECUTION_PRIORITY
+    ]
+    parallel_calls = [
+        (index, tool_call)
+        for index, tool_call in indexed_calls
+        if tool_call.get("name") not in _AMAP_PRODUCT_EXECUTION_PRIORITY
+    ]
+
+    async def execute_indexed(index: int, tool_call: dict) -> tuple[int, ToolExecutionRecord]:
+        return index, await execute_one_tool_call(request, tool_call)
+
+    async def execute_amap_products() -> list[tuple[int, ToolExecutionRecord]]:
+        records = []
+        for index, tool_call in sorted(
+            amap_product_calls,
+            key=lambda item: (_AMAP_PRODUCT_EXECUTION_PRIORITY[item[1]["name"]], item[0]),
+        ):
+            records.append(await execute_indexed(index, tool_call))
+        return records
+
+    pending = [execute_indexed(index, tool_call) for index, tool_call in parallel_calls]
+    if amap_product_calls:
+        pending.append(execute_amap_products())
+    batches = await asyncio.gather(*pending)
+
+    indexed_results: list[tuple[int, ToolExecutionRecord]] = []
+    for batch in batches:
+        if isinstance(batch, list):
+            indexed_results.extend(batch)
+        else:
+            indexed_results.append(batch)
+    indexed_results.sort(key=lambda item: item[0])
+    return [record for _, record in indexed_results]
 
 
 async def execute_tools_parallel(
