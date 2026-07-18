@@ -131,7 +131,7 @@ async def _replace_deferred_product_answer(
                 if completed_answer is not None:
                     answer = completed_answer
             if not answer and request.state.product_tool_attempted:
-                answer = build_product_tool_failure_answer()
+                answer = build_product_tool_failure_answer(request.messages)
             if not answer:
                 answer = "已展示地图服务返回的结构化结果，请以卡片信息为准。"
     if answer:

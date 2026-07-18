@@ -181,6 +181,51 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("4号线", emitted_answer)
         self.assertNotIn("30分钟", emitted_answer)
 
+    async def test_location_context_timeout_uses_location_specific_safe_failure_message(self):
+        state = AgentLoopState(product_tool_attempted=True)
+        state.mark_current_step("step-location-timeout-answer")
+        append_chunk = AsyncMock()
+
+        messages = [
+            {"role": "user", "content": "从我当前位置到深圳市民中心"},
+            {
+                "role": "tool",
+                "tool_call_id": "tc-route",
+                "content": (
+                    '{"status":"unavailable","error_code":"context_required_not_provided",'
+                    '"context_type":"geolocation","context_status":"timeout",'
+                    '"reason":"geolocation_timeout"}'
+                ),
+            },
+        ]
+        with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
+            outcome = await handle_agent_round_outcome(
+                request=AgentRoundOutcomeRequest(
+                    db="db",
+                    messages=messages,
+                    state=state,
+                    runtime=_runtime(complete_step_fn=AsyncMock()),
+                    step_number=2,
+                    step_context=_step_context("step-location-timeout-answer"),
+                    round_result=AgentRoundResult(
+                        reasoning_buf="",
+                        content_buf="高德接口失败，请稍后重试。",
+                        tool_calls=[],
+                        finish_reason="stop",
+                        accumulated_usage=Usage(input_tokens=2, output_tokens=9),
+                        output_deferred=True,
+                    ),
+                )
+            )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        emitted_answer = append_chunk.await_args.args[2]
+        self.assertIn("未能获取当前位置", emitted_answer)
+        self.assertIn("浏览器或系统定位权限", emitted_answer)
+        self.assertIn("高德路线服务尚未执行", emitted_answer)
+        self.assertNotIn("高德接口失败", emitted_answer)
+        self.assertNotIn("本次未能从高德取得", emitted_answer)
+
     async def test_empty_deferred_model_answer_still_completes_from_product_result(self):
         state = AgentLoopState()
         state.mark_current_step("step-product-empty")

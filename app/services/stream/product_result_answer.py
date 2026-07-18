@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 _PRODUCT_RESULT_TYPES = {"place_results", "route_results"}
@@ -38,13 +39,37 @@ def build_grounded_product_answer(content_blocks: list[Any]) -> str:
     return "\n\n".join(paragraphs)
 
 
-def build_product_tool_failure_answer() -> str:
+def build_product_tool_failure_answer(messages: list[dict[str, Any]] | None = None) -> str:
     """产品工具未取得结构化结果时，阻止模型用训练知识补全具体事实。"""
 
+    if _has_unavailable_geolocation_context(messages or []):
+        return (
+            "本次未能获取当前位置，请检查浏览器或系统定位权限后重试，也可以直接提供明确起点。"
+            "由于位置没有获取成功，高德路线服务尚未执行。"
+        )
     return (
         "本次未能从高德取得可用的地点或路线数据，因此无法可靠给出具体地点、线路、时间、距离或费用。"
         "你可以稍后重试，或补充更明确的城市、起点和终点。"
     )
+
+
+def _has_unavailable_geolocation_context(messages: list[dict[str, Any]]) -> bool:
+    for message in reversed(messages):
+        if message.get("role") != "tool" or not isinstance(message.get("content"), str):
+            continue
+        try:
+            payload = json.loads(message["content"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if (
+            payload.get("error_code") == "context_required_not_provided"
+            and payload.get("context_type") == "geolocation"
+            and payload.get("context_status") in {"denied", "timeout", "unavailable"}
+        ):
+            return True
+    return False
 
 
 def _build_place_answer(block: Any) -> str:
