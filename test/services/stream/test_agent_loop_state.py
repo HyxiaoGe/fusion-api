@@ -5,6 +5,11 @@ from app.services.stream.agent_loop_state import AgentLoopState
 
 
 class AgentLoopStateTests(unittest.TestCase):
+    def test_active_elapsed_excludes_context_wait(self):
+        state = AgentLoopState(context_wait_seconds=45.0)
+
+        self.assertEqual(state.active_elapsed_seconds(now=320.0, run_start=0.0), 275.0)
+
     def test_initial_state_matches_runner_defaults(self):
         state = AgentLoopState()
 

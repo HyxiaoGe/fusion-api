@@ -49,6 +49,8 @@ def build_tool_round_request(
         clock=runtime.clock,
         tool_handlers=runtime.dynamic_tool_handlers,
         announced_tool_names=round_result.announced_tool_names,
+        task_id=runtime.task_id,
+        agent_state=state,
     )
 
 
@@ -76,7 +78,7 @@ def build_limit_summary_step_request(
         emitter=runtime.emitter,
         session_cache=runtime.session_cache,
         total_timeout_s=runtime.limits.total_timeout_s,
-        run_start=runtime.run_start,
+        run_start=runtime.run_start + state.context_wait_seconds,
         start_step_fn=runtime.start_step_fn,
         complete_step_fn=runtime.complete_step_fn,
         llm_call_fn=runtime.llm_call_fn,

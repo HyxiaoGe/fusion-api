@@ -28,6 +28,44 @@ def test_run_progress_updated_replaces_progress():
     }
 
 
+def test_context_required_and_result_are_replayable_without_location_payload():
+    state = empty_progress_state(run_id="r1", message_id="m1")
+    state = apply_progress_event(
+        state,
+        {
+            "type": "context_required",
+            "protocol_version": 2,
+            "context_type": "geolocation",
+            "request_id": "ctx-1",
+            "purpose": "nearby_search",
+            "reason": "搜索当前位置附近的地点",
+            "expires_at": 123.5,
+        },
+    )
+
+    assert state["context_request"] == {
+        "request_id": "ctx-1",
+        "context_type": "geolocation",
+        "purpose": "nearby_search",
+        "reason": "搜索当前位置附近的地点",
+        "expires_at": 123.5,
+        "status": "pending",
+    }
+    assert "latitude" not in str(state)
+
+    state = apply_progress_event(
+        state,
+        {
+            "type": "context_result",
+            "protocol_version": 2,
+            "context_type": "geolocation",
+            "request_id": "ctx-1",
+            "status": "provided",
+        },
+    )
+    assert state["context_request"]["status"] == "provided"
+
+
 def test_plan_snapshot_replaces_existing_plan():
     state = empty_progress_state(run_id="r1", message_id="m1")
     state = apply_progress_event(

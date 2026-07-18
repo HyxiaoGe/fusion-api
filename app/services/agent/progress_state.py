@@ -19,6 +19,7 @@ def empty_progress_state(*, run_id: str, message_id: str) -> dict[str, Any]:
         "plan": None,
         "tool_digests": [],
         "evidence": [],
+        "context_request": None,
         "updated_at": None,
     }
 
@@ -61,6 +62,20 @@ def apply_progress_event(state: dict[str, Any], event: dict[str, Any]) -> dict[s
                 limit=None,
             )
             next_state["evidence"] = _cap_evidence(next_state["evidence"])
+    elif event_type == "context_required" and event.get("protocol_version") == 2:
+        next_state["context_request"] = {
+            "request_id": str(event.get("request_id", "")),
+            "context_type": event.get("context_type"),
+            "purpose": event.get("purpose"),
+            "reason": _truncate(event.get("reason"), 120),
+            "expires_at": event.get("expires_at"),
+            "status": "pending",
+        }
+    elif event_type == "context_result" and event.get("protocol_version") == 2:
+        current = next_state.get("context_request")
+        if not isinstance(current, dict) or current.get("request_id") != event.get("request_id"):
+            return state
+        current["status"] = event.get("status")
     elif event_type in {"run_completed", "run_failed", "run_interrupted"}:
         next_state["status"] = _terminal_status(event)
     else:

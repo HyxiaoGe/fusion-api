@@ -417,16 +417,68 @@ class AdminAuditService:
                 def endpoint(value: Any) -> dict[str, str]:
                     return cls._string_fields(value, ("label", "city")) if isinstance(value, dict) else {}
 
+                def transit_leg(value: Any) -> dict[str, Any]:
+                    if not isinstance(value, dict):
+                        return {}
+                    return {
+                        **cls._string_fields(
+                            value,
+                            (
+                                "kind",
+                                "line_name",
+                                "departure_stop",
+                                "arrival_stop",
+                                "entrance",
+                                "exit",
+                            ),
+                        ),
+                        **cls._count_fields(
+                            value,
+                            ("via_stop_count", "distance_m", "duration_s"),
+                        ),
+                    }
+
+                def transit_alternative(value: Any) -> dict[str, Any]:
+                    if not isinstance(value, dict):
+                        return {}
+                    raw_legs = value.get("legs")
+                    return {
+                        **cls._string_fields(value, ("transit_type", "summary")),
+                        **cls._count_fields(
+                            value,
+                            ("duration_s", "walking_distance_m", "transfers"),
+                        ),
+                        "legs": [
+                            transit_leg(raw_leg) for raw_leg in (raw_legs[:8] if isinstance(raw_legs, list) else [])
+                        ],
+                    }
+
                 safe_routes = []
                 for raw_route in raw_block.get("routes", [])[:3]:
                     if not isinstance(raw_route, dict):
                         continue
                     safe_route: dict[str, Any] = {
-                        **cls._string_fields(raw_route, ("mode", "summary")),
-                        **cls._count_fields(raw_route, ("distance_m", "duration_s", "transfers")),
+                        **cls._string_fields(raw_route, ("mode", "summary", "transit_type")),
+                        **cls._count_fields(
+                            raw_route,
+                            ("distance_m", "duration_s", "transfers", "walking_distance_m"),
+                        ),
                     }
+                    raw_legs = raw_route.get("legs")
+                    safe_route["legs"] = [
+                        transit_leg(raw_leg) for raw_leg in (raw_legs[:8] if isinstance(raw_legs, list) else [])
+                    ]
+                    raw_alternatives = raw_route.get("alternatives")
+                    safe_route["alternatives"] = [
+                        transit_alternative(raw_alternative)
+                        for raw_alternative in (raw_alternatives[:2] if isinstance(raw_alternatives, list) else [])
+                    ]
                     toll = raw_route.get("toll_yuan")
-                    if isinstance(toll, (int, float)) and not isinstance(toll, bool):
+                    if (
+                        raw_route.get("mode") == "driving"
+                        and isinstance(toll, (int, float))
+                        and not isinstance(toll, bool)
+                    ):
                         safe_route["toll_yuan"] = toll
                     safe_routes.append(safe_route)
                 model = RouteResultsBlock.model_validate(

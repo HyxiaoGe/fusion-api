@@ -228,6 +228,35 @@ class RouteEndpoint(BaseModel):
     city: Optional[str] = Field(default=None, max_length=40)
 
 
+class TransitLeg(BaseModel):
+    """公共交通单段安全展示字段；所有字段可选以兼容不完整上游结果。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Optional[Literal["walking", "subway", "bus", "other"]] = None
+    line_name: Optional[str] = Field(default=None, max_length=120)
+    departure_stop: Optional[str] = Field(default=None, max_length=120)
+    arrival_stop: Optional[str] = Field(default=None, max_length=120)
+    via_stop_count: Optional[int] = Field(default=None, ge=0, le=100)
+    distance_m: Optional[int] = Field(default=None, ge=0, le=100_000_000)
+    duration_s: Optional[int] = Field(default=None, ge=0, le=10_000_000)
+    entrance: Optional[str] = Field(default=None, max_length=80)
+    exit: Optional[str] = Field(default=None, max_length=80)
+
+
+class TransitAlternative(BaseModel):
+    """公共交通备选方案；不递归嵌套 alternatives。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    transit_type: Optional[Literal["subway", "bus", "mixed", "public_transit"]] = None
+    duration_s: Optional[int] = Field(default=None, ge=0, le=10_000_000)
+    walking_distance_m: Optional[int] = Field(default=None, ge=0, le=100_000_000)
+    transfers: Optional[int] = Field(default=None, ge=0, le=100)
+    summary: Optional[str] = Field(default=None, max_length=160)
+    legs: List[TransitLeg] = Field(default_factory=list, max_length=8)
+
+
 class RouteOption(BaseModel):
     """单种出行方式的路线摘要。"""
 
@@ -239,6 +268,10 @@ class RouteOption(BaseModel):
     summary: Optional[str] = Field(default=None, max_length=160)
     toll_yuan: Optional[float] = Field(default=None, ge=0, le=1_000_000)
     transfers: Optional[int] = Field(default=None, ge=0, le=100)
+    transit_type: Optional[Literal["subway", "bus", "mixed", "public_transit"]] = None
+    walking_distance_m: Optional[int] = Field(default=None, ge=0, le=100_000_000)
+    legs: List[TransitLeg] = Field(default_factory=list, max_length=8)
+    alternatives: List[TransitAlternative] = Field(default_factory=list, max_length=2)
 
 
 class RouteResultsBlock(BaseModel):
@@ -441,6 +474,34 @@ class ChatRequest(BaseModel):
 class ContinueAgentRunRequest(BaseModel):
     previous_run_id: Optional[str] = None
     stream: bool = True
+
+
+class GeolocationContextPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    accuracy_m: float = Field(ge=0, le=50_000)
+    acquired_at: float = Field(ge=0)
+
+
+class AgentContextResultRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    context_type: Literal["geolocation"]
+    status: Literal["provided", "denied", "timeout", "unavailable"]
+    location: Optional[GeolocationContextPayload] = None
+    reason: Optional[str] = Field(default=None, min_length=1, max_length=120)
+
+    @model_validator(mode="after")
+    def validate_status_payload(self) -> "AgentContextResultRequest":
+        if self.status == "provided":
+            if self.location is None or self.reason is not None:
+                raise ValueError("provided 必须且只能携带 location")
+            return self
+        if self.location is not None or self.reason is None:
+            raise ValueError("非 provided 必须且只能携带 reason")
+        return self
 
 
 class StopStreamRequest(BaseModel):

@@ -6,6 +6,9 @@ from pydantic import ValidationError
 
 from app.services.agent.events import (
     AgentEventBase,
+    ContentBlockDiscarded,
+    ContextRequired,
+    ContextResult,
     EvidenceItemUpserted,
     PlanSnapshot,
     RunCompleted,
@@ -94,9 +97,60 @@ class AgentEventModelTests(unittest.TestCase):
         self.assertEqual(d["sequence"], 0)
         self.assertEqual(d["run_id"], "r1")
 
+    def test_content_block_discarded_requires_explicit_block_id(self):
+        event = ContentBlockDiscarded(
+            type="content_block_discarded",
+            protocol_version=2,
+            block_id="blk-tool-preamble",
+            **self._common(),
+        )
+
+        self.assertEqual(event.block_id, "blk-tool-preamble")
+        with self.assertRaises(ValidationError):
+            ContentBlockDiscarded(
+                type="content_block_discarded",
+                protocol_version=2,
+                **self._common(),
+            )
+
     def test_extra_field_forbidden(self):
         with self.assertRaises(ValidationError):
             StepStarted(type="step_started", step_number=1, bogus_field="x", **self._common())
+
+    def test_geolocation_context_events_have_strict_safe_contract(self):
+        required = ContextRequired(
+            type="context_required",
+            protocol_version=2,
+            context_type="geolocation",
+            request_id="ctx-1",
+            purpose="nearby_search",
+            reason="搜索当前位置附近的地点",
+            expires_at=123.5,
+            **self._common(),
+        )
+        result = ContextResult(
+            type="context_result",
+            protocol_version=2,
+            context_type="geolocation",
+            request_id="ctx-1",
+            status="provided",
+            **self._common(),
+        )
+
+        self.assertEqual(required.purpose, "nearby_search")
+        self.assertEqual(result.status, "provided")
+        self.assertNotIn("location", result.model_dump())
+        with self.assertRaises(ValidationError):
+            ContextRequired(
+                type="context_required",
+                protocol_version=2,
+                context_type="geolocation",
+                request_id="ctx-1",
+                purpose="bogus",
+                reason="x",
+                expires_at=123.5,
+                **self._common(),
+            )
 
 
 class AgentEventExportTests(unittest.TestCase):

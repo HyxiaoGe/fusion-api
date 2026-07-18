@@ -175,6 +175,14 @@ class ContentBlockUpserted(AgentEventBase):
     content_block: ProductResultBlock
 
 
+class ContentBlockDiscarded(AgentEventBase):
+    """撤回已流式发送、但不应进入最终消息的过程性 block。"""
+
+    type: Literal["content_block_discarded"]
+    protocol_version: Literal[2]
+    block_id: str = Field(min_length=1, max_length=128)
+
+
 class ContextStatusUpdated(AgentEventBase):
     """单轮 LLM 上下文状态；字段严格白名单，不携带 prompt 或内部来源。"""
 
@@ -191,6 +199,28 @@ class ContextStatusUpdated(AgentEventBase):
     removed_turns: int = Field(default=0, ge=0)
     removed_messages: int = Field(default=0, ge=0)
     removed_tool_transactions: int = Field(default=0, ge=0)
+
+
+class ContextRequired(AgentEventBase):
+    """请求客户端补充运行上下文；不得包含精确位置。"""
+
+    type: Literal["context_required"]
+    protocol_version: Literal[2]
+    context_type: Literal["geolocation"]
+    request_id: str
+    purpose: Literal["nearby_search", "route_origin", "route_destination", "local_weather"]
+    reason: str
+    expires_at: float
+
+
+class ContextResult(AgentEventBase):
+    """上下文握手结果状态；不得包含精确位置。"""
+
+    type: Literal["context_result"]
+    protocol_version: Literal[2]
+    context_type: Literal["geolocation"]
+    request_id: str
+    status: Literal["provided", "denied", "timeout", "unavailable"]
 
 
 AnyAgentEvent = Annotated[
@@ -210,6 +240,9 @@ AnyAgentEvent = Annotated[
     | ToolResultDigest
     | EvidenceItemUpserted
     | ContentBlockUpserted
-    | ContextStatusUpdated,
+    | ContentBlockDiscarded
+    | ContextStatusUpdated
+    | ContextRequired
+    | ContextResult,
     Field(discriminator="type"),
 ]

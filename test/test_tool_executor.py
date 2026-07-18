@@ -2,6 +2,7 @@
 
 import asyncio
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.source_evidence_ledger import stable_web_evidence_id
@@ -24,6 +25,38 @@ class ToolRetryPolicyTests(unittest.TestCase):
 
 
 class DynamicToolExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_runtime_location_is_only_forwarded_to_handler_not_events_or_logs(self):
+        handler = MagicMock()
+        handler.tool_name = "local_place_search"
+        handler.supports_automatic_retry = False
+        handler.execute = AsyncMock()
+        handler.execute_with_runtime_context = AsyncMock(return_value=ToolResult(status="success", data={}))
+        handler.log = AsyncMock()
+        handler._build_result_summary.return_value = {"kind": "external_tool", "truncated": False}
+        emitter = AsyncMock()
+        runtime_context = SimpleNamespace(
+            geolocation=SimpleNamespace(latitude=22.616123, longitude=114.031456, accuracy_m=10)
+        )
+        args = {"query": "咖啡", "anchor_source": "current_location"}
+
+        await execute_tools_parallel(
+            [{"id": "call-current", "name": "local_place_search", "arguments": args}],
+            "conv-1",
+            "user-1",
+            "model-1",
+            "openai",
+            emitter=emitter,
+            tool_handlers={"local_place_search": handler},
+            runtime_context=runtime_context,
+        )
+
+        handler.execute.assert_not_awaited()
+        handler.execute_with_runtime_context.assert_awaited_once_with(args, runtime_context)
+        self.assertEqual(handler.log.await_args.kwargs["input_params"], args)
+        self.assertEqual(emitter.tool_call_started.await_args.kwargs["arguments"], args)
+        self.assertNotIn("114.031456", str(handler.log.await_args))
+        self.assertNotIn("114.031456", str(emitter.method_calls))
+
     async def test_run_scoped_handler_is_resolved_without_global_registration(self):
         handler = AsyncMock()
         handler.tool_name = "mcp_docs_a1b2c3d4"

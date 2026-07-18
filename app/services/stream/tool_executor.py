@@ -54,6 +54,7 @@ class ToolExecutionBatchRequest:
     emitter: Optional[AgentEventEmitter] = None
     network_budget: "NetworkToolBudget | None" = None
     tool_handlers: Mapping[str, Any] | None = None
+    runtime_context: Any = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +103,13 @@ class AgentEventCompositeWriter:
             self.recorder.record_chunk(conversation_id, chunk_type, payload)
 
 
+async def _execute_handler(handler, args: dict, runtime_context: Any = None):
+    execute_with_runtime_context = getattr(handler, "execute_with_runtime_context", None)
+    if runtime_context is not None and callable(execute_with_runtime_context):
+        return await execute_with_runtime_context(args, runtime_context)
+    return await handler.execute(args)
+
+
 @backoff.on_predicate(
     backoff.constant,
     predicate=_should_retry_tool_result,
@@ -112,7 +120,7 @@ class AgentEventCompositeWriter:
         f"{d['wait']:.0f}s 后重试: {d['value'].error_message}"
     ),
 )
-async def execute_tool_with_retry(handler, args: dict):
+async def execute_tool_with_retry(handler, args: dict, runtime_context: Any = None):
     """带重试的工具执行（仅瞬时故障重试），返回 ToolResult。
 
     永久性错误（not_found / invalid / 401 / 403 / 404 / 400 / rate_limit）不重试。
@@ -123,19 +131,19 @@ async def execute_tool_with_retry(handler, args: dict):
 
     try:
         return await asyncio.wait_for(
-            handler.execute(args),
+            _execute_handler(handler, args, runtime_context),
             timeout=AGENT_TOOL_TIMEOUT,
         )
     except asyncio.TimeoutError:
         return ToolResult(status="failed", error_message="工具调用超时")
 
 
-async def execute_tool_once(handler, args: dict):
+async def execute_tool_once(handler, args: dict, runtime_context: Any = None):
     """有副作用或不具备幂等保证的工具只执行一次，但仍保留统一超时。"""
     from app.services.tool_handlers import ToolResult
 
     try:
-        return await asyncio.wait_for(handler.execute(args), timeout=AGENT_TOOL_TIMEOUT)
+        return await asyncio.wait_for(_execute_handler(handler, args, runtime_context), timeout=AGENT_TOOL_TIMEOUT)
     except asyncio.TimeoutError:
         return ToolResult(status="failed", error_message="工具调用超时")
 
@@ -249,13 +257,13 @@ async def execute_tool_handler(*, request: ToolExecutionBatchRequest, tool_call:
         execute_tool_once if getattr(handler, "supports_automatic_retry", True) is False else execute_tool_with_retry
     )
     if request.emitter is None:
-        return await executor(handler, args)
+        return await executor(handler, args, request.runtime_context)
     return await execute_tool_with_lifecycle(
         tool_call_id=tool_call["id"],
         tool_name=handler.tool_name,
         args=args,
         target=handler,
-        execute=executor,
+        execute=lambda target, arguments: executor(target, arguments, request.runtime_context),
         result_summary_builder=handler._build_result_summary,
         emitter=request.emitter,
     )
@@ -395,6 +403,7 @@ async def execute_tools_parallel(
     emitter: Optional[AgentEventEmitter] = None,
     network_budget: "NetworkToolBudget | None" = None,
     tool_handlers: Mapping[str, Any] | None = None,
+    runtime_context: Any = None,
 ) -> list[ToolExecutionRecord]:
     """
     并行执行所有 tool_calls。
@@ -416,5 +425,6 @@ async def execute_tools_parallel(
         emitter=emitter,
         network_budget=network_budget,
         tool_handlers=tool_handlers,
+        runtime_context=runtime_context,
     )
     return await execute_tool_batch(request, tool_calls)

@@ -6,6 +6,7 @@ from app.schemas.chat import (
     RouteEndpoint,
     RouteOption,
     RouteResultsBlock,
+    TransitLeg,
 )
 from app.services.stream.product_result_answer import (
     build_grounded_product_answer,
@@ -14,6 +15,37 @@ from app.services.stream.product_result_answer import (
 
 
 class ProductResultAnswerTests(unittest.TestCase):
+    def test_transit_answer_uses_transit_type_and_compact_line_names(self):
+        block = RouteResultsBlock(
+            type="route_results",
+            schema_version=1,
+            provider="amap",
+            status="success",
+            origin=RouteEndpoint(label="民治站"),
+            destination=RouteEndpoint(label="市民中心"),
+            routes=[
+                RouteOption(
+                    mode="transit",
+                    transit_type="subway",
+                    duration_s=1800,
+                    transfers=1,
+                    legs=[
+                        TransitLeg(kind="walking"),
+                        TransitLeg(kind="subway", line_name="地铁5号线"),
+                        TransitLeg(kind="subway", line_name="地铁2号线"),
+                    ],
+                )
+            ],
+        )
+
+        answer = build_grounded_product_answer([block])
+
+        self.assertIn("地铁约 30 分钟", answer)
+        self.assertIn("地铁5号线→地铁2号线", answer)
+        self.assertNotIn("步行→", answer)
+        self.assertNotIn("公里", answer)
+        self.assertNotIn(" 米", answer)
+
     def test_place_answer_only_uses_structured_fields_and_limitations(self):
         block = PlaceResultsBlock(
             type="place_results",
@@ -60,9 +92,11 @@ class ProductResultAnswerTests(unittest.TestCase):
 
         self.assertIn("深圳民治到深圳湾公园", answer)
         self.assertIn("驾车约 27 分钟、9.6 公里", answer)
-        self.assertIn("公交约 39 分钟、8.9 公里、换乘 1 次", answer)
+        self.assertIn("公交约 39 分钟、换乘 1 次", answer)
+        self.assertNotIn("8.9 公里", answer)
         self.assertIn("步行约 208 分钟、16 公里", answer)
-        self.assertIn("驾车用时最短", answer)
+        self.assertIn("如果优先考虑本次返回的用时，建议选择驾车", answer)
+        self.assertIn("如果更倾向公共交通，可选择公交方案", answer)
         for unsupported in ("停车", "路况", "候车", "费用", "拥堵"):
             self.assertNotIn(unsupported, answer)
 

@@ -20,6 +20,7 @@ from app.services.mcp.amap_product_tools import (
     AMAP_PRODUCT_DEFINITIONS,
     AMAP_PRODUCT_REMOTE_DEPENDENCIES,
     AmapProductToolHandler,
+    AmapRunCoordinateConversion,
     build_amap_product_binding,
 )
 from app.services.mcp.client import McpClientError, McpClientManager
@@ -76,8 +77,15 @@ _REDACTED = "[REDACTED]"
 _TRUNCATED = "[TRUNCATED]"
 _MAX_STRUCTURED_TEXT_CHARS = 20_000
 _MAX_STRUCTURED_TEXT_DEPTH = 64
+_DEFAULT_EXTERNAL_PAYLOAD_MAX_DEPTH = 10
+_AMAP_TRANSIT_EXTERNAL_PAYLOAD_MAX_DEPTH = 14
+_AMAP_TRANSIT_REMOTE_TOOL_NAME = "maps_direction_transit_integrated"
 _STRUCTURED_DATA_UNAVAILABLE = "[STRUCTURED_DATA_UNAVAILABLE]"
 _STRUCTURED_TEXT_REJECTED = object()
+_COORDINATE_TOKEN_PATTERN = r"[+-]?(?:\d+(?:\.\d+)?|\.\d+)\s*,\s*[+-]?(?:\d+(?:\.\d+)?|\.\d+)"
+_AMAP_COORDINATE_SEQUENCE_PATTERN = re.compile(
+    rf"^\s*{_COORDINATE_TOKEN_PATTERN}(?:\s*;\s*{_COORDINATE_TOKEN_PATTERN})*\s*$"
+)
 _TEXT_KEY_PATTERN = r"(?P<key_quote>[\"']?)(?P<key>[a-z](?:[a-z0-9 _-]|\\u[0-9a-f]{4}){0,127})(?P=key_quote)"
 _AUTHORIZATION_SCHEME_PATTERN = re.compile(
     rf"(?P<prefix>(?<![a-z0-9]){_TEXT_KEY_PATTERN}\s*[:=]\s*)"
@@ -357,6 +365,7 @@ class McpAgentRemoteExecutor:
         concurrency_limiter: McpAgentToolConcurrencyLimiter,
         circuit_breaker: McpAgentServerCircuitBreaker,
         run_budget: McpAgentToolRunBudget,
+        is_official_amap: bool = False,
     ) -> None:
         self.server_id = server_id
         self.client_manager = client_manager
@@ -365,12 +374,17 @@ class McpAgentRemoteExecutor:
         self.concurrency_limiter = concurrency_limiter
         self.circuit_breaker = circuit_breaker
         self.run_budget = run_budget
+        self.is_official_amap = is_official_amap
 
     async def is_run_budget_exhausted(self) -> bool:
         return await self.run_budget.is_exhausted(self.server_id)
 
     async def remaining_run_budget(self) -> int:
         return await self.run_budget.remaining(self.server_id)
+
+    async def try_consume_run_budget(self) -> bool:
+        """为同一高德服务的非 MCP 外呼消费一次 run 级真实调用预算。"""
+        return await self.run_budget.try_consume(self.server_id)
 
     async def call(
         self,
@@ -422,7 +436,12 @@ class McpAgentRemoteExecutor:
                     raise
                 await self.circuit_breaker.record_success(permit)
                 permit = None
-            return _sanitize_external_payload(_normalize_mcp_payload(payload))
+            return _sanitize_external_payload(
+                _normalize_mcp_payload(payload),
+                preserve_amap_transit_fields=(
+                    self.is_official_amap and remote_tool_name == _AMAP_TRANSIT_REMOTE_TOOL_NAME
+                ),
+            )
         finally:
             if permit is not None:
                 await self.circuit_breaker.release_without_result(permit)
@@ -605,6 +624,7 @@ def load_mcp_agent_tools(
     official_amap_rows = [row for row in rows if is_official_amap_endpoint(str(row.endpoint_url))]
 
     for row in rows:
+        official_amap = is_official_amap_endpoint(str(row.endpoint_url))
         remote_executor = McpAgentRemoteExecutor(
             server_id=str(row.id),
             client_manager=resolved_client,
@@ -613,8 +633,9 @@ def load_mcp_agent_tools(
             concurrency_limiter=concurrency_limiter,
             circuit_breaker=resolved_circuit_breaker,
             run_budget=run_budget,
+            is_official_amap=official_amap,
         )
-        if is_official_amap_endpoint(str(row.endpoint_url)):
+        if official_amap:
             if len(official_amap_rows) == 1:
                 _append_amap_product_tools(
                     row=row,
@@ -662,6 +683,7 @@ def _append_amap_product_tools(
 ) -> None:
     snapshots = {snapshot["name"]: snapshot for snapshot in _iter_authorized_snapshots(row)}
     orchestration_lock = asyncio.Lock()
+    coordinate_conversion = AmapRunCoordinateConversion()
     for product_definition in AMAP_PRODUCT_DEFINITIONS:
         product_name = product_definition["function"]["name"]
         dependency_names = AMAP_PRODUCT_REMOTE_DEPENDENCIES[product_name]
@@ -686,6 +708,7 @@ def _append_amap_product_tools(
             remote_executor=remote_executor,
             dependency_hashes=dependency_hashes,
             orchestration_lock=orchestration_lock,
+            coordinate_conversion=coordinate_conversion,
             max_llm_context_bytes=limits.max_llm_context_bytes,
         )
         audit_bindings.append(binding.to_audit_dict())
@@ -737,20 +760,29 @@ def _is_sensitive_key(value: Any) -> bool:
     )
 
 
-def _sanitize_external_payload(value: Any) -> Any:
+def _sanitize_external_payload(value: Any, *, preserve_amap_transit_fields: bool = False) -> Any:
     remaining_nodes = 1_000
+    max_depth = (
+        _AMAP_TRANSIT_EXTERNAL_PAYLOAD_MAX_DEPTH
+        if preserve_amap_transit_fields
+        else _DEFAULT_EXTERNAL_PAYLOAD_MAX_DEPTH
+    )
 
     def visit(node: Any, depth: int) -> Any:
         nonlocal remaining_nodes
         remaining_nodes -= 1
-        if remaining_nodes < 0 or depth > 10:
+        if remaining_nodes < 0 or depth > max_depth:
             return _TRUNCATED
         if isinstance(node, dict):
             output: dict[str, Any] = {}
             items = list(node.items())
             for raw_key, child in items[:100]:
                 key = str(raw_key)[:256]
-                output[key] = _REDACTED if _is_sensitive_key(key) else visit(child, depth + 1)
+                normalized_key = _normalize_key(key)
+                is_private_amap_geometry = preserve_amap_transit_fields and "polyline" in normalized_key
+                output[key] = (
+                    _REDACTED if _is_sensitive_key(key) or is_private_amap_geometry else visit(child, depth + 1)
+                )
             if len(items) > 100:
                 output[_TRUNCATED] = len(items) - 100
             return output
@@ -760,6 +792,8 @@ def _sanitize_external_payload(value: Any) -> Any:
                 output.append(_TRUNCATED)
             return output
         if isinstance(node, str):
+            if preserve_amap_transit_fields and _AMAP_COORDINATE_SEQUENCE_PATTERN.fullmatch(node):
+                return _REDACTED
             return node if len(node) <= 20_000 else node[:20_000] + "…"
         if node is None or isinstance(node, (bool, int, float)):
             return node

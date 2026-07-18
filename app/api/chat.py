@@ -8,6 +8,7 @@ from app.core.logger import app_logger as logger
 from app.core.redis import get_redis_pool, stream_chunks_key, stream_meta_key
 from app.db.models import User
 from app.schemas.chat import (
+    AgentContextResultRequest,
     ChatRequest,
     ContinueAgentRunRequest,
     MessageUpdateRequest,
@@ -191,6 +192,29 @@ async def continue_agent_run(
         previous_run_id=continue_request.previous_run_id,
         trace_id=request.state.request_id,
     )
+
+
+@router.post("/conversations/{conversation_id}/runs/{run_id}/context/{context_request_id}")
+async def submit_agent_context(
+    conversation_id: str,
+    run_id: str,
+    context_request_id: str,
+    context_request: AgentContextResultRequest,
+    request: Request,
+    chat_service: ChatService = Depends(get_chat_service),
+    current_user: User = Depends(get_current_user),
+):
+    """提交 Agent 当前 run 正在等待的运行上下文。"""
+    data = await chat_service.submit_agent_context_result(
+        conversation_id=conversation_id,
+        run_id=run_id,
+        request_id=context_request_id,
+        user_id=str(current_user.id),
+        status=context_request.status,
+        location=context_request.location.model_dump(mode="json") if context_request.location is not None else None,
+        reason=context_request.reason,
+    )
+    return success(data=data, request_id=request.state.request_id)
 
 
 @router.put("/conversations/{conversation_id}/messages/{message_id}")

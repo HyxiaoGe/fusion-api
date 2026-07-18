@@ -240,6 +240,7 @@ class McpAgentToolCatalogTests(unittest.TestCase):
     def test_amap_catalog_exposes_only_two_stable_product_tools_when_dependencies_are_complete(self):
         remote_names = [
             "maps_geo",
+            "maps_regeocode",
             "maps_text_search",
             "maps_around_search",
             "maps_search_detail",
@@ -518,6 +519,21 @@ class McpAgentToolHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(secret, context)
         self.assertNotIn("</mcp_tool_result><script>", context)
         self.assertLessEqual(len(context.encode("utf-8")), handler.max_llm_context_bytes)
+
+    async def test_generic_mcp_keeps_default_external_payload_depth_boundary(self):
+        nested: object = "GENERIC-DEEP-PUBLIC-VALUE"
+        for index in range(8):
+            nested = {f"level_{index}": nested}
+        client = FakeClientManager(
+            result={"content": [{"type": "text", "text": json.dumps({"nested": nested}, ensure_ascii=False)}]}
+        )
+        handler = self.build_handler(build_row(), client)
+
+        result = await handler.execute({"query": "MCP"})
+
+        serialized = json.dumps(result.data["payload"], ensure_ascii=False)
+        self.assertIn("[TRUNCATED]", serialized)
+        self.assertNotIn("GENERIC-DEEP-PUBLIC-VALUE", serialized)
 
     async def test_structured_candidates_fail_closed_without_retaining_raw_text(self):
         cases = {
@@ -805,6 +821,7 @@ class McpAgentToolHandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_amap_products_share_real_remote_call_budget_and_definition_reauthorization(self):
         remote_names = [
             "maps_geo",
+            "maps_regeocode",
             "maps_text_search",
             "maps_around_search",
             "maps_search_detail",
@@ -846,6 +863,7 @@ class McpAgentToolHandlerTests(unittest.IsolatedAsyncioTestCase):
         tool_set = self.build_tool_set([row], client, max_calls_per_server=2)
         local = tool_set.handlers["local_place_search"]
         route = tool_set.handlers["route_compare"]
+        self.assertIs(local.coordinate_conversion, route.coordinate_conversion)
 
         local_result = await local.execute({"query": "咖啡", "near": "民治地铁站"})
         route_result = await route.execute({"origin": "民治", "destination": "市民中心"})
@@ -867,6 +885,131 @@ class McpAgentToolHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(drift_result.data["error_code"], "tool_definition_changed")
         self.assertEqual(fresh_client.calls, [])
+
+    async def test_amap_transit_preserves_public_line_fields_without_leaking_spatial_or_secret_data(self):
+        remote_names = [
+            "maps_geo",
+            "maps_regeocode",
+            "maps_text_search",
+            "maps_around_search",
+            "maps_search_detail",
+            "maps_direction_driving",
+            "maps_direction_transit_integrated",
+            "maps_direction_walking",
+            "maps_direction_bicycling",
+        ]
+        row = build_row(
+            provider="amap",
+            endpoint_url="https://mcp.amap.com/mcp",
+            allowed_tools=remote_names,
+            discovered_tools=[
+                {"name": name, "description": name, "input_schema": {"type": "object"}} for name in remote_names
+            ],
+        )
+        secret = "AMAP-KEY-MUST-NOT-LEAK"
+        departure_coordinate = "114.031001,22.616001"
+        arrival_coordinate = "114.057001,22.543001"
+        polyline = f"{departure_coordinate};114.045001,22.580001;{arrival_coordinate}"
+
+        class TransitProductClient(FakeClientManager):
+            async def call_tool(self, config, tool_name, arguments):
+                self.calls.append((config, tool_name, arguments))
+                if tool_name == "maps_geo":
+                    location = "114.031,22.616" if arguments["address"] == "民治站" else "114.057,22.543"
+                    value = {"geocodes": [{"location": location, "city": "深圳市"}]}
+                elif tool_name == "maps_direction_transit_integrated":
+                    value = {
+                        "route": {
+                            "transits": [
+                                {
+                                    "duration": "2100",
+                                    "walking_distance": "320",
+                                    "segments": [
+                                        {
+                                            "bus": {
+                                                "buslines": [
+                                                    {
+                                                        "name": "地铁5号线(赤湾-黄贝岭)",
+                                                        "type": "地铁线路",
+                                                        "departure_stop": {
+                                                            "name": "民治站",
+                                                            "location": departure_coordinate,
+                                                        },
+                                                        "arrival_stop": {
+                                                            "name": "五和站",
+                                                            "location": arrival_coordinate,
+                                                        },
+                                                        "polyline": polyline,
+                                                        "api_key": secret,
+                                                    },
+                                                    {
+                                                        "name": "M201路候选线路",
+                                                        "departure_stop": {"name": "民治站"},
+                                                        "arrival_stop": {"name": "五和站"},
+                                                    },
+                                                    "[TRUNCATED]",
+                                                ]
+                                            },
+                                            "entrance": {
+                                                "name": "A口",
+                                                "location": departure_coordinate,
+                                            },
+                                            "exit": {
+                                                "name": "D口",
+                                                "location": arrival_coordinate,
+                                            },
+                                        }
+                                    ],
+                                }
+                            ]
+                        }
+                    }
+                else:
+                    raise AssertionError(f"未预期的工具调用：{tool_name}")
+                return {
+                    "content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}],
+                    "isError": False,
+                }
+
+        client = TransitProductClient()
+        route = self.build_tool_set([row], client).handlers["route_compare"]
+
+        safe_payload = await route.remote_executor.call(
+            "maps_direction_transit_integrated",
+            route.dependency_hashes["maps_direction_transit_integrated"],
+            {
+                "origin": "114.031,22.616",
+                "destination": "114.057,22.543",
+                "city": "深圳市",
+                "cityd": "深圳市",
+            },
+        )
+        safe_payload_text = json.dumps(safe_payload, ensure_ascii=False)
+        self.assertIn("地铁5号线(赤湾-黄贝岭)", safe_payload_text)
+        self.assertIn("民治站", safe_payload_text)
+        self.assertIn("五和站", safe_payload_text)
+        for private_value in (departure_coordinate, arrival_coordinate, polyline, secret):
+            self.assertNotIn(private_value, safe_payload_text)
+
+        result = await route.execute({"origin": "民治站", "destination": "市民中心", "modes": ["transit"]})
+
+        self.assertEqual(result.status, "success")
+        transit = result.data["result"]["routes"][0]
+        self.assertEqual(transit["transit_type"], "subway")
+        self.assertEqual(transit["transfers"], 0)
+        self.assertEqual(len([leg for leg in transit["legs"] if leg["kind"] == "subway"]), 1)
+        subway = next(leg for leg in transit["legs"] if leg["kind"] == "subway")
+        self.assertEqual(subway["line_name"], "地铁5号线(赤湾-黄贝岭)")
+        self.assertEqual(subway["departure_stop"], "民治站")
+        self.assertEqual(subway["arrival_stop"], "五和站")
+        self.assertEqual(subway["entrance"], "A口")
+        self.assertEqual(subway["exit"], "D口")
+        serialized = json.dumps(result.data["result"], ensure_ascii=False)
+        context = route.format_llm_context(result)
+        for private_value in (departure_coordinate, arrival_coordinate, polyline, secret):
+            self.assertNotIn(private_value, serialized)
+            self.assertNotIn(private_value, context)
+        self.assertNotIn("M201路候选线路", serialized)
 
     async def test_circuit_breaker_opens_after_three_remote_failures_and_isolates_servers(self):
         clock = FakeClock()

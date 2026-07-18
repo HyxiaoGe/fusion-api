@@ -314,6 +314,16 @@ class AgentEventEmitter:
             max_payload_bytes=65_536,
         )
 
+    async def content_block_discarded(self, *, block_id: str) -> None:
+        await self._emit(
+            ev.ContentBlockDiscarded(
+                type="content_block_discarded",
+                protocol_version=2,
+                block_id=block_id,
+                **self._envelope(),
+            )
+        )
+
     async def context_status_updated(
         self,
         *,
@@ -345,6 +355,46 @@ class AgentEventEmitter:
                 removed_turns=removed_turns,
                 removed_messages=removed_messages,
                 removed_tool_transactions=removed_tool_transactions,
+                **self._envelope(),
+            )
+        )
+
+    async def context_required(
+        self,
+        *,
+        request_id: str,
+        context_type: str,
+        purpose: str,
+        reason: str,
+        expires_at: float,
+    ) -> None:
+        await self._emit(
+            ev.ContextRequired(
+                type="context_required",
+                protocol_version=2,
+                context_type=context_type,
+                request_id=request_id,
+                purpose=purpose,
+                reason=reason,
+                expires_at=expires_at,
+                **self._envelope(),
+            )
+        )
+
+    async def context_result(
+        self,
+        *,
+        request_id: str,
+        context_type: str,
+        status: str,
+    ) -> None:
+        await self._emit(
+            ev.ContextResult(
+                type="context_result",
+                protocol_version=2,
+                context_type=context_type,
+                request_id=request_id,
+                status=status,
                 **self._envelope(),
             )
         )

@@ -15,6 +15,8 @@ from app.schemas.chat import (
     RouteEndpoint,
     RouteOption,
     RouteResultsBlock,
+    TransitAlternative,
+    TransitLeg,
 )
 from app.services.admin_audit_service import AdminAuditService
 from app.services.agent.continuation import deserialize_content_blocks
@@ -105,6 +107,36 @@ def route_block(*, block_id: str = "blk-route") -> RouteResultsBlock:
 
 
 class ProductResultSchemaTests(unittest.TestCase):
+    def test_route_transit_extension_keeps_schema_v1_and_old_payload_compatibility(self):
+        old_payload = route_block().model_dump(mode="json")
+        for key in ("transit_type", "walking_distance_m", "legs", "alternatives"):
+            old_payload["routes"][0].pop(key, None)
+        old = RouteResultsBlock.model_validate(old_payload)
+        self.assertEqual(old.schema_version, 1)
+        self.assertIsNone(old.routes[0].transit_type)
+        self.assertEqual(old.routes[0].legs, [])
+        self.assertEqual(old.routes[0].alternatives, [])
+        restored = deserialize_content_blocks([old_payload])
+        self.assertIsInstance(restored[0], RouteResultsBlock)
+        self.assertEqual(restored[0].routes[0].mode, "driving")
+
+        transit = RouteOption(
+            mode="transit",
+            transit_type="subway",
+            walking_distance_m=320,
+            legs=[TransitLeg(kind="walking"), TransitLeg(kind="subway", line_name="地铁5号线")],
+            alternatives=[TransitAlternative(transit_type="bus", legs=[TransitLeg(kind="bus", line_name="M201路")])],
+        )
+        self.assertEqual(transit.model_dump(mode="json")["transit_type"], "subway")
+
+        with self.assertRaises(ValidationError):
+            RouteOption(mode="transit", legs=[TransitLeg(kind="walking") for _ in range(9)])
+        with self.assertRaises(ValidationError):
+            RouteOption(
+                mode="transit",
+                alternatives=[TransitAlternative() for _ in range(3)],
+            )
+
     def test_provider_neutral_blocks_serialize_with_schema_version(self):
         place = place_block()
         route = route_block()
@@ -331,6 +363,44 @@ class ProductResultRecoveryTests(unittest.TestCase):
         self.assertNotIn("location", route_projection["origin"])
         self.assertNotIn("provider_response", route_serialized)
         self.assertNotIn("ROUTE_PRIVATE_SENTINEL", route_serialized)
+
+    def test_admin_projection_preserves_bounded_transit_structure(self):
+        raw = route_block().model_dump(mode="json")
+        raw["routes"] = [
+            {
+                "mode": "transit",
+                "distance_m": 12_000,
+                "duration_s": 2_400,
+                "transit_type": "mixed",
+                "walking_distance_m": 420,
+                "transfers": 1,
+                "legs": [
+                    {"kind": "subway", "line_name": "地铁5号线", "departure_stop": "民治站"},
+                    {"kind": "bus", "line_name": "M201路", "arrival_stop": "市民中心站"},
+                ],
+                "alternatives": [
+                    {
+                        "transit_type": "bus",
+                        "distance_m": 13_000,
+                        "duration_s": 2_700,
+                        "walking_distance_m": 300,
+                        "transfers": 0,
+                        "summary": "公交备选",
+                        "legs": [{"kind": "bus", "line_name": "M202路"}],
+                    }
+                ],
+                "unsafe": "DROP_ME",
+            }
+        ]
+
+        projection = AdminAuditService._content_block_projection(raw)
+
+        route = projection["routes"][0]
+        self.assertEqual(route["transit_type"], "mixed")
+        self.assertEqual(route["legs"][0]["line_name"], "地铁5号线")
+        self.assertEqual(route["alternatives"][0]["transit_type"], "bus")
+        self.assertNotIn("distance_m", route["alternatives"][0])
+        self.assertNotIn("unsafe", json.dumps(projection, ensure_ascii=False))
 
 
 class ProductResultEventTests(unittest.IsolatedAsyncioTestCase):

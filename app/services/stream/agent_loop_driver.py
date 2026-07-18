@@ -69,7 +69,7 @@ async def run_agent_loop(
         break
 
     if state.limit_reason is not None:
-        if has_product_result_blocks(state.content_blocks):
+        if has_product_result_blocks(state.content_blocks) or state.product_tool_attempted:
             limit_finish_reason = state.finish_reason
             try:
                 await _complete_product_result_without_llm(
@@ -93,7 +93,7 @@ async def _complete_product_result_without_llm(
     state: AgentLoopState,
     runtime: AgentLoopRuntime,
 ) -> None:
-    """产品结果块本身已足够收尾，不再消耗一轮模型调用。"""
+    """产品工具路径用结构化结果或安全失败文案确定性收口，不再消耗模型调用。"""
     step_number, step_context = await _start_next_step(state=state, runtime=runtime)
     state.finish_reason = "stop"
     await handle_agent_round_outcome(
@@ -119,7 +119,7 @@ async def _complete_product_result_without_llm(
 
 async def _stop_if_limit_reached(*, state: AgentLoopState, runtime: AgentLoopRuntime) -> bool:
     state.limit_reason = check_agent_loop_limit(
-        elapsed_seconds=runtime.clock() - runtime.run_start,
+        elapsed_seconds=state.active_elapsed_seconds(now=runtime.clock(), run_start=runtime.run_start),
         step=state.step,
         total_tool_calls=state.total_tool_calls,
         limits=runtime.limits,
@@ -197,7 +197,7 @@ async def _run_round(
         emitter=runtime.emitter,
         on_context_updated=state.update_context,
     )
-    if has_product_result_blocks(state.content_blocks) and _accepts_keyword(
+    if (has_product_result_blocks(state.content_blocks) or state.product_tool_attempted) and _accepts_keyword(
         runtime.run_round_fn,
         "defer_output",
     ):

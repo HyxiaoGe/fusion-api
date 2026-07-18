@@ -2,7 +2,17 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from app.schemas.chat import PlaceResult, PlaceResultsBlock, SearchBlock, SearchSourceSummary, SourceReference, Usage
+from app.schemas.chat import (
+    PlaceResult,
+    PlaceResultsBlock,
+    RouteEndpoint,
+    RouteOption,
+    RouteResultsBlock,
+    SearchBlock,
+    SearchSourceSummary,
+    SourceReference,
+    Usage,
+)
 from app.services.stream.agent_loop_outcome import AgentLoopExit
 from app.services.stream.agent_loop_policy import AgentLoopLimits
 from app.services.stream.agent_loop_round_outcome import AgentRoundOutcomeRequest, handle_agent_round_outcome
@@ -106,6 +116,71 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.consecutive_no_progress_search_results, 2)
         self.assertIsNone(state.current_step_id)
 
+    async def test_failed_product_tool_attempt_is_recorded_for_next_round_guard(self):
+        state = AgentLoopState()
+        state.mark_current_step("step-product-failed")
+
+        async def handle_tool_calls_round_fn(**kwargs):
+            kwargs["request"].on_tools_executed(1)
+            return ToolRoundOutcome(
+                tool_call_count=1,
+                tool_names=[],
+                product_result_count=0,
+            )
+
+        outcome = await handle_agent_round_outcome(
+            request=AgentRoundOutcomeRequest(
+                db="db",
+                messages=[{"role": "user", "content": "比较通勤路线"}],
+                state=state,
+                runtime=_runtime(handle_tool_calls_round_fn=handle_tool_calls_round_fn),
+                step_number=1,
+                step_context=_step_context("step-product-failed"),
+                round_result=AgentRoundResult(
+                    reasoning_buf="",
+                    content_buf="",
+                    tool_calls=[{"id": "tc-route", "name": "route_compare", "arguments": "{}"}],
+                    finish_reason="tool_calls",
+                    accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+                ),
+            )
+        )
+
+        self.assertIsNone(outcome)
+        self.assertTrue(state.product_tool_attempted)
+
+    async def test_failed_product_tool_deferred_answer_uses_safe_failure_message(self):
+        state = AgentLoopState(product_tool_attempted=True)
+        state.mark_current_step("step-product-failure-answer")
+        append_chunk = AsyncMock()
+
+        with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
+            outcome = await handle_agent_round_outcome(
+                request=AgentRoundOutcomeRequest(
+                    db="db",
+                    messages=[{"role": "user", "content": "比较通勤路线"}],
+                    state=state,
+                    runtime=_runtime(complete_step_fn=AsyncMock()),
+                    step_number=2,
+                    step_context=_step_context("step-product-failure-answer"),
+                    round_result=AgentRoundResult(
+                        reasoning_buf="",
+                        content_buf="4号线直达，早高峰约30分钟。",
+                        tool_calls=[],
+                        finish_reason="stop",
+                        accumulated_usage=Usage(input_tokens=2, output_tokens=9),
+                        output_deferred=True,
+                    ),
+                )
+            )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        emitted_answer = append_chunk.await_args.args[2]
+        self.assertIn("本次未能从高德取得可用", emitted_answer)
+        self.assertIn("稍后重试", emitted_answer)
+        self.assertNotIn("4号线", emitted_answer)
+        self.assertNotIn("30分钟", emitted_answer)
+
     async def test_empty_deferred_model_answer_still_completes_from_product_result(self):
         state = AgentLoopState()
         state.mark_current_step("step-product-empty")
@@ -144,6 +219,59 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
         self.assertIn("示例咖啡", append_chunk.await_args.args[2])
+
+    async def test_valid_deferred_model_answer_is_emitted_and_kept_for_persistence(self):
+        state = AgentLoopState()
+        state.mark_current_step("step-product-valid")
+        state.content_blocks.append(
+            PlaceResultsBlock(
+                type="place_results",
+                schema_version=1,
+                provider="amap",
+                query="烤肉",
+                near="深圳民治",
+                status="success",
+                result_count=1,
+                places=[PlaceResult(name="炭火一号", rating=4.7)],
+                limitations=["不包含实时排队或空位信息"],
+            )
+        )
+        model_answer = (
+            "结论：如果更看重本次返回的评分，可以优先看炭火一号。实时排队和空位本次无法确认，建议到店前核实。"
+        )
+        append_chunk = AsyncMock()
+        complete_step_fn = AsyncMock()
+        warnings: list[str] = []
+
+        with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
+            outcome = await handle_agent_round_outcome(
+                request=AgentRoundOutcomeRequest(
+                    db="db",
+                    messages=[{"role": "user", "content": "找一家烤肉店"}],
+                    state=state,
+                    runtime=_runtime(
+                        complete_step_fn=complete_step_fn,
+                        warning_fn=warnings.append,
+                    ),
+                    step_number=2,
+                    step_context=_step_context("step-product-valid"),
+                    round_result=AgentRoundResult(
+                        reasoning_buf="只按实际字段总结",
+                        content_buf=model_answer,
+                        tool_calls=[],
+                        finish_reason="stop",
+                        accumulated_usage=Usage(input_tokens=2, output_tokens=20),
+                        output_deferred=True,
+                    ),
+                )
+            )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        self.assertEqual(append_chunk.await_args.args[2], model_answer)
+        self.assertEqual(state.content_blocks[-1].text, model_answer)
+        self.assertEqual([block.type for block in state.content_blocks], ["place_results", "text"])
+        self.assertEqual(warnings, [])
+        complete_step_fn.assert_awaited_once()
 
     async def test_cancelled_deferred_model_output_is_not_persisted(self):
         state = AgentLoopState()
@@ -190,6 +318,7 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         complete_step_fn = AsyncMock()
         append_chunk = AsyncMock()
         step_context = _step_context("step-product")
+        warnings: list[str] = []
 
         with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
             outcome = await handle_agent_round_outcome(
@@ -197,7 +326,7 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
                     db="db",
                     messages=[{"role": "user", "content": "找一家不用排队的烤肉店"}],
                     state=state,
-                    runtime=_runtime(complete_step_fn=complete_step_fn),
+                    runtime=_runtime(complete_step_fn=complete_step_fn, warning_fn=warnings.append),
                     step_number=2,
                     step_context=step_context,
                     round_result=AgentRoundResult(
@@ -219,7 +348,124 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("不会排队", emitted_answer)
         self.assertEqual(state.content_blocks[-1].text, emitted_answer)
         self.assertEqual([block.type for block in state.content_blocks], ["place_results", "text"])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("reason_code=unsupported_claim", warnings[0])
+        self.assertNotIn("停车", warnings[0])
+        self.assertNotIn("排队", warnings[0])
         complete_step_fn.assert_awaited_once()
+
+    async def test_grounded_fallback_also_completes_missing_place_relation_caveat(self):
+        state = AgentLoopState()
+        state.mark_current_step("step-product-fallback-caveat")
+        state.content_blocks.extend(
+            [
+                PlaceResultsBlock(
+                    type="place_results",
+                    schema_version=1,
+                    provider="amap",
+                    query="烤肉",
+                    near="深圳民治",
+                    status="success",
+                    result_count=1,
+                    places=[PlaceResult(name="炭火一号", rating=4.7)],
+                ),
+                PlaceResultsBlock(
+                    type="place_results",
+                    schema_version=1,
+                    provider="amap",
+                    query="桌球",
+                    near="深圳民治",
+                    status="success",
+                    result_count=1,
+                    places=[PlaceResult(name="金杆桌球", rating=4.1)],
+                ),
+            ]
+        )
+        append_chunk = AsyncMock()
+
+        with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
+            outcome = await handle_agent_round_outcome(
+                request=AgentRoundOutcomeRequest(
+                    db="db",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": "想吃烤肉，吃完去桌球厅，不想走太远，请给组合建议",
+                        }
+                    ],
+                    state=state,
+                    runtime=_runtime(complete_step_fn=AsyncMock()),
+                    step_number=2,
+                    step_context=_step_context("step-product-fallback-caveat"),
+                    round_result=AgentRoundResult(
+                        reasoning_buf="",
+                        content_buf="推荐未返回的火星烤肉店，吃完步行即达桌球厅。",
+                        tool_calls=[],
+                        finish_reason="stop",
+                        accumulated_usage=Usage(input_tokens=2, output_tokens=10),
+                        output_deferred=True,
+                    ),
+                )
+            )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        emitted_answer = append_chunk.await_args.args[2]
+        self.assertIn("炭火一号", emitted_answer)
+        self.assertIn("金杆桌球", emitted_answer)
+        self.assertNotIn("火星烤肉店", emitted_answer)
+        self.assertIn("地点之间的距离和步行时间", emitted_answer)
+        self.assertIn("另行查询路线", emitted_answer)
+
+    async def test_deferred_product_answer_repairs_unsafe_clause_and_keeps_safe_prose(self):
+        state = AgentLoopState()
+        state.mark_current_step("step-product-repair")
+        state.content_blocks.append(
+            RouteResultsBlock(
+                type="route_results",
+                schema_version=1,
+                provider="amap",
+                status="success",
+                origin=RouteEndpoint(label="民治站"),
+                destination=RouteEndpoint(label="雅宝站"),
+                routes=[
+                    RouteOption(mode="driving", duration_s=840, distance_m=6200),
+                    RouteOption(mode="transit", duration_s=1920, walking_distance_m=420),
+                ],
+            )
+        )
+        model_answer = "结论：驾车约14分钟，是本次用时最短的方案。高峰期可能拥堵。地铁约32分钟，适合能接受换乘的情况。"
+        append_chunk = AsyncMock()
+        warnings: list[str] = []
+
+        with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
+            outcome = await handle_agent_round_outcome(
+                request=AgentRoundOutcomeRequest(
+                    db="db",
+                    messages=[{"role": "user", "content": "比较通勤路线"}],
+                    state=state,
+                    runtime=_runtime(complete_step_fn=AsyncMock(), warning_fn=warnings.append),
+                    step_number=2,
+                    step_context=_step_context("step-product-repair"),
+                    round_result=AgentRoundResult(
+                        reasoning_buf="",
+                        content_buf=model_answer,
+                        tool_calls=[],
+                        finish_reason="stop",
+                        accumulated_usage=Usage(input_tokens=2, output_tokens=20),
+                        output_deferred=True,
+                    ),
+                )
+            )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        emitted_answer = append_chunk.await_args.args[2]
+        self.assertIn("驾车约14分钟", emitted_answer)
+        self.assertIn("地铁约32分钟", emitted_answer)
+        self.assertNotIn("高峰期可能拥堵", emitted_answer)
+        self.assertIn("本次高德结果无法确认", emitted_answer)
+        self.assertEqual(state.content_blocks[-1].text, emitted_answer)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("已安全修整", warnings[0])
 
     async def test_final_answer_evidence_does_not_swallow_stream_write_unavailable(self):
         from app.services.stream_state_service import StreamWriteUnavailableError
@@ -406,6 +652,75 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.current_step_id, None)
         self.assertEqual(tool_requests[0].db, "db")
         self.assertIs(tool_requests[0].messages, messages)
+
+    async def test_tool_call_round_discards_streamed_preamble_before_execution(self):
+        state = AgentLoopState()
+        state.mark_current_step("step-tool-preamble")
+        emitter = SimpleNamespace(content_block_discarded=AsyncMock())
+        execution_started = False
+
+        async def handle_tool_calls_round_fn(**kwargs):
+            nonlocal execution_started
+            self.assertEqual(emitter.content_block_discarded.await_count, 1)
+            execution_started = True
+            kwargs["request"].on_tools_executed(1)
+
+        outcome = await handle_agent_round_outcome(
+            request=AgentRoundOutcomeRequest(
+                db="db",
+                messages=[{"role": "user", "content": "比较通勤路线"}],
+                state=state,
+                runtime=_runtime(
+                    emitter=emitter,
+                    handle_tool_calls_round_fn=handle_tool_calls_round_fn,
+                ),
+                step_number=1,
+                step_context=_step_context("step-tool-preamble"),
+                round_result=AgentRoundResult(
+                    reasoning_buf="",
+                    content_buf="好的，我先调用路线工具。",
+                    tool_calls=[{"id": "tc-route", "name": "route_compare", "arguments": "{}"}],
+                    finish_reason="tool_calls",
+                    accumulated_usage=Usage(input_tokens=1, output_tokens=8),
+                ),
+            )
+        )
+
+        self.assertIsNone(outcome)
+        self.assertTrue(execution_started)
+        emitter.content_block_discarded.assert_awaited_once_with(block_id="step-tool-preamble-text")
+
+    async def test_deferred_tool_call_round_does_not_discard_unemitted_content(self):
+        state = AgentLoopState()
+        state.mark_current_step("step-deferred-tool")
+        emitter = SimpleNamespace(content_block_discarded=AsyncMock())
+
+        async def handle_tool_calls_round_fn(**kwargs):
+            kwargs["request"].on_tools_executed(1)
+
+        await handle_agent_round_outcome(
+            request=AgentRoundOutcomeRequest(
+                db="db",
+                messages=[{"role": "user", "content": "继续查询"}],
+                state=state,
+                runtime=_runtime(
+                    emitter=emitter,
+                    handle_tool_calls_round_fn=handle_tool_calls_round_fn,
+                ),
+                step_number=2,
+                step_context=_step_context("step-deferred-tool"),
+                round_result=AgentRoundResult(
+                    reasoning_buf="",
+                    content_buf="继续查询。",
+                    tool_calls=[{"id": "tc-route", "name": "route_compare", "arguments": "{}"}],
+                    finish_reason="tool_calls",
+                    accumulated_usage=Usage(input_tokens=1, output_tokens=4),
+                    output_deferred=True,
+                ),
+            )
+        )
+
+        emitter.content_block_discarded.assert_not_awaited()
 
     async def test_unknown_round_marks_unknown_and_completes_text_step(self):
         state = AgentLoopState()

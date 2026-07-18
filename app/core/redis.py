@@ -43,6 +43,16 @@ def stream_stop_guard_key(conversation_id: str) -> str:
     return f"stream:stop_guard:{conversation_id}"
 
 
+def agent_context_request_key(request_id: str) -> str:
+    """等待前端补充运行上下文的短期请求状态。"""
+    return f"agent:context:request:{request_id}"
+
+
+def agent_context_notify_key(request_id: str) -> str:
+    """唤醒等待同一上下文请求的后台 Agent task。"""
+    return f"agent:context:notify:{request_id}"
+
+
 async def init_redis() -> None:
     """在 lifespan startup 阶段调用"""
     global _redis_pool
@@ -99,3 +109,4 @@ LUA_CLEANUP_STREAM_INIT = _load_lua("cleanup_stream_init")
 LUA_INSPECT_STREAM = _load_lua("inspect_stream")
 LUA_APPEND_STREAM = _load_lua("append_stream")
 LUA_RELEASE_STREAM_STOP_GUARD = _load_lua("release_stream_stop_guard")
+LUA_SUBMIT_AGENT_CONTEXT = _load_lua("submit_agent_context")

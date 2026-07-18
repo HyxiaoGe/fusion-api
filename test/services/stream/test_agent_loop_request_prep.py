@@ -54,7 +54,20 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             ["tc-place", "tc-route", "tc-search"],
         )
         boundary = prepared[1]["content"]
+        self.assertIn("【高德工具选择规则】", boundary)
+        self.assertIn("两个自然语言起终点", boundary)
+        self.assertIn("直接调用 route_compare", boundary)
+        self.assertIn("不要先调用 web_search 或 local_place_search", boundary)
+        self.assertIn("当前位置", boundary)
+        self.assertIn("source=current_location", boundary)
         self.assertIn("【高德事实边界规则】", boundary)
+        self.assertIn("工具失败、不可用或未取得可用结果", boundary)
+        self.assertIn("不得用训练知识补充具体地点、线路、时间、距离、费用或路况", boundary)
+        self.assertIn("不得仅根据地址片区或同村", boundary)
+        self.assertIn("步行可达", boundary)
+        self.assertIn("隔壁片区", boundary)
+        self.assertIn("本次返回候选中", boundary)
+        self.assertIn("距离或就近作为选择条件", boundary)
         self.assertIn("只能来自对应 result.places 或 result.routes 中实际返回的字段", boundary)
         self.assertIn("禁止使用常识、品牌印象、店名词义或训练知识", boundary)
         self.assertIn("环境、安静度、座位、出品、通常营业时间、公园步道", boundary)
@@ -76,7 +89,10 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("允许说明最快、最慢、换乘次数或距离远近", boundary)
         self.assertIn("必须明确依据的返回字段", boundary)
         self.assertIn("停车位、停车难度、停车费、公交票价或成本", boundary)
-        self.assertIn("当前路况、周六路况、等车时间、环保或免费", boundary)
+        self.assertIn(
+            "当前路况、周六路况、进出站或换乘等待时间、出行灵活性、舒适度、环保或免费",
+            boundary,
+        )
         self.assertIn("不得声称路线耗时包含或不包含停车及其他未返回构成", boundary)
         self.assertIn("未返回的路线属性只能说明无法从本次高德结果确认", boundary)
         self.assertNotIn("民治星巴克", boundary)

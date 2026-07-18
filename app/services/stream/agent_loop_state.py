@@ -26,6 +26,10 @@ class AgentLoopState:
     terminal_emitted: bool = False
     plan_items: dict[str, dict] = field(default_factory=dict)
     consecutive_no_progress_search_results: int = 0
+    context_wait_seconds: float = 0.0
+    runtime_contexts: dict[str, Any] = field(default_factory=dict)
+    unavailable_contexts: dict[str, str] = field(default_factory=dict)
+    product_tool_attempted: bool = False
 
     def next_step_number(self) -> int:
         self.step += 1
@@ -50,6 +54,9 @@ class AgentLoopState:
             else:
                 self.consecutive_no_progress_search_results = 0
 
+    def record_product_tool_attempt(self, attempted: bool) -> None:
+        self.product_tool_attempted = self.product_tool_attempted or attempted
+
     def should_summarize_no_progress_search(self) -> bool:
         return self.consecutive_no_progress_search_results >= NO_PROGRESS_SEARCH_SUMMARY_THRESHOLD
 
@@ -59,6 +66,12 @@ class AgentLoopState:
     def update_context(self, context: ContextUsage | None) -> None:
         if context is not None:
             self.last_context = context
+
+    def record_context_wait(self, seconds: float) -> None:
+        self.context_wait_seconds += max(0.0, seconds)
+
+    def active_elapsed_seconds(self, *, now: float, run_start: float) -> float:
+        return max(0.0, now - run_start - self.context_wait_seconds)
 
     def final_usage(self) -> Usage | None:
         if self.accumulated_usage.input_tokens <= 0 and self.last_context is None:

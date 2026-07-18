@@ -24,6 +24,7 @@ from app.schemas.chat import (
     Usage,
 )
 from app.schemas.response import ApiException, ErrorCode
+from app.services.agent.context_broker import submit_context_result
 from app.services.agent.continuation import (
     build_continuation_context,
     get_continuation_system_prompt,
@@ -442,6 +443,41 @@ class ChatService:
                 "X-Accel-Buffering": "no",
             },
         )
+
+    async def submit_agent_context_result(
+        self,
+        *,
+        conversation_id: str,
+        run_id: str,
+        request_id: str,
+        user_id: str,
+        status: str,
+        location: dict[str, Any] | None,
+        reason: str | None,
+    ) -> dict[str, Any]:
+        """向仍在等待的同一 Agent run 提交短期上下文，不回显精确位置。"""
+        conversation = self.conversation_service.get_conversation(conversation_id, user_id)
+        if not conversation:
+            raise ApiException.not_found("会话不存在或无权访问")
+
+        submission = await submit_context_result(
+            request_id=request_id,
+            user_id=str(user_id),
+            conversation_id=conversation_id,
+            run_id=run_id,
+            status=status,
+            location=location,
+            reason=reason,
+        )
+        if submission.outcome in {"accepted", "idempotent"}:
+            return submission.model_dump(mode="json")
+        if submission.outcome == "expired":
+            raise ApiException.gone("上下文请求已过期")
+        if submission.outcome in {"conflict", "stale"}:
+            raise ApiException.conflict("上下文请求已失效或结果冲突")
+        if submission.outcome in {"not_found", "forbidden"}:
+            raise ApiException.not_found("上下文请求不存在或无权访问")
+        raise ApiException.conflict("上下文请求当前不可提交")
 
     def _get_or_create_conversation(
         self,

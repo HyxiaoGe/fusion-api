@@ -79,6 +79,10 @@ class ApiException(Exception):
         return cls(ErrorCode.CONFLICT, message, 409)
 
     @classmethod
+    def gone(cls, message: str = "资源已过期") -> "ApiException":
+        return cls(ErrorCode.CONFLICT, message, 410)
+
+    @classmethod
     def internal_error(cls, message: str = "服务器内部错误") -> "ApiException":
         return cls(ErrorCode.INTERNAL_ERROR, message, 500)
 

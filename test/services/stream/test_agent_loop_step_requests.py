@@ -98,11 +98,16 @@ class AgentLoopStepRequestTests(unittest.TestCase):
         self.assertEqual(request.tool_calls, round_result.tool_calls)
         self.assertEqual(request.reasoning_buf, "需要工具")
         self.assertEqual(request.announced_tool_names, frozenset({"web_search"}))
+        self.assertEqual(request.task_id, "task-req")
+        self.assertIs(request.agent_state, state)
         self.assertIs(request.on_tools_executed.__self__, state)
         self.assertIs(request.on_tools_executed.__func__, state.record_executed_tool_calls.__func__)
 
     def test_build_limit_summary_step_request_advances_step_and_wires_runtime_dependencies(self):
-        state = AgentLoopState(accumulated_usage=Usage(input_tokens=5, output_tokens=7))
+        state = AgentLoopState(
+            accumulated_usage=Usage(input_tokens=5, output_tokens=7),
+            context_wait_seconds=45.0,
+        )
         state.step = 3
         state.content_blocks.append(TextBlock(type="text", id="text-existing", text="已有内容"))
         messages = [{"role": "user", "content": "hi"}]
@@ -120,7 +125,7 @@ class AgentLoopStepRequestTests(unittest.TestCase):
         self.assertIs(request.call_kwargs, runtime.call_kwargs)
         self.assertEqual(request.accumulated_usage, Usage(input_tokens=5, output_tokens=7))
         self.assertEqual(request.total_timeout_s, 300)
-        self.assertEqual(request.run_start, 100.0)
+        self.assertEqual(request.run_start, 145.0)
         self.assertIs(request.start_step_fn, runtime.start_step_fn)
         self.assertIs(request.complete_step_fn, runtime.complete_step_fn)
         self.assertIs(request.llm_call_fn, runtime.llm_call_fn)

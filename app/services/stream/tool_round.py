@@ -16,7 +16,14 @@ from app.services.source_candidate_ranker import (
     SourceSelectionPlan,
 )
 from app.services.source_evidence_ledger import build_selected_source_evidence_item, canonicalize_evidence_url
+from app.services.stream.agent_loop_state import AgentLoopState
 from app.services.stream.step_lifecycle import AgentStepContext, mark_tool_round_started
+from app.services.stream.tool_context import (
+    BlockedToolContext,
+    ToolContextResolution,
+    ToolRuntimeContext,
+    resolve_tool_context,
+)
 from app.services.stream.tool_execution_result import ToolExecutionRecord
 from app.services.stream_state_service import StreamWriteTerminalError
 
@@ -61,6 +68,9 @@ class ToolRoundRequest:
     clock: Callable[[], float] = time.time
     tool_handlers: dict[str, Any] | None = None
     announced_tool_names: frozenset[str] | None = None
+    task_id: str = ""
+    agent_state: AgentLoopState | None = None
+    resolve_tool_context_fn: Callable[..., Awaitable[ToolContextResolution]] = resolve_tool_context
 
 
 def build_assistant_tool_message(
@@ -129,6 +139,7 @@ async def execute_tool_round_tools(
     request: ToolRoundRequest,
     *,
     selected_tool_calls: list[dict] | None = None,
+    runtime_context: ToolRuntimeContext | None = None,
 ) -> list[ToolExecutionRecord]:
     if selected_tool_calls is None:
         announced_tool_calls, _ = _partition_tool_calls_by_announcement(request)
@@ -149,6 +160,8 @@ async def execute_tool_round_tools(
     }
     if request.tool_handlers:
         execute_kwargs["tool_handlers"] = request.tool_handlers
+    if runtime_context is not None:
+        execute_kwargs["runtime_context"] = runtime_context
     try:
         return await request.execute_tools_fn(
             executed_tool_calls,
@@ -188,6 +201,7 @@ def append_tool_round_messages_with_plan(
     missing_result_tool_calls: list[dict] | None = None,
     not_executed_tool_calls: list[dict] | None = None,
     unavailable_tool_calls: list[dict] | None = None,
+    context_blocked_calls: dict[str, BlockedToolContext] | None = None,
     built_content_blocks: dict[str, Any] | None = None,
 ) -> None:
     request.messages.append(
@@ -207,6 +221,7 @@ def append_tool_round_messages_with_plan(
     missing_result_ids = {str(tool_call.get("id", "")) for tool_call in missing_result_tool_calls or []}
     not_executed_ids = {str(tool_call.get("id", "")) for tool_call in not_executed_tool_calls or []}
     unavailable_ids = {str(tool_call.get("id", "")) for tool_call in unavailable_tool_calls or []}
+    context_blocked_by_id = context_blocked_calls or {}
 
     for tool_call in request.tool_calls:
         tool_call_id = str(tool_call.get("id", ""))
@@ -239,6 +254,17 @@ def append_tool_round_messages_with_plan(
                     "role": "tool",
                     "tool_call_id": tool_call["id"],
                     "content": _format_missing_tool_result_context(),
+                }
+            )
+            continue
+
+        blocked_context = context_blocked_by_id.get(tool_call_id)
+        if blocked_context is not None:
+            request.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": _format_context_unavailable_tool_context(blocked_context),
                 }
             )
             continue
@@ -349,11 +375,29 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
 
     announced_tool_calls, unavailable_tool_calls = _partition_tool_calls_by_announcement(request)
     selected_tool_calls = _select_tool_calls_within_limit(request, announced_tool_calls)
-    if selected_tool_calls[0]:
-        await update_tool_round_plan_started(request, tool_calls=selected_tool_calls[0])
-    raw_results = await execute_tool_round_tools(request, selected_tool_calls=selected_tool_calls[0])
+    context_resolution = ToolContextResolution(executable_calls=selected_tool_calls[0])
+    if request.agent_state is not None and selected_tool_calls[0]:
+        context_resolution = await request.resolve_tool_context_fn(
+            tool_calls=selected_tool_calls[0],
+            state=request.agent_state,
+            emitter=request.emitter,
+            user_id=request.user_id,
+            conversation_id=request.conversation_id,
+            message_id=request.assistant_message_id,
+            run_id=request.run_id,
+            task_id=request.task_id,
+            clock=request.clock,
+        )
+    executable_tool_calls = context_resolution.executable_calls
+    if executable_tool_calls:
+        await update_tool_round_plan_started(request, tool_calls=executable_tool_calls)
+    raw_results = await execute_tool_round_tools(
+        request,
+        selected_tool_calls=executable_tool_calls,
+        runtime_context=context_resolution.runtime_context,
+    )
     results, missing_result_tool_calls = _reconcile_tool_execution_results(
-        selected_tool_calls=selected_tool_calls[0],
+        selected_tool_calls=executable_tool_calls,
         results=raw_results,
         run_id=request.run_id,
     )
@@ -368,19 +412,20 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
         missing_result_tool_calls=missing_result_tool_calls,
         not_executed_tool_calls=selected_tool_calls[1],
         unavailable_tool_calls=unavailable_tool_calls,
+        context_blocked_calls=context_resolution.blocked_calls,
         built_content_blocks=built_content_blocks,
     )
     persist_tool_round_checkpoint(request)
     await emit_product_result_blocks(request, results, built_content_blocks=built_content_blocks)
 
-    executed_count = len(selected_tool_calls[0])
+    executed_count = len(executable_tool_calls)
     tool_names = await complete_tool_round_step(request, results, executed_count=executed_count)
     restore_reasoning_after_tool_decision(request.call_kwargs)
     return ToolRoundOutcome(
         tool_call_count=executed_count,
         tool_names=tool_names,
         no_progress_search_results=_classify_no_progress_search_results(
-            selected_tool_calls=selected_tool_calls[0],
+            selected_tool_calls=executable_tool_calls,
             results=results,
         ),
         product_result_count=sum(
@@ -606,6 +651,20 @@ def _format_unavailable_tool_context() -> str:
             "status": "not_executed",
             "reason": "tool_not_announced_this_round",
             "message": "该工具本轮不可用，本次调用未执行，不能作为事实依据；请停止重复调用。",
+        },
+        ensure_ascii=False,
+    )
+
+
+def _format_context_unavailable_tool_context(blocked: BlockedToolContext) -> str:
+    return json.dumps(
+        {
+            "status": "unavailable",
+            "error_code": "context_required_not_provided",
+            "context_type": "geolocation",
+            "context_status": blocked.status,
+            "reason": blocked.reason,
+            "instruction": "未执行工具；不得声称已获取用户位置，本 run 不要再次请求当前位置。",
         },
         ensure_ascii=False,
     )

@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from app.services.stream.agent_loop_state import AgentLoopState
 from app.services.stream.step_lifecycle import AgentStepContext
+from app.services.stream.tool_context import BlockedToolContext, ToolContextResolution, ToolRuntimeContext
 from app.services.stream.tool_execution_result import ToolExecutionRecord
 from app.services.stream.tool_round import ToolRoundOutcome, ToolRoundRequest, handle_tool_calls_round
 from app.services.stream_state_service import StreamWriteTerminalError
@@ -50,8 +51,10 @@ def _request(
     on_tools_executed=None,
     complete_step_fn=None,
     network_budget=None,
+    agent_state=None,
+    resolve_tool_context_fn=None,
 ) -> ToolRoundRequest:
-    return ToolRoundRequest(
+    kwargs = dict(
         db="db",
         assistant_message_id="msg-1",
         conversation_id="conv-1",
@@ -85,9 +88,82 @@ def _request(
         max_tool_calls=max_tool_calls,
         clock=Mock(return_value=10.5),
     )
+    if agent_state is not None:
+        kwargs["agent_state"] = agent_state
+    if resolve_tool_context_fn is not None:
+        kwargs["resolve_tool_context_fn"] = resolve_tool_context_fn
+    return ToolRoundRequest(**kwargs)
 
 
 class ToolRoundBudgetTests(IsolatedAsyncioTestCase):
+    async def test_denied_context_executes_no_tool_consumes_no_quota_and_appends_synthetic_result(self):
+        tool_call = {
+            "id": "tc-current",
+            "name": "local_place_search",
+            "arguments": json.dumps({"query": "咖啡", "anchor_source": "current_location"}),
+        }
+        state = AgentLoopState()
+        on_tools_executed = Mock(wraps=state.record_executed_tool_calls)
+        execute_tools_fn = AsyncMock(return_value=[])
+        resolver = AsyncMock(
+            return_value=ToolContextResolution(
+                executable_calls=[],
+                blocked_calls={"tc-current": BlockedToolContext(status="denied", reason="permission_denied")},
+            )
+        )
+        request = _request(
+            tool_calls=[tool_call],
+            completed_tool_calls=0,
+            max_tool_calls=20,
+            execute_tools_fn=execute_tools_fn,
+            on_tools_executed=on_tools_executed,
+            agent_state=state,
+            resolve_tool_context_fn=resolver,
+        )
+
+        outcome = await handle_tool_calls_round(request=request)
+
+        execute_tools_fn.assert_not_awaited()
+        self.assertEqual(outcome.tool_call_count, 0)
+        self.assertEqual(state.total_tool_calls, 0)
+        self.assertEqual(request.messages[-1]["role"], "tool")
+        payload = json.loads(request.messages[-1]["content"])
+        self.assertEqual(payload["status"], "unavailable")
+        self.assertEqual(payload["context_status"], "denied")
+
+    async def test_provided_context_is_forwarded_internally_and_actual_tool_counts_once(self):
+        tool_call = {
+            "id": "tc-current",
+            "name": "local_place_search",
+            "arguments": json.dumps({"query": "咖啡", "anchor_source": "current_location"}),
+        }
+        record = _record(tool_call)
+        state = AgentLoopState()
+        on_tools_executed = Mock(wraps=state.record_executed_tool_calls)
+        execute_tools_fn = AsyncMock(return_value=[record])
+        runtime_context = ToolRuntimeContext()
+        resolver = AsyncMock(
+            return_value=ToolContextResolution(
+                executable_calls=[tool_call],
+                runtime_context=runtime_context,
+            )
+        )
+        request = _request(
+            tool_calls=[tool_call],
+            completed_tool_calls=0,
+            max_tool_calls=20,
+            execute_tools_fn=execute_tools_fn,
+            on_tools_executed=on_tools_executed,
+            agent_state=state,
+            resolve_tool_context_fn=resolver,
+        )
+
+        outcome = await handle_tool_calls_round(request=request)
+
+        self.assertEqual(outcome.tool_call_count, 1)
+        self.assertEqual(state.total_tool_calls, 1)
+        self.assertIs(execute_tools_fn.await_args.kwargs["runtime_context"], runtime_context)
+
     async def test_same_batch_marks_two_budget_stopped_search_results_as_no_progress(self):
         tool_calls = _tool_calls(2)
         execute_tools_fn = AsyncMock(

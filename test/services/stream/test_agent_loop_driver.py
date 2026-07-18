@@ -207,6 +207,132 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
 
+    async def test_failed_product_tool_attempt_also_defers_next_round_output(self):
+        state = AgentLoopState(product_tool_attempted=True)
+
+        async def start_step_fn(**kwargs):
+            context = AgentStepContext(
+                step_id="step-product-failed-final",
+                step_number=kwargs["step_number"],
+                started_at=kwargs["clock"](),
+                thinking_block_id="thinking-product-failed-final",
+                text_block_id="text-product-failed-final",
+            )
+            kwargs["on_step_started"](context.step_id)
+            return context
+
+        async def run_round_fn(**kwargs):
+            self.assertTrue(kwargs["defer_output"])
+            return AgentRoundResult(
+                reasoning_buf="",
+                content_buf="训练知识补全的具体路线",
+                tool_calls=[],
+                finish_reason="stop",
+                accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+                output_deferred=True,
+            )
+
+        append_chunk = AsyncMock()
+        with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
+            outcome = await run_agent_loop(
+                db=object(),
+                messages=[{"role": "user", "content": "比较通勤路线"}],
+                state=state,
+                runtime=_runtime(
+                    start_step_fn=start_step_fn,
+                    complete_step_fn=AsyncMock(),
+                    run_round_fn=run_round_fn,
+                ),
+            )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        self.assertIn("本次未能从高德取得可用", append_chunk.await_args.args[2])
+        self.assertNotIn("训练知识", append_chunk.await_args.args[2])
+
+    async def test_failed_product_tool_attempt_limit_uses_safe_failure_without_limit_summary(self):
+        cases = (
+            {
+                "name": "max_steps",
+                "step": 8,
+                "tool_calls": 1,
+                "limits": AgentLoopLimits(max_steps=8, max_tool_calls=20, total_timeout_s=300),
+                "clock": 1.0,
+                "finish_reason": "tool_calls",
+            },
+            {
+                "name": "max_tool_calls",
+                "step": 1,
+                "tool_calls": 20,
+                "limits": AgentLoopLimits(max_steps=8, max_tool_calls=20, total_timeout_s=300),
+                "clock": 1.0,
+                "finish_reason": "tool_calls",
+            },
+            {
+                "name": "timeout",
+                "step": 1,
+                "tool_calls": 1,
+                "limits": AgentLoopLimits(max_steps=8, max_tool_calls=20, total_timeout_s=30),
+                "clock": 31.0,
+                "finish_reason": "timeout",
+            },
+        )
+
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                state = AgentLoopState(
+                    product_tool_attempted=True,
+                    step=case["step"],
+                    total_tool_calls=case["tool_calls"],
+                )
+                emitter = DummyEmitter(limit_reasons=[])
+                started_steps: list[int] = []
+
+                async def start_step_fn(**kwargs):
+                    started_steps.append(kwargs["step_number"])
+                    context = AgentStepContext(
+                        step_id=f"step-{kwargs['step_number']}",
+                        step_number=kwargs["step_number"],
+                        started_at=kwargs["clock"](),
+                        thinking_block_id=f"thinking-{kwargs['step_number']}",
+                        text_block_id=f"text-{kwargs['step_number']}",
+                    )
+                    kwargs["on_step_started"](context.step_id)
+                    return context
+
+                async def unsafe_limit_summary(**kwargs):
+                    request = kwargs["request"]
+                    request.content_blocks.append(TextBlock(type="text", id="unsafe", text="4号线直达，约30分钟"))
+                    request.on_step_started("unsafe-summary")
+                    return LimitSummaryOutcome(accumulated_usage=Usage(input_tokens=9, output_tokens=9))
+
+                summary = AsyncMock(side_effect=unsafe_limit_summary)
+                append_chunk = AsyncMock()
+                with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
+                    outcome = await run_agent_loop(
+                        db=object(),
+                        messages=[{"role": "user", "content": "比较通勤路线"}],
+                        state=state,
+                        runtime=_runtime(
+                            emitter=emitter,
+                            limits=case["limits"],
+                            clock=lambda value=case["clock"]: value,
+                            start_step_fn=start_step_fn,
+                            complete_step_fn=AsyncMock(),
+                            run_limit_summary_step_fn=summary,
+                        ),
+                    )
+
+                summary.assert_not_awaited()
+                self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+                self.assertEqual(emitter.limit_reasons, [case["name"]])
+                self.assertEqual(state.limit_reason, case["name"])
+                self.assertEqual(state.finish_reason, case["finish_reason"])
+                safe_answer = append_chunk.await_args.args[2]
+                self.assertIn("本次未能从高德取得可用", safe_answer)
+                self.assertNotIn("4号线", safe_answer)
+                self.assertEqual([block.type for block in state.content_blocks], ["text"])
+                self.assertEqual(started_steps, [case["step"] + 1])
+
     async def test_product_result_limit_uses_grounded_completion_without_limit_summary(self):
         cases = (
             {

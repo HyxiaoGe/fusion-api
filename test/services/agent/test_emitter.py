@@ -99,6 +99,25 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
         # 之后 _current_step_id 已被清空（白盒）
         self.assertIsNone(em._current_step_id)
 
+    async def test_content_block_discarded_uses_current_step_envelope(self):
+        writer = AsyncMock()
+        em = AgentEventEmitter(
+            run_id="r1",
+            trace_id="r1",
+            conversation_id="c1",
+            task_id="task-1",
+            redis_writer=writer,
+        )
+        step_id = await em.step_started(step_number=1)
+
+        await em.content_block_discarded(block_id="blk-tool-preamble")
+
+        payload = writer.append_chunk.await_args.args[3]
+        self.assertEqual(payload["type"], "content_block_discarded")
+        self.assertEqual(payload["protocol_version"], 2)
+        self.assertEqual(payload["block_id"], "blk-tool-preamble")
+        self.assertEqual(payload["step_id"], step_id)
+
     async def test_run_level_events_have_step_id_none_even_with_active_step(self):
         """run_failed/interrupted/limit_reached/completed 不能继承 _current_step_id"""
         writer = AsyncMock()
@@ -292,3 +311,38 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(digest_payload["type"], "tool_result_digest")
         self.assertEqual(digest_payload["step_id"], step_id)
         self.assertEqual(digest_payload["tool_call_id"], "tc1")
+
+    async def test_geolocation_context_events_share_sequence_and_never_contain_coordinates(self):
+        writer = AsyncMock()
+        em = AgentEventEmitter(
+            run_id="r1",
+            trace_id="r1",
+            conversation_id="c1",
+            task_id="task-1",
+            redis_writer=writer,
+        )
+        step_id = await em.step_started(step_number=1)
+
+        await em.context_required(
+            request_id="ctx-1",
+            context_type="geolocation",
+            purpose="nearby_search",
+            reason="搜索当前位置附近的地点",
+            expires_at=123.5,
+        )
+        await em.context_result(
+            request_id="ctx-1",
+            context_type="geolocation",
+            status="provided",
+        )
+
+        required = writer.append_chunk.call_args_list[-2].args[3]
+        result = writer.append_chunk.call_args_list[-1].args[3]
+        self.assertEqual(required["type"], "context_required")
+        self.assertEqual(result["type"], "context_result")
+        self.assertEqual([required["sequence"], result["sequence"]], [1, 2])
+        self.assertEqual(required["step_id"], step_id)
+        self.assertEqual(result["step_id"], step_id)
+        serialized = str([required, result])
+        self.assertNotIn("latitude", serialized)
+        self.assertNotIn("longitude", serialized)

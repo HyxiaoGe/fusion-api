@@ -5,12 +5,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.services.final_answer_evidence import build_used_final_answer_evidence
+from app.services.mcp.amap_product_tools import AMAP_PRODUCT_TOOL_NAMES
 from app.services.stream.agent_loop_outcome import AgentLoopExit, AgentLoopOutcome
 from app.services.stream.agent_loop_runtime import AgentLoopRuntime
 from app.services.stream.agent_loop_state import AgentLoopState
 from app.services.stream.agent_loop_step_requests import build_tool_round_request
 from app.services.stream.agent_round import AgentRoundResult
-from app.services.stream.product_result_answer import build_grounded_product_answer
+from app.services.stream.product_answer_validator import (
+    repair_unsupported_product_answer,
+    validate_product_answer,
+)
+from app.services.stream.product_result_answer import (
+    build_grounded_product_answer,
+    build_product_tool_failure_answer,
+)
 from app.services.stream.round_completion import append_round_content_blocks, complete_text_response_step
 from app.services.stream.step_lifecycle import AgentStepContext
 from app.services.stream.tool_round import ToolRoundOutcome
@@ -85,10 +93,47 @@ async def _replace_deferred_product_answer(
 ) -> AgentRoundOutcomeRequest:
     if not request.round_result.output_deferred:
         return request
-    answer = (
-        build_grounded_product_answer(request.state.content_blocks)
-        or "已展示地图服务返回的结构化结果，请以卡片信息为准。"
+    candidate = request.round_result.content_buf.strip()
+    validation = validate_product_answer(
+        candidate,
+        request.state.content_blocks,
+        messages=request.messages,
     )
+    if validation.is_valid:
+        answer = candidate
+    else:
+        repaired_answer, repair_reason_code = repair_unsupported_product_answer(
+            candidate,
+            request.state.content_blocks,
+            messages=request.messages,
+        )
+        if repaired_answer is not None:
+            request.runtime.warning_fn(
+                "产品结果模型回答含越界分句，已安全修整: "
+                f"conv_id={request.runtime.conversation_id} run_id={request.runtime.run_id} "
+                f"step={request.step_number} reason_code={validation.reason_code}"
+            )
+            answer = repaired_answer
+        else:
+            request.runtime.warning_fn(
+                "产品结果模型回答校验未通过，使用确定性兜底: "
+                f"conv_id={request.runtime.conversation_id} run_id={request.runtime.run_id} "
+                f"step={request.step_number} reason_code={validation.reason_code} "
+                f"repair_reason_code={repair_reason_code}"
+            )
+            answer = build_grounded_product_answer(request.state.content_blocks)
+            if answer:
+                completed_answer, _ = repair_unsupported_product_answer(
+                    answer,
+                    request.state.content_blocks,
+                    messages=request.messages,
+                )
+                if completed_answer is not None:
+                    answer = completed_answer
+            if not answer and request.state.product_tool_attempted:
+                answer = build_product_tool_failure_answer()
+            if not answer:
+                answer = "已展示地图服务返回的结构化结果，请以卡片信息为准。"
     if answer:
         await append_chunk(
             request.runtime.conversation_id,
@@ -150,6 +195,7 @@ async def _complete_empty_round_before_summary(request: AgentRoundOutcomeRequest
 
 
 async def _handle_tool_calls_round(request: AgentRoundOutcomeRequest) -> AgentLoopOutcome | None:
+    await _discard_streamed_tool_round_content(request)
     outcome = await request.runtime.handle_tool_calls_round_fn(
         request=build_tool_round_request(
             db=request.db,
@@ -163,6 +209,12 @@ async def _handle_tool_calls_round(request: AgentRoundOutcomeRequest) -> AgentLo
     )
     if isinstance(outcome, ToolRoundOutcome):
         request.state.record_no_progress_search_results(outcome.no_progress_search_results)
+        request.state.record_product_tool_attempt(
+            any(
+                str(tool_call.get("name", "")) in AMAP_PRODUCT_TOOL_NAMES
+                for tool_call in request.round_result.tool_calls
+            )
+        )
     _sync_plan_items(request)
     request.state.clear_current_step()
     if isinstance(outcome, ToolRoundOutcome) and outcome.product_result_count > 0:
@@ -179,6 +231,17 @@ async def _handle_tool_calls_round(request: AgentRoundOutcomeRequest) -> AgentLo
             summary_finish_reason="no_progress_summary",
         )
     return None
+
+
+async def _discard_streamed_tool_round_content(request: AgentRoundOutcomeRequest) -> None:
+    """工具决策前的正文只是过程性话术，工具调用成立后精确撤回。"""
+
+    if request.round_result.output_deferred or not request.round_result.content_buf:
+        return
+    discard = getattr(request.runtime.emitter, "content_block_discarded", None)
+    if discard is None:
+        return
+    await discard(block_id=request.step_context.text_block_id)
 
 
 async def _complete_unknown_round(request: AgentRoundOutcomeRequest) -> None:
