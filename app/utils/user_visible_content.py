@@ -45,10 +45,19 @@ def _pending_internal_tool_name(text: str) -> tuple[int, tuple[str, ...]] | None
         if start > 0 and (text[start - 1].isalnum() or text[start - 1] == "_"):
             continue
         suffix = text[start:]
-        matches = tuple(name for name in _INTERNAL_TOOL_NAMES if name.startswith(suffix) and name != suffix)
+        # 完整名称位于 chunk 末尾时仍需等待右边界。否则先输出中文标签，
+        # 下一 chunk 若继续补成更长标识，累计可见文本就会发生回退。
+        matches = tuple(name for name in _INTERNAL_TOOL_NAMES if name.startswith(suffix))
         if matches:
             return start, matches
     return None
+
+
+def _pending_trailing_space_start(text: str) -> int | None:
+    """暂存 chunk 尾部空白，为下一 chunk 的工具名前后间距决策保留余地。"""
+
+    trailing = re.search(r"[ \t]+$", text)
+    return trailing.start() if trailing is not None else None
 
 
 def _pending_tool_visible_start(text: str, tool_start: int) -> int:
@@ -90,13 +99,19 @@ def sanitize_internal_tool_names(
     pending_tool = _pending_internal_tool_name(text) if include_named_tools else None
     if pending_tool is not None:
         pending_starts.append(_pending_tool_visible_start(text, pending_tool[0]))
+    pending_space_start = _pending_trailing_space_start(text) if include_named_tools else None
+    if pending_space_start is not None:
+        pending_starts.append(pending_space_start)
 
     if not final and pending_starts:
         visible_source = text[: min(pending_starts)]
     elif final and pending_tool is not None:
         start, matches = pending_tool
         suffix = text[start:]
-        if len(matches) == 1 and len(suffix) >= 4:
+        exact_label = _INTERNAL_TOOL_LABELS.get(suffix)
+        if exact_label is not None:
+            visible_source = f"{text[:start]}{exact_label}"
+        elif len(matches) == 1 and len(suffix) >= 4:
             visible_source = f"{text[:start]}{_INTERNAL_TOOL_LABELS[matches[0]]}"
 
     sanitized = _MCP_ALIAS_RE.sub("外部工具", visible_source)

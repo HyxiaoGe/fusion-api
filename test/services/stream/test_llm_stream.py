@@ -181,6 +181,41 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
         for internal_name in ("route_compare", "local_place_search"):
             self.assertNotIn(internal_name, emitted_reasoning)
 
+    async def test_consume_stream_round_keeps_reasoning_monotonic_for_character_chunks(self):
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-character-tools",
+            task_id="task-character-tools",
+            should_use_reasoning=True,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+        )
+        raw_reasoning = "我直接调用 route_compare 工具来获取路线信息。"
+        append_chunk = AsyncMock()
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            outcome = await llm_stream_module.consume_stream_round(
+                async_response(
+                    [
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content=character),
+                            finish_reason="stop" if index == len(raw_reasoning) - 1 else None,
+                        )
+                        for index, character in enumerate(raw_reasoning)
+                    ]
+                ),
+                request,
+            )
+
+        emitted_reasoning = "".join(
+            call.args[2] for call in append_chunk.await_args_list if call.args[1] == "reasoning"
+        )
+        self.assertEqual(outcome.reasoning_buf, "我直接调用路线比较工具来获取路线信息。")
+        self.assertEqual(emitted_reasoning, outcome.reasoning_buf)
+        self.assertEqual(emitted_reasoning.count("工具来获取路线信息"), 1)
+
     async def test_consume_stream_round_hides_mixed_prefix_dsml_without_executing_ambiguous_protocol(self):
         request = llm_stream_module.LLMStreamRequest(
             conversation_id="conv-1",
