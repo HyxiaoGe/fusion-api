@@ -1813,10 +1813,10 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("只能引用 result.places 中实际返回的地点及其实际返回字段", context)
         self.assertIn("不得引入 result.places 未返回的地点", context)
-        self.assertIn("缺失时都必须明确说明“无法从本次高德结果确认”", context)
+        self.assertIn("缺失时都必须明确说明“无法从本次查询结果确认”", context)
         self.assertIn("不得推断实时排队、空位、预约情况、每人预算、三人预算", context)
         self.assertIn("地点间步行时间或地点间距离", context)
-        self.assertIn("reference_cost_yuan 只是高德参考消费，不代表人均消费或实时价格", context)
+        self.assertIn("reference_cost_yuan 只是参考消费，不代表人均消费或实时价格", context)
         self.assertIn("只有地点实际返回 distance_m 时", context)
         self.assertIn("相对本次 anchor/near 的距离", context)
         self.assertIn("先给结论", context)
@@ -1848,7 +1848,7 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("只能引用 result.routes 中实际返回的路线及其实际返回字段", context)
         self.assertIn("不得引入 result.routes 未返回的路线或出行方式", context)
-        self.assertIn("缺失时都必须明确说明“无法从本次高德结果确认”", context)
+        self.assertIn("缺失时都必须明确说明“无法从本次查询结果确认”", context)
         self.assertIn("duration_s 和非公共交通方案的 distance_m", context)
         self.assertIn("route.distance 是起终点步行距离，不是 transit 方案全程距离", context)
         self.assertIn("不得自行估算路线时间或距离", context)

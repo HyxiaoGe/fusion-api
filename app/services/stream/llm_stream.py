@@ -18,6 +18,7 @@ from app.ai.llm_observability import merge_litellm_kwargs
 from app.core.logger import app_logger as logger
 from app.schemas.chat import Usage
 from app.services.stream_state_service import append_chunk, check_lock_owner
+from app.utils.user_visible_content import sanitize_internal_tool_names
 
 # 每 N 个 chunk 检查一次锁状态
 LOCK_CHECK_INTERVAL = 20
@@ -46,10 +47,6 @@ _DSML_PARAMETER_RE = re.compile(
     r"</｜｜DSML｜｜parameter>",
     re.DOTALL | re.IGNORECASE,
 )
-_MCP_ALIAS_PREFIX = "mcp_"
-_MCP_ALIAS_TOKEN_LENGTH = 43
-_MCP_ALIAS_RE = re.compile(rf"{_MCP_ALIAS_PREFIX}[A-Za-z0-9_-]{{{_MCP_ALIAS_TOKEN_LENGTH}}}")
-_MCP_ALIAS_PARTIAL_RE = re.compile(rf"{_MCP_ALIAS_PREFIX}[A-Za-z0-9_-]+$")
 
 
 @dataclass(frozen=True)
@@ -79,10 +76,31 @@ class LLMStreamState:
 @dataclass(frozen=True)
 class LLMStreamOutcome:
     reasoning_buf: str
+    raw_reasoning_buf: str
     content_buf: str
     tool_calls: list[dict]
     finish_reason: str
     usage_data: Optional[Usage]
+
+
+class StreamRoundTuple(tuple):
+    """保持旧五元组契约，并额外携带只供模型协议使用的原始 reasoning。"""
+
+    protocol_reasoning_buf: str
+
+    def __new__(
+        cls,
+        reasoning_buf: str,
+        content_buf: str,
+        tool_calls: list[dict],
+        finish_reason: str,
+        usage_data: Optional[Usage],
+        *,
+        protocol_reasoning_buf: str,
+    ):
+        instance = super().__new__(cls, (reasoning_buf, content_buf, tool_calls, finish_reason, usage_data))
+        instance.protocol_reasoning_buf = protocol_reasoning_buf
+        return instance
 
 
 def _is_llm_error_retryable(exc: Exception) -> bool:
@@ -180,32 +198,10 @@ def strip_pending_dsml_tool_protocol(text: str) -> str:
     return text if pending_start is None else text[:pending_start]
 
 
-def _pending_mcp_alias_start(text: str) -> int | None:
-    max_suffix_length = min(len(text), len(_MCP_ALIAS_PREFIX) + _MCP_ALIAS_TOKEN_LENGTH - 1)
-    for suffix_length in range(max_suffix_length, 0, -1):
-        suffix = text[-suffix_length:]
-        if _MCP_ALIAS_PREFIX.startswith(suffix):
-            return len(text) - suffix_length
-        if (
-            suffix.startswith(_MCP_ALIAS_PREFIX)
-            and len(suffix) < len(_MCP_ALIAS_PREFIX) + _MCP_ALIAS_TOKEN_LENGTH
-            and all(char.isalnum() or char in {"_", "-"} for char in suffix[len(_MCP_ALIAS_PREFIX) :])
-        ):
-            return len(text) - suffix_length
-    return None
-
-
 def sanitize_internal_mcp_aliases(text: str, *, final: bool = False) -> str:
-    """内部运行级 MCP alias 不得进入用户可见 reasoning/answering。"""
-    visible_source = text
-    if not final:
-        pending_start = _pending_mcp_alias_start(text)
-        if pending_start is not None:
-            visible_source = text[:pending_start]
-    sanitized = _MCP_ALIAS_RE.sub("外部工具", visible_source)
-    if final:
-        sanitized = _MCP_ALIAS_PARTIAL_RE.sub("外部工具", sanitized)
-    return sanitized
+    """兼容旧调用名；正文只隐藏运行级 alias，不改写普通技术文本。"""
+
+    return sanitize_internal_tool_names(text, final=final, include_named_tools=False)
 
 
 def _visible_delta(visible_text: str, emitted_text: str, *, channel: str) -> str:
@@ -299,12 +295,12 @@ def filter_internal_mcp_reasoning_delta(state: LLMStreamState, reasoning_delta: 
     if not reasoning_delta:
         return ""
     state.raw_reasoning_buf += reasoning_delta
-    visible_reasoning = sanitize_internal_mcp_aliases(state.raw_reasoning_buf)
+    visible_reasoning = sanitize_internal_tool_names(state.raw_reasoning_buf)
     return _visible_delta(visible_reasoning, state.reasoning_buf, channel="reasoning")
 
 
 async def flush_pending_internal_mcp_aliases(*, request: LLMStreamRequest, state: LLMStreamState) -> None:
-    final_reasoning = sanitize_internal_mcp_aliases(state.raw_reasoning_buf, final=True)
+    final_reasoning = sanitize_internal_tool_names(state.raw_reasoning_buf, final=True)
     final_content = strip_reasoning_tag_blocks(state.raw_content_buf)
     final_content = strip_pending_dsml_tool_protocol(final_content)
     final_content = sanitize_internal_mcp_aliases(final_content, final=True)
@@ -461,6 +457,7 @@ async def consume_stream_round(response, request: LLMStreamRequest) -> LLMStream
 
     return LLMStreamOutcome(
         reasoning_buf=state.reasoning_buf,
+        raw_reasoning_buf=state.raw_reasoning_buf,
         content_buf=state.content_buf,
         tool_calls=tool_calls,
         finish_reason=state.finish_reason,
@@ -500,12 +497,13 @@ async def stream_round(
             defer_output=defer_output,
         ),
     )
-    return (
+    return StreamRoundTuple(
         outcome.reasoning_buf,
         outcome.content_buf,
         outcome.tool_calls,
         outcome.finish_reason,
         outcome.usage_data,
+        protocol_reasoning_buf=outcome.raw_reasoning_buf,
     )
 
 

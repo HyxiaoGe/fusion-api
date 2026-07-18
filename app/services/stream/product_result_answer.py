@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 _PRODUCT_RESULT_TYPES = {"place_results", "route_results"}
@@ -18,6 +19,56 @@ _TRANSIT_TYPE_LABELS = {
     "mixed": "公交与地铁",
     "public_transit": "公共交通",
 }
+_PROVIDER_ATTRIBUTION_REPLACEMENTS = (
+    (re.compile(r"本次\s*高德(?:地图)?\s*结果"), "本次查询结果"),
+    (re.compile(r"高德(?:地图)?\s*本次返回(?:的)?结果"), "本次查询结果"),
+    (re.compile(r"根据\s*高德(?:地图)?\s*(?:本次)?返回的"), "根据本次查询返回的"),
+    (re.compile(r"高德(?:地图)?\s*(?:当前|本次)?\s*(?:未能|没有|未)\s*返回"), "本次查询未能返回"),
+    (re.compile(r"高德(?:地图)?\s*(?:本次)?返回了"), "本次查询返回了"),
+    (re.compile(r"高德(?:地图)?\s*(?:本次)?返回"), "本次查询返回"),
+    (re.compile(r"高德(?:地图)?\s*(?:的)?(?:查询|路线|地点)?结果"), "本次查询结果"),
+    (re.compile(r"高德(?:地图)?\s*(?:预估|估算)"), "本次查询预估"),
+    (re.compile(r"高德(?:地图)?\s*路线(?:服务|规划)"), "路线查询"),
+    (re.compile(r"高德(?:地图)?\s*参考消费"), "参考消费"),
+    (re.compile(r"高德(?:地图)?\s*(?:接口|工具|服务)"), "地图服务"),
+)
+_PROVIDER_NAME_RE = re.compile(r"高德(?:地图)?")
+
+
+def neutralize_product_provider_mentions(answer: str, content_blocks: list[Any] | None = None) -> str:
+    """中性化产品正文中的供应商归因，同时保护结构化结果里的真实实体名。"""
+
+    neutralized = answer
+    protected_terms: dict[str, str] = {}
+    for index, term in enumerate(_provider_entity_terms(content_blocks or [])):
+        placeholder = f"\ue000{index}\ue001"
+        if term in neutralized:
+            neutralized = neutralized.replace(term, placeholder)
+            protected_terms[placeholder] = term
+    for pattern, replacement in _PROVIDER_ATTRIBUTION_REPLACEMENTS:
+        neutralized = pattern.sub(replacement, neutralized)
+    neutralized = _PROVIDER_NAME_RE.sub("地图服务", neutralized)
+    for placeholder, term in protected_terms.items():
+        neutralized = neutralized.replace(placeholder, term)
+    return neutralized
+
+
+def _provider_entity_terms(content_blocks: list[Any]) -> list[str]:
+    terms: set[str] = set()
+    for block in content_blocks:
+        block_type = _value(block, "type")
+        if block_type == "place_results":
+            for place in _value(block, "places") or []:
+                for key in ("name", "address", "district", "business_area"):
+                    value = _value(place, key)
+                    if isinstance(value, str) and "高德" in value:
+                        terms.add(value)
+        elif block_type == "route_results":
+            for endpoint_key in ("origin", "destination"):
+                value = _value(_value(block, endpoint_key), "label")
+                if isinstance(value, str) and "高德" in value:
+                    terms.add(value)
+    return sorted(terms, key=len, reverse=True)
 
 
 def has_product_result_blocks(content_blocks: list[Any]) -> bool:
@@ -45,10 +96,10 @@ def build_product_tool_failure_answer(messages: list[dict[str, Any]] | None = No
     if _has_unavailable_geolocation_context(messages or []):
         return (
             "本次未能获取当前位置，请检查浏览器或系统定位权限后重试，也可以直接提供明确起点。"
-            "由于位置没有获取成功，高德路线服务尚未执行。"
+            "由于位置没有获取成功，路线查询尚未执行。"
         )
     return (
-        "本次未能从高德取得可用的地点或路线数据，因此无法可靠给出具体地点、线路、时间、距离或费用。"
+        "本次未取得可用的地点或路线数据，因此无法可靠给出具体地点、线路、时间、距离或费用。"
         "你可以稍后重试，或补充更明确的城市、起点和终点。"
     )
 
@@ -75,13 +126,12 @@ def _has_unavailable_geolocation_context(messages: list[dict[str, Any]]) -> bool
 def _build_place_answer(block: Any) -> str:
     places = [item for item in (_value(block, "places") or []) if _value(item, "name")]
     query = _value(block, "query") or "地点搜索"
-    provider = _provider_label(_value(block, "provider"))
     if not places:
-        lead = f"{provider}本次没有返回可展示的「{query}」地点。"
+        lead = f"本次查询没有返回可展示的「{query}」地点。"
     else:
         names = "、".join(str(_value(place, "name")) for place in places[:3])
         suffix = "等" if len(places) > 3 else ""
-        lead = f"{provider}返回 {len(places)} 个「{query}」地点：{names}{suffix}。"
+        lead = f"本次查询返回 {len(places)} 个「{query}」地点：{names}{suffix}。"
     limitations = _limitations_sentence(block)
     return f"{lead}{limitations}"
 
@@ -92,12 +142,11 @@ def _build_route_answer(block: Any) -> str:
         return ""
     origin = _value(_value(block, "origin"), "label") or "起点"
     destination = _value(_value(block, "destination"), "label") or "终点"
-    provider = _provider_label(_value(block, "provider"))
     route_summaries = [_format_route(route) for route in routes]
     route_summaries = [summary for summary in route_summaries if summary]
     if not route_summaries:
         return ""
-    lead = f"{provider}返回了{origin}到{destination}的路线：{'；'.join(route_summaries)}。"
+    lead = f"本次查询返回了{origin}到{destination}的路线：{'；'.join(route_summaries)}。"
     recommendation = _route_recommendation_sentence(routes)
     limitations = _limitations_sentence(block)
     return f"{lead}{recommendation}{limitations}"
@@ -186,15 +235,13 @@ def _route_recommendation_sentence(routes: list[Any]) -> str:
 
 def _limitations_sentence(block: Any) -> str:
     limitations = [
-        str(item).strip() for item in (_value(block, "limitations") or []) if isinstance(item, str) and item.strip()
+        neutralize_product_provider_mentions(str(item).strip())
+        for item in (_value(block, "limitations") or [])
+        if isinstance(item, str) and item.strip()
     ]
     if not limitations:
         return ""
     return "；".join(dict.fromkeys(limitations)) + "。"
-
-
-def _provider_label(provider: Any) -> str:
-    return "高德" if str(provider).lower() in {"amap", "gaode", "高德"} else "地图服务"
 
 
 def _value(value: Any, key: str) -> Any:

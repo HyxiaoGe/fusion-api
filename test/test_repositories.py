@@ -13,6 +13,25 @@ from app.db.repositories import ConversationRepository, FileRepository
 
 
 class MessageRepositoryTests(unittest.TestCase):
+    def test_convert_message_sanitizes_legacy_thinking_tool_names(self):
+        db_message = MessageModel(
+            id="msg-thinking",
+            conversation_id="conv-1",
+            role="assistant",
+            content=[
+                {
+                    "type": "thinking",
+                    "id": "thinking-1",
+                    "thinking": "调用 route_compare，再用 local_place_search 核对。",
+                }
+            ],
+            created_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
+        )
+
+        message = ConversationRepository(None)._convert_message_to_schema(db_message)
+
+        self.assertEqual(message.content[0].thinking, "调用路线比较，再用地点搜索核对。")
+
     def test_convert_message_restores_nested_context_and_accepts_legacy_usage(self):
         current = MessageModel(
             id="msg-current",

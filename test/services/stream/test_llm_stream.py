@@ -119,6 +119,68 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("mcp_", emitted)
         self.assertEqual(emitted, "调用 外部工具 获取官方资料。结果来自 外部工具，下面给出结论。")
 
+    async def test_consume_stream_round_rewrites_split_internal_tool_names_as_product_language(self):
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-tools",
+            task_id="task-tools",
+            should_use_reasoning=True,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+        )
+        append_chunk = AsyncMock()
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            outcome = await llm_stream_module.consume_stream_round(
+                async_response(
+                    [
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content="我会调用 route_"),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(
+                                content=None,
+                                reasoning_content="compare 工具，并用 local_place_",
+                            ),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content="search 查找地点。"),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content="已通过 web_", reasoning_content=None),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content="search 和 url_", reasoning_content=None),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content="read 核对。", reasoning_content=None),
+                            finish_reason="stop",
+                        ),
+                    ]
+                ),
+                request,
+            )
+
+        self.assertEqual(outcome.reasoning_buf, "我会调用路线比较工具，并用地点搜索查找地点。")
+        self.assertEqual(
+            outcome.raw_reasoning_buf,
+            "我会调用 route_compare 工具，并用 local_place_search 查找地点。",
+        )
+        self.assertEqual(outcome.content_buf, "已通过 web_search 和 url_read 核对。")
+        emitted_reasoning = "".join(
+            call.args[2] for call in append_chunk.await_args_list if call.args[1] == "reasoning"
+        )
+        self.assertEqual(emitted_reasoning, outcome.reasoning_buf)
+        for internal_name in ("route_compare", "local_place_search"):
+            self.assertNotIn(internal_name, emitted_reasoning)
+
     async def test_consume_stream_round_hides_mixed_prefix_dsml_without_executing_ambiguous_protocol(self):
         request = llm_stream_module.LLMStreamRequest(
             conversation_id="conv-1",
@@ -602,6 +664,32 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
             run_id="run-1",
             step_id="step-1",
         )
+
+    async def test_stream_round_exposes_raw_reasoning_without_expanding_legacy_tuple(self):
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", AsyncMock()),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            result = await llm_stream_module.stream_round(
+                async_response(
+                    [
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content="调用 route_compare"),
+                            finish_reason=None,
+                        ),
+                        make_chunk(delta=SimpleNamespace(content="答案"), finish_reason="stop"),
+                    ]
+                ),
+                "conv-1",
+                "task-1",
+                True,
+                "blk-thinking",
+                "blk-text",
+            )
+
+        self.assertEqual(result, ("调用路线比较", "答案", [], "stop", None))
+        self.assertEqual(len(result), 5)
+        self.assertEqual(result.protocol_reasoning_buf, "调用 route_compare")
 
     async def test_llm_call_with_retry_attaches_chat_stream_tags(self):
         response = object()

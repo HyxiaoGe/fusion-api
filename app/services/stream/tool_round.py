@@ -61,6 +61,7 @@ class ToolRoundRequest:
     persist_message_fn: Callable[..., Any]
     execute_tools_fn: Callable[..., Awaitable[list[ToolExecutionRecord]]]
     complete_step_fn: Callable[..., Awaitable[Any]]
+    protocol_reasoning_buf: str | None = None
     assistant_message_sequence: int | None = None
     on_tools_executed: Callable[[int], None] | None = None
     completed_tool_calls: int | None = None
@@ -207,7 +208,7 @@ def append_tool_round_messages_with_plan(
     request.messages.append(
         build_assistant_tool_message(
             tool_calls=request.tool_calls,
-            reasoning_buf=request.reasoning_buf,
+            reasoning_buf=getattr(request, "protocol_reasoning_buf", None) or request.reasoning_buf,
             should_use_reasoning=request.should_use_reasoning,
         )
     )

@@ -176,7 +176,8 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
         emitted_answer = append_chunk.await_args.args[2]
-        self.assertIn("本次未能从高德取得可用", emitted_answer)
+        self.assertIn("本次未取得可用", emitted_answer)
+        self.assertNotIn("高德", emitted_answer)
         self.assertIn("稍后重试", emitted_answer)
         self.assertNotIn("4号线", emitted_answer)
         self.assertNotIn("30分钟", emitted_answer)
@@ -222,9 +223,8 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         emitted_answer = append_chunk.await_args.args[2]
         self.assertIn("未能获取当前位置", emitted_answer)
         self.assertIn("浏览器或系统定位权限", emitted_answer)
-        self.assertIn("高德路线服务尚未执行", emitted_answer)
-        self.assertNotIn("高德接口失败", emitted_answer)
-        self.assertNotIn("本次未能从高德取得", emitted_answer)
+        self.assertIn("路线查询尚未执行", emitted_answer)
+        self.assertNotIn("高德", emitted_answer)
 
     async def test_empty_deferred_model_answer_still_completes_from_product_result(self):
         state = AgentLoopState()
@@ -318,6 +318,50 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(warnings, [])
         complete_step_fn.assert_awaited_once()
 
+    async def test_valid_deferred_product_answer_neutralizes_provider_attribution_but_keeps_place_name(self):
+        state = AgentLoopState()
+        state.mark_current_step("step-product-provider-neutral")
+        state.content_blocks.append(
+            PlaceResultsBlock(
+                type="place_results",
+                schema_version=1,
+                provider="amap",
+                query="商场",
+                near="深圳市民中心",
+                status="success",
+                result_count=1,
+                places=[PlaceResult(name="高德置地广场")],
+            )
+        )
+        append_chunk = AsyncMock()
+
+        with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
+            outcome = await handle_agent_round_outcome(
+                request=AgentRoundOutcomeRequest(
+                    db="db",
+                    messages=[{"role": "user", "content": "附近有什么商场"}],
+                    state=state,
+                    runtime=_runtime(complete_step_fn=AsyncMock()),
+                    step_number=2,
+                    step_context=_step_context("step-product-provider-neutral"),
+                    round_result=AgentRoundResult(
+                        reasoning_buf="",
+                        content_buf="根据高德返回的结果，可以优先查看高德置地广场。",
+                        tool_calls=[],
+                        finish_reason="stop",
+                        accumulated_usage=Usage(input_tokens=2, output_tokens=12),
+                        output_deferred=True,
+                    ),
+                )
+            )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        emitted_answer = append_chunk.await_args.args[2]
+        self.assertIn("根据本次查询返回的结果", emitted_answer)
+        self.assertIn("高德置地广场", emitted_answer)
+        self.assertNotIn("根据高德返回", emitted_answer)
+        self.assertEqual(state.content_blocks[-1].text, emitted_answer)
+
     async def test_cancelled_deferred_model_output_is_not_persisted(self):
         state = AgentLoopState()
         state.mark_current_step("step-product-cancelled")
@@ -387,7 +431,8 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
         emitted_answer = append_chunk.await_args.args[2]
-        self.assertIn("高德返回 1 个", emitted_answer)
+        self.assertIn("本次查询返回 1 个", emitted_answer)
+        self.assertNotIn("高德", emitted_answer)
         self.assertIn("不包含实时排队或空位信息", emitted_answer)
         self.assertNotIn("停车", emitted_answer)
         self.assertNotIn("不会排队", emitted_answer)
@@ -507,7 +552,8 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("驾车约14分钟", emitted_answer)
         self.assertIn("地铁约32分钟", emitted_answer)
         self.assertNotIn("高峰期可能拥堵", emitted_answer)
-        self.assertIn("本次高德结果无法确认", emitted_answer)
+        self.assertIn("本次查询结果无法确认", emitted_answer)
+        self.assertNotIn("高德", emitted_answer)
         self.assertEqual(state.content_blocks[-1].text, emitted_answer)
         self.assertEqual(len(warnings), 1)
         self.assertIn("已安全修整", warnings[0])

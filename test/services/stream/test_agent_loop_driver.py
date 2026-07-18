@@ -246,7 +246,8 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
-        self.assertIn("本次未能从高德取得可用", append_chunk.await_args.args[2])
+        self.assertIn("本次未取得可用", append_chunk.await_args.args[2])
+        self.assertNotIn("高德", append_chunk.await_args.args[2])
         self.assertNotIn("训练知识", append_chunk.await_args.args[2])
 
     async def test_failed_product_tool_attempt_limit_uses_safe_failure_without_limit_summary(self):
@@ -328,7 +329,8 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(state.limit_reason, case["name"])
                 self.assertEqual(state.finish_reason, case["finish_reason"])
                 safe_answer = append_chunk.await_args.args[2]
-                self.assertIn("本次未能从高德取得可用", safe_answer)
+                self.assertIn("本次未取得可用", safe_answer)
+                self.assertNotIn("高德", safe_answer)
                 self.assertNotIn("4号线", safe_answer)
                 self.assertEqual([block.type for block in state.content_blocks], ["text"])
                 self.assertEqual(started_steps, [case["step"] + 1])

@@ -228,7 +228,8 @@ class ProductAnswerValidatorTests(unittest.TestCase):
         repaired, reason_code = repair_unsupported_product_answer(answer, [_route_block()])
 
         self.assertEqual(reason_code, "ok")
-        self.assertIn("高德本次返回的路线数据", repaired)
+        self.assertIn("本次返回的路线数据", repaired)
+        self.assertNotIn("高德", repaired)
         self.assertIn("驾车约14分钟", repaired)
         self.assertIn("公共交通约32分钟", repaired)
         self.assertNotIn("实时路线数据", repaired)
@@ -246,6 +247,24 @@ class ProductAnswerValidatorTests(unittest.TestCase):
         self.assertNotRegex(repaired, r"14分钟[^。\n]{0,30}32分钟")
         self.assertTrue(validate_product_answer(repaired, [_route_block()]).is_valid)
 
+    def test_repair_drops_source_only_and_dangling_predicate_clauses(self):
+        route = _route_block()
+        route.routes.append(RouteOption(mode="bicycling", duration_s=1200, distance_m=5000))
+        answer = (
+            "根据本次查询结果，驾车约14分钟，骑行约20分钟、5公里，是非常适合骑行的通勤距离，停车方便，地铁约32分钟。"
+        )
+
+        repaired, reason_code = repair_unsupported_product_answer(answer, [route])
+
+        self.assertEqual(reason_code, "ok")
+        self.assertIn("驾车约14分钟", repaired)
+        self.assertIn("骑行约20分钟、5公里", repaired)
+        self.assertIn("地铁约32分钟", repaired)
+        self.assertNotIn("根据本次查询结果。", repaired)
+        self.assertNotIn("是非常适合", repaired)
+        self.assertNotIn("停车方便", repaired)
+        self.assertTrue(validate_product_answer(repaired, [route]).is_valid)
+
     def test_repairs_only_unsupported_clause_and_keeps_grounded_model_prose(self):
         answer = "结论：驾车约14分钟，是本次用时最短的方案。高峰期可能拥堵。地铁约32分钟，适合能接受1次换乘的情况。"
 
@@ -256,7 +275,8 @@ class ProductAnswerValidatorTests(unittest.TestCase):
         self.assertIn("驾车约14分钟", repaired)
         self.assertIn("地铁约32分钟", repaired)
         self.assertNotIn("高峰期可能拥堵", repaired)
-        self.assertIn("本次高德结果无法确认", repaired)
+        self.assertIn("本次查询结果无法确认", repaired)
+        self.assertNotIn("高德", repaired)
         self.assertTrue(validate_product_answer(repaired, [_route_block()]).is_valid)
 
     def test_hard_fact_error_is_not_repaired(self):

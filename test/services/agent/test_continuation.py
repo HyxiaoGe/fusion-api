@@ -8,7 +8,7 @@ from sqlalchemy.orm import sessionmaker
 from app.db.database import Base
 from app.db.models import AgentSession
 from app.db.models import Message as MessageModel
-from app.schemas.chat import TextBlock
+from app.schemas.chat import TextBlock, ThinkingBlock
 from app.schemas.response import ApiException
 from app.services.agent.continuation import (
     CONTINUATION_SYSTEM_PROMPT,
@@ -57,6 +57,22 @@ class AgentContinuationTests(unittest.TestCase):
         blocks = deserialize_content_blocks([{"type": "text", "id": "blk_old", "text": "旧回答"}])
 
         self.assertEqual(blocks, [TextBlock(type="text", id="blk_old", text="旧回答")])
+
+    def test_deserialize_content_blocks_sanitizes_legacy_thinking_tool_names(self):
+        blocks = deserialize_content_blocks(
+            [
+                {
+                    "type": "thinking",
+                    "id": "thinking-old",
+                    "thinking": "调用 web_search，再用 url_read 读取网页。",
+                }
+            ]
+        )
+
+        self.assertEqual(
+            blocks,
+            [ThinkingBlock(type="thinking", id="thinking-old", thinking="调用联网搜索，再用网页读取读取网页。")],
+        )
 
     def test_inject_continuation_prompt_after_existing_system_messages(self):
         messages = [

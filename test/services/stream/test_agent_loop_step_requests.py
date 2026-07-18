@@ -66,7 +66,8 @@ class AgentLoopStepRequestTests(unittest.TestCase):
             text_block_id="text-tool",
         )
         round_result = AgentRoundResult(
-            reasoning_buf="需要工具",
+            reasoning_buf="需要 联网搜索",
+            protocol_reasoning_buf="需要 web_search",
             content_buf="",
             tool_calls=[{"id": "tc-1", "name": "web_search", "arguments": "{}"}],
             finish_reason="tool_calls",
@@ -96,7 +97,8 @@ class AgentLoopStepRequestTests(unittest.TestCase):
         self.assertIs(request.session_cache, runtime.session_cache)
         self.assertIs(request.network_budget, runtime.network_budget)
         self.assertEqual(request.tool_calls, round_result.tool_calls)
-        self.assertEqual(request.reasoning_buf, "需要工具")
+        self.assertEqual(request.reasoning_buf, "需要 联网搜索")
+        self.assertEqual(request.protocol_reasoning_buf, "需要 web_search")
         self.assertEqual(request.announced_tool_names, frozenset({"web_search"}))
         self.assertEqual(request.task_id, "task-req")
         self.assertIs(request.agent_state, state)

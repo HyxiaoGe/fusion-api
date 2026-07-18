@@ -54,13 +54,13 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             ["tc-place", "tc-route", "tc-search"],
         )
         boundary = prepared[1]["content"]
-        self.assertIn("【高德工具选择规则】", boundary)
+        self.assertIn("【地点与路线工具选择规则】", boundary)
         self.assertIn("两个自然语言起终点", boundary)
         self.assertIn("直接调用 route_compare", boundary)
         self.assertIn("不要先调用 web_search 或 local_place_search", boundary)
         self.assertIn("当前位置", boundary)
         self.assertIn("source=current_location", boundary)
-        self.assertIn("【高德事实边界规则】", boundary)
+        self.assertIn("【地点与路线事实边界规则】", boundary)
         self.assertIn("工具失败、不可用或未取得可用结果", boundary)
         self.assertIn("不得用训练知识补充具体地点、线路、时间、距离、费用或路况", boundary)
         self.assertIn("不得仅根据地址片区或同村", boundary)
@@ -78,7 +78,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不得在正文或括号中补充估计", boundary)
         self.assertIn("结果为 0 条时，不得根据常识推荐任何有名称的地点", boundary)
         self.assertIn("reference_cost_yuan", boundary)
-        self.assertIn("只能原样称为高德参考消费", boundary)
+        self.assertIn("只能原样称为参考消费", boundary)
         self.assertIn("不得评价为便宜、实惠或性价比高", boundary)
         self.assertIn("允许依据实际返回的 rating 或 open_hours 做有限排序或说明", boundary)
         self.assertIn("必须明确所依据的字段", boundary)
@@ -94,7 +94,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             boundary,
         )
         self.assertIn("不得声称路线耗时包含或不包含停车及其他未返回构成", boundary)
-        self.assertIn("未返回的路线属性只能说明无法从本次高德结果确认", boundary)
+        self.assertIn("未返回的路线属性只能说明无法从本次查询结果确认", boundary)
         self.assertNotIn("民治星巴克", boundary)
         self.assertNotIn("深圳北站", boundary)
 
@@ -107,7 +107,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         boundaries = [
             message
             for message in prepared
-            if message.get("role") == "system" and "【高德事实边界规则】" in str(message.get("content", ""))
+            if message.get("role") == "system" and "【地点与路线事实边界规则】" in str(message.get("content", ""))
         ]
         self.assertEqual(len(boundaries), 1)
 
@@ -118,7 +118,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         prepared = inject_amap_fact_boundary(messages, call_kwargs)
 
         self.assertIs(prepared, messages)
-        self.assertFalse(any("【高德事实边界规则】" in str(message.get("content", "")) for message in prepared))
+        self.assertFalse(any("【地点与路线事实边界规则】" in str(message.get("content", "")) for message in prepared))
 
     def test_build_call_config_applies_controlled_max_tokens(self):
         for raw_value, expected in ((1, 1), (1024, 1024), (9999, 4096)):

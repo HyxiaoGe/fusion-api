@@ -7,6 +7,7 @@ from uuid import RFC_4122, UUID, uuid4
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from app.utils.time import utc_now
+from app.utils.user_visible_content import sanitize_internal_tool_names
 
 # ============================================================
 # Content Blocks（消息内容块）
@@ -27,6 +28,11 @@ class ThinkingBlock(BaseModel):
     type: Literal["thinking"]
     id: str = Field(default_factory=lambda: f"blk_{uuid4().hex[:12]}")
     thinking: str
+
+    @field_validator("thinking")
+    @classmethod
+    def sanitize_user_visible_thinking(cls, value: str) -> str:
+        return sanitize_internal_tool_names(value, final=True)
 
 
 class FileBlock(BaseModel):

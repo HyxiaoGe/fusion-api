@@ -20,6 +20,7 @@ class AgentRoundResult:
     tool_calls: list[dict]
     finish_reason: str
     accumulated_usage: Usage
+    protocol_reasoning_buf: str | None = None
     context: ContextUsage | None = None
     announced_tool_names: frozenset[str] | None = None
     output_deferred: bool = False
@@ -254,6 +255,7 @@ async def run_agent_round(
     )
     return AgentRoundResult(
         reasoning_buf=reasoning_buf,
+        protocol_reasoning_buf=getattr(stream_result, "protocol_reasoning_buf", reasoning_buf),
         content_buf=content_buf,
         tool_calls=tool_calls,
         finish_reason=finish_reason,

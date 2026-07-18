@@ -25,6 +25,20 @@ from app.services.tool_handlers.base import ToolResult
 
 
 class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
+    def test_append_tool_round_messages_uses_raw_reasoning_only_for_model_protocol(self):
+        request = Mock(
+            messages=[],
+            content_blocks=[],
+            tool_calls=[{"id": "tc-1", "name": "route_compare", "arguments": "{}"}],
+            reasoning_buf="需要调用 路线比较",
+            protocol_reasoning_buf="需要调用 route_compare",
+            should_use_reasoning=True,
+        )
+
+        tool_round_module.append_tool_round_messages_with_plan(request, [], source_plan=None)
+
+        self.assertEqual(request.messages[0]["reasoning_content"], "需要调用 route_compare")
+
     def _build_product_round_request(self, *, event_error=None):
         block = PlaceResultsBlock(
             type="place_results",

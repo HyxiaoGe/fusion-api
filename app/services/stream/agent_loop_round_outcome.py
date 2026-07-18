@@ -18,6 +18,7 @@ from app.services.stream.product_answer_validator import (
 from app.services.stream.product_result_answer import (
     build_grounded_product_answer,
     build_product_tool_failure_answer,
+    neutralize_product_provider_mentions,
 )
 from app.services.stream.round_completion import append_round_content_blocks, complete_text_response_step
 from app.services.stream.step_lifecycle import AgentStepContext
@@ -93,7 +94,10 @@ async def _replace_deferred_product_answer(
 ) -> AgentRoundOutcomeRequest:
     if not request.round_result.output_deferred:
         return request
-    candidate = request.round_result.content_buf.strip()
+    candidate = neutralize_product_provider_mentions(
+        request.round_result.content_buf.strip(),
+        request.state.content_blocks,
+    )
     validation = validate_product_answer(
         candidate,
         request.state.content_blocks,
@@ -134,6 +138,7 @@ async def _replace_deferred_product_answer(
                 answer = build_product_tool_failure_answer(request.messages)
             if not answer:
                 answer = "已展示地图服务返回的结构化结果，请以卡片信息为准。"
+    answer = neutralize_product_provider_mentions(answer, request.state.content_blocks)
     if answer:
         await append_chunk(
             request.runtime.conversation_id,
@@ -153,6 +158,7 @@ async def _replace_deferred_product_answer(
         step_context=request.step_context,
         round_result=AgentRoundResult(
             reasoning_buf="",
+            protocol_reasoning_buf=request.round_result.protocol_reasoning_buf,
             content_buf=answer,
             tool_calls=request.round_result.tool_calls,
             finish_reason=request.round_result.finish_reason,

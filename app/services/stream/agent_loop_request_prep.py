@@ -296,11 +296,13 @@ def inject_tool_usage_contract(messages: list[dict], call_kwargs: dict) -> list[
 
 
 def inject_amap_fact_boundary(messages: list[dict], call_kwargs: dict) -> list[dict]:
-    """高德产品工具启用时前置通用事实边界，不提升任何外部结果为 system 内容。"""
+    """地点与路线产品工具启用时前置通用事实边界，不提升任何外部结果为 system 内容。"""
     announced_tools = set(announced_tool_names_from_call_kwargs(call_kwargs))
     if not AMAP_PRODUCT_TOOL_NAMES.intersection(announced_tools):
         return messages
-    if any(msg.get("role") == "system" and "【高德事实边界规则】" in str(msg.get("content", "")) for msg in messages):
+    if any(
+        msg.get("role") == "system" and "【地点与路线事实边界规则】" in str(msg.get("content", "")) for msg in messages
+    ):
         return messages
 
     insert_at = 0

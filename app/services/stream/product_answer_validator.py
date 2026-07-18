@@ -127,14 +127,17 @@ _MARKDOWN_TABLE_SEPARATOR_RE = re.compile(
 _AMAP_REALTIME_ROUTE_DATA_RE = re.compile(r"高德(?:地图)?(?:本次)?返回(?:的|了)?实时路线数据")
 _REPAIR_SENTENCE_RE = re.compile(r"[^。！？!?]+(?:[。！？!?]+|$)")
 _NUMBERED_LIST_PREFIX_RE = re.compile(r"^\s*\d+[.、)]\s*")
+_REPAIR_MARKDOWN_PREFIX_RE = re.compile(r"^\s*(?:#{1,6}|[-*>])\s*")
+_REPAIR_SOURCE_ONLY_RE = re.compile(r"^(?:根据|结合)?(?:本次|此次)(?:查询|返回)?结果(?:显示|来看)?$")
+_REPAIR_DANGLING_PREDICATE_RE = re.compile(r"^(?:是|为|属于)(?:非常|很|较|比较|更|最|也)?")
 _SAFE_CAVEATS = {
-    "realtime": "实时排队、空位、预约、停车、拥堵、候车和票价等未返回信息，本次高德结果无法确认，建议出发前核实。",
-    "cost": "未返回的费用信息，本次高德结果无法确认，建议以实际信息为准。",
-    "numeric": "未返回的时间、距离和费用信息，本次高德结果无法确认，请以卡片数值为准。",
-    "relation": "地点之间的距离和步行时间本次高德结果无法确认，如需组合出行建议应另行查询路线。",
-    "attribute": "口味、适合人群和转场体验等未返回属性，本次高德结果无法确认。",
+    "realtime": "实时排队、空位、预约、停车、拥堵、候车和票价等未返回信息，本次查询结果无法确认，建议出发前核实。",
+    "cost": "未返回的费用信息，本次查询结果无法确认，建议以实际信息为准。",
+    "numeric": "未返回的时间、距离和费用信息，本次查询结果无法确认，请以卡片数值为准。",
+    "relation": "地点之间的距离和步行时间本次查询结果无法确认，如需组合出行建议应另行查询路线。",
+    "attribute": "口味、适合人群和转场体验等未返回属性，本次查询结果无法确认。",
     "scope": "最高、最低等排序只代表本次返回候选，不能扩展为区域整体结论。",
-    "transit_total_distance": "公共交通全程距离本次高德结果无法确认，请以卡片已展示的步行距离和线路信息为准。",
+    "transit_total_distance": "公共交通全程距离本次查询结果无法确认，请以卡片已展示的步行距离和线路信息为准。",
 }
 
 
@@ -324,7 +327,7 @@ def _iter_repair_units(answer: str):
 def _rewrite_repairable_labels(answer: str) -> tuple[str, bool]:
     """只修正不改变路线事实的来源标签，避免因一个错误形容词丢弃整段比较。"""
 
-    rewritten = _AMAP_REALTIME_ROUTE_DATA_RE.sub("高德本次返回的路线数据", answer)
+    rewritten = _AMAP_REALTIME_ROUTE_DATA_RE.sub("本次返回的路线数据", answer)
     return rewritten, rewritten != answer
 
 
@@ -342,6 +345,8 @@ def _salvage_safe_subclauses(
         clause = _NUMBERED_LIST_PREFIX_RE.sub("", raw_clause).strip()
         if len(re.sub(r"\s+", "", clause)) < 4:
             continue
+        if not _is_independent_repair_clause(clause):
+            continue
         validation = validate_product_answer(
             clause,
             content_blocks,
@@ -357,6 +362,13 @@ def _salvage_safe_subclauses(
             continue
         salvaged.append(f"{clause.rstrip('。！？!?；;')}。")
     return salvaged
+
+
+def _is_independent_repair_clause(clause: str) -> bool:
+    """过滤逗号拆分后失去主语或只剩来源提示的病句。"""
+
+    plain_clause = _REPAIR_MARKDOWN_PREFIX_RE.sub("", clause).strip()
+    return not (_REPAIR_SOURCE_ONLY_RE.fullmatch(plain_clause) or _REPAIR_DANGLING_PREDICATE_RE.match(plain_clause))
 
 
 def _has_safe_place_repair_scope(clause: str, facts: _FactIndex) -> bool:
