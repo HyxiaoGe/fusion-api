@@ -5,6 +5,7 @@
 ## 安全边界
 
 - 生产域名必须显式传入 `--confirm-production`。
+- 账密注册/登录只允许性能工具在受控环境调用；实际认证运行前必须由密钥管理器向进程环境注入至少 32 字符、无首尾空白的 `FUSION_PERF_INTERNAL_AUTH_TOKEN`。该 secret 没有 CLI 参数，缺失或无效时会在 `/auth/register`、`/auth/login` 请求发出前 fail closed；携带该头的请求拒绝任何自动重定向，secret 也不会写入结果、repr 或进度日志。
 - HTTP 默认阶梯为 `1,5,10,25,50`，SSE 默认阶梯为 `1,3,5`。
 - HTTP 在至少 20 个样本后，错误率或超时率达到 5% 会停止；连续失败达到 10 次也会停止。
 - SSE 任意 flow 失败或收到 error frame 后，不再提升并发。
@@ -21,6 +22,12 @@ auth-service 暂无公开删号接口。runner 吊销全部 refresh token 后，
 ## 使用
 
 仓库 `.env.example` 中的 `fusion-client` 已不是生产实际应用 ID。runner 默认使用当前公开生产应用 ID，也可通过 `FUSION_PERF_CLIENT_ID` 或 `--client-id` 覆盖：
+
+先由受控作业平台或密钥管理器向进程注入内部认证 token，禁止把 token 明文写进命令行、脚本、结果文件或 shell trace。启动前只验证变量存在，不要输出变量值：
+
+```bash
+python -c 'import os, sys; v = os.environ.get("FUSION_PERF_INTERNAL_AUTH_TOKEN", ""); sys.exit(len(v) < 32 or v != v.strip())'
+```
 
 ```bash
 python -m scripts.perf.runner \

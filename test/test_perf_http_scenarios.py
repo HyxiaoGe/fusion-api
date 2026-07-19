@@ -12,6 +12,8 @@ from scripts.perf.http_scenarios import (
     sample_json_request,
 )
 
+VALID_INTERNAL_TOKEN = "test-internal-auth-token-0123456789abcdef"
+
 
 @dataclass(frozen=True)
 class FakeResponse:
@@ -25,8 +27,16 @@ class FakeJsonClient:
         self.error = error
         self.calls = []
 
-    def request_json(self, method, url, *, payload=None, token=None):
-        self.calls.append({"method": method, "url": url, "payload": payload, "token": token})
+    def request_json(self, method, url, *, payload=None, token=None, extra_headers=None):
+        self.calls.append(
+            {
+                "method": method,
+                "url": url,
+                "payload": payload,
+                "token": token,
+                "extra_headers": extra_headers,
+            }
+        )
         if self.error is not None:
             raise self.error
         if len(self.responses) > 1:
@@ -43,6 +53,7 @@ class HttpScenarioDefinitionTests(unittest.TestCase):
             password="password-secret",
             client_id="fusion-client",
             access_token="access-secret",
+            internal_auth_token=VALID_INTERNAL_TOKEN,
             conversation_id="conv/unsafe id",
             page_size=25,
         )
@@ -51,6 +62,10 @@ class HttpScenarioDefinitionTests(unittest.TestCase):
         self.assertEqual(scenarios["auth_login"].method, "POST")
         self.assertEqual(scenarios["auth_login"].url, "https://auth.example/auth/login")
         self.assertNotIn("register", scenarios["auth_login"].url)
+        self.assertEqual(
+            scenarios["auth_login"].extra_headers,
+            {"X-Fusion-Internal-Auth": VALID_INTERNAL_TOKEN},
+        )
         self.assertEqual(scenarios["models"].url, "https://fusion.example/api/models/")
         self.assertEqual(
             scenarios["conversation_list"].url,
@@ -64,6 +79,7 @@ class HttpScenarioDefinitionTests(unittest.TestCase):
         self.assertNotIn("perf-user@example.com", serialized_repr)
         self.assertNotIn("password-secret", serialized_repr)
         self.assertNotIn("access-secret", serialized_repr)
+        self.assertNotIn(VALID_INTERNAL_TOKEN, serialized_repr)
 
     def test_omits_conversation_detail_when_no_existing_id_is_provided(self):
         scenarios = build_l1_scenarios(
@@ -73,9 +89,22 @@ class HttpScenarioDefinitionTests(unittest.TestCase):
             password="password-secret",
             client_id="fusion-client",
             access_token="access-secret",
+            internal_auth_token=VALID_INTERNAL_TOKEN,
         )
 
         self.assertEqual(set(scenarios), {"auth_login", "models", "conversation_list"})
+
+    def test_l1_login_scenario_fails_closed_without_internal_token(self):
+        with self.assertRaisesRegex(ValueError, "FUSION_PERF_INTERNAL_AUTH_TOKEN"):
+            build_l1_scenarios(
+                target_url="https://fusion.example",
+                auth_url="https://auth.example",
+                email="perf-user@example.com",
+                password="password-secret",
+                client_id="fusion-client",
+                access_token="access-secret",
+                internal_auth_token=None,
+            )
 
 
 class HttpScenarioSamplingTests(unittest.TestCase):
@@ -100,6 +129,7 @@ class HttpScenarioSamplingTests(unittest.TestCase):
             method="POST",
             url="https://auth.example/auth/login",
             payload={"email": "perf@example.com", "password": "secret"},
+            extra_headers={"X-Fusion-Internal-Auth": VALID_INTERNAL_TOKEN},
             response_validator=lambda data: bool(data.get("access_token")),
         )
         authenticated_client = FakeJsonClient([FakeResponse(200, {"items": []})])
@@ -125,6 +155,12 @@ class HttpScenarioSamplingTests(unittest.TestCase):
 
         self.assertIsNone(login_sample.error)
         self.assertEqual(login_client.calls[0]["payload"]["email"], "perf@example.com")
+        self.assertEqual(
+            login_client.calls[0]["extra_headers"],
+            {"X-Fusion-Internal-Auth": VALID_INTERNAL_TOKEN},
+        )
+        self.assertNotIn(VALID_INTERNAL_TOKEN, repr(login))
+        self.assertNotIn(VALID_INTERNAL_TOKEN, repr(login_sample))
         self.assertEqual(authenticated_client.calls[0]["token"], "access-secret")
         self.assertIsNone(list_sample.error)
         self.assertEqual(authenticated_post_client.calls[0]["payload"], {"value": 1})

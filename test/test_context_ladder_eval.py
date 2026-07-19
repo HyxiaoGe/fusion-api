@@ -23,6 +23,8 @@ from scripts.context_ladder_eval import (
     validate_args,
 )
 
+VALID_INTERNAL_TOKEN = "test-internal-auth-token-0123456789abcdef"
+
 
 def _required_args(*extra: str) -> argparse.Namespace:
     return build_parser().parse_args(
@@ -556,6 +558,7 @@ class ExecuteSafetyTest(unittest.TestCase):
                     events.append("cleanup") or {"conversations_deleted": 1, "tokens_revoked": 1, "errors": []}
                 ),
             ),
+            patch.dict("os.environ", {"FUSION_PERF_INTERNAL_AUTH_TOKEN": VALID_INTERNAL_TOKEN}),
         ):
             guard_cls.return_value.check.return_value = []
             guard_cls.return_value.resources_summary.return_value = {}
@@ -593,7 +596,7 @@ class ExecuteSafetyTest(unittest.TestCase):
             patch("scripts.context_ladder_eval.HttpClient", return_value=FakeClient()),
             patch("scripts.context_ladder_eval.ResourceGuard") as guard_cls,
             patch("scripts.context_ladder_eval._verify_live_model"),
-            patch("scripts.context_ladder_eval.authenticate", return_value="token"),
+            patch("scripts.context_ladder_eval.authenticate", return_value="token") as auth_mock,
             patch(
                 "scripts.context_ladder_eval.generate_identity", return_value=("perf-safe", "safe@example", "secret")
             ),
@@ -601,6 +604,7 @@ class ExecuteSafetyTest(unittest.TestCase):
                 "scripts.context_ladder_eval.cleanup_run",
                 return_value={"conversations_deleted": 0, "tokens_revoked": 1, "errors": []},
             ),
+            patch.dict("os.environ", {"FUSION_PERF_INTERNAL_AUTH_TOKEN": VALID_INTERNAL_TOKEN}),
         ):
             guard_cls.return_value.check.return_value = []
             guard_cls.return_value.resources_summary.return_value = {}
@@ -609,6 +613,8 @@ class ExecuteSafetyTest(unittest.TestCase):
         self.assertTrue(result["stopped"])
         self.assertIn("cold-50:cost:insufficient_remaining_budget", result["stop_reasons"])
         self.assertEqual(result["results"], [])
+        self.assertEqual(auth_mock.call_args.kwargs["internal_auth_token"], VALID_INTERNAL_TOKEN)
+        self.assertNotIn(VALID_INTERNAL_TOKEN, json.dumps(result))
 
     def test_setup_failure_returns_auditable_cleanup_result(self):
         stage = self._stage()
@@ -645,6 +651,39 @@ class ExecuteSafetyTest(unittest.TestCase):
         self.assertEqual(result["cleanup"]["account_rows_retained"], 0)
         self.assertFalse(result["cleanup"]["account_cleanup_supported"])
         self.assertNotIn("secret setup detail", json.dumps(result))
+
+    def test_missing_internal_auth_token_reports_zero_account_rows_retained(self):
+        stage = self._stage()
+        args = _required_args(
+            "--apply",
+            "--confirm-production",
+            "--generation-controls-verified",
+            "--allow-account-residue",
+        )
+
+        with (
+            patch("scripts.context_ladder_eval.build_ladder_plan", return_value=self._plan(stage)),
+            patch("scripts.context_ladder_eval.HttpClient", return_value=object()),
+            patch("scripts.context_ladder_eval.ResourceGuard") as guard_cls,
+            patch("scripts.context_ladder_eval._verify_live_model"),
+            patch("scripts.context_ladder_eval.authenticate") as auth_mock,
+            patch(
+                "scripts.context_ladder_eval.generate_identity", return_value=("perf-safe", "safe@example", "secret")
+            ),
+            patch(
+                "scripts.context_ladder_eval.cleanup_run",
+                return_value={"conversations_deleted": 0, "tokens_revoked": 0, "errors": []},
+            ),
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            guard_cls.return_value.check.return_value = []
+            guard_cls.return_value.resources_summary.return_value = {}
+            result = execute(args)
+
+        auth_mock.assert_not_called()
+        self.assertTrue(result["stopped"])
+        self.assertIn("setup:InternalAuthGateError", result["stop_reasons"])
+        self.assertEqual(result["cleanup"]["account_rows_retained"], 0)
 
     def test_managed_trim_round_requires_real_trim_telemetry(self):
         stage = StagePlan(

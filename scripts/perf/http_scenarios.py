@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Protocol
 from urllib.parse import quote, urlencode
 
+from scripts.perf.auth_gate import INTERNAL_AUTH_HEADER, require_internal_auth_token
 from scripts.perf.core import RequestSample, StopPolicy, summarize_samples
 
 JsonMethod = Literal["GET", "POST"]
@@ -36,6 +37,7 @@ class JsonRequester(Protocol):
         *,
         payload: dict[str, Any] | None = None,
         token: str | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> JsonResponseLike: ...
 
 
@@ -48,6 +50,7 @@ class JsonScenario:
     url: str = field(repr=False)
     payload: dict[str, Any] | None = field(default=None, repr=False, compare=False)
     token: str | None = field(default=None, repr=False, compare=False)
+    extra_headers: dict[str, str] | None = field(default=None, repr=False, compare=False)
     expected_statuses: tuple[int, ...] = (200,)
     response_validator: ResponseValidator | None = field(default=None, repr=False, compare=False)
 
@@ -99,6 +102,7 @@ def build_l1_scenarios(
     password: str,
     client_id: str,
     access_token: str | None,
+    internal_auth_token: str | None,
     conversation_id: str | None = None,
     page_size: int = 20,
 ) -> dict[str, JsonScenario]:
@@ -111,12 +115,14 @@ def build_l1_scenarios(
 
     if not 1 <= page_size <= 100:
         raise ValueError("page_size 必须在 1 到 100 之间")
+    internal_token = require_internal_auth_token(internal_auth_token)
     scenarios = {
         "auth_login": JsonScenario(
             name="auth_login",
             method="POST",
             url=_join_url(auth_url, "/auth/login"),
             payload={"email": email, "password": password, "client_id": client_id},
+            extra_headers={INTERNAL_AUTH_HEADER: internal_token},
             response_validator=_auth_login_response,
         ),
         "models": JsonScenario(
@@ -166,6 +172,7 @@ def sample_json_request(client: JsonRequester, scenario: JsonScenario) -> Reques
             scenario.url,
             payload=copy.deepcopy(scenario.payload),
             token=scenario.token,
+            extra_headers=copy.deepcopy(scenario.extra_headers),
         )
         status = int(response.status)
         if status not in scenario.expected_statuses:

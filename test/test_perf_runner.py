@@ -1,5 +1,8 @@
+import io
 import json
 import unittest
+import urllib.error
+from unittest.mock import patch
 
 from scripts.perf.core import (
     CleanupManifest,
@@ -10,15 +13,34 @@ from scripts.perf.core import (
     extract_agent_trace_ids,
     summarize_samples,
 )
-from scripts.perf.runner import JsonResponse, authenticate, cleanup_run
+from scripts.perf.runner import (
+    HttpClient,
+    JsonResponse,
+    RunnerError,
+    _FailClosedRedirectHandler,
+    authenticate,
+    build_parser,
+    cleanup_run,
+    execute,
+)
+
+VALID_INTERNAL_TOKEN = "test-internal-auth-token-0123456789abcdef"
 
 
 class FakeClient:
     def __init__(self):
         self.calls = []
 
-    def request_json(self, method, url, *, payload=None, token=None):
-        self.calls.append({"method": method, "url": url, "payload": payload, "token": token})
+    def request_json(self, method, url, *, payload=None, token=None, extra_headers=None):
+        self.calls.append(
+            {
+                "method": method,
+                "url": url,
+                "payload": payload,
+                "token": token,
+                "extra_headers": extra_headers,
+            }
+        )
         if url.endswith("/auth/register"):
             return JsonResponse(201, {"refresh_token": "registration-refresh"})
         if url.endswith("/auth/login"):
@@ -197,14 +219,139 @@ class CleanupManifestTest(unittest.TestCase):
         client = FakeClient()
         manifest = CleanupManifest(run_id="perf-abcd", email="fusion-perf+perf-abcd@seanfield.org")
 
-        access_token = authenticate(client, "https://auth.example", "app-public-id", manifest, "password-secret")
+        access_token = authenticate(
+            client,
+            "https://auth.example",
+            "app-public-id",
+            manifest,
+            "password-secret",
+            internal_auth_token=VALID_INTERNAL_TOKEN,
+        )
 
         self.assertEqual(access_token, "scoped-access")
         self.assertEqual(client.calls[1]["payload"]["client_id"], "app-public-id")
         self.assertEqual(
+            [call["extra_headers"] for call in client.calls],
+            [
+                {"X-Fusion-Internal-Auth": VALID_INTERNAL_TOKEN},
+                {"X-Fusion-Internal-Auth": VALID_INTERNAL_TOKEN},
+            ],
+        )
+        self.assertEqual(
             [label for label, _ in manifest.refresh_tokens()],
             ["fusion_login", "registration"],
         )
+
+    def test_authentication_fails_before_network_when_internal_token_is_missing(self):
+        client = FakeClient()
+        manifest = CleanupManifest(run_id="perf-abcd", email="fusion-perf+perf-abcd@seanfield.org")
+
+        for invalid_token in (None, "", "x" * 31, f" {VALID_INTERNAL_TOKEN}", f"{VALID_INTERNAL_TOKEN} "):
+            with self.subTest(invalid_token=invalid_token):
+                with self.assertRaisesRegex(RunnerError, "FUSION_PERF_INTERNAL_AUTH_TOKEN"):
+                    authenticate(
+                        client,
+                        "https://auth.example",
+                        "app-public-id",
+                        manifest,
+                        "password-secret",
+                        internal_auth_token=invalid_token,
+                    )
+
+        self.assertEqual(client.calls, [])
+
+    def test_http_client_sends_only_explicit_extra_headers(self):
+        class FakeHttpResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b"{}"
+
+        client = HttpClient(timeout_seconds=1)
+        with (
+            patch.object(client._no_redirect_opener, "open", return_value=FakeHttpResponse()) as restricted_open,
+            patch("scripts.perf.runner.urllib.request.urlopen", return_value=FakeHttpResponse()) as urlopen,
+        ):
+            client.request_json(
+                "POST",
+                "https://auth.example/auth/login",
+                payload={"email": "private@example.com"},
+                extra_headers={"X-Fusion-Internal-Auth": VALID_INTERNAL_TOKEN},
+            )
+            client.request_json("GET", "https://fusion.example/api/models/")
+
+        first_headers = {key.lower(): value for key, value in restricted_open.call_args.args[0].header_items()}
+        second_headers = {key.lower(): value for key, value in urlopen.call_args.args[0].header_items()}
+        self.assertEqual(first_headers["x-fusion-internal-auth"], VALID_INTERNAL_TOKEN)
+        self.assertNotIn("x-fusion-internal-auth", second_headers)
+        for status in (301, 302, 303, 307, 308):
+            with self.subTest(status=status):
+                self.assertIsNone(
+                    _FailClosedRedirectHandler().redirect_request(
+                        restricted_open.call_args.args[0],
+                        None,
+                        status,
+                        "Redirect",
+                        {},
+                        "https://other.example/capture",
+                    )
+                )
+
+    def test_http_client_turns_auth_redirect_into_sanitized_failure(self):
+        client = HttpClient(timeout_seconds=1)
+        redirect = urllib.error.HTTPError(
+            "https://auth.example/auth/login",
+            302,
+            "Found",
+            {},
+            io.BytesIO(b"redirect body"),
+        )
+
+        with patch.object(client._no_redirect_opener, "open", side_effect=redirect) as restricted_open:
+            with self.assertRaisesRegex(RunnerError, "HTTP 302: 请求失败") as raised:
+                client.request_json(
+                    "POST",
+                    "https://auth.example/auth/login",
+                    payload={"email": "private@example.com"},
+                    extra_headers={"X-Fusion-Internal-Auth": VALID_INTERNAL_TOKEN},
+                )
+
+        self.assertEqual(restricted_open.call_count, 1)
+        self.assertNotIn(VALID_INTERNAL_TOKEN, str(raised.exception))
+
+    def test_runner_authentication_reads_internal_token_from_environment(self):
+        args = build_parser().parse_args(
+            [
+                "--mode",
+                "sse",
+                "--target-url",
+                "https://fusion.example",
+                "--auth-url",
+                "https://auth.example",
+                "--model-id",
+                "model-a",
+            ]
+        )
+
+        with (
+            patch.dict("os.environ", {"FUSION_PERF_INTERNAL_AUTH_TOKEN": VALID_INTERNAL_TOKEN}),
+            patch("scripts.perf.runner.HttpClient", return_value=object()),
+            patch("scripts.perf.runner.authenticate", side_effect=RunnerError("expected stop")) as auth_mock,
+            patch(
+                "scripts.perf.runner.cleanup_run",
+                return_value={"conversations_deleted": 0, "tokens_revoked": 0, "errors": []},
+            ),
+        ):
+            with self.assertRaisesRegex(RunnerError, "expected stop"):
+                execute(args)
+
+        self.assertEqual(auth_mock.call_args.kwargs["internal_auth_token"], VALID_INTERNAL_TOKEN)
 
     def test_cleanup_deletes_only_manifest_conversations_and_revokes_both_tokens(self):
         client = FakeClient()

@@ -16,8 +16,14 @@ import urllib.request
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Mapping
 
+from scripts.perf.auth_gate import (
+    INTERNAL_AUTH_ENV_VAR,
+    INTERNAL_AUTH_HEADER,
+    InternalAuthGateError,
+    require_internal_auth_token,
+)
 from scripts.perf.core import (
     CleanupManifest,
     RequestSample,
@@ -43,9 +49,17 @@ class JsonResponse:
     data: dict[str, Any]
 
 
+class _FailClosedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """带额外安全头的请求不允许自动重定向。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class HttpClient:
     def __init__(self, timeout_seconds: float) -> None:
         self.timeout_seconds = timeout_seconds
+        self._no_redirect_opener = urllib.request.build_opener(_FailClosedRedirectHandler())
 
     def request_json(
         self,
@@ -54,6 +68,7 @@ class HttpClient:
         *,
         payload: dict[str, Any] | None = None,
         token: str | None = None,
+        extra_headers: Mapping[str, str] | None = None,
     ) -> JsonResponse:
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
         headers = {"Accept": "application/json", "User-Agent": "fusion-perf-runner/1"}
@@ -62,8 +77,12 @@ class HttpClient:
         if token:
             headers["Authorization"] = f"Bearer {token}"
         request = urllib.request.Request(url=url, data=data, headers=headers, method=method)
+        if extra_headers is not None:
+            for name, value in extra_headers.items():
+                request.add_unredirected_header(name, value)
+        open_request = self._no_redirect_opener.open if extra_headers else urllib.request.urlopen
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+            with open_request(request, timeout=self.timeout_seconds) as response:
                 return JsonResponse(response.status, _decode_json(response.read()))
         except urllib.error.HTTPError as error:
             error.read()
@@ -110,17 +129,26 @@ def authenticate(
     client_id: str,
     manifest: CleanupManifest,
     password: str,
+    *,
+    internal_auth_token: str | None,
 ) -> str:
+    try:
+        internal_token = require_internal_auth_token(internal_auth_token)
+    except InternalAuthGateError as error:
+        raise RunnerError(str(error)) from error
+    internal_headers = {INTERNAL_AUTH_HEADER: internal_token}
     registration = client.request_json(
         "POST",
         join_url(auth_url, "/auth/register"),
         payload={"email": manifest.email, "password": password, "name": f"Fusion Perf {manifest.run_id}"},
+        extra_headers=internal_headers,
     ).data
     manifest.add_refresh_token("registration", _required_token(registration, "refresh_token"))
     login = client.request_json(
         "POST",
         join_url(auth_url, "/auth/login"),
         payload={"email": manifest.email, "password": password, "client_id": client_id},
+        extra_headers=internal_headers,
     ).data
     manifest.add_refresh_token("fusion_login", _required_token(login, "refresh_token"))
     return _required_token(login, "access_token")
@@ -351,7 +379,14 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         if args.mode in {"http", "all"}:
             stop_reasons = _execute_http_stages(args, client, policy, stages)
         if not stop_reasons and args.mode in {"sse", "all"}:
-            token = authenticate(client, args.auth_url, args.client_id, manifest, password)
+            token = authenticate(
+                client,
+                args.auth_url,
+                args.client_id,
+                manifest,
+                password,
+                internal_auth_token=os.getenv(INTERNAL_AUTH_ENV_VAR),
+            )
             stop_reasons = _execute_sse_stages(args, client, token, manifest, stages)
     finally:
         cleanup = cleanup_run(client, args.target_url, args.auth_url, token, manifest)

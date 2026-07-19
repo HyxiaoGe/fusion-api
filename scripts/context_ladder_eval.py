@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import socket
 import sys
@@ -23,6 +24,7 @@ from urllib.parse import urlsplit
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from scripts.perf.auth_gate import INTERNAL_AUTH_ENV_VAR, require_internal_auth_token
 from scripts.perf.core import CleanupManifest, SSEParser, extract_agent_trace_ids, fingerprint
 from scripts.perf.resource_guard import ResourceGuard, UrllibPrometheusClient
 from scripts.perf.runner import (
@@ -981,8 +983,16 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             base["monitoring"] = {"prometheus": "active", "loki": "active"}
             _verify_live_model(client, args)
             base["live_model_verified"] = True
+            internal_auth_token = require_internal_auth_token(os.getenv(INTERNAL_AUTH_ENV_VAR))
             account_registration_attempted = True
-            token = authenticate(client, args.auth_url, args.client_id, manifest, password)
+            token = authenticate(
+                client,
+                args.auth_url,
+                args.client_id,
+                manifest,
+                password,
+                internal_auth_token=internal_auth_token,
+            )
             setup_completed = True
             for stage in execution_stages:
                 reserved_cost = _planned_stage_cost(

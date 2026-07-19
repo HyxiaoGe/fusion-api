@@ -1,6 +1,7 @@
 import argparse
 import json
 import unittest
+from unittest.mock import patch
 
 from scripts.perf.core import CleanupManifest
 from scripts.perf.full_runner import (
@@ -9,15 +10,34 @@ from scripts.perf.full_runner import (
     _resource_hard_stop,
     _with_cache_bypass_nonce,
     build_import_payload,
+    build_parser,
     extract_run_started_message_id,
     normalize_http_stage,
     validate_args,
 )
+from scripts.perf.full_runner import (
+    execute as execute_full_runner,
+)
+from scripts.perf.http_scenarios import build_l1_scenarios, run_scenario_stage
 from scripts.perf.runner import JsonResponse, RunnerError
+
+VALID_INTERNAL_TOKEN = "test-internal-auth-token-0123456789abcdef"
 
 
 class FakeClient:
-    def request_json(self, method, url, *, payload=None, token=None):
+    def __init__(self):
+        self.calls = []
+
+    def request_json(self, method, url, *, payload=None, token=None, extra_headers=None):
+        self.calls.append(
+            {
+                "method": method,
+                "url": url,
+                "payload": payload,
+                "token": token,
+                "extra_headers": extra_headers,
+            }
+        )
         return JsonResponse(
             200,
             {
@@ -34,8 +54,8 @@ class FakeCleanupClient:
         self.missing_conversations = missing_conversations
         self.calls = []
 
-    def request_json(self, method, url, *, payload=None, token=None):
-        self.calls.append((method, url, payload, token))
+    def request_json(self, method, url, *, payload=None, token=None, extra_headers=None):
+        self.calls.append((method, url, payload, token, extra_headers))
         if self.fail_revoke and url.endswith("/auth/token/revoke"):
             raise RuntimeError("private exception")
         if self.missing_conversations and method == "DELETE":
@@ -97,6 +117,7 @@ class FullRunnerTests(unittest.TestCase):
             "POST",
             "https://auth.example/auth/login",
             payload={"email": "private@example.com", "password": "password-secret"},
+            extra_headers={"X-Fusion-Internal-Auth": VALID_INTERNAL_TOKEN},
         )
 
         self.assertEqual(response.status, 200)
@@ -105,6 +126,63 @@ class FullRunnerTests(unittest.TestCase):
         self.assertNotIn("refresh-secret", serialized)
         self.assertNotIn("private@example.com", serialized)
         self.assertNotIn("password-secret", repr(client))
+        self.assertNotIn(VALID_INTERNAL_TOKEN, repr(client))
+        self.assertEqual(
+            client._client.calls[0]["extra_headers"],
+            {"X-Fusion-Internal-Auth": VALID_INTERNAL_TOKEN},
+        )
+
+    def test_l1_login_pipeline_keeps_internal_token_out_of_repr_and_stage_result(self):
+        manifest = CleanupManifest(run_id="perf-safe", email="private@example.com")
+        raw_client = FakeClient()
+        client = CapturingLoginClient(raw_client, manifest)
+        login = build_l1_scenarios(
+            target_url="https://fusion.example",
+            auth_url="https://auth.example",
+            email="private@example.com",
+            password="password-secret",
+            client_id="fusion-client",
+            access_token="access-secret",
+            internal_auth_token=VALID_INTERNAL_TOKEN,
+        )["auth_login"]
+
+        stage, consecutive = run_scenario_stage(client, login, concurrency=1, requests=1)
+
+        self.assertEqual(consecutive, 0)
+        self.assertEqual(stage["successful"], 1)
+        self.assertEqual(
+            raw_client.calls[0]["extra_headers"],
+            {"X-Fusion-Internal-Auth": VALID_INTERNAL_TOKEN},
+        )
+        self.assertNotIn(VALID_INTERNAL_TOKEN, repr(login))
+        self.assertNotIn(VALID_INTERNAL_TOKEN, repr(client))
+        self.assertNotIn(VALID_INTERNAL_TOKEN, json.dumps(stage))
+
+    def test_execute_reads_internal_auth_token_from_environment(self):
+        args = build_parser().parse_args(
+            [
+                "--target-url",
+                "https://fusion.example",
+                "--auth-url",
+                "https://auth.example",
+                "--model-id",
+                "model-a",
+            ]
+        )
+
+        with (
+            patch.dict("os.environ", {"FUSION_PERF_INTERNAL_AUTH_TOKEN": VALID_INTERNAL_TOKEN}),
+            patch("scripts.perf.full_runner.HttpClient", return_value=object()),
+            patch("scripts.perf.full_runner.authenticate", side_effect=RunnerError("expected stop")) as auth_mock,
+            patch(
+                "scripts.perf.full_runner._cleanup_full",
+                return_value={"conversations_deleted": 0, "tokens_revoked": 0, "errors": []},
+            ),
+        ):
+            with self.assertRaisesRegex(RunnerError, "expected stop"):
+                execute_full_runner(args)
+
+        self.assertEqual(auth_mock.call_args.kwargs["internal_auth_token"], VALID_INTERNAL_TOKEN)
 
     def test_parallel_cleanup_is_exact_and_deduplicates_errors(self):
         manifest = CleanupManifest(run_id="perf-safe", email="private@example.com")

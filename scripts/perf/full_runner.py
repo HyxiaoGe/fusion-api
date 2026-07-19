@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import os
 import re
 import socket
 import sys
@@ -20,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from scripts.perf.auth_gate import INTERNAL_AUTH_ENV_VAR
 from scripts.perf.core import CleanupManifest, SSEParser, StopPolicy, extract_agent_trace_ids, percentile
 from scripts.perf.http_scenarios import build_l1_scenarios, run_scenario_stage
 from scripts.perf.reliability_scenarios import (
@@ -139,8 +141,15 @@ class CapturingLoginClient:
         *,
         payload: dict[str, Any] | None = None,
         token: str | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> JsonResponse:
-        response = self._client.request_json(method, url, payload=payload, token=token)
+        response = self._client.request_json(
+            method,
+            url,
+            payload=payload,
+            token=token,
+            extra_headers=extra_headers,
+        )
         refresh_token = response.data.get("refresh_token") if url.endswith("/auth/login") else None
         if isinstance(refresh_token, str) and refresh_token:
             with self._lock:
@@ -879,7 +888,15 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             stop_reasons.extend(resource_guard.check())
         if stop_reasons:
             raise RunnerError("生产资源门禁不可用")
-        token = authenticate(client, args.auth_url, args.client_id, manifest, password)
+        internal_auth_token = os.getenv(INTERNAL_AUTH_ENV_VAR)
+        token = authenticate(
+            client,
+            args.auth_url,
+            args.client_id,
+            manifest,
+            password,
+            internal_auth_token=internal_auth_token,
+        )
         seed = _run_new_flow(
             client,
             args.target_url,
@@ -901,6 +918,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 password=password,
                 client_id=args.client_id,
                 access_token=token,
+                internal_auth_token=internal_auth_token,
                 conversation_id=conversation_id,
             )
             login_client = CapturingLoginClient(client, manifest)
