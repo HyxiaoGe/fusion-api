@@ -76,11 +76,61 @@ class IsUserAccessRevokedTests(unittest.TestCase):
         self.assertGreater(fake.calls, 0)
 
 
+class IsSessionAccessRevokedTests(unittest.TestCase):
+    def test_revoked_sid_marker_revokes_session(self):
+        fake = _FakeRedis({"revoked_sid:sid-1": "1"})
+        with patch.object(revocation, "get_redis", return_value=fake):
+            self.assertTrue(revocation.is_session_access_revoked("sid-1"))
+
+    def test_missing_sid_keeps_legacy_token_compatible(self):
+        with patch.object(revocation, "get_redis", return_value=_FakeRedis({})) as redis_mock:
+            self.assertFalse(revocation.is_session_access_revoked(None))
+        redis_mock.assert_not_called()
+
+    def test_session_revocation_redis_outage_fails_open(self):
+        fake = _FakeRedis({}, raise_exc=ConnectionError("redis down"))
+        with patch.object(revocation, "get_redis", return_value=fake):
+            self.assertFalse(revocation.is_session_access_revoked("sid-1"))
+        self.assertGreater(fake.calls, 0)
+
+
 class GetCurrentUserRevocationTests(unittest.TestCase):
     """get_current_user 在签名校验通过后，对已吊销令牌返回 401，并且不再触达用户同步逻辑。"""
 
     def _auth_user(self, sub="u1", iat=1000):
         return AuthenticatedUser(sub=sub, email="a@b.c", raw_payload={"sub": sub, "iat": iat, "type": "access"})
+
+    def test_revoked_sid_raises_401_before_user_sync(self):
+        sentinel_db = object()
+        auth_user = AuthenticatedUser(
+            sub="u1",
+            email="a@b.c",
+            raw_payload={"sub": "u1", "iat": 3000, "sid": "sid-1", "type": "access"},
+        )
+        with (
+            patch.object(security.jwt_validator, "verify", return_value=auth_user),
+            patch.object(revocation, "get_redis", return_value=_FakeRedis({"revoked_sid:sid-1": "1"})),
+            patch.object(security, "_sync_user_from_claims") as sync_mock,
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                security.get_current_user(db=sentinel_db, token="tok")
+        self.assertEqual(ctx.exception.status_code, 401)
+        sync_mock.assert_not_called()
+
+    def test_malformed_sid_raises_401_without_user_sync(self):
+        auth_user = AuthenticatedUser(
+            sub="u1",
+            email="a@b.c",
+            raw_payload={"sub": "u1", "iat": 3000, "sid": 123, "type": "access"},
+        )
+        with (
+            patch.object(security.jwt_validator, "verify", return_value=auth_user),
+            patch.object(security, "_sync_user_from_claims") as sync_mock,
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                security.get_current_user(db=object(), token="tok")
+        self.assertEqual(ctx.exception.status_code, 401)
+        sync_mock.assert_not_called()
 
     def test_revoked_token_raises_401_before_user_sync(self):
         sentinel_db = object()
@@ -137,6 +187,25 @@ class ResolveUserFromBearerRevocationTests(unittest.TestCase):
             patch("app.api.files.UserRepository", return_value=repo),
         ):
             self.assertIsNone(files._resolve_user_from_bearer(self._request(), db=object()))
+
+    def test_revoked_sid_bearer_resolves_to_none(self):
+        repo = MagicMock()
+        repo.get.return_value = SimpleNamespace(id="u1")
+        with (
+            patch.object(
+                security.jwt_validator,
+                "verify",
+                return_value=AuthenticatedUser(
+                    sub="u1",
+                    email="a@b.c",
+                    raw_payload={"iat": 3000, "sid": "sid-1"},
+                ),
+            ),
+            patch.object(revocation, "get_redis", return_value=_FakeRedis({"revoked_sid:sid-1": "1"})),
+            patch("app.api.files.UserRepository", return_value=repo),
+        ):
+            self.assertIsNone(files._resolve_user_from_bearer(self._request(), db=object()))
+        repo.get.assert_not_called()
 
     def test_valid_bearer_resolves_user(self):
         user = SimpleNamespace(id="u1")

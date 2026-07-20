@@ -13,7 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.revocation import is_user_access_revoked
+from app.core.revocation import extract_session_id, is_session_access_revoked, is_user_access_revoked
 from app.db.database import get_db
 from app.db.models import User
 from app.db.repositories import SocialAccountRepository, UserRepository
@@ -284,9 +284,18 @@ def get_current_user(db: Session = Depends(get_db), token: str = Depends(oauth2_
         logger.warning("Auth token verification failed: %s", exc)
         raise credentials_exception
 
+    try:
+        session_id = extract_session_id(auth_user.raw_payload)
+    except ValueError:
+        logger.warning("Auth token verification failed: invalid sid claim")
+        raise credentials_exception
+
     # 跨应用单点登出：签名/类型校验通过后，再查共享 Redis 的吊销标记。放在 _sync_user_from_claims
     # 之前，吊销令牌即可快速失败，省去 userinfo 拉取与 DB 写。
-    if is_user_access_revoked(auth_user.sub, auth_user.raw_payload.get("iat")):
+    if is_session_access_revoked(session_id) or is_user_access_revoked(
+        auth_user.sub,
+        auth_user.raw_payload.get("iat"),
+    ):
         logger.info("Access token revoked via SLO for user %s", auth_user.sub)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
