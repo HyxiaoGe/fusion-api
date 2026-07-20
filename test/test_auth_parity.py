@@ -72,9 +72,7 @@ class GetCurrentUserParityTests(_InjectedJWKSMixin, unittest.TestCase):
         token = _mint(self.keypair, type="access", scopes=["admin"])
         sentinel = SimpleNamespace(id="user-1", is_superuser=True)
         db = MagicMock()
-        with patch(
-            "app.core.security._sync_user_from_claims", return_value=sentinel
-        ) as sync:
+        with patch("app.core.security._sync_user_from_claims", return_value=sentinel) as sync:
             user = security.get_current_user(db=db, token=token)
         self.assertIs(user, sentinel)
         sync.assert_called_once()
@@ -83,6 +81,20 @@ class GetCurrentUserParityTests(_InjectedJWKSMixin, unittest.TestCase):
         args = sync.call_args.args
         self.assertIs(args[0], db)
         self.assertEqual(args[2], token)
+
+    def test_sid_claim_is_parsed_and_checked_without_replacing_subject(self):
+        token = _mint(self.keypair, type="access", sid="sid-1")
+        sentinel = SimpleNamespace(id="user-1", is_superuser=False)
+        fake_redis = MagicMock()
+        fake_redis.get.return_value = None
+        with (
+            patch("app.core.revocation.get_redis", return_value=fake_redis),
+            patch("app.core.security._sync_user_from_claims", return_value=sentinel),
+        ):
+            user = security.get_current_user(db=MagicMock(), token=token)
+        self.assertIs(user, sentinel)
+        fake_redis.get.assert_any_call("revoked_sid:sid-1")
+        fake_redis.get.assert_any_call("revoked_user:user-1")
 
     def test_refresh_type_token_is_rejected_401(self):
         # The critical guard: a non-access token must NOT authenticate a protected route.
@@ -126,9 +138,7 @@ class ResolveUserFromBearerParityTests(_InjectedJWKSMixin, unittest.TestCase):
         self.assertIsNone(result)
 
     def test_returns_none_without_bearer_prefix(self):
-        result = files._resolve_user_from_bearer(
-            SimpleNamespace(headers={}), MagicMock()
-        )
+        result = files._resolve_user_from_bearer(SimpleNamespace(headers={}), MagicMock())
         self.assertIsNone(result)
 
 
