@@ -20,6 +20,10 @@ class DeployAuthConfigTests(unittest.TestCase):
         self.assertIn("RESOLVED_AUTH_SERVICE_JWKS_URL", self.workflow)
         self.assertIn("auth JWKS ok", self.workflow)
 
+    def test_auth_clock_skew_leeway_is_documented_and_deployed(self):
+        self.assertIn("AUTH_SERVICE_JWT_LEEWAY_SECONDS=5", self.env_example)
+        self.assertIn("AUTH_SERVICE_JWT_LEEWAY_SECONDS:-5", self.workflow)
+
     def test_deploy_runs_api_surface_smoke_after_health(self):
         self.assertIn("Run deployment smoke", self.workflow)
         self.assertIn("python3 scripts/deployment_smoke.py --base-url http://127.0.0.1:8002", self.workflow)

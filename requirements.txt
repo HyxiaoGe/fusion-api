@@ -29,7 +29,7 @@ mcp==1.28.1
 sse-starlette==2.4.1
 PyJWT[crypto]>=2.8.0
 # 共享 JWT 校验 SDK：固定 PyPI 版本，保证本地、CI 与生产镜像解析到同一发布物。
-seanfield-auth-client[fastapi]==0.3.0
+seanfield-auth-client[fastapi]==0.3.1
 passlib[bcrypt]
 itsdangerous
 # 锁 <6：redis 8.x 改了 XREAD 字段键的解码（decode_responses 下不再回字符串键），

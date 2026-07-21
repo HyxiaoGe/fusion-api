@@ -33,6 +33,7 @@ jwt_validator = JWTValidator(
     issuer=settings.AUTH_SERVICE_BASE_URL.rstrip("/"),
     audience=settings.AUTH_SERVICE_CLIENT_ID,
     require_token_type="access",
+    leeway_seconds=settings.AUTH_SERVICE_JWT_LEEWAY_SECONDS,
 )
 
 

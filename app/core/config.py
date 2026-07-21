@@ -1,6 +1,7 @@
 import os
 from typing import List, Optional
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
@@ -74,6 +75,9 @@ class Settings(BaseSettings):
     AUTH_SERVICE_BASE_URL: str = os.getenv("AUTH_SERVICE_BASE_URL", "http://localhost:8100")
     AUTH_SERVICE_CLIENT_ID: Optional[str] = os.getenv("AUTH_SERVICE_CLIENT_ID")
     AUTH_SERVICE_JWKS_URL: Optional[str] = os.getenv("AUTH_SERVICE_JWKS_URL")
+    # 分布式认证节点允许极小、受控的墙钟偏差。默认 5 秒足以覆盖 NTP 正常漂移，
+    # 上限 60 秒防止配置错误把 exp/nbf/iat 的安全窗口无限扩大。
+    AUTH_SERVICE_JWT_LEEWAY_SECONDS: float = Field(default=5.0, ge=0.0, le=60.0)
     # 服务端内网直连地址（可选）。设置后 JWKS 抓取与 userinfo 走内网，绕开公网域名经
     # Cloudflare tunnel 的回环（实测 1-3s → 内网 3-8ms）。issuer/audience 仍用公网
     # AUTH_SERVICE_BASE_URL 校验，不受影响。

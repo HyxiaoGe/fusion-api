@@ -24,7 +24,7 @@ class CIContainerContractTest(unittest.TestCase):
     def test_auth_client_uses_fixed_pypi_release(self) -> None:
         production = (ROOT / "requirements.txt").read_text(encoding="utf-8")
 
-        self.assertIn("seanfield-auth-client[fastapi]==0.3.0", production)
+        self.assertIn("seanfield-auth-client[fastapi]==0.3.1", production)
         self.assertNotIn("git+https://github.com/HyxiaoGe/auth-service", production)
         self.assertNotIn("#subdirectory=auth-client", production)
 
