@@ -222,6 +222,14 @@ class ProductAnswerValidatorTests(unittest.TestCase):
         self.assertFalse(validation.is_valid)
         self.assertEqual(validation.reason_code, "unsupported_claim")
 
+    def test_requested_departure_time_non_realtime_boundary_is_retained(self):
+        answer = "用户指定的出发时间为“工作日早上 8:30”，本次结果未按该时刻的实时路况或班次计算。"
+
+        validation = validate_product_answer(answer, [_route_block()])
+
+        self.assertTrue(validation.is_valid)
+        self.assertEqual(validation.reason_code, "ok")
+
     def test_repair_rewrites_realtime_route_data_label_and_keeps_grounded_comparison(self):
         answer = "根据高德返回的实时路线数据，驾车约14分钟，公共交通约32分钟。"
 

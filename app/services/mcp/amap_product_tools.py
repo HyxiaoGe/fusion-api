@@ -66,6 +66,7 @@ _COORDINATE_PATTERN = re.compile(r"^\s*[+-]?(?:\d+(?:\.\d+)?|\.\d+)\s*,\s*[+-]?(
 _PRODUCT_TIMEOUT_SECONDS = 25.0
 _MAX_CONTEXT_BYTES = 12_000
 _MAX_RESULT_BYTES = 32_000
+_MAX_REQUESTED_DEPARTURE_TIME_CHARS = 80
 _TRUNCATED = "[TRUNCATED]"
 _AMAP_COORDINATE_CONVERT_ATTEMPT = "amap_coordinate_convert"
 _INLINE_SECRET_VALUE = r'"(?:\\.|[^"\\])+"|\'(?:\\.|[^\'\\])+\'|[a-z0-9._~+/=-]{4,}'
@@ -93,6 +94,8 @@ _ROUTE_RESULT_USAGE_CONTRACT = (
     "transit_type、transfers、legs 和 alternatives，线路、站点、出入口或步行距离缺失时不得猜测。\n"
     "- 公共交通不得使用 distance_m：route.distance 是起终点步行距离，不是 transit 方案全程距离。\n"
     "- 不得自行估算路线时间或距离；也不得估算票价或过路费，公共交通结果不提供票价。\n"
+    "- 当 limitations 说明用户指定了出发时间时，必须明确告知本次结果未按该时刻的实时路况或班次计算，"
+    "不得据此推算到达时间。\n"
 )
 _PRODUCT_FINAL_ANSWER_CONTRACT = (
     "最终综合回答要求（工具调用已经满足任务且无需继续调用时必须遵守）：\n"
@@ -106,6 +109,7 @@ _PRODUCT_FINAL_ANSWER_CONTRACT = (
 AMAP_FACT_BOUNDARY_SYSTEM_PROMPT = """【地点与路线工具选择规则】
 - 用户要求规划或比较两个自然语言起终点之间的路线时，直接调用 route_compare；城市字段可选，route_compare 会自行解析地点并做同城消歧，不要先调用 web_search 或 local_place_search 猜测城市或解析端点。
 - 用户把“当前位置”作为路线起点或终点时，仍直接调用 route_compare，并把对应 source 设置为 source=current_location；不要向用户索要或自行生成坐标，系统会在需要时申请浏览器定位。
+- 仅当用户明确指定日期、工作日、周末或具体出发时间时，才把原始自然语言时间传入 requested_departure_time；未指定时必须省略，不得默认填写“现在”。该字段只记录查询意图，不代表地图服务按该时刻计算。
 - local_place_search 只用于搜索、筛选或推荐地点，不是 route_compare 的前置步骤。
 
 【地点与路线事实边界规则】
@@ -178,6 +182,8 @@ AMAP_PRODUCT_DEFINITIONS = [
                 "城市字段可选；用户给出两个命名地点时，即使城市未明确也应直接调用本工具，工具会"
                 "利用已解析端点的城市做同城消歧，不要先用网页搜索猜测城市。"
                 "需要把当前位置作为端点时，显式设置对应的 source=current_location。"
+                "用户指定日期或时间时必须传入 requested_departure_time；该值只用于标记查询意图，"
+                "本次路线不会按该时刻的实时路况或班次计算；未指定时必须省略，不得默认填写“现在”。"
             ),
             "parameters": {
                 "type": "object",
@@ -193,6 +199,15 @@ AMAP_PRODUCT_DEFINITIONS = [
                     "destination_source": {
                         "type": "string",
                         "enum": ["named", "current_location"],
+                    },
+                    "requested_departure_time": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": _MAX_REQUESTED_DEPARTURE_TIME_CHARS,
+                        "description": (
+                            "用户原话中的日期或出发时间，例如“工作日早上 8:30”；仅当用户明确指定时传入，"
+                            "未指定时必须省略，不得默认填写“现在”。仅记录查询意图，不会传给地图路线接口。"
+                        ),
                     },
                     "modes": {
                         "type": "array",
@@ -374,6 +389,7 @@ class AmapProductToolHandler(BaseToolHandler):
                     unavailable_modes=list(partial.get("pending_modes", [])),
                     origin=partial["origin"],
                     destination=partial["destination"],
+                    requested_departure_time=partial.get("requested_departure_time"),
                     status="degraded",
                 )
             else:
@@ -394,6 +410,7 @@ class AmapProductToolHandler(BaseToolHandler):
                     unavailable_modes=list(partial.get("pending_modes", [])),
                     origin=partial["origin"],
                     destination=partial["destination"],
+                    requested_departure_time=partial.get("requested_departure_time"),
                     status="degraded",
                 )
                 result.duration_ms = _duration_ms(started_at)
@@ -615,6 +632,7 @@ class AmapProductToolHandler(BaseToolHandler):
             destination=destination,
             routes=[],
             pending_modes=list(normalized["modes"]),
+            requested_departure_time=normalized.get("requested_departure_time"),
         )
         routes: list[dict[str, Any]] = partial["routes"]
         unavailable_modes: list[str] = []
@@ -646,6 +664,7 @@ class AmapProductToolHandler(BaseToolHandler):
             unavailable_modes=unavailable_modes,
             origin=origin,
             destination=destination,
+            requested_departure_time=normalized.get("requested_departure_time"),
             status="degraded" if unavailable_modes else "success",
         )
 
@@ -759,14 +778,19 @@ class AmapProductToolHandler(BaseToolHandler):
         unavailable_modes: list[str],
         origin: dict[str, Any],
         destination: dict[str, Any],
+        requested_departure_time: str | None,
         status: str,
     ) -> ToolResult:
+        limitations = ["路线时间和距离仅代表本次查询结果"]
+        if requested_departure_time:
+            safe_departure_time = _redact_product_text(requested_departure_time)[:_MAX_REQUESTED_DEPARTURE_TIME_CHARS]
+            limitations.append(f"用户指定的出发时间为“{safe_departure_time}”，本次结果未按该时刻的实时路况或班次计算")
         product_result = {
             "origin": _public_endpoint(origin),
             "destination": _public_endpoint(destination),
             "routes": routes[:3],
             "unavailable_modes": list(dict.fromkeys(unavailable_modes))[:3],
-            "limitations": ["路线时间和距离仅代表本次查询结果"],
+            "limitations": limitations,
         }
         return ToolResult(status=status, data={"result": _bound_result(product_result)})
 
@@ -995,6 +1019,7 @@ def _validate_route_args(args: Any) -> dict[str, Any]:
             "destination_city",
             "origin_source",
             "destination_source",
+            "requested_departure_time",
             "modes",
         },
     )
@@ -1023,6 +1048,11 @@ def _validate_route_args(args: Any) -> dict[str, Any]:
         "destination_city": _optional_text(source, "destination_city", 40),
         "origin_source": origin_source,
         "destination_source": destination_source,
+        "requested_departure_time": _normalized_optional_text(
+            source,
+            "requested_departure_time",
+            _MAX_REQUESTED_DEPARTURE_TIME_CHARS,
+        ),
         "modes": modes,
     }
 
@@ -1079,6 +1109,11 @@ def _optional_text(source: dict[str, Any], key: str, max_chars: int) -> str | No
     if key not in source or source[key] is None:
         return None
     return _required_text(source, key, max_chars)
+
+
+def _normalized_optional_text(source: dict[str, Any], key: str, max_chars: int) -> str | None:
+    value = _optional_text(source, key, max_chars)
+    return re.sub(r"\s+", " ", value) if value is not None else None
 
 
 def _extract_geo(

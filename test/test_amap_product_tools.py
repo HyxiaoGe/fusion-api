@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 from app.services.agent.context_broker import Geolocation
 from app.services.mcp.amap_product_tools import (
+    AMAP_FACT_BOUNDARY_SYSTEM_PROMPT,
     AMAP_PRODUCT_DEFINITIONS,
     AmapProductToolHandler,
     AmapRunCoordinateConversion,
@@ -124,11 +125,17 @@ class AmapProductDefinitionTests(unittest.TestCase):
                 "destination_city",
                 "origin_source",
                 "destination_source",
+                "requested_departure_time",
                 "modes",
             },
         )
         self.assertEqual(route_schema["properties"]["origin_source"]["enum"], ["named", "current_location"])
         self.assertEqual(route_schema["properties"]["destination_source"]["enum"], ["named", "current_location"])
+        self.assertEqual(route_schema["properties"]["requested_departure_time"]["maxLength"], 80)
+        departure_description = route_schema["properties"]["requested_departure_time"]["description"]
+        self.assertIn("仅当用户明确指定", departure_description)
+        self.assertIn("未指定时必须省略", departure_description)
+        self.assertIn("不得默认填写“现在”", departure_description)
         self.assertEqual(route_schema["properties"]["modes"]["maxItems"], 3)
         local_description = definitions["local_place_search"]["function"]["description"]
         route_description = definitions["route_compare"]["function"]["description"]
@@ -141,6 +148,10 @@ class AmapProductDefinitionTests(unittest.TestCase):
         self.assertIn("缺失字段必须说明无法确认", route_description)
         self.assertIn("城市字段可选", route_description)
         self.assertIn("不要先用网页搜索猜测城市", route_description)
+        self.assertIn("用户指定日期或时间时必须传入", route_description)
+        self.assertIn("未指定时必须省略", route_description)
+        self.assertIn("仅当用户明确指定日期", AMAP_FACT_BOUNDARY_SYSTEM_PROMPT)
+        self.assertIn("不得默认填写“现在”", AMAP_FACT_BOUNDARY_SYSTEM_PROMPT)
 
 
 class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
@@ -856,6 +867,71 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
+    async def test_requested_departure_time_adds_fact_boundary_without_reaching_remote_tools(self):
+        handler, executor = build_handler(
+            "route_compare",
+            {
+                "maps_geo": [
+                    mcp_payload({"geocodes": [{"location": "114.031,22.616", "city": "深圳市"}]}),
+                    mcp_payload({"geocodes": [{"location": "114.057,22.543", "city": "深圳市"}]}),
+                ],
+                "maps_direction_driving": [mcp_payload({"paths": [{"distance": "12000", "duration": "1400"}]})],
+            },
+        )
+
+        result = await handler.execute(
+            {
+                "origin": "南景新村",
+                "destination": "双子塔",
+                "requested_departure_time": "工作日早上 8:30",
+                "modes": ["driving"],
+            }
+        )
+
+        self.assertEqual(result.status, "success")
+        limitation = "用户指定的出发时间为“工作日早上 8:30”，本次结果未按该时刻的实时路况或班次计算"
+        self.assertIn(limitation, result.data["result"]["limitations"])
+        self.assertIn(limitation, handler.format_llm_context(result))
+        self.assertTrue(all("requested_departure_time" not in call[2] for call in executor.calls))
+        self.assertTrue(
+            all("工作日早上 8:30" not in json.dumps(call[2], ensure_ascii=False) for call in executor.calls)
+        )
+
+        block = handler.build_content_block(result, "blk-route-time", "log-route-time")
+        self.assertIsNotNone(block)
+        self.assertIn(limitation, block.limitations)
+
+    async def test_requested_departure_time_is_optional_but_rejects_oversized_text(self):
+        handler, executor = build_handler("route_compare", {}, remaining_budget=0)
+
+        result = await handler.execute(
+            {
+                "origin": "南景新村",
+                "destination": "双子塔",
+                "requested_departure_time": "时" * 81,
+            }
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.data["error_code"], "invalid_arguments")
+        self.assertEqual(executor.calls, [])
+
+    def test_route_result_redacts_requested_departure_time_before_echoing_limitation(self):
+        handler, _executor = build_handler("route_compare", {})
+
+        result = handler._build_route_result(
+            routes=[{"mode": "driving", "distance_m": 12000, "duration_s": 1400}],
+            unavailable_modes=[],
+            origin={"label": "南景新村", "city": "深圳市"},
+            destination={"label": "双子塔", "city": "深圳市"},
+            requested_departure_time="工作日 8:30 token=DEPARTURE_SECRET",
+            status="success",
+        )
+
+        serialized = json.dumps(result.data["result"], ensure_ascii=False)
+        self.assertNotIn("DEPARTURE_SECRET", serialized)
+        self.assertIn("token=[REDACTED]", serialized)
+
     async def test_transit_ignores_empty_railway_objects_when_counting_subway_transfers(self):
         handler, _executor = build_handler(
             "route_compare",
