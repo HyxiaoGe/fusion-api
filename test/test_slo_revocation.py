@@ -15,7 +15,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from auth import AuthenticatedUser
+from auth_service_client import AuthenticatedUser
 from fastapi import HTTPException
 
 from app.api import files

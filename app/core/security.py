@@ -5,7 +5,7 @@ import time
 from typing import Optional
 
 import httpx
-from auth import AuthenticatedUser, JWTValidator
+from auth_service_client import AuthenticatedUser, JWTValidator
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jwt import InvalidTokenError

@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import httpx
-from auth import AuthenticatedUser
+from auth_service_client import AuthenticatedUser
 from sqlalchemy.exc import IntegrityError
 
 from app.core import security

@@ -21,6 +21,13 @@ class CIContainerContractTest(unittest.TestCase):
         self.assertIn("fakeredis[lua]", ci)
         self.assertIn("ruff==", ci)
 
+    def test_auth_client_uses_fixed_pypi_release(self) -> None:
+        production = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+
+        self.assertIn("seanfield-auth-client[fastapi]==0.3.0", production)
+        self.assertNotIn("git+https://github.com/HyxiaoGe/auth-service", production)
+        self.assertNotIn("#subdirectory=auth-client", production)
+
     def test_dockerfile_exposes_dependencies_and_production_targets(self) -> None:
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
 
@@ -33,6 +40,7 @@ class CIContainerContractTest(unittest.TestCase):
         self.assertNotIn("build-essential", production)
         self.assertNotIn("gcc", production)
         self.assertNotIn("ruff", production)
+        self.assertNotRegex(dockerfile, r"(?m)^\s*git\s*\\?\s*$")
 
     def test_windows_workflow_tests_ephemeral_production_container(self) -> None:
         workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
