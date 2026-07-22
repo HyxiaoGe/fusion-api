@@ -80,14 +80,9 @@ jobs:
         timeout-minutes: 10
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
-          $ErrorActionPreference = "Stop"
           $image = "${env:IMAGE_NAME}:${env:GITHUB_SHA}"
-
-          docker build --target production -t $image .
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          docker run --rm $image sh -lc "timeout 300s python -m pip install --default-timeout=30 --no-cache-dir -r requirements-ci.txt && python scripts/check_architecture.py && ruff check . && timeout 270s python -u -m unittest discover -s test -t . -v"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\scripts\ci\run_windows_container_ci.ps1 -Image $image -LogDirectory "_ci-logs"
+          exit $LASTEXITCODE
 
       - name: Login to ACR
         uses: docker/login-action@v3
@@ -97,7 +92,61 @@ jobs:
           password: ${{ secrets.ACR_PASSWORD }}
 
       - name: Push Docker image
-        run: docker push "%IMAGE_NAME%:%GITHUB_SHA%"
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $started = [DateTimeOffset]::UtcNow
+          docker push "${env:IMAGE_NAME}:${env:GITHUB_SHA}" 2>&1 | ForEach-Object {
+            $line = $_.ToString()
+            Write-Host $line
+            $line | Add-Content -LiteralPath "_ci-logs\image-push.log" -Encoding utf8
+          }
+          $exitCode = $LASTEXITCODE
+          $finished = [DateTimeOffset]::UtcNow
+          $result = [pscustomobject]@{
+            name = "image-push"; display_name = "Push Docker image"
+            status = $(if ($exitCode -eq 0) { "success" } else { "failure" })
+            exit_code = $exitCode; started_at = $started.ToString("o"); finished_at = $finished.ToString("o")
+            duration_seconds = [math]::Round(($finished - $started).TotalSeconds, 2)
+            log_file = "_ci-logs\image-push.log"
+          }
+          $stages = [System.Collections.ArrayList]::new()
+          if (Test-Path "_ci-logs\stages.json") {
+            $parsedStages = Get-Content "_ci-logs\stages.json" -Raw | ConvertFrom-Json
+            foreach ($stage in $parsedStages) { [void]$stages.Add($stage) }
+          }
+          [void]$stages.Add($result)
+          $stages.ToArray() | ConvertTo-Json -Depth 4 | Out-File "_ci-logs\stages.json" -Encoding utf8
+          exit $exitCode
+
+      - name: Write CI build summary
+        if: always()
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $stages = [System.Collections.ArrayList]::new()
+          if (Test-Path "_ci-logs\stages.json") {
+            $parsedStages = Get-Content "_ci-logs\stages.json" -Raw | ConvertFrom-Json
+            foreach ($stage in $parsedStages) { [void]$stages.Add($stage) }
+          }
+          if (-not ($stages | Where-Object name -eq "image-push")) {
+            [void]$stages.Add([pscustomobject]@{ name="image-push"; display_name="Push Docker image"; status="skipped"; exit_code=$null; duration_seconds=0; log_file=$null })
+          }
+          $lines = @("## Windows CI build summary", "", ('Runner: `{0}`' -f '${{ runner.name }}'), "", "| Stage | Status | Duration (s) | Exit code |", "|---|---:|---:|---:|")
+          foreach ($stage in $stages) {
+            $exitCode = if ($null -eq $stage.exit_code) { "-" } else { $stage.exit_code }
+            $lines += "| $($stage.display_name) | $($stage.status) | $($stage.duration_seconds) | $exitCode |"
+          }
+          $failed = $stages | Where-Object status -eq "failure" | Select-Object -First 1
+          if ($failed) { $lines += @("", "First failure: **$($failed.display_name)** (`$($failed.log_file)`)" ) }
+          $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload failed CI logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fusion-api-ci-logs-${{ github.run_id }}
+          path: _ci-logs
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Cleanup local Docker artifacts
         if: always()

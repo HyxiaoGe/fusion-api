@@ -20,6 +20,7 @@ CLAUDE.md
 .mcp.json
 .claude/
 .next/
+_ci-logs/
 
 # Generated model acceptance raw records; keep summarized reports in git.
 reports/model-acceptance/results-*.jsonl
