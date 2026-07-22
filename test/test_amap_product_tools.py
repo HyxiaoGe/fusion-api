@@ -1245,6 +1245,194 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(route["transit_type"], "subway")
         self.assertEqual(route["legs"][0]["line_name"], "地铁5号线(环中线)")
 
+    async def test_origin_without_city_falls_back_to_global_poi_detail(self):
+        handler, executor = build_handler(
+            "route_compare",
+            {
+                "maps_geo": [
+                    mcp_payload({"geocodes": []}),
+                    mcp_payload({"geocodes": [{"location": "114.050,22.553", "city": "深圳市"}]}),
+                ],
+                "maps_text_search": [
+                    mcp_payload({"pois": [{"id": "shenzhen-north", "name": "深圳北站", "cityname": "深圳市"}]})
+                ],
+                "maps_search_detail": [
+                    mcp_payload(
+                        {
+                            "id": "shenzhen-north",
+                            "name": "深圳北站",
+                            "location": "114.030,22.610",
+                            "city": "深圳市",
+                        }
+                    )
+                ],
+                "maps_direction_driving": [mcp_payload({"paths": [{"distance": "12000", "duration": "1400"}]})],
+            },
+        )
+
+        result = await handler.execute(
+            {
+                "origin": "深圳北站",
+                "destination": "莲花山公园",
+                "modes": ["driving"],
+            }
+        )
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual(
+            [call[0] for call in executor.calls],
+            [
+                "maps_geo",
+                "maps_text_search",
+                "maps_search_detail",
+                "maps_geo",
+                "maps_direction_driving",
+            ],
+        )
+        self.assertEqual(executor.calls[1][2], {"keywords": "深圳北站"})
+        self.assertEqual(result.data["result"]["origin"], {"label": "深圳北站", "city": "深圳市"})
+        self.assertNotIn("114.030", json.dumps(result.data["result"], ensure_ascii=False))
+
+    async def test_cityless_global_poi_fallback_rejects_detail_without_city(self):
+        handler, executor = build_handler(
+            "route_compare",
+            {
+                "maps_geo": [mcp_payload({"geocodes": []})],
+                "maps_text_search": [
+                    mcp_payload({"pois": [{"id": "shenzhen-north", "name": "深圳北站", "cityname": "深圳市"}]})
+                ],
+                "maps_search_detail": [
+                    mcp_payload(
+                        {
+                            "id": "shenzhen-north",
+                            "name": "深圳北站",
+                            "location": "114.030,22.610",
+                            "province": "广东省",
+                        }
+                    )
+                ],
+            },
+        )
+
+        result = await handler.execute(
+            {
+                "origin": "深圳北站",
+                "destination": "莲花山公园",
+                "modes": ["driving"],
+            }
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.data["error_code"], "invalid_response")
+        self.assertEqual(
+            [call[0] for call in executor.calls],
+            ["maps_geo", "maps_text_search", "maps_search_detail"],
+        )
+
+    async def test_cityless_global_poi_fallback_rejects_cross_city_matches(self):
+        handler, executor = build_handler(
+            "route_compare",
+            {
+                "maps_geo": [mcp_payload({"geocodes": []})],
+                "maps_text_search": [
+                    mcp_payload(
+                        {
+                            "pois": [
+                                {"id": "shenzhen-center", "name": "中心站", "cityname": "深圳市"},
+                                {"id": "guangzhou-center", "name": "中心站", "cityname": "广州市"},
+                            ]
+                        }
+                    )
+                ],
+            },
+        )
+
+        result = await handler.execute(
+            {
+                "origin": "中心站",
+                "destination": "莲花山公园",
+                "modes": ["driving"],
+            }
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.data["error_code"], "invalid_response")
+        self.assertEqual([call[0] for call in executor.calls], ["maps_geo", "maps_text_search"])
+
+    async def test_cityless_global_poi_fallback_rejects_label_without_city(self):
+        handler, executor = build_handler(
+            "route_compare",
+            {
+                "maps_geo": [mcp_payload({"geocodes": []})],
+                "maps_text_search": [
+                    mcp_payload({"pois": [{"id": "shenzhen-center", "name": "中心站", "cityname": "深圳市"}]})
+                ],
+            },
+        )
+
+        result = await handler.execute(
+            {
+                "origin": "中心站",
+                "destination": "莲花山公园",
+                "modes": ["driving"],
+            }
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.data["error_code"], "invalid_response")
+        self.assertEqual([call[0] for call in executor.calls], ["maps_geo", "maps_text_search"])
+
+    async def test_cityless_global_poi_fallback_rejects_duplicate_exact_matches(self):
+        handler, executor = build_handler(
+            "route_compare",
+            {
+                "maps_geo": [mcp_payload({"geocodes": []})],
+                "maps_text_search": [
+                    mcp_payload(
+                        {
+                            "pois": [
+                                {"id": "shenzhen-north-1", "name": "深圳北站", "cityname": "深圳市"},
+                                {"id": "shenzhen-north-2", "name": "深圳北站", "cityname": "深圳市"},
+                            ]
+                        }
+                    )
+                ],
+            },
+        )
+
+        result = await handler.execute(
+            {
+                "origin": "深圳北站",
+                "destination": "莲花山公园",
+                "modes": ["driving"],
+            }
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.data["error_code"], "invalid_response")
+        self.assertEqual([call[0] for call in executor.calls], ["maps_geo", "maps_text_search"])
+
+    async def test_cityless_global_poi_fallback_preserves_route_budget(self):
+        handler, executor = build_handler(
+            "route_compare",
+            {
+                "maps_geo": [mcp_payload({"geocodes": []})],
+            },
+            remaining_budget=4,
+        )
+
+        result = await handler.execute(
+            {
+                "origin": "深圳北站",
+                "destination": "莲花山公园",
+                "modes": ["driving"],
+            }
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.data["error_code"], "server_run_budget_exhausted")
+        self.assertEqual([call[0] for call in executor.calls], ["maps_geo"])
+
     async def test_destination_ambiguity_prefers_resolved_origin_city_without_forcing_remote_city_filter(self):
         handler, executor = build_handler(
             "route_compare",

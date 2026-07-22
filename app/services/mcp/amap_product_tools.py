@@ -617,7 +617,12 @@ class AmapProductToolHandler(BaseToolHandler):
         origin = (
             dict(current_endpoint)
             if normalized["origin_source"] == "current_location"
-            else await self._geocode_endpoint(normalized["origin"], normalized.get("origin_city"), stats)
+            else await self._geocode_endpoint(
+                normalized["origin"],
+                normalized.get("origin_city"),
+                stats,
+                reserve_calls=(1 if normalized["destination_source"] == "named" else 0) + 1,
+            )
         )
         destination = (
             dict(current_endpoint)
@@ -627,6 +632,7 @@ class AmapProductToolHandler(BaseToolHandler):
                 normalized.get("destination_city"),
                 stats,
                 preferred_city=(origin.get("city") if not normalized.get("destination_city") else None),
+                reserve_calls=1,
             )
         )
         partial.update(
@@ -694,6 +700,7 @@ class AmapProductToolHandler(BaseToolHandler):
         stats: "_RemoteCallStats",
         *,
         preferred_city: str | None = None,
+        reserve_calls: int = 0,
     ) -> dict[str, Any]:
         try:
             payload = await self._call(
@@ -719,18 +726,25 @@ class AmapProductToolHandler(BaseToolHandler):
             return endpoint
 
         selection_city = city or preferred_city
-        if not selection_city:
-            raise McpClientError("invalid_response", MCP_TOOL_UNAVAILABLE_MESSAGE)
+        await self._require_remaining_budget(2 + reserve_calls)
+        search_arguments: dict[str, Any] = {
+            "keywords": _normalize_amap_search_keywords(label),
+        }
+        if selection_city:
+            search_arguments.update(city=selection_city, citylimit=True)
         search_payload = await self._call(
             "maps_text_search",
-            {
-                "keywords": _normalize_amap_search_keywords(label),
-                "city": selection_city,
-                "citylimit": True,
-            },
+            search_arguments,
             stats,
         )
-        poi_id = _select_endpoint_poi_id(search_payload, label=label)
+        require_detail_city = selection_city is None
+        if selection_city:
+            poi_id = _select_endpoint_poi_id(search_payload, label=label)
+        else:
+            global_selection = _select_global_endpoint_poi(search_payload, label=label)
+            if global_selection is None:
+                raise McpClientError("invalid_response", MCP_TOOL_UNAVAILABLE_MESSAGE)
+            poi_id, selection_city = global_selection
         if not poi_id:
             raise McpClientError("invalid_response", MCP_TOOL_UNAVAILABLE_MESSAGE)
         detail_payload = await self._call("maps_search_detail", {"id": poi_id}, stats)
@@ -739,6 +753,7 @@ class AmapProductToolHandler(BaseToolHandler):
             label=label,
             expected_poi_id=poi_id,
             expected_city=selection_city,
+            require_detail_city=require_detail_city,
         )
         if endpoint is None:
             raise McpClientError("invalid_response", MCP_TOOL_UNAVAILABLE_MESSAGE)
@@ -1178,12 +1193,30 @@ def _select_endpoint_poi_id(payload: Any, *, label: str) -> str | None:
     return None
 
 
+def _select_global_endpoint_poi(payload: Any, *, label: str) -> tuple[str, str] | None:
+    normalized_label = _normalize_endpoint_match_text(label)
+    if not normalized_label:
+        return None
+    exact_matches: list[tuple[str, str]] = []
+    for place in _extract_places(payload, limit=10):
+        poi_id = place.get("poi_id")
+        name = place.get("name")
+        city = place.get("city")
+        if not isinstance(poi_id, str) or not isinstance(name, str) or not isinstance(city, str):
+            continue
+        normalized_name = _normalize_endpoint_match_text(name)
+        if normalized_name == normalized_label and _endpoint_label_mentions_city(normalized_label, city):
+            exact_matches.append((poi_id, city))
+    return exact_matches[0] if len(exact_matches) == 1 else None
+
+
 def _extract_endpoint_detail(
     payload: Any,
     *,
     label: str,
     expected_poi_id: str,
-    expected_city: str,
+    expected_city: str | None,
+    require_detail_city: bool = False,
 ) -> dict[str, Any] | None:
     for root in _structured_data_roots(payload):
         detail_id = _first_text(root, ("id", "poi_id", "poiid"), 160)
@@ -1192,8 +1225,12 @@ def _extract_endpoint_detail(
         location = _safe_coordinate(root.get("location"))
         if not location:
             continue
-        city = _first_text(root, ("city", "cityname", "province"), 40)
-        if city and not _city_matches(expected_city, city):
+        city = _first_text(root, ("city", "cityname"), 40)
+        if require_detail_city and not city:
+            continue
+        if expected_city and city and not _city_matches(expected_city, city):
+            continue
+        if not expected_city and not city:
             continue
         return {
             "label": _redact_product_text(label)[:120],
@@ -1207,18 +1244,24 @@ def _normalize_endpoint_match_text(value: str) -> str:
     return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", value.casefold())
 
 
+def _normalize_city_match_text(value: str) -> str:
+    normalized = _normalize_endpoint_match_text(value)
+    for suffix in ("自治州", "地区", "市", "盟"):
+        if normalized.endswith(suffix):
+            return normalized[: -len(suffix)]
+    return normalized
+
+
+def _endpoint_label_mentions_city(normalized_label: str, city: str) -> bool:
+    normalized_city = _normalize_city_match_text(city)
+    return len(normalized_city) >= 2 and normalized_city in normalized_label
+
+
 def _city_matches(requested: str, candidate: Any) -> bool:
     if not isinstance(candidate, str):
         return False
-
-    def normalize(value: str) -> str:
-        normalized = re.sub(r"\s+", "", value).casefold()
-        for suffix in ("自治州", "地区", "市", "盟"):
-            if normalized.endswith(suffix):
-                return normalized[: -len(suffix)]
-        return normalized
-
-    return bool(normalize(requested)) and normalize(requested) == normalize(candidate)
+    normalized_requested = _normalize_city_match_text(requested)
+    return bool(normalized_requested) and normalized_requested == _normalize_city_match_text(candidate)
 
 
 def _extract_places(payload: Any, *, limit: int) -> list[dict[str, Any]]:
@@ -1244,6 +1287,7 @@ def _extract_places(payload: Any, *, limit: int) -> list[dict[str, Any]]:
             "poi_id": ("id", "poi_id", "poiid"),
             "address": ("address", "formatted_address"),
             "district": ("district", "adname"),
+            "city": ("city", "cityname"),
             "type": ("type", "typecode"),
         }
         for target, aliases in field_map.items():
