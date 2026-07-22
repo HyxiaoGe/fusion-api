@@ -75,6 +75,61 @@ class TestStreamStateService(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entries[1][1]["content"], "Hello")
         self.assertEqual(entries[2][1]["content"], " World")
 
+    async def test_read_stream_partial_content_aggregates_only_server_text_channels(self):
+        from app.services.stream_state_service import (
+            append_chunk,
+            init_stream,
+            read_stream_partial_content,
+        )
+
+        await init_stream("conv-partial", "user-1", "gpt-4", "msg-1", "task-1")
+        await append_chunk(
+            "conv-partial",
+            "reasoning",
+            "先分析",
+            "thinking-1",
+            task_id="task-1",
+        )
+        await append_chunk(
+            "conv-partial",
+            "answering",
+            "第一段",
+            "answer-1",
+            task_id="task-1",
+        )
+        await append_chunk(
+            "conv-partial",
+            "agent_event",
+            "不应进入 partial",
+            "answer-evil",
+            task_id="task-1",
+        )
+        await append_chunk(
+            "conv-partial",
+            "answering",
+            "第二段",
+            "answer-1",
+            task_id="task-1",
+        )
+
+        blocks = await read_stream_partial_content("conv-partial")
+
+        self.assertEqual(
+            blocks,
+            [
+                {
+                    "type": "thinking",
+                    "id": "thinking-1",
+                    "thinking": "先分析",
+                },
+                {
+                    "type": "text",
+                    "id": "answer-1",
+                    "text": "第一段第二段",
+                },
+            ],
+        )
+
     async def test_finalize_stream_success_writes_done(self):
         from app.services.stream_state_service import finalize_stream, init_stream
 

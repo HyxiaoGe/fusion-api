@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.schemas.chat import ThinkingBlock
+from app.schemas.content_block_registry import is_registered_rich_content_block
 from app.services.search_read_planner import build_search_read_plan, format_search_read_plan_guidance
 from app.services.source_candidate_ranker import (
     SearchResultForRanking,
@@ -429,9 +430,7 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
             selected_tool_calls=executable_tool_calls,
             results=results,
         ),
-        product_result_count=sum(
-            _value(block, "type") in {"place_results", "route_results"} for block in built_content_blocks.values()
-        ),
+        product_result_count=sum(is_registered_rich_content_block(block) for block in built_content_blocks.values()),
     )
 
 
@@ -453,7 +452,7 @@ async def emit_product_result_blocks(
     for record in results:
         tool_call_id = str(record.tool_call.get("id", ""))
         content_block = built_content_blocks.get(tool_call_id)
-        if content_block is not None and _value(content_block, "type") in {"place_results", "route_results"}:
+        if is_registered_rich_content_block(content_block):
             try:
                 await emit(tool_call_id=tool_call_id, content_block=content_block)
             except StreamWriteTerminalError:

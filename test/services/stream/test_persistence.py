@@ -127,7 +127,7 @@ class PersistMessageMonotonicTests(unittest.TestCase):
         )
         db = MagicMock()
         _populated_query(db).filter_by.return_value.first.return_value = existing
-        longer = [TextBlock(type="text", id="answer-1", text="更长的 checkpoint 回答")]
+        longer = [TextBlock(type="text", id="answer-1", text="短而更长的 checkpoint 回答")]
 
         persist_message(db, "msg-1", "conv-1", "gpt-4", longer, partial=True)
 
@@ -151,7 +151,7 @@ class PersistMessageMonotonicTests(unittest.TestCase):
         self.assertEqual(existing.content, [search_block, incoming.model_dump()])
         db.commit.assert_called_once()
 
-    def test_non_prefix_text_checkpoint_prefers_current_visible_incoming_text(self):
+    def test_non_prefix_text_checkpoint_keeps_existing_server_branch(self):
         existing = SimpleNamespace(
             content=[{"type": "text", "id": "answer-1", "text": "后台分支内容"}],
             usage=None,
@@ -162,7 +162,7 @@ class PersistMessageMonotonicTests(unittest.TestCase):
 
         persist_message(db, "msg-1", "conv-1", "gpt-4", [incoming], partial=True)
 
-        self.assertEqual(existing.content, [incoming.model_dump()])
+        self.assertEqual(existing.content, [{"type": "text", "id": "answer-1", "text": "后台分支内容"}])
         db.commit.assert_called_once()
 
     def test_thinking_checkpoint_uses_same_prefix_merge_rule(self):

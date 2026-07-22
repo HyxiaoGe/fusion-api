@@ -371,6 +371,9 @@ class AdminAuditService:
             **cls._count_fields(raw_block, ("schema_version",)),
             **cls._string_list_fields(raw_block, ("limitations",)),
         }
+        raw_attribution = raw_block.get("attribution")
+        if isinstance(raw_attribution, dict):
+            common["attribution"] = cls._string_fields(raw_attribution, ("label",))
         try:
             if block_type == "place_results":
                 safe_places = []
@@ -403,6 +406,11 @@ class AdminAuditService:
                         if isinstance(raw_photo, dict):
                             photos.append(cls._string_fields(raw_photo, ("url", "title")))
                     safe_place["photos"] = photos
+                    actions = []
+                    for raw_action in raw_place.get("actions", [])[:2]:
+                        if isinstance(raw_action, dict):
+                            actions.append(cls._string_fields(raw_action, ("kind", "label", "url")))
+                    safe_place["actions"] = actions
                     safe_places.append(safe_place)
                 model = PlaceResultsBlock.model_validate(
                     {

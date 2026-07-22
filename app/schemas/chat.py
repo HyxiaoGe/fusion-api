@@ -125,8 +125,20 @@ class UrlBlock(BaseModel):
     reason: Optional[str] = None
 
 
+class UnsupportedContentBlock(BaseModel):
+    """无法由当前版本解释的安全占位块，不携带原始 payload 或工具信息。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["unsupported_result"]
+    id: str = Field(min_length=1, max_length=160)
+    source_type: str = Field(min_length=1, max_length=80)
+    source_schema_version: Optional[int] = None
+    reason: Literal["unsupported_type", "unsupported_version", "invalid_payload"]
+
+
 class PlacePhoto(BaseModel):
-    """地点图片；只接受高德官方 HTTPS 域名，避免把上游任意 URL 带给前端。"""
+    """地点图片的通用展示字段；供应商域名白名单由专用投影器负责。"""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -137,16 +149,46 @@ class PlacePhoto(BaseModel):
     @classmethod
     def validate_official_photo_url(cls, value: str) -> str:
         parsed = urlsplit(value)
-        hostname = (parsed.hostname or "").lower()
         if (
             parsed.scheme != "https"
+            or not parsed.hostname
             or parsed.username is not None
             or parsed.password is not None
             or parsed.port not in {None, 443}
             or parsed.fragment
-            or not _is_amap_official_hostname(hostname)
         ):
-            raise ValueError("地点图片必须使用高德官方 HTTPS 地址")
+            raise ValueError("地点图片必须使用无凭据的标准 HTTPS 地址")
+        return value
+
+
+class StructuredResultAttribution(BaseModel):
+    """富结果的用户可见来源归因；不暴露内部 provider alias。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: str = Field(min_length=1, max_length=80)
+
+
+class StructuredResultAction(BaseModel):
+    """由专用结果投影器生成的外部操作。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["open_external"]
+    label: str = Field(min_length=1, max_length=40)
+    url: str = Field(max_length=2048)
+
+    @field_validator("url")
+    @classmethod
+    def validate_external_url(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise ValueError("富结果外部操作必须使用无凭据的 HTTPS 地址")
         return value
 
 
@@ -164,6 +206,7 @@ class PlaceResult(BaseModel):
     photos: List[PlacePhoto] = Field(default_factory=list, max_length=1)
     rating: Optional[float] = Field(default=None, ge=0, le=5)
     reference_cost_yuan: Optional[float] = Field(default=None, ge=0, le=1_000_000)
+    actions: List[StructuredResultAction] = Field(default_factory=list, max_length=2)
     platform_url: Optional[str] = Field(default=None, max_length=2048)
     business_area: Optional[str] = Field(default=None, max_length=120)
     open_hours: Optional[str] = Field(default=None, max_length=240)
@@ -203,6 +246,7 @@ class PlaceResultsBlock(BaseModel):
     id: str = Field(default_factory=lambda: f"blk_{uuid4().hex[:12]}", max_length=160)
     schema_version: Literal[1]
     provider: str = Field(min_length=1, max_length=40)
+    attribution: Optional[StructuredResultAttribution] = None
     query: str = Field(min_length=1, max_length=80)
     near: Optional[str] = Field(default=None, max_length=120)
     status: Literal["success", "degraded"]
@@ -289,6 +333,7 @@ class RouteResultsBlock(BaseModel):
     id: str = Field(default_factory=lambda: f"blk_{uuid4().hex[:12]}", max_length=160)
     schema_version: Literal[1]
     provider: str = Field(min_length=1, max_length=40)
+    attribution: Optional[StructuredResultAttribution] = None
     status: Literal["success", "degraded"]
     origin: RouteEndpoint
     destination: RouteEndpoint
@@ -308,10 +353,6 @@ class RouteResultsBlock(BaseModel):
         return value
 
 
-def _is_amap_official_hostname(hostname: str) -> bool:
-    return hostname in {"amap.com", "autonavi.com"} or hostname.endswith((".amap.com", ".autonavi.com"))
-
-
 ProductResultBlock = Union[PlaceResultsBlock, RouteResultsBlock]
 
 
@@ -322,9 +363,13 @@ ContentBlock = Union[
     FileBlock,
     SearchBlock,
     UrlBlock,
+    UnsupportedContentBlock,
     PlaceResultsBlock,
     RouteResultsBlock,
 ]
+
+# stop 接口只接受客户端实际流式渲染的文本类 block；工具与富结果由服务端持久化。
+ClientPartialContentBlock = Union[TextBlock, ThinkingBlock]
 
 
 # ============================================================
@@ -513,7 +558,7 @@ class AgentContextResultRequest(BaseModel):
 class StopStreamRequest(BaseModel):
     """停止流前由客户端提交的当前可见助手内容；空数组兼容旧客户端。"""
 
-    partial_content: List[ContentBlock] = Field(default_factory=list)
+    partial_content: List[ClientPartialContentBlock] = Field(default_factory=list)
 
 
 class ChatResponse(BaseModel):

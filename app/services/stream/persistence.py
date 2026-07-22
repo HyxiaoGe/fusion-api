@@ -15,7 +15,7 @@ from sqlalchemy import text
 from app.ai.tools import build_url_read_tool
 from app.core.config import settings
 from app.core.logger import app_logger as logger
-from app.schemas.chat import UrlBlock, Usage
+from app.schemas.chat import ClientPartialContentBlock, UrlBlock, Usage
 from app.services.security.url_policy import evaluate_url_policy
 from app.services.source_context import UntrustedSourceContext, format_untrusted_source_context
 from app.utils.time import utc_now
@@ -43,8 +43,10 @@ def _serialize_content_block(block) -> dict:
 def _merge_same_id_block(existing: dict, incoming: dict) -> dict:
     """合并同 ID block；流式文本按前缀关系保留更完整的一侧。"""
     block_type = incoming.get("type")
-    if existing.get("type") != block_type or block_type not in {"text", "thinking"}:
-        return incoming
+    if existing.get("type") != block_type:
+        return existing
+    if block_type not in {"text", "thinking"}:
+        return existing
 
     content_field = "text" if block_type == "text" else "thinking"
     existing_text = existing.get(content_field)
@@ -55,8 +57,51 @@ def _merge_same_id_block(existing: dict, incoming: dict) -> dict:
         return incoming
     if existing_text.startswith(incoming_text):
         return existing
-    # 分叉时以客户端当前可见流为准，避免后台旧分支覆盖用户所见。
-    return incoming
+    # 同 ID 出现分叉时保留已持久化的服务端分支，禁止 partial 覆盖。
+    return existing
+
+
+def filter_authoritative_partial_content(
+    authoritative_content: list,
+    requested_content: list[ClientPartialContentBlock],
+) -> list[ClientPartialContentBlock]:
+    """仅保留与服务端流同 type/id 且内容是服务端前缀的客户端 partial。"""
+    authority: dict[tuple[str, str], str] = {}
+    for raw_block in authoritative_content:
+        block = _serialize_content_block(raw_block)
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        content_field = "text" if block_type == "text" else "thinking" if block_type == "thinking" else None
+        block_id = block.get("id")
+        content = block.get(content_field) if content_field else None
+        if content_field and isinstance(block_id, str) and isinstance(content, str):
+            authority[(block_type, block_id)] = content
+
+    selected: dict[tuple[str, str], ClientPartialContentBlock] = {}
+    selected_lengths: dict[tuple[str, str], int] = {}
+    order: list[tuple[str, str]] = []
+    for raw_block in requested_content:
+        block = _serialize_content_block(raw_block)
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        content_field = "text" if block_type == "text" else "thinking" if block_type == "thinking" else None
+        block_id = block.get("id")
+        content = block.get(content_field) if content_field else None
+        if not content_field or not isinstance(block_id, str) or not isinstance(content, str) or not content:
+            continue
+        key = (block_type, block_id)
+        server_content = authority.get(key)
+        if server_content is None or not server_content.startswith(content):
+            continue
+        if key not in selected:
+            order.append(key)
+        if key not in selected or len(content) > selected_lengths[key]:
+            selected[key] = raw_block
+            selected_lengths[key] = len(content)
+
+    return [selected[key] for key in order]
 
 
 def merge_partial_content_blocks(existing_content: list, incoming_content: list) -> list[dict]:
@@ -68,6 +113,8 @@ def merge_partial_content_blocks(existing_content: list, incoming_content: list)
 
     for raw_block in incoming_content:
         incoming = _serialize_content_block(raw_block)
+        if not isinstance(incoming, dict) or incoming.get("type") not in {"text", "thinking"}:
+            continue
         block_id = incoming.get("id") if isinstance(incoming, dict) else None
         if not block_id or block_id not in positions:
             positions[block_id] = len(merged)

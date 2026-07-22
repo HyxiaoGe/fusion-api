@@ -15,6 +15,8 @@ from app.schemas.chat import (
     RouteEndpoint,
     RouteOption,
     RouteResultsBlock,
+    StructuredResultAction,
+    StructuredResultAttribution,
     TransitAlternative,
     TransitLeg,
 )
@@ -72,6 +74,7 @@ def place_block(*, block_id: str = "blk-place", result_count: int = 1) -> PlaceR
         id=block_id,
         schema_version=1,
         provider="amap",
+        attribution=StructuredResultAttribution(label="高德地图"),
         query="烤肉",
         near="民治地铁站",
         status="success",
@@ -88,6 +91,7 @@ def route_block(*, block_id: str = "blk-route") -> RouteResultsBlock:
         id=block_id,
         schema_version=1,
         provider="amap",
+        attribution=StructuredResultAttribution(label="高德地图"),
         status="degraded",
         origin=RouteEndpoint(label="民治地铁站", city="深圳市"),
         destination=RouteEndpoint(label="深圳市民中心", city="深圳市"),
@@ -146,6 +150,32 @@ class ProductResultSchemaTests(unittest.TestCase):
         self.assertEqual(route.model_dump(mode="json")["routes"][0]["mode"], "driving")
         self.assertNotIn("location", route.model_dump(mode="json")["origin"])
 
+        neutral_place = PlaceResultsBlock(
+            type="place_results",
+            id="neutral-place",
+            schema_version=1,
+            provider="future-map-provider",
+            attribution=StructuredResultAttribution(label="城市地图服务"),
+            query="咖啡",
+            status="success",
+            result_count=1,
+            places=[
+                PlaceResult(
+                    name="未来咖啡店",
+                    actions=[
+                        StructuredResultAction(
+                            kind="open_external",
+                            label="打开地图",
+                            url="https://maps.example.com/place/1",
+                        )
+                    ],
+                )
+            ],
+        )
+        serialized = neutral_place.model_dump(mode="json")
+        self.assertEqual(serialized["attribution"], {"label": "城市地图服务"})
+        self.assertEqual(serialized["places"][0]["actions"][0]["label"], "打开地图")
+
     def test_blocks_reject_unknown_fields_oversized_payloads_and_untrusted_urls(self):
         with self.assertRaises(ValidationError):
             PlaceResultsBlock.model_validate(
@@ -185,6 +215,14 @@ class ProductResultSchemaTests(unittest.TestCase):
             )
         with self.assertRaises(ValidationError):
             PlacePhoto(url="http://store.is.autonavi.com/photo.jpg")
+        generic_photo = PlacePhoto(url="https://images.example.com/place.jpg")
+        self.assertEqual(generic_photo.url, "https://images.example.com/place.jpg")
+        with self.assertRaises(ValidationError):
+            StructuredResultAction(
+                kind="open_external",
+                label="不安全链接",
+                url="http://maps.example.com/place/1",
+            )
         with self.assertRaises(ValidationError):
             PlaceResult.model_validate(
                 {
@@ -203,6 +241,30 @@ class ProductResultSchemaTests(unittest.TestCase):
 
 
 class AmapProductContentBlockTests(unittest.TestCase):
+    def test_place_projector_rejects_non_amap_photo_even_when_generic_schema_accepts_https(self):
+        handler = build_handler("local_place_search")
+        result = ToolResult(
+            status="success",
+            data={
+                "result": {
+                    "query": "咖啡",
+                    "places": [
+                        {
+                            "poi_id": "B0FFEvilPhoto",
+                            "name": "测试咖啡店",
+                            "photos": [{"url": "https://tracking.example.com/private.jpg"}],
+                        }
+                    ],
+                }
+            },
+        )
+
+        block = handler.build_content_block(result, "blk-place", "log-place")
+
+        self.assertIsInstance(block, PlaceResultsBlock)
+        self.assertEqual(block.places[0].photos, [])
+        self.assertNotIn("tracking.example.com", json.dumps(block.model_dump(mode="json")))
+
     def test_place_success_builds_bounded_redacted_block_and_ignores_upstream_url(self):
         handler = build_handler("local_place_search")
         result = ToolResult(
@@ -250,6 +312,12 @@ class AmapProductContentBlockTests(unittest.TestCase):
             "https://uri.amap.com/marker?poiid=B0FFTEST&src=fusion&callnative=0",
         )
         self.assertEqual(block.places[0].reference_cost_yuan, 98)
+        self.assertEqual(block.attribution.label, "高德地图")
+        self.assertEqual(block.places[0].actions[0].label, "查看详情")
+        self.assertEqual(
+            block.places[0].actions[0].url,
+            "https://uri.amap.com/marker?poiid=B0FFTEST&src=fusion&callnative=0",
+        )
         self.assertEqual(block.places[0].business_area, "民治")
         serialized = json.dumps(block.model_dump(mode="json"), ensure_ascii=False)
         self.assertNotIn("NAME_SENTINEL", serialized)
@@ -296,6 +364,7 @@ class AmapProductContentBlockTests(unittest.TestCase):
         self.assertEqual(block.status, "degraded")
         self.assertEqual(block.origin.label, "民治地铁站")
         self.assertEqual(block.routes[0].duration_s, 1_500)
+        self.assertEqual(block.attribution.label, "高德地图")
         self.assertNotIn("location", block.model_dump(mode="json")["origin"])
         self.assertEqual(handler._build_result_summary(degraded)["mode_count"], 1)
         self.assertIsNone(
@@ -325,14 +394,13 @@ class ProductResultRecoveryTests(unittest.TestCase):
         self.assertIsInstance(message.content[1], RouteResultsBlock)
         self.assertEqual(continuation, message.content)
 
-    def test_partial_merge_upserts_same_product_block_and_keeps_other_blocks(self):
+    def test_client_partial_merge_cannot_upsert_product_blocks(self):
         existing = [place_block(result_count=0).model_dump(mode="json"), route_block().model_dump(mode="json")]
         incoming_place = place_block().model_dump(mode="json")
 
         merged = merge_partial_content_blocks(existing, [incoming_place])
 
-        self.assertEqual([block["type"] for block in merged], ["place_results", "route_results"])
-        self.assertEqual(merged[0], incoming_place)
+        self.assertEqual(merged, existing)
 
     def test_admin_projection_keeps_only_product_contract_fields(self):
         raw = place_block().model_dump(mode="json")

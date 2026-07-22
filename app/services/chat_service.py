@@ -16,7 +16,7 @@ from app.core.logger import app_logger as logger
 from app.db.repositories import ConversationRepository, FileRepository
 from app.schemas.chat import (
     ChatResponse,
-    ContentBlock,
+    ClientPartialContentBlock,
     Conversation,
     FileBlock,
     Message,
@@ -112,7 +112,7 @@ class ChatService:
         conversation_id: str,
         user_id: str,
         message_id: str,
-        partial_content: List[ContentBlock],
+        partial_content: List[ClientPartialContentBlock],
         stream_meta: Dict[str, str],
     ) -> bool:
         """在 stop 冻结流程中持久化客户端已确认展示的 partial blocks。"""
@@ -127,7 +127,9 @@ class ChatService:
 
         from app.db.models import Message as MessageModel
 
-        serialized_content = [block.model_dump() for block in partial_content]
+        serialized_content = merge_partial_content_blocks([], partial_content)
+        if not serialized_content:
+            return False
         try:
             acquire_message_persistence_lock(self.db, message_id)
             conversation = self.conversation_service.get_conversation(conversation_id, str(user_id))

@@ -13,6 +13,64 @@ from app.db.repositories import ConversationRepository, FileRepository
 
 
 class MessageRepositoryTests(unittest.TestCase):
+    def test_convert_message_isolates_unknown_future_and_corrupt_blocks(self):
+        db_message = MessageModel(
+            id="msg-mixed",
+            conversation_id="conv-1",
+            role="assistant",
+            content=[
+                {"type": "text", "id": "answer-1", "text": "有效回答"},
+                {"type": "future_widget", "id": "future-1", "payload": {}},
+                {
+                    "type": "place_results",
+                    "id": "future-place",
+                    "schema_version": 2,
+                    "provider": "future-provider",
+                },
+                {"type": "route_results", "id": "broken-route", "schema_version": 1},
+                {"type": "text", "id": "answer-2", "text": "仍能恢复"},
+            ],
+            created_at=datetime(2026, 7, 22, tzinfo=timezone.utc),
+        )
+
+        message = ConversationRepository(None)._convert_message_to_schema(db_message)
+
+        self.assertEqual(
+            [block.type for block in message.content],
+            ["text", "unsupported_result", "unsupported_result", "unsupported_result", "text"],
+        )
+        self.assertEqual(message.content[1].reason, "unsupported_type")
+        self.assertEqual(message.content[2].reason, "unsupported_version")
+        self.assertEqual(message.content[3].reason, "invalid_payload")
+
+    def test_convert_message_keeps_future_only_message_as_safe_fallback(self):
+        db_message = MessageModel(
+            id="msg-future-only",
+            conversation_id="conv-1",
+            role="assistant",
+            content=[
+                {
+                    "type": "place_results",
+                    "id": "future-place",
+                    "schema_version": 2,
+                    "provider": "PRIVATE_PROVIDER",
+                    "raw_payload": {"secret": "PRIVATE_SECRET"},
+                }
+            ],
+            created_at=datetime(2026, 7, 22, tzinfo=timezone.utc),
+        )
+
+        message = ConversationRepository(None)._convert_message_to_schema(db_message)
+
+        self.assertEqual(len(message.content), 1)
+        fallback = message.content[0]
+        self.assertEqual(fallback.type, "unsupported_result")
+        self.assertEqual(fallback.id, "future-place")
+        self.assertEqual(fallback.source_type, "place_results")
+        self.assertEqual(fallback.source_schema_version, 2)
+        self.assertEqual(fallback.reason, "unsupported_version")
+        self.assertNotIn("PRIVATE", str(fallback.model_dump(mode="json")))
+
     def test_convert_message_sanitizes_legacy_thinking_tool_names(self):
         db_message = MessageModel(
             id="msg-thinking",

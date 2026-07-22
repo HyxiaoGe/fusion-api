@@ -21,17 +21,10 @@ from app.db.models import User as UserModel
 from app.schemas.chat import (
     AgentRunSummary,
     Conversation,
-    FileBlock,
     Message,
-    PlaceResultsBlock,
-    RouteResultsBlock,
-    SearchBlock,
-    SearchSourceSummary,
-    TextBlock,
-    ThinkingBlock,
-    UrlBlock,
     Usage,
 )
+from app.schemas.content_block_registry import deserialize_content_blocks
 from app.utils.time import utc_now
 
 logger = logging.getLogger(__name__)
@@ -379,49 +372,7 @@ class ConversationRepository:
         agent_run: AgentRunSummary | None = None,
     ) -> Message:
         """将消息数据库模型转换为业务模型（JSONB → content blocks）"""
-        content_blocks = []
-        for block_data in db_message.content or []:
-            block_type = block_data.get("type")
-            if block_type == "text":
-                content_blocks.append(TextBlock(**block_data))
-            elif block_type == "thinking":
-                content_blocks.append(ThinkingBlock(**block_data))
-            elif block_type == "file":
-                content_blocks.append(FileBlock(**block_data))
-            elif block_type == "search":
-                content_blocks.append(
-                    SearchBlock(
-                        type="search",
-                        id=block_data.get("id", f"blk_{__import__('uuid').uuid4().hex[:12]}"),
-                        query=block_data.get("query", ""),
-                        tool_call_log_id=block_data.get("tool_call_log_id", ""),
-                        sources=[SearchSourceSummary(**s) for s in block_data.get("sources", [])],
-                        status=block_data.get("status", "success"),
-                        error_message=block_data.get("error_message"),
-                        source_count=block_data.get("source_count", 0),
-                        source_refs=block_data.get("source_refs", []),
-                        requested_provider=block_data.get("requested_provider"),
-                        result_provider=block_data.get("result_provider"),
-                        fallback_used=bool(block_data.get("fallback_used", False)),
-                        provider_chain=block_data.get("provider_chain", []),
-                        requested_count=block_data.get("requested_count"),
-                        actual_count=block_data.get("actual_count"),
-                        context_source_count=block_data.get("context_source_count"),
-                        context_source_limit=block_data.get("context_source_limit"),
-                        search_budget=block_data.get("search_budget"),
-                        intent=block_data.get("intent"),
-                        domains=block_data.get("domains", []),
-                        recency_days=block_data.get("recency_days"),
-                        budget_limited=bool(block_data.get("budget_limited", False)),
-                    )
-                )
-            elif block_type == "url_read":
-                content_blocks.append(UrlBlock(**block_data))
-            elif block_type == "place_results":
-                content_blocks.append(PlaceResultsBlock(**block_data))
-            elif block_type == "route_results":
-                content_blocks.append(RouteResultsBlock(**block_data))
-            # 未知类型跳过，保持前向兼容
+        content_blocks = deserialize_content_blocks(db_message.content)
 
         return Message(
             id=db_message.id,

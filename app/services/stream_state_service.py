@@ -363,6 +363,39 @@ async def get_stream_meta(conversation_id: str) -> Optional[dict]:
         return None
 
 
+async def read_stream_partial_content(conversation_id: str) -> list[dict[str, str]]:
+    """从已冻结的 Redis Stream 重建服务端实际发出的 text/thinking blocks。"""
+    redis = get_redis_pool()
+    if not redis:
+        return []
+    try:
+        entries = await redis.xrange(stream_chunks_key(conversation_id))
+    except Exception as error:
+        logger.warning("读取 stop 权威 partial 失败: conv_id=%s, error=%s", conversation_id, error)
+        return []
+
+    blocks: dict[tuple[str, str], dict[str, str]] = {}
+    order: list[tuple[str, str]] = []
+    for _, fields in entries:
+        chunk_type = fields.get("type")
+        if chunk_type == "answering":
+            block_type, content_field = "text", "text"
+        elif chunk_type == "reasoning":
+            block_type, content_field = "thinking", "thinking"
+        else:
+            continue
+        block_id = fields.get("block_id")
+        content = fields.get("content")
+        if not block_id or not isinstance(content, str):
+            continue
+        key = (block_type, block_id)
+        if key not in blocks:
+            blocks[key] = {"type": block_type, "id": block_id, content_field: ""}
+            order.append(key)
+        blocks[key][content_field] += content
+    return [blocks[key] for key in order]
+
+
 # ──────────────────────────────────────────────
 # 读端（SSE 端点调用）
 # ──────────────────────────────────────────────

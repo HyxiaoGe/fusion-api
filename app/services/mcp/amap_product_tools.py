@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from html import escape
 from typing import Any, Protocol
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from pydantic import ValidationError
 
@@ -22,6 +22,8 @@ from app.schemas.chat import (
     RouteEndpoint,
     RouteOption,
     RouteResultsBlock,
+    StructuredResultAction,
+    StructuredResultAttribution,
     TransitAlternative,
     TransitLeg,
 )
@@ -815,6 +817,7 @@ class AmapProductToolHandler(BaseToolHandler):
                     id=block_id,
                     schema_version=1,
                     provider=self.binding.provider,
+                    attribution=StructuredResultAttribution(label="高德地图"),
                     query=_safe_block_text(product_result.get("query"), 80) or "地点搜索",
                     near=_safe_block_text(product_result.get("near"), 120),
                     status=result.status,
@@ -848,6 +851,7 @@ class AmapProductToolHandler(BaseToolHandler):
                 id=block_id,
                 schema_version=1,
                 provider=self.binding.provider,
+                attribution=StructuredResultAttribution(label="高德地图"),
                 status=result.status,
                 origin=origin,
                 destination=destination,
@@ -1308,7 +1312,7 @@ def _build_place_result(raw: dict[str, Any]) -> PlaceResult | None:
             if not isinstance(item, dict):
                 continue
             url = item.get("url")
-            if not isinstance(url, str):
+            if not isinstance(url, str) or not _is_official_amap_media_url(url):
                 continue
             try:
                 photos.append(
@@ -1334,12 +1338,31 @@ def _build_place_result(raw: dict[str, Any]) -> PlaceResult | None:
         "photos": photos,
         "rating": _safe_rating(raw.get("rating")),
         "reference_cost_yuan": _safe_number(raw.get("reference_cost_yuan")),
+        "actions": (
+            [StructuredResultAction(kind="open_external", label="查看详情", url=platform_url)] if platform_url else []
+        ),
         "platform_url": platform_url,
         "business_area": _safe_block_text(raw.get("business_area"), 120),
         "open_hours": _safe_block_text(raw.get("open_hours"), 240),
         "detail_status": raw.get("detail_status", "not_requested"),
     }
     return PlaceResult(**data)
+
+
+def _is_official_amap_media_url(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+        hostname = (parsed.hostname or "").lower()
+        return (
+            parsed.scheme == "https"
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.port in {None, 443}
+            and not parsed.fragment
+            and (hostname in {"amap.com", "autonavi.com"} or hostname.endswith((".amap.com", ".autonavi.com")))
+        )
+    except ValueError:
+        return False
 
 
 def _build_route_endpoint(raw: Any) -> RouteEndpoint | None:

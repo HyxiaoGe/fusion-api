@@ -1,5 +1,8 @@
 import unittest
+from typing import Literal
 from unittest.mock import AsyncMock, Mock
+
+from pydantic import BaseModel
 
 from app.schemas.chat import (
     PlaceResult,
@@ -10,6 +13,7 @@ from app.schemas.chat import (
     SourceReference,
     TextBlock,
 )
+from app.schemas.content_block_registry import CONTENT_BLOCK_REGISTRY, ContentBlockRegistration
 from app.services.source_evidence_ledger import stable_web_evidence_id
 from app.services.stream import tool_round as tool_round_module
 from app.services.stream.step_lifecycle import AgentStepContext
@@ -22,6 +26,12 @@ from app.services.stream.tool_round import (
 )
 from app.services.stream_state_service import StreamWriteTerminalError
 from app.services.tool_handlers.base import ToolResult
+
+
+class FutureRegisteredResultBlock(BaseModel):
+    type: Literal["future_results"]
+    id: str
+    schema_version: Literal[1]
 
 
 class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
@@ -245,6 +255,33 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.tool_names, ["local_place_search"])
         self.assertEqual(outcome.product_result_count, 1)
         handler.build_content_block.assert_called_once()
+
+    async def test_registered_future_rich_block_is_emitted_and_counted_without_type_hardcoding(self):
+        registry_key = ("future_results", 1)
+        CONTENT_BLOCK_REGISTRY[registry_key] = ContentBlockRegistration(
+            FutureRegisteredResultBlock,
+            schema_version=1,
+        )
+        try:
+            request, order, persisted, _, handler = self._build_product_round_request()
+            future_block = FutureRegisteredResultBlock(
+                type="future_results",
+                id="blk-future",
+                schema_version=1,
+            )
+            handler.build_content_block.return_value = future_block
+
+            outcome = await handle_tool_calls_round(request=request)
+        finally:
+            CONTENT_BLOCK_REGISTRY.pop(registry_key, None)
+
+        self.assertEqual(outcome.product_result_count, 1)
+        self.assertIs(persisted[-1][-1], future_block)
+        self.assertIs(order[3][2], future_block)
+        request.emitter.content_block_upserted.assert_awaited_once_with(
+            tool_call_id="tc-place",
+            content_block=future_block,
+        )
 
     async def test_terminal_product_event_failure_happens_after_partial_checkpoint(self):
         request, order, persisted, block, handler = self._build_product_round_request(

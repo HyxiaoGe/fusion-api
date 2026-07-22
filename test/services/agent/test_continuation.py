@@ -53,6 +53,47 @@ class FakeDb:
 
 
 class AgentContinuationTests(unittest.TestCase):
+    def test_deserialize_content_blocks_isolates_invalid_blocks(self):
+        blocks = deserialize_content_blocks(
+            [
+                {"type": "text", "id": "answer-1", "text": "有效回答"},
+                {"type": "future_widget", "id": "future-1"},
+                {"type": "place_results", "id": "future-place", "schema_version": 2},
+                {"type": "text", "id": "answer-2", "text": "继续回答"},
+            ]
+        )
+
+        self.assertEqual(
+            [block.type for block in blocks],
+            ["text", "unsupported_result", "unsupported_result", "text"],
+        )
+        self.assertEqual(blocks[1].reason, "unsupported_type")
+        self.assertEqual(blocks[2].reason, "unsupported_version")
+
+    def test_build_continuation_context_keeps_future_only_content_as_fallback(self):
+        message = SimpleNamespace(
+            id="msg-1",
+            conversation_id="conv-1",
+            role="assistant",
+            content=[{"type": "route_results", "id": "route-future", "schema_version": 2}],
+        )
+        previous_session = SimpleNamespace(id="run-old", status="limit_reached", run_config={})
+        db = FakeDb(message=message, sessions=[previous_session])
+
+        context = build_continuation_context(
+            db,
+            conversation_id="conv-1",
+            message_id="msg-1",
+            previous_run_id="run-old",
+            default_limits=AgentLoopLimits(max_steps=8, max_tool_calls=20, total_timeout_s=300),
+        )
+
+        self.assertEqual(len(context.initial_content_blocks), 1)
+        fallback = context.initial_content_blocks[0]
+        self.assertEqual(fallback.type, "unsupported_result")
+        self.assertEqual(fallback.id, "route-future")
+        self.assertEqual(fallback.reason, "unsupported_version")
+
     def test_deserialize_content_blocks_preserves_existing_block_id(self):
         blocks = deserialize_content_blocks([{"type": "text", "id": "blk_old", "text": "旧回答"}])
 

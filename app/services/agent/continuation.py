@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
-from pydantic import TypeAdapter
 from sqlalchemy.orm import Session
 
 from app.ai.prompts.agent_loop import (
@@ -15,10 +13,10 @@ from app.ai.prompts.agent_loop import get_continuation_system_prompt
 from app.db.models import AgentSession
 from app.db.models import Message as MessageModel
 from app.schemas.chat import ContentBlock
+from app.schemas.content_block_registry import deserialize_content_blocks
 from app.schemas.response import ApiException
 from app.services.stream.agent_loop_policy import AgentLoopLimits
 
-_CONTENT_BLOCKS_ADAPTER = TypeAdapter(list[ContentBlock])
 CONTINUATION_SYSTEM_PROMPT = _CONTINUATION_SYSTEM_PROMPT
 
 
@@ -28,10 +26,6 @@ class AgentContinuationContext:
     previous_session: AgentSession
     limits: AgentLoopLimits
     initial_content_blocks: list[ContentBlock]
-
-
-def deserialize_content_blocks(raw_blocks: list[dict[str, Any]] | None) -> list[ContentBlock]:
-    return _CONTENT_BLOCKS_ADAPTER.validate_python(raw_blocks or [])
 
 
 def inject_continuation_prompt(messages: list[dict]) -> list[dict]:

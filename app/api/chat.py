@@ -20,7 +20,13 @@ from app.schemas.response import ApiException, ErrorCode, success
 from app.services.chat_service import ChatService
 from app.services.network_diagnostics_service import NetworkDiagnosticsService
 from app.services.stream import stream_redis_as_sse
-from app.services.stream_state_service import cancel_stream, claim_stream_stop, release_stream_stop_guard
+from app.services.stream.persistence import filter_authoritative_partial_content
+from app.services.stream_state_service import (
+    cancel_stream,
+    claim_stream_stop,
+    read_stream_partial_content,
+    release_stream_stop_guard,
+)
 from app.services.task_manager import cancel_task
 
 router = APIRouter()
@@ -385,13 +391,19 @@ async def stop_stream(
 
             cancel_task(conv_id, expected_task_id)
             if partial_content:
-                chat_service.persist_stream_partial_before_stop(
-                    conversation_id=conv_id,
-                    user_id=str(current_user.id),
-                    message_id=message_id,
-                    partial_content=partial_content,
-                    stream_meta=meta,
+                authoritative_content = await read_stream_partial_content(conv_id)
+                authorized_partial = filter_authoritative_partial_content(
+                    authoritative_content,
+                    partial_content,
                 )
+                if authorized_partial:
+                    chat_service.persist_stream_partial_before_stop(
+                        conversation_id=conv_id,
+                        user_id=str(current_user.id),
+                        message_id=message_id,
+                        partial_content=authorized_partial,
+                        stream_meta=meta,
+                    )
             return success(
                 data={"cancelled": True},
                 request_id=request.state.request_id,
