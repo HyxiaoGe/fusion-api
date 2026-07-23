@@ -24,6 +24,14 @@ from app.services.mcp.amap_product_tools import (
     build_amap_product_binding,
 )
 from app.services.mcp.client import McpClientError, McpClientManager
+from app.services.mcp.flyai_travel_tools import (
+    FLYAI_TRAVEL_DEFINITIONS,
+    FlyAiTravelAdapterClient,
+    FlyAiTravelRunControls,
+    FlyAiTravelToolHandler,
+    build_flyai_travel_binding,
+    build_flyai_user_scope,
+)
 from app.services.mcp.provider_profiles import is_official_amap_endpoint, tool_is_allowed_for_endpoint
 from app.services.mcp.runtime import get_mcp_client_manager
 from app.services.mcp.server_service import MCP_TOOL_UNAVAILABLE_MESSAGE, McpServerService
@@ -600,12 +608,14 @@ class McpAgentToolHandler(BaseToolHandler):
 def load_mcp_agent_tools(
     db: Any,
     *,
+    user_id: str | None = None,
     limits: McpAgentToolLimits | None = None,
     client_manager: McpClientManager | None = None,
     session_factory: Callable[[], Any] = SessionLocal,
     repository_factory: Callable[[Any], McpServerRepository] = McpServerRepository,
     concurrency_limiter: McpAgentToolConcurrencyLimiter = _DEFAULT_CONCURRENCY_LIMITER,
     circuit_breaker: McpAgentServerCircuitBreaker | None = None,
+    flyai_client: FlyAiTravelAdapterClient | None = None,
 ) -> McpAgentToolSet:
     """从持久化发现快照构建一次 Agent run 专属的 MCP 工具集合。"""
 
@@ -621,6 +631,28 @@ def load_mcp_agent_tools(
     definitions: list[dict[str, Any]] = []
     handlers: dict[str, BaseToolHandler] = {}
     audit_bindings: list[dict[str, Any]] = []
+    if (
+        settings.ENABLE_FLYAI_TRAVEL_TOOLS
+        and user_id
+        and settings.FLYAI_ADAPTER_BASE_URL
+        and settings.FLYAI_ADAPTER_TOKEN
+    ):
+        try:
+            resolved_flyai_client = flyai_client or FlyAiTravelAdapterClient(
+                base_url=settings.FLYAI_ADAPTER_BASE_URL,
+                token=settings.FLYAI_ADAPTER_TOKEN,
+                timeout_seconds=min(25.0, max(0.1, settings.FLYAI_TRAVEL_TOOL_TIMEOUT_SECONDS)),
+            )
+            _append_flyai_travel_tools(
+                definitions=definitions,
+                handlers=handlers,
+                audit_bindings=audit_bindings,
+                client=resolved_flyai_client,
+                user_scope=build_flyai_user_scope(user_id, settings.FLYAI_ADAPTER_TOKEN),
+                limits=resolved_limits,
+            )
+        except ValueError:
+            logger.warning("FlyAI 出行工具配置无效，本次 Agent run 不注册相关工具")
     official_amap_rows = [row for row in rows if is_official_amap_endpoint(str(row.endpoint_url))]
 
     for row in rows:
@@ -670,6 +702,42 @@ def load_mcp_agent_tools(
         handlers=handlers,
         audit_bindings=audit_bindings,
     )
+
+
+def _append_flyai_travel_tools(
+    *,
+    definitions: list[dict[str, Any]],
+    handlers: dict[str, BaseToolHandler],
+    audit_bindings: list[dict[str, Any]],
+    client: FlyAiTravelAdapterClient,
+    user_scope: str,
+    limits: McpAgentToolLimits,
+) -> None:
+    controls = FlyAiTravelRunControls(
+        max_calls=min(4, max(1, settings.FLYAI_TRAVEL_MAX_TOOL_CALLS_PER_RUN)),
+        # adapter 对同一 user_scope 只允许 1 个 CLI 进程；模型同轮并行调用时在 API 内排队，
+        # 避免第二个航班/高铁请求撞 429 并被错误展示为“未使用”。
+        concurrency=1,
+    )
+    for product_definition in FLYAI_TRAVEL_DEFINITIONS:
+        product_name = product_definition["function"]["name"]
+        if len(definitions) >= limits.max_tools:
+            return
+        definition = json.loads(json.dumps(product_definition, ensure_ascii=False))
+        if len(canonical_json_bytes([*definitions, definition])) > limits.max_definition_bytes:
+            continue
+        if product_name in handlers:
+            raise RuntimeError("MCP 工具别名冲突")
+        binding = build_flyai_travel_binding(product_name)
+        definitions.append(definition)
+        handlers[product_name] = FlyAiTravelToolHandler(
+            binding=binding,
+            client=client,
+            controls=controls,
+            user_scope=user_scope,
+            max_llm_context_bytes=limits.max_llm_context_bytes,
+        )
+        audit_bindings.append(binding.to_audit_dict())
 
 
 def _append_amap_product_tools(

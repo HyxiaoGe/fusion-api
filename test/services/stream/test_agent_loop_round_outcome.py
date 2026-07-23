@@ -149,6 +149,35 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(outcome)
         self.assertTrue(state.product_tool_attempted)
 
+    async def test_failed_travel_tool_attempt_is_recorded_for_next_round_guard(self):
+        state = AgentLoopState()
+        state.mark_current_step("step-travel-failed")
+
+        async def handle_tool_calls_round_fn(**kwargs):
+            kwargs["request"].on_tools_executed(1)
+            return ToolRoundOutcome(tool_call_count=1, tool_names=[], product_result_count=0)
+
+        outcome = await handle_agent_round_outcome(
+            request=AgentRoundOutcomeRequest(
+                db="db",
+                messages=[{"role": "user", "content": "查询航班"}],
+                state=state,
+                runtime=_runtime(handle_tool_calls_round_fn=handle_tool_calls_round_fn),
+                step_number=1,
+                step_context=_step_context("step-travel-failed"),
+                round_result=AgentRoundResult(
+                    reasoning_buf="",
+                    content_buf="",
+                    tool_calls=[{"id": "tc-flight", "name": "search_flights", "arguments": "{}"}],
+                    finish_reason="tool_calls",
+                    accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+                ),
+            )
+        )
+
+        self.assertIsNone(outcome)
+        self.assertTrue(state.product_tool_attempted)
+
     async def test_failed_product_tool_deferred_answer_uses_safe_failure_message(self):
         state = AgentLoopState(product_tool_attempted=True)
         state.mark_current_step("step-product-failure-answer")

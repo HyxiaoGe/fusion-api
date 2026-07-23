@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -118,7 +119,7 @@ class AgentLoopWiringDependencies:
     info_fn: LogFn
     error_fn: LogFn
     warning_fn: LogFn
-    load_dynamic_tools_fn: Callable[[Any], Any] | None = None
+    load_dynamic_tools_fn: Callable[..., Any] | None = None
 
     def to_execution_dependencies(self) -> AgentLoopDependencies:
         return AgentLoopDependencies(
@@ -182,7 +183,11 @@ def build_agent_loop_lifecycle_call(
         and options.get("disable_tools") is not True
         and dependencies.load_dynamic_tools_fn is not None
     )
-    dynamic_tool_set = dependencies.load_dynamic_tools_fn(db) if should_load_dynamic_tools else None
+    dynamic_tool_set = (
+        _load_dynamic_tools(dependencies.load_dynamic_tools_fn, db=db, user_id=run_input.user_id)
+        if should_load_dynamic_tools
+        else None
+    )
     call_config = dependencies.build_call_config_fn(
         provider=run_input.provider,
         options=options,
@@ -201,3 +206,15 @@ def build_agent_loop_lifecycle_call(
         execution=execution,
         dependencies=dependencies.to_lifecycle_dependencies(),
     )
+
+
+def _load_dynamic_tools(load_fn: Callable[..., Any], *, db: Any, user_id: str) -> Any:
+    """新加载器接收 user_id；旧测试替身和兼容扩展仍可保持单参数签名。"""
+
+    parameters = inspect.signature(load_fn).parameters.values()
+    supports_user_id = any(parameter.name == "user_id" for parameter in parameters) or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters
+    )
+    if supports_user_id:
+        return load_fn(db, user_id=user_id)
+    return load_fn(db)

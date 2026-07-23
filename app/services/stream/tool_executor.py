@@ -240,7 +240,7 @@ async def emit_budget_result(
         request.emitter,
         tool_call_id=tool_call["id"],
         tool_name=handler.tool_name,
-        arguments=args,
+        arguments=_sanitize_event_arguments(handler, args),
     )
     await emit_tool_call_result(
         request.emitter,
@@ -261,12 +261,19 @@ async def execute_tool_handler(*, request: ToolExecutionBatchRequest, tool_call:
     return await execute_tool_with_lifecycle(
         tool_call_id=tool_call["id"],
         tool_name=handler.tool_name,
-        args=args,
+        args=_sanitize_event_arguments(handler, args),
         target=handler,
-        execute=lambda target, arguments: executor(target, arguments, request.runtime_context),
+        execute=lambda target, _event_arguments: executor(target, args, request.runtime_context),
         result_summary_builder=handler._build_result_summary,
         emitter=request.emitter,
     )
+
+
+def _sanitize_event_arguments(handler, args: dict) -> dict:
+    """只调用真实 handler 类型显式实现的方法，避免无 spec 的 Mock 伪造属性。"""
+
+    sanitizer = getattr(type(handler), "sanitize_input_params_for_event", None)
+    return sanitizer(handler, args) if callable(sanitizer) else args
 
 
 async def log_tool_execution(

@@ -1,8 +1,16 @@
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from app.schemas.chat import ContextUsage, TextBlock, Usage
+from app.schemas.chat import (
+    ContextUsage,
+    FlightOption,
+    FlightResultsBlock,
+    TextBlock,
+    TravelEndpoint,
+    Usage,
+)
 from app.services.stream.persistence import persist_message
 
 
@@ -39,6 +47,51 @@ class MessagePersistenceAdvisoryLockTests(unittest.TestCase):
 
 
 class PersistMessageMonotonicTests(unittest.TestCase):
+    def test_rich_result_datetime_is_serialized_for_jsonb(self):
+        existing = SimpleNamespace(content=[], usage=None)
+        db = MagicMock()
+        _populated_query(db).filter_by.return_value.first.return_value = existing
+        departure = TravelEndpoint(
+            city="深圳",
+            station_name="宝安国际机场",
+            station_code="SZX",
+            terminal="T3",
+            scheduled_at=datetime(2026, 7, 25, 19, 50, tzinfo=timezone.utc),
+        )
+        arrival = TravelEndpoint(
+            city="北京",
+            station_name="大兴国际机场",
+            station_code="PKX",
+            scheduled_at=datetime(2026, 7, 25, 23, 0, tzinfo=timezone.utc),
+        )
+        block = FlightResultsBlock(
+            type="flight_results",
+            schema_version=1,
+            provider="flyai",
+            status="success",
+            origin="深圳",
+            destination="北京",
+            departure_date="2026-07-25",
+            observed_at=datetime(2026, 7, 22, 15, 0, tzinfo=timezone.utc),
+            result_count=1,
+            flights=[
+                FlightOption(
+                    option_id="opt_1",
+                    flight_no="MU6280",
+                    departure=departure,
+                    arrival=arrival,
+                    duration_s=11_400,
+                    stops=0,
+                )
+            ],
+        )
+
+        persist_message(db, "msg-1", "conv-1", "deepseek-chat", [block])
+
+        self.assertIsInstance(existing.content[0]["observed_at"], str)
+        self.assertIsInstance(existing.content[0]["flights"][0]["departure"]["scheduled_at"], str)
+        db.commit.assert_called_once()
+
     def test_new_assistant_persists_reserved_sequence_and_utc_aware_time(self):
         db = MagicMock()
         db.get_bind.return_value = SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))

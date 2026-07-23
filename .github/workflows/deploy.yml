@@ -15,6 +15,7 @@ concurrency:
 env:
   REGISTRY: crpi-77w10wlykpqilmmb.cn-shenzhen.personal.cr.aliyuncs.com
   IMAGE_NAME: crpi-77w10wlykpqilmmb.cn-shenzhen.personal.cr.aliyuncs.com/seanfield/fusion-api
+  FLYAI_ADAPTER_IMAGE_NAME: crpi-77w10wlykpqilmmb.cn-shenzhen.personal.cr.aliyuncs.com/seanfield/fusion-flyai-adapter
 
 jobs:
   build:
@@ -77,16 +78,23 @@ jobs:
           docker ps
 
       - name: Test and build Docker image
-        timeout-minutes: 10
+        timeout-minutes: 15
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           $ErrorActionPreference = "Stop"
           $image = "${env:IMAGE_NAME}:${env:GITHUB_SHA}"
+          $adapterImage = "${env:FLYAI_ADAPTER_IMAGE_NAME}:${env:GITHUB_SHA}"
 
           docker build --target production -t $image .
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           docker run --rm $image sh -lc "timeout 300s python -m pip install --default-timeout=30 --no-cache-dir -r requirements-ci.txt && python scripts/check_architecture.py && ruff check . && timeout 270s python -u -m unittest discover -s test -t . -v"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          docker build --target test -t "${adapterImage}-test" ./flyai-adapter
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          docker build --target production -t $adapterImage ./flyai-adapter
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Login to ACR
@@ -97,12 +105,16 @@ jobs:
           password: ${{ secrets.ACR_PASSWORD }}
 
       - name: Push Docker image
-        run: docker push "%IMAGE_NAME%:%GITHUB_SHA%"
+        run: |
+          docker push "%IMAGE_NAME%:%GITHUB_SHA%"
+          docker push "%FLYAI_ADAPTER_IMAGE_NAME%:%GITHUB_SHA%"
 
       - name: Cleanup local Docker artifacts
         if: always()
         run: |
           docker image rm "%IMAGE_NAME%:%GITHUB_SHA%" 2>NUL
+          docker image rm "%FLYAI_ADAPTER_IMAGE_NAME%:%GITHUB_SHA%" 2>NUL
+          docker image rm "%FLYAI_ADAPTER_IMAGE_NAME%:%GITHUB_SHA%-test" 2>NUL
           docker builder prune --filter "until=72h" -f
 
   deploy-dev:
@@ -172,6 +184,7 @@ jobs:
           DEPLOY_MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS: ${{ vars.MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS }}
           DEPLOY_DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           DEPLOY_AMAP_MCP_API_KEY: ${{ secrets.AMAP_MCP_API_KEY }}
+          DEPLOY_FLYAI_API_KEY: ${{ secrets.FLYAI_API_KEY }}
         run: |
           cd ~/project/fusion
           set -o pipefail
@@ -196,11 +209,24 @@ jobs:
           export MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS="${DEPLOY_MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS:-${MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS:-30}}"
           export DASHSCOPE_API_KEY="${DEPLOY_DASHSCOPE_API_KEY:-${DASHSCOPE_API_KEY:-}}"
           export AMAP_MCP_API_KEY="${DEPLOY_AMAP_MCP_API_KEY:-${AMAP_MCP_API_KEY:-}}"
+          export FLYAI_API_KEY="${DEPLOY_FLYAI_API_KEY:-}"
+          if [ -z "${FLYAI_API_KEY}" ]; then
+            echo "FlyAI 发布密钥未配置，拒绝以静默禁用方式部署"
+            exit 1
+          fi
+          export FLYAI_ADAPTER_TOKEN="$(python3 -c 'import hashlib,hmac,os; print(hmac.new(os.environ["FLYAI_API_KEY"].encode(), b"fusion-deploy-flyai-adapter-v1", hashlib.sha256).hexdigest(), end="")')"
           n=0
           until docker pull ${{ env.IMAGE_NAME }}:${{ github.sha }}; do
             n=$((n+1))
             if [ $n -ge 6 ]; then echo "docker pull 重试 $n 次仍失败"; exit 1; fi
             echo "docker pull 失败（网络抖动），第 $n 次，10s 后重试..."
+            sleep 10
+          done
+          n=0
+          until docker pull ${{ env.FLYAI_ADAPTER_IMAGE_NAME }}:${{ github.sha }}; do
+            n=$((n+1))
+            if [ $n -ge 6 ]; then echo "FlyAI adapter 镜像拉取重试 $n 次仍失败"; exit 1; fi
+            echo "FlyAI adapter 镜像拉取失败（网络抖动），第 $n 次，10s 后重试..."
             sleep 10
           done
           # dev 中 auth-service 只在 Docker 网络内暴露，未发布宿主机 8100。
@@ -216,6 +242,27 @@ jobs:
           fi
           cat > docker-compose.fusion-api-ghcr.yml <<'EOF'
           services:
+            flyai-adapter:
+              image: ${{ env.FLYAI_ADAPTER_IMAGE_NAME }}:${{ github.sha }}
+              container_name: fusion-flyai-adapter
+              restart: always
+              read_only: true
+              tmpfs:
+                - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+              cap_drop:
+                - ALL
+              security_opt:
+                - no-new-privileges:true
+              pids_limit: 64
+              mem_limit: 256m
+              cpus: 0.5
+              environment:
+                - FLYAI_API_KEY=${FLYAI_API_KEY}
+                - FLYAI_ADAPTER_TOKEN=${FLYAI_ADAPTER_TOKEN}
+                - PORT=8080
+              networks:
+                - fusion-flyai
+
             fusion-api:
               image: ${{ env.IMAGE_NAME }}:${{ github.sha }}
               container_name: fusion-api
@@ -283,6 +330,11 @@ jobs:
                 - MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS=${MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS}
                 - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:-}
                 - AMAP_MCP_API_KEY=${AMAP_MCP_API_KEY:-}
+                - ENABLE_FLYAI_TRAVEL_TOOLS=true
+                - FLYAI_ADAPTER_BASE_URL=http://flyai-adapter:8080
+                - FLYAI_ADAPTER_TOKEN=${FLYAI_ADAPTER_TOKEN}
+                - FLYAI_TRAVEL_TOOL_TIMEOUT_SECONDS=20
+                - FLYAI_TRAVEL_MAX_TOOL_CALLS_PER_RUN=4
                 - ENABLE_DOCS=false
               deploy:
                 resources:
@@ -293,6 +345,7 @@ jobs:
                 - postgres_default
                 - middleware_default
                 - fusion-prompthub
+                - fusion-flyai
 
           networks:
             postgres_default:
@@ -301,6 +354,9 @@ jobs:
               external: true
             fusion-prompthub:
               external: true
+            fusion-flyai:
+              name: fusion-flyai
+              driver: bridge
           EOF
           docker network inspect fusion-prompthub >/dev/null 2>&1 \
             || docker network create fusion-prompthub >/dev/null
@@ -321,6 +377,32 @@ jobs:
             docker logs --tail=120 fusion-api || true
             exit 1
           fi
+
+          adapter_healthy=0
+          for attempt in $(seq 1 30); do
+            if docker exec fusion-flyai-adapter node -e \
+              "fetch('http://127.0.0.1:8080/health',{signal:AbortSignal.timeout(2000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then
+              adapter_healthy=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$adapter_healthy" != "1" ]; then
+            docker logs --tail=120 fusion-flyai-adapter || true
+            exit 1
+          fi
+
+          docker exec -i fusion-api python - <<'PY'
+          from app.core.config import settings
+
+          if not settings.ENABLE_FLYAI_TRAVEL_TOOLS:
+              raise SystemExit("FlyAI travel tools are disabled")
+          if settings.FLYAI_ADAPTER_BASE_URL != "http://flyai-adapter:8080":
+              raise SystemExit("FlyAI adapter base URL mismatch")
+          if not settings.FLYAI_ADAPTER_TOKEN:
+              raise SystemExit("FlyAI adapter token is missing")
+          print("FlyAI adapter configuration ok")
+          PY
 
           docker inspect fusion-api --format '{{range .Mounts}}{{println .Destination}}{{end}}' | grep -qx '/app/storage/files'
           docker exec -i fusion-api python - <<'PY'
@@ -494,8 +576,13 @@ jobs:
         if: always()
         run: |
           current="${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          adapter_current="${{ env.FLYAI_ADAPTER_IMAGE_NAME }}:${{ github.sha }}"
           docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' ${{ env.IMAGE_NAME }} \
             | awk -v current="$current" '$1 != current {print $2}' \
+            | sort -u \
+            | xargs -r docker rmi || true
+          docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' ${{ env.FLYAI_ADAPTER_IMAGE_NAME }} \
+            | awk -v current="$adapter_current" '$1 != current {print $2}' \
             | sort -u \
             | xargs -r docker rmi || true
 

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from app.services.final_answer_evidence import build_used_final_answer_evidence
 from app.services.mcp.amap_product_tools import AMAP_PRODUCT_TOOL_NAMES
+from app.services.mcp.flyai_travel_tools import FLYAI_TRAVEL_TOOL_NAMES
 from app.services.stream.agent_loop_outcome import AgentLoopExit, AgentLoopOutcome
 from app.services.stream.agent_loop_runtime import AgentLoopRuntime
 from app.services.stream.agent_loop_state import AgentLoopState
@@ -137,7 +138,7 @@ async def _replace_deferred_product_answer(
             if not answer and request.state.product_tool_attempted:
                 answer = build_product_tool_failure_answer(request.messages)
             if not answer:
-                answer = "已展示地图服务返回的结构化结果，请以卡片信息为准。"
+                answer = "已展示本次查询的结构化结果，请以卡片信息为准。"
     answer = neutralize_product_provider_mentions(answer, request.state.content_blocks)
     if answer:
         await append_chunk(
@@ -217,7 +218,7 @@ async def _handle_tool_calls_round(request: AgentRoundOutcomeRequest) -> AgentLo
         request.state.record_no_progress_search_results(outcome.no_progress_search_results)
         request.state.record_product_tool_attempt(
             any(
-                str(tool_call.get("name", "")) in AMAP_PRODUCT_TOOL_NAMES
+                str(tool_call.get("name", "")) in AMAP_PRODUCT_TOOL_NAMES | FLYAI_TRAVEL_TOOL_NAMES
                 for tool_call in request.round_result.tool_calls
             )
         )

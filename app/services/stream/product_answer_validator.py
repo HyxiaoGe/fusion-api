@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from itertools import combinations
 from typing import Any
 
@@ -16,11 +17,19 @@ class ProductAnswerValidation:
     reason_code: str
 
 
-_PRODUCT_RESULT_TYPES = {"place_results", "route_results"}
+_PRODUCT_RESULT_TYPES = {"place_results", "route_results", "flight_results", "train_results"}
 _RISK_TERM_RE = re.compile(
     r"排队|空位|预约|停车|拥堵|堵车|路况|候车|票价|免费|实时|人均|"
     r"准点|稳定|靠谱|拥挤|安全|舒适|坡度|自行车道|共享单车|省钱|便宜|实惠|性价比|"
-    r"等待|灵活|掐点|翻倍|早高峰|晚高峰|高峰期|雨天|天气"
+    r"等待|灵活|掐点|翻倍|早高峰|晚高峰|高峰期|雨天|天气|"
+    r"余票|有票|售罄|延误|取消|退改签|退票|改签|行李|登机口|检票口|站台"
+)
+_TRAVEL_GROUNDED_PRICE_TERM_RE = re.compile(r"票价|省钱|便宜|实惠")
+_TRAVEL_UNSUPPORTED_CLAIM_RE = re.compile(
+    r"余票|有票|售罄|准点|延误|取消|退改签|退票|改签|行李|登机口|检票口|站台|"
+    r"(?:航班|班次)(?:也)?(?:更多|较多|很多|多)|接机(?:也)?方便|"
+    r"(?:机场|车站).{0,8}(?:交通|接驳|打车|接机).{0,6}(?:方便|便利)|"
+    r"离(?:市区|目的地).{0,8}(?:近|远)|省(?:下)?住宿费|节省住宿(?:费|成本)"
 )
 _COST_TERM_RE = re.compile(r"费用|成本|过路费")
 _LIMITATION_CUE_RE = re.compile(
@@ -120,17 +129,31 @@ _UNSCOPED_SUPERLATIVE_RE = re.compile(
     r"(?:评分|消费|价格|距离|用时).{0,6}(?:最高|最低|最短|最长|最近|最远|最便宜)|"
     r"(?:最高|最低|最短|最长|最近|最远|最便宜).{0,6}(?:评分|消费|价格|距离|用时)"
 )
-_RETURNED_SCOPE_RE = re.compile(r"本次|此次|返回|候选|所列|卡片|这些|结果中")
+_RETURNED_SCOPE_RE = re.compile(r"本次|此次|返回|候选|所列|卡片|这些|其中|上述|结果中")
 _MARKDOWN_TABLE_SEPARATOR_RE = re.compile(
     r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$",
     re.MULTILINE,
 )
+_MARKDOWN_HEADING_RE = re.compile(r"^\s*#{1,6}\s+\S")
 _AMAP_REALTIME_ROUTE_DATA_RE = re.compile(r"高德(?:地图)?(?:本次)?返回(?:的|了)?实时路线数据")
+_TRAVEL_NUMBER_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:(?:[A-Z]{2}|[A-Z]\d|\d[A-Z])\d{3,4}|[GDCZTKSY]\d{1,5})(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+_TRAVEL_STATION_MENTION_RE = re.compile(
+    r"(?:到达|抵达|前往|从|到|在|由)"
+    r"(?P<name>[\u4e00-\u9fffA-Za-z0-9·（）()]{2,32}?(?:国际机场|机场|火车站|高铁站|站))"
+)
+_CLOCK_TIME_RE = re.compile(r"(?<!\d)(?:[01]\d|2[0-3]):[0-5]\d(?!\d)")
+_TRAVEL_WEEKDAY_RE = re.compile(r"(?:星期|周)(?P<day>[一二三四五六日天])")
+_TRAVEL_MULTIPLIER_RE = re.compile(r"(?<!\d)\d+(?:\.\d+)?\s*倍")
 _REPAIR_SENTENCE_RE = re.compile(r"[^。！？!?]+(?:[。！？!?]+|$)")
 _NUMBERED_LIST_PREFIX_RE = re.compile(r"^\s*\d+[.、)]\s*")
 _REPAIR_MARKDOWN_PREFIX_RE = re.compile(r"^\s*(?:#{1,6}|[-*>])\s*")
 _REPAIR_SOURCE_ONLY_RE = re.compile(r"^(?:根据|结合)?(?:本次|此次)(?:查询|返回)?结果(?:显示|来看)?$")
 _REPAIR_DANGLING_PREDICATE_RE = re.compile(r"^(?:是|为|属于)(?:非常|很|较|比较|更|最|也)?")
+_MARKDOWN_HORIZONTAL_RULE_RE = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$")
+_SEMANTIC_TEXT_RE = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]")
 _SAFE_CAVEATS = {
     "realtime": "实时排队、空位、预约、停车、拥堵、候车和票价等未返回信息，本次查询结果无法确认，建议出发前核实。",
     "cost": "未返回的费用信息，本次查询结果无法确认，建议以实际信息为准。",
@@ -139,6 +162,7 @@ _SAFE_CAVEATS = {
     "attribute": "口味、适合人群和转场体验等未返回属性，本次查询结果无法确认。",
     "scope": "最高、最低等排序只代表本次返回候选，不能扩展为区域整体结论。",
     "transit_total_distance": "公共交通全程距离本次查询结果无法确认，请以卡片已展示的步行距离和线路信息为准。",
+    "travel": "余票、准点率、退改签、行李、登机口、检票口、站台及机场接驳便利度等信息本次查询未返回，预订和出发前请另行核实。",
 }
 
 
@@ -169,6 +193,11 @@ class _FactIndex:
     route_endpoint_pairs: set[frozenset[str]]
     has_place_results: bool
     has_route_results: bool
+    has_travel_results: bool
+    travel_numbers: set[str]
+    travel_station_names: set[str]
+    travel_clock_times: set[str]
+    travel_weekdays: set[str]
 
 
 def validate_product_answer(
@@ -181,7 +210,7 @@ def validate_product_answer(
     """验证高置信硬事实；无法可靠判断的自然语言交给前置事实边界约束。"""
 
     normalized_answer = answer.strip() if isinstance(answer, str) else ""
-    if not normalized_answer:
+    if not normalized_answer or not _SEMANTIC_TEXT_RE.search(normalized_answer):
         return ProductAnswerValidation(False, "empty_answer")
     if _MARKDOWN_TABLE_SEPARATOR_RE.search(normalized_answer):
         return ProductAnswerValidation(False, "unsupported_format")
@@ -204,6 +233,14 @@ def validate_product_answer(
         allowed_accesses=facts.route_access_names,
     ):
         return ProductAnswerValidation(False, "unknown_route_entity")
+    if facts.has_travel_results and _has_unknown_travel_number(normalized_answer, facts.travel_numbers):
+        return ProductAnswerValidation(False, "unknown_travel_number")
+    if facts.has_travel_results and _has_unknown_travel_entity(normalized_answer, facts.travel_station_names):
+        return ProductAnswerValidation(False, "unknown_travel_entity")
+    if facts.has_travel_results and _has_unknown_travel_time(normalized_answer, facts.travel_clock_times):
+        return ProductAnswerValidation(False, "unknown_travel_time")
+    if facts.has_travel_results and _has_unknown_travel_weekday(normalized_answer, facts.travel_weekdays):
+        return ProductAnswerValidation(False, "unknown_travel_date")
     if facts.searched_place_names and _has_unknown_recommended_place(
         normalized_answer,
         facts.searched_place_names,
@@ -238,7 +275,14 @@ def repair_unsupported_product_answer(
     product_blocks = [block for block in content_blocks if _value(block, "type") in _PRODUCT_RESULT_TYPES]
     if not answer.strip() or not product_blocks:
         return None, "not_repairable"
-    if _MARKDOWN_TABLE_SEPARATOR_RE.search(answer):
+    answer, format_rewritten = _strip_markdown_tables(answer)
+    if not answer:
+        return None, "unsupported_format"
+    if format_rewritten and {"flight_results", "train_results"}.issubset(
+        {_value(block, "type") for block in product_blocks}
+    ):
+        # 混合出行表格通常同时承载跨类型比较；删行后无法可靠保留标题与子项归属，
+        # 交给结构化兜底生成简洁比较，避免出现无标题列表或残句。
         return None, "unsupported_format"
     answer, label_rewritten = _rewrite_repairable_labels(answer)
     facts = _build_fact_index(product_blocks)
@@ -260,6 +304,8 @@ def repair_unsupported_product_answer(
             safe_text_length += len(re.sub(r"\s+", "", unit))
             continue
         if validation.reason_code == "unsupported_claim":
+            if format_rewritten:
+                continue
             reasons = {
                 reason
                 for clause in _CLAUSE_SPLIT_RE.split(unit)
@@ -276,6 +322,8 @@ def repair_unsupported_product_answer(
             safe_text_length += sum(len(re.sub(r"\s+", "", item)) for item in salvaged)
             continue
         if validation.reason_code == "unsupported_place_relation":
+            if format_rewritten:
+                continue
             caveat_codes.add("relation")
             salvaged = _salvage_safe_subclauses(
                 unit,
@@ -287,6 +335,8 @@ def repair_unsupported_product_answer(
             safe_text_length += sum(len(re.sub(r"\s+", "", item)) for item in salvaged)
             continue
         if validation.reason_code == "numeric_mismatch":
+            if format_rewritten:
+                continue
             caveat_codes.add("numeric")
             salvaged = _salvage_safe_subclauses(
                 unit,
@@ -297,11 +347,16 @@ def repair_unsupported_product_answer(
             kept_units.extend(salvaged)
             safe_text_length += sum(len(re.sub(r"\s+", "", item)) for item in salvaged)
             continue
+        if format_rewritten and validation.reason_code.startswith("unknown_travel_"):
+            continue
         return None, validation.reason_code
-    if safe_text_length < 8 or (not caveat_codes and not label_rewritten):
+    if safe_text_length < 8 or (not caveat_codes and not label_rewritten and not format_rewritten):
         return None, "not_repairable"
     repaired = "\n".join(_normalize_repaired_unit(unit) for unit in kept_units)
+    repaired = _drop_empty_markdown_sections(repaired)
     repaired = repaired.strip(" ，,。！？!?；;\n")
+    if not _SEMANTIC_TEXT_RE.search(repaired):
+        return None, "not_repairable"
     if caveat_codes:
         caveats = [_SAFE_CAVEATS[code] for code in sorted(caveat_codes)]
         repaired = f"{repaired.rstrip('。')}。\n\n{' '.join(caveats)}"
@@ -321,7 +376,7 @@ def _iter_repair_units(answer: str):
     for line in answer.splitlines():
         for match in _REPAIR_SENTENCE_RE.finditer(line):
             unit = match.group(0).strip()
-            if unit:
+            if unit and not _MARKDOWN_HORIZONTAL_RULE_RE.fullmatch(unit):
                 yield unit
 
 
@@ -330,6 +385,30 @@ def _rewrite_repairable_labels(answer: str) -> tuple[str, bool]:
 
     rewritten = _AMAP_REALTIME_ROUTE_DATA_RE.sub("本次返回的路线数据", answer)
     return rewritten, rewritten != answer
+
+
+def _strip_markdown_tables(answer: str) -> tuple[str, bool]:
+    """删除与结构化卡片重复的 Markdown 表格，保留表格外可独立校验的正文。"""
+
+    lines = answer.splitlines()
+    kept_lines: list[str] = []
+    removed = False
+    index = 0
+    while index < len(lines):
+        current = lines[index]
+        if index + 1 < len(lines) and "|" in current and _MARKDOWN_TABLE_SEPARATOR_RE.fullmatch(lines[index + 1]):
+            removed = True
+            while kept_lines and not kept_lines[-1].strip():
+                kept_lines.pop()
+            if kept_lines and _MARKDOWN_HEADING_RE.match(kept_lines[-1]):
+                kept_lines.pop()
+            index += 2
+            while index < len(lines) and "|" in lines[index]:
+                index += 1
+            continue
+        kept_lines.append(current)
+        index += 1
+    return "\n".join(kept_lines).strip(), removed
 
 
 def _salvage_safe_subclauses(
@@ -404,6 +483,20 @@ def _normalize_repaired_unit(unit: str) -> str:
     return _NUMBERED_LIST_PREFIX_RE.sub("- ", unit)
 
 
+def _drop_empty_markdown_sections(answer: str) -> str:
+    """删除修整后没有正文的标题，避免表格或越界句被移除后留下空章节。"""
+
+    lines = answer.splitlines()
+    kept: list[str] = []
+    for index, line in enumerate(lines):
+        if _MARKDOWN_HEADING_RE.match(line):
+            following = next((item for item in lines[index + 1 :] if item.strip()), None)
+            if following is None or _MARKDOWN_HEADING_RE.match(following):
+                continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def _has_sufficient_repair_coverage(answer: str, facts: _FactIndex) -> bool:
     """修整后的路线回答不能只剩标题或单一方案，否则完整兜底比残缺正文更可靠。"""
 
@@ -438,6 +531,11 @@ def _build_fact_index(blocks: list[Any]) -> _FactIndex:
     route_endpoint_pairs: set[frozenset[str]] = set()
     has_place_results = False
     has_route_results = False
+    has_travel_results = False
+    travel_numbers: set[str] = set()
+    travel_station_names: set[str] = set()
+    travel_clock_times: set[str] = set()
+    travel_weekdays: set[str] = set()
 
     for block in blocks:
         block_type = _value(block, "type")
@@ -465,6 +563,36 @@ def _build_fact_index(blocks: list[Any]) -> _FactIndex:
                     _value(place, "reference_cost_yuan"),
                 )
                 _add_scoped_number(numeric_values, place_values, "rating", _value(place, "rating"))
+            continue
+
+        if block_type in {"flight_results", "train_results"}:
+            has_travel_results = True
+            travel_weekdays.update(_weekday_tokens(_value(block, "departure_date")))
+            collection = "flights" if block_type == "flight_results" else "trains"
+            number_key = "flight_no" if block_type == "flight_results" else "train_no"
+            for option in (_value(block, collection) or [])[:5]:
+                number = _value(option, number_key)
+                if isinstance(number, str) and number.strip():
+                    travel_numbers.add(number.strip().upper())
+                duration_s = _number(_value(option, "duration_s"))
+                if duration_s is not None:
+                    numeric_values["duration_minutes"].add(duration_s / 60)
+                price_minor = _number(_value(_value(option, "price"), "amount_minor"))
+                if price_minor is not None:
+                    numeric_values["money_yuan"].add(price_minor / 100)
+                for endpoint_key in ("departure", "arrival"):
+                    endpoint = _value(option, endpoint_key)
+                    _add_text(entity_names, _value(endpoint, "city"))
+                    station_name = _value(endpoint, "station_name")
+                    _add_text(entity_names, station_name)
+                    _add_text(travel_station_names, station_name)
+                    terminal = _value(endpoint, "terminal")
+                    if isinstance(terminal, str) and terminal.strip():
+                        travel_numbers.add(terminal.strip().upper())
+                    scheduled_at = _value(endpoint, "scheduled_at")
+                    clock_time = _clock_time(scheduled_at)
+                    if clock_time:
+                        travel_clock_times.add(clock_time)
             continue
 
         has_route_results = True
@@ -501,6 +629,11 @@ def _build_fact_index(blocks: list[Any]) -> _FactIndex:
         route_endpoint_pairs=route_endpoint_pairs,
         has_place_results=has_place_results,
         has_route_results=has_route_results,
+        has_travel_results=has_travel_results,
+        travel_numbers=travel_numbers,
+        travel_station_names=travel_station_names,
+        travel_clock_times=travel_clock_times,
+        travel_weekdays=travel_weekdays,
     )
 
 
@@ -575,8 +708,17 @@ def _unsupported_clause_reason(clause: str, facts: _FactIndex) -> str | None:
         return "attribute"
     if _UNSCOPED_SUPERLATIVE_RE.search(clause) and not _RETURNED_SCOPE_RE.search(clause):
         return "scope"
-    if _RISK_TERM_RE.search(clause) and not _LIMITATION_CUE_RE.search(clause):
-        return "realtime"
+    if (
+        facts.has_travel_results
+        and _TRAVEL_UNSUPPORTED_CLAIM_RE.search(clause)
+        and not _LIMITATION_CUE_RE.search(clause)
+    ):
+        return "travel"
+    risk_terms = _RISK_TERM_RE.findall(clause)
+    if risk_terms and not _LIMITATION_CUE_RE.search(clause):
+        non_price_terms = [term for term in risk_terms if not _TRAVEL_GROUNDED_PRICE_TERM_RE.fullmatch(term)]
+        if non_price_terms or not _is_supported_travel_price_claim(clause, facts):
+            return "realtime"
     if _COST_TERM_RE.search(clause) and not _LIMITATION_CUE_RE.search(clause):
         if "过路费" in clause:
             category = "toll_yuan"
@@ -597,6 +739,16 @@ def _has_supported_money_value(clause: str, allowed_money: set[float]) -> bool:
         if _matches_allowed(float(match.group("value")), allowed_money, category="money_yuan"):
             return True
     return False
+
+
+def _is_supported_travel_price_claim(clause: str, facts: _FactIndex) -> bool:
+    """只放行带真实返回金额且明确限定在本次候选内的价格描述。"""
+
+    if not facts.has_travel_results or not facts.numeric_values["money_yuan"]:
+        return False
+    return bool(
+        _has_supported_money_value(clause, facts.numeric_values["money_yuan"]) or _RETURNED_SCOPE_RE.search(clause)
+    )
 
 
 def _has_unreturned_place_relation(answer: str, facts: _FactIndex) -> bool:
@@ -642,6 +794,51 @@ def _has_unknown_route_entity(
         if _canonical_access_name(match.group("name")) not in normalized_accesses:
             return True
     return False
+
+
+def _has_unknown_travel_number(answer: str, allowed_numbers: set[str]) -> bool:
+    return any(match.group(0).upper() not in allowed_numbers for match in _TRAVEL_NUMBER_RE.finditer(answer))
+
+
+def _has_unknown_travel_entity(answer: str, allowed_stations: set[str]) -> bool:
+    normalized = {_canonical_travel_station(value) for value in allowed_stations}
+    for match in _TRAVEL_STATION_MENTION_RE.finditer(answer):
+        if _canonical_travel_station(match.group("name")) not in normalized:
+            return True
+    return False
+
+
+def _has_unknown_travel_time(answer: str, allowed_times: set[str]) -> bool:
+    return any(match.group(0) not in allowed_times for match in _CLOCK_TIME_RE.finditer(answer))
+
+
+def _has_unknown_travel_weekday(answer: str, allowed_weekdays: set[str]) -> bool:
+    return any(match.group("day") not in allowed_weekdays for match in _TRAVEL_WEEKDAY_RE.finditer(answer))
+
+
+def _weekday_tokens(value: Any) -> set[str]:
+    if not isinstance(value, str):
+        return set()
+    try:
+        weekday = datetime.strptime(value, "%Y-%m-%d").weekday()
+    except ValueError:
+        return set()
+    token = ("一", "二", "三", "四", "五", "六", "日")[weekday]
+    return {token, "天"} if token == "日" else {token}
+
+
+def _canonical_travel_station(value: str) -> str:
+    return _compact_text(value).replace("国际机场", "机场")
+
+
+def _clock_time(value: Any) -> str | None:
+    if hasattr(value, "strftime"):
+        return value.strftime("%H:%M")
+    if isinstance(value, str):
+        match = re.search(r"T(\d{2}:\d{2})", value)
+        if match:
+            return match.group(1)
+    return None
 
 
 def _canonical_station_name(value: str) -> str:
@@ -711,6 +908,8 @@ def _has_unknown_place_fact(answer: str, allowed_places: set[str]) -> bool:
 
 def _has_numeric_mismatch(answer: str, facts: _FactIndex, user_text: str) -> bool:
     for clause in _CLAUSE_SPLIT_RE.split(answer):
+        if facts.has_travel_results and _TRAVEL_MULTIPLIER_RE.search(clause):
+            return True
         compound_spans: list[tuple[int, int]] = []
         for match in _HOUR_MINUTE_RE.finditer(clause):
             compound_spans.append(match.span())

@@ -91,6 +91,14 @@ class SanitizeArgumentsTests(unittest.TestCase):
         self.assertNotIn("must-not-leak", serialized)
         self.assertLessEqual(len(serialized.encode("utf-8")), 4096)
 
+    def test_flyai_travel_tool_hides_query_fields_from_persisted_event(self):
+        args = {"origin": "深圳", "destination": "上海", "departure_date": "2026-08-01"}
+
+        sanitized = sanitize_arguments("search_flights", args)
+
+        self.assertEqual(sanitized, {"argument_count": 3})
+        self.assertNotIn("深圳", json.dumps(sanitized, ensure_ascii=False))
+
     def test_amap_product_tool_redacts_inline_credentials_but_preserves_normal_question(self):
         args = {
             "query": "api key: 如何申请地图服务",

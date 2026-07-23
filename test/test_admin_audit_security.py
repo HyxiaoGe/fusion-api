@@ -280,6 +280,42 @@ class AdminAuditSanitizerTests(unittest.TestCase):
         self.assertNotIn("OUTPUT_COOKIE_SENTINEL", serialized)
         self.assertNotIn("</amap_product_result>", serialized)
 
+    def test_flyai_travel_projection_keeps_only_safe_summary_metadata(self):
+        tool = ToolCallLog(
+            id="tool-flight",
+            tool_name="search_flights",
+            status="failed",
+            model_id="model",
+            provider="llm-provider",
+            input_params={
+                "tool_name": "search_flights",
+                "argument_count": 3,
+                "origin": "私人住址",
+                "departure_date": "2026-08-01",
+            },
+            output_data={
+                "tool_name": "search_flights",
+                "status": "failed",
+                "result_count": 0,
+                "response_bytes": 128,
+                "error_code": "rate_limited",
+                "booking_url": "https://a.feizhu.com/private?token=secret",
+                "raw_response": "private travel payload",
+            },
+        )
+
+        item = AdminAuditService._tool_item(tool)
+        serialized = json.dumps(item, ensure_ascii=False)
+
+        self.assertEqual(item["arguments"], {"tool_name": "search_flights", "argument_count": 3})
+        self.assertEqual(item["result_preview"]["result_count"], 0)
+        self.assertEqual(item["result_preview"]["error_code"], "rate_limited")
+        self.assertNotIn("私人住址", serialized)
+        self.assertNotIn("2026-08-01", serialized)
+        self.assertNotIn("booking_url", serialized)
+        self.assertNotIn("raw_response", serialized)
+        self.assertNotIn("secret", serialized)
+
     def test_error_projection_uses_boundaries_and_supports_structured_and_chinese_markers(self):
         cases = {
             "HTTP 401 unauthorized": "authentication_failed",

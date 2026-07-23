@@ -162,6 +162,13 @@ class Settings(BaseSettings):
     MCP_SERVER_CIRCUIT_FAILURE_THRESHOLD: int = int(os.getenv("MCP_SERVER_CIRCUIT_FAILURE_THRESHOLD", "3"))
     MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS: float = float(os.getenv("MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS", "30"))
 
+    # FlyAI 出行产品工具通过私有 HTTP 适配器访问，不在 API 容器执行第三方 CLI。
+    ENABLE_FLYAI_TRAVEL_TOOLS: bool = os.getenv("ENABLE_FLYAI_TRAVEL_TOOLS", "false").lower() == "true"
+    FLYAI_ADAPTER_BASE_URL: str = os.getenv("FLYAI_ADAPTER_BASE_URL", "")
+    FLYAI_ADAPTER_TOKEN: str = os.getenv("FLYAI_ADAPTER_TOKEN", "")
+    FLYAI_TRAVEL_TOOL_TIMEOUT_SECONDS: float = float(os.getenv("FLYAI_TRAVEL_TOOL_TIMEOUT_SECONDS", "20"))
+    FLYAI_TRAVEL_MAX_TOOL_CALLS_PER_RUN: int = int(os.getenv("FLYAI_TRAVEL_MAX_TOOL_CALLS_PER_RUN", "4"))
+
     # PromptHub bundle 后台同步；disabled 不发出请求，聊天热路径始终只读本地 LKG。
     PROMPTHUB_SYNC_MODE: str = os.getenv("PROMPTHUB_SYNC_MODE", "disabled").lower()
     PROMPTHUB_BASE_URL: str = os.getenv("PROMPTHUB_BASE_URL", "")

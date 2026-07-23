@@ -20,6 +20,10 @@ from app.services.chat.message_builder import (
     is_image_file,
 )
 from app.services.mcp.amap_product_tools import AMAP_FACT_BOUNDARY_SYSTEM_PROMPT, AMAP_PRODUCT_TOOL_NAMES
+from app.services.mcp.flyai_travel_tools import (
+    FLYAI_TRAVEL_FACT_BOUNDARY_SYSTEM_PROMPT,
+    FLYAI_TRAVEL_TOOL_NAMES,
+)
 from app.services.stream.persistence import preprocess_url_in_message
 
 VOLCENGINE_PROVIDERS = {"volcengine"}
@@ -209,6 +213,7 @@ async def prepare_agent_loop_messages(
         messages = inject_no_vision_file_boundary(messages)
     messages = inject_tool_usage_contract(messages, call_config.call_kwargs)
     messages = inject_amap_fact_boundary(messages, call_config.call_kwargs)
+    messages = inject_flyai_travel_fact_boundary(messages, call_config.call_kwargs)
     messages = inject_no_tool_network_boundary(messages, call_config.call_kwargs)
     return AgentLoopPreparedMessages(
         messages=messages,
@@ -312,6 +317,24 @@ def inject_amap_fact_boundary(messages: list[dict], call_kwargs: dict) -> list[d
     return [*messages[:insert_at], boundary_msg, *messages[insert_at:]]
 
 
+def inject_flyai_travel_fact_boundary(messages: list[dict], call_kwargs: dict) -> list[dict]:
+    """航班或高铁产品工具启用时注入供应商中性的事实边界。"""
+
+    announced_tools = set(announced_tool_names_from_call_kwargs(call_kwargs))
+    if not FLYAI_TRAVEL_TOOL_NAMES.intersection(announced_tools):
+        return messages
+    if any(
+        msg.get("role") == "system" and "【航班与高铁事实边界规则】" in str(msg.get("content", "")) for msg in messages
+    ):
+        return messages
+
+    insert_at = 0
+    while insert_at < len(messages) and messages[insert_at].get("role") == "system":
+        insert_at += 1
+    boundary_msg = {"role": "system", "content": FLYAI_TRAVEL_FACT_BOUNDARY_SYSTEM_PROMPT}
+    return [*messages[:insert_at], boundary_msg, *messages[insert_at:]]
+
+
 def inject_no_tool_network_boundary(messages: list[dict], call_kwargs: dict) -> list[dict]:
     """无联网工具模式下补一条 system 边界，避免模型把内部知识包装成实时搜索。"""
     announced_tools = set(announced_tool_names_from_call_kwargs(call_kwargs))
@@ -319,6 +342,7 @@ def inject_no_tool_network_boundary(messages: list[dict], call_kwargs: dict) -> 
     if (
         network_tool_names.intersection(announced_tools)
         or AMAP_PRODUCT_TOOL_NAMES.intersection(announced_tools)
+        or FLYAI_TRAVEL_TOOL_NAMES.intersection(announced_tools)
         or any(name.startswith("mcp_") for name in announced_tools)
     ):
         return messages

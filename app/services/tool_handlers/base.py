@@ -143,6 +143,10 @@ class BaseToolHandler(ABC):
         """子类可覆盖以清理即将持久化的工具入参。"""
         return input_params
 
+    def sanitize_input_params_for_event(self, input_params: dict) -> dict:
+        """子类可覆盖以清理进度事件里的工具入参。"""
+        return input_params
+
     def sanitize_output_data_for_log(self, result: ToolResult) -> dict:
         """子类可覆盖以限制即将持久化的工具输出。"""
         return result.data
@@ -170,7 +174,7 @@ class BaseToolHandler(ABC):
         await emitter.tool_call_started(
             tool_call_id=tool_call_id,
             tool_name=self.tool_name,
-            arguments=args,
+            arguments=self.sanitize_input_params_for_event(args),
         )
         start = time.monotonic()
         try:

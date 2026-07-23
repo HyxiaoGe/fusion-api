@@ -28,6 +28,7 @@ from app.schemas.response import ApiException, ErrorCode
 from app.services.admin_audit_sanitizer import mask_email, sanitize_admin_value
 from app.services.agent_strategy_config import get_agent_tools_disabled_aliases
 from app.services.mcp.amap_product_tools import AMAP_PRODUCT_TOOL_NAMES
+from app.services.mcp.flyai_travel_tools import FLYAI_TRAVEL_TOOL_NAMES
 
 
 class AdminAuditService:
@@ -646,6 +647,15 @@ class AdminAuditService:
                     "subcall_attempt_count",
                     "remote_tools_attempted",
                 )
+                if key in raw_output
+            }
+        elif tool.tool_name in FLYAI_TRAVEL_TOOL_NAMES:
+            argument_projection = {
+                key: raw_arguments[key] for key in ("tool_name", "argument_count") if key in raw_arguments
+            }
+            output_projection = {
+                key: raw_output[key]
+                for key in ("tool_name", "status", "result_count", "response_bytes", "error_code")
                 if key in raw_output
             }
         else:

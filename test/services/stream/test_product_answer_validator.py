@@ -162,16 +162,58 @@ class ProductAnswerValidatorTests(unittest.TestCase):
             with self.subTest(answer=answer):
                 self.assertEqual(validate_product_answer(answer, [_route_block()]).is_valid, expected)
 
-    def test_markdown_table_is_rejected_before_repair_can_leave_broken_rows(self):
-        answer = "结论：驾车约14分钟。\n\n| 方案 | 耗时 |\n| --- | --- |\n| 驾车 | 14分钟 |\n| 地铁 | 32分钟 |"
+    def test_markdown_table_is_removed_while_grounded_prose_is_repaired(self):
+        answer = (
+            "结论：驾车约14分钟，公交约32分钟。\n\n| 方案 | 耗时 |\n| --- | --- |\n| 驾车 | 14分钟 |\n| 地铁 | 32分钟 |"
+        )
 
         validation = validate_product_answer(answer, [_route_block()])
         repaired, reason_code = repair_unsupported_product_answer(answer, [_route_block()])
 
         self.assertFalse(validation.is_valid)
         self.assertEqual(validation.reason_code, "unsupported_format")
+        self.assertEqual(reason_code, "ok")
+        self.assertEqual(repaired, "结论：驾车约14分钟，公交约32分钟。")
+        self.assertTrue(validate_product_answer(repaired, [_route_block()]).is_valid)
+
+    def test_markdown_table_only_still_requires_deterministic_fallback(self):
+        answer = "| 方案 | 耗时 |\n| --- | --- |\n| 驾车 | 14分钟 |\n| 地铁 | 32分钟 |"
+
+        repaired, reason_code = repair_unsupported_product_answer(answer, [_route_block()])
+
         self.assertIsNone(repaired)
         self.assertEqual(reason_code, "unsupported_format")
+
+    def test_markdown_cleanup_cannot_turn_empty_headings_into_punctuation_answer(self):
+        answer = "## 上午高铁推荐\n### 车次列表\n| 车次 | 耗时 |\n| --- | --- |\n| G426 | 2小时 |"
+
+        repaired, reason_code = repair_unsupported_product_answer(answer, [_route_block()])
+        punctuation_validation = validate_product_answer("。", [_route_block()])
+
+        self.assertIsNone(repaired)
+        self.assertEqual(reason_code, "not_repairable")
+        self.assertFalse(punctuation_validation.is_valid)
+        self.assertEqual(punctuation_validation.reason_code, "empty_answer")
+
+    def test_markdown_repair_drops_unsafe_whole_sentence_instead_of_leaving_fragment(self):
+        answer = (
+            "## 方案概览\n"
+            "### 路线明细\n"
+            "| 方案 | 耗时 |\n"
+            "| --- | --- |\n"
+            "| 驾车 | 14分钟 |\n"
+            "| 公交 | 32分钟 |\n\n"
+            "驾车约14分钟，公交约32分钟。\n"
+            "最终推荐：若重视用时，驾车更舒适。"
+        )
+
+        repaired, reason_code = repair_unsupported_product_answer(answer, [_route_block()])
+
+        self.assertEqual(reason_code, "ok")
+        self.assertNotIn("路线明细", repaired)
+        self.assertNotIn("最终推荐", repaired)
+        self.assertNotIn("更舒适", repaired)
+        self.assertIn("驾车约14分钟，公交约32分钟", repaired)
 
     def test_high_confidence_unsupported_claim_falls_back(self):
         validation = validate_product_answer(

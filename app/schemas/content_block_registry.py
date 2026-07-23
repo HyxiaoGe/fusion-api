@@ -15,11 +15,13 @@ from pydantic import BaseModel, ValidationError
 from app.schemas.chat import (
     ContentBlock,
     FileBlock,
+    FlightResultsBlock,
     PlaceResultsBlock,
     RouteResultsBlock,
     SearchBlock,
     TextBlock,
     ThinkingBlock,
+    TrainResultsBlock,
     UnsupportedContentBlock,
     UrlBlock,
 )
@@ -55,6 +57,8 @@ CONTENT_BLOCK_REGISTRY: dict[tuple[str, int | None], ContentBlockRegistration] =
     ("unsupported_result", None): ContentBlockRegistration(UnsupportedContentBlock),
     ("place_results", 1): ContentBlockRegistration(PlaceResultsBlock, schema_version=1),
     ("route_results", 1): ContentBlockRegistration(RouteResultsBlock, schema_version=1),
+    ("flight_results", 1): ContentBlockRegistration(FlightResultsBlock, schema_version=1),
+    ("train_results", 1): ContentBlockRegistration(TrainResultsBlock, schema_version=1),
 }
 
 _SAFE_BLOCK_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,160}$")

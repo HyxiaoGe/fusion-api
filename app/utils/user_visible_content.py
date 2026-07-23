@@ -15,6 +15,8 @@ _MCP_ALIAS_PARTIAL_RE = re.compile(rf"{_MCP_ALIAS_PREFIX}[A-Za-z0-9_-]+$")
 _INTERNAL_TOOL_LABELS = {
     "local_place_search": "地点搜索",
     "route_compare": "路线比较",
+    "search_flights": "航班查询",
+    "search_trains": "高铁查询",
     "url_read": "网页读取",
     "web_search": "联网搜索",
 }

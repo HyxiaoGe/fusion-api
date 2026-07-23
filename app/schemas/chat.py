@@ -353,7 +353,159 @@ class RouteResultsBlock(BaseModel):
         return value
 
 
-ProductResultBlock = Union[PlaceResultsBlock, RouteResultsBlock]
+class TravelEndpoint(BaseModel):
+    """航班或高铁班次的单个时刻端点。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    city: str = Field(min_length=1, max_length=80)
+    station_name: str = Field(min_length=1, max_length=120)
+    station_code: Optional[str] = Field(default=None, min_length=1, max_length=16)
+    terminal: Optional[str] = Field(default=None, min_length=1, max_length=32)
+    scheduled_at: datetime
+
+    @field_validator("scheduled_at")
+    @classmethod
+    def validate_scheduled_at_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("班次时间必须包含时区")
+        return value
+
+
+class TravelMoney(BaseModel):
+    """出行参考价格；金额使用最小货币单位。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    currency: Literal["CNY"]
+    amount_minor: int = Field(ge=0, le=100_000_000)
+
+
+class FlightOption(BaseModel):
+    """单个直达航班的安全展示字段。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    option_id: str = Field(min_length=1, max_length=80)
+    airline_name: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    flight_no: str = Field(min_length=1, max_length=40)
+    departure: TravelEndpoint
+    arrival: TravelEndpoint
+    duration_s: int = Field(ge=0, le=172_800)
+    cabin_class: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    stops: Literal[0]
+    price: Optional[TravelMoney] = None
+    actions: List[StructuredResultAction] = Field(default_factory=list, max_length=1)
+
+
+class TrainOption(BaseModel):
+    """单个直达高铁或火车班次的安全展示字段。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    option_id: str = Field(min_length=1, max_length=80)
+    train_no: str = Field(min_length=1, max_length=40)
+    train_type: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    departure: TravelEndpoint
+    arrival: TravelEndpoint
+    duration_s: int = Field(ge=0, le=172_800)
+    seat_class: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    stops: Literal[0]
+    price: Optional[TravelMoney] = None
+    actions: List[StructuredResultAction] = Field(default_factory=list, max_length=1)
+
+
+class FlightResultsBlock(BaseModel):
+    """航班查询产品结果块。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["flight_results"]
+    id: str = Field(default_factory=lambda: f"blk_{uuid4().hex[:12]}", max_length=160)
+    schema_version: Literal[1]
+    provider: Literal["flyai"]
+    attribution: Optional[StructuredResultAttribution] = None
+    status: Literal["success", "degraded"]
+    origin: str = Field(min_length=1, max_length=80)
+    destination: str = Field(min_length=1, max_length=80)
+    departure_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    observed_at: datetime
+    result_count: int = Field(ge=0, le=5)
+    flights: List[FlightOption] = Field(default_factory=list, max_length=5)
+    limitations: List[str] = Field(default_factory=list, max_length=8)
+    tool_call_log_id: str = Field(default="", max_length=160)
+
+    @model_validator(mode="after")
+    def validate_result(self):
+        if self.result_count != len(self.flights):
+            raise ValueError("result_count 必须等于 flights 数量")
+        if self.observed_at.tzinfo is None or self.observed_at.utcoffset() is None:
+            raise ValueError("observed_at 必须包含时区")
+        return self
+
+    @field_validator("departure_date")
+    @classmethod
+    def validate_departure_date(cls, value: str) -> str:
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+        except ValueError as error:
+            raise ValueError("departure_date 必须是有效日期") from error
+        return value
+
+    @field_validator("limitations")
+    @classmethod
+    def validate_limitations(cls, value: List[str]) -> List[str]:
+        if any(not item.strip() or len(item) > 240 for item in value):
+            raise ValueError("limitations 单项不能为空且不能超过 240 字符")
+        return value
+
+
+class TrainResultsBlock(BaseModel):
+    """高铁或火车查询产品结果块。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["train_results"]
+    id: str = Field(default_factory=lambda: f"blk_{uuid4().hex[:12]}", max_length=160)
+    schema_version: Literal[1]
+    provider: Literal["flyai"]
+    attribution: Optional[StructuredResultAttribution] = None
+    status: Literal["success", "degraded"]
+    origin: str = Field(min_length=1, max_length=80)
+    destination: str = Field(min_length=1, max_length=80)
+    departure_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    observed_at: datetime
+    result_count: int = Field(ge=0, le=5)
+    trains: List[TrainOption] = Field(default_factory=list, max_length=5)
+    limitations: List[str] = Field(default_factory=list, max_length=8)
+    tool_call_log_id: str = Field(default="", max_length=160)
+
+    @model_validator(mode="after")
+    def validate_result(self):
+        if self.result_count != len(self.trains):
+            raise ValueError("result_count 必须等于 trains 数量")
+        if self.observed_at.tzinfo is None or self.observed_at.utcoffset() is None:
+            raise ValueError("observed_at 必须包含时区")
+        return self
+
+    @field_validator("departure_date")
+    @classmethod
+    def validate_departure_date(cls, value: str) -> str:
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+        except ValueError as error:
+            raise ValueError("departure_date 必须是有效日期") from error
+        return value
+
+    @field_validator("limitations")
+    @classmethod
+    def validate_limitations(cls, value: List[str]) -> List[str]:
+        if any(not item.strip() or len(item) > 240 for item in value):
+            raise ValueError("limitations 单项不能为空且不能超过 240 字符")
+        return value
+
+
+ProductResultBlock = Union[PlaceResultsBlock, RouteResultsBlock, FlightResultsBlock, TrainResultsBlock]
 
 
 # content block 的联合类型，后续扩展直接在此添加
@@ -366,6 +518,8 @@ ContentBlock = Union[
     UnsupportedContentBlock,
     PlaceResultsBlock,
     RouteResultsBlock,
+    FlightResultsBlock,
+    TrainResultsBlock,
 ]
 
 # stop 接口只接受客户端实际流式渲染的文本类 block；工具与富结果由服务端持久化。

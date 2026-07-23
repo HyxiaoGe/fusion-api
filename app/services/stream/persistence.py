@@ -148,7 +148,9 @@ def persist_message(
 
         acquire_message_persistence_lock(db, assistant_message_id)
         existing = db.query(MessageModel).populate_existing().filter_by(id=assistant_message_id).first()
-        serialized_content = [block.model_dump() for block in content_blocks]
+        # PostgreSQL JSONB 只能接收 JSON 原生值；富结果中的 aware datetime、URL 等
+        # 必须先按 Pydantic JSON 模式序列化，不能把 Python 对象直接交给驱动。
+        serialized_content = [block.model_dump(mode="json") for block in content_blocks]
         if existing:
             if sequence is not None:
                 if existing.sequence is None:

@@ -1,4 +1,27 @@
 services:
+  flyai-adapter:
+    profiles: ["flyai"]
+    build:
+      context: ./flyai-adapter
+    container_name: fusion-flyai-adapter
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 0.5
+    environment:
+      - FLYAI_API_KEY=${FLYAI_API_KEY:-}
+      - FLYAI_ADAPTER_TOKEN=${FLYAI_ADAPTER_TOKEN:-}
+      - PORT=8080
+    networks:
+      - flyai
+
   app:
     build: .
     container_name: fusion-api
@@ -46,6 +69,11 @@ services:
       - MINIMAX_API_KEY=${MINIMAX_API_KEY:-}
       - LITELLM_PROXY_URL=${LITELLM_PROXY_URL:-http://litellm-proxy:4000}
       - LITELLM_API_KEY=${LITELLM_API_KEY:-}
+      - ENABLE_FLYAI_TRAVEL_TOOLS=${ENABLE_FLYAI_TRAVEL_TOOLS:-false}
+      - FLYAI_ADAPTER_BASE_URL=${FLYAI_ADAPTER_BASE_URL:-http://flyai-adapter:8080}
+      - FLYAI_ADAPTER_TOKEN=${FLYAI_ADAPTER_TOKEN:-}
+      - FLYAI_TRAVEL_TOOL_TIMEOUT_SECONDS=${FLYAI_TRAVEL_TOOL_TIMEOUT_SECONDS:-20}
+      - FLYAI_TRAVEL_MAX_TOOL_CALLS_PER_RUN=${FLYAI_TRAVEL_MAX_TOOL_CALLS_PER_RUN:-4}
     deploy:
       resources:
         limits:
@@ -55,6 +83,7 @@ services:
       - default
       - middleware
       - litellm_net
+      - flyai
 
 networks:
   default:
@@ -66,3 +95,5 @@ networks:
   litellm_net:
     external: true
     name: litellm-proxy_default
+  flyai:
+    name: fusion_flyai_network
