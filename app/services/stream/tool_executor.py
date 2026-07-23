@@ -55,6 +55,7 @@ class ToolExecutionBatchRequest:
     network_budget: "NetworkToolBudget | None" = None
     tool_handlers: Mapping[str, Any] | None = None
     runtime_context: Any = None
+    successful_tool_call_signatures: set[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -173,6 +174,29 @@ def parse_tool_arguments(tool_call: dict) -> dict:
         return {}
 
 
+def build_successful_call_signature(
+    tool_call: dict,
+    tool_handlers: Mapping[str, Any] | None = None,
+) -> str | None:
+    """返回 handler 显式声明的运行内成功调用签名。"""
+
+    handler = resolve_tool_handler(str(tool_call.get("name", "")), tool_handlers)
+    if handler is None:
+        return None
+    signature_builder = getattr(type(handler), "build_successful_call_signature", None)
+    if not callable(signature_builder):
+        return None
+    args = parse_tool_arguments(tool_call)
+    if not isinstance(args, dict):
+        return None
+    try:
+        signature = signature_builder(handler, args)
+    except Exception:  # noqa: BLE001 — 去重签名失败必须回退真实执行
+        logger.warning("工具成功调用签名生成失败: tool=%s", tool_call.get("name"), exc_info=True)
+        return None
+    return signature if isinstance(signature, str) and signature else None
+
+
 def prepare_tool_arguments(
     *,
     tool_name: str,
@@ -206,6 +230,7 @@ def build_tool_execution_record(
     result,
     handler,
     ids: ToolExecutionIds,
+    reused: bool = False,
 ) -> ToolExecutionRecord:
     return ToolExecutionRecord(
         tool_call=tool_call,
@@ -213,6 +238,7 @@ def build_tool_execution_record(
         handler=handler,
         block_id=ids.block_id,
         log_id=ids.log_id,
+        reused=reused,
     )
 
 
@@ -225,6 +251,27 @@ def build_unknown_tool_record(*, tool_call: dict, ids: ToolExecutionIds) -> Tool
         result=ToolResult(status="failed", error_message=f"未知工具: {tool_call['name']}"),
         handler=None,
         ids=ids,
+    )
+
+
+def build_reused_tool_record(
+    *,
+    tool_call: dict,
+    handler,
+    ids: ToolExecutionIds,
+) -> ToolExecutionRecord:
+    from app.services.tool_handlers import ToolResult
+
+    return build_tool_execution_record(
+        tool_call=tool_call,
+        result=ToolResult(
+            status="success",
+            data={"reused_successful_result": True},
+            duration_ms=0,
+        ),
+        handler=handler,
+        ids=ids,
+        reused=True,
     )
 
 
@@ -324,6 +371,14 @@ async def execute_one_tool_call(request: ToolExecutionBatchRequest, tool_call: d
     if not handler:
         return build_unknown_tool_record(tool_call=tool_call, ids=ids)
 
+    successful_signature = build_successful_call_signature(tool_call, request.tool_handlers)
+    if (
+        successful_signature is not None
+        and request.successful_tool_call_signatures is not None
+        and successful_signature in request.successful_tool_call_signatures
+    ):
+        return build_reused_tool_record(tool_call=tool_call, handler=handler, ids=ids)
+
     args = parse_tool_arguments(tool_call)
     args, budget_result = prepare_tool_arguments(
         tool_name=tool_call["name"],
@@ -348,6 +403,12 @@ async def execute_one_tool_call(request: ToolExecutionBatchRequest, tool_call: d
             args=executable_args,
         )
     attach_internal_tool_metadata(result, args)
+    if (
+        result.status == "success"
+        and successful_signature is not None
+        and request.successful_tool_call_signatures is not None
+    ):
+        request.successful_tool_call_signatures.add(successful_signature)
 
     await log_tool_execution(request=request, handler=handler, ids=ids, result=result, args=executable_args)
     record = build_tool_execution_record(tool_call=tool_call, result=result, handler=handler, ids=ids)
@@ -370,6 +431,18 @@ async def execute_tool_batch(
         for index, tool_call in indexed_calls
         if tool_call.get("name") not in _AMAP_PRODUCT_EXECUTION_PRIORITY
     ]
+    reusable_groups: dict[str, list[tuple[int, dict]]] = {}
+    ungrouped_parallel_calls: list[tuple[int, dict]] = []
+    for index, tool_call in parallel_calls:
+        signature = (
+            build_successful_call_signature(tool_call, request.tool_handlers)
+            if request.successful_tool_call_signatures is not None
+            else None
+        )
+        if signature is None:
+            ungrouped_parallel_calls.append((index, tool_call))
+        else:
+            reusable_groups.setdefault(signature, []).append((index, tool_call))
 
     async def execute_indexed(index: int, tool_call: dict) -> tuple[int, ToolExecutionRecord]:
         return index, await execute_one_tool_call(request, tool_call)
@@ -383,7 +456,16 @@ async def execute_tool_batch(
             records.append(await execute_indexed(index, tool_call))
         return records
 
-    pending = [execute_indexed(index, tool_call) for index, tool_call in parallel_calls]
+    async def execute_reusable_group(
+        grouped_calls: list[tuple[int, dict]],
+    ) -> list[tuple[int, ToolExecutionRecord]]:
+        records = []
+        for index, tool_call in grouped_calls:
+            records.append(await execute_indexed(index, tool_call))
+        return records
+
+    pending = [execute_indexed(index, tool_call) for index, tool_call in ungrouped_parallel_calls]
+    pending.extend(execute_reusable_group(grouped_calls) for grouped_calls in reusable_groups.values())
     if amap_product_calls:
         pending.append(execute_amap_products())
     batches = await asyncio.gather(*pending)
@@ -411,6 +493,7 @@ async def execute_tools_parallel(
     network_budget: "NetworkToolBudget | None" = None,
     tool_handlers: Mapping[str, Any] | None = None,
     runtime_context: Any = None,
+    successful_tool_call_signatures: set[str] | None = None,
 ) -> list[ToolExecutionRecord]:
     """
     并行执行所有 tool_calls。
@@ -433,5 +516,6 @@ async def execute_tools_parallel(
         network_budget=network_budget,
         tool_handlers=tool_handlers,
         runtime_context=runtime_context,
+        successful_tool_call_signatures=successful_tool_call_signatures,
     )
     return await execute_tool_batch(request, tool_calls)

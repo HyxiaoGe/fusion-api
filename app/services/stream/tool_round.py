@@ -26,6 +26,7 @@ from app.services.stream.tool_context import (
     resolve_tool_context,
 )
 from app.services.stream.tool_execution_result import ToolExecutionRecord
+from app.services.stream.tool_executor import build_successful_call_signature
 from app.services.stream_state_service import StreamWriteTerminalError
 
 logger = logging.getLogger(__name__)
@@ -164,8 +165,10 @@ async def execute_tool_round_tools(
         execute_kwargs["tool_handlers"] = request.tool_handlers
     if runtime_context is not None:
         execute_kwargs["runtime_context"] = runtime_context
+    if request.agent_state is not None:
+        execute_kwargs["successful_tool_call_signatures"] = request.agent_state.successful_tool_call_signatures
     try:
-        return await request.execute_tools_fn(
+        results = await request.execute_tools_fn(
             executed_tool_calls,
             request.conversation_id,
             request.user_id,
@@ -173,9 +176,14 @@ async def execute_tool_round_tools(
             request.provider,
             **execute_kwargs,
         )
-    finally:
+    except BaseException:
         if request.on_tools_executed is not None:
             request.on_tools_executed(len(executed_tool_calls))
+        raise
+    else:
+        if request.on_tools_executed is not None:
+            request.on_tools_executed(_actual_tool_execution_count(executed_tool_calls, results))
+        return results
 
 
 async def update_tool_round_plan_started(request: ToolRoundRequest, *, tool_calls: list[dict] | None = None) -> None:
@@ -203,6 +211,7 @@ def append_tool_round_messages_with_plan(
     missing_result_tool_calls: list[dict] | None = None,
     not_executed_tool_calls: list[dict] | None = None,
     unavailable_tool_calls: list[dict] | None = None,
+    reused_tool_calls: list[dict] | None = None,
     context_blocked_calls: dict[str, BlockedToolContext] | None = None,
     built_content_blocks: dict[str, Any] | None = None,
 ) -> None:
@@ -223,6 +232,7 @@ def append_tool_round_messages_with_plan(
     missing_result_ids = {str(tool_call.get("id", "")) for tool_call in missing_result_tool_calls or []}
     not_executed_ids = {str(tool_call.get("id", "")) for tool_call in not_executed_tool_calls or []}
     unavailable_ids = {str(tool_call.get("id", "")) for tool_call in unavailable_tool_calls or []}
+    reused_ids = {str(tool_call.get("id", "")) for tool_call in reused_tool_calls or []}
     context_blocked_by_id = context_blocked_calls or {}
 
     for tool_call in request.tool_calls:
@@ -267,6 +277,16 @@ def append_tool_round_messages_with_plan(
                     "role": "tool",
                     "tool_call_id": tool_call["id"],
                     "content": _format_context_unavailable_tool_context(blocked_context),
+                }
+            )
+            continue
+
+        if tool_call_id in reused_ids:
+            request.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": _format_reused_tool_context(),
                 }
             )
             continue
@@ -391,8 +411,11 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
             clock=request.clock,
         )
     executable_tool_calls = context_resolution.executable_calls
-    if executable_tool_calls:
-        await update_tool_round_plan_started(request, tool_calls=executable_tool_calls)
+    planned_execution_tool_calls = [
+        tool_call for tool_call in executable_tool_calls if not _is_successfully_reusable_call(request, tool_call)
+    ]
+    if planned_execution_tool_calls:
+        await update_tool_round_plan_started(request, tool_calls=planned_execution_tool_calls)
     raw_results = await execute_tool_round_tools(
         request,
         selected_tool_calls=executable_tool_calls,
@@ -403,32 +426,38 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
         results=raw_results,
         run_id=request.run_id,
     )
-    source_plan = _build_source_selection_plan(results)
-    record_network_budget_feedback(request, results, source_plan=source_plan)
-    await emit_selected_source_evidence(request, results, source_plan=source_plan)
+    executed_results = [record for record in results if not record.reused]
+    reused_limited_tool_calls, not_executed_tool_calls = _partition_successfully_reusable_calls(
+        request,
+        selected_tool_calls[1],
+    )
+    source_plan = _build_source_selection_plan(executed_results)
+    record_network_budget_feedback(request, executed_results, source_plan=source_plan)
+    await emit_selected_source_evidence(request, executed_results, source_plan=source_plan)
     built_content_blocks = build_tool_round_content_blocks(results)
     append_tool_round_messages_with_plan(
         request,
         results,
         source_plan=source_plan,
         missing_result_tool_calls=missing_result_tool_calls,
-        not_executed_tool_calls=selected_tool_calls[1],
+        not_executed_tool_calls=not_executed_tool_calls,
         unavailable_tool_calls=unavailable_tool_calls,
+        reused_tool_calls=reused_limited_tool_calls,
         context_blocked_calls=context_resolution.blocked_calls,
         built_content_blocks=built_content_blocks,
     )
     persist_tool_round_checkpoint(request)
     await emit_product_result_blocks(request, results, built_content_blocks=built_content_blocks)
 
-    executed_count = len(executable_tool_calls)
-    tool_names = await complete_tool_round_step(request, results, executed_count=executed_count)
+    executed_count = _actual_tool_execution_count(executable_tool_calls, results)
+    tool_names = await complete_tool_round_step(request, executed_results, executed_count=executed_count)
     restore_reasoning_after_tool_decision(request.call_kwargs)
     return ToolRoundOutcome(
         tool_call_count=executed_count,
         tool_names=tool_names,
         no_progress_search_results=_classify_no_progress_search_results(
             selected_tool_calls=executable_tool_calls,
-            results=results,
+            results=executed_results,
         ),
         product_result_count=sum(is_registered_rich_content_block(block) for block in built_content_blocks.values()),
     )
@@ -550,8 +579,17 @@ def _select_tool_calls_within_limit(
         return candidate_tool_calls, []
 
     remaining_capacity = max(0, max_tool_calls - completed_tool_calls)
-    executed_tool_calls = candidate_tool_calls[:remaining_capacity]
-    not_executed_tool_calls = candidate_tool_calls[remaining_capacity:]
+    executed_tool_calls: list[dict] = []
+    not_executed_tool_calls: list[dict] = []
+    for tool_call in candidate_tool_calls:
+        if _is_successfully_reusable_call(request, tool_call):
+            executed_tool_calls.append(tool_call)
+            continue
+        if remaining_capacity > 0:
+            executed_tool_calls.append(tool_call)
+            remaining_capacity -= 1
+            continue
+        not_executed_tool_calls.append(tool_call)
     if not_executed_tool_calls:
         logger.info(
             "工具调用批次受全局上限截断: "
@@ -560,6 +598,40 @@ def _select_tool_calls_within_limit(
             f"not_executed={len(not_executed_tool_calls)}"
         )
     return executed_tool_calls, not_executed_tool_calls
+
+
+def _actual_tool_execution_count(
+    submitted_tool_calls: list[dict],
+    results: list[ToolExecutionRecord],
+) -> int:
+    submitted_ids = {str(tool_call.get("id", "")) for tool_call in submitted_tool_calls}
+    reused_ids = {
+        str(record.tool_call.get("id", ""))
+        for record in results
+        if record.reused and str(record.tool_call.get("id", "")) in submitted_ids
+    }
+    return max(0, len(submitted_tool_calls) - len(reused_ids))
+
+
+def _is_successfully_reusable_call(request: ToolRoundRequest, tool_call: dict) -> bool:
+    state = request.agent_state
+    if not isinstance(state, AgentLoopState):
+        return False
+    tool_handlers = request.tool_handlers if isinstance(request.tool_handlers, dict) else None
+    signature = build_successful_call_signature(tool_call, tool_handlers)
+    return signature is not None and signature in state.successful_tool_call_signatures
+
+
+def _partition_successfully_reusable_calls(
+    request: ToolRoundRequest,
+    tool_calls: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    reused: list[dict] = []
+    not_executed: list[dict] = []
+    for tool_call in tool_calls:
+        target = reused if _is_successfully_reusable_call(request, tool_call) else not_executed
+        target.append(tool_call)
+    return reused, not_executed
 
 
 def _reconcile_tool_execution_results(
@@ -640,6 +712,17 @@ def _format_not_executed_tool_context() -> str:
             "reason": "limit_reached",
             "limit_reason": "max_tool_calls",
             "message": "Agent 工具调用额度已耗尽，本次调用未执行，不能将其视为事实依据。",
+        },
+        ensure_ascii=False,
+    )
+
+
+def _format_reused_tool_context() -> str:
+    return json.dumps(
+        {
+            "status": "reused",
+            "reason": "identical_successful_result",
+            "message": "同名同参查询已成功执行；请复用上一条成功结果并直接回答，不要再次调用或重复展示。",
         },
         ensure_ascii=False,
     )

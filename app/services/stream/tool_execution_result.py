@@ -14,6 +14,10 @@ if TYPE_CHECKING:
     from app.services.tool_handlers.base import BaseToolHandler, ToolResult
 
 TOOL_RESULT_UNAVAILABLE_CONTEXT = "工具未取得可用结果，不能把该工具结果作为依据。"
+TOOL_RESULT_REUSED_CONTEXT = (
+    "该工具的同名同参查询已在本轮成功执行。请复用上一条成功结果并直接回答，"
+    "不要再次调用相同工具，也不要重复生成结果卡片。"
+)
 
 
 @dataclass
@@ -25,6 +29,7 @@ class ToolExecutionRecord:
     handler: BaseToolHandler | None
     block_id: str
     log_id: str
+    reused: bool = False
 
     @property
     def tool_name(self) -> str:
@@ -33,6 +38,8 @@ class ToolExecutionRecord:
 
     def format_llm_context(self, *, citation_numbers: list[int] | None = None) -> str:
         """格式化注入下一轮 LLM 的工具上下文。"""
+        if self.reused:
+            return TOOL_RESULT_REUSED_CONTEXT
         if self.handler is None:
             return TOOL_RESULT_UNAVAILABLE_CONTEXT
         if citation_numbers is None or not getattr(self.handler, "supports_run_level_citations", False):
@@ -41,6 +48,6 @@ class ToolExecutionRecord:
 
     def build_content_block(self) -> ContentBlock | None:
         """构造可落库的工具结果 content block。"""
-        if self.handler is None:
+        if self.reused or self.handler is None:
             return None
         return self.handler.build_content_block(self.result, self.block_id, self.log_id)

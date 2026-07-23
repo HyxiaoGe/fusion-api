@@ -1,6 +1,7 @@
 """tool_executor 重试策略测试"""
 
 import asyncio
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -25,6 +26,153 @@ class ToolRetryPolicyTests(unittest.TestCase):
 
 
 class DynamicToolExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_identical_successful_travel_query_is_reused_without_second_execution(self):
+        from app.services.mcp.flyai_travel_tools import (
+            FLYAI_SEARCH_TRAINS,
+            FlyAiTravelToolHandler,
+            build_flyai_travel_binding,
+        )
+
+        handler = FlyAiTravelToolHandler(
+            binding=build_flyai_travel_binding(FLYAI_SEARCH_TRAINS),
+            client=MagicMock(),
+            controls=MagicMock(),
+            user_scope="scope",
+        )
+        handler.execute = AsyncMock(return_value=ToolResult(status="success", data={"result_count": 1}))
+        handler.log = AsyncMock()
+        emitter = AsyncMock()
+        successful_signatures: set[str] = set()
+        first_call = {
+            "id": "call-train-1",
+            "name": FLYAI_SEARCH_TRAINS,
+            "arguments": json.dumps(
+                {
+                    "origin": " 深圳 ",
+                    "destination": "广州",
+                    "departure_date": "2026-07-25",
+                }
+            ),
+        }
+        repeated_call = {
+            "id": "call-train-2",
+            "name": FLYAI_SEARCH_TRAINS,
+            "arguments": {
+                "departure_date": "2026-07-25",
+                "destination": "广州",
+                "origin": "深圳",
+                "sort_by": "recommended",
+                "limit": 5,
+            },
+        }
+
+        records = await execute_tools_parallel(
+            [first_call, repeated_call],
+            "conv-1",
+            "user-1",
+            "model-1",
+            "qwen",
+            emitter=emitter,
+            tool_handlers={FLYAI_SEARCH_TRAINS: handler},
+            successful_tool_call_signatures=successful_signatures,
+        )
+
+        self.assertEqual(handler.execute.await_count, 1)
+        self.assertEqual(handler.log.await_count, 1)
+        self.assertFalse(records[0].reused)
+        self.assertTrue(records[1].reused)
+        self.assertIn("复用上一条成功结果", records[1].format_llm_context())
+        self.assertIn("直接回答", records[1].format_llm_context())
+        self.assertIsNone(records[1].build_content_block())
+        self.assertEqual(emitter.tool_call_started.await_count, 1)
+        self.assertEqual(emitter.tool_call_completed.await_count, 1)
+        self.assertEqual(emitter.tool_result_digest.await_count, 1)
+
+    async def test_different_travel_time_ranges_are_not_reused(self):
+        from app.services.mcp.flyai_travel_tools import (
+            FLYAI_SEARCH_TRAINS,
+            FlyAiTravelToolHandler,
+            build_flyai_travel_binding,
+        )
+
+        handler = FlyAiTravelToolHandler(
+            binding=build_flyai_travel_binding(FLYAI_SEARCH_TRAINS),
+            client=MagicMock(),
+            controls=MagicMock(),
+            user_scope="scope",
+        )
+        handler.execute = AsyncMock(return_value=ToolResult(status="success", data={"result_count": 1}))
+        handler.log = AsyncMock()
+        successful_signatures: set[str] = set()
+        calls = [
+            {
+                "id": f"call-train-{hour}",
+                "name": FLYAI_SEARCH_TRAINS,
+                "arguments": {
+                    "origin": "深圳",
+                    "destination": "广州",
+                    "departure_date": "2026-07-25",
+                    "departure_hour_start": hour,
+                },
+            }
+            for hour in (8, 9)
+        ]
+
+        records = await execute_tools_parallel(
+            calls,
+            "conv-1",
+            "user-1",
+            "model-1",
+            "qwen",
+            tool_handlers={FLYAI_SEARCH_TRAINS: handler},
+            successful_tool_call_signatures=successful_signatures,
+        )
+
+        self.assertEqual(handler.execute.await_count, 2)
+        self.assertTrue(all(not record.reused for record in records))
+
+    async def test_failed_identical_travel_query_can_retry_until_one_succeeds(self):
+        from app.services.mcp.flyai_travel_tools import (
+            FLYAI_SEARCH_TRAINS,
+            FlyAiTravelToolHandler,
+            build_flyai_travel_binding,
+        )
+
+        handler = FlyAiTravelToolHandler(
+            binding=build_flyai_travel_binding(FLYAI_SEARCH_TRAINS),
+            client=MagicMock(),
+            controls=MagicMock(),
+            user_scope="scope",
+        )
+        handler.execute = AsyncMock(
+            side_effect=[
+                ToolResult(status="failed", error_message="临时失败"),
+                ToolResult(status="success", data={"result_count": 1}),
+            ]
+        )
+        handler.log = AsyncMock()
+        successful_signatures: set[str] = set()
+        arguments = {
+            "origin": "深圳",
+            "destination": "广州",
+            "departure_date": "2026-07-25",
+        }
+        calls = [{"id": f"call-train-{index}", "name": FLYAI_SEARCH_TRAINS, "arguments": arguments} for index in (1, 2)]
+
+        records = await execute_tools_parallel(
+            calls,
+            "conv-1",
+            "user-1",
+            "model-1",
+            "qwen",
+            tool_handlers={FLYAI_SEARCH_TRAINS: handler},
+            successful_tool_call_signatures=successful_signatures,
+        )
+
+        self.assertEqual(handler.execute.await_count, 2)
+        self.assertTrue(all(not record.reused for record in records))
+        self.assertEqual([record.result.status for record in records], ["failed", "success"])
+
     async def test_runtime_location_is_only_forwarded_to_handler_not_events_or_logs(self):
         handler = MagicMock()
         handler.tool_name = "local_place_search"

@@ -53,6 +53,8 @@ def _request(
     network_budget=None,
     agent_state=None,
     resolve_tool_context_fn=None,
+    tool_handlers=None,
+    emitter=None,
 ) -> ToolRoundRequest:
     kwargs = dict(
         db="db",
@@ -76,7 +78,7 @@ def _request(
         ),
         step_number=1,
         run_id="run-1",
-        emitter=SimpleNamespace(),
+        emitter=SimpleNamespace() if emitter is None else (None if emitter is False else emitter),
         session_cache=SimpleNamespace(),
         network_budget=network_budget or SimpleNamespace(),
         call_kwargs={},
@@ -87,6 +89,7 @@ def _request(
         completed_tool_calls=completed_tool_calls,
         max_tool_calls=max_tool_calls,
         clock=Mock(return_value=10.5),
+        tool_handlers=tool_handlers,
     )
     if agent_state is not None:
         kwargs["agent_state"] = agent_state
@@ -96,6 +99,148 @@ def _request(
 
 
 class ToolRoundBudgetTests(IsolatedAsyncioTestCase):
+    async def test_second_identical_successful_travel_round_reuses_result_without_consuming_quota(self):
+        from app.services.mcp.flyai_travel_tools import (
+            FLYAI_SEARCH_TRAINS,
+            FlyAiTravelToolHandler,
+            build_flyai_travel_binding,
+        )
+        from app.services.stream.tool_executor import execute_tools_parallel
+
+        handler = FlyAiTravelToolHandler(
+            binding=build_flyai_travel_binding(FLYAI_SEARCH_TRAINS),
+            client=Mock(),
+            controls=Mock(),
+            user_scope="scope",
+        )
+        handler.execute = AsyncMock(return_value=ToolResult(status="success", data={"result_count": 1}))
+        handler.log = AsyncMock()
+        state = AgentLoopState()
+        on_tools_executed = Mock(wraps=state.record_executed_tool_calls)
+        first_call = {
+            "id": "tc-train-1",
+            "name": FLYAI_SEARCH_TRAINS,
+            "arguments": {
+                "origin": "深圳",
+                "destination": "广州",
+                "departure_date": "2026-07-25",
+            },
+        }
+        repeated_call = {
+            "id": "tc-train-2",
+            "name": FLYAI_SEARCH_TRAINS,
+            "arguments": json.dumps(
+                {
+                    "limit": 5,
+                    "sort_by": "recommended",
+                    "departure_date": "2026-07-25",
+                    "destination": "广州",
+                    "origin": " 深圳 ",
+                }
+            ),
+        }
+
+        first_request = _request(
+            tool_calls=[first_call],
+            completed_tool_calls=0,
+            max_tool_calls=1,
+            execute_tools_fn=execute_tools_parallel,
+            on_tools_executed=on_tools_executed,
+            agent_state=state,
+            tool_handlers={FLYAI_SEARCH_TRAINS: handler},
+            emitter=False,
+            resolve_tool_context_fn=AsyncMock(return_value=ToolContextResolution(executable_calls=[first_call])),
+        )
+        second_complete_step = AsyncMock()
+        second_request = _request(
+            tool_calls=[repeated_call],
+            completed_tool_calls=1,
+            max_tool_calls=1,
+            execute_tools_fn=execute_tools_parallel,
+            on_tools_executed=on_tools_executed,
+            complete_step_fn=second_complete_step,
+            agent_state=state,
+            tool_handlers={FLYAI_SEARCH_TRAINS: handler},
+            emitter=False,
+            resolve_tool_context_fn=AsyncMock(return_value=ToolContextResolution(executable_calls=[repeated_call])),
+        )
+
+        with patch("app.services.stream.tool_round.mark_tool_round_started", new=AsyncMock()) as mark_started:
+            first_outcome = await handle_tool_calls_round(request=first_request)
+            second_outcome = await handle_tool_calls_round(request=second_request)
+
+        self.assertEqual(first_outcome.tool_call_count, 1)
+        self.assertEqual(second_outcome.tool_call_count, 0)
+        self.assertEqual(state.total_tool_calls, 1)
+        self.assertEqual(handler.execute.await_count, 1)
+        self.assertEqual(handler.log.await_count, 1)
+        self.assertEqual(mark_started.await_count, 1)
+        self.assertEqual(second_complete_step.await_args.kwargs["tool_call_count"], 0)
+        self.assertEqual(second_complete_step.await_args.kwargs["completed_tool_calls"], 1)
+        self.assertEqual(
+            [message["role"] for message in second_request.messages],
+            ["user", "assistant", "tool"],
+        )
+        self.assertEqual(second_request.messages[-1]["tool_call_id"], "tc-train-2")
+        self.assertIn("复用上一条成功结果", second_request.messages[-1]["content"])
+        self.assertEqual(second_request.content_blocks, [])
+
+    async def test_qwen_four_train_calls_with_identical_last_two_count_three_actual_executions(self):
+        from app.services.mcp.flyai_travel_tools import (
+            FLYAI_SEARCH_TRAINS,
+            FlyAiTravelToolHandler,
+            build_flyai_travel_binding,
+        )
+        from app.services.stream.tool_executor import execute_tools_parallel
+
+        handler = FlyAiTravelToolHandler(
+            binding=build_flyai_travel_binding(FLYAI_SEARCH_TRAINS),
+            client=Mock(),
+            controls=Mock(),
+            user_scope="scope",
+        )
+        handler.execute = AsyncMock(return_value=ToolResult(status="success", data={"result_count": 1}))
+        handler.log = AsyncMock()
+        state = AgentLoopState()
+        calls = [
+            {
+                "id": f"tc-train-{index}",
+                "name": FLYAI_SEARCH_TRAINS,
+                "arguments": {
+                    "origin": "深圳",
+                    "destination": "广州",
+                    "departure_date": "2026-07-25",
+                    "departure_hour_start": hour,
+                },
+            }
+            for index, hour in enumerate((6, 8, 10, 10), 1)
+        ]
+        request = _request(
+            tool_calls=calls,
+            completed_tool_calls=0,
+            max_tool_calls=20,
+            execute_tools_fn=execute_tools_parallel,
+            on_tools_executed=state.record_executed_tool_calls,
+            agent_state=state,
+            tool_handlers={FLYAI_SEARCH_TRAINS: handler},
+            emitter=False,
+            resolve_tool_context_fn=AsyncMock(return_value=ToolContextResolution(executable_calls=calls)),
+        )
+
+        with patch("app.services.stream.tool_round.mark_tool_round_started", new=AsyncMock()):
+            outcome = await handle_tool_calls_round(request=request)
+
+        self.assertEqual(outcome.tool_call_count, 3)
+        self.assertEqual(state.total_tool_calls, 3)
+        self.assertEqual(handler.execute.await_count, 3)
+        self.assertEqual(handler.log.await_count, 3)
+        self.assertEqual(
+            [message["role"] for message in request.messages],
+            ["user", "assistant", "tool", "tool", "tool", "tool"],
+        )
+        self.assertIn("复用上一条成功结果", request.messages[-1]["content"])
+        self.assertEqual(request.content_blocks, [])
+
     async def test_denied_context_executes_no_tool_consumes_no_quota_and_appends_synthetic_result(self):
         tool_call = {
             "id": "tc-current",

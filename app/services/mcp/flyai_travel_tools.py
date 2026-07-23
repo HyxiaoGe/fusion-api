@@ -586,6 +586,19 @@ class FlyAiTravelToolHandler(BaseToolHandler):
             ][:8]
         return {key: value for key, value in output.items() if value is not None}
 
+    def build_successful_call_signature(self, input_params: dict) -> str | None:
+        """相同出行查询成功后可在当前 Agent run 内直接复用。"""
+
+        try:
+            normalized = _validate_args(self.tool_name, input_params)
+        except (ValidationError, ValueError, TypeError):
+            return None
+        payload = {
+            "tool_name": self.tool_name,
+            "arguments": normalized,
+        }
+        return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
     def _build_result_summary(self, result: ToolResult) -> dict:
         return {
             "kind": "external_tool",

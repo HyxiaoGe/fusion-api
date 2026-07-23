@@ -151,6 +151,15 @@ class BaseToolHandler(ABC):
         """子类可覆盖以限制即将持久化的工具输出。"""
         return result.data
 
+    def build_successful_call_signature(self, input_params: dict) -> str | None:
+        """为可安全复用的只读调用生成运行内签名。
+
+        默认禁用，避免未来有副作用的工具被错误去重。只有能保证“同名 + 归一化参数”
+        成功结果可在同一 Agent run 内复用的 handler 才应覆盖。
+        """
+
+        return None
+
     async def execute_with_emitter(
         self,
         *,
