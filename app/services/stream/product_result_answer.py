@@ -9,7 +9,7 @@ from typing import Any
 
 from app.utils.user_visible_content import sanitize_internal_tool_names
 
-_PRODUCT_RESULT_TYPES = {"place_results", "route_results", "flight_results", "train_results"}
+_PRODUCT_RESULT_TYPES = {"place_results", "route_results", "weather_results", "flight_results", "train_results"}
 _ROUTE_MODE_LABELS = {
     "driving": "驾车",
     "transit": "公交",
@@ -80,6 +80,11 @@ def _provider_entity_terms(content_blocks: list[Any]) -> list[str]:
                 value = _value(_value(block, endpoint_key), "label")
                 if isinstance(value, str) and "高德" in value:
                     terms.add(value)
+        elif block_type == "weather_results":
+            for key in ("query", "resolved_location"):
+                value = _value(block, key)
+                if isinstance(value, str) and "高德" in value:
+                    terms.add(value)
         elif block_type in {"flight_results", "train_results"}:
             collection = "flights" if block_type == "flight_results" else "trains"
             for option in _value(block, collection) or []:
@@ -118,10 +123,14 @@ def build_grounded_product_answer(content_blocks: list[Any]) -> str:
             paragraph = _build_place_answer(block)
         elif block_type == "route_results":
             paragraph = _build_route_answer(block)
+        elif block_type == "weather_results":
+            paragraph = _build_weather_answer(block)
         elif block_type == "flight_results":
             paragraph = _build_flight_answer(block)
-        else:
+        elif block_type == "train_results":
             paragraph = _build_train_answer(block)
+        else:
+            paragraph = ""
         if paragraph:
             paragraphs.append(paragraph)
     return "\n\n".join(paragraphs)
@@ -132,12 +141,12 @@ def build_product_tool_failure_answer(messages: list[dict[str, Any]] | None = No
 
     if _has_unavailable_geolocation_context(messages or []):
         return (
-            "本次未能获取当前位置，请检查浏览器或系统定位权限后重试，也可以直接提供明确起点。"
-            "由于位置没有获取成功，路线查询尚未执行。"
+            "本次未能获取当前位置，请检查浏览器或系统定位权限后重试，也可以直接提供明确地点。"
+            "由于位置没有获取成功，依赖当前位置的查询尚未执行。"
         )
     return (
-        "本次未取得可用的地点或路线数据，也未取得可用的航班或高铁数据，因此无法可靠给出具体地点、线路、班次、"
-        "时间、距离或费用。你可以稍后重试，或补充更明确的城市、起点、终点和日期。"
+        "本次未取得可用的地点或路线数据，也未取得可用的天气预报、航班或高铁数据，因此无法可靠给出具体地点、"
+        "天气、线路、班次、时间、距离或费用。你可以稍后重试，或补充更明确的城市、地点、起点、终点和日期。"
     )
 
 
@@ -187,6 +196,80 @@ def _build_route_answer(block: Any) -> str:
     recommendation = _route_recommendation_sentence(routes)
     limitations = _limitations_sentence(block)
     return f"{lead}{recommendation}{limitations}"
+
+
+def _build_weather_answer(block: Any) -> str:
+    days = [item for item in (_value(block, "forecast_days") or []) if _value(item, "date")][:4]
+    if not days:
+        return ""
+    location = _value(block, "resolved_location") or "该行政区"
+    summaries: list[str] = []
+    has_precipitation = False
+    has_strong_wind = False
+    weekday_labels = ("一", "二", "三", "四", "五", "六", "日")
+    for day in days:
+        raw_date = _value(day, "date")
+        if hasattr(raw_date, "strftime"):
+            date_label = f"{raw_date.month}月{raw_date.day}日"
+        else:
+            try:
+                parsed_date = datetime.strptime(str(raw_date), "%Y-%m-%d")
+                date_label = f"{parsed_date.month}月{parsed_date.day}日"
+            except ValueError:
+                continue
+        weekday = _value(day, "weekday")
+        weekday_label = (
+            f"周{weekday_labels[weekday - 1]}"
+            if isinstance(weekday, int) and not isinstance(weekday, bool) and 1 <= weekday <= 7
+            else ""
+        )
+        day_weather = _value(day, "day_weather")
+        night_weather = _value(day, "night_weather")
+        high_c = _value(day, "high_c")
+        low_c = _value(day, "low_c")
+        if not all(
+            (
+                isinstance(day_weather, str) and day_weather,
+                isinstance(night_weather, str) and night_weather,
+                isinstance(high_c, (int, float)) and not isinstance(high_c, bool),
+                isinstance(low_c, (int, float)) and not isinstance(low_c, bool),
+            )
+        ):
+            continue
+        detail = (
+            f"{date_label}{f'（{weekday_label}）' if weekday_label else ''}"
+            f"白天{day_weather}、夜间{night_weather}，{_format_temperature(low_c)}–{_format_temperature(high_c)}℃"
+        )
+        wind_parts: list[str] = []
+        for direction_key, power_key, period in (
+            ("day_wind_direction", "day_wind_power", "白天"),
+            ("night_wind_direction", "night_wind_power", "夜间"),
+        ):
+            direction = _value(day, direction_key)
+            power = _value(day, power_key)
+            if isinstance(direction, str) and direction and isinstance(power, str) and power:
+                wind_parts.append(f"{period}{direction}风{power}级")
+        if wind_parts:
+            detail += f"，{'、'.join(wind_parts)}"
+        summaries.append(detail)
+        has_precipitation = has_precipitation or bool(re.search(r"雨|雪|雷", f"{day_weather}{night_weather}"))
+        has_strong_wind = has_strong_wind or bool(
+            re.search(r"大风|台风", f"{day_weather}{night_weather}{''.join(wind_parts)}")
+        )
+    if not summaries:
+        return ""
+    lead = f"{location}天气预报：{'；'.join(summaries)}。"
+    if has_precipitation:
+        advice = "如需外出，建议携带雨具并根据天气减少长时间步行。"
+    elif has_strong_wind:
+        advice = "如需外出，建议做好一般防风措施并减少长时间步行。"
+    else:
+        advice = ""
+    return f"{lead}{advice}{_limitations_sentence(block)}"
+
+
+def _format_temperature(value: int | float) -> str:
+    return str(int(value)) if float(value).is_integer() else str(round(float(value), 1))
 
 
 def _build_flight_answer(block: Any) -> str:

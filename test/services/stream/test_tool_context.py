@@ -6,6 +6,44 @@ from app.services.stream.agent_loop_state import AgentLoopState
 
 
 class ToolContextResolutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_current_location_weather_requests_local_weather_context(self):
+        from app.services.stream.tool_context import resolve_tool_context
+
+        emitter = AsyncMock()
+        create_request = AsyncMock(return_value=object())
+        wait_result = AsyncMock(
+            return_value=ResolvedContext(
+                request_id="ctx-weather",
+                status="provided",
+                location=Geolocation(latitude=22.616, longitude=114.031, accuracy_m=25, acquired_at=99),
+            )
+        )
+        call = {
+            "id": "weather-current",
+            "name": "weather_forecast",
+            "arguments": '{"location":"当前位置","location_source":"current_location"}',
+        }
+
+        result = await resolve_tool_context(
+            tool_calls=[call],
+            state=AgentLoopState(),
+            emitter=emitter,
+            user_id="user-1",
+            conversation_id="conv-1",
+            message_id="msg-1",
+            run_id="run-1",
+            task_id="task-1",
+            clock=lambda: 100.0,
+            request_id_factory=lambda: "ctx-weather",
+            create_request_fn=create_request,
+            wait_result_fn=wait_result,
+        )
+
+        self.assertEqual(result.executable_calls, [call])
+        self.assertEqual(result.runtime_context.geolocation.latitude, 22.616)
+        self.assertEqual(create_request.await_args.kwargs["purpose"], "local_weather")
+        self.assertEqual(create_request.await_args.kwargs["reason"], "查询当前位置所在行政区的天气预报")
+
     async def test_broker_failure_blocks_dependent_call_without_crashing_or_reprompting(self):
         from app.services.stream.tool_context import resolve_tool_context
 

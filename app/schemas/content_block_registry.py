@@ -24,6 +24,7 @@ from app.schemas.chat import (
     TrainResultsBlock,
     UnsupportedContentBlock,
     UrlBlock,
+    WeatherResultsBlock,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,7 @@ CONTENT_BLOCK_REGISTRY: dict[tuple[str, int | None], ContentBlockRegistration] =
     ("unsupported_result", None): ContentBlockRegistration(UnsupportedContentBlock),
     ("place_results", 1): ContentBlockRegistration(PlaceResultsBlock, schema_version=1),
     ("route_results", 1): ContentBlockRegistration(RouteResultsBlock, schema_version=1),
+    ("weather_results", 1): ContentBlockRegistration(WeatherResultsBlock, schema_version=1),
     ("flight_results", 1): ContentBlockRegistration(FlightResultsBlock, schema_version=1),
     ("train_results", 1): ContentBlockRegistration(TrainResultsBlock, schema_version=1),
 }

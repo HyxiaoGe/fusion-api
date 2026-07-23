@@ -252,7 +252,52 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         emitted_answer = append_chunk.await_args.args[2]
         self.assertIn("未能获取当前位置", emitted_answer)
         self.assertIn("浏览器或系统定位权限", emitted_answer)
-        self.assertIn("路线查询尚未执行", emitted_answer)
+        self.assertIn("依赖当前位置的查询尚未执行", emitted_answer)
+        self.assertNotIn("路线查询尚未执行", emitted_answer)
+
+    async def test_weather_location_context_denied_uses_neutral_safe_failure_message(self):
+        state = AgentLoopState(product_tool_attempted=True)
+        state.mark_current_step("step-weather-location-denied")
+        append_chunk = AsyncMock()
+        messages = [
+            {"role": "user", "content": "我这里未来几天天气怎么样"},
+            {
+                "role": "tool",
+                "tool_call_id": "tc-weather",
+                "content": (
+                    '{"status":"unavailable","error_code":"context_required_not_provided",'
+                    '"context_type":"geolocation","context_status":"denied",'
+                    '"reason":"permission_denied"}'
+                ),
+            },
+        ]
+
+        with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
+            outcome = await handle_agent_round_outcome(
+                request=AgentRoundOutcomeRequest(
+                    db="db",
+                    messages=messages,
+                    state=state,
+                    runtime=_runtime(complete_step_fn=AsyncMock()),
+                    step_number=2,
+                    step_context=_step_context("step-weather-location-denied"),
+                    round_result=AgentRoundResult(
+                        reasoning_buf="",
+                        content_buf="当前温度30度。",
+                        tool_calls=[],
+                        finish_reason="stop",
+                        accumulated_usage=Usage(input_tokens=2, output_tokens=9),
+                        output_deferred=True,
+                    ),
+                )
+            )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        emitted_answer = append_chunk.await_args.args[2]
+        self.assertIn("未能获取当前位置", emitted_answer)
+        self.assertIn("依赖当前位置的查询尚未执行", emitted_answer)
+        self.assertNotIn("当前温度30度", emitted_answer)
+        self.assertNotIn("起点", emitted_answer)
         self.assertNotIn("高德", emitted_answer)
 
     async def test_empty_deferred_model_answer_still_completes_from_product_result(self):

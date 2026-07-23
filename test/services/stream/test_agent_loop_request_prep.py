@@ -39,6 +39,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             "tools": [
                 {"type": "function", "function": {"name": "local_place_search"}},
                 {"type": "function", "function": {"name": "route_compare"}},
+                {"type": "function", "function": {"name": "weather_forecast"}},
                 {"type": "function", "function": {"name": "web_search"}},
             ]
         }
@@ -95,6 +96,9 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("不得声称路线耗时包含或不包含停车及其他未返回构成", boundary)
         self.assertIn("未返回的路线属性只能说明无法从本次查询结果确认", boundary)
+        self.assertIn("【天气事实边界规则】", boundary)
+        self.assertIn("实时温度、湿度、空气质量、降雨概率", boundary)
+        self.assertIn("不得声称代表具体建筑物、街道或园区的精确天气", boundary)
         self.assertNotIn("民治星巴克", boundary)
         self.assertNotIn("深圳北站", boundary)
 

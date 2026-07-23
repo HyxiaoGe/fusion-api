@@ -61,6 +61,8 @@ def _geolocation_purpose(tool_call: dict) -> str | None:
             return "route_origin"
         if args.get("destination_source") == "current_location":
             return "route_destination"
+    if tool_call.get("name") == "weather_forecast" and args.get("location_source") == "current_location":
+        return "local_weather"
     return None
 
 
@@ -122,6 +124,7 @@ async def resolve_tool_context(
         "nearby_search": "搜索当前位置附近的地点",
         "route_origin": "使用当前位置作为路线起点",
         "route_destination": "使用当前位置作为路线终点",
+        "local_weather": "查询当前位置所在行政区的天气预报",
     }.get(purpose, "完成当前工具调用需要位置信息")
     try:
         pending = await create_request_fn(

@@ -237,7 +237,48 @@ class McpAgentToolCatalogTests(unittest.TestCase):
         self.assertEqual(tool_set.handlers, {})
         self.assertEqual(tool_set.audit_bindings, [])
 
-    def test_amap_catalog_exposes_only_two_stable_product_tools_when_dependencies_are_complete(self):
+    def test_amap_catalog_exposes_stable_product_tools_when_dependencies_are_complete(self):
+        remote_names = [
+            "maps_geo",
+            "maps_regeocode",
+            "maps_text_search",
+            "maps_around_search",
+            "maps_search_detail",
+            "maps_direction_driving",
+            "maps_direction_transit_integrated",
+            "maps_direction_walking",
+            "maps_direction_bicycling",
+            "maps_weather",
+        ]
+        row = build_row(
+            provider="amap",
+            endpoint_url="https://mcp.amap.com/mcp",
+            allowed_tools=remote_names,
+            discovered_tools=[
+                {"name": name, "description": name, "input_schema": {"type": "object"}} for name in remote_names
+            ],
+        )
+
+        tool_set = load_tools([row])
+
+        product_names = [definition["function"]["name"] for definition in tool_set.definitions]
+        self.assertEqual(product_names, ["local_place_search", "route_compare", "weather_forecast"])
+        self.assertEqual(set(tool_set.handlers), set(product_names))
+        self.assertIs(
+            tool_set.handlers["local_place_search"].orchestration_lock,
+            tool_set.handlers["route_compare"].orchestration_lock,
+        )
+        self.assertIs(
+            tool_set.handlers["route_compare"].orchestration_lock,
+            tool_set.handlers["weather_forecast"].orchestration_lock,
+        )
+        self.assertNotIn("maps_", json.dumps(tool_set.definitions, ensure_ascii=False))
+        self.assertEqual(
+            [binding["remote_tool_name"] for binding in tool_set.audit_bindings],
+            ["product:local_place_search", "product:route_compare", "product:weather_forecast"],
+        )
+
+    def test_amap_catalog_hides_only_weather_when_maps_weather_is_missing(self):
         remote_names = [
             "maps_geo",
             "maps_regeocode",
@@ -260,18 +301,11 @@ class McpAgentToolCatalogTests(unittest.TestCase):
 
         tool_set = load_tools([row])
 
-        product_names = [definition["function"]["name"] for definition in tool_set.definitions]
-        self.assertEqual(product_names, ["local_place_search", "route_compare"])
-        self.assertEqual(set(tool_set.handlers), set(product_names))
-        self.assertIs(
-            tool_set.handlers["local_place_search"].orchestration_lock,
-            tool_set.handlers["route_compare"].orchestration_lock,
-        )
-        self.assertNotIn("maps_", json.dumps(tool_set.definitions, ensure_ascii=False))
         self.assertEqual(
-            [binding["remote_tool_name"] for binding in tool_set.audit_bindings],
-            ["product:local_place_search", "product:route_compare"],
+            [definition["function"]["name"] for definition in tool_set.definitions],
+            ["local_place_search", "route_compare"],
         )
+        self.assertNotIn("weather_forecast", tool_set.handlers)
 
     def test_multiple_enabled_official_amap_rows_fail_closed_without_affecting_other_providers(self):
         amap_rows = [

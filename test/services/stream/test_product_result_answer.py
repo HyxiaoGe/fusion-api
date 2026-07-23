@@ -1,4 +1,5 @@
 import unittest
+from datetime import date, datetime, timezone
 
 from app.schemas.chat import (
     PlaceResult,
@@ -7,7 +8,10 @@ from app.schemas.chat import (
     RouteOption,
     RouteResultsBlock,
     TransitLeg,
+    WeatherForecastDay,
+    WeatherResultsBlock,
 )
+from app.services.stream.product_answer_validator import validate_product_answer
 from app.services.stream.product_result_answer import (
     build_grounded_product_answer,
     build_product_tool_failure_answer,
@@ -17,6 +21,68 @@ from app.services.stream.product_result_answer import (
 
 
 class ProductResultAnswerTests(unittest.TestCase):
+    def test_weather_fallback_uses_only_forecast_fields_and_safe_advice(self):
+        block = WeatherResultsBlock(
+            type="weather_results",
+            schema_version=1,
+            provider="amap",
+            status="degraded",
+            query="南山区",
+            resolved_location="南山区",
+            day_count=2,
+            forecast_days=[
+                WeatherForecastDay(
+                    date=date(2026, 7, 23),
+                    weekday=4,
+                    day_weather="多云",
+                    night_weather="阵雨",
+                    high_c=32,
+                    low_c=27,
+                ),
+                WeatherForecastDay(
+                    date=date(2026, 7, 24),
+                    weekday=5,
+                    day_weather="雷阵雨",
+                    night_weather="多云",
+                    high_c=31,
+                    low_c=26,
+                    day_wind_direction="南",
+                    day_wind_power="≤3",
+                ),
+            ],
+            fetched_at=datetime(2026, 7, 23, 8, tzinfo=timezone.utc),
+            limitations=["天气预报按行政区提供，不代表具体建筑物", "仅返回 2 天有效预报"],
+        )
+
+        answer = build_grounded_product_answer([block])
+
+        self.assertTrue(has_product_result_blocks([block]))
+        self.assertIn("南山区天气预报", answer)
+        self.assertIn("7月23日（周四）白天多云、夜间阵雨，27–32℃", answer)
+        self.assertIn("7月24日（周五）白天雷阵雨、夜间多云，26–31℃", answer)
+        self.assertIn("建议携带雨具", answer)
+        self.assertTrue(validate_product_answer(answer, [block]).is_valid)
+        self.assertNotIn("高德", answer)
+        for unsupported in ("湿度", "空气质量", "降雨概率", "预警"):
+            self.assertNotIn(unsupported, answer)
+
+    def test_geolocation_failure_answer_is_product_neutral(self):
+        answer = build_product_tool_failure_answer(
+            [
+                {
+                    "role": "tool",
+                    "content": (
+                        '{"error_code":"context_required_not_provided","context_type":"geolocation",'
+                        '"context_status":"denied"}'
+                    ),
+                }
+            ]
+        )
+
+        self.assertIn("依赖当前位置的查询尚未执行", answer)
+        self.assertNotIn("路线查询尚未执行", answer)
+        self.assertNotIn("起点", answer)
+
     def test_neutralize_product_provider_mentions_keeps_sentences_natural(self):
         answer = neutralize_product_provider_mentions(
             "根据高德返回的路线结果，驾车更快。"

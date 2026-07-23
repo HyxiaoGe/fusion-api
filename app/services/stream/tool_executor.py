@@ -39,6 +39,7 @@ _INTERNAL_TOOL_ARG_KEYS = {"budget_decision"}
 _AMAP_PRODUCT_EXECUTION_PRIORITY = {
     "route_compare": 0,
     "local_place_search": 1,
+    "weather_forecast": 2,
 }
 
 

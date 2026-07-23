@@ -1,13 +1,16 @@
 import asyncio
 import json
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from app.schemas.chat import WeatherResultsBlock
 from app.services.agent.context_broker import Geolocation
 from app.services.mcp.amap_product_tools import (
     AMAP_FACT_BOUNDARY_SYSTEM_PROMPT,
     AMAP_PRODUCT_DEFINITIONS,
+    AMAP_PRODUCT_REMOTE_DEPENDENCIES,
     AmapProductToolHandler,
     AmapRunCoordinateConversion,
     build_amap_product_binding,
@@ -66,6 +69,8 @@ def build_handler(
     timeout_seconds=25,
     coordinate_converter=None,
     coordinate_conversion=None,
+    weather_cache=None,
+    now=None,
 ):
     hashes = {
         "maps_geo": "hash-geo",
@@ -77,6 +82,7 @@ def build_handler(
         "maps_direction_transit_integrated": "hash-transit",
         "maps_direction_walking": "hash-walking",
         "maps_direction_bicycling": "hash-bicycling",
+        "maps_weather": "hash-weather",
     }
     binding = build_amap_product_binding(
         row=SimpleNamespace(id="amap-1", provider="amap", config_version=3),
@@ -94,6 +100,8 @@ def build_handler(
             timeout_seconds=timeout_seconds,
             **({"coordinate_converter": coordinate_converter} if coordinate_converter is not None else {}),
             **({"coordinate_conversion": coordinate_conversion} if coordinate_conversion is not None else {}),
+            **({"weather_cache": weather_cache} if weather_cache is not None else {}),
+            **({"now": now} if now is not None else {}),
         ),
         executor,
     )
@@ -103,7 +111,7 @@ class AmapProductDefinitionTests(unittest.TestCase):
     def test_definitions_are_stable_closed_product_contracts(self):
         definitions = {item["function"]["name"]: item for item in AMAP_PRODUCT_DEFINITIONS}
 
-        self.assertEqual(set(definitions), {"local_place_search", "route_compare"})
+        self.assertEqual(set(definitions), {"local_place_search", "route_compare", "weather_forecast"})
         local_schema = definitions["local_place_search"]["function"]["parameters"]
         route_schema = definitions["route_compare"]["function"]["parameters"]
         self.assertFalse(local_schema["additionalProperties"])
@@ -152,6 +160,512 @@ class AmapProductDefinitionTests(unittest.TestCase):
         self.assertIn("未指定时必须省略", route_description)
         self.assertIn("仅当用户明确指定日期", AMAP_FACT_BOUNDARY_SYSTEM_PROMPT)
         self.assertIn("不得默认填写“现在”", AMAP_FACT_BOUNDARY_SYSTEM_PROMPT)
+        weather_schema = definitions["weather_forecast"]["function"]["parameters"]
+        self.assertEqual(set(weather_schema["properties"]), {"location", "city", "location_source"})
+        self.assertEqual(weather_schema["required"], ["location"])
+        self.assertFalse(weather_schema["additionalProperties"])
+        self.assertEqual(
+            AMAP_PRODUCT_REMOTE_DEPENDENCIES["weather_forecast"],
+            frozenset({"maps_geo", "maps_regeocode", "maps_weather"}),
+        )
+
+
+class FakeWeatherCache:
+    def __init__(self, values=None, *, get_error=None, set_error=None):
+        self.values = dict(values or {})
+        self.get_error = get_error
+        self.set_error = set_error
+        self.get_calls = []
+        self.set_calls = []
+
+    async def get(self, adcode):
+        self.get_calls.append(adcode)
+        if self.get_error:
+            raise self.get_error
+        return self.values.get(adcode)
+
+    async def set(self, adcode, value):
+        self.set_calls.append((adcode, value))
+        if self.set_error:
+            raise self.set_error
+        self.values[adcode] = value
+
+
+class HangingWeatherCache(FakeWeatherCache):
+    def __init__(self, *, hang_get=False, hang_set=False):
+        super().__init__()
+        self.hang_get = hang_get
+        self.hang_set = hang_set
+
+    async def get(self, adcode):
+        if self.hang_get:
+            await asyncio.Event().wait()
+        return await super().get(adcode)
+
+    async def set(self, adcode, value):
+        if self.hang_set:
+            await asyncio.Event().wait()
+        await super().set(adcode, value)
+
+
+def four_day_weather(*, city="深圳市", adcode="440300"):
+    return mcp_payload(
+        {
+            "city": city,
+            "forecasts": [
+                {
+                    "date": f"2026-07-{day}",
+                    "week": str(weekday),
+                    "dayweather": day_weather,
+                    "nightweather": night_weather,
+                    "daytemp": str(high),
+                    "nighttemp": str(low),
+                    "daytemp_float": str(high),
+                    "nighttemp_float": str(low),
+                    "daywind": "南",
+                    "nightwind": "东南",
+                    "daypower": "≤3",
+                    "nightpower": "≤3",
+                }
+                for day, weekday, day_weather, night_weather, high, low in (
+                    (23, 4, "多云", "阵雨", 32, 27),
+                    (24, 5, "阵雨", "多云", 31, 26),
+                    (25, 6, "雷阵雨", "多云", 31, 26),
+                    (26, 7, "多云", "多云", 33, 27),
+                )
+            ],
+        }
+    )
+
+
+class AmapWeatherForecastTests(unittest.IsolatedAsyncioTestCase):
+    async def test_named_location_geocodes_then_builds_safe_block(self):
+        fetched_at = datetime(2026, 7, 23, 8, tzinfo=timezone.utc)
+        cache = FakeWeatherCache()
+        handler, executor = build_handler(
+            "weather_forecast",
+            {
+                "maps_geo": [
+                    mcp_payload({"geocodes": [{"formatted_address": "深圳市", "city": "深圳市", "adcode": "440300"}]})
+                ],
+                "maps_weather": [four_day_weather()],
+            },
+            weather_cache=cache,
+            now=lambda: fetched_at,
+        )
+
+        result = await handler.execute({"location": "深圳市"})
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual([call[0] for call in executor.calls], ["maps_geo", "maps_weather"])
+        self.assertEqual(executor.calls[1][2], {"city": "440300"})
+        self.assertEqual(result.data["result"]["day_count"], 4)
+        self.assertEqual(
+            datetime.fromisoformat(result.data["result"]["fetched_at"].replace("Z", "+00:00")),
+            fetched_at,
+        )
+        self.assertNotIn("coordinates", json.dumps(result.data, ensure_ascii=False))
+        self.assertEqual(cache.get_calls, ["440300"])
+        self.assertEqual(cache.set_calls[0][0], "440300")
+
+        block = handler.build_content_block(result, "blk-weather", "log-weather")
+        self.assertIsInstance(block, WeatherResultsBlock)
+        self.assertEqual(block.query, "深圳市")
+        self.assertEqual(block.resolved_location, "深圳市")
+        self.assertEqual(block.forecast_days[0].high_c, 32)
+        public_payload = json.dumps(result.data["result"], ensure_ascii=False)
+        self.assertNotIn("440300", public_payload)
+        self.assertNotIn("440300", handler.format_llm_context(result))
+        self.assertNotIn("440300", block.model_dump_json())
+
+    async def test_named_location_accepts_official_maps_geo_results_shape(self):
+        handler, executor = build_handler(
+            "weather_forecast",
+            {
+                "maps_geo": [
+                    mcp_payload(
+                        {
+                            "results": [
+                                {
+                                    "country": "中国",
+                                    "province": "广东省",
+                                    "city": "深圳市",
+                                    "district": "龙华区",
+                                    "adcode": "440309",
+                                    "location": "114.044910,22.696735",
+                                    "level": "区县",
+                                }
+                            ]
+                        }
+                    )
+                ],
+                "maps_weather": [four_day_weather(city="龙华区", adcode="440309")],
+            },
+            weather_cache=FakeWeatherCache(),
+            now=lambda: datetime(2026, 7, 23, 8, tzinfo=timezone.utc),
+        )
+
+        result = await handler.execute({"location": "龙华区", "city": "深圳"})
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual([call[0] for call in executor.calls], ["maps_geo", "maps_weather"])
+        self.assertEqual(executor.calls[1][2], {"city": "440309"})
+        self.assertEqual(result.data["result"]["resolved_location"], "龙华区")
+
+    async def test_private_location_forms_are_rejected_before_budget_or_remote_events(self):
+        for location in ("440300", "114.031,22.616", "当前位置"):
+            with self.subTest(location=location):
+                handler, executor = build_handler(
+                    "weather_forecast",
+                    {},
+                    remaining_budget=0,
+                    weather_cache=FakeWeatherCache(),
+                )
+
+                result = await handler.execute({"location": location})
+
+                self.assertEqual(result.status, "failed")
+                self.assertEqual(result.data["error_code"], "invalid_arguments")
+                self.assertEqual(executor.calls, [])
+                self.assertEqual(executor.remaining_budget, 0)
+
+    async def test_named_location_geocodes_then_returns_degraded_partial_forecast(self):
+        partial = four_day_weather(city="南山区", adcode="440305")
+        root = partial["content"][0]["structured_data"]
+        root["forecasts"] = root["forecasts"][:2]
+        handler, executor = build_handler(
+            "weather_forecast",
+            {
+                "maps_geo": [
+                    mcp_payload(
+                        {
+                            "geocodes": [
+                                {
+                                    "formatted_address": "广东省深圳市南山区",
+                                    "city": "深圳市",
+                                    "district": "南山区",
+                                    "adcode": "440305",
+                                    "location": "113.93,22.53",
+                                }
+                            ]
+                        }
+                    )
+                ],
+                "maps_weather": [partial],
+            },
+            weather_cache=FakeWeatherCache(),
+            now=lambda: datetime(2026, 7, 23, 8, tzinfo=timezone.utc),
+        )
+
+        result = await handler.execute({"location": "南山区", "city": "深圳市"})
+
+        self.assertEqual(result.status, "degraded")
+        self.assertEqual([call[0] for call in executor.calls], ["maps_geo", "maps_weather"])
+        self.assertEqual(executor.calls[1][2], {"city": "440305"})
+        self.assertEqual(result.data["result"]["resolved_location"], "南山区")
+        self.assertIn("仅返回 2 天有效预报", result.data["result"]["limitations"])
+
+    async def test_geocode_requires_one_unique_adcode_after_city_filtering(self):
+        ambiguous = mcp_payload(
+            {
+                "geocodes": [
+                    {"formatted_address": "广东省深圳市南山区", "city": "深圳市", "adcode": "440305"},
+                    {"formatted_address": "四川省南充市南部县", "city": "南充市", "adcode": "511321"},
+                ]
+            }
+        )
+        handler, executor = build_handler(
+            "weather_forecast",
+            {"maps_geo": [ambiguous]},
+            weather_cache=FakeWeatherCache(),
+        )
+
+        ambiguous_result = await handler.execute({"location": "南山"})
+
+        self.assertEqual(ambiguous_result.status, "failed")
+        self.assertEqual(ambiguous_result.data["error_code"], "invalid_response")
+        self.assertEqual([call[0] for call in executor.calls], ["maps_geo"])
+
+        duplicate = mcp_payload(
+            {
+                "geocodes": [
+                    {"formatted_address": "广东省深圳市南山区", "city": "深圳市", "adcode": "440305"},
+                    {"formatted_address": "深圳市南山区", "city": "深圳", "adcode": "440305"},
+                    {"formatted_address": "四川省南充市南部县", "city": "南充市", "adcode": "511321"},
+                ]
+            }
+        )
+        handler, executor = build_handler(
+            "weather_forecast",
+            {
+                "maps_geo": [duplicate],
+                "maps_weather": [four_day_weather(city="南山区", adcode="440305")],
+            },
+            weather_cache=FakeWeatherCache(),
+        )
+
+        selected = await handler.execute({"location": "南山区", "city": "深圳市"})
+
+        self.assertEqual(selected.status, "success")
+        self.assertEqual([call[0] for call in executor.calls], ["maps_geo", "maps_weather"])
+
+    async def test_current_location_resolves_official_regeocode_shape_without_exposing_coordinates(self):
+        cache = FakeWeatherCache()
+        handler, executor = build_handler(
+            "weather_forecast",
+            {
+                "maps_regeocode": [
+                    mcp_payload(
+                        {
+                            "country": "中国",
+                            "province": "广东省",
+                            "city": "深圳市",
+                            "district": "龙华区",
+                        }
+                    )
+                ],
+                "maps_geo": [
+                    mcp_payload(
+                        {
+                            "results": [
+                                {
+                                    "country": "中国",
+                                    "province": "广东省",
+                                    "city": "深圳市",
+                                    "district": "龙华区",
+                                    "adcode": "440309",
+                                    "location": "114.044910,22.696735",
+                                    "level": "区县",
+                                },
+                            ]
+                        }
+                    )
+                ],
+                "maps_weather": [four_day_weather(city="龙华区", adcode="440309")],
+            },
+            weather_cache=cache,
+            coordinate_converter=AsyncMock(return_value="114.031000,22.616000"),
+            now=lambda: datetime(2026, 7, 23, 8, tzinfo=timezone.utc),
+        )
+        context = ToolRuntimeContext(
+            geolocation=Geolocation(
+                latitude=22.616,
+                longitude=114.031,
+                accuracy_m=20,
+                acquired_at=1_700_000_000,
+            )
+        )
+
+        result = await handler.execute_with_runtime_context(
+            {"location": "当前位置", "location_source": "current_location"},
+            context,
+        )
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual([call[0] for call in executor.calls], ["maps_regeocode", "maps_geo", "maps_weather"])
+        self.assertEqual(
+            executor.calls[1][2],
+            {"address": "广东省深圳市龙华区", "city": "深圳市"},
+        )
+        self.assertEqual(executor.calls[2][2], {"city": "440309"})
+        serialized = json.dumps(result.data, ensure_ascii=False)
+        self.assertNotIn("114.031", serialized)
+        self.assertNotIn("22.616", serialized)
+        self.assertNotIn("114.044910", serialized)
+        self.assertNotIn("22.696735", serialized)
+        self.assertEqual(result.data["result"]["query"], "当前位置")
+        self.assertEqual(result.data["result"]["resolved_location"], "龙华区")
+        cached = cache.set_calls[0][1]
+        self.assertEqual(
+            set(cached),
+            {"resolved_location", "forecast_days", "fetched_at", "limitations"},
+        )
+        self.assertNotIn("当前位置", json.dumps(cached, ensure_ascii=False))
+
+    async def test_current_location_reserves_conversion_regeocode_geo_and_weather_before_starting(self):
+        converter = AsyncMock(return_value="114.031000,22.616000")
+        handler, executor = build_handler(
+            "weather_forecast",
+            {},
+            remaining_budget=3,
+            weather_cache=FakeWeatherCache(),
+            coordinate_converter=converter,
+        )
+        context = ToolRuntimeContext(
+            geolocation=Geolocation(
+                latitude=22.616,
+                longitude=114.031,
+                accuracy_m=20,
+                acquired_at=1_700_000_000,
+            )
+        )
+
+        result = await handler.execute_with_runtime_context(
+            {"location": "当前位置", "location_source": "current_location"},
+            context,
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.data["error_code"], "server_run_budget_exhausted")
+        converter.assert_not_awaited()
+        self.assertEqual(executor.calls, [])
+        self.assertEqual(executor.coordinate_budget_attempts, 0)
+
+    async def test_cache_core_never_persists_query_and_hit_rebuilds_current_query(self):
+        cache = FakeWeatherCache()
+        handler, executor = build_handler(
+            "weather_forecast",
+            {
+                "maps_geo": [
+                    mcp_payload(
+                        {
+                            "geocodes": [
+                                {"formatted_address": "深圳市南山区地点甲", "city": "深圳市", "adcode": "440300"}
+                            ]
+                        }
+                    ),
+                    mcp_payload(
+                        {
+                            "geocodes": [
+                                {"formatted_address": "深圳市福田区地点乙", "city": "深圳市", "adcode": "440300"}
+                            ]
+                        }
+                    ),
+                ],
+                "maps_weather": [four_day_weather()],
+            },
+            weather_cache=cache,
+            now=lambda: datetime(2026, 7, 23, 8, tzinfo=timezone.utc),
+        )
+
+        first = await handler.execute({"location": "深圳"})
+        second = await handler.execute({"location": "鹏城"})
+
+        self.assertEqual(first.data["result"]["query"], "深圳")
+        self.assertEqual(second.data["result"]["query"], "鹏城")
+        self.assertEqual([call[0] for call in executor.calls], ["maps_geo", "maps_weather", "maps_geo"])
+        cached_payload = cache.set_calls[0][1]
+        self.assertEqual(
+            set(cached_payload),
+            {"resolved_location", "forecast_days", "fetched_at", "limitations"},
+        )
+        self.assertNotIn("query", json.dumps(cached_payload, ensure_ascii=False))
+        self.assertNotIn("tool_call_log_id", json.dumps(cached_payload, ensure_ascii=False))
+        self.assertNotIn("地点甲", json.dumps(cached_payload, ensure_ascii=False))
+        self.assertNotIn("地点乙", json.dumps(cached_payload, ensure_ascii=False))
+
+    async def test_cache_rejects_future_stale_and_cross_shanghai_day_entries(self):
+        base_core = {
+            "resolved_location": "深圳市",
+            "forecast_days": [
+                {
+                    "date": "2026-07-23",
+                    "weekday": 4,
+                    "day_weather": "多云",
+                    "night_weather": "阵雨",
+                    "high_c": 32,
+                    "low_c": 27,
+                }
+            ],
+            "limitations": ["仅返回 1 天有效预报"],
+        }
+        cases = (
+            ("future", "2026-07-23T08:31:00+00:00", datetime(2026, 7, 23, 8, tzinfo=timezone.utc)),
+            ("stale", "2026-07-23T07:29:00+00:00", datetime(2026, 7, 23, 8, tzinfo=timezone.utc)),
+            ("cross-day", "2026-07-22T15:59:00+00:00", datetime(2026, 7, 22, 16, 1, tzinfo=timezone.utc)),
+        )
+        for label, fetched_at, now in cases:
+            with self.subTest(label=label):
+                cache = FakeWeatherCache({"440300": {**base_core, "fetched_at": fetched_at}})
+                handler, executor = build_handler(
+                    "weather_forecast",
+                    {
+                        "maps_geo": [
+                            mcp_payload(
+                                {
+                                    "geocodes": [
+                                        {
+                                            "formatted_address": "深圳市",
+                                            "city": "深圳市",
+                                            "adcode": "440300",
+                                        }
+                                    ]
+                                }
+                            )
+                        ],
+                        "maps_weather": [four_day_weather()],
+                    },
+                    weather_cache=cache,
+                    now=lambda value=now: value,
+                )
+
+                result = await handler.execute({"location": "深圳市"})
+
+                self.assertEqual(result.status, "success")
+                self.assertEqual([call[0] for call in executor.calls], ["maps_geo", "maps_weather"])
+
+    async def test_cache_failures_bypass_and_zero_valid_days_fail_closed(self):
+        cache = FakeWeatherCache(get_error=RuntimeError("redis down"), set_error=RuntimeError("redis down"))
+        handler, executor = build_handler(
+            "weather_forecast",
+            {
+                "maps_geo": [
+                    mcp_payload({"geocodes": [{"formatted_address": "深圳市", "city": "深圳市", "adcode": "440300"}]})
+                ],
+                "maps_weather": [
+                    mcp_payload(
+                        {
+                            "city": "深圳市",
+                            "forecasts": [{"date": "bad", "dayweather": "多云"}],
+                        }
+                    )
+                ],
+            },
+            weather_cache=cache,
+        )
+
+        result = await handler.execute({"location": "深圳市"})
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.data["error_code"], "invalid_response")
+        self.assertEqual([call[0] for call in executor.calls], ["maps_geo", "maps_weather"])
+        self.assertIsNone(handler.build_content_block(result, "blk-weather", "log-weather"))
+
+    async def test_hanging_cache_get_and_set_are_bypassed_without_losing_weather_result(self):
+        for label, cache in (
+            ("get", HangingWeatherCache(hang_get=True)),
+            ("set", HangingWeatherCache(hang_set=True)),
+        ):
+            with self.subTest(label=label):
+                handler, executor = build_handler(
+                    "weather_forecast",
+                    {
+                        "maps_geo": [
+                            mcp_payload(
+                                {
+                                    "geocodes": [
+                                        {
+                                            "formatted_address": "深圳市",
+                                            "city": "深圳市",
+                                            "adcode": "440300",
+                                        }
+                                    ]
+                                }
+                            )
+                        ],
+                        "maps_weather": [four_day_weather()],
+                    },
+                    weather_cache=cache,
+                    now=lambda: datetime(2026, 7, 23, 8, tzinfo=timezone.utc),
+                )
+
+                result = await asyncio.wait_for(
+                    handler.execute({"location": "深圳市"}),
+                    timeout=1.0,
+                )
+
+                self.assertEqual(result.status, "success")
+                self.assertEqual([call[0] for call in executor.calls], ["maps_geo", "maps_weather"])
 
 
 class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):

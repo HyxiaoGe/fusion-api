@@ -1,4 +1,5 @@
 # app/schemas/chat.py
+from datetime import date as CalendarDate
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional, Union
 from urllib.parse import parse_qs, urlsplit
@@ -353,6 +354,77 @@ class RouteResultsBlock(BaseModel):
         return value
 
 
+class WeatherForecastDay(BaseModel):
+    """单日天气预报的供应商无关安全字段。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    date: CalendarDate
+    weekday: int = Field(ge=1, le=7)
+    day_weather: str = Field(min_length=1, max_length=80)
+    night_weather: str = Field(min_length=1, max_length=80)
+    high_c: float = Field(ge=-100, le=100)
+    low_c: float = Field(ge=-100, le=100)
+    day_wind_direction: Optional[str] = Field(default=None, max_length=40)
+    night_wind_direction: Optional[str] = Field(default=None, max_length=40)
+    day_wind_power: Optional[str] = Field(default=None, max_length=40)
+    night_wind_power: Optional[str] = Field(default=None, max_length=40)
+
+    @model_validator(mode="after")
+    def validate_weekday(self):
+        if self.weekday != self.date.isoweekday():
+            raise ValueError("weekday 必须与 date 的 ISO 星期一致")
+        if self.high_c < self.low_c:
+            raise ValueError("high_c 不能低于 low_c")
+        return self
+
+
+class WeatherResultsBlock(BaseModel):
+    """天气预报产品结果块。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["weather_results"]
+    id: str = Field(default_factory=lambda: f"blk_{uuid4().hex[:12]}", max_length=160)
+    schema_version: Literal[1]
+    provider: Literal["amap"]
+    attribution: Optional[StructuredResultAttribution] = None
+    status: Literal["success", "degraded"]
+    query: str = Field(min_length=1, max_length=120)
+    resolved_location: str = Field(min_length=1, max_length=120)
+    day_count: int = Field(ge=1, le=4)
+    forecast_days: List[WeatherForecastDay] = Field(min_length=1, max_length=4)
+    fetched_at: datetime
+    limitations: List[str] = Field(default_factory=list, max_length=8)
+    tool_call_log_id: str = Field(default="", max_length=160)
+
+    @field_validator("fetched_at")
+    @classmethod
+    def validate_fetched_at_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("天气获取时间必须包含时区")
+        return value
+
+    @field_validator("limitations")
+    @classmethod
+    def validate_limitations(cls, value: List[str]) -> List[str]:
+        if any(not item.strip() or len(item) > 240 for item in value):
+            raise ValueError("limitations 单项不能为空且不能超过 240 字符")
+        return value
+
+    @model_validator(mode="after")
+    def validate_forecast_days(self):
+        if self.day_count != len(self.forecast_days):
+            raise ValueError("day_count 必须等于 forecast_days 数量")
+        dates = [item.date for item in self.forecast_days]
+        if dates != sorted(dates) or len(dates) != len(set(dates)):
+            raise ValueError("forecast_days 必须按日期升序且日期唯一")
+        expected_status = "success" if self.day_count == 4 else "degraded"
+        if self.status != expected_status:
+            raise ValueError("四天完整预报必须为 success，其余可用预报必须为 degraded")
+        return self
+
+
 class TravelEndpoint(BaseModel):
     """航班或高铁班次的单个时刻端点。"""
 
@@ -505,7 +577,13 @@ class TrainResultsBlock(BaseModel):
         return value
 
 
-ProductResultBlock = Union[PlaceResultsBlock, RouteResultsBlock, FlightResultsBlock, TrainResultsBlock]
+ProductResultBlock = Union[
+    PlaceResultsBlock,
+    RouteResultsBlock,
+    WeatherResultsBlock,
+    FlightResultsBlock,
+    TrainResultsBlock,
+]
 
 
 # content block 的联合类型，后续扩展直接在此添加
@@ -518,6 +596,7 @@ ContentBlock = Union[
     UnsupportedContentBlock,
     PlaceResultsBlock,
     RouteResultsBlock,
+    WeatherResultsBlock,
     FlightResultsBlock,
     TrainResultsBlock,
 ]

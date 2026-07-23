@@ -1,6 +1,6 @@
 import json
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -19,6 +19,8 @@ from app.schemas.chat import (
     StructuredResultAttribution,
     TransitAlternative,
     TransitLeg,
+    WeatherForecastDay,
+    WeatherResultsBlock,
 )
 from app.services.admin_audit_service import AdminAuditService
 from app.services.agent.continuation import deserialize_content_blocks
@@ -111,6 +113,83 @@ def route_block(*, block_id: str = "blk-route") -> RouteResultsBlock:
 
 
 class ProductResultSchemaTests(unittest.TestCase):
+    def test_weather_block_enforces_safe_v1_contract(self):
+        block = WeatherResultsBlock(
+            type="weather_results",
+            id="blk-weather",
+            schema_version=1,
+            provider="amap",
+            attribution=StructuredResultAttribution(label="高德地图"),
+            status="degraded",
+            query="深圳市南山区",
+            resolved_location="深圳市南山区",
+            day_count=2,
+            forecast_days=[
+                WeatherForecastDay(
+                    date=date(2026, 7, 23),
+                    weekday=4,
+                    day_weather="多云",
+                    night_weather="阵雨",
+                    high_c=32,
+                    low_c=27,
+                    day_wind_direction="南",
+                    day_wind_power="≤3",
+                ),
+                WeatherForecastDay(
+                    date=date(2026, 7, 24),
+                    weekday=5,
+                    day_weather="阵雨",
+                    night_weather="多云",
+                    high_c=31,
+                    low_c=26,
+                ),
+            ],
+            fetched_at=datetime(2026, 7, 23, 8, tzinfo=timezone.utc),
+            limitations=["天气预报按行政区提供，不代表具体建筑物"],
+            tool_call_log_id="log-weather",
+        )
+
+        payload = block.model_dump(mode="json")
+        self.assertEqual(payload["forecast_days"][0]["date"], "2026-07-23")
+        self.assertNotIn("coordinates", payload)
+        self.assertNotIn("provider_payload", payload)
+
+        invalid_payloads = [
+            {**payload, "day_count": 1},
+            {**payload, "fetched_at": "2026-07-23T08:00:00"},
+            {
+                **payload,
+                "forecast_days": [payload["forecast_days"][1], payload["forecast_days"][0]],
+            },
+            {
+                **payload,
+                "forecast_days": [
+                    {**payload["forecast_days"][0], "weekday": 5},
+                    payload["forecast_days"][1],
+                ],
+            },
+            {
+                **payload,
+                "forecast_days": [
+                    {**payload["forecast_days"][0], "high_c": 101},
+                    payload["forecast_days"][1],
+                ],
+            },
+            {
+                **payload,
+                "forecast_days": [
+                    {**payload["forecast_days"][0], "high_c": 20, "low_c": 27},
+                    payload["forecast_days"][1],
+                ],
+            },
+            {**payload, "provider": "future-provider"},
+            {**payload, "coordinates": "114.1,22.5"},
+        ]
+        for invalid in invalid_payloads:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValidationError):
+                    WeatherResultsBlock.model_validate(invalid)
+
     def test_route_transit_extension_keeps_schema_v1_and_old_payload_compatibility(self):
         old_payload = route_block().model_dump(mode="json")
         for key in ("transit_type", "walking_distance_m", "legs", "alternatives"):

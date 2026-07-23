@@ -1,4 +1,5 @@
 import unittest
+from datetime import date, datetime, timezone
 
 from app.schemas.chat import (
     PlaceResult,
@@ -7,11 +8,14 @@ from app.schemas.chat import (
     RouteOption,
     RouteResultsBlock,
     TransitLeg,
+    WeatherForecastDay,
+    WeatherResultsBlock,
 )
 from app.services.stream.product_answer_validator import (
     repair_unsupported_product_answer,
     validate_product_answer,
 )
+from app.services.stream.product_result_answer import build_grounded_product_answer
 
 
 def _place_block():
@@ -73,7 +77,181 @@ def _route_block():
     )
 
 
+def _weather_block():
+    return WeatherResultsBlock(
+        type="weather_results",
+        schema_version=1,
+        provider="amap",
+        status="degraded",
+        query="南山区",
+        resolved_location="南山区",
+        day_count=2,
+        forecast_days=[
+            WeatherForecastDay(
+                date=date(2026, 7, 23),
+                weekday=4,
+                day_weather="多云",
+                night_weather="阵雨",
+                high_c=32,
+                low_c=27,
+                day_wind_direction="南",
+                day_wind_power="≤3",
+                night_wind_direction="东南",
+                night_wind_power="≤3",
+            ),
+            WeatherForecastDay(
+                date=date(2026, 7, 24),
+                weekday=5,
+                day_weather="雷阵雨",
+                night_weather="多云",
+                high_c=31,
+                low_c=26,
+            ),
+        ],
+        fetched_at=datetime(2026, 7, 23, 8, tzinfo=timezone.utc),
+        limitations=["天气预报按行政区提供，不代表具体建筑物", "仅返回 2 天有效预报"],
+    )
+
+
+def _four_day_weather_block():
+    block = _weather_block()
+    payload = block.model_dump(mode="python")
+    payload["status"] = "success"
+    payload["day_count"] = 4
+    payload["forecast_days"].extend(
+        [
+            WeatherForecastDay(
+                date=date(2026, 7, 25),
+                weekday=6,
+                day_weather="晴",
+                night_weather="多云",
+                high_c=30,
+                low_c=25,
+            ),
+            WeatherForecastDay(
+                date=date(2026, 7, 26),
+                weekday=7,
+                day_weather="多云",
+                night_weather="阴",
+                high_c=29,
+                low_c=24,
+            ),
+        ]
+    )
+    return WeatherResultsBlock.model_validate(payload)
+
+
 class ProductAnswerValidatorTests(unittest.TestCase):
+    def test_weather_facts_are_validated_with_day_scope_and_temperature_units(self):
+        cases = (
+            ("周四白天多云、夜间阵雨，最高32℃、最低27摄氏度。", True, "ok"),
+            ("周五白天雷阵雨，最高31度、最低26℃。", True, "ok"),
+            ("周五最高32℃。", False, "weather_fact_mismatch"),
+            ("周四白天晴，最高32℃。", False, "weather_fact_mismatch"),
+            ("周五夜间阵雨。", False, "weather_fact_mismatch"),
+            ("周四最高31℃，周五最高32℃。", False, "weather_fact_mismatch"),
+            ("周四白天雷阵雨，周五白天多云。", False, "weather_fact_mismatch"),
+        )
+
+        for answer, expected, reason in cases:
+            with self.subTest(answer=answer):
+                validation = validate_product_answer(answer, [_weather_block()])
+                self.assertEqual(validation.is_valid, expected)
+                self.assertEqual(validation.reason_code, reason)
+
+    def test_weather_realtime_claims_reject_positive_but_allow_explicit_limits(self):
+        cases = (
+            ("当前温度是30℃，湿度80%。", False),
+            ("降雨概率为70%，已发布暴雨预警。", False),
+            ("空气质量良好，湿度较高，降雨概率较低。", False),
+            ("周五路面积水明显。", False),
+            ("本次只取得天气预报，未返回实时温度、湿度、空气质量或预警。", True),
+            ("未返回湿度，但空气质量良好。", False),
+            ("未返回湿度，但降雨概率70%。", False),
+            ("周五有雷阵雨，建议携带雨具。", True),
+        )
+
+        for answer, expected in cases:
+            with self.subTest(answer=answer):
+                self.assertEqual(validate_product_answer(answer, [_weather_block()]).is_valid, expected)
+
+    def test_weather_unsupported_claim_skips_generic_repair_and_uses_grounded_fallback(self):
+        answer = "周五白天雷阵雨。当前温度30℃。"
+
+        repaired, reason = repair_unsupported_product_answer(answer, [_weather_block()])
+        fallback = build_grounded_product_answer([_weather_block()])
+
+        self.assertIsNone(repaired)
+        self.assertEqual(reason, "unsupported_claim")
+        self.assertIn("周五", fallback)
+        self.assertNotIn("当前温度", fallback)
+        self.assertNotIn("排队", fallback)
+        self.assertNotIn("停车", fallback)
+
+    def test_weather_location_wind_general_conditions_and_calendar_must_be_grounded(self):
+        cases = (
+            ("福田区周四白天多云。", False),
+            ("福田区的周五白天雷阵雨。", False),
+            ("福田区的天气预报为多云。", False),
+            ("福田区未来几天有雨。", False),
+            ("福田区： 周五白天雷阵雨。", False),
+            ("福田区 周五白天雷阵雨。", False),
+            ("南山区周四白天南风≤3级。", True),
+            ("周四白天西北风8级。", False),
+            ("周四有雨。", True),
+            ("周四会下雨。", True),
+            ("周四白天有雨。", False),
+            ("周四白天会下雨。", False),
+            ("周四夜间有雨。", True),
+            ("7月23日（周五）白天多云。", False),
+            ("7月30日（周五）白天多云。", False),
+            ("2026-07-30周五白天多云。", False),
+            ("7月24日（周五）白天雷阵雨。", True),
+            ("预警等级较高。", False),
+            ("本次预报未返回天气预警。", True),
+            ("天气预报按行政区提供。", True),
+            ("地点只解析到行政区级预报。", True),
+            ("所在区域的天气以本次预报为准。", True),
+        )
+
+        for answer, expected in cases:
+            with self.subTest(answer=answer):
+                self.assertEqual(validate_product_answer(answer, [_weather_block()]).is_valid, expected)
+
+    def test_weather_cannot_infer_route_choice_or_no_travel_impact(self):
+        cases = (
+            "天气不会影响出行。",
+            "周四雨天建议优先驾车。",
+            "周四有雨，推荐乘地铁。",
+        )
+
+        for answer in cases:
+            with self.subTest(answer=answer):
+                validation = validate_product_answer(answer, [_weather_block(), _route_block()])
+                self.assertFalse(validation.is_valid)
+                self.assertEqual(validation.reason_code, "unsupported_claim")
+
+    def test_wind_advice_requires_returned_strong_wind(self):
+        no_wind = validate_product_answer("周四建议做好防风措施。", [_weather_block()])
+        windy_payload = _weather_block().model_dump(mode="python")
+        windy_payload["forecast_days"][0]["day_weather"] = "大风"
+        windy = WeatherResultsBlock.model_validate(windy_payload)
+        has_wind = validate_product_answer("周四白天有大风，建议做好防风措施。", [windy])
+
+        self.assertFalse(no_wind.is_valid)
+        self.assertTrue(has_wind.is_valid)
+
+    def test_weekend_scope_cannot_borrow_weekday_weather_facts(self):
+        cases = (
+            ("周末最高30℃。", True),
+            ("周末最高32℃。", False),
+            ("周末有阵雨。", False),
+        )
+
+        for answer, expected in cases:
+            with self.subTest(answer=answer):
+                self.assertEqual(validate_product_answer(answer, [_four_day_weather_block()]).is_valid, expected)
+
     def test_valid_llm_prose_with_derived_difference_and_explicit_limits_is_retained(self):
         answer = (
             "结论：如果更看重用时，可以优先驾车。高德本次返回驾车约14分钟、公交约32分钟，"
