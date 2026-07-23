@@ -409,6 +409,42 @@ class AmapWeatherForecastTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(selected.status, "success")
         self.assertEqual([call[0] for call in executor.calls], ["maps_geo", "maps_weather"])
 
+    async def test_named_location_uses_embedded_city_to_disambiguate_same_named_district(self):
+        handler, executor = build_handler(
+            "weather_forecast",
+            {
+                "maps_geo": [
+                    mcp_payload(
+                        {
+                            "results": [
+                                {
+                                    "formatted_address": "广东省深圳市南山区",
+                                    "city": "深圳市",
+                                    "district": "南山区",
+                                    "adcode": "440305",
+                                },
+                                {
+                                    "formatted_address": "黑龙江省鹤岗市南山区",
+                                    "city": "鹤岗市",
+                                    "district": "南山区",
+                                    "adcode": "230404",
+                                },
+                            ]
+                        }
+                    )
+                ],
+                "maps_weather": [four_day_weather(city="南山区", adcode="440305")],
+            },
+            weather_cache=FakeWeatherCache(),
+            now=lambda: datetime(2026, 7, 23, 8, tzinfo=timezone.utc),
+        )
+
+        result = await handler.execute({"location": "深圳南山区"})
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual([call[0] for call in executor.calls], ["maps_geo", "maps_weather"])
+        self.assertEqual(executor.calls[1][2], {"city": "440305"})
+
     async def test_current_location_resolves_official_regeocode_shape_without_exposing_coordinates(self):
         cache = FakeWeatherCache()
         handler, executor = build_handler(

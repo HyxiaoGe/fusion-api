@@ -664,6 +664,7 @@ class AmapProductToolHandler(BaseToolHandler):
                 )
                 resolved = _extract_weather_geo_location(
                     geo_payload,
+                    requested_location=reverse_location.label,
                     requested_city=reverse_location.city,
                 )
                 if resolved is None:
@@ -681,6 +682,7 @@ class AmapProductToolHandler(BaseToolHandler):
             )
             resolved = _extract_weather_geo_location(
                 geo_payload,
+                requested_location=query,
                 requested_city=normalized.get("city"),
             )
             if resolved is None:
@@ -1440,6 +1442,7 @@ def _extract_reverse_city(payload: Any) -> str | None:
 def _extract_weather_geo_location(
     payload: Any,
     *,
+    requested_location: str,
     requested_city: str | None,
 ) -> tuple[str, str] | None:
     candidates: list[tuple[str, str, str | None]] = []
@@ -1460,6 +1463,15 @@ def _extract_weather_geo_location(
                 resolved = _weather_location_label(candidate)
                 if resolved:
                     candidates.append((adcode, resolved, city))
+    if not requested_city:
+        normalized_location = _normalize_endpoint_match_text(requested_location)
+        city_matches = [
+            candidate
+            for candidate in candidates
+            if candidate[2] and _endpoint_label_mentions_city(normalized_location, candidate[2])
+        ]
+        if city_matches:
+            candidates = city_matches
     grouped: dict[str, list[tuple[str, str, str | None]]] = {}
     for candidate in candidates:
         grouped.setdefault(candidate[0], []).append(candidate)
