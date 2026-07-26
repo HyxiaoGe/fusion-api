@@ -149,6 +149,52 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(outcome)
         self.assertTrue(state.product_tool_attempted)
 
+    async def test_required_user_input_stops_before_another_model_round(self):
+        state = AgentLoopState()
+        state.mark_current_step("step-weather-ambiguous")
+
+        async def handle_tool_calls_round_fn(**kwargs):
+            request = kwargs["request"]
+            request.on_tools_executed(1)
+            request.agent_state.pending_tool_repairs["repair-weather"] = {
+                "required_fields": ["location"],
+                "retryable": False,
+                "requires_user_input": True,
+            }
+            return ToolRoundOutcome(
+                tool_call_count=1,
+                tool_names=["weather_forecast"],
+                product_result_count=0,
+            )
+
+        outcome = await handle_agent_round_outcome(
+            request=AgentRoundOutcomeRequest(
+                db="db",
+                messages=[{"role": "user", "content": "南山区明天天气如何？"}],
+                state=state,
+                runtime=_runtime(handle_tool_calls_round_fn=handle_tool_calls_round_fn),
+                step_number=1,
+                step_context=_step_context("step-weather-ambiguous"),
+                round_result=AgentRoundResult(
+                    reasoning_buf="",
+                    content_buf="",
+                    tool_calls=[
+                        {
+                            "id": "tc-weather",
+                            "name": "weather_forecast",
+                            "arguments": '{"location":"南山区"}',
+                        }
+                    ],
+                    finish_reason="tool_calls",
+                    accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+                ),
+            )
+        )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.PRODUCT_RESULT_READY)
+        self.assertEqual(state.total_tool_calls, 1)
+        self.assertIsNone(state.current_step_id)
+
     async def test_failed_travel_tool_attempt_is_recorded_for_next_round_guard(self):
         state = AgentLoopState()
         state.mark_current_step("step-travel-failed")
@@ -210,6 +256,86 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("稍后重试", emitted_answer)
         self.assertNotIn("4号线", emitted_answer)
         self.assertNotIn("30分钟", emitted_answer)
+
+    async def test_pending_location_repair_deterministically_asks_for_complete_location(self):
+        state = AgentLoopState(
+            product_tool_attempted=True,
+            pending_tool_repairs={
+                "weather_forecast": {
+                    "required_fields": ["location"],
+                    "requires_user_input": True,
+                }
+            },
+        )
+        state.mark_current_step("step-weather-city-clarification")
+        append_chunk = AsyncMock()
+
+        with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
+            outcome = await handle_agent_round_outcome(
+                request=AgentRoundOutcomeRequest(
+                    db="db",
+                    messages=[{"role": "user", "content": "南山区明天天气如何？"}],
+                    state=state,
+                    runtime=_runtime(complete_step_fn=AsyncMock()),
+                    step_number=2,
+                    step_context=_step_context("step-weather-city-clarification"),
+                    round_result=AgentRoundResult(
+                        reasoning_buf="",
+                        content_buf="深圳南山区明天多云。",
+                        tool_calls=[],
+                        finish_reason="stop",
+                        accumulated_usage=Usage(input_tokens=2, output_tokens=9),
+                        output_deferred=True,
+                    ),
+                )
+            )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        emitted_answer = append_chunk.await_args.args[2]
+        self.assertIn("请补充包含城市的完整地点", emitted_answer)
+        self.assertIn("不会猜测", emitted_answer)
+        self.assertNotIn("深圳南山区明天多云", emitted_answer)
+        self.assertNotIn("高德", emitted_answer)
+
+    async def test_non_product_protocol_repair_overrides_model_answer_without_asking_for_missing_info(self):
+        state = AgentLoopState(
+            pending_tool_repairs={
+                "repair_protocol": {
+                    "required_fields": [],
+                    "retryable": False,
+                    "requires_user_input": False,
+                    "retry_exhausted": True,
+                }
+            },
+        )
+        state.mark_current_step("step-protocol-repair")
+        append_chunk = AsyncMock()
+
+        with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
+            outcome = await handle_agent_round_outcome(
+                request=AgentRoundOutcomeRequest(
+                    db="db",
+                    messages=[{"role": "user", "content": "帮我查一下资料"}],
+                    state=state,
+                    runtime=_runtime(complete_step_fn=AsyncMock()),
+                    step_number=2,
+                    step_context=_step_context("step-protocol-repair"),
+                    round_result=AgentRoundResult(
+                        reasoning_buf="",
+                        content_buf="工具已经成功返回了结果。",
+                        tool_calls=[],
+                        finish_reason="stop",
+                        accumulated_usage=Usage(input_tokens=2, output_tokens=9),
+                        output_deferred=True,
+                    ),
+                )
+            )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        emitted_answer = append_chunk.await_args.args[2]
+        self.assertIn("请重试当前请求", emitted_answer)
+        self.assertNotIn("补充更明确", emitted_answer)
+        self.assertNotIn("工具已经成功", emitted_answer)
 
     async def test_location_context_timeout_uses_location_specific_safe_failure_message(self):
         state = AgentLoopState(product_tool_attempted=True)

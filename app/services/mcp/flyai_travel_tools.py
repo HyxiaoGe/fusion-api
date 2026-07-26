@@ -599,6 +599,21 @@ class FlyAiTravelToolHandler(BaseToolHandler):
         }
         return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
+    def validate_arguments(self, args: dict) -> list[dict[str, str]]:
+        """把 Pydantic 字段错误安全投影给统一修参协议，不触发 CLI。"""
+
+        try:
+            _validate_args(self.tool_name, args)
+        except ValidationError as error:
+            projected = []
+            for item in _safe_validation_error_codes(error):
+                field, _, code = item.partition(":")
+                projected.append({"field": field, "code": code or "invalid"})
+            return projected or [{"field": "request", "code": "invalid_arguments"}]
+        except (ValueError, TypeError):
+            return [{"field": "request", "code": "invalid_arguments"}]
+        return []
+
     def _build_result_summary(self, result: ToolResult) -> dict:
         return {
             "kind": "external_tool",

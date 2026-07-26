@@ -16,6 +16,7 @@ from app.schemas.chat import (
 from app.schemas.content_block_registry import CONTENT_BLOCK_REGISTRY, ContentBlockRegistration
 from app.services.source_evidence_ledger import stable_web_evidence_id
 from app.services.stream import tool_round as tool_round_module
+from app.services.stream.agent_loop_state import AgentLoopState
 from app.services.stream.step_lifecycle import AgentStepContext
 from app.services.stream.tool_execution_result import ToolExecutionRecord
 from app.services.stream.tool_round import (
@@ -35,6 +36,60 @@ class FutureRegisteredResultBlock(BaseModel):
 
 
 class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
+    def test_pending_repairs_are_keyed_and_only_matching_success_resolves_them(self):
+        state = AgentLoopState()
+        first_repair = ToolExecutionRecord(
+            tool_call={"id": "tc-a", "name": "weather_forecast"},
+            result=ToolResult(
+                status="failed",
+                data={
+                    "repair": {
+                        "repair_id": "repair-a",
+                        "required_fields": ["location"],
+                        "retryable": True,
+                        "requires_user_input": False,
+                    }
+                },
+            ),
+            handler=None,
+            block_id="blk-a",
+            log_id="log-a",
+        )
+        second_repair = ToolExecutionRecord(
+            tool_call={"id": "tc-b", "name": "weather_forecast"},
+            result=ToolResult(
+                status="failed",
+                data={
+                    "repair": {
+                        "repair_id": "repair-b",
+                        "required_fields": ["location"],
+                        "retryable": False,
+                        "requires_user_input": True,
+                    }
+                },
+            ),
+            handler=None,
+            block_id="blk-b",
+            log_id="log-b",
+        )
+
+        tool_round_module._record_tool_repairs(state, [first_repair, second_repair])
+        tool_round_module._record_tool_repairs(
+            state,
+            [
+                ToolExecutionRecord(
+                    tool_call={"id": "tc-a-ok", "name": "weather_forecast"},
+                    result=ToolResult(status="success", data={"resolves_repair_id": "repair-a"}),
+                    handler=None,
+                    block_id="blk-a-ok",
+                    log_id="log-a-ok",
+                )
+            ],
+        )
+
+        self.assertNotIn("repair-a", state.pending_tool_repairs)
+        self.assertIn("repair-b", state.pending_tool_repairs)
+
     def test_append_tool_round_messages_uses_raw_reasoning_only_for_model_protocol(self):
         request = Mock(
             messages=[],
@@ -298,9 +353,9 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
         handler.build_content_block.assert_called_once()
 
     def test_unannounced_calls_do_not_consume_global_tool_capacity(self):
-        stale_call = {"id": "tc-stale", "name": "mcp_maps_search"}
-        search_call = {"id": "tc-search", "name": "web_search"}
-        read_call = {"id": "tc-read", "name": "url_read"}
+        stale_call = {"id": "tc-stale", "name": "mcp_maps_search", "arguments": "{}"}
+        search_call = {"id": "tc-search", "name": "web_search", "arguments": "{}"}
+        read_call = {"id": "tc-read", "name": "url_read", "arguments": "{}"}
         request = Mock(
             tool_calls=[stale_call, search_call, read_call],
             announced_tool_names=frozenset({"web_search", "url_read"}),
@@ -308,6 +363,7 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
             max_tool_calls=20,
             network_budget=object(),
             run_id="run-limit",
+            tool_handlers={},
         )
 
         with self.assertLogs("app.services.stream.tool_round", level="WARNING") as captured:
@@ -325,6 +381,106 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("run_id=run-limit requested=3 announced=2 unavailable=1", logs)
         self.assertNotIn("mcp_maps_search", logs)
         self.assertNotIn("tc-stale", logs)
+
+    def test_local_preflight_failure_does_not_displace_valid_call_at_global_limit(self):
+        class Handler:
+            def __init__(self, tool_name):
+                self.tool_name = tool_name
+
+        invalid_handler = Handler("mcp_invalid_json")
+        valid_handler = Handler("mcp_valid")
+        extra_handler = Handler("mcp_extra")
+        invalid = {
+            "id": "tc-invalid",
+            "name": invalid_handler.tool_name,
+            "arguments": "{bad",
+        }
+        valid = {
+            "id": "tc-valid",
+            "name": valid_handler.tool_name,
+            "arguments": "{}",
+        }
+        extra = {
+            "id": "tc-extra",
+            "name": extra_handler.tool_name,
+            "arguments": "{}",
+        }
+        request = Mock(
+            tool_calls=[invalid, valid, extra],
+            completed_tool_calls=19,
+            max_tool_calls=20,
+            network_budget=object(),
+            run_id="run-preflight-limit",
+            agent_state=None,
+            tool_handlers={
+                invalid_handler.tool_name: invalid_handler,
+                valid_handler.tool_name: valid_handler,
+                extra_handler.tool_name: extra_handler,
+            },
+        )
+
+        selected, not_executed = tool_round_module._select_tool_calls_within_limit(request)
+
+        self.assertEqual(selected, [invalid, valid])
+        self.assertEqual(not_executed, [extra])
+
+    def test_local_preflight_failures_are_bounded_after_global_limit_is_exhausted(self):
+        class Handler:
+            tool_name = "mcp_invalid_json"
+
+        handler = Handler()
+        invalid_calls = [
+            {
+                "id": f"tc-invalid-{index}",
+                "name": handler.tool_name,
+                "arguments": "{bad",
+            }
+            for index in range(100)
+        ]
+        request = Mock(
+            tool_calls=invalid_calls,
+            completed_tool_calls=20,
+            max_tool_calls=20,
+            network_budget=object(),
+            run_id="run-preflight-attempt-cap",
+            agent_state=None,
+            tool_handlers={handler.tool_name: handler},
+        )
+
+        selected, not_executed = tool_round_module._select_tool_calls_within_limit(request)
+
+        self.assertEqual(
+            len(selected),
+            tool_round_module.MAX_LOCAL_PREFLIGHT_ATTEMPTS_PER_ROUND,
+        )
+        self.assertEqual(
+            len(not_executed),
+            len(invalid_calls) - tool_round_module.MAX_LOCAL_PREFLIGHT_ATTEMPTS_PER_ROUND,
+        )
+
+    def test_unknown_tool_with_invalid_json_cannot_bypass_global_limit(self):
+        unknown_calls = [
+            {
+                "id": f"tc-unknown-{index}",
+                "name": "mcp_runtime_handler_missing",
+                "arguments": "{bad",
+            }
+            for index in range(100)
+        ]
+        request = Mock(
+            tool_calls=unknown_calls,
+            completed_tool_calls=20,
+            max_tool_calls=20,
+            network_budget=object(),
+            run_id="run-unknown-handler-limit",
+            agent_state=None,
+            tool_handlers={},
+        )
+
+        selected, not_executed = tool_round_module._select_tool_calls_within_limit(request)
+
+        self.assertEqual(selected, [])
+        self.assertEqual(not_executed, unknown_calls)
 
     def test_build_assistant_tool_message_preserves_tool_calls_and_reasoning(self):
         tool_calls = [

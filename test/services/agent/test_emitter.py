@@ -302,6 +302,8 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
             key_findings=["官方页面确认发布时间。"],
             source_refs=[],
             truncated=False,
+            repair_state="retrying",
+            repair_id="repair_0123456789abcdef",
         )
 
         plan_payload = writer.append_chunk.call_args_list[-2].args[3]
@@ -311,6 +313,8 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(digest_payload["type"], "tool_result_digest")
         self.assertEqual(digest_payload["step_id"], step_id)
         self.assertEqual(digest_payload["tool_call_id"], "tc1")
+        self.assertEqual(digest_payload["repair_state"], "retrying")
+        self.assertEqual(digest_payload["repair_id"], "repair_0123456789abcdef")
 
     async def test_geolocation_context_events_share_sequence_and_never_contain_coordinates(self):
         writer = AsyncMock()

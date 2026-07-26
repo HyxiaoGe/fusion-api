@@ -290,10 +290,20 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([call[0] for call in calls], ["persist", "finalize"])
         self.assertTrue(calls[0][1][6])
-        self.assertIn("emit run_failed 失败: emit failed down", warnings)
+        self.assertIn("emit run_failed 失败: error_type=RuntimeError", warnings)
+        self.assertNotIn("emit failed down", " ".join(warnings))
         self.assertEqual(
             calls[1],
-            ("finalize", ("conv-1",), {"success": False, "error_msg": "LLM 5xx", "task_id": "task-1"}),
+            (
+                "finalize",
+                ("conv-1",),
+                {
+                    "success": False,
+                    "error_msg": "生成服务暂时不可用，请稍后重试",
+                    "error_code": "agent_run_failed",
+                    "task_id": "task-1",
+                },
+            ),
         )
         self.assertFalse(state.terminal_emitted)
 
@@ -320,7 +330,82 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(calls[0][1]["error_code"], "context_budget_exceeded")
         self.assertEqual(calls[1][2]["error_code"], "context_budget_exceeded")
-        self.assertEqual(calls[1][2]["error_msg"], "请缩短输入")
+        self.assertEqual(
+            calls[0][1]["message"],
+            "当前消息与必要上下文过长，请缩短本次输入或移除较大的文件后重试",
+        )
+        self.assertEqual(
+            calls[1][2]["error_msg"],
+            "当前消息与必要上下文过长，请缩短本次输入或移除较大的文件后重试",
+        )
+
+    async def test_finalize_failed_never_exposes_secret_bearing_exception_message(self):
+        secret = "sk-secret-value"
+        calls = []
+
+        async def fail_agent_run_fn(**kwargs):
+            calls.append(("fail", kwargs))
+
+        async def finalize_stream_fn(*args, **kwargs):
+            calls.append(("finalize", args, kwargs))
+
+        await finalize_failed_run(
+            context=_context(),
+            error=RuntimeError(f"Authorization: Bearer {secret}; upstream 503"),
+            persist_message_fn=lambda *_args: None,
+            fail_agent_run_fn=fail_agent_run_fn,
+            finalize_stream_fn=finalize_stream_fn,
+            warning_fn=lambda message: calls.append(("warning", message)),
+        )
+
+        rendered = repr(calls)
+        self.assertNotIn(secret, rendered)
+        self.assertEqual(calls[0][1]["error_code"], "agent_run_failed")
+        self.assertEqual(calls[0][1]["message"], "生成服务暂时不可用，请稍后重试")
+        self.assertEqual(calls[1][2]["error_code"], "agent_run_failed")
+        self.assertEqual(calls[1][2]["error_msg"], "生成服务暂时不可用，请稍后重试")
+
+    async def test_untrusted_structured_error_code_is_not_forwarded(self):
+        class SecretCodeError(RuntimeError):
+            error_code = "sk_secret_value"
+
+        calls = []
+
+        async def fail_agent_run_fn(**kwargs):
+            calls.append(("fail", kwargs))
+
+        async def finalize_stream_fn(*args, **kwargs):
+            calls.append(("finalize", args, kwargs))
+
+        await finalize_failed_run(
+            context=_context(),
+            error=SecretCodeError("upstream failed"),
+            persist_message_fn=lambda *_args: None,
+            fail_agent_run_fn=fail_agent_run_fn,
+            finalize_stream_fn=finalize_stream_fn,
+            warning_fn=lambda _message: None,
+        )
+
+        self.assertEqual(calls[0][1]["error_code"], "agent_run_failed")
+        self.assertEqual(calls[1][2]["error_code"], "agent_run_failed")
+        self.assertNotIn("sk_secret_value", repr(calls))
+
+    async def test_fallback_failure_log_never_contains_exception_message(self):
+        warnings = []
+
+        async def write_fallback_error_status_fn(**_kwargs):
+            raise RuntimeError("Authorization: Bearer sk-secret-value")
+
+        await write_fallback_run_error(
+            context=_context(),
+            write_fallback_error_status_fn=write_fallback_error_status_fn,
+            warning_fn=warnings.append,
+        )
+
+        self.assertEqual(
+            warnings,
+            ["finally 兜底 write_session_status 失败: error_type=RuntimeError"],
+        )
 
     async def test_write_fallback_run_error_skips_when_terminal_already_emitted(self):
         state = AgentLoopState()

@@ -3,6 +3,7 @@ import json
 import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 
 from app.schemas.chat import WeatherResultsBlock
@@ -124,6 +125,7 @@ class AmapProductDefinitionTests(unittest.TestCase):
             local_schema["properties"]["anchor_source"]["enum"],
             ["named", "current_location", "none"],
         )
+        self.assertEqual(set(local_schema["required"]), {"query", "anchor_source"})
         self.assertEqual(
             set(route_schema["properties"]),
             {
@@ -139,12 +141,18 @@ class AmapProductDefinitionTests(unittest.TestCase):
         )
         self.assertEqual(route_schema["properties"]["origin_source"]["enum"], ["named", "current_location"])
         self.assertEqual(route_schema["properties"]["destination_source"]["enum"], ["named", "current_location"])
+        self.assertEqual(
+            set(route_schema["required"]),
+            {"origin", "destination", "origin_source", "destination_source", "modes"},
+        )
         self.assertEqual(route_schema["properties"]["requested_departure_time"]["maxLength"], 80)
         departure_description = route_schema["properties"]["requested_departure_time"]["description"]
         self.assertIn("仅当用户明确指定", departure_description)
         self.assertIn("未指定时必须省略", departure_description)
         self.assertIn("不得默认填写“现在”", departure_description)
         self.assertEqual(route_schema["properties"]["modes"]["maxItems"], 3)
+        weather_schema = definitions["weather_forecast"]["function"]["parameters"]
+        self.assertEqual(set(weather_schema["required"]), {"location", "location_source"})
         local_description = definitions["local_place_search"]["function"]["description"]
         route_description = definitions["route_compare"]["function"]["description"]
         self.assertIn("只能使用 result.places 实际返回的地点和字段", local_description)
@@ -160,13 +168,54 @@ class AmapProductDefinitionTests(unittest.TestCase):
         self.assertIn("未指定时必须省略", route_description)
         self.assertIn("仅当用户明确指定日期", AMAP_FACT_BOUNDARY_SYSTEM_PROMPT)
         self.assertIn("不得默认填写“现在”", AMAP_FACT_BOUNDARY_SYSTEM_PROMPT)
-        weather_schema = definitions["weather_forecast"]["function"]["parameters"]
-        self.assertEqual(set(weather_schema["properties"]), {"location", "city", "location_source"})
-        self.assertEqual(weather_schema["required"], ["location"])
+        self.assertEqual(set(weather_schema["properties"]), {"location", "location_source"})
         self.assertFalse(weather_schema["additionalProperties"])
+        weather_description = definitions["weather_forecast"]["function"]["description"]
+        self.assertIn("完整地点文本", weather_description)
+        self.assertIn("不得自行补充用户未提供的城市", weather_description)
         self.assertEqual(
             AMAP_PRODUCT_REMOTE_DEPENDENCIES["weather_forecast"],
             frozenset({"maps_geo", "maps_regeocode", "maps_weather"}),
+        )
+
+    def test_semantic_branch_arguments_are_required_before_remote_execution(self):
+        cases = (
+            (
+                "local_place_search",
+                {"query": "烤肉"},
+                {"anchor_source"},
+            ),
+            (
+                "route_compare",
+                {"origin": "南景新村", "destination": "双子塔"},
+                {"origin_source", "destination_source", "modes"},
+            ),
+            (
+                "weather_forecast",
+                {"location": "深圳南山区"},
+                {"location_source"},
+            ),
+        )
+
+        for tool_name, arguments, expected_fields in cases:
+            with self.subTest(tool_name=tool_name):
+                handler, _ = build_handler(tool_name, {})
+                errors = handler.validate_arguments(arguments)
+                self.assertEqual(
+                    {error["field"] for error in errors if error["code"] == "required"},
+                    expected_fields,
+                )
+
+        weather_handler, _ = build_handler("weather_forecast", {})
+        self.assertEqual(
+            weather_handler.validate_arguments(
+                {
+                    "location": "南山区",
+                    "location_source": "named",
+                    "city": "深圳市",
+                }
+            ),
+            [{"field": "request", "code": "invalid_arguments"}],
         )
 
 
@@ -238,6 +287,30 @@ def four_day_weather(*, city="深圳市", adcode="440300"):
     )
 
 
+def named_weather_args(location: str) -> dict[str, str]:
+    return {"location": location, "location_source": "named"}
+
+
+def local_search_args(args: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(args)
+    normalized.setdefault("anchor_source", "named" if normalized.get("near") else "none")
+    return normalized
+
+
+def route_compare_args(args: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(args)
+    normalized.setdefault(
+        "origin_source",
+        "current_location" if normalized.get("origin") == "当前位置" else "named",
+    )
+    normalized.setdefault(
+        "destination_source",
+        "current_location" if normalized.get("destination") == "当前位置" else "named",
+    )
+    normalized.setdefault("modes", ["driving", "transit"])
+    return normalized
+
+
 class AmapWeatherForecastTests(unittest.IsolatedAsyncioTestCase):
     async def test_named_location_geocodes_then_builds_safe_block(self):
         fetched_at = datetime(2026, 7, 23, 8, tzinfo=timezone.utc)
@@ -254,7 +327,7 @@ class AmapWeatherForecastTests(unittest.IsolatedAsyncioTestCase):
             now=lambda: fetched_at,
         )
 
-        result = await handler.execute({"location": "深圳市"})
+        result = await handler.execute(named_weather_args("深圳市"))
 
         self.assertEqual(result.status, "success")
         self.assertEqual([call[0] for call in executor.calls], ["maps_geo", "maps_weather"])
@@ -305,7 +378,7 @@ class AmapWeatherForecastTests(unittest.IsolatedAsyncioTestCase):
             now=lambda: datetime(2026, 7, 23, 8, tzinfo=timezone.utc),
         )
 
-        result = await handler.execute({"location": "龙华区", "city": "深圳"})
+        result = await handler.execute(named_weather_args("深圳市龙华区"))
 
         self.assertEqual(result.status, "success")
         self.assertEqual([call[0] for call in executor.calls], ["maps_geo", "maps_weather"])
@@ -322,7 +395,28 @@ class AmapWeatherForecastTests(unittest.IsolatedAsyncioTestCase):
                     weather_cache=FakeWeatherCache(),
                 )
 
-                result = await handler.execute({"location": location})
+                result = await handler.execute(named_weather_args(location))
+
+                self.assertEqual(result.status, "failed")
+                self.assertEqual(result.data["error_code"], "invalid_arguments")
+                self.assertEqual(executor.calls, [])
+                self.assertEqual(executor.remaining_budget, 0)
+
+    async def test_location_and_source_must_match_without_remote_or_geolocation_access(self):
+        for args in (
+            {"location": "深圳市", "location_source": "current_location"},
+            {"location": "当前位置", "location_source": "named"},
+            {"location": "深圳市"},
+        ):
+            with self.subTest(args=args):
+                handler, executor = build_handler(
+                    "weather_forecast",
+                    {},
+                    remaining_budget=0,
+                    weather_cache=FakeWeatherCache(),
+                )
+
+                result = await handler.execute(args)
 
                 self.assertEqual(result.status, "failed")
                 self.assertEqual(result.data["error_code"], "invalid_arguments")
@@ -357,15 +451,16 @@ class AmapWeatherForecastTests(unittest.IsolatedAsyncioTestCase):
             now=lambda: datetime(2026, 7, 23, 8, tzinfo=timezone.utc),
         )
 
-        result = await handler.execute({"location": "南山区", "city": "深圳市"})
+        result = await handler.execute(named_weather_args("深圳市南山区"))
 
         self.assertEqual(result.status, "degraded")
         self.assertEqual([call[0] for call in executor.calls], ["maps_geo", "maps_weather"])
         self.assertEqual(executor.calls[1][2], {"city": "440305"})
         self.assertEqual(result.data["result"]["resolved_location"], "南山区")
         self.assertIn("仅返回 2 天有效预报", result.data["result"]["limitations"])
+        self.assertNotIn("resolves_repair_id", result.data)
 
-    async def test_geocode_requires_one_unique_adcode_after_city_filtering(self):
+    async def test_geocode_requires_one_unique_adcode_without_model_city_filtering(self):
         ambiguous = mcp_payload(
             {
                 "geocodes": [
@@ -380,10 +475,12 @@ class AmapWeatherForecastTests(unittest.IsolatedAsyncioTestCase):
             weather_cache=FakeWeatherCache(),
         )
 
-        ambiguous_result = await handler.execute({"location": "南山"})
+        ambiguous_result = await handler.execute(named_weather_args("南山"))
 
         self.assertEqual(ambiguous_result.status, "failed")
-        self.assertEqual(ambiguous_result.data["error_code"], "invalid_response")
+        self.assertEqual(ambiguous_result.data["error_code"], "ambiguous_location")
+        self.assertFalse(ambiguous_result.data["repair"]["retryable"])
+        self.assertTrue(ambiguous_result.data["repair"]["requires_user_input"])
         self.assertEqual([call[0] for call in executor.calls], ["maps_geo"])
 
         duplicate = mcp_payload(
@@ -391,7 +488,6 @@ class AmapWeatherForecastTests(unittest.IsolatedAsyncioTestCase):
                 "geocodes": [
                     {"formatted_address": "广东省深圳市南山区", "city": "深圳市", "adcode": "440305"},
                     {"formatted_address": "深圳市南山区", "city": "深圳", "adcode": "440305"},
-                    {"formatted_address": "四川省南充市南部县", "city": "南充市", "adcode": "511321"},
                 ]
             }
         )
@@ -402,14 +498,15 @@ class AmapWeatherForecastTests(unittest.IsolatedAsyncioTestCase):
                 "maps_weather": [four_day_weather(city="南山区", adcode="440305")],
             },
             weather_cache=FakeWeatherCache(),
+            now=lambda: datetime(2026, 7, 23, 8, tzinfo=timezone.utc),
         )
 
-        selected = await handler.execute({"location": "南山区", "city": "深圳市"})
+        selected = await handler.execute(named_weather_args("深圳市南山区"))
 
         self.assertEqual(selected.status, "success")
         self.assertEqual([call[0] for call in executor.calls], ["maps_geo", "maps_weather"])
 
-    async def test_named_location_uses_embedded_city_to_disambiguate_same_named_district(self):
+    async def test_named_location_requires_city_confirmation_without_guessing(self):
         handler, executor = build_handler(
             "weather_forecast",
             {
@@ -433,17 +530,212 @@ class AmapWeatherForecastTests(unittest.IsolatedAsyncioTestCase):
                         }
                     )
                 ],
+            },
+            weather_cache=FakeWeatherCache(),
+            now=lambda: datetime(2026, 7, 23, 8, tzinfo=timezone.utc),
+        )
+
+        result = await handler.execute(named_weather_args("南山区"))
+        context = handler.format_llm_context(result)
+        safe_log = handler.sanitize_output_data_for_log(result)
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.data["error_code"], "ambiguous_location")
+        self.assertEqual(
+            result.data["repair"],
+            {
+                "action": "provide_argument",
+                "repair_id": result.data["repair"]["repair_id"],
+                "required_fields": ["location"],
+                "allowed_values": {},
+                "retryable": False,
+                "requires_user_input": True,
+                "retry_exhausted": False,
+                "max_attempts": 1,
+                "candidate_count": 2,
+            },
+        )
+        self.assertEqual([call[0] for call in executor.calls], ["maps_geo"])
+        self.assertIn('"tool_result": "argument_repair_required"', context)
+        self.assertIn('"required_fields": ["location"]', context)
+        self.assertIn('"requires_user_input": true', context)
+        self.assertIn("直接向用户确认", context)
+        self.assertNotIn("440305", context)
+        self.assertNotIn("230404", context)
+        self.assertEqual(safe_log["error_code"], "ambiguous_location")
+        self.assertEqual(safe_log["repair_action"], "provide_argument")
+        self.assertEqual(safe_log["repair_candidate_count"], 2)
+        self.assertNotIn("深圳市", json.dumps(safe_log, ensure_ascii=False))
+        self.assertNotIn("鹤岗市", json.dumps(safe_log, ensure_ascii=False))
+
+    async def test_weather_repair_is_not_promised_without_full_retry_budget(self):
+        handler, executor = build_handler(
+            "weather_forecast",
+            {
+                "maps_geo": [
+                    mcp_payload(
+                        {
+                            "results": [
+                                {"formatted_address": "广东省深圳市南山区", "city": "深圳市", "adcode": "440305"},
+                                {"formatted_address": "黑龙江省鹤岗市南山区", "city": "鹤岗市", "adcode": "230404"},
+                            ]
+                        }
+                    )
+                ]
+            },
+            remaining_budget=2,
+            weather_cache=FakeWeatherCache(),
+        )
+
+        result = await handler.execute_with_runtime_context(
+            named_weather_args("南山区"),
+            ToolRuntimeContext(
+                step_number=1,
+                argument_repair_state={},
+                remaining_agent_steps=1,
+                remaining_agent_tool_calls=1,
+            ),
+        )
+
+        self.assertFalse(result.data["repair"]["retryable"])
+        self.assertTrue(result.data["repair"]["requires_user_input"])
+        self.assertFalse(result.data["repair"]["retry_exhausted"])
+        self.assertEqual([call[0] for call in executor.calls], ["maps_geo"])
+
+    async def test_complete_location_that_remains_ambiguous_requires_user_input(self):
+        handler, executor = build_handler(
+            "weather_forecast",
+            {
+                "maps_geo": [
+                    mcp_payload(
+                        {
+                            "results": [
+                                {
+                                    "formatted_address": "广东省深圳市南山区甲",
+                                    "city": "深圳市",
+                                    "district": "南山区",
+                                    "adcode": "440305",
+                                },
+                                {
+                                    "formatted_address": "广东省深圳市南山区乙",
+                                    "city": "深圳市",
+                                    "district": "南山区",
+                                    "adcode": "440399",
+                                },
+                            ]
+                        }
+                    )
+                ],
+            },
+            weather_cache=FakeWeatherCache(),
+        )
+
+        result = await handler.execute(named_weather_args("深圳市南山区"))
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.data["error_code"], "ambiguous_location")
+        self.assertEqual(result.data["repair"]["required_fields"], ["location"])
+        self.assertTrue(result.data["repair"]["requires_user_input"])
+        self.assertEqual(result.data["repair"]["candidate_count"], 2)
+        self.assertEqual([call[0] for call in executor.calls], ["maps_geo"])
+
+    async def test_explicit_city_succeeds_in_a_new_user_run_after_ambiguity(self):
+        repair_state = {}
+        handler, executor = build_handler(
+            "weather_forecast",
+            {
+                "maps_geo": [
+                    mcp_payload(
+                        {
+                            "results": [
+                                {
+                                    "formatted_address": "广东省深圳市南山区",
+                                    "city": "深圳市",
+                                    "district": "南山区",
+                                    "adcode": "440305",
+                                },
+                                {
+                                    "formatted_address": "黑龙江省鹤岗市南山区",
+                                    "city": "鹤岗市",
+                                    "district": "南山区",
+                                    "adcode": "230404",
+                                },
+                            ]
+                        }
+                    ),
+                    mcp_payload(
+                        {
+                            "results": [
+                                {
+                                    "formatted_address": "广东省深圳市南山区",
+                                    "city": "深圳市",
+                                    "district": "南山区",
+                                    "adcode": "440305",
+                                }
+                            ]
+                        }
+                    ),
+                ],
                 "maps_weather": [four_day_weather(city="南山区", adcode="440305")],
             },
             weather_cache=FakeWeatherCache(),
             now=lambda: datetime(2026, 7, 23, 8, tzinfo=timezone.utc),
         )
 
-        result = await handler.execute({"location": "深圳南山区"})
+        first = await handler.execute_with_runtime_context(
+            named_weather_args("南山区"),
+            ToolRuntimeContext(
+                step_number=1,
+                argument_repair_state=repair_state,
+            ),
+        )
+        second = await handler.execute_with_runtime_context(
+            named_weather_args("深圳市南山区"),
+            ToolRuntimeContext(
+                step_number=1,
+                argument_repair_state={},
+            ),
+        )
 
-        self.assertEqual(result.status, "success")
-        self.assertEqual([call[0] for call in executor.calls], ["maps_geo", "maps_weather"])
-        self.assertEqual(executor.calls[1][2], {"city": "440305"})
+        self.assertEqual(first.status, "failed")
+        self.assertEqual(first.data["error_code"], "ambiguous_location")
+        self.assertEqual(first.data["repair"]["allowed_values"], {})
+        self.assertFalse(first.data["repair"]["retryable"])
+        self.assertTrue(first.data["repair"]["requires_user_input"])
+        self.assertEqual(second.status, "success")
+        self.assertNotIn("resolves_repair_id", second.data)
+        self.assertEqual(
+            [call[0] for call in executor.calls],
+            ["maps_geo", "maps_geo", "maps_weather"],
+        )
+        self.assertEqual(repair_state, {})
+
+    async def test_ambiguous_candidates_without_city_fields_require_user_input(self):
+        handler, executor = build_handler(
+            "weather_forecast",
+            {
+                "maps_geo": [
+                    mcp_payload(
+                        {
+                            "results": [
+                                {"formatted_address": "候选甲", "adcode": "440305"},
+                                {"formatted_address": "候选乙", "adcode": "230404"},
+                            ]
+                        }
+                    )
+                ],
+            },
+            weather_cache=FakeWeatherCache(),
+        )
+
+        result = await handler.execute(named_weather_args("南山区"))
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.data["error_code"], "ambiguous_location")
+        self.assertEqual(result.data["repair"]["required_fields"], ["location"])
+        self.assertTrue(result.data["repair"]["requires_user_input"])
+        self.assertEqual(result.data["repair"]["candidate_count"], 2)
+        self.assertEqual([call[0] for call in executor.calls], ["maps_geo"])
 
     async def test_current_location_resolves_official_regeocode_shape_without_exposing_coordinates(self):
         cache = FakeWeatherCache()
@@ -574,8 +866,8 @@ class AmapWeatherForecastTests(unittest.IsolatedAsyncioTestCase):
             now=lambda: datetime(2026, 7, 23, 8, tzinfo=timezone.utc),
         )
 
-        first = await handler.execute({"location": "深圳"})
-        second = await handler.execute({"location": "鹏城"})
+        first = await handler.execute(named_weather_args("深圳"))
+        second = await handler.execute(named_weather_args("鹏城"))
 
         self.assertEqual(first.data["result"]["query"], "深圳")
         self.assertEqual(second.data["result"]["query"], "鹏城")
@@ -635,7 +927,7 @@ class AmapWeatherForecastTests(unittest.IsolatedAsyncioTestCase):
                     now=lambda value=now: value,
                 )
 
-                result = await handler.execute({"location": "深圳市"})
+                result = await handler.execute(named_weather_args("深圳市"))
 
                 self.assertEqual(result.status, "success")
                 self.assertEqual([call[0] for call in executor.calls], ["maps_geo", "maps_weather"])
@@ -660,7 +952,7 @@ class AmapWeatherForecastTests(unittest.IsolatedAsyncioTestCase):
             weather_cache=cache,
         )
 
-        result = await handler.execute({"location": "深圳市"})
+        result = await handler.execute(named_weather_args("深圳市"))
 
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.data["error_code"], "invalid_response")
@@ -696,7 +988,7 @@ class AmapWeatherForecastTests(unittest.IsolatedAsyncioTestCase):
                 )
 
                 result = await asyncio.wait_for(
-                    handler.execute({"location": "深圳市"}),
+                    handler.execute(named_weather_args("深圳市")),
                     timeout=1.0,
                 )
 
@@ -745,17 +1037,19 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
         )
 
         local_result = await local_handler.execute_with_runtime_context(
-            {"query": "烤肉", "anchor_source": "current_location"},
+            local_search_args({"query": "烤肉", "anchor_source": "current_location"}),
             context,
         )
         route_result = await route_handler.execute_with_runtime_context(
-            {
-                "origin": "当前位置",
-                "origin_source": "current_location",
-                "destination": "深圳市民中心",
-                "destination_source": "named",
-                "modes": ["driving"],
-            },
+            route_compare_args(
+                {
+                    "origin": "当前位置",
+                    "origin_source": "current_location",
+                    "destination": "深圳市民中心",
+                    "destination_source": "named",
+                    "modes": ["driving"],
+                }
+            ),
             context,
         )
 
@@ -801,17 +1095,19 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
         )
 
         first = await local_handler.execute_with_runtime_context(
-            {"query": "咖啡", "anchor_source": "current_location"},
+            local_search_args({"query": "咖啡", "anchor_source": "current_location"}),
             context,
         )
         second = await route_handler.execute_with_runtime_context(
-            {
-                "origin": "当前位置",
-                "origin_source": "current_location",
-                "destination": "深圳市民中心",
-                "destination_source": "named",
-                "modes": ["driving"],
-            },
+            route_compare_args(
+                {
+                    "origin": "当前位置",
+                    "origin_source": "current_location",
+                    "destination": "深圳市民中心",
+                    "destination_source": "named",
+                    "modes": ["driving"],
+                }
+            ),
             context,
         )
 
@@ -854,7 +1150,7 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute_with_runtime_context(
-            {"query": "烤肉", "anchor_source": "current_location", "radius_m": 1500},
+            local_search_args({"query": "烤肉", "anchor_source": "current_location", "radius_m": 1500}),
             ToolRuntimeContext(geolocation=location),
         )
 
@@ -879,13 +1175,33 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
         location = Geolocation(latitude=22.5, longitude=114.0, accuracy_m=10, acquired_at=1_700_000_000)
 
         result = await handler.execute_with_runtime_context(
-            {"query": "咖啡", "anchor_source": "current_location"},
+            local_search_args({"query": "咖啡", "anchor_source": "current_location"}),
             ToolRuntimeContext(geolocation=location),
         )
 
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.data["error_code"], "location_conversion_failed")
         self.assertEqual(executor.calls, [])
+
+    async def test_anchor_source_is_required_and_must_match_near(self):
+        for args in (
+            {"query": "咖啡"},
+            {"query": "咖啡", "anchor_source": "named"},
+            {"query": "咖啡", "near": "民治", "anchor_source": "none"},
+            {"query": "咖啡", "near": "民治", "anchor_source": "current_location"},
+        ):
+            with self.subTest(args=args):
+                handler, executor = build_handler(
+                    "local_place_search",
+                    {},
+                    remaining_budget=0,
+                )
+
+                result = await handler.execute(args)
+
+                self.assertEqual(result.status, "failed")
+                self.assertEqual(result.data["error_code"], "invalid_arguments")
+                self.assertEqual(executor.calls, [])
 
     async def test_near_search_normalizes_whitespace_separated_keywords_only_for_amap_arguments(self):
         original_query = "烤肉 火锅 烧烤 餐厅 桌球馆"
@@ -898,7 +1214,7 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute(
-            {"query": original_query, "city": "深圳", "near": "民治地铁站", "radius_m": 3000}
+            local_search_args({"query": original_query, "city": "深圳", "near": "民治地铁站", "radius_m": 3000})
         )
 
         self.assertEqual(result.status, "success")
@@ -912,7 +1228,7 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
             {"maps_text_search": [mcp_payload({"pois": []})]},
         )
 
-        result = await handler.execute({"query": original_query, "city": "深圳"})
+        result = await handler.execute(local_search_args({"query": original_query, "city": "深圳"}))
 
         self.assertEqual(result.status, "success")
         self.assertEqual(executor.calls[0][2]["keywords"], "烤肉|火锅|烧烤|桌球馆")
@@ -922,7 +1238,9 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
             "local_place_search",
             {"maps_text_search": [mcp_payload({"pois": []})]},
         )
-        english_result = await english_handler.execute({"query": "coffee shop, hot pot", "city": "深圳"})
+        english_result = await english_handler.execute(
+            local_search_args({"query": "coffee shop, hot pot", "city": "深圳"})
+        )
         self.assertEqual(english_result.status, "success")
         self.assertEqual(english_executor.calls[0][2]["keywords"], "coffee shop|hot pot")
         self.assertEqual(english_result.data["result"]["query"], "coffee shop, hot pot")
@@ -941,7 +1259,7 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
                 {"maps_text_search": [mcp_payload({"pois": []})]},
             )
             with self.subTest(query=query):
-                result = await handler.execute({"query": query, "city": "深圳"})
+                result = await handler.execute(local_search_args({"query": query, "city": "深圳"}))
                 self.assertEqual(result.status, "success")
                 self.assertEqual(executor.calls[0][2]["keywords"], query)
                 self.assertEqual(result.data["result"]["query"], query)
@@ -970,7 +1288,7 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        result = await handler.execute({"query": "烤肉", "city": "深圳", "limit": 3})
+        result = await handler.execute(local_search_args({"query": "烤肉", "city": "深圳", "limit": 3}))
 
         self.assertEqual(result.status, "success")
         self.assertEqual(result.data["result"]["result_count"], 3)
@@ -1031,7 +1349,7 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        result = await handler.execute({"query": "烤肉", "city": "深圳", "limit": 10})
+        result = await handler.execute(local_search_args({"query": "烤肉", "city": "深圳", "limit": 10}))
 
         self.assertEqual(result.status, "success")
         self.assertEqual(result.data["result"]["result_count"], 5)
@@ -1071,7 +1389,7 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
             remaining_budget=2,
         )
 
-        result = await handler.execute({"query": "火锅"})
+        result = await handler.execute(local_search_args({"query": "火锅"}))
 
         self.assertEqual(result.status, "degraded")
         places = result.data["result"]["places"]
@@ -1115,7 +1433,7 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
             timeout_seconds=0.01,
         )
 
-        result = await handler.execute({"query": "烤肉"})
+        result = await handler.execute(local_search_args({"query": "烤肉"}))
 
         self.assertEqual(result.status, "degraded")
         self.assertEqual(result.data["result"]["places"][0]["name"], "餐厅一")
@@ -1146,7 +1464,9 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        result = await handler.execute({"query": "烤肉", "city": "深圳", "near": "民治地铁站", "radius_m": 2000})
+        result = await handler.execute(
+            local_search_args({"query": "烤肉", "city": "深圳", "near": "民治地铁站", "radius_m": 2000})
+        )
 
         self.assertEqual(result.status, "success")
         self.assertEqual(executor.calls[0][0], "maps_geo")
@@ -1177,7 +1497,7 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        result = await handler.execute({"query": "烤肉", "near": "民治地铁站"})
+        result = await handler.execute(local_search_args({"query": "烤肉", "near": "民治地铁站"}))
 
         self.assertEqual(result.status, "success")
         self.assertEqual(executor.calls[1][2]["location"], "114.031,22.616")
@@ -1200,7 +1520,7 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        result = await handler.execute({"query": "烤肉", "near": "民治地铁站"})
+        result = await handler.execute(local_search_args({"query": "烤肉", "near": "民治地铁站"}))
 
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.data["error_code"], "invalid_response")
@@ -1228,7 +1548,7 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        result = await handler.execute({"query": "咖啡"})
+        result = await handler.execute(local_search_args({"query": "咖啡"}))
 
         self.assertEqual(result.status, "success")
         self.assertEqual(result.data["result"]["places"], [])
@@ -1268,7 +1588,7 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
                 {"maps_geo": [mcp_payload({"results": candidates})]},
             )
             with self.subTest(args=args, candidates=candidates):
-                result = await handler.execute(args)
+                result = await handler.execute(local_search_args(args))
                 self.assertEqual(result.status, "failed")
                 self.assertEqual(result.data["error_code"], "invalid_response")
                 self.assertEqual([call[0] for call in executor.calls], ["maps_geo"])
@@ -1291,7 +1611,7 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        result = await handler.execute({"query": "烤肉", "city": "深圳", "near": "民治"})
+        result = await handler.execute(local_search_args({"query": "烤肉", "city": "深圳", "near": "民治"}))
 
         self.assertEqual(result.status, "success")
         self.assertEqual(executor.calls[1][2]["location"], "114.031,22.616")
@@ -1320,7 +1640,7 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
             if city:
                 args["city"] = city
             with self.subTest(city=city):
-                ambiguous_result = await ambiguous_handler.execute(args)
+                ambiguous_result = await ambiguous_handler.execute(local_search_args(args))
                 self.assertEqual(ambiguous_result.status, "failed")
                 self.assertEqual(ambiguous_result.data["error_code"], "invalid_response")
                 self.assertEqual([call[0] for call in ambiguous_executor.calls], ["maps_geo"])
@@ -1329,10 +1649,108 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
             "local_place_search",
             {"maps_geo": [mcp_payload({"geocodes": [{"location": "121.473,31.230", "city": "上海市"}]})]},
         )
-        mismatched = await mismatched_handler.execute({"query": "烤肉", "city": "深圳", "near": "民治"})
+        mismatched = await mismatched_handler.execute(
+            local_search_args({"query": "烤肉", "city": "深圳", "near": "民治"})
+        )
         self.assertEqual(mismatched.status, "failed")
         self.assertEqual(mismatched.data["error_code"], "invalid_response")
         self.assertEqual([call[0] for call in mismatched_executor.calls], ["maps_geo"])
+
+    async def test_geocode_explicit_city_rejects_unique_candidate_without_city(self):
+        handler, executor = build_handler(
+            "local_place_search",
+            {
+                "maps_geo": [
+                    mcp_payload(
+                        {
+                            "geocodes": [
+                                {
+                                    "location": "114.031,22.616",
+                                }
+                            ]
+                        }
+                    )
+                ],
+                "maps_around_search": [mcp_payload({"pois": []})],
+            },
+        )
+
+        result = await handler.execute(
+            local_search_args(
+                {
+                    "query": "烤肉",
+                    "city": "深圳",
+                    "near": "民治",
+                }
+            )
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.data["error_code"], "invalid_response")
+        self.assertEqual([call[0] for call in executor.calls], ["maps_geo"])
+
+    async def test_route_explicit_city_falls_back_when_unique_geocode_candidate_has_no_city(self):
+        handler, executor = build_handler(
+            "route_compare",
+            {
+                "maps_geo": [
+                    mcp_payload({"geocodes": [{"location": "114.031,22.616"}]}),
+                    mcp_payload({"geocodes": [{"location": "114.057,22.543", "city": "深圳市"}]}),
+                ],
+                "maps_text_search": [
+                    mcp_payload(
+                        {
+                            "pois": [
+                                {
+                                    "id": "minzhi-station",
+                                    "name": "民治地铁站",
+                                    "cityname": "深圳市",
+                                }
+                            ]
+                        }
+                    )
+                ],
+                "maps_search_detail": [
+                    mcp_payload(
+                        {
+                            "id": "minzhi-station",
+                            "name": "民治地铁站",
+                            "location": "114.031,22.616",
+                            "city": "深圳市",
+                        }
+                    )
+                ],
+                "maps_direction_driving": [mcp_payload({"paths": [{"distance": "12000", "duration": "1400"}]})],
+            },
+        )
+
+        result = await handler.execute(
+            route_compare_args(
+                {
+                    "origin": "民治地铁站",
+                    "destination": "深圳市民中心",
+                    "origin_city": "深圳",
+                    "destination_city": "深圳",
+                    "modes": ["driving"],
+                }
+            )
+        )
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual(
+            [call[0] for call in executor.calls],
+            [
+                "maps_geo",
+                "maps_text_search",
+                "maps_search_detail",
+                "maps_geo",
+                "maps_direction_driving",
+            ],
+        )
+        self.assertEqual(
+            executor.calls[1][2],
+            {"keywords": "民治地铁站", "city": "深圳", "citylimit": True},
+        )
 
     async def test_local_preflight_requires_complete_minimum_budget_without_consuming_any_call(self):
         cases = (
@@ -1342,7 +1760,7 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
         for args, remaining in cases:
             handler, executor = build_handler("local_place_search", {}, remaining_budget=remaining)
             with self.subTest(args=args, remaining=remaining):
-                result = await handler.execute(args)
+                result = await handler.execute(local_search_args(args))
                 self.assertEqual(result.status, "failed")
                 self.assertEqual(result.data["error_code"], "server_run_budget_exhausted")
                 self.assertEqual(executor.calls, [])
@@ -1375,7 +1793,9 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
             orchestration_lock=orchestration_lock,
         )
 
-        results = await asyncio.gather(first.execute({"query": "咖啡"}), second.execute({"query": "烤肉"}))
+        results = await asyncio.gather(
+            first.execute(local_search_args({"query": "咖啡"})), second.execute(local_search_args({"query": "烤肉"}))
+        )
 
         self.assertEqual(sorted(result.status for result in results), ["failed", "success"])
         failed = next(result for result in results if result.status == "failed")
@@ -1389,7 +1809,7 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
         ):
             handler, executor = build_handler("local_place_search", {})
             with self.subTest(args=args):
-                result = await handler.execute(args)
+                result = await handler.execute(local_search_args(args))
                 self.assertEqual(result.status, "failed")
                 self.assertEqual(result.data["error_code"], "invalid_arguments")
                 self.assertEqual(executor.calls, [])
@@ -1402,7 +1822,7 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
         ):
             handler, executor = build_handler("local_place_search", {}, remaining_budget=0)
             with self.subTest(args=args):
-                result = await handler.execute(args)
+                result = await handler.execute(local_search_args(args))
                 self.assertEqual(result.status, "failed")
                 self.assertEqual(result.data["error_code"], "invalid_arguments")
                 self.assertEqual(executor.calls, [])
@@ -1411,12 +1831,60 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
             "local_place_search",
             {"maps_text_search": [mcp_payload({"pois": []})]},
         )
-        allowed = await allowed_handler.execute({"query": "api key: 如何申请地图服务"})
+        allowed = await allowed_handler.execute(local_search_args({"query": "api key: 如何申请地图服务"}))
         self.assertEqual(allowed.status, "success")
         self.assertEqual(len(allowed_executor.calls), 1)
 
 
 class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
+    async def test_route_sources_and_modes_are_required_and_sources_must_match_endpoints(self):
+        for args in (
+            {
+                "origin": "民治地铁站",
+                "destination": "深圳市民中心",
+                "destination_source": "named",
+                "modes": ["driving"],
+            },
+            {
+                "origin": "民治地铁站",
+                "destination": "深圳市民中心",
+                "origin_source": "named",
+                "modes": ["driving"],
+            },
+            {
+                "origin": "民治地铁站",
+                "destination": "深圳市民中心",
+                "origin_source": "named",
+                "destination_source": "named",
+            },
+            {
+                "origin": "民治地铁站",
+                "destination": "深圳市民中心",
+                "origin_source": "current_location",
+                "destination_source": "named",
+                "modes": ["driving"],
+            },
+            {
+                "origin": "当前位置",
+                "destination": "深圳市民中心",
+                "origin_source": "named",
+                "destination_source": "named",
+                "modes": ["driving"],
+            },
+        ):
+            with self.subTest(args=args):
+                handler, executor = build_handler(
+                    "route_compare",
+                    {},
+                    remaining_budget=0,
+                )
+
+                result = await handler.execute(args)
+
+                self.assertEqual(result.status, "failed")
+                self.assertEqual(result.data["error_code"], "invalid_arguments")
+                self.assertEqual(executor.calls, [])
+
     async def test_requested_departure_time_adds_fact_boundary_without_reaching_remote_tools(self):
         handler, executor = build_handler(
             "route_compare",
@@ -1430,12 +1898,14 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute(
-            {
-                "origin": "南景新村",
-                "destination": "双子塔",
-                "requested_departure_time": "工作日早上 8:30",
-                "modes": ["driving"],
-            }
+            route_compare_args(
+                {
+                    "origin": "南景新村",
+                    "destination": "双子塔",
+                    "requested_departure_time": "工作日早上 8:30",
+                    "modes": ["driving"],
+                }
+            )
         )
 
         self.assertEqual(result.status, "success")
@@ -1455,11 +1925,13 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         handler, executor = build_handler("route_compare", {}, remaining_budget=0)
 
         result = await handler.execute(
-            {
-                "origin": "南景新村",
-                "destination": "双子塔",
-                "requested_departure_time": "时" * 81,
-            }
+            route_compare_args(
+                {
+                    "origin": "南景新村",
+                    "destination": "双子塔",
+                    "requested_departure_time": "时" * 81,
+                }
+            )
         )
 
         self.assertEqual(result.status, "failed")
@@ -1542,7 +2014,9 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        result = await handler.execute({"origin": "民治站", "destination": "雅宝站", "modes": ["transit"]})
+        result = await handler.execute(
+            route_compare_args({"origin": "民治站", "destination": "雅宝站", "modes": ["transit"]})
+        )
 
         route = result.data["result"]["routes"][0]
         self.assertEqual(route["transit_type"], "subway")
@@ -1614,7 +2088,9 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        result = await handler.execute({"origin": "民治站", "destination": "市民中心", "modes": ["transit"]})
+        result = await handler.execute(
+            route_compare_args({"origin": "民治站", "destination": "市民中心", "modes": ["transit"]})
+        )
 
         route = result.data["result"]["routes"][0]
         self.assertEqual(route["transit_type"], "subway")
@@ -1660,7 +2136,9 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        result = await handler.execute({"origin": "民治站", "destination": "市民中心", "modes": ["transit"]})
+        result = await handler.execute(
+            route_compare_args({"origin": "民治站", "destination": "市民中心", "modes": ["transit"]})
+        )
 
         route = result.data["result"]["routes"][0]
         self.assertEqual(route["transit_type"], "public_transit")
@@ -1707,11 +2185,13 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute(
-            {
-                "origin": "南景新村",
-                "destination": "双子塔",
-                "modes": ["driving"],
-            }
+            route_compare_args(
+                {
+                    "origin": "南景新村",
+                    "destination": "双子塔",
+                    "modes": ["driving"],
+                }
+            )
         )
 
         self.assertEqual(result.status, "success")
@@ -1776,7 +2256,9 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        result = await handler.execute({"origin": "南景新村", "destination": "双子塔", "modes": ["transit"]})
+        result = await handler.execute(
+            route_compare_args({"origin": "南景新村", "destination": "双子塔", "modes": ["transit"]})
+        )
 
         self.assertEqual(result.status, "success")
         self.assertEqual(
@@ -1821,11 +2303,13 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute(
-            {
-                "origin": "深圳北站",
-                "destination": "莲花山公园",
-                "modes": ["driving"],
-            }
+            route_compare_args(
+                {
+                    "origin": "深圳北站",
+                    "destination": "莲花山公园",
+                    "modes": ["driving"],
+                }
+            )
         )
 
         self.assertEqual(result.status, "success")
@@ -1865,11 +2349,13 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute(
-            {
-                "origin": "深圳北站",
-                "destination": "莲花山公园",
-                "modes": ["driving"],
-            }
+            route_compare_args(
+                {
+                    "origin": "深圳北站",
+                    "destination": "莲花山公园",
+                    "modes": ["driving"],
+                }
+            )
         )
 
         self.assertEqual(result.status, "failed")
@@ -1898,11 +2384,13 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute(
-            {
-                "origin": "中心站",
-                "destination": "莲花山公园",
-                "modes": ["driving"],
-            }
+            route_compare_args(
+                {
+                    "origin": "中心站",
+                    "destination": "莲花山公园",
+                    "modes": ["driving"],
+                }
+            )
         )
 
         self.assertEqual(result.status, "failed")
@@ -1921,11 +2409,13 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute(
-            {
-                "origin": "中心站",
-                "destination": "莲花山公园",
-                "modes": ["driving"],
-            }
+            route_compare_args(
+                {
+                    "origin": "中心站",
+                    "destination": "莲花山公园",
+                    "modes": ["driving"],
+                }
+            )
         )
 
         self.assertEqual(result.status, "failed")
@@ -1951,11 +2441,13 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute(
-            {
-                "origin": "深圳北站",
-                "destination": "莲花山公园",
-                "modes": ["driving"],
-            }
+            route_compare_args(
+                {
+                    "origin": "深圳北站",
+                    "destination": "莲花山公园",
+                    "modes": ["driving"],
+                }
+            )
         )
 
         self.assertEqual(result.status, "failed")
@@ -1972,11 +2464,13 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute(
-            {
-                "origin": "深圳北站",
-                "destination": "莲花山公园",
-                "modes": ["driving"],
-            }
+            route_compare_args(
+                {
+                    "origin": "深圳北站",
+                    "destination": "莲花山公园",
+                    "modes": ["driving"],
+                }
+            )
         )
 
         self.assertEqual(result.status, "failed")
@@ -2003,11 +2497,13 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute(
-            {
-                "origin": "南景新村",
-                "destination": "双子塔",
-                "modes": ["driving"],
-            }
+            route_compare_args(
+                {
+                    "origin": "南景新村",
+                    "destination": "双子塔",
+                    "modes": ["driving"],
+                }
+            )
         )
 
         self.assertEqual(result.status, "success")
@@ -2034,13 +2530,15 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute_with_runtime_context(
-            {
-                "origin": "当前位置",
-                "origin_source": "current_location",
-                "destination": "深圳市民中心",
-                "destination_source": "named",
-                "modes": ["driving"],
-            },
+            route_compare_args(
+                {
+                    "origin": "当前位置",
+                    "origin_source": "current_location",
+                    "destination": "深圳市民中心",
+                    "destination_source": "named",
+                    "modes": ["driving"],
+                }
+            ),
             ToolRuntimeContext(geolocation=location),
         )
 
@@ -2094,12 +2592,14 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute_with_runtime_context(
-            {
-                "origin": "当前位置",
-                "origin_source": "current_location",
-                "destination": "双子塔",
-                "modes": ["driving"],
-            },
+            route_compare_args(
+                {
+                    "origin": "当前位置",
+                    "origin_source": "current_location",
+                    "destination": "双子塔",
+                    "modes": ["driving"],
+                }
+            ),
             ToolRuntimeContext(geolocation=location),
         )
 
@@ -2120,7 +2620,7 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(converted, serialized)
         self.assertNotIn("114.061718", serialized)
 
-    async def test_geocodes_natural_language_and_calls_deduped_modes_in_fixed_order(self):
+    async def test_geocodes_natural_language_and_preserves_announced_mode_order(self):
         handler, executor = build_handler(
             "route_compare",
             {
@@ -2144,11 +2644,13 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute(
-            {
-                "origin": "民治地铁站",
-                "destination": "深圳市民中心",
-                "modes": ["walking", "driving", "transit"],
-            }
+            route_compare_args(
+                {
+                    "origin": "民治地铁站",
+                    "destination": "深圳市民中心",
+                    "modes": ["walking", "driving", "transit"],
+                }
+            )
         )
 
         self.assertEqual(result.status, "success")
@@ -2157,16 +2659,16 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
             [
                 "maps_geo",
                 "maps_geo",
+                "maps_direction_walking",
                 "maps_direction_driving",
                 "maps_direction_transit_integrated",
-                "maps_direction_walking",
             ],
         )
-        transit_args = executor.calls[3][2]
+        transit_args = executor.calls[4][2]
         self.assertEqual(transit_args["city"], "深圳市")
         self.assertEqual(transit_args["cityd"], "深圳市")
         self.assertEqual(
-            [route["mode"] for route in result.data["result"]["routes"]], ["driving", "transit", "walking"]
+            [route["mode"] for route in result.data["result"]["routes"]], ["walking", "driving", "transit"]
         )
         routes = {route["mode"]: route for route in result.data["result"]["routes"]}
         self.assertEqual(routes["driving"]["distance_m"], 16000)
@@ -2191,13 +2693,15 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute(
-            {
-                "origin": "民治地铁站",
-                "destination": "深圳市民中心",
-                "origin_city": "深圳",
-                "destination_city": "深圳",
-                "modes": ["transit"],
-            }
+            route_compare_args(
+                {
+                    "origin": "民治地铁站",
+                    "destination": "深圳市民中心",
+                    "origin_city": "深圳",
+                    "destination_city": "深圳",
+                    "modes": ["transit"],
+                }
+            )
         )
 
         self.assertEqual(result.status, "success")
@@ -2206,7 +2710,7 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(executor.calls[2][2]["city"], "深圳市")
         self.assertEqual(executor.calls[2][2]["cityd"], "深圳市")
 
-    async def test_dedupes_modes_within_raw_array_limit(self):
+    async def test_duplicate_modes_are_rejected_instead_of_silently_deduped(self):
         handler, executor = build_handler(
             "route_compare",
             {
@@ -2222,18 +2726,18 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute(
-            {
-                "origin": "民治地铁站",
-                "destination": "深圳市民中心",
-                "modes": ["transit", "driving", "driving"],
-            }
+            route_compare_args(
+                {
+                    "origin": "民治地铁站",
+                    "destination": "深圳市民中心",
+                    "modes": ["transit", "driving", "driving"],
+                }
+            )
         )
 
-        self.assertEqual(result.status, "success")
-        self.assertEqual(
-            [call[0] for call in executor.calls[2:]],
-            ["maps_direction_driving", "maps_direction_transit_integrated"],
-        )
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.data["error_code"], "invalid_arguments")
+        self.assertEqual(executor.calls, [])
 
     async def test_partial_mode_failure_returns_degraded_with_safe_whitelist_context(self):
         handler, _executor = build_handler(
@@ -2251,7 +2755,7 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute(
-            {"origin": "民治地铁站", "destination": "深圳市民中心", "modes": ["driving", "transit"]}
+            route_compare_args({"origin": "民治地铁站", "destination": "深圳市民中心", "modes": ["driving", "transit"]})
         )
         context = handler.format_llm_context(result)
 
@@ -2277,11 +2781,13 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute(
-            {
-                "origin": "民治地铁站",
-                "destination": "深圳市民中心",
-                "modes": ["driving", "transit", "walking"],
-            }
+            route_compare_args(
+                {
+                    "origin": "民治地铁站",
+                    "destination": "深圳市民中心",
+                    "modes": ["driving", "transit", "walking"],
+                }
+            )
         )
 
         self.assertEqual(result.status, "degraded")
@@ -2304,11 +2810,13 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute(
-            {
-                "origin": "民治地铁站",
-                "destination": "深圳市民中心",
-                "modes": ["driving", "transit", "walking"],
-            }
+            route_compare_args(
+                {
+                    "origin": "民治地铁站",
+                    "destination": "深圳市民中心",
+                    "modes": ["driving", "transit", "walking"],
+                }
+            )
         )
 
         self.assertEqual(result.status, "degraded")
@@ -2319,7 +2827,9 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
     async def test_route_preflight_requires_three_remaining_calls_without_consuming_budget(self):
         handler, executor = build_handler("route_compare", {}, remaining_budget=2)
 
-        result = await handler.execute({"origin": "民治地铁站", "destination": "深圳市民中心", "modes": ["driving"]})
+        result = await handler.execute(
+            route_compare_args({"origin": "民治地铁站", "destination": "深圳市民中心", "modes": ["driving"]})
+        )
 
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.data["error_code"], "server_run_budget_exhausted")
@@ -2339,7 +2849,7 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute(
-            {"origin": "民治地铁站", "destination": "深圳市民中心", "modes": ["driving", "walking"]}
+            route_compare_args({"origin": "民治地铁站", "destination": "深圳市民中心", "modes": ["driving", "walking"]})
         )
 
         self.assertEqual(result.status, "degraded")
@@ -2367,11 +2877,13 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
             )
             with self.subTest(error_code=error_code):
                 result = await handler.execute(
-                    {
-                        "origin": "民治地铁站",
-                        "destination": "深圳市民中心",
-                        "modes": ["driving", "walking"],
-                    }
+                    route_compare_args(
+                        {
+                            "origin": "民治地铁站",
+                            "destination": "深圳市民中心",
+                            "modes": ["driving", "walking"],
+                        }
+                    )
                 )
                 self.assertEqual(result.status, "failed")
                 self.assertEqual(result.data["error_code"], error_code)
@@ -2391,7 +2903,7 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute(
-            {"origin": "民治地铁站", "destination": "深圳市民中心", "modes": ["driving", "walking"]}
+            route_compare_args({"origin": "民治地铁站", "destination": "深圳市民中心", "modes": ["driving", "walking"]})
         )
 
         self.assertEqual(result.status, "failed")
@@ -2421,7 +2933,7 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute(
-            {"origin": "民治地铁站", "destination": "深圳市民中心", "modes": ["driving", "walking"]}
+            route_compare_args({"origin": "民治地铁站", "destination": "深圳市民中心", "modes": ["driving", "walking"]})
         )
 
         self.assertEqual(result.status, "failed")
@@ -2454,7 +2966,9 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
             with self.subTest(mode=mode):
-                result = await handler.execute({"origin": "民治地铁站", "destination": "深圳市民中心", "modes": [mode]})
+                result = await handler.execute(
+                    route_compare_args({"origin": "民治地铁站", "destination": "深圳市民中心", "modes": [mode]})
+                )
                 self.assertEqual(result.status, "failed")
                 self.assertEqual(result.data["error_code"], "invalid_response")
                 self.assertEqual([call[0] for call in executor.calls], ["maps_geo", "maps_geo", remote_tool])
@@ -2472,14 +2986,14 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute(
-            {"origin": "民治地铁站", "destination": "深圳市民中心", "modes": ["driving", "transit"]}
+            route_compare_args({"origin": "民治地铁站", "destination": "深圳市民中心", "modes": ["driving", "transit"]})
         )
 
         self.assertEqual(result.status, "degraded")
         self.assertEqual(result.data["result"]["unavailable_modes"], ["transit"])
         self.assertNotIn("maps_direction_transit_integrated", [call[0] for call in executor.calls])
 
-    async def test_transit_does_not_fallback_to_input_cities_when_geocode_omits_city(self):
+    async def test_explicit_input_cities_require_city_bearing_geocode_or_strict_fallback(self):
         handler, executor = build_handler(
             "route_compare",
             {
@@ -2487,34 +3001,37 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
                     mcp_payload({"geocodes": [{"location": "114.031,22.616"}]}),
                     mcp_payload({"geocodes": [{"location": "114.057,22.543"}]}),
                 ],
+                "maps_text_search": [mcp_payload({"pois": []})],
                 "maps_direction_driving": [mcp_payload({"route": {"paths": [{"distance": "16000"}]}})],
             },
         )
 
         result = await handler.execute(
-            {
-                "origin": "民治地铁站",
-                "destination": "深圳市民中心",
-                "origin_city": "广州",
-                "destination_city": "佛山",
-                "modes": ["driving", "transit"],
-            }
+            route_compare_args(
+                {
+                    "origin": "民治地铁站",
+                    "destination": "深圳市民中心",
+                    "origin_city": "广州",
+                    "destination_city": "佛山",
+                    "modes": ["driving", "transit"],
+                }
+            )
         )
 
-        self.assertEqual(result.status, "degraded")
-        self.assertEqual(result.data["result"]["unavailable_modes"], ["transit"])
-        self.assertNotIn("maps_direction_transit_integrated", [call[0] for call in executor.calls])
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.data["error_code"], "invalid_response")
+        self.assertEqual([call[0] for call in executor.calls], ["maps_geo", "maps_text_search"])
 
     async def test_rejects_coordinate_endpoints(self):
         for args in ({"origin": "114.031,22.616", "destination": "深圳市民中心"},):
             handler, executor = build_handler("route_compare", {})
             with self.subTest(args=args):
-                result = await handler.execute(args)
+                result = await handler.execute(route_compare_args(args))
                 self.assertEqual(result.status, "failed")
                 self.assertEqual(result.data["error_code"], "invalid_arguments")
                 self.assertEqual(executor.calls, [])
 
-    async def test_recovers_four_known_modes_by_selecting_three_commute_priorities(self):
+    async def test_four_modes_are_rejected_instead_of_silently_truncated(self):
         handler, executor = build_handler(
             "route_compare",
             {
@@ -2531,28 +3048,18 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = await handler.execute(
-            {
-                "origin": "民治地铁站",
-                "destination": "深圳市民中心",
-                "modes": ["driving", "transit", "walking", "bicycling"],
-            }
+            route_compare_args(
+                {
+                    "origin": "民治地铁站",
+                    "destination": "深圳市民中心",
+                    "modes": ["driving", "transit", "walking", "bicycling"],
+                }
+            )
         )
 
-        self.assertEqual(result.status, "success")
-        self.assertEqual(
-            [call[0] for call in executor.calls],
-            [
-                "maps_geo",
-                "maps_geo",
-                "maps_direction_driving",
-                "maps_direction_transit_integrated",
-                "maps_direction_bicycling",
-            ],
-        )
-        self.assertEqual(
-            [route["mode"] for route in result.data["result"]["routes"]],
-            ["driving", "transit", "bicycling"],
-        )
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.data["error_code"], "invalid_arguments")
+        self.assertEqual(executor.calls, [])
 
     async def test_route_rejects_inline_credentials_in_endpoints_before_budget_or_network(self):
         for args in (
@@ -2572,7 +3079,7 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         ):
             handler, executor = build_handler("route_compare", {}, remaining_budget=0)
             with self.subTest(args=args):
-                result = await handler.execute(args)
+                result = await handler.execute(route_compare_args(args))
                 self.assertEqual(result.status, "failed")
                 self.assertEqual(result.data["error_code"], "invalid_arguments")
                 self.assertEqual(executor.calls, [])
@@ -2597,7 +3104,7 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        result = await handler.execute({"query": "咖啡"})
+        result = await handler.execute(local_search_args({"query": "咖啡"}))
         context = handler.format_llm_context(result)
 
         self.assertEqual(result.status, "success")
@@ -2705,7 +3212,7 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        result = await handler.execute({"query": "咖啡", "limit": 3})
+        result = await handler.execute(local_search_args({"query": "咖啡", "limit": 3}))
         context = handler.format_llm_context(result)
         safe_log = handler.sanitize_output_data_for_log(result)
         serialized = json.dumps(

@@ -556,6 +556,30 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_failed_path_log_never_contains_exception_message(self):
+        secret = "sk-secret-value"
+        errors = []
+        execution = self._execution()
+
+        async def run_agent_loop_fn(**_kwargs):
+            raise RuntimeError(f"Authorization: Bearer {secret}; upstream 503")
+
+        with self.assertRaises(RuntimeError):
+            await run_agent_loop_lifecycle(
+                request=self._request(),
+                execution=execution,
+                dependencies=self._dependencies(
+                    run_agent_loop_fn=run_agent_loop_fn,
+                    error_fn=errors.append,
+                ),
+            )
+
+        self.assertEqual(
+            errors,
+            ["Agent 生成异常: conv_id=conv-life, error_type=RuntimeError"],
+        )
+        self.assertNotIn(secret, " ".join(errors))
+
 
 if __name__ == "__main__":
     unittest.main()

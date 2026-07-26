@@ -34,6 +34,47 @@ async def async_response(chunks):
 
 
 class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
+    def test_llm_retry_does_not_match_rate_substring_in_plain_message(self):
+        self.assertFalse(
+            llm_stream_module._is_llm_error_retryable(
+                RuntimeError("moderate policy rejection"),
+            )
+        )
+
+    def test_llm_retry_does_not_parse_status_from_secret_bearing_message(self):
+        error = RuntimeError("Authorization: Bearer sk-secret-value; upstream 503")
+
+        self.assertFalse(llm_stream_module._is_llm_error_retryable(error))
+
+    def test_llm_retry_accepts_structured_retryable_status(self):
+        class UpstreamUnavailableError(RuntimeError):
+            status_code = 503
+
+        self.assertTrue(
+            llm_stream_module._is_llm_error_retryable(
+                UpstreamUnavailableError("Authorization: Bearer sk-secret-value"),
+            )
+        )
+
+    def test_llm_retry_log_never_contains_exception_message(self):
+        class UpstreamUnavailableError(RuntimeError):
+            status_code = 503
+
+        error = UpstreamUnavailableError("Authorization: Bearer sk-secret-value")
+        with patch("app.services.stream.llm_stream.logger.warning") as warning:
+            llm_stream_module._log_llm_retry(
+                {
+                    "tries": 1,
+                    "wait": 2,
+                    "exception": error,
+                }
+            )
+
+        rendered = " ".join(str(value) for value in warning.call_args.args)
+        self.assertNotIn("sk-secret-value", rendered)
+        self.assertNotIn(str(error), rendered)
+        self.assertIn("http_503", rendered)
+
     async def test_consume_stream_round_defers_all_model_output_for_product_result_guard(self):
         request = llm_stream_module.LLMStreamRequest(
             conversation_id="conv-product",

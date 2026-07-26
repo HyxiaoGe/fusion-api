@@ -30,9 +30,7 @@ class _AnswerSource:
         return stable_web_evidence_id(self.url, fallback=f"ev-final-{digest}")
 
 
-def build_used_final_answer_evidence(
-    *, content_blocks: list[Any], answer_text: str
-) -> list[dict[str, Any]]:
+def build_used_final_answer_evidence(*, content_blocks: list[Any], answer_text: str) -> list[dict[str, Any]]:
     """从最终回答文本里保守识别真正使用过的网页来源。"""
     normalized_answer = (answer_text or "").strip()
     if not normalized_answer:
@@ -144,9 +142,7 @@ def _sources_from_citations(answer_text: str, search_sources: list[_AnswerSource
 def _sources_from_url_mentions(answer_text: str, sources: list[_AnswerSource]) -> list[_AnswerSource]:
     lowered = answer_text.lower()
     mentioned_urls = {
-        canonical
-        for url in _URL_PATTERN.findall(answer_text)
-        if (canonical := canonicalize_evidence_url(url))
+        canonical for url in _URL_PATTERN.findall(answer_text) if (canonical := canonicalize_evidence_url(url))
     }
     matched: list[_AnswerSource] = []
 

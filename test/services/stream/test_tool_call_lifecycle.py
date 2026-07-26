@@ -51,7 +51,11 @@ class ToolCallLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempt.duration_ms, 30)
         self.assertIsNone(attempt.cancelled_error)
         self.assertEqual(attempt.result.status, "failed")
-        self.assertEqual(attempt.result.error_message, "ValueError: 参数非法")
+        self.assertEqual(attempt.result.error_message, "工具执行未完成")
+        self.assertEqual(
+            attempt.result.data,
+            {"error_code": "tool_execution_failed", "retryable": False},
+        )
 
     async def test_complete_tool_lifecycle_sets_duration_and_emits_completed_once(self):
         complete_tool_lifecycle = getattr(lifecycle_module, "complete_tool_lifecycle")
@@ -71,7 +75,6 @@ class ToolCallLifecycleTests(unittest.IsolatedAsyncioTestCase):
             duration_ms=12,
             result_summary_builder=build_summary,
         )
-
         self.assertEqual(result.duration_ms, 12)
         self.assertEqual(summaries, [result])
         self.assertEqual(
@@ -89,6 +92,69 @@ class ToolCallLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     },
                 )
             ],
+        )
+
+    async def test_repair_metadata_is_projected_without_argument_values(self):
+        complete_tool_lifecycle = getattr(lifecycle_module, "complete_tool_lifecycle")
+        emitter = RecordingEmitter()
+        result = ToolResult(
+            status="failed",
+            data={
+                "repair": {
+                    "repair_id": "repair_0123456789abcdef",
+                    "retryable": True,
+                    "allowed_values": {"city": ["深圳市"]},
+                }
+            },
+        )
+
+        await complete_tool_lifecycle(
+            emitter=emitter,
+            tool_call_id="call-repair",
+            tool_name="weather_forecast",
+            result=result,
+            duration_ms=0,
+            result_summary_builder=lambda _result: {"kind": "weather", "truncated": False},
+        )
+
+        completed = emitter.events[0][1]
+        self.assertEqual(completed["status"], "degraded")
+        self.assertEqual(
+            completed["result_summary"],
+            {
+                "kind": "weather",
+                "truncated": False,
+                "repair_state": "retrying",
+                "repair_id": "repair_0123456789abcdef",
+            },
+        )
+        self.assertNotIn("深圳市", str(completed))
+
+    async def test_success_metadata_resolves_only_matching_repair(self):
+        complete_tool_lifecycle = getattr(lifecycle_module, "complete_tool_lifecycle")
+        emitter = RecordingEmitter()
+        result = ToolResult(
+            status="success",
+            data={"resolves_repair_id": "repair_0123456789abcdef"},
+        )
+
+        await complete_tool_lifecycle(
+            emitter=emitter,
+            tool_call_id="call-resolved",
+            tool_name="weather_forecast",
+            result=result,
+            duration_ms=10,
+            result_summary_builder=lambda _result: {"kind": "weather", "truncated": False},
+        )
+
+        self.assertEqual(
+            emitter.events[0][1]["result_summary"],
+            {
+                "kind": "weather",
+                "truncated": False,
+                "repair_state": "resolved",
+                "resolves_repair_id": "repair_0123456789abcdef",
+            },
         )
 
     async def test_execute_tool_with_lifecycle_emits_success_and_sets_measured_duration(self):
@@ -168,7 +234,11 @@ class ToolCallLifecycleTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result.status, "failed")
-        self.assertEqual(result.error_message, "ValueError: 参数非法")
+        self.assertEqual(result.error_message, "工具执行未完成")
+        self.assertEqual(
+            result.data,
+            {"error_code": "tool_execution_failed", "retryable": False},
+        )
         self.assertEqual(result.duration_ms, None)
         self.assertEqual(len(summaries), 1)
         self.assertIs(summaries[0], result)
@@ -183,7 +253,7 @@ class ToolCallLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     "status": "failed",
                     "duration_ms": 30,
                     "result_summary": {"kind": "search", "status": "failed"},
-                    "error": "ValueError: 参数非法",
+                    "error": "工具执行未完成",
                 },
             ),
         )
@@ -262,7 +332,7 @@ class ToolCallLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     "status": "failed",
                     "duration_ms": 41,
                     "result_summary": {"kind": "search", "status": "failed"},
-                    "error": "CancelledError: 用户中止",
+                    "error": "工具执行未完成",
                 },
             ),
         )

@@ -8,6 +8,7 @@ tool_executor 负责。
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -72,14 +73,58 @@ async def emit_tool_call_result(
 ) -> None:
     if emitter is None:
         return
+    data = getattr(result, "data", None)
+    repair = data.get("repair") if isinstance(data, dict) else None
+    event_status = "degraded" if isinstance(repair, dict) and repair.get("retryable") is True else result.status
+    result_summary = _build_event_result_summary(
+        result_summary_builder(result),
+        data=data,
+        repair=repair,
+    )
     await emitter.tool_call_completed(
         tool_call_id=tool_call_id,
         tool_name=tool_name,
-        status=result.status,
+        status=event_status,
         duration_ms=duration_ms if duration_ms is not None else 0,
-        result_summary=result_summary_builder(result),
-        error=result.error_message if result.status != "success" else None,
+        result_summary=result_summary,
+        error=(
+            None
+            if isinstance(repair, dict) and repair.get("retryable") is True
+            else result.error_message
+            if result.status != "success"
+            else None
+        ),
     )
+
+
+def _build_event_result_summary(
+    raw_summary: Any,
+    *,
+    data: dict[str, Any] | None,
+    repair: Any,
+) -> dict[str, Any]:
+    summary = dict(raw_summary) if isinstance(raw_summary, dict) else {"kind": "tool", "truncated": True}
+    if isinstance(repair, dict):
+        repair_id = _safe_repair_id(repair.get("repair_id"))
+        summary["repair_state"] = (
+            "retrying"
+            if repair.get("retryable") is True
+            else "requires_user_input"
+            if repair.get("requires_user_input") is True
+            else "exhausted"
+        )
+        if repair_id:
+            summary["repair_id"] = repair_id
+    elif isinstance(data, dict):
+        resolves_repair_id = _safe_repair_id(data.get("resolves_repair_id"))
+        if resolves_repair_id:
+            summary["repair_state"] = "resolved"
+            summary["resolves_repair_id"] = resolves_repair_id
+    return summary
+
+
+def _safe_repair_id(value: Any) -> str | None:
+    return value if isinstance(value, str) and re.fullmatch(r"repair_[a-f0-9]{16}", value) else None
 
 
 def measure_duration_ms(start_mono: float) -> int:
@@ -163,7 +208,9 @@ async def execute_tool_with_lifecycle(
 
 
 def _build_failed_result(exc: BaseException) -> ToolResult:
+    error_code = "tool_cancelled" if isinstance(exc, asyncio.CancelledError) else "tool_execution_failed"
     return ToolResult(
         status="failed",
-        error_message=f"{type(exc).__name__}: {exc}",
+        data={"error_code": error_code, "retryable": False},
+        error_message="工具执行未完成",
     )

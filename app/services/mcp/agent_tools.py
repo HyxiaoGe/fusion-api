@@ -41,6 +41,7 @@ from app.services.mcp.tool_contract import (
     build_tool_label,
     canonical_json_bytes,
     is_valid_tool_snapshot,
+    validate_tool_arguments,
 )
 from app.services.tool_handlers.base import BaseToolHandler, ToolResult
 
@@ -481,10 +482,12 @@ class McpAgentToolHandler(BaseToolHandler):
         *,
         binding: McpAgentToolBinding,
         remote_executor: McpAgentRemoteExecutor,
+        input_schema: dict[str, Any],
         max_llm_context_bytes: int = 12_000,
     ):
         self.binding = binding
         self.remote_executor = remote_executor
+        self.input_schema = json.loads(json.dumps(input_schema, ensure_ascii=False))
         self.max_llm_context_bytes = max_llm_context_bytes
 
     @property
@@ -497,6 +500,11 @@ class McpAgentToolHandler(BaseToolHandler):
 
     async def is_run_budget_exhausted(self) -> bool:
         return await self.remote_executor.is_run_budget_exhausted()
+
+    def validate_arguments(self, args: Any) -> list[dict[str, str]]:
+        """仅按本轮已向模型公告的净化 schema 做无网络预校验。"""
+
+        return validate_tool_arguments(self.input_schema, args)
 
     async def execute(self, args: dict) -> ToolResult:
         started_at = time.monotonic()
@@ -525,7 +533,15 @@ class McpAgentToolHandler(BaseToolHandler):
                 self.binding.alias,
                 error.code,
             )
-            return self._failed_result(started_at, error_code=error.code)
+            return self._failed_result(
+                started_at,
+                error_code=error.code,
+                validation_errors=_project_remote_validation_errors(
+                    self.input_schema,
+                    error,
+                    args,
+                ),
+            )
         except Exception as error:  # noqa: BLE001 — 不记录可能含凭据的原始异常文本
             logger.warning(
                 "MCP Agent 工具调用异常 server_id=%s tool_alias=%s error_type=%s",
@@ -593,16 +609,122 @@ class McpAgentToolHandler(BaseToolHandler):
             "definition_sha256": self.binding.definition_sha256,
         }
 
-    def _failed_result(self, started_at: float, *, error_code: str) -> ToolResult:
+    def _failed_result(
+        self,
+        started_at: float,
+        *,
+        error_code: str,
+        validation_errors: list[str] | None = None,
+    ) -> ToolResult:
+        data = {
+            **self._binding_metadata(),
+            "error_code": _safe_mcp_error_code(error_code) or "internal_error",
+        }
+        if validation_errors:
+            data["validation_errors"] = validation_errors[:8]
         return ToolResult(
             status="failed",
             duration_ms=_duration_ms(started_at),
-            data={
-                **self._binding_metadata(),
-                "error_code": _safe_mcp_error_code(error_code) or "internal_error",
-            },
+            data=data,
             error_message=MCP_AGENT_TOOL_ERROR_MESSAGE,
         )
+
+
+def _project_remote_validation_errors(
+    schema: dict[str, Any],
+    error: McpClientError,
+    arguments: dict[str, Any],
+) -> list[str]:
+    if error.code != "remote_invalid_arguments":
+        return []
+    details = error.safe_details
+    fields = details.get("fields") if isinstance(details, dict) else None
+    source_code = details.get("code") if isinstance(details, dict) else None
+    if not isinstance(fields, list):
+        return []
+    code = "required" if source_code == "missing_required_argument" else "invalid_arguments"
+    projected: list[str] = []
+    for field in fields:
+        if not isinstance(field, str):
+            continue
+        exists, required = _schema_field_metadata(schema, field, arguments)
+        if exists and (code != "required" or (required and _argument_field_is_missing(arguments, field))):
+            projected.append(f"{field}:{code}")
+    return projected[:8]
+
+
+def _schema_field_metadata(
+    schema: dict[str, Any],
+    field: str,
+    arguments: dict[str, Any],
+) -> tuple[bool, bool]:
+    if field == "$":
+        return True, False
+    current: Any = schema
+    current_arguments: list[Any] = [arguments]
+    required = False
+    parts = field.split(".")
+    for index, raw_part in enumerate(parts):
+        is_array = raw_part.endswith("[]")
+        part = raw_part[:-2] if is_array else raw_part
+        if not part or part == "*":
+            return False, False
+        properties = current.get("properties") if isinstance(current, dict) else None
+        if not isinstance(properties, dict) or part not in properties:
+            return False, False
+        required_fields = current.get("required")
+        required = index == len(parts) - 1 and isinstance(required_fields, list) and part in required_fields
+        current = properties[part]
+        if index < len(parts) - 1:
+            next_arguments = [value[part] for value in current_arguments if isinstance(value, dict) and part in value]
+            if not next_arguments:
+                parent_required = isinstance(required_fields, list) and part in required_fields
+                if not parent_required:
+                    return True, False
+                current_arguments = []
+            else:
+                current_arguments = next_arguments
+        if is_array:
+            items = current.get("items") if isinstance(current, dict) else None
+            if not isinstance(items, dict):
+                return False, False
+            current = items
+            if index < len(parts) - 1:
+                current_arguments = [item for value in current_arguments if isinstance(value, list) for item in value]
+                if not current_arguments:
+                    return True, False
+    return True, required
+
+
+def _argument_field_is_missing(arguments: dict[str, Any], field: str) -> bool:
+    """只把实参对象中真实缺少的字段投影为 required。
+
+    数组路径按任一现有元素缺少字段处理；空数组本身不构成叶子字段缺失。
+    """
+
+    current_values: list[Any] = [arguments]
+    parts = field.split(".")
+    for index, raw_part in enumerate(parts):
+        is_array = raw_part.endswith("[]")
+        part = raw_part[:-2] if is_array else raw_part
+        next_values: list[Any] = []
+        for value in current_values:
+            if not isinstance(value, dict):
+                return False
+            if part not in value:
+                return True
+            next_values.append(value[part])
+        if index == len(parts) - 1:
+            return False
+        if is_array:
+            if any(not isinstance(value, list) for value in next_values):
+                return False
+            current_values = [item for value in next_values for item in value]
+        else:
+            current_values = next_values
+        if not current_values:
+            return False
+    return False
 
 
 def load_mcp_agent_tools(
@@ -693,6 +815,7 @@ def load_mcp_agent_tools(
             handlers[alias] = McpAgentToolHandler(
                 binding=binding,
                 remote_executor=remote_executor,
+                input_schema=definition["function"]["parameters"],
                 max_llm_context_bytes=resolved_limits.max_llm_context_bytes,
             )
             audit_bindings.append(binding.to_audit_dict())

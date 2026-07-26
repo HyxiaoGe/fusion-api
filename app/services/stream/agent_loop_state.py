@@ -31,6 +31,8 @@ class AgentLoopState:
     unavailable_contexts: dict[str, str] = field(default_factory=dict)
     product_tool_attempted: bool = False
     successful_tool_call_signatures: set[str] = field(default_factory=set)
+    argument_repair_state: dict[str, dict[str, Any]] = field(default_factory=dict)
+    pending_tool_repairs: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def next_step_number(self) -> int:
         self.step += 1

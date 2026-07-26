@@ -202,7 +202,9 @@ async def _finalize_failed(
     execution: AgentLoopExecutionContext,
     dependencies: AgentLoopLifecycleDependencies,
 ) -> None:
-    dependencies.error_fn(f"Agent 生成异常: conv_id={execution.completion_context.conversation_id}, error={error}")
+    dependencies.error_fn(
+        f"Agent 生成异常: conv_id={execution.completion_context.conversation_id}, error_type={type(error).__name__}"
+    )
     await dependencies.finalize_failed_run_fn(
         context=execution.completion_context,
         error=error,

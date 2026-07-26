@@ -17,6 +17,13 @@ TerminalRunFn = Callable[..., Awaitable[Any]]
 WarningFn = Callable[[str], None]
 DurationMsFactory = Callable[[], int]
 
+AGENT_RUN_FAILED_MESSAGE = "生成服务暂时不可用，请稍后重试"
+AGENT_RUN_FAILED_ERROR_CODE = "agent_run_failed"
+_PUBLIC_ERROR_MESSAGES = {
+    "context_budget_exceeded": "当前消息与必要上下文过长，请缩短本次输入或移除较大的文件后重试",
+    "context_estimation_unavailable": "上下文预算暂时无法校验，请稍后重试",
+}
+
 
 @dataclass(frozen=True)
 class AgentLoopRunCompletionContext:
@@ -158,6 +165,11 @@ async def finalize_failed_run(
         partial=True,
     )
     structured_error_code = _safe_structured_error_code(error)
+    public_error_code = structured_error_code or AGENT_RUN_FAILED_ERROR_CODE
+    public_error_message = _PUBLIC_ERROR_MESSAGES.get(
+        public_error_code,
+        AGENT_RUN_FAILED_MESSAGE,
+    )
     try:
         await fail_agent_run_fn(
             emitter=context.emitter,
@@ -165,29 +177,26 @@ async def finalize_failed_run(
             stats=context.state.run_stats(context.run_id),
             duration_ms_factory=context.duration_ms_factory,
             current_step_id=context.state.current_step_id,
-            error_code=structured_error_code or type(error).__name__,
-            message=str(error),
+            error_code=public_error_code,
+            message=public_error_message,
         )
         context.state.mark_terminal_emitted()
     except StreamWriteTerminalError:
         raise
     except Exception as emit_exc:  # noqa: BLE001
-        warning_fn(f"emit run_failed 失败: {emit_exc}")
+        warning_fn(f"emit run_failed 失败: error_type={type(emit_exc).__name__}")
     finalize_kwargs = {
         "success": False,
-        "error_msg": str(error),
+        "error_msg": public_error_message,
+        "error_code": public_error_code,
         "task_id": context.task_id,
     }
-    if structured_error_code:
-        finalize_kwargs["error_code"] = structured_error_code
     await finalize_stream_fn(context.conversation_id, **finalize_kwargs)
 
 
 def _safe_structured_error_code(error: Exception) -> str:
     candidate = getattr(error, "error_code", None)
-    if not isinstance(candidate, str) or not 1 <= len(candidate) <= 64:
-        return ""
-    if not all(char.isascii() and (char.isalnum() or char == "_") for char in candidate):
+    if not isinstance(candidate, str) or candidate not in _PUBLIC_ERROR_MESSAGES:
         return ""
     return candidate
 
@@ -208,4 +217,4 @@ async def write_fallback_run_error(
             duration_ms_factory=context.duration_ms_factory,
         )
     except Exception as exc:  # noqa: BLE001
-        warning_fn(f"finally 兜底 write_session_status 失败: {exc}")
+        warning_fn(f"finally 兜底 write_session_status 失败: error_type={type(exc).__name__}")

@@ -19,6 +19,7 @@ from app.services.stream.product_answer_validator import (
 from app.services.stream.product_result_answer import (
     build_grounded_product_answer,
     build_product_tool_failure_answer,
+    build_tool_repair_clarification,
     neutralize_product_provider_mentions,
 )
 from app.services.stream.round_completion import append_round_content_blocks, complete_text_response_step
@@ -93,8 +94,24 @@ async def _complete_text_round(request: AgentRoundOutcomeRequest) -> None:
 async def _replace_deferred_product_answer(
     request: AgentRoundOutcomeRequest,
 ) -> AgentRoundOutcomeRequest:
+    clarification = build_tool_repair_clarification(request.state.pending_tool_repairs)
+    if clarification:
+        grounded_answer = build_grounded_product_answer(request.state.content_blocks)
+        answer = "\n\n".join(part for part in (grounded_answer, clarification) if part)
+        await append_chunk(
+            request.runtime.conversation_id,
+            "answering",
+            answer,
+            request.step_context.text_block_id,
+            task_id=request.runtime.task_id,
+            run_id=request.runtime.run_id,
+            step_id=request.step_context.step_id,
+        )
+        return _with_replaced_answer(request, answer)
+
     if not request.round_result.output_deferred:
         return request
+
     candidate = neutralize_product_provider_mentions(
         request.round_result.content_buf.strip(),
         request.state.content_blocks,
@@ -150,6 +167,13 @@ async def _replace_deferred_product_answer(
             run_id=request.runtime.run_id,
             step_id=request.step_context.step_id,
         )
+    return _with_replaced_answer(request, answer)
+
+
+def _with_replaced_answer(
+    request: AgentRoundOutcomeRequest,
+    answer: str,
+) -> AgentRoundOutcomeRequest:
     return AgentRoundOutcomeRequest(
         db=request.db,
         messages=request.messages,
@@ -224,6 +248,8 @@ async def _handle_tool_calls_round(request: AgentRoundOutcomeRequest) -> AgentLo
         )
     _sync_plan_items(request)
     request.state.clear_current_step()
+    if _requires_user_input(request.state):
+        return AgentLoopOutcome(exit=AgentLoopExit.PRODUCT_RESULT_READY)
     if isinstance(outcome, ToolRoundOutcome) and outcome.product_result_count > 0:
         return None
     should_summarize = request.state.should_summarize_no_progress_search()
@@ -238,6 +264,13 @@ async def _handle_tool_calls_round(request: AgentRoundOutcomeRequest) -> AgentLo
             summary_finish_reason="no_progress_summary",
         )
     return None
+
+
+def _requires_user_input(state: AgentLoopState) -> bool:
+    return any(
+        isinstance(repair, dict) and repair.get("requires_user_input") is True
+        for repair in state.pending_tool_repairs.values()
+    )
 
 
 async def _discard_streamed_tool_round_content(request: AgentRoundOutcomeRequest) -> None:

@@ -6,12 +6,14 @@ spec §4.2。stream_round 把 litellm streaming response 消费成
 个 chunk 检查锁所有权（被踢则提前返回 finish_reason="cancelled"）。
 """
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass, field
 from typing import Optional
 
 import backoff
+import httpx
 import litellm
 
 from app.ai.llm_observability import merge_litellm_kwargs
@@ -26,8 +28,42 @@ LOCK_CHECK_INTERVAL = 20
 # LLM 调用重试次数
 AGENT_LLM_MAX_RETRIES = 1
 
-# 可重试的错误关键字
-_LLM_RETRYABLE_KEYWORDS = ("429", "rate", "503", "502", "timeout")
+_LLM_RETRYABLE_STATUS_CODES = frozenset({429, 502, 503, 504})
+_LLM_RETRYABLE_ERROR_CODES = frozenset(
+    {
+        "429",
+        "502",
+        "503",
+        "504",
+        "api_connection_error",
+        "api_timeout",
+        "connection_error",
+        "connection_timeout",
+        "overloaded_error",
+        "rate_limit_error",
+        "rate_limit_exceeded",
+        "rate_limited",
+        "request_timeout",
+        "service_unavailable",
+        "timeout",
+        "too_many_requests",
+        "upstream_unavailable",
+    }
+)
+_SAFE_ERROR_CODE_RE = re.compile(r"[A-Za-z0-9_]{1,64}")
+_LITELLM_RETRYABLE_TYPES = (
+    (litellm.RateLimitError, "rate_limit"),
+    (litellm.ServiceUnavailableError, "service_unavailable"),
+    (litellm.APIConnectionError, "connection_error"),
+    (litellm.Timeout, "timeout"),
+)
+_NETWORK_RETRYABLE_TYPES = (
+    asyncio.TimeoutError,
+    TimeoutError,
+    httpx.TimeoutException,
+    httpx.NetworkError,
+    httpx.ProtocolError,
+)
 
 _OPEN_THINK_TAG_RE = re.compile(r"<think\b[^>]*>", re.IGNORECASE)
 _CLOSE_THINK_TAG_RE = re.compile(r"</think\s*>", re.IGNORECASE)
@@ -103,9 +139,72 @@ class StreamRoundTuple(tuple):
         return instance
 
 
+def _iter_exception_chain(exc: Exception):
+    """遍历包装异常，但不读取异常文本。"""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _structured_status_code(exc: BaseException) -> int | None:
+    for attribute in ("status_code", "http_status", "status"):
+        value = getattr(exc, attribute, None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+
+    response = getattr(exc, "response", None)
+    value = getattr(response, "status_code", None)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _structured_error_code(exc: BaseException) -> str | None:
+    for attribute in ("error_code", "code"):
+        value = getattr(exc, attribute, None)
+        if isinstance(value, str) and _SAFE_ERROR_CODE_RE.fullmatch(value):
+            return value.lower()
+    return None
+
+
+def _llm_retry_reason(exc: Exception) -> str | None:
+    for current in _iter_exception_chain(exc):
+        for error_type, reason in _LITELLM_RETRYABLE_TYPES:
+            if isinstance(current, error_type):
+                return reason
+        if isinstance(current, _NETWORK_RETRYABLE_TYPES):
+            return "network_error"
+
+        status_code = _structured_status_code(current)
+        if status_code in _LLM_RETRYABLE_STATUS_CODES:
+            return f"http_{status_code}"
+
+        error_code = _structured_error_code(current)
+        if error_code in _LLM_RETRYABLE_ERROR_CODES:
+            return error_code
+    return None
+
+
 def _is_llm_error_retryable(exc: Exception) -> bool:
-    err = str(exc).lower()
-    return any(kw in err for kw in _LLM_RETRYABLE_KEYWORDS)
+    """只按结构化状态、错误码和已知异常类型判断是否重试。"""
+    return _llm_retry_reason(exc) is not None
+
+
+def _log_llm_retry(details: dict) -> None:
+    """记录可运维字段，禁止把上游异常文本写入日志。"""
+    exception = details.get("exception")
+    error_type = type(exception).__name__ if isinstance(exception, BaseException) else "UnknownError"
+    retry_reason = _llm_retry_reason(exception) if isinstance(exception, Exception) else None
+    logger.warning(
+        "LLM 调用失败后重试: attempt=%s wait_seconds=%.0f error_type=%s retry_reason=%s",
+        details.get("tries", 0),
+        details.get("wait", 0),
+        error_type,
+        retry_reason or "unclassified",
+    )
 
 
 def extract_usage(chunk) -> Optional[Usage]:
@@ -513,9 +612,7 @@ async def stream_round(
     max_tries=AGENT_LLM_MAX_RETRIES + 1,
     interval=2,
     giveup=lambda e: not _is_llm_error_retryable(e),
-    on_backoff=lambda d: logger.warning(
-        f"LLM 调用失败（第 {d['tries']} 次），{d['wait']:.0f}s 后重试: {d['exception']}"
-    ),
+    on_backoff=_log_llm_retry,
 )
 async def llm_call_with_retry(
     litellm_model: str,
@@ -525,8 +622,8 @@ async def llm_call_with_retry(
 ):
     """带重试的 LLM 调用，返回 streaming response。
 
-    可重试错误：429 / rate / 503 / 502 / timeout，固定 2s 间隔。
-    其它错误立即抛出。重试逻辑由 @backoff.on_exception 装饰器实现。
+    可重试错误只接受结构化 429 / 502 / 503 / 504、已知连接/超时异常
+    和明确错误码，固定 2s 间隔。其它错误立即抛出。
     """
     merged_call_kwargs = merge_litellm_kwargs(
         "chat_stream",

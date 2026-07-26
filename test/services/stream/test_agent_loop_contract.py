@@ -48,6 +48,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
         capabilities=None,
         options=None,
         dynamic_tool_set=None,
+        user_message="hi",
     ) -> AgentLoopContractResult:
         result = AgentLoopContractResult()
         self.last_result = result
@@ -170,7 +171,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             stack.enter_context(
                 patch(
                     "app.services.stream.agent_loop_request_prep.build_llm_messages",
-                    AsyncMock(return_value=[{"role": "user", "content": "hi"}]),
+                    AsyncMock(return_value=[{"role": "user", "content": user_message}]),
                 )
             )
             stack.enter_context(
@@ -224,10 +225,10 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                     litellm_model="openai/gpt-4",
                     litellm_kwargs={},
                     provider="openai",
-                    raw_messages=[{"role": "user", "content": "hi"}],
+                    raw_messages=[{"role": "user", "content": user_message}],
                     has_vision=False,
                     file_ids=None,
-                    original_message="hi",
+                    original_message=user_message,
                     assistant_message_id="msg-contract",
                     task_id="task-contract",
                     options=options or {"use_reasoning": False},
@@ -404,6 +405,116 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event["tool_name"] for event in tool_events], [alias, alias])
         self.assertEqual(result.session_status_calls[-1]["total_tool_calls"], 1)
         self.assertIn("不可信外部数据", str(result.llm_calls[1]["messages"]))
+
+    async def test_argument_repair_uses_next_agent_round_without_backend_guessing(self):
+        alias = "mcp_region_lookup"
+        definition = {
+            "type": "function",
+            "function": {
+                "name": alias,
+                "description": "区域资料查询",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "locale": {"type": "string"},
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+        class RepairAwareHandler:
+            tool_name = alias
+            supports_automatic_retry = False
+
+            def __init__(self):
+                self.calls = []
+
+            async def execute(self, _args):
+                raise AssertionError("必须走 runtime context")
+
+            async def execute_with_runtime_context(self, args, runtime_context):
+                self.calls.append((dict(args), runtime_context))
+                if len(self.calls) == 1:
+                    return ToolResult(
+                        status="failed",
+                        data={
+                            "error_code": "ambiguous_location",
+                            "repair": {
+                                "action": "provide_argument",
+                                "required_fields": ["locale"],
+                                "allowed_values": {"locale": ["zh-CN"]},
+                                "retryable": True,
+                                "requires_user_input": False,
+                                "max_attempts": 1,
+                                "candidate_count": 2,
+                            },
+                        },
+                    )
+                return ToolResult(status="success", data={"result": {"query": "南山区资料"}})
+
+            async def log(self, **_kwargs):
+                return None
+
+            def _build_result_summary(self, result):
+                return {"kind": "external_tool", "title": "天气预报", "truncated": False}
+
+            def format_llm_context(self, result, *, citation_numbers=None):
+                if result.status == "failed":
+                    return "argument_repair_required：仅可补 locale=zh-CN"
+                return "区域资料查询成功"
+
+            def build_content_block(self, result, block_id, log_id):
+                return None
+
+        handler = RepairAwareHandler()
+        dynamic_tool_set = SimpleNamespace(
+            definitions=[definition],
+            handlers={alias: handler},
+            audit_bindings=[],
+        )
+        result = await self._run_agent_contract(
+            rounds=[
+                (
+                    "",
+                    "",
+                    [{"id": "tc-region-1", "name": alias, "arguments": '{"query":"南山区资料"}'}],
+                    "tool_calls",
+                    None,
+                ),
+                (
+                    "",
+                    "",
+                    [
+                        {
+                            "id": "tc-region-2",
+                            "name": alias,
+                            "arguments": '{"query":"南山区资料","locale":"zh-CN"}',
+                        }
+                    ],
+                    "tool_calls",
+                    None,
+                ),
+                ("", "查询完成", [], "stop", None),
+            ],
+            use_real_tool_executor=True,
+            dynamic_tool_set=dynamic_tool_set,
+            capabilities={"functionCalling": True, "agentTools": True, "searchCapable": False},
+            user_message="查询南山区资料",
+        )
+
+        self.assertEqual(len(handler.calls), 2)
+        first_args, first_context = handler.calls[0]
+        second_args, second_context = handler.calls[1]
+        self.assertEqual(first_args, {"query": "南山区资料"})
+        self.assertEqual(second_args["locale"], "zh-CN")
+        self.assertEqual(first_context.step_number, 1)
+        self.assertEqual(second_context.step_number, 2)
+        self.assertIs(first_context.argument_repair_state, second_context.argument_repair_state)
+        self.assertEqual(result.session_status_calls[-1]["total_tool_calls"], 2)
+        self.assertIn("argument_repair_required", str(result.llm_calls[1]["messages"]))
 
     async def test_exhausted_mcp_server_tools_are_hidden_from_next_llm_round(self):
         class SharedServerBudget:
@@ -923,7 +1034,10 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
         result = self.last_result
         self.assertEqual(result.redis_entry_types[0], "start")
         self.assertEqual(result.redis_entry_types[-1], "error")
-        self.assertEqual(result.redis_entries[-1][1]["content"], "LLM 5xx")
+        terminal_error = json.loads(result.redis_entries[-1][1]["content"])
+        self.assertEqual(terminal_error["code"], "agent_run_failed")
+        self.assertEqual(terminal_error["message"], "生成服务暂时不可用，请稍后重试")
+        self.assertNotIn("LLM 5xx", result.redis_entries[-1][1]["content"])
         self.assertEqual(result.redis_meta["status"], "error")
 
     async def test_session_and_step_contract_records_completed_tool_run(self):

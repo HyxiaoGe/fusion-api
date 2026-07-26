@@ -69,7 +69,11 @@ async def run_agent_loop(
         break
 
     if state.limit_reason is not None:
-        if has_product_result_blocks(state.content_blocks) or state.product_tool_attempted:
+        if (
+            has_product_result_blocks(state.content_blocks)
+            or state.product_tool_attempted
+            or state.pending_tool_repairs
+        ):
             limit_finish_reason = state.finish_reason
             try:
                 await _complete_product_result_without_llm(
@@ -93,7 +97,7 @@ async def _complete_product_result_without_llm(
     state: AgentLoopState,
     runtime: AgentLoopRuntime,
 ) -> None:
-    """产品工具路径用结构化结果或安全失败文案确定性收口，不再消耗模型调用。"""
+    """产品结果或待修参数用结构化状态确定性收口，不再消耗模型调用。"""
     step_number, step_context = await _start_next_step(state=state, runtime=runtime)
     state.finish_reason = "stop"
     await handle_agent_round_outcome(
@@ -197,7 +201,9 @@ async def _run_round(
         emitter=runtime.emitter,
         on_context_updated=state.update_context,
     )
-    if (has_product_result_blocks(state.content_blocks) or state.product_tool_attempted) and _accepts_keyword(
+    if (
+        has_product_result_blocks(state.content_blocks) or state.product_tool_attempted or state.pending_tool_repairs
+    ) and _accepts_keyword(
         runtime.run_round_fn,
         "defer_output",
     ):

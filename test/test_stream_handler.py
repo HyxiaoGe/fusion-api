@@ -832,7 +832,9 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(types[0], "run_started")
         self.assertIn("run_failed", types)
         run_failed = [e for e in events if e["type"] == "run_failed"][0]
-        self.assertIn("upstream LLM 5xx", run_failed["message"])
+        self.assertEqual(run_failed["error_code"], "agent_run_failed")
+        self.assertEqual(run_failed["message"], "生成服务暂时不可用，请稍后重试")
+        self.assertNotIn("upstream LLM 5xx", json.dumps(run_failed, ensure_ascii=False))
 
         # session 终态
         self.assertEqual(self.session_statuses[-1]["status"], "error")

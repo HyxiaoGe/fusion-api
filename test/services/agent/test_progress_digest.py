@@ -155,3 +155,58 @@ def test_plan_limited_search_does_not_create_evidence_items_or_generic_title():
     assert digest["source_refs"] == []
     assert digest["title"] == "搜索计划已收敛"
     assert digest["summary"] == "搜索计划已收敛"
+
+
+def test_repair_digest_projects_only_state_and_opaque_id():
+    record = SimpleNamespace(
+        tool_call={"id": "call-repair", "name": "weather_forecast"},
+        tool_name="weather_forecast",
+        result=SimpleNamespace(
+            status="failed",
+            data={
+                "repair": {
+                    "repair_id": "repair_0123456789abcdef",
+                    "retryable": True,
+                    "allowed_values": {"city": ["深圳市"]},
+                }
+            },
+            error_message=None,
+        ),
+        handler=SimpleNamespace(
+            _build_result_summary=lambda _result: {
+                "kind": "weather",
+                "title": "天气查询",
+                "truncated": False,
+            }
+        ),
+    )
+
+    digest = build_tool_result_digest(record)
+
+    assert digest["repair_state"] == "retrying"
+    assert digest["repair_id"] == "repair_0123456789abcdef"
+    assert "深圳市" not in str(digest)
+
+
+def test_success_digest_carries_matching_resolution_id():
+    record = SimpleNamespace(
+        tool_call={"id": "call-resolved", "name": "weather_forecast"},
+        tool_name="weather_forecast",
+        result=SimpleNamespace(
+            status="success",
+            data={"resolves_repair_id": "repair_0123456789abcdef"},
+            error_message=None,
+        ),
+        handler=SimpleNamespace(
+            _build_result_summary=lambda _result: {
+                "kind": "weather",
+                "title": "天气查询",
+                "truncated": False,
+            }
+        ),
+    )
+
+    digest = build_tool_result_digest(record)
+
+    assert digest["repair_state"] == "resolved"
+    assert digest["repair_id"] == "repair_0123456789abcdef"

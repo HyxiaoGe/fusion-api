@@ -23,13 +23,20 @@ from app.services.stream.tool_context import (
     BlockedToolContext,
     ToolContextResolution,
     ToolRuntimeContext,
+    enrich_tool_runtime_context,
     resolve_tool_context,
 )
 from app.services.stream.tool_execution_result import ToolExecutionRecord
-from app.services.stream.tool_executor import build_successful_call_signature
+from app.services.stream.tool_executor import (
+    build_successful_call_signature,
+    is_local_argument_preflight_failure,
+)
 from app.services.stream_state_service import StreamWriteTerminalError
 
 logger = logging.getLogger(__name__)
+
+# 本地预校验不消耗真实工具额度，但仍限制单轮事件、日志与上下文放大。
+MAX_LOCAL_PREFLIGHT_ATTEMPTS_PER_ROUND = 4
 
 
 @dataclass(frozen=True)
@@ -68,6 +75,7 @@ class ToolRoundRequest:
     on_tools_executed: Callable[[int], None] | None = None
     completed_tool_calls: int | None = None
     max_tool_calls: int | None = None
+    max_steps: int | None = None
     clock: Callable[[], float] = time.time
     tool_handlers: dict[str, Any] | None = None
     announced_tool_names: frozenset[str] | None = None
@@ -410,6 +418,33 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
             task_id=request.task_id,
             clock=request.clock,
         )
+        runtime_context = enrich_tool_runtime_context(
+            context_resolution.runtime_context,
+            messages=request.messages,
+            state=request.agent_state,
+            step_number=request.step_number,
+        )
+        if request.max_steps is not None:
+            runtime_context.remaining_agent_steps = max(0, request.max_steps - request.step_number)
+        if request.max_tool_calls is not None:
+            completed = request.completed_tool_calls or 0
+            runtime_context.remaining_agent_tool_calls_before_round = max(
+                0,
+                request.max_tool_calls - completed,
+            )
+            planned_current_calls = sum(
+                not _is_successfully_reusable_call(request, tool_call)
+                for tool_call in context_resolution.executable_calls
+            )
+            runtime_context.remaining_agent_tool_calls = max(
+                0,
+                request.max_tool_calls - completed - planned_current_calls,
+            )
+        context_resolution = ToolContextResolution(
+            executable_calls=context_resolution.executable_calls,
+            blocked_calls=context_resolution.blocked_calls,
+            runtime_context=runtime_context,
+        )
     executable_tool_calls = context_resolution.executable_calls
     planned_execution_tool_calls = [
         tool_call for tool_call in executable_tool_calls if not _is_successfully_reusable_call(request, tool_call)
@@ -427,6 +462,7 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
         run_id=request.run_id,
     )
     executed_results = [record for record in results if not record.reused]
+    _record_tool_repairs(request.agent_state, executed_results)
     reused_limited_tool_calls, not_executed_tool_calls = _partition_successfully_reusable_calls(
         request,
         selected_tool_calls[1],
@@ -461,6 +497,31 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
         ),
         product_result_count=sum(is_registered_rich_content_block(block) for block in built_content_blocks.values()),
     )
+
+
+def _record_tool_repairs(
+    state: AgentLoopState | None,
+    results: list[ToolExecutionRecord],
+) -> None:
+    if state is None:
+        return
+    for record in results:
+        data = getattr(record.result, "data", None)
+        resolves_repair_id = data.get("resolves_repair_id") if isinstance(data, dict) else None
+        if isinstance(resolves_repair_id, str):
+            state.pending_tool_repairs.pop(resolves_repair_id, None)
+        repair = data.get("repair") if isinstance(data, dict) else None
+        if not isinstance(repair, dict):
+            continue
+        repair_id = repair.get("repair_id")
+        if not isinstance(repair_id, str) or not repair_id:
+            repair_id = str(record.tool_call.get("id", "")) or record.tool_name
+        state.pending_tool_repairs[repair_id] = {
+            "required_fields": [field for field in repair.get("required_fields", []) if isinstance(field, str)][:4],
+            "retryable": repair.get("retryable") is True,
+            "requires_user_input": repair.get("requires_user_input") is True,
+            "retry_exhausted": repair.get("retry_exhausted") is True,
+        }
 
 
 def build_tool_round_content_blocks(results: list[ToolExecutionRecord]) -> dict[str, Any]:
@@ -579,11 +640,22 @@ def _select_tool_calls_within_limit(
         return candidate_tool_calls, []
 
     remaining_capacity = max(0, max_tool_calls - completed_tool_calls)
+    remaining_preflight_attempts = MAX_LOCAL_PREFLIGHT_ATTEMPTS_PER_ROUND
     executed_tool_calls: list[dict] = []
     not_executed_tool_calls: list[dict] = []
     for tool_call in candidate_tool_calls:
         if _is_successfully_reusable_call(request, tool_call):
             executed_tool_calls.append(tool_call)
+            continue
+        if is_local_argument_preflight_failure(
+            tool_call,
+            request.tool_handlers,
+        ):
+            if remaining_preflight_attempts > 0:
+                executed_tool_calls.append(tool_call)
+                remaining_preflight_attempts -= 1
+            else:
+                not_executed_tool_calls.append(tool_call)
             continue
         if remaining_capacity > 0:
             executed_tool_calls.append(tool_call)
@@ -610,7 +682,14 @@ def _actual_tool_execution_count(
         for record in results
         if record.reused and str(record.tool_call.get("id", "")) in submitted_ids
     }
-    return max(0, len(submitted_tool_calls) - len(reused_ids))
+    local_preflight_ids = {
+        str(record.tool_call.get("id", ""))
+        for record in results
+        if isinstance(getattr(record.result, "data", None), dict)
+        and record.result.data.get("local_preflight") is True
+        and str(record.tool_call.get("id", "")) in submitted_ids
+    }
+    return max(0, len(submitted_tool_calls) - len(reused_ids) - len(local_preflight_ids))
 
 
 def _is_successfully_reusable_call(request: ToolRoundRequest, tool_call: dict) -> bool:

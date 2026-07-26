@@ -65,7 +65,7 @@ def _task_done_callback(task: asyncio.Task):
         return
     exc = task.exception()
     if exc:
-        logger.error(f"日志写入异步任务异常: {exc}", exc_info=exc)
+        logger.error("日志写入异步任务异常: error_type=%s", type(exc).__name__)
 
 
 class BaseToolHandler(ABC):
@@ -188,13 +188,13 @@ class BaseToolHandler(ABC):
         start = time.monotonic()
         try:
             result = await self.execute(args)
-        except BaseException as exc:  # noqa: BLE001 — 必须在 re-raise 前发 completed
+        except BaseException:  # noqa: BLE001 — 必须在 re-raise 前发 completed
             duration_ms = int((time.monotonic() - start) * 1000)
             # 用合成 failed result 走子类 _build_result_summary，保证 kind 与失败路径一致
             synthetic_failed = ToolResult(
                 status="failed",
-                data={},
-                error_message=f"{type(exc).__name__}: {exc}",
+                data={"error_code": "tool_execution_failed", "retryable": False},
+                error_message="工具执行未完成",
             )
             await emitter.tool_call_completed(
                 tool_call_id=tool_call_id,
@@ -202,7 +202,7 @@ class BaseToolHandler(ABC):
                 status="failed",
                 duration_ms=duration_ms,
                 result_summary=self._build_result_summary(synthetic_failed),
-                error=f"{type(exc).__name__}: {exc}",
+                error="工具执行未完成",
             )
             raise
         duration_ms = int((time.monotonic() - start) * 1000)

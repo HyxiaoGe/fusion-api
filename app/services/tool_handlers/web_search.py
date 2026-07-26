@@ -15,6 +15,7 @@ from app.ai.prompts.agent_loop import (
     SEARCH_CONTEXT_OPENING,
     SEARCH_CONTEXT_TRUST_BOUNDARY,
 )
+from app.core.logger import app_logger as logger
 from app.schemas.chat import SearchBlock, SearchSource, SearchSourceSummary, SourceReference
 from app.services.agent_strategy_config import get_agent_strategy_config
 from app.services.external.search_client import search_web
@@ -130,13 +131,19 @@ class WebSearchHandler(BaseToolHandler):
                     **provider_metadata,
                 },
             )
-        except Exception as e:
+        except Exception as exc:  # noqa: BLE001 — 上游异常文本可能含凭据，禁止回显或落日志
             duration_ms = int((time.monotonic() - start) * 1000)
+            logger.warning(
+                "联网搜索调用异常: error_type=%s",
+                type(exc).__name__,
+            )
             return ToolResult(
                 status="failed",
                 duration_ms=duration_ms,
-                error_message=str(e),
+                error_message="搜索服务暂时不可用",
                 data={
+                    "error_code": "search_unavailable",
+                    "retryable": True,
                     "query": query,
                     "sources": [],
                     "result_count": 0,

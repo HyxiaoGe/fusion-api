@@ -79,6 +79,37 @@ def _get_model_capabilities(model_id: str) -> dict[str, Any]:
     )
 
 
+def _continuation_original_user_text(
+    messages: list[Any],
+    *,
+    assistant_message_id: str,
+) -> str:
+    """找出被续写回答对应的上一条用户原文；只读取 text block。"""
+
+    assistant_index = next(
+        (index for index, message in enumerate(messages) if str(getattr(message, "id", "")) == assistant_message_id),
+        len(messages),
+    )
+    for message in reversed(messages[:assistant_index]):
+        if getattr(message, "role", None) != "user":
+            continue
+        content = getattr(message, "content", None)
+        if not isinstance(content, list):
+            return ""
+        text_parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                block_type = block.get("type")
+                text = block.get("text")
+            else:
+                block_type = getattr(block, "type", None)
+                text = getattr(block, "text", None)
+            if block_type == "text" and isinstance(text, str) and text:
+                text_parts.append(text)
+        return "\n".join(text_parts)[:4_000]
+    return ""
+
+
 class ChatService:
     def __init__(self, db: Session):
         self.db = db
@@ -394,6 +425,10 @@ class ChatService:
             previous_run_id=previous_run_id,
             default_limits=_agent_loop_limits(),
         )
+        original_user_text = _continuation_original_user_text(
+            conversation.messages,
+            assistant_message_id=assistant_message_id,
+        )
 
         task_id = str(uuid_mod.uuid4())
         init_result = await init_stream(
@@ -418,7 +453,7 @@ class ChatService:
                 raw_messages=conversation.messages,
                 has_vision=has_vision,
                 file_ids=None,
-                original_message="",
+                original_message=original_user_text,
                 assistant_message_id=assistant_message_id,
                 assistant_message_sequence=continuation.assistant_message.sequence,
                 task_id=task_id,

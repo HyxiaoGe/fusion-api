@@ -15,6 +15,7 @@ from app.services.stream.product_answer_validator import validate_product_answer
 from app.services.stream.product_result_answer import (
     build_grounded_product_answer,
     build_product_tool_failure_answer,
+    build_tool_repair_clarification,
     has_product_result_blocks,
     neutralize_product_provider_mentions,
 )
@@ -130,6 +131,22 @@ class ProductResultAnswerTests(unittest.TestCase):
 
         self.assertNotIn("高德", answer)
         self.assertIn("本次未取得可用的地点或路线数据", answer)
+
+    def test_argument_repair_clarification_is_specific_and_provider_neutral(self):
+        answer = build_tool_repair_clarification(
+            {
+                "weather_forecast": {
+                    "required_fields": ["location"],
+                    "requires_user_input": True,
+                }
+            }
+        )
+
+        self.assertIn("请补充包含城市的完整地点", answer)
+        self.assertIn("不会猜测", answer)
+        self.assertNotIn("高德", answer)
+        self.assertNotIn("深圳", answer)
+        self.assertNotIn("鹤岗", answer)
 
     def test_transit_answer_uses_transit_type_and_compact_line_names(self):
         block = RouteResultsBlock(

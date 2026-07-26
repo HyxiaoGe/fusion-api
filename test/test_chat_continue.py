@@ -15,7 +15,17 @@ class ChatContinueTests(unittest.IsolatedAsyncioTestCase):
             id="conv-1",
             user_id="user-1",
             model_id="deepseek-chat",
-            messages=[],
+            messages=[
+                SimpleNamespace(
+                    id="user-msg-1",
+                    role="user",
+                    content=[
+                        {"type": "text", "text": "深圳南山区明天天气如何？"},
+                        {"type": "file", "filename": "weather.txt"},
+                    ],
+                ),
+                SimpleNamespace(id="msg-1", role="assistant", content=[]),
+            ],
         )
         service.conversation_service.get_conversation = MagicMock(return_value=conversation)
         continuation_context = SimpleNamespace(
@@ -66,6 +76,10 @@ class ChatContinueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             service.stream_handler.generate_to_redis.call_args.kwargs["assistant_message_sequence"],
             42,
+        )
+        self.assertEqual(
+            service.stream_handler.generate_to_redis.call_args.kwargs["original_message"],
+            "深圳南山区明天天气如何？",
         )
         register_task_mock.assert_called_once()
         self.assertIs(register_task_mock.call_args.args[1], task)

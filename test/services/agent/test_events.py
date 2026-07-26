@@ -229,11 +229,14 @@ class AgentProgressV2EventModelTests(unittest.TestCase):
             key_findings=["官方页面确认发布时间。"],
             source_refs=["ev-1"],
             truncated=False,
+            repair_state="resolved",
+            repair_id="repair_0123456789abcdef",
             **{k: v for k, v in self._common().items() if k not in {"step_id", "tool_call_id"}},
         )
 
         self.assertEqual(ev.tool_call_id, "tc1")
         self.assertEqual(ev.key_findings, ["官方页面确认发布时间。"])
+        self.assertEqual(ev.repair_state, "resolved")
 
     def test_evidence_item_upserted_model(self):
         ev = EvidenceItemUpserted(

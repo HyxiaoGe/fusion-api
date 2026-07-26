@@ -163,6 +163,83 @@ def test_tool_digest_upserts_and_caps_to_twenty_items():
     assert state["tool_digests"][0]["tool_call_id"] == "tc-2"
 
 
+def test_resolved_digest_removes_only_matching_pending_repair():
+    state = empty_progress_state(run_id="r1", message_id="m1")
+    for tool_call_id, repair_id in (
+        ("tc-pending-a", "repair_aaaaaaaaaaaaaaaa"),
+        ("tc-pending-b", "repair_bbbbbbbbbbbbbbbb"),
+    ):
+        state = apply_progress_event(
+            state,
+            {
+                "type": "tool_result_digest",
+                "protocol_version": 2,
+                "tool_call_id": tool_call_id,
+                "tool_name": "weather_forecast",
+                "status": "degraded",
+                "title": "正在修正工具参数",
+                "summary": "参数修正中",
+                "repair_state": "retrying",
+                "repair_id": repair_id,
+            },
+        )
+
+    state = apply_progress_event(
+        state,
+        {
+            "type": "tool_result_digest",
+            "protocol_version": 2,
+            "tool_call_id": "tc-resolved",
+            "tool_name": "weather_forecast",
+            "status": "success",
+            "title": "天气查询完成",
+            "summary": "工具返回了可用结果。",
+            "repair_state": "resolved",
+            "repair_id": "repair_aaaaaaaaaaaaaaaa",
+        },
+    )
+
+    assert [digest["tool_call_id"] for digest in state["tool_digests"]] == [
+        "tc-pending-b",
+        "tc-resolved",
+    ]
+
+
+def test_success_completion_resolves_snapshot_even_when_resolved_digest_is_lost():
+    state = empty_progress_state(run_id="r1", message_id="m1")
+    state = apply_progress_event(
+        state,
+        {
+            "type": "tool_result_digest",
+            "protocol_version": 2,
+            "tool_call_id": "tc-pending",
+            "tool_name": "weather_forecast",
+            "status": "degraded",
+            "title": "正在修正工具参数",
+            "summary": "参数修正中",
+            "repair_state": "retrying",
+            "repair_id": "repair_aaaaaaaaaaaaaaaa",
+        },
+    )
+
+    state = apply_progress_event(
+        state,
+        {
+            "type": "tool_call_completed",
+            "tool_call_id": "tc-success",
+            "tool_name": "weather_forecast",
+            "status": "success",
+            "duration_ms": 10,
+            "result_summary": {
+                "kind": "external_tool",
+                "resolves_repair_id": "repair_aaaaaaaaaaaaaaaa",
+            },
+        },
+    )
+
+    assert state["tool_digests"] == []
+
+
 def test_evidence_upsert_cap_keeps_used_and_truncates_fields():
     state = empty_progress_state(run_id="r1", message_id="m1")
 

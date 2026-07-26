@@ -150,6 +150,31 @@ def build_product_tool_failure_answer(messages: list[dict[str, Any]] | None = No
     )
 
 
+def build_tool_repair_clarification(pending_repairs: dict[str, dict[str, Any]] | None) -> str:
+    """为尚未完成的模型修参生成确定性用户澄清，不暴露候选或供应商。"""
+
+    repairs = pending_repairs or {}
+    needs_unambiguous_location = any(
+        isinstance(repair, dict)
+        and repair.get("requires_user_input") is True
+        and "location" in repair.get("required_fields", [])
+        for repair in repairs.values()
+    )
+    if needs_unambiguous_location:
+        return (
+            "这个地点可能对应多个城市或行政区，请补充包含城市的完整地点后重试。"
+            "在地点确认前，我不会猜测城市或给出天气结论。"
+        )
+    if any(
+        isinstance(repair, dict) and (repair.get("retryable") is True or repair.get("retry_exhausted") is True)
+        for repair in repairs.values()
+    ):
+        return "本次工具参数未能可靠完成自动修正，请重试当前请求。"
+    if repairs:
+        return "当前查询还缺少必要信息，请补充更明确的条件后重试；信息确认前不会猜测结果。"
+    return ""
+
+
 def _has_unavailable_geolocation_context(messages: list[dict[str, Any]]) -> bool:
     for message in reversed(messages):
         if message.get("role") != "tool" or not isinstance(message.get("content"), str):

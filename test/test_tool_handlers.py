@@ -192,15 +192,21 @@ class WebSearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "degraded")
 
     async def test_execute_search_failure(self):
-        """搜索异常返回 failed"""
+        """搜索异常返回结构化可重试失败，且不泄漏原始异常文本。"""
+        secret = "Authorization: Bearer dummy-secret"
         with patch(
             "app.services.tool_handlers.web_search.search_web",
             new_callable=AsyncMock,
-            side_effect=Exception("search down"),
+            side_effect=Exception(secret),
         ):
             result = await self.handler.execute({"query": "test"})
 
         self.assertEqual(result.status, "failed")
+        self.assertEqual(result.error_message, "搜索服务暂时不可用")
+        self.assertEqual(result.data["error_code"], "search_unavailable")
+        self.assertTrue(result.data["retryable"])
+        self.assertNotIn(secret, result.error_message)
+        self.assertNotIn(secret, repr(result.data))
 
     def test_format_llm_context(self):
         """格式化搜索上下文包含来源编号"""
@@ -1193,8 +1199,9 @@ class ExecuteWithEmitterTests(unittest.IsolatedAsyncioTestCase):
         emitter.tool_call_completed.assert_awaited_once()
         completed = emitter.tool_call_completed.call_args.kwargs
         self.assertEqual(completed["status"], "failed")
-        self.assertIn("RuntimeError", completed["error"])
-        self.assertIn("oops", completed["error"])
+        self.assertEqual(completed["error"], "工具执行未完成")
+        self.assertNotIn("RuntimeError", completed["error"])
+        self.assertNotIn("oops", completed["error"])
 
     async def test_execute_cancelled_still_emits_failed_completed_then_propagates(self):
         """CancelledError 也应触发 tool_call_completed（不留 orphaned running）"""

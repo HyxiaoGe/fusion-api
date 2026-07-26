@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
@@ -14,10 +15,10 @@ if TYPE_CHECKING:
 def build_tool_result_digest(record: ToolExecutionRecord) -> dict[str, Any]:
     evidence_items = build_evidence_items(record)
     summary = _result_summary(record)
-    status = _digest_status(record.result.status)
+    status = "degraded" if summary.get("repairable") is True else _digest_status(record.result.status)
     title = _digest_title(record.tool_name, status, summary)
 
-    return {
+    digest = {
         "tool_call_id": str(record.tool_call.get("id", "")),
         "tool_name": record.tool_name,
         "status": status,
@@ -27,6 +28,12 @@ def build_tool_result_digest(record: ToolExecutionRecord) -> dict[str, Any]:
         "source_refs": [item["id"] for item in evidence_items],
         "truncated": bool(summary.get("truncated", False)),
     }
+    repair_state, repair_id = _repair_digest_state(record)
+    if repair_state:
+        digest["repair_state"] = repair_state
+    if repair_id:
+        digest["repair_id"] = repair_id
+    return digest
 
 
 def build_evidence_items(record: ToolExecutionRecord) -> list[dict[str, Any]]:
@@ -62,7 +69,16 @@ def _result_summary(record: ToolExecutionRecord) -> dict[str, Any]:
         summary = builder(record.result)
     except Exception:
         return {"kind": record.tool_name, "truncated": True}
-    return summary if isinstance(summary, dict) else {"kind": record.tool_name, "truncated": False}
+    if not isinstance(summary, dict):
+        summary = {"kind": record.tool_name, "truncated": False}
+    repair = record.result.data.get("repair")
+    if isinstance(repair, dict):
+        summary = {
+            **summary,
+            "repairable": repair.get("retryable") is True,
+            "requires_user_input": repair.get("requires_user_input") is True,
+        }
+    return summary
 
 
 def _digest_status(status: str) -> str:
@@ -90,6 +106,10 @@ def _default_title(tool_name: str, status: str, summary: dict[str, Any]) -> str:
 
 
 def _digest_title(tool_name: str, status: str, summary: dict[str, Any]) -> str:
+    if summary.get("repairable") is True:
+        return "正在修正工具参数"
+    if summary.get("requires_user_input") is True:
+        return "需要补充查询条件"
     if status == "success" and tool_name == "web_search" and summary.get("kind") == "search":
         return "搜索完成"
     if tool_name == "url_read" and status != "success":
@@ -98,6 +118,11 @@ def _digest_title(tool_name: str, status: str, summary: dict[str, Any]) -> str:
 
 
 def _digest_summary(record: ToolExecutionRecord, status: str, summary: dict[str, Any]) -> str:
+    if summary.get("repairable") is True:
+        return "参数可安全修正，Agent 将在下一轮补齐后重试。"
+    if summary.get("requires_user_input") is True:
+        return "现有信息不足以安全修正参数，需要用户补充查询条件。"
+
     if record.tool_name == "url_read":
         if status == "success":
             return "已读取网页内容，供后续回答核验。"
@@ -151,3 +176,23 @@ def _is_public_url(url: str) -> bool:
 def _safe_text(value: Any, max_chars: int) -> str:
     text = "" if value is None else str(value)
     return text[:max_chars]
+
+
+def _repair_digest_state(record: ToolExecutionRecord) -> tuple[str | None, str | None]:
+    data = record.result.data if isinstance(record.result.data, dict) else {}
+    repair = data.get("repair")
+    if isinstance(repair, dict):
+        state = (
+            "retrying"
+            if repair.get("retryable") is True
+            else "requires_user_input"
+            if repair.get("requires_user_input") is True
+            else "exhausted"
+        )
+        return state, _safe_repair_id(repair.get("repair_id"))
+    resolves_repair_id = _safe_repair_id(data.get("resolves_repair_id"))
+    return ("resolved", resolves_repair_id) if resolves_repair_id else (None, None)
+
+
+def _safe_repair_id(value: Any) -> str | None:
+    return value if isinstance(value, str) and re.fullmatch(r"repair_[a-f0-9]{16}", value) else None

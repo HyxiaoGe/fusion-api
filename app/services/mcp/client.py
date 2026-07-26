@@ -30,6 +30,15 @@ _TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.:/-]+$")
 _AUTH_NAME_PATTERN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _IDEMPOTENT_OPERATIONS = frozenset({"initialize", "tools_list"})
 _RETRYABLE_ERROR_CODES = frozenset({"connect_timeout", "call_timeout", "network_error", "protocol_error"})
+_REMOTE_ARGUMENT_ERROR_CODES = frozenset(
+    {
+        "invalid_arguments",
+        "invalid_params",
+        "missing_required_argument",
+        "validation_error",
+    }
+)
+_SAFE_ERROR_FIELD_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]{0,63}$")
 _FORBIDDEN_AUTH_HEADERS = {
     "accept",
     "connection",
@@ -84,9 +93,16 @@ class _ResolvedConnection:
 class McpClientError(Exception):
     """只携带可持久化、可返回的固定脱敏错误。"""
 
-    def __init__(self, code: str, safe_message: str):
+    def __init__(
+        self,
+        code: str,
+        safe_message: str,
+        *,
+        safe_details: dict[str, Any] | None = None,
+    ):
         self.code = code
         self.safe_message = safe_message
+        self.safe_details = dict(safe_details or {})
         super().__init__(safe_message)
 
 
@@ -259,6 +275,13 @@ class McpClientManager:
             if not isinstance(payload, dict) or len(_json_bytes(payload)) > self.policy.max_response_bytes:
                 raise McpClientError("invalid_response", "MCP 服务返回无效响应")
             if payload.get("isError") is True:
+                safe_details = _project_structured_tool_error(payload)
+                if safe_details is not None:
+                    raise McpClientError(
+                        "remote_invalid_arguments",
+                        "MCP 工具参数校验失败",
+                        safe_details=safe_details,
+                    )
                 raise McpClientError("tool_error", "MCP 工具执行失败")
             return payload
 
@@ -520,6 +543,42 @@ def _normalize_json_payload(value: Any) -> Any:
         return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
     except (TypeError, ValueError, OverflowError):
         raise McpClientError("invalid_response", "MCP 服务返回无效响应") from None
+
+
+def _project_structured_tool_error(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """只接受显式结构化参数错误，不从自由文本猜测错误语义。"""
+
+    structured = payload.get("structuredContent")
+    if not isinstance(structured, dict):
+        structured = payload.get("structured_content")
+    if not isinstance(structured, dict):
+        return None
+    candidate = structured.get("error")
+    error = candidate if isinstance(candidate, dict) else structured
+    code = error.get("code")
+    if not isinstance(code, str) or code not in _REMOTE_ARGUMENT_ERROR_CODES:
+        return None
+
+    fields: list[str] = []
+    for key in ("field", "required_field"):
+        value = error.get(key)
+        if isinstance(value, str):
+            fields.append(value)
+    for key in ("fields", "required_fields"):
+        values = error.get(key)
+        if isinstance(values, list):
+            fields.extend(value for value in values if isinstance(value, str))
+    errors = error.get("errors")
+    if isinstance(errors, list):
+        for item in errors[:16]:
+            if not isinstance(item, dict):
+                continue
+            value = item.get("field")
+            if isinstance(value, str):
+                fields.append(value)
+
+    safe_fields = list(dict.fromkeys(field for field in fields if _SAFE_ERROR_FIELD_PATTERN.fullmatch(field)))[:8]
+    return {"code": code, "fields": safe_fields}
 
 
 def _json_bytes(value: Any) -> bytes:

@@ -21,9 +21,16 @@ _CONTEXT_TYPE = "geolocation"
 _CONTEXT_TIMEOUT_SECONDS = 60.0
 
 
-@dataclass(frozen=True)
+@dataclass
 class ToolRuntimeContext:
     geolocation: Geolocation | None = None
+    step_number: int = 0
+    argument_repair_state: dict[str, dict[str, Any]] | None = None
+    remaining_agent_steps: int | None = None
+    remaining_agent_tool_calls: int | None = None
+    remaining_agent_tool_calls_before_round: int | None = None
+    remaining_agent_tool_calls_after_batch: int | None = None
+    remaining_argument_repair_slots: int | None = None
 
 
 @dataclass(frozen=True)
@@ -37,6 +44,21 @@ class ToolContextResolution:
     executable_calls: list[dict]
     blocked_calls: dict[str, BlockedToolContext] = field(default_factory=dict)
     runtime_context: ToolRuntimeContext = field(default_factory=ToolRuntimeContext)
+
+
+def enrich_tool_runtime_context(
+    context: ToolRuntimeContext,
+    *,
+    messages: list[dict],
+    state: AgentLoopState,
+    step_number: int,
+) -> ToolRuntimeContext:
+    """补入本轮步骤号与 run 级通用修参状态。"""
+
+    del messages
+    context.step_number = step_number
+    context.argument_repair_state = state.argument_repair_state
+    return context
 
 
 def _arguments(tool_call: dict) -> dict[str, Any]:

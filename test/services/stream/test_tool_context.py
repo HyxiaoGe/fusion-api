@@ -3,9 +3,29 @@ from unittest.mock import AsyncMock
 
 from app.services.agent.context_broker import Geolocation, ResolvedContext
 from app.services.stream.agent_loop_state import AgentLoopState
+from app.services.stream.tool_context import ToolRuntimeContext, enrich_tool_runtime_context
 
 
 class ToolContextResolutionTests(unittest.IsolatedAsyncioTestCase):
+    def test_runtime_context_receives_step_number_and_shared_repair_state(self):
+        state = AgentLoopState(argument_repair_state={})
+        enhanced_messages = [
+            {
+                "role": "user",
+                "content": "南山区明天天气怎么样？\n\n附件内容：公司地址位于深圳市。",
+            }
+        ]
+
+        context = enrich_tool_runtime_context(
+            ToolRuntimeContext(),
+            messages=enhanced_messages,
+            state=state,
+            step_number=1,
+        )
+
+        self.assertEqual(context.step_number, 1)
+        self.assertIs(context.argument_repair_state, state.argument_repair_state)
+
     async def test_current_location_weather_requests_local_weather_context(self):
         from app.services.stream.tool_context import resolve_tool_context
 
