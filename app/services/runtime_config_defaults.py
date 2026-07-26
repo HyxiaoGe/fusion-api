@@ -217,6 +217,22 @@ DEFAULT_HOME_PROMPT_CATALOG = {
             "required_capabilities": [],
         },
         {
+            "id": "weather-planning",
+            "kind": "starter",
+            "title": "天气与出行",
+            "description": "查看预报并安排合适活动",
+            "content": (
+                "请查询【城市+区县】在【日期】的天气预报，说明气温、降水和风力，"
+                "并结合【计划的活动】给出穿衣、雨具和出行建议。"
+            ),
+            "category": "出行",
+            "icon_key": "cloud-sun",
+            "tone": "cyan",
+            "sort_order": 120,
+            "enabled": True,
+            "required_capabilities": [],
+        },
+        {
             "id": "template-code-explanation",
             "kind": "template",
             "title": "代码解释",

@@ -10,16 +10,17 @@ class PromptCatalogServiceTests(unittest.TestCase):
 
         items = DEFAULT_HOME_PROMPT_CATALOG["items"]
         ids = [item["id"] for item in items]
-        travel_ids = {
+        location_ids = {
             "commute-planning",
             "weekend-itinerary",
             "dining-entertainment",
+            "weather-planning",
         }
 
         self.assertEqual(len(ids), len(set(ids)))
-        self.assertEqual(sum(item["kind"] == "starter" for item in items), 11)
+        self.assertEqual(sum(item["kind"] == "starter" for item in items), 12)
         self.assertGreaterEqual(sum(item["kind"] == "template" for item in items), 3)
-        self.assertTrue(travel_ids.issubset(ids))
+        self.assertTrue(location_ids.issubset(ids))
 
         items_by_id = {item["id"]: item for item in items}
         self.assertEqual(
@@ -80,6 +81,25 @@ class PromptCatalogServiceTests(unittest.TestCase):
             },
         )
         self.assertEqual(
+            items_by_id["weather-planning"],
+            {
+                "id": "weather-planning",
+                "kind": "starter",
+                "title": "天气与出行",
+                "description": "查看预报并安排合适活动",
+                "content": (
+                    "请查询【城市+区县】在【日期】的天气预报，说明气温、降水和风力，"
+                    "并结合【计划的活动】给出穿衣、雨具和出行建议。"
+                ),
+                "category": "出行",
+                "icon_key": "cloud-sun",
+                "tone": "cyan",
+                "sort_order": 120,
+                "enabled": True,
+                "required_capabilities": [],
+            },
+        )
+        self.assertEqual(
             {
                 item_id: items_by_id[item_id]["sort_order"]
                 for item_id in (
@@ -94,7 +114,7 @@ class PromptCatalogServiceTests(unittest.TestCase):
                 "template-question-answering": 230,
             },
         )
-        for item_id in travel_ids:
+        for item_id in location_ids:
             item = items_by_id[item_id]
             self.assertEqual(item["kind"], "starter")
             self.assertEqual(item["category"], "出行")
@@ -102,6 +122,7 @@ class PromptCatalogServiceTests(unittest.TestCase):
             self.assertNotIn("高德", item["content"])
             self.assertNotIn("route_compare", item["content"])
             self.assertNotIn("local_place_search", item["content"])
+            self.assertNotIn("weather_forecast", item["content"])
 
     def test_catalog_filters_disabled_items_and_exposes_runtime_version(self):
         from app.services.prompt_catalog_service import get_home_prompt_catalog
