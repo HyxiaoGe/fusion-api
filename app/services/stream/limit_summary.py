@@ -6,6 +6,7 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from inspect import Parameter, signature
 from typing import Any
 
 from app.ai.llm_round_observability import create_llm_round_observation
@@ -21,6 +22,14 @@ from app.services.chat.context_manager import ContextManagementError, ContextPla
 from app.services.stream.context_status import build_context_usage, emit_context_status
 
 LIMIT_SUMMARY_PROMPT = _LIMIT_SUMMARY_PROMPT
+
+
+def _accepts_keyword(fn: Callable[..., Any], keyword: str) -> bool:
+    try:
+        parameters = signature(fn).parameters
+    except (TypeError, ValueError):
+        return True
+    return keyword in parameters or any(parameter.kind == Parameter.VAR_KEYWORD for parameter in parameters.values())
 
 
 @dataclass(frozen=True)
@@ -186,6 +195,9 @@ async def call_limit_summary_round(
             **final_call_kwargs,
         )
         response = observation.wrap_response(response)
+        stream_kwargs = {"run_id": request.run_id, "step_id": step_id}
+        if _accepts_keyword(request.stream_round_fn, "provider"):
+            stream_kwargs["provider"] = request.provider
         reasoning_buf, content_buf, tool_calls, finish_reason, usage_data = await request.stream_round_fn(
             response,
             request.conversation_id,
@@ -193,8 +205,7 @@ async def call_limit_summary_round(
             request.should_use_reasoning,
             thinking_block_id,
             text_block_id,
-            run_id=request.run_id,
-            step_id=step_id,
+            **stream_kwargs,
         )
     except BaseException as exc:
         await observation.finish_error(exc)

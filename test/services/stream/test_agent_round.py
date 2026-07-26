@@ -69,6 +69,7 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertTrue(received_kwargs["defer_output"])
+        self.assertEqual(received_kwargs["provider"], "openai")
         self.assertTrue(result.output_deferred)
 
     async def test_run_agent_round_emits_estimated_and_final_context_status(self):

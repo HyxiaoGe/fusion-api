@@ -528,6 +528,51 @@ class AmapProductToolHandler(BaseToolHandler):
             return [{"field": "request", "code": "invalid_arguments"}]
         return []
 
+    def build_runtime_argument_repair(
+        self,
+        args: dict,
+        runtime_context: Any,
+    ) -> dict[str, Any] | None:
+        """班次站点缺少城市时，要求模型使用当前 run 的结构化城市做一次受控修参。"""
+
+        if self.tool_name != AMAP_ROUTE_COMPARE:
+            return None
+        route_city_hints = getattr(runtime_context, "route_city_hints", None)
+        if not isinstance(route_city_hints, dict):
+            return None
+        required_fields: list[str] = []
+        allowed_values: dict[str, list[str]] = {}
+        mismatch_detected = False
+        for endpoint_field in ("origin", "destination"):
+            if args.get(f"{endpoint_field}_source") != "named":
+                continue
+            city_field = f"{endpoint_field}_city"
+            label = args.get(endpoint_field)
+            if not isinstance(label, str):
+                continue
+            candidates = route_city_hints.get(label.strip())
+            if (
+                not isinstance(candidates, tuple)
+                or len(candidates) != 1
+                or not isinstance(candidates[0], str)
+                or not candidates[0].strip()
+            ):
+                continue
+            provided_city = args.get(city_field)
+            if isinstance(provided_city, str) and provided_city.strip():
+                if _city_matches(provided_city, candidates[0]):
+                    continue
+                mismatch_detected = True
+            required_fields.append(city_field)
+            allowed_values[city_field] = [candidates[0]]
+        if not required_fields:
+            return None
+        return {
+            "error_code": "route_city_mismatch" if mismatch_detected else "route_city_required",
+            "required_fields": required_fields,
+            "allowed_values": allowed_values,
+        }
+
     def build_successful_call_signature(self, input_params: dict) -> str | None:
         """相同高德产品查询成功后可在当前 Agent run 内直接复用。"""
 
@@ -1049,7 +1094,7 @@ class AmapProductToolHandler(BaseToolHandler):
             return endpoint
 
         selection_city = city or preferred_city
-        await self._require_remaining_budget(2 + reserve_calls)
+        await self._require_remaining_budget((1 if selection_city else 2) + reserve_calls)
         search_arguments: dict[str, Any] = {
             "keywords": _normalize_amap_search_keywords(label),
         }
@@ -1062,6 +1107,13 @@ class AmapProductToolHandler(BaseToolHandler):
         )
         require_detail_city = selection_city is None
         if selection_city:
+            endpoint = _select_city_scoped_endpoint(
+                search_payload,
+                label=label,
+                expected_city=selection_city,
+            )
+            if endpoint is not None:
+                return endpoint
             poi_id = _select_endpoint_poi_id(search_payload, label=label)
         else:
             global_selection = _select_global_endpoint_poi(search_payload, label=label)
@@ -1070,6 +1122,7 @@ class AmapProductToolHandler(BaseToolHandler):
             poi_id, selection_city = global_selection
         if not poi_id:
             raise McpClientError("invalid_response", MCP_TOOL_UNAVAILABLE_MESSAGE)
+        await self._require_remaining_budget(1 + reserve_calls)
         detail_payload = await self._call("maps_search_detail", {"id": poi_id}, stats)
         endpoint = _extract_endpoint_detail(
             detail_payload,
@@ -1826,6 +1879,49 @@ def _select_endpoint_poi_id(payload: Any, *, label: str) -> str | None:
         if normalized_label in _normalize_endpoint_match_text(name):
             return poi_id
     return None
+
+
+def _select_city_scoped_endpoint(
+    payload: Any,
+    *,
+    label: str,
+    expected_city: str,
+) -> dict[str, Any] | None:
+    """城市已确定时，严格复用文本搜索返回的唯一最佳坐标，避免无必要的详情子调用。"""
+
+    normalized_label = _normalize_endpoint_match_text(label)
+    if not normalized_label:
+        return None
+    candidates: list[tuple[int, dict[str, Any]]] = []
+    for place in _extract_places(payload, limit=10):
+        name = place.get("name")
+        location = place.get("location")
+        city = place.get("city")
+        if (
+            not isinstance(name, str)
+            or not isinstance(location, str)
+            or not isinstance(city, str)
+            or not _city_matches(expected_city, city)
+        ):
+            continue
+        normalized_name = _normalize_endpoint_match_text(name)
+        if normalized_label not in normalized_name:
+            continue
+        candidates.append(
+            (
+                len(normalized_name) - len(normalized_label),
+                {
+                    "label": _redact_product_text(label)[:120],
+                    "location": location,
+                    "city": city,
+                },
+            )
+        )
+    if not candidates:
+        return None
+    best_score = min(score for score, _ in candidates)
+    best = [endpoint for score, endpoint in candidates if score == best_score]
+    return best[0] if len(best) == 1 else None
 
 
 def _select_global_endpoint_poi(payload: Any, *, label: str) -> tuple[str, str] | None:

@@ -122,7 +122,8 @@ def build_grounded_product_answer(content_blocks: list[Any]) -> str:
     if itinerary is not None:
         itinerary_answer = _build_itinerary_answer(itinerary, product_blocks)
         if itinerary_answer:
-            return itinerary_answer
+            supplements = _build_itinerary_route_supplements(itinerary, product_blocks)
+            return "\n\n".join([itinerary_answer, *supplements])
 
     paragraphs: list[str] = []
     handled_travel_groups: set[tuple[str, str, str]] = set()
@@ -231,10 +232,88 @@ def _build_itinerary_answer(itinerary: Any, content_blocks: list[Any]) -> str:
 
     if not paragraphs:
         return ""
+    destination_weather = _referenced_itinerary_source(
+        plans,
+        source_by_id,
+        kind="destination_weather",
+        block_type="weather_results",
+    )
+    if destination_weather is not None:
+        weather_summary = _build_itinerary_weather_answer(itinerary, destination_weather)
+        if weather_summary:
+            paragraphs.append(weather_summary)
+    local_route = _referenced_itinerary_source(plans, source_by_id, kind="local_route", block_type="route_results")
+    if local_route is not None:
+        route_summary = _build_route_answer(local_route)
+        if route_summary:
+            paragraphs.append(route_summary)
     limitations = _limitations_sentence(itinerary)
     if limitations:
         paragraphs.append(limitations)
     return "\n\n".join(paragraphs)
+
+
+def _build_itinerary_weather_answer(itinerary: Any, weather: Any) -> str:
+    start_date = str(_value(itinerary, "start_date") or "")[:10]
+    end_date = str(_value(itinerary, "end_date") or start_date)[:10]
+    forecast_days = [
+        day
+        for day in (_value(weather, "forecast_days") or [])
+        if start_date <= str(_value(day, "date") or "")[:10] <= end_date
+    ]
+    if not forecast_days:
+        return ""
+    return _build_weather_answer(
+        {
+            "resolved_location": _value(weather, "resolved_location"),
+            "forecast_days": forecast_days,
+            "limitations": _value(weather, "limitations") or [],
+        }
+    )
+
+
+def _build_itinerary_route_supplements(itinerary: Any, content_blocks: list[Any]) -> list[str]:
+    """保留未被方案卡引用、但确由本轮工具返回的接驳路线。"""
+
+    referenced_ids = {
+        str(_value(result_ref, "block_id") or "")
+        for plan in _value(itinerary, "plans") or []
+        for section in _value(plan, "sections") or []
+        for result_ref in _value(section, "result_refs") or []
+    }
+    summaries: list[str] = []
+    for block in content_blocks:
+        if _value(block, "type") != "route_results":
+            continue
+        block_id = str(_value(block, "id") or "")
+        if block_id and block_id in referenced_ids:
+            continue
+        summary = _build_route_answer(block)
+        if summary:
+            summaries.append(summary)
+        if len(summaries) >= 2:
+            break
+    return summaries
+
+
+def _referenced_itinerary_source(
+    plans: list[Any],
+    source_by_id: dict[str, Any],
+    *,
+    kind: str,
+    block_type: str,
+) -> Any | None:
+    """按行程引用取回一次配套结果，避免兜底正文丢失已完成的接驳信息。"""
+
+    for plan in plans:
+        for section in _value(plan, "sections") or []:
+            if _value(section, "kind") != kind:
+                continue
+            for result_ref in _value(section, "result_refs") or []:
+                source = source_by_id.get(str(_value(result_ref, "block_id") or ""))
+                if source is not None and _value(source, "type") == block_type:
+                    return source
+    return None
 
 
 def _referenced_travel_summary(

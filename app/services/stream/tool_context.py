@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
+from app.schemas.chat import FlightResultsBlock, TrainResultsBlock
 from app.services.agent.context_broker import (
     Geolocation,
     PendingContextRequest,
@@ -26,6 +28,7 @@ class ToolRuntimeContext:
     geolocation: Geolocation | None = None
     step_number: int = 0
     argument_repair_state: dict[str, dict[str, Any]] | None = None
+    route_city_hints: dict[str, tuple[str, ...]] = field(default_factory=dict)
     remaining_agent_steps: int | None = None
     remaining_agent_tool_calls: int | None = None
     remaining_agent_tool_calls_before_round: int | None = None
@@ -58,7 +61,62 @@ def enrich_tool_runtime_context(
     del messages
     context.step_number = step_number
     context.argument_repair_state = state.argument_repair_state
+    context.route_city_hints = _trusted_route_city_hints(state.content_blocks)
     return context
+
+
+def _trusted_route_city_hints(content_blocks: list[Any]) -> dict[str, tuple[str, ...]]:
+    """只从当前 run 已投影的班次结果中提取精确站点城市，冲突值不进入修参通道。"""
+
+    collected: dict[str, dict[str, set[str]]] = {}
+    for block in content_blocks:
+        if isinstance(block, FlightResultsBlock):
+            options = block.flights
+        elif isinstance(block, TrainResultsBlock):
+            options = block.trains
+        else:
+            continue
+        expected_cities = {
+            "departure": _normalize_route_city(block.origin),
+            "arrival": _normalize_route_city(block.destination),
+        }
+        for option in options[:5]:
+            for endpoint_field in ("departure", "arrival"):
+                endpoint = _value(option, endpoint_field)
+                station_name = _value(endpoint, "station_name")
+                city = _value(endpoint, "city")
+                if not isinstance(station_name, str) or not isinstance(city, str):
+                    continue
+                station_name = station_name.strip()
+                city = city.strip()
+                if not station_name or not city or len(station_name) > 120 or len(city) > 80:
+                    continue
+                normalized_city = _normalize_route_city(city)
+                if not normalized_city or normalized_city != expected_cities[endpoint_field]:
+                    continue
+                variants = collected.setdefault(station_name, {}).setdefault(normalized_city, set())
+                variants.add(city)
+    hints: dict[str, tuple[str, ...]] = {}
+    for station_name, normalized_cities in list(collected.items())[:40]:
+        if len(normalized_cities) != 1:
+            continue
+        variants = next(iter(normalized_cities.values()))
+        hints[station_name] = (min(variants, key=lambda value: (len(value), value)),)
+    return hints
+
+
+def _normalize_route_city(value: str) -> str:
+    normalized = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", value.casefold())
+    for suffix in ("自治州", "地区", "市", "盟"):
+        if normalized.endswith(suffix):
+            return normalized[: -len(suffix)]
+    return normalized
+
+
+def _value(value: Any, key: str) -> Any:
+    if isinstance(value, dict):
+        return value.get(key)
+    return getattr(value, key, None)
 
 
 def _arguments(tool_call: dict) -> dict[str, Any]:

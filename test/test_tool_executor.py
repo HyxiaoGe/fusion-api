@@ -416,6 +416,86 @@ class DynamicToolExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(handler.execute.await_count, 2)
         self.assertFalse(later_invalid[0].result.data["repair"]["retryable"])
 
+    async def test_runtime_repair_drops_unrequested_extra_arguments_before_execution(self):
+        class RuntimeRepairHandler:
+            tool_name = "route_compare"
+            supports_automatic_retry = False
+
+            def __init__(self):
+                self.calls = []
+
+            def validate_arguments(self, _args):
+                return []
+
+            def build_runtime_argument_repair(self, args, _runtime_context):
+                if "origin_city" in args:
+                    return None
+                return {
+                    "error_code": "route_city_required",
+                    "required_fields": ["origin_city"],
+                    "allowed_values": {"origin_city": ["厦门"]},
+                }
+
+            async def execute_with_runtime_context(self, args, _runtime_context):
+                self.calls.append(dict(args))
+                return ToolResult(status="success", data={"routes": []})
+
+            async def log(self, **_kwargs):
+                return None
+
+            def _build_result_summary(self, _result):
+                return {"kind": "external_tool", "truncated": False}
+
+        handler = RuntimeRepairHandler()
+        repair_state = {}
+        base_arguments = {
+            "origin": "厦门北站",
+            "destination": "邮轮中心厦鼓码头",
+            "modes": ["transit"],
+        }
+
+        first = await execute_tools_parallel(
+            [
+                {
+                    "id": "route-invalid",
+                    "name": handler.tool_name,
+                    "arguments": json.dumps(base_arguments, ensure_ascii=False),
+                }
+            ],
+            "conv-1",
+            "user-1",
+            "model-1",
+            "moonshot",
+            tool_handlers={handler.tool_name: handler},
+            runtime_context=SimpleNamespace(argument_repair_state=repair_state, step_number=1),
+        )
+        repaired = await execute_tools_parallel(
+            [
+                {
+                    "id": "route-repaired",
+                    "name": handler.tool_name,
+                    "arguments": json.dumps(
+                        {
+                            **base_arguments,
+                            "origin_city": "厦门",
+                            "destination_city": "厦门",
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            ],
+            "conv-1",
+            "user-1",
+            "model-1",
+            "moonshot",
+            tool_handlers={handler.tool_name: handler},
+            runtime_context=SimpleNamespace(argument_repair_state=repair_state, step_number=2),
+        )
+
+        self.assertEqual(first[0].result.data["error_code"], "route_city_required")
+        self.assertEqual(repaired[0].result.status, "success")
+        self.assertEqual(handler.calls, [{**base_arguments, "origin_city": "厦门"}])
+
     async def test_later_invalid_episode_uses_a_new_repair_id_after_resolution(self):
         class RepairHandler:
             tool_name = "mcp_docs_a1b2c3d4"
@@ -1170,6 +1250,115 @@ class DynamicToolExecutionTests(unittest.IsolatedAsyncioTestCase):
             [record.tool_call["id"] for record in records],
             ["call-place-1", "call-route", "call-place-2"],
         )
+
+    async def test_same_round_travel_defers_untrusted_route_without_consuming_network_call(self):
+        travel_handler = MagicMock()
+        travel_handler.tool_name = "search_trains"
+        travel_handler.execute = AsyncMock(return_value=ToolResult(status="success", data={"result": {}}))
+        travel_handler.execute_with_runtime_context = None
+        travel_handler.log = AsyncMock()
+        route_handler = MagicMock()
+        route_handler.tool_name = "route_compare"
+        route_handler.execute = AsyncMock(return_value=ToolResult(status="success", data={"result": {}}))
+        route_handler.execute_with_runtime_context = None
+        route_handler.log = AsyncMock()
+        runtime_context = SimpleNamespace(
+            argument_repair_state={},
+            route_city_hints={},
+            step_number=1,
+            remaining_agent_steps=7,
+            remaining_agent_tool_calls_before_round=20,
+        )
+
+        records = await execute_tools_parallel(
+            [
+                {
+                    "id": "call-train",
+                    "name": "search_trains",
+                    "arguments": {"origin": "广州", "destination": "杭州"},
+                },
+                {
+                    "id": "call-route",
+                    "name": "route_compare",
+                    "arguments": {
+                        "origin": "杭州东站",
+                        "origin_source": "named",
+                        "destination": "西湖",
+                        "destination_source": "named",
+                    },
+                },
+            ],
+            "conv-1",
+            "user-1",
+            "model-1",
+            "openai",
+            tool_handlers={
+                "search_trains": travel_handler,
+                "route_compare": route_handler,
+            },
+            runtime_context=runtime_context,
+        )
+
+        self.assertEqual(records[0].result.status, "success")
+        self.assertEqual(records[1].result.status, "failed")
+        self.assertEqual(
+            records[1].result.data["error_code"],
+            "route_requires_prior_travel_results",
+        )
+        self.assertTrue(records[1].result.data["local_preflight"])
+        travel_handler.execute.assert_awaited_once()
+        route_handler.execute.assert_not_awaited()
+
+    async def test_same_round_travel_allows_route_from_prior_trusted_station(self):
+        travel_handler = MagicMock()
+        travel_handler.tool_name = "search_trains"
+        travel_handler.execute = AsyncMock(return_value=ToolResult(status="success", data={"result": {}}))
+        travel_handler.execute_with_runtime_context = None
+        travel_handler.log = AsyncMock()
+        route_handler = MagicMock()
+        route_handler.tool_name = "route_compare"
+        route_handler.execute = AsyncMock(return_value=ToolResult(status="success", data={"result": {}}))
+        route_handler.execute_with_runtime_context = None
+        route_handler.log = AsyncMock()
+        runtime_context = SimpleNamespace(
+            argument_repair_state={},
+            route_city_hints={"杭州东站": ("杭州",)},
+            step_number=2,
+            remaining_agent_steps=6,
+            remaining_agent_tool_calls_before_round=18,
+        )
+
+        records = await execute_tools_parallel(
+            [
+                {
+                    "id": "call-train",
+                    "name": "search_trains",
+                    "arguments": {"origin": "广州", "destination": "杭州"},
+                },
+                {
+                    "id": "call-route",
+                    "name": "route_compare",
+                    "arguments": {
+                        "origin": "杭州东站",
+                        "origin_source": "named",
+                        "destination": "西湖",
+                        "destination_source": "named",
+                    },
+                },
+            ],
+            "conv-1",
+            "user-1",
+            "model-1",
+            "openai",
+            tool_handlers={
+                "search_trains": travel_handler,
+                "route_compare": route_handler,
+            },
+            runtime_context=runtime_context,
+        )
+
+        self.assertEqual([record.result.status for record in records], ["success", "success"])
+        route_handler.execute.assert_awaited_once()
 
 
 class WebSearchRedirectPresentationTests(unittest.TestCase):

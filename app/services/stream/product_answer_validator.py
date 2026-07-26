@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from itertools import combinations
 from typing import Any
 
@@ -161,11 +161,14 @@ _WEATHER_UNSUPPORTED_METRIC_RE = re.compile(
     r"(?:当前|现在|实时).{0,10}(?:温度|气温|湿度|AQI|空气质量|降雨概率|预警)|"
     r"(?:温度|气温|湿度|AQI|空气质量|降雨概率|预警).{0,10}(?:当前|现在|实时)|"
     r"(?:湿度|AQI|空气质量|降雨概率).{0,8}(?:为|是|达到|约)?\s*\d|"
-    r"(?:发布|存在|有).{0,6}(?:天气)?预警",
+    r"(?:发布|存在|有).{0,6}(?:天气)?预警|"
+    r"(?:平均|体感)(?:气温|温度)",
     re.IGNORECASE,
 )
 _WEATHER_UNSUPPORTED_CAPABILITY_RE = re.compile(r"湿度|AQI|空气质量|降雨概率|预警|积水", re.IGNORECASE)
 _WEATHER_CONDITION_RE = re.compile(
+    r"不会有降水|不会有雨|没有降水|无降水|不会下雨|不下雨|没有雨|没雨|不会降雨|不降雨|"
+    r"降水(?:量)?(?:为|是)?0(?:毫米|mm)?|无雨|有降水|会降水|"
     r"会下雨|会下雪|有雨|下雨|有雪|下雪|雷阵雨|雨夹雪|暴雨|大雨|中雨|小雨|阵雨|雷雨|"
     r"大雪|中雪|小雪|阵雪|"
     r"多云|阴天|阴|晴天|晴|雾|霾|大风|台风|雨天"
@@ -174,7 +177,16 @@ _WEATHER_TEMPERATURE_RE = re.compile(
     r"(?P<value>-?\d+(?:\.\d+)?)\s*(?:℃|°\s*C|摄氏度|度)",
     re.IGNORECASE,
 )
-_WEATHER_ADVICE_RE = re.compile(r"带伞|携带雨具|雨具|防风|减少.{0,6}步行|避免.{0,6}步行")
+_WEATHER_TEMPERATURE_NO_UNIT_RE = re.compile(
+    r"(?:(?P<kind_before>最高|最低)?(?:气温|温度)(?P<kind_after>最高|最低)?|"
+    r"(?P<kind_only>最高|最低))\s*(?:为|是|约)?\s*"
+    r"(?P<value>-?\d+(?:\.\d+)?)(?![\d.]|\s*(?:℃|°\s*C|摄氏度|度))",
+    re.IGNORECASE,
+)
+_WEATHER_ADVICE_RE = re.compile(
+    r"带伞|携带雨具|雨具|防风|防晒|加衣|保暖|穿.{0,6}(?:外套|衣|鞋)|着装|"
+    r"减少.{0,6}步行|避免.{0,6}步行"
+)
 _WEATHER_HAZARD_RE = re.compile(r"雨|雪|雷|大风|台风")
 _WEATHER_LOCATION_RE = re.compile(
     r"(?P<name>[\u4e00-\u9fff]{2,12}(?:省|市|区|县|旗))"
@@ -182,17 +194,102 @@ _WEATHER_LOCATION_RE = re.compile(
     r"[\s：:,，]{0,3}(?:周|星期|今天|明天|天气|预报|白天|夜间|最高|最低|有|会|\d{1,2}月))"
 )
 _WEATHER_WIND_RE = re.compile(
-    r"(?P<direction>东南|东北|西南|西北|东|南|西|北)?风"
+    r"(?P<direction>东南|东北|西南|西北|东|南|西|北)?风(?:力)?"
     r"(?P<power>[≤＜<≥＞>]?\s*\d+(?:\s*[-~至]\s*\d+)?)?\s*级?"
 )
+_WEATHER_WIND_DIRECTION_RE = re.compile(r"风向\s*(?P<direction>东南|东北|西南|西北|东|南|西|北)")
+_WEATHER_FACT_CUE_RE = re.compile(r"气温|温度|最高|最低|雨|雪|雷|多云|阴|晴|雾|霾|风|防晒|保暖|加衣|雨具")
 _WEATHER_UNSUPPORTED_IMPACT_RE = re.compile(
     r"(?:天气|雨天|有雨|下雨|会下雨|有雪|下雪|会下雪).{0,12}(?:不会|不|无)?影响"
     r"(?:出行|行程|通勤|路线)|"
     r"(?:天气|雨天|有雨|下雨|会下雨|有雪|下雪|会下雪).{0,20}(?:建议|推荐|优先).{0,12}"
     r"(?:驾车|开车|自驾|公交|地铁|公共交通|步行|骑行)"
 )
+_WEATHER_DATE_TOKEN_PATTERN = r"(?:\d{4}-\d{2}-\d{2}|\d{1,2}月\d{1,2}日)"
+_WEATHER_DATE_RANGE_PATTERN = rf"{_WEATHER_DATE_TOKEN_PATTERN}(?:\s*(?:至|到|~|～|—)\s*{_WEATHER_DATE_TOKEN_PATTERN})?"
+_WEATHER_COVERAGE_RETRY_SUFFIX_PATTERN = (
+    r"(?:，?(?:建议|请)?(?:临近(?:出发|行程|目标)?日期(?:后|时)?|稍后|届时)"
+    r"(?:再|重新)?(?:查询|重试|查看|核实)(?:天气|预报)?)?"
+)
+_WEATHER_COVERAGE_POSITIVE_NEGATIVE_RE = re.compile(
+    rf"(?:当前|本次|现有)?(?:天气)?预报(?:窗口|范围|数据)?(?:只|仅)?覆盖"
+    rf"(?P<covered>{_WEATHER_DATE_RANGE_PATTERN})"
+    rf"，(?:但|不过)?(?:暂)?(?:未覆盖|不覆盖|没有覆盖)"
+    rf"(?P<uncovered>{_WEATHER_DATE_RANGE_PATTERN})"
+    rf"{_WEATHER_COVERAGE_RETRY_SUFFIX_PATTERN}"
+)
+_WEATHER_RETURNED_RANGE_LIMITATION_RE = re.compile(
+    rf"(?:当前|本次|现有)?(?:天气)?预报(?:只|仅)?(?:返回|包含)"
+    rf"(?P<covered>{_WEATHER_DATE_RANGE_PATTERN})(?:的)?数据"
+    rf"，(?:但|不过)?(?:没有|未返回|未包含)"
+    rf"(?P<uncovered>{_WEATHER_DATE_RANGE_PATTERN})(?:的)?数据"
+    rf"{_WEATHER_COVERAGE_RETRY_SUFFIX_PATTERN}"
+)
+_WEATHER_RETURNED_RANGE_RE = re.compile(
+    rf"(?:当前|本次|现有)?(?:天气)?预报(?:只|仅)(?:返回|包含|提供|有)"
+    rf"(?P<covered>{_WEATHER_DATE_RANGE_PATTERN})(?:的)?数据"
+    rf"{_WEATHER_COVERAGE_RETRY_SUFFIX_PATTERN}"
+)
+_WEATHER_NOT_RETURNED_RANGE_RE = re.compile(
+    rf"(?:当前|本次|现有)?(?:天气)?预报"
+    rf"(?:暂无|暂时没有|没有返回|没有包含|没有提供|未返回|未包含|未提供|不返回|不包含|不提供|"
+    rf"没返回|没包含|没提供|没有)(?P<uncovered>{_WEATHER_DATE_RANGE_PATTERN})(?:的)?数据"
+    rf"{_WEATHER_COVERAGE_RETRY_SUFFIX_PATTERN}"
+)
+_WEATHER_COVERAGE_NEGATIVE_RES = (
+    re.compile(
+        rf"(?:当前|本次|现有)?(?:天气)?预报(?:窗口|范围|数据)?"
+        rf"(?:暂)?(?:未覆盖|不覆盖|没有覆盖)(?P<uncovered>{_WEATHER_DATE_RANGE_PATTERN})"
+        rf"{_WEATHER_COVERAGE_RETRY_SUFFIX_PATTERN}"
+    ),
+    re.compile(
+        rf"(?P<uncovered>{_WEATHER_DATE_RANGE_PATTERN})(?:的)?(?:天气)?预报(?:暂)?(?:不在|未在)"
+        rf"(?:当前|本次|现有)?(?:(?:天气)?预报)?(?:的)?覆盖范围(?:内)?"
+        rf"{_WEATHER_COVERAGE_RETRY_SUFFIX_PATTERN}"
+    ),
+    re.compile(
+        rf"(?P<uncovered>{_WEATHER_DATE_RANGE_PATTERN})(?:暂)?(?:不在|未在|超出|超过)"
+        rf"(?:当前|本次|现有)?(?:天气)?预报(?:窗口|覆盖范围)(?:内)?"
+        rf"{_WEATHER_COVERAGE_RETRY_SUFFIX_PATTERN}"
+    ),
+    re.compile(
+        rf"(?P<uncovered>{_WEATHER_DATE_RANGE_PATTERN})(?:的)?(?:天气)?预报(?:暂)?(?:未覆盖|不覆盖)"
+        rf"{_WEATHER_COVERAGE_RETRY_SUFFIX_PATTERN}"
+    ),
+)
+_WEATHER_COVERAGE_CUE_RE = re.compile(
+    r"覆盖范围|未覆盖|不覆盖|没有覆盖|超出.{0,8}预报|超过.{0,8}预报|"
+    r"(?:只|仅)(?:返回|包含|提供|有)|"
+    r"暂无|暂时没有|没有返回|没有包含|没有提供|未返回|未包含|未提供|不返回|不包含|不提供|"
+    r"没返回|没包含|没提供|"
+    rf"没有{_WEATHER_DATE_RANGE_PATTERN}(?:的)?数据"
+)
 _WEATHER_SENTENCE_SPLIT_RE = re.compile(r"[。！？!?；;\n]+")
-_WEATHER_EXPLICIT_DAY_RE = re.compile(r"\d{4}-\d{2}-\d{2}|\d{1,2}月\d{1,2}日|(?:星期|周)[一二三四五六日天]|周末")
+_WEATHER_COMPACT_RANGE_RE = re.compile(
+    r"(?P<month>\d{1,2})月(?P<start>\d{1,2})(?:日)?\s*[-~至到～—]\s*(?P<end>\d{1,2})日"
+)
+_WEATHER_DAY_ONLY_RE = re.compile(r"(?<!月)(?<!\d)(?P<day>\d{1,2})日")
+_WEATHER_EXPLICIT_DAY_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}|\d{1,2}月\d{1,2}日|(?<!月)(?<!\d)\d{1,2}日|"
+    r"(?:星期|周)[一二三四五六日天]|周末|"
+    r"明后天|大后天|今晚|今夜|今早|今晨|明晚|明夜|明早|明晨|今天|明天|后天"
+)
+_WEATHER_RELATIVE_DAY_RE = re.compile(r"明后天|大后天|今晚|今夜|今早|今晨|明晚|明夜|明早|明晨|今天|明天|后天")
+_WEATHER_RELATIVE_DAY_OFFSETS = {
+    "今天": (0,),
+    "今晚": (0,),
+    "今夜": (0,),
+    "今早": (0,),
+    "今晨": (0,),
+    "明天": (1,),
+    "明晚": (1,),
+    "明夜": (1,),
+    "明早": (1,),
+    "明晨": (1,),
+    "后天": (2,),
+    "大后天": (3,),
+    "明后天": (1, 2),
+}
 _REPAIR_SENTENCE_RE = re.compile(r"[^。！？!?]+(?:[。！？!?]+|$)")
 _NUMBERED_LIST_PREFIX_RE = re.compile(r"^\s*\d+[.、)]\s*")
 _REPAIR_MARKDOWN_PREFIX_RE = re.compile(r"^\s*(?:#{1,6}|[-*>])\s*")
@@ -317,7 +414,11 @@ def validate_product_answer(
         return ProductAnswerValidation(False, "unknown_travel_entity")
     if facts.has_travel_results and _has_unknown_travel_time(normalized_answer, facts.travel_clock_times):
         return ProductAnswerValidation(False, "unknown_travel_time")
-    if facts.has_travel_results and _has_unknown_travel_weekday(normalized_answer, facts.travel_weekdays):
+    if facts.has_travel_results and _has_unknown_travel_weekday(
+        normalized_answer,
+        facts.travel_weekdays,
+        facts.weather_days,
+    ):
         return ProductAnswerValidation(False, "unknown_travel_date")
     if facts.searched_place_names and _has_unknown_recommended_place(
         normalized_answer,
@@ -905,17 +1006,37 @@ def _weather_claim_reason(answer: str, facts: _FactIndex) -> str | None:
                 return "unsupported_claim"
         if _WEATHER_UNSUPPORTED_IMPACT_RE.search(sentence):
             return "unsupported_claim"
+        coverage_validation = _validate_weather_coverage_sentence(sentence, facts.weather_days)
+        if coverage_validation is False:
+            return "weather_fact_mismatch"
+        if coverage_validation is True:
+            continue
         if _weather_has_unknown_explicit_date(sentence, facts.weather_days):
             return "weather_fact_mismatch"
         if _weather_has_conflicting_date_weekday(sentence, facts.weather_days):
             return "weather_fact_mismatch"
         scoped_days = _weather_scoped_days(sentence, facts.weather_days)
-        has_weather_fact = bool(
+        has_parsed_weather_fact = bool(
             _WEATHER_CONDITION_RE.search(sentence)
             or _WEATHER_TEMPERATURE_RE.search(sentence)
+            or _WEATHER_TEMPERATURE_NO_UNIT_RE.search(sentence)
+            or _has_parsed_weather_wind(sentence)
+            or _WEATHER_WIND_DIRECTION_RE.search(sentence)
             or _WEATHER_ADVICE_RE.search(sentence)
         )
+        has_weather_fact = has_parsed_weather_fact or bool(_WEATHER_FACT_CUE_RE.search(sentence))
+        if has_weather_fact and (
+            _weather_has_unresolved_relative_day(sentence, facts.weather_days) or "明后天" in sentence
+        ):
+            return "weather_fact_mismatch"
         if has_weather_fact and _WEATHER_EXPLICIT_DAY_RE.search(sentence) and not scoped_days:
+            return "weather_fact_mismatch"
+        if (
+            has_weather_fact
+            and not has_parsed_weather_fact
+            and _WEATHER_EXPLICIT_DAY_RE.search(sentence)
+            and not _LIMITATION_CUE_RE.search(sentence)
+        ):
             return "weather_fact_mismatch"
         if not scoped_days:
             scoped_days = facts.weather_days
@@ -934,11 +1055,27 @@ def _weather_claim_reason(answer: str, facts: _FactIndex) -> str | None:
             period = _weather_period_before(sentence, match.start())
             claim_days = _weather_scoped_days(sentence, facts.weather_days, position=match.start()) or scoped_days
             allowed_conditions = _allowed_weather_conditions(claim_days, period)
-            if not any(_weather_condition_matches(condition, allowed) for allowed in allowed_conditions):
+            if _is_weather_dry_condition_claim(condition):
+                matches_condition = bool(allowed_conditions) and all(
+                    _weather_condition_matches(condition, allowed) for allowed in allowed_conditions
+                )
+            else:
+                matches_condition = any(
+                    _weather_condition_matches(condition, allowed) for allowed in allowed_conditions
+                )
+            if not matches_condition:
                 return "weather_fact_mismatch"
         for match in _WEATHER_TEMPERATURE_RE.finditer(sentence):
             value = float(match.group("value"))
             kind = _weather_temperature_kind_before(sentence, match.start())
+            claim_days = _weather_scoped_days(sentence, facts.weather_days, position=match.start()) or scoped_days
+            allowed_temperatures = _allowed_weather_temperatures(claim_days, kind)
+            if not any(abs(value - allowed) <= 0.05 for allowed in allowed_temperatures):
+                return "weather_fact_mismatch"
+        for match in _WEATHER_TEMPERATURE_NO_UNIT_RE.finditer(sentence):
+            value = float(match.group("value"))
+            kind_label = match.group("kind_before") or match.group("kind_after") or match.group("kind_only")
+            kind = "high" if kind_label == "最高" else "low" if kind_label == "最低" else None
             claim_days = _weather_scoped_days(sentence, facts.weather_days, position=match.start()) or scoped_days
             allowed_temperatures = _allowed_weather_temperatures(claim_days, kind)
             if not any(abs(value - allowed) <= 0.05 for allowed in allowed_temperatures):
@@ -957,7 +1094,16 @@ def _weather_claim_reason(answer: str, facts: _FactIndex) -> str | None:
                 for allowed_direction, allowed_power in allowed_winds
             ):
                 return "weather_fact_mismatch"
+        for match in _WEATHER_WIND_DIRECTION_RE.finditer(sentence):
+            direction = match.group("direction")
+            claim_days = _weather_scoped_days(sentence, facts.weather_days, position=match.start()) or scoped_days
+            period = _weather_period_before(sentence, match.start())
+            allowed_winds = _allowed_weather_winds(claim_days, period)
+            if not any(direction == allowed_direction for allowed_direction, _ in allowed_winds):
+                return "weather_fact_mismatch"
         if _WEATHER_ADVICE_RE.search(sentence):
+            if re.search(r"防晒|加衣|保暖|穿.{0,6}(?:外套|衣|鞋)|着装", sentence):
+                return "unsupported_claim"
             conditions = {value for day in scoped_days for value in (day.day_weather, day.night_weather)}
             if "防风" in sentence:
                 supported = any(re.search(r"大风|台风", value) for value in conditions)
@@ -968,6 +1114,75 @@ def _weather_claim_reason(answer: str, facts: _FactIndex) -> str | None:
             if not supported:
                 return "unsupported_claim"
     return None
+
+
+def _validate_weather_coverage_sentence(
+    sentence: str,
+    days: list[_WeatherDayFacts],
+) -> bool | None:
+    """纯覆盖说明必须与结构化预报日期一致；夹带其他语义不进入该白名单。"""
+
+    normalized = re.sub(r"\s+", "", sentence).replace(",", "，").strip("，。！？!?；;")
+    allowed_dates = {day.date for day in days}
+    for pattern in (_WEATHER_COVERAGE_POSITIVE_NEGATIVE_RE, _WEATHER_RETURNED_RANGE_LIMITATION_RE):
+        match = pattern.fullmatch(normalized)
+        if match is None:
+            continue
+        covered_dates = _parse_weather_date_range(match.group("covered"), days)
+        uncovered_dates = _parse_weather_date_range(match.group("uncovered"), days)
+        return (
+            covered_dates is not None
+            and uncovered_dates is not None
+            and covered_dates == allowed_dates
+            and uncovered_dates.isdisjoint(allowed_dates)
+        )
+    match = _WEATHER_RETURNED_RANGE_RE.fullmatch(normalized)
+    if match is not None:
+        covered_dates = _parse_weather_date_range(match.group("covered"), days)
+        return covered_dates is not None and covered_dates == allowed_dates
+    match = _WEATHER_NOT_RETURNED_RANGE_RE.fullmatch(normalized)
+    if match is not None:
+        uncovered_dates = _parse_weather_date_range(match.group("uncovered"), days)
+        return uncovered_dates is not None and uncovered_dates.isdisjoint(allowed_dates)
+    for pattern in _WEATHER_COVERAGE_NEGATIVE_RES:
+        match = pattern.fullmatch(normalized)
+        if match is None:
+            continue
+        uncovered_dates = _parse_weather_date_range(match.group("uncovered"), days)
+        return uncovered_dates is not None and uncovered_dates.isdisjoint(allowed_dates)
+    if _WEATHER_COVERAGE_CUE_RE.search(normalized) and re.search(_WEATHER_DATE_TOKEN_PATTERN, normalized):
+        return False
+    return None
+
+
+def _parse_weather_date_range(
+    value: str,
+    days: list[_WeatherDayFacts],
+) -> set[str] | None:
+    matches = list(re.finditer(_WEATHER_DATE_TOKEN_PATTERN, value))
+    if not matches or len(matches) > 2 or not days:
+        return None
+    base_year = int(min(day.date for day in days)[:4])
+    parsed_dates = []
+    for index, match in enumerate(matches):
+        token = match.group(0)
+        try:
+            if "-" in token:
+                parsed = datetime.strptime(token, "%Y-%m-%d").date()
+            else:
+                month_text, day_text = token.removesuffix("日").split("月", 1)
+                year = base_year
+                if index == 1 and parsed_dates and int(month_text) < parsed_dates[0].month:
+                    year += 1
+                parsed = datetime(year, int(month_text), int(day_text)).date()
+        except ValueError:
+            return None
+        parsed_dates.append(parsed)
+    start = parsed_dates[0]
+    end = parsed_dates[-1]
+    if end < start or (end - start).days > 31:
+        return None
+    return {(start + timedelta(days=offset)).isoformat() for offset in range((end - start).days + 1)}
 
 
 def _weather_scoped_days(
@@ -1000,6 +1215,16 @@ def _weather_scoped_days(
             while start >= 0:
                 mentions.append((start, day))
                 start = sentence.find("周末", start + 2)
+    if days:
+        day_by_date = {day.date: day for day in days}
+        base_date = datetime.strptime(min(day_by_date), "%Y-%m-%d").date()
+        for match in _WEATHER_RELATIVE_DAY_RE.finditer(sentence):
+            for offset in _WEATHER_RELATIVE_DAY_OFFSETS[match.group(0)]:
+                relative_day = day_by_date.get((base_date + timedelta(days=offset)).isoformat())
+                if relative_day is not None:
+                    mentions.append((match.start(), relative_day))
+        mentions.extend(_weather_compact_range_mentions(sentence, days))
+        mentions.extend(_weather_day_only_mentions(sentence, days))
     if position is not None and mentions:
         preceding = [item for item in mentions if item[0] <= position]
         selected_position = max(item[0] for item in preceding) if preceding else min(item[0] for item in mentions)
@@ -1007,10 +1232,50 @@ def _weather_scoped_days(
     return list(dict.fromkeys(day for _, day in sorted(mentions, key=lambda item: item[0])))
 
 
+def _weather_has_unresolved_relative_day(
+    sentence: str,
+    days: list[_WeatherDayFacts],
+) -> bool:
+    if not days:
+        return bool(_WEATHER_RELATIVE_DAY_RE.search(sentence))
+    allowed_dates = {day.date for day in days}
+    base_date = datetime.strptime(min(allowed_dates), "%Y-%m-%d").date()
+    return any(
+        any(
+            (base_date + timedelta(days=offset)).isoformat() not in allowed_dates
+            for offset in _WEATHER_RELATIVE_DAY_OFFSETS[match.group(0)]
+        )
+        for match in _WEATHER_RELATIVE_DAY_RE.finditer(sentence)
+    )
+
+
+def _has_parsed_weather_wind(sentence: str) -> bool:
+    return any(match.group("direction") or match.group("power") for match in _WEATHER_WIND_RE.finditer(sentence))
+
+
 def _weather_period_before(sentence: str, position: int) -> str | None:
     prefix = sentence[:position]
-    day_position = max(prefix.rfind("白天"), prefix.rfind("日间"))
-    night_position = max(prefix.rfind("夜间"), prefix.rfind("晚上"), prefix.rfind("夜里"))
+    day_position = max(
+        prefix.rfind("白天"),
+        prefix.rfind("日间"),
+        prefix.rfind("今早"),
+        prefix.rfind("今晨"),
+        prefix.rfind("明早"),
+        prefix.rfind("明晨"),
+        prefix.rfind("早上"),
+        prefix.rfind("上午"),
+        prefix.rfind("中午"),
+        prefix.rfind("下午"),
+    )
+    night_position = max(
+        prefix.rfind("夜间"),
+        prefix.rfind("晚上"),
+        prefix.rfind("夜里"),
+        prefix.rfind("今晚"),
+        prefix.rfind("今夜"),
+        prefix.rfind("明晚"),
+        prefix.rfind("明夜"),
+    )
     if max(day_position, night_position) < 0:
         return None
     return "day" if day_position > night_position else "night"
@@ -1025,6 +1290,10 @@ def _allowed_weather_conditions(days: list[_WeatherDayFacts], period: str | None
 
 
 def _weather_condition_matches(claim: str, allowed: str) -> bool:
+    if _is_weather_dry_condition_claim(claim):
+        return "雨" not in allowed
+    if claim in {"有降水", "会降水"}:
+        return "雨" in allowed or "雪" in allowed
     if claim == "雨天":
         return "雨" in allowed
     if claim in {"有雨", "下雨", "会下雨"}:
@@ -1034,6 +1303,22 @@ def _weather_condition_matches(claim: str, allowed: str) -> bool:
     normalized_claim = claim.removesuffix("天")
     normalized_allowed = allowed.removesuffix("天")
     return normalized_claim == normalized_allowed or normalized_claim in normalized_allowed
+
+
+def _is_weather_dry_condition_claim(claim: str) -> bool:
+    return claim in {
+        "不会有降水",
+        "不会有雨",
+        "没有降水",
+        "无降水",
+        "不会下雨",
+        "不下雨",
+        "没有雨",
+        "没雨",
+        "不会降雨",
+        "不降雨",
+        "无雨",
+    } or claim.startswith("降水")
 
 
 def _weather_temperature_kind_before(sentence: str, position: int) -> str | None:
@@ -1104,7 +1389,67 @@ def _weather_has_unknown_explicit_date(sentence: str, days: list[_WeatherDayFact
     for match in re.finditer(r"\d{1,2}月\d{1,2}日", sentence):
         if match.group(0) not in allowed_month_days:
             return True
+    compact_range_spans: list[tuple[int, int]] = []
+    for match in _WEATHER_COMPACT_RANGE_RE.finditer(sentence):
+        compact_range_spans.append(match.span())
+        if not _weather_compact_range_days(match, days):
+            return True
+    known_day_only_starts = {start for start, _ in _weather_day_only_mentions(sentence, days)}
+    for match in _WEATHER_DAY_ONLY_RE.finditer(sentence):
+        if any(start <= match.start() < end for start, end in compact_range_spans):
+            continue
+        if match.start() not in known_day_only_starts:
+            return True
     return False
+
+
+def _weather_compact_range_mentions(
+    sentence: str,
+    days: list[_WeatherDayFacts],
+) -> list[tuple[int, _WeatherDayFacts]]:
+    mentions: list[tuple[int, _WeatherDayFacts]] = []
+    for match in _WEATHER_COMPACT_RANGE_RE.finditer(sentence):
+        mentions.extend((match.start(), day) for day in _weather_compact_range_days(match, days))
+    return mentions
+
+
+def _weather_compact_range_days(
+    match: re.Match[str],
+    days: list[_WeatherDayFacts],
+) -> list[_WeatherDayFacts]:
+    month = int(match.group("month"))
+    start = int(match.group("start"))
+    end = int(match.group("end"))
+    if end < start or end - start > 31:
+        return []
+    by_month_day = {(int(day.date[5:7]), int(day.date[8:10])): day for day in days}
+    calendar_days = range(start, end + 1)
+    if any((month, calendar_day) not in by_month_day for calendar_day in calendar_days):
+        return []
+    return [by_month_day[(month, calendar_day)] for calendar_day in calendar_days]
+
+
+def _weather_day_only_mentions(
+    sentence: str,
+    days: list[_WeatherDayFacts],
+) -> list[tuple[int, _WeatherDayFacts]]:
+    """解析“7月29日……，30日……”中的后续日号；没有前置完整日期时保持拒绝。"""
+
+    full_date_starts = [match.start() for match in re.finditer(r"\d{1,2}月\d{1,2}日", sentence)]
+    if not full_date_starts:
+        return []
+    days_by_calendar_day: dict[int, list[_WeatherDayFacts]] = {}
+    for day in days:
+        days_by_calendar_day.setdefault(int(day.date[8:10]), []).append(day)
+
+    mentions: list[tuple[int, _WeatherDayFacts]] = []
+    for match in _WEATHER_DAY_ONLY_RE.finditer(sentence):
+        if not any(start < match.start() for start in full_date_starts):
+            continue
+        candidates = days_by_calendar_day.get(int(match.group("day")), [])
+        if len(candidates) == 1:
+            mentions.append((match.start(), candidates[0]))
+    return mentions
 
 
 def _has_unsupported_claim(answer: str, facts: _FactIndex) -> bool:
@@ -1229,8 +1574,24 @@ def _has_unknown_travel_time(answer: str, allowed_times: set[str]) -> bool:
     return any(match.group(0) not in allowed_times for match in _CLOCK_TIME_RE.finditer(answer))
 
 
-def _has_unknown_travel_weekday(answer: str, allowed_weekdays: set[str]) -> bool:
-    return any(match.group("day") not in allowed_weekdays for match in _TRAVEL_WEEKDAY_RE.finditer(answer))
+def _has_unknown_travel_weekday(
+    answer: str,
+    allowed_weekdays: set[str],
+    weather_days: list[_WeatherDayFacts],
+) -> bool:
+    weekday_labels = ("一", "二", "三", "四", "五", "六", "日")
+    for sentence in _WEATHER_SENTENCE_SPLIT_RE.split(answer):
+        for match in _TRAVEL_WEEKDAY_RE.finditer(sentence):
+            weekday = match.group("day").replace("天", "日")
+            if weekday in allowed_weekdays:
+                continue
+            scoped_weather_days = _weather_scoped_days(sentence, weather_days)
+            if _WEATHER_FACT_CUE_RE.search(sentence) and any(
+                weekday_labels[day.weekday - 1] == weekday for day in scoped_weather_days
+            ):
+                continue
+            return True
+    return False
 
 
 def _has_travel_candidate_mismatch(

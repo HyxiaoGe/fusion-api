@@ -112,7 +112,117 @@ class ProductResultAnswerTests(unittest.TestCase):
         self.assertIn("返程G101", answer)
         self.assertIn("参考票价合计1130元", answer)
         self.assertIn("天气预报已完整覆盖行程日期", answer)
+        self.assertIn("上海市天气预报", answer)
+        self.assertNotIn("7月31日", answer)
+        validation = validate_product_answer(answer, [*source_blocks, itinerary])
+        self.assertTrue(validation.is_valid, validation.reason_code)
+        invalid_travel_weekday = validate_product_answer(
+            f"{answer}\n\n返程周日出发。",
+            [*source_blocks, itinerary],
+        )
+        self.assertFalse(invalid_travel_weekday.is_valid)
+        self.assertEqual(invalid_travel_weekday.reason_code, "unknown_travel_date")
+
+    def test_itinerary_fallback_keeps_referenced_local_route(self):
+        source_blocks = [
+            _travel_block(
+                block_type="train_results",
+                block_id="train-out",
+                origin="深圳",
+                destination="上海",
+                departure_date="2026-08-01",
+                option_id="train-out-1",
+                number="G100",
+                duration_s=28800,
+                price_minor=56000,
+            ),
+            _travel_block(
+                block_type="train_results",
+                block_id="train-return",
+                origin="上海",
+                destination="深圳",
+                departure_date="2026-08-03",
+                option_id="train-return-1",
+                number="G101",
+                duration_s=29400,
+                price_minor=57000,
+            ),
+            _weather_result("weather-destination"),
+            {
+                "type": "route_results",
+                "id": "route-local",
+                "status": "success",
+                "origin": {"label": "上海站"},
+                "destination": {"label": "外滩"},
+                "routes": [
+                    {
+                        "mode": "transit",
+                        "transit_type": "subway",
+                        "duration_s": 2100,
+                        "transfers": 1,
+                        "legs": [{"kind": "subway", "line_name": "地铁1号线"}],
+                    }
+                ],
+                "limitations": ["路线时间和距离仅代表本次查询结果"],
+            },
+        ]
+        itinerary = _itinerary_result()
+        itinerary["plans"][0]["sections"].append(
+            {
+                "kind": "local_route",
+                "coverage": None,
+                "result_refs": [{"block_id": "route-local", "item_ids": []}],
+            }
+        )
+
+        answer = build_grounded_product_answer([*source_blocks, itinerary])
+
+        self.assertIn("上海站到外滩", answer)
+        self.assertIn("地铁约 35 分钟", answer)
+        self.assertIn("地铁1号线", answer)
         self.assertTrue(validate_product_answer(answer, [*source_blocks, itinerary]).is_valid)
+
+    def test_itinerary_fallback_keeps_unreferenced_route_returned_in_same_round(self):
+        source_blocks = [
+            _travel_block(
+                block_type="train_results",
+                block_id="train-out",
+                origin="深圳",
+                destination="上海",
+                departure_date="2026-08-01",
+                option_id="train-out-1",
+                number="G100",
+                duration_s=28800,
+                price_minor=56000,
+            ),
+            _travel_block(
+                block_type="train_results",
+                block_id="train-return",
+                origin="上海",
+                destination="深圳",
+                departure_date="2026-08-03",
+                option_id="train-return-1",
+                number="G101",
+                duration_s=29400,
+                price_minor=57000,
+            ),
+            _weather_result("weather-destination"),
+            {
+                "type": "route_results",
+                "id": "route-unreferenced",
+                "status": "success",
+                "origin": {"label": "上海虹桥站"},
+                "destination": {"label": "外滩"},
+                "routes": [{"mode": "driving", "duration_s": 2400, "distance_m": 21000}],
+                "limitations": ["路线时间和距离仅代表本次查询结果"],
+            },
+        ]
+
+        answer = build_grounded_product_answer([*source_blocks, _itinerary_result()])
+
+        self.assertIn("上海虹桥站到外滩", answer)
+        self.assertIn("驾车约 40 分钟、21 公里", answer)
+        self.assertTrue(validate_product_answer(answer, [*source_blocks, _itinerary_result()]).is_valid)
 
     def test_weather_fallback_uses_only_forecast_fields_and_safe_advice(self):
         block = WeatherResultsBlock(
@@ -376,9 +486,38 @@ def _weather_result(block_id: str) -> dict:
         "id": block_id,
         "resolved_location": "上海市",
         "forecast_days": [
-            {"date": "2026-08-01"},
-            {"date": "2026-08-02"},
-            {"date": "2026-08-03"},
+            {
+                "date": "2026-08-01",
+                "weekday": 6,
+                "day_weather": "多云",
+                "night_weather": "多云",
+                "low_c": 27,
+                "high_c": 34,
+            },
+            {
+                "date": "2026-08-02",
+                "weekday": 7,
+                "day_weather": "阵雨",
+                "night_weather": "多云",
+                "low_c": 26,
+                "high_c": 32,
+            },
+            {
+                "date": "2026-08-03",
+                "weekday": 1,
+                "day_weather": "多云",
+                "night_weather": "多云",
+                "low_c": 27,
+                "high_c": 33,
+            },
+            {
+                "date": "2026-07-31",
+                "weekday": 5,
+                "day_weather": "晴",
+                "night_weather": "晴",
+                "low_c": 28,
+                "high_c": 35,
+            },
         ],
         "limitations": [],
     }

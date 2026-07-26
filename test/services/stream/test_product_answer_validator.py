@@ -322,6 +322,179 @@ class ProductAnswerValidatorTests(unittest.TestCase):
             with self.subTest(answer=answer):
                 self.assertEqual(validate_product_answer(answer, [_weather_block()]).is_valid, expected)
 
+    def test_weather_forecast_coverage_limits_allow_unknown_dates_without_allowing_claims(self):
+        cases = (
+            ("当前预报只覆盖7月23日至7月24日，未覆盖8月2日至8月4日。", True, "ok"),
+            ("当前预报仅覆盖7月23日至7月24日，未覆盖8月2日。", True, "ok"),
+            ("本次天气预报只返回7月23日至7月24日的数据，没有8月2日至8月4日的数据。", True, "ok"),
+            ("8月2日至8月4日不在当前天气预报覆盖范围内，建议临近日期后重试。", True, "ok"),
+            ("8月2日暂不在当前天气预报覆盖范围内。", True, "ok"),
+            ("8月2日的天气预报不在覆盖范围内。", True, "ok"),
+            ("8月2日的天气预报暂未覆盖。", True, "ok"),
+            ("8月2日天气为晴。", False, "weather_fact_mismatch"),
+            ("8月2日最高35℃。", False, "weather_fact_mismatch"),
+            ("当前天气预报未覆盖8月2日，但预计晴。", False, "weather_fact_mismatch"),
+            ("当前天气预报未覆盖8月2日，预计无雨。", False, "weather_fact_mismatch"),
+            ("当前天气预报未覆盖8月2日，届时不会降雨。", False, "weather_fact_mismatch"),
+            ("当前天气预报未覆盖8月2日，届时降水为0。", False, "weather_fact_mismatch"),
+            ("当前天气预报未覆盖8月2日，最高气温35。", False, "weather_fact_mismatch"),
+            ("当前天气预报未覆盖8月2日，建议携带雨具。", False, "weather_fact_mismatch"),
+            ("当前天气预报未覆盖8月2日，建议穿外套。", False, "weather_fact_mismatch"),
+            ("当前天气预报未覆盖8月2日，建议注意防晒。", False, "weather_fact_mismatch"),
+            ("当前天气预报未覆盖8月2日，出行风险需临近日期再评估。", False, "weather_fact_mismatch"),
+            ("8月2日航班查询数据未覆盖。", False, "weather_fact_mismatch"),
+            ("当前预报只覆盖7月20日至7月22日，未覆盖8月2日至8月4日。", False, "weather_fact_mismatch"),
+            ("当前预报只覆盖8月1日至8月2日，未覆盖8月3日。", False, "weather_fact_mismatch"),
+            ("当前预报只覆盖7月23日至7月25日，未覆盖8月2日。", False, "weather_fact_mismatch"),
+            ("当前预报未覆盖7月23日。", False, "weather_fact_mismatch"),
+            ("7月23日天气预报不在覆盖范围内。", False, "weather_fact_mismatch"),
+            ("当前预报未覆盖7月23日至7月24日。", False, "weather_fact_mismatch"),
+            ("当前预报未返回7月23日数据。", False, "weather_fact_mismatch"),
+            ("当前预报不包含7月23日数据。", False, "weather_fact_mismatch"),
+            ("当前预报没有返回7月23日数据。", False, "weather_fact_mismatch"),
+            ("当前预报没返回7月23日数据。", False, "weather_fact_mismatch"),
+            ("当前预报暂无7月23日数据。", False, "weather_fact_mismatch"),
+            ("本次天气预报只返回7月23日的数据。", False, "weather_fact_mismatch"),
+            ("本次天气预报仅包含7月23日数据。", False, "weather_fact_mismatch"),
+            ("本次天气预报仅有7月23日数据。", False, "weather_fact_mismatch"),
+            ("本次天气预报只提供7月23日数据。", False, "weather_fact_mismatch"),
+            ("本次天气预报只返回7月23日至7月24日的数据。", True, "ok"),
+            ("当前预报未返回8月2日数据。", True, "ok"),
+        )
+
+        for answer, expected, reason in cases:
+            with self.subTest(answer=answer):
+                validation = validate_product_answer(answer, [_weather_block()])
+                self.assertEqual(validation.is_valid, expected)
+                self.assertEqual(validation.reason_code, reason)
+
+    def test_weather_forecast_coverage_limit_is_retained_by_repair(self):
+        answer = "周五白天雷阵雨，最高31℃。当前预报未覆盖8月2日至8月4日。实时排队很少。"
+
+        repaired, reason = repair_unsupported_product_answer(answer, [_weather_block()])
+
+        self.assertEqual(reason, "ok")
+        self.assertIsNotNone(repaired)
+        self.assertIn("当前预报未覆盖8月2日至8月4日", repaired)
+
+    def test_weather_relative_dates_and_unknown_weekdays_are_scoped_before_fact_validation(self):
+        cases = (
+            ("今天白天多云，最高32℃。", True),
+            ("明天白天雷阵雨，最高31℃。", True),
+            ("明天白天多云。", False),
+            ("明天最高32℃。", False),
+            ("明天无雨。", False),
+            ("明天不会下雨。", False),
+            ("明天不下雨。", False),
+            ("明天没有雨。", False),
+            ("明天不会有雨。", False),
+            ("明天没有降水。", False),
+            ("明天无降水。", False),
+            ("明天不会有降水。", False),
+            ("明天最高气温32。", False),
+            ("明天气温最高32。", False),
+            ("明天最高32。", False),
+            ("明天风力8级。", False),
+            ("明天微风。", False),
+            ("明天风向西北。", False),
+            ("明天建议穿外套。", False),
+            ("明天建议加衣。", False),
+            ("明天注意保暖。", False),
+            ("今晚多云。", False),
+            ("明晚阵雨。", False),
+            ("今早雷阵雨。", False),
+            ("明早多云。", False),
+            ("今天早上阵雨。", False),
+            ("今天上午阵雨。", False),
+            ("明天下午多云。", False),
+            ("明天平均气温31。", False),
+            ("明天体感温度31。", False),
+            ("明天白天南风≤3级。", False),
+            ("后天建议携带雨具。", False),
+            ("周三白天南风≤3级。", False),
+        )
+
+        for answer, expected in cases:
+            with self.subTest(answer=answer):
+                self.assertEqual(validate_product_answer(answer, [_weather_block()]).is_valid, expected)
+
+        four_day_cases = (
+            ("大后天白天晴。", False),
+            ("明后天最高30℃。", False),
+        )
+        for answer, expected in four_day_cases:
+            with self.subTest(answer=answer):
+                self.assertEqual(
+                    validate_product_answer(answer, [_four_day_weather_block()]).is_valid,
+                    expected,
+                )
+
+    def test_weather_accepts_compact_two_day_summary_from_travel_models(self):
+        block = WeatherResultsBlock(
+            type="weather_results",
+            schema_version=1,
+            provider="amap",
+            status="degraded",
+            query="杭州",
+            resolved_location="杭州市",
+            day_count=2,
+            forecast_days=[
+                WeatherForecastDay(
+                    date=date(2026, 7, 29),
+                    weekday=3,
+                    day_weather="多云",
+                    night_weather="多云",
+                    high_c=38,
+                    low_c=28,
+                    day_wind_direction="东南",
+                    day_wind_power="1-3",
+                    night_wind_direction="东南",
+                    night_wind_power="1-3",
+                ),
+                WeatherForecastDay(
+                    date=date(2026, 7, 30),
+                    weekday=4,
+                    day_weather="小雨",
+                    night_weather="晴",
+                    high_c=39,
+                    low_c=29,
+                    day_wind_direction="东北",
+                    day_wind_power="1-3",
+                    night_wind_direction="东北",
+                    night_wind_power="1-3",
+                ),
+            ],
+            fetched_at=datetime(2026, 7, 27, 8, tzinfo=timezone.utc),
+            limitations=["天气预报按行政区提供，不代表具体建筑物"],
+        )
+
+        cases = (
+            ("7月29日杭州多云，28–38℃，30日白天小雨，29–39℃，晚上晴，建议带伞。", True),
+            (
+                "杭州7月29-30日天气情况\n"
+                "7月29日（周三）：全天多云，气温28~38℃，东南风1-3级。\n"
+                "7月30日（周四）：白天小雨，夜间转晴，气温29~39℃，东北风1-3级。",
+                True,
+            ),
+            ("7月29日杭州多云，28–38℃，30日白天晴，29–39℃。", False),
+            ("7月29日杭州多云，31日白天小雨。", False),
+            ("杭州7月29-31日天气情况。", False),
+            ("30日白天小雨，29–39℃。", False),
+        )
+
+        for answer, expected in cases:
+            with self.subTest(answer=answer):
+                self.assertEqual(validate_product_answer(answer, [block]).is_valid, expected)
+
+        unsafe_advice = (
+            "杭州7月29-30日天气情况：7月29日全天多云，气温28~38℃；"
+            "7月30日白天小雨、夜间转晴，气温29~39℃。两日体感闷热，注意防晒。"
+        )
+        self.assertEqual(
+            validate_product_answer(unsafe_advice, [block]).reason_code,
+            "unsupported_claim",
+        )
+
     def test_weather_unsupported_claim_skips_generic_repair_and_uses_grounded_fallback(self):
         answer = "周五白天雷阵雨。当前温度30℃。"
 

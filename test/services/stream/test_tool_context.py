@@ -1,6 +1,15 @@
 import unittest
+from datetime import datetime
 from unittest.mock import AsyncMock
+from zoneinfo import ZoneInfo
 
+from app.schemas.chat import (
+    FlightOption,
+    FlightResultsBlock,
+    TrainOption,
+    TrainResultsBlock,
+    TravelEndpoint,
+)
 from app.services.agent.context_broker import Geolocation, ResolvedContext
 from app.services.stream.agent_loop_state import AgentLoopState
 from app.services.stream.tool_context import ToolRuntimeContext, enrich_tool_runtime_context
@@ -25,6 +34,127 @@ class ToolContextResolutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(context.step_number, 1)
         self.assertIs(context.argument_repair_state, state.argument_repair_state)
+
+    def test_runtime_context_only_exposes_unique_trusted_travel_station_cities(self):
+        observed_at = datetime(2026, 7, 26, 8, tzinfo=ZoneInfo("Asia/Shanghai"))
+        flight_block = FlightResultsBlock(
+            type="flight_results",
+            schema_version=1,
+            provider="flyai",
+            status="success",
+            origin="深圳",
+            destination="上海",
+            departure_date="2026-08-02",
+            observed_at=observed_at,
+            result_count=2,
+            flights=[
+                FlightOption(
+                    option_id="flight-1",
+                    flight_no="CZ1001",
+                    departure=TravelEndpoint(
+                        city="深圳市",
+                        station_name="深圳宝安国际机场",
+                        scheduled_at=observed_at,
+                    ),
+                    arrival=TravelEndpoint(
+                        city="上海",
+                        station_name="浦东国际机场",
+                        scheduled_at=observed_at,
+                    ),
+                    duration_s=7_200,
+                    stops=0,
+                ),
+                FlightOption(
+                    option_id="flight-invalid-city",
+                    flight_no="CZ1002",
+                    departure=TravelEndpoint(
+                        city="深圳市",
+                        station_name="深圳宝安国际机场",
+                        scheduled_at=observed_at,
+                    ),
+                    arrival=TravelEndpoint(
+                        city="北京",
+                        station_name="浦东国际机场",
+                        scheduled_at=observed_at,
+                    ),
+                    duration_s=7_200,
+                    stops=0,
+                ),
+            ],
+        )
+        train_block = TrainResultsBlock(
+            type="train_results",
+            schema_version=1,
+            provider="flyai",
+            status="success",
+            origin="深圳",
+            destination="上海",
+            departure_date="2026-08-02",
+            observed_at=observed_at,
+            result_count=3,
+            trains=[
+                TrainOption(
+                    option_id="train-1",
+                    train_no="G1001",
+                    departure=TravelEndpoint(
+                        city="深圳市",
+                        station_name="深圳北站",
+                        scheduled_at=observed_at,
+                    ),
+                    arrival=TravelEndpoint(
+                        city="上海市",
+                        station_name="上海虹桥站",
+                        scheduled_at=observed_at,
+                    ),
+                    duration_s=28_800,
+                    stops=0,
+                ),
+                TrainOption(
+                    option_id="train-2",
+                    train_no="G1002",
+                    departure=TravelEndpoint(
+                        city="深圳市",
+                        station_name="同名站",
+                        scheduled_at=observed_at,
+                    ),
+                    arrival=TravelEndpoint(
+                        city="上海",
+                        station_name="同名站",
+                        scheduled_at=observed_at,
+                    ),
+                    duration_s=3_600,
+                    stops=0,
+                ),
+                TrainOption(
+                    option_id="train-3",
+                    train_no="G1003",
+                    departure=TravelEndpoint(
+                        city="深圳",
+                        station_name="深圳东站",
+                        scheduled_at=observed_at,
+                    ),
+                    arrival=TravelEndpoint(
+                        city="上海",
+                        station_name="上海虹桥站",
+                        scheduled_at=observed_at,
+                    ),
+                    duration_s=3_600,
+                    stops=0,
+                ),
+            ],
+        )
+        state = AgentLoopState(content_blocks=[flight_block, train_block])
+
+        context = enrich_tool_runtime_context(
+            ToolRuntimeContext(),
+            messages=[],
+            state=state,
+            step_number=2,
+        )
+
+        self.assertEqual(context.route_city_hints["浦东国际机场"], ("上海",))
+        self.assertEqual(context.route_city_hints["上海虹桥站"], ("上海",))
+        self.assertNotIn("同名站", context.route_city_hints)
 
     async def test_current_location_weather_requests_local_weather_context(self):
         from app.services.stream.tool_context import resolve_tool_context

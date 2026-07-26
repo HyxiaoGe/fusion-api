@@ -166,6 +166,12 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 stack.enter_context(
                     patch("app.services.stream.tool_executor.append_chunk", side_effect=_capture_append)
                 )
+                stack.enter_context(
+                    patch(
+                        "app.services.stream.agent_loop_round_outcome.append_chunk",
+                        side_effect=_capture_append,
+                    )
+                )
                 stack.enter_context(patch("app.services.stream.runner.finalize_stream", side_effect=_capture_finalize))
             stack.enter_context(patch("app.services.stream.runner.persist_message", side_effect=_capture_persist))
             stack.enter_context(
@@ -515,6 +521,213 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(first_context.argument_repair_state, second_context.argument_repair_state)
         self.assertEqual(result.session_status_calls[-1]["total_tool_calls"], 2)
         self.assertIn("argument_repair_required", str(result.llm_calls[1]["messages"]))
+
+    async def test_runtime_argument_repair_allows_only_one_failed_retry_in_same_run(self):
+        alias = "route_compare"
+        definition = {
+            "type": "function",
+            "function": {
+                "name": alias,
+                "description": "路线比较",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "origin": {"type": "string"},
+                        "origin_city": {"type": "string"},
+                        "destination": {"type": "string"},
+                    },
+                    "required": ["origin", "destination"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+        class RuntimeRepairHandler:
+            tool_name = alias
+            supports_automatic_retry = False
+
+            def __init__(self):
+                self.calls = []
+
+            def build_runtime_argument_repair(self, args, _runtime_context):
+                if "origin_city" in args:
+                    return None
+                return {
+                    "error_code": "route_city_required",
+                    "required_fields": ["origin_city"],
+                    "allowed_values": {"origin_city": ["上海市"]},
+                }
+
+            async def execute_with_runtime_context(self, args, runtime_context):
+                self.calls.append((dict(args), runtime_context))
+                return ToolResult(status="failed", data={"error_code": "invalid_response"})
+
+            async def log(self, **_kwargs):
+                return None
+
+            def _build_result_summary(self, result):
+                return {"kind": "external_tool", "title": "路线比较", "truncated": False}
+
+            def format_llm_context(self, result, *, citation_numbers=None):
+                return "路线工具未取得可用结果"
+
+            def build_content_block(self, result, block_id, log_id):
+                return None
+
+        handler = RuntimeRepairHandler()
+        base_arguments = {"origin": "上海浦东国际机场", "destination": "外滩"}
+        repaired_arguments = {**base_arguments, "origin_city": "上海市"}
+        result = await self._run_agent_contract(
+            rounds=[
+                (
+                    "",
+                    "",
+                    [{"id": "tc-route-1", "name": alias, "arguments": json.dumps(base_arguments)}],
+                    "tool_calls",
+                    None,
+                ),
+                (
+                    "",
+                    "",
+                    [{"id": "tc-route-2", "name": alias, "arguments": json.dumps(repaired_arguments)}],
+                    "tool_calls",
+                    None,
+                ),
+                (
+                    "",
+                    "",
+                    [{"id": "tc-route-3", "name": alias, "arguments": json.dumps(repaired_arguments)}],
+                    "tool_calls",
+                    None,
+                ),
+                ("", "本次未取得接驳路线。", [], "stop", None),
+            ],
+            use_real_tool_executor=True,
+            dynamic_tool_set=SimpleNamespace(
+                definitions=[definition],
+                handlers={alias: handler},
+                audit_bindings=[],
+            ),
+            capabilities={"functionCalling": True, "agentTools": True, "searchCapable": False},
+            user_message="查询上海浦东国际机场到外滩的路线",
+        )
+
+        self.assertEqual(len(handler.calls), 1)
+        self.assertEqual(handler.calls[0][0], repaired_arguments)
+        self.assertIn("上海市", str(result.llm_calls[1]["messages"]))
+        self.assertIn("argument_repair_exhausted", str(result.llm_calls[3]["messages"]))
+        self.assertEqual(result.session_status_calls[-1]["total_tool_calls"], 1)
+
+    async def test_runtime_argument_repair_rejects_changed_route_before_remote_call(self):
+        alias = "route_compare"
+        definition = {
+            "type": "function",
+            "function": {
+                "name": alias,
+                "description": "路线比较",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "origin": {"type": "string"},
+                        "origin_city": {"type": "string"},
+                        "destination": {"type": "string"},
+                    },
+                    "required": ["origin", "destination"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+        class RuntimeRepairHandler:
+            tool_name = alias
+            supports_automatic_retry = False
+
+            def __init__(self):
+                self.calls = []
+
+            def build_runtime_argument_repair(self, args, _runtime_context):
+                if "origin_city" in args:
+                    return None
+                return {
+                    "error_code": "route_city_required",
+                    "required_fields": ["origin_city"],
+                    "allowed_values": {"origin_city": ["上海市"]},
+                }
+
+            async def execute_with_runtime_context(self, args, runtime_context):
+                self.calls.append((dict(args), runtime_context))
+                return ToolResult(status="success", data={"routes": []})
+
+            async def log(self, **_kwargs):
+                return None
+
+            def _build_result_summary(self, result):
+                return {"kind": "external_tool", "title": "路线比较", "truncated": False}
+
+            def format_llm_context(self, result, *, citation_numbers=None):
+                return "路线工具结果"
+
+            def build_content_block(self, result, block_id, log_id):
+                return None
+
+        handler = RuntimeRepairHandler()
+        result = await self._run_agent_contract(
+            rounds=[
+                (
+                    "",
+                    "",
+                    [
+                        {
+                            "id": "tc-route-constraint-1",
+                            "name": alias,
+                            "arguments": json.dumps(
+                                {
+                                    "origin": "上海浦东国际机场",
+                                    "destination": "外滩",
+                                }
+                            ),
+                        }
+                    ],
+                    "tool_calls",
+                    None,
+                ),
+                (
+                    "",
+                    "",
+                    [
+                        {
+                            "id": "tc-route-constraint-2",
+                            "name": alias,
+                            "arguments": json.dumps(
+                                {
+                                    "origin": "上海浦东国际机场",
+                                    "origin_city": "上海市",
+                                    "destination": "迪士尼",
+                                }
+                            ),
+                        }
+                    ],
+                    "tool_calls",
+                    None,
+                ),
+                ("", "没有执行被替换的路线。", [], "stop", None),
+            ],
+            use_real_tool_executor=True,
+            dynamic_tool_set=SimpleNamespace(
+                definitions=[definition],
+                handlers={alias: handler},
+                audit_bindings=[],
+            ),
+            capabilities={"functionCalling": True, "agentTools": True, "searchCapable": False},
+            user_message="查询上海浦东国际机场到外滩的路线",
+        )
+
+        self.assertEqual(handler.calls, [])
+        self.assertIn(
+            "argument_repair_constraint_violation",
+            str(result.llm_calls[2]["messages"]),
+        )
+        self.assertEqual(result.session_status_calls[-1]["total_tool_calls"], 0)
 
     async def test_exhausted_mcp_server_tools_are_hidden_from_next_llm_round(self):
         class SharedServerBudget:

@@ -1856,6 +1856,87 @@ class AmapLocalPlaceSearchTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
+    def test_trusted_station_city_requires_one_structured_argument_repair_before_remote_call(self):
+        handler, _ = build_handler("route_compare", {})
+        context = ToolRuntimeContext(
+            route_city_hints={
+                "浦东国际机场": ("上海",),
+            }
+        )
+
+        repair = handler.build_runtime_argument_repair(
+            route_compare_args(
+                {
+                    "origin": "浦东国际机场",
+                    "destination": "外滩",
+                    "modes": ["transit"],
+                }
+            ),
+            context,
+        )
+
+        self.assertEqual(
+            repair,
+            {
+                "error_code": "route_city_required",
+                "required_fields": ["origin_city"],
+                "allowed_values": {"origin_city": ["上海"]},
+            },
+        )
+        self.assertIsNone(
+            handler.build_runtime_argument_repair(
+                route_compare_args(
+                    {
+                        "origin": "浦东国际机场",
+                        "origin_city": "上海市",
+                        "destination": "外滩",
+                        "modes": ["transit"],
+                    }
+                ),
+                context,
+            )
+        )
+        self.assertEqual(
+            handler.build_runtime_argument_repair(
+                route_compare_args(
+                    {
+                        "origin": "浦东国际机场",
+                        "origin_city": "北京",
+                        "destination": "外滩",
+                        "modes": ["transit"],
+                    }
+                ),
+                context,
+            ),
+            {
+                "error_code": "route_city_mismatch",
+                "required_fields": ["origin_city"],
+                "allowed_values": {"origin_city": ["上海"]},
+            },
+        )
+
+    def test_trusted_station_city_repair_does_not_guess_for_partial_or_conflicting_matches(self):
+        handler, _ = build_handler("route_compare", {})
+        args = route_compare_args(
+            {
+                "origin": "浦东机场",
+                "destination": "外滩",
+                "modes": ["transit"],
+            }
+        )
+
+        self.assertIsNone(
+            handler.build_runtime_argument_repair(
+                args,
+                ToolRuntimeContext(
+                    route_city_hints={
+                        "上海浦东国际机场": ("上海市",),
+                        "浦东机场": ("上海市", "其他城市"),
+                    }
+                ),
+            )
+        )
+
     async def test_route_sources_and_modes_are_required_and_sources_must_match_endpoints(self):
         for args in (
             {
@@ -2295,6 +2376,86 @@ class AmapRouteCompareTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(route["mode"], "transit")
         self.assertEqual(route["transit_type"], "subway")
         self.assertEqual(route["legs"][0]["line_name"], "地铁5号线(环中线)")
+
+    async def test_city_scoped_poi_coordinates_preserve_weather_and_two_route_mode_budget(self):
+        handler, executor = build_handler(
+            "route_compare",
+            {
+                "maps_geo": [
+                    mcp_payload({"geocodes": []}),
+                    mcp_payload({"geocodes": []}),
+                ],
+                "maps_text_search": [
+                    mcp_payload(
+                        {
+                            "pois": [
+                                {
+                                    "id": "pvg",
+                                    "name": "上海浦东国际机场",
+                                    "location": "121.805,31.143",
+                                    "cityname": "上海市",
+                                }
+                            ]
+                        }
+                    ),
+                    mcp_payload(
+                        {
+                            "pois": [
+                                {
+                                    "id": "bund",
+                                    "name": "外滩",
+                                    "location": "121.490,31.241",
+                                    "cityname": "上海市",
+                                }
+                            ]
+                        }
+                    ),
+                ],
+                "maps_direction_transit_integrated": [
+                    mcp_payload(
+                        {
+                            "route": {
+                                "transits": [
+                                    {
+                                        "duration": "4200",
+                                        "walking_distance": "700",
+                                        "segments": [],
+                                    }
+                                ]
+                            }
+                        }
+                    )
+                ],
+                "maps_direction_driving": [mcp_payload({"paths": [{"distance": "46000", "duration": "3300"}]})],
+            },
+            remaining_budget=6,
+        )
+
+        result = await handler.execute(
+            route_compare_args(
+                {
+                    "origin": "浦东国际机场",
+                    "origin_city": "上海",
+                    "destination": "外滩",
+                    "destination_city": "上海",
+                    "modes": ["transit", "driving"],
+                }
+            )
+        )
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual(
+            [call[0] for call in executor.calls],
+            [
+                "maps_geo",
+                "maps_text_search",
+                "maps_geo",
+                "maps_text_search",
+                "maps_direction_transit_integrated",
+                "maps_direction_driving",
+            ],
+        )
+        self.assertNotIn("maps_search_detail", [call[0] for call in executor.calls])
 
     async def test_origin_without_city_falls_back_to_global_poi_detail(self):
         handler, executor = build_handler(

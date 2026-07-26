@@ -85,6 +85,7 @@ async def collect_agent_round_stream(
     conversation_id: str,
     task_id: str,
     run_id: str,
+    provider: str | None = None,
     litellm_model: str,
     litellm_kwargs: dict,
     messages: list[dict],
@@ -105,6 +106,8 @@ async def collect_agent_round_stream(
     if observation is not None:
         response = observation.wrap_response(response)
     stream_kwargs = {"run_id": run_id, "step_id": step_context.step_id}
+    if provider is not None and _accepts_keyword(stream_round_fn, "provider"):
+        stream_kwargs["provider"] = provider
     if defer_output and _accepts_keyword(stream_round_fn, "defer_output"):
         stream_kwargs["defer_output"] = True
     return await stream_round_fn(
@@ -224,6 +227,7 @@ async def run_agent_round(
             conversation_id=conversation_id,
             task_id=task_id,
             run_id=run_id,
+            provider=provider,
             litellm_model=litellm_model,
             litellm_kwargs=litellm_kwargs,
             messages=effective_messages,

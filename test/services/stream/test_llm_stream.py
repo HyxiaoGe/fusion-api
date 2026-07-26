@@ -257,6 +257,237 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(emitted_reasoning, outcome.reasoning_buf)
         self.assertEqual(emitted_reasoning.count("工具来获取路线信息"), 1)
 
+    async def test_consume_stream_round_merges_cumulative_reasoning_snapshots_once(self):
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-reasoning-snapshot",
+            task_id="task-reasoning-snapshot",
+            should_use_reasoning=True,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+            provider="moonshot",
+        )
+        append_chunk = AsyncMock()
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            outcome = await llm_stream_module.consume_stream_round(
+                async_response(
+                    [
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content="先核对用户提供的出发日期"),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content="先核对用户提供的出发日期和目的地"),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(
+                                content=None,
+                                reasoning_content="先核对用户提供的出发日期和目的地，再查询天气",
+                            ),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(
+                                content=None,
+                                reasoning_content="先核对用户提供的出发日期和目的地，再查询天气并比较路线。",
+                            ),
+                            finish_reason="stop",
+                        ),
+                    ]
+                ),
+                request,
+            )
+
+        emitted_reasoning = "".join(
+            call.args[2] for call in append_chunk.await_args_list if call.args[1] == "reasoning"
+        )
+        expected = "先核对用户提供的出发日期和目的地，再查询天气并比较路线。"
+        self.assertEqual(outcome.raw_reasoning_buf, expected)
+        self.assertEqual(outcome.reasoning_buf, expected)
+        self.assertEqual(emitted_reasoning, outcome.reasoning_buf)
+
+    async def test_consume_stream_round_keeps_standard_reasoning_deltas_even_when_one_extends_previous(self):
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-standard-reasoning-delta",
+            task_id="task-standard-reasoning-delta",
+            should_use_reasoning=True,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+            provider="openai",
+        )
+        append_chunk = AsyncMock()
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            outcome = await llm_stream_module.consume_stream_round(
+                async_response(
+                    [
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content="哈"),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content="哈哈"),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content="。"),
+                            finish_reason="stop",
+                        ),
+                    ]
+                ),
+                request,
+            )
+
+        emitted_reasoning = "".join(
+            call.args[2] for call in append_chunk.await_args_list if call.args[1] == "reasoning"
+        )
+        self.assertEqual(outcome.raw_reasoning_buf, "哈哈哈。")
+        self.assertEqual(outcome.reasoning_buf, "哈哈哈。")
+        self.assertEqual(emitted_reasoning, outcome.reasoning_buf)
+
+    async def test_consume_stream_round_falls_back_to_moonshot_deltas_after_prefix_like_probe(self):
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-moonshot-delta",
+            task_id="task-moonshot-delta",
+            should_use_reasoning=True,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+            provider="moonshot",
+        )
+        append_chunk = AsyncMock()
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            outcome = await llm_stream_module.consume_stream_round(
+                async_response(
+                    [
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content="用户"),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content="用户在"),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content="检查行程约束"),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content="。"),
+                            finish_reason="stop",
+                        ),
+                    ]
+                ),
+                request,
+            )
+
+        emitted_reasoning = "".join(
+            call.args[2] for call in append_chunk.await_args_list if call.args[1] == "reasoning"
+        )
+        self.assertEqual(outcome.raw_reasoning_buf, "用户用户在检查行程约束。")
+        self.assertEqual(outcome.reasoning_buf, outcome.raw_reasoning_buf)
+        self.assertEqual(emitted_reasoning, outcome.reasoning_buf)
+
+    async def test_consume_stream_round_deduplicates_repeated_moonshot_reasoning_snapshots(self):
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-repeated-reasoning-snapshot",
+            task_id="task-repeated-reasoning-snapshot",
+            should_use_reasoning=True,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+            provider="moonshot",
+        )
+        append_chunk = AsyncMock()
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            outcome = await llm_stream_module.consume_stream_round(
+                async_response(
+                    [
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content="准备调用 route_compare"),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content="准备调用 route_compare"),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content="准备调用 route_compare 工具"),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content="准备调用 route_compare 工具。"),
+                            finish_reason="stop",
+                        ),
+                    ]
+                ),
+                request,
+            )
+
+        emitted_reasoning = "".join(
+            call.args[2] for call in append_chunk.await_args_list if call.args[1] == "reasoning"
+        )
+        self.assertEqual(outcome.raw_reasoning_buf, "准备调用 route_compare 工具。")
+        self.assertEqual(outcome.reasoning_buf, "准备调用路线比较工具。")
+        self.assertEqual(emitted_reasoning, outcome.reasoning_buf)
+        self.assertNotIn("route_compare", emitted_reasoning)
+
+    async def test_consume_stream_round_keeps_latest_moonshot_snapshot_without_appending_revision_tail(self):
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-revised-reasoning-snapshot",
+            task_id="task-revised-reasoning-snapshot",
+            should_use_reasoning=True,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+            provider="moonshot",
+        )
+        append_chunk = AsyncMock()
+        snapshots = [
+            "a" * 20,
+            "a" * 40 + "x",
+            "a" * 40 + "yz",
+            "a" * 40 + "yz!",
+            "a" * 40 + "zz!",
+        ]
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            outcome = await llm_stream_module.consume_stream_round(
+                async_response(
+                    [
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content=snapshot),
+                            finish_reason="stop" if index == len(snapshots) - 1 else None,
+                        )
+                        for index, snapshot in enumerate(snapshots)
+                    ]
+                ),
+                request,
+            )
+
+        emitted_reasoning = "".join(
+            call.args[2] for call in append_chunk.await_args_list if call.args[1] == "reasoning"
+        )
+        self.assertEqual(outcome.raw_reasoning_buf, snapshots[-1])
+        self.assertEqual(outcome.reasoning_buf, snapshots[-2])
+        self.assertEqual(emitted_reasoning, outcome.reasoning_buf)
+        self.assertNotIn("zz", emitted_reasoning)
+
     async def test_consume_stream_round_hides_weather_tool_name_in_reasoning(self):
         request = llm_stream_module.LLMStreamRequest(
             conversation_id="conv-weather-tool",

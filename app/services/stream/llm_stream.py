@@ -83,6 +83,8 @@ _DSML_PARAMETER_RE = re.compile(
     r"</｜｜DSML｜｜parameter>",
     re.DOTALL | re.IGNORECASE,
 )
+_REASONING_SNAPSHOT_PROBE_CHUNKS = 4
+_REASONING_SNAPSHOT_MIN_LENGTH = 16
 
 
 @dataclass(frozen=True)
@@ -92,6 +94,7 @@ class LLMStreamRequest:
     should_use_reasoning: bool
     thinking_block_id: str
     text_block_id: str
+    provider: Optional[str] = None
     run_id: Optional[str] = None
     step_id: Optional[str] = None
     defer_output: bool = False
@@ -107,6 +110,9 @@ class LLMStreamState:
     chunk_count: int = 0
     finish_reason: str = "stop"
     tool_calls_acc: dict[int, dict] = field(default_factory=dict)
+    reasoning_transport_mode: str = "probing"
+    reasoning_probe_chunks: list[str] = field(default_factory=list)
+    reasoning_snapshot_revision_logged: bool = False
 
 
 @dataclass(frozen=True)
@@ -307,13 +313,90 @@ def _visible_delta(visible_text: str, emitted_text: str, *, channel: str) -> str
     if visible_text.startswith(emitted_text):
         return visible_text[len(emitted_text) :]
 
-    common_prefix_length = 0
-    for left, right in zip(visible_text, emitted_text):
-        if left != right:
+    logger.warning(f"{channel} 内容过滤出现非单调输出，已忽略不可追加部分")
+    return ""
+
+
+def _uses_cumulative_reasoning_snapshots(provider: str | None) -> bool:
+    """仅 Moonshot reasoning_content 进入有限探测，其它提供商遵循标准 delta。"""
+
+    return bool(provider and provider.strip().lower() == "moonshot")
+
+
+def _common_prefix_length(left: str, right: str) -> int:
+    length = 0
+    for left_char, right_char in zip(left, right):
+        if left_char != right_char:
             break
-        common_prefix_length += 1
-    logger.warning(f"{channel} 内容过滤出现非单调输出，已保留可追加部分")
-    return visible_text[common_prefix_length:]
+        length += 1
+    return length
+
+
+def _looks_like_reasoning_snapshot_transition(previous: str, incoming: str) -> bool:
+    if not previous or not incoming:
+        return False
+    if incoming == previous or incoming.startswith(previous):
+        return True
+
+    shorter_length = min(len(previous), len(incoming))
+    if shorter_length < _REASONING_SNAPSHOT_MIN_LENGTH:
+        return False
+    return _common_prefix_length(previous, incoming) / shorter_length >= 0.8
+
+
+def _resolve_reasoning_probe(state: LLMStreamState, *, final: bool = False) -> None:
+    chunks = state.reasoning_probe_chunks
+    if not chunks:
+        return
+
+    transitions_are_snapshots = len(chunks) >= 2 and all(
+        _looks_like_reasoning_snapshot_transition(previous, incoming) for previous, incoming in zip(chunks, chunks[1:])
+    )
+    enough_snapshot_evidence = (
+        transitions_are_snapshots
+        and len(chunks) >= (_REASONING_SNAPSHOT_PROBE_CHUNKS if not final else 3)
+        and len(chunks[-1]) >= _REASONING_SNAPSHOT_MIN_LENGTH
+    )
+    if enough_snapshot_evidence:
+        state.reasoning_transport_mode = "snapshot"
+        state.raw_reasoning_buf = chunks[-1]
+    else:
+        state.reasoning_transport_mode = "delta"
+        state.raw_reasoning_buf = "".join(chunks)
+    chunks.clear()
+
+
+def _merge_reasoning_delta(
+    state: LLMStreamState,
+    incoming: str,
+    *,
+    provider: str | None,
+) -> None:
+    if not _uses_cumulative_reasoning_snapshots(provider):
+        state.reasoning_transport_mode = "delta"
+        state.raw_reasoning_buf += incoming
+        return
+
+    if state.reasoning_transport_mode == "delta":
+        state.raw_reasoning_buf += incoming
+        return
+    if state.reasoning_transport_mode == "snapshot":
+        if (
+            state.raw_reasoning_buf
+            and not incoming.startswith(state.raw_reasoning_buf)
+            and not state.reasoning_snapshot_revision_logged
+        ):
+            logger.warning("reasoning 累计快照发生修订，已更新原文并保持已发送内容单调")
+            state.reasoning_snapshot_revision_logged = True
+        state.raw_reasoning_buf = incoming
+        return
+
+    state.reasoning_probe_chunks.append(incoming)
+    chunks = state.reasoning_probe_chunks
+    if len(chunks) >= 2 and not _looks_like_reasoning_snapshot_transition(chunks[-2], chunks[-1]):
+        _resolve_reasoning_probe(state)
+    elif len(chunks) >= _REASONING_SNAPSHOT_PROBE_CHUNKS:
+        _resolve_reasoning_probe(state)
 
 
 def _pending_dsml_tool_protocol_start(text: str) -> int | None:
@@ -390,15 +473,22 @@ def filter_reasoning_tag_content_delta(state: LLMStreamState, content_delta: str
     return _visible_delta(visible_content, state.content_buf, channel="answering")
 
 
-def filter_internal_mcp_reasoning_delta(state: LLMStreamState, reasoning_delta: str) -> str:
+def filter_internal_mcp_reasoning_delta(
+    state: LLMStreamState,
+    reasoning_delta: str,
+    *,
+    provider: str | None,
+) -> str:
     if not reasoning_delta:
         return ""
-    state.raw_reasoning_buf += reasoning_delta
+    _merge_reasoning_delta(state, reasoning_delta, provider=provider)
     visible_reasoning = sanitize_internal_tool_names(state.raw_reasoning_buf)
     return _visible_delta(visible_reasoning, state.reasoning_buf, channel="reasoning")
 
 
 async def flush_pending_internal_mcp_aliases(*, request: LLMStreamRequest, state: LLMStreamState) -> None:
+    if state.reasoning_transport_mode == "probing":
+        _resolve_reasoning_probe(state, final=True)
     final_reasoning = sanitize_internal_tool_names(state.raw_reasoning_buf, final=True)
     final_content = strip_reasoning_tag_blocks(state.raw_content_buf)
     final_content = strip_pending_dsml_tool_protocol(final_content)
@@ -485,7 +575,11 @@ async def process_stream_choice(*, request: LLMStreamRequest, state: LLMStreamSt
 
     raw_reasoning_delta = extract_reasoning_delta(delta, request.should_use_reasoning)
     content_delta = extract_content_delta(delta, raw_reasoning_delta)
-    reasoning_delta = filter_internal_mcp_reasoning_delta(state, raw_reasoning_delta)
+    reasoning_delta = filter_internal_mcp_reasoning_delta(
+        state,
+        raw_reasoning_delta,
+        provider=request.provider,
+    )
     content_delta = filter_reasoning_tag_content_delta(state, content_delta)
     await append_reasoning_and_content(
         request=request,
@@ -571,6 +665,7 @@ async def stream_round(
     should_use_reasoning: bool,
     thinking_block_id: str,
     text_block_id: str,
+    provider: Optional[str] = None,
     run_id: Optional[str] = None,
     step_id: Optional[str] = None,
     defer_output: bool = False,
@@ -591,6 +686,7 @@ async def stream_round(
             should_use_reasoning=should_use_reasoning,
             thinking_block_id=thinking_block_id,
             text_block_id=text_block_id,
+            provider=provider,
             run_id=run_id,
             step_id=step_id,
             defer_output=defer_output,
