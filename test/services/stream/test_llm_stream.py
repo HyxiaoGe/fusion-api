@@ -257,6 +257,60 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(emitted_reasoning, outcome.reasoning_buf)
         self.assertEqual(emitted_reasoning.count("工具来获取路线信息"), 1)
 
+    async def test_consume_stream_round_hides_weather_tool_name_in_reasoning(self):
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-weather-tool",
+            task_id="task-weather-tool",
+            should_use_reasoning=True,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+        )
+        append_chunk = AsyncMock()
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            outcome = await llm_stream_module.consume_stream_round(
+                async_response(
+                    [
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content="需要调用"),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content="weather"),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content="_"),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content="fore"),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content="cast"),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content="工具查询天气。"),
+                            finish_reason="stop",
+                        ),
+                    ]
+                ),
+                request,
+            )
+
+        emitted_reasoning = "".join(
+            call.args[2] for call in append_chunk.await_args_list if call.args[1] == "reasoning"
+        )
+        self.assertEqual(outcome.reasoning_buf, "需要调用天气查询工具查询天气。")
+        self.assertEqual(emitted_reasoning, outcome.reasoning_buf)
+        self.assertNotIn("weather_forecast", emitted_reasoning)
+        self.assertNotIn("weather_fore", emitted_reasoning)
+
     async def test_consume_stream_round_hides_mixed_prefix_dsml_without_executing_ambiguous_protocol(self):
         request = llm_stream_module.LLMStreamRequest(
             conversation_id="conv-1",

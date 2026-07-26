@@ -114,10 +114,45 @@ class FlyAiTravelToolTests(unittest.IsolatedAsyncioTestCase):
                 parameters["properties"]["sort_by"]["enum"],
                 list(("recommended", "price_asc", "duration_asc", "departure_asc")),
             )
+            self.assertEqual(parameters["properties"]["arrival_before_hour"]["maximum"], 24)
         self.assertIn("cabin_class", by_name[FLYAI_SEARCH_FLIGHTS]["properties"])
         self.assertNotIn("seat_class", by_name[FLYAI_SEARCH_FLIGHTS]["properties"])
         self.assertIn("seat_class", by_name[FLYAI_SEARCH_TRAINS]["properties"])
         self.assertNotIn("cabin_class", by_name[FLYAI_SEARCH_TRAINS]["properties"])
+
+    async def test_arrival_deadline_is_filtered_locally_and_not_forwarded_to_adapter(self):
+        captured: dict = {}
+
+        async def respond(request: httpx.Request) -> httpx.Response:
+            adapter_request = json.loads(request.content)
+            captured["request"] = adapter_request
+            payload = _adapter_payload(transport_no="G100", request=adapter_request)
+            late_item = json.loads(json.dumps(payload["items"][0]))
+            late_item["transport_no"] = "G200"
+            late_item["departure"]["scheduled_at"] = "2026-08-01T10:00:00+08:00"
+            late_item["arrival"]["scheduled_at"] = "2026-08-01T12:30:00+08:00"
+            next_day_item = json.loads(json.dumps(payload["items"][0]))
+            next_day_item["transport_no"] = "G300"
+            next_day_item["departure"]["scheduled_at"] = "2026-08-01T23:00:00+08:00"
+            next_day_item["arrival"]["scheduled_at"] = "2026-08-02T08:00:00+08:00"
+            payload["items"] = [payload["items"][0], late_item, next_day_item]
+            return httpx.Response(200, json=payload)
+
+        handler = _handler(FLYAI_SEARCH_TRAINS, httpx.MockTransport(respond))
+        result = await handler.execute(
+            {
+                "origin": "深圳",
+                "destination": "上海",
+                "departure_date": "2026-08-01",
+                "departure_hour_start": 7,
+                "arrival_before_hour": 12,
+            }
+        )
+
+        self.assertEqual(result.status, "success")
+        self.assertNotIn("arrival_before_hour", captured["request"])
+        self.assertEqual(captured["request"]["sort_by"], "departure_asc")
+        self.assertEqual([item["transport_no"] for item in result.data["result"]["items"]], ["G100"])
 
     async def test_flight_success_projects_safe_fields_and_trusted_booking_action(self):
         captured: dict = {}
@@ -556,18 +591,10 @@ class FlyAiTravelToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("如果优先考虑本次返回的计划行程时长，可优先考虑航班CZ2002", mapped_comparison)
         self.assertNotIn("计划行程时长，可优先考虑航班CZ1001", mapped_comparison)
         self.assertIn("如果预算优先，可考虑高铁G100", mapped_comparison)
-        self.assertTrue(
-            validate_product_answer(mapped_comparison, [multi_flight_block, cheaper_train_block]).is_valid
-        )
+        self.assertTrue(validate_product_answer(mapped_comparison, [multi_flight_block, cheaper_train_block]).is_valid)
 
         faster_train_block = cheaper_train_block.model_copy(
-            update={
-                "trains": [
-                    cheaper_train_block.trains[0].model_copy(
-                        update={"duration_s": 45 * 60}
-                    )
-                ]
-            }
+            update={"trains": [cheaper_train_block.trains[0].model_copy(update={"duration_s": 45 * 60})]}
         )
         cross_mode_comparison = build_grounded_product_answer([multi_flight_block, faster_train_block])
         self.assertIn("如果优先考虑本次返回的计划行程时长，可优先考虑高铁G100", cross_mode_comparison)

@@ -130,16 +130,32 @@ _PRODUCT_FINAL_ANSWER_CONTRACT = (
     "- 正文应补充卡片的决策价值，不要只把卡片字段机械串成一句话。\n"
 )
 AMAP_FACT_BOUNDARY_SYSTEM_PROMPT = """【地点与路线工具选择规则】
-- 用户要求规划或比较两个自然语言起终点之间的路线时，直接调用 route_compare；城市字段可选，route_compare 会自行解析地点并做同城消歧，不要先调用 web_search 或 local_place_search 猜测城市或解析端点。
+- 用户要求规划或比较两个自然语言起终点之间的路线时，直接调用 route_compare；上下文没有可靠城市时
+  城市字段可选，route_compare 会自行解析地点并做同城消歧；上下文已有用户明确城市或结构化结果的
+  city 时必须显式传入，不要先调用 web_search 或 local_place_search 猜测城市或解析端点。
 - 用户把“当前位置”作为路线起点或终点时，仍直接调用 route_compare，并把对应 source 设置为 source=current_location；不要向用户索要或自行生成坐标，系统会在需要时申请浏览器定位。
 - local_place_search、route_compare 和 weather_forecast 的位置来源字段必须每次显式传入；route_compare 的 modes 也必须显式传入，不得依赖后端默认值。
 - 仅当用户明确指定日期、工作日、周末或具体出发时间时，才把原始自然语言时间传入 requested_departure_time；未指定时必须省略，不得默认填写“现在”。该字段只记录查询意图，不代表地图服务按该时刻计算。
 - local_place_search 只用于搜索、筛选或推荐地点，不是 route_compare 的前置步骤。
 - 用户询问指定地点或当前位置的天气预报时调用 weather_forecast；当前位置使用
   location_source=current_location，系统会在需要时申请浏览器定位，不得生成或复述坐标。
+- 用户在组合行程中同时要求目的地天气时，只要地点和日期意图已经明确，就必须调用 weather_forecast；
+  不得用 web_search 或 url_read 替代结构化天气查询。天气日期超出预报窗口时，
+  仍调用 weather_forecast 并基于返回的覆盖状态如实说明，不得改用普通搜索猜测远期天气。
+- 用户在组合行程中要求目的地市内接驳时，先完成航班或高铁查询，再从实际返回且符合用户偏好的
+  班次中选择一个到达机场或车站；下一轮以该结果的完整 station_name 为起点、用户明确给出的市内
+  地点为终点，只调用一次 route_compare，并显式传入需要比较的 modes；必须把班次结果中的 city
+  同时作为 origin_city 和 destination_city 传入。预算优先时使用本次返回中参考价最低的可用班次，
+  时间优先时使用计划时长最短的可用班次；不得猜测机场或车站，不得同时为多个候选分别调用接驳路线。
+  未取得可用班次或用户未给出市内目的地时，不调用接驳路线。
 - weather_forecast 的 location 必须保留用户明确要求查询的完整地点文本；不得自行补充用户未提供的城市。
 - weather_forecast 的 location 只能填写用户明确要求查询的肯定目标；否定、排除或明确要求不查询的地点不得调用。
 - 工具返回 argument_repair_required 时，必须严格按工具结果中的 repair 约束处理：仅当用户原始消息已经明确给出所需字段时，才补齐参数并最多重试 1 次；信息不足时直接向用户确认，不得根据候选值猜测。
+
+【组合行程必填信息规则】
+- 航班、高铁、目的地天气或到达后接驳组成的组合行程，只有在出发地、目的地和具体出发日期均可从用户原话唯一确定时才能开始调用工具。
+- “明天”“本周六”等相对日期如果结合当前日期只能得到一个具体日期，可以正常换算；“下周”“近期”“过几天”等表达如果存在多个合理的具体出发日期，必须先向用户确认具体日期。
+- 在用户确认前不得擅自选择任一候选日期，也不得选择任一候选日期调用 search_flights、search_trains、weather_forecast 或 route_compare；直接用一句简洁问题确认出发日期，且不要生成行程方案。
 
 【地点与路线事实边界规则】
 当上下文包含 local_place_search 或 route_compare 的结构化结果时，必须遵守：
@@ -511,6 +527,26 @@ class AmapProductToolHandler(BaseToolHandler):
         except _InvalidArguments:
             return [{"field": "request", "code": "invalid_arguments"}]
         return []
+
+    def build_successful_call_signature(self, input_params: dict) -> str | None:
+        """相同高德产品查询成功后可在当前 Agent run 内直接复用。"""
+
+        try:
+            if self.tool_name == AMAP_LOCAL_PLACE_SEARCH:
+                normalized = _validate_local_args(input_params)
+            elif self.tool_name == AMAP_ROUTE_COMPARE:
+                normalized = _validate_route_args(input_params)
+            elif self.tool_name == AMAP_WEATHER_FORECAST:
+                normalized = _validate_weather_args(input_params)
+            else:
+                return None
+        except (_InvalidArguments, TypeError, ValueError):
+            return None
+        payload = {
+            "tool_name": self.tool_name,
+            "arguments": normalized,
+        }
+        return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
     async def execute(self, args: dict) -> ToolResult:
         return await self._execute(args, runtime_context=None)

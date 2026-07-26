@@ -56,6 +56,12 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         )
         boundary = prepared[1]["content"]
         self.assertIn("【地点与路线工具选择规则】", boundary)
+        self.assertIn("【组合行程必填信息规则】", boundary)
+        self.assertIn("存在多个合理的具体出发日期", boundary)
+        self.assertIn("必须先向用户确认具体日期", boundary)
+        self.assertIn(
+            "不得选择任一候选日期调用 search_flights、search_trains、weather_forecast 或 route_compare", boundary
+        )
         self.assertIn("两个自然语言起终点", boundary)
         self.assertIn("直接调用 route_compare", boundary)
         self.assertIn("不要先调用 web_search 或 local_place_search", boundary)
@@ -97,6 +103,15 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不得声称路线耗时包含或不包含停车及其他未返回构成", boundary)
         self.assertIn("未返回的路线属性只能说明无法从本次查询结果确认", boundary)
         self.assertIn("【天气事实边界规则】", boundary)
+        self.assertIn("组合行程", boundary)
+        self.assertIn("必须调用 weather_forecast", boundary)
+        self.assertIn("不得用 web_search 或 url_read 替代", boundary)
+        self.assertIn("目的地市内接驳", boundary)
+        self.assertIn("先完成航班或高铁查询", boundary)
+        self.assertIn("只调用一次 route_compare", boundary)
+        self.assertIn("不得猜测机场或车站", boundary)
+        self.assertIn("必须把班次结果中的 city", boundary)
+        self.assertIn("origin_city 和 destination_city", boundary)
         self.assertIn("实时温度、湿度、空气质量、降雨概率", boundary)
         self.assertIn("不得声称代表具体建筑物、街道或园区的精确天气", boundary)
         self.assertNotIn("民治星巴克", boundary)

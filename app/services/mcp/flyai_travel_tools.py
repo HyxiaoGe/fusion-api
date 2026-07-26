@@ -73,6 +73,7 @@ _DIAGNOSTIC_ARGUMENT_FIELDS = frozenset(
         "max_price_yuan",
         "departure_hour_start",
         "departure_hour_end",
+        "arrival_before_hour",
         "sort_by",
         "limit",
         "cabin_class",
@@ -91,6 +92,7 @@ class _TravelSearchArgs(BaseModel):
     max_price_yuan: int | None = Field(default=None, ge=0, le=1_000_000)
     departure_hour_start: int | None = Field(default=None, ge=0, le=23)
     departure_hour_end: int | None = Field(default=None, ge=0, le=23)
+    arrival_before_hour: int | None = Field(default=None, ge=1, le=24)
     sort_by: Literal["recommended", "price_asc", "duration_asc", "departure_asc"] = "recommended"
     limit: int = Field(default=5, ge=1, le=5)
 
@@ -207,8 +209,11 @@ FLYAI_TRAVEL_DEFINITIONS = [
             "name": FLYAI_SEARCH_FLIGHTS,
             "description": (
                 "查询两个城市间指定日期的单程直达航班，返回最多 5 个结构化班次与查询时刻参考价。"
-                "适用于用户明确提供出发地、目的地和日期的航班查询；不查询余票、准点率、退改签、"
+                "仅适用于用户明确提供出发地、目的地，且日期能从用户原话唯一确定的航班查询；"
+                "存在多个合理日期时必须先询问，不得替用户选择日期。不查询余票、准点率、退改签、"
                 "行李、登机口，也不执行预订。"
+                "用户要求在某个整点前到达时，必须传 arrival_before_hour，结果会限定为出发日当天"
+                "该整点前到达的班次。"
             ),
             "parameters": {
                 "type": "object",
@@ -220,6 +225,7 @@ FLYAI_TRAVEL_DEFINITIONS = [
                     "max_price_yuan": {"type": "integer", "minimum": 0, "maximum": 1_000_000},
                     "departure_hour_start": {"type": "integer", "minimum": 0, "maximum": 23},
                     "departure_hour_end": {"type": "integer", "minimum": 0, "maximum": 23},
+                    "arrival_before_hour": {"type": "integer", "minimum": 1, "maximum": 24},
                     "sort_by": {"type": "string", "enum": list(_SORT_VALUES)},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 5},
                 },
@@ -234,8 +240,11 @@ FLYAI_TRAVEL_DEFINITIONS = [
             "name": FLYAI_SEARCH_TRAINS,
             "description": (
                 "查询两个城市间指定日期的单程直达高铁或火车班次，返回最多 5 个结构化班次与查询时刻"
-                "参考价。适用于用户明确提供出发地、目的地和日期的车次查询；不查询余票、退改签、"
+                "参考价。仅适用于用户明确提供出发地、目的地，且日期能从用户原话唯一确定的车次查询；"
+                "存在多个合理日期时必须先询问，不得替用户选择日期。不查询余票、退改签、"
                 "检票口或站台，也不执行购票。"
+                "用户要求在某个整点前到达时，必须传 arrival_before_hour，结果会限定为出发日当天"
+                "该整点前到达的班次。"
             ),
             "parameters": {
                 "type": "object",
@@ -247,6 +256,7 @@ FLYAI_TRAVEL_DEFINITIONS = [
                     "max_price_yuan": {"type": "integer", "minimum": 0, "maximum": 1_000_000},
                     "departure_hour_start": {"type": "integer", "minimum": 0, "maximum": 23},
                     "departure_hour_end": {"type": "integer", "minimum": 0, "maximum": 23},
+                    "arrival_before_hour": {"type": "integer", "minimum": 1, "maximum": 24},
                     "sort_by": {"type": "string", "enum": list(_SORT_VALUES)},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 5},
                 },
@@ -476,13 +486,14 @@ class FlyAiTravelToolHandler(BaseToolHandler):
             async with self.controls.semaphore:
                 if not await self.controls.try_consume():
                     return self._failed_result(started_at, "travel_run_budget_exhausted")
+                adapter_arguments = _adapter_arguments(normalized, raw_args=args)
                 response, response_bytes = await self.client.search(
                     tool_name=self.tool_name,
-                    arguments=normalized,
+                    arguments=adapter_arguments,
                     user_scope=self.user_scope,
                 )
-            _validate_response_request(response.request, normalized)
-            projected = _project_result(self.tool_name, response, limit=normalized["limit"])
+            _validate_response_request(response.request, adapter_arguments)
+            projected = _project_result(self.tool_name, response, arguments=normalized)
             return ToolResult(
                 status="success",
                 duration_ms=_duration_ms(started_at),
@@ -652,6 +663,17 @@ def _validate_args(tool_name: str, args: Any) -> dict[str, Any]:
     return model.model_validate(args).model_dump(mode="json", exclude_none=True)
 
 
+def _adapter_arguments(normalized: dict[str, Any], *, raw_args: Any) -> dict[str, Any]:
+    """剥离仅由 Fusion 处理的筛选条件，保持私有 adapter 契约稳定。"""
+
+    arguments = {key: value for key, value in normalized.items() if key != "arrival_before_hour"}
+    if normalized.get("arrival_before_hour") is not None and (
+        not isinstance(raw_args, dict) or "sort_by" not in raw_args
+    ):
+        arguments["sort_by"] = "departure_asc"
+    return arguments
+
+
 def _safe_validation_error_codes(error: ValidationError) -> list[str]:
     """只记录参数字段与稳定错误类型，不记录模型生成的参数值。"""
 
@@ -671,24 +693,44 @@ def _validate_response_request(request: _AdapterRequest, expected: dict[str, Any
         raise FlyAiTravelError("invalid_response")
 
 
-def _project_result(tool_name: str, response: _AdapterResponse, *, limit: int) -> dict[str, Any]:
+def _project_result(
+    tool_name: str,
+    response: _AdapterResponse,
+    *,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    arrival_before_hour = arguments.get("arrival_before_hour")
+    departure_date = arguments["departure_date"]
+    candidates = response.items
+    if isinstance(arrival_before_hour, int):
+        candidates = [
+            item
+            for item in candidates
+            if item.arrival.scheduled_at.date().isoformat() == departure_date
+            and item.arrival.scheduled_at.hour < arrival_before_hour
+        ]
+
     items: list[dict[str, Any]] = []
-    for item in response.items[:limit]:
+    for item in candidates[: arguments["limit"]]:
         projected = item.model_dump(mode="json")
         projected["option_id"] = _option_id(tool_name, item)
         if not _trusted_booking_url(projected.get("booking_url")):
             projected.pop("booking_url", None)
         items.append(projected)
+    limitations = [
+        "班次与参考价格仅代表本次查询时刻，预订前请再次核实",
+        "本次结果不包含余票、准点率、退改签、行李、登机口、检票口或站台信息",
+    ]
+    if isinstance(arrival_before_hour, int):
+        limitations.append(f"结果已限定为出发日当天 {arrival_before_hour:02d}:00 前到达")
+
     return {
         "origin": response.request.origin,
         "destination": response.request.destination,
         "departure_date": response.request.departure_date,
         "observed_at": response.observed_at.isoformat(),
         "items": items,
-        "limitations": [
-            "班次与参考价格仅代表本次查询时刻，预订前请再次核实",
-            "本次结果不包含余票、准点率、退改签、行李、登机口、检票口或站台信息",
-        ],
+        "limitations": limitations,
     }
 
 

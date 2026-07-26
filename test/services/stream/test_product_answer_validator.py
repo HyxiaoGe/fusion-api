@@ -141,7 +141,154 @@ def _four_day_weather_block():
     return WeatherResultsBlock.model_validate(payload)
 
 
+def _travel_candidate_blocks() -> list[dict]:
+    return [
+        {
+            "type": "flight_results",
+            "id": "flight-outbound",
+            "origin": "深圳",
+            "destination": "上海",
+            "departure_date": "2026-08-01",
+            "flights": [
+                {
+                    "option_id": "flight-a",
+                    "flight_no": "ZH1001",
+                    "departure": {
+                        "city": "深圳",
+                        "station_name": "深圳宝安国际机场",
+                        "scheduled_at": "2026-08-01T08:00:00+08:00",
+                    },
+                    "arrival": {
+                        "city": "上海",
+                        "station_name": "上海虹桥国际机场",
+                        "scheduled_at": "2026-08-01T10:00:00+08:00",
+                    },
+                    "duration_s": 7200,
+                    "price": {"currency": "CNY", "amount_minor": 60000},
+                },
+                {
+                    "option_id": "flight-b",
+                    "flight_no": "ZH1002",
+                    "departure": {
+                        "city": "深圳",
+                        "station_name": "深圳宝安国际机场",
+                        "scheduled_at": "2026-08-01T11:00:00+08:00",
+                    },
+                    "arrival": {
+                        "city": "上海",
+                        "station_name": "上海浦东国际机场",
+                        "scheduled_at": "2026-08-01T13:30:00+08:00",
+                    },
+                    "duration_s": 9000,
+                    "price": {"currency": "CNY", "amount_minor": 50000},
+                },
+            ],
+        },
+        {
+            "type": "flight_results",
+            "id": "flight-return",
+            "origin": "上海",
+            "destination": "深圳",
+            "departure_date": "2026-08-03",
+            "flights": [
+                {
+                    "option_id": "flight-return-a",
+                    "flight_no": "ZH2001",
+                    "departure": {
+                        "city": "上海",
+                        "station_name": "上海虹桥国际机场",
+                        "scheduled_at": "2026-08-03T18:00:00+08:00",
+                    },
+                    "arrival": {
+                        "city": "深圳",
+                        "station_name": "深圳宝安国际机场",
+                        "scheduled_at": "2026-08-03T20:20:00+08:00",
+                    },
+                    "duration_s": 8400,
+                    "price": {"currency": "CNY", "amount_minor": 70000},
+                }
+            ],
+        },
+    ]
+
+
 class ProductAnswerValidatorTests(unittest.TestCase):
+    def test_travel_facts_must_belong_to_same_candidate_and_direction(self):
+        cases = (
+            ("去程ZH1001约120分钟，参考价600元。", True),
+            ("去程ZH1001约150分钟，参考价600元。", False),
+            ("去程ZH1001约120分钟，参考价500元。", False),
+            ("返程ZH2001约140分钟，参考价700元。", True),
+            ("返程ZH2001约120分钟，参考价700元。", False),
+        )
+
+        for answer, expected in cases:
+            with self.subTest(answer=answer):
+                validation = validate_product_answer(answer, _travel_candidate_blocks())
+                self.assertEqual(validation.is_valid, expected)
+                if not expected:
+                    self.assertEqual(validation.reason_code, "candidate_fact_mismatch")
+
+    def test_travel_candidate_validation_supports_parallel_candidates_and_implicit_scope(self):
+        cases = (
+            ("ZH1001参考价600元，ZH1002参考价500元。", True),
+            ("ZH1001参考价500元，ZH1002参考价600元。", False),
+            ("08:00出发，参考价600元。", True),
+            ("08:00出发，参考价500元。", False),
+            ("ZH1001，08:00出发，参考价600元。", True),
+            ("ZH1001，11:00出发，参考价600元。", False),
+        )
+
+        for answer, expected in cases:
+            with self.subTest(answer=answer):
+                validation = validate_product_answer(answer, _travel_candidate_blocks())
+                self.assertEqual(validation.is_valid, expected)
+                if not expected:
+                    self.assertEqual(validation.reason_code, "candidate_fact_mismatch")
+
+    def test_travel_candidate_validation_does_not_skip_claims_before_total(self):
+        blocks = [
+            *_travel_candidate_blocks(),
+            {
+                "type": "itinerary_results",
+                "plans": [{"known_cost": {"currency": "CNY", "amount_minor": 110000}}],
+            },
+        ]
+        cases = (
+            ("ZH1001参考价600元，ZH1002参考价500元，合计1100元。", True),
+            ("ZH1001参考价500元，ZH1002参考价600元，合计1100元。", False),
+        )
+
+        for answer, expected in cases:
+            with self.subTest(answer=answer):
+                validation = validate_product_answer(answer, blocks)
+                self.assertEqual(validation.is_valid, expected)
+                if not expected:
+                    self.assertEqual(validation.reason_code, "candidate_fact_mismatch")
+
+    def test_travel_candidate_direction_binding_works_without_numeric_facts_and_with_same_sentence(self):
+        cases = (
+            ("去程建议选择ZH2001。", False),
+            ("去程建议选择ZH1001。", True),
+            ("去程可选ZH1001或ZH2001。", False),
+            ("去程建议ZH1001，ZH2001作为备选。", False),
+            ("回程建议选择ZH1001。", False),
+            ("回程建议选择ZH2001。", True),
+            ("去程ZH1001约120分钟，参考价600元，返程ZH2001约140分钟，参考价700元。", True),
+            ("去程ZH2001约140分钟，参考价700元，返程ZH1001约120分钟，参考价600元。", False),
+            ("去程和返程分别是ZH1001和ZH2001。", True),
+            ("返程和去程分别是ZH2001和ZH1001。", True),
+            ("往返分别是ZH1001和ZH2001。", True),
+            ("往返分别是ZH2001和ZH1001。", False),
+        )
+
+        for answer, expected in cases:
+            with self.subTest(answer=answer):
+                validation = validate_product_answer(answer, _travel_candidate_blocks())
+                self.assertEqual(validation.is_valid, expected)
+                if not expected:
+                    self.assertEqual(validation.reason_code, "candidate_fact_mismatch")
+
     def test_weather_facts_are_validated_with_day_scope_and_temperature_units(self):
         cases = (
             ("周四白天多云、夜间阵雨，最高32℃、最低27摄氏度。", True, "ok"),

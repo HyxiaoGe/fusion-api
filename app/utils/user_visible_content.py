@@ -19,6 +19,7 @@ _INTERNAL_TOOL_LABELS = {
     "search_trains": "高铁查询",
     "url_read": "网页读取",
     "web_search": "联网搜索",
+    "weather_forecast": "天气查询",
 }
 _INTERNAL_TOOL_NAMES = tuple(sorted(_INTERNAL_TOOL_LABELS, key=len, reverse=True))
 _INTERNAL_TOOL_NAME_RE = re.compile(
@@ -41,10 +42,14 @@ def _pending_mcp_alias_start(text: str) -> int | None:
     return None
 
 
+def _is_ascii_identifier_char(char: str) -> bool:
+    return char.isascii() and (char.isalnum() or char == "_")
+
+
 def _pending_internal_tool_name(text: str) -> tuple[int, tuple[str, ...]] | None:
     earliest_start = max(0, len(text) - max(len(name) for name in _INTERNAL_TOOL_NAMES))
     for start in range(earliest_start, len(text)):
-        if start > 0 and (text[start - 1].isalnum() or text[start - 1] == "_"):
+        if start > 0 and _is_ascii_identifier_char(text[start - 1]):
             continue
         suffix = text[start:]
         # 完整名称位于 chunk 末尾时仍需等待右边界。否则先输出中文标签，

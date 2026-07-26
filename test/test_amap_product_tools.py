@@ -125,6 +125,7 @@ class AmapProductDefinitionTests(unittest.TestCase):
             local_schema["properties"]["anchor_source"]["enum"],
             ["named", "current_location", "none"],
         )
+
         self.assertEqual(set(local_schema["required"]), {"query", "anchor_source"})
         self.assertEqual(
             set(route_schema["properties"]),
@@ -177,6 +178,24 @@ class AmapProductDefinitionTests(unittest.TestCase):
             AMAP_PRODUCT_REMOTE_DEPENDENCIES["weather_forecast"],
             frozenset({"maps_geo", "maps_regeocode", "maps_weather"}),
         )
+
+    def test_successful_call_signature_is_stable_for_equivalent_valid_arguments(self):
+        handler, _ = build_handler("weather_forecast", {})
+
+        first = handler.build_successful_call_signature({"location": "上海市", "location_source": "named"})
+        second = handler.build_successful_call_signature({"location_source": "named", "location": "上海市"})
+        different = handler.build_successful_call_signature({"location": "深圳市", "location_source": "named"})
+
+        self.assertIsNotNone(first)
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, different)
+
+    def test_successful_call_signature_rejects_invalid_arguments(self):
+        handler, _ = build_handler("weather_forecast", {})
+
+        signature = handler.build_successful_call_signature({"location": "上海市", "location_source": "unknown"})
+
+        self.assertIsNone(signature)
 
     def test_semantic_branch_arguments_are_required_before_remote_execution(self):
         cases = (

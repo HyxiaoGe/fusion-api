@@ -22,6 +22,98 @@ from app.services.stream.product_result_answer import (
 
 
 class ProductResultAnswerTests(unittest.TestCase):
+    def test_fallback_keeps_both_directions_when_more_than_four_product_blocks_exist(self):
+        blocks = [
+            _travel_block(
+                block_type="flight_results",
+                block_id="flight-out",
+                origin="深圳",
+                destination="上海",
+                departure_date="2026-08-01",
+                option_id="flight-out-1",
+                number="ZH1001",
+                duration_s=8400,
+                price_minor=68000,
+            ),
+            _travel_block(
+                block_type="train_results",
+                block_id="train-out",
+                origin="深圳",
+                destination="上海",
+                departure_date="2026-08-01",
+                option_id="train-out-1",
+                number="G100",
+                duration_s=28800,
+                price_minor=56000,
+            ),
+            _weather_result("weather-old"),
+            _travel_block(
+                block_type="flight_results",
+                block_id="flight-return",
+                origin="上海",
+                destination="深圳",
+                departure_date="2026-08-03",
+                option_id="flight-return-1",
+                number="ZH1002",
+                duration_s=9000,
+                price_minor=72000,
+            ),
+            _travel_block(
+                block_type="train_results",
+                block_id="train-return",
+                origin="上海",
+                destination="深圳",
+                departure_date="2026-08-03",
+                option_id="train-return-1",
+                number="G101",
+                duration_s=29400,
+                price_minor=57000,
+            ),
+            _weather_result("weather-new"),
+        ]
+
+        answer = build_grounded_product_answer(blocks)
+
+        self.assertIn("深圳到上海", answer)
+        self.assertIn("上海到深圳", answer)
+
+    def test_itinerary_fallback_uses_referenced_plan_and_weather_coverage(self):
+        source_blocks = [
+            _travel_block(
+                block_type="train_results",
+                block_id="train-out",
+                origin="深圳",
+                destination="上海",
+                departure_date="2026-08-01",
+                option_id="train-out-1",
+                number="G100",
+                duration_s=28800,
+                price_minor=56000,
+            ),
+            _travel_block(
+                block_type="train_results",
+                block_id="train-return",
+                origin="上海",
+                destination="深圳",
+                departure_date="2026-08-03",
+                option_id="train-return-1",
+                number="G101",
+                duration_s=29400,
+                price_minor=57000,
+            ),
+            _weather_result("weather-destination"),
+        ]
+        itinerary = _itinerary_result()
+
+        answer = build_grounded_product_answer([*source_blocks, itinerary])
+
+        self.assertIn("最低参考价组合", answer)
+        self.assertIn("去程G100", answer)
+        self.assertIn("返程G101", answer)
+        self.assertIn("参考票价合计1130元", answer)
+        self.assertIn("天气预报已完整覆盖行程日期", answer)
+        self.assertTrue(validate_product_answer(answer, [*source_blocks, itinerary]).is_valid)
+
     def test_weather_fallback_uses_only_forecast_fields_and_safe_advice(self):
         block = WeatherResultsBlock(
             type="weather_results",
@@ -234,6 +326,103 @@ class ProductResultAnswerTests(unittest.TestCase):
         self.assertNotIn("高德", answer)
         for unsupported in ("停车", "路况", "候车", "费用", "拥堵"):
             self.assertNotIn(unsupported, answer)
+
+
+def _travel_block(
+    *,
+    block_type: str,
+    block_id: str,
+    origin: str,
+    destination: str,
+    departure_date: str,
+    option_id: str,
+    number: str,
+    duration_s: int,
+    price_minor: int,
+) -> dict:
+    collection = "flights" if block_type == "flight_results" else "trains"
+    number_key = "flight_no" if block_type == "flight_results" else "train_no"
+    return {
+        "type": block_type,
+        "id": block_id,
+        "origin": origin,
+        "destination": destination,
+        "departure_date": departure_date,
+        collection: [
+            {
+                "option_id": option_id,
+                number_key: number,
+                "departure": {
+                    "city": origin,
+                    "station_name": f"{origin}站",
+                    "scheduled_at": f"{departure_date}T08:00:00+08:00",
+                },
+                "arrival": {
+                    "city": destination,
+                    "station_name": f"{destination}站",
+                    "scheduled_at": f"{departure_date}T16:00:00+08:00",
+                },
+                "duration_s": duration_s,
+                "price": {"currency": "CNY", "amount_minor": price_minor},
+            }
+        ],
+        "limitations": [],
+    }
+
+
+def _weather_result(block_id: str) -> dict:
+    return {
+        "type": "weather_results",
+        "id": block_id,
+        "resolved_location": "上海市",
+        "forecast_days": [
+            {"date": "2026-08-01"},
+            {"date": "2026-08-02"},
+            {"date": "2026-08-03"},
+        ],
+        "limitations": [],
+    }
+
+
+def _itinerary_result() -> dict:
+    return {
+        "type": "itinerary_results",
+        "id": "itinerary-1",
+        "status": "success",
+        "trip_type": "round_trip",
+        "origin": "深圳",
+        "destination": "上海",
+        "start_date": "2026-08-01",
+        "end_date": "2026-08-03",
+        "plans": [
+            {
+                "id": "lowest-price",
+                "title": "最低参考价组合",
+                "status": "complete",
+                "strategy": "lowest_reference_price",
+                "known_cost": {"currency": "CNY", "amount_minor": 113000},
+                "known_duration_s": 58200,
+                "sections": [
+                    {
+                        "kind": "outbound_transport",
+                        "coverage": None,
+                        "result_refs": [{"block_id": "train-out", "item_ids": ["train-out-1"]}],
+                    },
+                    {
+                        "kind": "return_transport",
+                        "coverage": None,
+                        "result_refs": [{"block_id": "train-return", "item_ids": ["train-return-1"]}],
+                    },
+                    {
+                        "kind": "destination_weather",
+                        "coverage": "full",
+                        "result_refs": [{"block_id": "weather-destination", "item_ids": []}],
+                    },
+                ],
+            }
+        ],
+        "limitations": ["班次时长不包含前后接驳、值机、安检或候车时间"],
+    }
 
 
 if __name__ == "__main__":

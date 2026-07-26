@@ -3,13 +3,37 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from app.schemas.chat import ContextUsage, Usage
 from app.services.stream.agent_loop_policy import AgentLoopLimitReason
 from app.services.stream.run_finalizer import AgentRunStats
 
 NO_PROGRESS_SEARCH_SUMMARY_THRESHOLD = 2
+
+
+@dataclass(frozen=True)
+class ProductToolOutcome:
+    """Agent run 内的安全产品工具摘要，不携带内部错误或第三方 payload。"""
+
+    tool_name: str
+    mode: Literal["flight", "train", "weather", "route"]
+    status: Literal["available", "unavailable"]
+    block_id: str | None = None
+    origin: str | None = None
+    destination: str | None = None
+    departure_date: str | None = None
+    location: str | None = None
+
+    @property
+    def identity_key(self) -> tuple[str, str | None, str | None, str | None, str | None]:
+        return (
+            self.tool_name,
+            self.origin,
+            self.destination,
+            self.departure_date,
+            self.location,
+        )
 
 
 @dataclass
@@ -30,6 +54,7 @@ class AgentLoopState:
     runtime_contexts: dict[str, Any] = field(default_factory=dict)
     unavailable_contexts: dict[str, str] = field(default_factory=dict)
     product_tool_attempted: bool = False
+    product_tool_outcomes: list[ProductToolOutcome] = field(default_factory=list)
     successful_tool_call_signatures: set[str] = field(default_factory=set)
     argument_repair_state: dict[str, dict[str, Any]] = field(default_factory=dict)
     pending_tool_repairs: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -59,6 +84,24 @@ class AgentLoopState:
 
     def record_product_tool_attempt(self, attempted: bool) -> None:
         self.product_tool_attempted = self.product_tool_attempted or attempted
+
+    def record_product_tool_outcomes(self, outcomes: tuple[ProductToolOutcome, ...]) -> None:
+        for outcome in outcomes:
+            existing_index = next(
+                (
+                    index
+                    for index, existing in enumerate(self.product_tool_outcomes)
+                    if existing.identity_key == outcome.identity_key
+                ),
+                None,
+            )
+            if existing_index is None:
+                self.product_tool_outcomes.append(outcome)
+                continue
+            existing = self.product_tool_outcomes[existing_index]
+            if existing.status == "available" and outcome.status == "unavailable":
+                continue
+            self.product_tool_outcomes[existing_index] = outcome
 
     def should_summarize_no_progress_search(self) -> bool:
         return self.consecutive_no_progress_search_results >= NO_PROGRESS_SEARCH_SUMMARY_THRESHOLD

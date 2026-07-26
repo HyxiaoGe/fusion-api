@@ -17,7 +17,14 @@ class ProductAnswerValidation:
     reason_code: str
 
 
-_PRODUCT_RESULT_TYPES = {"place_results", "route_results", "weather_results", "flight_results", "train_results"}
+_PRODUCT_RESULT_TYPES = {
+    "place_results",
+    "route_results",
+    "weather_results",
+    "flight_results",
+    "train_results",
+    "itinerary_results",
+}
 _RISK_TERM_RE = re.compile(
     r"排队|空位|预约|停车|拥堵|堵车|路况|候车|票价|免费|实时|人均|"
     r"准点|稳定|靠谱|拥挤|安全|舒适|坡度|自行车道|共享单车|省钱|便宜|实惠|性价比|"
@@ -147,6 +154,9 @@ _TRAVEL_STATION_MENTION_RE = re.compile(
 _CLOCK_TIME_RE = re.compile(r"(?<!\d)(?:[01]\d|2[0-3]):[0-5]\d(?!\d)")
 _TRAVEL_WEEKDAY_RE = re.compile(r"(?:星期|周)(?P<day>[一二三四五六日天])")
 _TRAVEL_MULTIPLIER_RE = re.compile(r"(?<!\d)\d+(?:\.\d+)?\s*倍")
+_TRAVEL_FACT_SENTENCE_RE = re.compile(r"[。！？!?；;\n]+")
+_TRAVEL_DIRECTION_RE = re.compile(r"去程|返程|回程")
+_TRAVEL_TOTAL_CLAIM_RE = re.compile(r"(?:合计|总计|总时长|总票价|总费用)[^，,]*")
 _WEATHER_UNSUPPORTED_METRIC_RE = re.compile(
     r"(?:当前|现在|实时).{0,10}(?:温度|气温|湿度|AQI|空气质量|降雨概率|预警)|"
     r"(?:温度|气温|湿度|AQI|空气质量|降雨概率|预警).{0,10}(?:当前|现在|实时)|"
@@ -234,6 +244,7 @@ class _FactIndex:
     travel_station_names: set[str]
     travel_clock_times: set[str]
     travel_weekdays: set[str]
+    travel_candidates: list["_TravelCandidateFacts"]
     has_weather_results: bool
     weather_days: list["_WeatherDayFacts"]
     weather_locations: set[str]
@@ -251,6 +262,17 @@ class _WeatherDayFacts:
     night_wind_direction: str | None
     day_wind_power: str | None
     night_wind_power: str | None
+
+
+@dataclass(frozen=True)
+class _TravelCandidateFacts:
+    direction: str
+    number: str
+    identifiers: frozenset[str]
+    station_names: frozenset[str]
+    clock_times: frozenset[str]
+    duration_minutes: float | None
+    price_yuan: float | None
 
 
 def validate_product_answer(
@@ -309,6 +331,8 @@ def validate_product_answer(
         return ProductAnswerValidation(False, "unknown_place")
     if _has_numeric_mismatch(normalized_answer, facts, user_text):
         return ProductAnswerValidation(False, "numeric_mismatch")
+    if facts.has_travel_results and _has_travel_candidate_mismatch(normalized_answer, facts.travel_candidates):
+        return ProductAnswerValidation(False, "candidate_fact_mismatch")
     if _has_route_comparison_mismatch(normalized_answer, facts):
         return ProductAnswerValidation(False, "numeric_mismatch")
     if (
@@ -595,9 +619,12 @@ def _build_fact_index(blocks: list[Any]) -> _FactIndex:
     travel_station_names: set[str] = set()
     travel_clock_times: set[str] = set()
     travel_weekdays: set[str] = set()
+    travel_candidates: list[_TravelCandidateFacts] = []
     has_weather_results = False
     weather_days: list[_WeatherDayFacts] = []
     weather_locations: set[str] = set()
+
+    travel_directions = _travel_block_directions(blocks)
 
     for block in blocks:
         block_type = _value(block, "type")
@@ -632,6 +659,7 @@ def _build_fact_index(blocks: list[Any]) -> _FactIndex:
             travel_weekdays.update(_weekday_tokens(_value(block, "departure_date")))
             collection = "flights" if block_type == "flight_results" else "trains"
             number_key = "flight_no" if block_type == "flight_results" else "train_no"
+            direction = travel_directions.get(str(_value(block, "id") or ""), "outbound")
             for option in (_value(block, collection) or [])[:5]:
                 number = _value(option, number_key)
                 if isinstance(number, str) and number.strip():
@@ -642,19 +670,50 @@ def _build_fact_index(blocks: list[Any]) -> _FactIndex:
                 price_minor = _number(_value(_value(option, "price"), "amount_minor"))
                 if price_minor is not None:
                     numeric_values["money_yuan"].add(price_minor / 100)
+                candidate_stations: set[str] = set()
+                candidate_times: set[str] = set()
+                candidate_identifiers = (
+                    {number.strip().upper()} if isinstance(number, str) and number.strip() else set()
+                )
                 for endpoint_key in ("departure", "arrival"):
                     endpoint = _value(option, endpoint_key)
                     _add_text(entity_names, _value(endpoint, "city"))
                     station_name = _value(endpoint, "station_name")
                     _add_text(entity_names, station_name)
                     _add_text(travel_station_names, station_name)
+                    if isinstance(station_name, str) and station_name.strip():
+                        candidate_stations.add(_canonical_travel_station(station_name))
                     terminal = _value(endpoint, "terminal")
                     if isinstance(terminal, str) and terminal.strip():
                         travel_numbers.add(terminal.strip().upper())
+                        candidate_identifiers.add(terminal.strip().upper())
                     scheduled_at = _value(endpoint, "scheduled_at")
                     clock_time = _clock_time(scheduled_at)
                     if clock_time:
                         travel_clock_times.add(clock_time)
+                        candidate_times.add(clock_time)
+                if isinstance(number, str) and number.strip():
+                    travel_candidates.append(
+                        _TravelCandidateFacts(
+                            direction=direction,
+                            number=number.strip().upper(),
+                            identifiers=frozenset(candidate_identifiers),
+                            station_names=frozenset(candidate_stations),
+                            clock_times=frozenset(candidate_times),
+                            duration_minutes=duration_s / 60 if duration_s is not None else None,
+                            price_yuan=price_minor / 100 if price_minor is not None else None,
+                        )
+                    )
+            continue
+
+        if block_type == "itinerary_results":
+            for plan in (_value(block, "plans") or [])[:2]:
+                known_duration_s = _number(_value(plan, "known_duration_s"))
+                if known_duration_s is not None:
+                    numeric_values["duration_minutes"].add(known_duration_s / 60)
+                known_cost_minor = _number(_value(_value(plan, "known_cost"), "amount_minor"))
+                if known_cost_minor is not None:
+                    numeric_values["money_yuan"].add(known_cost_minor / 100)
             continue
 
         if block_type == "weather_results":
@@ -738,10 +797,43 @@ def _build_fact_index(blocks: list[Any]) -> _FactIndex:
         travel_station_names=travel_station_names,
         travel_clock_times=travel_clock_times,
         travel_weekdays=travel_weekdays,
+        travel_candidates=travel_candidates,
         has_weather_results=has_weather_results,
         weather_days=weather_days,
         weather_locations=weather_locations,
     )
+
+
+def _travel_block_directions(blocks: list[Any]) -> dict[str, str]:
+    """以首个行程方向为去程，并用 itinerary 引用覆盖，避免靠正文猜方向。"""
+
+    travel_blocks = [block for block in blocks if _value(block, "type") in {"flight_results", "train_results"}]
+    if not travel_blocks:
+        return {}
+    first_origin = _compact_text(str(_value(travel_blocks[0], "origin") or ""))
+    first_destination = _compact_text(str(_value(travel_blocks[0], "destination") or ""))
+    directions: dict[str, str] = {}
+    for block in travel_blocks:
+        block_id = str(_value(block, "id") or "")
+        origin = _compact_text(str(_value(block, "origin") or ""))
+        destination = _compact_text(str(_value(block, "destination") or ""))
+        directions[block_id] = (
+            "return"
+            if origin == first_destination and destination == first_origin and first_origin != first_destination
+            else "outbound"
+        )
+    for itinerary in (block for block in blocks if _value(block, "type") == "itinerary_results"):
+        for plan in (_value(itinerary, "plans") or [])[:2]:
+            for section in _value(plan, "sections") or []:
+                kind = _value(section, "kind")
+                if kind not in {"outbound_transport", "return_transport"}:
+                    continue
+                direction = "outbound" if kind == "outbound_transport" else "return"
+                for result_ref in _value(section, "result_refs") or []:
+                    block_id = str(_value(result_ref, "block_id") or "")
+                    if block_id in directions:
+                        directions[block_id] = direction
+    return directions
 
 
 def _collect_route_facts(
@@ -1139,6 +1231,145 @@ def _has_unknown_travel_time(answer: str, allowed_times: set[str]) -> bool:
 
 def _has_unknown_travel_weekday(answer: str, allowed_weekdays: set[str]) -> bool:
     return any(match.group("day") not in allowed_weekdays for match in _TRAVEL_WEEKDAY_RE.finditer(answer))
+
+
+def _has_travel_candidate_mismatch(
+    answer: str,
+    candidates: list[_TravelCandidateFacts],
+) -> bool:
+    """同一语义句中的班次、方向、时长、价格、站点和时间必须属于同一候选。"""
+
+    for sentence in _TRAVEL_FACT_SENTENCE_RE.split(answer):
+        sentence = _TRAVEL_TOTAL_CLAIM_RE.sub("", sentence).strip(" ，,")
+        if not sentence:
+            continue
+        direction_match = _TRAVEL_DIRECTION_RE.search(sentence)
+        direction = (
+            "outbound"
+            if direction_match and direction_match.group(0) == "去程"
+            else "return"
+            if direction_match
+            else None
+        )
+        candidate_numbers = {candidate.number for candidate in candidates}
+        number_matches = [
+            match for match in _TRAVEL_NUMBER_RE.finditer(sentence) if match.group(0).upper() in candidate_numbers
+        ]
+        if number_matches:
+            for index, match in enumerate(number_matches):
+                local_direction = _travel_direction_for_number(
+                    sentence,
+                    number_matches,
+                    index,
+                )
+                claim = (
+                    sentence
+                    if len(number_matches) == 1
+                    else sentence[match.start() : number_matches[index + 1].start()]
+                    if index + 1 < len(number_matches)
+                    else sentence[match.start() :]
+                )
+                scoped = [
+                    candidate
+                    for candidate in candidates
+                    if candidate.number == match.group(0).upper()
+                    and (local_direction is None or candidate.direction == local_direction)
+                ]
+                if not scoped or (
+                    _travel_claim_fact_count(claim) and not _travel_claim_matches_candidate(claim, scoped)
+                ):
+                    return True
+            continue
+
+        fact_count = _travel_claim_fact_count(sentence)
+        if fact_count < 2 and not (direction is not None and fact_count):
+            continue
+        scoped = [candidate for candidate in candidates if direction is None or candidate.direction == direction]
+        if not _travel_claim_matches_candidate(sentence, scoped):
+            return True
+    return False
+
+
+def _travel_direction_for_number(
+    sentence: str,
+    number_matches: list[re.Match[str]],
+    index: int,
+) -> str | None:
+    """让方向持续约束并列班次，同时支持“去程和返程分别是 A 和 B”。"""
+
+    first_prefix = sentence[: number_matches[0].start()]
+    if "往返" in first_prefix and "分别" in first_prefix and index < 2:
+        return "outbound" if index == 0 else "return"
+    paired_directions = list(_TRAVEL_DIRECTION_RE.finditer(first_prefix))
+    if "分别" in first_prefix and len(paired_directions) >= 2 and index < len(paired_directions):
+        return "outbound" if paired_directions[index].group(0) == "去程" else "return"
+
+    directions = list(_TRAVEL_DIRECTION_RE.finditer(sentence[: number_matches[index].start()]))
+    if not directions:
+        return None
+    return "outbound" if directions[-1].group(0) == "去程" else "return"
+
+
+def _travel_claim_fact_count(sentence: str) -> int:
+    return sum(
+        (
+            bool(_travel_claimed_durations(sentence)),
+            any(match.group("unit") == "元" for match in _NUMBER_UNIT_RE.finditer(sentence)),
+            bool(_CLOCK_TIME_RE.search(sentence)),
+            bool(_TRAVEL_STATION_MENTION_RE.search(sentence)),
+        )
+    )
+
+
+def _travel_claim_matches_candidate(
+    claim: str,
+    candidates: list[_TravelCandidateFacts],
+) -> bool:
+    duration_values = _travel_claimed_durations(claim)
+    price_values = {
+        float(match.group("value")) for match in _NUMBER_UNIT_RE.finditer(claim) if match.group("unit") == "元"
+    }
+    clock_times = {match.group(0) for match in _CLOCK_TIME_RE.finditer(claim)}
+    station_names = {
+        _canonical_travel_station(match.group("name")) for match in _TRAVEL_STATION_MENTION_RE.finditer(claim)
+    }
+    return any(
+        (
+            not duration_values
+            or (
+                candidate.duration_minutes is not None
+                and all(abs(value - candidate.duration_minutes) <= 0.05 for value in duration_values)
+            )
+        )
+        and (
+            not price_values
+            or (
+                candidate.price_yuan is not None
+                and all(abs(value - candidate.price_yuan) <= 0.05 for value in price_values)
+            )
+        )
+        and clock_times <= candidate.clock_times
+        and station_names <= candidate.station_names
+        for candidate in candidates
+    )
+
+
+def _travel_claimed_durations(sentence: str) -> set[float]:
+    values: set[float] = set()
+    compound_spans: list[tuple[int, int]] = []
+    for match in _HOUR_MINUTE_RE.finditer(sentence):
+        compound_spans.append(match.span())
+        value = float(match.group("hours")) * 60
+        if match.group("minutes") is not None:
+            value += float(match.group("minutes"))
+        values.add(value)
+    for match in _NUMBER_UNIT_RE.finditer(sentence):
+        if match.group("unit") != "分钟":
+            continue
+        if any(start <= match.start() and match.end() <= end for start, end in compound_spans):
+            continue
+        values.add(float(match.group("value")))
+    return values
 
 
 def _weekday_tokens(value: Any) -> set[str]:

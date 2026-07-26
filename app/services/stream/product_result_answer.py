@@ -9,7 +9,14 @@ from typing import Any
 
 from app.utils.user_visible_content import sanitize_internal_tool_names
 
-_PRODUCT_RESULT_TYPES = {"place_results", "route_results", "weather_results", "flight_results", "train_results"}
+_PRODUCT_RESULT_TYPES = {
+    "place_results",
+    "route_results",
+    "weather_results",
+    "flight_results",
+    "train_results",
+    "itinerary_results",
+}
 _ROUTE_MODE_LABELS = {
     "driving": "驾车",
     "transit": "公交",
@@ -107,19 +114,51 @@ def has_product_result_blocks(content_blocks: list[Any]) -> bool:
 
 def build_grounded_product_answer(content_blocks: list[Any]) -> str:
     """只读取产品结果块的已校验字段，不复用模型生成的自由文本。"""
-    product_blocks = [block for block in content_blocks if _value(block, "type") in _PRODUCT_RESULT_TYPES][-4:]
-    latest_flight = next(
-        (block for block in reversed(product_blocks) if _value(block, "type") == "flight_results"), None
+    product_blocks = [block for block in content_blocks if _value(block, "type") in _PRODUCT_RESULT_TYPES]
+    itinerary = next(
+        (block for block in reversed(product_blocks) if _value(block, "type") == "itinerary_results"),
+        None,
     )
-    latest_train = next((block for block in reversed(product_blocks) if _value(block, "type") == "train_results"), None)
-    if latest_flight is not None and latest_train is not None:
-        comparison = _build_mixed_travel_answer(latest_flight, latest_train)
-        if comparison:
-            return comparison
+    if itinerary is not None:
+        itinerary_answer = _build_itinerary_answer(itinerary, product_blocks)
+        if itinerary_answer:
+            return itinerary_answer
+
     paragraphs: list[str] = []
+    handled_travel_groups: set[tuple[str, str, str]] = set()
     for block in product_blocks:
         block_type = _value(block, "type")
-        if block_type == "place_results":
+        if block_type in {"flight_results", "train_results"}:
+            group = _travel_group(block)
+            if group in handled_travel_groups:
+                continue
+            handled_travel_groups.add(group)
+            flight_block = next(
+                (
+                    candidate
+                    for candidate in reversed(product_blocks)
+                    if _value(candidate, "type") == "flight_results" and _travel_group(candidate) == group
+                ),
+                None,
+            )
+            train_block = next(
+                (
+                    candidate
+                    for candidate in reversed(product_blocks)
+                    if _value(candidate, "type") == "train_results" and _travel_group(candidate) == group
+                ),
+                None,
+            )
+            paragraph = (
+                _build_mixed_travel_answer(flight_block, train_block)
+                if flight_block is not None and train_block is not None
+                else _build_flight_answer(flight_block)
+                if flight_block is not None
+                else _build_train_answer(train_block)
+            )
+        elif block_type == "itinerary_results":
+            paragraph = ""
+        elif block_type == "place_results":
             paragraph = _build_place_answer(block)
         elif block_type == "route_results":
             paragraph = _build_route_answer(block)
@@ -134,6 +173,106 @@ def build_grounded_product_answer(content_blocks: list[Any]) -> str:
         if paragraph:
             paragraphs.append(paragraph)
     return "\n\n".join(paragraphs)
+
+
+def _build_itinerary_answer(itinerary: Any, content_blocks: list[Any]) -> str:
+    """从 itinerary 的引用关系生成完整兜底，不重新推断或混搭候选。"""
+
+    source_by_id = {
+        str(block_id): block
+        for block in content_blocks
+        if (block_id := _value(block, "id")) and _value(block, "type") != "itinerary_results"
+    }
+    plans = [plan for plan in (_value(itinerary, "plans") or []) if _value(plan, "sections")]
+    if not plans:
+        return ""
+
+    paragraphs: list[str] = []
+    for plan in plans[:2]:
+        section_summaries: list[str] = []
+        weather_coverages: list[str] = []
+        references_valid = True
+        for section in _value(plan, "sections") or []:
+            kind = _value(section, "kind")
+            if kind == "destination_weather":
+                coverage = _value(section, "coverage")
+                if isinstance(coverage, str):
+                    weather_coverages.append(coverage)
+                continue
+            if kind not in {"outbound_transport", "return_transport"}:
+                continue
+            summary = _referenced_travel_summary(
+                _value(section, "result_refs") or [],
+                source_by_id,
+                direction="去程" if kind == "outbound_transport" else "返程",
+            )
+            if not summary:
+                references_valid = False
+                break
+            section_summaries.append(summary)
+        if not references_valid or not section_summaries:
+            continue
+
+        title = _value(plan, "title") or "行程组合"
+        plan_lines = [f"{title}：{'；'.join(section_summaries)}。"]
+        known_cost = _value(_value(plan, "known_cost"), "amount_minor")
+        if isinstance(known_cost, int) and not isinstance(known_cost, bool) and known_cost >= 0:
+            plan_lines.append(f"参考票价合计{_format_yuan(known_cost)}元。")
+        known_duration_s = _value(plan, "known_duration_s")
+        if isinstance(known_duration_s, int) and not isinstance(known_duration_s, bool) and known_duration_s >= 0:
+            plan_lines.append(f"班次计划时长合计约{_format_duration(known_duration_s)}。")
+        if "full" in weather_coverages:
+            plan_lines.append("天气预报已完整覆盖行程日期。")
+        elif "partial" in weather_coverages:
+            plan_lines.append("天气预报仅部分覆盖行程日期。")
+        elif "outside_range" in weather_coverages:
+            plan_lines.append("当前天气预报窗口未覆盖行程日期。")
+        paragraphs.append("".join(plan_lines))
+
+    if not paragraphs:
+        return ""
+    limitations = _limitations_sentence(itinerary)
+    if limitations:
+        paragraphs.append(limitations)
+    return "\n\n".join(paragraphs)
+
+
+def _referenced_travel_summary(
+    result_refs: list[Any],
+    source_by_id: dict[str, Any],
+    *,
+    direction: str,
+) -> str:
+    for result_ref in result_refs:
+        source = source_by_id.get(str(_value(result_ref, "block_id") or ""))
+        if source is None:
+            continue
+        block_type = _value(source, "type")
+        if block_type not in {"flight_results", "train_results"}:
+            continue
+        collection = "flights" if block_type == "flight_results" else "trains"
+        number_key = "flight_no" if block_type == "flight_results" else "train_no"
+        item_ids = {str(item) for item in (_value(result_ref, "item_ids") or [])}
+        option = next(
+            (
+                item
+                for item in (_value(source, collection) or [])
+                if not item_ids or str(_value(item, "option_id") or "") in item_ids
+            ),
+            None,
+        )
+        if option is None:
+            continue
+        return f"{direction}{_compact_travel_option(option, number_key)}"
+    return ""
+
+
+def _travel_group(block: Any) -> tuple[str, str, str]:
+    return (
+        str(_value(block, "origin") or ""),
+        str(_value(block, "destination") or ""),
+        str(_value(block, "departure_date") or ""),
+    )
 
 
 def build_product_tool_failure_answer(messages: list[dict[str, Any]] | None = None) -> str:

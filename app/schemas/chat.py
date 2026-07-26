@@ -577,12 +577,163 @@ class TrainResultsBlock(BaseModel):
         return value
 
 
+class ItineraryResultRef(BaseModel):
+    """行程方案对既有规范化产品结果的引用。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    block_id: str = Field(min_length=1, max_length=160)
+    item_ids: List[str] = Field(default_factory=list, max_length=5)
+
+    @field_validator("item_ids")
+    @classmethod
+    def validate_item_ids(cls, value: List[str]) -> List[str]:
+        if any(not item.strip() or len(item) > 80 for item in value):
+            raise ValueError("item_ids 单项不能为空且不能超过 80 字符")
+        if len(value) != len(set(value)):
+            raise ValueError("item_ids 不能重复")
+        return value
+
+
+class ItinerarySection(BaseModel):
+    """一个行程方案内的去程、返程、天气或当地路线。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=80)
+    kind: Literal[
+        "outbound_transport",
+        "return_transport",
+        "destination_weather",
+        "local_route",
+    ]
+    status: Literal["complete", "partial", "unavailable"]
+    title: str = Field(min_length=1, max_length=80)
+    coverage: Optional[Literal["full", "partial", "outside_range"]] = None
+    result_refs: List[ItineraryResultRef] = Field(min_length=1, max_length=8)
+
+    @model_validator(mode="after")
+    def validate_section_contract(self):
+        if self.kind == "destination_weather":
+            if self.coverage is None:
+                raise ValueError("天气 section 必须声明 coverage")
+            if any(ref.item_ids for ref in self.result_refs):
+                raise ValueError("天气 section 不能引用 item_ids")
+            if self.coverage == "full" and self.status != "complete":
+                raise ValueError("完整天气覆盖的 section 必须为 complete")
+            if self.coverage != "full" and self.status == "complete":
+                raise ValueError("非完整天气覆盖的 section 不能为 complete")
+        elif self.coverage is not None:
+            raise ValueError("只有天气 section 可以声明 coverage")
+        return self
+
+
+class ItineraryPlan(BaseModel):
+    """按一个确定性指标选出的行程组合。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=80)
+    title: str = Field(min_length=1, max_length=80)
+    status: Literal["complete", "partial"]
+    strategy: Literal["lowest_reference_price", "shortest_scheduled_duration"]
+    tags: List[Literal["lowest_reference_price", "shortest_scheduled_duration"]] = Field(
+        min_length=1,
+        max_length=1,
+    )
+    known_cost: Optional[TravelMoney] = None
+    known_duration_s: Optional[int] = Field(default=None, ge=0, le=604_800)
+    sections: List[ItinerarySection] = Field(min_length=1, max_length=4)
+
+    @model_validator(mode="after")
+    def validate_plan_contract(self):
+        if self.tags != [self.strategy]:
+            raise ValueError("tags 必须与 strategy 完全一致")
+        section_kinds = [section.kind for section in self.sections]
+        if len(section_kinds) != len(set(section_kinds)):
+            raise ValueError("同一方案不能重复 section kind")
+        if "outbound_transport" not in section_kinds:
+            raise ValueError("行程方案必须包含去程 section")
+        return self
+
+
+class ItineraryAvailability(BaseModel):
+    """不携带内部错误的产品工具可用性摘要。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    journey: Literal["outbound", "return", "destination_weather", "local_route"]
+    mode: Literal["flight", "train", "weather", "route"]
+    status: Literal["available", "unavailable"]
+
+    @model_validator(mode="after")
+    def validate_journey_mode(self):
+        allowed = {
+            "outbound": {"flight", "train"},
+            "return": {"flight", "train"},
+            "destination_weather": {"weather"},
+            "local_route": {"route"},
+        }
+        if self.mode not in allowed[self.journey]:
+            raise ValueError("availability 的 journey 与 mode 不匹配")
+        return self
+
+
+class ItineraryResultsBlock(BaseModel):
+    """引用既有产品结果的统一行程视图。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["itinerary_results"]
+    id: str = Field(default_factory=lambda: f"blk_itinerary_{uuid4().hex[:12]}", max_length=160)
+    schema_version: Literal[1]
+    provider: Literal["fusion"]
+    status: Literal["success", "degraded"]
+    trip_type: Literal["one_way", "round_trip"]
+    origin: str = Field(min_length=1, max_length=80)
+    destination: str = Field(min_length=1, max_length=80)
+    start_date: CalendarDate
+    end_date: Optional[CalendarDate] = None
+    recommended_plan_id: None = None
+    plans: List[ItineraryPlan] = Field(min_length=1, max_length=2)
+    availability: List[ItineraryAvailability] = Field(default_factory=list, max_length=8)
+    limitations: List[str] = Field(default_factory=list, max_length=8)
+
+    @field_validator("limitations")
+    @classmethod
+    def validate_limitations(cls, value: List[str]) -> List[str]:
+        if any(not item.strip() or len(item) > 240 for item in value):
+            raise ValueError("limitations 单项不能为空且不能超过 240 字符")
+        if len(value) != len(set(value)):
+            raise ValueError("limitations 不能重复")
+        return value
+
+    @model_validator(mode="after")
+    def validate_itinerary_contract(self):
+        if self.trip_type == "one_way" and self.end_date is not None:
+            raise ValueError("单程行程的 end_date 必须为空")
+        if self.trip_type == "round_trip" and (self.end_date is None or self.end_date <= self.start_date):
+            raise ValueError("往返行程必须包含晚于 start_date 的 end_date")
+        plan_ids = [plan.id for plan in self.plans]
+        strategies = [plan.strategy for plan in self.plans]
+        if len(plan_ids) != len(set(plan_ids)) or len(strategies) != len(set(strategies)):
+            raise ValueError("行程方案 id 和 strategy 不能重复")
+        availability_keys = [(item.journey, item.mode) for item in self.availability]
+        if len(availability_keys) != len(set(availability_keys)):
+            raise ValueError("availability 不能重复")
+        has_return = any(section.kind == "return_transport" for plan in self.plans for section in plan.sections)
+        if self.trip_type == "one_way" and has_return:
+            raise ValueError("单程行程不能包含返程 section")
+        return self
+
+
 ProductResultBlock = Union[
     PlaceResultsBlock,
     RouteResultsBlock,
     WeatherResultsBlock,
     FlightResultsBlock,
     TrainResultsBlock,
+    ItineraryResultsBlock,
 ]
 
 
@@ -599,6 +750,7 @@ ContentBlock = Union[
     WeatherResultsBlock,
     FlightResultsBlock,
     TrainResultsBlock,
+    ItineraryResultsBlock,
 ]
 
 # stop 接口只接受客户端实际流式渲染的文本类 block；工具与富结果由服务端持久化。
