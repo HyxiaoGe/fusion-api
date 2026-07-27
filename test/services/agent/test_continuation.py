@@ -17,6 +17,7 @@ from app.services.agent.continuation import (
     find_latest_limit_reached_session,
     inject_continuation_prompt,
     resolve_continuation_limits,
+    resolve_continuation_plan_mode,
 )
 from app.services.stream.agent_loop_policy import AgentLoopLimits
 
@@ -144,6 +145,12 @@ class AgentContinuationTests(unittest.TestCase):
 
         self.assertEqual(resolve_continuation_limits(session, default_limits=default_limits), default_limits)
 
+    def test_resolve_continuation_plan_mode_preserves_previous_run_contract(self):
+        for stored, expected in (("on", "on"), ("off", "off"), ("auto", "auto"), ("legacy", "auto"), (None, "auto")):
+            with self.subTest(stored=stored):
+                session = SimpleNamespace(run_config={"plan_mode": stored} if stored is not None else None)
+                self.assertEqual(resolve_continuation_plan_mode(session), expected)
+
     def test_find_latest_limit_reached_session_rejects_missing_session(self):
         db = FakeDb(sessions=[])
 
@@ -260,7 +267,12 @@ class AgentContinuationTests(unittest.TestCase):
         previous_session = SimpleNamespace(
             id="run-old",
             status="limit_reached",
-            run_config={"max_steps": 3, "max_tool_calls": 5, "timeout_s": 60},
+            run_config={
+                "max_steps": 3,
+                "max_tool_calls": 5,
+                "timeout_s": 60,
+                "plan_mode": "on",
+            },
         )
         db = FakeDb(message=message, sessions=[previous_session])
 
@@ -275,6 +287,7 @@ class AgentContinuationTests(unittest.TestCase):
         self.assertIs(context.assistant_message, message)
         self.assertIs(context.previous_session, previous_session)
         self.assertEqual(context.limits, AgentLoopLimits(max_steps=3, max_tool_calls=5, total_timeout_s=60))
+        self.assertEqual(context.plan_mode, "on")
         self.assertEqual(context.initial_content_blocks, [TextBlock(type="text", id="blk_old", text="旧回答")])
 
 

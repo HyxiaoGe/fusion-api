@@ -18,7 +18,14 @@ from app.services.tool_handlers.base import ToolResult
 
 
 class ToolCallEmitter(Protocol):
-    async def tool_call_started(self, *, tool_call_id: str, tool_name: str, arguments: dict) -> None:
+    async def tool_call_started(
+        self,
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        arguments: dict,
+        plan_item_id: str | None = None,
+    ) -> None:
         """发送工具调用开始事件。"""
 
     async def tool_call_completed(
@@ -30,6 +37,7 @@ class ToolCallEmitter(Protocol):
         duration_ms: int,
         result_summary: dict,
         error: str | None,
+        plan_item_id: str | None = None,
     ) -> None:
         """发送工具调用完成事件。"""
 
@@ -52,14 +60,18 @@ async def emit_tool_call_started(
     tool_call_id: str,
     tool_name: str,
     arguments: dict,
+    plan_item_id: str | None = None,
 ) -> None:
     if emitter is None:
         return
-    await emitter.tool_call_started(
+    kwargs = dict(
         tool_call_id=tool_call_id,
         tool_name=tool_name,
         arguments=arguments,
     )
+    if plan_item_id is not None:
+        kwargs["plan_item_id"] = plan_item_id
+    await emitter.tool_call_started(**kwargs)
 
 
 async def emit_tool_call_result(
@@ -70,6 +82,7 @@ async def emit_tool_call_result(
     result: ToolResult,
     duration_ms: int | None,
     result_summary_builder: ResultSummaryBuilder,
+    plan_item_id: str | None = None,
 ) -> None:
     if emitter is None:
         return
@@ -81,7 +94,7 @@ async def emit_tool_call_result(
         data=data,
         repair=repair,
     )
-    await emitter.tool_call_completed(
+    kwargs = dict(
         tool_call_id=tool_call_id,
         tool_name=tool_name,
         status=event_status,
@@ -95,6 +108,9 @@ async def emit_tool_call_result(
             else None
         ),
     )
+    if plan_item_id is not None:
+        kwargs["plan_item_id"] = plan_item_id
+    await emitter.tool_call_completed(**kwargs)
 
 
 def _build_event_result_summary(
@@ -160,6 +176,7 @@ async def complete_tool_lifecycle(
     duration_ms: int,
     result_summary_builder: ResultSummaryBuilder,
     set_result_duration: bool = True,
+    plan_item_id: str | None = None,
 ) -> None:
     if set_result_duration and result.duration_ms is None:
         result.duration_ms = duration_ms
@@ -170,6 +187,7 @@ async def complete_tool_lifecycle(
         result=result,
         duration_ms=duration_ms,
         result_summary_builder=result_summary_builder,
+        plan_item_id=plan_item_id,
     )
 
 
@@ -182,6 +200,7 @@ async def execute_tool_with_lifecycle(
     execute: ToolExecutorFn,
     result_summary_builder: ResultSummaryBuilder,
     emitter: ToolCallEmitter | None,
+    plan_item_id: str | None = None,
 ) -> ToolResult:
     if emitter is None:
         return await execute(target, args)
@@ -191,6 +210,7 @@ async def execute_tool_with_lifecycle(
         tool_call_id=tool_call_id,
         tool_name=tool_name,
         arguments=args,
+        plan_item_id=plan_item_id,
     )
     attempt = await run_tool_attempt(target=target, args=args, execute=execute)
     await complete_tool_lifecycle(
@@ -200,6 +220,7 @@ async def execute_tool_with_lifecycle(
         result=attempt.result,
         duration_ms=attempt.duration_ms,
         result_summary_builder=result_summary_builder,
+        plan_item_id=plan_item_id,
         set_result_duration=not attempt.from_exception,
     )
     if attempt.cancelled_error:

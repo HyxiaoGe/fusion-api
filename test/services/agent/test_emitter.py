@@ -99,6 +99,37 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
         # 之后 _current_step_id 已被清空（白盒）
         self.assertIsNone(em._current_step_id)
 
+    async def test_tool_events_carry_plan_item_link_without_exposing_it_as_argument(self):
+        writer = AsyncMock()
+        em = AgentEventEmitter(
+            run_id="r1",
+            trace_id="r1",
+            conversation_id="c1",
+            task_id="task-1",
+            redis_writer=writer,
+        )
+
+        await em.tool_call_started(
+            tool_call_id="t1",
+            tool_name="web_search",
+            arguments={"query": "深圳天气"},
+            plan_item_id="weather",
+        )
+        await em.tool_call_completed(
+            tool_call_id="t1",
+            tool_name="web_search",
+            status="success",
+            duration_ms=10,
+            result_summary={},
+            plan_item_id="weather",
+        )
+
+        started = writer.append_chunk.call_args_list[-2].args[3]
+        completed = writer.append_chunk.call_args_list[-1].args[3]
+        self.assertEqual(started["plan_item_id"], "weather")
+        self.assertNotIn("plan_item_id", started["arguments"])
+        self.assertEqual(completed["plan_item_id"], "weather")
+
     async def test_content_block_discarded_uses_current_step_envelope(self):
         writer = AsyncMock()
         em = AgentEventEmitter(
@@ -304,6 +335,7 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
             truncated=False,
             repair_state="retrying",
             repair_id="repair_0123456789abcdef",
+            plan_item_id="search",
         )
 
         plan_payload = writer.append_chunk.call_args_list[-2].args[3]
@@ -315,6 +347,7 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(digest_payload["tool_call_id"], "tc1")
         self.assertEqual(digest_payload["repair_state"], "retrying")
         self.assertEqual(digest_payload["repair_id"], "repair_0123456789abcdef")
+        self.assertEqual(digest_payload["plan_item_id"], "search")
 
     async def test_geolocation_context_events_share_sequence_and_never_contain_coordinates(self):
         writer = AsyncMock()

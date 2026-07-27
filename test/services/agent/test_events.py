@@ -216,6 +216,31 @@ class AgentProgressV2EventModelTests(unittest.TestCase):
                 **self._common(),
             )
 
+    def test_plan_snapshot_supports_model_plan_metadata_and_item_linkage(self):
+        event = PlanSnapshot(
+            type="plan_snapshot",
+            protocol_version=2,
+            plan_id="plan-r1",
+            mode="on",
+            source="model",
+            revision=2,
+            reason="model_update",
+            items=[
+                {
+                    "id": "route",
+                    "title": "查询路线",
+                    "status": "running",
+                    "kind": "search",
+                    "depends_on": [],
+                    "planned_tools": ["route_compare"],
+                }
+            ],
+            **self._common(),
+        )
+
+        self.assertEqual(event.source, "model")
+        self.assertEqual(event.items[0].planned_tools, ["route_compare"])
+
     def test_tool_result_digest_model(self):
         ev = ToolResultDigest(
             type="tool_result_digest",

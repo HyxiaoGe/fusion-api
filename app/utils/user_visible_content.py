@@ -20,10 +20,24 @@ _INTERNAL_TOOL_LABELS = {
     "url_read": "网页读取",
     "web_search": "联网搜索",
     "weather_forecast": "天气查询",
+    "update_plan": "更新计划",
+    "_plan_item_id": "对应计划步骤",
+    "plan_item_id": "对应计划步骤",
+    "planned_tools": "预计使用的工具",
 }
 _INTERNAL_TOOL_NAMES = tuple(sorted(_INTERNAL_TOOL_LABELS, key=len, reverse=True))
+_PLAN_CONTROL_FIELD_NAMES = tuple(
+    sorted(
+        ("_plan_item_id", "plan_item_id", "planned_tools"),
+        key=len,
+        reverse=True,
+    )
+)
 _INTERNAL_TOOL_NAME_RE = re.compile(
     rf"(?<![A-Za-z0-9_])(?:{'|'.join(re.escape(name) for name in _INTERNAL_TOOL_NAMES)})(?![A-Za-z0-9_])"
+)
+_PLAN_CONTROL_FIELD_RE = re.compile(
+    rf"(?<![A-Za-z0-9_])(?:{'|'.join(re.escape(name) for name in _PLAN_CONTROL_FIELD_NAMES)})(?![A-Za-z0-9_])"
 )
 
 
@@ -46,15 +60,18 @@ def _is_ascii_identifier_char(char: str) -> bool:
     return char.isascii() and (char.isalnum() or char == "_")
 
 
-def _pending_internal_tool_name(text: str) -> tuple[int, tuple[str, ...]] | None:
-    earliest_start = max(0, len(text) - max(len(name) for name in _INTERNAL_TOOL_NAMES))
+def _pending_internal_tool_name(
+    text: str,
+    names: tuple[str, ...],
+) -> tuple[int, tuple[str, ...]] | None:
+    earliest_start = max(0, len(text) - max(len(name) for name in names))
     for start in range(earliest_start, len(text)):
         if start > 0 and _is_ascii_identifier_char(text[start - 1]):
             continue
         suffix = text[start:]
         # 完整名称位于 chunk 末尾时仍需等待右边界。否则先输出中文标签，
         # 下一 chunk 若继续补成更长标识，累计可见文本就会发生回退。
-        matches = tuple(name for name in _INTERNAL_TOOL_NAMES if name.startswith(suffix))
+        matches = tuple(name for name in names if name.startswith(suffix))
         if matches:
             return start, matches
     return None
@@ -99,14 +116,15 @@ def sanitize_internal_tool_names(
     """把内部函数标识改写为产品化名称，并正确处理跨 chunk 的半截标识。"""
 
     visible_source = text
+    visible_names = _INTERNAL_TOOL_NAMES if include_named_tools else _PLAN_CONTROL_FIELD_NAMES
     pending_starts: list[int] = []
     pending_mcp_start = _pending_mcp_alias_start(text)
     if pending_mcp_start is not None:
         pending_starts.append(pending_mcp_start)
-    pending_tool = _pending_internal_tool_name(text) if include_named_tools else None
+    pending_tool = _pending_internal_tool_name(text, visible_names)
     if pending_tool is not None:
         pending_starts.append(_pending_tool_visible_start(text, pending_tool[0]))
-    pending_space_start = _pending_trailing_space_start(text) if include_named_tools else None
+    pending_space_start = _pending_trailing_space_start(text)
     if pending_space_start is not None:
         pending_starts.append(pending_space_start)
 
@@ -124,7 +142,39 @@ def sanitize_internal_tool_names(
     sanitized = _MCP_ALIAS_RE.sub("外部工具", visible_source)
     if include_named_tools:
         sanitized = _INTERNAL_TOOL_NAME_RE.sub(_replace_internal_tool_name, sanitized)
-        sanitized = _normalize_tool_label_spacing(sanitized)
+    else:
+        sanitized = _PLAN_CONTROL_FIELD_RE.sub(_replace_internal_tool_name, sanitized)
+    sanitized = _normalize_tool_label_spacing(sanitized)
     if final:
         sanitized = _MCP_ALIAS_PARTIAL_RE.sub("外部工具", sanitized)
-    return sanitized
+    return _sanitize_update_plan(sanitized, final=final)
+
+
+def _sanitize_update_plan(text: str, *, final: bool) -> str:
+    name = "update_plan"
+    label = "更新计划"
+    sanitized = re.sub(
+        r"(?<![A-Za-z0-9_])update_plan(?![A-Za-z0-9_])",
+        label,
+        text,
+    )
+    if not final:
+        trailing_space = _pending_trailing_space_start(sanitized)
+        if trailing_space is not None:
+            return sanitized[:trailing_space]
+    for length in range(min(len(sanitized), len(name) - 1), 0, -1):
+        suffix = sanitized[-length:]
+        if not name.startswith(suffix):
+            continue
+        start = len(sanitized) - length
+        if start > 0 and _is_ascii_identifier_char(sanitized[start - 1]):
+            continue
+        while start > 0 and sanitized[start - 1] in {" ", "\t"}:
+            start -= 1
+        if final:
+            if length >= 4:
+                sanitized = f"{sanitized[:start]}{label}"
+            break
+        return sanitized[:start]
+    sanitized = re.sub(rf"(?<=[\u4e00-\u9fff])\s+{label}", label, sanitized)
+    return re.sub(rf"{label}\s+(?=[\u4e00-\u9fff])", label, sanitized)

@@ -27,6 +27,12 @@ from app.services.stream.step_lifecycle import AgentStepContext
 from app.services.stream.tool_round import ToolRoundOutcome
 from app.services.stream_state_service import StreamWriteTerminalError, append_chunk
 
+PLAN_REQUIRED_RETRY_PROMPT = (
+    "【计划控制修正】当前为强制计划模式，上一轮未建立有效计划，不能直接回答。"
+    "必须先调用计划控制工具创建 2 至 6 个步骤，再继续回答或调用外部工具。"
+    "只静默修正，不要向用户解释这条内部规则。"
+)
+
 
 @dataclass(frozen=True)
 class AgentRoundOutcomeRequest:
@@ -45,6 +51,8 @@ async def handle_agent_round_outcome(
 ) -> AgentLoopOutcome | None:
     finish_reason = request.round_result.finish_reason
     if finish_reason == "stop":
+        if _requires_plan_before_stop(request):
+            return await _repair_missing_required_plan(request)
         if _needs_empty_answer_summary(request):
             await _complete_empty_round_before_summary(request)
             return AgentLoopOutcome(exit=AgentLoopExit.SUMMARY_REQUIRED)
@@ -58,8 +66,48 @@ async def handle_agent_round_outcome(
     if finish_reason == "tool_calls" and request.round_result.tool_calls:
         return await _handle_tool_calls_round(request)
 
+    if _requires_plan_before_stop(request):
+        return await _repair_missing_required_plan(request)
+
     await _complete_unknown_round(request)
     return AgentLoopOutcome(exit=AgentLoopExit.COMPLETED)
+
+
+def _requires_plan_before_stop(request: AgentRoundOutcomeRequest) -> bool:
+    return request.runtime.plan_mode == "on" and not request.state.plan_coordinator.has_valid_model_plan
+
+
+async def _complete_plan_required_round(request: AgentRoundOutcomeRequest) -> None:
+    """丢弃未经过强制计划门禁的正文，并给下一轮加入内部修正指令。"""
+
+    await complete_text_response_step(
+        context=request.step_context,
+        emitter=request.runtime.emitter,
+        session_cache=request.runtime.session_cache,
+        complete_step_fn=request.runtime.complete_step_fn,
+        completed_tool_calls=request.state.total_tool_calls,
+        max_tool_calls=request.runtime.limits.max_tool_calls,
+        clock=request.runtime.clock,
+    )
+    if not any(
+        message.get("role") == "system" and PLAN_REQUIRED_RETRY_PROMPT in str(message.get("content", ""))
+        for message in request.messages
+    ):
+        request.messages.append({"role": "system", "content": PLAN_REQUIRED_RETRY_PROMPT})
+    request.state.clear_current_step()
+
+
+async def _repair_missing_required_plan(
+    request: AgentRoundOutcomeRequest,
+) -> AgentLoopOutcome | None:
+    await _complete_plan_required_round(request)
+    repair_exhausted = request.state.plan_coordinator.record_repair_round()
+    if repair_exhausted:
+        return AgentLoopOutcome(
+            exit=AgentLoopExit.SUMMARY_REQUIRED,
+            summary_finish_reason="plan_repair_exhausted",
+        )
+    return None
 
 
 def _append_round_blocks(request: AgentRoundOutcomeRequest) -> None:
@@ -241,11 +289,19 @@ async def _handle_tool_calls_round(request: AgentRoundOutcomeRequest) -> AgentLo
     if isinstance(outcome, ToolRoundOutcome):
         request.state.record_no_progress_search_results(outcome.no_progress_search_results)
         request.state.record_product_tool_attempt(
-            any(
+            outcome.tool_call_count > 0
+            and any(
                 str(tool_call.get("name", "")) in AMAP_PRODUCT_TOOL_NAMES | FLYAI_TRAVEL_TOOL_NAMES
                 for tool_call in request.round_result.tool_calls
             )
         )
+        if outcome.control_repair_exhausted:
+            _sync_plan_items(request)
+            request.state.clear_current_step()
+            return AgentLoopOutcome(
+                exit=AgentLoopExit.SUMMARY_REQUIRED,
+                summary_finish_reason="plan_repair_exhausted",
+            )
     _sync_plan_items(request)
     request.state.clear_current_step()
     if _requires_user_input(request.state):
@@ -308,5 +364,11 @@ async def _emit_final_answer_used_evidence(request: AgentRoundOutcomeRequest) ->
 
 def _sync_plan_items(request: AgentRoundOutcomeRequest) -> None:
     if not request.step_context.plan_items:
+        return
+    request.state.plan_coordinator.adopt_observed_items(
+        list(request.step_context.plan_items.values()),
+        reason="legacy_observed",
+    )
+    if request.state.plan_coordinator.has_valid_model_plan:
         return
     request.state.plan_items = {str(item_id): dict(item) for item_id, item in request.step_context.plan_items.items()}

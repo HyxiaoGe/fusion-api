@@ -457,7 +457,7 @@ class ChatService:
                 assistant_message_id=assistant_message_id,
                 assistant_message_sequence=continuation.assistant_message.sequence,
                 task_id=task_id,
-                options={},
+                options={"plan_mode": continuation.plan_mode},
                 capabilities=capabilities,
                 trace_id=trace_id,
                 initial_content_blocks=continuation.initial_content_blocks,

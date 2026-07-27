@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from app.schemas.chat import ContextUsage, Usage
+from app.services.agent.plan_coordinator import PlanCoordinator
 from app.services.stream.agent_loop_policy import AgentLoopLimitReason
 from app.services.stream.itinerary_observability import ItineraryToolObservation
 from app.services.stream.run_finalizer import AgentRunStats
@@ -60,6 +61,7 @@ class AgentLoopState:
     argument_repair_state: dict[str, dict[str, Any]] = field(default_factory=dict)
     pending_tool_repairs: dict[str, dict[str, Any]] = field(default_factory=dict)
     itinerary_tool_observations: list[ItineraryToolObservation] = field(default_factory=list)
+    plan_coordinator: PlanCoordinator = field(default_factory=lambda: PlanCoordinator(run_id=""))
 
     def next_step_number(self) -> int:
         self.step += 1

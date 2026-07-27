@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
 from app.ai.litellm_utils import merge_extra_body
 from app.ai.prompts.agent_loop import (
+    get_agent_plan_control_prompt,
     get_no_tool_network_boundary_prompt,
     get_no_vision_file_boundary_prompt,
     get_tool_usage_contract_prompt,
 )
 from app.ai.tools import build_web_search_tool
 from app.db.repositories import FileRepository
+from app.services.agent.plan_coordinator import PlanMode, normalize_plan_mode
 from app.services.chat.message_builder import (
     build_llm_messages,
     inject_file_content,
@@ -28,6 +31,8 @@ from app.services.stream.persistence import preprocess_url_in_message
 
 VOLCENGINE_PROVIDERS = {"volcengine"}
 MAX_CONTROLLED_OUTPUT_TOKENS = 4096
+PLAN_ITEM_ARGUMENT_NAME = "_plan_item_id"
+PLAN_ITEM_ID_PATTERN = "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
 
 
 @dataclass(frozen=True)
@@ -39,6 +44,59 @@ class AgentLoopCallConfig:
     supports_dynamic_tools: bool = False
     dynamic_tool_handlers: dict[str, Any] = field(default_factory=dict)
     tool_bindings: list[dict[str, Any]] = field(default_factory=list)
+    plan_mode: PlanMode = "auto"
+    control_tool_names: frozenset[str] = frozenset()
+
+
+def build_update_plan_tool() -> dict[str, Any]:
+    """仅供 Agent Loop 控制面消费，不映射到任何外部 handler。"""
+
+    return {
+        "type": "function",
+        "function": {
+            "name": "update_plan",
+            "description": (
+                "创建或更新本次任务的执行计划。复杂、多步骤或需要调用外部工具的任务应先调用；"
+                "这是内部控制工具，不查询外部数据。"
+            ),
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "explanation": {"type": "string", "description": "本次创建或修订计划的原因。"},
+                    "plan": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 12,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "pattern": PLAN_ITEM_ID_PATTERN,
+                                    "description": "稳定步骤 ID；可使用数字、字母、下划线和连字符。",
+                                },
+                                "step": {"type": "string", "description": "用户可理解的结果导向步骤。"},
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"],
+                                },
+                                "kind": {
+                                    "type": "string",
+                                    "enum": ["reasoning", "search", "read", "synthesis", "answer", "other"],
+                                },
+                                "depends_on": {"type": "array", "items": {"type": "string"}},
+                                "planned_tools": {"type": "array", "items": {"type": "string"}},
+                            },
+                            "required": ["id", "step", "status", "planned_tools"],
+                        },
+                    },
+                },
+                "required": ["plan"],
+            },
+        },
+    }
 
 
 @dataclass(frozen=True)
@@ -62,6 +120,35 @@ def announced_tool_names_from_call_kwargs(call_kwargs: dict) -> list[str]:
 def _tool_definition_name(tool: dict) -> str:
     function = tool.get("function") if isinstance(tool, dict) else None
     return str(function.get("name", "")) if isinstance(function, dict) else ""
+
+
+def _with_plan_item_binding(tool: dict, *, required: bool) -> dict:
+    """给外部工具增加仅供 Agent Loop 消费的计划项关联字段。"""
+
+    if _tool_definition_name(tool) == "update_plan":
+        return tool
+    prepared = deepcopy(tool)
+    function = prepared.get("function")
+    if not isinstance(function, dict):
+        return prepared
+    parameters = function.get("parameters")
+    if not isinstance(parameters, dict) or parameters.get("type") != "object":
+        return prepared
+    properties = parameters.setdefault("properties", {})
+    if not isinstance(properties, dict):
+        return prepared
+    properties[PLAN_ITEM_ARGUMENT_NAME] = {
+        "type": "string",
+        "pattern": PLAN_ITEM_ID_PATTERN,
+        "description": (
+            "内部计划步骤 ID。存在执行计划时，必须填写本次调用所属步骤的精确 id；该字段由 Fusion 在调用真实工具前移除。"
+        ),
+    }
+    if required:
+        required_fields = parameters.setdefault("required", [])
+        if isinstance(required_fields, list) and PLAN_ITEM_ARGUMENT_NAME not in required_fields:
+            required_fields.append(PLAN_ITEM_ARGUMENT_NAME)
+    return prepared
 
 
 def supports_search_tools(capabilities: dict) -> bool:
@@ -104,7 +191,10 @@ def build_agent_loop_call_config(
     should_use_reasoning = use_reasoning is True or (use_reasoning is None and supports_thinking)
 
     tools_disabled = options.get("disable_tools") is True
+    requested_plan_mode = normalize_plan_mode(options.get("plan_mode"))
     supports_function_calling = supports_search_tools(capabilities) and not tools_disabled
+    supports_control_tools = bool(capabilities.get("functionCalling", False)) and not tools_disabled
+    plan_mode: PlanMode = requested_plan_mode if supports_control_tools else "off"
     supports_dynamic_tools = supports_dynamic_agent_tools(capabilities) and not tools_disabled
     call_kwargs: dict = {}
     max_tokens = normalize_controlled_max_tokens(options.get("max_tokens"))
@@ -116,13 +206,25 @@ def build_agent_loop_call_config(
     provided_handlers = dynamic_tool_handlers or {}
     if supports_dynamic_tools:
         tools.extend(tool for tool in (additional_tools or []) if _tool_definition_name(tool) in provided_handlers)
+    control_tool_names: frozenset[str] = frozenset()
+    if supports_control_tools and plan_mode != "off":
+        tools.append(build_update_plan_tool())
+        control_tool_names = frozenset({"update_plan"})
+        tools = [
+            _with_plan_item_binding(tool, required=plan_mode == "on")
+            if _tool_definition_name(tool) not in control_tool_names
+            else tool
+            for tool in tools
+        ]
     if tools:
         call_kwargs["tools"] = tools
         call_kwargs["tool_choice"] = "auto"
         if should_use_reasoning and provider in volcengine_providers:
             merge_extra_body(call_kwargs, {"thinking": {"type": "disabled"}})
 
-    announced_tools = announced_tool_names_from_call_kwargs(call_kwargs)
+    announced_tools = [
+        name for name in announced_tool_names_from_call_kwargs(call_kwargs) if name not in control_tool_names
+    ]
     announced_tool_set = set(announced_tools)
     active_handlers = {name: handler for name, handler in provided_handlers.items() if name in announced_tool_set}
     active_bindings = [
@@ -136,6 +238,8 @@ def build_agent_loop_call_config(
         supports_dynamic_tools=bool(active_handlers),
         dynamic_tool_handlers=active_handlers,
         tool_bindings=active_bindings,
+        plan_mode=plan_mode,
+        control_tool_names=control_tool_names,
     )
 
 
@@ -214,11 +318,16 @@ async def prepare_agent_loop_messages(
     messages = inject_tool_usage_contract(messages, call_config.call_kwargs)
     messages = inject_amap_fact_boundary(messages, call_config.call_kwargs)
     messages = inject_flyai_travel_fact_boundary(messages, call_config.call_kwargs)
+    messages = inject_plan_control_contract(messages, call_config)
     messages = inject_no_tool_network_boundary(messages, call_config.call_kwargs)
     return AgentLoopPreparedMessages(
         messages=messages,
         initial_content_blocks=initial_content_blocks,
-        final_tool_names=announced_tool_names_from_call_kwargs(call_config.call_kwargs),
+        final_tool_names=[
+            name
+            for name in announced_tool_names_from_call_kwargs(call_config.call_kwargs)
+            if name not in getattr(call_config, "control_tool_names", frozenset())
+        ],
     )
 
 
@@ -333,6 +442,27 @@ def inject_flyai_travel_fact_boundary(messages: list[dict], call_kwargs: dict) -
         insert_at += 1
     boundary_msg = {"role": "system", "content": FLYAI_TRAVEL_FACT_BOUNDARY_SYSTEM_PROMPT}
     return [*messages[:insert_at], boundary_msg, *messages[insert_at:]]
+
+
+def inject_plan_control_contract(
+    messages: list[dict],
+    call_config: AgentLoopCallConfig,
+) -> list[dict]:
+    """向支持计划控制的模型注入行为契约，避免复杂任务只展示观察型占位计划。"""
+
+    if "update_plan" not in getattr(call_config, "control_tool_names", frozenset()):
+        return messages
+    if any(msg.get("role") == "system" and "【执行计划控制规则】" in str(msg.get("content", "")) for msg in messages):
+        return messages
+
+    insert_at = 0
+    while insert_at < len(messages) and messages[insert_at].get("role") == "system":
+        insert_at += 1
+    contract_msg = {
+        "role": "system",
+        "content": get_agent_plan_control_prompt(call_config.plan_mode),
+    }
+    return [*messages[:insert_at], contract_msg, *messages[insert_at:]]
 
 
 def inject_no_tool_network_boundary(messages: list[dict], call_kwargs: dict) -> list[dict]:

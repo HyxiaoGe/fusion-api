@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.services.agent.emitter import AgentEventEmitter
+from app.services.agent.plan_coordinator import PlanCoordinator
 from app.services.agent.progress_recorder import AgentProgressRecorder
 from app.services.stream.agent_loop_policy import AgentLoopLimits
 from app.services.stream.agent_loop_request_prep import AgentLoopCallConfig
@@ -99,7 +100,12 @@ def _build_execution_parts(
     return AgentLoopExecutionParts(
         run_id=run_id,
         run_start=dependencies.clock(),
-        state=AgentLoopState(),
+        state=AgentLoopState(
+            plan_coordinator=PlanCoordinator(
+                run_id=run_id,
+                mode=getattr(request.call_config, "plan_mode", "auto"),
+            )
+        ),
         network_budget=NetworkToolBudget(),
         emitter=emitter,
     )
@@ -168,6 +174,8 @@ def build_agent_loop_runtime(
         warning_fn=dependencies.warning_fn,
         clock=dependencies.clock,
         dynamic_tool_handlers=getattr(request.call_config, "dynamic_tool_handlers", {}),
+        plan_mode=getattr(request.call_config, "plan_mode", "auto"),
+        control_tool_names=getattr(request.call_config, "control_tool_names", frozenset()),
     )
 
 

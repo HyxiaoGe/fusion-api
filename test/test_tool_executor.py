@@ -1467,7 +1467,11 @@ class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):
         handler = AsyncMock()
         handler.tool_name = "web_search"
         handler.execute.return_value = ToolResult(status="success", data={"items": []})
-        tool_call = {"id": "call-1", "name": "web_search", "arguments": {"query": "redis stream"}}
+        tool_call = {
+            "id": "call-1",
+            "name": "web_search",
+            "arguments": {"query": "redis stream"},
+        }
 
         request = request_cls(
             conversation_id="conv-1",
@@ -1557,7 +1561,11 @@ class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):
         handler.format_llm_context.return_value = "LLM 可见上下文"
         handler.build_content_block.return_value = {"type": "tool_result"}
 
-        tool_call = {"id": "call-1", "name": "web_search", "arguments": {"query": "redis stream"}}
+        tool_call = {
+            "id": "call-1",
+            "name": "web_search",
+            "arguments": {"query": "redis stream"},
+        }
 
         with patch("app.services.tool_handlers.get_handler", return_value=handler):
             records = await execute_tools_parallel(
@@ -1717,7 +1725,12 @@ class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):
             "truncated": False,
         }
         emitter = AsyncMock()
-        tool_call = {"id": "call-1", "name": "web_search", "arguments": {"query": "redis stream"}}
+        tool_call = {
+            "id": "call-1",
+            "name": "web_search",
+            "arguments": {"query": "redis stream"},
+            "plan_item_id": "search",
+        }
 
         with patch("app.services.tool_handlers.get_handler", return_value=handler):
             await execute_tools_parallel(
@@ -1738,6 +1751,9 @@ class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(digest_kwargs["tool_name"], "web_search")
         self.assertEqual(digest_kwargs["status"], "success")
         self.assertEqual(digest_kwargs["title"], "搜索完成")
+        self.assertEqual(digest_kwargs["plan_item_id"], "search")
+        self.assertEqual(emitter.tool_call_started.await_args.kwargs["plan_item_id"], "search")
+        self.assertEqual(emitter.tool_call_completed.await_args.kwargs["plan_item_id"], "search")
         expected_evidence_id = stable_web_evidence_id("https://example.com/news", fallback="ev-call-1-0")
         self.assertEqual(digest_kwargs["source_refs"], [expected_evidence_id])
         self.assertLessEqual(len(digest_kwargs["key_findings"]), 5)

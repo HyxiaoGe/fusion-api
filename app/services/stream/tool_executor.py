@@ -354,6 +354,7 @@ async def emit_budget_result(
         tool_call_id=tool_call["id"],
         tool_name=handler.tool_name,
         arguments=_sanitize_event_arguments(handler, args),
+        plan_item_id=tool_call.get("plan_item_id"),
     )
     await emit_tool_call_result(
         request.emitter,
@@ -362,6 +363,7 @@ async def emit_budget_result(
         result=result,
         duration_ms=result.duration_ms or 0,
         result_summary_builder=handler._build_result_summary,
+        plan_item_id=tool_call.get("plan_item_id"),
     )
 
 
@@ -379,6 +381,7 @@ async def execute_tool_handler(*, request: ToolExecutionBatchRequest, tool_call:
         execute=lambda target, _event_arguments: executor(target, args, request.runtime_context),
         result_summary_builder=handler._build_result_summary,
         emitter=request.emitter,
+        plan_item_id=tool_call.get("plan_item_id"),
     )
 
 
@@ -419,7 +422,11 @@ async def emit_progress_digest_events(
     if request.emitter is None:
         return
     try:
-        await request.emitter.tool_result_digest(**build_tool_result_digest(record))
+        digest = build_tool_result_digest(record)
+        plan_item_id = record.tool_call.get("plan_item_id")
+        if isinstance(plan_item_id, str):
+            digest["plan_item_id"] = plan_item_id
+        await request.emitter.tool_result_digest(**digest)
         for evidence in build_evidence_items(record):
             await request.emitter.evidence_item_upserted(
                 tool_call_id=str(record.tool_call.get("id", "")),

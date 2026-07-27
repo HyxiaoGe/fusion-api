@@ -31,6 +31,16 @@ class LimitSummaryHelpersTests(unittest.TestCase):
         self.assertNotIn("额度", content)
         self.assertNotIn("预算", content)
 
+    def test_plan_repair_summary_does_not_claim_tool_limit(self):
+        messages = []
+
+        append_limit_summary_prompt(messages, summary_finish_reason="plan_repair_exhausted")
+
+        content = messages[-1]["content"]
+        self.assertIn("只基于已经实际取得的结果", content)
+        self.assertIn("建议重试", content)
+        self.assertNotIn("你已达到工具调用上限", content)
+
     def test_build_limit_summary_call_kwargs_copies_and_removes_tool_controls(self):
         tools = [{"function": {"name": "web_search"}}]
         call_kwargs = {

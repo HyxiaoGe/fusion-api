@@ -53,6 +53,7 @@ def build_tool_round_request(
         announced_tool_names=round_result.announced_tool_names,
         task_id=runtime.task_id,
         agent_state=state,
+        output_deferred=round_result.output_deferred,
     )
 
 

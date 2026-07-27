@@ -111,6 +111,26 @@ def test_plan_snapshot_replaces_existing_plan():
     assert [item["id"] for item in state["plan"]["items"]] == ["answer"]
 
 
+def test_plan_snapshot_rejects_stale_same_plan_but_accepts_new_plan_revision_reset():
+    state = empty_progress_state(run_id="r1", message_id="m1")
+    state = apply_progress_event(
+        state,
+        {"type": "plan_snapshot", "protocol_version": 2, "plan_id": "observed", "revision": 9, "items": []},
+    )
+    stale = apply_progress_event(
+        state,
+        {"type": "plan_snapshot", "protocol_version": 2, "plan_id": "observed", "revision": 2, "items": []},
+    )
+    switched = apply_progress_event(
+        stale,
+        {"type": "plan_snapshot", "protocol_version": 2, "plan_id": "model", "revision": 1, "items": []},
+    )
+
+    assert stale["plan"]["revision"] == 9
+    assert switched["plan"]["plan_id"] == "model"
+    assert switched["plan"]["revision"] == 1
+
+
 def test_plan_step_update_ignores_stale_revision():
     state = empty_progress_state(run_id="r1", message_id="m1")
     state = apply_progress_event(

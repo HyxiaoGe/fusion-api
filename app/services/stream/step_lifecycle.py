@@ -38,6 +38,7 @@ class AgentStepContext:
     text_block_id: str
     run_id: str = ""
     plan_items: dict[str, dict] = field(default_factory=dict)
+    model_plan_managed: bool = False
 
 
 def _make_block_id() -> str:
@@ -68,6 +69,7 @@ async def start_agent_step(
     completed_tool_calls: int | None = None,
     max_tool_calls: int | None = None,
     plan_items: dict[str, dict] | None = None,
+    model_plan_managed: bool = False,
     clock: Callable[[], float] = time.time,
     block_id_factory: Callable[[], str] = _make_block_id,
     on_step_started: Callable[[str], None] | None = None,
@@ -83,6 +85,7 @@ async def start_agent_step(
         completed_tool_calls=completed_tool_calls,
         max_tool_calls=max_tool_calls,
         plan_items=plan_items,
+        model_plan_managed=model_plan_managed,
     )
     await session_cache.write_step_started(
         run_id=run_id,
@@ -97,6 +100,7 @@ async def start_agent_step(
         thinking_block_id=block_id_factory(),
         text_block_id=block_id_factory(),
         plan_items=_copy_plan_items(plan_items),
+        model_plan_managed=model_plan_managed,
     )
 
 
@@ -145,6 +149,18 @@ async def mark_tool_round_started(
     max_tool_calls: int | None = None,
 ) -> None:
     stage = _tool_stage(tool_names)
+    if context.model_plan_managed:
+        await _maybe_call_async(
+            emitter,
+            "run_progress_updated",
+            phase="reading" if stage == "read" else "researching",
+            label="正在读取关键来源" if stage == "read" else "正在调用外部工具",
+            completed_steps=None,
+            total_steps=None,
+            completed_tool_calls=completed_tool_calls,
+            max_tool_calls=max_tool_calls,
+        )
+        return
     await _ensure_tool_plan_initialized(
         emitter=emitter,
         context=context,
@@ -277,7 +293,10 @@ async def _maybe_emit_plan_step_started(
     completed_tool_calls: int | None,
     max_tool_calls: int | None,
     plan_items: dict[str, dict] | None = None,
+    model_plan_managed: bool = False,
 ) -> None:
+    if model_plan_managed:
+        return
     if not plan_items:
         return
 
@@ -392,6 +411,8 @@ async def _maybe_emit_plan_step_completed(
     completed_tool_calls: int | None,
     max_tool_calls: int | None,
 ) -> None:
+    if context.model_plan_managed:
+        return
     if not context.plan_items and tool_call_count <= 0:
         return
 

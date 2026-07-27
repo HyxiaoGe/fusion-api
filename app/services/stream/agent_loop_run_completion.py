@@ -76,6 +76,7 @@ async def finalize_completed_run(
     finalize_stream_fn: FinalizeStreamFn,
 ) -> None:
     try:
+        await _emit_terminal_plan(context, terminal_state.run_finish_reason)
         persist_run_message(context=context, persist_message_fn=persist_message_fn, partial=False)
         await complete_agent_run_fn(
             emitter=context.emitter,
@@ -106,6 +107,7 @@ async def finalize_superseded_run(
     finalize_stream_fn: FinalizeStreamFn,
 ) -> None:
     try:
+        await _emit_terminal_plan(context, "superseded")
         persist_run_message(context=context, persist_message_fn=persist_message_fn, partial=True)
         await interrupt_agent_run_fn(
             emitter=context.emitter,
@@ -139,6 +141,7 @@ async def finalize_cancelled_run(
     finalize_stream_fn: FinalizeStreamFn,
     warning_fn: WarningFn,
 ) -> None:
+    await _emit_terminal_plan(context, "interrupted")
     persist_run_message(
         context=context,
         persist_message_fn=persist_message_fn,
@@ -184,6 +187,7 @@ async def finalize_failed_run(
     finalize_stream_fn: FinalizeStreamFn,
     warning_fn: WarningFn,
 ) -> None:
+    await _emit_terminal_plan(context, "failed")
     persist_run_message(
         context=context,
         persist_message_fn=persist_message_fn,
@@ -233,6 +237,20 @@ def _safe_structured_error_code(error: Exception) -> str:
     if not isinstance(candidate, str) or candidate not in _PUBLIC_ERROR_MESSAGES:
         return ""
     return candidate
+
+
+async def _emit_terminal_plan(context: AgentLoopRunCompletionContext, outcome: str) -> None:
+    has_final_answer = any(
+        (block.get("type") if isinstance(block, dict) else getattr(block, "type", None)) == "text"
+        and bool(str(block.get("text", "") if isinstance(block, dict) else getattr(block, "text", "")).strip())
+        for block in context.state.content_blocks
+    )
+    snapshot = context.state.plan_coordinator.terminalize(
+        outcome,
+        has_final_answer=has_final_answer,
+    )
+    if snapshot is not None:
+        await context.emitter.plan_snapshot(**snapshot)
 
 
 def _emit_itinerary_observation(

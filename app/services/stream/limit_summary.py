@@ -13,6 +13,7 @@ from app.ai.llm_round_observability import create_llm_round_observation
 from app.ai.prompts.agent_loop import LIMIT_SUMMARY_PROMPT as _LIMIT_SUMMARY_PROMPT
 from app.ai.prompts.agent_loop import (
     NO_PROGRESS_SUMMARY_PROMPT,
+    PLAN_REPAIR_SUMMARY_PROMPT,
     SUMMARY_NON_DISCLOSURE_PROMPT,
     get_limit_summary_prompt,
 )
@@ -95,6 +96,8 @@ def append_limit_summary_prompt(
 ) -> None:
     if summary_finish_reason == "no_progress_summary":
         prompt = NO_PROGRESS_SUMMARY_PROMPT
+    elif summary_finish_reason == "plan_repair_exhausted":
+        prompt = PLAN_REPAIR_SUMMARY_PROMPT
     else:
         prompt = get_limit_summary_prompt()
         if SUMMARY_NON_DISCLOSURE_PROMPT not in prompt:

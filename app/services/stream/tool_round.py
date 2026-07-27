@@ -28,6 +28,7 @@ from app.services.source_evidence_ledger import build_selected_source_evidence_i
 from app.services.stream.agent_loop_state import AgentLoopState, ProductToolOutcome
 from app.services.stream.itinerary_observability import build_itinerary_tool_observation
 from app.services.stream.itinerary_result_composer import compose_itinerary_result
+from app.services.stream.plan_control import process_plan_control_calls
 from app.services.stream.step_lifecycle import AgentStepContext, mark_tool_round_started
 from app.services.stream.tool_context import (
     BlockedToolContext,
@@ -57,6 +58,7 @@ class ToolRoundOutcome:
     product_result_count: int = 0
     itinerary_result_count: int = 0
     product_outcomes: tuple[ProductToolOutcome, ...] = ()
+    control_repair_exhausted: bool = False
 
 
 @dataclass(frozen=True)
@@ -93,6 +95,7 @@ class ToolRoundRequest:
     announced_tool_names: frozenset[str] | None = None
     task_id: str = ""
     agent_state: AgentLoopState | None = None
+    output_deferred: bool = False
     resolve_tool_context_fn: Callable[..., Awaitable[ToolContextResolution]] = resolve_tool_context
 
 
@@ -234,6 +237,7 @@ def append_tool_round_messages_with_plan(
     reused_tool_calls: list[dict] | None = None,
     context_blocked_calls: dict[str, BlockedToolContext] | None = None,
     built_content_blocks: dict[str, Any] | None = None,
+    control_tool_responses: dict[str, str] | None = None,
 ) -> None:
     request.messages.append(
         build_assistant_tool_message(
@@ -254,9 +258,19 @@ def append_tool_round_messages_with_plan(
     unavailable_ids = {str(tool_call.get("id", "")) for tool_call in unavailable_tool_calls or []}
     reused_ids = {str(tool_call.get("id", "")) for tool_call in reused_tool_calls or []}
     context_blocked_by_id = context_blocked_calls or {}
+    control_responses_by_id = control_tool_responses or {}
 
     for tool_call in request.tool_calls:
         tool_call_id = str(tool_call.get("id", ""))
+        if tool_call_id in control_responses_by_id:
+            request.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": control_responses_by_id[tool_call_id],
+                }
+            )
+            continue
         record = records_by_id.get(tool_call_id)
         if record is not None:
             citation_numbers = _assign_search_citation_numbers(citation_registry, record)
@@ -412,10 +426,23 @@ async def complete_tool_round_step(
 
 
 async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutcome:
-    append_tool_round_reasoning(request)
-    persist_tool_round_checkpoint(request)
+    if not request.output_deferred:
+        append_tool_round_reasoning(request)
+        persist_tool_round_checkpoint(request)
 
-    announced_tool_calls, unavailable_tool_calls = _partition_tool_calls_by_announcement(request)
+    control_result = await process_plan_control_calls(
+        tool_calls=request.tool_calls,
+        coordinator=request.agent_state.plan_coordinator
+        if request.agent_state is not None
+        else AgentLoopState().plan_coordinator,
+        emitter=request.emitter,
+    )
+    if request.agent_state is not None and request.agent_state.plan_coordinator.has_valid_model_plan:
+        object.__setattr__(request.step_context, "model_plan_managed", True)
+    announced_tool_calls, unavailable_tool_calls = _partition_tool_calls_by_announcement(
+        request,
+        tool_calls=control_result.external_tool_calls,
+    )
     selected_tool_calls = _select_tool_calls_within_limit(request, announced_tool_calls)
     context_resolution = ToolContextResolution(executable_calls=selected_tool_calls[0])
     if request.agent_state is not None and selected_tool_calls[0]:
@@ -458,6 +485,16 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
             runtime_context=runtime_context,
         )
     executable_tool_calls = context_resolution.executable_calls
+    if request.agent_state is not None:
+        started_snapshot = request.agent_state.plan_coordinator.mark_tools_started(
+            [
+                str(tool_call["plan_item_id"])
+                for tool_call in executable_tool_calls
+                if isinstance(tool_call.get("plan_item_id"), str)
+            ]
+        )
+        if started_snapshot is not None:
+            await request.emitter.plan_snapshot(**started_snapshot)
     planned_execution_tool_calls = [
         tool_call for tool_call in executable_tool_calls if not _is_successfully_reusable_call(request, tool_call)
     ]
@@ -474,6 +511,11 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
         run_id=request.run_id,
     )
     executed_results = [record for record in results if not record.reused]
+    if request.agent_state is not None:
+        tool_statuses = _plan_item_statuses_from_results(results)
+        result_snapshot = request.agent_state.plan_coordinator.mark_tool_results(tool_statuses)
+        if result_snapshot is not None:
+            await request.emitter.plan_snapshot(**result_snapshot)
     _record_tool_repairs(request.agent_state, executed_results)
     _record_itinerary_tool_observations(request.agent_state, executed_results)
     reused_limited_tool_calls, not_executed_tool_calls = _partition_successfully_reusable_calls(
@@ -494,6 +536,7 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
         reused_tool_calls=reused_limited_tool_calls,
         context_blocked_calls=context_resolution.blocked_calls,
         built_content_blocks=built_content_blocks,
+        control_tool_responses=control_result.tool_responses,
     )
     product_outcomes = build_product_tool_outcomes(results, built_content_blocks=built_content_blocks)
     if request.agent_state is not None:
@@ -533,7 +576,32 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
         product_result_count=sum(is_registered_rich_content_block(block) for block in built_content_blocks.values()),
         itinerary_result_count=1 if itinerary_result is not None else 0,
         product_outcomes=product_outcomes,
+        control_repair_exhausted=control_result.repair_exhausted,
     )
+
+
+def _plan_item_statuses_from_results(
+    results: list[ToolExecutionRecord],
+) -> dict[str, str]:
+    """同一计划项可能并行调用多个工具，以最严重结果决定本轮状态。"""
+
+    candidates: dict[str, list[str]] = {}
+    for record in results:
+        plan_item_id = record.tool_call.get("plan_item_id")
+        if not isinstance(plan_item_id, str):
+            continue
+        data = record.result.data if isinstance(record.result.data, dict) else {}
+        repair = data.get("repair") if isinstance(data, dict) else None
+        if isinstance(repair, dict) and repair.get("retryable") is True:
+            status = "running"
+        elif record.result.status in {"success", "degraded"}:
+            status = "completed"
+        else:
+            status = "failed"
+        candidates.setdefault(plan_item_id, []).append(status)
+
+    priority = {"completed": 1, "running": 2, "failed": 3}
+    return {item_id: max(statuses, key=priority.__getitem__) for item_id, statuses in candidates.items()}
 
 
 def _record_tool_repairs(
@@ -852,13 +920,18 @@ def _max_tool_calls(request: ToolRoundRequest) -> int | None:
     return value if isinstance(value, int) else None
 
 
-def _partition_tool_calls_by_announcement(request: ToolRoundRequest) -> tuple[list[dict], list[dict]]:
+def _partition_tool_calls_by_announcement(
+    request: ToolRoundRequest,
+    *,
+    tool_calls: list[dict] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    candidate_tool_calls = request.tool_calls if tool_calls is None else tool_calls
     if request.announced_tool_names is None:
-        return request.tool_calls, []
+        return candidate_tool_calls, []
 
     announced_tool_calls: list[dict] = []
     unavailable_tool_calls: list[dict] = []
-    for tool_call in request.tool_calls:
+    for tool_call in candidate_tool_calls:
         if tool_call.get("name") in request.announced_tool_names:
             announced_tool_calls.append(tool_call)
         else:
@@ -867,7 +940,7 @@ def _partition_tool_calls_by_announcement(request: ToolRoundRequest) -> tuple[li
         logger.warning(
             "模型返回本轮未公告工具调用: run_id=%s requested=%s announced=%s unavailable=%s",
             request.run_id,
-            len(request.tool_calls),
+            len(candidate_tool_calls),
             len(announced_tool_calls),
             len(unavailable_tool_calls),
         )

@@ -330,7 +330,17 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
         run_started = next(event for event in result.events if event["type"] == "run_started")
         self.assertEqual(run_started["tools"], [alias])
         self.assertEqual(run_started["config"]["mcp_tool_bindings"][0]["server_id"], "server-docs")
-        self.assertEqual(result.llm_calls[0]["call_kwargs"]["tools"], [definition])
+        request_tools = result.llm_calls[0]["call_kwargs"]["tools"]
+        self.assertEqual(request_tools[0]["function"]["name"], alias)
+        request_parameters = request_tools[0]["function"]["parameters"]
+        self.assertEqual(request_parameters["properties"]["query"], {"type": "string"})
+        self.assertIn("_plan_item_id", request_parameters["properties"])
+        self.assertNotIn("_plan_item_id", request_parameters["required"])
+        self.assertNotIn("_plan_item_id", definition["function"]["parameters"]["properties"])
+        self.assertEqual(
+            [tool["function"]["name"] for tool in request_tools],
+            [alias, "update_plan"],
+        )
         self.assertNotIn("web_search", str(result.llm_calls[0]["call_kwargs"]))
         second_round_tool_messages = [
             message for message in result.llm_calls[1]["messages"] if message.get("role") == "tool"

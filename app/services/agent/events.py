@@ -42,6 +42,7 @@ class ToolCallStarted(AgentEventBase):
     type: Literal["tool_call_started"]
     tool_name: str
     arguments: dict[str, Any]
+    plan_item_id: str | None = None
 
 
 class ToolCallDelta(AgentEventBase):
@@ -57,6 +58,7 @@ class ToolCallCompleted(AgentEventBase):
     duration_ms: int
     result_summary: dict[str, Any]
     error: str | None = None
+    plan_item_id: str | None = None
 
 
 class StepCompleted(AgentEventBase):
@@ -107,6 +109,8 @@ class AgentPlanItem(BaseModel):
     summary: str | None = None
     tool_names: list[str] = Field(default_factory=list)
     evidence_item_ids: list[str] = Field(default_factory=list)
+    depends_on: list[str] = Field(default_factory=list)
+    planned_tools: list[str] = Field(default_factory=list)
 
 
 class AgentEvidenceItem(BaseModel):
@@ -137,7 +141,10 @@ class PlanSnapshot(AgentEventBase):
     type: Literal["plan_snapshot"]
     protocol_version: Literal[2]
     plan_id: str
+    mode: Literal["auto", "on", "off"] = "auto"
+    source: Literal["model", "observed"] = "observed"
     revision: int
+    reason: str = "legacy_observed"
     items: list[AgentPlanItem]
 
 
@@ -145,7 +152,10 @@ class PlanStepUpdated(AgentEventBase):
     type: Literal["plan_step_updated"]
     protocol_version: Literal[2]
     plan_id: str
+    mode: Literal["auto", "on", "off"] = "auto"
+    source: Literal["model", "observed"] = "observed"
     revision: int
+    reason: str = "legacy_observed"
     item: AgentPlanItem
 
 
@@ -161,6 +171,7 @@ class ToolResultDigest(AgentEventBase):
     truncated: bool = False
     repair_state: Literal["retrying", "requires_user_input", "exhausted", "resolved"] | None = None
     repair_id: str | None = None
+    plan_item_id: str | None = None
 
 
 class EvidenceItemUpserted(AgentEventBase):

@@ -15,6 +15,7 @@ from app.db.models import Message as MessageModel
 from app.schemas.chat import ContentBlock
 from app.schemas.content_block_registry import deserialize_content_blocks
 from app.schemas.response import ApiException
+from app.services.agent.plan_coordinator import PlanMode, normalize_plan_mode
 from app.services.stream.agent_loop_policy import AgentLoopLimits
 
 CONTINUATION_SYSTEM_PROMPT = _CONTINUATION_SYSTEM_PROMPT
@@ -25,6 +26,7 @@ class AgentContinuationContext:
     assistant_message: MessageModel
     previous_session: AgentSession
     limits: AgentLoopLimits
+    plan_mode: PlanMode
     initial_content_blocks: list[ContentBlock]
 
 
@@ -46,6 +48,13 @@ def resolve_continuation_limits(session: AgentSession, *, default_limits: AgentL
         )
     except (TypeError, ValueError):
         return default_limits
+
+
+def resolve_continuation_plan_mode(session: AgentSession) -> PlanMode:
+    """续跑必须继承原 run 的计划契约，非法旧值安全降级为 auto。"""
+
+    config = session.run_config if isinstance(session.run_config, dict) else {}
+    return normalize_plan_mode(config.get("plan_mode"))
 
 
 def find_latest_limit_reached_session(
@@ -98,5 +107,6 @@ def build_continuation_context(
         assistant_message=assistant_message,
         previous_session=previous_session,
         limits=resolve_continuation_limits(previous_session, default_limits=default_limits),
+        plan_mode=resolve_continuation_plan_mode(previous_session),
         initial_content_blocks=deserialize_content_blocks(assistant_message.content),
     )

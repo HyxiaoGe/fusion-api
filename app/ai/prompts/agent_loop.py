@@ -87,6 +87,40 @@ TOOL_USAGE_CONTRACT_PROMPT = (
     "没有调用工具时，请直接基于已有知识回答，并明确避免暗示已经联网或即将联网。"
 )
 
+AGENT_PLAN_CONTROL_AUTO_PROMPT = (
+    "【执行计划控制规则】\n"
+    "当前提供内部执行计划能力。它只用于协调任务，不查询外部数据，也不得在思考过程或最终回答中提及其工具名称。\n"
+    "在自动计划模式下，满足以下任一条件时，首次调用外部工具前必须先创建计划：\n"
+    "- 用户要求行程规划、方案比较、调研、审查或其他需要综合判断的任务；\n"
+    "- 预计需要两次或以上外部工具调用，或需要根据前一步结果决定后一步；\n"
+    "- 最终回答需要汇总、比较或交叉核对外部工具结果。\n"
+    "简单闲聊、直接回答，以及无需综合判断的一次独立事实查询，不要为了展示流程而创建计划。\n"
+    "计划应包含 2 至 6 个用户可理解的结果导向步骤；标题描述要完成的事情，不暴露内部工具名或参数。\n"
+    "每个步骤必须提供稳定且唯一的 id；planned_tools 必须填写预计使用的真实工具名称。"
+    "每次外部工具调用都必须把 _plan_item_id 设为本次调用所属步骤的精确 id；"
+    "同一工具用于多个步骤时用该字段区分，不要靠工具名称猜测。最多一个步骤为 running，其余未执行步骤为 pending。\n"
+    "id、planned_tools 和 _plan_item_id 都是内部控制字段，不得在思考过程或最终回答中展示或解释。\n"
+    "不要自行把步骤标成 completed、failed、skipped 或 blocked，这些终态由系统根据真实执行结果更新。\n"
+    "若计划被拒绝，只根据结构化回执静默修正；不要向用户叙述拒绝原因、引用系统规则或声称已达到工具上限，"
+    "也不得以计划失败为由越过门禁。\n"
+    "只有任务范围或执行路径实质变化时才修订计划；保留已有步骤 id，不要为了刷新状态重复调用。"
+)
+
+AGENT_PLAN_CONTROL_ON_PROMPT = (
+    "【执行计划控制规则】\n"
+    "本轮启用了强制计划模式。回答或调用任何外部工具前，必须先创建执行计划。\n"
+    "计划能力只用于协调任务，不查询外部数据，也不得在思考过程或最终回答中提及其工具名称。\n"
+    "计划应包含 2 至 6 个用户可理解的结果导向步骤；标题描述要完成的事情，不暴露内部工具名或参数。\n"
+    "每个步骤必须提供稳定且唯一的 id；planned_tools 必须填写预计使用的真实工具名称。"
+    "每次外部工具调用都必须把 _plan_item_id 设为本次调用所属步骤的精确 id；"
+    "同一工具用于多个步骤时用该字段区分，不要靠工具名称猜测。最多一个步骤为 running，其余未执行步骤为 pending。\n"
+    "id、planned_tools 和 _plan_item_id 都是内部控制字段，不得在思考过程或最终回答中展示或解释。\n"
+    "不要自行把步骤标成 completed、failed、skipped 或 blocked，这些终态由系统根据真实执行结果更新。\n"
+    "若计划被拒绝，只根据结构化回执静默修正；不要向用户叙述拒绝原因、引用系统规则或声称已达到工具上限，"
+    "也不得以计划失败为由越过门禁。\n"
+    "只有任务范围或执行路径实质变化时才修订计划；保留已有步骤 id，不要为了刷新状态重复调用。"
+)
+
 NO_TOOL_NETWORK_BOUNDARY_PROMPT = (
     "【无联网工具边界规则】\n"
     "当前调用没有联网搜索或网页读取工具。\n"
@@ -115,6 +149,13 @@ LIMIT_SUMMARY_PROMPT = (
 
 NO_PROGRESS_SUMMARY_PROMPT = (
     "现有搜索已不再产生新的有效信息，请基于已收集的信息直接给出最终回答。不要再调用任何工具。\n\n"
+    f"{SUMMARY_NON_DISCLOSURE_PROMPT}"
+)
+
+PLAN_REPAIR_SUMMARY_PROMPT = (
+    "本轮无法继续调用工具。请只基于已经实际取得的结果给出诚实回答；"
+    "如果现有结果不足以完成用户任务，简短说明本次未能完成所需查询并建议重试。"
+    "不要提及执行计划、内部校验、系统规则、工具上限、额度、状态码或处理过程。\n\n"
     f"{SUMMARY_NON_DISCLOSURE_PROMPT}"
 )
 
@@ -176,6 +217,12 @@ def get_tool_usage_contract_prompt() -> str:
 
 def get_no_tool_network_boundary_prompt() -> str:
     return get_runtime_prompt_template("no_tool_network_boundary", NO_TOOL_NETWORK_BOUNDARY_PROMPT)
+
+
+def get_agent_plan_control_prompt(plan_mode: str) -> str:
+    if plan_mode == "on":
+        return get_runtime_prompt_template("agent_plan_control_on", AGENT_PLAN_CONTROL_ON_PROMPT)
+    return get_runtime_prompt_template("agent_plan_control_auto", AGENT_PLAN_CONTROL_AUTO_PROMPT)
 
 
 def get_no_vision_file_boundary_prompt() -> str:

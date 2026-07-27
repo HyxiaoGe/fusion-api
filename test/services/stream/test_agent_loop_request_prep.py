@@ -5,6 +5,7 @@ from app.services.stream.agent_loop_request_prep import (
     build_agent_loop_call_config,
     inject_amap_fact_boundary,
     inject_no_tool_network_boundary,
+    inject_plan_control_contract,
     prepare_agent_loop_messages,
 )
 
@@ -19,6 +20,142 @@ class FakeFileRepository:
 
 
 class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
+    def test_plan_mode_defaults_auto_and_control_tool_is_hidden_from_user_tool_list(self):
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={},
+            capabilities={"functionCalling": True, "searchCapable": True},
+        )
+
+        model_tool_names = [tool["function"]["name"] for tool in config.call_kwargs["tools"]]
+        self.assertEqual(config.plan_mode, "auto")
+        self.assertIn("update_plan", model_tool_names)
+        self.assertIn("web_search", model_tool_names)
+        self.assertNotIn("update_plan", config.announced_tools)
+        self.assertEqual(config.control_tool_names, frozenset({"update_plan"}))
+
+    def test_plan_mode_off_preserves_old_tools_without_control_tool(self):
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={"plan_mode": "off"},
+            capabilities={"functionCalling": True, "searchCapable": True},
+        )
+
+        model_tool_names = [tool["function"]["name"] for tool in config.call_kwargs["tools"]]
+        self.assertEqual(config.plan_mode, "off")
+        self.assertNotIn("update_plan", model_tool_names)
+        self.assertEqual(config.announced_tools, ["web_search"])
+        parameters = config.call_kwargs["tools"][0]["function"]["parameters"]
+        self.assertNotIn("_plan_item_id", parameters["properties"])
+
+    def test_on_mode_requires_explicit_plan_item_binding_on_external_tools(self):
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={"plan_mode": "on"},
+            capabilities={"functionCalling": True, "searchCapable": True},
+        )
+
+        tools = {tool["function"]["name"]: tool for tool in config.call_kwargs["tools"]}
+        web_parameters = tools["web_search"]["function"]["parameters"]
+        plan_parameters = tools["update_plan"]["function"]["parameters"]
+        plan_item = plan_parameters["properties"]["plan"]["items"]
+
+        self.assertIn("_plan_item_id", web_parameters["properties"])
+        self.assertIn("_plan_item_id", web_parameters["required"])
+        self.assertEqual(web_parameters["properties"]["_plan_item_id"]["type"], "string")
+        self.assertIn("id", plan_item["required"])
+        self.assertIn("planned_tools", plan_item["required"])
+        self.assertEqual(
+            plan_item["properties"]["id"]["pattern"],
+            "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+        )
+        self.assertEqual(
+            web_parameters["properties"]["_plan_item_id"]["pattern"],
+            "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+        )
+        self.assertNotIn("_plan_item_id", plan_parameters["properties"])
+
+    def test_auto_mode_exposes_optional_plan_item_binding_without_breaking_simple_tools(self):
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={"plan_mode": "auto"},
+            capabilities={"functionCalling": True, "searchCapable": True},
+        )
+
+        web_tool = next(tool for tool in config.call_kwargs["tools"] if tool["function"]["name"] == "web_search")
+        parameters = web_tool["function"]["parameters"]
+
+        self.assertIn("_plan_item_id", parameters["properties"])
+        self.assertNotIn("_plan_item_id", parameters.get("required", []))
+
+    def test_control_plan_tool_only_requires_function_calling_not_search_capability(self):
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={"plan_mode": "on"},
+            capabilities={"functionCalling": True, "searchCapable": False},
+        )
+
+        self.assertEqual(
+            [tool["function"]["name"] for tool in config.call_kwargs["tools"]],
+            ["update_plan"],
+        )
+        self.assertEqual(config.announced_tools, [])
+
+    def test_requested_on_mode_defensively_disables_when_model_cannot_call_control_tool(self):
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={"plan_mode": "on"},
+            capabilities={"functionCalling": False, "searchCapable": False},
+        )
+
+        self.assertEqual(config.plan_mode, "off")
+        self.assertNotIn("tools", config.call_kwargs)
+        self.assertEqual(config.control_tool_names, frozenset())
+
+    def test_auto_plan_contract_requires_plan_for_itinerary_and_multi_tool_tasks(self):
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={},
+            capabilities={"functionCalling": True, "searchCapable": True},
+        )
+        messages = [{"role": "user", "content": "规划通勤路线"}]
+
+        prepared = inject_plan_control_contract(messages, config)
+
+        self.assertEqual(prepared[0]["role"], "system")
+        contract = prepared[0]["content"]
+        self.assertIn("【执行计划控制规则】", contract)
+        self.assertIn("首次调用外部工具前必须先创建计划", contract)
+        self.assertIn("行程规划、方案比较、调研、审查", contract)
+        self.assertIn("两次或以上外部工具调用", contract)
+        self.assertIn("一次独立事实查询", contract)
+        self.assertIn("不要自行把步骤标成 completed", contract)
+        self.assertIn("不要向用户叙述拒绝原因", contract)
+        self.assertIn("不得以计划失败为由越过门禁", contract)
+        self.assertNotIn("update_plan", contract)
+
+    def test_on_plan_contract_requires_plan_before_any_answer_or_external_tool(self):
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={"plan_mode": "on"},
+            capabilities={"functionCalling": True, "searchCapable": True},
+        )
+
+        prepared = inject_plan_control_contract([{"role": "user", "content": "你好"}], config)
+
+        self.assertIn("本轮启用了强制计划模式", prepared[0]["content"])
+        self.assertIn("回答或调用任何外部工具前", prepared[0]["content"])
+
+    def test_plan_contract_is_not_injected_when_plan_mode_is_off(self):
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={"plan_mode": "off"},
+            capabilities={"functionCalling": True, "searchCapable": True},
+        )
+        messages = [{"role": "user", "content": "规划通勤路线"}]
+
+        self.assertIs(inject_plan_control_contract(messages, config), messages)
+
     def test_amap_fact_boundary_is_generic_system_prompt_and_preserves_multi_tool_message_order(self):
         messages = [
             {"role": "system", "content": "基础系统提示"},
@@ -176,7 +313,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
     def test_build_call_config_enables_tools_and_volcengine_reasoning_compat(self):
         config = build_agent_loop_call_config(
             provider="volcengine",
-            options={},
+            options={"plan_mode": "off"},
             capabilities={"functionCalling": True, "deepThinking": True},
         )
 
@@ -202,7 +339,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
     def test_build_call_config_disables_agent_tools_when_agent_tools_capability_is_false(self):
         config = build_agent_loop_call_config(
             provider="qwen",
-            options={},
+            options={"plan_mode": "off"},
             capabilities={"functionCalling": True, "agentTools": False, "deepThinking": False},
         )
 
@@ -214,7 +351,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
     def test_build_call_config_uses_search_capable_as_runtime_tool_contract(self):
         config = build_agent_loop_call_config(
             provider="openai",
-            options={},
+            options={"plan_mode": "off"},
             capabilities={"functionCalling": True, "agentTools": False, "searchCapable": True},
         )
 
@@ -225,7 +362,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
     def test_build_call_config_disables_tools_when_search_capable_is_false(self):
         config = build_agent_loop_call_config(
             provider="openai",
-            options={},
+            options={"plan_mode": "off"},
             capabilities={"functionCalling": True, "agentTools": True, "webSearch": True, "searchCapable": False},
         )
 
@@ -248,7 +385,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
 
         config = build_agent_loop_call_config(
             provider="openai",
-            options={},
+            options={"plan_mode": "off"},
             capabilities={"functionCalling": True, "searchCapable": False},
             additional_tools=[mcp_tool],
             dynamic_tool_handlers={"mcp_microsoft_docs_a1b2c3d4": handler},
@@ -295,7 +432,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
 
         config = build_agent_loop_call_config(
             provider="openai",
-            options={},
+            options={"plan_mode": "off"},
             capabilities={"functionCalling": True, "agentTools": False, "searchCapable": False},
             additional_tools=[mcp_tool],
             dynamic_tool_handlers={"mcp_docs_a1b2c3d4": object()},
@@ -367,16 +504,20 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             build_llm_messages_fn=build_llm_messages_fn,
         )
 
-        self.assertEqual([message["role"] for message in prepared.messages], ["system", "system", "user"])
+        self.assertEqual(
+            [message["role"] for message in prepared.messages],
+            ["system", "system", "system", "user"],
+        )
         self.assertIn("日期 system", prepared.messages[0]["content"])
-        self.assertIn("【无联网工具边界规则】", prepared.messages[1]["content"])
-        self.assertIn("不要声称已经搜索", prepared.messages[1]["content"])
-        self.assertIn("无法实时核验", prepared.messages[1]["content"])
-        self.assertIn("不要把已有知识包装成最新事实", prepared.messages[1]["content"])
-        self.assertIn("普通稳定问题直接回答", prepared.messages[1]["content"])
-        self.assertNotIn("切换模型", prepared.messages[1]["content"])
-        self.assertNotIn("【工具调用一致性规则】", prepared.messages[1]["content"])
-        self.assertEqual(prepared.messages[2]["content"], "OpenAI 最近发布了什么模型？")
+        self.assertIn("【执行计划控制规则】", prepared.messages[1]["content"])
+        self.assertIn("【无联网工具边界规则】", prepared.messages[2]["content"])
+        self.assertIn("不要声称已经搜索", prepared.messages[2]["content"])
+        self.assertIn("无法实时核验", prepared.messages[2]["content"])
+        self.assertIn("不要把已有知识包装成最新事实", prepared.messages[2]["content"])
+        self.assertIn("普通稳定问题直接回答", prepared.messages[2]["content"])
+        self.assertNotIn("切换模型", prepared.messages[2]["content"])
+        self.assertNotIn("【工具调用一致性规则】", prepared.messages[2]["content"])
+        self.assertEqual(prepared.messages[3]["content"], "OpenAI 最近发布了什么模型？")
 
     async def test_prepare_messages_injects_no_vision_boundary_when_image_attached_to_text_model(self):
         async def build_llm_messages_fn(
@@ -405,12 +546,16 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             is_image_file_fn=lambda file_id, _repo: file_id == "image-1",
         )
 
-        self.assertEqual([message["role"] for message in prepared.messages], ["system", "system", "system", "user"])
+        self.assertEqual(
+            [message["role"] for message in prepared.messages],
+            ["system", "system", "system", "system", "user"],
+        )
         self.assertIn("【无图片理解能力边界规则】", prepared.messages[1]["content"])
         self.assertIn("当前模型不能读取或理解图片附件", prepared.messages[1]["content"])
         self.assertIn("不要臆测图片内容", prepared.messages[1]["content"])
-        self.assertIn("【无联网工具边界规则】", prepared.messages[2]["content"])
-        self.assertEqual(prepared.messages[3]["content"], "这张图里有什么？")
+        self.assertIn("【执行计划控制规则】", prepared.messages[2]["content"])
+        self.assertIn("【无联网工具边界规则】", prepared.messages[3]["content"])
+        self.assertEqual(prepared.messages[4]["content"], "这张图里有什么？")
 
     async def test_prepare_messages_builds_llm_input_files_url_context_and_tool_contract(self):
         file_repo = FakeFileRepository()
@@ -490,14 +635,15 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prepared.final_tool_names, ["web_search", "url_read"])
         self.assertEqual(
             [message["role"] for message in prepared.messages],
-            ["system", "system", "system", "user", "user"],
+            ["system", "system", "system", "system", "user", "user"],
         )
         self.assertIn("日期 system", prepared.messages[0]["content"])
         self.assertIn("【无图片理解能力边界规则】", prepared.messages[1]["content"])
         self.assertIn("【工具调用一致性规则】", prepared.messages[2]["content"])
-        self.assertNotIn("【无联网工具边界规则】", prepared.messages[2]["content"])
-        self.assertIn("<web_context>", prepared.messages[3]["content"])
-        self.assertIn("文档正文", prepared.messages[4]["content"])
+        self.assertIn("【执行计划控制规则】", prepared.messages[3]["content"])
+        self.assertNotIn("【无联网工具边界规则】", prepared.messages[3]["content"])
+        self.assertIn("<web_context>", prepared.messages[4]["content"])
+        self.assertIn("文档正文", prepared.messages[5]["content"])
         self.assertEqual(call_config.announced_tools, ["web_search"])
 
     def test_tool_usage_contract_uses_centralized_prompt(self):

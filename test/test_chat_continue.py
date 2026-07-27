@@ -32,6 +32,7 @@ class ChatContinueTests(unittest.IsolatedAsyncioTestCase):
             assistant_message=SimpleNamespace(sequence=42),
             initial_content_blocks=[],
             limits=SimpleNamespace(max_steps=8, max_tool_calls=20, total_timeout_s=300),
+            plan_mode="on",
         )
         service.stream_handler.generate_to_redis = AsyncMock()
 
@@ -80,6 +81,10 @@ class ChatContinueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             service.stream_handler.generate_to_redis.call_args.kwargs["original_message"],
             "深圳南山区明天天气如何？",
+        )
+        self.assertEqual(
+            service.stream_handler.generate_to_redis.call_args.kwargs["options"],
+            {"plan_mode": "on"},
         )
         register_task_mock.assert_called_once()
         self.assertIs(register_task_mock.call_args.args[1], task)
@@ -132,6 +137,7 @@ class ChatContinueTests(unittest.IsolatedAsyncioTestCase):
             assistant_message=SimpleNamespace(sequence=42),
             initial_content_blocks=[],
             limits=SimpleNamespace(max_steps=8, max_tool_calls=20, total_timeout_s=300),
+            plan_mode="off",
         )
 
         with (

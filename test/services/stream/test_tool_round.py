@@ -12,6 +12,7 @@ from app.schemas.chat import (
     SearchSourceSummary,
     SourceReference,
     TextBlock,
+    ThinkingBlock,
 )
 from app.schemas.content_block_registry import CONTENT_BLOCK_REGISTRY, ContentBlockRegistration
 from app.services.source_evidence_ledger import stable_web_evidence_id
@@ -36,6 +37,316 @@ class FutureRegisteredResultBlock(BaseModel):
 
 
 class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
+    async def test_deferred_plan_control_round_does_not_persist_hidden_reasoning(self):
+        update_call = {
+            "id": "tc-plan",
+            "name": "update_plan",
+            "arguments": {
+                "reason": "先搜索再回答",
+                "items": [
+                    {
+                        "id": "search",
+                        "title": "搜索资料",
+                        "status": "running",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "answer",
+                        "title": "整理回答",
+                        "status": "pending",
+                        "kind": "answer",
+                        "depends_on": ["search"],
+                        "planned_tools": [],
+                    },
+                ],
+            },
+        }
+        persisted = Mock()
+        state = AgentLoopState()
+        state.plan_coordinator.run_id = "run-deferred"
+        state.plan_coordinator.mode = "on"
+        request = tool_round_module.ToolRoundRequest(
+            db="db",
+            assistant_message_id="msg-deferred",
+            conversation_id="conv-deferred",
+            user_id="user-1",
+            model_id="gpt-4",
+            provider="openai",
+            content_blocks=[],
+            messages=[{"role": "user", "content": "制定计划"}],
+            tool_calls=[update_call],
+            reasoning_buf="内部 _plan_item_id 推理",
+            should_use_reasoning=True,
+            step_context=AgentStepContext(
+                step_id="step-deferred",
+                run_id="run-deferred",
+                step_number=1,
+                started_at=1.0,
+                thinking_block_id="thinking-deferred",
+                text_block_id="text-deferred",
+            ),
+            step_number=1,
+            run_id="run-deferred",
+            emitter=AsyncMock(),
+            session_cache=object(),
+            network_budget=object(),
+            call_kwargs={},
+            persist_message_fn=persisted,
+            execute_tools_fn=AsyncMock(return_value=[]),
+            complete_step_fn=AsyncMock(),
+            announced_tool_names=frozenset({"update_plan"}),
+            agent_state=state,
+            output_deferred=True,
+        )
+
+        await handle_tool_calls_round(request=request)
+
+        self.assertFalse(any(isinstance(block, ThinkingBlock) for block in request.content_blocks))
+        for call in persisted.call_args_list:
+            self.assertFalse(any(isinstance(block, ThinkingBlock) for block in call.args[4]))
+
+    async def test_mixed_plan_and_external_calls_are_all_paired_but_only_external_counts(self):
+        update_call = {
+            "id": "tc-plan",
+            "name": "update_plan",
+            "arguments": {
+                "reason": "先搜索再回答",
+                "items": [
+                    {
+                        "id": "search",
+                        "title": "搜索资料",
+                        "status": "running",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "answer",
+                        "title": "整理回答",
+                        "status": "pending",
+                        "kind": "answer",
+                        "depends_on": ["search"],
+                        "planned_tools": [],
+                    },
+                ],
+            },
+        }
+        external_call = {
+            "id": "tc-search",
+            "name": "web_search",
+            "arguments": {
+                "query": "深圳天气",
+                "_plan_item_id": "search",
+            },
+        }
+        handler = Mock()
+        handler.format_llm_context.return_value = "搜索结果"
+        handler.build_content_block.return_value = None
+        executed_calls = []
+
+        async def execute_tools_fn(tool_calls, *_args, **_kwargs):
+            executed_calls.extend(tool_calls)
+            return [
+                ToolExecutionRecord(
+                    tool_call=tool_calls[0],
+                    result=ToolResult(status="success"),
+                    handler=handler,
+                    block_id="blk-search",
+                    log_id="log-search",
+                )
+            ]
+
+        state = AgentLoopState()
+        state.plan_coordinator.run_id = "run-1"
+        state.plan_coordinator.mode = "on"
+        request = tool_round_module.ToolRoundRequest(
+            db="db",
+            assistant_message_id="msg-1",
+            conversation_id="conv-1",
+            user_id="user-1",
+            model_id="gpt-4",
+            provider="openai",
+            content_blocks=[],
+            messages=[{"role": "user", "content": "深圳天气"}],
+            tool_calls=[update_call, external_call],
+            reasoning_buf="",
+            should_use_reasoning=False,
+            step_context=AgentStepContext(
+                step_id="step-1",
+                run_id="run-1",
+                step_number=1,
+                started_at=1.0,
+                thinking_block_id="thinking",
+                text_block_id="text",
+            ),
+            step_number=1,
+            run_id="run-1",
+            emitter=AsyncMock(),
+            session_cache=object(),
+            network_budget=object(),
+            call_kwargs={},
+            persist_message_fn=Mock(),
+            execute_tools_fn=execute_tools_fn,
+            complete_step_fn=AsyncMock(),
+            on_tools_executed=state.record_executed_tool_calls,
+            completed_tool_calls=0,
+            max_tool_calls=20,
+            announced_tool_names=frozenset({"update_plan", "web_search"}),
+            agent_state=state,
+        )
+
+        outcome = await handle_tool_calls_round(request=request)
+
+        self.assertEqual(outcome.tool_call_count, 1)
+        self.assertEqual(state.total_tool_calls, 1)
+        self.assertEqual(executed_calls[0]["plan_item_id"], "search")
+        self.assertEqual(state.plan_coordinator.items[0]["status"], "completed")
+        paired_ids = [message["tool_call_id"] for message in request.messages if message.get("role") == "tool"]
+        self.assertEqual(paired_ids, ["tc-plan", "tc-search"])
+
+    def test_plan_item_status_aggregates_all_results_and_includes_reused_success(self):
+        def record(
+            *,
+            tool_call_id: str,
+            plan_item_id: str,
+            status: str,
+            retryable: bool = False,
+            reused: bool = False,
+        ) -> ToolExecutionRecord:
+            data = {"repair": {"retryable": True}} if retryable else {}
+            return ToolExecutionRecord(
+                tool_call={
+                    "id": tool_call_id,
+                    "name": "web_search",
+                    "plan_item_id": plan_item_id,
+                },
+                result=ToolResult(status=status, data=data),
+                handler=None,
+                block_id=f"blk-{tool_call_id}",
+                log_id=f"log-{tool_call_id}",
+                reused=reused,
+            )
+
+        statuses = tool_round_module._plan_item_statuses_from_results(
+            [
+                record(tool_call_id="ok", plan_item_id="research", status="success"),
+                record(
+                    tool_call_id="retry",
+                    plan_item_id="research",
+                    status="failed",
+                    retryable=True,
+                ),
+                record(tool_call_id="failed", plan_item_id="research", status="failed"),
+                record(
+                    tool_call_id="reused",
+                    plan_item_id="cached",
+                    status="success",
+                    reused=True,
+                ),
+            ]
+        )
+
+        self.assertEqual(statuses, {"research": "failed", "cached": "completed"})
+
+    async def test_on_mode_pairs_but_does_not_execute_unplanned_external_call(self):
+        state = AgentLoopState()
+        state.plan_coordinator.run_id = "run-1"
+        state.plan_coordinator.mode = "on"
+        execute_tools_fn = AsyncMock(side_effect=AssertionError("未规划外部工具不得执行"))
+        request = tool_round_module.ToolRoundRequest(
+            db="db",
+            assistant_message_id="msg-1",
+            conversation_id="conv-1",
+            user_id="user-1",
+            model_id="gpt-4",
+            provider="openai",
+            content_blocks=[],
+            messages=[{"role": "user", "content": "查询天气"}],
+            tool_calls=[{"id": "tc-search", "name": "web_search", "arguments": {"query": "深圳天气"}}],
+            reasoning_buf="",
+            should_use_reasoning=False,
+            step_context=AgentStepContext(
+                step_id="step-1",
+                run_id="run-1",
+                step_number=1,
+                started_at=1.0,
+                thinking_block_id="thinking",
+                text_block_id="text",
+            ),
+            step_number=1,
+            run_id="run-1",
+            emitter=AsyncMock(),
+            session_cache=object(),
+            network_budget=object(),
+            call_kwargs={},
+            persist_message_fn=Mock(),
+            execute_tools_fn=execute_tools_fn,
+            complete_step_fn=AsyncMock(),
+            on_tools_executed=state.record_executed_tool_calls,
+            completed_tool_calls=0,
+            max_tool_calls=20,
+            announced_tool_names=frozenset({"update_plan", "web_search"}),
+            agent_state=state,
+        )
+
+        outcome = await handle_tool_calls_round(request=request)
+
+        execute_tools_fn.assert_not_awaited()
+        self.assertEqual(outcome.tool_call_count, 0)
+        self.assertEqual(state.total_tool_calls, 0)
+        response = next(message for message in request.messages if message.get("role") == "tool")
+        self.assertEqual(response["tool_call_id"], "tc-search")
+        self.assertIn('"reason":"plan_required"', response["content"])
+
+    async def test_invalid_control_call_is_paired_without_protocol_payload_leak(self):
+        state = AgentLoopState()
+        state.plan_coordinator.run_id = "run-1"
+        request = tool_round_module.ToolRoundRequest(
+            db="db",
+            assistant_message_id="msg-1",
+            conversation_id="conv-1",
+            user_id="user-1",
+            model_id="gpt-4",
+            provider="openai",
+            content_blocks=[],
+            messages=[{"role": "user", "content": "复杂任务"}],
+            tool_calls=[{"id": "tc-plan", "name": "update_plan", "arguments": "<｜DSML｜>broken"}],
+            reasoning_buf="",
+            should_use_reasoning=False,
+            step_context=AgentStepContext(
+                step_id="step-1",
+                run_id="run-1",
+                step_number=1,
+                started_at=1.0,
+                thinking_block_id="thinking",
+                text_block_id="text",
+            ),
+            step_number=1,
+            run_id="run-1",
+            emitter=AsyncMock(),
+            session_cache=object(),
+            network_budget=object(),
+            call_kwargs={},
+            persist_message_fn=Mock(),
+            execute_tools_fn=AsyncMock(),
+            complete_step_fn=AsyncMock(),
+            on_tools_executed=state.record_executed_tool_calls,
+            completed_tool_calls=0,
+            max_tool_calls=20,
+            announced_tool_names=frozenset({"update_plan"}),
+            agent_state=state,
+        )
+
+        outcome = await handle_tool_calls_round(request=request)
+
+        self.assertEqual(outcome.tool_call_count, 0)
+        response = next(message for message in request.messages if message.get("role") == "tool")
+        self.assertIn("invalid_plan_structure", response["content"])
+        self.assertNotIn("DSML", response["content"])
+        self.assertEqual(request.content_blocks, [])
+
     def test_pending_repairs_are_keyed_and_only_matching_success_resolves_them(self):
         state = AgentLoopState()
         first_repair = ToolExecutionRecord(

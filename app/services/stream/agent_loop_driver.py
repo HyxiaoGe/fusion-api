@@ -154,6 +154,8 @@ async def _start_next_step(
     }
     if _accepts_keyword(runtime.start_step_fn, "plan_items"):
         start_step_kwargs["plan_items"] = state.plan_items
+    if _accepts_keyword(runtime.start_step_fn, "model_plan_managed"):
+        start_step_kwargs["model_plan_managed"] = state.plan_coordinator.has_valid_model_plan
     step_context = await runtime.start_step_fn(**start_step_kwargs)
     state.mark_current_step(step_context.step_id)
     return step_number, step_context
@@ -201,12 +203,14 @@ async def _run_round(
         emitter=runtime.emitter,
         on_context_updated=state.update_context,
     )
-    if (
-        has_product_result_blocks(state.content_blocks) or state.product_tool_attempted or state.pending_tool_repairs
-    ) and _accepts_keyword(
-        runtime.run_round_fn,
-        "defer_output",
-    ):
+    must_defer_until_plan = runtime.plan_mode == "on" and not state.plan_coordinator.has_valid_model_plan
+    should_defer_output = (
+        has_product_result_blocks(state.content_blocks)
+        or state.product_tool_attempted
+        or state.pending_tool_repairs
+        or must_defer_until_plan
+    )
+    if should_defer_output and _accepts_keyword(runtime.run_round_fn, "defer_output"):
         run_round_kwargs["defer_output"] = True
     round_result = await runtime.run_round_fn(**run_round_kwargs)
     state.finish_reason = round_result.finish_reason

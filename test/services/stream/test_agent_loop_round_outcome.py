@@ -13,6 +13,7 @@ from app.schemas.chat import (
     SourceReference,
     Usage,
 )
+from app.services.agent.plan_coordinator import PlanCoordinator
 from app.services.stream.agent_loop_outcome import AgentLoopExit
 from app.services.stream.agent_loop_policy import AgentLoopLimits
 from app.services.stream.agent_loop_round_outcome import AgentRoundOutcomeRequest, handle_agent_round_outcome
@@ -77,6 +78,78 @@ def _step_context(step_id="step-outcome"):
 
 
 class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_on_mode_hidden_stop_without_plan_retries_then_uses_plan_repair_summary(self):
+        state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-plan", mode="on"))
+        messages = [{"role": "user", "content": "制定一个计划"}]
+        complete_step = AsyncMock(return_value=1)
+        runtime = _runtime(complete_step_fn=complete_step, plan_mode="on")
+
+        outcomes = []
+        for index in range(3):
+            state.mark_current_step(f"step-plan-{index}")
+            outcomes.append(
+                await handle_agent_round_outcome(
+                    request=AgentRoundOutcomeRequest(
+                        db="db",
+                        messages=messages,
+                        state=state,
+                        runtime=runtime,
+                        step_number=index + 1,
+                        step_context=_step_context(f"step-plan-{index}"),
+                        round_result=AgentRoundResult(
+                            reasoning_buf="忽略计划",
+                            content_buf="直接回答",
+                            tool_calls=[],
+                            finish_reason="stop",
+                            accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+                            output_deferred=True,
+                        ),
+                    )
+                )
+            )
+
+        self.assertIsNone(outcomes[0])
+        self.assertIsNone(outcomes[1])
+        self.assertEqual(outcomes[2].exit, AgentLoopExit.SUMMARY_REQUIRED)
+        self.assertEqual(outcomes[2].summary_finish_reason, "plan_repair_exhausted")
+        self.assertEqual(state.plan_coordinator.repair_attempt_count, 3)
+        self.assertEqual(state.content_blocks, [])
+        self.assertFalse(any(message.get("role") == "assistant" for message in messages))
+        self.assertIn("必须先调用计划控制工具", messages[-1]["content"])
+        self.assertEqual(complete_step.await_count, 3)
+
+    async def test_on_mode_repairs_any_non_cancelled_terminal_without_valid_plan(self):
+        for finish_reason in ("tool_protocol_error", "length", "tool_calls"):
+            with self.subTest(finish_reason=finish_reason):
+                state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id=f"run-{finish_reason}", mode="on"))
+                messages = [{"role": "user", "content": "制定计划"}]
+                complete_step = AsyncMock(return_value=1)
+
+                outcome = await handle_agent_round_outcome(
+                    request=AgentRoundOutcomeRequest(
+                        db="db",
+                        messages=messages,
+                        state=state,
+                        runtime=_runtime(complete_step_fn=complete_step, plan_mode="on"),
+                        step_number=1,
+                        step_context=_step_context(f"step-{finish_reason}"),
+                        round_result=AgentRoundResult(
+                            reasoning_buf="协议异常",
+                            content_buf="不应展示",
+                            tool_calls=[],
+                            finish_reason=finish_reason,
+                            accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+                            output_deferred=True,
+                        ),
+                    )
+                )
+
+                self.assertIsNone(outcome)
+                self.assertEqual(state.plan_coordinator.repair_attempt_count, 1)
+                self.assertEqual(state.content_blocks, [])
+                self.assertFalse(state.unknown_terminated)
+                complete_step.assert_awaited_once()
+
     async def test_product_tool_round_returns_to_driver_for_next_model_decision(self):
         state = AgentLoopState()
         state.mark_current_step("step-product-tool")

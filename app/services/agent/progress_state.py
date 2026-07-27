@@ -38,9 +38,19 @@ def apply_progress_event(state: dict[str, Any], event: dict[str, Any]) -> dict[s
             "max_tool_calls": event.get("max_tool_calls"),
         }
     elif event_type == "plan_snapshot" and event.get("protocol_version") == 2:
+        current_plan = next_state.get("plan")
+        if (
+            isinstance(current_plan, dict)
+            and current_plan.get("plan_id") == event.get("plan_id")
+            and event.get("revision", 0) <= current_plan.get("revision", 0)
+        ):
+            return state
         next_state["plan"] = {
             "plan_id": event.get("plan_id"),
+            "mode": event.get("mode", "auto"),
+            "source": event.get("source", "observed"),
             "revision": event.get("revision", 0),
+            "reason": _truncate(event.get("reason", "legacy_observed"), 80),
             "items": [_normalize_plan_item(item) for item in event.get("items", [])],
         }
     elif event_type == "plan_step_updated" and event.get("protocol_version") == 2:
@@ -122,6 +132,9 @@ def _apply_plan_step_update(state: dict[str, Any], event: dict[str, Any]) -> Non
     else:
         items.append(item)
     plan["revision"] = revision
+    plan["mode"] = event.get("mode", plan.get("mode", "auto"))
+    plan["source"] = event.get("source", plan.get("source", "observed"))
+    plan["reason"] = _truncate(event.get("reason", plan.get("reason", "legacy_observed")), 80)
 
 
 def _normalize_plan_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -133,6 +146,8 @@ def _normalize_plan_item(item: dict[str, Any]) -> dict[str, Any]:
         "summary": _truncate(item.get("summary"), 120) if item.get("summary") else None,
         "tool_names": _string_list(item.get("tool_names"), limit=8, max_chars=40),
         "evidence_item_ids": _string_list(item.get("evidence_item_ids"), limit=12, max_chars=80),
+        "depends_on": _string_list(item.get("depends_on"), limit=12, max_chars=64),
+        "planned_tools": _string_list(item.get("planned_tools"), limit=12, max_chars=128),
     }
 
 
@@ -146,6 +161,7 @@ def _normalize_tool_digest(event: dict[str, Any]) -> dict[str, Any]:
         "key_findings": _string_list(event.get("key_findings"), limit=5, max_chars=80),
         "source_refs": _string_list(event.get("source_refs"), limit=12, max_chars=80),
         "truncated": bool(event.get("truncated", False)),
+        "plan_item_id": str(event.get("plan_item_id")) if event.get("plan_item_id") else None,
     }
     repair_state = event.get("repair_state")
     if repair_state in {"retrying", "requires_user_input", "exhausted", "resolved"}:

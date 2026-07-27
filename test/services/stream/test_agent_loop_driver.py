@@ -3,7 +3,8 @@ from dataclasses import dataclass
 from unittest.mock import AsyncMock, patch
 
 from app.schemas.chat import PlaceResult, PlaceResultsBlock, TextBlock, Usage
-from app.services.stream.agent_loop_driver import AgentLoopExit, run_agent_loop
+from app.services.agent.plan_coordinator import PlanCoordinator
+from app.services.stream.agent_loop_driver import AgentLoopExit, _run_round, run_agent_loop
 from app.services.stream.agent_loop_policy import AgentLoopLimits, map_run_terminal_state
 from app.services.stream.agent_loop_runtime import AgentLoopRuntime
 from app.services.stream.agent_loop_state import AgentLoopState
@@ -65,6 +66,38 @@ def _runtime(**overrides):
 
 
 class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
+    async def test_on_mode_defers_model_output_until_valid_plan_exists(self):
+        captured = []
+
+        async def run_round_fn(**kwargs):
+            captured.append(kwargs)
+            return AgentRoundResult(
+                reasoning_buf="内部思考",
+                content_buf="不应提前展示",
+                tool_calls=[],
+                finish_reason="stop",
+                accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+                output_deferred=kwargs.get("defer_output", False),
+            )
+
+        state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-plan", mode="on"))
+        result = await _run_round(
+            messages=[{"role": "user", "content": "你好"}],
+            state=state,
+            runtime=_runtime(plan_mode="on", run_round_fn=run_round_fn),
+            step_number=1,
+            step_context=AgentStepContext(
+                step_id="step-plan",
+                step_number=1,
+                started_at=1.0,
+                thinking_block_id="thinking-plan",
+                text_block_id="text-plan",
+            ),
+        )
+
+        self.assertTrue(captured[0]["defer_output"])
+        self.assertTrue(result.output_deferred)
+
     async def test_required_user_input_uses_deterministic_clarification_without_second_llm_round(self):
         state = AgentLoopState()
         started_steps: list[int] = []

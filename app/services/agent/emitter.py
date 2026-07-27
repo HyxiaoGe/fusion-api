@@ -118,13 +118,21 @@ class AgentEventEmitter:
         )
         return step_id
 
-    async def tool_call_started(self, *, tool_call_id: str, tool_name: str, arguments: dict[str, Any]) -> None:
+    async def tool_call_started(
+        self,
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        plan_item_id: str | None = None,
+    ) -> None:
         sanitized = sanitize_arguments(tool_name, arguments)
         await self._emit(
             ev.ToolCallStarted(
                 type="tool_call_started",
                 tool_name=tool_name,
                 arguments=sanitized,
+                plan_item_id=plan_item_id,
                 **self._envelope(tool_call_id=tool_call_id),
             )
         )
@@ -148,6 +156,7 @@ class AgentEventEmitter:
         duration_ms: int,
         result_summary: dict[str, Any],
         error: str | None = None,
+        plan_item_id: str | None = None,
     ) -> None:
         capped = cap_and_truncate(result_summary, max_bytes=1024)
         await self._emit(
@@ -158,6 +167,7 @@ class AgentEventEmitter:
                 duration_ms=duration_ms,
                 result_summary=capped,
                 error=error,
+                plan_item_id=plan_item_id,
                 **self._envelope(tool_call_id=tool_call_id),
             )
         )
@@ -237,25 +247,49 @@ class AgentEventEmitter:
             )
         )
 
-    async def plan_snapshot(self, *, plan_id: str, revision: int, items: list[dict[str, Any]]) -> None:
+    async def plan_snapshot(
+        self,
+        *,
+        plan_id: str,
+        revision: int,
+        items: list[dict[str, Any]],
+        mode: str = "auto",
+        source: str = "observed",
+        reason: str = "legacy_observed",
+    ) -> None:
         await self._emit(
             ev.PlanSnapshot(
                 type="plan_snapshot",
                 protocol_version=2,
                 plan_id=plan_id,
+                mode=mode,
+                source=source,
                 revision=revision,
+                reason=reason,
                 items=items,
                 **self._envelope(step_id=None),
             )
         )
 
-    async def plan_step_updated(self, *, plan_id: str, revision: int, item: dict[str, Any]) -> None:
+    async def plan_step_updated(
+        self,
+        *,
+        plan_id: str,
+        revision: int,
+        item: dict[str, Any],
+        mode: str = "auto",
+        source: str = "observed",
+        reason: str = "legacy_observed",
+    ) -> None:
         await self._emit(
             ev.PlanStepUpdated(
                 type="plan_step_updated",
                 protocol_version=2,
                 plan_id=plan_id,
+                mode=mode,
+                source=source,
                 revision=revision,
+                reason=reason,
                 item=item,
                 **self._envelope(),
             )
@@ -274,6 +308,7 @@ class AgentEventEmitter:
         truncated: bool = False,
         repair_state: str | None = None,
         repair_id: str | None = None,
+        plan_item_id: str | None = None,
     ) -> None:
         await self._emit(
             ev.ToolResultDigest(
@@ -288,6 +323,7 @@ class AgentEventEmitter:
                 truncated=truncated,
                 repair_state=repair_state,
                 repair_id=repair_id,
+                plan_item_id=plan_item_id,
                 **self._envelope(tool_call_id=tool_call_id),
             )
         )

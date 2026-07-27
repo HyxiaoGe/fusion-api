@@ -210,6 +210,7 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 "max_steps": 3,
                 "max_tool_calls": 5,
                 "timeout_s": 30,
+                "plan_mode": "auto",
                 "runtime_config_versions": {
                     "agent_strategy/default": "code-default",
                 },
@@ -245,6 +246,7 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 "max_steps": 3,
                 "max_tool_calls": 5,
                 "timeout_s": 30,
+                "plan_mode": "auto",
                 "runtime_config_versions": {
                     "agent_strategy/default": "agent-strategy-v7",
                 },

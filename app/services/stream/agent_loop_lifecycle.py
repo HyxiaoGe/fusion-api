@@ -239,6 +239,7 @@ def _run_config(limits: AgentLoopLimits, call_config: AgentLoopCallConfig | None
         "max_steps": limits.max_steps,
         "max_tool_calls": limits.max_tool_calls,
         "timeout_s": limits.total_timeout_s,
+        "plan_mode": getattr(call_config, "plan_mode", "auto"),
         "runtime_config_versions": runtime_config_versions,
     }
     binding_fields = (

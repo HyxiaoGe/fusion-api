@@ -1,8 +1,10 @@
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from app.schemas.chat import ContextUsage, TextBlock, Usage
+from app.services.agent.plan_coordinator import PlanCoordinator
 from app.services.stream.agent_loop_run_completion import (
     AgentLoopRunCompletionContext,
     finalize_cancelled_run,
@@ -193,6 +195,52 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[1][1]["finish_reason"], "stop")
         self.assertEqual(calls[2], ("finalize", ("conv-1",), {"success": True, "task_id": "task-1"}))
         self.assertTrue(state.terminal_emitted)
+
+    async def test_finalize_completed_does_not_complete_answer_plan_without_nonempty_text(self):
+        state = AgentLoopState()
+        state.content_blocks.append(TextBlock(type="text", id="txt-1", text="   "))
+        state.plan_coordinator = PlanCoordinator(run_id="run-1", mode="on")
+        state.plan_coordinator.apply_model_update(
+            {
+                "reason": "先分析再回答",
+                "items": [
+                    {
+                        "id": "reasoning",
+                        "title": "分析",
+                        "status": "running",
+                        "kind": "reasoning",
+                        "depends_on": [],
+                        "planned_tools": [],
+                    },
+                    {
+                        "id": "answer",
+                        "title": "回答",
+                        "status": "pending",
+                        "kind": "answer",
+                        "depends_on": ["reasoning"],
+                        "planned_tools": [],
+                    },
+                ],
+            }
+        )
+        emitter = AsyncMock()
+
+        async def complete_agent_run_fn(**_kwargs):
+            return None
+
+        async def finalize_stream_fn(*_args, **_kwargs):
+            return None
+
+        await finalize_completed_run(
+            context=replace(_context(state), emitter=emitter),
+            terminal_state=SimpleNamespace(session_status="completed", run_finish_reason="stop"),
+            persist_message_fn=lambda *_args: None,
+            complete_agent_run_fn=complete_agent_run_fn,
+            finalize_stream_fn=finalize_stream_fn,
+        )
+
+        snapshot = emitter.plan_snapshot.await_args.kwargs
+        self.assertEqual([item["status"] for item in snapshot["items"]], ["blocked", "blocked"])
 
     async def test_itinerary_observation_failure_never_changes_completed_terminal_result(self):
         state = AgentLoopState()

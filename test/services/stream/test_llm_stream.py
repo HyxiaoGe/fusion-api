@@ -257,6 +257,125 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(emitted_reasoning, outcome.reasoning_buf)
         self.assertEqual(emitted_reasoning.count("工具来获取路线信息"), 1)
 
+    async def test_answering_rewrites_split_and_repeated_update_plan_monotonically(self):
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-update-plan",
+            task_id="task-update-plan",
+            should_use_reasoning=False,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+        )
+        append_chunk = AsyncMock()
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            outcome = await llm_stream_module.consume_stream_round(
+                async_response(
+                    [
+                        make_chunk(delta=SimpleNamespace(content="调用 up"), finish_reason=None),
+                        make_chunk(
+                            delta=SimpleNamespace(content="date_plan 后，再调用 update_plan 完成。"),
+                            finish_reason="stop",
+                        ),
+                    ]
+                ),
+                request,
+            )
+
+        emitted = "".join(call.args[2] for call in append_chunk.await_args_list if call.args[1] == "answering")
+        self.assertEqual(outcome.content_buf, "调用更新计划后，再调用更新计划完成。")
+        self.assertEqual(emitted, outcome.content_buf)
+        self.assertNotIn("update_plan", emitted)
+
+    async def test_answering_buffers_trailing_space_before_character_split_update_plan(self):
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-update-plan-characters",
+            task_id="task-update-plan-characters",
+            should_use_reasoning=False,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+        )
+        append_chunk = AsyncMock()
+        raw_chunks = ["调用 ", "u", *"pdate_plan 完成"]
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            outcome = await llm_stream_module.consume_stream_round(
+                async_response(
+                    [
+                        make_chunk(
+                            delta=SimpleNamespace(content=chunk),
+                            finish_reason="stop" if index == len(raw_chunks) - 1 else None,
+                        )
+                        for index, chunk in enumerate(raw_chunks)
+                    ]
+                ),
+                request,
+            )
+
+        emitted = "".join(call.args[2] for call in append_chunk.await_args_list if call.args[1] == "answering")
+        self.assertEqual(outcome.content_buf, "调用更新计划完成")
+        self.assertEqual(emitted, outcome.content_buf)
+        self.assertNotIn("update_plan", emitted)
+
+    def test_final_short_update_plan_prefix_is_preserved_but_unique_long_prefix_is_productized(self):
+        sanitize = llm_stream_module.sanitize_internal_mcp_aliases
+
+        self.assertEqual(sanitize("正常结尾 ", final=True), "正常结尾 ")
+        self.assertEqual(sanitize("调用 up", final=True), "调用 up")
+        self.assertEqual(sanitize("调用 upd", final=True), "调用 upd")
+        self.assertEqual(sanitize("调用 upda", final=True), "调用更新计划")
+        self.assertEqual(
+            sanitize("update_plan 与 update_plan 完成", final=True),
+            "更新计划与更新计划完成",
+        )
+
+    async def test_consume_stream_round_productizes_plan_binding_names_across_answer_chunks(self):
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-plan-binding-sanitizer",
+            task_id="task-plan-binding-sanitizer",
+            should_use_reasoning=False,
+            thinking_block_id=None,
+            text_block_id="blk-text",
+        )
+        append_chunk = AsyncMock()
+        raw_chunks = [
+            "内部字段 _plan_",
+            "item_id、planned_",
+            "tools 和 plan_item_",
+            "id 不应展示，route_compare 可保留。",
+        ]
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            outcome = await llm_stream_module.consume_stream_round(
+                async_response(
+                    [
+                        make_chunk(
+                            delta=SimpleNamespace(content=chunk),
+                            finish_reason="stop" if index == len(raw_chunks) - 1 else None,
+                        )
+                        for index, chunk in enumerate(raw_chunks)
+                    ]
+                ),
+                request,
+            )
+
+        emitted = "".join(call.args[2] for call in append_chunk.await_args_list if call.args[1] == "answering")
+        self.assertEqual(emitted, outcome.content_buf)
+        self.assertNotIn("_plan_item_id", emitted)
+        self.assertNotIn("planned_tools", emitted)
+        self.assertNotIn("plan_item_id", emitted)
+        self.assertIn("对应计划步骤", emitted)
+        self.assertIn("预计使用的工具", emitted)
+        self.assertIn("route_compare", emitted)
+
     async def test_consume_stream_round_merges_cumulative_reasoning_snapshots_once(self):
         request = llm_stream_module.LLMStreamRequest(
             conversation_id="conv-reasoning-snapshot",
