@@ -4,12 +4,17 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.db.models import AgentSession, ToolCallLog
+from app.db.models import AgentSession, Message, ToolCallLog
 from app.schemas.network_diagnostics import (
     NetworkDiagnosticsResponse,
     NetworkDiagnosticsSummary,
     NetworkDiagnosticsToolItem,
     ToolStatus,
+)
+from app.services.stream.itinerary_observability import (
+    ItineraryToolObservation,
+    build_itinerary_run_payload,
+    build_itinerary_tool_observation_from_values,
 )
 
 
@@ -42,6 +47,14 @@ class NetworkDiagnosticsService:
             .order_by(ToolCallLog.created_at.asc())
             .all()
         )
+        message = (
+            self.db.query(Message)
+            .filter(
+                Message.conversation_id == conversation_id,
+                Message.id == message_id,
+            )
+            .first()
+        )
 
         tools = [self._tool_item_from_log(log, is_admin=is_admin) for log in logs]
         is_empty = session is None and not tools
@@ -53,6 +66,15 @@ class NetworkDiagnosticsService:
             summary=self._build_summary(session, tools),
             tools=tools,
             is_empty=is_empty,
+            admin=(
+                self._build_itinerary_admin_summary(
+                    session,
+                    tools,
+                    message.content if message is not None and isinstance(message.content, list) else [],
+                )
+                if is_admin
+                else None
+            ),
         )
 
     def _build_summary(
@@ -88,9 +110,25 @@ class NetworkDiagnosticsService:
                 "trace_id": log.trace_id,
                 "step_number": log.step_number,
                 "input_params": self._sanitize_input_params(input_params),
-                "error_message": log.error_message,
                 "created_at": log.created_at.isoformat() if log.created_at else None,
             }
+            observation = build_itinerary_tool_observation_from_values(
+                tool_name=log.tool_name,
+                status=log.status,
+                duration_ms=log.duration_ms,
+                output_data=output_data,
+            )
+            if observation is not None:
+                admin.update(
+                    outcome=observation.outcome,
+                    error_category=observation.error_category,
+                    controlled_repair=observation.controlled_repair,
+                    travel_budget_exhausted=observation.travel_budget_exhausted,
+                    server_budget_exhausted=observation.server_budget_exhausted,
+                    upstream_error=observation.upstream_error,
+                )
+            else:
+                admin["error_message"] = log.error_message
 
         return NetworkDiagnosticsToolItem(
             tool_call_log_id=log.id,
@@ -110,6 +148,49 @@ class NetworkDiagnosticsService:
             started_at=log.created_at,
             admin=admin,
         )
+
+    def _build_itinerary_admin_summary(
+        self,
+        session: AgentSession | None,
+        tools: list[NetworkDiagnosticsToolItem],
+        content_blocks: list[Any],
+    ) -> dict[str, Any] | None:
+        observations = [
+            ItineraryToolObservation(
+                tool_name=item.tool_name,
+                outcome=item.admin["outcome"],
+                error_category=item.admin.get("error_category"),
+                duration_ms=item.duration_ms,
+                controlled_repair=item.admin.get("controlled_repair") is True,
+                travel_budget_exhausted=item.admin.get("travel_budget_exhausted") is True,
+                server_budget_exhausted=item.admin.get("server_budget_exhausted") is True,
+                upstream_error=item.admin.get("upstream_error") is True,
+            )
+            for item in tools
+            if item.admin is not None and item.admin.get("outcome") in {"success", "degraded", "failed", "timeout"}
+        ]
+        if session is None and not observations:
+            return None
+        payload = build_itinerary_run_payload(
+            run_id=session.id if session is not None else "unknown",
+            model_id=session.model_id if session is not None else "unknown",
+            provider=session.provider if session is not None else "unknown",
+            content_blocks=content_blocks,
+            tool_observations=observations,
+            run_status=session.status if session is not None else "error",
+            finish_reason="unknown",
+            limit_reason=session.limit_reason if session is not None else None,
+            total_duration_ms=session.total_duration_ms if session is not None else 0,
+            total_steps=session.total_steps if session is not None else 0,
+            total_tool_calls=session.total_tool_calls if session is not None else len(observations),
+        )
+        if payload is None:
+            return None
+        return {
+            key: value
+            for key, value in payload.items()
+            if key not in {"event", "schema_version", "run_id", "finish_reason"}
+        }
 
     def _normalize_status(self, status: str) -> ToolStatus:
         if status in ("success", "failed", "degraded", "interrupted"):

@@ -47,3 +47,4 @@ class NetworkDiagnosticsResponse(BaseModel):
     summary: NetworkDiagnosticsSummary = Field(default_factory=NetworkDiagnosticsSummary)
     tools: list[NetworkDiagnosticsToolItem] = Field(default_factory=list)
     is_empty: bool = False
+    admin: dict[str, Any] | None = None

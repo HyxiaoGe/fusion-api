@@ -120,6 +120,7 @@ def _build_completion_context(
         task_id=request.task_id,
         run_id=parts.run_id,
         model_id=request.model_id,
+        provider=request.provider,
         assistant_message_id=request.assistant_message_id,
         assistant_message_sequence=request.assistant_message_sequence,
         emitter=parts.emitter,

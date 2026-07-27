@@ -243,6 +243,28 @@ def list_models(
     )
 
 
+@router.get("/itinerary-stability")
+def get_itinerary_stability(
+    request: Request,
+    created_from: datetime | None = None,
+    created_to: datetime | None = None,
+    model_id: str | None = Query(None, max_length=200),
+    reason: str | None = Header(None, alias="X-Admin-Audit-Reason", max_length=300),
+    service: AdminAuditService = Depends(get_admin_audit_service),
+    auditor: User = Depends(get_conversation_auditor),
+):
+    return success(
+        data=service.get_itinerary_stability(
+            admin=auditor,
+            **_context(request, reason),
+            created_from=created_from,
+            created_to=created_to,
+            model_id=model_id,
+        ),
+        request_id=request.state.request_id,
+    )
+
+
 @router.get("/models/{model_id:path}")
 def get_model(
     model_id: str,

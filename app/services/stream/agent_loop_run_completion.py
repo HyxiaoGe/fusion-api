@@ -8,6 +8,7 @@ from typing import Any
 
 from app.services.stream.agent_loop_policy import AgentRunTerminalState
 from app.services.stream.agent_loop_state import AgentLoopState
+from app.services.stream.itinerary_observability import build_itinerary_run_payload, emit_itinerary_run_log
 from app.services.stream.run_finalizer import InterruptedStatusWriteError
 from app.services.stream_state_service import StreamOwnershipLostError, StreamWriteTerminalError
 
@@ -32,6 +33,7 @@ class AgentLoopRunCompletionContext:
     task_id: str
     run_id: str
     model_id: str
+    provider: str
     assistant_message_id: str
     emitter: Any
     session_cache: Any
@@ -73,18 +75,26 @@ async def finalize_completed_run(
     complete_agent_run_fn: TerminalRunFn,
     finalize_stream_fn: FinalizeStreamFn,
 ) -> None:
-    persist_run_message(context=context, persist_message_fn=persist_message_fn, partial=False)
-    await complete_agent_run_fn(
-        emitter=context.emitter,
-        session_cache=context.session_cache,
-        stats=context.state.run_stats(context.run_id),
-        duration_ms_factory=context.duration_ms_factory,
-        session_status=terminal_state.session_status,
-        finish_reason=terminal_state.run_finish_reason,
-        limit_reason=context.state.limit_reason,
-    )
-    context.state.mark_terminal_emitted()
-    await finalize_stream_fn(context.conversation_id, success=True, task_id=context.task_id)
+    try:
+        persist_run_message(context=context, persist_message_fn=persist_message_fn, partial=False)
+        await complete_agent_run_fn(
+            emitter=context.emitter,
+            session_cache=context.session_cache,
+            stats=context.state.run_stats(context.run_id),
+            duration_ms_factory=context.duration_ms_factory,
+            session_status=terminal_state.session_status,
+            finish_reason=terminal_state.run_finish_reason,
+            limit_reason=context.state.limit_reason,
+        )
+        context.state.mark_terminal_emitted()
+        await finalize_stream_fn(context.conversation_id, success=True, task_id=context.task_id)
+    finally:
+        _emit_itinerary_observation(
+            context,
+            run_status=terminal_state.session_status,
+            finish_reason=terminal_state.run_finish_reason,
+            limit_reason=context.state.limit_reason,
+        )
 
 
 async def finalize_superseded_run(
@@ -95,22 +105,30 @@ async def finalize_superseded_run(
     interrupt_agent_run_fn: TerminalRunFn,
     finalize_stream_fn: FinalizeStreamFn,
 ) -> None:
-    persist_run_message(context=context, persist_message_fn=persist_message_fn, partial=True)
-    await interrupt_agent_run_fn(
-        emitter=context.emitter,
-        session_cache=context.session_cache,
-        stats=context.state.run_stats(context.run_id),
-        duration_ms_factory=context.duration_ms_factory,
-        current_step_id=context.state.current_step_id,
-        reason="superseded",
-    )
-    context.state.mark_terminal_emitted()
-    await finalize_stream_fn(
-        context.conversation_id,
-        success=False,
-        error_msg=error_msg or "被新请求取代",
-        task_id=context.task_id,
-    )
+    try:
+        persist_run_message(context=context, persist_message_fn=persist_message_fn, partial=True)
+        await interrupt_agent_run_fn(
+            emitter=context.emitter,
+            session_cache=context.session_cache,
+            stats=context.state.run_stats(context.run_id),
+            duration_ms_factory=context.duration_ms_factory,
+            current_step_id=context.state.current_step_id,
+            reason="superseded",
+        )
+        context.state.mark_terminal_emitted()
+        await finalize_stream_fn(
+            context.conversation_id,
+            success=False,
+            error_msg=error_msg or "被新请求取代",
+            task_id=context.task_id,
+        )
+    finally:
+        _emit_itinerary_observation(
+            context,
+            run_status="interrupted",
+            finish_reason="unknown",
+            limit_reason=None,
+        )
 
 
 async def finalize_cancelled_run(
@@ -128,25 +146,33 @@ async def finalize_cancelled_run(
         partial=True,
     )
     try:
-        await interrupt_agent_run_fn(
-            emitter=context.emitter,
-            session_cache=context.session_cache,
-            stats=context.state.run_stats(context.run_id),
-            duration_ms_factory=context.duration_ms_factory,
-            current_step_id=context.state.current_step_id,
-            reason="user_cancelled",
+        try:
+            await interrupt_agent_run_fn(
+                emitter=context.emitter,
+                session_cache=context.session_cache,
+                stats=context.state.run_stats(context.run_id),
+                duration_ms_factory=context.duration_ms_factory,
+                current_step_id=context.state.current_step_id,
+                reason="user_cancelled",
+            )
+            context.state.mark_terminal_emitted()
+        except InterruptedStatusWriteError:
+            raise
+        except StreamOwnershipLostError as emit_exc:
+            warning_fn(f"emit run_interrupted ownership lost，外部 stop 已接管流终态: {emit_exc}")
+            context.state.mark_terminal_emitted()
+        except StreamWriteTerminalError:
+            raise
+        except Exception as emit_exc:  # noqa: BLE001 — 非 Stream 写终止错误不能阻塞 cancel 传播
+            warning_fn(f"emit run_interrupted 失败: {emit_exc}")
+        await finalize_stream_fn(context.conversation_id, success=False, error_msg="用户中止", task_id=context.task_id)
+    finally:
+        _emit_itinerary_observation(
+            context,
+            run_status="interrupted",
+            finish_reason="unknown",
+            limit_reason=None,
         )
-        context.state.mark_terminal_emitted()
-    except InterruptedStatusWriteError:
-        raise
-    except StreamOwnershipLostError as emit_exc:
-        warning_fn(f"emit run_interrupted ownership lost，外部 stop 已接管流终态: {emit_exc}")
-        context.state.mark_terminal_emitted()
-    except StreamWriteTerminalError:
-        raise
-    except Exception as emit_exc:  # noqa: BLE001 — 非 Stream 写终止错误不能阻塞 cancel 传播
-        warning_fn(f"emit run_interrupted 失败: {emit_exc}")
-    await finalize_stream_fn(context.conversation_id, success=False, error_msg="用户中止", task_id=context.task_id)
 
 
 async def finalize_failed_run(
@@ -171,27 +197,35 @@ async def finalize_failed_run(
         AGENT_RUN_FAILED_MESSAGE,
     )
     try:
-        await fail_agent_run_fn(
-            emitter=context.emitter,
-            session_cache=context.session_cache,
-            stats=context.state.run_stats(context.run_id),
-            duration_ms_factory=context.duration_ms_factory,
-            current_step_id=context.state.current_step_id,
-            error_code=public_error_code,
-            message=public_error_message,
+        try:
+            await fail_agent_run_fn(
+                emitter=context.emitter,
+                session_cache=context.session_cache,
+                stats=context.state.run_stats(context.run_id),
+                duration_ms_factory=context.duration_ms_factory,
+                current_step_id=context.state.current_step_id,
+                error_code=public_error_code,
+                message=public_error_message,
+            )
+            context.state.mark_terminal_emitted()
+        except StreamWriteTerminalError:
+            raise
+        except Exception as emit_exc:  # noqa: BLE001
+            warning_fn(f"emit run_failed 失败: error_type={type(emit_exc).__name__}")
+        finalize_kwargs = {
+            "success": False,
+            "error_msg": public_error_message,
+            "error_code": public_error_code,
+            "task_id": context.task_id,
+        }
+        await finalize_stream_fn(context.conversation_id, **finalize_kwargs)
+    finally:
+        _emit_itinerary_observation(
+            context,
+            run_status="error",
+            finish_reason="unknown",
+            limit_reason=None,
         )
-        context.state.mark_terminal_emitted()
-    except StreamWriteTerminalError:
-        raise
-    except Exception as emit_exc:  # noqa: BLE001
-        warning_fn(f"emit run_failed 失败: error_type={type(emit_exc).__name__}")
-    finalize_kwargs = {
-        "success": False,
-        "error_msg": public_error_message,
-        "error_code": public_error_code,
-        "task_id": context.task_id,
-    }
-    await finalize_stream_fn(context.conversation_id, **finalize_kwargs)
 
 
 def _safe_structured_error_code(error: Exception) -> str:
@@ -199,6 +233,34 @@ def _safe_structured_error_code(error: Exception) -> str:
     if not isinstance(candidate, str) or candidate not in _PUBLIC_ERROR_MESSAGES:
         return ""
     return candidate
+
+
+def _emit_itinerary_observation(
+    context: AgentLoopRunCompletionContext,
+    *,
+    run_status: str,
+    finish_reason: str,
+    limit_reason: str | None,
+) -> None:
+    try:
+        stats = context.state.run_stats(context.run_id)
+        emit_itinerary_run_log(
+            build_itinerary_run_payload(
+                run_id=context.run_id,
+                model_id=context.model_id,
+                provider=context.provider,
+                content_blocks=context.state.content_blocks,
+                tool_observations=context.state.itinerary_tool_observations,
+                run_status=run_status,
+                finish_reason=finish_reason,
+                limit_reason=limit_reason,
+                total_duration_ms=context.duration_ms_factory(),
+                total_steps=stats.total_steps,
+                total_tool_calls=stats.total_tool_calls,
+            )
+        )
+    except Exception:  # noqa: BLE001 — 观测失败绝不能改变 Agent 主链终态
+        return
 
 
 async def write_fallback_run_error(

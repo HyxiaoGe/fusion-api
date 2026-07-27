@@ -125,6 +125,202 @@ class AdminAuditApiTests(unittest.TestCase):
         self.assertIn("admin.audit.messages.list", actions)
         self.assertNotIn("message-secret", events_response.text)
 
+    def test_itinerary_stability_returns_bounded_safe_aggregates(self):
+        from app.db.models import AgentSession, Message, ToolCallLog
+
+        created = datetime(2026, 7, 27, 10, 0, 0)
+        message = Message(
+            id="msg-trip",
+            conversation_id="conv-1",
+            role="assistant",
+            content=[
+                {
+                    "type": "itinerary_results",
+                    "status": "degraded",
+                    "origin": "private-origin",
+                    "destination": "private-destination",
+                }
+            ],
+            model_id="deepseek-chat",
+            created_at=created,
+        )
+        session = AgentSession(
+            id="run-trip",
+            conversation_id="conv-1",
+            message_id="msg-trip",
+            user_id="user-1",
+            model_id="deepseek-chat",
+            provider="deepseek",
+            status="limit_reached",
+            limit_reason="max_tool_calls",
+            total_steps=2,
+            total_tool_calls=3,
+            total_duration_ms=4000,
+            created_at=created,
+        )
+        logs = [
+            ToolCallLog(
+                id="tool-flight",
+                conversation_id="conv-1",
+                message_id="msg-trip",
+                user_id="user-1",
+                tool_name="search_flights",
+                status="success",
+                duration_ms=1000,
+                model_id="deepseek-chat",
+                provider="deepseek",
+                output_data={"status": "success", "private_payload": "must-not-leak"},
+                trace_id="run-trip",
+                created_at=created,
+            ),
+            ToolCallLog(
+                id="tool-weather",
+                conversation_id="conv-1",
+                message_id="msg-trip",
+                user_id="user-1",
+                tool_name="weather_forecast",
+                status="failed",
+                duration_ms=2000,
+                model_id="deepseek-chat",
+                provider="deepseek",
+                output_data={"error_code": "upstream_error", "private_payload": "must-not-leak"},
+                trace_id="run-trip",
+                created_at=created,
+            ),
+            ToolCallLog(
+                id="tool-flight-timeout",
+                conversation_id="conv-1",
+                message_id="msg-trip",
+                user_id="user-1",
+                tool_name="search_flights",
+                status="failed",
+                duration_ms=3000,
+                model_id="deepseek-chat",
+                provider="deepseek",
+                output_data={"error_code": "call_timeout"},
+                trace_id="run-trip",
+                created_at=created,
+            ),
+        ]
+        self.db.add(message)
+        self.db.commit()
+        self.db.add(session)
+        self.db.commit()
+        self.db.add_all(logs)
+        self.db.commit()
+
+        response = self.client.get(
+            "/api/admin/audit/itinerary-stability",
+            params={
+                "created_from": "2026-07-27T00:00:00",
+                "created_to": "2026-07-28T00:00:00",
+                "model_id": "deepseek-chat",
+            },
+            headers={"X-Admin-Audit-Reason": "itinerary-stability-check"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()["data"]
+        self.assertEqual(data["scope"]["sample_definition"], "terminal_run_with_travel_tool")
+        self.assertEqual(data["summary"]["itinerary"]["total"], 1)
+        self.assertEqual(data["summary"]["itinerary"]["partial"], 1)
+        self.assertEqual(data["summary"]["signals"]["agent_limit_reached"], 1)
+        self.assertEqual(data["summary"]["signals"]["upstream_error"], 1)
+        self.assertEqual(data["summary"]["run_latency_ms"]["p50_ms"], 4000)
+        self.assertEqual(data["by_model"][0]["model_id"], "deepseek-chat")
+        self.assertEqual(data["by_tool"][0]["tool_name"], "search_flights")
+        self.assertEqual(data["by_tool"][0]["calls"]["success"], 1)
+        self.assertEqual(data["by_tool"][0]["calls"]["failed"], 1)
+        self.assertEqual(data["by_tool"][0]["calls"]["timeout"], 1)
+        self.assertEqual(
+            data["summary"]["product_tools"]["total"],
+            data["summary"]["product_tools"]["success"]
+            + data["summary"]["product_tools"]["degraded"]
+            + data["summary"]["product_tools"]["failed"],
+        )
+        self.assertNotIn("private-origin", response.text)
+        self.assertNotIn("private-destination", response.text)
+        self.assertNotIn("must-not-leak", response.text)
+
+        events = self.client.get("/api/admin/audit/events?action=admin.audit.itinerary_stability.view").json()["data"][
+            "items"
+        ]
+        self.assertEqual(len(events), 1)
+
+    def test_itinerary_stability_rejects_ranges_over_seven_days(self):
+        response = self.client.get(
+            "/api/admin/audit/itinerary-stability",
+            params={
+                "created_from": "2026-07-01T00:00:00",
+                "created_to": "2026-07-09T00:00:00",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_itinerary_stability_converts_shanghai_window_to_utc_storage_time(self):
+        from app.db.models import AgentSession, Message, ToolCallLog
+
+        stored_utc = datetime(2026, 7, 27, 7, 30, 0)
+        self.db.add(
+            Message(
+                id="msg-timezone-trip",
+                conversation_id="conv-1",
+                role="assistant",
+                content=[{"type": "itinerary_results", "status": "success"}],
+                model_id="kimi-k2.5",
+                created_at=stored_utc,
+            )
+        )
+        self.db.commit()
+        self.db.add(
+            AgentSession(
+                id="run-timezone-trip",
+                conversation_id="conv-1",
+                message_id="msg-timezone-trip",
+                user_id="user-1",
+                model_id="kimi-k2.5",
+                provider="moonshot",
+                status="completed",
+                total_steps=1,
+                total_tool_calls=1,
+                total_duration_ms=2000,
+                created_at=stored_utc,
+            )
+        )
+        self.db.commit()
+        self.db.add(
+            ToolCallLog(
+                id="tool-timezone-trip",
+                conversation_id="conv-1",
+                message_id="msg-timezone-trip",
+                user_id="user-1",
+                tool_name="search_trains",
+                status="success",
+                duration_ms=1000,
+                model_id="kimi-k2.5",
+                provider="moonshot",
+                output_data={"status": "success"},
+                trace_id="run-timezone-trip",
+                created_at=stored_utc,
+            )
+        )
+        self.db.commit()
+
+        response = self.client.get(
+            "/api/admin/audit/itinerary-stability",
+            params={
+                "created_from": "2026-07-27T15:00:00+08:00",
+                "created_to": "2026-07-27T16:00:00+08:00",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()["data"]
+        self.assertEqual(data["summary"]["itinerary"]["total"], 1)
+        self.assertEqual(data["scope"]["created_from"], "2026-07-27T15:00:00+08:00")
+        self.assertEqual(data["scope"]["created_to"], "2026-07-27T16:00:00+08:00")
+
     def test_audit_events_include_target_user_summary_and_keep_deleted_target_id(self):
         from app.db.models import AdminAuditEvent
 

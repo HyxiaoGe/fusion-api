@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import Integer, case, cast, func, or_
@@ -39,6 +39,9 @@ def page_payload(items: list[Any], total: int, page: int, page_size: int) -> dic
 
 
 class AdminAuditRepository:
+    ITINERARY_STABILITY_MAX_ANCHORS = 10_000
+    ITINERARY_STABILITY_MAX_TOOL_ROWS = 50_000
+
     def __init__(self, db: Session):
         self.db = db
 
@@ -501,13 +504,118 @@ class AdminAuditRepository:
             current["latest_performance_run"] = row
         return stats
 
+    def list_itinerary_stability_rows(
+        self,
+        *,
+        created_from: datetime,
+        created_to: datetime,
+        model_id: str | None = None,
+    ) -> dict[str, Any]:
+        """用有界批量查询返回行程聚合所需 ORM 行，不读取正文以外的敏感字段。"""
+
+        primary_tools = ("search_flights", "search_trains")
+        product_tools = (
+            "local_place_search",
+            "route_compare",
+            "search_flights",
+            "search_trains",
+            "weather_forecast",
+        )
+        anchor_query = self.db.query(ToolCallLog).filter(
+            ToolCallLog.tool_name.in_(primary_tools),
+            ToolCallLog.created_at >= created_from,
+            ToolCallLog.created_at < created_to,
+        )
+        if model_id is not None:
+            anchor_query = anchor_query.filter(ToolCallLog.model_id == model_id)
+        anchors = (
+            anchor_query.order_by(ToolCallLog.created_at.asc(), ToolCallLog.id.asc())
+            .limit(self.ITINERARY_STABILITY_MAX_ANCHORS + 1)
+            .all()
+        )
+        truncated = len(anchors) > self.ITINERARY_STABILITY_MAX_ANCHORS
+        anchors = anchors[: self.ITINERARY_STABILITY_MAX_ANCHORS]
+        if not anchors:
+            return {
+                "anchors": [],
+                "sessions": [],
+                "messages": [],
+                "tool_logs": [],
+                "truncated": truncated,
+            }
+
+        trace_ids = sorted({row.trace_id for row in anchors if row.trace_id})
+        message_ids = sorted({row.message_id for row in anchors if row.message_id})
+        session_filter = []
+        if trace_ids:
+            session_filter.append(AgentSession.id.in_(trace_ids))
+        if message_ids:
+            session_filter.append(AgentSession.message_id.in_(message_ids))
+        sessions = (
+            self.db.query(AgentSession)
+            .filter(or_(*session_filter))
+            .order_by(AgentSession.created_at.asc(), AgentSession.id.asc())
+            .limit(self.ITINERARY_STABILITY_MAX_ANCHORS)
+            .all()
+            if session_filter
+            else []
+        )
+
+        resolved_trace_ids = sorted({row.id for row in sessions} | set(trace_ids))
+        resolved_message_ids = sorted({row.message_id for row in sessions if row.message_id} | set(message_ids))
+        tool_filter = []
+        if resolved_trace_ids:
+            tool_filter.append(ToolCallLog.trace_id.in_(resolved_trace_ids))
+        if resolved_message_ids:
+            tool_filter.append(ToolCallLog.message_id.in_(resolved_message_ids))
+        tool_logs = (
+            self.db.query(ToolCallLog)
+            .filter(
+                ToolCallLog.tool_name.in_(product_tools),
+                ToolCallLog.created_at >= created_from,
+                ToolCallLog.created_at < created_to,
+                or_(*tool_filter),
+            )
+            .order_by(ToolCallLog.created_at.asc(), ToolCallLog.id.asc())
+            .limit(self.ITINERARY_STABILITY_MAX_TOOL_ROWS + 1)
+            .all()
+            if tool_filter
+            else []
+        )
+        if len(tool_logs) > self.ITINERARY_STABILITY_MAX_TOOL_ROWS:
+            truncated = True
+            tool_logs = tool_logs[: self.ITINERARY_STABILITY_MAX_TOOL_ROWS]
+
+        messages = (
+            self.db.query(Message)
+            .filter(Message.id.in_(resolved_message_ids), Message.role == "assistant")
+            .order_by(Message.created_at.asc(), Message.id.asc())
+            .limit(self.ITINERARY_STABILITY_MAX_ANCHORS)
+            .all()
+            if resolved_message_ids
+            else []
+        )
+        return {
+            "anchors": anchors,
+            "sessions": sessions,
+            "messages": messages,
+            "tool_logs": tool_logs,
+            "truncated": truncated,
+        }
+
     @staticmethod
     def _latest_datetime(left: datetime | None, right: datetime | None) -> datetime | None:
         if left is None:
             return right
         if right is None:
             return left
-        return max(left, right)
+
+        def comparison_value(value: datetime) -> datetime:
+            if value.tzinfo is None or value.utcoffset() is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc)
+
+        return left if comparison_value(left) >= comparison_value(right) else right
 
     def list_audit_events(
         self,

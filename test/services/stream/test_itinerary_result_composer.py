@@ -408,6 +408,86 @@ def test_compose_only_includes_route_with_strict_destination_station_match():
     assert all(section.result_refs[0].block_id == "route-valid" for section in route_sections)
 
 
+def test_compose_degrades_when_requested_route_does_not_match_selected_transport():
+    blocks = [
+        _flight_block(
+            block_id="cheap-flight-out",
+            origin="深圳",
+            destination="上海",
+            departure_date="2026-08-01",
+            option_id="cheap-flight-out-1",
+            flight_no="ZH1001",
+            price_minor=10000,
+            duration_s=7200,
+            departure_at="2026-08-01T08:00:00+08:00",
+            arrival_at="2026-08-01T10:00:00+08:00",
+        ),
+        _train_block(
+            block_id="train-out",
+            origin="深圳",
+            destination="上海",
+            departure_date="2026-08-01",
+            option_id="train-out-1",
+            train_no="G100",
+            price_minor=56000,
+            duration_s=28800,
+            departure_at="2026-08-01T07:00:00+08:00",
+            arrival_at="2026-08-01T15:00:00+08:00",
+        ),
+        _flight_block(
+            block_id="cheap-flight-return",
+            origin="上海",
+            destination="深圳",
+            departure_date="2026-08-03",
+            option_id="cheap-flight-return-1",
+            flight_no="ZH1002",
+            price_minor=10000,
+            duration_s=7200,
+            departure_at="2026-08-03T18:00:00+08:00",
+            arrival_at="2026-08-03T20:00:00+08:00",
+        ),
+        _train_block(
+            block_id="train-return",
+            origin="上海",
+            destination="深圳",
+            departure_date="2026-08-03",
+            option_id="train-return-1",
+            train_no="G101",
+            price_minor=57000,
+            duration_s=29400,
+            departure_at="2026-08-03T08:00:00+08:00",
+            arrival_at="2026-08-03T16:10:00+08:00",
+        ),
+        _route_block(block_id="station-route", city="上海", station="上海站"),
+    ]
+    itinerary = compose_itinerary_result(
+        blocks,
+        product_outcomes=[
+            ProductToolOutcome(
+                tool_name="route_compare",
+                mode="route",
+                status="available",
+                block_id="station-route",
+                origin="上海站",
+                destination="上海人民广场",
+            )
+        ],
+    )
+
+    assert itinerary is not None
+    assert itinerary.status == "degraded"
+    assert all(plan.status == "partial" for plan in itinerary.plans)
+    assert all(not any(section.kind == "local_route" for section in plan.sections) for plan in itinerary.plans)
+    assert (
+        ItineraryAvailability(
+            journey="local_route",
+            mode="route",
+            status="unavailable",
+        )
+        in itinerary.availability
+    )
+
+
 def test_compose_returns_none_without_travel_results():
     itinerary = compose_itinerary_result(
         [

@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
@@ -22,6 +22,27 @@ from app.db.models import (
 
 
 class AdminAuditRepositoryTests(unittest.TestCase):
+    def test_latest_datetime_compares_naive_utc_and_aware_values(self):
+        naive_utc = datetime(2026, 7, 27, 7, 30, 0)
+        aware_shanghai = datetime(
+            2026,
+            7,
+            27,
+            16,
+            0,
+            0,
+            tzinfo=timezone(timedelta(hours=8)),
+        )
+
+        self.assertIs(
+            AdminAuditRepository._latest_datetime(naive_utc, aware_shanghai),
+            aware_shanghai,
+        )
+        self.assertIs(
+            AdminAuditRepository._latest_datetime(aware_shanghai, naive_utc),
+            aware_shanghai,
+        )
+
     def setUp(self):
         self.engine = create_engine(
             "sqlite://",

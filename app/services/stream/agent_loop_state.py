@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from app.schemas.chat import ContextUsage, Usage
 from app.services.stream.agent_loop_policy import AgentLoopLimitReason
+from app.services.stream.itinerary_observability import ItineraryToolObservation
 from app.services.stream.run_finalizer import AgentRunStats
 
 NO_PROGRESS_SEARCH_SUMMARY_THRESHOLD = 2
@@ -58,6 +59,7 @@ class AgentLoopState:
     successful_tool_call_signatures: set[str] = field(default_factory=set)
     argument_repair_state: dict[str, dict[str, Any]] = field(default_factory=dict)
     pending_tool_repairs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    itinerary_tool_observations: list[ItineraryToolObservation] = field(default_factory=list)
 
     def next_step_number(self) -> int:
         self.step += 1
@@ -102,6 +104,9 @@ class AgentLoopState:
             if existing.status == "available" and outcome.status == "unavailable":
                 continue
             self.product_tool_outcomes[existing_index] = outcome
+
+    def record_itinerary_tool_observations(self, observations: list[ItineraryToolObservation]) -> None:
+        self.itinerary_tool_observations.extend(observations)
 
     def should_summarize_no_progress_search(self) -> bool:
         return self.consecutive_no_progress_search_results >= NO_PROGRESS_SEARCH_SUMMARY_THRESHOLD

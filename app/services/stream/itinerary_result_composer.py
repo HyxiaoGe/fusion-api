@@ -85,7 +85,13 @@ def compose_itinerary_result(
 
     existing = _find_existing_itinerary(content_blocks, journeys[0])
     weather = _select_weather(content_blocks, journeys)
-    plans = _build_plans(journeys, weather, content_blocks)
+    route_requested = any(getattr(outcome, "mode", None) == "route" for outcome in outcomes)
+    plans = _build_plans(
+        journeys,
+        weather,
+        content_blocks,
+        route_requested=route_requested,
+    )
     if not plans:
         return None
 
@@ -263,13 +269,22 @@ def _build_plans(
     journeys: list[_Journey],
     weather: tuple[WeatherResultsBlock, str] | None,
     content_blocks: list[Any],
+    *,
+    route_requested: bool,
 ) -> list[ItineraryPlan]:
     plans: list[ItineraryPlan] = []
     for strategy in ("lowest_reference_price", "shortest_scheduled_duration"):
         selections = _select_candidates(journeys, strategy)
         if not selections:
             continue
-        plan = _build_plan(strategy, journeys, selections, weather, content_blocks)
+        plan = _build_plan(
+            strategy,
+            journeys,
+            selections,
+            weather,
+            content_blocks,
+            route_requested=route_requested,
+        )
         if any(_plan_signature(existing) == _plan_signature(plan) for existing in plans):
             continue
         plans.append(plan)
@@ -307,6 +322,8 @@ def _build_plan(
     selections: dict[JourneyKind, _TravelCandidate],
     weather: tuple[WeatherResultsBlock, str] | None,
     content_blocks: list[Any],
+    *,
+    route_requested: bool,
 ) -> ItineraryPlan:
     sections = [
         _transport_section(journey, selections[journey.kind]) for journey in journeys if journey.kind in selections
@@ -316,7 +333,7 @@ def _build_plan(
     route = _select_route(content_blocks, selections)
     if route is not None:
         sections.append(_route_section(route))
-    complete = len(selections) == len(journeys)
+    complete = len(selections) == len(journeys) and (not route_requested or route is not None)
     known_cost = _known_cost(selections, complete=complete)
     known_duration = sum(candidate.duration_s for candidate in selections.values()) if complete else None
     return ItineraryPlan(
@@ -463,6 +480,10 @@ def _build_availability(
     if any(section.kind == "local_route" for plan in plans for section in plan.sections):
         statuses[("local_route", "route")] = "available"
     _merge_outcome_availability(statuses, journeys, product_outcomes)
+    if any(getattr(outcome, "mode", None) == "route" for outcome in product_outcomes) and not any(
+        section.kind == "local_route" for plan in plans for section in plan.sections
+    ):
+        statuses[("local_route", "route")] = "unavailable"
     ordering = {
         ("outbound", "flight"): 0,
         ("outbound", "train"): 1,

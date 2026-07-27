@@ -26,6 +26,7 @@ from app.services.source_candidate_ranker import (
 )
 from app.services.source_evidence_ledger import build_selected_source_evidence_item, canonicalize_evidence_url
 from app.services.stream.agent_loop_state import AgentLoopState, ProductToolOutcome
+from app.services.stream.itinerary_observability import build_itinerary_tool_observation
 from app.services.stream.itinerary_result_composer import compose_itinerary_result
 from app.services.stream.step_lifecycle import AgentStepContext, mark_tool_round_started
 from app.services.stream.tool_context import (
@@ -474,6 +475,7 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
     )
     executed_results = [record for record in results if not record.reused]
     _record_tool_repairs(request.agent_state, executed_results)
+    _record_itinerary_tool_observations(request.agent_state, executed_results)
     reused_limited_tool_calls, not_executed_tool_calls = _partition_successfully_reusable_calls(
         request,
         selected_tool_calls[1],
@@ -557,6 +559,18 @@ def _record_tool_repairs(
             "requires_user_input": repair.get("requires_user_input") is True,
             "retry_exhausted": repair.get("retry_exhausted") is True,
         }
+
+
+def _record_itinerary_tool_observations(
+    state: AgentLoopState | None,
+    results: list[ToolExecutionRecord],
+) -> None:
+    if state is None:
+        return
+    observations = [
+        observation for record in results if (observation := build_itinerary_tool_observation(record)) is not None
+    ]
+    state.record_itinerary_tool_observations(observations)
 
 
 def build_tool_round_content_blocks(results: list[ToolExecutionRecord]) -> dict[str, Any]:

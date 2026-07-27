@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 
 from app.schemas.chat import ContextUsage, TextBlock, Usage
@@ -11,6 +12,7 @@ from app.services.stream.agent_loop_run_completion import (
     write_fallback_run_error,
 )
 from app.services.stream.agent_loop_state import AgentLoopState
+from app.services.stream.itinerary_observability import ItineraryToolObservation
 
 
 def _context(state: AgentLoopState | None = None) -> AgentLoopRunCompletionContext:
@@ -20,6 +22,7 @@ def _context(state: AgentLoopState | None = None) -> AgentLoopRunCompletionConte
         task_id="task-1",
         run_id="run-1",
         model_id="gpt-4",
+        provider="openai",
         assistant_message_id="msg-1",
         emitter="emitter",
         session_cache="session-cache",
@@ -189,6 +192,49 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[1][1]["session_status"], "completed")
         self.assertEqual(calls[1][1]["finish_reason"], "stop")
         self.assertEqual(calls[2], ("finalize", ("conv-1",), {"success": True, "task_id": "task-1"}))
+        self.assertTrue(state.terminal_emitted)
+
+    async def test_itinerary_observation_failure_never_changes_completed_terminal_result(self):
+        state = AgentLoopState()
+        state.record_itinerary_tool_observations(
+            [
+                ItineraryToolObservation(
+                    "search_flights",
+                    "success",
+                    None,
+                    100,
+                    False,
+                    False,
+                    False,
+                    False,
+                )
+            ]
+        )
+
+        def fail_duration() -> int:
+            raise RuntimeError("observation failed")
+
+        context = replace(
+            _context(state),
+            duration_ms_factory=fail_duration,
+        )
+        finalized = []
+
+        async def complete_agent_run_fn(**_kwargs):
+            return None
+
+        async def finalize_stream_fn(*args, **kwargs):
+            finalized.append((args, kwargs))
+
+        await finalize_completed_run(
+            context=context,
+            terminal_state=SimpleNamespace(session_status="completed", run_finish_reason="stop"),
+            persist_message_fn=lambda *_args: None,
+            complete_agent_run_fn=complete_agent_run_fn,
+            finalize_stream_fn=finalize_stream_fn,
+        )
+
+        self.assertEqual(finalized, [(("conv-1",), {"success": True, "task_id": "task-1"})])
         self.assertTrue(state.terminal_emitted)
 
     async def test_finalize_superseded_persists_and_interrupts_before_error_finalize(self):

@@ -5,7 +5,9 @@ from __future__ import annotations
 import math
 import re
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 
@@ -29,6 +31,7 @@ from app.services.admin_audit_sanitizer import mask_email, sanitize_admin_value
 from app.services.agent_strategy_config import get_agent_tools_disabled_aliases
 from app.services.mcp.amap_product_tools import AMAP_PRODUCT_TOOL_NAMES
 from app.services.mcp.flyai_travel_tools import FLYAI_TRAVEL_TOOL_NAMES
+from app.services.stream.itinerary_observability import aggregate_itinerary_stability
 
 
 class AdminAuditService:
@@ -1136,6 +1139,71 @@ class AdminAuditService:
             reason=reason,
         )
         return item
+
+    def get_itinerary_stability(
+        self,
+        *,
+        admin: User,
+        request_id: str,
+        reason: str | None,
+        created_from: datetime | None,
+        created_to: datetime | None,
+        model_id: str | None,
+    ) -> dict[str, Any]:
+        normalized_model_id = None
+        if model_id is not None:
+            normalized_model_id = self._safe_model_id(model_id)
+            if normalized_model_id is None:
+                raise ApiException.bad_request("模型 ID 无效")
+        display_end = (
+            self._normalize_itinerary_time(created_to)
+            if created_to is not None
+            else datetime.now(ZoneInfo("Asia/Shanghai"))
+        )
+        display_start = (
+            self._normalize_itinerary_time(created_from)
+            if created_from is not None
+            else display_end - timedelta(hours=24)
+        )
+        if display_end <= display_start:
+            raise ApiException.bad_request("created_to 必须晚于 created_from")
+        if display_end - display_start > timedelta(days=7):
+            raise ApiException.bad_request("行程稳定性查询范围不能超过 7 天")
+        storage_start = display_start.astimezone(timezone.utc).replace(tzinfo=None)
+        storage_end = display_end.astimezone(timezone.utc).replace(tzinfo=None)
+
+        rows = self.repository.list_itinerary_stability_rows(
+            created_from=storage_start,
+            created_to=storage_end,
+            model_id=normalized_model_id,
+        )
+        if rows.get("truncated") is True:
+            raise ApiException.service_unavailable("行程稳定性样本超出单次安全聚合上限，请缩短查询范围")
+        result = aggregate_itinerary_stability(
+            rows,
+            created_from=display_start,
+            created_to=display_end,
+            model_id=normalized_model_id,
+        )
+        self._record(
+            admin=admin,
+            action="admin.audit.itinerary_stability.view",
+            resource_type="itinerary_stability",
+            request_id=request_id,
+            reason=reason,
+            metadata={
+                "created_from": display_start.isoformat(),
+                "created_to": display_end.isoformat(),
+                "model_id": normalized_model_id,
+            },
+        )
+        return result
+
+    @staticmethod
+    def _normalize_itinerary_time(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+        return value.astimezone(ZoneInfo("Asia/Shanghai"))
 
     @staticmethod
     def _safe_model_id(value: Any) -> str | None:
