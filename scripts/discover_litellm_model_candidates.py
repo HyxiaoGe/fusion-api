@@ -227,6 +227,17 @@ def _discover_litellm(
     return aliases_by_model, unknown
 
 
+def _all_litellm_alias_targets(snapshot: Any) -> dict[str, set[str]]:
+    entries, _ = _snapshot_entries(snapshot, source="litellm")
+    targets: dict[str, set[str]] = {}
+    for entry in entries:
+        alias = _nonempty_string(entry.get("model_name"))
+        underlying = _entry_underlying_model(entry)
+        if alias and underlying:
+            targets.setdefault(alias, set()).add(underlying)
+    return targets
+
+
 def discover_candidates(
     *,
     adapter: ProviderAdapter,
@@ -252,8 +263,25 @@ def discover_candidates(
         )
     upstream_ids = set(upstream)
     litellm_ids = set(litellm)
-    new = [upstream[model_id] for model_id in sorted(upstream_ids - litellm_ids)]
-    existing = [adapter.build_candidate(model_id, litellm[model_id]) for model_id in sorted(upstream_ids & litellm_ids)]
+    alias_targets = _all_litellm_alias_targets(litellm_snapshot)
+    new_ids = upstream_ids - litellm_ids
+    existing_ids = upstream_ids & litellm_ids
+    alias_conflicts: list[UnknownCandidate] = []
+    for model_id in sorted(new_ids):
+        targets = alias_targets.get(model_id, set())
+        if not targets:
+            continue
+        alias_conflicts.append(
+            UnknownCandidate(
+                source="litellm",
+                model_id=model_id,
+                reason="候选业务别名已被未归属当前 provider 的 LiteLLM 条目占用",
+            )
+        )
+        new_ids.remove(model_id)
+
+    new = [upstream[model_id] for model_id in sorted(new_ids)]
+    existing = [adapter.build_candidate(model_id, litellm.get(model_id, [])) for model_id in sorted(existing_ids)]
     removed = [adapter.build_candidate(model_id, litellm[model_id]) for model_id in sorted(litellm_ids - upstream_ids)]
     return CandidateReport(
         provider_key=adapter.provider_key,
@@ -261,7 +289,7 @@ def discover_candidates(
         new=new,
         existing=existing,
         removed=removed,
-        unknown=[*upstream_unknown, *litellm_unknown],
+        unknown=[*upstream_unknown, *litellm_unknown, *alias_conflicts],
     )
 
 

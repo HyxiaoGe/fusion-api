@@ -13,6 +13,7 @@ import os
 import sys
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -75,21 +76,42 @@ def check_gzip_file_gate(path: Path, *, max_age_seconds: int) -> FileGate:
 
 
 def check_restic_marker(path: Path, *, max_age_seconds: int) -> FileGate:
-    gate = check_file_gate(path, max_age_seconds=max_age_seconds)
-    if not gate.ok:
-        return gate
+    if not path.is_file():
+        return FileGate(path=str(path), ok=False, reason="文件不存在")
+    if path.stat().st_size <= 0:
+        return FileGate(path=str(path), ok=False, reason="文件为空")
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return FileGate(path=str(path), ok=False, age_seconds=gate.age_seconds, reason="restic marker 不是有效 JSON")
-    if not isinstance(payload, Mapping) or payload.get("status") != "success" or not payload.get("snapshot_id"):
+        return FileGate(path=str(path), ok=False, reason="restic marker 不是有效 JSON")
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("status") != "success"
+        or not payload.get("snapshot_id")
+        or payload.get("tag") != "daily"
+    ):
         return FileGate(
             path=str(path),
             ok=False,
-            age_seconds=gate.age_seconds,
-            reason="restic marker 缺少 status=success 或 snapshot_id",
+            reason="restic marker 缺少 status=success、snapshot_id 或 daily tag",
         )
-    return gate
+    try:
+        completed_at = datetime.fromisoformat(str(payload.get("completed_at") or "").replace("Z", "+00:00"))
+    except ValueError:
+        return FileGate(path=str(path), ok=False, reason="restic marker completed_at 无效")
+    if completed_at.tzinfo is None:
+        return FileGate(path=str(path), ok=False, reason="restic marker completed_at 缺少时区")
+    age_seconds = int((datetime.now(UTC) - completed_at.astimezone(UTC)).total_seconds())
+    if age_seconds < -300:
+        return FileGate(path=str(path), ok=False, age_seconds=age_seconds, reason="restic snapshot time 位于未来")
+    if age_seconds > max_age_seconds:
+        return FileGate(
+            path=str(path),
+            ok=False,
+            age_seconds=age_seconds,
+            reason=f"restic snapshot 年龄超过 {max_age_seconds} 秒",
+        )
+    return FileGate(path=str(path), ok=True, age_seconds=max(0, age_seconds))
 
 
 def evaluate_readiness(

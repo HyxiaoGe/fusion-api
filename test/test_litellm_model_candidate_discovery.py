@@ -123,6 +123,46 @@ class ModelCandidateDiscoveryTests(unittest.TestCase):
         self.assertEqual(len(report.unknown), 1)
         self.assertEqual(report.unknown[0].reason, "上游快照包含重复模型 id")
 
+    def test_candidate_is_quarantined_when_business_alias_is_owned_by_other_provider(self):
+        report = discovery.discover_candidates(
+            adapter=discovery.MoonshotProviderAdapter(),
+            upstream_snapshot={"data": [{"id": "kimi-k3"}]},
+            litellm_snapshot={
+                "data": [
+                    litellm_entry(
+                        "kimi-k3",
+                        "openai/other-provider-model",
+                        provider_key="other",
+                    )
+                ]
+            },
+        )
+
+        self.assertEqual(report.new, [])
+        self.assertEqual(report.existing, [])
+        self.assertEqual(len(report.unknown), 1)
+        self.assertIn("别名", report.unknown[0].reason)
+
+    def test_exact_underlying_alias_without_provider_ownership_is_still_quarantined(self):
+        report = discovery.discover_candidates(
+            adapter=discovery.MoonshotProviderAdapter(),
+            upstream_snapshot={"data": [{"id": "kimi-k3"}]},
+            litellm_snapshot={
+                "data": [
+                    litellm_entry(
+                        "kimi-k3",
+                        "moonshot/kimi-k3",
+                        provider_key="other",
+                    )
+                ]
+            },
+        )
+
+        self.assertEqual(report.new, [])
+        self.assertEqual(report.existing, [])
+        self.assertEqual(len(report.unknown), 1)
+        self.assertIn("未归属", report.unknown[0].reason)
+
     def test_empty_upstream_does_not_mark_all_existing_models_removed(self):
         report = discovery.discover_candidates(
             adapter=discovery.MoonshotProviderAdapter(),

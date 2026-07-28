@@ -5,6 +5,7 @@ import json
 import tempfile
 import time
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from scripts import check_litellm_upgrade_readiness as readiness
@@ -84,6 +85,27 @@ class LiteLLMUpgradeReadinessTest(unittest.TestCase):
 
         self.assertFalse(gate.ok)
         self.assertIn("success", gate.reason)
+
+    def test_secondary_marker_uses_snapshot_time_not_file_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "restic.json"
+            marker.write_text(
+                json.dumps(
+                    {
+                        "status": "success",
+                        "snapshot_id": "snapshot-id",
+                        "completed_at": (datetime.now(UTC) - timedelta(hours=2)).isoformat(),
+                        "tag": "daily",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            marker.touch()
+
+            gate = readiness.check_restic_marker(marker, max_age_seconds=3600)
+
+        self.assertFalse(gate.ok)
+        self.assertIn("snapshot", gate.reason)
 
     def test_serialized_report_never_contains_master_key(self) -> None:
         report = readiness.evaluate_readiness(

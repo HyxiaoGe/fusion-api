@@ -16,6 +16,9 @@
 - 新 daily 快照：`c17f85b9`。
 - 日志结果：`=== 备份成功 ===`。
 - 当日全库备份：`pg_20260728.sql.gz`，压缩包约 85 MB。
+- marker 集成后的再次备份成功，完整 snapshot ID 为
+  `aa48738456aabd7ca50c1c554647577d0714b3d7954afb7885dd22667e09878b`。
+- marker 已由最新 `daily` snapshot 只读结果重新生成，包含 `completed_at` 和 `tag=daily`，文件权限为 `0600`；升级门禁按 snapshot 时间而不是 marker mtime 判断新鲜度。
 
 ## 恢复演练
 
@@ -72,3 +75,19 @@
 Moonshot `new` 中明确包含 `kimi-k3`。Qwen 同时返回大量语音、图片、翻译等非聊天模型，证明“厂商发现成功”不能直接触发 Fusion 上架；后续必须增加 endpoint/capability 分类和真实能力验收。
 
 `removed` 只表示厂商当前 `/v1/models` 与 LiteLLM 已知目录存在差异，状态保持 `retirement_review`，不会自动删除现有模型。
+
+## Kimi K3 元数据证据边界
+
+2026-07-28 再次核对当前官方资料：
+
+- Moonshot 官方开放平台已列出 `kimi-k3`，中国区 API base 为 `https://api.moonshot.cn/v1`；
+- 官方声明 K3 始终开启推理，支持 `reasoning_effort=low/high/max`、视觉输入、SSE 和 Tool Calling，上下文为 1,048,576 tokens；
+- 官方中国区价格为每 1M tokens：缓存命中输入 ¥2、未命中输入 ¥20、输出 ¥100；
+- 同时抓取的 LiteLLM 官方成本表共有 2,984 个条目，其中 63 个 key 包含 Moonshot，但没有 `kimi-k3`。
+
+因此当前不写入 K3 override：Fusion metadata 目前以 USD 单位展示，LiteLLM 运行时成本表也尚未收录 K3；在没有受审汇率/自定义计费策略和真实 usage/cost 证据前，自动换算会制造错误计费。候选保持隔离，等待 LiteLLM 上游收录或后续明确批准的定价策略。
+
+官方资料：
+
+- <https://platform.kimi.com/docs/guide/kimi-k3-quickstart>
+- <https://platform.kimi.com/docs/pricing/chat-k3>

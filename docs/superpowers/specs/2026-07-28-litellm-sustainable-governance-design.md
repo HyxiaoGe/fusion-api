@@ -35,11 +35,13 @@
   -> 只读候选快照
   -> 与 LiteLLM /model/info 对账
   -> 候选隔离报告
-  -> 能力与费用验收
+  -> 官方成本表与受审 override 只读富化
+  -> LiteLLM wildcard 预准入能力与费用验收
   -> 人工或策略批准
   -> LiteLLM DB model
   -> Fusion virtual key allowlist
   -> Fusion 选择器
+  -> Fusion 全模型产品验收
 ```
 
 ## 版本升级策略
@@ -61,6 +63,7 @@
 - 监控调度状态、最近执行时间、下次执行时间，以及端点明确返回的 source/fallback 原因。
 - 当前官方 status 端点没有独立的“远端数据拉取成功”字段；调度健康不能替代价格抽样对账，禁止把 `last_run` 表述成已确认成功。
 - 刷新内容只用于价格、上下文窗口和能力元数据。
+- 候选管道保存同源官方成本表的 SHA-256、ETag、抓取时间和模型数，避免把“调度存在”误当成内容正确。
 - 上游没有价格的模型必须保持 `unknown` 或显式自定义价格，禁止猜测价格。
 
 ## 候选模型隔离
@@ -80,6 +83,18 @@
 
 候选报告不得包含 API key，不得产生 LiteLLM 写操作。后续准入器只能消费已通过能力、费用和产品验收的候选。
 
+候选富化优先使用官方 LiteLLM 成本表。共享 `openai/` adapter 通过 provider 的 `cost_map_prefix` 映射到官方成本条目；官方表缺失时只能使用有审查记录的 metadata override。缺少成本、能力或来源证据的候选继续隔离。
+
+预准入摘要必须绑定完整候选契约哈希，覆盖 provider、underlying model、endpoint、环境变量名、价格、能力和元数据来源；任一字段变化都必须重新验收。跨 provider 业务 alias 冲突、provider 发现失败以及成本 namespace 不一致均为 fail-closed。
+
+## 两阶段验收
+
+未注册候选不会出现在 Fusion `/api/models`，因此不能用现有 Fusion 全模型脚本完成首次准入：
+
+1. 预准入验收通过 LiteLLM wildcard 路由直接调用候选 underlying model，至少验证非流式文本、SSE、可选 tool calling、usage/cost 和声明能力。该阶段不得创建 DB model。
+2. 预准入通过后只生成 dry-run 注册与 allowlist 计划；v1.93+ 的 DB model 密钥引用使用官方 `os.environ/变量名` 格式，实际写入必须经过发布门禁。
+3. 注册后再运行 `MODEL_ACCEPTANCE_RUNBOOK.md` 的 Fusion SSE、Agent、视觉和真实 UI 验收。失败时回滚 allowlist/模型注册，不把预准入结果冒充产品验收。
+
 ## 失败与降级
 
 - 厂商发现失败：保留上一份成功快照，记录 stale，不下线现有模型。
@@ -92,6 +107,8 @@
 
 - 默认执行任何新脚本都只读，必须显式参数才允许写操作。
 - 候选报告单元测试覆盖 new、existing、removed、unknown、空响应和重复模型。
+- 预准入验收默认 dry-run，只有显式 `--apply` 才允许产生收费请求，且永远没有模型注册或 allowlist 写能力。
+- 准入计划必须同时要求预准入通过、能力与价格 metadata 完整，并保持 dry-run。
 - LiteLLM Compose 具备 readiness healthcheck。
 - 成本表调度状态可被机器读取并产生失败退出码。
 - 升级演练可从数据库副本启动 `v1.93.0`，现有 Fusion 模型目录和 virtual key 不发生意外变化。
