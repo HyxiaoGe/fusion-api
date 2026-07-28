@@ -9,6 +9,7 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from urllib.parse import urlencode
 
 import httpx
 
@@ -73,6 +74,57 @@ def _read_json_response(response: Any) -> Any:
     return response.json()
 
 
+def _candidate_preflight_status(
+    *,
+    litellm_config: Mapping[str, Any],
+    litellm_snapshot: Any,
+    candidate_key_models: Sequence[str] | None,
+    candidate_key_lookup_failed: bool,
+    environ: Mapping[str, str],
+) -> dict[str, Any]:
+    config = litellm_config.get("candidate_preflight")
+    if not isinstance(config, Mapping):
+        return {
+            "status": "blocked",
+            "transport": None,
+            "route_model_name": None,
+            "credential_source": None,
+            "reasons": ["candidate_preflight_config_missing"],
+        }
+    transport = str(config.get("transport") or "")
+    route_model_name = str(config.get("route_model_name") or "")
+    credential_env = str(config.get("api_key_env") or "")
+    master_key_env = str(litellm_config.get("api_key_env") or "")
+    reasons: list[str] = []
+    if transport != "litellm_wildcard":
+        reasons.append("candidate_preflight_transport_invalid")
+    entries = litellm_snapshot.get("data") if isinstance(litellm_snapshot, Mapping) else None
+    route_found = isinstance(entries, list) and any(
+        isinstance(entry, Mapping)
+        and entry.get("model_name") == route_model_name
+        and isinstance(entry.get("litellm_params"), Mapping)
+        and entry["litellm_params"].get("model") == "*"
+        for entry in entries
+    )
+    if not route_model_name or not route_found:
+        reasons.append("candidate_preflight_route_missing")
+    if not credential_env or not environ.get(credential_env):
+        reasons.append("candidate_preflight_key_missing")
+    elif credential_env == master_key_env or environ.get(credential_env) == environ.get(master_key_env):
+        reasons.append("candidate_preflight_key_not_dedicated")
+    elif candidate_key_lookup_failed:
+        reasons.append("candidate_preflight_key_allowlist_unverifiable")
+    elif candidate_key_models is None or route_model_name not in candidate_key_models:
+        reasons.append("candidate_preflight_key_route_missing")
+    return {
+        "status": "ready" if not reasons else "blocked",
+        "transport": transport or None,
+        "route_model_name": route_model_name or None,
+        "credential_source": credential_env or None,
+        "reasons": reasons,
+    }
+
+
 def coordinate_candidates(
     *,
     registry: Mapping[str, Any],
@@ -96,7 +148,7 @@ def coordinate_candidates(
             if isinstance(provider, Mapping):
                 key = _provider_key(provider)
                 results[key] = _error_result(key, "missing_litellm_api_key")
-        return _report(results)
+        return _report(results, candidate_preflight=None)
 
     litellm_base_url = str(litellm.get("base_url") or "").rstrip("/")
     try:
@@ -112,7 +164,37 @@ def coordinate_candidates(
             if isinstance(provider, Mapping):
                 key = _provider_key(provider)
                 results[key] = _error_result(key, "litellm_request_failed")
-        return _report(results)
+        return _report(results, candidate_preflight=None)
+
+    preflight_config = litellm.get("candidate_preflight")
+    candidate_key_env = str(preflight_config.get("api_key_env") or "") if isinstance(preflight_config, Mapping) else ""
+    candidate_key = environ.get(candidate_key_env, "")
+    candidate_key_models: list[str] | None = None
+    candidate_key_lookup_failed = False
+    if candidate_key and candidate_key_env != litellm_key_env and candidate_key != litellm_key:
+        try:
+            key_payload = _read_json_response(
+                client.get(
+                    f"{litellm_base_url}/key/info?{urlencode({'key': candidate_key})}",
+                    headers={"Authorization": f"Bearer {litellm_key}"},
+                    timeout=timeout_seconds,
+                )
+            )
+            key_info = key_payload.get("info") if isinstance(key_payload, Mapping) else None
+            key_models = key_info.get("models") if isinstance(key_info, Mapping) else None
+            if not isinstance(key_models, list) or not all(isinstance(model, str) for model in key_models):
+                raise ValueError("candidate key allowlist 无效")
+            candidate_key_models = list(key_models)
+        except Exception:
+            candidate_key_lookup_failed = True
+
+    candidate_preflight = _candidate_preflight_status(
+        litellm_config=litellm,
+        litellm_snapshot=litellm_snapshot,
+        candidate_key_models=candidate_key_models,
+        candidate_key_lookup_failed=candidate_key_lookup_failed,
+        environ=environ,
+    )
 
     for provider in providers:
         if not isinstance(provider, Mapping):
@@ -145,15 +227,28 @@ def coordinate_candidates(
         except Exception:
             # 错误类型足够用于告警；第三方异常正文可能包含 token，禁止输出。
             results[key] = _error_result(key, "upstream_request_failed")
-    return _report(results)
+    return _report(results, candidate_preflight=candidate_preflight)
 
 
-def _report(results: Mapping[str, Any]) -> dict[str, Any]:
+def _report(
+    results: Mapping[str, Any],
+    *,
+    candidate_preflight: Mapping[str, Any] | None,
+) -> dict[str, Any]:
     ok_count = sum(1 for value in results.values() if value.get("status") == "ok")
     return {
         "mode": "read_only",
         "writes_performed": False,
         "write_actions": [],
+        "candidate_preflight": dict(candidate_preflight)
+        if candidate_preflight is not None
+        else {
+            "status": "blocked",
+            "transport": None,
+            "route_model_name": None,
+            "credential_source": None,
+            "reasons": ["litellm_snapshot_unavailable"],
+        },
         "summary": {
             "providers_total": len(results),
             "providers_ok": ok_count,

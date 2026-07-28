@@ -166,6 +166,41 @@ def _override_for(
     return value if _is_mapping(value) else {}
 
 
+def validate_override_approval(overrides: Mapping[str, Any]) -> dict[str, Any]:
+    if overrides.get("schema_version") != 1:
+        raise ValueError("override.schema_version 必须为 1")
+    providers = overrides.get("providers")
+    approval = overrides.get("approval")
+    if not _is_mapping(providers) or not _is_mapping(approval):
+        raise ValueError("override 缺少 providers 或 approval")
+    required = ("policy_version", "reviewed_by", "reviewed_at", "providers_sha256")
+    if any(not str(approval.get(key) or "").strip() for key in required):
+        raise ValueError("override approval 字段不完整")
+    try:
+        reviewed_at = datetime.fromisoformat(str(approval["reviewed_at"]).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("override reviewed_at 无效") from exc
+    if reviewed_at.tzinfo is None:
+        raise ValueError("override reviewed_at 必须包含时区")
+    source_urls = approval.get("source_urls")
+    if not isinstance(source_urls, list) or not source_urls:
+        raise ValueError("override approval 缺少 source_urls")
+    for source_url in source_urls:
+        parsed = urlparse(str(source_url))
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise ValueError("override source_urls 必须全部为 HTTPS")
+    expected_sha256 = cost_map_sha256(providers)
+    if approval.get("providers_sha256") != expected_sha256:
+        raise ValueError("override providers_sha256 不匹配")
+    return {
+        "policy_version": str(approval["policy_version"]),
+        "reviewed_by": str(approval["reviewed_by"]),
+        "reviewed_at": reviewed_at.astimezone(timezone.utc).isoformat(),
+        "source_urls": [str(item) for item in source_urls],
+        "providers_sha256": expected_sha256,
+    }
+
+
 def _metadata(
     *,
     candidate: Mapping[str, Any],
@@ -212,6 +247,7 @@ def enrich_candidate_report(
     if not _is_mapping(providers):
         raise ValueError("candidate_report.providers 必须是对象")
     configs = _provider_configs(registry)
+    override_approval = validate_override_approval(overrides) if overrides is not None else None
     for provider_key, provider_result in providers.items():
         if not _is_mapping(provider_result):
             continue
@@ -241,7 +277,9 @@ def enrich_candidate_report(
             candidate["metadata_evidence"] = {
                 "cost_map_key": key or None,
                 "cost_map_matched": entry is not None,
+                "cost_map_sha256": cost_map_status["sha256"],
                 "reviewed_override_applied": bool(override),
+                "override_approval": copy.deepcopy(override_approval) if override else None,
             }
     report["enrichment"] = {
         "mode": "read_only",
@@ -250,6 +288,7 @@ def enrich_candidate_report(
         "cost_map_sha256": cost_map_status["sha256"],
         "cost_map_fetched_at": cost_map_status["fetched_at"],
         "overrides_applied": overrides is not None,
+        "override_approval": override_approval,
     }
     return report
 

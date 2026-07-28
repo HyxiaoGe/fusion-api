@@ -41,6 +41,11 @@ def registry(*providers):
         "litellm": {
             "base_url": "http://litellm.internal:4000",
             "api_key_env": "LITELLM_MASTER_KEY",
+            "candidate_preflight": {
+                "transport": "litellm_wildcard",
+                "route_model_name": "*",
+                "api_key_env": "LITELLM_CANDIDATE_KEY",
+            },
         },
         "providers": list(providers),
     }
@@ -74,6 +79,11 @@ class ModelCandidateOrchestratorTests(unittest.TestCase):
                     {
                         "data": [
                             {
+                                "model_name": "*",
+                                "litellm_params": {"model": "*"},
+                                "model_info": {"metadata": {}},
+                            },
+                            {
                                 "model_name": "kimi-k2.5",
                                 "litellm_params": {"model": "moonshot/kimi-k2.6"},
                                 "model_info": {"metadata": {"provider_key": "moonshot"}},
@@ -86,6 +96,7 @@ class ModelCandidateOrchestratorTests(unittest.TestCase):
                         ]
                     }
                 ),
+                "http://litellm.internal:4000/key/info?key=candidate-secret": FakeResponse({"info": {"models": ["*"]}}),
                 "https://api.moonshot.example/v1/models": FakeResponse(
                     {"data": [{"id": "kimi-k2.6"}, {"id": "kimi-k3"}]}
                 ),
@@ -101,6 +112,7 @@ class ModelCandidateOrchestratorTests(unittest.TestCase):
                 "LITELLM_MASTER_KEY": "litellm-secret",
                 "MOONSHOT_API_KEY": "moonshot-secret",
                 "ACME_API_KEY": "acme-secret",
+                "LITELLM_CANDIDATE_KEY": "candidate-secret",
             },
             client=client,
         )
@@ -108,8 +120,88 @@ class ModelCandidateOrchestratorTests(unittest.TestCase):
         self.assertEqual(report["summary"], {"providers_total": 2, "providers_ok": 2, "providers_failed": 0})
         self.assertEqual(report["providers"]["moonshot"]["report"]["new"][0]["model_id"], "kimi-k3")
         self.assertEqual(report["providers"]["acme"]["report"]["new"][0]["model_id"], "acme-reasoner")
-        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(len(client.calls), 4)
         self.assertTrue(all(call[1].keys() <= {"headers", "timeout"} for call in client.calls))
+        self.assertEqual(report["candidate_preflight"]["status"], "ready")
+
+    def test_candidate_preflight_requires_candidate_key_wildcard_allowlist(self):
+        client = FakeHttpClient(
+            {
+                "http://litellm.internal:4000/model/info": FakeResponse(
+                    {"data": [{"model_name": "*", "litellm_params": {"model": "*"}}]}
+                ),
+                "http://litellm.internal:4000/key/info?key=candidate-secret": FakeResponse(
+                    {"info": {"models": ["kimi-k2.5"]}}
+                ),
+                "https://api.moonshot.example/v1/models": FakeResponse({"data": [{"id": "kimi-k3"}]}),
+            }
+        )
+
+        report = orchestrator.coordinate_candidates(
+            registry=registry(moonshot_config()),
+            environ={
+                "LITELLM_MASTER_KEY": "litellm-secret",
+                "LITELLM_CANDIDATE_KEY": "candidate-secret",
+                "MOONSHOT_API_KEY": "moonshot-secret",
+            },
+            client=client,
+        )
+
+        self.assertEqual(report["candidate_preflight"]["status"], "blocked")
+        self.assertEqual(
+            report["candidate_preflight"]["reasons"],
+            ["candidate_preflight_key_route_missing"],
+        )
+        self.assertNotIn("candidate-secret", json.dumps(report))
+
+    def test_candidate_preflight_rejects_master_key_reuse_without_key_lookup(self):
+        client = FakeHttpClient(
+            {
+                "http://litellm.internal:4000/model/info": FakeResponse(
+                    {"data": [{"model_name": "*", "litellm_params": {"model": "*"}}]}
+                ),
+                "https://api.moonshot.example/v1/models": FakeResponse({"data": [{"id": "kimi-k3"}]}),
+            }
+        )
+
+        report = orchestrator.coordinate_candidates(
+            registry=registry(moonshot_config()),
+            environ={
+                "LITELLM_MASTER_KEY": "shared-secret",
+                "LITELLM_CANDIDATE_KEY": "shared-secret",
+                "MOONSHOT_API_KEY": "moonshot-secret",
+            },
+            client=client,
+        )
+
+        self.assertEqual(
+            report["candidate_preflight"]["reasons"],
+            ["candidate_preflight_key_not_dedicated"],
+        )
+        self.assertFalse(any("/key/info?" in call[0] for call in client.calls))
+
+    def test_candidate_preflight_is_blocked_without_wildcard_route_or_dedicated_key(self):
+        client = FakeHttpClient(
+            {
+                "http://litellm.internal:4000/model/info": FakeResponse({"data": []}),
+                "https://api.moonshot.example/v1/models": FakeResponse({"data": [{"id": "kimi-k3"}]}),
+            }
+        )
+
+        report = orchestrator.coordinate_candidates(
+            registry=registry(moonshot_config()),
+            environ={
+                "LITELLM_MASTER_KEY": "litellm-secret",
+                "MOONSHOT_API_KEY": "moonshot-secret",
+            },
+            client=client,
+        )
+
+        self.assertEqual(report["candidate_preflight"]["status"], "blocked")
+        self.assertEqual(
+            set(report["candidate_preflight"]["reasons"]),
+            {"candidate_preflight_route_missing", "candidate_preflight_key_missing"},
+        )
 
     def test_missing_provider_key_fails_closed_without_request_or_removed_candidates(self):
         client = FakeHttpClient(

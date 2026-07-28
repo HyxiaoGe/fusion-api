@@ -88,6 +88,9 @@ def candidate_acceptance(*, model_id="kimi-k3", failed=False, high_risk=False):
                 "tool": True,
                 "usage": True,
                 "cost": True,
+                "vision": True,
+                "reasoning": True,
+                "preserved_tool_round": True,
             }
         },
         "quality_issues": [],
@@ -124,6 +127,9 @@ class CandidateAdmissionPlanTests(unittest.TestCase):
             model_new["payload"]["litellm_params"]["api_key"],
             "os.environ/MOONSHOT_API_KEY",
         )
+        governance = model_new["payload"]["model_info"]["metadata"]["governance"]
+        self.assertEqual(len(governance["candidate_fingerprint"]), 64)
+        self.assertTrue(governance["metadata_evidence"]["cost_map_matched"])
         self.assertNotIn("api_key_env", model_new["payload"]["litellm_params"])
         self.assertEqual(plan["allowlist_plan"], {"add": ["kimi-k3"], "remove": []})
         self.assertEqual(plan["post_registration_fusion_gate"]["status"], "required")
@@ -141,8 +147,16 @@ class CandidateAdmissionPlanTests(unittest.TestCase):
                     cost_present=True,
                     output_present=True,
                     stream_done=True if name == "stream" else None,
+                    reasoning_present=True if name == "reasoning" else None,
                 )
-                for name in ("text", "stream", "tool_calling")
+                for name in (
+                    "text",
+                    "stream",
+                    "tool_calling",
+                    "vision",
+                    "reasoning",
+                    "preserved_tool_round",
+                )
             ],
         )
 
@@ -187,6 +201,18 @@ class CandidateAdmissionPlanTests(unittest.TestCase):
 
         self.assertEqual(plan["eligible"], [])
         self.assertIn("high_quality_risk", plan["isolated"][0]["reasons"])
+
+    def test_declared_capability_without_matching_preflight_case_is_isolated(self):
+        summary = candidate_acceptance()
+        summary["candidate_checks_by_model"]["kimi-k3"]["vision"] = False
+
+        plan = admission.build_admission_plan(
+            candidate_report=candidate_report(),
+            candidate_acceptance_summary=summary,
+        )
+
+        self.assertEqual(plan["eligible"], [])
+        self.assertIn("candidate_capability_checks_incomplete", plan["isolated"][0]["reasons"])
 
     def test_missing_pricing_is_isolated(self):
         plan = admission.build_admission_plan(

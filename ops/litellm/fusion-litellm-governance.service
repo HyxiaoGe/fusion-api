@@ -1,0 +1,26 @@
+[Unit]
+Description=Fusion LiteLLM 只读治理周期
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=%h/project/fusion/fusion-api/scripts/run_litellm_governance_cycle.py
+ConditionPathExists=%h/.config/fusion/litellm-provider-registry.json
+ConditionPathExists=%h/.config/fusion/litellm-governance.env
+ConditionPathIsDirectory=%h/backups/litellm-governance
+ConditionFileIsExecutable=%h/.local/share/fusion/litellm-governance-venv/bin/python
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/project/fusion/fusion-api
+EnvironmentFile=%h/.config/fusion/litellm-governance.env
+UMask=0077
+ExecStartPre=%h/.local/share/fusion/litellm-governance-venv/bin/python scripts/check_litellm_governance_runtime.py
+ExecStart=%h/.local/share/fusion/litellm-governance-venv/bin/python scripts/run_litellm_governance_cycle.py \
+  --registry %h/.config/fusion/litellm-provider-registry.json \
+  --output-dir %h/backups/litellm-governance \
+  --acceptance-dir %h/.local/share/fusion/litellm-acceptance
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/backups/litellm-governance
+ReadOnlyPaths=%h/.config/fusion -%h/.local/share/fusion/litellm-acceptance

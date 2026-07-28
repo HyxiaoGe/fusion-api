@@ -88,6 +88,13 @@ python scripts/write_restic_success_marker.py \
 
 复制 `provider-registry.example.json` 到运维主机的受控配置目录，并按实际支持情况启用 provider。Registry 只记录地址和环境变量名，不保存 API key。
 
+`litellm.candidate_preflight` 还必须指向专用的 wildcard route（业务名和
+underlying model 都为 `*`）及只用于候选验收的 virtual key。协调器会通过
+`/model/info` 验证 wildcard route，并通过 `/key/info` 确认专用 key 的
+allowlist 确实包含 `*`；candidate key 的环境变量和值都不得与 master key
+相同。只存在环境变量但没有独立凭证或路由权限也会保持隔离。运维反代和
+access log 还必须对 `/key/info?key=...` 查询参数做脱敏。
+
 ```bash
 python scripts/orchestrate_litellm_model_candidates.py \
   --registry /path/to/provider-registry.json \
@@ -122,24 +129,104 @@ python scripts/enrich_litellm_model_candidates.py \
 - 厂商使用共享 `openai/` 前缀时，可在 registry 配置 `cost_map_prefix`；
 - 官方表暂未收录但已有厂商正式证据时，可通过受审 `--overrides` 文件补齐；文件只允许 metadata，不保存密钥。
 
+override 必须符合 `candidate-overrides.example.json`：审批记录包含策略版本、
+审阅人、带时区时间、HTTPS 官方来源和当前 `providers` 配置 SHA-256。任何一项
+缺失或配置哈希变化都会 fail-closed，旧审批不能静默复用。
+
+## 统一只读治理周期
+
+日常调度使用统一入口，不再手工拼接成本抓取、发现、富化和准入计划：
+
+```bash
+python scripts/run_litellm_governance_cycle.py \
+  --registry /path/to/litellm-provider-registry.json \
+  --output-dir /path/to/litellm-governance \
+  --acceptance-dir /path/to/litellm-acceptance \
+  --overrides /path/to/candidate-overrides.json
+```
+
+该命令只执行官方成本表和厂商目录 GET，并写入本地原子化产物；不会发送
+completion、注册模型、修改 allowlist 或调用其他写 API。每次运行保存
+`runs/<run_id>/`、manifest 和摘要：
+
+- 成本抓取、厂商发现失败或验收文件损坏时写 `latest-failure.json`，不覆盖上一份
+  `latest-success.json`；
+- `candidate-queue.json` 将模型置为 `quarantined`、
+  `preflight_required` 或 `admission_ready`；
+- 验收摘要必须按候选完整契约指纹命名为 `<sha256>.json`，旧模型或旧元数据
+  的结果不能复用；
+- `removed` 只进入 `retirement-review.json`，永远不会自动删除。
+
+`fusion-litellm-governance.service` 和 `.timer` 是 user systemd 模板，每 6 小时
+按 Asia/Shanghai 运行，并带持久补跑和随机抖动。安装前先建立目录并替换模板
+中的仓库路径。两个 service 固定使用独立 Python 3.11+ venv，不能依赖宿主
+`/usr/bin/python3`：
+
+```bash
+python3.11 -m venv "$HOME/.local/share/fusion/litellm-governance-venv"
+"$HOME/.local/share/fusion/litellm-governance-venv/bin/python" \
+  -m pip install -r ops/litellm/requirements-governance.txt
+"$HOME/.local/share/fusion/litellm-governance-venv/bin/python" -c \
+  'import sys, httpx; assert sys.version_info >= (3, 11); print(sys.version, httpx.__version__)'
+
+mkdir -p \
+  "$HOME/.config/fusion" \
+  "$HOME/.config/systemd/user" \
+  "$HOME/.local/share/fusion/litellm-acceptance" \
+  "$HOME/backups/litellm-governance"
+
+install -m 0600 /path/to/litellm-governance.env \
+  "$HOME/.config/fusion/litellm-governance.env"
+install -m 0600 /path/to/litellm-provider-registry.json \
+  "$HOME/.config/fusion/litellm-provider-registry.json"
+install -m 0644 ops/litellm/fusion-litellm-governance.service \
+  "$HOME/.config/systemd/user/fusion-litellm-governance.service"
+install -m 0644 ops/litellm/fusion-litellm-governance.timer \
+  "$HOME/.config/systemd/user/fusion-litellm-governance.timer"
+install -m 0644 ops/litellm/fusion-litellm-cost-sync.service \
+  "$HOME/.config/systemd/user/fusion-litellm-cost-sync.service"
+install -m 0644 ops/litellm/fusion-litellm-cost-sync.timer \
+  "$HOME/.config/systemd/user/fusion-litellm-cost-sync.timer"
+```
+
+启用 timer 属于运维变更，必须在目标环境发布授权后执行。运行时成本表的
+schedule 仍是 LiteLLM 进程内存状态，所以由独立
+`fusion-litellm-cost-sync.timer` 每 15 分钟幂等检查：
+
+- 已按 6 小时健康调度时只 GET，不产生写入；
+- 未调度或周期错误时才调用一次 schedule API，再 GET 复核；
+- stale、fallback 或异常不会通过反复重排掩盖，service 非零退出并保留
+  journal 证据。
+
+可以先用默认 dry-run 手工查看计划：
+
+```bash
+python scripts/ensure_litellm_cost_map_sync.py
+```
+
+统一周期保存的是官方成本表审计快照，不能替代 Proxy 内部刷新；成本同步
+守护也不能替代候选发现和 Fusion 准入。
+
 ## 候选预准入与注册计划
 
-从富化报告提取单个 `new` 候选后，先查看零请求计划；只有明确接受一次真实收费验收时才使用 `--apply`：
+从 `candidate-queue.json` 提取单个 `preflight_required` 候选后，先查看零请求
+计划；只有明确接受一次真实收费验收时才使用 `--apply`：
 
 ```bash
 python scripts/check_litellm_candidate_preflight.py candidate.json --dry-run
 
 LITELLM_CANDIDATE_KEY=... \
 python scripts/check_litellm_candidate_preflight.py candidate.json --apply \
-  > /path/to/reports/candidate-acceptance.json
-
-python scripts/plan_litellm_candidate_admission.py \
-  --candidate-report /path/to/reports/model-candidates-enriched.json \
-  --candidate-acceptance-summary /path/to/reports/candidate-acceptance.json \
-  --output /path/to/reports/candidate-admission-plan.json
+  > /path/to/litellm-acceptance/<candidate-fingerprint>.json
 ```
 
-准入器本身没有 apply 模式，也不发 HTTP。它仅在以下条件全部成立时生成 `/model/new` dry-run payload：
+下一次统一治理周期会读取匹配指纹的验收摘要，并为通过的单候选生成带
+`run_id` 的 admission plan。能力矩阵由候选声明驱动，除文本、SSE、
+tool calling、usage 和 cost 外，还会按需验证视觉语义、reasoning 字段以及
+保留完整 assistant tool message 的多轮工具调用。
+
+计划器本身没有 apply 模式，也不发 HTTP。它仅在以下条件全部成立时生成
+`/model/new` dry-run payload：
 
 - 候选发现状态正常；
 - 价格、能力和来源证据完整；
@@ -148,7 +235,60 @@ python scripts/plan_litellm_candidate_admission.py \
 - 验收摘要中的完整候选契约 SHA-256 与当前 provider、underlying model、endpoint、价格、能力和元数据证据完全一致；
 - 没有 reasoning 标签泄漏等高风险质量问题。
 
-生成的 v1.93+ payload 使用 LiteLLM 官方格式 `api_key: os.environ/变量名`，不会把真实厂商密钥写入报告。实际注册、allowlist 修改和注册后的 Fusion 产品验收仍属于发布门禁。
+生成的 v1.93+ payload 使用 LiteLLM 官方格式
+`api_key: os.environ/变量名`，不会把真实厂商密钥写入报告。可以用完全隔离、
+零厂商请求的脚本复核 DB model 跨重启解析契约：
+
+```bash
+bash scripts/validate_litellm_db_env_reference.sh
+```
+
+## 受控准入事务
+
+`execute_litellm_candidate_admission.py` 的 dry-run 可以读取人工提取的单个
+admission plan，且不发任何 HTTP：
+
+```bash
+python scripts/execute_litellm_candidate_admission.py \
+  --plan /path/to/single-admission-plan.json \
+  --output /path/to/admission-transaction.json
+```
+
+真实 apply 属于发布门禁，禁止直接消费任意 `--plan`。执行器必须从
+`--governance-root/latest-success.json` 出发，验证 run path、manifest SHA、
+candidate queue 与 admission plans artifact SHA，重算 queue candidate
+fingerprint，并从候选原始契约重建 `/model/new` payload；随后还要同时确认
+`run_id`、模型 ID 和候选 fingerprint。
+
+执行器从环境读取 LiteLLM master key、Fusion virtual key 和厂商 key，在写前
+读取 `/model/info` 与 `/key/info` 建立 CAS before-state，
+依次执行注册、读回、allowlist、Fusion `/api/models/` 读回和目录审计；中途
+失败会通过 CAS 尽力恢复原 allowlist，并只在能证明本事务 UUID 所有权时删除
+本次新建的模型。
+
+```bash
+python scripts/execute_litellm_candidate_admission.py \
+  --governance-root /path/to/litellm-governance \
+  --candidate-fingerprint '<sha256>' \
+  --output /path/to/admission-transaction.json \
+  --expected-run-id '<run_id>' \
+  --confirm-model-id '<model_id>' \
+  --confirm-fingerprint '<sha256>' \
+  --apply
+```
+
+只有 `/model/new` 明确返回本事务 UUID，且按 UUID、alias、underlying model、
+`api_base`、治理 fingerprint 与完整 metadata 精确读回后，才会打开
+allowlist。注册响应结果不确定时不会按名称猜测并删除模型，而是标记
+`manual_cleanup_required`，由发布人员基于事务证据人工处置。
+
+脚本成功只证明注册事务与 API 读回通过，不能替代真实登录态下的模型选择、
+文本/流式/工具/刷新恢复等产品层验收。最终目录审计默认只读，并在存在 error
+时非零退出：
+
+```bash
+python scripts/audit_litellm_model_catalog.py --dry-run
+```
 
 provider 发现失败会写入 `pipeline_issues` 并让准入 CLI 非零退出；共享 `openai/` adapter 只接受 provider namespace 一致的成本条目；若候选 `model_id` 已被其他 underlying model 用作业务 alias，发现阶段直接转入 `unknown` 隔离。
 

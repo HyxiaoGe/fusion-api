@@ -1,0 +1,11 @@
+[Unit]
+Description=每 6 小时运行 Fusion LiteLLM 只读治理周期
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:20:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=10m
+Unit=fusion-litellm-governance.service
+
+[Install]
+WantedBy=timers.target

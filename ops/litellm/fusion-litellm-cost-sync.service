@@ -1,0 +1,22 @@
+[Unit]
+Description=确保 Fusion LiteLLM 运行时成本表同步
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=%h/project/fusion/fusion-api/scripts/ensure_litellm_cost_map_sync.py
+ConditionPathExists=%h/.config/fusion/litellm-governance.env
+ConditionFileIsExecutable=%h/.local/share/fusion/litellm-governance-venv/bin/python
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/project/fusion/fusion-api
+EnvironmentFile=%h/.config/fusion/litellm-governance.env
+UMask=0077
+ExecStartPre=%h/.local/share/fusion/litellm-governance-venv/bin/python scripts/check_litellm_governance_runtime.py
+ExecStart=%h/.local/share/fusion/litellm-governance-venv/bin/python scripts/ensure_litellm_cost_map_sync.py \
+  --expected-interval-hours 6 \
+  --max-staleness-hours 12 \
+  --apply
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only

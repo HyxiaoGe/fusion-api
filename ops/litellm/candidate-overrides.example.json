@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "approval": {
+    "policy_version": "fusion-model-override/v1",
+    "reviewed_by": "replace-with-reviewer",
+    "reviewed_at": "2026-07-28T12:00:00+08:00",
+    "source_urls": [
+      "https://example.com/provider/model-pricing"
+    ],
+    "providers_sha256": "87e815aef2d95074531bc1125b308400d045cbf43dd415e4586a619bec25a118"
+  },
+  "providers": {
+    "example-provider": {
+      "models": {
+        "example-model": {
+          "display_name": "Example Model",
+          "capabilities": {
+            "functionCalling": true,
+            "vision": false
+          },
+          "pricing": {
+            "input": 1.0,
+            "output": 3.0,
+            "unit": "USD/1M tokens"
+          }
+        }
+      }
+    }
+  }
+}

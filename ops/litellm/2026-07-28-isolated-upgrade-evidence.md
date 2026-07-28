@@ -40,6 +40,18 @@
 - 迁移前后 17 个 DB model 业务别名完全一致。
 - 临时 Redis 接入后启动日志无新增 ERROR/Traceback，容器 restart=0、OOM=false。
 
+### DB 环境变量引用跨重启验证
+
+使用 `scripts/validate_litellm_db_env_reference.sh` 在独立 Docker 网络中再次验证固定 digest：
+
+- 通过 `/model/new` 注册 `api_key: os.environ/FAKE_PROVIDER_KEY`；
+- 停止并重建 LiteLLM 容器，数据库和 salt 保持不变；
+- 重启后调用本地 mock provider，mock 只接受预设假 Bearer key；
+- completion 返回 `env-reference-ok`；
+- 外部厂商请求数为 `0`，测试容器和网络在退出时清理。
+
+这证明 v1.93.0 固定 digest 能在 DB model 跨重启加载时解析环境变量引用；实际准入仍需确认目标主机已注入对应环境变量。
+
 ## 成本表同步
 
 - `POST /reload/model_cost_map`：HTTP 200。

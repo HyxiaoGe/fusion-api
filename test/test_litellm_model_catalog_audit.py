@@ -153,6 +153,37 @@ class ModelCatalogAuditTests(unittest.TestCase):
         self.assertEqual(issue.model_name, "bad-model")
         self.assertIn("pricing", issue.message)
 
+    def test_governance_model_requires_persistent_candidate_evidence(self):
+        report = audit.audit_catalog(
+            litellm_entries=[
+                litellm_entry(
+                    "governed-model",
+                    metadata={
+                        "provider_key": "moonshot",
+                        "provider_display": "Moonshot",
+                        "capabilities": {"functionCalling": True},
+                        "pricing": {"input": 1.0, "output": 3.0, "unit": "USD/1M tokens"},
+                        "source": "fusion-governance-v1",
+                    },
+                )
+            ],
+            fusion_models=[{"modelId": "governed-model"}],
+            key_models=["governed-model"],
+        )
+
+        issue = [item for item in report.issues if item.code == "governance_evidence_missing"][0]
+        self.assertEqual(issue.severity, "error")
+        self.assertEqual(audit.audit_exit_code(report), 1)
+
+    def test_clean_report_has_zero_exit_code(self):
+        report = audit.audit_catalog(
+            litellm_entries=[litellm_entry("deepseek-chat")],
+            fusion_models=[{"modelId": "deepseek-chat"}],
+            key_models=["deepseek-chat"],
+        )
+
+        self.assertEqual(audit.audit_exit_code(report), 0)
+
     def test_serialize_report_does_not_include_secrets(self):
         report = audit.audit_catalog(
             litellm_entries=[litellm_entry("deepseek-chat")],

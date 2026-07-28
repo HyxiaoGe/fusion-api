@@ -26,6 +26,8 @@ DEFAULT_FUSION_BASE_URL = "https://fusion.seanfield.org"
 
 DEPRECATED_MODELS = {"mimo-v2-flash", "mimo-v2-pro"}
 REQUIRED_METADATA_KEYS = ("provider_key", "provider_display", "capabilities", "pricing")
+GOVERNANCE_SOURCE = "fusion-governance-v1"
+REQUIRED_GOVERNANCE_KEYS = ("candidate_fingerprint", "metadata_evidence")
 
 
 class HttpClient(Protocol):
@@ -133,6 +135,15 @@ def _missing_metadata_keys(metadata: Mapping[str, Any]) -> list[str]:
 
 def _has_required_metadata(metadata: Mapping[str, Any]) -> bool:
     return not _missing_metadata_keys(metadata)
+
+
+def _missing_governance_keys(metadata: Mapping[str, Any]) -> list[str]:
+    if metadata.get("source") != GOVERNANCE_SOURCE:
+        return []
+    governance = metadata.get("governance")
+    if not isinstance(governance, Mapping):
+        return list(REQUIRED_GOVERNANCE_KEYS)
+    return [key for key in REQUIRED_GOVERNANCE_KEYS if governance.get(key) in (None, "", [], {})]
 
 
 def _stable_json(value: Any) -> str:
@@ -262,6 +273,16 @@ def audit_catalog(
                     message=f"业务模型缺少关键 metadata: {', '.join(missing)}",
                 )
             )
+        governance_missing = _missing_governance_keys(model["metadata"])
+        if governance_missing:
+            issues.append(
+                CatalogIssue(
+                    code="governance_evidence_missing",
+                    severity="error",
+                    model_name=model["model_name"],
+                    message=f"治理模型缺少证据字段: {', '.join(governance_missing)}",
+                )
+            )
 
     sync_plan = build_allowlist_sync_plan(db_model_names=eligible_db_model_names, key_models=key_models)
     if key_models is not None:
@@ -388,6 +409,10 @@ def serialize_report(report: AuditReport, *, context: Mapping[str, Any] | None =
     }
 
 
+def audit_exit_code(report: AuditReport) -> int:
+    return 1 if int(report.summary.get("error_count", 0)) > 0 else 0
+
+
 def _default_litellm_base_url() -> str:
     return os.environ.get(LITELLM_BASE_URL_ENV) or os.environ.get(LITELLM_PROXY_URL_ENV) or DEFAULT_LITELLM_BASE_URL
 
@@ -449,7 +474,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             virtual_key=args.virtual_key,
             sync_plan=report.sync_plan,
         )
-    return 0
+    return audit_exit_code(report)
 
 
 if __name__ == "__main__":

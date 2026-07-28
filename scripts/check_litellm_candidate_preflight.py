@@ -22,6 +22,9 @@ LITELLM_PROXY_URL_ENV = "LITELLM_PROXY_URL"
 LITELLM_MASTER_KEY_ENV = "LITELLM_MASTER_KEY"
 LITELLM_CANDIDATE_KEY_ENV = "LITELLM_CANDIDATE_KEY"
 DEFAULT_LITELLM_BASE_URL = "http://localhost:4000"
+RED_PIXEL_PNG_DATA_URL = (
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+)
 
 
 class HttpClient(Protocol):
@@ -49,6 +52,18 @@ class Candidate:
             for key in ("functionCalling", "toolCalling", "tool_calling", "supports_function_calling")
         )
 
+    @property
+    def supports_vision(self) -> bool:
+        return self.capabilities.get("vision") is True
+
+    @property
+    def supports_reasoning(self) -> bool:
+        return self.capabilities.get("deepThinking") is True
+
+    @property
+    def requires_preserved_tool_round(self) -> bool:
+        return self.supports_tool_calling and self.supports_reasoning
+
 
 @dataclass(frozen=True)
 class CaseResult:
@@ -58,6 +73,7 @@ class CaseResult:
     cost_present: bool | None = None
     output_present: bool | None = None
     stream_done: bool | None = None
+    reasoning_present: bool | None = None
     issues: tuple[str, ...] = ()
     quality_flags: tuple[str, ...] = ()
 
@@ -105,7 +121,12 @@ def parse_candidate(payload: Mapping[str, Any]) -> Candidate:
 
 def candidate_contract_fingerprint(candidate: Candidate | Mapping[str, Any]) -> str:
     normalized = candidate if isinstance(candidate, Candidate) else parse_candidate(candidate)
-    canonical = json.dumps(asdict(normalized), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    contract = asdict(normalized)
+    # 全量成本表 SHA 用于追溯本次快照，但其他厂商条目的变化不应让已经通过
+    # 验收的候选失效。候选自身的价格、能力、cost_map_key 和 metadata 仍在
+    # contract 中，相关条目变化会自然产生新指纹。
+    contract["metadata_evidence"].pop("cost_map_sha256", None)
+    canonical = json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(canonical).hexdigest()
 
 
@@ -139,8 +160,10 @@ def _case_result(
     cost_present: bool,
     stream_done: bool | None = None,
     output_text: str = "",
+    reasoning_present: bool | None = None,
+    extra_issues: tuple[str, ...] = (),
 ) -> CaseResult:
-    issues: list[str] = []
+    issues: list[str] = list(extra_issues)
     if not output_present:
         issues.append("missing_output")
     if stream_done is False:
@@ -156,6 +179,7 @@ def _case_result(
         cost_present=cost_present,
         output_present=output_present,
         stream_done=stream_done,
+        reasoning_present=reasoning_present,
         issues=tuple(issues),
         quality_flags=_detect_quality_flags(output_text),
     )
@@ -332,13 +356,211 @@ def _run_tool_case(
         return _failed_case("tool_calling", exc)
 
 
+def _run_vision_case(
+    *,
+    candidate: Candidate,
+    url: str,
+    api_key: str,
+    timeout_seconds: float,
+    client: HttpClient,
+) -> CaseResult:
+    try:
+        response = client.post(
+            url,
+            headers=_request_headers(api_key),
+            json={
+                "model": candidate.litellm_model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": RED_PIXEL_PNG_DATA_URL}},
+                            {"type": "text", "text": "图片的主要颜色是什么？只回复 red 或 红色。"},
+                        ],
+                    }
+                ],
+                "max_tokens": 16,
+                "temperature": 0,
+            },
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, Mapping):
+            raise ValueError("响应不是 JSON 对象")
+        choices = payload.get("choices")
+        message = choices[0].get("message", {}) if isinstance(choices, list) and choices else {}
+        content = message.get("content") if isinstance(message, Mapping) else None
+        text = content if isinstance(content, str) else ""
+        normalized = text.casefold()
+        matched = "red" in normalized or "红" in text
+        return _case_result(
+            name="vision",
+            output_present=bool(text.strip()),
+            usage_present=_has_usage(payload),
+            cost_present=_has_cost(response, payload),
+            output_text=text,
+            extra_issues=() if matched else ("vision_expectation_mismatch",),
+        )
+    except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+        return _failed_case("vision", exc)
+
+
+def _run_reasoning_case(
+    *,
+    candidate: Candidate,
+    url: str,
+    api_key: str,
+    timeout_seconds: float,
+    client: HttpClient,
+) -> CaseResult:
+    try:
+        response = client.post(
+            url,
+            headers=_request_headers(api_key),
+            json={
+                "model": candidate.litellm_model,
+                "messages": [{"role": "user", "content": "计算 17×19，只回复答案。"}],
+                "reasoning_effort": "low",
+                "max_tokens": 64,
+                "temperature": 0,
+            },
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, Mapping):
+            raise ValueError("响应不是 JSON 对象")
+        choices = payload.get("choices")
+        message = choices[0].get("message", {}) if isinstance(choices, list) and choices else {}
+        content = message.get("content") if isinstance(message, Mapping) else None
+        reasoning = None
+        if isinstance(message, Mapping):
+            reasoning = message.get("reasoning_content") or message.get("reasoning")
+        reasoning_present = isinstance(reasoning, str) and bool(reasoning.strip())
+        return _case_result(
+            name="reasoning",
+            output_present=isinstance(content, str) and bool(content.strip()),
+            usage_present=_has_usage(payload),
+            cost_present=_has_cost(response, payload),
+            output_text=content if isinstance(content, str) else "",
+            reasoning_present=reasoning_present,
+            extra_issues=() if reasoning_present else ("missing_reasoning",),
+        )
+    except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+        return _failed_case("reasoning", exc)
+
+
+def _run_preserved_tool_round_case(
+    *,
+    candidate: Candidate,
+    url: str,
+    api_key: str,
+    timeout_seconds: float,
+    client: HttpClient,
+) -> CaseResult:
+    try:
+        first = client.post(
+            url,
+            headers=_request_headers(api_key),
+            json={
+                "model": candidate.litellm_model,
+                "messages": [{"role": "user", "content": "查询上海天气，然后告诉我是否适合散步。"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "description": "查询城市天气",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                                "required": ["city"],
+                            },
+                        },
+                    }
+                ],
+                "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+                "reasoning_effort": "low",
+                "max_tokens": 128,
+            },
+            timeout=timeout_seconds,
+        )
+        first.raise_for_status()
+        first_payload = first.json()
+        choices = first_payload.get("choices") if isinstance(first_payload, Mapping) else None
+        assistant = choices[0].get("message", {}) if isinstance(choices, list) and choices else {}
+        tool_calls = assistant.get("tool_calls") if isinstance(assistant, Mapping) else None
+        if not isinstance(tool_calls, list) or not tool_calls:
+            raise ValueError("首轮缺少 tool_calls")
+        tool_call_id = tool_calls[0].get("id")
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            raise ValueError("tool_call id 缺失")
+        second = client.post(
+            url,
+            headers=_request_headers(api_key),
+            json={
+                "model": candidate.litellm_model,
+                "messages": [
+                    {"role": "user", "content": "查询上海天气，然后告诉我是否适合散步。"},
+                    dict(assistant),
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": '{"weather":"sunny","temperature_c":24}',
+                    },
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "description": "查询城市天气",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                                "required": ["city"],
+                            },
+                        },
+                    }
+                ],
+                "reasoning_effort": "low",
+                "max_tokens": 128,
+            },
+            timeout=timeout_seconds,
+        )
+        second.raise_for_status()
+        second_payload = second.json()
+        second_choices = second_payload.get("choices") if isinstance(second_payload, Mapping) else None
+        message = second_choices[0].get("message", {}) if isinstance(second_choices, list) and second_choices else {}
+        content = message.get("content") if isinstance(message, Mapping) else None
+        return _case_result(
+            name="preserved_tool_round",
+            output_present=isinstance(content, str) and bool(content.strip()),
+            usage_present=_has_usage(first_payload) and _has_usage(second_payload),
+            cost_present=_has_cost(first, first_payload) and _has_cost(second, second_payload),
+            output_text=content if isinstance(content, str) else "",
+        )
+    except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+        return _failed_case("preserved_tool_round", exc)
+
+
 def _planned_cases(candidate: Candidate) -> list[CaseResult]:
     tool_status = "planned" if candidate.supports_tool_calling else "skipped"
-    return [
+    cases = [
         CaseResult(name="text", status="planned"),
         CaseResult(name="stream", status="planned"),
         CaseResult(name="tool_calling", status=tool_status),
     ]
+    cases.append(CaseResult(name="vision", status="planned" if candidate.supports_vision else "skipped"))
+    cases.append(CaseResult(name="reasoning", status="planned" if candidate.supports_reasoning else "skipped"))
+    cases.append(
+        CaseResult(
+            name="preserved_tool_round",
+            status="planned" if candidate.requires_preserved_tool_round else "skipped",
+        )
+    )
+    return cases
 
 
 def run_preflight(
@@ -390,6 +612,42 @@ def run_preflight(
         )
     else:
         cases.append(CaseResult(name="tool_calling", status="skipped"))
+    if candidate.supports_vision:
+        cases.append(
+            _run_vision_case(
+                candidate=candidate,
+                url=url,
+                api_key=api_key,
+                timeout_seconds=timeout_seconds,
+                client=client,
+            )
+        )
+    else:
+        cases.append(CaseResult(name="vision", status="skipped"))
+    if candidate.supports_reasoning:
+        cases.append(
+            _run_reasoning_case(
+                candidate=candidate,
+                url=url,
+                api_key=api_key,
+                timeout_seconds=timeout_seconds,
+                client=client,
+            )
+        )
+    else:
+        cases.append(CaseResult(name="reasoning", status="skipped"))
+    if candidate.requires_preserved_tool_round:
+        cases.append(
+            _run_preserved_tool_round_case(
+                candidate=candidate,
+                url=url,
+                api_key=api_key,
+                timeout_seconds=timeout_seconds,
+                client=client,
+            )
+        )
+    else:
+        cases.append(CaseResult(name="preserved_tool_round", status="skipped"))
     return PreflightReport(
         healthy=all(case.status in {"passed", "skipped"} for case in cases),
         dry_run=False,
@@ -426,6 +684,19 @@ def serialize_report(
         and case_by_name["tool_calling"].status in {"passed", "skipped"},
         "usage": bool(executed) and all(case.usage_present is True for case in executed),
         "cost": bool(executed) and all(case.cost_present is True for case in executed),
+        "vision": not report.candidate.supports_vision
+        or (case_by_name.get("vision") is not None and case_by_name["vision"].status == "passed"),
+        "reasoning": not report.candidate.supports_reasoning
+        or (
+            case_by_name.get("reasoning") is not None
+            and case_by_name["reasoning"].status == "passed"
+            and case_by_name["reasoning"].reasoning_present is True
+        ),
+        "preserved_tool_round": not report.candidate.requires_preserved_tool_round
+        or (
+            case_by_name.get("preserved_tool_round") is not None
+            and case_by_name["preserved_tool_round"].status == "passed"
+        ),
     }
     return {
         "acceptance_stage": "candidate_pre_registration",

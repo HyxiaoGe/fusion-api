@@ -30,6 +30,13 @@ SAFE_METADATA_KEYS = (
     "knowledge_cutoff",
     "recommended_for",
 )
+REQUIRED_OVERRIDE_APPROVAL_KEYS = (
+    "policy_version",
+    "reviewed_by",
+    "reviewed_at",
+    "source_urls",
+    "providers_sha256",
+)
 
 
 def _is_mapping(value: Any) -> bool:
@@ -71,6 +78,10 @@ def _metadata_reasons(candidate: Mapping[str, Any]) -> list[str]:
         evidence.get("cost_map_matched") is True or evidence.get("reviewed_override_applied") is True
     ):
         reasons.append("metadata_evidence_missing")
+    elif evidence.get("reviewed_override_applied") is True:
+        approval = evidence.get("override_approval")
+        if not _is_mapping(approval) or any(not approval.get(key) for key in REQUIRED_OVERRIDE_APPROVAL_KEYS):
+            reasons.append("override_approval_missing")
     if metadata.get("provider_key") != candidate.get("provider_key"):
         reasons.append("metadata_provider_mismatch")
     return reasons
@@ -105,6 +116,22 @@ def _registration_reasons(candidate: Mapping[str, Any]) -> list[str]:
     return reasons
 
 
+def candidate_static_gate_reasons(
+    candidate: Mapping[str, Any],
+    *,
+    provider_key: str,
+) -> list[str]:
+    """返回不依赖收费验收结果的候选静态隔离原因。"""
+    reasons: list[str] = []
+    if candidate.get("isolation_status") != "candidate":
+        reasons.append("candidate_category_not_new")
+    reasons.extend(_metadata_reasons(candidate))
+    reasons.extend(_registration_reasons(candidate))
+    if candidate.get("provider_key") != provider_key:
+        reasons.append("candidate_provider_mismatch")
+    return list(dict.fromkeys(reasons))
+
+
 def _acceptance_reasons(
     model_id: str,
     candidate: Mapping[str, Any],
@@ -131,6 +158,17 @@ def _acceptance_reasons(
     checks = (summary.get("candidate_checks_by_model") or {}).get(model_id)
     if not _is_mapping(checks) or any(checks.get(check) is not True for check in REQUIRED_CANDIDATE_CHECKS):
         reasons.append("candidate_acceptance_checks_incomplete")
+    capabilities = (candidate.get("metadata") or {}).get("capabilities") or {}
+    dynamic_checks: list[str] = []
+    if _is_mapping(capabilities):
+        if capabilities.get("vision") is True:
+            dynamic_checks.append("vision")
+        if capabilities.get("deepThinking") is True:
+            dynamic_checks.append("reasoning")
+        if capabilities.get("deepThinking") is True and capabilities.get("functionCalling") is True:
+            dynamic_checks.append("preserved_tool_round")
+    if not _is_mapping(checks) or any(checks.get(check) is not True for check in dynamic_checks):
+        reasons.append("candidate_capability_checks_incomplete")
     if _has_high_quality_risk(model_id, summary):
         reasons.append("high_quality_risk")
     mismatch_by_model = summary.get("tool_expectation_mismatch_by_model")
@@ -166,9 +204,20 @@ def _safe_metadata(candidate: Mapping[str, Any]) -> dict[str, Any]:
     return {key: metadata[key] for key in SAFE_METADATA_KEYS if key in metadata}
 
 
-def _eligible_entry(candidate: Mapping[str, Any]) -> dict[str, Any]:
+def build_eligible_entry(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    """从完整候选契约确定性重建单模型准入条目。"""
     registration = candidate["registration"]
     model_id = _nonempty_string(candidate.get("model_id"))
+    metadata = _safe_metadata(candidate)
+    metadata.update(
+        {
+            "source": "fusion-governance-v1",
+            "governance": {
+                "candidate_fingerprint": candidate_contract_fingerprint(candidate),
+                "metadata_evidence": candidate["metadata_evidence"],
+            },
+        }
+    )
     payload = {
         "model_name": model_id,
         "litellm_params": {
@@ -177,7 +226,7 @@ def _eligible_entry(candidate: Mapping[str, Any]) -> dict[str, Any]:
             "api_key": f"os.environ/{registration['api_key_env']}",
         },
         "model_info": {
-            "metadata": _safe_metadata(candidate),
+            "metadata": metadata,
         },
     }
     return {
@@ -265,16 +314,13 @@ def build_admission_plan(
         reasons: list[str] = []
         if provider_result.get("status") != "ok":
             reasons.append("provider_status_not_ok")
-        if candidate.get("isolation_status") != "candidate":
-            reasons.append("candidate_category_not_new")
-        reasons.extend(_metadata_reasons(candidate))
-        reasons.extend(_registration_reasons(candidate))
+        reasons.extend(candidate_static_gate_reasons(candidate, provider_key=provider_key))
         model_id = _nonempty_string(candidate.get("model_id"))
         reasons.extend(_acceptance_reasons(model_id, candidate, candidate_acceptance_summary))
         if reasons:
             isolated.append(_isolated_entry(candidate, provider_key, reasons))
         else:
-            eligible.append(_eligible_entry(candidate))
+            eligible.append(build_eligible_entry(candidate))
     return {
         "status": "failed" if pipeline_issues else "complete",
         "mode": "dry_run",

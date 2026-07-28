@@ -1,0 +1,12 @@
+[Unit]
+Description=每 15 分钟检查 Fusion LiteLLM 成本表同步
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=15m
+Persistent=true
+RandomizedDelaySec=2m
+Unit=fusion-litellm-cost-sync.service
+
+[Install]
+WantedBy=timers.target

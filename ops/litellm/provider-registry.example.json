@@ -1,7 +1,12 @@
 {
   "litellm": {
     "base_url": "http://127.0.0.1:4000",
-    "api_key_env": "LITELLM_MASTER_KEY"
+    "api_key_env": "LITELLM_MASTER_KEY",
+    "candidate_preflight": {
+      "transport": "litellm_wildcard",
+      "route_model_name": "*",
+      "api_key_env": "LITELLM_CANDIDATE_KEY"
+    }
   },
   "providers": [
     {

@@ -1,6 +1,8 @@
 import copy
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from scripts import enrich_litellm_model_candidates as enrichment
 from scripts.fetch_litellm_cost_map import cost_map_sha256
@@ -52,6 +54,14 @@ def enrich(**kwargs):
 
 
 class CandidateEnrichmentTests(unittest.TestCase):
+    def test_versioned_override_example_has_valid_approval_hash(self):
+        path = Path(__file__).resolve().parents[1] / "ops/litellm/candidate-overrides.example.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+
+        approval = enrichment.validate_override_approval(payload)
+
+        self.assertEqual(approval["policy_version"], "fusion-model-override/v1")
+
     def test_cost_map_status_must_match_and_be_fresh(self):
         cost_map = {"model": {"input_cost_per_token": 0.1}}
         now = datetime.now(timezone.utc)
@@ -121,29 +131,61 @@ class CandidateEnrichmentTests(unittest.TestCase):
         self.assertFalse(candidate["metadata_evidence"]["cost_map_matched"])
 
     def test_reviewed_override_can_fill_cost_map_gap_without_secret_material(self):
+        providers = {
+            "moonshot": {
+                "models": {
+                    "kimi-k3": {
+                        "display_name": "Kimi K3",
+                        "capabilities": {"functionCalling": True, "vision": True},
+                        "pricing": {"input": 0.6, "output": 2.5, "unit": "USD/1M tokens"},
+                    }
+                }
+            }
+        }
         result = enrich(
             candidate_report=candidate_report(),
             registry=registry(),
             cost_map={},
             overrides={
-                "providers": {
-                    "moonshot": {
-                        "models": {
-                            "kimi-k3": {
-                                "display_name": "Kimi K3",
-                                "capabilities": {"functionCalling": True, "vision": True},
-                                "pricing": {"input": 0.6, "output": 2.5, "unit": "USD/1M tokens"},
-                            }
-                        }
-                    }
-                }
+                "schema_version": 1,
+                "approval": {
+                    "policy_version": "fusion-model-override/v1",
+                    "reviewed_by": "model-governance",
+                    "reviewed_at": "2026-07-28T12:00:00+08:00",
+                    "source_urls": ["https://example.test/kimi-k3"],
+                    "providers_sha256": cost_map_sha256(providers),
+                },
+                "providers": providers,
             },
         )
 
         candidate = result["providers"]["moonshot"]["report"]["new"][0]
         self.assertEqual(candidate["metadata"]["display_name"], "Kimi K3")
         self.assertTrue(candidate["metadata_evidence"]["reviewed_override_applied"])
+        self.assertEqual(
+            candidate["metadata_evidence"]["override_approval"]["policy_version"],
+            "fusion-model-override/v1",
+        )
         self.assertNotIn("api_key", candidate["registration"])
+
+    def test_override_without_matching_approval_hash_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "providers_sha256"):
+            enrich(
+                candidate_report=candidate_report(),
+                registry=registry(),
+                cost_map={},
+                overrides={
+                    "schema_version": 1,
+                    "approval": {
+                        "policy_version": "fusion-model-override/v1",
+                        "reviewed_by": "model-governance",
+                        "reviewed_at": "2026-07-28T12:00:00+08:00",
+                        "source_urls": ["https://example.test/kimi-k3"],
+                        "providers_sha256": "bad",
+                    },
+                    "providers": {"moonshot": {"models": {}}},
+                },
+            )
 
     def test_provider_specific_cost_prefix_supports_shared_openai_adapter(self):
         report = candidate_report()
