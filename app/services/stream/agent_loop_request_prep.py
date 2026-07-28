@@ -9,14 +9,15 @@ from typing import Any
 
 from app.ai.litellm_utils import merge_extra_body
 from app.ai.prompts.agent_loop import (
+    DEEP_RESEARCH_CONTRACT_PROMPT,
     get_agent_plan_control_prompt,
     get_no_tool_network_boundary_prompt,
     get_no_vision_file_boundary_prompt,
     get_tool_usage_contract_prompt,
 )
-from app.ai.tools import build_web_search_tool
+from app.ai.tools import build_url_read_tool, build_web_search_tool
 from app.db.repositories import FileRepository
-from app.services.agent.plan_coordinator import PlanMode, normalize_plan_mode
+from app.services.agent.plan_coordinator import PlanMode
 from app.services.chat.message_builder import (
     build_llm_messages,
     inject_file_content,
@@ -27,6 +28,7 @@ from app.services.mcp.flyai_travel_tools import (
     FLYAI_TRAVEL_FACT_BOUNDARY_SYSTEM_PROMPT,
     FLYAI_TRAVEL_TOOL_NAMES,
 )
+from app.services.stream.agent_task_policy import resolve_agent_task_policy
 from app.services.stream.persistence import preprocess_url_in_message
 
 VOLCENGINE_PROVIDERS = {"volcengine"}
@@ -46,6 +48,9 @@ class AgentLoopCallConfig:
     tool_bindings: list[dict[str, Any]] = field(default_factory=list)
     plan_mode: PlanMode = "auto"
     control_tool_names: frozenset[str] = frozenset()
+    task_mode: str = "standard"
+    network_profile: str = "standard"
+    evidence_policy: str = "standard"
 
 
 def build_update_plan_tool() -> dict[str, Any]:
@@ -67,7 +72,7 @@ def build_update_plan_tool() -> dict[str, Any]:
                     "plan": {
                         "type": "array",
                         "minItems": 2,
-                        "maxItems": 12,
+                        "maxItems": 6,
                         "items": {
                             "type": "object",
                             "additionalProperties": False,
@@ -179,6 +184,7 @@ def build_agent_loop_call_config(
     capabilities: dict | None,
     volcengine_providers: set[str] | frozenset[str] = frozenset(VOLCENGINE_PROVIDERS),
     build_web_search_tool_fn: Callable[[], dict] = build_web_search_tool,
+    build_url_read_tool_fn: Callable[[], dict] = build_url_read_tool,
     additional_tools: list[dict] | None = None,
     dynamic_tool_handlers: dict[str, Any] | None = None,
     tool_bindings: list[dict[str, Any]] | None = None,
@@ -191,7 +197,8 @@ def build_agent_loop_call_config(
     should_use_reasoning = use_reasoning is True or (use_reasoning is None and supports_thinking)
 
     tools_disabled = options.get("disable_tools") is True
-    requested_plan_mode = normalize_plan_mode(options.get("plan_mode"))
+    task_policy = resolve_agent_task_policy(options=options, capabilities=capabilities)
+    requested_plan_mode = task_policy.plan_mode
     supports_function_calling = supports_search_tools(capabilities) and not tools_disabled
     supports_control_tools = bool(capabilities.get("functionCalling", False)) and not tools_disabled
     plan_mode: PlanMode = requested_plan_mode if supports_control_tools else "off"
@@ -203,6 +210,8 @@ def build_agent_loop_call_config(
     tools: list[dict] = []
     if supports_function_calling:
         tools.append(build_web_search_tool_fn())
+        if task_policy.task_mode == "deep_research":
+            tools.append(build_url_read_tool_fn())
     provided_handlers = dynamic_tool_handlers or {}
     if supports_dynamic_tools:
         tools.extend(tool for tool in (additional_tools or []) if _tool_definition_name(tool) in provided_handlers)
@@ -240,6 +249,9 @@ def build_agent_loop_call_config(
         tool_bindings=active_bindings,
         plan_mode=plan_mode,
         control_tool_names=control_tool_names,
+        task_mode=task_policy.task_mode,
+        network_profile=task_policy.network_profile,
+        evidence_policy=task_policy.evidence_policy,
     )
 
 
@@ -319,6 +331,7 @@ async def prepare_agent_loop_messages(
     messages = inject_amap_fact_boundary(messages, call_config.call_kwargs)
     messages = inject_flyai_travel_fact_boundary(messages, call_config.call_kwargs)
     messages = inject_plan_control_contract(messages, call_config)
+    messages = inject_deep_research_contract(messages, call_config)
     messages = inject_no_tool_network_boundary(messages, call_config.call_kwargs)
     return AgentLoopPreparedMessages(
         messages=messages,
@@ -463,6 +476,27 @@ def inject_plan_control_contract(
         "content": get_agent_plan_control_prompt(call_config.plan_mode),
     }
     return [*messages[:insert_at], contract_msg, *messages[insert_at:]]
+
+
+def inject_deep_research_contract(
+    messages: list[dict],
+    call_config: AgentLoopCallConfig,
+) -> list[dict]:
+    if getattr(call_config, "task_mode", "standard") != "deep_research":
+        return messages
+    if any(
+        message.get("role") == "system" and "【深度研究执行约束】" in str(message.get("content", ""))
+        for message in messages
+    ):
+        return messages
+    insert_at = 0
+    while insert_at < len(messages) and messages[insert_at].get("role") == "system":
+        insert_at += 1
+    return [
+        *messages[:insert_at],
+        {"role": "system", "content": DEEP_RESEARCH_CONTRACT_PROMPT},
+        *messages[insert_at:],
+    ]
 
 
 def inject_no_tool_network_boundary(messages: list[dict], call_kwargs: dict) -> list[dict]:

@@ -187,6 +187,27 @@ class TestStreamStateService(unittest.IsolatedAsyncioTestCase):
         entries = await self.fake_redis.xrange("stream:chunks:conv-cancel-race")
         self.assertEqual([entry[1]["type"] for entry in entries], ["start"])
 
+    async def test_cancel_stream_writes_structured_interrupted_terminal(self):
+        from app.services.stream_state_service import cancel_stream, init_stream
+
+        await init_stream("conv-cancel", "user-1", "gpt-4", "msg-1", "task-1")
+
+        cancelled = await cancel_stream(
+            "conv-cancel",
+            "msg-1",
+            expected_task_id="task-1",
+        )
+
+        self.assertTrue(cancelled)
+        entries = await self.fake_redis.xrange("stream:chunks:conv-cancel")
+        payload = json.loads(entries[-1][1]["content"])
+        self.assertEqual(entries[-1][1]["type"], "error")
+        self.assertEqual(payload["code"], "stream_interrupted")
+        self.assertEqual(payload["message"], "用户中止")
+        self.assertEqual(payload["data"]["reason"], "user_cancelled")
+        meta = await self.fake_redis.hgetall("stream:meta:conv-cancel")
+        self.assertEqual(meta["status"], "cancelled")
+
     async def test_stop_claim_blocks_continuation_init_until_guard_is_released(self):
         from app.core.redis import stream_stop_guard_key
         from app.services.stream_state_service import (

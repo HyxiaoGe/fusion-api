@@ -106,7 +106,7 @@ def _build_execution_parts(
                 mode=getattr(request.call_config, "plan_mode", "auto"),
             )
         ),
-        network_budget=NetworkToolBudget(),
+        network_budget=NetworkToolBudget(profile=getattr(request.call_config, "network_profile", "standard")),
         emitter=emitter,
     )
 
@@ -176,6 +176,8 @@ def build_agent_loop_runtime(
         dynamic_tool_handlers=getattr(request.call_config, "dynamic_tool_handlers", {}),
         plan_mode=getattr(request.call_config, "plan_mode", "auto"),
         control_tool_names=getattr(request.call_config, "control_tool_names", frozenset()),
+        task_mode=getattr(request.call_config, "task_mode", "standard"),
+        evidence_policy=getattr(request.call_config, "evidence_policy", "standard"),
     )
 
 

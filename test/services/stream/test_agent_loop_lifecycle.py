@@ -3,7 +3,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app.schemas.chat import TextBlock
+from app.schemas.chat import SearchBlock, SearchSourceSummary, SourceReference, TextBlock, UrlBlock
 from app.services.stream.agent_loop_driver import AgentLoopExit, AgentLoopOutcome
 from app.services.stream.agent_loop_execution import (
     AgentLoopDependencies as ExecutionDependencies,
@@ -15,10 +15,12 @@ from app.services.stream.agent_loop_execution import (
 from app.services.stream.agent_loop_lifecycle import (
     AgentLoopLifecycleDependencies,
     AgentLoopLifecycleRequest,
+    configure_research_state,
     run_agent_loop_lifecycle,
 )
 from app.services.stream.agent_loop_policy import AgentLoopLimits
 from app.services.stream.agent_loop_request_prep import AgentLoopPreparedMessages
+from app.services.stream.research_evidence import validate_research_completion
 
 
 async def _unused_async(**_kwargs):
@@ -30,6 +32,139 @@ def _unused_sync(*_args, **_kwargs):
 
 
 class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def test_deep_research_with_files_still_requires_network_gate(self):
+        execution = self._execution(
+            call_config=SimpleNamespace(
+                should_use_reasoning=False,
+                call_kwargs={},
+                announced_tools=["web_search", "url_read"],
+                task_mode="deep_research",
+                network_profile="deep_research",
+                evidence_policy="deep_research_v1",
+                plan_mode="on",
+            )
+        )
+
+        configure_research_state(
+            state=execution.state,
+            call_config=execution.runtime,
+            file_ids=["file-1"],
+            content_blocks=[],
+        )
+
+        self.assertTrue(execution.state.research_network_required)
+        self.assertEqual(
+            execution.state.plan_coordinator.required_initial_tool_counts,
+            {
+                "web_search": 1,
+                "url_read": 3,
+            },
+        )
+
+    def test_continuation_rebuilds_research_workset_from_persisted_source_blocks(self):
+        execution = self._execution(
+            call_config=SimpleNamespace(
+                should_use_reasoning=False,
+                call_kwargs={},
+                announced_tools=["web_search", "url_read"],
+                task_mode="deep_research",
+                network_profile="deep_research",
+                evidence_policy="deep_research_v1",
+                plan_mode="on",
+            )
+        )
+        historical_blocks = [
+            SearchBlock(
+                type="search",
+                query="研究",
+                sources=[SearchSourceSummary(title="来源", url="https://example.com/report")],
+                source_refs=[
+                    SourceReference(
+                        kind="search",
+                        title="来源",
+                        url="https://example.com/report",
+                        evidence_id="ev-report",
+                        citation_index=1,
+                    )
+                ],
+                source_count=1,
+            ),
+            UrlBlock(
+                type="url_read",
+                url="https://example.com/report",
+                title="来源",
+                source_refs=[
+                    SourceReference(
+                        kind="url_read",
+                        title="来源",
+                        url="https://example.com/report",
+                        evidence_id="ev-report",
+                        citation_index=1,
+                    )
+                ],
+                source_count=1,
+            ),
+            UrlBlock(
+                type="url_read",
+                url="https://example.com/second",
+                title="第二来源",
+                source_refs=[
+                    SourceReference(
+                        kind="url_read",
+                        title="第二来源",
+                        url="https://example.com/second",
+                        evidence_id="ev-second",
+                        citation_index=2,
+                    )
+                ],
+                source_count=1,
+            ),
+        ]
+
+        configure_research_state(
+            state=execution.state,
+            call_config=execution.runtime,
+            file_ids=None,
+            content_blocks=historical_blocks,
+            allow_read_success=False,
+        )
+
+        self.assertEqual(execution.state.research_workset.successful_searches, 1)
+        self.assertEqual(execution.state.research_workset.successful_read_urls, set())
+        self.assertFalse(
+            validate_research_completion(
+                execution.state.research_workset,
+                "历史来源不能直接复用。[1][2]",
+            ).is_valid
+        )
+
+        execution.state.record_research_content_blocks(
+            [
+                UrlBlock(
+                    type="url_read",
+                    url="https://example.com/report",
+                    title="来源",
+                    source_refs=historical_blocks[1].source_refs,
+                    source_count=1,
+                ),
+                UrlBlock(
+                    type="url_read",
+                    url="https://example.com/second",
+                    title="第二来源",
+                    source_refs=historical_blocks[2].source_refs,
+                    source_count=1,
+                ),
+            ]
+        )
+
+        self.assertEqual(execution.state.research_workset.valid_citation_indexes, {1, 2})
+        self.assertTrue(
+            validate_research_completion(
+                execution.state.research_workset,
+                "重新读取后可继续引用。[1][2]",
+            ).is_valid
+        )
+
     def _call_config(self):
         return SimpleNamespace(
             should_use_reasoning=False,
@@ -211,6 +346,9 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 "max_tool_calls": 5,
                 "timeout_s": 30,
                 "plan_mode": "auto",
+                "task_mode": "standard",
+                "network_profile": "standard",
+                "evidence_policy": "standard",
                 "runtime_config_versions": {
                     "agent_strategy/default": "code-default",
                 },
@@ -247,6 +385,9 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 "max_tool_calls": 5,
                 "timeout_s": 30,
                 "plan_mode": "auto",
+                "task_mode": "standard",
+                "network_profile": "standard",
+                "evidence_policy": "standard",
                 "runtime_config_versions": {
                     "agent_strategy/default": "agent-strategy-v7",
                 },

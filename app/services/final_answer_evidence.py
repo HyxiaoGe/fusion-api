@@ -22,15 +22,25 @@ class _AnswerSource:
     canonical_url: str
     domain: str | None
     favicon: str | None = None
+    explicit_evidence_id: str | None = None
+    citation_index: int | None = None
 
     @property
     def evidence_id(self) -> str:
+        if self.explicit_evidence_id:
+            return self.explicit_evidence_id
         raw_key = self.url or self.canonical_url or self.title
         digest = hashlib.sha1(raw_key.encode("utf-8")).hexdigest()[:12]
         return stable_web_evidence_id(self.url, fallback=f"ev-final-{digest}")
 
 
-def build_used_final_answer_evidence(*, content_blocks: list[Any], answer_text: str) -> list[dict[str, Any]]:
+def build_used_final_answer_evidence(
+    *,
+    content_blocks: list[Any],
+    answer_text: str,
+    evidence_policy: str = "standard",
+    allowed_citation_indexes: set[int] | frozenset[int] | None = None,
+) -> list[dict[str, Any]]:
     """从最终回答文本里保守识别真正使用过的网页来源。"""
     normalized_answer = (answer_text or "").strip()
     if not normalized_answer:
@@ -41,8 +51,17 @@ def build_used_final_answer_evidence(*, content_blocks: list[Any], answer_text: 
     if not all_sources:
         return []
 
+    if evidence_policy == "deep_research_v1":
+        allowed = set(allowed_citation_indexes or ())
+        used = _sources_from_allowed_explicit_citations(
+            normalized_answer,
+            all_sources,
+            allowed_citation_indexes=allowed,
+        )
+        return [_to_evidence_item(source) for source in _dedupe_sources(used)]
+
     used: list[_AnswerSource] = []
-    _extend_unique(used, _sources_from_citations(normalized_answer, search_sources))
+    _extend_unique(used, _sources_from_citations(normalized_answer, search_sources, all_sources))
     _extend_unique(used, _sources_from_url_mentions(normalized_answer, all_sources))
     _extend_unique(used, _sources_from_unique_domain_mentions(normalized_answer, all_sources))
 
@@ -50,6 +69,26 @@ def build_used_final_answer_evidence(*, content_blocks: list[Any], answer_text: 
         used.append(read_sources[0])
 
     return [_to_evidence_item(source) for source in used]
+
+
+def _sources_from_allowed_explicit_citations(
+    answer_text: str,
+    all_sources: list[_AnswerSource],
+    *,
+    allowed_citation_indexes: set[int],
+) -> list[_AnswerSource]:
+    by_index = {
+        source.citation_index: source
+        for source in all_sources
+        if isinstance(source.citation_index, int)
+        and not isinstance(source.citation_index, bool)
+        and source.citation_index in allowed_citation_indexes
+    }
+    return [
+        by_index[citation_index]
+        for match in _CITATION_PATTERN.finditer(answer_text)
+        if (citation_index := int(match.group(1) or match.group(2))) in by_index
+    ]
 
 
 def _collect_sources(content_blocks: list[Any]) -> tuple[list[_AnswerSource], list[_AnswerSource]]:
@@ -106,10 +145,20 @@ def _source_from_ref(ref: Any) -> _AnswerSource | None:
         title=_value(ref, "title") or "",
         url=_value(ref, "url") or "",
         favicon=_value(ref, "favicon"),
+        explicit_evidence_id=_value(ref, "evidence_id"),
+        citation_index=_value(ref, "citation_index"),
     )
 
 
-def _source_from_values(*, kind: str, title: str, url: str, favicon: str | None = None) -> _AnswerSource | None:
+def _source_from_values(
+    *,
+    kind: str,
+    title: str,
+    url: str,
+    favicon: str | None = None,
+    explicit_evidence_id: str | None = None,
+    citation_index: int | None = None,
+) -> _AnswerSource | None:
     raw_url = str(url or "").strip()
     canonical_url = canonicalize_evidence_url(raw_url)
     evidence_url = canonical_url or raw_url
@@ -124,16 +173,33 @@ def _source_from_values(*, kind: str, title: str, url: str, favicon: str | None 
         canonical_url=evidence_url,
         domain=domain,
         favicon=favicon,
+        explicit_evidence_id=explicit_evidence_id,
+        citation_index=citation_index,
     )
 
 
-def _sources_from_citations(answer_text: str, search_sources: list[_AnswerSource]) -> list[_AnswerSource]:
+def _sources_from_citations(
+    answer_text: str,
+    search_sources: list[_AnswerSource],
+    all_sources: list[_AnswerSource],
+) -> list[_AnswerSource]:
     sources: list[_AnswerSource] = []
+    explicit_sources = {
+        source.citation_index: source
+        for source in all_sources
+        if isinstance(source.citation_index, int) and source.citation_index > 0
+    }
     for match in _CITATION_PATTERN.finditer(answer_text):
         index_text = match.group(1) or match.group(2)
         if not index_text:
             continue
-        index = int(index_text) - 1
+        citation_index = int(index_text)
+        if explicit_sources:
+            source = explicit_sources.get(citation_index)
+            if source is not None:
+                sources.append(source)
+            continue
+        index = citation_index - 1
         if 0 <= index < len(search_sources):
             sources.append(search_sources[index])
     return sources
@@ -201,6 +267,7 @@ def _to_evidence_item(source: _AnswerSource) -> dict[str, Any]:
         "claim": "最终回答引用了该来源。",
         "snippet": None,
         "used_by_final_answer": True,
+        "citation_index": source.citation_index,
     }
 
 

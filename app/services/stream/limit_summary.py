@@ -14,13 +14,21 @@ from app.ai.prompts.agent_loop import LIMIT_SUMMARY_PROMPT as _LIMIT_SUMMARY_PRO
 from app.ai.prompts.agent_loop import (
     NO_PROGRESS_SUMMARY_PROMPT,
     PLAN_REPAIR_SUMMARY_PROMPT,
+    RESEARCH_EVIDENCE_SUMMARY_PROMPT,
     SUMMARY_NON_DISCLOSURE_PROMPT,
     get_limit_summary_prompt,
 )
 from app.core.logger import app_logger as logger
 from app.schemas.chat import ContextUsage, TextBlock, ThinkingBlock, Usage
 from app.services.chat.context_manager import ContextManagementError, ContextPlan, prepare_context
+from app.services.final_answer_evidence import build_used_final_answer_evidence
 from app.services.stream.context_status import build_context_usage, emit_context_status
+from app.services.stream.research_evidence import (
+    ResearchEvidenceWorkset,
+    build_research_repair_prompt,
+    validate_research_completion,
+)
+from app.services.stream_state_service import StreamWriteTerminalError, append_chunk
 
 LIMIT_SUMMARY_PROMPT = _LIMIT_SUMMARY_PROMPT
 
@@ -37,6 +45,7 @@ def _accepts_keyword(fn: Callable[..., Any], keyword: str) -> bool:
 class LimitSummaryOutcome:
     accumulated_usage: Usage
     context: ContextUsage | None = None
+    incomplete: bool = False
 
 
 @dataclass(frozen=True)
@@ -79,6 +88,9 @@ class LimitSummaryStepRequest:
     on_context_updated: Callable[[ContextUsage], None] | None = None
     assistant_message_id: str | None = None
     summary_finish_reason: str = "limit_summary"
+    task_mode: str = "standard"
+    evidence_policy: str = "standard"
+    research_workset: ResearchEvidenceWorkset | None = None
 
 
 def build_limit_summary_call_kwargs(call_kwargs: dict) -> dict:
@@ -93,25 +105,52 @@ def append_limit_summary_prompt(
     messages: list[dict],
     *,
     summary_finish_reason: str = "limit_summary",
+    task_mode: str = "standard",
 ) -> None:
     if summary_finish_reason == "no_progress_summary":
         prompt = NO_PROGRESS_SUMMARY_PROMPT
     elif summary_finish_reason == "plan_repair_exhausted":
         prompt = PLAN_REPAIR_SUMMARY_PROMPT
+    elif summary_finish_reason == "research_evidence_repair_exhausted":
+        prompt = RESEARCH_EVIDENCE_SUMMARY_PROMPT
     else:
         prompt = get_limit_summary_prompt()
         if SUMMARY_NON_DISCLOSURE_PROMPT not in prompt:
             prompt = f"{prompt}\n\n{SUMMARY_NON_DISCLOSURE_PROMPT}"
+    if task_mode == "deep_research" and RESEARCH_EVIDENCE_SUMMARY_PROMPT not in prompt:
+        prompt = f"{prompt}\n\n{RESEARCH_EVIDENCE_SUMMARY_PROMPT}"
     messages.append({"role": "system", "content": prompt})
 
 
-def remove_conflicting_tool_usage_contract(messages: list[dict]) -> None:
-    """收尾总结不再携带“需要联网就必须调工具”的旧 system 契约。"""
-    messages[:] = [
-        message
-        for message in messages
-        if not (message.get("role") == "system" and "【工具调用一致性规则】" in str(message.get("content", "")))
-    ]
+def remove_conflicting_tool_usage_contract(
+    messages: list[dict],
+    *,
+    task_mode: str = "standard",
+) -> None:
+    """收尾总结移除会继续诱发工具协议的旧契约与事务历史。"""
+
+    deep_research_control_markers = (
+        "【自主联网判断规则】",
+        "【工具调用一致性规则】",
+        "【执行计划控制规则】",
+        "【深度研究执行约束】",
+        "【深度研究阶段控制】",
+        "【深度研究完成校验】",
+        "【计划控制修正】",
+    )
+    filtered: list[dict] = []
+    for message in messages:
+        role = message.get("role")
+        content = str(message.get("content", ""))
+        if role == "system" and "【工具调用一致性规则】" in content:
+            continue
+        if task_mode == "deep_research":
+            if role in {"assistant", "tool"}:
+                continue
+            if role == "system" and any(marker in content for marker in deep_research_control_markers):
+                continue
+        filtered.append(message)
+    messages[:] = filtered
 
 
 SUMMARY_TOOL_PROTOCOL_RETRY_PROMPT = (
@@ -120,6 +159,9 @@ SUMMARY_TOOL_PROTOCOL_RETRY_PROMPT = (
 )
 
 SUMMARY_PROTOCOL_FALLBACK_TEXT = "当前未能生成可靠的最终答复，请稍后重试。"
+DEEP_RESEARCH_INCOMPLETE_TEXT = (
+    "本次研究尚未完成，当前取得的可核验依据不足，暂时无法给出可靠结论。你可以稍后重试，或缩小研究范围后重新发起。"
+)
 
 
 def _create_limit_summary_observation(
@@ -201,6 +243,8 @@ async def call_limit_summary_round(
         stream_kwargs = {"run_id": request.run_id, "step_id": step_id}
         if _accepts_keyword(request.stream_round_fn, "provider"):
             stream_kwargs["provider"] = request.provider
+        if request.task_mode == "deep_research" and _accepts_keyword(request.stream_round_fn, "defer_output"):
+            stream_kwargs["defer_output"] = True
         reasoning_buf, content_buf, tool_calls, finish_reason, usage_data = await request.stream_round_fn(
             response,
             request.conversation_id,
@@ -320,49 +364,122 @@ async def run_summary_round_with_timeout(
         return LimitSummaryRoundResult(reasoning_buf="", content_buf="", usage_data=None)
 
     if not _is_summary_tool_protocol_violation(first_result):
-        return first_result
+        result = first_result
+    else:
+        warning = request.warning_fn if request.warning_fn is not None else logger.warning
+        warning(
+            "无工具收尾总结返回了工具协议，执行一次无工具重试: "
+            f"conv_id={request.conversation_id}, run_id={request.run_id}, step={request.step_number}"
+        )
+        request.messages.append({"role": "system", "content": SUMMARY_TOOL_PROTOCOL_RETRY_PROMPT})
+        retry_remaining = remaining - (time.monotonic() - started_at)
+        if retry_remaining <= 0:
+            return _build_summary_protocol_fallback(first_result)
+
+        try:
+            retry_result = await asyncio.wait_for(
+                call_limit_summary_round(
+                    request=request,
+                    thinking_block_id=thinking_block_id,
+                    text_block_id=text_block_id,
+                    step_id=summary_context.step_id,
+                ),
+                timeout=retry_remaining,
+            )
+        except asyncio.TimeoutError:
+            warning(
+                "无工具收尾重试超出剩余预算，使用安全失败文案: "
+                f"conv_id={request.conversation_id}, budget={retry_remaining}s"
+            )
+            return _build_summary_protocol_fallback(first_result)
+
+        usage_data = _combine_optional_usage(first_result.usage_data, retry_result.usage_data)
+        if _is_summary_tool_protocol_violation(retry_result):
+            warning(
+                "无工具收尾重试仍返回工具协议，使用安全失败文案: "
+                f"conv_id={request.conversation_id}, run_id={request.run_id}, step={request.step_number}"
+            )
+            return _build_summary_protocol_fallback(retry_result, usage_data=usage_data)
+        result = LimitSummaryRoundResult(
+            reasoning_buf=retry_result.reasoning_buf,
+            content_buf=retry_result.content_buf,
+            usage_data=usage_data,
+            context=retry_result.context,
+            tool_calls=(),
+            finish_reason=retry_result.finish_reason,
+        )
+
+    return await _repair_deep_research_summary_citations(
+        request=request,
+        summary_context=summary_context,
+        thinking_block_id=thinking_block_id,
+        text_block_id=text_block_id,
+        result=result,
+        remaining=remaining - (time.monotonic() - started_at),
+    )
+
+
+async def _repair_deep_research_summary_citations(
+    *,
+    request: LimitSummaryStepRequest,
+    summary_context: Any,
+    thinking_block_id: str,
+    text_block_id: str,
+    result: LimitSummaryRoundResult,
+    remaining: float,
+) -> LimitSummaryRoundResult:
+    """证据充足但最终引用缺失或越界时，允许一次无工具引用修正。"""
+
+    if request.task_mode != "deep_research":
+        return result
+    workset = request.research_workset or ResearchEvidenceWorkset()
+    validation = validate_research_completion(workset, result.content_buf)
+    if validation.is_valid or validation.reason not in {"missing_citation", "invalid_citation"}:
+        return result
 
     warning = request.warning_fn if request.warning_fn is not None else logger.warning
     warning(
-        "无工具收尾总结返回了工具协议，执行一次无工具重试: "
-        f"conv_id={request.conversation_id}, run_id={request.run_id}, step={request.step_number}"
+        "深度研究收尾引用校验未通过，执行一次无工具引用修正: "
+        f"conv_id={request.conversation_id}, run_id={request.run_id}, "
+        f"step={request.step_number}, reason={validation.reason}"
     )
-    request.messages.append({"role": "system", "content": SUMMARY_TOOL_PROTOCOL_RETRY_PROMPT})
-    retry_remaining = remaining - (time.monotonic() - started_at)
-    if retry_remaining <= 0:
-        return _build_summary_protocol_fallback(first_result)
-
+    if remaining <= 0:
+        return result
+    request.messages.append(
+        {
+            "role": "system",
+            "content": build_research_repair_prompt(validation.reason, workset),
+        }
+    )
     try:
-        retry_result = await asyncio.wait_for(
+        repaired = await asyncio.wait_for(
             call_limit_summary_round(
                 request=request,
                 thinking_block_id=thinking_block_id,
                 text_block_id=text_block_id,
                 step_id=summary_context.step_id,
             ),
-            timeout=retry_remaining,
+            timeout=remaining,
         )
     except asyncio.TimeoutError:
         warning(
-            "无工具收尾重试超出剩余预算，使用安全失败文案: "
-            f"conv_id={request.conversation_id}, budget={retry_remaining}s"
+            "深度研究收尾引用修正超出剩余预算: "
+            f"conv_id={request.conversation_id}, budget={remaining}s"
         )
-        return _build_summary_protocol_fallback(first_result)
-
-    usage_data = _combine_optional_usage(first_result.usage_data, retry_result.usage_data)
-    if _is_summary_tool_protocol_violation(retry_result):
+        return result
+    if _is_summary_tool_protocol_violation(repaired):
         warning(
-            "无工具收尾重试仍返回工具协议，使用安全失败文案: "
+            "深度研究收尾引用修正返回工具协议，保留原候选等待安全门禁: "
             f"conv_id={request.conversation_id}, run_id={request.run_id}, step={request.step_number}"
         )
-        return _build_summary_protocol_fallback(retry_result, usage_data=usage_data)
+        return result
     return LimitSummaryRoundResult(
-        reasoning_buf=retry_result.reasoning_buf,
-        content_buf=retry_result.content_buf,
-        usage_data=usage_data,
-        context=retry_result.context,
+        reasoning_buf=repaired.reasoning_buf,
+        content_buf=repaired.content_buf,
+        usage_data=_combine_optional_usage(result.usage_data, repaired.usage_data),
+        context=repaired.context,
         tool_calls=(),
-        finish_reason=retry_result.finish_reason,
+        finish_reason=repaired.finish_reason,
     )
 
 
@@ -401,10 +518,14 @@ async def run_limit_summary_step(
 ) -> LimitSummaryOutcome:
     summary_context = await start_limit_summary_step(request=request)
 
-    remove_conflicting_tool_usage_contract(request.messages)
+    remove_conflicting_tool_usage_contract(
+        request.messages,
+        task_mode=request.task_mode,
+    )
     append_limit_summary_prompt(
         request.messages,
         summary_finish_reason=request.summary_finish_reason,
+        task_mode=request.task_mode,
     )
     thinking_block_id = summary_context.thinking_block_id
     text_block_id = summary_context.text_block_id
@@ -423,13 +544,22 @@ async def run_limit_summary_step(
     )
 
     next_usage = accumulate_summary_usage(request.accumulated_usage, round_result.usage_data)
-    append_summary_content_blocks(
-        content_blocks=request.content_blocks,
-        reasoning_buf=round_result.reasoning_buf,
-        content_buf=round_result.content_buf,
-        thinking_block_id=thinking_block_id,
-        text_block_id=text_block_id,
-    )
+    incomplete = False
+    if request.task_mode == "deep_research":
+        incomplete = await _complete_deep_research_summary(
+            request=request,
+            round_result=round_result,
+            text_block_id=text_block_id,
+            step_id=summary_context.step_id,
+        )
+    else:
+        append_summary_content_blocks(
+            content_blocks=request.content_blocks,
+            reasoning_buf=round_result.reasoning_buf,
+            content_buf=round_result.content_buf,
+            thinking_block_id=thinking_block_id,
+            text_block_id=text_block_id,
+        )
     await complete_limit_summary_step(
         summary_context=summary_context,
         emitter=request.emitter,
@@ -437,4 +567,70 @@ async def run_limit_summary_step(
         complete_step_fn=request.complete_step_fn,
         clock=request.clock,
     )
-    return LimitSummaryOutcome(accumulated_usage=next_usage, context=round_result.context)
+    return LimitSummaryOutcome(
+        accumulated_usage=next_usage,
+        context=round_result.context,
+        incomplete=incomplete,
+    )
+
+
+async def _complete_deep_research_summary(
+    *,
+    request: LimitSummaryStepRequest,
+    round_result: LimitSummaryRoundResult,
+    text_block_id: str,
+    step_id: str,
+) -> bool:
+    workset = request.research_workset or ResearchEvidenceWorkset()
+    validation = validate_research_completion(workset, round_result.content_buf)
+    answer = round_result.content_buf.strip() if validation.is_valid else DEEP_RESEARCH_INCOMPLETE_TEXT
+    if not validation.is_valid:
+        warning = request.warning_fn if request.warning_fn is not None else logger.warning
+        warning(
+            "深度研究收尾未通过安全门禁: "
+            f"conv_id={request.conversation_id}, run_id={request.run_id}, "
+            f"step={request.step_number}, research_validation_reason={validation.reason}"
+        )
+    await append_chunk(
+        request.conversation_id,
+        "answering",
+        answer,
+        text_block_id,
+        task_id=request.task_id,
+        run_id=request.run_id,
+        step_id=step_id,
+    )
+    request.content_blocks.append(TextBlock(type="text", id=text_block_id, text=answer))
+    if not validation.is_valid:
+        return True
+    await _emit_deep_summary_used_evidence(
+        request=request,
+        answer_text=answer,
+        workset=workset,
+    )
+    return False
+
+
+async def _emit_deep_summary_used_evidence(
+    *,
+    request: LimitSummaryStepRequest,
+    answer_text: str,
+    workset: ResearchEvidenceWorkset,
+) -> None:
+    emit = getattr(request.emitter, "evidence_item_upserted", None)
+    if emit is None:
+        return
+    try:
+        evidence_items = build_used_final_answer_evidence(
+            content_blocks=request.content_blocks,
+            answer_text=answer_text,
+            evidence_policy=request.evidence_policy,
+            allowed_citation_indexes=workset.valid_citation_indexes,
+        )
+        for evidence in evidence_items:
+            await emit(tool_call_id=None, evidence=evidence)
+    except StreamWriteTerminalError:
+        raise
+    except Exception as error:  # noqa: BLE001 — used evidence 观测失败不能覆盖安全收尾
+        warning = request.warning_fn if request.warning_fn is not None else logger.warning
+        warning(f"深度研究总结 used evidence 发送失败: error_type={type(error).__name__}")

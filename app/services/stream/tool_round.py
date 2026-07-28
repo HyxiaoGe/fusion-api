@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
+from urllib.parse import urlsplit
 
 from app.schemas.chat import (
     FlightResultsBlock,
@@ -19,12 +20,17 @@ from app.schemas.chat import (
     WeatherResultsBlock,
 )
 from app.schemas.content_block_registry import is_registered_rich_content_block
+from app.services.agent.progress_digest import build_evidence_items, build_tool_result_digest
 from app.services.search_read_planner import build_search_read_plan, format_search_read_plan_guidance
 from app.services.source_candidate_ranker import (
     SearchResultForRanking,
     SourceSelectionPlan,
 )
-from app.services.source_evidence_ledger import build_selected_source_evidence_item, canonicalize_evidence_url
+from app.services.source_evidence_ledger import (
+    build_selected_source_evidence_item,
+    canonicalize_evidence_url,
+    stable_web_evidence_id,
+)
 from app.services.stream.agent_loop_state import AgentLoopState, ProductToolOutcome
 from app.services.stream.itinerary_observability import build_itinerary_tool_observation
 from app.services.stream.itinerary_result_composer import compose_itinerary_result
@@ -283,6 +289,13 @@ def append_tool_round_messages_with_plan(
                 if built_content_blocks is not None and tool_call_id in built_content_blocks
                 else record.build_content_block()
             )
+            content_block = _attach_source_reference_metadata(
+                content_block,
+                record=record,
+                citation_numbers=citation_numbers,
+            )
+            if built_content_blocks is not None and tool_call_id in built_content_blocks:
+                built_content_blocks[tool_call_id] = content_block
             if content_block is not None:
                 request.content_blocks.append(content_block)
             request.messages.append(
@@ -346,7 +359,7 @@ def append_tool_round_messages_with_plan(
 
 
 def _build_search_citation_registry(content_blocks: list[Any]) -> dict[str, int]:
-    search_blocks = [block for block in content_blocks if _value(block, "type") == "search"]
+    search_blocks = [block for block in content_blocks if _value(block, "type") in {"search", "url_read"}]
     use_source_refs = any(_value(block, "source_refs") for block in search_blocks)
     registry: dict[str, int] = {}
 
@@ -354,13 +367,16 @@ def _build_search_citation_registry(content_blocks: list[Any]) -> dict[str, int]
         sources = (_value(block, "source_refs") or []) if use_source_refs else (_value(block, "sources") or [])
         for source in sources:
             if use_source_refs:
-                if _value(source, "kind") not in {None, "", "search"}:
-                    continue
                 if _value(source, "status") not in {None, "", "success"}:
                     continue
             key = _citation_source_key(source)
             if key and key not in registry:
-                registry[key] = len(registry) + 1
+                explicit_index = _value(source, "citation_index")
+                registry[key] = (
+                    explicit_index
+                    if isinstance(explicit_index, int) and not isinstance(explicit_index, bool) and explicit_index > 0
+                    else max(registry.values(), default=0) + 1
+                )
     return registry
 
 
@@ -368,10 +384,20 @@ def _assign_search_citation_numbers(
     registry: dict[str, int],
     record: ToolExecutionRecord,
 ) -> list[int] | None:
-    if record.tool_name != "web_search":
+    if record.tool_name not in {"web_search", "url_read"} or record.result.status != "success":
         return None
     result_data = _value(record.result, "data") or {}
-    sources = _value(result_data, "sources") or []
+    sources = (
+        _value(result_data, "sources") or []
+        if record.tool_name == "web_search"
+        else [
+            {
+                "url": _value(result_data, "url") or _value(result_data, "safe_log_url"),
+                "title": _value(result_data, "title") or "",
+            }
+        ]
+    )
+    sources = [source for source in sources if _value(source, "url")]
     if not sources:
         return None
 
@@ -386,6 +412,38 @@ def _assign_search_citation_numbers(
             registry[key] = citation_number
         numbers.append(citation_number)
     return numbers
+
+
+def _attach_source_reference_metadata(
+    content_block: Any,
+    *,
+    record: ToolExecutionRecord,
+    citation_numbers: list[int] | None,
+) -> Any:
+    refs = _value(content_block, "source_refs")
+    if content_block is None or not isinstance(refs, list) or not citation_numbers:
+        return content_block
+    enriched_refs = []
+    for index, ref in enumerate(refs):
+        citation_index = citation_numbers[index] if index < len(citation_numbers) else None
+        raw_url = str(_value(ref, "url") or "")
+        evidence_id = stable_web_evidence_id(
+            raw_url,
+            fallback=f"ev-{record.tool_call.get('id', 'tool')}-{index}",
+        )
+        update = {
+            "evidence_id": evidence_id,
+            "citation_index": citation_index,
+        }
+        if hasattr(ref, "model_copy"):
+            enriched_refs.append(ref.model_copy(update=update))
+        else:
+            enriched_refs.append({**ref, **update} if isinstance(ref, dict) else ref)
+    if hasattr(content_block, "model_copy"):
+        return content_block.model_copy(update={"source_refs": enriched_refs})
+    if isinstance(content_block, dict):
+        return {**content_block, "source_refs": enriched_refs}
+    return content_block
 
 
 def _citation_source_key(source: Any) -> str:
@@ -538,6 +596,12 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
         built_content_blocks=built_content_blocks,
         control_tool_responses=control_result.tool_responses,
     )
+    _record_research_workset(request.agent_state, results, built_content_blocks=built_content_blocks)
+    await _emit_citation_source_evidence(
+        request,
+        results=results,
+        built_content_blocks=built_content_blocks,
+    )
     product_outcomes = build_product_tool_outcomes(results, built_content_blocks=built_content_blocks)
     if request.agent_state is not None:
         request.agent_state.record_product_tool_outcomes(product_outcomes)
@@ -594,6 +658,8 @@ def _plan_item_statuses_from_results(
         repair = data.get("repair") if isinstance(data, dict) else None
         if isinstance(repair, dict) and repair.get("retryable") is True:
             status = "running"
+        elif record.result.status == "degraded" and record.tool_name in {"web_search", "url_read"}:
+            status = "failed"
         elif record.result.status in {"success", "degraded"}:
             status = "completed"
         else:
@@ -639,6 +705,85 @@ def _record_itinerary_tool_observations(
         observation for record in results if (observation := build_itinerary_tool_observation(record)) is not None
     ]
     state.record_itinerary_tool_observations(observations)
+
+
+def _record_research_workset(
+    state: AgentLoopState | None,
+    results: list[ToolExecutionRecord],
+    *,
+    built_content_blocks: dict[str, Any],
+) -> None:
+    if state is None:
+        return
+    blocks = [block for block in built_content_blocks.values() if _value(block, "type") in {"search", "url_read"}]
+    if not blocks:
+        return
+    summaries: dict[str, tuple[str, list[str]]] = {}
+    for record in results:
+        if record.tool_name not in {"web_search", "url_read"}:
+            continue
+        digest = build_tool_result_digest(record)
+        for evidence in build_evidence_items(record):
+            evidence_id = str(evidence.get("id") or "")
+            if evidence_id:
+                summaries[evidence_id] = (
+                    str(evidence.get("snippet") or digest.get("summary") or ""),
+                    list(digest.get("key_findings") or []),
+                )
+    state.record_research_content_blocks(blocks, summaries=summaries)
+
+
+async def _emit_citation_source_evidence(
+    request: ToolRoundRequest,
+    *,
+    results: list[ToolExecutionRecord],
+    built_content_blocks: dict[str, Any],
+) -> None:
+    emit = getattr(request.emitter, "evidence_item_upserted", None)
+    if emit is None:
+        return
+    base_evidence_by_id = {
+        str(evidence.get("id")): evidence
+        for record in results
+        for evidence in build_evidence_items(record)
+        if evidence.get("id")
+    }
+    for tool_call_id, block in built_content_blocks.items():
+        block_type = _value(block, "type")
+        if block_type not in {"search", "url_read"}:
+            continue
+        for ref in _value(block, "source_refs") or []:
+            evidence_id = _value(ref, "evidence_id")
+            citation_index = _value(ref, "citation_index")
+            url = canonicalize_evidence_url(str(_value(ref, "url") or ""))
+            if not evidence_id or not citation_index or not url:
+                continue
+            base_evidence = base_evidence_by_id.get(str(evidence_id), {})
+            try:
+                await emit(
+                    tool_call_id=tool_call_id,
+                    evidence={
+                        **base_evidence,
+                        "id": evidence_id,
+                        "kind": "web",
+                        "status": base_evidence.get(
+                            "status",
+                            "read_success" if block_type == "url_read" else "candidate",
+                        ),
+                        "title": str(_value(ref, "title") or "网页来源")[:80],
+                        "url": url,
+                        "domain": urlsplit(url).hostname,
+                        "claim": base_evidence.get("claim")
+                        or ("已读取网页原文。" if block_type == "url_read" else "搜索候选来源。"),
+                        "snippet": base_evidence.get("snippet"),
+                        "used_by_final_answer": False,
+                        "citation_index": citation_index,
+                    },
+                )
+            except StreamWriteTerminalError:
+                raise
+            except Exception:
+                logger.warning("发送来源引用编号 evidence 失败", exc_info=True)
 
 
 def build_tool_round_content_blocks(results: list[ToolExecutionRecord]) -> dict[str, Any]:

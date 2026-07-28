@@ -124,6 +124,7 @@ class AgentEvidenceItem(BaseModel):
     claim: str
     snippet: str | None = None
     used_by_final_answer: bool = False
+    citation_index: int | None = Field(default=None, ge=1)
 
 
 class RunProgressUpdated(AgentEventBase):

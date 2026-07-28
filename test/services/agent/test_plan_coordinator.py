@@ -6,6 +6,161 @@ from app.services.agent.plan_coordinator import PlanCoordinator
 
 
 class PlanCoordinatorTests(unittest.TestCase):
+    def test_plan_rejects_more_than_six_items_to_match_user_visible_contract(self):
+        coordinator = PlanCoordinator(run_id="run-1", mode="on")
+        result = coordinator.apply_model_update(
+            {
+                "reason": "过长计划",
+                "items": [
+                    {
+                        "id": f"step-{index}",
+                        "title": f"步骤 {index}",
+                        "status": "running" if index == 1 else "pending",
+                        "kind": "other",
+                        "depends_on": [] if index == 1 else [f"step-{index - 1}"],
+                        "planned_tools": [],
+                    }
+                    for index in range(1, 8)
+                ],
+            }
+        )
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "invalid_plan_structure")
+
+    def test_initial_plan_must_cover_configured_tool_counts(self):
+        coordinator = PlanCoordinator(run_id="run-1", mode="on")
+        coordinator.configure_initial_tool_requirements(
+            {
+                "web_search": 1,
+                "url_read": 3,
+            }
+        )
+        missing_reads = coordinator.apply_model_update(
+            {
+                "reason": "只规划搜索",
+                "items": [
+                    {
+                        "id": "search",
+                        "title": "搜索资料",
+                        "status": "running",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "read-one",
+                        "title": "读取来源一",
+                        "status": "pending",
+                        "kind": "read",
+                        "depends_on": ["search"],
+                        "planned_tools": ["url_read"],
+                    },
+                    {
+                        "id": "answer",
+                        "title": "整理答案",
+                        "status": "pending",
+                        "kind": "answer",
+                        "depends_on": ["read-one"],
+                        "planned_tools": [],
+                    },
+                ],
+            }
+        )
+
+        self.assertFalse(missing_reads.accepted)
+        self.assertEqual(missing_reads.reason, "missing_required_initial_tool_coverage")
+        self.assertFalse(coordinator.has_valid_model_plan)
+
+        corrected = coordinator.apply_model_update(
+            {
+                "reason": "补足独立读取步骤",
+                "items": [
+                    {
+                        "id": "search",
+                        "title": "搜索资料",
+                        "status": "running",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "read-one",
+                        "title": "读取来源一",
+                        "status": "pending",
+                        "kind": "read",
+                        "depends_on": ["search"],
+                        "planned_tools": ["url_read"],
+                    },
+                    {
+                        "id": "read-two",
+                        "title": "读取来源二",
+                        "status": "pending",
+                        "kind": "read",
+                        "depends_on": ["read-one"],
+                        "planned_tools": ["url_read"],
+                    },
+                    {
+                        "id": "read-three",
+                        "title": "读取来源三",
+                        "status": "pending",
+                        "kind": "read",
+                        "depends_on": ["read-two"],
+                        "planned_tools": ["url_read"],
+                    },
+                    {
+                        "id": "answer",
+                        "title": "整理答案",
+                        "status": "pending",
+                        "kind": "answer",
+                        "depends_on": ["read-three"],
+                        "planned_tools": [],
+                    },
+                ],
+            }
+        )
+
+        self.assertTrue(corrected.accepted)
+
+    def test_initial_required_tools_must_have_distinct_plan_owners(self):
+        coordinator = PlanCoordinator(run_id="run-1", mode="on")
+        coordinator.configure_initial_tool_requirements(
+            {
+                "web_search": 1,
+                "url_read": 3,
+            }
+        )
+
+        result = coordinator.apply_model_update(
+            {
+                "reason": "错误地让搜索和读取共用计划项",
+                "items": [
+                    {
+                        "id": f"research-{index}",
+                        "title": f"研究来源 {index}",
+                        "status": "running" if index == 1 else "pending",
+                        "kind": "search",
+                        "depends_on": [] if index == 1 else [f"research-{index - 1}"],
+                        "planned_tools": ["web_search", "url_read"],
+                    }
+                    for index in range(1, 4)
+                ]
+                + [
+                    {
+                        "id": "answer",
+                        "title": "整理答案",
+                        "status": "pending",
+                        "kind": "answer",
+                        "depends_on": ["research-3"],
+                        "planned_tools": [],
+                    }
+                ],
+            }
+        )
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "missing_required_initial_tool_coverage")
+
     def test_valid_model_plan_owns_revision_and_generic_fields(self):
         coordinator = PlanCoordinator(run_id="run-1", mode="on")
 
@@ -88,6 +243,22 @@ class PlanCoordinatorTests(unittest.TestCase):
         )
         self.assertIsNone(
             coordinator.plan_item_id_for_tool("search_trains", requested_item_id="missing"),
+        )
+
+    def test_active_plan_item_ids_exclude_terminal_steps(self):
+        coordinator = PlanCoordinator(run_id="run-1", mode="on")
+        coordinator.source = "model"
+        coordinator.revision = 1
+        coordinator.items = [
+            {"id": "done", "status": "completed", "planned_tools": ["url_read"]},
+            {"id": "current", "status": "running", "planned_tools": ["url_read"]},
+            {"id": "next", "status": "pending", "planned_tools": ["url_read"]},
+            {"id": "failed", "status": "failed", "planned_tools": ["url_read"]},
+        ]
+
+        self.assertEqual(
+            coordinator.active_plan_item_ids_for_tool("url_read"),
+            ["current", "next"],
         )
 
     def test_numeric_string_plan_ids_remain_stable_for_tool_binding(self):

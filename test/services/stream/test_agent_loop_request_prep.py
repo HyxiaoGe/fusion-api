@@ -4,6 +4,7 @@ from app.schemas.chat import TextBlock
 from app.services.stream.agent_loop_request_prep import (
     build_agent_loop_call_config,
     inject_amap_fact_boundary,
+    inject_deep_research_contract,
     inject_no_tool_network_boundary,
     inject_plan_control_contract,
     prepare_agent_loop_messages,
@@ -33,6 +34,45 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("web_search", model_tool_names)
         self.assertNotIn("update_plan", config.announced_tools)
         self.assertEqual(config.control_tool_names, frozenset({"update_plan"}))
+
+    def test_deep_research_forces_plan_mode_and_records_task_policy(self):
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={"task_mode": "deep_research", "plan_mode": "off"},
+            capabilities={"functionCalling": True, "searchCapable": True},
+        )
+
+        self.assertEqual(config.task_mode, "deep_research")
+        self.assertEqual(config.plan_mode, "on")
+        self.assertEqual(config.network_profile, "deep_research")
+        self.assertEqual(config.evidence_policy, "deep_research_v1")
+        tools = {tool["function"]["name"]: tool for tool in config.call_kwargs["tools"]}
+        self.assertIn("url_read", tools)
+        self.assertIn("_plan_item_id", tools["url_read"]["function"]["parameters"]["required"])
+        self.assertEqual(config.announced_tools, ["web_search", "url_read"])
+
+    def test_deep_research_contract_is_only_injected_for_research_mode(self):
+        research = build_agent_loop_call_config(
+            provider="openai",
+            options={"task_mode": "deep_research"},
+            capabilities={"functionCalling": True, "searchCapable": True},
+        )
+        standard = build_agent_loop_call_config(
+            provider="openai",
+            options={},
+            capabilities={"functionCalling": True, "searchCapable": True},
+        )
+
+        research_messages = inject_deep_research_contract([{"role": "user", "content": "调研"}], research)
+        standard_messages = inject_deep_research_contract([{"role": "user", "content": "调研"}], standard)
+
+        self.assertIn("【深度研究执行约束】", research_messages[0]["content"])
+        self.assertIn("互补查询", research_messages[0]["content"])
+        self.assertIn("正文使用 [n] 引用", research_messages[0]["content"])
+        self.assertIn("planned_tools 必须覆盖 web_search", research_messages[0]["content"])
+        self.assertIn("至少三个未完成步骤包含 url_read", research_messages[0]["content"])
+        self.assertIn("web_search 与 url_read 必须由不同计划步骤负责", research_messages[0]["content"])
+        self.assertEqual(standard_messages, [{"role": "user", "content": "调研"}])
 
     def test_plan_mode_off_preserves_old_tools_without_control_tool(self):
         config = build_agent_loop_call_config(
@@ -65,6 +105,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(web_parameters["properties"]["_plan_item_id"]["type"], "string")
         self.assertIn("id", plan_item["required"])
         self.assertIn("planned_tools", plan_item["required"])
+        self.assertEqual(plan_parameters["properties"]["plan"]["maxItems"], 6)
         self.assertEqual(
             plan_item["properties"]["id"]["pattern"],
             "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",

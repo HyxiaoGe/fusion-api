@@ -81,6 +81,8 @@ class SourceReference(BaseModel):
     status: Literal["success", "failed", "degraded"] = "success"
     tool_call_log_id: str = ""
     error_message: Optional[str] = None
+    evidence_id: Optional[str] = None
+    citation_index: Optional[int] = Field(default=None, ge=1)
 
 
 class SearchBlock(BaseModel):

@@ -9,6 +9,7 @@ from app.schemas.chat import ContextUsage, Usage
 from app.services.agent.plan_coordinator import PlanCoordinator
 from app.services.stream.agent_loop_policy import AgentLoopLimitReason
 from app.services.stream.itinerary_observability import ItineraryToolObservation
+from app.services.stream.research_evidence import MAX_RESEARCH_REPAIRS, ResearchEvidenceWorkset
 from app.services.stream.run_finalizer import AgentRunStats
 
 NO_PROGRESS_SEARCH_SUMMARY_THRESHOLD = 2
@@ -62,6 +63,9 @@ class AgentLoopState:
     pending_tool_repairs: dict[str, dict[str, Any]] = field(default_factory=dict)
     itinerary_tool_observations: list[ItineraryToolObservation] = field(default_factory=list)
     plan_coordinator: PlanCoordinator = field(default_factory=lambda: PlanCoordinator(run_id=""))
+    research_workset: ResearchEvidenceWorkset = field(default_factory=ResearchEvidenceWorkset)
+    research_network_required: bool = False
+    research_repair_attempts: int = 0
 
     def next_step_number(self) -> int:
         self.step += 1
@@ -122,6 +126,31 @@ class AgentLoopState:
 
     def record_context_wait(self, seconds: float) -> None:
         self.context_wait_seconds += max(0.0, seconds)
+
+    def configure_research_mode(self, *, network_required: bool) -> None:
+        self.research_network_required = network_required
+
+    def record_research_content_blocks(
+        self,
+        content_blocks: list[Any],
+        *,
+        summaries: dict[str, tuple[str, list[str]]] | None = None,
+        allow_read_success: bool = True,
+    ) -> None:
+        if any(
+            (block.get("type") if isinstance(block, dict) else getattr(block, "type", None)) in {"search", "url_read"}
+            for block in content_blocks
+        ):
+            self.research_network_required = True
+        self.research_workset.record_content_blocks(
+            content_blocks,
+            summaries=summaries,
+            allow_read_success=allow_read_success,
+        )
+
+    def record_research_repair(self) -> bool:
+        self.research_repair_attempts += 1
+        return self.research_repair_attempts > MAX_RESEARCH_REPAIRS
 
     def active_elapsed_seconds(self, *, now: float, run_start: float) -> float:
         return max(0.0, now - run_start - self.context_wait_seconds)

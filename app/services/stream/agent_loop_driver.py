@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from inspect import Parameter, signature
 
 from app.services.stream.agent_loop_outcome import AgentLoopExit, AgentLoopOutcome
@@ -12,6 +13,14 @@ from app.services.stream.agent_loop_state import AgentLoopState
 from app.services.stream.agent_loop_step_requests import build_limit_summary_step_request
 from app.services.stream.agent_round import AgentRoundResult
 from app.services.stream.product_result_answer import has_product_result_blocks
+from app.services.stream.research_evidence import (
+    build_deep_research_stage_prompt,
+    build_research_untrusted_context_messages,
+    build_research_workset_prompt,
+    deep_research_stage_required_tool,
+    deep_research_stage_tool_names,
+    resolve_deep_research_stage,
+)
 from app.services.stream.step_lifecycle import AgentStepContext
 
 
@@ -182,6 +191,39 @@ async def _run_round(
         call_kwargs=runtime.call_kwargs,
         dynamic_tool_handlers=runtime.dynamic_tool_handlers,
     )
+    research_stage = None
+    plan_repair_tool = None
+    active_plan_item_ids: list[str] = []
+    if runtime.task_mode == "deep_research":
+        research_stage = resolve_deep_research_stage(
+            state.research_workset,
+            has_valid_plan=state.plan_coordinator.has_valid_model_plan,
+        )
+        required_tool = deep_research_stage_required_tool(research_stage)
+        if required_tool:
+            active_plan_item_ids = state.plan_coordinator.active_plan_item_ids_for_tool(required_tool)
+            if not active_plan_item_ids:
+                plan_repair_tool = required_tool
+        call_kwargs = _filter_tools_for_research_stage(
+            call_kwargs,
+            allowed_tool_names=(
+                frozenset({"update_plan"}) if plan_repair_tool else deep_research_stage_tool_names(research_stage)
+            ),
+        )
+        if required_tool and active_plan_item_ids and not plan_repair_tool:
+            call_kwargs = _constrain_research_stage_plan_binding(
+                call_kwargs,
+                tool_name=required_tool,
+                active_plan_item_ids=active_plan_item_ids,
+            )
+    effective_messages = _messages_with_research_workset(
+        messages,
+        state=state,
+        runtime=runtime,
+        research_stage=research_stage,
+        plan_repair_tool=plan_repair_tool,
+        active_plan_item_ids=active_plan_item_ids,
+    )
     run_round_kwargs = dict(
         conversation_id=runtime.conversation_id,
         task_id=runtime.task_id,
@@ -191,7 +233,7 @@ async def _run_round(
         provider=runtime.provider,
         litellm_model=runtime.litellm_model,
         litellm_kwargs=runtime.litellm_kwargs,
-        messages=messages,
+        messages=effective_messages,
         should_use_reasoning=runtime.should_use_reasoning,
         call_kwargs=call_kwargs,
         accumulated_usage=state.accumulated_usage,
@@ -209,6 +251,7 @@ async def _run_round(
         or state.product_tool_attempted
         or state.pending_tool_repairs
         or must_defer_until_plan
+        or runtime.task_mode == "deep_research"
     )
     if should_defer_output and _accepts_keyword(runtime.run_round_fn, "defer_output"):
         run_round_kwargs["defer_output"] = True
@@ -217,6 +260,64 @@ async def _run_round(
     state.update_usage(round_result.accumulated_usage)
     state.update_context(round_result.context)
     return round_result
+
+
+def _filter_tools_for_research_stage(
+    call_kwargs: dict,
+    *,
+    allowed_tool_names: frozenset[str] | None,
+) -> dict:
+    if allowed_tool_names is None or not call_kwargs.get("tools"):
+        return call_kwargs
+
+    filtered_tools = []
+    for tool in call_kwargs["tools"]:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        tool_name = function.get("name") if isinstance(function, dict) else None
+        if tool_name in allowed_tool_names:
+            filtered_tools.append(tool)
+
+    filtered_call_kwargs = dict(call_kwargs)
+    if filtered_tools:
+        filtered_call_kwargs["tools"] = filtered_tools
+    else:
+        filtered_call_kwargs.pop("tools", None)
+        filtered_call_kwargs.pop("tool_choice", None)
+    return filtered_call_kwargs
+
+
+def _constrain_research_stage_plan_binding(
+    call_kwargs: dict,
+    *,
+    tool_name: str,
+    active_plan_item_ids: list[str],
+) -> dict:
+    """把阶段工具的计划项参数收窄为当前仍可执行的 ID。"""
+
+    constrained = deepcopy(call_kwargs)
+    for tool in constrained.get("tools", []):
+        function = tool.get("function") if isinstance(tool, dict) else None
+        if not isinstance(function, dict) or function.get("name") != tool_name:
+            continue
+        parameters = function.get("parameters")
+        if not isinstance(parameters, dict) or parameters.get("type") != "object":
+            continue
+        properties = parameters.setdefault("properties", {})
+        if not isinstance(properties, dict):
+            continue
+        binding = dict(properties.get("_plan_item_id") or {})
+        binding.update(
+            {
+                "type": "string",
+                "enum": list(active_plan_item_ids),
+                "description": "内部计划步骤 ID，只能选择当前仍可执行的计划项。",
+            }
+        )
+        properties["_plan_item_id"] = binding
+        required = parameters.setdefault("required", [])
+        if isinstance(required, list) and "_plan_item_id" not in required:
+            required.append("_plan_item_id")
+    return constrained
 
 
 async def _filter_exhausted_dynamic_tools(
@@ -264,10 +365,60 @@ async def _run_limit_summary(
         request=build_limit_summary_step_request(
             state=state,
             runtime=runtime,
-            messages=messages,
+            messages=_messages_with_research_workset(
+                messages,
+                state=state,
+                runtime=runtime,
+                include_candidates=False,
+            ),
             summary_finish_reason=summary_finish_reason,
         ),
     )
     state.update_usage(summary_outcome.accumulated_usage)
     state.update_context(summary_outcome.context)
+    if summary_outcome.incomplete:
+        state.mark_unknown_terminated()
     state.clear_current_step()
+
+
+def _messages_with_research_workset(
+    messages: list[dict],
+    *,
+    state: AgentLoopState,
+    runtime: AgentLoopRuntime,
+    include_candidates: bool = True,
+    research_stage: str | None = None,
+    plan_repair_tool: str | None = None,
+    active_plan_item_ids: list[str] | None = None,
+) -> list[dict]:
+    if runtime.task_mode != "deep_research":
+        return messages
+    stage_prompt = (
+        build_deep_research_stage_prompt(
+            research_stage,
+            plan_repair_tool=plan_repair_tool,
+            active_plan_item_ids=active_plan_item_ids,
+        )
+        if research_stage
+        else ""
+    )
+    prompt = build_research_workset_prompt(
+        state.research_workset,
+        include_candidates=include_candidates,
+    )
+    untrusted_messages = build_research_untrusted_context_messages(
+        state.research_workset,
+        include_candidates=include_candidates,
+    )
+    if not stage_prompt and not prompt and not untrusted_messages:
+        return messages
+    insert_at = 0
+    while insert_at < len(messages) and messages[insert_at].get("role") == "system":
+        insert_at += 1
+    return [
+        *messages[:insert_at],
+        *([{"role": "system", "content": stage_prompt}] if stage_prompt else []),
+        *([{"role": "system", "content": prompt}] if prompt else []),
+        *untrusted_messages,
+        *messages[insert_at:],
+    ]

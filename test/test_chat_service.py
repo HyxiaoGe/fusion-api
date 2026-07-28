@@ -19,6 +19,35 @@ def _populated_query(db):
 
 
 class ChatServiceTests(unittest.TestCase):
+    def test_deep_research_capability_gate_runs_before_conversation_or_message_persistence(self):
+        service = ChatService(MagicMock())
+        service._get_or_create_conversation = MagicMock()
+        service.conversation_service = MagicMock()
+
+        with (
+            patch(
+                "app.services.chat_service.llm_manager.resolve_model",
+                return_value=("openai/qwen-vl-max", "qwen", {}),
+            ),
+            patch(
+                "app.services.chat_service.litellm_catalog.get_capabilities",
+                return_value={"functionCalling": True, "searchCapable": False},
+            ),
+            self.assertRaises(ApiException) as raised,
+        ):
+            asyncio.run(
+                service.process_message(
+                    model_id="qwen-vl-max",
+                    message="调研最新模型",
+                    user_id="user-1",
+                    options={"task_mode": "deep_research"},
+                )
+            )
+
+        self.assertEqual(raised.exception.code, "MODEL_UNAVAILABLE")
+        service._get_or_create_conversation.assert_not_called()
+        service.conversation_service.create_message.assert_not_called()
+
     def test_stop_guard_init_failure_returns_explicit_retryable_message(self):
         with self.assertRaises(ApiException) as raised:
             _require_stream_initialized(

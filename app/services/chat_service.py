@@ -50,6 +50,7 @@ from app.services.stream.agent_loop_request_prep import (
     inject_no_vision_file_boundary,
     normalize_controlled_max_tokens,
 )
+from app.services.stream.agent_task_policy import resolve_agent_task_policy
 from app.services.stream.persistence import acquire_message_persistence_lock, merge_partial_content_blocks
 from app.services.stream.runner import _agent_loop_limits
 from app.services.stream_state_service import StreamInitResult, finalize_stream, get_stream_meta, init_stream
@@ -252,6 +253,10 @@ class ChatService:
         # 模型能力来自 LiteLLM metadata（vision / functionCalling 影响消息构造和工具开关）
         capabilities = _get_model_capabilities(model_id)
         has_vision = capabilities.get("vision", False)
+        task_policy = resolve_agent_task_policy(options=options, capabilities=capabilities)
+        options = task_policy.apply_to_options(options)
+        if task_policy.task_mode == "deep_research" and not stream:
+            raise ApiException.bad_request("深度研究模式仅支持流式对话")
 
         # 获取或创建会话
         conversation, is_new_conversation = self._get_or_create_conversation(
@@ -425,6 +430,16 @@ class ChatService:
             previous_run_id=previous_run_id,
             default_limits=_agent_loop_limits(),
         )
+        stored_task_policy = getattr(continuation, "task_policy", None)
+        continuation_options = (
+            stored_task_policy.apply_to_options()
+            if stored_task_policy is not None
+            else {"plan_mode": continuation.plan_mode}
+        )
+        continuation_policy = resolve_agent_task_policy(
+            options=continuation_options,
+            capabilities=capabilities,
+        )
         original_user_text = _continuation_original_user_text(
             conversation.messages,
             assistant_message_id=assistant_message_id,
@@ -457,7 +472,7 @@ class ChatService:
                 assistant_message_id=assistant_message_id,
                 assistant_message_sequence=continuation.assistant_message.sequence,
                 task_id=task_id,
-                options={"plan_mode": continuation.plan_mode},
+                options=continuation_policy.apply_to_options(),
                 capabilities=capabilities,
                 trace_id=trace_id,
                 initial_content_blocks=continuation.initial_content_blocks,

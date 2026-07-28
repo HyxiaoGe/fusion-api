@@ -18,6 +18,7 @@ from app.services.agent.continuation import (
     inject_continuation_prompt,
     resolve_continuation_limits,
     resolve_continuation_plan_mode,
+    resolve_continuation_task_policy,
 )
 from app.services.stream.agent_loop_policy import AgentLoopLimits
 
@@ -150,6 +151,23 @@ class AgentContinuationTests(unittest.TestCase):
             with self.subTest(stored=stored):
                 session = SimpleNamespace(run_config={"plan_mode": stored} if stored is not None else None)
                 self.assertEqual(resolve_continuation_plan_mode(session), expected)
+
+    def test_resolve_continuation_task_policy_preserves_deep_research_contract(self):
+        session = SimpleNamespace(
+            run_config={
+                "task_mode": "deep_research",
+                "plan_mode": "on",
+                "network_profile": "deep_research",
+                "evidence_policy": "deep_research_v1",
+            }
+        )
+
+        policy = resolve_continuation_task_policy(session)
+
+        self.assertEqual(policy.task_mode, "deep_research")
+        self.assertEqual(policy.plan_mode, "on")
+        self.assertEqual(policy.network_profile, "deep_research")
+        self.assertEqual(policy.evidence_policy, "deep_research_v1")
 
     def test_find_latest_limit_reached_session_rejects_missing_session(self):
         db = FakeDb(sessions=[])

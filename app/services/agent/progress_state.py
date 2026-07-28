@@ -84,12 +84,7 @@ def apply_progress_event(state: dict[str, Any], event: dict[str, Any]) -> dict[s
     elif event_type == "evidence_item_upserted" and event.get("protocol_version") == 2:
         evidence = event.get("evidence")
         if isinstance(evidence, dict):
-            _upsert_by_key(
-                next_state["evidence"],
-                _normalize_evidence(evidence),
-                key="id",
-                limit=None,
-            )
+            _upsert_evidence(next_state["evidence"], _normalize_evidence(evidence))
             next_state["evidence"] = _cap_evidence(next_state["evidence"])
     elif event_type == "context_required" and event.get("protocol_version") == 2:
         next_state["context_request"] = {
@@ -183,6 +178,13 @@ def _normalize_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
         "claim": _truncate(evidence.get("claim"), 120),
         "snippet": _truncate(evidence.get("snippet"), 180) if evidence.get("snippet") else None,
         "used_by_final_answer": bool(evidence.get("used_by_final_answer", False)),
+        "citation_index": (
+            evidence.get("citation_index")
+            if isinstance(evidence.get("citation_index"), int)
+            and not isinstance(evidence.get("citation_index"), bool)
+            and evidence.get("citation_index") > 0
+            else None
+        ),
     }
 
 
@@ -210,6 +212,24 @@ def _cap_evidence(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         reverse=True,
     )[:MAX_EVIDENCE_ITEMS]
     return [item for _, item in sorted(kept, key=lambda entry: entry[0])]
+
+
+def _upsert_evidence(items: list[dict[str, Any]], incoming: dict[str, Any]) -> None:
+    for index, existing in enumerate(items):
+        if existing.get("id") != incoming.get("id"):
+            continue
+        existing_priority = _evidence_priority(existing)
+        incoming_priority = _evidence_priority(incoming)
+        primary = incoming if incoming_priority >= existing_priority else existing
+        secondary = existing if primary is incoming else incoming
+        merged = {
+            key: value if value is not None and value != "" else secondary.get(key) for key, value in primary.items()
+        }
+        for key, value in secondary.items():
+            merged.setdefault(key, value)
+        items[index] = merged
+        return
+    items.append(incoming)
 
 
 def _evidence_priority(item: dict[str, Any]) -> int:

@@ -13,6 +13,7 @@ from app.schemas.chat import (
     SourceReference,
     TextBlock,
     ThinkingBlock,
+    UrlBlock,
 )
 from app.schemas.content_block_registry import CONTENT_BLOCK_REGISTRY, ContentBlockRegistration
 from app.services.source_evidence_ledger import stable_web_evidence_id
@@ -212,6 +213,7 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
             tool_call_id: str,
             plan_item_id: str,
             status: str,
+            tool_name: str = "web_search",
             retryable: bool = False,
             reused: bool = False,
         ) -> ToolExecutionRecord:
@@ -219,7 +221,7 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
             return ToolExecutionRecord(
                 tool_call={
                     "id": tool_call_id,
-                    "name": "web_search",
+                    "name": tool_name,
                     "plan_item_id": plan_item_id,
                 },
                 result=ToolResult(status=status, data=data),
@@ -249,6 +251,37 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(statuses, {"research": "failed", "cached": "completed"})
+
+    def test_degraded_network_result_does_not_complete_plan_item(self):
+        def record(tool_name: str, plan_item_id: str) -> ToolExecutionRecord:
+            return ToolExecutionRecord(
+                tool_call={
+                    "id": f"tc-{plan_item_id}",
+                    "name": tool_name,
+                    "plan_item_id": plan_item_id,
+                },
+                result=ToolResult(status="degraded", data={}),
+                handler=None,
+                block_id=f"blk-{plan_item_id}",
+                log_id=f"log-{plan_item_id}",
+            )
+
+        statuses = tool_round_module._plan_item_statuses_from_results(
+            [
+                record("web_search", "search"),
+                record("url_read", "read"),
+                record("route_compare", "route"),
+            ]
+        )
+
+        self.assertEqual(
+            statuses,
+            {
+                "search": "failed",
+                "read": "failed",
+                "route": "completed",
+            },
+        )
 
     async def test_on_mode_pairs_but_does_not_execute_unplanned_external_call(self):
         state = AgentLoopState()
@@ -1512,6 +1545,96 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[2] 第一轮重复来源", context)
         self.assertIn("[6] 第二轮新增来源", context)
         self.assertNotIn("[1] 第一轮重复来源", context)
+        next_block = content_blocks[-1]
+        self.assertIsInstance(next_block, SearchBlock)
+        self.assertEqual(
+            [ref.citation_index for ref in next_block.source_refs],
+            [2, 6],
+        )
+        self.assertEqual(
+            next_block.source_refs[0].evidence_id,
+            stable_web_evidence_id("https://first.example.com/2", fallback="unused"),
+        )
+
+    def test_url_read_reuses_search_citation_metadata_for_same_canonical_url(self):
+        from app.services.tool_handlers.url_read import UrlReadHandler
+
+        url = "https://example.com/report?utm_source=search"
+        evidence_id = stable_web_evidence_id(url, fallback="unused")
+        previous_block = SearchBlock(
+            type="search",
+            query="研究报告",
+            sources=[SearchSourceSummary(title="报告", url=url)],
+            source_refs=[
+                SourceReference(
+                    kind="search",
+                    title="报告",
+                    url=url,
+                    evidence_id=evidence_id,
+                    citation_index=4,
+                )
+            ],
+            source_count=1,
+        )
+        tool_call = {
+            "id": "tc-read",
+            "name": "url_read",
+            "arguments": '{"url":"https://example.com/report"}',
+        }
+        record = ToolExecutionRecord(
+            tool_call=tool_call,
+            result=ToolResult(
+                status="success",
+                data={
+                    "url": "https://example.com/report",
+                    "title": "报告原文",
+                    "content": "原文内容",
+                },
+            ),
+            handler=UrlReadHandler(),
+            block_id="blk-read",
+            log_id="log-read",
+        )
+        content_blocks = [previous_block]
+
+        tool_round_module.append_tool_round_messages(
+            tool_round_module.ToolRoundRequest(
+                db="db",
+                assistant_message_id="msg-1",
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="gpt-4",
+                provider="openai",
+                content_blocks=content_blocks,
+                messages=[{"role": "user", "content": "读取报告"}],
+                tool_calls=[tool_call],
+                reasoning_buf="",
+                should_use_reasoning=True,
+                step_context=AgentStepContext(
+                    step_id="step-read",
+                    run_id="run-1",
+                    step_number=2,
+                    started_at=10.0,
+                    thinking_block_id="blk-thinking",
+                    text_block_id="blk-text",
+                ),
+                step_number=2,
+                run_id="run-1",
+                emitter=object(),
+                session_cache=object(),
+                network_budget=object(),
+                call_kwargs={},
+                persist_message_fn=Mock(),
+                execute_tools_fn=Mock(),
+                complete_step_fn=Mock(),
+            ),
+            [record],
+        )
+
+        read_block = content_blocks[-1]
+        self.assertIsInstance(read_block, UrlBlock)
+        self.assertEqual(read_block.source_refs[0].citation_index, 4)
+        self.assertEqual(read_block.source_refs[0].evidence_id, evidence_id)
 
     def test_build_search_read_decision_ledger_summarizes_budget_and_read_decisions(self):
         from app.services.search_read_decision_ledger import build_search_read_decision_ledger

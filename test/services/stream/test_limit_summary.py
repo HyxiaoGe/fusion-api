@@ -1,11 +1,13 @@
 import asyncio
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.schemas.chat import ContextUsage, Usage
+from app.schemas.chat import ContextUsage, SearchBlock, SearchSourceSummary, SourceReference, UrlBlock, Usage
 from app.services.chat.context_manager import ContextPlan
 from app.services.chat.context_manager import prepare_context as prepare_context_real
 from app.services.stream.limit_summary import (
+    DEEP_RESEARCH_INCOMPLETE_TEXT,
     LIMIT_SUMMARY_PROMPT,
     LimitSummaryStepRequest,
     accumulate_summary_usage,
@@ -13,9 +15,74 @@ from app.services.stream.limit_summary import (
     append_summary_content_blocks,
     build_limit_summary_call_kwargs,
     compute_summary_timeout,
+    remove_conflicting_tool_usage_contract,
     run_limit_summary_step,
 )
+from app.services.stream.research_evidence import ResearchEvidenceWorkset
 from app.services.stream.step_lifecycle import AgentStepContext
+
+
+def _deep_summary_evidence() -> tuple[ResearchEvidenceWorkset, list]:
+    blocks = [
+        SearchBlock(
+            type="search",
+            query="研究问题",
+            sources=[
+                SearchSourceSummary(title="候选 A", url="https://example.com/a"),
+                SearchSourceSummary(title="候选 B", url="https://example.com/b"),
+            ],
+            source_refs=[
+                SourceReference(
+                    kind="search",
+                    title="候选 A",
+                    url="https://example.com/a",
+                    evidence_id="ev-a",
+                    citation_index=2,
+                ),
+                SourceReference(
+                    kind="search",
+                    title="候选 B",
+                    url="https://example.com/b",
+                    evidence_id="ev-b",
+                    citation_index=3,
+                ),
+            ],
+            source_count=2,
+        ),
+        UrlBlock(
+            type="url_read",
+            url="https://example.com/a",
+            title="来源 A",
+            source_refs=[
+                SourceReference(
+                    kind="url_read",
+                    title="来源 A",
+                    url="https://example.com/a",
+                    evidence_id="ev-a",
+                    citation_index=2,
+                )
+            ],
+            source_count=1,
+        ),
+        UrlBlock(
+            type="url_read",
+            url="https://example.com/b",
+            title="来源 B",
+            source_refs=[
+                SourceReference(
+                    kind="url_read",
+                    title="来源 B",
+                    url="https://example.com/b",
+                    evidence_id="ev-b",
+                    citation_index=3,
+                )
+            ],
+            source_count=1,
+        ),
+    ]
+    workset = ResearchEvidenceWorkset()
+    workset.record_content_blocks(blocks)
+    return workset, blocks
 
 
 class LimitSummaryHelpersTests(unittest.TestCase):
@@ -39,6 +106,21 @@ class LimitSummaryHelpersTests(unittest.TestCase):
         content = messages[-1]["content"]
         self.assertIn("只基于已经实际取得的结果", content)
         self.assertIn("建议重试", content)
+        self.assertNotIn("你已达到工具调用上限", content)
+
+    def test_deep_research_plan_repair_summary_keeps_research_citation_contract(self):
+        messages = []
+
+        append_limit_summary_prompt(
+            messages,
+            summary_finish_reason="plan_repair_exhausted",
+            task_mode="deep_research",
+        )
+
+        content = messages[-1]["content"]
+        self.assertIn("只基于已经实际取得的结果", content)
+        self.assertIn("只基于当前已成功取得并读取的来源", content)
+        self.assertIn("只能使用研究证据工作集列出的引用编号", content)
         self.assertNotIn("你已达到工具调用上限", content)
 
     def test_build_limit_summary_call_kwargs_copies_and_removes_tool_controls(self):
@@ -96,6 +178,31 @@ class LimitSummaryHelpersTests(unittest.TestCase):
 
         self.assertIs(result, accumulated_usage)
 
+    def test_deep_summary_removes_tool_history_and_control_prompts_but_keeps_evidence(self):
+        messages = [
+            {"role": "system", "content": "【Fusion 身份一致性规则】保留"},
+            {"role": "system", "content": "【自主联网判断规则】按需调用工具"},
+            {"role": "system", "content": "【执行计划控制规则】必须更新计划"},
+            {"role": "system", "content": "【深度研究执行约束】先建立计划"},
+            {"role": "system", "content": "【本轮研究证据工作集】\n[2] status=read_success"},
+            {"role": "assistant", "content": "", "tool_calls": [{"name": "url_read"}]},
+            {"role": "tool", "content": "原始工具结果"},
+            {"role": "user", "content": "原始研究问题"},
+            {"role": "user", "content": "<web_context>已读来源安全投影</web_context>"},
+        ]
+
+        remove_conflicting_tool_usage_contract(messages, task_mode="deep_research")
+
+        self.assertEqual(
+            messages,
+            [
+                {"role": "system", "content": "【Fusion 身份一致性规则】保留"},
+                {"role": "system", "content": "【本轮研究证据工作集】\n[2] status=read_success"},
+                {"role": "user", "content": "原始研究问题"},
+                {"role": "user", "content": "<web_context>已读来源安全投影</web_context>"},
+            ],
+        )
+
     def test_append_summary_content_blocks_adds_reasoning_and_text(self):
         content_blocks = []
 
@@ -131,6 +238,175 @@ class LimitSummaryHelpersTests(unittest.TestCase):
 
 
 class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
+    def _deep_request(self, *, workset, content_blocks, answer):
+        stream_kwargs = []
+        answers = iter(answer if isinstance(answer, (list, tuple)) else [answer])
+
+        async def start_step_fn(**_kwargs):
+            return AgentStepContext(
+                step_id="step-deep-summary",
+                step_number=9,
+                started_at=100.0,
+                thinking_block_id="blk-deep-thinking",
+                text_block_id="blk-deep-text",
+            )
+
+        async def prepare_context_fn(**kwargs):
+            return ContextPlan(
+                messages=list(kwargs["messages"]),
+                status="no_op",
+                context_window_tokens=1000,
+                context_window_source="test",
+                context_window_status="known",
+                estimated_tokens_before=100,
+                estimated_tokens_after=100,
+            )
+
+        async def stream_round_fn(*_args, **kwargs):
+            stream_kwargs.append(kwargs)
+            return "", next(answers), [], "stop", Usage(input_tokens=2, output_tokens=3)
+
+        emitter = SimpleNamespace(evidence_item_upserted=AsyncMock())
+        request = LimitSummaryStepRequest(
+            conversation_id="conv-deep",
+            task_id="task-deep",
+            run_id="run-deep",
+            step_number=9,
+            model_id="gpt-4",
+            provider="openai",
+            litellm_model="openai/gpt-4",
+            litellm_kwargs={},
+            messages=[{"role": "user", "content": "深度研究"}],
+            should_use_reasoning=False,
+            content_blocks=content_blocks,
+            call_kwargs={},
+            accumulated_usage=Usage(input_tokens=1, output_tokens=1),
+            emitter=emitter,
+            session_cache=object(),
+            total_timeout_s=300,
+            run_start=100.0,
+            start_step_fn=start_step_fn,
+            complete_step_fn=AsyncMock(),
+            llm_call_fn=AsyncMock(return_value="response"),
+            stream_round_fn=stream_round_fn,
+            log_round_summary_fn=lambda **_kwargs: None,
+            clock=lambda: 120.0,
+            task_mode="deep_research",
+            evidence_policy="deep_research_v1",
+            research_workset=workset,
+        )
+        return request, emitter, stream_kwargs, prepare_context_fn
+
+    async def test_deep_summary_defers_and_emits_valid_answer_once_with_used_evidence(self):
+        workset, blocks = _deep_summary_evidence()
+        request, emitter, stream_kwargs, prepare_context_fn = self._deep_request(
+            workset=workset,
+            content_blocks=blocks,
+            answer="综合结论来自两个已读来源。[2][3]",
+        )
+
+        with (
+            patch("app.services.stream.limit_summary.prepare_context", new=prepare_context_fn),
+            patch("app.services.stream.limit_summary.append_chunk", new=AsyncMock()) as append_chunk,
+        ):
+            outcome = await run_limit_summary_step(request=request)
+
+        self.assertTrue(stream_kwargs[0]["defer_output"])
+        self.assertFalse(outcome.incomplete)
+        append_chunk.assert_awaited_once()
+        self.assertEqual(append_chunk.await_args.args[2], "综合结论来自两个已读来源。[2][3]")
+        self.assertEqual(request.content_blocks[-1].text, "综合结论来自两个已读来源。[2][3]")
+        self.assertEqual(emitter.evidence_item_upserted.await_count, 2)
+
+    async def test_deep_summary_replaces_invalid_or_insufficient_answer_with_deterministic_text(self):
+        complete_workset, complete_blocks = _deep_summary_evidence()
+        incomplete_workset = ResearchEvidenceWorkset()
+        cases = (
+            (incomplete_workset, [], "看似完成的结论。[2]"),
+        )
+
+        for workset, blocks, answer in cases:
+            with self.subTest(answer=answer):
+                request, emitter, _stream_kwargs, prepare_context_fn = self._deep_request(
+                    workset=workset,
+                    content_blocks=list(blocks),
+                    answer=answer,
+                )
+                with (
+                    patch("app.services.stream.limit_summary.prepare_context", new=prepare_context_fn),
+                    patch("app.services.stream.limit_summary.append_chunk", new=AsyncMock()) as append_chunk,
+                ):
+                    outcome = await run_limit_summary_step(request=request)
+
+                self.assertTrue(outcome.incomplete)
+                append_chunk.assert_awaited_once()
+                self.assertEqual(append_chunk.await_args.args[2], DEEP_RESEARCH_INCOMPLETE_TEXT)
+                self.assertEqual(request.content_blocks[-1].text, DEEP_RESEARCH_INCOMPLETE_TEXT)
+                emitter.evidence_item_upserted.assert_not_awaited()
+
+    async def test_deep_summary_repairs_missing_or_invalid_citation_once_before_emitting(self):
+        cases = (
+            ("缺少引用的完整结论。", "补齐引用后的完整结论。[2][3]"),
+            ("使用了错误编号。[99]", "改用已读来源编号后的完整结论。[2][3]"),
+        )
+
+        for invalid_answer, repaired_answer in cases:
+            with self.subTest(invalid_answer=invalid_answer):
+                workset, blocks = _deep_summary_evidence()
+                request, emitter, stream_kwargs, prepare_context_fn = self._deep_request(
+                    workset=workset,
+                    content_blocks=list(blocks),
+                    answer=[invalid_answer, repaired_answer],
+                )
+                warnings = []
+                request = LimitSummaryStepRequest(
+                    **{
+                        **request.__dict__,
+                        "warning_fn": warnings.append,
+                    }
+                )
+                with (
+                    patch("app.services.stream.limit_summary.prepare_context", new=prepare_context_fn),
+                    patch("app.services.stream.limit_summary.append_chunk", new=AsyncMock()) as append_chunk,
+                ):
+                    outcome = await run_limit_summary_step(request=request)
+
+                self.assertFalse(outcome.incomplete)
+                self.assertEqual(len(stream_kwargs), 2)
+                self.assertEqual(request.llm_call_fn.await_count, 2)
+                append_chunk.assert_awaited_once()
+                self.assertEqual(append_chunk.await_args.args[2], repaired_answer)
+                self.assertEqual(request.content_blocks[-1].text, repaired_answer)
+                self.assertEqual(emitter.evidence_item_upserted.await_count, 2)
+                self.assertTrue(any("引用校验未通过" in warning for warning in warnings))
+                self.assertTrue(
+                    any(
+                        "深度研究完成校验" in str(message.get("content", ""))
+                        for message in request.messages
+                    )
+                )
+
+    async def test_deep_summary_keeps_deterministic_failure_when_citation_repair_still_invalid(self):
+        workset, blocks = _deep_summary_evidence()
+        request, emitter, stream_kwargs, prepare_context_fn = self._deep_request(
+            workset=workset,
+            content_blocks=list(blocks),
+            answer=["伪造引用。[99]", "仍然伪造引用。[98]"],
+        )
+
+        with (
+            patch("app.services.stream.limit_summary.prepare_context", new=prepare_context_fn),
+            patch("app.services.stream.limit_summary.append_chunk", new=AsyncMock()) as append_chunk,
+        ):
+            outcome = await run_limit_summary_step(request=request)
+
+        self.assertTrue(outcome.incomplete)
+        self.assertEqual(len(stream_kwargs), 2)
+        append_chunk.assert_awaited_once()
+        self.assertEqual(append_chunk.await_args.args[2], DEEP_RESEARCH_INCOMPLETE_TEXT)
+        self.assertEqual(request.content_blocks[-1].text, DEEP_RESEARCH_INCOMPLETE_TEXT)
+        emitter.evidence_item_upserted.assert_not_awaited()
+
     async def test_no_progress_summary_removes_conflicting_tool_usage_contract_before_call(self):
         sent_messages = []
 

@@ -40,7 +40,7 @@ def build_evidence_items(record: ToolExecutionRecord) -> list[dict[str, Any]]:
     tool_call_id = str(record.tool_call.get("id", "tool"))
     if record.tool_name == "url_read":
         item = build_url_read_evidence_item(
-            record.result.data or {},
+            _result_data(record),
             status=record.result.status,
             tool_call_id=tool_call_id,
         )
@@ -71,7 +71,7 @@ def _result_summary(record: ToolExecutionRecord) -> dict[str, Any]:
         return {"kind": record.tool_name, "truncated": True}
     if not isinstance(summary, dict):
         summary = {"kind": record.tool_name, "truncated": False}
-    repair = record.result.data.get("repair")
+    repair = _result_data(record).get("repair")
     if isinstance(repair, dict):
         summary = {
             **summary,
@@ -152,7 +152,7 @@ def _key_findings(evidence_items: list[dict[str, Any]]) -> list[str]:
 
 
 def _extract_sources(record: ToolExecutionRecord) -> list[Any]:
-    data = record.result.data or {}
+    data = _result_data(record)
     sources = data.get("sources") or data.get("source_refs") or []
     return sources if isinstance(sources, list) else []
 
@@ -179,7 +179,7 @@ def _safe_text(value: Any, max_chars: int) -> str:
 
 
 def _repair_digest_state(record: ToolExecutionRecord) -> tuple[str | None, str | None]:
-    data = record.result.data if isinstance(record.result.data, dict) else {}
+    data = _result_data(record)
     repair = data.get("repair")
     if isinstance(repair, dict):
         state = (
@@ -196,3 +196,8 @@ def _repair_digest_state(record: ToolExecutionRecord) -> tuple[str | None, str |
 
 def _safe_repair_id(value: Any) -> str | None:
     return value if isinstance(value, str) and re.fullmatch(r"repair_[a-f0-9]{16}", value) else None
+
+
+def _result_data(record: ToolExecutionRecord) -> dict[str, Any]:
+    data = getattr(record.result, "data", None)
+    return data if isinstance(data, dict) else {}

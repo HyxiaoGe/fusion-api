@@ -22,6 +22,10 @@ from app.services.stream.product_result_answer import (
     build_tool_repair_clarification,
     neutralize_product_provider_mentions,
 )
+from app.services.stream.research_evidence import (
+    build_research_repair_prompt,
+    validate_research_completion,
+)
 from app.services.stream.round_completion import append_round_content_blocks, complete_text_response_step
 from app.services.stream.step_lifecycle import AgentStepContext
 from app.services.stream.tool_round import ToolRoundOutcome
@@ -49,10 +53,15 @@ async def handle_agent_round_outcome(
     *,
     request: AgentRoundOutcomeRequest,
 ) -> AgentLoopOutcome | None:
+    if _requires_deep_synthesis_protocol_summary(request):
+        return await _complete_deep_synthesis_protocol_round(request)
+
     finish_reason = request.round_result.finish_reason
     if finish_reason == "stop":
         if _requires_plan_before_stop(request):
             return await _repair_missing_required_plan(request)
+        if _requires_research_completion_repair(request):
+            return await _repair_research_completion(request)
         if _needs_empty_answer_summary(request):
             await _complete_empty_round_before_summary(request)
             return AgentLoopOutcome(exit=AgentLoopExit.SUMMARY_REQUIRED)
@@ -68,13 +77,93 @@ async def handle_agent_round_outcome(
 
     if _requires_plan_before_stop(request):
         return await _repair_missing_required_plan(request)
+    if _requires_research_completion_repair(request):
+        return await _repair_research_completion(request)
 
     await _complete_unknown_round(request)
     return AgentLoopOutcome(exit=AgentLoopExit.COMPLETED)
 
 
+def _requires_deep_synthesis_protocol_summary(request: AgentRoundOutcomeRequest) -> bool:
+    """零公告工具的深研综合轮若仍吐出工具协议，直接进入无工具安全收口。"""
+
+    workset = request.state.research_workset
+    return (
+        request.runtime.task_mode == "deep_research"
+        and workset.successful_searches >= 1
+        and len(workset.successful_read_urls) >= 2
+        and request.round_result.announced_tool_names == frozenset()
+        and bool(request.round_result.tool_calls)
+    )
+
+
+async def _complete_deep_synthesis_protocol_round(
+    request: AgentRoundOutcomeRequest,
+) -> AgentLoopOutcome:
+    request.runtime.warning_fn(
+        "深度研究综合阶段返回未公告工具协议，切换到无工具证据收口: "
+        f"conv_id={request.runtime.conversation_id}, run_id={request.runtime.run_id}, "
+        f"step={request.step_number}"
+    )
+    await complete_text_response_step(
+        context=request.step_context,
+        emitter=request.runtime.emitter,
+        session_cache=request.runtime.session_cache,
+        complete_step_fn=request.runtime.complete_step_fn,
+        completed_tool_calls=request.state.total_tool_calls,
+        max_tool_calls=request.runtime.limits.max_tool_calls,
+        clock=request.runtime.clock,
+    )
+    request.state.clear_current_step()
+    return AgentLoopOutcome(
+        exit=AgentLoopExit.SUMMARY_REQUIRED,
+        summary_finish_reason="research_evidence_repair_exhausted",
+    )
+
+
 def _requires_plan_before_stop(request: AgentRoundOutcomeRequest) -> bool:
     return request.runtime.plan_mode == "on" and not request.state.plan_coordinator.has_valid_model_plan
+
+
+def _requires_research_completion_repair(request: AgentRoundOutcomeRequest) -> bool:
+    if request.runtime.task_mode != "deep_research" or not request.state.research_network_required:
+        return False
+    result = validate_research_completion(
+        request.state.research_workset,
+        request.round_result.content_buf,
+    )
+    return not result.is_valid
+
+
+async def _repair_research_completion(
+    request: AgentRoundOutcomeRequest,
+) -> AgentLoopOutcome | None:
+    result = validate_research_completion(
+        request.state.research_workset,
+        request.round_result.content_buf,
+    )
+    await complete_text_response_step(
+        context=request.step_context,
+        emitter=request.runtime.emitter,
+        session_cache=request.runtime.session_cache,
+        complete_step_fn=request.runtime.complete_step_fn,
+        completed_tool_calls=request.state.total_tool_calls,
+        max_tool_calls=request.runtime.limits.max_tool_calls,
+        clock=request.runtime.clock,
+    )
+    request.messages.append(
+        {
+            "role": "system",
+            "content": build_research_repair_prompt(result.reason, request.state.research_workset),
+        }
+    )
+    request.state.clear_current_step()
+    if request.state.record_research_repair():
+        return AgentLoopOutcome(
+            exit=AgentLoopExit.SUMMARY_REQUIRED,
+            summary_finish_reason="research_evidence_repair_exhausted",
+        )
+    return None
 
 
 async def _complete_plan_required_round(request: AgentRoundOutcomeRequest) -> None:
@@ -159,6 +248,20 @@ async def _replace_deferred_product_answer(
 
     if not request.round_result.output_deferred:
         return request
+
+    if request.runtime.task_mode == "deep_research":
+        answer = request.round_result.content_buf.strip()
+        if answer:
+            await append_chunk(
+                request.runtime.conversation_id,
+                "answering",
+                answer,
+                request.step_context.text_block_id,
+                task_id=request.runtime.task_id,
+                run_id=request.runtime.run_id,
+                step_id=request.step_context.step_id,
+            )
+        return _with_replaced_answer(request, answer)
 
     candidate = neutralize_product_provider_mentions(
         request.round_result.content_buf.strip(),
@@ -353,6 +456,8 @@ async def _emit_final_answer_used_evidence(request: AgentRoundOutcomeRequest) ->
         evidence_items = build_used_final_answer_evidence(
             content_blocks=request.state.content_blocks,
             answer_text=request.round_result.content_buf,
+            evidence_policy=request.runtime.evidence_policy,
+            allowed_citation_indexes=request.state.research_workset.valid_citation_indexes,
         )
         for evidence in evidence_items:
             await emit(tool_call_id=None, evidence=evidence)
