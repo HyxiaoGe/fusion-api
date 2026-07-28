@@ -21,6 +21,7 @@ from app.services.stream.agent_loop_lifecycle import (
 from app.services.stream.agent_loop_policy import AgentLoopLimits
 from app.services.stream.agent_loop_request_prep import AgentLoopPreparedMessages
 from app.services.stream.research_evidence import validate_research_completion
+from app.services.stream_state_service import StreamOwnershipLostError
 
 
 async def _unused_async(**_kwargs):
@@ -698,6 +699,44 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 ("fallback", execution.completion_context),
             ],
         )
+
+    async def test_ownership_lost_finalizes_as_cancelled_without_reporting_failure(self):
+        call_order = []
+        execution = self._execution()
+
+        async def run_agent_loop_fn(**_kwargs):
+            raise StreamOwnershipLostError("external stop")
+
+        async def finalize_cancelled_run_fn(**kwargs):
+            call_order.append(("cancelled", kwargs["context"]))
+
+        async def finalize_failed_run_fn(**_kwargs):
+            raise AssertionError("外部终态已接管时不应进入失败收尾")
+
+        async def write_fallback_run_error_fn(**kwargs):
+            call_order.append(("fallback", kwargs["context"]))
+
+        errors = []
+        await run_agent_loop_lifecycle(
+            request=self._request(),
+            execution=execution,
+            dependencies=self._dependencies(
+                run_agent_loop_fn=run_agent_loop_fn,
+                finalize_cancelled_run_fn=finalize_cancelled_run_fn,
+                finalize_failed_run_fn=finalize_failed_run_fn,
+                write_fallback_run_error_fn=write_fallback_run_error_fn,
+                error_fn=errors.append,
+            ),
+        )
+
+        self.assertEqual(
+            call_order,
+            [
+                ("cancelled", execution.completion_context),
+                ("fallback", execution.completion_context),
+            ],
+        )
+        self.assertEqual(errors, [])
 
     async def test_failed_path_finalizes_then_reraises_and_writes_fallback(self):
         call_order = []

@@ -14,6 +14,7 @@ from app.services.stream.agent_loop_outcome import AgentLoopExit
 from app.services.stream.agent_loop_policy import AgentLoopLimits, map_run_terminal_state
 from app.services.stream.agent_loop_request_prep import AgentLoopCallConfig
 from app.services.stream.research_evidence import assign_missing_source_reference_metadata
+from app.services.stream_state_service import StreamOwnershipLostError
 
 AsyncFn = Callable[..., Awaitable[Any]]
 PersistMessageFn = Callable[..., Any]
@@ -66,6 +67,10 @@ async def run_agent_loop_lifecycle(
     except asyncio.CancelledError:
         await _finalize_cancelled(execution=execution, dependencies=dependencies)
         raise
+    except StreamOwnershipLostError:
+        # stop 接口或后续请求已经原子接管 Redis 终态时，后台任务可能先观察到
+        # 写入权失效，再收到 asyncio cancellation。这属于正常中断，不应记为生成失败。
+        await _finalize_cancelled(execution=execution, dependencies=dependencies)
     except Exception as error:
         await _finalize_failed(error=error, execution=execution, dependencies=dependencies)
         raise
