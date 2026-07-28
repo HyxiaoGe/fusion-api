@@ -17,7 +17,7 @@ import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-from app.services.mcp.provider_profiles import endpoint_auth_binding_is_allowed
+from app.services.mcp.provider_profiles import endpoint_auth_binding_is_allowed, endpoint_timeout_floors
 
 logger = logging.getLogger(__name__)
 
@@ -244,14 +244,14 @@ class McpClientManager:
         self._resolve_connection(config)
 
     async def test_connection(self, config: McpConnectionConfig) -> None:
-        async def operation(_session: McpSession) -> None:
+        async def operation(_session: McpSession, _call_timeout_seconds: float) -> None:
             return None
 
         await self._run(config, "initialize", operation)
 
     async def list_tools(self, config: McpConnectionConfig) -> list[dict[str, Any]]:
-        async def operation(session: McpSession) -> list[dict[str, Any]]:
-            return await self._list_tools(session)
+        async def operation(session: McpSession, call_timeout_seconds: float) -> list[dict[str, Any]]:
+            return await self._list_tools(session, call_timeout_seconds)
 
         return await self._run(config, "tools_list", operation)
 
@@ -273,12 +273,12 @@ class McpClientManager:
         ):
             raise McpClientError("invalid_arguments", "MCP 工具参数无效")
 
-        async def operation(session: McpSession) -> dict[str, Any]:
-            async with asyncio.timeout(self.policy.call_timeout_seconds):
+        async def operation(session: McpSession, call_timeout_seconds: float) -> dict[str, Any]:
+            async with asyncio.timeout(call_timeout_seconds):
                 result = await session.call_tool(
                     tool_name,
                     normalized_arguments,
-                    read_timeout_seconds=timedelta(seconds=self.policy.call_timeout_seconds),
+                    read_timeout_seconds=timedelta(seconds=call_timeout_seconds),
                 )
             payload = _normalize_json_payload(result.model_dump(by_alias=True, mode="json", exclude_none=True))
             if not isinstance(payload, dict) or len(_json_bytes(payload)) > self.policy.max_response_bytes:
@@ -303,6 +303,15 @@ class McpClientManager:
         started_at = time.perf_counter()
         is_idempotent = operation_name in _IDEMPOTENT_OPERATIONS
         max_attempts = max(1, self.policy.idempotent_max_attempts) if is_idempotent else 1
+        timeout_floors = endpoint_timeout_floors(config.endpoint_url)
+        connect_timeout_seconds = self.policy.connect_timeout_seconds
+        call_timeout_seconds = self.policy.call_timeout_seconds
+        idempotent_total_timeout_seconds = self.policy.idempotent_total_timeout_seconds
+        if timeout_floors is not None:
+            connect_floor, call_floor, idempotent_total_floor = timeout_floors
+            connect_timeout_seconds = max(connect_timeout_seconds, connect_floor)
+            call_timeout_seconds = max(call_timeout_seconds, call_floor)
+            idempotent_total_timeout_seconds = max(idempotent_total_timeout_seconds, idempotent_total_floor)
 
         async def run_attempts():
             for attempt in range(1, max_attempts + 1):
@@ -312,12 +321,12 @@ class McpClientManager:
                         endpoint_url=connection.endpoint_url,
                         headers=connection.headers,
                         query_params=connection.query_params,
-                        connect_timeout_seconds=self.policy.connect_timeout_seconds,
-                        call_timeout_seconds=self.policy.call_timeout_seconds,
+                        connect_timeout_seconds=connect_timeout_seconds,
+                        call_timeout_seconds=call_timeout_seconds,
                     ) as session:
-                        async with asyncio.timeout(self.policy.connect_timeout_seconds):
+                        async with asyncio.timeout(connect_timeout_seconds):
                             await session.initialize()
-                        result = await operation(session)
+                        result = await operation(session, call_timeout_seconds)
                     logger.info(
                         "MCP 操作完成 server_id=%s provider=%s operation=%s attempt=%s duration_ms=%s",
                         config.server_id,
@@ -365,7 +374,7 @@ class McpClientManager:
             return await run_attempts()
 
         try:
-            async with asyncio.timeout(max(0.1, self.policy.idempotent_total_timeout_seconds)):
+            async with asyncio.timeout(max(0.1, idempotent_total_timeout_seconds)):
                 return await run_attempts()
         except TimeoutError:
             error = (
@@ -383,14 +392,14 @@ class McpClientManager:
             )
             raise error from None
 
-    async def _list_tools(self, session: McpSession) -> list[dict[str, Any]]:
+    async def _list_tools(self, session: McpSession, call_timeout_seconds: float) -> list[dict[str, Any]]:
         tools: list[dict[str, Any]] = []
         seen_names: set[str] = set()
         seen_cursors: set[str] = set()
         cursor: str | None = None
 
         for _page in range(self.policy.max_discovery_pages):
-            async with asyncio.timeout(self.policy.call_timeout_seconds):
+            async with asyncio.timeout(call_timeout_seconds):
                 result = await session.list_tools(cursor=cursor)
             page_tools = getattr(result, "tools", None)
             if not isinstance(page_tools, list):
