@@ -1,0 +1,19 @@
+services:
+  litellm-proxy:
+    # 固定稳定版本和已验证 digest；禁止 latest、RC、dev 或 Watchtower 自动滚动。
+    image: litellm/litellm:v1.93.0@sha256:a1745e629abfb17d434426ff48b115f54f4f4c4a0f5af241de569e93c63c411e
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen("http://127.0.0.1:4000/health/readiness", timeout=5)
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    labels:
+      # LiteLLM 会执行数据库迁移，只允许通过受控升级流程变更镜像。
+      com.centurylinklabs.watchtower.enable: "false"

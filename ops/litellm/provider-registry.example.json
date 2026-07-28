@@ -1,0 +1,40 @@
+{
+  "litellm": {
+    "base_url": "http://127.0.0.1:4000",
+    "api_key_env": "LITELLM_MASTER_KEY"
+  },
+  "providers": [
+    {
+      "adapter": "moonshot",
+      "base_url": "https://api.moonshot.cn/v1",
+      "api_key_env": "MOONSHOT_API_KEY"
+    },
+    {
+      "adapter": "openai-compatible",
+      "provider_key": "deepseek",
+      "provider_display": "DeepSeek",
+      "litellm_prefix": "deepseek",
+      "api_model_prefix": "deepseek-",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key_env": "DEEPSEEK_API_KEY"
+    },
+    {
+      "adapter": "openai-compatible",
+      "provider_key": "qwen",
+      "provider_display": "通义千问",
+      "litellm_prefix": "openai",
+      "api_model_prefix": "qwen-",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "api_key_env": "QWEN_API_KEY"
+    },
+    {
+      "adapter": "openai-compatible",
+      "provider_key": "xiaomi",
+      "provider_display": "小米 MiMo",
+      "litellm_prefix": "openai",
+      "api_model_prefix": "mimo-",
+      "base_url": "https://api.xiaomimimo.com/v1",
+      "api_key_env": "XIAOMI_API_KEY"
+    }
+  ]
+}
