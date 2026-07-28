@@ -212,6 +212,71 @@ class ModelCandidateOrchestratorTests(unittest.TestCase):
         self.assertEqual(report["candidate_preflight"]["status"], "ready")
         self.assertIn("litellm_model_id=route-id", " ".join(call[0] for call in client.calls))
 
+    def test_native_provider_flattened_wildcard_is_resolved_by_route_metadata(self):
+        client = FakeHttpClient(
+            {
+                "http://litellm.internal:4000/model/info": FakeResponse(
+                    {
+                        "data": [
+                            {
+                                "model_name": "candidate/kimi-k2.6",
+                                "litellm_params": {
+                                    "model": "candidate/kimi-k2.6",
+                                    "api_base": "https://api.moonshot.example",
+                                },
+                                "model_info": {
+                                    "id": "moonshot-route-id",
+                                    "metadata": {
+                                        "provider_key": "moonshot",
+                                        "purpose": "candidate_preflight",
+                                    },
+                                },
+                            }
+                        ]
+                    }
+                ),
+                "http://litellm.internal:4000/model/info?litellm_model_id=moonshot-route-id": FakeResponse(
+                    {
+                        "data": [
+                            {
+                                "model_name": "candidate/moonshot/*",
+                                "litellm_params": {
+                                    "model": "moonshot/*",
+                                    "api_base": "https://api.moonshot.example",
+                                    "api_key": "os.environ/MOONSHOT_API_KEY",
+                                },
+                                "model_info": {
+                                    "metadata": {
+                                        "provider_key": "moonshot",
+                                        "purpose": "candidate_preflight",
+                                    }
+                                },
+                            }
+                        ]
+                    }
+                ),
+                "http://litellm.internal:4000/key/info?key=candidate-secret": FakeResponse(
+                    {"info": {"models": ["candidate/moonshot/*"]}}
+                ),
+                "https://api.moonshot.example/v1/models": FakeResponse(
+                    {"data": [{"id": "kimi-k2.6"}, {"id": "kimi-k3"}]}
+                ),
+            }
+        )
+
+        report = orchestrator.coordinate_candidates(
+            registry=registry(moonshot_config()),
+            environ={
+                "LITELLM_MASTER_KEY": "master",
+                "LITELLM_CANDIDATE_KEY": "candidate-secret",
+                "MOONSHOT_API_KEY": "provider",
+            },
+            client=client,
+        )
+
+        self.assertEqual(report["candidate_preflight"]["status"], "ready")
+        self.assertIn("litellm_model_id=moonshot-route-id", " ".join(call[0] for call in client.calls))
+
     def test_shared_openai_adapter_routes_are_verified_per_provider(self):
         qwen = {
             **acme_config(),

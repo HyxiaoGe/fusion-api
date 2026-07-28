@@ -207,11 +207,20 @@ def _resolve_raw_candidate_routes(
             resolved[provider_key] = direct[0]
             continue
         prefix = route_name.removesuffix("*")
-        deployment_ids = {
-            str((entry.get("model_info") or {}).get("id") or "")
-            for entry in entries
-            if isinstance(entry, Mapping) and str(entry.get("model_name") or "").startswith(prefix)
-        }
+        deployment_ids: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            model_info = entry.get("model_info")
+            model_info = model_info if isinstance(model_info, Mapping) else {}
+            metadata = model_info.get("metadata")
+            metadata = metadata if isinstance(metadata, Mapping) else {}
+            matches_expanded_route = str(entry.get("model_name") or "").startswith(prefix)
+            matches_route_metadata = (
+                metadata.get("provider_key") == provider_key and metadata.get("purpose") == "candidate_preflight"
+            )
+            if matches_expanded_route or matches_route_metadata:
+                deployment_ids.add(str(model_info.get("id") or ""))
         deployment_ids.discard("")
         raw_matches: list[Mapping[str, Any]] = []
         for deployment_id in sorted(deployment_ids):
