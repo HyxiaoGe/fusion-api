@@ -84,7 +84,12 @@ class ChatContinueTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             service.stream_handler.generate_to_redis.call_args.kwargs["options"],
-            {"plan_mode": "on"},
+            {
+                "task_mode": "standard",
+                "plan_mode": "on",
+                "network_profile": "standard",
+                "evidence_policy": "standard",
+            },
         )
         register_task_mock.assert_called_once()
         self.assertIs(register_task_mock.call_args.args[1], task)

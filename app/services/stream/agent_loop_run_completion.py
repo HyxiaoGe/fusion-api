@@ -141,7 +141,10 @@ async def finalize_cancelled_run(
     finalize_stream_fn: FinalizeStreamFn,
     warning_fn: WarningFn,
 ) -> None:
-    await _emit_terminal_plan(context, "interrupted")
+    try:
+        await _emit_terminal_plan(context, "interrupted")
+    except StreamOwnershipLostError as emit_exc:
+        warning_fn(f"terminal plan ownership lost，外部 stop 已接管流终态: {emit_exc}")
     persist_run_message(
         context=context,
         persist_message_fn=persist_message_fn,
@@ -168,7 +171,14 @@ async def finalize_cancelled_run(
             raise
         except Exception as emit_exc:  # noqa: BLE001 — 非 Stream 写终止错误不能阻塞 cancel 传播
             warning_fn(f"emit run_interrupted 失败: {emit_exc}")
-        await finalize_stream_fn(context.conversation_id, success=False, error_msg="用户中止", task_id=context.task_id)
+        await finalize_stream_fn(
+            context.conversation_id,
+            success=False,
+            error_msg="用户中止",
+            task_id=context.task_id,
+            error_code="stream_interrupted",
+            error_data={"reason": "user_cancelled"},
+        )
     finally:
         _emit_itinerary_observation(
             context,

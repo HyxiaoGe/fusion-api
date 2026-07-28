@@ -76,6 +76,35 @@ def _source_plan_with_read_limit(urls: list[str], *, max_recommended: int):
 
 
 class NetworkToolBudgetTests(unittest.TestCase):
+    def test_deep_research_profile_uses_research_limit_without_overwriting_query_intent(self):
+        budget = NetworkToolBudget(profile="deep_research")
+
+        first_args, first_degraded = budget.prepare_web_search_args(
+            {"query": "OpenAI 官方发布说明", "intent": "official_source"}
+        )
+        second_args, second_degraded = budget.prepare_web_search_args(
+            {"query": "OpenAI 近期媒体报道", "intent": "freshness"}
+        )
+        third_args, third_degraded = budget.prepare_web_search_args(
+            {"query": "OpenAI 产品差异比较", "intent": "comparison"}
+        )
+
+        self.assertIsNone(first_degraded)
+        self.assertIsNone(second_degraded)
+        self.assertIsNone(third_degraded)
+        self.assertEqual(first_args["intent"], "official_source")
+        self.assertEqual(second_args["intent"], "freshness")
+        self.assertEqual(third_args["intent"], "comparison")
+        self.assertEqual(first_args["budget_decision"]["planned_search_limit"], 3)
+        self.assertEqual(second_args["budget_decision"]["planned_search_limit"], 3)
+        self.assertEqual(third_args["budget_decision"]["planned_search_limit"], 3)
+
+        fourth_args, fourth_degraded = budget.prepare_web_search_args(
+            {"query": "OpenAI 其他重复扩展", "intent": "comparison"}
+        )
+        self.assertIsNotNone(fourth_degraded)
+        self.assertEqual(fourth_args["budget_decision"]["reason_code"], "planned_search_limit_reached")
+
     def test_web_search_uses_standard_budget_when_intent_missing(self):
         budget = NetworkToolBudget()
 
@@ -561,8 +590,22 @@ class NetworkToolBudgetTests(unittest.TestCase):
         self.assertEqual(degraded.status, "degraded")
         self.assertTrue(degraded.data["budget_limited"])
 
-    def test_sixth_url_read_returns_degraded(self):
+    def test_standard_sixth_url_read_returns_degraded(self):
         budget = NetworkToolBudget()
+
+        for i in range(5):
+            _args, degraded = budget.prepare_url_read_args({"url": f"https://example.com/{i}"})
+            self.assertIsNone(degraded)
+
+        args, degraded = budget.prepare_url_read_args({"url": "https://example.com/5"})
+
+        self.assertEqual(args["url"], "https://example.com/5")
+        self.assertIsNotNone(degraded)
+        self.assertEqual(degraded.status, "degraded")
+        self.assertTrue(degraded.data["budget_limited"])
+
+    def test_deep_research_sixth_url_read_returns_degraded_like_standard(self):
+        budget = NetworkToolBudget(profile="deep_research")
 
         for i in range(5):
             _args, degraded = budget.prepare_url_read_args({"url": f"https://example.com/{i}"})

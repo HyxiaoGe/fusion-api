@@ -13,6 +13,7 @@ from app.services.stream.agent_loop_execution import AgentLoopExecutionContext
 from app.services.stream.agent_loop_outcome import AgentLoopExit
 from app.services.stream.agent_loop_policy import AgentLoopLimits, map_run_terminal_state
 from app.services.stream.agent_loop_request_prep import AgentLoopCallConfig
+from app.services.stream.research_evidence import assign_missing_source_reference_metadata
 
 AsyncFn = Callable[..., Awaitable[Any]]
 PersistMessageFn = Callable[..., Any]
@@ -82,6 +83,20 @@ async def _run_success_path(
     prepared_messages = await _prepare_messages(request=request, execution=execution, dependencies=dependencies)
     execution.state.content_blocks.extend(request.initial_content_blocks)
     execution.state.content_blocks.extend(prepared_messages.initial_content_blocks)
+    configure_research_state(
+        state=execution.state,
+        call_config=request.call_config,
+        file_ids=request.file_ids,
+        content_blocks=request.initial_content_blocks,
+        allow_read_success=False,
+    )
+    configure_research_state(
+        state=execution.state,
+        call_config=request.call_config,
+        file_ids=request.file_ids,
+        content_blocks=prepared_messages.initial_content_blocks,
+        allow_read_success=True,
+    )
 
     loop_outcome = await dependencies.run_agent_loop_fn(
         db=execution.completion_context.db,
@@ -125,6 +140,36 @@ async def _start_run(
         message_id=context.assistant_message_id,
         tools=request.call_config.announced_tools,
         config=_run_config(request.limits, request.call_config),
+    )
+
+
+def configure_research_state(
+    *,
+    state: Any,
+    call_config: AgentLoopCallConfig,
+    file_ids: list | None,
+    content_blocks: list[Any],
+    allow_read_success: bool = True,
+) -> None:
+    if getattr(call_config, "task_mode", "standard") != "deep_research":
+        return
+    state.configure_research_mode(network_required=True)
+    state.plan_coordinator.configure_initial_tool_requirements(
+        {
+            "web_search": 1,
+            "url_read": 3,
+        }
+    )
+    research_blocks = [
+        block
+        for block in content_blocks
+        if getattr(block, "type", None) in {"search", "url_read"}
+        or (isinstance(block, dict) and block.get("type") in {"search", "url_read"})
+    ]
+    assign_missing_source_reference_metadata(research_blocks)
+    state.record_research_content_blocks(
+        research_blocks,
+        allow_read_success=allow_read_success,
     )
 
 
@@ -240,6 +285,9 @@ def _run_config(limits: AgentLoopLimits, call_config: AgentLoopCallConfig | None
         "max_tool_calls": limits.max_tool_calls,
         "timeout_s": limits.total_timeout_s,
         "plan_mode": getattr(call_config, "plan_mode", "auto"),
+        "task_mode": getattr(call_config, "task_mode", "standard"),
+        "network_profile": getattr(call_config, "network_profile", "standard"),
+        "evidence_policy": getattr(call_config, "evidence_policy", "standard"),
         "runtime_config_versions": runtime_config_versions,
     }
     binding_fields = (

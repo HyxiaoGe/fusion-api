@@ -1,6 +1,7 @@
 import unittest
 
 from app.schemas.chat import SearchBlock, SearchSourceSummary, SourceReference, TextBlock, UrlBlock
+from app.services.final_answer_evidence import build_used_final_answer_evidence
 from app.services.source_evidence_ledger import stable_web_evidence_id
 
 
@@ -24,6 +25,101 @@ def search_block(refs: list[SourceReference]) -> SearchBlock:
 
 
 class FinalAnswerEvidenceTests(unittest.TestCase):
+    def test_explicit_read_citation_metadata_maps_to_read_source(self):
+        content_blocks = [
+            UrlBlock(
+                type="url_read",
+                url="https://example.com/report",
+                title="研究报告",
+                source_refs=[
+                    SourceReference(
+                        kind="url_read",
+                        title="研究报告",
+                        url="https://example.com/report",
+                        evidence_id="ev-report",
+                        citation_index=7,
+                    )
+                ],
+                source_count=1,
+            )
+        ]
+
+        evidence = build_used_final_answer_evidence(
+            content_blocks=content_blocks,
+            answer_text="结论来自原始报告。[7]",
+        )
+
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0]["id"], "ev-report")
+
+    def test_deep_research_marks_only_allowed_explicit_citations(self):
+        content_blocks = [
+            UrlBlock(
+                type="url_read",
+                url="https://unread.example/report",
+                title="未读来源",
+                source_refs=[
+                    SourceReference(
+                        kind="url_read",
+                        title="未读来源",
+                        url="https://unread.example/report",
+                        evidence_id="ev-unread",
+                        citation_index=1,
+                    )
+                ],
+                source_count=1,
+            ),
+            UrlBlock(
+                type="url_read",
+                url="https://read.example/report",
+                title="已读来源",
+                source_refs=[
+                    SourceReference(
+                        kind="url_read",
+                        title="已读来源",
+                        url="https://read.example/report",
+                        evidence_id="ev-read",
+                        citation_index=2,
+                    )
+                ],
+                source_count=1,
+            ),
+        ]
+
+        evidence = build_used_final_answer_evidence(
+            content_blocks=content_blocks,
+            answer_text="结论引用已读来源[2]，但文字还提到了 unread.example 和非法编号[99]。",
+            evidence_policy="deep_research_v1",
+            allowed_citation_indexes={2},
+        )
+
+        self.assertEqual([item["id"] for item in evidence], ["ev-read"])
+
+    def test_deep_research_does_not_use_standard_single_read_fallback(self):
+        block = UrlBlock(
+            type="url_read",
+            url="https://read.example/report",
+            title="已读来源",
+            source_refs=[
+                SourceReference(
+                    kind="url_read",
+                    title="已读来源",
+                    url="https://read.example/report",
+                    evidence_id="ev-read",
+                    citation_index=2,
+                )
+            ],
+        )
+
+        evidence = build_used_final_answer_evidence(
+            content_blocks=[block],
+            answer_text="没有显式引用，只提到 read.example。",
+            evidence_policy="deep_research_v1",
+            allowed_citation_indexes={2},
+        )
+
+        self.assertEqual(evidence, [])
+
     def test_marks_numbered_markdown_citation_as_used(self):
         from app.services.final_answer_evidence import build_used_final_answer_evidence
 

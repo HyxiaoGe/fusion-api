@@ -128,6 +128,21 @@ def test_duplicate_skipped_search_does_not_create_evidence_items():
     assert evidence == []
 
 
+def test_legacy_tool_result_without_data_builds_empty_evidence():
+    record = SimpleNamespace(
+        tool_call={"id": "call-legacy", "name": "web_search"},
+        tool_name="web_search",
+        result=SimpleNamespace(
+            status="success",
+            error_message=None,
+        ),
+        handler=None,
+    )
+
+    assert build_evidence_items(record) == []
+    assert build_tool_result_digest(record)["source_refs"] == []
+
+
 def test_plan_limited_search_does_not_create_evidence_items_or_generic_title():
     record = SimpleNamespace(
         tool_call={"id": "call-5", "name": "web_search"},

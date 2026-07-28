@@ -1,6 +1,47 @@
 from app.services.agent.progress_state import apply_progress_event, empty_progress_state
 
 
+def test_evidence_metadata_merge_preserves_selected_status_and_citation():
+    state = empty_progress_state(run_id="r1", message_id="m1")
+    state = apply_progress_event(
+        state,
+        {
+            "type": "evidence_item_upserted",
+            "protocol_version": 2,
+            "evidence": {
+                "id": "ev-1",
+                "kind": "web",
+                "status": "selected",
+                "title": "来源",
+                "url": "https://example.com/report",
+                "claim": "建议深读",
+                "snippet": "候选摘要",
+            },
+        },
+    )
+    state = apply_progress_event(
+        state,
+        {
+            "type": "evidence_item_upserted",
+            "protocol_version": 2,
+            "evidence": {
+                "id": "ev-1",
+                "kind": "web",
+                "status": "candidate",
+                "title": "来源",
+                "url": "https://example.com/report",
+                "claim": "搜索候选",
+                "snippet": None,
+                "citation_index": 7,
+            },
+        },
+    )
+
+    assert state["evidence"][0]["status"] == "selected"
+    assert state["evidence"][0]["snippet"] == "候选摘要"
+    assert state["evidence"][0]["citation_index"] == 7
+
+
 def test_run_progress_updated_replaces_progress():
     state = empty_progress_state(run_id="r1", message_id="m1")
 

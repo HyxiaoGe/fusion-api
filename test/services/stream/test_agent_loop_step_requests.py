@@ -135,6 +135,9 @@ class AgentLoopStepRequestTests(unittest.TestCase):
         self.assertIs(request.log_round_summary_fn, runtime.log_round_summary_fn)
         self.assertIs(request.warning_fn, runtime.warning_fn)
         self.assertIs(request.clock, runtime.clock)
+        self.assertEqual(request.task_mode, "standard")
+        self.assertEqual(request.evidence_policy, "standard")
+        self.assertIs(request.research_workset, state.research_workset)
         self.assertIs(request.on_step_started.__self__, state)
         self.assertIs(request.on_step_started.__func__, state.mark_current_step.__func__)
 

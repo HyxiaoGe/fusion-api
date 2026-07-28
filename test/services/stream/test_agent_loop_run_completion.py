@@ -34,6 +34,102 @@ def _context(state: AgentLoopState | None = None) -> AgentLoopRunCompletionConte
 
 
 class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_finalize_cancelled_continues_session_interrupt_after_terminal_plan_ownership_lost(self):
+        from app.services.stream_state_service import StreamOwnershipLostError
+
+        state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-1", mode="on"))
+        state.plan_coordinator.apply_model_update(
+            {
+                "reason": "执行研究",
+                "items": [
+                    {
+                        "id": "research",
+                        "title": "研究",
+                        "status": "running",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "answer",
+                        "title": "回答",
+                        "status": "pending",
+                        "kind": "answer",
+                        "depends_on": ["research"],
+                        "planned_tools": [],
+                    },
+                ],
+            }
+        )
+        emitter = AsyncMock()
+        emitter.plan_snapshot.side_effect = StreamOwnershipLostError("external stop")
+        interrupt_agent_run_fn = AsyncMock()
+        finalize_stream_fn = AsyncMock()
+        warnings = []
+
+        await finalize_cancelled_run(
+            context=replace(_context(state), emitter=emitter),
+            persist_message_fn=lambda *_args: None,
+            interrupt_agent_run_fn=interrupt_agent_run_fn,
+            finalize_stream_fn=finalize_stream_fn,
+            warning_fn=warnings.append,
+        )
+
+        interrupt_agent_run_fn.assert_awaited_once()
+        finalize_stream_fn.assert_awaited_once_with(
+            "conv-1",
+            success=False,
+            error_msg="用户中止",
+            task_id="task-1",
+            error_code="stream_interrupted",
+            error_data={"reason": "user_cancelled"},
+        )
+        self.assertTrue(state.terminal_emitted)
+        self.assertIn("terminal plan ownership lost", warnings[0])
+
+    async def test_finalize_cancelled_terminal_plan_ownership_lost_still_raises_status_write_failure(self):
+        from app.services.stream.run_finalizer import InterruptedStatusWriteError
+        from app.services.stream_state_service import StreamOwnershipLostError
+
+        state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-1", mode="on"))
+        state.plan_coordinator.apply_model_update(
+            {
+                "reason": "执行研究",
+                "items": [
+                    {
+                        "id": "research",
+                        "title": "研究",
+                        "status": "running",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "answer",
+                        "title": "回答",
+                        "status": "pending",
+                        "kind": "answer",
+                        "depends_on": ["research"],
+                        "planned_tools": [],
+                    },
+                ],
+            }
+        )
+        emitter = AsyncMock()
+        emitter.plan_snapshot.side_effect = StreamOwnershipLostError("external stop")
+        interrupt_agent_run_fn = AsyncMock(side_effect=InterruptedStatusWriteError("status write failed"))
+
+        with self.assertRaises(InterruptedStatusWriteError):
+            await finalize_cancelled_run(
+                context=replace(_context(state), emitter=emitter),
+                persist_message_fn=lambda *_args: None,
+                interrupt_agent_run_fn=interrupt_agent_run_fn,
+                finalize_stream_fn=AsyncMock(),
+                warning_fn=lambda _message: None,
+            )
+
+        interrupt_agent_run_fn.assert_awaited_once()
+
     async def test_failed_run_persists_context_even_without_visible_content(self):
         state = AgentLoopState()
         state.update_context(
@@ -92,7 +188,18 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(state.terminal_emitted)
         self.assertEqual(
             finalized,
-            [(("conv-1",), {"success": False, "error_msg": "用户中止", "task_id": "task-1"})],
+            [
+                (
+                    ("conv-1",),
+                    {
+                        "success": False,
+                        "error_msg": "用户中止",
+                        "task_id": "task-1",
+                        "error_code": "stream_interrupted",
+                        "error_data": {"reason": "user_cancelled"},
+                    },
+                )
+            ],
         )
         self.assertIn("外部 stop 已接管流终态", warnings[0])
 
@@ -352,7 +459,17 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("emit run_interrupted 失败: emit down", warnings)
         self.assertEqual(
             calls[1],
-            ("finalize", ("conv-1",), {"success": False, "error_msg": "用户中止", "task_id": "task-1"}),
+            (
+                "finalize",
+                ("conv-1",),
+                {
+                    "success": False,
+                    "error_msg": "用户中止",
+                    "task_id": "task-1",
+                    "error_code": "stream_interrupted",
+                    "error_data": {"reason": "user_cancelled"},
+                },
+            ),
         )
         self.assertFalse(state.terminal_emitted)
 

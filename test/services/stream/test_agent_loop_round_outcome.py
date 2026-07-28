@@ -78,6 +78,190 @@ def _step_context(step_id="step-outcome"):
 
 
 class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_deep_synthesis_unannounced_tool_protocol_goes_directly_to_safe_summary(self):
+        state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-synthesis", mode="on"))
+        state.configure_research_mode(network_required=True)
+        state.research_workset.successful_searches = 1
+        state.research_workset.successful_read_urls = {
+            "https://example.com/a",
+            "https://example.com/b",
+        }
+        state.plan_coordinator.source = "model"
+        state.plan_coordinator.revision = 1
+        state.plan_coordinator.items = [
+            {
+                "id": "answer",
+                "title": "综合回答",
+                "status": "running",
+                "kind": "answer",
+                "depends_on": [],
+                "planned_tools": [],
+            }
+        ]
+        state.mark_current_step("step-synthesis")
+        complete_step = AsyncMock()
+        warnings = []
+
+        outcome = await handle_agent_round_outcome(
+            request=AgentRoundOutcomeRequest(
+                db="db",
+                messages=[{"role": "user", "content": "深度调研"}],
+                state=state,
+                runtime=_runtime(
+                    complete_step_fn=complete_step,
+                    task_mode="deep_research",
+                    evidence_policy="deep_research_v1",
+                    plan_mode="on",
+                    warning_fn=warnings.append,
+                ),
+                step_number=4,
+                step_context=_step_context("step-synthesis"),
+                round_result=AgentRoundResult(
+                    reasoning_buf="",
+                    content_buf="",
+                    tool_calls=[
+                        {
+                            "id": "dsml-step-synthesis-1",
+                            "name": "update_plan",
+                            "arguments": "{}",
+                        }
+                    ],
+                    finish_reason="tool_calls",
+                    accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+                    announced_tool_names=frozenset(),
+                    output_deferred=True,
+                ),
+            )
+        )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.SUMMARY_REQUIRED)
+        self.assertEqual(outcome.summary_finish_reason, "research_evidence_repair_exhausted")
+        self.assertEqual(state.total_tool_calls, 0)
+        self.assertIsNone(state.current_step_id)
+        complete_step.assert_awaited_once()
+        self.assertTrue(any("未公告工具协议" in warning for warning in warnings))
+
+    async def test_deep_research_unknown_terminal_cannot_bypass_evidence_gate(self):
+        state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-unknown", mode="on"))
+        state.configure_research_mode(network_required=True)
+        state.plan_coordinator.source = "model"
+        state.plan_coordinator.revision = 1
+        state.plan_coordinator.items = [{"id": "research", "status": "running"}]
+        state.mark_current_step("step-unknown")
+
+        outcome = await handle_agent_round_outcome(
+            request=AgentRoundOutcomeRequest(
+                db="db",
+                messages=[{"role": "user", "content": "深度调研"}],
+                state=state,
+                runtime=_runtime(
+                    complete_step_fn=AsyncMock(),
+                    task_mode="deep_research",
+                    evidence_policy="deep_research_v1",
+                    plan_mode="on",
+                ),
+                step_number=1,
+                step_context=_step_context("step-unknown"),
+                round_result=AgentRoundResult(
+                    reasoning_buf="",
+                    content_buf="没有证据的终态。",
+                    tool_calls=[],
+                    finish_reason="length",
+                    accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+                    output_deferred=True,
+                ),
+            )
+        )
+
+        self.assertIsNone(outcome)
+        self.assertFalse(state.unknown_terminated)
+        self.assertEqual(state.research_repair_attempts, 1)
+        self.assertEqual(state.content_blocks, [])
+
+    async def test_deep_research_defers_invalid_answer_and_exhausts_after_two_repairs(self):
+        state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-research", mode="on"))
+        state.configure_research_mode(network_required=True)
+        messages = [{"role": "user", "content": "深度调研"}]
+        complete_step = AsyncMock()
+        runtime = _runtime(
+            complete_step_fn=complete_step,
+            task_mode="deep_research",
+            evidence_policy="deep_research_v1",
+            plan_mode="on",
+        )
+        state.plan_coordinator.source = "model"
+        state.plan_coordinator.revision = 1
+        state.plan_coordinator.items = [{"id": "research", "status": "running"}]
+
+        outcomes = []
+        for index in range(3):
+            state.mark_current_step(f"step-research-{index}")
+            outcomes.append(
+                await handle_agent_round_outcome(
+                    request=AgentRoundOutcomeRequest(
+                        db="db",
+                        messages=messages,
+                        state=state,
+                        runtime=runtime,
+                        step_number=index + 1,
+                        step_context=_step_context(f"step-research-{index}"),
+                        round_result=AgentRoundResult(
+                            reasoning_buf="",
+                            content_buf="没有真实来源的回答。",
+                            tool_calls=[],
+                            finish_reason="stop",
+                            accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+                            output_deferred=True,
+                        ),
+                    )
+                )
+            )
+
+        self.assertIsNone(outcomes[0])
+        self.assertIsNone(outcomes[1])
+        self.assertEqual(outcomes[2].exit, AgentLoopExit.SUMMARY_REQUIRED)
+        self.assertEqual(outcomes[2].summary_finish_reason, "research_evidence_repair_exhausted")
+        self.assertEqual(state.research_repair_attempts, 3)
+        self.assertEqual(state.content_blocks, [])
+        self.assertIn("至少完成一次有效搜索", messages[-1]["content"])
+
+    async def test_deep_research_with_files_still_requires_network_evidence(self):
+        state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-file", mode="on"))
+        state.configure_research_mode(network_required=True)
+        state.plan_coordinator.source = "model"
+        state.plan_coordinator.revision = 1
+        state.plan_coordinator.items = [{"id": "file", "status": "running"}]
+        state.mark_current_step("step-file")
+        messages = [{"role": "user", "content": "总结附件"}]
+
+        outcome = await handle_agent_round_outcome(
+            request=AgentRoundOutcomeRequest(
+                db="db",
+                messages=messages,
+                state=state,
+                runtime=_runtime(
+                    complete_step_fn=AsyncMock(),
+                    task_mode="deep_research",
+                    evidence_policy="deep_research_v1",
+                    plan_mode="on",
+                ),
+                step_number=1,
+                step_context=_step_context("step-file"),
+                round_result=AgentRoundResult(
+                    reasoning_buf="",
+                    content_buf="附件的核心结论如下。",
+                    tool_calls=[],
+                    finish_reason="stop",
+                    accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+                    output_deferred=True,
+                ),
+            )
+        )
+
+        self.assertIsNone(outcome)
+        self.assertEqual(state.content_blocks, [])
+        self.assertIn("至少完成一次有效搜索", messages[-1]["content"])
+
     async def test_on_mode_hidden_stop_without_plan_retries_then_uses_plan_repair_summary(self):
         state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-plan", mode="on"))
         messages = [{"role": "user", "content": "制定一个计划"}]

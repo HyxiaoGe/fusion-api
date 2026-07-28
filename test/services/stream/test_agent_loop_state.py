@@ -61,6 +61,23 @@ class AgentLoopStateTests(unittest.TestCase):
         self.assertEqual(state.consecutive_no_progress_search_results, 1)
         self.assertFalse(state.should_summarize_no_progress_search())
 
+    def test_file_research_enables_network_gate_after_any_network_tool_record(self):
+        state = AgentLoopState()
+        state.configure_research_mode(network_required=False)
+
+        state.record_research_content_blocks(
+            [
+                {
+                    "type": "url_read",
+                    "id": "url-read-failed",
+                    "status": "failed",
+                    "source_refs": [],
+                }
+            ]
+        )
+
+        self.assertTrue(state.research_network_required)
+
     def test_usage_content_and_terminal_mutations_are_explicit(self):
         state = AgentLoopState()
         block = TextBlock(type="text", id="blk-1", text="answer")

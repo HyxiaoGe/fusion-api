@@ -45,7 +45,7 @@ class ModelPlanUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reason: str = Field(min_length=1, max_length=240)
-    items: list[ModelPlanItem] = Field(min_length=2, max_length=12)
+    items: list[ModelPlanItem] = Field(min_length=2, max_length=6)
 
 
 @dataclass(frozen=True)
@@ -68,6 +68,7 @@ class PlanCoordinator:
     items: list[dict[str, Any]] = field(default_factory=list)
     valid_update_count: int = 0
     repair_attempt_count: int = 0
+    required_initial_tool_counts: dict[str, int] = field(default_factory=dict)
 
     @property
     def has_valid_model_plan(self) -> bool:
@@ -98,6 +99,21 @@ class PlanCoordinator:
         dependencies = {item.id: set(item.depends_on) for item in update.items}
         if _has_dependency_cycle(dependencies):
             return self._reject_repair("dependency_cycle")
+        if not self.has_valid_model_plan and self.required_initial_tool_counts:
+            required_tool_names = set(self.required_initial_tool_counts)
+            planned_counts = {
+                tool_name: sum(
+                    tool_name in item.planned_tools
+                    and not (required_tool_names - {tool_name}).intersection(item.planned_tools)
+                    for item in update.items
+                )
+                for tool_name in self.required_initial_tool_counts
+            }
+            if any(
+                planned_counts.get(tool_name, 0) < required_count
+                for tool_name, required_count in self.required_initial_tool_counts.items()
+            ):
+                return self._reject_repair("missing_required_initial_tool_coverage")
         if self.has_valid_model_plan:
             previous_status = {str(item.get("id")): item.get("status") for item in self.items}
             previous_items_by_id = {str(item.get("id")): item for item in self.items}
@@ -140,6 +156,19 @@ class PlanCoordinator:
     def record_repair_round(self) -> bool:
         self.repair_attempt_count += 1
         return self.repair_attempt_count > 2
+
+    def configure_initial_tool_requirements(self, requirements: dict[str, int]) -> None:
+        """配置首个模型计划必须预留的工具步骤数量。"""
+
+        self.required_initial_tool_counts = {
+            str(tool_name): int(count)
+            for tool_name, count in requirements.items()
+            if isinstance(tool_name, str)
+            and tool_name
+            and isinstance(count, int)
+            and not isinstance(count, bool)
+            and count > 0
+        }
 
     def adopt_observed_items(self, items: list[dict[str, Any]], *, reason: str = "legacy_observed") -> None:
         if self.has_valid_model_plan or self.mode == "off":
@@ -201,6 +230,21 @@ class PlanCoordinator:
     def contains_item(self, item_id: str) -> bool:
         return any(item.get("id") == item_id for item in self.items)
 
+    def has_active_tool_owner(self, tool_name: str) -> bool:
+        """判断当前计划是否存在可合法绑定该工具的未完成步骤。"""
+
+        return bool(self.active_plan_item_ids_for_tool(tool_name))
+
+    def active_plan_item_ids_for_tool(self, tool_name: str) -> list[str]:
+        """返回当前工具可绑定的未完成计划项 ID，供工具 schema 收窄取值。"""
+
+        return [
+            str(item.get("id"))
+            for item in self.items
+            if tool_name in (item.get("planned_tools") or [])
+            and item.get("status") not in {"completed", "failed", "skipped", "blocked"}
+        ]
+
     def plan_item_id_for_tool(
         self,
         tool_name: str,
@@ -208,10 +252,7 @@ class PlanCoordinator:
         requested_item_id: str | None = None,
     ) -> str | None:
         matches = [
-            str(item.get("id"))
-            for item in self.items
-            if tool_name in (item.get("planned_tools") or [])
-            and item.get("status") not in {"completed", "failed", "skipped", "blocked"}
+            *self.active_plan_item_ids_for_tool(tool_name),
         ]
         if requested_item_id is not None:
             return requested_item_id if requested_item_id in matches else None
@@ -231,12 +272,7 @@ class PlanCoordinator:
         result: list[str | None] = [None] * len(tool_names)
         for tool_name in dict.fromkeys(tool_names):
             call_indexes = [index for index, name in enumerate(tool_names) if name == tool_name]
-            candidates = [
-                str(item.get("id"))
-                for item in self.items
-                if tool_name in (item.get("planned_tools") or [])
-                and item.get("status") not in {"completed", "failed", "skipped", "blocked"}
-            ]
+            candidates = self.active_plan_item_ids_for_tool(tool_name)
             if len(candidates) == 1:
                 for index in call_indexes:
                     result[index] = candidates[0]

@@ -36,6 +36,7 @@ _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\
 class NetworkToolBudget:
     """限制一次 assistant run 内的联网工具调用次数。"""
 
+    profile: str = "standard"
     web_search_calls: int = 0
     url_read_calls: int = 0
     web_search_queries: list[str] = field(default_factory=list)
@@ -66,7 +67,10 @@ class NetworkToolBudget:
             normalized.pop("domains", None)
 
         planned_search_limit = _planned_search_call_limit(
-            intent, self.web_search_intents, network_config=network_config
+            intent,
+            self.web_search_intents,
+            profile=self.profile,
+            network_config=network_config,
         )
         previous_query_count = len(self.web_search_queries)
 
@@ -426,11 +430,12 @@ def _planned_search_call_limit(
     intent: str | None,
     previous_intents: list[str | None],
     *,
+    profile: str = "standard",
     network_config: dict | None = None,
 ) -> int:
     """控制真实 provider 搜索轮次，避免 LLM 机械扩写 query。"""
 
-    if intent == DEEP_RESEARCH_INTENT or DEEP_RESEARCH_INTENT in previous_intents:
+    if profile == DEEP_RESEARCH_INTENT or intent == DEEP_RESEARCH_INTENT or DEEP_RESEARCH_INTENT in previous_intents:
         return _network_int(network_config, "deep_research_planned_search_calls", DEEP_RESEARCH_PLANNED_SEARCH_CALLS)
     return _network_int(network_config, "default_planned_search_calls", DEFAULT_PLANNED_SEARCH_CALLS)
 

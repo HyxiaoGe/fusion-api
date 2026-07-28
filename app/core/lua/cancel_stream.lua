@@ -42,8 +42,17 @@ end
 -- 删除 lock
 redis.call("DEL", lock_key)
 
--- 写 error entry 让 SSE 读取器正常结束
-redis.call("XADD", stream_key, "*", "type", "error", "content", "用户中止")
+-- 写结构化 error entry 让 SSE 读取器正常结束，并与 orphan/replaced 等
+-- 中断终态共用 stream_interrupted 协议，避免前端误判为发送失败。
+redis.call(
+    "XADD",
+    stream_key,
+    "*",
+    "type",
+    "error",
+    "content",
+    '{"code":"stream_interrupted","message":"用户中止","data":{"reason":"user_cancelled"}}'
+)
 
 -- 更新 meta 状态
 redis.call("HSET", meta_key, "status", "cancelled")
