@@ -283,6 +283,213 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    def test_deep_research_read_plan_item_remains_active_until_two_distinct_reads(self):
+        state = AgentLoopState()
+        state.plan_coordinator.configure_initial_tool_requirements(
+            {
+                "web_search": 1,
+                "url_read": 1,
+            }
+        )
+        state.plan_coordinator.items = [
+            {
+                "id": "read",
+                "planned_tools": ["url_read"],
+            }
+        ]
+        record = ToolExecutionRecord(
+            tool_call={
+                "id": "tc-read",
+                "name": "url_read",
+                "plan_item_id": "read",
+            },
+            result=ToolResult(status="success", data={}),
+            handler=None,
+            block_id="blk-read",
+            log_id="log-read",
+        )
+
+        state.research_workset.successful_read_urls = {"https://example.com/one"}
+        self.assertEqual(
+            tool_round_module._plan_item_statuses_from_results(
+                [record],
+                agent_state=state,
+            ),
+            {"read": "running"},
+        )
+
+        state.research_workset.successful_read_urls.add("https://example.com/two")
+        self.assertEqual(
+            tool_round_module._plan_item_statuses_from_results(
+                [record],
+                agent_state=state,
+            ),
+            {"read": "completed"},
+        )
+
+    def test_multiple_read_owners_keep_each_items_actual_result(self):
+        state = AgentLoopState()
+        state.plan_coordinator.configure_initial_tool_requirements(
+            {
+                "web_search": 1,
+                "url_read": 1,
+            }
+        )
+        state.plan_coordinator.items = [
+            {"id": "read-ok", "planned_tools": ["url_read"]},
+            {"id": "read-failed", "planned_tools": ["url_read"]},
+        ]
+        state.research_workset.successful_read_urls = {
+            "https://example.com/one",
+            "https://example.com/two",
+        }
+
+        def record(plan_item_id: str, status: str) -> ToolExecutionRecord:
+            return ToolExecutionRecord(
+                tool_call={
+                    "id": f"tc-{plan_item_id}",
+                    "name": "url_read",
+                    "plan_item_id": plan_item_id,
+                },
+                result=ToolResult(status=status, data={}),
+                handler=None,
+                block_id=f"blk-{plan_item_id}",
+                log_id=f"log-{plan_item_id}",
+            )
+
+        statuses = tool_round_module._plan_item_statuses_from_results(
+            [
+                record("read-ok", "success"),
+                record("read-failed", "degraded"),
+            ],
+            agent_state=state,
+        )
+
+        self.assertEqual(
+            statuses,
+            {
+                "read-ok": "completed",
+                "read-failed": "failed",
+            },
+        )
+
+    async def test_deep_research_records_search_after_source_metadata_is_attached(self):
+        from app.schemas.chat import SearchSource
+        from app.services.stream.tool_context import ToolContextResolution
+        from app.services.tool_handlers.web_search import WebSearchHandler
+
+        state = AgentLoopState()
+        state.plan_coordinator.run_id = "run-research"
+        state.plan_coordinator.mode = "on"
+        state.plan_coordinator.source = "model"
+        state.plan_coordinator.revision = 1
+        state.plan_coordinator.items = [
+            {
+                "id": "search",
+                "title": "搜索候选来源",
+                "status": "pending",
+                "kind": "search",
+                "depends_on": [],
+                "planned_tools": ["web_search"],
+            },
+            {
+                "id": "read",
+                "title": "核验来源",
+                "status": "pending",
+                "kind": "read",
+                "depends_on": ["search"],
+                "planned_tools": ["url_read"],
+            },
+        ]
+        state.plan_coordinator.configure_initial_tool_requirements(
+            {
+                "web_search": 1,
+                "url_read": 1,
+            }
+        )
+        tool_call = {
+            "id": "tc-search",
+            "name": "web_search",
+            "arguments": '{"query":"PostgreSQL 18","_plan_item_id":"search"}',
+        }
+
+        async def execute_tools_fn(tool_calls, *args, **kwargs):
+            return [
+                ToolExecutionRecord(
+                    tool_call=tool_calls[0],
+                    result=ToolResult(
+                        status="success",
+                        data={
+                            "query": "PostgreSQL 18",
+                            "sources": [
+                                SearchSource(
+                                    title="PostgreSQL 18 文档",
+                                    url="https://example.com/postgresql-18",
+                                    description="官方版本说明",
+                                )
+                            ],
+                        },
+                    ),
+                    handler=WebSearchHandler(),
+                    block_id="blk-search",
+                    log_id="log-search",
+                )
+            ]
+
+        await handle_tool_calls_round(
+            request=tool_round_module.ToolRoundRequest(
+                db="db",
+                assistant_message_id="msg-search",
+                conversation_id="conv-search",
+                user_id="user-1",
+                model_id="deepseek-chat",
+                provider="deepseek",
+                content_blocks=[],
+                messages=[{"role": "user", "content": "研究 PostgreSQL 18"}],
+                tool_calls=[tool_call],
+                reasoning_buf="",
+                should_use_reasoning=True,
+                step_context=AgentStepContext(
+                    step_id="step-search",
+                    run_id="run-research",
+                    step_number=2,
+                    started_at=1.0,
+                    thinking_block_id="thinking-search",
+                    text_block_id="text-search",
+                ),
+                step_number=2,
+                run_id="run-research",
+                emitter=AsyncMock(),
+                session_cache=object(),
+                network_budget=object(),
+                call_kwargs={},
+                persist_message_fn=Mock(),
+                execute_tools_fn=execute_tools_fn,
+                complete_step_fn=AsyncMock(),
+                announced_tool_names=frozenset({"web_search"}),
+                agent_state=state,
+                resolve_tool_context_fn=AsyncMock(
+                    return_value=ToolContextResolution(
+                        executable_calls=[
+                            {
+                                "id": "tc-search",
+                                "name": "web_search",
+                                "arguments": '{"query":"PostgreSQL 18"}',
+                                "plan_item_id": "search",
+                            }
+                        ]
+                    )
+                ),
+            )
+        )
+
+        self.assertEqual(state.research_workset.successful_searches, 1)
+        self.assertEqual(
+            state.research_workset.unread_candidate_urls,
+            {"https://example.com/postgresql-18"},
+        )
+        self.assertEqual(state.plan_coordinator.items[0]["status"], "completed")
+
     async def test_on_mode_pairs_but_does_not_execute_unplanned_external_call(self):
         state = AgentLoopState()
         state.plan_coordinator.run_id = "run-1"

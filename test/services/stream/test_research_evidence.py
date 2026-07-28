@@ -1,6 +1,7 @@
 import unittest
 
 from app.schemas.chat import SearchBlock, SearchSourceSummary, SourceReference, UrlBlock
+from app.services.agent.plan_coordinator import PlanCoordinator
 from app.services.stream.research_evidence import (
     ResearchEvidenceWorkset,
     assign_missing_source_reference_metadata,
@@ -275,6 +276,42 @@ class ResearchEvidenceTests(unittest.TestCase):
         invalid = validate_research_completion(workset, "引用了不存在的来源。[9]")
         self.assertFalse(invalid.is_valid)
         self.assertEqual(invalid.reason, "invalid_citation")
+
+    def test_fallback_plan_keeps_full_research_evidence_gate(self):
+        coordinator = PlanCoordinator(run_id="run-fallback", mode="on")
+        coordinator.configure_initial_tool_requirements(
+            {
+                "web_search": 1,
+                "url_read": 1,
+            }
+        )
+        self.assertTrue(coordinator.adopt_research_fallback().accepted)
+        workset = ResearchEvidenceWorkset()
+
+        self.assertEqual(
+            resolve_deep_research_stage(workset, has_valid_plan=coordinator.has_valid_model_plan),
+            "search",
+        )
+        self.assertEqual(validate_research_completion(workset, "无依据结论").reason, "missing_search")
+
+        workset.record_content_blocks([_search_block()])
+        self.assertEqual(
+            resolve_deep_research_stage(workset, has_valid_plan=coordinator.has_valid_model_plan),
+            "read",
+        )
+        workset.record_content_blocks([_read_block("https://example.com/a", evidence_id="ev-a", citation_index=2)])
+        self.assertEqual(validate_research_completion(workset, "只有一条来源。[2]").reason, "insufficient_reads")
+
+        workset.record_content_blocks([_read_block("https://example.com/b", evidence_id="ev-b", citation_index=3)])
+        self.assertEqual(
+            resolve_deep_research_stage(workset, has_valid_plan=coordinator.has_valid_model_plan),
+            "synthesis",
+        )
+        self.assertTrue(validate_research_completion(workset, "已核验结论。[2]").is_valid)
+        self.assertEqual(
+            validate_research_completion(workset, "引用不存在来源。[9]").reason,
+            "invalid_citation",
+        )
 
     def test_completion_rejects_insufficient_reads(self):
         workset = ResearchEvidenceWorkset()

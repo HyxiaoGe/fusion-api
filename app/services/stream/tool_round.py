@@ -569,11 +569,6 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
         run_id=request.run_id,
     )
     executed_results = [record for record in results if not record.reused]
-    if request.agent_state is not None:
-        tool_statuses = _plan_item_statuses_from_results(results)
-        result_snapshot = request.agent_state.plan_coordinator.mark_tool_results(tool_statuses)
-        if result_snapshot is not None:
-            await request.emitter.plan_snapshot(**result_snapshot)
     _record_tool_repairs(request.agent_state, executed_results)
     _record_itinerary_tool_observations(request.agent_state, executed_results)
     reused_limited_tool_calls, not_executed_tool_calls = _partition_successfully_reusable_calls(
@@ -597,6 +592,14 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
         control_tool_responses=control_result.tool_responses,
     )
     _record_research_workset(request.agent_state, results, built_content_blocks=built_content_blocks)
+    if request.agent_state is not None:
+        tool_statuses = _plan_item_statuses_from_results(
+            results,
+            agent_state=request.agent_state,
+        )
+        result_snapshot = request.agent_state.plan_coordinator.mark_tool_results(tool_statuses)
+        if result_snapshot is not None:
+            await request.emitter.plan_snapshot(**result_snapshot)
     await _emit_citation_source_evidence(
         request,
         results=results,
@@ -646,6 +649,8 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
 
 def _plan_item_statuses_from_results(
     results: list[ToolExecutionRecord],
+    *,
+    agent_state: AgentLoopState | None = None,
 ) -> dict[str, str]:
     """同一计划项可能并行调用多个工具，以最严重结果决定本轮状态。"""
 
@@ -667,7 +672,22 @@ def _plan_item_statuses_from_results(
         candidates.setdefault(plan_item_id, []).append(status)
 
     priority = {"completed": 1, "running": 2, "failed": 3}
-    return {item_id: max(statuses, key=priority.__getitem__) for item_id, statuses in candidates.items()}
+    resolved = {item_id: max(statuses, key=priority.__getitem__) for item_id, statuses in candidates.items()}
+    if agent_state is None or agent_state.plan_coordinator.required_initial_tool_counts.get("url_read", 0) <= 0:
+        return resolved
+
+    read_owner_ids = {
+        str(item.get("id"))
+        for item in agent_state.plan_coordinator.items
+        if isinstance(item, dict) and isinstance(item.get("id"), str) and "url_read" in item.get("planned_tools", [])
+    }
+    if len(read_owner_ids) != 1:
+        return resolved
+    read_item_ids = read_owner_ids.intersection(resolved)
+    read_status = "completed" if len(agent_state.research_workset.successful_read_urls) >= 2 else "running"
+    for item_id in read_item_ids:
+        resolved[item_id] = read_status
+    return resolved
 
 
 def _record_tool_repairs(

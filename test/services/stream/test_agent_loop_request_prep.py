@@ -70,7 +70,8 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("互补查询", research_messages[0]["content"])
         self.assertIn("正文使用 [n] 引用", research_messages[0]["content"])
         self.assertIn("planned_tools 必须覆盖 web_search", research_messages[0]["content"])
-        self.assertIn("至少三个未完成步骤包含 url_read", research_messages[0]["content"])
+        self.assertIn("至少一个未完成步骤包含 url_read", research_messages[0]["content"])
+        self.assertIn("同一个读取步骤可以读取多个独立来源", research_messages[0]["content"])
         self.assertIn("web_search 与 url_read 必须由不同计划步骤负责", research_messages[0]["content"])
         self.assertEqual(standard_messages, [{"role": "user", "content": "调研"}])
 
