@@ -8,6 +8,7 @@ class DeployAuthConfigTests(unittest.TestCase):
         self.app_config = (root / "app" / "core" / "config.py").read_text(encoding="utf-8")
         self.env_example = (root / ".env.example").read_text(encoding="utf-8")
         self.workflow = (root / ".github" / "workflows" / "deploy.yml").read_text(encoding="utf-8")
+        self.compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
         self.ci_requirements = (root / "requirements-ci.txt").read_text(encoding="utf-8")
 
     def test_deploy_dev_overrides_auth_internal_base_to_docker_dns(self):
@@ -75,6 +76,7 @@ class DeployAuthConfigTests(unittest.TestCase):
     def test_deploy_passes_mcp_policy_and_credentials_without_erasing_server_env(self):
         self.assertIn("DEPLOY_DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}", self.workflow)
         self.assertIn("DEPLOY_AMAP_MCP_API_KEY: ${{ secrets.AMAP_MCP_API_KEY }}", self.workflow)
+        self.assertIn("DEPLOY_CONTEXT7_API_KEY: ${{ secrets.CONTEXT7_API_KEY }}", self.workflow)
         self.assertIn(
             'export DASHSCOPE_API_KEY="${DEPLOY_DASHSCOPE_API_KEY:-${DASHSCOPE_API_KEY:-}}"',
             self.workflow,
@@ -84,7 +86,20 @@ class DeployAuthConfigTests(unittest.TestCase):
             self.workflow,
         )
         self.assertIn(
-            'export MCP_ALLOWED_HOSTS="${DEPLOY_MCP_ALLOWED_HOSTS:-${MCP_ALLOWED_HOSTS:-learn.microsoft.com,dashscope.aliyuncs.com,mcp.amap.com}}"',
+            'export CONTEXT7_API_KEY="${DEPLOY_CONTEXT7_API_KEY:-${CONTEXT7_API_KEY:-}}"',
+            self.workflow,
+        )
+        self.assertIn("append_csv_value()", self.workflow)
+        self.assertIn(
+            'export MCP_ALLOWED_HOSTS="$(append_csv_value "${MCP_ALLOWED_HOSTS}" "mcp.context7.com")"',
+            self.workflow,
+        )
+        self.assertIn(
+            'export MCP_ALLOWED_CREDENTIAL_REFS="$(append_csv_value "${MCP_ALLOWED_CREDENTIAL_REFS}" "CONTEXT7_API_KEY")"',
+            self.workflow,
+        )
+        self.assertIn(
+            'export MCP_ALLOWED_HOSTS="${DEPLOY_MCP_ALLOWED_HOSTS:-${MCP_ALLOWED_HOSTS:-learn.microsoft.com,dashscope.aliyuncs.com,mcp.amap.com,mcp.context7.com}}"',
             self.workflow,
         )
         for variable in (
@@ -104,10 +119,23 @@ class DeployAuthConfigTests(unittest.TestCase):
             "MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS",
             "DASHSCOPE_API_KEY",
             "AMAP_MCP_API_KEY",
+            "CONTEXT7_API_KEY",
         ):
             self.assertIn(f"- {variable}=${{{variable}", self.workflow)
         self.assertNotIn("echo ${DASHSCOPE_API_KEY}", self.workflow)
         self.assertNotIn("echo ${AMAP_MCP_API_KEY}", self.workflow)
+        self.assertNotIn("echo ${CONTEXT7_API_KEY}", self.workflow)
+        self.assertNotIn('if [ -z "${CONTEXT7_API_KEY}" ]', self.workflow)
+        self.assertIn("- CONTEXT7_API_KEY=${CONTEXT7_API_KEY:-}", self.compose)
+        self.assertIn("Context7 MCP policy configuration ok", self.workflow)
+        self.assertIn(
+            '"mcp.context7.com" not in settings.RESOLVED_MCP_ALLOWED_HOSTS',
+            self.workflow,
+        )
+        self.assertIn(
+            '"CONTEXT7_API_KEY" not in settings.RESOLVED_MCP_ALLOWED_CREDENTIAL_REFS',
+            self.workflow,
+        )
 
     def test_mcp_timeout_defaults_keep_client_budget_inside_admin_request_budget(self):
         self.assertIn("MCP_IDEMPOTENT_TOTAL_TIMEOUT_SECONDS=12", self.env_example)
@@ -129,7 +157,17 @@ class DeployAuthConfigTests(unittest.TestCase):
         self.assertIn("MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS:-30", self.workflow)
 
     def test_mcp_default_hosts_include_public_no_auth_acceptance_server(self):
-        default_hosts = "learn.microsoft.com,dashscope.aliyuncs.com,mcp.amap.com"
+        default_hosts = "learn.microsoft.com,dashscope.aliyuncs.com,mcp.amap.com,mcp.context7.com"
+        default_credential_refs = "DASHSCOPE_API_KEY,AMAP_MCP_API_KEY,CONTEXT7_API_KEY"
         self.assertIn(f'"{default_hosts}"', self.app_config)
         self.assertIn(f"MCP_ALLOWED_HOSTS={default_hosts}", self.env_example)
         self.assertIn(f"MCP_ALLOWED_HOSTS:-{default_hosts}", self.workflow)
+        self.assertIn(f'"{default_credential_refs}"', self.app_config)
+        self.assertIn(
+            f"MCP_ALLOWED_CREDENTIAL_REFS={default_credential_refs}",
+            self.env_example,
+        )
+        self.assertIn(
+            f"MCP_ALLOWED_CREDENTIAL_REFS:-{default_credential_refs}",
+            self.workflow,
+        )

@@ -184,6 +184,7 @@ jobs:
           DEPLOY_MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS: ${{ vars.MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS }}
           DEPLOY_DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           DEPLOY_AMAP_MCP_API_KEY: ${{ secrets.AMAP_MCP_API_KEY }}
+          DEPLOY_CONTEXT7_API_KEY: ${{ secrets.CONTEXT7_API_KEY }}
           DEPLOY_FLYAI_API_KEY: ${{ secrets.FLYAI_API_KEY }}
         run: |
           cd ~/project/fusion
@@ -193,8 +194,8 @@ jobs:
           set +a
           export PROMPTHUB_API_KEY="${DEPLOY_PROMPTHUB_API_KEY:-}"
           export PROMPTHUB_SYNC_MODE="${DEPLOY_PROMPTHUB_SYNC_MODE:-disabled}"
-          export MCP_ALLOWED_HOSTS="${DEPLOY_MCP_ALLOWED_HOSTS:-${MCP_ALLOWED_HOSTS:-learn.microsoft.com,dashscope.aliyuncs.com,mcp.amap.com}}"
-          export MCP_ALLOWED_CREDENTIAL_REFS="${DEPLOY_MCP_ALLOWED_CREDENTIAL_REFS:-${MCP_ALLOWED_CREDENTIAL_REFS:-DASHSCOPE_API_KEY,AMAP_MCP_API_KEY}}"
+          export MCP_ALLOWED_HOSTS="${DEPLOY_MCP_ALLOWED_HOSTS:-${MCP_ALLOWED_HOSTS:-learn.microsoft.com,dashscope.aliyuncs.com,mcp.amap.com,mcp.context7.com}}"
+          export MCP_ALLOWED_CREDENTIAL_REFS="${DEPLOY_MCP_ALLOWED_CREDENTIAL_REFS:-${MCP_ALLOWED_CREDENTIAL_REFS:-DASHSCOPE_API_KEY,AMAP_MCP_API_KEY,CONTEXT7_API_KEY}}"
           export MCP_CONNECT_TIMEOUT_SECONDS="${DEPLOY_MCP_CONNECT_TIMEOUT_SECONDS:-${MCP_CONNECT_TIMEOUT_SECONDS:-5}}"
           export MCP_CALL_TIMEOUT_SECONDS="${DEPLOY_MCP_CALL_TIMEOUT_SECONDS:-${MCP_CALL_TIMEOUT_SECONDS:-15}}"
           export MCP_IDEMPOTENT_TOTAL_TIMEOUT_SECONDS="${DEPLOY_MCP_IDEMPOTENT_TOTAL_TIMEOUT_SECONDS:-${MCP_IDEMPOTENT_TOTAL_TIMEOUT_SECONDS:-12}}"
@@ -209,6 +210,21 @@ jobs:
           export MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS="${DEPLOY_MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS:-${MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS:-30}}"
           export DASHSCOPE_API_KEY="${DEPLOY_DASHSCOPE_API_KEY:-${DASHSCOPE_API_KEY:-}}"
           export AMAP_MCP_API_KEY="${DEPLOY_AMAP_MCP_API_KEY:-${AMAP_MCP_API_KEY:-}}"
+          export CONTEXT7_API_KEY="${DEPLOY_CONTEXT7_API_KEY:-${CONTEXT7_API_KEY:-}}"
+          append_csv_value() {
+            current="$1"
+            required="$2"
+            if [ -z "${current}" ]; then
+              printf '%s' "${required}"
+              return
+            fi
+            case ",${current}," in
+              *",${required},"*) printf '%s' "${current}" ;;
+              *) printf '%s,%s' "${current}" "${required}" ;;
+            esac
+          }
+          export MCP_ALLOWED_HOSTS="$(append_csv_value "${MCP_ALLOWED_HOSTS}" "mcp.context7.com")"
+          export MCP_ALLOWED_CREDENTIAL_REFS="$(append_csv_value "${MCP_ALLOWED_CREDENTIAL_REFS}" "CONTEXT7_API_KEY")"
           export FLYAI_API_KEY="${DEPLOY_FLYAI_API_KEY:-}"
           if [ -z "${FLYAI_API_KEY}" ]; then
             echo "FlyAI 发布密钥未配置，拒绝以静默禁用方式部署"
@@ -330,6 +346,7 @@ jobs:
                 - MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS=${MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS}
                 - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:-}
                 - AMAP_MCP_API_KEY=${AMAP_MCP_API_KEY:-}
+                - CONTEXT7_API_KEY=${CONTEXT7_API_KEY:-}
                 - ENABLE_FLYAI_TRAVEL_TOOLS=true
                 - FLYAI_ADAPTER_BASE_URL=http://flyai-adapter:8080
                 - FLYAI_ADAPTER_TOKEN=${FLYAI_ADAPTER_TOKEN}
@@ -402,6 +419,16 @@ jobs:
           if not settings.FLYAI_ADAPTER_TOKEN:
               raise SystemExit("FlyAI adapter token is missing")
           print("FlyAI adapter configuration ok")
+          PY
+
+          docker exec -i fusion-api python - <<'PY'
+          from app.core.config import settings
+
+          if "mcp.context7.com" not in settings.RESOLVED_MCP_ALLOWED_HOSTS:
+              raise SystemExit("Context7 MCP host policy is missing")
+          if "CONTEXT7_API_KEY" not in settings.RESOLVED_MCP_ALLOWED_CREDENTIAL_REFS:
+              raise SystemExit("Context7 MCP credential policy is missing")
+          print("Context7 MCP policy configuration ok")
           PY
 
           docker inspect fusion-api --format '{{range .Mounts}}{{println .Destination}}{{end}}' | grep -qx '/app/storage/files'

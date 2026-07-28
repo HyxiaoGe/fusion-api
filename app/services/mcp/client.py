@@ -17,6 +17,8 @@ import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+from app.services.mcp.provider_profiles import endpoint_auth_binding_is_allowed
+
 logger = logging.getLogger(__name__)
 
 # SDK 传输层会记录原始 session id、URL 和异常；Fusion 只保留下方固定字段的脱敏审计日志。
@@ -210,6 +212,13 @@ class McpClientManager:
         """只校验静态安全边界，不要求部署环境此刻已有凭证值。"""
 
         _validate_endpoint(config.endpoint_url, self.policy.allowed_hosts)
+        if not endpoint_auth_binding_is_allowed(
+            config.endpoint_url,
+            auth_type=config.auth_type,
+            auth_name=config.auth_name,
+            credential_ref=config.credential_ref,
+        ):
+            raise McpClientError("invalid_auth", "MCP 鉴权配置无效")
         auth_type = config.auth_type
         if auth_type == "none":
             if config.auth_name or config.credential_ref:

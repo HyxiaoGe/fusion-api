@@ -491,12 +491,14 @@ async def execute_one_tool_call(request: ToolExecutionBatchRequest, tool_call: d
         )
     validation_errors = _validate_handler_arguments(handler, args)
     if validation_errors:
-        result = _build_argument_preflight_result(
-            request,
-            handler.tool_name,
-            error_code="arguments_schema_invalid",
-            validation_errors=validation_errors,
-        )
+        result = _build_handler_local_preflight_result(handler, validation_errors)
+        if result is None:
+            result = _build_argument_preflight_result(
+                request,
+                handler.tool_name,
+                error_code="arguments_schema_invalid",
+                validation_errors=validation_errors,
+            )
         return await _complete_preflight_tool_result(
             request=request,
             tool_call=tool_call,
@@ -651,6 +653,30 @@ def _validate_handler_arguments(
         ):
             errors.append(f"{field}:{error_type}")
     return list(dict.fromkeys(errors))[:8]
+
+
+def _build_handler_local_preflight_result(
+    handler: Any,
+    validation_errors: list[str],
+):
+    """允许 handler 安全投影状态型预检结果；异常时回退通用参数修复。"""
+
+    builder = getattr(type(handler), "build_local_preflight_result", None)
+    if not callable(builder):
+        return None
+    try:
+        result = builder(handler, list(validation_errors))
+    except Exception as error:  # noqa: BLE001 — 不记录可能包含业务数据的异常文本
+        logger.warning(
+            "工具自定义预检结果构造失败: tool=%s error_type=%s",
+            getattr(handler, "tool_name", ""),
+            type(error).__name__,
+        )
+        return None
+
+    from app.services.tool_handlers import ToolResult
+
+    return result if isinstance(result, ToolResult) else None
 
 
 def _argument_repair_key(tool_name: str) -> str:

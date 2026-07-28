@@ -6,6 +6,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from app.services.mcp.agent_tools import (
+    Context7McpAgentToolHandler,
+    McpAgentToolBinding,
+)
+from app.services.mcp.context7_guard import Context7RunLibraryRegistry
 from app.services.mcp.tool_contract import (
     MAX_TOOL_ARGUMENT_ARRAY_ITEMS,
     MAX_TOOL_ARGUMENT_JSON_BYTES,
@@ -53,6 +58,61 @@ class ToolRetryPolicyTests(unittest.TestCase):
 
 
 class DynamicToolExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_context7_unresolved_library_id_preserves_recovery_instruction(self):
+        handler = Context7McpAgentToolHandler(
+            binding=McpAgentToolBinding(
+                alias="mcp_context7_query",
+                server_id="context7-server",
+                server_name="Context7",
+                provider="context7",
+                remote_tool_name="query-docs",
+                config_version=1,
+                tool_label="Context7 query-docs",
+                definition_sha256="a" * 64,
+            ),
+            remote_executor=MagicMock(),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "libraryId": {"type": "string", "minLength": 3, "maxLength": 200},
+                    "query": {"type": "string", "minLength": 1, "maxLength": 500},
+                },
+                "required": ["libraryId", "query"],
+                "additionalProperties": False,
+            },
+            library_registry=Context7RunLibraryRegistry(),
+        )
+        handler.log = AsyncMock()
+
+        records = await execute_tools_parallel(
+            [
+                {
+                    "id": "call-context7-unresolved",
+                    "name": handler.tool_name,
+                    "arguments": json.dumps(
+                        {
+                            "libraryId": "/websites/fastapi_tiangolo",
+                            "query": "How do I define lifespan events?",
+                        }
+                    ),
+                }
+            ],
+            "conv-context7",
+            "user-1",
+            "model-1",
+            "openai",
+            tool_handlers={handler.tool_name: handler},
+            runtime_context=SimpleNamespace(argument_repair_state={}, step_number=1),
+        )
+
+        record = records[0]
+        self.assertEqual(record.result.data["error_code"], "context7_library_id_unresolved")
+        self.assertTrue(record.result.data["local_preflight"])
+        self.assertNotIn("repair", record.result.data)
+        self.assertIn("请先调用库解析工具", record.format_llm_context())
+        self.assertNotIn("改写成不含代码块", record.format_llm_context())
+        handler.log.assert_awaited_once()
+
     def test_success_signature_failure_log_does_not_leak_raw_exception(self):
         secret = "Authorization: Bearer SIGNATURE_SECRET"
 
