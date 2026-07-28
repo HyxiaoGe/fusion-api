@@ -307,6 +307,151 @@ class McpClientManagerTests(unittest.TestCase):
 
         self.assertEqual(connector.connections[0]["headers"], {"Authorization": "Bearer test-secret"})
 
+    def test_context7_custom_header_uses_allowlisted_credential(self):
+        secret = "context7-test-secret"
+        connector = FakeConnector(FakeSession())
+        manager = McpClientManager(
+            policy=build_policy(
+                allowed_hosts=frozenset({"mcp.context7.com"}),
+                allowed_credential_refs=frozenset({"CONTEXT7_API_KEY"}),
+            ),
+            connector=connector,
+            environ={"CONTEXT7_API_KEY": f"  {secret}\r\n"},
+        )
+        config = build_config(
+            provider="context7",
+            endpoint_url="https://mcp.context7.com/mcp",
+            auth_type="header",
+            auth_name="CONTEXT7_API_KEY",
+            credential_ref="CONTEXT7_API_KEY",
+        )
+
+        asyncio.run(manager.test_connection(config))
+
+        self.assertEqual(
+            connector.connections[0]["headers"],
+            {"CONTEXT7_API_KEY": secret},
+        )
+
+    def test_context7_configured_credential_fails_closed_when_secret_is_missing(self):
+        connector = FakeConnector(FakeSession())
+        manager = McpClientManager(
+            policy=build_policy(
+                allowed_hosts=frozenset({"mcp.context7.com"}),
+                allowed_credential_refs=frozenset({"CONTEXT7_API_KEY"}),
+            ),
+            connector=connector,
+            environ={},
+        )
+        config = build_config(
+            provider="context7",
+            endpoint_url="https://mcp.context7.com/mcp",
+            auth_type="header",
+            auth_name="CONTEXT7_API_KEY",
+            credential_ref="CONTEXT7_API_KEY",
+        )
+
+        with self.assertRaises(McpClientError) as raised:
+            asyncio.run(manager.test_connection(config))
+
+        self.assertEqual(raised.exception.code, "credential_unavailable")
+        self.assertNotIn("CONTEXT7_API_KEY", str(raised.exception))
+        self.assertEqual(connector.connections, [])
+
+    def test_context7_credential_is_bound_to_official_host_and_exact_header(self):
+        invalid_configs = (
+            build_config(
+                provider="context7",
+                endpoint_url="https://dashscope.aliyuncs.com/api/v1/mcps/WebSearch/mcp",
+                auth_type="header",
+                auth_name="CONTEXT7_API_KEY",
+                credential_ref="CONTEXT7_API_KEY",
+            ),
+            build_config(
+                provider="context7",
+                endpoint_url="https://mcp.context7.com/mcp",
+                auth_type="header",
+                auth_name="X-API-Key",
+                credential_ref="CONTEXT7_API_KEY",
+            ),
+            build_config(
+                provider="context7",
+                endpoint_url="https://mcp.context7.com/mcp",
+                auth_type="header",
+                auth_name="CONTEXT7_API_KEY",
+                credential_ref="DASHSCOPE_API_KEY",
+            ),
+        )
+        for config in invalid_configs:
+            connector = FakeConnector(FakeSession())
+            manager = McpClientManager(
+                policy=build_policy(
+                    allowed_hosts=frozenset(
+                        {
+                            "dashscope.aliyuncs.com",
+                            "mcp.context7.com",
+                        }
+                    ),
+                    allowed_credential_refs=frozenset(
+                        {
+                            "DASHSCOPE_API_KEY",
+                            "CONTEXT7_API_KEY",
+                        }
+                    ),
+                ),
+                connector=connector,
+                environ={
+                    "DASHSCOPE_API_KEY": "dashscope-secret",
+                    "CONTEXT7_API_KEY": "context7-secret",
+                },
+            )
+            with self.subTest(config=config):
+                with self.assertRaises(McpClientError) as raised:
+                    asyncio.run(manager.test_connection(config))
+                self.assertEqual(raised.exception.code, "invalid_auth")
+                self.assertEqual(connector.connections, [])
+
+    def test_provider_credentials_cannot_be_sent_to_each_others_official_hosts(self):
+        cases = (
+            build_config(
+                provider="context7",
+                endpoint_url="https://mcp.context7.com/mcp",
+                auth_type="query",
+                auth_name="key",
+                credential_ref="AMAP_MCP_API_KEY",
+            ),
+            build_config(
+                provider="amap",
+                endpoint_url="https://mcp.amap.com/mcp",
+                auth_type="header",
+                auth_name="CONTEXT7_API_KEY",
+                credential_ref="CONTEXT7_API_KEY",
+            ),
+        )
+        for config in cases:
+            connector = FakeConnector(FakeSession())
+            manager = McpClientManager(
+                policy=build_policy(
+                    allowed_hosts=frozenset({"mcp.amap.com", "mcp.context7.com"}),
+                    allowed_credential_refs=frozenset(
+                        {
+                            "AMAP_MCP_API_KEY",
+                            "CONTEXT7_API_KEY",
+                        }
+                    ),
+                ),
+                connector=connector,
+                environ={
+                    "AMAP_MCP_API_KEY": "amap-secret",
+                    "CONTEXT7_API_KEY": "context7-secret",
+                },
+            )
+            with self.subTest(config=config):
+                with self.assertRaises(McpClientError) as raised:
+                    asyncio.run(manager.test_connection(config))
+                self.assertEqual(raised.exception.code, "invalid_auth")
+                self.assertEqual(connector.connections, [])
+
     def test_exception_message_and_log_never_leak_bearer_secret(self):
         secret = "test-secret"
         session = FakeSession(initialize_error=httpx.LocalProtocolError(f"Illegal Authorization: Bearer {secret}"))
@@ -392,12 +537,19 @@ class McpClientManagerTests(unittest.TestCase):
 
         session = RateLimitedSession()
         manager = McpClientManager(
-            policy=build_policy(allowed_hosts=frozenset({"mcp.amap.com"})),
+            policy=build_policy(
+                allowed_hosts=frozenset({"mcp.amap.com"}),
+                allowed_credential_refs=frozenset({"AMAP_MCP_API_KEY"}),
+            ),
             connector=FakeConnector(session),
-            environ={"DASHSCOPE_API_KEY": "credential-secret"},
+            environ={"AMAP_MCP_API_KEY": "credential-secret"},
         )
         config = build_config(
+            provider="amap",
             endpoint_url="https://mcp.amap.com/mcp",
+            auth_type="query",
+            auth_name="key",
+            credential_ref="AMAP_MCP_API_KEY",
             allowed_tools=["search"],
         )
 

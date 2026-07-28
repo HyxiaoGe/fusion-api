@@ -24,6 +24,12 @@ from app.services.mcp.amap_product_tools import (
     build_amap_product_binding,
 )
 from app.services.mcp.client import McpClientError, McpClientManager
+from app.services.mcp.context7_guard import (
+    CONTEXT7_QUERY_TOOL,
+    CONTEXT7_RESOLVE_TOOL,
+    Context7RunLibraryRegistry,
+    validate_context7_arguments,
+)
 from app.services.mcp.flyai_travel_tools import (
     FLYAI_TRAVEL_DEFINITIONS,
     FlyAiTravelAdapterClient,
@@ -32,7 +38,11 @@ from app.services.mcp.flyai_travel_tools import (
     build_flyai_travel_binding,
     build_flyai_user_scope,
 )
-from app.services.mcp.provider_profiles import is_official_amap_endpoint, tool_is_allowed_for_endpoint
+from app.services.mcp.provider_profiles import (
+    is_official_amap_endpoint,
+    is_official_context7_endpoint,
+    tool_is_allowed_for_endpoint,
+)
 from app.services.mcp.runtime import get_mcp_client_manager
 from app.services.mcp.server_service import MCP_TOOL_UNAVAILABLE_MESSAGE, McpServerService
 from app.services.mcp.tool_contract import (
@@ -615,6 +625,7 @@ class McpAgentToolHandler(BaseToolHandler):
         *,
         error_code: str,
         validation_errors: list[str] | None = None,
+        local_preflight: bool = False,
     ) -> ToolResult:
         data = {
             **self._binding_metadata(),
@@ -622,12 +633,97 @@ class McpAgentToolHandler(BaseToolHandler):
         }
         if validation_errors:
             data["validation_errors"] = validation_errors[:8]
+        if local_preflight:
+            data["local_preflight"] = True
         return ToolResult(
             status="failed",
             duration_ms=_duration_ms(started_at),
             data=data,
             error_message=MCP_AGENT_TOOL_ERROR_MESSAGE,
         )
+
+
+class Context7McpAgentToolHandler(McpAgentToolHandler):
+    """限制 Context7 外发参数，并强制 query-docs 使用本轮解析结果。"""
+
+    def __init__(self, *, library_registry: Context7RunLibraryRegistry, **kwargs):
+        super().__init__(**kwargs)
+        self.library_registry = library_registry
+
+    def validate_arguments(self, args: Any) -> list[dict[str, str]]:
+        errors = [
+            *super().validate_arguments(args),
+            *validate_context7_arguments(self.binding.remote_tool_name, args),
+        ]
+        if (
+            not errors
+            and self.binding.remote_tool_name == CONTEXT7_QUERY_TOOL
+            and isinstance(args, dict)
+            and not self.library_registry.contains(args.get("libraryId"))
+        ):
+            errors.append({"field": "libraryId", "code": "unresolved"})
+        return list({(item["field"], item["code"]): item for item in errors}.values())[:8]
+
+    def build_local_preflight_result(self, validation_errors: list[str]) -> ToolResult | None:
+        """保留 Context7 状态型预检原因，避免通用 schema 修复误导模型。"""
+
+        if validation_errors != ["libraryId:unresolved"]:
+            return None
+        return self._failed_result(
+            time.monotonic(),
+            error_code="context7_library_id_unresolved",
+            validation_errors=validation_errors,
+            local_preflight=True,
+        )
+
+    async def execute(self, args: dict) -> ToolResult:
+        started_at = time.monotonic()
+        policy_errors = self.validate_arguments(args)
+        if policy_errors:
+            error_code = (
+                "context7_library_id_unresolved"
+                if any(item["code"] == "unresolved" for item in policy_errors)
+                else "context7_arguments_rejected"
+            )
+            return self._failed_result(
+                started_at,
+                error_code=error_code,
+                validation_errors=[f"{item['field']}:{item['code']}" for item in policy_errors],
+                local_preflight=True,
+            )
+        if self.binding.remote_tool_name == CONTEXT7_QUERY_TOOL and not self.library_registry.contains(
+            args.get("libraryId")
+        ):
+            return self._failed_result(
+                started_at,
+                error_code="context7_library_id_unresolved",
+                local_preflight=True,
+            )
+
+        result = await super().execute(args)
+        if (
+            self.binding.remote_tool_name == CONTEXT7_RESOLVE_TOOL
+            and result.status == "success"
+            and "payload" in result.data
+        ):
+            self.library_registry.register_from_payload(result.data["payload"])
+        return result
+
+    def format_llm_context(
+        self,
+        result: ToolResult,
+        *,
+        citation_numbers: list[int] | None = None,
+    ) -> str:
+        error_code = result.data.get("error_code")
+        if error_code == "context7_library_id_unresolved":
+            return "技术文档库标识尚未解析。请先调用库解析工具，再使用本轮返回的 Library ID 查询文档。"
+        if error_code in {"arguments_schema_invalid", "context7_arguments_rejected"}:
+            return (
+                "技术文档检索参数未通过本地安全检查。"
+                "请将问题改写成不含代码块、凭据、个人数据或内部实现的单行公开技术问题后再试。"
+            )
+        return super().format_llm_context(result, citation_numbers=citation_numbers)
 
 
 def _project_remote_validation_errors(
@@ -753,6 +849,7 @@ def load_mcp_agent_tools(
     definitions: list[dict[str, Any]] = []
     handlers: dict[str, BaseToolHandler] = {}
     audit_bindings: list[dict[str, Any]] = []
+    context7_registries: dict[str, Context7RunLibraryRegistry] = {}
     if (
         settings.ENABLE_FLYAI_TRAVEL_TOOLS
         and user_id
@@ -812,12 +909,23 @@ def load_mcp_agent_tools(
             definition_sha256 = agent_tool_definition_sha256(row, snapshot)
             binding = _build_binding(row, snapshot["name"], alias, definition_sha256)
             definitions.append(definition)
-            handlers[alias] = McpAgentToolHandler(
-                binding=binding,
-                remote_executor=remote_executor,
-                input_schema=definition["function"]["parameters"],
-                max_llm_context_bytes=resolved_limits.max_llm_context_bytes,
-            )
+            handler_kwargs = {
+                "binding": binding,
+                "remote_executor": remote_executor,
+                "input_schema": definition["function"]["parameters"],
+                "max_llm_context_bytes": resolved_limits.max_llm_context_bytes,
+            }
+            if is_official_context7_endpoint(str(row.endpoint_url)):
+                library_registry = context7_registries.setdefault(
+                    str(row.id),
+                    Context7RunLibraryRegistry(),
+                )
+                handlers[alias] = Context7McpAgentToolHandler(
+                    library_registry=library_registry,
+                    **handler_kwargs,
+                )
+            else:
+                handlers[alias] = McpAgentToolHandler(**handler_kwargs)
             audit_bindings.append(binding.to_audit_dict())
 
     return McpAgentToolSet(

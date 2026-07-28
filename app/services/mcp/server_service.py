@@ -260,7 +260,7 @@ class McpServerService:
             raise ApiException.bad_request("allowed_tools 只能选择已发现工具")
         endpoint_allowlist = endpoint_tool_allowlist(endpoint_url)
         if endpoint_allowlist is not None and any(tool not in endpoint_allowlist for tool in allowed_tools):
-            raise ApiException.bad_request("高德 MCP 仅允许已批准的只读工具")
+            raise ApiException.bad_request("官方 MCP 端点仅允许已批准的工具")
 
     @staticmethod
     def _build_candidate(row, changes: dict[str, Any]) -> dict[str, Any]:

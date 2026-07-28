@@ -26,6 +26,7 @@ AMAP_READ_ONLY_TOOLS = [
     "maps_around_search",
     "maps_search_detail",
 ]
+CONTEXT7_READ_ONLY_TOOLS = ["resolve-library-id", "query-docs"]
 
 
 class FakeRepository:
@@ -218,7 +219,8 @@ class McpServerServiceTests(unittest.TestCase):
                         McpServerUpdate(allowed_tools=[*AMAP_READ_ONLY_TOOLS, blocked_tool]),
                     )
                 self.assertEqual(raised.exception.status_code, 400)
-                self.assertIn("高德", raised.exception.message)
+                self.assertIn("官方 MCP 端点", raised.exception.message)
+                self.assertNotIn("高德", raised.exception.message)
 
     def test_non_amap_endpoint_keeps_discovered_subset_behavior(self):
         future_tool = {"name": "provider_future_tool", "description": None, "input_schema": {"type": "object"}}
@@ -228,6 +230,70 @@ class McpServerServiceTests(unittest.TestCase):
         updated = service.update_server(row.id, McpServerUpdate(allowed_tools=["provider_future_tool"]))
 
         self.assertEqual(updated.allowed_tools, ["provider_future_tool"])
+
+    def test_context7_endpoint_only_allows_approved_documentation_tools(self):
+        blocked_tool = "future-write-tool"
+        discovered_tools = [
+            {
+                "name": name,
+                "description": name,
+                "input_schema": {"type": "object"},
+            }
+            for name in [*CONTEXT7_READ_ONLY_TOOLS, blocked_tool]
+        ]
+        row = build_row(
+            provider="context7",
+            endpoint_url="https://mcp.context7.com/mcp",
+            auth_type="header",
+            auth_name="CONTEXT7_API_KEY",
+            credential_ref="CONTEXT7_API_KEY",
+            allowed_tools=[],
+            discovered_tools=discovered_tools,
+        )
+        service = McpServerService(FakeRepository([row]), FakeClientManager(), clock=lambda: NOW)
+
+        updated = service.update_server(
+            row.id,
+            McpServerUpdate(allowed_tools=CONTEXT7_READ_ONLY_TOOLS),
+        )
+        self.assertEqual(updated.allowed_tools, CONTEXT7_READ_ONLY_TOOLS)
+
+        with self.assertRaises(ApiException) as raised:
+            service.update_server(
+                row.id,
+                McpServerUpdate(allowed_tools=[*CONTEXT7_READ_ONLY_TOOLS, blocked_tool]),
+            )
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("官方 MCP 端点", raised.exception.message)
+        self.assertNotIn("高德", raised.exception.message)
+
+    def test_context7_refresh_drops_unapproved_authorization(self):
+        tools = [
+            {
+                "name": name,
+                "description": name,
+                "input_schema": {"type": "object"},
+            }
+            for name in [*CONTEXT7_READ_ONLY_TOOLS, "future-write-tool"]
+        ]
+        row = build_row(
+            provider="context7",
+            endpoint_url="https://mcp.context7.com/mcp",
+            auth_type="header",
+            auth_name="CONTEXT7_API_KEY",
+            credential_ref="CONTEXT7_API_KEY",
+            allowed_tools=[*CONTEXT7_READ_ONLY_TOOLS, "future-write-tool"],
+            discovered_tools=tools,
+        )
+        service = McpServerService(
+            FakeRepository([row]),
+            FakeClientManager(tools=tools),
+            clock=lambda: NOW,
+        )
+
+        refreshed = asyncio.run(service.refresh_tools(row.id))
+
+        self.assertEqual(refreshed.allowed_tools, CONTEXT7_READ_ONLY_TOOLS)
 
     def test_amap_refresh_drops_stale_disallowed_authorization(self):
         tools = [

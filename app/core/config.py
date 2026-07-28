@@ -143,11 +143,11 @@ class Settings(BaseSettings):
     # 远程 MCP Client：仅允许精确配置的 HTTPS 主机和凭证环境变量引用。
     MCP_ALLOWED_HOSTS: str = os.getenv(
         "MCP_ALLOWED_HOSTS",
-        "learn.microsoft.com,dashscope.aliyuncs.com,mcp.amap.com",
+        "learn.microsoft.com,dashscope.aliyuncs.com,mcp.amap.com,mcp.context7.com",
     )
     MCP_ALLOWED_CREDENTIAL_REFS: str = os.getenv(
         "MCP_ALLOWED_CREDENTIAL_REFS",
-        "DASHSCOPE_API_KEY,AMAP_MCP_API_KEY",
+        "DASHSCOPE_API_KEY,AMAP_MCP_API_KEY,CONTEXT7_API_KEY",
     )
     MCP_CONNECT_TIMEOUT_SECONDS: float = float(os.getenv("MCP_CONNECT_TIMEOUT_SECONDS", "5"))
     MCP_CALL_TIMEOUT_SECONDS: float = float(os.getenv("MCP_CALL_TIMEOUT_SECONDS", "15"))

@@ -769,6 +769,31 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
             len(invalid_calls) - tool_round_module.MAX_LOCAL_PREFLIGHT_ATTEMPTS_PER_ROUND,
         )
 
+    def test_local_preflight_result_does_not_increment_actual_global_tool_count(self):
+        tool_call = {
+            "id": "tc-context7-unresolved",
+            "name": "mcp_context7_query",
+            "arguments": "{}",
+        }
+        record = ToolExecutionRecord(
+            tool_call=tool_call,
+            result=ToolResult(
+                status="failed",
+                data={
+                    "error_code": "context7_library_id_unresolved",
+                    "local_preflight": True,
+                },
+            ),
+            handler=None,
+            block_id="block-context7",
+            log_id="log-context7",
+        )
+
+        self.assertEqual(
+            tool_round_module._actual_tool_execution_count([tool_call], [record]),
+            0,
+        )
+
     def test_unknown_tool_with_invalid_json_cannot_bypass_global_limit(self):
         unknown_calls = [
             {
