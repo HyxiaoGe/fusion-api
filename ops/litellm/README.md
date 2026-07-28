@@ -254,6 +254,8 @@ schedule 仍是 LiteLLM 进程内存状态，所以由独立
 
 - 已按 6 小时健康调度时只 GET，不产生写入；
 - 未调度或周期错误时才调用一次 schedule API，再 GET 复核；
+- 新建调度后若 LiteLLM 尚未给出 `last_run` / `next_run`，只执行一次
+  `reload/model_cost_map` 完成冷启动，再次 GET 复核；
 - stale、fallback 或异常不会通过反复重排掩盖，service 非零退出并保留
   journal 证据。
 

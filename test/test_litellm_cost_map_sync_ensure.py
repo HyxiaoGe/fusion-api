@@ -16,6 +16,15 @@ def status(*, scheduled=True, interval=6, stale=False):
     }
 
 
+def cold_status(*, scheduled=True, interval=6):
+    return {
+        "scheduled": scheduled,
+        "interval_hours": interval,
+        "last_run": None,
+        "next_run": None,
+    }
+
+
 class SequenceClient:
     def __init__(self, payloads):
         self.payloads = list(payloads)
@@ -63,6 +72,42 @@ class LiteLLMCostMapSyncEnsureTests(unittest.TestCase):
         url, kwargs = client.post_calls[0]
         self.assertEqual(url, "http://litellm/schedule/model_cost_map_reload")
         self.assertEqual(kwargs["params"], {"hours": 6})
+
+    def test_new_schedule_bootstraps_missing_timestamps_with_one_reload(self):
+        client = SequenceClient(
+            [
+                status(scheduled=False, interval=None),
+                cold_status(),
+                status(),
+            ]
+        )
+
+        result = ensure.ensure_sync(base_url="http://litellm", master_key="secret", apply=True, client=client)
+
+        self.assertTrue(result["healthy"])
+        self.assertEqual(result["action"], "scheduled_and_reloaded")
+        self.assertEqual(len(client.post_calls), 2)
+        schedule_url, schedule_kwargs = client.post_calls[0]
+        reload_url, reload_kwargs = client.post_calls[1]
+        self.assertEqual(schedule_url, "http://litellm/schedule/model_cost_map_reload")
+        self.assertEqual(schedule_kwargs["params"], {"hours": 6})
+        self.assertEqual(reload_url, "http://litellm/reload/model_cost_map")
+        self.assertNotIn("params", reload_kwargs)
+
+    def test_bootstrap_reload_failure_remains_unhealthy(self):
+        client = SequenceClient(
+            [
+                status(scheduled=False, interval=None),
+                cold_status(),
+                cold_status(),
+            ]
+        )
+
+        result = ensure.ensure_sync(base_url="http://litellm", master_key="secret", apply=True, client=client)
+
+        self.assertFalse(result["healthy"])
+        self.assertEqual(result["action"], "scheduled_and_reloaded")
+        self.assertEqual(len(client.post_calls), 2)
 
     def test_wrong_interval_is_repairable(self):
         client = SequenceClient([status(interval=12), status()])

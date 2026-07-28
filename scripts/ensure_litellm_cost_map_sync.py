@@ -1,7 +1,8 @@
 """幂等确保 LiteLLM 运行时成本表按期刷新，并输出脱敏状态。
 
 默认只读；只有显式 ``--apply`` 且当前未调度或周期不符时，才调用一次
-LiteLLM schedule API。陈旧、fallback 或响应异常只告警，不通过反复重排掩盖。
+LiteLLM schedule API。若新建调度后仍缺少首次运行时间戳，再执行一次成本表刷新
+完成冷启动。陈旧、fallback 或响应异常只告警，不通过反复重排掩盖。
 """
 
 from __future__ import annotations
@@ -39,6 +40,17 @@ def _repairable(payload: Mapping[str, Any], *, expected_interval_hours: float) -
         isinstance(interval, (int, float))
         and not isinstance(interval, bool)
         and float(interval) != expected_interval_hours
+    )
+
+
+def _needs_bootstrap_reload(payload: Mapping[str, Any], *, expected_interval_hours: float) -> bool:
+    interval = payload.get("interval_hours")
+    return (
+        payload.get("scheduled") is True
+        and isinstance(interval, (int, float))
+        and not isinstance(interval, bool)
+        and float(interval) == expected_interval_hours
+        and (not payload.get("last_run") or not payload.get("next_run"))
     )
 
 
@@ -87,6 +99,28 @@ def ensure_sync(
                 expected_interval_hours=expected_interval_hours,
                 max_staleness_hours=max_staleness_hours,
             )
+            if _needs_bootstrap_reload(
+                after_payload,
+                expected_interval_hours=expected_interval_hours,
+            ):
+                response = client.post(
+                    f"{base_url.rstrip('/')}/reload/model_cost_map",
+                    headers={"Authorization": f"Bearer {master_key}"},
+                    timeout=timeout_seconds,
+                )
+                response.raise_for_status()
+                action = "scheduled_and_reloaded"
+                after_payload = fetch_status(
+                    base_url=base_url,
+                    master_key=master_key,
+                    timeout_seconds=timeout_seconds,
+                    client=client,
+                )
+                after = evaluate_status(
+                    after_payload,
+                    expected_interval_hours=expected_interval_hours,
+                    max_staleness_hours=max_staleness_hours,
+                )
     return {
         "mode": "apply" if apply else "dry_run",
         "action": action,
