@@ -73,6 +73,52 @@
 
 这些项目必须在实际 dev 升级授权和门禁阶段继续完成，不能由本隔离证据替代。
 
+## Provider wildcard 隔离实证
+
+2026-07-29 使用同一固定 v1.93.0 digest、临时 PostgreSQL 和本地
+OpenAI-compatible mock 再次验证候选路由。LiteLLM、数据库和 mock 均位于
+`--internal` 独立 Docker 网络，没有发布主机端口；配置只使用假 key，未访问
+任何模型厂商或产生费用。验证结束后容器、网络和临时配置全部删除。
+
+隔离配置：
+
+```yaml
+model_list:
+  - model_name: candidate/acme/*
+    litellm_params:
+      model: openai/*
+      api_base: http://mock:8080/v1
+      api_key: fake-key
+```
+
+实测客户端请求 `candidate/acme/new-model` 返回 HTTP 200；mock 收到的实际
+upstream model 为 `new-model`，Authorization 为预设假 key，而 LiteLLM 对
+客户端保持公共模型名 `candidate/acme/new-model`。这证明 provider-specific
+wildcard 能在共享 `openai/*` adapter 下正确剥离公共前缀并绑定独立 endpoint。
+
+v1.93.0 的普通 `/model/info` 会把 wildcard 展开为 LiteLLM 已知目录：
+
+- 展开行共享同一个 `model_info.id`；
+- 尚未进入 LiteLLM 目录的 `candidate/acme/new-model` 不会出现，但仍可路由；
+- 使用该共享 id 查询
+  `/model/info?litellm_model_id=<id>` 才会返回原始
+  `candidate/acme/* -> openai/*` 契约；
+- 原始响应包含 `api_base`，但会完全省略 `litellm_params.api_key`。
+
+因此 provider `/models` 是 day-0 新模型发现的事实源，普通 `/model/info`
+不能替代；协调器必须通过 deployment id 回查原始 route，并由后续真实预准入
+请求验证对应 endpoint 上的凭据可用性。
+
+临时 virtual key allowlist 实测：
+
+- `candidate/acme/*` 可调用该公共命名空间下的未知新模型；
+- `candidate/acme/new-model` 只允许该具体模型，其他模型返回 HTTP 403；
+- `openai/*` 无法授权 `candidate/acme/...` 公共请求名，同样返回 HTTP 403。
+
+治理链路因此只接受公共 `candidate/<provider>/*` allowlist，拒绝全局 `*`、
+underlying `openai/*` 和意外额外模型组。候选 route 还必须是配置层 deployment；
+`model_info.db_model=true` 会被拒绝，避免 wildcard 进入 Fusion 模型选择器。
+
 ## 真实只读候选发现
 
 使用 dev 当前厂商凭据、live LiteLLM `/model/info` 和一次性 `v1.93.0` 工具容器运行候选协调器；没有调用模型 completion，也没有 LiteLLM 写操作。
