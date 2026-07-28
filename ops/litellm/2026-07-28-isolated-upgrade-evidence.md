@@ -99,10 +99,16 @@ wildcard 能在共享 `openai/*` adapter 下正确剥离公共前缀并绑定独
 v1.93.0 的普通 `/model/info` 会把 wildcard 展开为 LiteLLM 已知目录：
 
 - 展开行共享同一个 `model_info.id`；
+- route 自定义的
+  `model_info.metadata={provider_key: acme, purpose: candidate_preflight}`
+  会被每条展开行完整保留；
+- 配置层 route 的展开行明确返回 `model_info.db_model=false`；
 - 尚未进入 LiteLLM 目录的 `candidate/acme/new-model` 不会出现，但仍可路由；
 - 使用该共享 id 查询
   `/model/info?litellm_model_id=<id>` 才会返回原始
   `candidate/acme/* -> openai/*` 契约；
+- 原始 route 同样完整保留 provider metadata，并明确返回
+  `model_info.db_model=false`；
 - 原始响应包含 `api_base`，但会完全省略 `litellm_params.api_key`。
 
 因此 provider `/models` 是 day-0 新模型发现的事实源，普通 `/model/info`

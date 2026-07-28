@@ -2,20 +2,28 @@
 Description=确保 Fusion LiteLLM 运行时成本表同步
 After=network-online.target
 Wants=network-online.target
-ConditionPathExists=%h/project/fusion/fusion-api/scripts/ensure_litellm_cost_map_sync.py
-ConditionPathExists=%h/.config/fusion/litellm-governance.env
-ConditionFileIsExecutable=%h/.local/share/fusion/litellm-governance-venv/bin/python
+AssertPathExists=%h/project/fusion/fusion-api/scripts/ensure_litellm_cost_map_sync.py
+AssertPathExists=%h/project/fusion/fusion-api/scripts/run_litellm_governance_unit.py
+AssertPathExists=%h/project/litellm-proxy/.env
+AssertPathExists=%h/.config/fusion/litellm-governance.env
+AssertFileIsExecutable=%h/.local/share/fusion/litellm-governance-venv/bin/python
 
 [Service]
 Type=oneshot
 WorkingDirectory=%h/project/fusion/fusion-api
-EnvironmentFile=%h/.config/fusion/litellm-governance.env
+Environment=PYTHONNOUSERSITE=1
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+UnsetEnvironment=PYTHONPATH PYTHONHOME LD_PRELOAD
 UMask=0077
-ExecStartPre=%h/.local/share/fusion/litellm-governance-venv/bin/python scripts/check_litellm_governance_runtime.py
-ExecStart=%h/.local/share/fusion/litellm-governance-venv/bin/python scripts/ensure_litellm_cost_map_sync.py \
-  --expected-interval-hours 6 \
-  --max-staleness-hours 12 \
-  --apply
+ExecStart=%h/.local/share/fusion/litellm-governance-venv/bin/python -m scripts.run_litellm_governance_unit \
+  --proxy-env %h/project/litellm-proxy/.env \
+  --governance-env %h/.config/fusion/litellm-governance.env \
+  --require-env LITELLM_MASTER_KEY \
+  -- \
+  %h/.local/share/fusion/litellm-governance-venv/bin/python -m scripts.ensure_litellm_cost_map_sync \
+    --expected-interval-hours 6 \
+    --max-staleness-hours 12 \
+    --apply
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

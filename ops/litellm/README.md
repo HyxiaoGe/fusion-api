@@ -1,6 +1,8 @@
 # LiteLLM 运维门禁
 
 本目录保存 LiteLLM 的可版本化升级约束，不包含密钥、数据库地址或厂商配置。
+除明确写出绝对路径的备份集成示例外，下面所有 `python -m scripts...` 命令都
+从 `fusion-api` 仓库根目录执行。
 
 ## Compose 合并检查
 
@@ -18,7 +20,7 @@ docker compose \
 ## 升级前检查
 
 ```bash
-python scripts/check_litellm_upgrade_readiness.py \
+python -m scripts.check_litellm_upgrade_readiness \
   --base-url http://127.0.0.1:4000 \
   --primary-backup /path/to/latest-postgres-dump.sql.gz \
   --secondary-backup-marker /path/to/latest-restic-success.marker
@@ -57,7 +59,7 @@ fi
 不要在 `finally`、失败分支或独立定时任务中无条件生成 marker。升级门禁使用同一路径：
 
 ```bash
-python scripts/check_litellm_upgrade_readiness.py \
+python -m scripts.check_litellm_upgrade_readiness \
   --base-url http://127.0.0.1:4000 \
   --primary-backup /path/to/latest-postgres-dump.sql.gz \
   --secondary-backup-marker "$HOME/backups/restic-success.json"
@@ -67,7 +69,7 @@ python scripts/check_litellm_upgrade_readiness.py \
 
 ```bash
 restic snapshots --tag daily --latest 1 --json > /tmp/restic-latest.json
-python scripts/write_restic_success_marker.py \
+python -m scripts.write_restic_success_marker \
   --snapshots-json /tmp/restic-latest.json \
   --output "$HOME/backups/restic-success.json"
 ```
@@ -120,7 +122,7 @@ provider `/models` 为事实源；`/model/info` 只用于验证代理路由和�
 key。单个 provider route 异常只隔离该 provider；公共 key 异常才阻塞全部。
 
 ```bash
-python scripts/orchestrate_litellm_model_candidates.py \
+python -m scripts.orchestrate_litellm_model_candidates \
   --registry /path/to/provider-registry.json \
   --output /path/to/reports/model-candidates.json
 ```
@@ -134,11 +136,11 @@ python scripts/orchestrate_litellm_model_candidates.py \
 LiteLLM Proxy 内部的 6 小时刷新负责运行时计费；候选管道另外保存同源的官方成本表快照，用于可审计地补齐新模型价格和能力：
 
 ```bash
-python scripts/fetch_litellm_cost_map.py \
+python -m scripts.fetch_litellm_cost_map \
   --output /path/to/reports/litellm-cost-map.json \
   --status-output /path/to/reports/litellm-cost-map-status.json
 
-python scripts/enrich_litellm_model_candidates.py \
+python -m scripts.enrich_litellm_model_candidates \
   --candidate-report /path/to/reports/model-candidates.json \
   --registry /path/to/provider-registry.json \
   --cost-map /path/to/reports/litellm-cost-map.json \
@@ -162,7 +164,7 @@ override 必须符合 `candidate-overrides.example.json`：审批记录包含策
 日常调度使用统一入口，不再手工拼接成本抓取、发现、富化和准入计划：
 
 ```bash
-python scripts/run_litellm_governance_cycle.py \
+python -m scripts.run_litellm_governance_cycle \
   --registry /path/to/litellm-provider-registry.json \
   --output-dir /path/to/litellm-governance \
   --acceptance-dir /path/to/litellm-acceptance \
@@ -199,8 +201,9 @@ mkdir -p \
   "$HOME/.local/share/fusion/litellm-acceptance" \
   "$HOME/backups/litellm-governance"
 
-install -m 0600 /path/to/litellm-governance.env \
+install -m 0600 ops/litellm/litellm-governance.env.example \
   "$HOME/.config/fusion/litellm-governance.env"
+# 直接编辑 0600 目标文件，只填写候选专用 key；不要复制 master/provider keys。
 install -m 0600 /path/to/litellm-provider-registry.json \
   "$HOME/.config/fusion/litellm-provider-registry.json"
 install -m 0644 ops/litellm/fusion-litellm-governance.service \
@@ -213,6 +216,38 @@ install -m 0644 ops/litellm/fusion-litellm-cost-sync.timer \
   "$HOME/.config/systemd/user/fusion-litellm-cost-sync.timer"
 ```
 
+两个 service 不使用 systemd `EnvironmentFile=`。它会在 `ExecStartPre`
+之前把文件中的任意变量注入进程，无法作为权限前置门禁。单元改由
+`run_litellm_governance_unit.py` 先以 `O_NOFOLLOW` 打开并用 `fstat` 检查现有
+`$HOME/project/litellm-proxy/.env`，通过后才按 registry 白名单读取 master
+和 provider keys，避免复制第二份凭据后发生轮换漂移。独立
+`litellm-governance.env` 只保存 `LITELLM_BASE_URL`、
+`LITELLM_CANDIDATE_KEY` 等治理专用变量。启用前两份文件都必须归当前用户所有、
+是普通文件且权限不宽于 `0600`：
+
+```bash
+chmod 0600 \
+  "$HOME/project/litellm-proxy/.env" \
+  "$HOME/.config/fusion/litellm-governance.env"
+
+"$HOME/.local/share/fusion/litellm-governance-venv/bin/python" \
+  -m scripts.check_litellm_governance_runtime \
+  --secret-file "$HOME/project/litellm-proxy/.env" \
+  --secret-file "$HOME/.config/fusion/litellm-governance.env"
+```
+
+wrapper 不输出文件内容；缺失文件、符号链接、owner 不匹配以及任何
+group/other 权限都会在解析前失败。通过后也只向目标任务注入
+`LITELLM_MASTER_KEY`、registry 声明且以 `_API_KEY` 结尾的 provider key，
+以及三个治理变量；`PYTHONPATH`、`PYTHONHOME`、`LD_PRELOAD` 和其他任意
+`.env` 变量不会进入目标环境。治理 env 若重复保存 master/provider key 同样
+失败。registry 也用同样的 no-follow/owner/权限门禁读取，并被复制到只读 sealed
+memfd；wrapper 和治理子进程消费同一份不可修改快照，避免密钥白名单与 endpoint
+配置在两次读取间漂移。dev 当前 LiteLLM `.env` 为 `0664`，因此发布时必须先在明确授权下收紧
+权限，不能直接启用 timer。systemd 单元对脚本、配置、目录和运行时使用
+`Assert*` 而不是会静默跳过的 `Condition*`；缺失依赖必须进入 failed 状态并
+保留 journal 证据。
+
 启用 timer 属于运维变更，必须在目标环境发布授权后执行。运行时成本表的
 schedule 仍是 LiteLLM 进程内存状态，所以由独立
 `fusion-litellm-cost-sync.timer` 每 15 分钟幂等检查：
@@ -222,10 +257,13 @@ schedule 仍是 LiteLLM 进程内存状态，所以由独立
 - stale、fallback 或异常不会通过反复重排掩盖，service 非零退出并保留
   journal 证据。
 
+成本守护使用固定 Asia/Shanghai `OnCalendar`，不依赖上一次 service 成功激活
+时间；即使前一次因权限或配置 assert 失败，后续 15 分钟触发仍会保留。
+
 可以先用默认 dry-run 手工查看计划：
 
 ```bash
-python scripts/ensure_litellm_cost_map_sync.py
+python -m scripts.ensure_litellm_cost_map_sync
 ```
 
 统一周期保存的是官方成本表审计快照，不能替代 Proxy 内部刷新；成本同步
@@ -237,10 +275,10 @@ python scripts/ensure_litellm_cost_map_sync.py
 计划；只有明确接受一次真实收费验收时才使用 `--apply`：
 
 ```bash
-python scripts/check_litellm_candidate_preflight.py candidate.json --dry-run
+python -m scripts.check_litellm_candidate_preflight candidate.json --dry-run
 
 LITELLM_CANDIDATE_KEY=... \
-python scripts/check_litellm_candidate_preflight.py candidate.json --apply \
+python -m scripts.check_litellm_candidate_preflight candidate.json --apply \
   > /path/to/litellm-acceptance/<candidate-fingerprint>.json
 ```
 
@@ -273,7 +311,7 @@ bash scripts/validate_litellm_db_env_reference.sh
 admission plan，且不发任何 HTTP：
 
 ```bash
-python scripts/execute_litellm_candidate_admission.py \
+python -m scripts.execute_litellm_candidate_admission \
   --plan /path/to/single-admission-plan.json \
   --output /path/to/admission-transaction.json
 ```
@@ -291,7 +329,7 @@ fingerprint，并从候选原始契约重建 `/model/new` payload；随后还要
 本次新建的模型。
 
 ```bash
-python scripts/execute_litellm_candidate_admission.py \
+python -m scripts.execute_litellm_candidate_admission \
   --governance-root /path/to/litellm-governance \
   --candidate-fingerprint '<sha256>' \
   --output /path/to/admission-transaction.json \
@@ -311,7 +349,7 @@ allowlist。注册响应结果不确定时不会按名称猜测并删除模型�
 时非零退出：
 
 ```bash
-python scripts/audit_litellm_model_catalog.py --dry-run
+python -m scripts.audit_litellm_model_catalog --dry-run
 ```
 
 provider 发现失败会写入 `pipeline_issues` 并让准入 CLI 非零退出；共享 `openai/` adapter 只接受 provider namespace 一致的成本条目；若候选 `model_id` 已被其他 underlying model 用作业务 alias，发现阶段直接转入 `unknown` 隔离。

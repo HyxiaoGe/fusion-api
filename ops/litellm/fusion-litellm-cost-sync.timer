@@ -3,7 +3,7 @@ Description=每 15 分钟检查 Fusion LiteLLM 成本表同步
 
 [Timer]
 OnBootSec=2m
-OnUnitActiveSec=15m
+OnCalendar=*-*-* *:00/15:00 Asia/Shanghai
 Persistent=true
 RandomizedDelaySec=2m
 Unit=fusion-litellm-cost-sync.service
