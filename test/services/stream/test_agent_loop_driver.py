@@ -221,7 +221,7 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("当前计划没有可执行的 url_read 步骤", system_text)
         self.assertIn("只能调用 update_plan 修订计划", system_text)
 
-    async def test_deep_research_keeps_existing_tools_before_valid_plan(self):
+    async def test_deep_research_only_exposes_plan_control_before_valid_plan(self):
         captured = []
 
         async def run_round_fn(**kwargs):
@@ -254,7 +254,7 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        self.assertEqual(_tool_names(captured[0]["call_kwargs"]), tools)
+        self.assertEqual(_tool_names(captured[0]["call_kwargs"]), ["update_plan"])
 
     async def test_deep_research_after_plan_blocks_repeated_update_plan_until_search_succeeds(self):
         captured = []
@@ -300,6 +300,57 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
             message["content"] for message in captured[0]["messages"] if message["role"] == "system"
         )
         self.assertIn("当前阶段只能调用 web_search", system_text)
+
+    async def test_deep_research_fallback_plan_continues_with_search_stage(self):
+        captured = []
+        coordinator = PlanCoordinator(run_id="run-fallback", mode="on")
+        coordinator.configure_initial_tool_requirements(
+            {
+                "web_search": 1,
+                "url_read": 1,
+            }
+        )
+        self.assertTrue(coordinator.adopt_research_fallback().accepted)
+
+        async def run_round_fn(**kwargs):
+            captured.append(kwargs)
+            return AgentRoundResult(
+                reasoning_buf="",
+                content_buf="",
+                tool_calls=[],
+                finish_reason="stop",
+                accumulated_usage=Usage(input_tokens=1, output_tokens=1),
+            )
+
+        await _run_round(
+            messages=[{"role": "user", "content": "研究问题"}],
+            state=AgentLoopState(plan_coordinator=coordinator),
+            runtime=_runtime(
+                task_mode="deep_research",
+                plan_mode="on",
+                call_kwargs={
+                    "tools": [
+                        _tool_definition("update_plan"),
+                        _tool_definition("web_search"),
+                        _tool_definition("url_read"),
+                    ],
+                    "tool_choice": "auto",
+                },
+                run_round_fn=run_round_fn,
+            ),
+            step_number=4,
+            step_context=AgentStepContext(
+                step_id="step-fallback-search",
+                step_number=4,
+                started_at=1.0,
+                thinking_block_id="thinking-fallback",
+                text_block_id="text-fallback",
+            ),
+        )
+
+        self.assertEqual(_tool_names(captured[0]["call_kwargs"]), ["web_search"])
+        binding_schema = captured[0]["call_kwargs"]["tools"][0]["function"]["parameters"]["properties"]["_plan_item_id"]
+        self.assertEqual(binding_schema["enum"], ["research-search"])
 
     async def test_deep_research_with_unread_candidates_blocks_repeated_plan_and_search(self):
         captured = []
@@ -367,9 +418,7 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(_tool_names(captured[0]["call_kwargs"]), ["url_read"])
-        binding_schema = captured[0]["call_kwargs"]["tools"][0]["function"]["parameters"]["properties"][
-            "_plan_item_id"
-        ]
+        binding_schema = captured[0]["call_kwargs"]["tools"][0]["function"]["parameters"]["properties"]["_plan_item_id"]
         self.assertEqual(binding_schema["enum"], ["current-read", "next-read"])
         self.assertIn(
             "_plan_item_id",

@@ -725,6 +725,58 @@ class PlanCoordinatorTests(unittest.TestCase):
         self.assertFalse(coordinator.record_repair_round())
         self.assertTrue(coordinator.record_repair_round())
 
+    def test_research_fallback_never_replaces_an_existing_valid_plan(self):
+        coordinator = PlanCoordinator(run_id="run-research", mode="on")
+        coordinator.configure_initial_tool_requirements(
+            {
+                "web_search": 1,
+                "url_read": 1,
+            }
+        )
+        accepted = coordinator.apply_model_update(
+            {
+                "reason": "搜索后核验来源",
+                "items": [
+                    {
+                        "id": "search",
+                        "title": "搜索来源",
+                        "status": "running",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "read",
+                        "title": "核验来源",
+                        "status": "pending",
+                        "kind": "read",
+                        "depends_on": ["search"],
+                        "planned_tools": ["url_read"],
+                    },
+                    {
+                        "id": "answer",
+                        "title": "整理结论",
+                        "status": "pending",
+                        "kind": "answer",
+                        "depends_on": ["read"],
+                        "planned_tools": [],
+                    },
+                ],
+            }
+        )
+        self.assertTrue(accepted.accepted)
+        coordinator.mark_tool_results({"search": "completed"})
+        existing_items = [dict(item) for item in coordinator.items]
+
+        self.assertFalse(coordinator.record_repair_round_with_fallback().exhausted)
+        self.assertFalse(coordinator.record_repair_round_with_fallback().exhausted)
+        third = coordinator.record_repair_round_with_fallback()
+
+        self.assertTrue(third.exhausted)
+        self.assertIsNone(third.fallback)
+        self.assertEqual(coordinator.source, "model")
+        self.assertEqual(coordinator.items, existing_items)
+
 
 if __name__ == "__main__":
     unittest.main()

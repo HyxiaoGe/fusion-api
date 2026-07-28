@@ -57,9 +57,41 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
             execution.state.plan_coordinator.required_initial_tool_counts,
             {
                 "web_search": 1,
-                "url_read": 3,
+                "url_read": 1,
             },
         )
+        result = execution.state.plan_coordinator.apply_model_update(
+            {
+                "reason": "按研究阶段组织计划",
+                "items": [
+                    {
+                        "id": "search",
+                        "title": "查找可靠来源",
+                        "status": "running",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "read",
+                        "title": "核验多个来源原文",
+                        "status": "pending",
+                        "kind": "read",
+                        "depends_on": ["search"],
+                        "planned_tools": ["url_read"],
+                    },
+                    {
+                        "id": "answer",
+                        "title": "整理结论与建议",
+                        "status": "pending",
+                        "kind": "answer",
+                        "depends_on": ["read"],
+                        "planned_tools": [],
+                    },
+                ],
+            }
+        )
+        self.assertTrue(result.accepted)
 
     def test_continuation_rebuilds_research_workset_from_persisted_source_blocks(self):
         execution = self._execution(

@@ -157,7 +157,7 @@ def configure_research_state(
     state.plan_coordinator.configure_initial_tool_requirements(
         {
             "web_search": 1,
-            "url_read": 3,
+            "url_read": 1,
         }
     )
     research_blocks = [

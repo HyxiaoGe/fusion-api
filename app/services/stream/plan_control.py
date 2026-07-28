@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.core.logger import app_logger as logger
 from app.services.agent.plan_coordinator import PlanCoordinator
 
 UPDATE_PLAN_TOOL_NAME = "update_plan"
@@ -47,6 +48,50 @@ def _response(*, status: str, reason: str, revision: int, hint: str | None = Non
     )
 
 
+def _control_rejection_hint(reason: str, coordinator: PlanCoordinator) -> str | None:
+    if reason == "missing_required_initial_tool_coverage":
+        requirements = "、".join(
+            f"{tool_name}×{count}" for tool_name, count in coordinator.required_initial_tool_counts.items()
+        )
+        return (
+            f"重新提交计划，并为所需工具分别保留独立步骤：{requirements}。"
+            "这些步骤必须处于 pending 或 in_progress，planned_tools 只声明该步骤实际使用的工具；"
+            "同一个 url_read 步骤可以连续读取多个不同来源。"
+        )
+    if reason == "invalid_plan_structure":
+        return (
+            "重新提交 2 至 6 个步骤；每项包含稳定 id、非空 step、pending 或 in_progress 状态，以及 planned_tools 数组。"
+        )
+    if reason == "multiple_running_items":
+        return "同一版计划最多只能有一个 in_progress 步骤，其余未完成步骤使用 pending。"
+    if reason in {"unknown_dependency", "self_dependency", "dependency_cycle"}:
+        return "depends_on 只能引用本次计划中已经声明的其他步骤 ID，并且不能形成循环依赖。"
+    return None
+
+
+def _required_tool_coverage_summary(
+    items: list[Any] | None,
+    coordinator: PlanCoordinator,
+) -> dict[str, int]:
+    """只统计服务端声明的工具名，避免把未校验模型内容写入日志。"""
+
+    counts = {tool_name: 0 for tool_name in coordinator.required_initial_tool_counts}
+    if not items:
+        return counts
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        planned_tools = item.get("planned_tools")
+        if not isinstance(planned_tools, list):
+            continue
+        declared_tools = {tool_name for tool_name in planned_tools if isinstance(tool_name, str)}
+        for tool_name in counts:
+            other_required_tools = set(counts) - {tool_name}
+            if tool_name in declared_tools and not other_required_tools.intersection(declared_tools):
+                counts[tool_name] += 1
+    return counts
+
+
 def _extract_plan_item_binding(call: dict) -> tuple[dict, str | None]:
     """提取并移除只供 Fusion 使用的计划项 ID，避免污染真实工具参数。"""
 
@@ -82,10 +127,25 @@ async def process_plan_control_calls(
         call_id = str(call.get("id", ""))
         payload = _parse_arguments(call.get("arguments"))
         result = coordinator.apply_model_update(payload)
+        if not result.accepted:
+            items = payload.get("plan") if isinstance(payload, dict) else None
+            if not isinstance(items, list) and isinstance(payload, dict):
+                items = payload.get("items")
+            logger.info(
+                "计划控制更新被拒绝: run_id=%s reason=%s item_count=%s required_tool_coverage=%s",
+                coordinator.run_id,
+                result.reason,
+                min(len(items), 7) if isinstance(items, list) else None,
+                _required_tool_coverage_summary(
+                    items if isinstance(items, list) else None,
+                    coordinator,
+                ),
+            )
         responses[call_id] = _response(
             status="accepted" if result.accepted else "rejected",
             reason=result.reason,
             revision=coordinator.revision,
+            hint=None if result.accepted else _control_rejection_hint(result.reason, coordinator),
         )
         accepted_control = accepted_control or result.accepted
         repairable_rejection = repairable_rejection or (
@@ -153,7 +213,11 @@ async def process_plan_control_calls(
         executable_external_calls.append(call)
     external_calls = executable_external_calls
 
-    repair_exhausted = coordinator.record_repair_round() if round_failed else False
+    repair_result = coordinator.record_repair_round_with_fallback() if round_failed else None
+    if repair_result is not None and repair_result.fallback is not None:
+        fallback = repair_result.fallback
+        if fallback.snapshot is not None:
+            await emitter.plan_snapshot(**fallback.snapshot)
 
     return PlanControlResult(
         external_tool_calls=[
@@ -169,5 +233,5 @@ async def process_plan_control_calls(
         ],
         tool_responses=responses,
         plan_item_ids=plan_item_ids,
-        repair_exhausted=repair_exhausted or coordinator.repair_attempt_count > 2,
+        repair_exhausted=repair_result.exhausted if repair_result is not None else False,
     )

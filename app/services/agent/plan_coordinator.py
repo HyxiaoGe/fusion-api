@@ -14,6 +14,7 @@ PlanStatus = Literal["pending", "running", "completed", "failed", "skipped", "bl
 PlanKind = Literal["reasoning", "search", "read", "synthesis", "answer", "other"]
 
 _PLAN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+_SYSTEM_FALLBACK_REASON = "system_fallback"
 
 
 class ModelPlanItem(BaseModel):
@@ -55,6 +56,12 @@ class PlanUpdateResult:
     snapshot: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class PlanRepairResult:
+    exhausted: bool
+    fallback: PlanUpdateResult | None = None
+
+
 @dataclass
 class PlanCoordinator:
     """集中管理模型计划 revision；观察型旧计划只能在模型计划出现前兼容写入。"""
@@ -72,7 +79,11 @@ class PlanCoordinator:
 
     @property
     def has_valid_model_plan(self) -> bool:
-        return self.source == "model" and self.revision > 0 and bool(self.items)
+        return (
+            (self.source == "model" or (self.source == "observed" and self.reason == _SYSTEM_FALLBACK_REASON))
+            and self.revision > 0
+            and bool(self.items)
+        )
 
     def apply_model_update(self, payload: Any) -> PlanUpdateResult:
         if self.mode == "off":
@@ -156,6 +167,67 @@ class PlanCoordinator:
     def record_repair_round(self) -> bool:
         self.repair_attempt_count += 1
         return self.repair_attempt_count > 2
+
+    def record_repair_round_with_fallback(self) -> PlanRepairResult:
+        """记录一次计划修复，并仅在尚无有效计划时采用研究兜底计划。"""
+
+        if not self.record_repair_round():
+            return PlanRepairResult(exhausted=False)
+        fallback = self.adopt_research_fallback()
+        if fallback.accepted:
+            return PlanRepairResult(exhausted=False, fallback=fallback)
+        return PlanRepairResult(exhausted=True)
+
+    def adopt_research_fallback(self) -> PlanUpdateResult:
+        """连续计划修复失败后采用最小研究计划，避免无证据直接收尾。"""
+
+        if (
+            self.has_valid_model_plan
+            or self.mode != "on"
+            or self.required_initial_tool_counts
+            != {
+                "web_search": 1,
+                "url_read": 1,
+            }
+        ):
+            return PlanUpdateResult(False, "fallback_not_applicable")
+        update = ModelPlanUpdate.model_validate(
+            {
+                "reason": _SYSTEM_FALLBACK_REASON,
+                "items": [
+                    {
+                        "id": "research-search",
+                        "title": "搜索候选来源",
+                        "status": "pending",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "research-read",
+                        "title": "核验关键来源",
+                        "status": "pending",
+                        "kind": "read",
+                        "depends_on": ["research-search"],
+                        "planned_tools": ["url_read"],
+                    },
+                    {
+                        "id": "research-answer",
+                        "title": "整理研究结论",
+                        "status": "pending",
+                        "kind": "answer",
+                        "depends_on": ["research-read"],
+                        "planned_tools": [],
+                    },
+                ],
+            }
+        )
+        self.revision += 1
+        self.source = "observed"
+        self.reason = _SYSTEM_FALLBACK_REASON
+        self.items = [item.model_dump() for item in update.items]
+        self.repair_attempt_count = 0
+        return PlanUpdateResult(True, _SYSTEM_FALLBACK_REASON, self.snapshot())
 
     def configure_initial_tool_requirements(self, requirements: dict[str, int]) -> None:
         """配置首个模型计划必须预留的工具步骤数量。"""

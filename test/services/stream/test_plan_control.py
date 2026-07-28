@@ -2,7 +2,7 @@
 
 import json
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from app.services.agent.plan_coordinator import PlanCoordinator
 from app.services.stream.plan_control import process_plan_control_calls
@@ -172,6 +172,135 @@ class PlanControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("DSML", response)
         self.assertEqual(result.external_tool_calls, [])
 
+    async def test_missing_initial_tool_coverage_returns_executable_repair_hint(self):
+        coordinator = PlanCoordinator(run_id="run-1", mode="on")
+        coordinator.configure_initial_tool_requirements(
+            {
+                "web_search": 1,
+                "url_read": 1,
+            }
+        )
+
+        result = await process_plan_control_calls(
+            tool_calls=[
+                _update_call(
+                    arguments={
+                        "explanation": "先搜索再回答",
+                        "plan": [
+                            {
+                                "id": "search",
+                                "step": "搜索资料",
+                                "status": "in_progress",
+                                "planned_tools": ["web_search"],
+                            },
+                            {
+                                "id": "answer",
+                                "step": "整理回答",
+                                "status": "pending",
+                                "planned_tools": [],
+                            },
+                        ],
+                    }
+                )
+            ],
+            coordinator=coordinator,
+            emitter=AsyncMock(),
+        )
+
+        response = json.loads(result.tool_responses["plan-1"])
+        self.assertEqual(response["reason"], "missing_required_initial_tool_coverage")
+        self.assertIn("web_search", response["hint"])
+        self.assertIn("url_read", response["hint"])
+        self.assertIn("独立步骤", response["hint"])
+
+    async def test_rejection_log_only_records_server_whitelisted_tool_counts(self):
+        coordinator = PlanCoordinator(run_id="run-1", mode="on")
+        coordinator.configure_initial_tool_requirements(
+            {
+                "web_search": 1,
+                "url_read": 1,
+            }
+        )
+        secret_marker = "用户私密内容\\n伪造日志"
+        arguments = {
+            "reason": "错误计划",
+            "items": [
+                {
+                    "id": "search",
+                    "title": "搜索",
+                    "status": "running",
+                    "kind": "search",
+                    "depends_on": [],
+                    "planned_tools": ["web_search", secret_marker],
+                },
+                {
+                    "id": "answer",
+                    "title": "回答",
+                    "status": "pending",
+                    "kind": "answer",
+                    "depends_on": ["search"],
+                    "planned_tools": [],
+                },
+            ],
+        }
+
+        with patch("app.services.stream.plan_control.logger.info") as log_info:
+            await process_plan_control_calls(
+                tool_calls=[_update_call(arguments=arguments)],
+                coordinator=coordinator,
+                emitter=AsyncMock(),
+            )
+
+        rendered_log_arguments = repr(log_info.call_args.args)
+        self.assertNotIn(secret_marker, rendered_log_arguments)
+        self.assertIn("{'web_search': 1, 'url_read': 0}", rendered_log_arguments)
+
+    async def test_rejection_log_uses_same_distinct_owner_rule_as_validation(self):
+        coordinator = PlanCoordinator(run_id="run-1", mode="on")
+        coordinator.configure_initial_tool_requirements(
+            {
+                "web_search": 1,
+                "url_read": 1,
+            }
+        )
+        arguments = {
+            "reason": "把搜索和读取混在同一步",
+            "items": [
+                {
+                    "id": "mixed",
+                    "title": "搜索并读取",
+                    "status": "running",
+                    "kind": "search",
+                    "depends_on": [],
+                    "planned_tools": ["web_search", "url_read"],
+                },
+                {
+                    "id": "answer",
+                    "title": "回答",
+                    "status": "pending",
+                    "kind": "answer",
+                    "depends_on": ["mixed"],
+                    "planned_tools": [],
+                },
+            ],
+        }
+
+        with patch("app.services.stream.plan_control.logger.info") as log_info:
+            result = await process_plan_control_calls(
+                tool_calls=[_update_call(arguments=arguments)],
+                coordinator=coordinator,
+                emitter=AsyncMock(),
+            )
+
+        self.assertEqual(
+            json.loads(result.tool_responses["plan-1"])["reason"],
+            "missing_required_initial_tool_coverage",
+        )
+        self.assertIn(
+            "{'web_search': 0, 'url_read': 0}",
+            repr(log_info.call_args.args),
+        )
+
     async def test_off_mode_does_not_gate_external_tools(self):
         coordinator = PlanCoordinator(run_id="run-1", mode="off")
         external = {"id": "tool-1", "name": "web_search", "arguments": {"query": "深圳天气"}}
@@ -201,6 +330,45 @@ class PlanControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(second.repair_exhausted)
         self.assertTrue(third.repair_exhausted)
         self.assertEqual(coordinator.repair_attempt_count, 3)
+
+    async def test_deep_research_adopts_safe_fallback_plan_after_repair_exhaustion(self):
+        coordinator = PlanCoordinator(run_id="run-research", mode="on")
+        coordinator.configure_initial_tool_requirements(
+            {
+                "web_search": 1,
+                "url_read": 1,
+            }
+        )
+        emitter = AsyncMock()
+        invalid = [_update_call(arguments={"broken": True})]
+
+        first = await process_plan_control_calls(
+            tool_calls=invalid,
+            coordinator=coordinator,
+            emitter=emitter,
+        )
+        second = await process_plan_control_calls(
+            tool_calls=invalid,
+            coordinator=coordinator,
+            emitter=emitter,
+        )
+        third = await process_plan_control_calls(
+            tool_calls=invalid,
+            coordinator=coordinator,
+            emitter=emitter,
+        )
+
+        self.assertFalse(first.repair_exhausted)
+        self.assertFalse(second.repair_exhausted)
+        self.assertFalse(third.repair_exhausted)
+        self.assertTrue(coordinator.has_valid_model_plan)
+        self.assertEqual(coordinator.source, "observed")
+        self.assertEqual(coordinator.reason, "system_fallback")
+        self.assertEqual(
+            [item["planned_tools"] for item in coordinator.items],
+            [["web_search"], ["url_read"], []],
+        )
+        emitter.plan_snapshot.assert_awaited_once()
 
     async def test_accepted_control_makes_same_round_non_repairable(self):
         coordinator = PlanCoordinator(run_id="run-1", mode="on")

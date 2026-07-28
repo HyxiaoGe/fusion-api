@@ -204,11 +204,12 @@ async def _run_round(
             active_plan_item_ids = state.plan_coordinator.active_plan_item_ids_for_tool(required_tool)
             if not active_plan_item_ids:
                 plan_repair_tool = required_tool
+        allowed_tool_names = deep_research_stage_tool_names(research_stage)
+        if research_stage == "planning" or plan_repair_tool:
+            allowed_tool_names = frozenset({"update_plan"})
         call_kwargs = _filter_tools_for_research_stage(
             call_kwargs,
-            allowed_tool_names=(
-                frozenset({"update_plan"}) if plan_repair_tool else deep_research_stage_tool_names(research_stage)
-            ),
+            allowed_tool_names=allowed_tool_names,
         )
         if required_tool and active_plan_item_ids and not plan_repair_tool:
             call_kwargs = _constrain_research_stage_plan_binding(

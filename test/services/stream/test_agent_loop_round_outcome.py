@@ -16,7 +16,11 @@ from app.schemas.chat import (
 from app.services.agent.plan_coordinator import PlanCoordinator
 from app.services.stream.agent_loop_outcome import AgentLoopExit
 from app.services.stream.agent_loop_policy import AgentLoopLimits
-from app.services.stream.agent_loop_round_outcome import AgentRoundOutcomeRequest, handle_agent_round_outcome
+from app.services.stream.agent_loop_round_outcome import (
+    PLAN_REQUIRED_RETRY_PROMPT,
+    AgentRoundOutcomeRequest,
+    handle_agent_round_outcome,
+)
 from app.services.stream.agent_loop_runtime import AgentLoopRuntime
 from app.services.stream.agent_loop_state import AgentLoopState
 from app.services.stream.agent_round import AgentRoundResult
@@ -301,6 +305,65 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(message.get("role") == "assistant" for message in messages))
         self.assertIn("必须先调用计划控制工具", messages[-1]["content"])
         self.assertEqual(complete_step.await_count, 3)
+
+    async def test_deep_research_hidden_stop_adopts_fallback_plan_after_retries(self):
+        state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-research", mode="on"))
+        state.plan_coordinator.configure_initial_tool_requirements(
+            {
+                "web_search": 1,
+                "url_read": 1,
+            }
+        )
+        messages = [{"role": "user", "content": "调研数据库升级风险"}]
+        complete_step = AsyncMock(return_value=1)
+        emitter = AsyncMock()
+        runtime = _runtime(
+            complete_step_fn=complete_step,
+            emitter=emitter,
+            plan_mode="on",
+            task_mode="deep_research",
+            evidence_policy="deep_research_v1",
+        )
+
+        outcomes = []
+        for index in range(3):
+            state.mark_current_step(f"step-research-{index}")
+            outcomes.append(
+                await handle_agent_round_outcome(
+                    request=AgentRoundOutcomeRequest(
+                        db="db",
+                        messages=messages,
+                        state=state,
+                        runtime=runtime,
+                        step_number=index + 1,
+                        step_context=_step_context(f"step-research-{index}"),
+                        round_result=AgentRoundResult(
+                            reasoning_buf="忽略计划",
+                            content_buf="直接回答",
+                            tool_calls=[],
+                            finish_reason="stop",
+                            accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+                            output_deferred=True,
+                        ),
+                    )
+                )
+            )
+
+        self.assertEqual(outcomes, [None, None, None])
+        self.assertTrue(state.plan_coordinator.has_valid_model_plan)
+        self.assertEqual(state.plan_coordinator.reason, "system_fallback")
+        self.assertEqual(state.plan_coordinator.repair_attempt_count, 0)
+        self.assertEqual(
+            [item["planned_tools"] for item in state.plan_coordinator.items],
+            [["web_search"], ["url_read"], []],
+        )
+        self.assertFalse(
+            any(
+                message.get("role") == "system" and message.get("content") == PLAN_REQUIRED_RETRY_PROMPT
+                for message in messages
+            )
+        )
+        emitter.plan_snapshot.assert_awaited_once()
 
     async def test_on_mode_repairs_any_non_cancelled_terminal_without_valid_plan(self):
         for finish_reason in ("tool_protocol_error", "length", "tool_calls"):

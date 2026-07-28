@@ -186,12 +186,25 @@ async def _complete_plan_required_round(request: AgentRoundOutcomeRequest) -> No
     request.state.clear_current_step()
 
 
+def _remove_plan_required_retry_prompt(messages: list[dict]) -> None:
+    """兜底计划生效后移除已经过期的强制建计划指令。"""
+
+    messages[:] = [
+        message
+        for message in messages
+        if not (message.get("role") == "system" and message.get("content") == PLAN_REQUIRED_RETRY_PROMPT)
+    ]
+
+
 async def _repair_missing_required_plan(
     request: AgentRoundOutcomeRequest,
 ) -> AgentLoopOutcome | None:
     await _complete_plan_required_round(request)
-    repair_exhausted = request.state.plan_coordinator.record_repair_round()
-    if repair_exhausted:
+    repair_result = request.state.plan_coordinator.record_repair_round_with_fallback()
+    if repair_result.fallback is not None and repair_result.fallback.snapshot is not None:
+        _remove_plan_required_retry_prompt(request.messages)
+        await request.runtime.emitter.plan_snapshot(**repair_result.fallback.snapshot)
+    if repair_result.exhausted:
         return AgentLoopOutcome(
             exit=AgentLoopExit.SUMMARY_REQUIRED,
             summary_finish_reason="plan_repair_exhausted",
