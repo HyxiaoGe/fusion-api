@@ -3,6 +3,7 @@ import logging
 import os
 import unittest
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from types import SimpleNamespace
 
 import httpx
@@ -26,6 +27,7 @@ class FakeSession:
         self.list_error = list_error
         self.list_cursors: list[str | None] = []
         self.calls: list[tuple[str, dict]] = []
+        self.call_read_timeouts: list[timedelta | None] = []
 
     async def initialize(self):
         if self.initialize_error:
@@ -40,6 +42,7 @@ class FakeSession:
 
     async def call_tool(self, name, arguments, read_timeout_seconds=None):
         self.calls.append((name, arguments))
+        self.call_read_timeouts.append(read_timeout_seconds)
         return self.call_result or SimpleNamespace(
             isError=False,
             model_dump=lambda **_: {"content": [{"type": "text", "text": "ok"}], "isError": False},
@@ -332,6 +335,97 @@ class McpClientManagerTests(unittest.TestCase):
             connector.connections[0]["headers"],
             {"CONTEXT7_API_KEY": secret},
         )
+
+    def test_context7_official_endpoint_uses_latency_timeout_floor(self):
+        session = FakeSession()
+        connector = FakeConnector(session)
+        manager = McpClientManager(
+            policy=build_policy(
+                allowed_hosts=frozenset({"mcp.context7.com"}),
+                allowed_credential_refs=frozenset({"CONTEXT7_API_KEY"}),
+            ),
+            connector=connector,
+            environ={},
+        )
+        config = build_config(
+            provider="context7",
+            endpoint_url="https://mcp.context7.com/mcp",
+            auth_type="none",
+            auth_name=None,
+            credential_ref=None,
+            allowed_tools=["resolve-library-id"],
+        )
+
+        asyncio.run(
+            manager.call_tool(
+                config,
+                "resolve-library-id",
+                {"libraryName": "FastAPI", "query": "lifespan"},
+            )
+        )
+
+        self.assertEqual(connector.connections[0]["connect_timeout_seconds"], 20.0)
+        self.assertEqual(connector.connections[0]["call_timeout_seconds"], 30.0)
+        self.assertEqual(session.call_read_timeouts, [timedelta(seconds=30)])
+
+    def test_context7_discovery_uses_total_timeout_floor(self):
+        class SlowContext7Session(FakeSession):
+            async def list_tools(self, cursor=None):
+                await asyncio.sleep(0.02)
+                return await super().list_tools(cursor)
+
+        session = SlowContext7Session(
+            tools=[
+                SimpleNamespace(
+                    name="resolve-library-id",
+                    description="解析公开软件库标识",
+                    inputSchema={"type": "object"},
+                )
+            ]
+        )
+        manager = McpClientManager(
+            policy=build_policy(
+                allowed_hosts=frozenset({"mcp.context7.com"}),
+                idempotent_total_timeout_seconds=0.001,
+            ),
+            connector=FakeConnector(session),
+            environ={},
+        )
+
+        tools = asyncio.run(
+            manager.list_tools(
+                build_config(
+                    provider="context7",
+                    endpoint_url="https://mcp.context7.com/mcp",
+                    auth_type="none",
+                    auth_name=None,
+                    credential_ref=None,
+                )
+            )
+        )
+
+        self.assertEqual([tool["name"] for tool in tools], ["resolve-library-id"])
+
+    def test_non_context7_endpoint_keeps_global_timeouts(self):
+        session = FakeSession()
+        connector = FakeConnector(session)
+        manager = McpClientManager(
+            policy=build_policy(connect_timeout_seconds=1.5, call_timeout_seconds=2.5),
+            connector=connector,
+            environ={"DASHSCOPE_API_KEY": "test-secret"},
+        )
+
+        asyncio.run(
+            manager.call_tool(
+                build_config(allowed_tools=["search"]),
+                "search",
+                {"query": "Fusion"},
+            )
+        )
+
+        self.assertEqual(connector.connections[0]["connect_timeout_seconds"], 1.5)
+        self.assertEqual(connector.connections[0]["call_timeout_seconds"], 2.5)
+        self.assertEqual(session.call_read_timeouts, [timedelta(seconds=2.5)])
 
     def test_context7_configured_credential_fails_closed_when_secret_is_missing(self):
         connector = FakeConnector(FakeSession())

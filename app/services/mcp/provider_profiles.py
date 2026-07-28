@@ -8,6 +8,9 @@ AMAP_MCP_HOST = "mcp.amap.com"
 CONTEXT7_MCP_HOST = "mcp.context7.com"
 AMAP_CREDENTIAL_REF = "AMAP_MCP_API_KEY"
 CONTEXT7_CREDENTIAL_REF = "CONTEXT7_API_KEY"
+CONTEXT7_CONNECT_TIMEOUT_FLOOR_SECONDS = 20.0
+CONTEXT7_CALL_TIMEOUT_FLOOR_SECONDS = 30.0
+CONTEXT7_IDEMPOTENT_TOTAL_TIMEOUT_FLOOR_SECONDS = 45.0
 AMAP_READ_ONLY_TOOL_ALLOWLIST = frozenset(
     {
         "maps_geo",
@@ -114,6 +117,18 @@ def is_official_amap_endpoint(endpoint_url: str) -> bool:
 
 def is_official_context7_endpoint(endpoint_url: str) -> bool:
     return _endpoint_hostname(endpoint_url) == CONTEXT7_MCP_HOST
+
+
+def endpoint_timeout_floors(endpoint_url: str) -> tuple[float, float, float] | None:
+    """为已知高延迟官方端点提供最小超时，不放大全部 MCP 的失败等待。"""
+
+    if _endpoint_hostname(endpoint_url) != CONTEXT7_MCP_HOST:
+        return None
+    return (
+        CONTEXT7_CONNECT_TIMEOUT_FLOOR_SECONDS,
+        CONTEXT7_CALL_TIMEOUT_FLOOR_SECONDS,
+        CONTEXT7_IDEMPOTENT_TOTAL_TIMEOUT_FLOOR_SECONDS,
+    )
 
 
 def endpoint_auth_binding_is_allowed(
