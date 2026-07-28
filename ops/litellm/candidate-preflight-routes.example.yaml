@@ -1,0 +1,42 @@
+# 候选模型专用路由。部署时合并到 LiteLLM model_list，但不要写入 DB，
+# 因而不会进入 Fusion 的持久模型选择器。
+model_list:
+  - model_name: candidate/moonshot/*
+    litellm_params:
+      model: moonshot/*
+      api_base: https://api.moonshot.cn/v1
+      api_key: os.environ/MOONSHOT_API_KEY
+    model_info:
+      metadata:
+        provider_key: moonshot
+        purpose: candidate_preflight
+
+  - model_name: candidate/deepseek/*
+    litellm_params:
+      model: deepseek/*
+      api_base: https://api.deepseek.com/v1
+      api_key: os.environ/DEEPSEEK_API_KEY
+    model_info:
+      metadata:
+        provider_key: deepseek
+        purpose: candidate_preflight
+
+  - model_name: candidate/qwen/*
+    litellm_params:
+      model: openai/*
+      api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+      api_key: os.environ/QWEN_API_KEY
+    model_info:
+      metadata:
+        provider_key: qwen
+        purpose: candidate_preflight
+
+  - model_name: candidate/xiaomi/*
+    litellm_params:
+      model: openai/*
+      api_base: https://api.xiaomimimo.com/v1
+      api_key: os.environ/XIAOMI_API_KEY
+    model_info:
+      metadata:
+        provider_key: xiaomi
+        purpose: candidate_preflight

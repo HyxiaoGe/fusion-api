@@ -14,6 +14,15 @@ from scripts import check_litellm_candidate_preflight as preflight
 CANDIDATE = {
     "model_id": "kimi-k3",
     "litellm_model": "moonshot/kimi-k3",
+    "preflight_model": "candidate/moonshot/kimi-k3",
+    "preflight_route": {
+        "status": "ready",
+        "route_model_name": "candidate/moonshot/*",
+        "route_litellm_model": "moonshot/*",
+        "api_base": "https://api.moonshot.cn/v1",
+        "api_key_env": "MOONSHOT_API_KEY",
+        "reasons": [],
+    },
     "capabilities": {"toolCalling": True},
     "pricing": {"input": 0.001, "output": 0.003, "unit": "USD"},
 }
@@ -119,6 +128,40 @@ def stream_response(*, usage: bool = True, cost: bool = True) -> FakeResponse:
 
 
 class LiteLLMCandidatePreflightTests(unittest.TestCase):
+    def test_apply_never_falls_back_to_master_key(self):
+        with (
+            patch.dict(
+                "os.environ",
+                {"LITELLM_MASTER_KEY": "master-only"},
+                clear=True,
+            ),
+            patch.object(preflight, "run_preflight") as run,
+        ):
+            exit_code = preflight.main([json.dumps(CANDIDATE), "--apply"])
+
+        self.assertEqual(exit_code, 2)
+        run.assert_not_called()
+
+    def test_requests_use_provider_route_instead_of_shared_adapter_model(self):
+        client = FakeClient(
+            responses=[text_response(), tool_response()],
+            stream_response=stream_response(),
+        )
+
+        preflight.run_preflight(
+            candidate=preflight.parse_candidate(CANDIDATE),
+            base_url="http://litellm:4000",
+            api_key="candidate-key",
+            apply=True,
+            client=client,
+        )
+
+        models = [call[1]["json"]["model"] for call in client.post_calls]
+        models.extend(call[2]["json"]["model"] for call in client.stream_calls)
+        self.assertTrue(models)
+        self.assertEqual(set(models), {"candidate/moonshot/kimi-k3"})
+        self.assertNotIn("moonshot/kimi-k3", models)
+
     def test_embedded_vision_fixture_is_a_valid_red_rgb_pixel(self):
         encoded = preflight.RED_PIXEL_PNG_DATA_URL.split(",", 1)[1]
         payload = base64.b64decode(encoded)
@@ -160,6 +203,8 @@ class LiteLLMCandidatePreflightTests(unittest.TestCase):
             {
                 "model_id": "kimi-k3",
                 "litellm_model": "moonshot/kimi-k3",
+                "preflight_model": "candidate/moonshot/kimi-k3",
+                "preflight_route": CANDIDATE["preflight_route"],
                 "metadata": {
                     "capabilities": {"functionCalling": True},
                     "pricing": {"input": 0.6, "output": 2.5, "unit": "USD/1M tokens"},
@@ -365,7 +410,7 @@ class LiteLLMCandidatePreflightTests(unittest.TestCase):
         self.assertNotIn("master_key", serialized["context"])
         self.assertNotIn("candidate_key", serialized["context"])
         self.assertEqual(serialized["acceptance_stage"], "candidate_pre_registration")
-        self.assertEqual(serialized["transport"], "litellm_wildcard")
+        self.assertEqual(serialized["transport"], "litellm_provider_wildcard")
 
     def test_serialized_applied_report_matches_admission_summary_contract(self):
         client = FakeClient(

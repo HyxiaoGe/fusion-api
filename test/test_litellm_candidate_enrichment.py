@@ -10,6 +10,20 @@ from scripts.fetch_litellm_cost_map import cost_map_sha256
 
 def candidate_report():
     return {
+        "candidate_preflight": {
+            "status": "ready",
+            "transport": "litellm_provider_wildcard",
+            "providers": {
+                "moonshot": {
+                    "status": "ready",
+                    "route_model_name": "candidate/moonshot/*",
+                    "route_litellm_model": "moonshot/*",
+                    "api_base": "https://api.moonshot.cn/v1",
+                    "api_key_env": "MOONSHOT_API_KEY",
+                    "reasons": [],
+                }
+            },
+        },
         "providers": {
             "moonshot": {
                 "status": "ok",
@@ -25,7 +39,7 @@ def candidate_report():
                     ],
                 },
             }
-        }
+        },
     }
 
 
@@ -54,6 +68,26 @@ def enrich(**kwargs):
 
 
 class CandidateEnrichmentTests(unittest.TestCase):
+    def test_candidate_is_bound_to_its_verified_provider_route(self):
+        report = enrich(
+            candidate_report=candidate_report(),
+            registry=registry(),
+            cost_map={
+                "moonshot/kimi-k3": {
+                    "input_cost_per_token": 0.000001,
+                    "output_cost_per_token": 0.000002,
+                    "supports_function_calling": True,
+                }
+            },
+        )
+
+        candidate = report["providers"]["moonshot"]["report"]["new"][0]
+        self.assertEqual(candidate["preflight_model"], "candidate/moonshot/kimi-k3")
+        self.assertEqual(
+            candidate["preflight_route"]["api_base"],
+            candidate["registration"]["api_base"],
+        )
+
     def test_versioned_override_example_has_valid_approval_hash(self):
         path = Path(__file__).resolve().parents[1] / "ops/litellm/candidate-overrides.example.json"
         payload = json.loads(path.read_text(encoding="utf-8"))

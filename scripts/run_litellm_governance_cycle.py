@@ -146,13 +146,15 @@ def _build_candidate_queue(
     admission_plans: dict[str, Any] = {}
     cycle_issues: list[dict[str, str]] = []
     preflight_contract = enriched_report.get("candidate_preflight")
-    preflight_ready = _is_mapping(preflight_contract) and preflight_contract.get("status") == "ready"
-    preflight_reasons = (
-        list(preflight_contract.get("reasons") or [])
-        if _is_mapping(preflight_contract)
-        else ["candidate_preflight_contract_missing"]
-    )
+    preflight_providers = preflight_contract.get("providers") if _is_mapping(preflight_contract) else {}
     for provider_key, candidate in _candidate_records(enriched_report):
+        provider_preflight = preflight_providers.get(provider_key) if _is_mapping(preflight_providers) else None
+        preflight_ready = _is_mapping(provider_preflight) and provider_preflight.get("status") == "ready"
+        preflight_reasons = (
+            list(provider_preflight.get("reasons") or [])
+            if _is_mapping(provider_preflight)
+            else ["candidate_preflight_provider_contract_missing"]
+        )
         snapshot_sha256 = _json_sha256(candidate)
         static_reasons = candidate_static_gate_reasons(candidate, provider_key=provider_key)
         fingerprint = ""

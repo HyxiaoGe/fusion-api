@@ -77,6 +77,7 @@ def _read_json_response(response: Any) -> Any:
 def _candidate_preflight_status(
     *,
     litellm_config: Mapping[str, Any],
+    providers: Sequence[Mapping[str, Any]],
     litellm_snapshot: Any,
     candidate_key_models: Sequence[str] | None,
     candidate_key_lookup_failed: bool,
@@ -92,37 +93,143 @@ def _candidate_preflight_status(
             "reasons": ["candidate_preflight_config_missing"],
         }
     transport = str(config.get("transport") or "")
-    route_model_name = str(config.get("route_model_name") or "")
     credential_env = str(config.get("api_key_env") or "")
     master_key_env = str(litellm_config.get("api_key_env") or "")
     reasons: list[str] = []
-    if transport != "litellm_wildcard":
+    if transport != "litellm_provider_wildcard":
         reasons.append("candidate_preflight_transport_invalid")
     entries = litellm_snapshot.get("data") if isinstance(litellm_snapshot, Mapping) else None
-    route_found = isinstance(entries, list) and any(
-        isinstance(entry, Mapping)
-        and entry.get("model_name") == route_model_name
-        and isinstance(entry.get("litellm_params"), Mapping)
-        and entry["litellm_params"].get("model") == "*"
-        for entry in entries
-    )
-    if not route_model_name or not route_found:
-        reasons.append("candidate_preflight_route_missing")
+    provider_statuses: dict[str, Any] = {}
+    expected_routes: set[str] = set()
+    for provider in providers:
+        provider_key = _provider_key(provider)
+        route_config = provider.get("candidate_preflight")
+        provider_reasons: list[str] = []
+        if not isinstance(route_config, Mapping):
+            route_config = {}
+            provider_reasons.append("candidate_preflight_provider_config_missing")
+        route_model_name = str(route_config.get("route_model_name") or "")
+        route_litellm_model = str(route_config.get("route_litellm_model") or "")
+        if (
+            not route_model_name.startswith(f"candidate/{provider_key}/")
+            or route_model_name.count("*") != 1
+            or not route_model_name.endswith("*")
+            or route_litellm_model.count("*") != 1
+            or not route_litellm_model.endswith("*")
+        ):
+            provider_reasons.append("candidate_preflight_route_invalid")
+        if route_model_name:
+            expected_routes.add(route_model_name)
+        matches = [
+            entry
+            for entry in entries or []
+            if isinstance(entry, Mapping) and entry.get("model_name") == route_model_name
+        ]
+        if len(matches) != 1:
+            provider_reasons.append(
+                "candidate_preflight_route_missing" if not matches else "candidate_preflight_route_ambiguous"
+            )
+        else:
+            entry = matches[0]
+            params = entry.get("litellm_params")
+            model_info = entry.get("model_info")
+            model_info = model_info if isinstance(model_info, Mapping) else {}
+            metadata = model_info.get("metadata")
+            if model_info.get("db_model") is True:
+                provider_reasons.append("candidate_preflight_route_db_backed")
+            if not isinstance(params, Mapping) or params.get("model") != route_litellm_model:
+                provider_reasons.append("candidate_preflight_route_model_mismatch")
+            if str((params or {}).get("api_base") or "").rstrip("/") != str(provider.get("base_url") or "").rstrip("/"):
+                provider_reasons.append("candidate_preflight_route_api_base_mismatch")
+            if not isinstance(metadata, Mapping) or (
+                metadata.get("provider_key") != provider_key or metadata.get("purpose") != "candidate_preflight"
+            ):
+                provider_reasons.append("candidate_preflight_route_metadata_mismatch")
+        provider_statuses[provider_key] = {
+            "status": "ready" if not provider_reasons else "blocked",
+            "route_model_name": route_model_name or None,
+            "route_litellm_model": route_litellm_model or None,
+            "api_base": provider.get("base_url"),
+            "api_key_env": provider.get("api_key_env"),
+            "reasons": provider_reasons,
+        }
     if not credential_env or not environ.get(credential_env):
         reasons.append("candidate_preflight_key_missing")
     elif credential_env == master_key_env or environ.get(credential_env) == environ.get(master_key_env):
         reasons.append("candidate_preflight_key_not_dedicated")
     elif candidate_key_lookup_failed:
         reasons.append("candidate_preflight_key_allowlist_unverifiable")
-    elif candidate_key_models is None or route_model_name not in candidate_key_models:
+    elif candidate_key_models is None:
         reasons.append("candidate_preflight_key_route_missing")
+    elif set(candidate_key_models) != expected_routes:
+        reasons.append("candidate_preflight_key_allowlist_mismatch")
+    if reasons:
+        for status in provider_statuses.values():
+            status["status"] = "blocked"
+            status["reasons"] = list(dict.fromkeys([*status["reasons"], *reasons]))
+    ready_count = sum(status["status"] == "ready" for status in provider_statuses.values())
     return {
-        "status": "ready" if not reasons else "blocked",
+        "status": "ready"
+        if provider_statuses and ready_count == len(provider_statuses)
+        else ("partial" if ready_count else "blocked"),
         "transport": transport or None,
-        "route_model_name": route_model_name or None,
         "credential_source": credential_env or None,
         "reasons": reasons,
+        "providers": provider_statuses,
     }
+
+
+def _resolve_raw_candidate_routes(
+    *,
+    providers: Sequence[Mapping[str, Any]],
+    litellm_snapshot: Mapping[str, Any],
+    litellm_base_url: str,
+    litellm_key: str,
+    client: Any,
+    timeout_seconds: float,
+) -> dict[str, Mapping[str, Any]]:
+    """兼容 v1.93：从展开目录定位 deployment id，再读取原始 wildcard route。"""
+    entries = litellm_snapshot.get("data")
+    entries = entries if isinstance(entries, list) else []
+    resolved: dict[str, Mapping[str, Any]] = {}
+    for provider in providers:
+        provider_key = _provider_key(provider)
+        route_config = provider.get("candidate_preflight")
+        if not isinstance(route_config, Mapping):
+            continue
+        route_name = str(route_config.get("route_model_name") or "")
+        direct = [entry for entry in entries if isinstance(entry, Mapping) and entry.get("model_name") == route_name]
+        if len(direct) == 1:
+            resolved[provider_key] = direct[0]
+            continue
+        prefix = route_name.removesuffix("*")
+        deployment_ids = {
+            str((entry.get("model_info") or {}).get("id") or "")
+            for entry in entries
+            if isinstance(entry, Mapping) and str(entry.get("model_name") or "").startswith(prefix)
+        }
+        deployment_ids.discard("")
+        raw_matches: list[Mapping[str, Any]] = []
+        for deployment_id in sorted(deployment_ids):
+            try:
+                payload = _read_json_response(
+                    client.get(
+                        f"{litellm_base_url}/model/info?{urlencode({'litellm_model_id': deployment_id})}",
+                        headers={"Authorization": f"Bearer {litellm_key}"},
+                        timeout=timeout_seconds,
+                    )
+                )
+            except Exception:
+                continue
+            raw_entries = payload.get("data") if isinstance(payload, Mapping) else None
+            raw_matches.extend(
+                entry
+                for entry in raw_entries or []
+                if isinstance(entry, Mapping) and entry.get("model_name") == route_name
+            )
+        if len(raw_matches) == 1:
+            resolved[provider_key] = raw_matches[0]
+    return resolved
 
 
 def coordinate_candidates(
@@ -166,6 +273,17 @@ def coordinate_candidates(
                 results[key] = _error_result(key, "litellm_request_failed")
         return _report(results, candidate_preflight=None)
 
+    provider_configs = [provider for provider in providers if isinstance(provider, Mapping)]
+    raw_routes = _resolve_raw_candidate_routes(
+        providers=provider_configs,
+        litellm_snapshot=litellm_snapshot,
+        litellm_base_url=litellm_base_url,
+        litellm_key=litellm_key,
+        client=client,
+        timeout_seconds=timeout_seconds,
+    )
+    raw_snapshot = {"data": list(raw_routes.values())}
+
     preflight_config = litellm.get("candidate_preflight")
     candidate_key_env = str(preflight_config.get("api_key_env") or "") if isinstance(preflight_config, Mapping) else ""
     candidate_key = environ.get(candidate_key_env, "")
@@ -190,7 +308,8 @@ def coordinate_candidates(
 
     candidate_preflight = _candidate_preflight_status(
         litellm_config=litellm,
-        litellm_snapshot=litellm_snapshot,
+        providers=provider_configs,
+        litellm_snapshot=raw_snapshot,
         candidate_key_models=candidate_key_models,
         candidate_key_lookup_failed=candidate_key_lookup_failed,
         environ=environ,
@@ -245,9 +364,9 @@ def _report(
         else {
             "status": "blocked",
             "transport": None,
-            "route_model_name": None,
             "credential_source": None,
             "reasons": ["litellm_snapshot_unavailable"],
+            "providers": {},
         },
         "summary": {
             "providers_total": len(results),

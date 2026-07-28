@@ -28,7 +28,7 @@
 1. 新增 provider adapter 和只读候选报告。
 2. 支持 Moonshot 与标准 OpenAI-compatible `/v1/models`。
 3. 用官方成本表和受审 override 富化候选；证据不全时保持隔离。
-4. 通过 LiteLLM wildcard 路由执行候选预准入文本、流式、工具和 usage/cost 验收。
+4. 通过逐 provider 的 LiteLLM wildcard 路由执行候选预准入文本、流式、工具和 usage/cost 验收；共享 `openai/*` adapter 的厂商按 alias、endpoint 和 key 隔离。
 5. 通过预准入后才允许生成 dry-run `/model/new` 和 allowlist 变更计划。
 6. 实际注册后复用现有 Fusion 全模型验收脚本完成产品门禁。
 7. 首版保持人工批准；积累稳定证据后再评估自动批准策略。

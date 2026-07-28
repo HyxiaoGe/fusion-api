@@ -19,7 +19,6 @@ import httpx
 
 LITELLM_BASE_URL_ENV = "LITELLM_BASE_URL"
 LITELLM_PROXY_URL_ENV = "LITELLM_PROXY_URL"
-LITELLM_MASTER_KEY_ENV = "LITELLM_MASTER_KEY"
 LITELLM_CANDIDATE_KEY_ENV = "LITELLM_CANDIDATE_KEY"
 DEFAULT_LITELLM_BASE_URL = "http://localhost:4000"
 RED_PIXEL_PNG_DATA_URL = (
@@ -37,6 +36,8 @@ class HttpClient(Protocol):
 class Candidate:
     model_id: str
     litellm_model: str
+    preflight_model: str
+    preflight_route: dict[str, Any]
     capabilities: dict[str, Any]
     pricing: dict[str, Any]
     provider_key: str = ""
@@ -90,6 +91,8 @@ def parse_candidate(payload: Mapping[str, Any]) -> Candidate:
     """解析并校验候选模型描述。"""
     model_id = payload.get("model_id")
     litellm_model = payload.get("litellm_model")
+    preflight_model = payload.get("preflight_model")
+    preflight_route = payload.get("preflight_route")
     metadata = payload.get("metadata")
     metadata = metadata if isinstance(metadata, Mapping) else {}
     registration = payload.get("registration")
@@ -102,6 +105,12 @@ def parse_candidate(payload: Mapping[str, Any]) -> Candidate:
         raise ValueError("candidate.model_id 必须是非空字符串")
     if not isinstance(litellm_model, str) or not litellm_model.strip():
         raise ValueError("candidate.litellm_model 必须是非空字符串")
+    if not isinstance(preflight_model, str) or not preflight_model.strip():
+        raise ValueError("candidate.preflight_model 必须是非空字符串")
+    if not isinstance(preflight_route, Mapping):
+        raise ValueError("candidate.preflight_route 必须是 JSON 对象")
+    if preflight_route.get("status") != "ready":
+        raise ValueError("candidate.preflight_route 尚未就绪")
     if not isinstance(capabilities, Mapping):
         raise ValueError("candidate.capabilities 必须是 JSON 对象")
     if not isinstance(pricing, Mapping):
@@ -109,6 +118,8 @@ def parse_candidate(payload: Mapping[str, Any]) -> Candidate:
     return Candidate(
         model_id=model_id.strip(),
         litellm_model=litellm_model.strip(),
+        preflight_model=preflight_model.strip(),
+        preflight_route=dict(preflight_route),
         capabilities=dict(capabilities),
         pricing=dict(pricing),
         provider_key=str(payload.get("provider_key") or metadata.get("provider_key") or "").strip(),
@@ -214,7 +225,7 @@ def _run_text_case(
             url,
             headers=_request_headers(api_key),
             json={
-                "model": candidate.litellm_model,
+                "model": candidate.preflight_model,
                 "messages": [{"role": "user", "content": "只回复 ok"}],
                 "max_tokens": 8,
                 "temperature": 0,
@@ -266,7 +277,7 @@ def _run_stream_case(
             url,
             headers=_request_headers(api_key),
             json={
-                "model": candidate.litellm_model,
+                "model": candidate.preflight_model,
                 "messages": [{"role": "user", "content": "只回复 ok"}],
                 "max_tokens": 8,
                 "temperature": 0,
@@ -318,7 +329,7 @@ def _run_tool_case(
             url,
             headers=_request_headers(api_key),
             json={
-                "model": candidate.litellm_model,
+                "model": candidate.preflight_model,
                 "messages": [{"role": "user", "content": "查询上海天气"}],
                 "max_tokens": 64,
                 "tools": [
@@ -369,7 +380,7 @@ def _run_vision_case(
             url,
             headers=_request_headers(api_key),
             json={
-                "model": candidate.litellm_model,
+                "model": candidate.preflight_model,
                 "messages": [
                     {
                         "role": "user",
@@ -419,7 +430,7 @@ def _run_reasoning_case(
             url,
             headers=_request_headers(api_key),
             json={
-                "model": candidate.litellm_model,
+                "model": candidate.preflight_model,
                 "messages": [{"role": "user", "content": "计算 17×19，只回复答案。"}],
                 "reasoning_effort": "low",
                 "max_tokens": 64,
@@ -464,7 +475,7 @@ def _run_preserved_tool_round_case(
             url,
             headers=_request_headers(api_key),
             json={
-                "model": candidate.litellm_model,
+                "model": candidate.preflight_model,
                 "messages": [{"role": "user", "content": "查询上海天气，然后告诉我是否适合散步。"}],
                 "tools": [
                     {
@@ -500,7 +511,7 @@ def _run_preserved_tool_round_case(
             url,
             headers=_request_headers(api_key),
             json={
-                "model": candidate.litellm_model,
+                "model": candidate.preflight_model,
                 "messages": [
                     {"role": "user", "content": "查询上海天气，然后告诉我是否适合散步。"},
                     dict(assistant),
@@ -700,7 +711,7 @@ def serialize_report(
     }
     return {
         "acceptance_stage": "candidate_pre_registration",
-        "transport": "litellm_wildcard",
+        "transport": "litellm_provider_wildcard",
         "healthy": report.healthy,
         "dry_run": report.dry_run,
         "candidate": asdict(report.candidate),
@@ -765,18 +776,16 @@ def main(argv: list[str] | None = None) -> int:
         args.base_url or os.getenv(LITELLM_BASE_URL_ENV) or os.getenv(LITELLM_PROXY_URL_ENV) or DEFAULT_LITELLM_BASE_URL
     )
     candidate_key = os.getenv(LITELLM_CANDIDATE_KEY_ENV)
-    master_key = os.getenv(LITELLM_MASTER_KEY_ENV)
-    api_key = candidate_key or master_key
-    credential_source = LITELLM_CANDIDATE_KEY_ENV if candidate_key else LITELLM_MASTER_KEY_ENV if master_key else "none"
-    if args.apply and not api_key:
-        _print_error("missing_litellm_key", ValueError("missing key"))
+    credential_source = LITELLM_CANDIDATE_KEY_ENV if candidate_key else "none"
+    if args.apply and not candidate_key:
+        _print_error("missing_candidate_key", ValueError("missing key"))
         return 2
 
     try:
         report = run_preflight(
             candidate=candidate,
             base_url=base_url,
-            api_key=api_key,
+            api_key=candidate_key,
             apply=args.apply,
             timeout_seconds=args.timeout_seconds,
         )

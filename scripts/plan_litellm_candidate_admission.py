@@ -1,6 +1,6 @@
 """基于候选发现与验收证据生成 LiteLLM 准入 dry-run 计划。
 
-首次准入只接受 direct LiteLLM wildcard 的候选验收。Fusion 全模型验收属于
+首次准入只接受按厂商隔离的 LiteLLM wildcard 候选验收。Fusion 全模型验收属于
 注册后的发布门禁，不能替代候选预准入证据。本脚本不发 HTTP，也没有 apply 模式。
 """
 
@@ -113,6 +113,16 @@ def _registration_reasons(candidate: Mapping[str, Any]) -> list[str]:
         reasons.append("registration_api_key_env_invalid")
     if not _nonempty_string(candidate.get("litellm_model")):
         reasons.append("registration_litellm_model_missing")
+    route = candidate.get("preflight_route")
+    preflight_model = _nonempty_string(candidate.get("preflight_model"))
+    if not _is_mapping(route) or route.get("status") != "ready":
+        reasons.append("candidate_preflight_route_unverified")
+    elif (
+        route.get("api_base") != registration.get("api_base")
+        or route.get("api_key_env") != registration.get("api_key_env")
+        or not preflight_model.startswith(_nonempty_string(route.get("route_model_name")).removesuffix("*"))
+    ):
+        reasons.append("candidate_preflight_route_mismatch")
     return reasons
 
 
@@ -142,8 +152,13 @@ def _acceptance_reasons(
         reasons.append("candidate_acceptance_not_executed")
     if summary.get("acceptance_stage") != "candidate_pre_registration":
         reasons.append("candidate_acceptance_stage_invalid")
-    if summary.get("transport") != "litellm_wildcard":
+    if summary.get("transport") != "litellm_provider_wildcard":
         reasons.append("candidate_acceptance_transport_invalid")
+    accepted_candidate = summary.get("candidate")
+    if not _is_mapping(accepted_candidate) or accepted_candidate.get("preflight_model") != candidate.get(
+        "preflight_model"
+    ):
+        reasons.append("candidate_acceptance_route_mismatch")
     try:
         expected_fingerprint = candidate_contract_fingerprint(candidate)
     except ValueError:

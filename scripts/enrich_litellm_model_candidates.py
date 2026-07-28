@@ -247,6 +247,8 @@ def enrich_candidate_report(
     if not _is_mapping(providers):
         raise ValueError("candidate_report.providers 必须是对象")
     configs = _provider_configs(registry)
+    preflight_contract = report.get("candidate_preflight")
+    preflight_providers = preflight_contract.get("providers") if _is_mapping(preflight_contract) else {}
     override_approval = validate_override_approval(overrides) if overrides is not None else None
     for provider_key, provider_result in providers.items():
         if not _is_mapping(provider_result):
@@ -267,6 +269,14 @@ def enrich_candidate_report(
                 "api_key_env": provider_config.get("api_key_env"),
                 "endpoint_status": "verified" if provider_result.get("status") == "ok" else "unknown",
             }
+            route = preflight_providers.get(str(provider_key)) if _is_mapping(preflight_providers) else None
+            if _is_mapping(route):
+                route_pattern = str(route.get("route_model_name") or "")
+                model_id = str(candidate.get("model_id") or "")
+                candidate["preflight_route"] = copy.deepcopy(dict(route))
+                candidate["preflight_model"] = (
+                    route_pattern[:-1] + model_id if route_pattern.endswith("*") and model_id else ""
+                )
             candidate["metadata"] = _metadata(
                 candidate=candidate,
                 provider_key=str(provider_key),

@@ -88,12 +88,29 @@ python scripts/write_restic_success_marker.py \
 
 复制 `provider-registry.example.json` 到运维主机的受控配置目录，并按实际支持情况启用 provider。Registry 只记录地址和环境变量名，不保存 API key。
 
-`litellm.candidate_preflight` 还必须指向专用的 wildcard route（业务名和
-underlying model 都为 `*`）及只用于候选验收的 virtual key。协调器会通过
-`/model/info` 验证 wildcard route，并通过 `/key/info` 确认专用 key 的
-allowlist 确实包含 `*`；candidate key 的环境变量和值都不得与 master key
-相同。只存在环境变量但没有独立凭证或路由权限也会保持隔离。运维反代和
-access log 还必须对 `/key/info?key=...` 查询参数做脱敏。
+`litellm.candidate_preflight` 必须使用 `litellm_provider_wildcard`，每个
+provider 还要声明独立的 `candidate/<provider>/*` route；实际 LiteLLM 配置
+参见 `candidate-preflight-routes.example.yaml`。协调器先从普通
+`/model/info` 找到 route deployment id，再用 `litellm_model_id` 读取原始
+wildcard 契约，逐条核对 alias、underlying wildcard、`api_base` 和 provider
+metadata。专用 key 的 allowlist 必须恰好等于全部公共候选 route，不能是
+全局 `*` 或 underlying `openai/*`。candidate key 的环境变量和值都不得与
+master key 相同。运维反代和 access log 还必须对 `/key/info?key=...` 查询
+参数做脱敏。
+
+LiteLLM v1.93 的原始 route 响应会省略 `litellm_params.api_key`，所以只读
+协调器不能把“读取不到 key 引用”误判为配置错误。provider key 环境变量名由
+受控 registry 与 route 配置共同维护；真正的凭据绑定还会由后续专用候选 key
+请求在对应 `api_base` 上验证，验收摘要再通过完整候选指纹固化证据。
+
+普通 `/model/info` 对 wildcard 展示的是 LiteLLM 已知目录的展开结果，可能
+不包含刚由厂商发布但 LiteLLM 成本目录尚未收录的模型。因此 day-0 发现始终以
+provider `/models` 为事实源；`/model/info` 只用于验证代理路由和现有注册状态。
+
+这层隔离对共享 `openai/*` adapter 的厂商尤其重要：Qwen 与 Xiaomi 虽然都用
+`openai/*`，候选请求仍分别使用 `candidate/qwen/<model_id>` 和
+`candidate/xiaomi/<model_id>`，由各自 route 绑定不同 endpoint 与 provider
+key。单个 provider route 异常只隔离该 provider；公共 key 异常才阻塞全部。
 
 ```bash
 python scripts/orchestrate_litellm_model_candidates.py \

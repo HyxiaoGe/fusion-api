@@ -85,13 +85,13 @@
 
 候选富化优先使用官方 LiteLLM 成本表。共享 `openai/` adapter 通过 provider 的 `cost_map_prefix` 映射到官方成本条目；官方表缺失时只能使用有审查记录的 metadata override。缺少成本、能力或来源证据的候选继续隔离。
 
-预准入摘要必须绑定完整候选契约哈希，覆盖 provider、underlying model、endpoint、环境变量名、价格、能力和元数据来源；任一字段变化都必须重新验收。跨 provider 业务 alias 冲突、provider 发现失败以及成本 namespace 不一致均为 fail-closed。
+预准入摘要必须绑定完整候选契约哈希，覆盖 provider、候选 route、实际请求 model、underlying model、endpoint、环境变量名、价格、能力和元数据来源；任一字段变化都必须重新验收。跨 provider 业务 alias 冲突、provider 发现失败以及成本 namespace 不一致均为 fail-closed。
 
 ## 两阶段验收
 
 未注册候选不会出现在 Fusion `/api/models`，因此不能用现有 Fusion 全模型脚本完成首次准入：
 
-1. 预准入验收通过 LiteLLM wildcard 路由直接调用候选 underlying model，至少验证非流式文本、SSE、可选 tool calling、usage/cost 和声明能力。该阶段不得创建 DB model。
+1. 预准入验收通过逐 provider 的 LiteLLM wildcard route 调用候选；route 必须绑定该 provider 的 endpoint、API key 引用和 metadata。共享 `openai/*` adapter 的厂商不得共用全局 `*` route。至少验证非流式文本、SSE、可选 tool calling、usage/cost 和声明能力。该阶段不得创建 DB model。
 2. 预准入通过后只生成 dry-run 注册与 allowlist 计划；v1.93+ 的 DB model 密钥引用使用官方 `os.environ/变量名` 格式，实际写入必须经过发布门禁。
 3. 注册后再运行 `MODEL_ACCEPTANCE_RUNBOOK.md` 的 Fusion SSE、Agent、视觉和真实 UI 验收。失败时回滚 allowlist/模型注册，不把预准入结果冒充产品验收。
 

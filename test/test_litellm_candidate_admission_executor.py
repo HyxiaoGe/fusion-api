@@ -45,6 +45,15 @@ def candidate_contract():
         "provider_display": "Moonshot",
         "model_id": "kimi-k3",
         "litellm_model": "moonshot/kimi-k3",
+        "preflight_model": "candidate/moonshot/kimi-k3",
+        "preflight_route": {
+            "status": "ready",
+            "route_model_name": "candidate/moonshot/*",
+            "route_litellm_model": "moonshot/*",
+            "api_base": "https://api.moonshot.cn/v1",
+            "api_key_env": "MOONSHOT_API_KEY",
+            "reasons": [],
+        },
         "isolation_status": "candidate",
         "metadata": {
             "display_name": "Kimi K3",

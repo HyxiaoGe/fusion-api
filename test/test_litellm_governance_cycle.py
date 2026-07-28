@@ -56,16 +56,34 @@ def candidate_report(*, status="ok", complete_metadata=True):
                     "api_key_env": "MOONSHOT_API_KEY",
                     "endpoint_status": "verified",
                 },
+                "preflight_model": "candidate/moonshot/kimi-k3",
+                "preflight_route": {
+                    "status": "ready",
+                    "route_model_name": "candidate/moonshot/*",
+                    "route_litellm_model": "moonshot/*",
+                    "api_base": "https://api.moonshot.cn/v1",
+                    "api_key_env": "MOONSHOT_API_KEY",
+                    "reasons": [],
+                },
             }
         )
     return {
         "mode": "read_only",
         "candidate_preflight": {
             "status": "ready",
-            "transport": "litellm_wildcard",
-            "route_model_name": "*",
+            "transport": "litellm_provider_wildcard",
             "credential_source": "LITELLM_CANDIDATE_KEY",
             "reasons": [],
+            "providers": {
+                "moonshot": {
+                    "status": "ready",
+                    "route_model_name": "candidate/moonshot/*",
+                    "route_litellm_model": "moonshot/*",
+                    "api_base": "https://api.moonshot.cn/v1",
+                    "api_key_env": "MOONSHOT_API_KEY",
+                    "reasons": [],
+                }
+            },
         },
         "summary": {
             "providers_total": 1,
