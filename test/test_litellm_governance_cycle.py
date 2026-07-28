@@ -63,6 +63,7 @@ def candidate_report(*, status="ok", complete_metadata=True):
                     "route_litellm_model": "moonshot/*",
                     "api_base": "https://api.moonshot.cn/v1",
                     "api_key_env": "MOONSHOT_API_KEY",
+                    "credential_generation": "test-v1",
                     "reasons": [],
                 },
             }
@@ -81,6 +82,7 @@ def candidate_report(*, status="ok", complete_metadata=True):
                     "route_litellm_model": "moonshot/*",
                     "api_base": "https://api.moonshot.cn/v1",
                     "api_key_env": "MOONSHOT_API_KEY",
+                    "credential_generation": "test-v1",
                     "reasons": [],
                 }
             },

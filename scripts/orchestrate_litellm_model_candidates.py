@@ -110,6 +110,7 @@ def _candidate_preflight_status(
             provider_reasons.append("candidate_preflight_provider_config_missing")
         route_model_name = str(route_config.get("route_model_name") or "")
         route_litellm_model = str(route_config.get("route_litellm_model") or "")
+        credential_generation = str(provider.get("credential_generation") or "").strip()
         if (
             not route_model_name.startswith(f"candidate/{provider_key}/")
             or route_model_name.count("*") != 1
@@ -120,6 +121,8 @@ def _candidate_preflight_status(
             provider_reasons.append("candidate_preflight_route_invalid")
         if route_model_name:
             expected_routes.add(route_model_name)
+        if not credential_generation:
+            provider_reasons.append("candidate_preflight_credential_generation_missing")
         matches = [
             entry
             for entry in entries or []
@@ -151,6 +154,7 @@ def _candidate_preflight_status(
             "route_litellm_model": route_litellm_model or None,
             "api_base": provider.get("base_url"),
             "api_key_env": provider.get("api_key_env"),
+            "credential_generation": credential_generation or None,
             "reasons": provider_reasons,
         }
     if not credential_env or not environ.get(credential_env):

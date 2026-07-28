@@ -85,7 +85,7 @@
 
 候选富化优先使用官方 LiteLLM 成本表。共享 `openai/` adapter 通过 provider 的 `cost_map_prefix` 映射到官方成本条目；官方表缺失时只能使用有审查记录的 metadata override。缺少成本、能力或来源证据的候选继续隔离。
 
-预准入摘要必须绑定完整候选契约哈希，覆盖 provider、候选 route、实际请求 model、underlying model、endpoint、环境变量名、价格、能力和元数据来源；任一字段变化都必须重新验收。跨 provider 业务 alias 冲突、provider 发现失败以及成本 namespace 不一致均为 fail-closed。
+预准入摘要必须绑定完整候选契约哈希，覆盖 provider、候选 route、实际请求 model、underlying model、endpoint、环境变量名、凭据轮换代际、价格、能力和元数据来源；任一字段变化都必须重新验收。摘要默认 7 天过期，缺失时间、过期或明显来自未来的证据均 fail-closed。跨 provider 业务 alias 冲突、provider 发现失败以及成本 namespace 不一致同样 fail-closed。
 
 ## 两阶段验收
 

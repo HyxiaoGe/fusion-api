@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import unittest
+from datetime import UTC, datetime, timedelta
 
 from scripts import check_litellm_candidate_preflight as preflight
 from scripts import plan_litellm_candidate_admission as admission
@@ -31,6 +32,7 @@ def kimi_candidate(*, pricing=True, endpoint_status="verified", extra=None):
             "route_litellm_model": "moonshot/*",
             "api_base": "https://api.moonshot.cn/v1",
             "api_key_env": "MOONSHOT_API_KEY",
+            "credential_generation": "test-v1",
             "reasons": [],
         },
         "isolation_status": "candidate",
@@ -72,10 +74,13 @@ def candidate_acceptance(*, model_id="kimi-k3", failed=False, high_risk=False):
     candidate = kimi_candidate()
     if model_id != candidate["model_id"]:
         candidate["model_id"] = model_id
+    now = datetime.now(UTC)
     summary = {
         "acceptance_stage": "candidate_pre_registration",
         "transport": "litellm_provider_wildcard",
         "candidate": candidate,
+        "generated_at": now.isoformat(),
+        "expires_at": (now + timedelta(days=7)).isoformat(),
         "healthy": not failed,
         "dry_run": False,
         "candidate_fingerprint": preflight.candidate_contract_fingerprint(candidate),
@@ -119,6 +124,67 @@ def candidate_acceptance(*, model_id="kimi-k3", failed=False, high_risk=False):
 
 
 class CandidateAdmissionPlanTests(unittest.TestCase):
+    def test_expired_acceptance_is_isolated(self):
+        summary = candidate_acceptance()
+        summary["generated_at"] = (datetime.now(UTC) - timedelta(days=8)).isoformat()
+        summary["expires_at"] = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+
+        plan = admission.build_admission_plan(
+            candidate_report=candidate_report(),
+            candidate_acceptance_summary=summary,
+        )
+
+        self.assertIn("candidate_acceptance_expired", plan["isolated"][0]["reasons"])
+
+    def test_acceptance_expires_at_the_exact_boundary(self):
+        summary = candidate_acceptance()
+        boundary = datetime.fromisoformat(summary["expires_at"])
+
+        reasons = admission._acceptance_reasons(
+            "kimi-k3",
+            kimi_candidate(),
+            summary,
+            now=boundary,
+        )
+
+        self.assertIn("candidate_acceptance_expired", reasons)
+
+    def test_missing_or_future_acceptance_time_is_isolated(self):
+        missing = candidate_acceptance()
+        missing.pop("expires_at")
+        future = candidate_acceptance()
+        future["generated_at"] = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+        future["expires_at"] = (datetime.now(UTC) + timedelta(days=7)).isoformat()
+
+        missing_plan = admission.build_admission_plan(
+            candidate_report=candidate_report(),
+            candidate_acceptance_summary=missing,
+        )
+        future_plan = admission.build_admission_plan(
+            candidate_report=candidate_report(),
+            candidate_acceptance_summary=future,
+        )
+
+        self.assertIn(
+            "candidate_acceptance_time_invalid",
+            missing_plan["isolated"][0]["reasons"],
+        )
+        self.assertIn(
+            "candidate_acceptance_from_future",
+            future_plan["isolated"][0]["reasons"],
+        )
+
+    def test_acceptance_cannot_extend_its_own_ttl(self):
+        summary = candidate_acceptance()
+        summary["expires_at"] = (datetime.fromisoformat(summary["generated_at"]) + timedelta(days=8)).isoformat()
+
+        plan = admission.build_admission_plan(
+            candidate_report=candidate_report(),
+            candidate_acceptance_summary=summary,
+        )
+
+        self.assertIn("candidate_acceptance_ttl_invalid", plan["isolated"][0]["reasons"])
+
     def test_kimi_k3_is_eligible_with_complete_metadata_and_candidate_acceptance(self):
         plan = admission.build_admission_plan(
             candidate_report=candidate_report(),

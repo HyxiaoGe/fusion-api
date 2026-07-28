@@ -12,6 +12,7 @@
       "adapter": "moonshot",
       "base_url": "https://api.moonshot.cn/v1",
       "api_key_env": "MOONSHOT_API_KEY",
+      "credential_generation": "initial",
       "candidate_preflight": {
         "route_model_name": "candidate/moonshot/*",
         "route_litellm_model": "moonshot/*"
@@ -25,6 +26,7 @@
       "api_model_prefix": "deepseek-",
       "base_url": "https://api.deepseek.com/v1",
       "api_key_env": "DEEPSEEK_API_KEY",
+      "credential_generation": "initial",
       "candidate_preflight": {
         "route_model_name": "candidate/deepseek/*",
         "route_litellm_model": "deepseek/*"
@@ -39,6 +41,7 @@
       "api_model_prefix": "qwen-",
       "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
       "api_key_env": "QWEN_API_KEY",
+      "credential_generation": "initial",
       "candidate_preflight": {
         "route_model_name": "candidate/qwen/*",
         "route_litellm_model": "openai/*"
@@ -52,6 +55,7 @@
       "api_model_prefix": "mimo-",
       "base_url": "https://api.xiaomimimo.com/v1",
       "api_key_env": "XIAOMI_API_KEY",
+      "credential_generation": "initial",
       "candidate_preflight": {
         "route_model_name": "candidate/xiaomi/*",
         "route_litellm_model": "openai/*"

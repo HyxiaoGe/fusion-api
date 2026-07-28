@@ -21,6 +21,7 @@ CANDIDATE = {
         "route_litellm_model": "moonshot/*",
         "api_base": "https://api.moonshot.cn/v1",
         "api_key_env": "MOONSHOT_API_KEY",
+        "credential_generation": "test-v1",
         "reasons": [],
     },
     "capabilities": {"toolCalling": True},
@@ -128,6 +129,15 @@ def stream_response(*, usage: bool = True, cost: bool = True) -> FakeResponse:
 
 
 class LiteLLMCandidatePreflightTests(unittest.TestCase):
+    def test_credential_generation_change_invalidates_candidate_fingerprint(self):
+        rotated = copy.deepcopy(CANDIDATE)
+        rotated["preflight_route"]["credential_generation"] = "test-v2"
+
+        self.assertNotEqual(
+            preflight.candidate_contract_fingerprint(CANDIDATE),
+            preflight.candidate_contract_fingerprint(rotated),
+        )
+
     def test_apply_never_falls_back_to_master_key(self):
         with (
             patch.dict(

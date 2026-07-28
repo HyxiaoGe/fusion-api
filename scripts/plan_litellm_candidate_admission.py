@@ -12,11 +12,15 @@ import os
 import re
 import sys
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
 
-from scripts.check_litellm_candidate_preflight import candidate_contract_fingerprint
+from scripts.check_litellm_candidate_preflight import (
+    DEFAULT_ACCEPTANCE_TTL_SECONDS,
+    candidate_contract_fingerprint,
+)
 
 REQUIRED_CANDIDATE_CHECKS = ("text", "stream", "tool", "usage", "cost")
 ENV_NAME_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -37,6 +41,7 @@ REQUIRED_OVERRIDE_APPROVAL_KEYS = (
     "source_urls",
     "providers_sha256",
 )
+MAX_ACCEPTANCE_CLOCK_SKEW_SECONDS = 300
 
 
 def _is_mapping(value: Any) -> bool:
@@ -120,6 +125,7 @@ def _registration_reasons(candidate: Mapping[str, Any]) -> list[str]:
     elif (
         route.get("api_base") != registration.get("api_base")
         or route.get("api_key_env") != registration.get("api_key_env")
+        or not _nonempty_string(route.get("credential_generation"))
         or not preflight_model.startswith(_nonempty_string(route.get("route_model_name")).removesuffix("*"))
     ):
         reasons.append("candidate_preflight_route_mismatch")
@@ -146,8 +152,27 @@ def _acceptance_reasons(
     model_id: str,
     candidate: Mapping[str, Any],
     summary: Mapping[str, Any],
+    *,
+    now: datetime | None = None,
 ) -> list[str]:
     reasons: list[str] = []
+    current_time = now or datetime.now(UTC)
+    try:
+        generated_at = datetime.fromisoformat(_nonempty_string(summary.get("generated_at")))
+        expires_at = datetime.fromisoformat(_nonempty_string(summary.get("expires_at")))
+        if generated_at.tzinfo is None or expires_at.tzinfo is None:
+            raise ValueError("验收时间缺少时区")
+        generated_at = generated_at.astimezone(UTC)
+        expires_at = expires_at.astimezone(UTC)
+        ttl_seconds = (expires_at - generated_at).total_seconds()
+        if ttl_seconds <= 0 or ttl_seconds > DEFAULT_ACCEPTANCE_TTL_SECONDS:
+            reasons.append("candidate_acceptance_ttl_invalid")
+        if current_time.astimezone(UTC) >= expires_at:
+            reasons.append("candidate_acceptance_expired")
+        if (generated_at - current_time.astimezone(UTC)).total_seconds() > MAX_ACCEPTANCE_CLOCK_SKEW_SECONDS:
+            reasons.append("candidate_acceptance_from_future")
+    except (TypeError, ValueError):
+        reasons.append("candidate_acceptance_time_invalid")
     if summary.get("dry_run") is not False or summary.get("healthy") is not True:
         reasons.append("candidate_acceptance_not_executed")
     if summary.get("acceptance_stage") != "candidate_pre_registration":

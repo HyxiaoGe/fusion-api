@@ -98,10 +98,17 @@ metadata。专用 key 的 allowlist 必须恰好等于全部公共候选 route�
 master key 相同。运维反代和 access log 还必须对 `/key/info?key=...` 查询
 参数做脱敏。
 
+每个 provider 还必须维护非空 `credential_generation`。首次可设为
+`initial`，以后只要对应 API key 在同一环境变量名下轮换，就必须同步递增该
+值。它会进入候选 route 和完整契约指纹，使旧凭据代际签发的验收自动失效。
+
 LiteLLM v1.93 的原始 route 响应会省略 `litellm_params.api_key`，所以只读
 协调器不能把“读取不到 key 引用”误判为配置错误。provider key 环境变量名由
 受控 registry 与 route 配置共同维护；真正的凭据绑定还会由后续专用候选 key
 请求在对应 `api_base` 上验证，验收摘要再通过完整候选指纹固化证据。
+
+每份真实预准入摘要记录带时区的 `generated_at` 和 `expires_at`，默认有效期
+7 天；缺失时间、过期、倒置区间或明显来自未来的证据都不能进入准入计划。
 
 普通 `/model/info` 对 wildcard 展示的是 LiteLLM 已知目录的展开结果，可能
 不包含刚由厂商发布但 LiteLLM 成本目录尚未收录的模型。因此 day-0 发现始终以

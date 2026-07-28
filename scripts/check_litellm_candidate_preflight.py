@@ -12,6 +12,7 @@ import json
 import os
 import sys
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
@@ -21,6 +22,7 @@ LITELLM_BASE_URL_ENV = "LITELLM_BASE_URL"
 LITELLM_PROXY_URL_ENV = "LITELLM_PROXY_URL"
 LITELLM_CANDIDATE_KEY_ENV = "LITELLM_CANDIDATE_KEY"
 DEFAULT_LITELLM_BASE_URL = "http://localhost:4000"
+DEFAULT_ACCEPTANCE_TTL_SECONDS = 7 * 24 * 60 * 60
 RED_PIXEL_PNG_DATA_URL = (
     "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
 )
@@ -671,6 +673,7 @@ def serialize_report(
     report: PreflightReport,
     *,
     context: Mapping[str, Any],
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """输出脱敏摘要，不序列化任何凭证字段。"""
     safe_context = {key: context[key] for key in ("litellm_base_url", "credential_source") if key in context}
@@ -709,9 +712,16 @@ def serialize_report(
             and case_by_name["preserved_tool_round"].status == "passed"
         ),
     }
+    generated_at = now or datetime.now(UTC)
+    if generated_at.tzinfo is None:
+        raise ValueError("验收时间必须包含时区")
+    generated_at = generated_at.astimezone(UTC)
+    expires_at = generated_at + timedelta(seconds=DEFAULT_ACCEPTANCE_TTL_SECONDS)
     return {
         "acceptance_stage": "candidate_pre_registration",
         "transport": "litellm_provider_wildcard",
+        "generated_at": generated_at.isoformat(),
+        "expires_at": expires_at.isoformat(),
         "healthy": report.healthy,
         "dry_run": report.dry_run,
         "candidate": asdict(report.candidate),

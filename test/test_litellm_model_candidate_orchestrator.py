@@ -55,6 +55,7 @@ def moonshot_config():
         "adapter": "moonshot",
         "base_url": "https://api.moonshot.example",
         "api_key_env": "MOONSHOT_API_KEY",
+        "credential_generation": "test-v1",
         "candidate_preflight": {
             "route_model_name": "candidate/moonshot/*",
             "route_litellm_model": "moonshot/*",
@@ -71,6 +72,7 @@ def acme_config():
         "api_model_prefix": "acme-",
         "base_url": "https://api.acme.example/v1",
         "api_key_env": "ACME_API_KEY",
+        "credential_generation": "test-v1",
         "candidate_preflight": {
             "route_model_name": "candidate/acme/*",
             "route_litellm_model": "openai/*",
@@ -79,6 +81,43 @@ def acme_config():
 
 
 class ModelCandidateOrchestratorTests(unittest.TestCase):
+    def test_provider_without_credential_generation_is_blocked(self):
+        provider = acme_config()
+        provider.pop("credential_generation")
+
+        status = orchestrator._candidate_preflight_status(
+            litellm_config=registry(provider)["litellm"],
+            providers=[provider],
+            litellm_snapshot={
+                "data": [
+                    {
+                        "model_name": "candidate/acme/*",
+                        "litellm_params": {
+                            "model": "openai/*",
+                            "api_base": "https://api.acme.example/v1",
+                        },
+                        "model_info": {
+                            "metadata": {
+                                "provider_key": "acme",
+                                "purpose": "candidate_preflight",
+                            }
+                        },
+                    }
+                ]
+            },
+            candidate_key_models=["candidate/acme/*"],
+            candidate_key_lookup_failed=False,
+            environ={
+                "LITELLM_MASTER_KEY": "master",
+                "LITELLM_CANDIDATE_KEY": "candidate",
+            },
+        )
+
+        self.assertIn(
+            "candidate_preflight_credential_generation_missing",
+            status["providers"]["acme"]["reasons"],
+        )
+
     def test_db_backed_candidate_route_is_never_ready(self):
         provider = acme_config()
         status = orchestrator._candidate_preflight_status(
