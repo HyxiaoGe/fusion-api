@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts import check_litellm_candidate_preflight as preflight
 from scripts import execute_litellm_candidate_admission as executor
@@ -214,6 +215,7 @@ class StatefulClient:
         omit_created_uuid=False,
         readback_mismatch=None,
         final_readback_mismatch=False,
+        fusion_missing_reads=0,
     ):
         self.fail_stage = fail_stage
         self.cas_conflict = cas_conflict
@@ -221,6 +223,7 @@ class StatefulClient:
         self.omit_created_uuid = omit_created_uuid
         self.readback_mismatch = readback_mismatch
         self.final_readback_mismatch = final_readback_mismatch
+        self.fusion_missing_reads = fusion_missing_reads
         self.entries = [model_entry("deepseek-chat", "deepseek/deepseek-chat", "uuid-deepseek")]
         self.key_models = ["deepseek-chat"]
         self.calls = []
@@ -247,6 +250,9 @@ class StatefulClient:
         if url.endswith("/api/models/"):
             if self.fail_stage == "fusion_readback":
                 raise RuntimeError("fusion readback failed with secret")
+            if self.fusion_missing_reads > 0:
+                self.fusion_missing_reads -= 1
+                return FakeResponse({"data": {"models": []}})
             models = [{"modelId": item["model_name"]} for item in self.entries if item["model_name"] in self.key_models]
             return FakeResponse({"data": {"models": models}})
         raise AssertionError(f"unexpected GET {url}")
@@ -528,6 +534,15 @@ class CandidateAdmissionExecutorTests(unittest.TestCase):
         payload = model_new_call[2]["json"]
         self.assertEqual(payload["litellm_params"]["api_key"], "os.environ/MOONSHOT_API_KEY")
         self.assertNotIn("provider-super-secret", json.dumps(payload))
+
+    def test_fusion_readback_waits_for_catalog_cache_refresh(self):
+        client = StatefulClient(fusion_missing_reads=2)
+
+        with patch.object(executor.time, "sleep") as sleep:
+            result = execute(client)
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(sleep.call_count, 2)
 
     def test_each_mutating_stage_failure_rolls_back_model_and_allowlist(self):
         for stage in ("verify", "key_update", "fusion_readback", "audit"):

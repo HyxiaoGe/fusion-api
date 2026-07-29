@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 from urllib.parse import urlencode
@@ -25,6 +26,8 @@ from scripts.check_litellm_candidate_preflight import candidate_contract_fingerp
 from scripts.plan_litellm_candidate_admission import build_eligible_entry
 
 TRANSACTION_SCHEMA_VERSION = 1
+FUSION_READBACK_ATTEMPTS = 35
+FUSION_READBACK_INTERVAL_SECONDS = 2.0
 ENV_NAME_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
@@ -428,6 +431,21 @@ def _fetch_fusion_models(client: HttpClient, fusion_base_url: str) -> list[dict]
     return [item for item in models if isinstance(item, dict)]
 
 
+def _wait_for_fusion_model(
+    client: HttpClient,
+    fusion_base_url: str,
+    model_id: str,
+) -> list[dict]:
+    """等待 Fusion 最长约 68 秒的目录缓存刷新。"""
+    for attempt in range(FUSION_READBACK_ATTEMPTS):
+        models = _fetch_fusion_models(client, fusion_base_url)
+        if model_id in {item.get("modelId") for item in models}:
+            return models
+        if attempt + 1 < FUSION_READBACK_ATTEMPTS:
+            time.sleep(FUSION_READBACK_INTERVAL_SECONDS)
+    raise TransactionFailure("fusion_model_missing", "fusion_readback")
+
+
 def _default_audit(
     *,
     litellm_entries: Sequence[Mapping[str, Any]],
@@ -678,9 +696,11 @@ def _execute_apply(
             phase="key_update",
         )
         result["completed_phases"].append("key_update")
-        fusion_models = _fetch_fusion_models(client, fusion_base_url)
-        if candidate["model_id"] not in {item.get("modelId") for item in fusion_models}:
-            raise TransactionFailure("fusion_model_missing", "fusion_readback")
+        fusion_models = _wait_for_fusion_model(
+            client,
+            fusion_base_url,
+            candidate["model_id"],
+        )
         result["completed_phases"].append("fusion_readback")
         _verify_created_model(
             client=client,
