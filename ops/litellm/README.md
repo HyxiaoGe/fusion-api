@@ -95,8 +95,9 @@ python -m scripts.write_restic_success_marker \
 响应列表字段、模型 id 字段、待移除前缀和分页参数。Google Gemini 使用
 `x-goog-api-key` 请求头并只接纳支持 `generateContent` 的模型；xAI 按当前实际
 链路从 OpenRouter 目录筛选 `x-ai/` 命名空间；MiniMax 国内账号从
-`api.minimaxi.com` 发现，并使用 Anthropic 兼容推理端点。目录中出现的新模型
-仍只进入隔离候选，不能绕过成本、能力和真实预检门禁直接上架。
+`api.minimaxi.com` 发现；LiteLLM 1.93 的原生 MiniMax provider 会在
+`api_base` 后拼接 OpenAI 兼容路径，因此推理基址必须保持为域名根路径。
+目录中出现的新模型仍只进入隔离候选，不能绕过成本、能力和真实预检门禁直接上架。
 
 `litellm.candidate_preflight` 必须使用 `litellm_provider_wildcard`，每个
 provider 还要声明独立的 `candidate/<provider>/*` route；实际 LiteLLM 配置

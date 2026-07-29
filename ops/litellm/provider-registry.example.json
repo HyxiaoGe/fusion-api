@@ -137,7 +137,7 @@
       "provider_display": "MiniMax",
       "litellm_prefix": "minimax",
       "api_model_prefix": "MiniMax-",
-      "base_url": "https://api.minimaxi.com/anthropic/v1/messages",
+      "base_url": "https://api.minimaxi.com",
       "api_key_env": "MINIMAX_API_KEY",
       "credential_generation": "initial",
       "discovery": {

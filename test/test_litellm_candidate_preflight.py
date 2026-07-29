@@ -342,6 +342,33 @@ class LiteLLMCandidatePreflightTests(unittest.TestCase):
         assistant = preserved_body["messages"][1]
         self.assertIn("tool_calls", assistant)
 
+    def test_reasoning_case_enables_low_effort_for_google_and_xai(self):
+        for provider_key in ("google", "xai"):
+            with self.subTest(provider_key=provider_key):
+                candidate = preflight.parse_candidate(
+                    {
+                        **CANDIDATE,
+                        "provider_key": provider_key,
+                        "capabilities": {"deepThinking": True},
+                    }
+                )
+                client = FakeClient(
+                    responses=[text_response(), reasoning_response()],
+                    stream_response=stream_response(),
+                )
+
+                report = preflight.run_preflight(
+                    candidate=candidate,
+                    base_url="http://litellm:4000",
+                    api_key="sk-candidate-secret",
+                    apply=True,
+                    client=client,
+                )
+
+                self.assertTrue(report.healthy)
+                reasoning_body = client.post_calls[1][1]["json"]
+                self.assertEqual(reasoning_body["reasoning_effort"], "low")
+
     def test_missing_usage_or_cost_fails_preflight(self):
         client = FakeClient(
             responses=[text_response(usage=False, cost=False), tool_response()],

@@ -466,6 +466,11 @@ def _run_reasoning_case(
     client: HttpClient,
 ) -> CaseResult:
     try:
+        reasoning_options = (
+            {"reasoning_effort": "low"}
+            if candidate.provider_key.casefold() in {"google", "xai"}
+            else {}
+        )
         response = client.post(
             url,
             headers=_request_headers(api_key),
@@ -473,6 +478,7 @@ def _run_reasoning_case(
                 "model": candidate.preflight_model,
                 "messages": [{"role": "user", "content": "计算 17×19，只回复答案。"}],
                 "max_tokens": 512,
+                **reasoning_options,
             },
             timeout=timeout_seconds,
         )
