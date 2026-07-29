@@ -174,6 +174,11 @@ def _entry_underlying_model(entry: Mapping[str, Any]) -> str:
     return _nonempty_string(params.get("model"))
 
 
+def _is_db_model_entry(entry: Mapping[str, Any]) -> bool:
+    model_info = entry.get("model_info")
+    return isinstance(model_info, Mapping) and model_info.get("db_model") is True
+
+
 def _snapshot_entries(snapshot: Any, *, source: str) -> tuple[list[Mapping[str, Any]], list[UnknownCandidate]]:
     raw_entries = snapshot.get("data") if isinstance(snapshot, Mapping) else snapshot
     if not isinstance(raw_entries, list):
@@ -231,11 +236,9 @@ def _discover_litellm(
     entries, unknown = _snapshot_entries(snapshot, source="litellm")
     aliases_by_model: dict[str, list[str]] = {}
     for entry in entries:
-        model_info = entry.get("model_info")
-        model_info = model_info if isinstance(model_info, Mapping) else {}
-        metadata = model_info.get("metadata")
-        metadata = metadata if isinstance(metadata, Mapping) else {}
-        if model_info.get("db_model") is not True and str(metadata.get("purpose") or "").startswith("candidate_"):
+        # Fusion 模型选择器只展示 db_model=true；YAML wildcard 展开的目录条目
+        # 只是可路由能力，不能被误判成已经准入 Fusion 的业务模型。
+        if not _is_db_model_entry(entry):
             continue
         if not adapter.owns_litellm_entry(entry):
             continue
@@ -260,6 +263,8 @@ def _all_litellm_alias_targets(snapshot: Any) -> dict[str, set[str]]:
     entries, _ = _snapshot_entries(snapshot, source="litellm")
     targets: dict[str, set[str]] = {}
     for entry in entries:
+        if not _is_db_model_entry(entry):
+            continue
         alias = _nonempty_string(entry.get("model_name"))
         underlying = _entry_underlying_model(entry)
         if alias and underlying:

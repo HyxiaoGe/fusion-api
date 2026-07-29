@@ -208,6 +208,37 @@ class ModelCandidateDiscoveryTests(unittest.TestCase):
         self.assertEqual([item.model_id for item in report.new], ["kimi-k3"])
         self.assertEqual(report.existing, [])
 
+    def test_non_db_business_wildcard_does_not_hide_model_from_fusion_candidate_queue(self):
+        wildcard_entry = litellm_entry(
+            "gemini/gemini-3.6-flash",
+            "gemini/gemini-3.6-flash",
+            provider_key="google",
+        )
+        wildcard_entry["model_info"]["db_model"] = False
+
+        report = discovery.discover_candidates(
+            adapter=discovery.OpenAICompatibleProviderAdapter(
+                provider_key="google",
+                provider_display="Google Gemini",
+                litellm_prefix="gemini",
+                upstream_id_field="name",
+                upstream_strip_prefix="models/",
+                required_generation_method="generateContent",
+            ),
+            upstream_snapshot={
+                "data": [
+                    {
+                        "name": "models/gemini-3.6-flash",
+                        "supportedGenerationMethods": ["generateContent"],
+                    }
+                ]
+            },
+            litellm_snapshot={"data": [wildcard_entry]},
+        )
+
+        self.assertEqual([item.model_id for item in report.new], ["gemini-3.6-flash"])
+        self.assertEqual(report.existing, [])
+
     def test_candidate_is_quarantined_when_business_alias_is_owned_by_other_provider(self):
         report = discovery.discover_candidates(
             adapter=discovery.MoonshotProviderAdapter(),

@@ -459,12 +459,18 @@ class ModelCandidateOrchestratorTests(unittest.TestCase):
                             {
                                 "model_name": "kimi-k2.5",
                                 "litellm_params": {"model": "moonshot/kimi-k2.6"},
-                                "model_info": {"metadata": {"provider_key": "moonshot"}},
+                                "model_info": {
+                                    "db_model": True,
+                                    "metadata": {"provider_key": "moonshot"},
+                                },
                             },
                             {
                                 "model_name": "acme-chat",
                                 "litellm_params": {"model": "openai/acme-chat"},
-                                "model_info": {"metadata": {"provider_key": "acme"}},
+                                "model_info": {
+                                    "db_model": True,
+                                    "metadata": {"provider_key": "acme"},
+                                },
                             },
                         ]
                     }
