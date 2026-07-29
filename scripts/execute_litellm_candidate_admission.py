@@ -815,13 +815,17 @@ def _entry_matches_expected(entry: Mapping[str, Any], payload: Mapping[str, Any]
     }
     actual_costs = {key: info.get(key) for key in expected_costs}
     expected_max_input_tokens = expected_info.get("max_input_tokens")
+    max_input_tokens_match = (
+        "max_input_tokens" not in expected_info
+        or info.get("max_input_tokens") == expected_max_input_tokens
+    )
     return (
         entry.get("model_name") == payload.get("model_name")
         and params.get("model") == expected_params.get("model")
         and params.get("api_base") == expected_params.get("api_base")
         and actual_metadata == expected_metadata
         and actual_costs == expected_costs
-        and info.get("max_input_tokens") == expected_max_input_tokens
+        and max_input_tokens_match
     )
 
 

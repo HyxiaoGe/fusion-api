@@ -541,6 +541,20 @@ class CandidateAdmissionExecutorTests(unittest.TestCase):
         self.assertTrue(executor._entry_matches_expected(matching, payload))
         self.assertFalse(executor._entry_matches_expected(mismatched, payload))
 
+    def test_created_model_verification_accepts_inferred_max_input_tokens_when_unspecified(self):
+        payload = admission_plan()["eligible"][0]["model_new_plan"]["payload"]
+        normalized = model_entry(
+            "kimi-k3",
+            "moonshot/kimi-k3",
+            "uuid-kimi-k3",
+            api_base="https://api.moonshot.cn/v1",
+            metadata=copy.deepcopy(payload["model_info"]["metadata"]),
+            max_input_tokens=1048576,
+        )
+
+        self.assertNotIn("max_input_tokens", payload["model_info"])
+        self.assertTrue(executor._entry_matches_expected(normalized, payload))
+
     def test_full_state_machine_succeeds(self):
         client = StatefulClient()
 
