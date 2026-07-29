@@ -7,11 +7,14 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import math
 import os
+import struct
 import sys
+import zlib
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,9 +27,31 @@ LITELLM_PROXY_URL_ENV = "LITELLM_PROXY_URL"
 LITELLM_CANDIDATE_KEY_ENV = "LITELLM_CANDIDATE_KEY"
 DEFAULT_LITELLM_BASE_URL = "http://localhost:4000"
 DEFAULT_ACCEPTANCE_TTL_SECONDS = 7 * 24 * 60 * 60
-RED_PIXEL_PNG_DATA_URL = (
-    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
-)
+
+def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    return (
+        struct.pack(">I", len(data))
+        + chunk_type
+        + data
+        + struct.pack(">I", zlib.crc32(chunk_type + data) & 0xFFFFFFFF)
+    )
+
+
+def _build_red_test_png_data_url() -> str:
+    """生成足够大的纯红 PNG，避免 1×1 图片被视觉适配器忽略。"""
+    width = height = 64
+    row = b"\x00" + b"\xff\x00\x00" * width
+    raw = row * height
+    payload = (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + _png_chunk(b"IDAT", zlib.compress(raw, level=9))
+        + _png_chunk(b"IEND", b"")
+    )
+    return f"data:image/png;base64,{base64.b64encode(payload).decode()}"
+
+
+RED_PIXEL_PNG_DATA_URL = _build_red_test_png_data_url()
 
 
 class HttpClient(Protocol):
@@ -402,7 +427,7 @@ def _run_vision_case(
                         ],
                     }
                 ],
-                "max_tokens": 512 if candidate.supports_reasoning else 16,
+                "max_tokens": 2048 if candidate.supports_reasoning else 16,
             },
             timeout=timeout_seconds,
         )

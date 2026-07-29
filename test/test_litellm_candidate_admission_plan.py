@@ -231,6 +231,12 @@ class CandidateAdmissionPlanTests(unittest.TestCase):
             model_new["payload"]["litellm_params"]["api_key"],
             "os.environ/MOONSHOT_API_KEY",
         )
+        self.assertEqual(model_new["payload"]["litellm_params"]["input_cost_per_token"], 0.000003)
+        self.assertEqual(model_new["payload"]["litellm_params"]["output_cost_per_token"], 0.000015)
+        self.assertEqual(
+            model_new["payload"]["litellm_params"]["cache_read_input_token_cost"],
+            0.0000003,
+        )
         self.assertEqual(model_new["payload"]["model_info"]["input_cost_per_token"], 0.000003)
         self.assertEqual(model_new["payload"]["model_info"]["output_cost_per_token"], 0.000015)
         self.assertEqual(

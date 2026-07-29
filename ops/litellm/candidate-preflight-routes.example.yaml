@@ -8,6 +8,11 @@ model_list:
       model: moonshot/kimi-k3
       api_base: https://api.moonshot.cn/v1
       api_key: os.environ/MOONSHOT_API_KEY
+      # LiteLLM 1.93 用 litellm_params 判定是否启用自定义定价；同时保留
+      # model_info 副本，供模型信息接口、治理读回和后续版本兼容使用。
+      input_cost_per_token: 0.000003
+      output_cost_per_token: 0.000015
+      cache_read_input_token_cost: 0.0000003
     model_info:
       input_cost_per_token: 0.000003
       output_cost_per_token: 0.000015

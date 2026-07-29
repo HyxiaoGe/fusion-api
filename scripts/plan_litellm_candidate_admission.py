@@ -307,8 +307,9 @@ def build_eligible_entry(candidate: Mapping[str, Any]) -> dict[str, Any]:
             },
         }
     )
+    cost_fields = _litellm_cost_fields(metadata)
     model_info = {
-        **_litellm_cost_fields(metadata),
+        **cost_fields,
         "metadata": metadata,
     }
     payload = {
@@ -317,6 +318,7 @@ def build_eligible_entry(candidate: Mapping[str, Any]) -> dict[str, Any]:
             "model": candidate["litellm_model"],
             "api_base": registration["api_base"],
             "api_key": f"os.environ/{registration['api_key_env']}",
+            **cost_fields,
         },
         "model_info": model_info,
     }

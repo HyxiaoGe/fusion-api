@@ -172,20 +172,24 @@ class LiteLLMCandidatePreflightTests(unittest.TestCase):
         self.assertEqual(set(models), {"candidate/moonshot/kimi-k3"})
         self.assertNotIn("moonshot/kimi-k3", models)
 
-    def test_embedded_vision_fixture_is_a_valid_red_rgb_pixel(self):
+    def test_embedded_vision_fixture_is_a_valid_red_rgb_image(self):
         encoded = preflight.RED_PIXEL_PNG_DATA_URL.split(",", 1)[1]
         payload = base64.b64decode(encoded)
         self.assertEqual(payload[:8], b"\x89PNG\r\n\x1a\n")
         offset = 8
         idat = bytearray()
+        width = height = None
         while offset < len(payload):
             size = struct.unpack(">I", payload[offset : offset + 4])[0]
             chunk_type = payload[offset + 4 : offset + 8]
             chunk = payload[offset + 8 : offset + 8 + size]
+            if chunk_type == b"IHDR":
+                width, height = struct.unpack(">II", chunk[:8])
             if chunk_type == b"IDAT":
                 idat.extend(chunk)
             offset += 12 + size
-        self.assertEqual(zlib.decompress(idat), b"\x00\xff\x00\x00")
+        self.assertEqual((width, height), (64, 64))
+        self.assertEqual(zlib.decompress(idat), (b"\x00" + b"\xff\x00\x00" * 64) * 64)
 
     def test_fingerprint_ignores_unrelated_global_cost_map_snapshot_change(self):
         first = copy.deepcopy(CANDIDATE)
