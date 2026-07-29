@@ -426,7 +426,8 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(canonical), 3)
         self.assertEqual(canonical[0]["content"], "旧问题")
 
-    async def test_run_agent_round_records_error_without_swallowing_it(self):
+    @patch("app.services.stream.agent_round.litellm_health.record_success")
+    async def test_run_agent_round_records_error_without_swallowing_it(self, record_success):
         step_context = AgentStepContext(
             step_id="step-error",
             step_number=1,
@@ -468,6 +469,7 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(raised.exception, error)
         observation.finish_error.assert_awaited_once_with(error)
+        record_success.assert_not_called()
 
     async def test_collect_agent_round_stream_calls_llm_then_streams_with_step_ids(self):
         messages = [{"role": "user", "content": "你好"}]
@@ -553,7 +555,8 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-    async def test_run_agent_round_records_success_and_accumulates_usage(self):
+    @patch("app.services.stream.agent_round.litellm_health.record_success")
+    async def test_run_agent_round_records_success_and_accumulates_usage(self, record_success):
         messages = [{"role": "user", "content": "你好"}]
         step_context = AgentStepContext(
             step_id="step-1",
@@ -616,6 +619,7 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
             log_round_summary_fn=log_round_summary_fn,
         )
 
+        record_success.assert_called_once_with("gpt-4")
         self.assertEqual(result.reasoning_buf, "推理")
         self.assertEqual(result.content_buf, "正文")
         self.assertEqual(result.tool_calls, [{"id": "tool-1"}])
@@ -664,6 +668,44 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
                 },
             ),
         )
+
+    async def test_run_agent_round_does_not_record_cancelled_stream_as_healthy(self):
+        step_context = AgentStepContext(
+            step_id="step-cancelled",
+            step_number=1,
+            started_at=100.0,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+        )
+
+        async def llm_call_fn(*_args, **_kwargs):
+            return "response"
+
+        async def stream_round_fn(*_args, **_kwargs):
+            return "", "", [], "cancelled", None
+
+        with patch("app.services.stream.agent_round.litellm_health.record_success") as record_success:
+            result = await run_agent_round(
+                conversation_id="conv-1",
+                task_id="task-1",
+                run_id="run-1",
+                step_number=1,
+                model_id="gpt-4",
+                provider="openai",
+                litellm_model="openai/gpt-4",
+                litellm_kwargs={},
+                messages=[],
+                should_use_reasoning=False,
+                call_kwargs={},
+                accumulated_usage=Usage(input_tokens=0, output_tokens=0),
+                step_context=step_context,
+                llm_call_fn=llm_call_fn,
+                stream_round_fn=stream_round_fn,
+                log_round_summary_fn=lambda **_kwargs: None,
+            )
+
+        self.assertEqual(result.finish_reason, "cancelled")
+        record_success.assert_not_called()
 
     async def test_run_agent_round_keeps_accumulated_usage_without_usage_data(self):
         accumulated_usage = Usage(input_tokens=2, output_tokens=3)

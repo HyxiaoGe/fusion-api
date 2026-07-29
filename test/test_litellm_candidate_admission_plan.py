@@ -254,6 +254,26 @@ class CandidateAdmissionPlanTests(unittest.TestCase):
         self.assertEqual(plan["allowlist_plan"], {"add": ["kimi-k3"], "remove": []})
         self.assertEqual(plan["post_registration_fusion_gate"]["status"], "required")
 
+    def test_reviewed_context_window_maps_to_model_info_max_input_tokens(self):
+        candidate = kimi_candidate()
+        candidate["model_id"] = "test-context-model"
+        candidate["litellm_model"] = "moonshot/test-context-model"
+        candidate["preflight_model"] = "candidate/moonshot/test-context-model"
+        candidate["metadata"]["display_name"] = "Test Context Model"
+        candidate["metadata"]["context_window_tokens"] = 262144
+        summary = candidate_acceptance(model_id="test-context-model")
+        summary["candidate"] = candidate
+        summary["candidate_fingerprint"] = preflight.candidate_contract_fingerprint(candidate)
+
+        plan = admission.build_admission_plan(
+            candidate_report=candidate_report(candidate),
+            candidate_acceptance_summary=summary,
+        )
+
+        model_info = plan["eligible"][0]["model_new_plan"]["payload"]["model_info"]
+        self.assertEqual(model_info["max_input_tokens"], 262144)
+        self.assertEqual(model_info["metadata"]["context_window_tokens"], 262144)
+
     def test_applied_preflight_serialization_is_directly_consumable(self):
         report = preflight.PreflightReport(
             healthy=True,

@@ -119,8 +119,55 @@ class CandidateEnrichmentTests(unittest.TestCase):
         )
         self.assertEqual(models["kimi-k2.7-code"]["pricing"]["input"], 0.95)
         self.assertEqual(models["kimi-k2.7-code"]["pricing"]["output"], 4.0)
+        self.assertEqual(models["kimi-k2.7-code"]["context_window_tokens"], 262144)
         self.assertEqual(models["kimi-k2.7-code-highspeed"]["pricing"]["input"], 1.9)
         self.assertEqual(models["kimi-k2.7-code-highspeed"]["pricing"]["output"], 8.0)
+        self.assertEqual(models["kimi-k2.7-code-highspeed"]["context_window_tokens"], 262144)
+        self.assertNotIn("context_window_tokens", models["kimi-k3"])
+
+    def test_reviewed_context_window_must_be_positive_integer_and_is_preserved(self):
+        path = Path(__file__).resolve().parents[1] / "ops/litellm/candidate-overrides.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        report = candidate_report()
+        report["providers"]["moonshot"]["report"]["new"][0].update(
+            {
+                "model_id": "kimi-k2.7-code",
+                "litellm_model": "moonshot/kimi-k2.7-code",
+            }
+        )
+
+        result = enrich(
+            candidate_report=report,
+            registry=registry(),
+            cost_map={},
+            overrides=payload,
+        )
+
+        candidate = result["providers"]["moonshot"]["report"]["new"][0]
+        self.assertEqual(candidate["metadata"]["context_window_tokens"], 262144)
+
+        for invalid_value in (True, 0, -1, 262144.0, "262144"):
+            with self.subTest(invalid_value=invalid_value):
+                invalid_payload = copy.deepcopy(payload)
+                invalid_payload["providers"]["moonshot"]["models"]["kimi-k2.7-code"][
+                    "context_window_tokens"
+                ] = invalid_value
+                invalid_payload["approval"]["providers_sha256"] = cost_map_sha256(
+                    invalid_payload["providers"]
+                )
+                document = {
+                    "schema_version": invalid_payload["schema_version"],
+                    "approval": {
+                        key: value
+                        for key, value in invalid_payload["approval"].items()
+                        if key != "document_sha256"
+                    },
+                    "providers": invalid_payload["providers"],
+                }
+                invalid_payload["approval"]["document_sha256"] = cost_map_sha256(document)
+
+                with self.assertRaisesRegex(ValueError, "context_window_tokens"):
+                    enrichment.validate_override_approval(invalid_payload)
 
     def test_published_regional_price_pair_allows_minor_provider_rounding(self):
         providers = {

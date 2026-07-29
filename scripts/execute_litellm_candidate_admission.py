@@ -356,6 +356,7 @@ def _state_fingerprint(entries: Sequence[Mapping[str, Any]], key_models: Sequenc
                 "cache_read_input_token_cost": (
                     info.get("cache_read_input_token_cost") if isinstance(info, Mapping) else None
                 ),
+                "max_input_tokens": info.get("max_input_tokens") if isinstance(info, Mapping) else None,
             }
         )
     catalog.sort(key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, default=str))
@@ -813,12 +814,14 @@ def _entry_matches_expected(entry: Mapping[str, Any], payload: Mapping[str, Any]
         if key.endswith("_cost_per_token") or key == "cache_read_input_token_cost"
     }
     actual_costs = {key: info.get(key) for key in expected_costs}
+    expected_max_input_tokens = expected_info.get("max_input_tokens")
     return (
         entry.get("model_name") == payload.get("model_name")
         and params.get("model") == expected_params.get("model")
         and params.get("api_base") == expected_params.get("api_base")
         and actual_metadata == expected_metadata
         and actual_costs == expected_costs
+        and info.get("max_input_tokens") == expected_max_input_tokens
     )
 
 

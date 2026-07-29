@@ -161,6 +161,9 @@ python -m scripts.enrich_litellm_model_candidates \
 账单币种、Fusion 的 USD 规范价、适用 API 地址和厂商区域价格对照一起放进
 `pricing_provenance`。厂商跨区域公布的价格可能因小数位而产生轻微换算舍入，
 校验允许区域比率最多 2% 的相对离散，但仍要求每档价格均来自官方双区证据。
+厂商正式文档明确上下文窗口时，可声明正整数 `context_window_tokens`；富化器会
+保留该受审字段，准入计划确定性映射为 `model_info.max_input_tokens`。未有正式
+证据的模型保持未知，不推测精确值。
 任一来源、时间、价格或配置变化都会使哈希失效；过期、
 成本表冲突和区域地址不一致都会 fail-closed。schema v1 仅保留兼容，不应用于
 新增正式 override。

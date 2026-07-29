@@ -22,13 +22,14 @@ class FakeResponse:
         return self.payload
 
 
-def model_entry(alias, underlying, model_uuid, *, api_base=None, metadata=None):
+def model_entry(alias, underlying, model_uuid, *, api_base=None, metadata=None, max_input_tokens=None):
     return {
         "model_name": alias,
         "litellm_params": {"model": underlying, "api_base": api_base},
         "model_info": {
             "id": model_uuid,
             "db_model": True,
+            **({"max_input_tokens": max_input_tokens} if max_input_tokens is not None else {}),
             "metadata": metadata
             or {
                 "provider_key": "moonshot",
@@ -274,6 +275,7 @@ class StatefulClient:
                     "uuid-kimi-k3",
                     api_base=api_base,
                     metadata=metadata,
+                    max_input_tokens=payload["model_info"].get("max_input_tokens"),
                 )
             )
             if self.fail_stage == "model_new":
@@ -511,6 +513,33 @@ class CandidateAdmissionExecutorTests(unittest.TestCase):
         self.assertEqual(result["status"], "cas_conflict")
         self.assertEqual(result["error"]["code"], "before_state_changed")
         self.assertFalse([call for call in client.calls if call[0] == "POST"])
+
+    def test_state_fingerprint_changes_with_max_input_tokens(self):
+        baseline = [model_entry("kimi-k2.7-code", "moonshot/kimi-k2.7-code", "uuid-k27")]
+        changed = copy.deepcopy(baseline)
+        changed[0]["model_info"]["max_input_tokens"] = 262144
+
+        self.assertNotEqual(
+            executor._state_fingerprint(baseline, ["kimi-k2.7-code"]),
+            executor._state_fingerprint(changed, ["kimi-k2.7-code"]),
+        )
+
+    def test_created_model_verification_compares_max_input_tokens(self):
+        payload = admission_plan()["eligible"][0]["model_new_plan"]["payload"]
+        payload["model_info"]["max_input_tokens"] = 262144
+        matching = model_entry(
+            "kimi-k3",
+            "moonshot/kimi-k3",
+            "uuid-kimi-k3",
+            api_base="https://api.moonshot.cn/v1",
+            metadata=copy.deepcopy(payload["model_info"]["metadata"]),
+            max_input_tokens=262144,
+        )
+        mismatched = copy.deepcopy(matching)
+        mismatched["model_info"]["max_input_tokens"] = 131072
+
+        self.assertTrue(executor._entry_matches_expected(matching, payload))
+        self.assertFalse(executor._entry_matches_expected(mismatched, payload))
 
     def test_full_state_machine_succeeds(self):
         client = StatefulClient()

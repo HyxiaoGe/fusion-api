@@ -7,7 +7,7 @@
   让选择器把不可用的项目灰显出来。
 
 设计：
-- 启动后跑一个后台 asyncio 任务，固定间隔（默认 5min）拉一次 `/health`
+- 启动后跑一个后台 asyncio 任务，固定间隔（默认 30min）拉一次 `/health`
 - 把结果按 LiteLLM 内部 `model_id` (UUID) 索引，并通过 `/model/info` 的
   UUID → alias 映射，反推每个 fusion 别名当前是 healthy / unhealthy / unknown
 - 首次未拉到时，所有别名返回 status="unknown"，FE 当 healthy 处理（不要
@@ -50,9 +50,8 @@ def _resolve_refresh_interval() -> float:
 _HEALTH_REQUEST_TIMEOUT = float(os.environ.get("LITELLM_HEALTH_REQUEST_TIMEOUT", "90"))
 
 _lock = threading.Lock()
-# alias -> {"status": "healthy"|"unhealthy", "error": str|None}
+# alias -> {"status": "healthy"|"unhealthy", "error": str|None, "checked_at": float}
 _by_alias: Dict[str, Dict[str, Any]] = {}
-_last_checked_at: float = 0.0
 _refresh_task: Optional[asyncio.Task] = None
 
 
@@ -162,20 +161,23 @@ async def _fetch_once() -> None:
         if uuid:
             unhealthy_by_uuid[uuid] = _classify_error(e.get("error") or "")
 
+    checked_at = time.time()
     new_state: Dict[str, Dict[str, Any]] = {}
     for alias, uuid in alias_to_uuid.items():
         if uuid in healthy_uuids:
-            new_state[alias] = {"status": "healthy", "error": None}
+            new_state[alias] = {"status": "healthy", "error": None, "checked_at": checked_at}
         elif uuid in unhealthy_by_uuid:
-            new_state[alias] = {"status": "unhealthy", "error": unhealthy_by_uuid[uuid] or "探测失败"}
+            new_state[alias] = {
+                "status": "unhealthy",
+                "error": unhealthy_by_uuid[uuid] or "探测失败",
+                "checked_at": checked_at,
+            }
         # uuid 既不在 healthy 也不在 unhealthy（极少见，可能是探测中或被跳过）：
         # 不写入 new_state，下面 get_health 兜底返回 "unknown"
 
     with _lock:
-        global _last_checked_at
         _by_alias.clear()
         _by_alias.update(new_state)
-        _last_checked_at = time.time()
     logger.info(
         f"litellm_health: probe done, healthy={sum(1 for v in new_state.values() if v['status'] == 'healthy')}, "
         f"unhealthy={sum(1 for v in new_state.values() if v['status'] == 'unhealthy')}"
@@ -220,5 +222,20 @@ def get_health(alias: str) -> Dict[str, Any]:
     with _lock:
         entry = _by_alias.get(alias)
         if entry is None:
-            return {"status": "unknown", "error": None, "checked_at": _last_checked_at or None}
-        return {**entry, "checked_at": _last_checked_at or None}
+            return {"status": "unknown", "error": None, "checked_at": None}
+        return dict(entry)
+
+
+def record_success(alias: str, checked_at: float | None = None) -> None:
+    """记录一次真实 LLM round 成功，避免新别名等待下一轮全量探测。
+
+    这里只提升成功调用过的单个别名；定时 `/health` 下一次完成后仍会整体覆盖
+    这份运行时结果，继续作为权威健康状态。
+    """
+    timestamp = time.time() if checked_at is None else checked_at
+    with _lock:
+        _by_alias[alias] = {
+            "status": "healthy",
+            "error": None,
+            "checked_at": timestamp,
+        }

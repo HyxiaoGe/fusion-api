@@ -3,7 +3,7 @@
   "approval": {
     "policy_version": "fusion-model-override/v2",
     "reviewed_by": "fusion-model-governance",
-    "reviewed_at": "2026-07-29T14:25:00+08:00",
+    "reviewed_at": "2026-07-29T15:07:00+08:00",
     "valid_until": "2026-10-29T14:25:00+08:00",
     "source_urls": [
       "https://platform.kimi.com/docs/pricing/chat-k27-code.md",
@@ -11,8 +11,8 @@
       "https://platform.kimi.com/docs/pricing/chat-k3.md",
       "https://platform.kimi.ai/docs/pricing/chat-k3.md"
     ],
-    "providers_sha256": "103b1382a1bc2a21996a24b318fa0bc756251b239d2bf1d7d1c1daf4446b48f7",
-    "document_sha256": "119250ab11e10c64bcff45ef97ebf40ee2042f44fc890aed0a4af7d27212484d"
+    "providers_sha256": "9d19657604903c7d27746ab3d057a19aab9ef797a9c8effce4b4b19c8ab75c58",
+    "document_sha256": "ed2cb3b709d06208ac4d985cd54d64263333673ce2a87da674bab85767b20dcd"
   },
   "providers": {
     "moonshot": {
@@ -74,6 +74,7 @@
         "kimi-k2.7-code": {
           "display_name": "Kimi K2.7 Code",
           "description": "月之暗面代码专项模型，国内 API 路由；支持 256K 上下文、多模态理解、深度思考与工具调用。",
+          "context_window_tokens": 262144,
           "capabilities": {
             "imageGen": false,
             "deepThinking": true,
@@ -128,6 +129,7 @@
         "kimi-k2.7-code-highspeed": {
           "display_name": "Kimi K2.7 Code HighSpeed",
           "description": "Kimi K2.7 Code 高速版，国内 API 路由；能力相同，输出速度更高，资源紧张时可用性可能波动。",
+          "context_window_tokens": 262144,
           "capabilities": {
             "imageGen": false,
             "deepThinking": true,

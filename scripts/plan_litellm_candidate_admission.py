@@ -34,6 +34,7 @@ SAFE_METADATA_KEYS = (
     "pricing_provenance",
     "knowledge_cutoff",
     "recommended_for",
+    "context_window_tokens",
 )
 REQUIRED_OVERRIDE_APPROVAL_KEYS = (
     "schema_version",
@@ -118,6 +119,13 @@ def _metadata_reasons(candidate: Mapping[str, Any]) -> list[str]:
         reasons.append("override_cost_map_conflict")
     if metadata.get("provider_key") != candidate.get("provider_key"):
         reasons.append("metadata_provider_mismatch")
+    context_window_tokens = metadata.get("context_window_tokens")
+    if "context_window_tokens" in metadata and (
+        isinstance(context_window_tokens, bool)
+        or not isinstance(context_window_tokens, int)
+        or context_window_tokens <= 0
+    ):
+        reasons.append("metadata_context_window_invalid")
     return reasons
 
 
@@ -308,8 +316,14 @@ def build_eligible_entry(candidate: Mapping[str, Any]) -> dict[str, Any]:
         }
     )
     cost_fields = _litellm_cost_fields(metadata)
+    context_window_fields = (
+        {"max_input_tokens": metadata["context_window_tokens"]}
+        if "context_window_tokens" in metadata
+        else {}
+    )
     model_info = {
         **cost_fields,
+        **context_window_fields,
         "metadata": metadata,
     }
     payload = {

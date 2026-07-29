@@ -269,6 +269,14 @@ def _validate_override_models(providers: Mapping[str, Any], *, schema_version: i
         for model in models.values():
             if not _is_mapping(model):
                 raise ValueError("override model 必须是对象")
+            if "context_window_tokens" in model:
+                context_window_tokens = model.get("context_window_tokens")
+                if (
+                    isinstance(context_window_tokens, bool)
+                    or not isinstance(context_window_tokens, int)
+                    or context_window_tokens <= 0
+                ):
+                    raise ValueError("override context_window_tokens 必须是正整数")
             pricing = model.get("pricing")
             if pricing is not None:
                 pricing = _validate_pricing_rates(pricing, label="pricing")
@@ -366,6 +374,7 @@ def _metadata(
         "pricing_provenance",
         "knowledge_cutoff",
         "recommended_for",
+        "context_window_tokens",
     ):
         if key in override:
             metadata[key] = copy.deepcopy(override[key])

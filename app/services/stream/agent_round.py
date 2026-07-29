@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from inspect import Parameter, signature
 from typing import Any
 
+from app.ai import litellm_health
 from app.ai.llm_round_observability import create_llm_round_observation
 from app.schemas.chat import ContextUsage, Usage
 from app.services.chat.context_manager import ContextManagementError, ContextPlan, prepare_context
@@ -248,6 +249,8 @@ async def run_agent_round(
         on_context_updated(final_context)
     await emit_context_status(emitter, phase="final", context=final_context)
     await observation.finish_success(usage=usage_data, finish_reason=finish_reason)
+    if finish_reason != "cancelled":
+        litellm_health.record_success(model_id)
     log_agent_round_summary(
         conversation_id=conversation_id,
         run_id=run_id,
