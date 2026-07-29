@@ -354,11 +354,14 @@ class CandidateAdmissionPlanTests(unittest.TestCase):
         candidate["metadata_evidence"]["reviewed_override_applied"] = True
         candidate["metadata_evidence"]["override_cost_map_conflict"] = True
         candidate["metadata_evidence"]["override_approval"] = {
+            "schema_version": 2,
             "policy_version": "fusion-model-override/v2",
             "reviewed_by": "model-governance",
             "reviewed_at": "2026-07-29T09:00:00+08:00",
             "source_urls": ["https://platform.kimi.com/docs/pricing/chat-k3.md"],
             "providers_sha256": "a" * 64,
+            "document_sha256": "b" * 64,
+            "valid_until": "2026-10-29T09:00:00+08:00",
         }
 
         plan = admission.build_admission_plan(
@@ -367,6 +370,50 @@ class CandidateAdmissionPlanTests(unittest.TestCase):
         )
 
         self.assertIn("override_cost_map_conflict", plan["isolated"][0]["reasons"])
+
+    def test_expired_or_legacy_override_cannot_reach_admission(self):
+        expired = kimi_candidate()
+        expired["metadata_evidence"] = {
+            "cost_map_matched": False,
+            "reviewed_override_applied": True,
+            "override_approval": {
+                "schema_version": 2,
+                "policy_version": "fusion-model-override/v2",
+                "reviewed_by": "model-governance",
+                "reviewed_at": "2026-07-01T09:00:00+08:00",
+                "source_urls": ["https://platform.kimi.com/docs/pricing/chat-k3.md"],
+                "providers_sha256": "a" * 64,
+                "document_sha256": "b" * 64,
+                "valid_until": "2026-07-02T09:00:00+08:00",
+            },
+        }
+        legacy = kimi_candidate()
+        legacy["metadata_evidence"] = {
+            "cost_map_matched": False,
+            "reviewed_override_applied": True,
+            "override_approval": {
+                "schema_version": 1,
+                "policy_version": "fusion-model-override/v1",
+                "reviewed_by": "model-governance",
+                "reviewed_at": "2026-07-01T09:00:00+08:00",
+                "source_urls": ["https://example.test/kimi-k3"],
+                "providers_sha256": "a" * 64,
+                "document_sha256": "legacy",
+                "valid_until": "2026-10-29T09:00:00+08:00",
+            },
+        }
+
+        expired_plan = admission.build_admission_plan(
+            candidate_report=candidate_report(expired),
+            candidate_acceptance_summary=candidate_acceptance(),
+        )
+        legacy_plan = admission.build_admission_plan(
+            candidate_report=candidate_report(legacy),
+            candidate_acceptance_summary=candidate_acceptance(),
+        )
+
+        self.assertIn("override_approval_expired", expired_plan["isolated"][0]["reasons"])
+        self.assertIn("override_approval_schema_unsupported", legacy_plan["isolated"][0]["reasons"])
 
     def test_unknown_endpoint_is_isolated(self):
         plan = admission.build_admission_plan(

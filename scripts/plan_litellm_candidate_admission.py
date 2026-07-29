@@ -36,11 +36,14 @@ SAFE_METADATA_KEYS = (
     "recommended_for",
 )
 REQUIRED_OVERRIDE_APPROVAL_KEYS = (
+    "schema_version",
     "policy_version",
     "reviewed_by",
     "reviewed_at",
     "source_urls",
     "providers_sha256",
+    "document_sha256",
+    "valid_until",
 )
 MAX_ACCEPTANCE_CLOCK_SKEW_SECONDS = 300
 REQUIRED_CAPABILITY_FIELDS = {
@@ -100,6 +103,17 @@ def _metadata_reasons(candidate: Mapping[str, Any]) -> list[str]:
         approval = evidence.get("override_approval")
         if not _is_mapping(approval) or any(not approval.get(key) for key in REQUIRED_OVERRIDE_APPROVAL_KEYS):
             reasons.append("override_approval_missing")
+        elif approval.get("schema_version") != 2 or approval.get("policy_version") != "fusion-model-override/v2":
+            reasons.append("override_approval_schema_unsupported")
+        else:
+            try:
+                valid_until = datetime.fromisoformat(_nonempty_string(approval.get("valid_until")))
+                if valid_until.tzinfo is None:
+                    raise ValueError("缺少时区")
+                if datetime.now(UTC) >= valid_until.astimezone(UTC):
+                    reasons.append("override_approval_expired")
+            except ValueError:
+                reasons.append("override_approval_time_invalid")
     if _is_mapping(evidence) and evidence.get("override_cost_map_conflict") is True:
         reasons.append("override_cost_map_conflict")
     if metadata.get("provider_key") != candidate.get("provider_key"):

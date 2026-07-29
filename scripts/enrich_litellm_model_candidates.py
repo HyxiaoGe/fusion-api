@@ -196,6 +196,7 @@ def validate_override_approval(overrides: Mapping[str, Any]) -> dict[str, Any]:
     if approval.get("providers_sha256") != expected_sha256:
         raise ValueError("override providers_sha256 不匹配")
     normalized = {
+        "schema_version": schema_version,
         "policy_version": str(approval["policy_version"]),
         "reviewed_by": str(approval["reviewed_by"]),
         "reviewed_at": reviewed_at.astimezone(timezone.utc).isoformat(),
