@@ -56,11 +56,16 @@ def _build_adapter(config: Mapping[str, Any]) -> ProviderAdapter:
         return MoonshotProviderAdapter()
     if adapter != "openai-compatible":
         raise ValueError("不支持的 provider adapter")
+    discovery = config.get("discovery")
+    discovery = discovery if isinstance(discovery, Mapping) else {}
     return OpenAICompatibleProviderAdapter(
         provider_key=str(config.get("provider_key") or ""),
         provider_display=str(config.get("provider_display") or ""),
         litellm_prefix=str(config.get("litellm_prefix") or ""),
         api_model_prefix=str(config.get("api_model_prefix") or ""),
+        upstream_id_field=str(discovery.get("id_field") or "id"),
+        upstream_strip_prefix=str(discovery.get("strip_prefix") or ""),
+        required_generation_method=str(discovery.get("required_generation_method") or ""),
     )
 
 
@@ -72,6 +77,82 @@ def _models_url(base_url: str) -> str:
 def _read_json_response(response: Any) -> Any:
     response.raise_for_status()
     return response.json()
+
+
+def _fetch_model_catalog(
+    *,
+    provider: Mapping[str, Any],
+    api_key: str,
+    client: Any,
+    timeout_seconds: float,
+) -> dict[str, list[Any]]:
+    """按厂商 discovery 契约读取并归一化为标准 data 列表。"""
+    discovery = provider.get("discovery")
+    discovery = discovery if isinstance(discovery, Mapping) else {}
+    url = str(discovery.get("url") or "").strip() or _models_url(str(provider.get("base_url") or ""))
+    auth = str(discovery.get("auth") or "bearer").strip()
+    response_field = str(discovery.get("response_field") or "data").strip()
+    if not url or not response_field:
+        raise ValueError("模型目录 url 和 response_field 不能为空")
+    if auth == "bearer":
+        headers = {"Authorization": f"Bearer {api_key}"}
+    elif auth == "x-goog-api-key":
+        headers = {"x-goog-api-key": api_key}
+    else:
+        raise ValueError("不支持的模型目录鉴权方式")
+
+    pagination = discovery.get("pagination")
+    pagination = pagination if isinstance(pagination, Mapping) else None
+    page_size = pagination.get("page_size") if pagination else None
+    page_size_param = str(pagination.get("page_size_param") or "pageSize") if pagination else ""
+    page_token_param = str(pagination.get("page_token_param") or "pageToken") if pagination else ""
+    next_token_field = str(pagination.get("next_page_token_field") or "nextPageToken") if pagination else ""
+    max_pages = int(pagination.get("max_pages") or 100) if pagination else 1
+    if pagination and (
+        not isinstance(page_size, int)
+        or isinstance(page_size, bool)
+        or page_size <= 0
+        or not page_size_param
+        or not page_token_param
+        or not next_token_field
+        or max_pages <= 0
+    ):
+        raise ValueError("模型目录分页配置无效")
+
+    entries: list[Any] = []
+    page_token = ""
+    seen_tokens: set[str] = set()
+    for _ in range(max_pages):
+        request_kwargs: dict[str, Any] = {
+            "headers": headers,
+            "timeout": timeout_seconds,
+        }
+        if pagination:
+            params: dict[str, Any] = {page_size_param: page_size}
+            if page_token:
+                params[page_token_param] = page_token
+            request_kwargs["params"] = params
+        payload = _read_json_response(client.get(url, **request_kwargs))
+        raw_entries = payload.get(response_field) if isinstance(payload, Mapping) else None
+        if not isinstance(raw_entries, list):
+            raise ValueError("模型目录响应字段不是列表")
+        entries.extend(raw_entries)
+        if not pagination:
+            break
+        next_page_token = _nonempty_catalog_string(payload.get(next_token_field))
+        if not next_page_token:
+            break
+        if next_page_token in seen_tokens:
+            raise ValueError("模型目录分页 token 重复")
+        seen_tokens.add(next_page_token)
+        page_token = next_page_token
+    else:
+        raise ValueError("模型目录分页超过安全上限")
+    return {"data": entries}
+
+
+def _nonempty_catalog_string(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
 
 
 def _candidate_preflight_status(
@@ -340,14 +421,13 @@ def coordinate_candidates(
             continue
         try:
             adapter = _build_adapter(provider)
-            upstream = _read_json_response(
-                client.get(
-                    _models_url(str(provider.get("base_url") or "")),
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    timeout=timeout_seconds,
-                )
+            upstream = _fetch_model_catalog(
+                provider=provider,
+                api_key=api_key,
+                client=client,
+                timeout_seconds=timeout_seconds,
             )
-            raw_models = upstream.get("data") if isinstance(upstream, Mapping) else upstream
+            raw_models = upstream.get("data")
             if not isinstance(raw_models, list) or not raw_models:
                 results[key] = _error_result(key, "upstream_empty")
                 continue

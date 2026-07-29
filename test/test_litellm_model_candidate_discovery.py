@@ -110,6 +110,73 @@ class ModelCandidateDiscoveryTests(unittest.TestCase):
         self.assertEqual([item.model_id for item in report.existing], ["acme-chat"])
         self.assertEqual(report.removed, [])
 
+    def test_configurable_upstream_fields_strip_prefix_and_filter_generation_method(self):
+        adapter = discovery.OpenAICompatibleProviderAdapter(
+            provider_key="google",
+            provider_display="Google Gemini",
+            litellm_prefix="gemini",
+            upstream_id_field="name",
+            upstream_strip_prefix="models/",
+            required_generation_method="generateContent",
+        )
+
+        report = discovery.discover_candidates(
+            adapter=adapter,
+            upstream_snapshot={
+                "data": [
+                    {
+                        "name": "models/gemini-3.6-flash",
+                        "supportedGenerationMethods": ["generateContent", "countTokens"],
+                    },
+                    {
+                        "name": "models/text-embedding-004",
+                        "supportedGenerationMethods": ["embedContent"],
+                    },
+                ]
+            },
+            litellm_snapshot={"data": []},
+        )
+
+        self.assertEqual([item.model_id for item in report.new], ["gemini-3.6-flash"])
+        self.assertEqual(report.new[0].litellm_model, "gemini/gemini-3.6-flash")
+        self.assertEqual(len(report.unknown), 1)
+        self.assertIn("generateContent", report.unknown[0].reason)
+
+    def test_nested_litellm_prefix_round_trips_openrouter_xai_model(self):
+        adapter = discovery.OpenAICompatibleProviderAdapter(
+            provider_key="xai",
+            provider_display="xAI",
+            litellm_prefix="openrouter/x-ai",
+            upstream_strip_prefix="x-ai/",
+        )
+
+        report = discovery.discover_candidates(
+            adapter=adapter,
+            upstream_snapshot={"data": [{"id": "x-ai/grok-4.5"}]},
+            litellm_snapshot={
+                "data": [
+                    litellm_entry(
+                        "grok-4.20-beta",
+                        "openrouter/x-ai/grok-4.20-beta",
+                        provider_key="xai",
+                    )
+                ]
+            },
+        )
+
+        self.assertEqual([item.model_id for item in report.new], ["grok-4.5"])
+        self.assertEqual(report.new[0].litellm_model, "openrouter/x-ai/grok-4.5")
+        self.assertEqual([item.model_id for item in report.removed], ["grok-4.20-beta"])
+        self.assertTrue(
+            adapter.owns_litellm_entry(
+                litellm_entry(
+                    "grok-4.5",
+                    "openrouter/x-ai/grok-4.5",
+                    provider_key="xai",
+                )
+            )
+        )
+
     def test_duplicate_upstream_model_is_reported_once_and_candidate_is_deduplicated(self):
         adapter = discovery.MoonshotProviderAdapter()
 

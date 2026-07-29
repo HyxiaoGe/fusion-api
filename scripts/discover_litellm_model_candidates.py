@@ -46,6 +46,8 @@ class ProviderAdapter(Protocol):
     provider_key: str
     provider_display: str
 
+    def source_model_id(self, entry: Mapping[str, Any]) -> str: ...
+
     def adapt_upstream_model(self, entry: Mapping[str, Any]) -> tuple[ModelCandidate | None, str | None]: ...
 
     def owns_litellm_entry(self, entry: Mapping[str, Any]) -> bool: ...
@@ -65,20 +67,39 @@ class OpenAICompatibleProviderAdapter:
         provider_display: str,
         litellm_prefix: str,
         api_model_prefix: str = "",
+        upstream_id_field: str = "id",
+        upstream_strip_prefix: str = "",
+        required_generation_method: str = "",
     ) -> None:
         self.provider_key = provider_key.strip().lower()
         self.provider_display = provider_display.strip()
         self.litellm_prefix = litellm_prefix.strip().strip("/")
         self.api_model_prefix = api_model_prefix.strip()
-        if not self.provider_key or not self.provider_display or not self.litellm_prefix:
-            raise ValueError("provider_key、provider_display 和 litellm_prefix 不能为空")
+        self.upstream_id_field = upstream_id_field.strip()
+        self.upstream_strip_prefix = upstream_strip_prefix.strip()
+        self.required_generation_method = required_generation_method.strip()
+        if not self.provider_key or not self.provider_display or not self.litellm_prefix or not self.upstream_id_field:
+            raise ValueError("provider_key、provider_display、litellm_prefix 和 upstream_id_field 不能为空")
+
+    def source_model_id(self, entry: Mapping[str, Any]) -> str:
+        return _nonempty_string(entry.get(self.upstream_id_field))
 
     def adapt_upstream_model(self, entry: Mapping[str, Any]) -> tuple[ModelCandidate | None, str | None]:
-        model_id = _nonempty_string(entry.get("id"))
+        model_id = self.source_model_id(entry)
         if not model_id:
-            return None, "模型条目缺少非空 id"
+            return None, f"模型条目缺少非空 {self.upstream_id_field}"
+        if self.upstream_strip_prefix:
+            if not model_id.startswith(self.upstream_strip_prefix):
+                return None, f"模型 id 不符合待移除前缀 {self.upstream_strip_prefix}"
+            model_id = _nonempty_string(model_id[len(self.upstream_strip_prefix) :])
+            if not model_id:
+                return None, "模型 id 去除前缀后为空"
         if self.api_model_prefix and not model_id.startswith(self.api_model_prefix):
             return None, f"模型 id 不符合前缀 {self.api_model_prefix}"
+        if self.required_generation_method:
+            generation_methods = entry.get("supportedGenerationMethods")
+            if not isinstance(generation_methods, list) or self.required_generation_method not in generation_methods:
+                return None, f"模型不支持 {self.required_generation_method}"
         return self.build_candidate(model_id), None
 
     def owns_litellm_entry(self, entry: Mapping[str, Any]) -> bool:
@@ -184,7 +205,9 @@ def _discover_upstream(
         if candidate is None:
             unknown.append(
                 UnknownCandidate(
-                    source="upstream", model_id=_nonempty_string(entry.get("id")), reason=reason or "无法映射"
+                    source="upstream",
+                    model_id=adapter.source_model_id(entry),
+                    reason=reason or "无法映射",
                 )
             )
             continue

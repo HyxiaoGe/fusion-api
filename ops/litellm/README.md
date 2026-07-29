@@ -90,6 +90,14 @@ python -m scripts.write_restic_success_marker \
 
 复制 `provider-registry.example.json` 到运维主机的受控配置目录，并按实际支持情况启用 provider。Registry 只记录地址和环境变量名，不保存 API key。
 
+厂商目录协议与推理协议可以分离配置：`base_url` 始终表示后续预检和准入使用的
+推理地址；可选的 `discovery` 对象只描述只读模型目录，包括固定 `url`、鉴权方式、
+响应列表字段、模型 id 字段、待移除前缀和分页参数。Google Gemini 使用
+`x-goog-api-key` 请求头并只接纳支持 `generateContent` 的模型；xAI 按当前实际
+链路从 OpenRouter 目录筛选 `x-ai/` 命名空间；MiniMax 国内账号从
+`api.minimaxi.com` 发现，并使用 Anthropic 兼容推理端点。目录中出现的新模型
+仍只进入隔离候选，不能绕过成本、能力和真实预检门禁直接上架。
+
 `litellm.candidate_preflight` 必须使用 `litellm_provider_wildcard`，每个
 provider 还要声明独立的 `candidate/<provider>/*` route；实际 LiteLLM 配置
 参见 `candidate-preflight-routes.example.yaml`。协调器先从普通

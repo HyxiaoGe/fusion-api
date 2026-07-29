@@ -80,7 +80,66 @@ def acme_config():
     }
 
 
+def google_config():
+    return {
+        "adapter": "openai-compatible",
+        "provider_key": "google",
+        "provider_display": "Google Gemini",
+        "litellm_prefix": "gemini",
+        "base_url": "",
+        "api_key_env": "GOOGLE_API_KEY",
+        "credential_generation": "test-v1",
+        "discovery": {
+            "url": "https://generativelanguage.googleapis.com/v1beta/models",
+            "auth": "x-goog-api-key",
+            "response_field": "models",
+            "id_field": "name",
+            "strip_prefix": "models/",
+            "required_generation_method": "generateContent",
+            "pagination": {
+                "page_size": 1000,
+                "page_size_param": "pageSize",
+                "page_token_param": "pageToken",
+                "next_page_token_field": "nextPageToken",
+            },
+        },
+    }
+
+
 class ModelCandidateOrchestratorTests(unittest.TestCase):
+    def test_minimax_without_discovery_config_uses_standard_v1_models_catalog(self):
+        provider = {
+            **acme_config(),
+            "provider_key": "minimax",
+            "provider_display": "MiniMax",
+            "litellm_prefix": "minimax",
+            "api_model_prefix": "MiniMax-",
+            "base_url": "https://api.minimax.io",
+            "api_key_env": "MINIMAX_API_KEY",
+        }
+        client = FakeHttpClient(
+            {
+                "http://litellm.internal:4000/model/info": FakeResponse({"data": []}),
+                "https://api.minimax.io/v1/models": FakeResponse({"data": [{"id": "MiniMax-M2.7"}]}),
+            }
+        )
+
+        report = orchestrator.coordinate_candidates(
+            registry=registry(provider),
+            environ={
+                "LITELLM_MASTER_KEY": "litellm-secret",
+                "MINIMAX_API_KEY": "minimax-secret",
+            },
+            client=client,
+        )
+
+        self.assertEqual(report["providers"]["minimax"]["status"], "ok")
+        self.assertEqual(
+            report["providers"]["minimax"]["report"]["new"][0]["litellm_model"],
+            "minimax/MiniMax-M2.7",
+        )
+        self.assertIn("https://api.minimax.io/v1/models", [call[0] for call in client.calls])
+
     def test_provider_without_credential_generation_is_blocked(self):
         provider = acme_config()
         provider.pop("credential_generation")
@@ -439,6 +498,110 @@ class ModelCandidateOrchestratorTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 4)
         self.assertTrue(all(call[1].keys() <= {"headers", "timeout"} for call in client.calls))
         self.assertEqual(report["candidate_preflight"]["status"], "ready")
+
+    def test_google_catalog_uses_header_auth_paginates_and_filters_generate_content(self):
+        google = google_config()
+        catalog_url = google["discovery"]["url"]
+
+        class PaginatedClient(FakeHttpClient):
+            def get(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                if url == "http://litellm.internal:4000/model/info":
+                    return FakeResponse({"data": []})
+                if url == catalog_url:
+                    params = kwargs.get("params")
+                    if params == {"pageSize": 1000}:
+                        return FakeResponse(
+                            {
+                                "models": [
+                                    {
+                                        "name": "models/gemini-3.6-flash",
+                                        "supportedGenerationMethods": ["generateContent"],
+                                    },
+                                    {
+                                        "name": "models/text-embedding-004",
+                                        "supportedGenerationMethods": ["embedContent"],
+                                    },
+                                ],
+                                "nextPageToken": "page-2",
+                            }
+                        )
+                    if params == {"pageSize": 1000, "pageToken": "page-2"}:
+                        return FakeResponse(
+                            {
+                                "models": [
+                                    {
+                                        "name": "models/gemini-3.6-pro",
+                                        "supportedGenerationMethods": ["generateContent"],
+                                    }
+                                ]
+                            }
+                        )
+                raise AssertionError(f"未预期的请求: {url} {kwargs}")
+
+        secret = "google-super-secret"
+        client = PaginatedClient({})
+        report = orchestrator.coordinate_candidates(
+            registry=registry(google),
+            environ={
+                "LITELLM_MASTER_KEY": "litellm-secret",
+                "GOOGLE_API_KEY": secret,
+            },
+            client=client,
+        )
+
+        provider = report["providers"]["google"]
+        self.assertEqual(provider["status"], "ok")
+        self.assertEqual(
+            [item["model_id"] for item in provider["report"]["new"]],
+            ["gemini-3.6-flash", "gemini-3.6-pro"],
+        )
+        self.assertEqual(provider["report"]["summary"]["unknown"], 1)
+        catalog_calls = [call for call in client.calls if call[0] == catalog_url]
+        self.assertEqual(len(catalog_calls), 2)
+        self.assertTrue(all(call[1]["headers"] == {"x-goog-api-key": secret} for call in catalog_calls))
+        self.assertTrue(all(secret not in call[0] for call in catalog_calls))
+        self.assertNotIn(secret, json.dumps(report, ensure_ascii=False))
+
+    def test_openrouter_xai_discovery_keeps_nested_litellm_underlying(self):
+        xai = {
+            "adapter": "openai-compatible",
+            "provider_key": "xai",
+            "provider_display": "xAI",
+            "litellm_prefix": "openrouter/x-ai",
+            "base_url": "",
+            "api_key_env": "OPENROUTER_API_KEY",
+            "credential_generation": "test-v1",
+            "discovery": {
+                "url": "https://openrouter.ai/api/v1/models",
+                "auth": "bearer",
+                "response_field": "data",
+                "id_field": "id",
+                "strip_prefix": "x-ai/",
+            },
+        }
+        client = FakeHttpClient(
+            {
+                "http://litellm.internal:4000/model/info": FakeResponse({"data": []}),
+                "https://openrouter.ai/api/v1/models": FakeResponse(
+                    {"data": [{"id": "x-ai/grok-4.5"}, {"id": "openai/gpt-5"}]}
+                ),
+            }
+        )
+
+        report = orchestrator.coordinate_candidates(
+            registry=registry(xai),
+            environ={
+                "LITELLM_MASTER_KEY": "litellm-secret",
+                "OPENROUTER_API_KEY": "openrouter-secret",
+            },
+            client=client,
+        )
+
+        provider = report["providers"]["xai"]["report"]
+        self.assertEqual([item["model_id"] for item in provider["new"]], ["grok-4.5"])
+        self.assertEqual(provider["new"][0]["litellm_model"], "openrouter/x-ai/grok-4.5")
+        self.assertEqual(provider["summary"]["unknown"], 1)
 
     def test_candidate_preflight_requires_candidate_key_wildcard_allowlist(self):
         client = FakeHttpClient(

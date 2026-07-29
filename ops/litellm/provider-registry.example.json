@@ -60,6 +60,90 @@
         "route_model_name": "candidate/xiaomi/*",
         "route_litellm_model": "openai/*"
       }
+    },
+    {
+      "adapter": "openai-compatible",
+      "provider_key": "google",
+      "provider_display": "Google Gemini",
+      "litellm_prefix": "gemini",
+      "api_model_prefix": "gemini-",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta",
+      "api_key_env": "GOOGLE_API_KEY",
+      "credential_generation": "initial",
+      "discovery": {
+        "url": "https://generativelanguage.googleapis.com/v1beta/models",
+        "auth": "x-goog-api-key",
+        "response_field": "models",
+        "id_field": "name",
+        "strip_prefix": "models/",
+        "required_generation_method": "generateContent",
+        "pagination": {
+          "page_size": 1000,
+          "page_size_param": "pageSize",
+          "page_token_param": "pageToken",
+          "next_page_token_field": "nextPageToken"
+        }
+      },
+      "candidate_preflight": {
+        "route_model_name": "candidate/google/*",
+        "route_litellm_model": "gemini/*"
+      }
+    },
+    {
+      "adapter": "openai-compatible",
+      "provider_key": "xai",
+      "provider_display": "xAI（经 OpenRouter）",
+      "litellm_prefix": "openrouter/x-ai",
+      "cost_map_prefix": "xai",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "credential_generation": "initial",
+      "discovery": {
+        "url": "https://openrouter.ai/api/v1/models",
+        "auth": "bearer",
+        "response_field": "data",
+        "id_field": "id",
+        "strip_prefix": "x-ai/"
+      },
+      "candidate_preflight": {
+        "route_model_name": "candidate/xai/*",
+        "route_litellm_model": "openrouter/x-ai/*"
+      }
+    },
+    {
+      "adapter": "openai-compatible",
+      "provider_key": "doubao",
+      "provider_display": "豆包",
+      "litellm_prefix": "openai",
+      "cost_map_prefix": "volcengine",
+      "api_model_prefix": "doubao-",
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "api_key_env": "DOUBAO_API_KEY",
+      "credential_generation": "initial",
+      "candidate_preflight": {
+        "route_model_name": "candidate/doubao/*",
+        "route_litellm_model": "openai/*"
+      }
+    },
+    {
+      "adapter": "openai-compatible",
+      "provider_key": "minimax",
+      "provider_display": "MiniMax",
+      "litellm_prefix": "minimax",
+      "api_model_prefix": "MiniMax-",
+      "base_url": "https://api.minimaxi.com/anthropic/v1/messages",
+      "api_key_env": "MINIMAX_API_KEY",
+      "credential_generation": "initial",
+      "discovery": {
+        "url": "https://api.minimaxi.com/v1/models",
+        "auth": "bearer",
+        "response_field": "data",
+        "id_field": "id"
+      },
+      "candidate_preflight": {
+        "route_model_name": "candidate/minimax/*",
+        "route_litellm_model": "minimax/*"
+      }
     }
   ]
 }
