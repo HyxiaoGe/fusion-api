@@ -203,7 +203,8 @@ def _case_result(
     name: str,
     output_present: bool,
     usage_present: bool,
-    cost_present: bool,
+    cost_present: bool | None,
+    cost_required: bool = True,
     stream_done: bool | None = None,
     output_text: str = "",
     reasoning_present: bool | None = None,
@@ -216,7 +217,7 @@ def _case_result(
         issues.append("missing_done")
     if not usage_present:
         issues.append("missing_usage")
-    if not cost_present:
+    if cost_required and cost_present is not True:
         issues.append("missing_cost")
     return CaseResult(
         name=name,
@@ -341,7 +342,10 @@ def _run_stream_case(
             name="stream",
             output_present=bool(output_text.strip()),
             usage_present=usage_present,
-            cost_present=cost_present,
+            # SSE 响应头会在生成结束前发出，协议上无法回填最终成本。若代理
+            # 恰好提供成本则保留证据，否则由同一路由的非流式用例统一门禁。
+            cost_present=True if cost_present else None,
+            cost_required=False,
             stream_done=stream_done,
             output_text=output_text,
         )
@@ -729,13 +733,14 @@ def serialize_report(
         for case in executed
         if case.quality_flags
     ]
+    cost_cases = [case for case in executed if case.cost_present is not None]
     checks = {
         "text": case_by_name.get("text") is not None and case_by_name["text"].status == "passed",
         "stream": case_by_name.get("stream") is not None and case_by_name["stream"].status == "passed",
         "tool": case_by_name.get("tool_calling") is not None
         and case_by_name["tool_calling"].status in {"passed", "skipped"},
         "usage": bool(executed) and all(case.usage_present is True for case in executed),
-        "cost": bool(executed) and all(case.cost_present is True for case in executed),
+        "cost": bool(cost_cases) and all(case.cost_present is True for case in cost_cases),
         "vision": not report.candidate.supports_vision
         or (case_by_name.get("vision") is not None and case_by_name["vision"].status == "passed"),
         "reasoning": not report.candidate.supports_reasoning

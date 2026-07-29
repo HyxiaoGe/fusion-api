@@ -395,7 +395,7 @@ class LiteLLMCandidatePreflightTests(unittest.TestCase):
         self.assertEqual(report.cases[0].status, "failed")
         self.assertIn("HTTPStatusError", report.cases[0].issues)
 
-    def test_stream_requires_text_done_usage_and_cost(self):
+    def test_stream_requires_text_done_and_usage_but_not_final_cost_header(self):
         client = FakeClient(
             responses=[text_response(), tool_response()],
             stream_response=stream_response(usage=False, cost=False),
@@ -413,8 +413,9 @@ class LiteLLMCandidatePreflightTests(unittest.TestCase):
         self.assertEqual(stream_case.status, "failed")
         self.assertTrue(stream_case.output_present)
         self.assertTrue(stream_case.stream_done)
+        self.assertIsNone(stream_case.cost_present)
         self.assertIn("missing_usage", stream_case.issues)
-        self.assertIn("missing_cost", stream_case.issues)
+        self.assertNotIn("missing_cost", stream_case.issues)
 
     def test_serialized_summary_never_contains_keys(self):
         report = preflight.run_preflight(
