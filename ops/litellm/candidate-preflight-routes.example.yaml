@@ -1,6 +1,21 @@
 # 候选模型专用路由。部署时合并到 LiteLLM model_list，但不要写入 DB，
 # 因而不会进入 Fusion 的持久模型选择器。
 model_list:
+  # 官方成本表尚未收录但已经过审计的精确候选路由。必须放在 wildcard
+  # 之前，且价格只能绑定该模型，禁止把 K3 价格套到全部 Moonshot 候选。
+  - model_name: candidate/moonshot/kimi-k3
+    litellm_params:
+      model: moonshot/kimi-k3
+      api_base: https://api.moonshot.cn/v1
+      api_key: os.environ/MOONSHOT_API_KEY
+    model_info:
+      input_cost_per_token: 0.000003
+      output_cost_per_token: 0.000015
+      cache_read_input_token_cost: 0.0000003
+      metadata:
+        provider_key: moonshot
+        purpose: candidate_pricing_override
+
   - model_name: candidate/moonshot/*
     litellm_params:
       model: moonshot/*

@@ -97,6 +97,22 @@ class CandidateEnrichmentTests(unittest.TestCase):
 
         self.assertEqual(approval["policy_version"], "fusion-model-override/v1")
 
+    def test_k3_override_has_full_document_hash_and_domestic_pricing_provenance(self):
+        path = Path(__file__).resolve().parents[1] / "ops/litellm/candidate-overrides.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+
+        approval = enrichment.validate_override_approval(payload)
+        model = payload["providers"]["moonshot"]["models"]["kimi-k3"]
+
+        self.assertEqual(payload["schema_version"], 2)
+        self.assertEqual(len(approval["document_sha256"]), 64)
+        self.assertEqual(model["pricing"]["input"], 3.0)
+        self.assertEqual(model["pricing_provenance"]["billing_rates"]["input"], 20.0)
+        self.assertEqual(
+            set(model["capabilities"]),
+            set(enrichment.FUSION_CAPABILITY_FIELDS),
+        )
+
     def test_cost_map_status_must_match_and_be_fresh(self):
         cost_map = {"model": {"input_cost_per_token": 0.1}}
         now = datetime.now(timezone.utc)
@@ -172,7 +188,30 @@ class CandidateEnrichmentTests(unittest.TestCase):
                     "kimi-k3": {
                         "display_name": "Kimi K3",
                         "capabilities": {"functionCalling": True, "vision": True},
-                        "pricing": {"input": 0.6, "output": 2.5, "unit": "USD/1M tokens"},
+                        "pricing": {
+                            "input": 3.0,
+                            "output": 15.0,
+                            "cache_read_input": 0.3,
+                            "unit": "USD/1M tokens",
+                        },
+                        "pricing_provenance": {
+                            "billing_region": "CN",
+                            "billing_currency": "CNY",
+                            "canonical_currency": "USD",
+                            "canonicalization_method": "provider_published_regional_price_pair",
+                            "billing_rates": {
+                                "input": 20.0,
+                                "output": 100.0,
+                                "cache_read_input": 2.0,
+                                "unit": "CNY/1M tokens",
+                            },
+                            "canonical_rates": {
+                                "input": 3.0,
+                                "output": 15.0,
+                                "cache_read_input": 0.3,
+                                "unit": "USD/1M tokens",
+                            },
+                        },
                     }
                 }
             }
@@ -196,12 +235,63 @@ class CandidateEnrichmentTests(unittest.TestCase):
 
         candidate = result["providers"]["moonshot"]["report"]["new"][0]
         self.assertEqual(candidate["metadata"]["display_name"], "Kimi K3")
+        self.assertEqual(candidate["metadata"]["pricing"]["cache_read_input"], 0.3)
+        self.assertEqual(candidate["metadata"]["pricing_provenance"]["billing_currency"], "CNY")
         self.assertTrue(candidate["metadata_evidence"]["reviewed_override_applied"])
         self.assertEqual(
             candidate["metadata_evidence"]["override_approval"]["policy_version"],
             "fusion-model-override/v1",
         )
         self.assertNotIn("api_key", candidate["registration"])
+
+    def test_override_pricing_provenance_must_match_canonical_pricing(self):
+        providers = {
+            "moonshot": {
+                "models": {
+                    "kimi-k3": {
+                        "capabilities": {"functionCalling": True},
+                        "pricing": {"input": 3.0, "output": 15.0, "unit": "USD/1M tokens"},
+                        "pricing_provenance": {
+                            "billing_region": "CN",
+                            "billing_currency": "CNY",
+                            "canonical_currency": "USD",
+                            "canonicalization_method": "provider_published_regional_price_pair",
+                            "billing_rates": {
+                                "input": 20.0,
+                                "output": 100.0,
+                                "unit": "CNY/1M tokens",
+                            },
+                            "canonical_rates": {
+                                "input": 2.0,
+                                "output": 15.0,
+                                "unit": "USD/1M tokens",
+                            },
+                        },
+                    }
+                }
+            }
+        }
+
+        with self.assertRaisesRegex(ValueError, "canonical_rates"):
+            enrich(
+                candidate_report=candidate_report(),
+                registry=registry(),
+                cost_map={},
+                overrides={
+                    "schema_version": 1,
+                    "approval": {
+                        "policy_version": "fusion-model-override/v1",
+                        "reviewed_by": "model-governance",
+                        "reviewed_at": "2026-07-29T09:00:00+08:00",
+                        "source_urls": [
+                            "https://platform.kimi.com/docs/pricing/chat-k3",
+                            "https://platform.kimi.ai/docs/pricing/chat-k3",
+                        ],
+                        "providers_sha256": cost_map_sha256(providers),
+                    },
+                    "providers": providers,
+                },
+            )
 
     def test_override_without_matching_approval_hash_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "providers_sha256"):

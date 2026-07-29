@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import sys
 from dataclasses import asdict, dataclass, field
@@ -156,13 +157,20 @@ def _has_usage(payload: Mapping[str, Any]) -> bool:
 
 
 def _has_cost(response: Any, payload: Mapping[str, Any]) -> bool:
+    def valid(value: Any) -> bool:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(parsed) and parsed > 0
+
     headers = getattr(response, "headers", {})
-    if headers.get("x-litellm-response-cost") is not None:
+    if valid(headers.get("x-litellm-response-cost")):
         return True
-    if payload.get("response_cost") is not None:
+    if valid(payload.get("response_cost")):
         return True
     hidden = payload.get("_hidden_params")
-    return isinstance(hidden, Mapping) and hidden.get("response_cost") is not None
+    return isinstance(hidden, Mapping) and valid(hidden.get("response_cost"))
 
 
 def _case_result(

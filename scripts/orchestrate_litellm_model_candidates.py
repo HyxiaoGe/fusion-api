@@ -215,11 +215,12 @@ def _resolve_raw_candidate_routes(
             model_info = model_info if isinstance(model_info, Mapping) else {}
             metadata = model_info.get("metadata")
             metadata = metadata if isinstance(metadata, Mapping) else {}
+            purpose = str(metadata.get("purpose") or "")
             matches_expanded_route = str(entry.get("model_name") or "").startswith(prefix)
             matches_route_metadata = (
                 metadata.get("provider_key") == provider_key and metadata.get("purpose") == "candidate_preflight"
             )
-            if matches_expanded_route or matches_route_metadata:
+            if matches_route_metadata or (matches_expanded_route and not purpose.startswith("candidate_")):
                 deployment_ids.add(str(model_info.get("id") or ""))
         deployment_ids.discard("")
         raw_matches: list[Mapping[str, Any]] = []

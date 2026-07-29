@@ -348,6 +348,11 @@ def _state_fingerprint(entries: Sequence[Mapping[str, Any]], key_models: Sequenc
                 "api_base": params.get("api_base") if isinstance(params, Mapping) else None,
                 "id": info.get("id") if isinstance(info, Mapping) else None,
                 "metadata": info.get("metadata") if isinstance(info, Mapping) else None,
+                "input_cost_per_token": info.get("input_cost_per_token") if isinstance(info, Mapping) else None,
+                "output_cost_per_token": info.get("output_cost_per_token") if isinstance(info, Mapping) else None,
+                "cache_read_input_token_cost": (
+                    info.get("cache_read_input_token_cost") if isinstance(info, Mapping) else None
+                ),
             }
         )
     catalog.sort(key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, default=str))
@@ -782,11 +787,18 @@ def _entry_matches_expected(entry: Mapping[str, Any], payload: Mapping[str, Any]
         return False
     expected_metadata = expected_info.get("metadata")
     actual_metadata = info.get("metadata")
+    expected_costs = {
+        key: value
+        for key, value in expected_info.items()
+        if key.endswith("_cost_per_token") or key == "cache_read_input_token_cost"
+    }
+    actual_costs = {key: info.get(key) for key in expected_costs}
     return (
         entry.get("model_name") == payload.get("model_name")
         and params.get("model") == expected_params.get("model")
         and params.get("api_base") == expected_params.get("api_base")
         and actual_metadata == expected_metadata
+        and actual_costs == expected_costs
     )
 
 

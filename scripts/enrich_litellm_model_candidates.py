@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import os
 import sys
 import tempfile
@@ -27,6 +28,7 @@ FUSION_CAPABILITY_FIELDS = {
     "vision": ("supports_vision",),
     "webSearch": ("supports_web_search",),
 }
+PRICING_RATE_FIELDS = ("input", "output", "cache_read_input")
 
 
 def _is_mapping(value: Any) -> bool:
@@ -167,8 +169,9 @@ def _override_for(
 
 
 def validate_override_approval(overrides: Mapping[str, Any]) -> dict[str, Any]:
-    if overrides.get("schema_version") != 1:
-        raise ValueError("override.schema_version 必须为 1")
+    schema_version = overrides.get("schema_version")
+    if schema_version not in (1, 2):
+        raise ValueError("override.schema_version 必须为 1 或 2")
     providers = overrides.get("providers")
     approval = overrides.get("approval")
     if not _is_mapping(providers) or not _is_mapping(approval):
@@ -192,13 +195,137 @@ def validate_override_approval(overrides: Mapping[str, Any]) -> dict[str, Any]:
     expected_sha256 = cost_map_sha256(providers)
     if approval.get("providers_sha256") != expected_sha256:
         raise ValueError("override providers_sha256 不匹配")
-    return {
+    normalized = {
         "policy_version": str(approval["policy_version"]),
         "reviewed_by": str(approval["reviewed_by"]),
         "reviewed_at": reviewed_at.astimezone(timezone.utc).isoformat(),
         "source_urls": [str(item) for item in source_urls],
         "providers_sha256": expected_sha256,
     }
+    if schema_version == 2:
+        valid_until_text = str(approval.get("valid_until") or "")
+        try:
+            valid_until = datetime.fromisoformat(valid_until_text.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("override valid_until 无效") from exc
+        if valid_until.tzinfo is None:
+            raise ValueError("override valid_until 必须包含时区")
+        now = datetime.now(timezone.utc)
+        if reviewed_at.astimezone(timezone.utc) > now.replace(microsecond=0):
+            raise ValueError("override reviewed_at 来自未来")
+        if valid_until.astimezone(timezone.utc) <= now:
+            raise ValueError("override 已过期")
+        document_sha256 = str(approval.get("document_sha256") or "")
+        document = {
+            "schema_version": schema_version,
+            "approval": {key: copy.deepcopy(value) for key, value in approval.items() if key != "document_sha256"},
+            "providers": providers,
+        }
+        expected_document_sha256 = cost_map_sha256(document)
+        if document_sha256 != expected_document_sha256:
+            raise ValueError("override document_sha256 不匹配")
+        normalized["document_sha256"] = expected_document_sha256
+        normalized["valid_until"] = valid_until.astimezone(timezone.utc).isoformat()
+    _validate_override_models(providers, schema_version=schema_version)
+    if schema_version == 2:
+        approved_sources = set(normalized["source_urls"])
+        for provider in providers.values():
+            for model in provider["models"].values():
+                provenance = model.get("pricing_provenance")
+                if not _is_mapping(provenance):
+                    continue
+                evidence_urls = {
+                    str(item.get("url")) for item in provenance.get("source_evidence") or [] if _is_mapping(item)
+                }
+                if not evidence_urls.issubset(approved_sources):
+                    raise ValueError("override pricing_provenance 来源未纳入审批")
+    return normalized
+
+
+def _valid_nonnegative_number(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value) and value >= 0
+
+
+def _validate_pricing_rates(rates: Any, *, label: str) -> Mapping[str, Any]:
+    if not _is_mapping(rates) or not str(rates.get("unit") or "").strip():
+        raise ValueError(f"override {label} 不完整")
+    for key in ("input", "output"):
+        if not _valid_nonnegative_number(rates.get(key)):
+            raise ValueError(f"override {label}.{key} 无效")
+    if "cache_read_input" in rates and not _valid_nonnegative_number(rates.get("cache_read_input")):
+        raise ValueError(f"override {label}.cache_read_input 无效")
+    return rates
+
+
+def _validate_override_models(providers: Mapping[str, Any], *, schema_version: int) -> None:
+    for provider in providers.values():
+        if not _is_mapping(provider):
+            raise ValueError("override provider 必须是对象")
+        models = provider.get("models")
+        if not _is_mapping(models):
+            raise ValueError("override provider.models 必须是对象")
+        for model in models.values():
+            if not _is_mapping(model):
+                raise ValueError("override model 必须是对象")
+            pricing = model.get("pricing")
+            if pricing is not None:
+                pricing = _validate_pricing_rates(pricing, label="pricing")
+            provenance = model.get("pricing_provenance")
+            if provenance is None:
+                continue
+            if not _is_mapping(provenance):
+                raise ValueError("override pricing_provenance 必须是对象")
+            required_provenance_keys = [
+                "billing_region",
+                "billing_currency",
+                "canonical_currency",
+                "canonicalization_method",
+            ]
+            if schema_version == 2:
+                required_provenance_keys.extend(("api_base", "input_basis"))
+            for key in required_provenance_keys:
+                if not str(provenance.get(key) or "").strip():
+                    raise ValueError(f"override pricing_provenance.{key} 缺失")
+            billing_rates = _validate_pricing_rates(
+                provenance.get("billing_rates"),
+                label="pricing_provenance.billing_rates",
+            )
+            canonical_rates = _validate_pricing_rates(
+                provenance.get("canonical_rates"),
+                label="pricing_provenance.canonical_rates",
+            )
+            if pricing is None or any(
+                pricing.get(key) != canonical_rates.get(key)
+                for key in (*PRICING_RATE_FIELDS, "unit")
+                if key in pricing or key in canonical_rates
+            ):
+                raise ValueError("override pricing_provenance.canonical_rates 与 pricing 不一致")
+            if str(billing_rates["unit"]).split("/", 1)[0] != str(provenance["billing_currency"]):
+                raise ValueError("override pricing_provenance.billing_rates 币种不一致")
+            if str(canonical_rates["unit"]).split("/", 1)[0] != str(provenance["canonical_currency"]):
+                raise ValueError("override pricing_provenance.canonical_rates 币种不一致")
+            if (
+                schema_version == 2
+                and provenance["canonicalization_method"] == "provider_published_regional_price_pair"
+            ):
+                ratios = [
+                    billing_rates[key] / canonical_rates[key]
+                    for key in PRICING_RATE_FIELDS
+                    if key in billing_rates and key in canonical_rates and canonical_rates[key] > 0
+                ]
+                if len(ratios) < 2 or max(ratios) - min(ratios) > 0.01:
+                    raise ValueError("override pricing_provenance 区域价格比例不一致")
+            source_evidence = provenance.get("source_evidence")
+            if schema_version == 1 and source_evidence is None:
+                continue
+            if not isinstance(source_evidence, list) or len(source_evidence) < 2:
+                raise ValueError("override pricing_provenance.source_evidence 不完整")
+            for evidence in source_evidence:
+                if not _is_mapping(evidence) or not str(evidence.get("region") or "").strip():
+                    raise ValueError("override pricing_provenance.source_evidence 无效")
+                parsed = urlparse(str(evidence.get("url") or ""))
+                if parsed.scheme != "https" or not parsed.netloc:
+                    raise ValueError("override pricing_provenance.source_evidence URL 无效")
 
 
 def _metadata(
@@ -221,7 +348,14 @@ def _metadata(
             metadata["capabilities"] = capabilities
         if pricing:
             metadata["pricing"] = pricing
-    for key in ("description", "capabilities", "pricing", "knowledge_cutoff", "recommended_for"):
+    for key in (
+        "description",
+        "capabilities",
+        "pricing",
+        "pricing_provenance",
+        "knowledge_cutoff",
+        "recommended_for",
+    ):
         if key in override:
             metadata[key] = copy.deepcopy(override[key])
     return metadata
@@ -264,6 +398,16 @@ def enrich_candidate_report(
                 continue
             key, entry = _cost_entry(candidate, provider_config, cost_map)
             override = _override_for(overrides, str(provider_key), str(candidate.get("model_id") or ""))
+            provenance = override.get("pricing_provenance") if _is_mapping(override) else None
+            if _is_mapping(provenance) and provenance.get("api_base") not in (None, provider_config.get("base_url")):
+                raise ValueError("override pricing_provenance.api_base 与 provider registry 不一致")
+            cost_pricing = _pricing(entry) if entry is not None else {}
+            override_pricing = override.get("pricing") if _is_mapping(override) else None
+            override_cost_map_conflict = bool(
+                cost_pricing
+                and _is_mapping(override_pricing)
+                and any(cost_pricing.get(field) != override_pricing.get(field) for field in ("input", "output", "unit"))
+            )
             candidate["registration"] = {
                 "api_base": provider_config.get("base_url"),
                 "api_key_env": provider_config.get("api_key_env"),
@@ -290,6 +434,7 @@ def enrich_candidate_report(
                 "cost_map_sha256": cost_map_status["sha256"],
                 "reviewed_override_applied": bool(override),
                 "override_approval": copy.deepcopy(override_approval) if override else None,
+                "override_cost_map_conflict": override_cost_map_conflict,
             }
     report["enrichment"] = {
         "mode": "read_only",

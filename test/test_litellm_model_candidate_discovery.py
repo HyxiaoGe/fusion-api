@@ -123,6 +123,24 @@ class ModelCandidateDiscoveryTests(unittest.TestCase):
         self.assertEqual(len(report.unknown), 1)
         self.assertEqual(report.unknown[0].reason, "上游快照包含重复模型 id")
 
+    def test_exact_non_db_candidate_pricing_route_does_not_hide_new_model(self):
+        route = litellm_entry(
+            "candidate/moonshot/kimi-k3",
+            "moonshot/kimi-k3",
+            provider_key="moonshot",
+        )
+        route["model_info"]["db_model"] = False
+        route["model_info"]["metadata"]["purpose"] = "candidate_pricing_override"
+
+        report = discovery.discover_candidates(
+            adapter=discovery.MoonshotProviderAdapter(),
+            upstream_snapshot={"data": [{"id": "kimi-k3"}]},
+            litellm_snapshot={"data": [route]},
+        )
+
+        self.assertEqual([item.model_id for item in report.new], ["kimi-k3"])
+        self.assertEqual(report.existing, [])
+
     def test_candidate_is_quarantined_when_business_alias_is_owned_by_other_provider(self):
         report = discovery.discover_candidates(
             adapter=discovery.MoonshotProviderAdapter(),

@@ -44,6 +44,8 @@ class LiteLLMGovernanceUnitTests(unittest.TestCase):
         self.assertIn("run_litellm_governance_unit.py", content)
         self.assertIn("-m scripts.run_litellm_governance_unit", content)
         self.assertIn("AssertPathExists=", content)
+        self.assertIn("ops/litellm/candidate-overrides.json", content)
+        self.assertIn("--overrides", content)
         self.assertNotIn("ConditionPathExists=", content)
         self.assertIn("litellm-governance-venv/bin/python", content)
         self.assertNotIn("ExecStartPre=", content)

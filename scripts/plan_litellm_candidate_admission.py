@@ -31,6 +31,7 @@ SAFE_METADATA_KEYS = (
     "provider_display",
     "capabilities",
     "pricing",
+    "pricing_provenance",
     "knowledge_cutoff",
     "recommended_for",
 )
@@ -42,6 +43,14 @@ REQUIRED_OVERRIDE_APPROVAL_KEYS = (
     "providers_sha256",
 )
 MAX_ACCEPTANCE_CLOCK_SKEW_SECONDS = 300
+REQUIRED_CAPABILITY_FIELDS = {
+    "imageGen",
+    "deepThinking",
+    "fileSupport",
+    "functionCalling",
+    "vision",
+    "webSearch",
+}
 
 
 def _is_mapping(value: Any) -> bool:
@@ -73,7 +82,11 @@ def _metadata_reasons(candidate: Mapping[str, Any]) -> list[str]:
         if not _nonempty_string(metadata.get(key)):
             reasons.append(f"metadata_{key}_missing")
     capabilities = metadata.get("capabilities")
-    if not _is_mapping(capabilities) or not capabilities:
+    if (
+        not _is_mapping(capabilities)
+        or set(capabilities) != REQUIRED_CAPABILITY_FIELDS
+        or any(not isinstance(capabilities.get(key), bool) for key in REQUIRED_CAPABILITY_FIELDS)
+    ):
         reasons.append("metadata_capabilities_incomplete")
     pricing = metadata.get("pricing")
     if not _pricing_complete(pricing):
@@ -87,13 +100,15 @@ def _metadata_reasons(candidate: Mapping[str, Any]) -> list[str]:
         approval = evidence.get("override_approval")
         if not _is_mapping(approval) or any(not approval.get(key) for key in REQUIRED_OVERRIDE_APPROVAL_KEYS):
             reasons.append("override_approval_missing")
+    if _is_mapping(evidence) and evidence.get("override_cost_map_conflict") is True:
+        reasons.append("override_cost_map_conflict")
     if metadata.get("provider_key") != candidate.get("provider_key"):
         reasons.append("metadata_provider_mismatch")
     return reasons
 
 
 def _pricing_complete(pricing: Any) -> bool:
-    if not _is_mapping(pricing) or not _nonempty_string(pricing.get("unit")):
+    if not _is_mapping(pricing) or pricing.get("unit") != "USD/1M tokens":
         return False
     for key in ("input", "output"):
         value = pricing.get(key)
@@ -244,6 +259,26 @@ def _safe_metadata(candidate: Mapping[str, Any]) -> dict[str, Any]:
     return {key: metadata[key] for key in SAFE_METADATA_KEYS if key in metadata}
 
 
+def _litellm_cost_fields(metadata: Mapping[str, Any]) -> dict[str, float]:
+    pricing = metadata.get("pricing")
+    if not _is_mapping(pricing) or pricing.get("unit") != "USD/1M tokens":
+        return {}
+    mapping = {
+        "input": "input_cost_per_token",
+        "output": "output_cost_per_token",
+        "cache_read_input": "cache_read_input_token_cost",
+    }
+    result: dict[str, float] = {}
+    for source, target in mapping.items():
+        value = pricing.get(source)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            if source in ("input", "output"):
+                return {}
+            continue
+        result[target] = value / 1_000_000
+    return result
+
+
 def build_eligible_entry(candidate: Mapping[str, Any]) -> dict[str, Any]:
     """从完整候选契约确定性重建单模型准入条目。"""
     registration = candidate["registration"]
@@ -258,6 +293,10 @@ def build_eligible_entry(candidate: Mapping[str, Any]) -> dict[str, Any]:
             },
         }
     )
+    model_info = {
+        **_litellm_cost_fields(metadata),
+        "metadata": metadata,
+    }
     payload = {
         "model_name": model_id,
         "litellm_params": {
@@ -265,9 +304,7 @@ def build_eligible_entry(candidate: Mapping[str, Any]) -> dict[str, Any]:
             "api_base": registration["api_base"],
             "api_key": f"os.environ/{registration['api_key_env']}",
         },
-        "model_info": {
-            "metadata": metadata,
-        },
+        "model_info": model_info,
     }
     return {
         "model_id": model_id,

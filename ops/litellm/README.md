@@ -155,9 +155,18 @@ python -m scripts.enrich_litellm_model_candidates \
 - 厂商使用共享 `openai/` 前缀时，可在 registry 配置 `cost_map_prefix`；
 - 官方表暂未收录但已有厂商正式证据时，可通过受审 `--overrides` 文件补齐；文件只允许 metadata，不保存密钥。
 
-override 必须符合 `candidate-overrides.example.json`：审批记录包含策略版本、
-审阅人、带时区时间、HTTPS 官方来源和当前 `providers` 配置 SHA-256。任何一项
-缺失或配置哈希变化都会 fail-closed，旧审批不能静默复用。
+正式 override 使用 schema v2（当前文件为 `candidate-overrides.json`）：审批记录
+包含策略版本、审阅人、带时区的审阅/失效时间、HTTPS 官方来源、
+`providers_sha256` 和覆盖完整文档的 `document_sha256`。区域定价必须把实际
+账单币种、Fusion 的 USD 规范价、适用 API 地址和厂商区域价格对照一起放进
+`pricing_provenance`。任一来源、时间、价格或配置变化都会使哈希失效；过期、
+成本表冲突和区域地址不一致都会 fail-closed。schema v1 仅保留兼容，不应用于
+新增正式 override。
+
+成本表缺失的收费模型还必须增加精确的非 DB 候选路由并在 `model_info` 根级
+声明每 token 成本，参考 `candidate-preflight-routes.example.yaml`。禁止把单模型
+价格挂到厂商 wildcard；精确候选路由不会进入 Fusion 业务目录，正式准入后则由
+`/model/new` 持久化相同成本字段。
 
 ## 统一只读治理周期
 

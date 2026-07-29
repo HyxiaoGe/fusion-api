@@ -208,6 +208,12 @@ def _discover_litellm(
     entries, unknown = _snapshot_entries(snapshot, source="litellm")
     aliases_by_model: dict[str, list[str]] = {}
     for entry in entries:
+        model_info = entry.get("model_info")
+        model_info = model_info if isinstance(model_info, Mapping) else {}
+        metadata = model_info.get("metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        if model_info.get("db_model") is not True and str(metadata.get("purpose") or "").startswith("candidate_"):
+            continue
         if not adapter.owns_litellm_entry(entry):
             continue
         alias = _nonempty_string(entry.get("model_name"))

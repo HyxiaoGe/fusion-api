@@ -357,6 +357,20 @@ class LiteLLMCandidatePreflightTests(unittest.TestCase):
         self.assertIn("missing_usage", text_case.issues)
         self.assertIn("missing_cost", text_case.issues)
 
+    def test_zero_or_non_numeric_cost_is_not_accepted(self):
+        self.assertFalse(
+            preflight._has_cost(
+                FakeResponse(headers={"x-litellm-response-cost": "0"}),
+                {},
+            )
+        )
+        self.assertFalse(
+            preflight._has_cost(
+                FakeResponse(headers={"x-litellm-response-cost": ""}),
+                {},
+            )
+        )
+
     def test_http_error_is_sanitized_and_fails_preflight(self):
         client = FakeClient(
             responses=[FakeResponse(status_code=500), tool_response()],

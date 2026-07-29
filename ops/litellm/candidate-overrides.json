@@ -1,0 +1,75 @@
+{
+  "schema_version": 2,
+  "approval": {
+    "policy_version": "fusion-model-override/v2",
+    "reviewed_by": "fusion-model-governance",
+    "reviewed_at": "2026-07-29T09:51:56+08:00",
+    "valid_until": "2026-10-29T09:51:56+08:00",
+    "source_urls": [
+      "https://platform.kimi.com/docs/pricing/chat-k3.md",
+      "https://platform.kimi.ai/docs/pricing/chat-k3.md"
+    ],
+    "providers_sha256": "a446d74741c3985c6e90908faa4e637d866982f970be168f3340004137c256c9",
+    "document_sha256": "6057778a457b5c591a568d1eee5283ad064dff0f9b4b80e32d1d059f7b38122b"
+  },
+  "providers": {
+    "moonshot": {
+      "models": {
+        "kimi-k3": {
+          "display_name": "Kimi K3",
+          "description": "月之暗面 Kimi K3，国内 API 路由；支持百万级上下文、多模态理解、深度思考与工具调用。",
+          "capabilities": {
+            "imageGen": false,
+            "deepThinking": true,
+            "fileSupport": false,
+            "functionCalling": true,
+            "vision": true,
+            "webSearch": false
+          },
+          "pricing": {
+            "input": 3.0,
+            "output": 15.0,
+            "cache_read_input": 0.3,
+            "unit": "USD/1M tokens"
+          },
+          "pricing_provenance": {
+            "api_base": "https://api.moonshot.cn/v1",
+            "billing_region": "CN",
+            "billing_currency": "CNY",
+            "canonical_currency": "USD",
+            "canonicalization_method": "provider_published_regional_price_pair",
+            "input_basis": "cache_miss",
+            "billing_rates": {
+              "input": 20.0,
+              "output": 100.0,
+              "cache_read_input": 2.0,
+              "unit": "CNY/1M tokens"
+            },
+            "canonical_rates": {
+              "input": 3.0,
+              "output": 15.0,
+              "cache_read_input": 0.3,
+              "unit": "USD/1M tokens"
+            },
+            "source_evidence": [
+              {
+                "region": "CN",
+                "url": "https://platform.kimi.com/docs/pricing/chat-k3.md"
+              },
+              {
+                "region": "GLOBAL",
+                "url": "https://platform.kimi.ai/docs/pricing/chat-k3.md"
+              }
+            ]
+          },
+          "recommended_for": [
+            "复杂推理",
+            "多模态理解",
+            "工具调用",
+            "长上下文任务"
+          ]
+        }
+      }
+    }
+  }
+}

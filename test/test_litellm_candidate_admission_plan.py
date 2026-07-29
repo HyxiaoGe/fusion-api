@@ -14,11 +14,39 @@ def kimi_candidate(*, pricing=True, endpoint_status="verified", extra=None):
         "provider_key": "moonshot",
         "provider_display": "Moonshot",
         "capabilities": {
+            "imageGen": False,
             "deepThinking": True,
+            "fileSupport": False,
             "functionCalling": True,
             "vision": True,
+            "webSearch": False,
         },
-        "pricing": {"input": 0.6, "output": 2.5, "unit": "USD"} if pricing else {},
+        "pricing": {
+            "input": 3.0,
+            "output": 15.0,
+            "cache_read_input": 0.3,
+            "unit": "USD/1M tokens",
+        }
+        if pricing
+        else {},
+        "pricing_provenance": {
+            "billing_region": "CN",
+            "billing_currency": "CNY",
+            "canonical_currency": "USD",
+            "canonicalization_method": "provider_published_regional_price_pair",
+            "billing_rates": {
+                "input": 20.0,
+                "output": 100.0,
+                "cache_read_input": 2.0,
+                "unit": "CNY/1M tokens",
+            },
+            "canonical_rates": {
+                "input": 3.0,
+                "output": 15.0,
+                "cache_read_input": 0.3,
+                "unit": "USD/1M tokens",
+            },
+        },
     }
     candidate = {
         "provider_key": "moonshot",
@@ -203,6 +231,16 @@ class CandidateAdmissionPlanTests(unittest.TestCase):
             model_new["payload"]["litellm_params"]["api_key"],
             "os.environ/MOONSHOT_API_KEY",
         )
+        self.assertEqual(model_new["payload"]["model_info"]["input_cost_per_token"], 0.000003)
+        self.assertEqual(model_new["payload"]["model_info"]["output_cost_per_token"], 0.000015)
+        self.assertEqual(
+            model_new["payload"]["model_info"]["cache_read_input_token_cost"],
+            0.0000003,
+        )
+        self.assertEqual(
+            model_new["payload"]["model_info"]["metadata"]["pricing_provenance"]["billing_currency"],
+            "CNY",
+        )
         governance = model_new["payload"]["model_info"]["metadata"]["governance"]
         self.assertEqual(len(governance["candidate_fingerprint"]), 64)
         self.assertTrue(governance["metadata_evidence"]["cost_map_matched"])
@@ -310,6 +348,25 @@ class CandidateAdmissionPlanTests(unittest.TestCase):
 
         self.assertEqual(plan["eligible"], [])
         self.assertIn("metadata_evidence_missing", plan["isolated"][0]["reasons"])
+
+    def test_override_cost_map_conflict_is_isolated(self):
+        candidate = kimi_candidate()
+        candidate["metadata_evidence"]["reviewed_override_applied"] = True
+        candidate["metadata_evidence"]["override_cost_map_conflict"] = True
+        candidate["metadata_evidence"]["override_approval"] = {
+            "policy_version": "fusion-model-override/v2",
+            "reviewed_by": "model-governance",
+            "reviewed_at": "2026-07-29T09:00:00+08:00",
+            "source_urls": ["https://platform.kimi.com/docs/pricing/chat-k3.md"],
+            "providers_sha256": "a" * 64,
+        }
+
+        plan = admission.build_admission_plan(
+            candidate_report=candidate_report(candidate),
+            candidate_acceptance_summary=candidate_acceptance(),
+        )
+
+        self.assertIn("override_cost_map_conflict", plan["isolated"][0]["reasons"])
 
     def test_unknown_endpoint_is_isolated(self):
         plan = admission.build_admission_plan(
