@@ -120,6 +120,12 @@
       "base_url": "https://ark.cn-beijing.volces.com/api/v3",
       "api_key_env": "DOUBAO_API_KEY",
       "credential_generation": "initial",
+      "discovery": {
+        "url": "https://ark.cn-beijing.volces.com/api/v3/models",
+        "auth": "bearer",
+        "response_field": "data",
+        "id_field": "id"
+      },
       "candidate_preflight": {
         "route_model_name": "candidate/doubao/*",
         "route_litellm_model": "openai/*"
