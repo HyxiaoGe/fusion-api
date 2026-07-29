@@ -21,6 +21,38 @@ model_list:
         provider_key: moonshot
         purpose: candidate_pricing_override
 
+  - model_name: candidate/moonshot/kimi-k2.7-code
+    litellm_params:
+      model: moonshot/kimi-k2.7-code
+      api_base: https://api.moonshot.cn/v1
+      api_key: os.environ/MOONSHOT_API_KEY
+      input_cost_per_token: 0.00000095
+      output_cost_per_token: 0.000004
+      cache_read_input_token_cost: 0.00000019
+    model_info:
+      input_cost_per_token: 0.00000095
+      output_cost_per_token: 0.000004
+      cache_read_input_token_cost: 0.00000019
+      metadata:
+        provider_key: moonshot
+        purpose: candidate_pricing_override
+
+  - model_name: candidate/moonshot/kimi-k2.7-code-highspeed
+    litellm_params:
+      model: moonshot/kimi-k2.7-code-highspeed
+      api_base: https://api.moonshot.cn/v1
+      api_key: os.environ/MOONSHOT_API_KEY
+      input_cost_per_token: 0.0000019
+      output_cost_per_token: 0.000008
+      cache_read_input_token_cost: 0.00000038
+    model_info:
+      input_cost_per_token: 0.0000019
+      output_cost_per_token: 0.000008
+      cache_read_input_token_cost: 0.00000038
+      metadata:
+        provider_key: moonshot
+        purpose: candidate_pricing_override
+
   - model_name: candidate/moonshot/*
     litellm_params:
       model: moonshot/*

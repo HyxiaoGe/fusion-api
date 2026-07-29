@@ -97,12 +97,13 @@ class CandidateEnrichmentTests(unittest.TestCase):
 
         self.assertEqual(approval["policy_version"], "fusion-model-override/v1")
 
-    def test_k3_override_has_full_document_hash_and_domestic_pricing_provenance(self):
+    def test_production_override_has_full_document_hash_and_domestic_pricing_provenance(self):
         path = Path(__file__).resolve().parents[1] / "ops/litellm/candidate-overrides.json"
         payload = json.loads(path.read_text(encoding="utf-8"))
 
         approval = enrichment.validate_override_approval(payload)
-        model = payload["providers"]["moonshot"]["models"]["kimi-k3"]
+        models = payload["providers"]["moonshot"]["models"]
+        model = models["kimi-k3"]
 
         self.assertEqual(payload["schema_version"], 2)
         self.assertEqual(len(approval["document_sha256"]), 64)
@@ -112,6 +113,125 @@ class CandidateEnrichmentTests(unittest.TestCase):
             set(model["capabilities"]),
             set(enrichment.FUSION_CAPABILITY_FIELDS),
         )
+        self.assertEqual(
+            set(models),
+            {"kimi-k3", "kimi-k2.7-code", "kimi-k2.7-code-highspeed"},
+        )
+        self.assertEqual(models["kimi-k2.7-code"]["pricing"]["input"], 0.95)
+        self.assertEqual(models["kimi-k2.7-code"]["pricing"]["output"], 4.0)
+        self.assertEqual(models["kimi-k2.7-code-highspeed"]["pricing"]["input"], 1.9)
+        self.assertEqual(models["kimi-k2.7-code-highspeed"]["pricing"]["output"], 8.0)
+
+    def test_published_regional_price_pair_allows_minor_provider_rounding(self):
+        providers = {
+            "moonshot": {
+                "models": {
+                    "kimi-k2.7-code": {
+                        "capabilities": {"functionCalling": True},
+                        "pricing": {
+                            "input": 0.95,
+                            "output": 4.0,
+                            "cache_read_input": 0.19,
+                            "unit": "USD/1M tokens",
+                        },
+                        "pricing_provenance": {
+                            "api_base": "https://api.moonshot.cn/v1",
+                            "billing_region": "CN",
+                            "billing_currency": "CNY",
+                            "canonical_currency": "USD",
+                            "canonicalization_method": "provider_published_regional_price_pair",
+                            "input_basis": "cache_miss",
+                            "billing_rates": {
+                                "input": 6.5,
+                                "output": 27.0,
+                                "cache_read_input": 1.3,
+                                "unit": "CNY/1M tokens",
+                            },
+                            "canonical_rates": {
+                                "input": 0.95,
+                                "output": 4.0,
+                                "cache_read_input": 0.19,
+                                "unit": "USD/1M tokens",
+                            },
+                            "source_evidence": [
+                                {
+                                    "region": "CN",
+                                    "url": "https://platform.kimi.com/docs/pricing/chat-k27-code.md",
+                                },
+                                {
+                                    "region": "GLOBAL",
+                                    "url": "https://platform.kimi.ai/docs/pricing/chat-k27-code.md",
+                                },
+                            ],
+                        },
+                    }
+                }
+            }
+        }
+        approval = {
+            "policy_version": "fusion-model-override/v2",
+            "reviewed_by": "model-governance",
+            "reviewed_at": "2026-07-29T12:00:00+08:00",
+            "valid_until": "2026-10-29T12:00:00+08:00",
+            "source_urls": [
+                "https://platform.kimi.com/docs/pricing/chat-k27-code.md",
+                "https://platform.kimi.ai/docs/pricing/chat-k27-code.md",
+            ],
+            "providers_sha256": cost_map_sha256(providers),
+        }
+        document = {
+            "schema_version": 2,
+            "approval": approval,
+            "providers": providers,
+        }
+        approval["document_sha256"] = cost_map_sha256(document)
+
+        report = candidate_report()
+        report["providers"]["moonshot"]["report"]["new"][0].update(
+            {
+                "model_id": "kimi-k2.7-code",
+                "litellm_model": "moonshot/kimi-k2.7-code",
+            }
+        )
+        result = enrich(
+            candidate_report=report,
+            registry=registry(),
+            cost_map={},
+            overrides={
+                "schema_version": 2,
+                "approval": approval,
+                "providers": providers,
+            },
+        )
+
+        candidate = result["providers"]["moonshot"]["report"]["new"][0]
+        self.assertEqual(candidate["metadata"]["pricing"]["input"], 0.95)
+
+        invalid_providers = copy.deepcopy(providers)
+        invalid_providers["moonshot"]["models"]["kimi-k2.7-code"]["pricing_provenance"][
+            "billing_rates"
+        ]["output"] = 35.0
+        invalid_approval = copy.deepcopy(approval)
+        invalid_approval["providers_sha256"] = cost_map_sha256(invalid_providers)
+        invalid_document = {
+            "schema_version": 2,
+            "approval": {
+                key: value
+                for key, value in invalid_approval.items()
+                if key != "document_sha256"
+            },
+            "providers": invalid_providers,
+        }
+        invalid_approval["document_sha256"] = cost_map_sha256(invalid_document)
+
+        with self.assertRaisesRegex(ValueError, "区域价格比例"):
+            enrichment.validate_override_approval(
+                {
+                    "schema_version": 2,
+                    "approval": invalid_approval,
+                    "providers": invalid_providers,
+                }
+            )
 
     def test_cost_map_status_must_match_and_be_fresh(self):
         cost_map = {"model": {"input_cost_per_token": 0.1}}

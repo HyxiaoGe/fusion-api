@@ -29,6 +29,7 @@ FUSION_CAPABILITY_FIELDS = {
     "webSearch": ("supports_web_search",),
 }
 PRICING_RATE_FIELDS = ("input", "output", "cache_read_input")
+REGIONAL_PRICE_RATIO_RELATIVE_TOLERANCE = 0.02
 
 
 def _is_mapping(value: Any) -> bool:
@@ -314,7 +315,16 @@ def _validate_override_models(providers: Mapping[str, Any], *, schema_version: i
                     for key in PRICING_RATE_FIELDS
                     if key in billing_rates and key in canonical_rates and canonical_rates[key] > 0
                 ]
-                if len(ratios) < 2 or max(ratios) - min(ratios) > 0.01:
+                ratio_midpoint = sum(ratios) / len(ratios) if ratios else 0
+                relative_spread = (
+                    (max(ratios) - min(ratios)) / ratio_midpoint
+                    if ratio_midpoint > 0
+                    else math.inf
+                )
+                if (
+                    len(ratios) < 2
+                    or relative_spread > REGIONAL_PRICE_RATIO_RELATIVE_TOLERANCE
+                ):
                     raise ValueError("override pricing_provenance 区域价格比例不一致")
             source_evidence = provenance.get("source_evidence")
             if schema_version == 1 and source_evidence is None:

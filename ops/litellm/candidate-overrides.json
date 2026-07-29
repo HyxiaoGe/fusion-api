@@ -3,14 +3,16 @@
   "approval": {
     "policy_version": "fusion-model-override/v2",
     "reviewed_by": "fusion-model-governance",
-    "reviewed_at": "2026-07-29T09:51:56+08:00",
-    "valid_until": "2026-10-29T09:51:56+08:00",
+    "reviewed_at": "2026-07-29T14:25:00+08:00",
+    "valid_until": "2026-10-29T14:25:00+08:00",
     "source_urls": [
+      "https://platform.kimi.com/docs/pricing/chat-k27-code.md",
+      "https://platform.kimi.ai/docs/pricing/chat-k27-code.md",
       "https://platform.kimi.com/docs/pricing/chat-k3.md",
       "https://platform.kimi.ai/docs/pricing/chat-k3.md"
     ],
-    "providers_sha256": "a446d74741c3985c6e90908faa4e637d866982f970be168f3340004137c256c9",
-    "document_sha256": "6057778a457b5c591a568d1eee5283ad064dff0f9b4b80e32d1d059f7b38122b"
+    "providers_sha256": "103b1382a1bc2a21996a24b318fa0bc756251b239d2bf1d7d1c1daf4446b48f7",
+    "document_sha256": "119250ab11e10c64bcff45ef97ebf40ee2042f44fc890aed0a4af7d27212484d"
   },
   "providers": {
     "moonshot": {
@@ -67,6 +69,114 @@
             "多模态理解",
             "工具调用",
             "长上下文任务"
+          ]
+        },
+        "kimi-k2.7-code": {
+          "display_name": "Kimi K2.7 Code",
+          "description": "月之暗面代码专项模型，国内 API 路由；支持 256K 上下文、多模态理解、深度思考与工具调用。",
+          "capabilities": {
+            "imageGen": false,
+            "deepThinking": true,
+            "fileSupport": false,
+            "functionCalling": true,
+            "vision": true,
+            "webSearch": false
+          },
+          "pricing": {
+            "input": 0.95,
+            "output": 4.0,
+            "cache_read_input": 0.19,
+            "unit": "USD/1M tokens"
+          },
+          "pricing_provenance": {
+            "api_base": "https://api.moonshot.cn/v1",
+            "billing_region": "CN",
+            "billing_currency": "CNY",
+            "canonical_currency": "USD",
+            "canonicalization_method": "provider_published_regional_price_pair",
+            "input_basis": "cache_miss",
+            "billing_rates": {
+              "input": 6.5,
+              "output": 27.0,
+              "cache_read_input": 1.3,
+              "unit": "CNY/1M tokens"
+            },
+            "canonical_rates": {
+              "input": 0.95,
+              "output": 4.0,
+              "cache_read_input": 0.19,
+              "unit": "USD/1M tokens"
+            },
+            "source_evidence": [
+              {
+                "region": "CN",
+                "url": "https://platform.kimi.com/docs/pricing/chat-k27-code.md"
+              },
+              {
+                "region": "GLOBAL",
+                "url": "https://platform.kimi.ai/docs/pricing/chat-k27-code.md"
+              }
+            ]
+          },
+          "recommended_for": [
+            "代码生成",
+            "长程编程",
+            "多模态理解",
+            "工具调用"
+          ]
+        },
+        "kimi-k2.7-code-highspeed": {
+          "display_name": "Kimi K2.7 Code HighSpeed",
+          "description": "Kimi K2.7 Code 高速版，国内 API 路由；能力相同，输出速度更高，资源紧张时可用性可能波动。",
+          "capabilities": {
+            "imageGen": false,
+            "deepThinking": true,
+            "fileSupport": false,
+            "functionCalling": true,
+            "vision": true,
+            "webSearch": false
+          },
+          "pricing": {
+            "input": 1.9,
+            "output": 8.0,
+            "cache_read_input": 0.38,
+            "unit": "USD/1M tokens"
+          },
+          "pricing_provenance": {
+            "api_base": "https://api.moonshot.cn/v1",
+            "billing_region": "CN",
+            "billing_currency": "CNY",
+            "canonical_currency": "USD",
+            "canonicalization_method": "provider_published_regional_price_pair",
+            "input_basis": "cache_miss",
+            "billing_rates": {
+              "input": 13.0,
+              "output": 54.0,
+              "cache_read_input": 2.6,
+              "unit": "CNY/1M tokens"
+            },
+            "canonical_rates": {
+              "input": 1.9,
+              "output": 8.0,
+              "cache_read_input": 0.38,
+              "unit": "USD/1M tokens"
+            },
+            "source_evidence": [
+              {
+                "region": "CN",
+                "url": "https://platform.kimi.com/docs/pricing/chat-k27-code.md"
+              },
+              {
+                "region": "GLOBAL",
+                "url": "https://platform.kimi.ai/docs/pricing/chat-k27-code.md"
+              }
+            ]
+          },
+          "recommended_for": [
+            "低延迟编码",
+            "长程编程",
+            "多模态理解",
+            "工具调用"
           ]
         }
       }
