@@ -237,8 +237,7 @@ def _run_text_case(
             json={
                 "model": candidate.preflight_model,
                 "messages": [{"role": "user", "content": "只回复 ok"}],
-                "max_tokens": 8,
-                "temperature": 0,
+                "max_tokens": 512 if candidate.supports_reasoning else 8,
             },
             timeout=timeout_seconds,
         )
@@ -289,8 +288,7 @@ def _run_stream_case(
             json={
                 "model": candidate.preflight_model,
                 "messages": [{"role": "user", "content": "只回复 ok"}],
-                "max_tokens": 8,
-                "temperature": 0,
+                "max_tokens": 512 if candidate.supports_reasoning else 8,
                 "stream": True,
                 "stream_options": {"include_usage": True},
             },
@@ -340,8 +338,8 @@ def _run_tool_case(
             headers=_request_headers(api_key),
             json={
                 "model": candidate.preflight_model,
-                "messages": [{"role": "user", "content": "查询上海天气"}],
-                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "必须调用 get_weather 工具查询上海天气，不要直接回答。"}],
+                "max_tokens": 1024 if candidate.supports_reasoning else 64,
                 "tools": [
                     {
                         "type": "function",
@@ -356,7 +354,11 @@ def _run_tool_case(
                         },
                     }
                 ],
-                "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+                "tool_choice": (
+                    "auto"
+                    if candidate.supports_reasoning
+                    else {"type": "function", "function": {"name": "get_weather"}}
+                ),
             },
             timeout=timeout_seconds,
         )
@@ -400,8 +402,7 @@ def _run_vision_case(
                         ],
                     }
                 ],
-                "max_tokens": 16,
-                "temperature": 0,
+                "max_tokens": 512 if candidate.supports_reasoning else 16,
             },
             timeout=timeout_seconds,
         )
@@ -442,9 +443,7 @@ def _run_reasoning_case(
             json={
                 "model": candidate.preflight_model,
                 "messages": [{"role": "user", "content": "计算 17×19，只回复答案。"}],
-                "reasoning_effort": "low",
-                "max_tokens": 64,
-                "temperature": 0,
+                "max_tokens": 512,
             },
             timeout=timeout_seconds,
         )
@@ -486,7 +485,12 @@ def _run_preserved_tool_round_case(
             headers=_request_headers(api_key),
             json={
                 "model": candidate.preflight_model,
-                "messages": [{"role": "user", "content": "查询上海天气，然后告诉我是否适合散步。"}],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "必须先调用 get_weather 工具查询上海天气，再判断是否适合散步。",
+                    }
+                ],
                 "tools": [
                     {
                         "type": "function",
@@ -501,9 +505,8 @@ def _run_preserved_tool_round_case(
                         },
                     }
                 ],
-                "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
-                "reasoning_effort": "low",
-                "max_tokens": 128,
+                "tool_choice": "auto",
+                "max_tokens": 1024,
             },
             timeout=timeout_seconds,
         )
@@ -523,7 +526,10 @@ def _run_preserved_tool_round_case(
             json={
                 "model": candidate.preflight_model,
                 "messages": [
-                    {"role": "user", "content": "查询上海天气，然后告诉我是否适合散步。"},
+                    {
+                        "role": "user",
+                        "content": "必须先调用 get_weather 工具查询上海天气，再判断是否适合散步。",
+                    },
                     dict(assistant),
                     {
                         "role": "tool",
@@ -545,8 +551,7 @@ def _run_preserved_tool_round_case(
                         },
                     }
                 ],
-                "reasoning_effort": "low",
-                "max_tokens": 128,
+                "max_tokens": 1024,
             },
             timeout=timeout_seconds,
         )

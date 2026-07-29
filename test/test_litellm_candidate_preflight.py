@@ -328,6 +328,8 @@ class LiteLLMCandidatePreflightTests(unittest.TestCase):
 
         self.assertTrue(report.healthy)
         self.assertEqual(len(client.post_calls), 6)
+        self.assertEqual(client.post_calls[1][1]["json"]["tool_choice"], "auto")
+        self.assertNotIn("reasoning_effort", client.post_calls[3][1]["json"])
         checks = serialized["candidate_checks_by_model"]["kimi-k3"]
         self.assertTrue(checks["vision"])
         self.assertTrue(checks["reasoning"])
