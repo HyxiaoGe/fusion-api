@@ -76,6 +76,9 @@ class PlanCoordinator:
     valid_update_count: int = 0
     repair_attempt_count: int = 0
     required_initial_tool_counts: dict[str, int] = field(default_factory=dict)
+    attempted_tool_item_ids: set[str] = field(default_factory=set)
+    successful_tool_item_ids: set[str] = field(default_factory=set)
+    failed_tool_item_ids: set[str] = field(default_factory=set)
 
     @property
     def has_valid_model_plan(self) -> bool:
@@ -90,7 +93,17 @@ class PlanCoordinator:
             return PlanUpdateResult(False, "plan_mode_off")
         if self.valid_update_count >= min(6, self.max_valid_updates):
             return PlanUpdateResult(False, "control_update_limit_reached")
-        payload = _normalize_model_plan_payload(payload, previous_items=self.items)
+        locked_item_ids = set(self.attempted_tool_item_ids)
+        locked_item_ids.update(
+            str(item.get("id"))
+            for item in self.items
+            if item.get("status") in {"completed", "failed", "skipped", "blocked"}
+        )
+        payload = _normalize_model_plan_payload(
+            payload,
+            previous_items=self.items,
+            locked_item_ids=locked_item_ids,
+        )
         try:
             update = ModelPlanUpdate.model_validate(payload)
         except ValidationError:
@@ -100,6 +113,18 @@ class PlanCoordinator:
         if len(item_ids) != len(set(item_ids)):
             return self._reject_repair("duplicate_item_id")
         known_ids = set(item_ids)
+        if self.has_valid_model_plan:
+            previous_items_by_id = {str(item.get("id")): item for item in self.items}
+            previous_terminal_ids = {
+                item_id
+                for item_id, item in previous_items_by_id.items()
+                if item.get("status") in {"completed", "failed", "skipped", "blocked"}
+            }
+            if previous_terminal_ids - known_ids:
+                return self._reject_repair("terminal_item_removed")
+            previous_attempted_ids = self.attempted_tool_item_ids.intersection(previous_items_by_id)
+            if previous_attempted_ids - known_ids:
+                return self._reject_repair("attempted_item_removed")
         if sum(item.status == "running" for item in update.items) > 1:
             return self._reject_repair("multiple_running_items")
         for item in update.items:
@@ -133,14 +158,17 @@ class PlanCoordinator:
                 for item_id, status in previous_status.items()
                 if status in {"completed", "failed", "skipped", "blocked"}
             }
-            if previous_terminal_ids - known_ids:
-                return self._reject_repair("terminal_item_removed")
+            previous_attempted_ids = self.attempted_tool_item_ids.intersection(previous_items_by_id)
             for item in update.items:
                 previous_item = previous_items_by_id.get(item.id)
                 if previous_status.get(item.id) in {"completed", "failed", "skipped", "blocked"} and previous_item:
                     locked_fields = ("title", "kind", "depends_on", "planned_tools")
                     if any(getattr(item, field) != previous_item.get(field) for field in locked_fields):
                         return self._reject_repair("terminal_item_mutated")
+                elif item.id in previous_attempted_ids and previous_item:
+                    locked_fields = ("title", "kind", "depends_on", "planned_tools")
+                    if any(getattr(item, field) != previous_item.get(field) for field in locked_fields):
+                        return self._reject_repair("attempted_item_mutated")
                 if (
                     item.status in {"completed", "failed", "skipped", "blocked"}
                     and previous_status.get(item.id) != item.status
@@ -159,6 +187,7 @@ class PlanCoordinator:
         self.source = "model"
         self.reason = "model_update"
         self.items = [item.model_dump() for item in update.items]
+        self.reset_repair_attempts()
         return PlanUpdateResult(True, "model_update", self.snapshot())
 
     def _reject_repair(self, reason: str) -> PlanUpdateResult:
@@ -167,6 +196,11 @@ class PlanCoordinator:
     def record_repair_round(self) -> bool:
         self.repair_attempt_count += 1
         return self.repair_attempt_count > 2
+
+    def reset_repair_attempts(self) -> None:
+        """有效计划更新或真实工具执行会打断连续修复失败。"""
+
+        self.repair_attempt_count = 0
 
     def record_repair_round_with_fallback(self) -> PlanRepairResult:
         """记录一次计划修复，并仅在尚无有效计划时采用研究兜底计划。"""
@@ -271,24 +305,47 @@ class PlanCoordinator:
             "items": [dict(item) for item in self.items],
         }
 
+    def canonical_plan_for_model(self) -> list[dict[str, Any]]:
+        """返回可直接用于下一次 update_plan 的安全 canonical 计划。"""
+
+        return [
+            {
+                "id": str(item.get("id")),
+                "step": str(item.get("title", "")),
+                "status": "in_progress" if item.get("status") == "running" else "pending",
+                "kind": item.get("kind", "other"),
+                "depends_on": list(item.get("depends_on") or []),
+                "planned_tools": list(item.get("planned_tools") or []),
+            }
+            for item in self.items
+            if item.get("id") and item.get("title")
+        ]
+
     def terminalize(self, outcome: str, *, has_final_answer: bool = False) -> dict[str, Any] | None:
         if not self.has_valid_model_plan:
             return None
         for item in self.items:
+            item_id = str(item.get("id"))
             status = item.get("status")
             if status in {"completed", "failed", "skipped", "blocked"}:
                 continue
-            if outcome == "stop":
-                if has_final_answer and item.get("kind") in {"reasoning", "synthesis", "answer"}:
+            if outcome in {"stop", "limit_reached", "incomplete"}:
+                if item_id in self.failed_tool_item_ids:
+                    item["status"] = "blocked"
+                elif item_id in self.successful_tool_item_ids:
                     item["status"] = "completed"
+                elif item_id in self.attempted_tool_item_ids:
+                    item["status"] = "blocked"
+                elif has_final_answer and item.get("kind") in {"reasoning", "synthesis", "answer"}:
+                    item["status"] = "completed"
+                elif outcome in {"limit_reached", "incomplete"}:
+                    item["status"] = "blocked"
                 elif item.get("kind") in {"reasoning", "synthesis", "answer"}:
                     item["status"] = "blocked"
                 elif status == "running":
                     item["status"] = "blocked"
                 else:
                     item["status"] = "skipped"
-            elif outcome in {"limit_reached", "incomplete"}:
-                item["status"] = "blocked"
             elif outcome in {"interrupted", "superseded"}:
                 item["status"] = "skipped"
             elif outcome == "failed":
@@ -316,6 +373,30 @@ class PlanCoordinator:
             if tool_name in (item.get("planned_tools") or [])
             and item.get("status") not in {"completed", "failed", "skipped", "blocked"}
         ]
+
+    def unexecuted_plan_item_ids_for_tool(self, tool_name: str) -> list[str]:
+        """返回尚未取得成功执行证据的未完成工具步骤。"""
+
+        return [
+            item_id
+            for item_id in self.active_plan_item_ids_for_tool(tool_name)
+            if item_id not in self.successful_tool_item_ids or item_id in self.failed_tool_item_ids
+        ]
+
+    def unexecuted_plan_tool_names(self) -> set[str]:
+        """返回仍有计划项未取得成功执行证据的工具名。"""
+
+        return {
+            str(tool_name)
+            for item in self.items
+            if (
+                str(item.get("id")) not in self.successful_tool_item_ids
+                or str(item.get("id")) in self.failed_tool_item_ids
+            )
+            and item.get("status") not in {"completed", "failed", "skipped", "blocked"}
+            for tool_name in (item.get("planned_tools") or [])
+            if isinstance(tool_name, str) and tool_name
+        }
 
     def plan_item_id_for_tool(
         self,
@@ -351,10 +432,24 @@ class PlanCoordinator:
         return result
 
     def mark_tools_started(self, plan_item_ids: list[str]) -> dict[str, Any] | None:
-        return self._apply_tool_statuses({item_id: "running" for item_id in plan_item_ids})
+        attempted_item_ids = {item_id for item_id in plan_item_ids if self.contains_item(item_id)}
+        self.attempted_tool_item_ids.update(attempted_item_ids)
+        self.successful_tool_item_ids.difference_update(attempted_item_ids)
+        self.failed_tool_item_ids.difference_update(attempted_item_ids)
+        return self._apply_tool_statuses({item_id: "running" for item_id in attempted_item_ids})
 
     def mark_tool_results(self, statuses: dict[str, PlanStatus]) -> dict[str, Any] | None:
-        return self._apply_tool_statuses(statuses)
+        self.attempted_tool_item_ids.update(statuses)
+        for item_id, status in statuses.items():
+            if status == "completed":
+                self.successful_tool_item_ids.add(item_id)
+                self.failed_tool_item_ids.discard(item_id)
+            elif status == "failed":
+                self.failed_tool_item_ids.add(item_id)
+            elif status == "running":
+                self.successful_tool_item_ids.discard(item_id)
+                self.failed_tool_item_ids.discard(item_id)
+        return self._apply_tool_statuses({item_id: "running" for item_id in statuses if self.contains_item(item_id)})
 
     def _apply_tool_statuses(self, statuses: dict[str, PlanStatus]) -> dict[str, Any] | None:
         if not self.has_valid_model_plan:
@@ -381,6 +476,7 @@ def _normalize_model_plan_payload(
     payload: Any,
     *,
     previous_items: list[dict[str, Any]],
+    locked_item_ids: set[str] | None = None,
 ) -> Any:
     """兼容主流 update_plan 的 explanation/plan/step/in_progress 形态。
 
@@ -402,6 +498,7 @@ def _normalize_model_plan_payload(
         str(item.get("title")): str(item.get("id")) for item in previous_items if item.get("title") and item.get("id")
     }
     previous_items_by_id = {str(item.get("id")): item for item in previous_items if item.get("id")}
+    canonical_item_ids = locked_item_ids or set()
     normalized_items: list[dict[str, Any]] = []
     for index, raw_item in enumerate(raw_items):
         if not isinstance(raw_item, dict):
@@ -417,12 +514,18 @@ def _normalize_model_plan_payload(
         if not isinstance(item_id, str) or not _PLAN_ID_RE.fullmatch(item_id):
             item_id = previous_ids_by_title.get(title, f"step-{index + 1}")
         previous_item = previous_items_by_id.get(item_id)
+        locked_item = previous_item if item_id in canonical_item_ids else None
+        if locked_item is not None:
+            title = str(locked_item.get("title", title))
 
         status = raw_item.get("status", "pending")
         if status == "in_progress":
             status = "running"
         elif status == "not_started":
             status = "pending"
+        previous_status = previous_item.get("status") if previous_item is not None else None
+        if previous_status in {"completed", "failed", "skipped", "blocked"}:
+            status = previous_status
         if compatibility_shape and not previous_items and status in {"completed", "failed", "skipped", "blocked"}:
             status = "pending"
 
@@ -433,6 +536,8 @@ def _normalize_model_plan_payload(
                 if previous_item is not None
                 else ("answer" if index == len(raw_items) - 1 else "other")
             )
+        if locked_item is not None:
+            kind = locked_item.get("kind", kind)
 
         depends_on = raw_item.get("depends_on")
         if not isinstance(depends_on, list):
@@ -441,11 +546,15 @@ def _normalize_model_plan_payload(
                 if previous_item is not None
                 else ([normalized_items[-1]["id"]] if normalized_items else [])
             )
+        if locked_item is not None:
+            depends_on = list(locked_item.get("depends_on") or [])
         planned_tools = raw_item.get("planned_tools")
         if not isinstance(planned_tools, list):
             planned_tools = raw_item.get("tools")
         if not isinstance(planned_tools, list):
             planned_tools = list(previous_item.get("planned_tools") or []) if previous_item is not None else []
+        if locked_item is not None:
+            planned_tools = list(locked_item.get("planned_tools") or [])
 
         normalized_items.append(
             {

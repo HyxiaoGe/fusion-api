@@ -349,6 +349,64 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
         snapshot = emitter.plan_snapshot.await_args.kwargs
         self.assertEqual([item["status"] for item in snapshot["items"]], ["blocked", "blocked"])
 
+    async def test_plan_repair_exhausted_preserves_successful_tools_and_completed_final_answer(self):
+        state = AgentLoopState()
+        state.content_blocks.append(TextBlock(type="text", id="txt-final", text="基于已取得资料的最终回答"))
+        state.plan_coordinator = PlanCoordinator(run_id="run-plan-repair", mode="on")
+        state.plan_coordinator.apply_model_update(
+            {
+                "reason": "检索、核验并回答",
+                "items": [
+                    {
+                        "id": "search-success",
+                        "title": "检索可靠资料",
+                        "status": "running",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "search-failed",
+                        "title": "补充对照资料",
+                        "status": "pending",
+                        "kind": "search",
+                        "depends_on": ["search-success"],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "answer",
+                        "title": "整理最终回答",
+                        "status": "pending",
+                        "kind": "answer",
+                        "depends_on": ["search-failed"],
+                        "planned_tools": [],
+                    },
+                ],
+            }
+        )
+        state.plan_coordinator.mark_tool_results({"search-success": "completed"})
+        state.plan_coordinator.mark_tools_started(["search-failed"])
+        state.plan_coordinator.mark_tool_results({"search-failed": "failed"})
+        emitter = AsyncMock()
+
+        await finalize_completed_run(
+            context=replace(_context(state), emitter=emitter),
+            terminal_state=SimpleNamespace(session_status="incomplete", run_finish_reason="incomplete"),
+            persist_message_fn=lambda *_args: None,
+            complete_agent_run_fn=AsyncMock(),
+            finalize_stream_fn=AsyncMock(),
+        )
+
+        snapshot = emitter.plan_snapshot.await_args.kwargs
+        self.assertEqual(
+            {item["id"]: item["status"] for item in snapshot["items"]},
+            {
+                "search-success": "completed",
+                "search-failed": "blocked",
+                "answer": "completed",
+            },
+        )
+
     async def test_itinerary_observation_failure_never_changes_completed_terminal_result(self):
         state = AgentLoopState()
         state.record_itinerary_tool_observations(

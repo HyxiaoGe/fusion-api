@@ -195,13 +195,17 @@ async def _run_round(
     plan_repair_tool = None
     active_plan_item_ids: list[str] = []
     if runtime.task_mode == "deep_research":
+        unexecuted_plan_tool_names = state.plan_coordinator.unexecuted_plan_tool_names()
         research_stage = resolve_deep_research_stage(
             state.research_workset,
             has_valid_plan=state.plan_coordinator.has_valid_model_plan,
+            unexecuted_plan_tool_names=unexecuted_plan_tool_names,
         )
         required_tool = deep_research_stage_required_tool(research_stage)
         if required_tool:
-            active_plan_item_ids = state.plan_coordinator.active_plan_item_ids_for_tool(required_tool)
+            active_plan_item_ids = state.plan_coordinator.unexecuted_plan_item_ids_for_tool(required_tool)
+            if not active_plan_item_ids:
+                active_plan_item_ids = state.plan_coordinator.active_plan_item_ids_for_tool(required_tool)
             if not active_plan_item_ids:
                 plan_repair_tool = required_tool
         allowed_tool_names = deep_research_stage_tool_names(research_stage)
@@ -378,6 +382,8 @@ async def _run_limit_summary(
     state.update_usage(summary_outcome.accumulated_usage)
     state.update_context(summary_outcome.context)
     if summary_outcome.incomplete:
+        state.mark_unknown_terminated()
+    if summary_finish_reason == "plan_repair_exhausted":
         state.mark_unknown_terminated()
     state.clear_current_step()
 

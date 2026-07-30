@@ -66,7 +66,8 @@ function calling 时，前端和后端都会把请求安全降级为 `off`，不
 - `planned_tools`: 模型计划使用的公开工具别名数组。
 
 控制工具对模型采用 `explanation + plan[]` 结构；每个计划项必须提交 `id`、
-`step`、`status` 和 `planned_tools`，可选提交 `kind` 与 `depends_on`。服务端
+`step`、非终态 `status`（`pending | in_progress`）和 `planned_tools`，可选提交
+`kind` 与 `depends_on`。服务端
 归一化为内部 `reason + items[]` 状态。`id` 接受数字、字母、下划线和连字符，
 必须在同一 plan 内稳定。模型修订标题或状态时不得无故更换 ID。
 时间戳、可选步骤和结果摘要留到计划交互阶段再扩展，v1 不提前增加未消费字段。
@@ -106,7 +107,9 @@ PlanCoordinator 校验：
 - 同一时刻最多一个 `running` 项。
 - `completed/failed/skipped/blocked` 不得在模型修订中无依据回退为
   `pending`。
-- 终态项的标题、类型、依赖和预计工具由服务端锁定，后续修订不得改写。
+- 已尝试或终态项的标题、类型、依赖和预计工具由服务端锁定；模型后续修订出现
+  轻微回声漂移时保留服务端 canonical 元数据，只接受安全状态更新。删除既有
+  执行项或破坏稳定 ID 仍拒绝，并返回当前 canonical 计划帮助模型修复。
 - revision 由服务端生成，忽略模型提交的 revision。
 
 ## 执行状态
@@ -116,11 +119,14 @@ PlanCoordinator 是 model plan 的 revision 和状态唯一所有者：
 1. 有效 `update_plan` 生成全量 `plan_snapshot`。
 2. 外部工具开始时，以显式或安全映射的 `plan_item_id` 把对应项推进到
    `running`。
-3. 工具结束按同一计划项的本轮聚合结果推进状态：不可恢复失败优先于可修复
-   失败，可修复失败保持 `running`，全部成功或降级才进入 `completed`；复用的
-   成功结果同样计入。被公告门禁、额度或上下文门禁拦截的调用不能先标
-   `running`。
+3. 工具结束按同一计划项记录服务端执行证据，但计划项在 run 内保持
+   `running`，允许同一计划项跨轮执行多个工具调用；复用的成功结果同样计入。
+   被公告门禁、额度或上下文门禁拦截的调用不能先标 `running`。
 4. run 正常完成前，仍为 `running` 的项必须由服务端终态化：
+   - 有成功工具证据且没有尚未修复失败的工具项进入 `completed`。
+   - 只有失败证据的工具项进入 `blocked`。
+   - 即使 run 因限制或计划修复耗尽进入 `incomplete`，已有成功工具证据仍
+     保持 `completed`；已经生成最终正文时，回答、整理和推理步骤可完成。
    - model plan 保留后端最终状态，不由前端推断。
    - 回答、整理和推理步骤可随正常回答完成。
    - 未执行的搜索、读取和工具步骤变为 `skipped`，仍在修复中的步骤变为

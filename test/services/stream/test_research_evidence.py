@@ -335,6 +335,33 @@ class ResearchEvidenceTests(unittest.TestCase):
         self.assertFalse(result.is_valid)
         self.assertEqual(result.reason, "missing_search")
 
+    def test_research_stage_does_not_synthesize_while_planned_tool_item_is_unexecuted(self):
+        workset = ResearchEvidenceWorkset()
+        workset.record_content_blocks(
+            [
+                _search_block(),
+                _read_block("https://example.com/a", evidence_id="ev-a", citation_index=2),
+                _read_block("https://example.com/b", evidence_id="ev-b", citation_index=3),
+            ]
+        )
+
+        self.assertEqual(
+            resolve_deep_research_stage(
+                workset,
+                has_valid_plan=True,
+                unexecuted_plan_tool_names={"web_search"},
+            ),
+            "search",
+        )
+        self.assertEqual(
+            resolve_deep_research_stage(
+                workset,
+                has_valid_plan=True,
+                unexecuted_plan_tool_names=set(),
+            ),
+            "synthesis",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

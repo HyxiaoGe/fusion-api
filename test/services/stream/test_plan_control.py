@@ -39,6 +39,90 @@ def _update_call(*, call_id: str = "plan-1", arguments: object | None = None) ->
 
 
 class PlanControlTests(unittest.IsolatedAsyncioTestCase):
+    async def test_identity_rejection_returns_current_canonical_plan_for_repair(self):
+        coordinator = PlanCoordinator(run_id="run-canonical-repair", mode="on")
+        self.assertTrue(
+            coordinator.apply_model_update(
+                {
+                    "reason": "查询路线后回答",
+                    "items": [
+                        {
+                            "id": "route",
+                            "title": "查询通勤路线",
+                            "status": "running",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["route_compare"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理通勤建议",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["route"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        coordinator.mark_tools_started(["route"])
+
+        result = await process_plan_control_calls(
+            tool_calls=[
+                _update_call(
+                    arguments={
+                        "reason": "错误替换已执行步骤",
+                        "items": [
+                            {
+                                "id": "answer",
+                                "title": "整理通勤建议",
+                                "status": "running",
+                                "kind": "answer",
+                                "depends_on": [],
+                                "planned_tools": [],
+                            },
+                            {
+                                "id": "followup",
+                                "title": "补充说明",
+                                "status": "pending",
+                                "kind": "other",
+                                "depends_on": ["answer"],
+                                "planned_tools": [],
+                            },
+                        ],
+                    }
+                )
+            ],
+            coordinator=coordinator,
+            emitter=AsyncMock(),
+        )
+
+        response = json.loads(result.tool_responses["plan-1"])
+        self.assertEqual(response["reason"], "attempted_item_removed")
+        self.assertEqual(
+            response["canonical_plan"],
+            [
+                {
+                    "id": "route",
+                    "step": "查询通勤路线",
+                    "status": "in_progress",
+                    "kind": "search",
+                    "depends_on": [],
+                    "planned_tools": ["route_compare"],
+                },
+                {
+                    "id": "answer",
+                    "step": "整理通勤建议",
+                    "status": "pending",
+                    "kind": "answer",
+                    "depends_on": ["route"],
+                    "planned_tools": [],
+                },
+            ],
+        )
+        self.assertIn("canonical_plan", response["hint"])
+
     async def test_mixed_round_applies_plan_before_returning_external_calls(self):
         emitter = AsyncMock()
         coordinator = PlanCoordinator(run_id="run-1", mode="on")

@@ -85,7 +85,7 @@ def build_update_plan_tool() -> dict[str, Any]:
                                 "step": {"type": "string", "description": "用户可理解的结果导向步骤。"},
                                 "status": {
                                     "type": "string",
-                                    "enum": ["pending", "in_progress", "completed"],
+                                    "enum": ["pending", "in_progress"],
                                 },
                                 "kind": {
                                     "type": "string",

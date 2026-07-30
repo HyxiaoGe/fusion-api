@@ -162,6 +162,7 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
         state = AgentLoopState()
         state.plan_coordinator.run_id = "run-1"
         state.plan_coordinator.mode = "on"
+        state.plan_coordinator.repair_attempt_count = 2
         request = tool_round_module.ToolRoundRequest(
             db="db",
             assistant_message_id="msg-1",
@@ -203,9 +204,208 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.tool_call_count, 1)
         self.assertEqual(state.total_tool_calls, 1)
         self.assertEqual(executed_calls[0]["plan_item_id"], "search")
-        self.assertEqual(state.plan_coordinator.items[0]["status"], "completed")
+        self.assertEqual(state.plan_coordinator.items[0]["status"], "running")
+        self.assertEqual(state.plan_coordinator.repair_attempt_count, 0)
         paired_ids = [message["tool_call_id"] for message in request.messages if message.get("role") == "tool"]
         self.assertEqual(paired_ids, ["tc-plan", "tc-search"])
+
+    async def test_real_tool_execution_breaks_consecutive_plan_repair_exhaustion(self):
+        state = AgentLoopState()
+        state.plan_coordinator.run_id = "run-repair"
+        state.plan_coordinator.mode = "on"
+        self.assertTrue(
+            state.plan_coordinator.apply_model_update(
+                {
+                    "reason": "搜索后回答",
+                    "items": [
+                        {
+                            "id": "search",
+                            "title": "搜索资料",
+                            "status": "running",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理回答",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["search"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        state.plan_coordinator.repair_attempt_count = 2
+
+        handler = Mock()
+        handler.format_llm_context.return_value = "搜索结果"
+        handler.build_content_block.return_value = None
+
+        async def execute_tools_fn(tool_calls, *_args, **_kwargs):
+            return [
+                ToolExecutionRecord(
+                    tool_call=tool_calls[0],
+                    result=ToolResult(status="success"),
+                    handler=handler,
+                    block_id="blk-search",
+                    log_id="log-search",
+                )
+            ]
+
+        outcome = await handle_tool_calls_round(
+            request=tool_round_module.ToolRoundRequest(
+                db="db",
+                assistant_message_id="msg-repair",
+                conversation_id="conv-repair",
+                user_id="user-repair",
+                model_id="gpt-4",
+                provider="openai",
+                content_blocks=[],
+                messages=[{"role": "user", "content": "搜索资料"}],
+                tool_calls=[
+                    {"id": "tc-plan-invalid", "name": "update_plan", "arguments": {"broken": True}},
+                    {
+                        "id": "tc-search",
+                        "name": "web_search",
+                        "arguments": {"query": "资料", "_plan_item_id": "search"},
+                    },
+                ],
+                reasoning_buf="",
+                should_use_reasoning=False,
+                step_context=AgentStepContext(
+                    step_id="step-repair",
+                    run_id="run-repair",
+                    step_number=2,
+                    started_at=1.0,
+                    thinking_block_id="thinking-repair",
+                    text_block_id="text-repair",
+                ),
+                step_number=2,
+                run_id="run-repair",
+                emitter=AsyncMock(),
+                session_cache=object(),
+                network_budget=object(),
+                call_kwargs={},
+                persist_message_fn=Mock(),
+                execute_tools_fn=execute_tools_fn,
+                complete_step_fn=AsyncMock(),
+                on_tools_executed=state.record_executed_tool_calls,
+                completed_tool_calls=0,
+                max_tool_calls=20,
+                announced_tool_names=frozenset({"update_plan", "web_search"}),
+                agent_state=state,
+            )
+        )
+
+        self.assertFalse(outcome.control_repair_exhausted)
+        self.assertEqual(state.plan_coordinator.repair_attempt_count, 0)
+        self.assertEqual(outcome.tool_call_count, 1)
+
+    async def test_missing_executor_result_still_locks_attempted_plan_item(self):
+        state = AgentLoopState()
+        state.plan_coordinator.run_id = "run-missing-result"
+        state.plan_coordinator.mode = "on"
+        self.assertTrue(
+            state.plan_coordinator.apply_model_update(
+                {
+                    "reason": "搜索后回答",
+                    "items": [
+                        {
+                            "id": "search",
+                            "title": "搜索资料",
+                            "status": "running",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理回答",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["search"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+
+        async def execute_tools_fn(_tool_calls, *_args, **_kwargs):
+            return []
+
+        outcome = await handle_tool_calls_round(
+            request=tool_round_module.ToolRoundRequest(
+                db="db",
+                assistant_message_id="msg-missing-result",
+                conversation_id="conv-missing-result",
+                user_id="user-missing-result",
+                model_id="gpt-4",
+                provider="openai",
+                content_blocks=[],
+                messages=[{"role": "user", "content": "搜索资料"}],
+                tool_calls=[
+                    {
+                        "id": "tc-search",
+                        "name": "web_search",
+                        "arguments": {"query": "资料", "_plan_item_id": "search"},
+                    }
+                ],
+                reasoning_buf="",
+                should_use_reasoning=False,
+                step_context=AgentStepContext(
+                    step_id="step-missing-result",
+                    run_id="run-missing-result",
+                    step_number=2,
+                    started_at=1.0,
+                    thinking_block_id="thinking-missing-result",
+                    text_block_id="text-missing-result",
+                ),
+                step_number=2,
+                run_id="run-missing-result",
+                emitter=AsyncMock(),
+                session_cache=object(),
+                network_budget=object(),
+                call_kwargs={},
+                persist_message_fn=Mock(),
+                execute_tools_fn=execute_tools_fn,
+                complete_step_fn=AsyncMock(),
+                completed_tool_calls=0,
+                max_tool_calls=20,
+                announced_tool_names=frozenset({"web_search"}),
+                agent_state=state,
+            )
+        )
+
+        self.assertEqual(outcome.tool_call_count, 1)
+        self.assertEqual(state.plan_coordinator.attempted_tool_item_ids, {"search"})
+        removed = state.plan_coordinator.apply_model_update(
+            {
+                "reason": "删除执行结果缺失的步骤",
+                "items": [
+                    {
+                        "id": "answer",
+                        "title": "整理回答",
+                        "status": "running",
+                        "kind": "answer",
+                        "depends_on": [],
+                        "planned_tools": [],
+                    },
+                    {
+                        "id": "followup",
+                        "title": "补充建议",
+                        "status": "pending",
+                        "kind": "other",
+                        "depends_on": ["answer"],
+                        "planned_tools": [],
+                    },
+                ],
+            }
+        )
+        self.assertEqual(removed.reason, "attempted_item_removed")
 
     def test_plan_item_status_aggregates_all_results_and_includes_reused_success(self):
         def record(
@@ -283,7 +483,7 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-    def test_deep_research_read_plan_item_remains_active_until_two_distinct_reads(self):
+    def test_successful_plan_tool_result_never_terminalizes_item_mid_run(self):
         state = AgentLoopState()
         state.plan_coordinator.configure_initial_tool_requirements(
             {
@@ -315,7 +515,7 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
                 [record],
                 agent_state=state,
             ),
-            {"read": "running"},
+            {"read": "completed"},
         )
 
         state.research_workset.successful_read_urls.add("https://example.com/two")
@@ -488,7 +688,7 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
             state.research_workset.unread_candidate_urls,
             {"https://example.com/postgresql-18"},
         )
-        self.assertEqual(state.plan_coordinator.items[0]["status"], "completed")
+        self.assertEqual(state.plan_coordinator.items[0]["status"], "running")
 
     async def test_on_mode_pairs_but_does_not_execute_unplanned_external_call(self):
         state = AgentLoopState()

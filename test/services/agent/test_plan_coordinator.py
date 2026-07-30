@@ -460,7 +460,7 @@ class PlanCoordinatorTests(unittest.TestCase):
         )
         self.assertEqual(multiple_running.reason, "multiple_running_items")
 
-    def test_model_plan_uses_new_plan_id_and_terminal_status_cannot_regress(self):
+    def test_model_plan_uses_new_plan_id_and_server_terminal_status_is_preserved(self):
         coordinator = PlanCoordinator(run_id="run-1", mode="on")
         coordinator.adopt_observed_items([{"id": "legacy", "title": "旧计划", "status": "running", "kind": "other"}])
         payload = {
@@ -487,8 +487,11 @@ class PlanCoordinatorTests(unittest.TestCase):
         first = coordinator.apply_model_update(payload)
         self.assertEqual(first.snapshot["plan_id"], "plan-run-1-model")
         coordinator.mark_tool_results({"search": "completed"})
+        coordinator.terminalize("stop", has_final_answer=True)
         payload["items"][0]["status"] = "running"
-        self.assertEqual(coordinator.apply_model_update(payload).reason, "terminal_status_regression")
+        echoed = coordinator.apply_model_update(payload)
+        self.assertTrue(echoed.accepted)
+        self.assertEqual(echoed.snapshot["items"][0]["status"], "completed")
 
         terminal = coordinator.terminalize("limit_reached")
         self.assertNotIn("running", [item["status"] for item in terminal["items"]])
@@ -528,6 +531,7 @@ class PlanCoordinatorTests(unittest.TestCase):
             ],
         }
         self.assertEqual(coordinator.apply_model_update(asserted).reason, "unproven_terminal_status")
+        coordinator.terminalize("stop", has_final_answer=True)
 
         removed = {
             "reason": "删除已完成项",
@@ -552,7 +556,7 @@ class PlanCoordinatorTests(unittest.TestCase):
         }
         self.assertEqual(coordinator.apply_model_update(removed).reason, "terminal_item_removed")
 
-    def test_terminal_item_metadata_cannot_be_rewritten_after_real_tool_completion(self):
+    def test_terminal_item_metadata_drift_is_replaced_with_server_canonical_values(self):
         coordinator = PlanCoordinator(run_id="run-1", mode="on")
         payload = {
             "reason": "查询航班后回答",
@@ -577,6 +581,7 @@ class PlanCoordinatorTests(unittest.TestCase):
         }
         self.assertTrue(coordinator.apply_model_update(payload).accepted)
         coordinator.mark_tool_results({"flight": "completed"})
+        coordinator.terminalize("stop", has_final_answer=True)
         before = coordinator.snapshot()
 
         rewritten = coordinator.apply_model_update(
@@ -603,9 +608,10 @@ class PlanCoordinatorTests(unittest.TestCase):
             }
         )
 
-        self.assertFalse(rewritten.accepted)
-        self.assertEqual(rewritten.reason, "terminal_item_mutated")
-        self.assertEqual(coordinator.snapshot()["items"], before["items"])
+        self.assertTrue(rewritten.accepted)
+        rewritten_flight = next(item for item in rewritten.snapshot["items"] if item["id"] == "flight")
+        before_flight = next(item for item in before["items"] if item["id"] == "flight")
+        self.assertEqual(rewritten_flight, before_flight)
 
     def test_terminal_item_omitted_optional_metadata_reuses_server_owned_values(self):
         coordinator = PlanCoordinator(run_id="run-1", mode="on")
@@ -633,6 +639,7 @@ class PlanCoordinatorTests(unittest.TestCase):
             ).accepted
         )
         coordinator.mark_tool_results({"flight": "completed"})
+        coordinator.terminalize("stop", has_final_answer=True)
 
         updated = coordinator.apply_model_update(
             {
@@ -776,6 +783,516 @@ class PlanCoordinatorTests(unittest.TestCase):
         self.assertIsNone(third.fallback)
         self.assertEqual(coordinator.source, "model")
         self.assertEqual(coordinator.items, existing_items)
+
+    def test_successful_tool_result_stays_running_until_server_terminalizes_run(self):
+        coordinator = PlanCoordinator(run_id="run-tool-progress", mode="on")
+        self.assertTrue(
+            coordinator.apply_model_update(
+                {
+                    "reason": "先搜索再回答",
+                    "items": [
+                        {
+                            "id": "search",
+                            "title": "搜索资料",
+                            "status": "running",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理答案",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["search"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+
+        first = coordinator.mark_tool_results({"search": "completed"})
+        second = coordinator.mark_tools_started(["search"])
+
+        self.assertIsNone(first)
+        self.assertEqual(coordinator.items[0]["status"], "running")
+        self.assertIsNone(second)
+        self.assertEqual(coordinator.active_plan_item_ids_for_tool("web_search"), ["search"])
+        self.assertEqual(coordinator.unexecuted_plan_item_ids_for_tool("web_search"), ["search"])
+        coordinator.mark_tool_results({"search": "completed"})
+
+        terminal = coordinator.terminalize("stop", has_final_answer=True)
+        self.assertEqual(
+            {item["id"]: item["status"] for item in terminal["items"]},
+            {"search": "completed", "answer": "completed"},
+        )
+
+    def test_model_echo_of_server_terminal_status_is_merged_without_regression(self):
+        coordinator = PlanCoordinator(run_id="run-terminal-merge", mode="on")
+        payload = {
+            "reason": "先搜索再回答",
+            "items": [
+                {
+                    "id": "search",
+                    "title": "搜索资料",
+                    "status": "running",
+                    "kind": "search",
+                    "depends_on": [],
+                    "planned_tools": ["web_search"],
+                },
+                {
+                    "id": "answer",
+                    "title": "整理答案",
+                    "status": "pending",
+                    "kind": "answer",
+                    "depends_on": ["search"],
+                    "planned_tools": [],
+                },
+            ],
+        }
+        self.assertTrue(coordinator.apply_model_update(payload).accepted)
+        coordinator.mark_tool_results({"search": "completed"})
+        coordinator.terminalize("stop", has_final_answer=True)
+
+        echoed = coordinator.apply_model_update(payload)
+
+        self.assertTrue(echoed.accepted)
+        self.assertEqual(
+            {item["id"]: item["status"] for item in echoed.snapshot["items"]},
+            {"search": "completed", "answer": "completed"},
+        )
+
+    def test_successful_update_and_real_tool_progress_reset_consecutive_repair_count(self):
+        coordinator = PlanCoordinator(run_id="run-repair-reset", mode="on")
+        self.assertFalse(coordinator.record_repair_round())
+        self.assertFalse(coordinator.record_repair_round())
+
+        accepted = coordinator.apply_model_update(
+            {
+                "reason": "建立有效计划",
+                "items": [
+                    {
+                        "id": "search",
+                        "title": "搜索资料",
+                        "status": "running",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "answer",
+                        "title": "整理答案",
+                        "status": "pending",
+                        "kind": "answer",
+                        "depends_on": ["search"],
+                        "planned_tools": [],
+                    },
+                ],
+            }
+        )
+        self.assertTrue(accepted.accepted)
+        self.assertEqual(coordinator.repair_attempt_count, 0)
+
+        self.assertFalse(coordinator.record_repair_round())
+        coordinator.reset_repair_attempts()
+        self.assertEqual(coordinator.repair_attempt_count, 0)
+
+    def test_unexecuted_plan_tool_names_excludes_items_with_successful_execution(self):
+        coordinator = PlanCoordinator(run_id="run-tool-coverage", mode="on")
+        coordinator.source = "model"
+        coordinator.revision = 1
+        coordinator.items = [
+            {"id": "search-a", "status": "running", "planned_tools": ["web_search"]},
+            {"id": "search-b", "status": "pending", "planned_tools": ["web_search"]},
+            {"id": "read", "status": "pending", "planned_tools": ["url_read"]},
+        ]
+
+        coordinator.mark_tool_results({"search-a": "completed"})
+
+        self.assertEqual(
+            coordinator.unexecuted_plan_tool_names(),
+            {"web_search", "url_read"},
+        )
+        self.assertEqual(
+            coordinator.unexecuted_plan_item_ids_for_tool("web_search"),
+            ["search-b"],
+        )
+
+    def test_later_success_clears_prior_tool_failure_before_terminalization(self):
+        coordinator = PlanCoordinator(run_id="run-tool-repair", mode="on")
+        coordinator.source = "model"
+        coordinator.revision = 1
+        coordinator.items = [
+            {
+                "id": "search",
+                "status": "running",
+                "kind": "search",
+                "planned_tools": ["web_search"],
+            }
+        ]
+
+        coordinator.mark_tool_results({"search": "failed"})
+        coordinator.mark_tool_results({"search": "completed"})
+        terminal = coordinator.terminalize("stop", has_final_answer=True)
+
+        self.assertEqual(terminal["items"][0]["status"], "completed")
+
+    def test_later_failure_reopens_successful_item_and_new_success_recovers_it(self):
+        def coordinator_for(run_id: str) -> PlanCoordinator:
+            coordinator = PlanCoordinator(run_id=run_id, mode="on")
+            coordinator.source = "model"
+            coordinator.revision = 1
+            coordinator.items = [
+                {
+                    "id": "search",
+                    "status": "running",
+                    "kind": "search",
+                    "planned_tools": ["web_search"],
+                }
+            ]
+            return coordinator
+
+        failed = coordinator_for("run-success-then-failed")
+        failed.mark_tool_results({"search": "completed"})
+        failed.mark_tool_results({"search": "failed"})
+
+        self.assertEqual(failed.unexecuted_plan_tool_names(), {"web_search"})
+        self.assertEqual(failed.unexecuted_plan_item_ids_for_tool("web_search"), ["search"])
+        self.assertEqual(
+            failed.terminalize("stop", has_final_answer=True)["items"][0]["status"],
+            "blocked",
+        )
+
+        recovered = coordinator_for("run-success-failed-recovered")
+        recovered.mark_tool_results({"search": "completed"})
+        recovered.mark_tool_results({"search": "failed"})
+        recovered.mark_tool_results({"search": "completed"})
+
+        self.assertEqual(recovered.unexecuted_plan_tool_names(), set())
+        self.assertEqual(recovered.unexecuted_plan_item_ids_for_tool("web_search"), [])
+        self.assertEqual(
+            recovered.terminalize("stop", has_final_answer=True)["items"][0]["status"],
+            "completed",
+        )
+
+    def test_retryable_running_result_reopens_success_until_new_success_arrives(self):
+        def coordinator_for(run_id: str) -> PlanCoordinator:
+            coordinator = PlanCoordinator(run_id=run_id, mode="on")
+            coordinator.source = "model"
+            coordinator.revision = 1
+            coordinator.items = [
+                {
+                    "id": "search",
+                    "status": "running",
+                    "kind": "search",
+                    "planned_tools": ["web_search"],
+                }
+            ]
+            return coordinator
+
+        unresolved = coordinator_for("run-success-running")
+        unresolved.mark_tool_results({"search": "completed"})
+        unresolved.mark_tool_results({"search": "running"})
+
+        self.assertEqual(unresolved.unexecuted_plan_tool_names(), {"web_search"})
+        self.assertEqual(unresolved.unexecuted_plan_item_ids_for_tool("web_search"), ["search"])
+        self.assertEqual(
+            unresolved.terminalize("stop", has_final_answer=True)["items"][0]["status"],
+            "blocked",
+        )
+
+        recovered = coordinator_for("run-success-running-success")
+        recovered.mark_tool_results({"search": "completed"})
+        recovered.mark_tool_results({"search": "running"})
+        recovered.mark_tool_results({"search": "completed"})
+
+        self.assertEqual(recovered.unexecuted_plan_tool_names(), set())
+        self.assertEqual(recovered.unexecuted_plan_item_ids_for_tool("web_search"), [])
+        self.assertEqual(
+            recovered.terminalize("stop", has_final_answer=True)["items"][0]["status"],
+            "completed",
+        )
+
+    def test_attempted_tool_item_cannot_be_removed_before_run_terminalization(self):
+        coordinator = PlanCoordinator(run_id="run-attempted-remove", mode="on")
+        self.assertTrue(
+            coordinator.apply_model_update(
+                {
+                    "reason": "先搜索再回答",
+                    "items": [
+                        {
+                            "id": "search",
+                            "title": "搜索资料",
+                            "status": "running",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理答案",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["search"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        coordinator.mark_tool_results({"search": "completed"})
+        before = coordinator.snapshot()
+
+        removed = coordinator.apply_model_update(
+            {
+                "reason": "删除已经执行的步骤",
+                "items": [
+                    {
+                        "id": "answer",
+                        "title": "整理答案",
+                        "status": "running",
+                        "kind": "answer",
+                        "depends_on": [],
+                        "planned_tools": [],
+                    },
+                    {
+                        "id": "followup",
+                        "title": "补充建议",
+                        "status": "pending",
+                        "kind": "other",
+                        "depends_on": ["answer"],
+                        "planned_tools": [],
+                    },
+                ],
+            }
+        )
+
+        self.assertFalse(removed.accepted)
+        self.assertEqual(removed.reason, "attempted_item_removed")
+        self.assertEqual(coordinator.snapshot()["items"], before["items"])
+
+    def test_attempted_tool_item_metadata_drift_is_replaced_with_server_canonical_values(self):
+        coordinator = PlanCoordinator(run_id="run-attempted-mutate", mode="on")
+        self.assertTrue(
+            coordinator.apply_model_update(
+                {
+                    "reason": "先搜索再回答",
+                    "items": [
+                        {
+                            "id": "search",
+                            "title": "搜索资料",
+                            "status": "running",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理答案",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["search"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        coordinator.mark_tool_results({"search": "completed"})
+        before = coordinator.snapshot()
+
+        rewritten = coordinator.apply_model_update(
+            {
+                "reason": "改写已经执行的步骤",
+                "items": [
+                    {
+                        "id": "search",
+                        "title": "查询航班",
+                        "status": "pending",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["search_flights"],
+                    },
+                    {
+                        "id": "answer",
+                        "title": "整理答案",
+                        "status": "running",
+                        "kind": "answer",
+                        "depends_on": ["search"],
+                        "planned_tools": [],
+                    },
+                ],
+            }
+        )
+
+        self.assertTrue(rewritten.accepted)
+        rewritten_search = next(item for item in rewritten.snapshot["items"] if item["id"] == "search")
+        before_search = next(item for item in before["items"] if item["id"] == "search")
+        self.assertEqual(
+            {key: rewritten_search[key] for key in ("title", "kind", "depends_on", "planned_tools")},
+            {key: before_search[key] for key in ("title", "kind", "depends_on", "planned_tools")},
+        )
+        self.assertEqual(rewritten_search["status"], "pending")
+
+    def test_kimi_style_full_plan_echo_keeps_attempted_item_canonical_and_advances_status(self):
+        coordinator = PlanCoordinator(run_id="run-kimi-drift", mode="on")
+        self.assertTrue(
+            coordinator.apply_model_update(
+                {
+                    "reason": "建立四步研究计划",
+                    "items": [
+                        {
+                            "id": "search-primary",
+                            "title": "检索核心资料",
+                            "status": "running",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "search-secondary",
+                            "title": "补充对照资料",
+                            "status": "pending",
+                            "kind": "search",
+                            "depends_on": ["search-primary"],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "compare",
+                            "title": "比较关键差异",
+                            "status": "pending",
+                            "kind": "synthesis",
+                            "depends_on": ["search-secondary"],
+                            "planned_tools": [],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理最终建议",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["compare"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        coordinator.mark_tool_results({"search-primary": "completed"})
+
+        update = coordinator.apply_model_update(
+            {
+                "reason": "根据搜索回声更新计划",
+                "items": [
+                    {
+                        "id": "search-primary",
+                        "title": "确认 Next.js 与 React 的最新版本",
+                        "status": "pending",
+                        "kind": "other",
+                        "depends_on": [],
+                        "planned_tools": [],
+                    },
+                    {
+                        "id": "search-secondary",
+                        "title": "补充对照资料",
+                        "status": "running",
+                        "kind": "search",
+                        "depends_on": ["search-primary"],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "compare",
+                        "title": "比较关键差异",
+                        "status": "pending",
+                        "kind": "synthesis",
+                        "depends_on": ["search-secondary"],
+                        "planned_tools": [],
+                    },
+                    {
+                        "id": "answer",
+                        "title": "整理最终建议",
+                        "status": "pending",
+                        "kind": "answer",
+                        "depends_on": ["compare"],
+                        "planned_tools": [],
+                    },
+                ],
+            }
+        )
+
+        self.assertTrue(update.accepted)
+        primary = next(item for item in update.snapshot["items"] if item["id"] == "search-primary")
+        self.assertEqual(
+            primary,
+            {
+                "id": "search-primary",
+                "title": "检索核心资料",
+                "status": "pending",
+                "kind": "search",
+                "depends_on": [],
+                "planned_tools": ["web_search"],
+            },
+        )
+
+    def test_attempted_tool_item_status_can_advance_without_losing_execution_evidence(self):
+        coordinator = PlanCoordinator(run_id="run-attempted-status", mode="on")
+        self.assertTrue(
+            coordinator.apply_model_update(
+                {
+                    "reason": "先搜索再回答",
+                    "items": [
+                        {
+                            "id": "search",
+                            "title": "搜索资料",
+                            "status": "running",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理答案",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["search"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        coordinator.mark_tool_results({"search": "completed"})
+
+        advanced = coordinator.apply_model_update(
+            {
+                "reason": "进入答案整理",
+                "items": [
+                    {
+                        "id": "search",
+                        "title": "搜索资料",
+                        "status": "pending",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "answer",
+                        "title": "整理答案",
+                        "status": "running",
+                        "kind": "answer",
+                        "depends_on": ["search"],
+                        "planned_tools": [],
+                    },
+                ],
+            }
+        )
+
+        self.assertTrue(advanced.accepted)
+        terminal = coordinator.terminalize("stop", has_final_answer=True)
+        self.assertEqual(
+            {item["id"]: item["status"] for item in terminal["items"]},
+            {"search": "completed", "answer": "completed"},
+        )
 
 
 if __name__ == "__main__":

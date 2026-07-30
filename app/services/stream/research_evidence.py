@@ -128,6 +128,7 @@ def resolve_deep_research_stage(
     workset: ResearchEvidenceWorkset,
     *,
     has_valid_plan: bool,
+    unexecuted_plan_tool_names: set[str] | None = None,
 ) -> DeepResearchStage:
     """只根据服务端状态决定下一轮工具阶段，不解析模型参数或外部正文。"""
 
@@ -136,6 +137,11 @@ def resolve_deep_research_stage(
     if workset.successful_searches < 1:
         return "search"
     if len(workset.successful_read_urls) >= 2:
+        remaining_tools = unexecuted_plan_tool_names or set()
+        if "web_search" in remaining_tools:
+            return "search"
+        if "url_read" in remaining_tools:
+            return "read" if workset.unread_candidate_urls else "search_repair"
         return "synthesis"
     if workset.unread_candidate_urls:
         return "read"

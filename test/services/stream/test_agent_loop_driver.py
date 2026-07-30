@@ -117,6 +117,31 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(state.unknown_terminated)
 
+    async def test_plan_repair_exhausted_never_finishes_run_as_completed_stop(self):
+        state = AgentLoopState()
+        summary = AsyncMock(
+            return_value=LimitSummaryOutcome(
+                accumulated_usage=Usage(input_tokens=3, output_tokens=5),
+                incomplete=False,
+            )
+        )
+
+        await _run_limit_summary(
+            state=state,
+            runtime=_runtime(run_limit_summary_step_fn=summary),
+            messages=[{"role": "user", "content": "制定计划"}],
+            summary_finish_reason="plan_repair_exhausted",
+        )
+
+        self.assertTrue(state.unknown_terminated)
+        self.assertEqual(
+            map_run_terminal_state(
+                unknown_terminated=state.unknown_terminated,
+                limit_reason=state.limit_reason,
+            ).run_finish_reason,
+            "incomplete",
+        )
+
     async def test_deep_research_search_stage_only_allows_plan_repair_when_plan_omits_web_search(self):
         captured = []
         state = _planned_research_state()
@@ -489,6 +514,7 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
             "https://example.com/one",
             "https://example.com/two",
         }
+        state.plan_coordinator.successful_tool_item_ids.add("research")
 
         async def run_round_fn(**kwargs):
             captured.append(kwargs)
@@ -528,6 +554,84 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("当前进入最终综合阶段", system_text)
         self.assertIn("不要再调用任何工具", system_text)
         self.assertIn("已读来源编号 [n]", system_text)
+
+    async def test_deep_research_keeps_planned_search_open_after_minimum_evidence_gate(self):
+        captured = []
+        state = _planned_research_state()
+        state.research_workset.successful_searches = 1
+        state.research_workset.successful_read_urls = {
+            "https://example.com/one",
+            "https://example.com/two",
+        }
+        state.plan_coordinator.mark_tool_results({"research": "completed"})
+        state.plan_coordinator.mark_tool_results({"research": "running"})
+
+        async def run_round_fn(**kwargs):
+            captured.append(kwargs)
+            return AgentRoundResult(
+                reasoning_buf="",
+                content_buf="",
+                tool_calls=[],
+                finish_reason="stop",
+                accumulated_usage=Usage(input_tokens=1, output_tokens=1),
+            )
+
+        await _run_round(
+            messages=[{"role": "user", "content": "继续完成计划中的检索"}],
+            state=state,
+            runtime=_runtime(
+                task_mode="deep_research",
+                plan_mode="on",
+                call_kwargs={
+                    "tools": [
+                        _tool_definition("update_plan"),
+                        _tool_definition("web_search"),
+                        _tool_definition("url_read"),
+                    ],
+                    "tool_choice": "auto",
+                },
+                run_round_fn=run_round_fn,
+            ),
+            step_number=5,
+            step_context=AgentStepContext(
+                step_id="step-planned-search",
+                step_number=5,
+                started_at=1.0,
+                thinking_block_id="thinking-planned-search",
+                text_block_id="text-planned-search",
+            ),
+        )
+
+        self.assertEqual(_tool_names(captured[0]["call_kwargs"]), ["web_search"])
+
+        state.plan_coordinator.mark_tool_results({"research": "completed"})
+        await _run_round(
+            messages=[{"role": "user", "content": "完成计划并综合"}],
+            state=state,
+            runtime=_runtime(
+                task_mode="deep_research",
+                plan_mode="on",
+                call_kwargs={
+                    "tools": [
+                        _tool_definition("update_plan"),
+                        _tool_definition("web_search"),
+                        _tool_definition("url_read"),
+                    ],
+                    "tool_choice": "auto",
+                },
+                run_round_fn=run_round_fn,
+            ),
+            step_number=6,
+            step_context=AgentStepContext(
+                step_id="step-recovered-search",
+                step_number=6,
+                started_at=1.0,
+                thinking_block_id="thinking-recovered-search",
+                text_block_id="text-recovered-search",
+            ),
+        )
+
+        self.assertEqual(_tool_names(captured[1]["call_kwargs"]), [])
 
     async def test_deep_research_always_defers_output_and_injects_bounded_workset(self):
         captured = []

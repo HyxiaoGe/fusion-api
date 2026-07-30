@@ -33,7 +33,14 @@ def _parse_arguments(raw: Any) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def _response(*, status: str, reason: str, revision: int, hint: str | None = None) -> str:
+def _response(
+    *,
+    status: str,
+    reason: str,
+    revision: int,
+    hint: str | None = None,
+    canonical_plan: list[dict[str, Any]] | None = None,
+) -> str:
     payload = {
         "status": status,
         "reason": reason,
@@ -41,6 +48,8 @@ def _response(*, status: str, reason: str, revision: int, hint: str | None = Non
     }
     if hint:
         payload["hint"] = hint
+    if canonical_plan:
+        payload["canonical_plan"] = canonical_plan
     return json.dumps(
         payload,
         ensure_ascii=False,
@@ -49,6 +58,11 @@ def _response(*, status: str, reason: str, revision: int, hint: str | None = Non
 
 
 def _control_rejection_hint(reason: str, coordinator: PlanCoordinator) -> str | None:
+    if reason in {"attempted_item_removed", "terminal_item_removed"}:
+        return (
+            "保留 canonical_plan 中全部既有步骤 ID；直接复用其中的 step、kind、depends_on 和 "
+            "planned_tools，仅按当前进度调整 pending 或 in_progress 状态后重新提交。"
+        )
     if reason == "missing_required_initial_tool_coverage":
         requirements = "、".join(
             f"{tool_name}×{count}" for tool_name, count in coordinator.required_initial_tool_counts.items()
@@ -146,6 +160,11 @@ async def process_plan_control_calls(
             reason=result.reason,
             revision=coordinator.revision,
             hint=None if result.accepted else _control_rejection_hint(result.reason, coordinator),
+            canonical_plan=(
+                coordinator.canonical_plan_for_model()
+                if not result.accepted and coordinator.has_valid_model_plan
+                else None
+            ),
         )
         accepted_control = accepted_control or result.accepted
         repairable_rejection = repairable_rejection or (

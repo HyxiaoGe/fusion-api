@@ -34,6 +34,9 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("web_search", model_tool_names)
         self.assertNotIn("update_plan", config.announced_tools)
         self.assertEqual(config.control_tool_names, frozenset({"update_plan"}))
+        update_plan = next(tool for tool in config.call_kwargs["tools"] if tool["function"]["name"] == "update_plan")
+        status_schema = update_plan["function"]["parameters"]["properties"]["plan"]["items"]["properties"]["status"]
+        self.assertEqual(status_schema["enum"], ["pending", "in_progress"])
 
     def test_deep_research_forces_plan_mode_and_records_task_policy(self):
         config = build_agent_loop_call_config(
