@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from app.schemas.chat import Usage
+from app.services.agent.plan_coordinator import PlanCoordinator
 from app.services.stream import llm_stream as llm_stream_module
 
 
@@ -34,6 +35,124 @@ async def async_response(chunks):
 
 
 class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_answer_preview_can_return_to_tool_step_when_tool_call_follows_content(self):
+        coordinator = PlanCoordinator(run_id="run-late-tool", mode="on")
+        self.assertTrue(
+            coordinator.apply_model_update(
+                {
+                    "reason": "先搜索再回答",
+                    "items": [
+                        {
+                            "id": "search",
+                            "title": "搜索资料",
+                            "status": "running",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理答案",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["search"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        coordinator.mark_tool_results({"search": "completed"})
+        events: list[str] = []
+
+        async def on_answer_started():
+            coordinator.preview_answer_started()
+            events.append("answer_preview")
+
+        async def append_chunk(*_args, **_kwargs):
+            events.append("answering")
+
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-late-tool",
+            task_id="task-late-tool",
+            should_use_reasoning=False,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+            on_answer_started=on_answer_started,
+        )
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", side_effect=append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            outcome = await llm_stream_module.consume_stream_round(
+                async_response(
+                    [
+                        make_chunk(delta=SimpleNamespace(content="先给出草稿"), finish_reason=None),
+                        make_chunk(
+                            delta=make_tool_delta(
+                                tool_call_id="tc-late",
+                                name="web_search",
+                                arguments='{"query":"补充事实"}',
+                            ),
+                            finish_reason="tool_calls",
+                        ),
+                    ]
+                ),
+                request,
+            )
+
+        self.assertEqual(events, ["answer_preview", "answering"])
+        self.assertEqual(outcome.finish_reason, "tool_calls")
+        self.assertEqual(outcome.tool_calls[0]["name"], "web_search")
+        plan_item_id = coordinator.plan_item_id_for_tool(outcome.tool_calls[0]["name"])
+        self.assertEqual(plan_item_id, "search")
+
+        resumed = coordinator.mark_tools_started([plan_item_id])
+
+        self.assertEqual(
+            {item["id"]: item["status"] for item in resumed["items"]},
+            {"search": "running", "answer": "pending"},
+        )
+        self.assertLessEqual(
+            sum(item["status"] == "running" for item in resumed["items"]),
+            1,
+        )
+
+    async def test_first_answering_chunk_runs_injected_answer_started_callback_first(self):
+        events: list[str] = []
+
+        async def on_answer_started():
+            events.append("answer_started")
+
+        async def append_chunk(*_args, **_kwargs):
+            events.append("answering")
+
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-answer-started",
+            task_id="task-answer-started",
+            should_use_reasoning=False,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+            on_answer_started=on_answer_started,
+        )
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", side_effect=append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            await llm_stream_module.consume_stream_round(
+                async_response(
+                    [
+                        make_chunk(delta=SimpleNamespace(content="第一段"), finish_reason=None),
+                        make_chunk(delta=SimpleNamespace(content="第二段"), finish_reason="stop"),
+                    ]
+                ),
+                request,
+            )
+
+        self.assertEqual(events, ["answer_started", "answering", "answering"])
+
     def test_llm_retry_does_not_match_rate_substring_in_plain_message(self):
         self.assertFalse(
             llm_stream_module._is_llm_error_retryable(

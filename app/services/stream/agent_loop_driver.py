@@ -187,6 +187,11 @@ async def _run_round(
     step_number: int,
     step_context: AgentStepContext,
 ) -> AgentRoundResult:
+    async def on_answer_started() -> None:
+        snapshot = state.plan_coordinator.preview_answer_started()
+        if snapshot is not None:
+            await runtime.emitter.plan_snapshot(**snapshot)
+
     call_kwargs = await _filter_exhausted_dynamic_tools(
         call_kwargs=runtime.call_kwargs,
         dynamic_tool_handlers=runtime.dynamic_tool_handlers,
@@ -250,6 +255,8 @@ async def _run_round(
         emitter=runtime.emitter,
         on_context_updated=state.update_context,
     )
+    if _accepts_keyword(runtime.run_round_fn, "on_answer_started"):
+        run_round_kwargs["on_answer_started"] = on_answer_started
     must_defer_until_plan = runtime.plan_mode == "on" and not state.plan_coordinator.has_valid_model_plan
     should_defer_output = (
         has_product_result_blocks(state.content_blocks)
@@ -366,6 +373,9 @@ async def _run_limit_summary(
     messages: list[dict],
     summary_finish_reason: str = "limit_summary",
 ) -> None:
+    snapshot = state.plan_coordinator.commit_answer_started()
+    if snapshot is not None:
+        await runtime.emitter.plan_snapshot(**snapshot)
     summary_outcome = await runtime.run_limit_summary_step_fn(
         request=build_limit_summary_step_request(
             state=state,

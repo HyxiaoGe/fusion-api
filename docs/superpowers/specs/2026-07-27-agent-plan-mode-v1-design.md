@@ -117,14 +117,30 @@ PlanCoordinator 校验：
 PlanCoordinator 是 model plan 的 revision 和状态唯一所有者：
 
 1. 有效 `update_plan` 生成全量 `plan_snapshot`。
+   有效计划必须至少包含一个 `answer` 或 `synthesis` 阶段；缺少回答阶段的
+   计划进入既有修复流程，不能成为可执行 canonical plan。
 2. 外部工具开始时，以显式或安全映射的 `plan_item_id` 把对应项推进到
    `running`。
-3. 工具结束按同一计划项记录服务端执行证据，但计划项在 run 内保持
-   `running`，允许同一计划项跨轮执行多个工具调用；复用的成功结果同样计入。
-   被公告门禁、额度或上下文门禁拦截的调用不能先标 `running`。
-4. run 正常完成前，仍为 `running` 的项必须由服务端终态化：
+3. 工具结束按同一计划项记录服务端执行证据，但在模型仍可能继续调用工具时，
+   计划项保持 `running`；复用的成功结果同样计入。被公告门禁、额度或上下文
+   门禁拦截的调用不能先标 `running`。
+4. 首个真实可见回答 chunk 写入前，Agent loop 必须先通知 PlanCoordinator：
+   - 流式正文只进入可逆 preview：当前非终态项退回 `pending`，最终
+     `answer/synthesis` 项进入 `running`；若同一轮随后出现工具调用，
+     preview 必须撤回并恢复对应工具项，且全量计划最多一个 `running`。
+   - 已确定不再调用工具的 deferred、确定性回答和 limit summary 进入 commit：
+     成功工具项按服务端证据进入 `completed`，失败或尝试未成功项进入
+     `blocked`，最终 `answer/synthesis` 项进入 `running`。
+   - preview 不能删除或改写成功、失败和尝试证据；前端不得通过正文、定时器或
+     工具事件猜测计划阶段。
+   - 回答阶段的权威 `plan_snapshot` 必须取得 Redis 写入确认；单次瞬时失败
+     可在既有连续失败阈值内对同一 revision 做有界重试，仍未确认时必须在
+     正文前终止本次生成，不能让后续回答事件越过丢失的阶段快照。
+5. run 正常完成前，仍为 `running` 的项必须由服务端终态化：
    - 有成功工具证据且没有尚未修复失败的工具项进入 `completed`。
    - 只有失败证据的工具项进入 `blocked`。
+   - 已形成最终回答时，模型计划中无 `planned_tools` 的 `other` 里程碑视为
+     已由本轮综合覆盖并进入 `completed`；带工具步骤仍只认服务端执行证据。
    - 即使 run 因限制或计划修复耗尽进入 `incomplete`，已有成功工具证据仍
      保持 `completed`；已经生成最终正文时，回答、整理和推理步骤可完成。
    - model plan 保留后端最终状态，不由前端推断。
@@ -198,6 +214,8 @@ revision 规则只作为兼容路径，不能用于 model plan。
 | SSE 重放乱序/重复 | UI 与数据库快照保持最新 revision |
 | 刷新历史 | model plan、状态和关联信息恢复一致 |
 | 用户取消/请求被取代 | 运行中计划项不会显示为 completed |
+| 首个回答正文出现 | 回答事件之前已收到 `answer/synthesis=running` 的计划快照 |
+| 正文后又出现工具调用 | 回答 preview 可撤回，工具项恢复为唯一 `running` |
 | 正常完成 | 必需计划项状态可信，成功页面仍展示计划 |
 | 豆包、Kimi、DeepSeek | 不泄漏内部控制协议；数字 ID 和结构异常可恢复 |
 | 通用研究任务 | 不依赖行程专用字段 |

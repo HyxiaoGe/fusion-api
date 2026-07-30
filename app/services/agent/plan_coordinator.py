@@ -135,6 +135,8 @@ class PlanCoordinator:
         dependencies = {item.id: set(item.depends_on) for item in update.items}
         if _has_dependency_cycle(dependencies):
             return self._reject_repair("dependency_cycle")
+        if not any(item.kind in {"answer", "synthesis"} for item in update.items):
+            return self._reject_repair("missing_answer_phase")
         if not self.has_valid_model_plan and self.required_initial_tool_counts:
             required_tool_names = set(self.required_initial_tool_counts)
             planned_counts = {
@@ -336,7 +338,10 @@ class PlanCoordinator:
                     item["status"] = "completed"
                 elif item_id in self.attempted_tool_item_ids:
                     item["status"] = "blocked"
-                elif has_final_answer and item.get("kind") in {"reasoning", "synthesis", "answer"}:
+                elif has_final_answer and (
+                    item.get("kind") in {"reasoning", "synthesis", "answer"}
+                    or (item.get("kind") == "other" and not (item.get("planned_tools") or []))
+                ):
                     item["status"] = "completed"
                 elif outcome in {"limit_reached", "incomplete"}:
                     item["status"] = "blocked"
@@ -436,7 +441,7 @@ class PlanCoordinator:
         self.attempted_tool_item_ids.update(attempted_item_ids)
         self.successful_tool_item_ids.difference_update(attempted_item_ids)
         self.failed_tool_item_ids.difference_update(attempted_item_ids)
-        return self._apply_tool_statuses({item_id: "running" for item_id in attempted_item_ids})
+        return self._apply_tool_statuses(self._single_running_tool_statuses(attempted_item_ids))
 
     def mark_tool_results(self, statuses: dict[str, PlanStatus]) -> dict[str, Any] | None:
         self.attempted_tool_item_ids.update(statuses)
@@ -449,9 +454,86 @@ class PlanCoordinator:
             elif status == "running":
                 self.successful_tool_item_ids.discard(item_id)
                 self.failed_tool_item_ids.discard(item_id)
-        return self._apply_tool_statuses({item_id: "running" for item_id in statuses if self.contains_item(item_id)})
+        known_item_ids = {item_id for item_id in statuses if self.contains_item(item_id)}
+        return self._apply_tool_statuses(self._single_running_tool_statuses(known_item_ids))
+
+    def _single_running_tool_statuses(self, item_ids: set[str]) -> dict[str, PlanStatus]:
+        if not item_ids:
+            return {}
+        statuses: dict[str, PlanStatus] = {
+            str(item.get("id")): "pending"
+            for item in self.items
+            if item.get("status") == "running" or str(item.get("id")) in item_ids
+        }
+        running_item_id = next(
+            (str(item.get("id")) for item in self.items if str(item.get("id")) in item_ids),
+            None,
+        )
+        if running_item_id is not None:
+            statuses[running_item_id] = "running"
+        return statuses
+
+    def preview_answer_started(self) -> dict[str, Any] | None:
+        """在首个可见回答 chunk 前临时切到回答阶段，允许后续工具调用撤回。"""
+
+        target_item_id = self._answer_phase_item_id()
+        if target_item_id is None:
+            return None
+        statuses = {
+            str(item.get("id")): ("running" if str(item.get("id")) == target_item_id else "pending")
+            for item in self.items
+            if item.get("status") not in {"completed", "failed", "skipped", "blocked"}
+        }
+        return self._apply_statuses(statuses, reason="answer_preview")
+
+    def commit_answer_started(self) -> dict[str, Any] | None:
+        """确认无工具的最终综合开始，并按服务端工具证据提交计划进度。"""
+
+        if not self.has_valid_model_plan:
+            return None
+        target_item_id = self._answer_phase_item_id()
+        statuses: dict[str, PlanStatus] = {}
+        for item in self.items:
+            item_id = str(item.get("id"))
+            if item.get("status") in {"completed", "failed", "skipped", "blocked"}:
+                continue
+            if item_id == target_item_id:
+                statuses[item_id] = "running"
+            elif item_id in self.failed_tool_item_ids:
+                statuses[item_id] = "blocked"
+            elif item_id in self.successful_tool_item_ids:
+                statuses[item_id] = "completed"
+            elif item_id in self.attempted_tool_item_ids:
+                statuses[item_id] = "blocked"
+            else:
+                statuses[item_id] = "pending"
+        return self._apply_statuses(statuses, reason="answer_started")
+
+    def _answer_phase_item_id(self) -> str | None:
+        non_terminal_items = [
+            item for item in self.items if item.get("status") not in {"completed", "failed", "skipped", "blocked"}
+        ]
+        for kind in ("answer", "synthesis"):
+            candidates = [
+                item
+                for item in non_terminal_items
+                if item.get("kind") == kind and not (item.get("planned_tools") or [])
+            ]
+            if not candidates:
+                candidates = [item for item in non_terminal_items if item.get("kind") == kind]
+            if candidates:
+                return str(candidates[-1].get("id"))
+        return None
 
     def _apply_tool_statuses(self, statuses: dict[str, PlanStatus]) -> dict[str, Any] | None:
+        return self._apply_statuses(statuses, reason="tool_progress")
+
+    def _apply_statuses(
+        self,
+        statuses: dict[str, PlanStatus],
+        *,
+        reason: str,
+    ) -> dict[str, Any] | None:
         if not self.has_valid_model_plan:
             return None
         changed = False
@@ -464,7 +546,7 @@ class PlanCoordinator:
         if not changed:
             return None
         self.revision += 1
-        self.reason = "tool_progress"
+        self.reason = reason
         return self.snapshot()
 
 

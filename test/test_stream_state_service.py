@@ -657,6 +657,60 @@ class TestStreamStateService(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entries[1][1]["content"], "新回答")
         self.assertIn("新事件", entries[2][1]["content"])
 
+    async def test_plan_snapshot_writer_fails_fast_when_redis_does_not_confirm_write(self):
+        from app.services.stream.tool_executor import AgentEventRedisWriter
+        from app.services.stream_state_service import StreamWriteUnavailableError
+
+        writer = AgentEventRedisWriter()
+        append = AsyncMock(return_value=None)
+        with (
+            patch(
+                "app.services.stream.tool_executor.append_chunk",
+                new=append,
+            ),
+            self.assertRaises(StreamWriteUnavailableError),
+        ):
+            await writer.append_chunk(
+                "conv-plan-snapshot",
+                "task-plan-snapshot",
+                "agent_event",
+                {"type": "plan_snapshot", "revision": 2},
+            )
+        self.assertEqual(append.await_count, 3)
+
+    async def test_plan_snapshot_writer_retries_transient_unconfirmed_write(self):
+        from app.services.stream.tool_executor import AgentEventRedisWriter
+
+        writer = AgentEventRedisWriter()
+        append = AsyncMock(side_effect=[None, "2-0"])
+        with patch(
+            "app.services.stream.tool_executor.append_chunk",
+            new=append,
+        ):
+            await writer.append_chunk(
+                "conv-plan-retry",
+                "task-plan-retry",
+                "agent_event",
+                {"type": "plan_snapshot", "revision": 3},
+            )
+
+        self.assertEqual(append.await_count, 2)
+
+    async def test_non_authoritative_agent_event_keeps_existing_failure_threshold(self):
+        from app.services.stream.tool_executor import AgentEventRedisWriter
+
+        writer = AgentEventRedisWriter()
+        with patch(
+            "app.services.stream.tool_executor.append_chunk",
+            new=AsyncMock(return_value=None),
+        ):
+            await writer.append_chunk(
+                "conv-progress",
+                "task-progress",
+                "agent_event",
+                {"type": "run_progress_updated"},
+            )
+
 
 class AppendChunkExtrasTests(unittest.IsolatedAsyncioTestCase):
     """spec §4.6: append_chunk **extras 写入 Redis Stream entry 额外 hash 字段"""

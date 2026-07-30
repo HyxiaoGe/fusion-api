@@ -96,6 +96,136 @@ def _planned_research_state() -> AgentLoopState:
 
 
 class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
+    async def test_round_answer_callback_emits_preview_snapshot_before_body_streams(self):
+        state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-answer-preview", mode="on"))
+        self.assertTrue(
+            state.plan_coordinator.apply_model_update(
+                {
+                    "reason": "先搜索再回答",
+                    "items": [
+                        {
+                            "id": "search",
+                            "title": "搜索资料",
+                            "status": "running",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理回答",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["search"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        state.plan_coordinator.mark_tool_results({"search": "completed"})
+        events: list[tuple[str, dict | None]] = []
+        emitter = AsyncMock()
+
+        async def record_snapshot(**snapshot):
+            events.append(("plan_snapshot", snapshot))
+
+        emitter.plan_snapshot.side_effect = record_snapshot
+
+        async def run_round_fn(**kwargs):
+            await kwargs["on_answer_started"]()
+            events.append(("answering", None))
+            return AgentRoundResult(
+                reasoning_buf="",
+                content_buf="最终回答",
+                tool_calls=[],
+                finish_reason="stop",
+                accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+            )
+
+        await _run_round(
+            messages=[{"role": "user", "content": "请回答"}],
+            state=state,
+            runtime=_runtime(
+                emitter=emitter,
+                run_round_fn=run_round_fn,
+            ),
+            step_number=2,
+            step_context=AgentStepContext(
+                step_id="step-answer-preview",
+                step_number=2,
+                started_at=1.0,
+                thinking_block_id="blk-thinking",
+                text_block_id="blk-text",
+            ),
+        )
+
+        self.assertEqual([event[0] for event in events], ["plan_snapshot", "answering"])
+        self.assertEqual(
+            {item["id"]: item["status"] for item in events[0][1]["items"]},
+            {"search": "pending", "answer": "running"},
+        )
+
+    async def test_limit_summary_emits_answering_plan_snapshot_before_summary_starts(self):
+        state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-limit-plan", mode="on"))
+        self.assertTrue(
+            state.plan_coordinator.apply_model_update(
+                {
+                    "reason": "先搜索再综合回答",
+                    "items": [
+                        {
+                            "id": "search",
+                            "title": "搜索资料",
+                            "status": "running",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "综合回答",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["search"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        state.plan_coordinator.mark_tool_results({"search": "completed"})
+        events: list[tuple[str, dict | None]] = []
+        emitter = AsyncMock()
+
+        async def record_snapshot(**snapshot):
+            events.append(("plan_snapshot", snapshot))
+
+        emitter.plan_snapshot.side_effect = record_snapshot
+
+        async def run_limit_summary_step_fn(**_kwargs):
+            events.append(("summary_started", None))
+            return LimitSummaryOutcome(accumulated_usage=Usage(input_tokens=3, output_tokens=5))
+
+        await _run_limit_summary(
+            state=state,
+            runtime=_runtime(
+                emitter=emitter,
+                run_limit_summary_step_fn=run_limit_summary_step_fn,
+            ),
+            messages=[{"role": "user", "content": "请总结"}],
+        )
+
+        self.assertEqual([event[0] for event in events], ["plan_snapshot", "summary_started"])
+        snapshot = events[0][1]
+        self.assertEqual(
+            {item["id"]: item["status"] for item in snapshot["items"]},
+            {"search": "completed", "answer": "running"},
+        )
+        self.assertLessEqual(
+            sum(item["status"] == "running" for item in snapshot["items"]),
+            1,
+        )
+
     async def test_incomplete_deep_summary_marks_run_unknown_terminated(self):
         state = AgentLoopState()
         summary = AsyncMock(

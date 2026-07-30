@@ -78,6 +78,11 @@ def _control_rejection_hint(reason: str, coordinator: PlanCoordinator) -> str | 
         )
     if reason == "multiple_running_items":
         return "同一版计划最多只能有一个 in_progress 步骤，其余未完成步骤使用 pending。"
+    if reason == "missing_answer_phase":
+        return (
+            "重新提交计划，并增加一个 kind 为 answer 或 synthesis 的最终步骤；"
+            "该步骤的 planned_tools 使用空数组，并依赖需要先完成的查询或核验步骤。"
+        )
     if reason in {"unknown_dependency", "self_dependency", "dependency_cycle"}:
         return "depends_on 只能引用本次计划中已经声明的其他步骤 ID，并且不能形成循环依赖。"
     return None

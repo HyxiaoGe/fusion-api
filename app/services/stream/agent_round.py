@@ -97,6 +97,7 @@ async def collect_agent_round_stream(
     stream_round_fn: Callable[..., Awaitable[StreamRoundResult]],
     observation: Any | None = None,
     defer_output: bool = False,
+    on_answer_started: Callable[[], Awaitable[None]] | None = None,
 ) -> StreamRoundResult:
     response = await llm_call_fn(
         litellm_model,
@@ -111,6 +112,8 @@ async def collect_agent_round_stream(
         stream_kwargs["provider"] = provider
     if defer_output and _accepts_keyword(stream_round_fn, "defer_output"):
         stream_kwargs["defer_output"] = True
+    if on_answer_started is not None and _accepts_keyword(stream_round_fn, "on_answer_started"):
+        stream_kwargs["on_answer_started"] = on_answer_started
     return await stream_round_fn(
         response,
         conversation_id,
@@ -176,6 +179,7 @@ async def run_agent_round(
     emitter: Any | None = None,
     on_context_updated: Callable[[ContextUsage], None] | None = None,
     defer_output: bool = False,
+    on_answer_started: Callable[[], Awaitable[None]] | None = None,
 ) -> AgentRoundResult:
     try:
         context_plan = await prepare_context(
@@ -239,6 +243,7 @@ async def run_agent_round(
             stream_round_fn=stream_round_fn,
             observation=observation,
             defer_output=defer_output,
+            on_answer_started=on_answer_started,
         )
     except BaseException as exc:
         await observation.finish_error(exc)

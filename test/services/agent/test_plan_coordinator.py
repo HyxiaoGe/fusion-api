@@ -676,6 +676,13 @@ class PlanCoordinatorTests(unittest.TestCase):
             [
                 {"id": "blocked", "title": "阻塞", "status": "blocked", "kind": "search"},
                 {"id": "search", "title": "搜索", "status": "pending", "kind": "search"},
+                {
+                    "id": "milestone",
+                    "title": "整理无工具里程碑",
+                    "status": "pending",
+                    "kind": "other",
+                    "planned_tools": [],
+                },
                 {"id": "answer", "title": "回答", "status": "pending", "kind": "answer"},
                 {"id": "reasoning", "title": "分析", "status": "running", "kind": "reasoning"},
                 {"id": "retry", "title": "重试", "status": "running", "kind": "search"},
@@ -683,7 +690,7 @@ class PlanCoordinatorTests(unittest.TestCase):
         ).terminalize("stop", has_final_answer=True)
         self.assertEqual(
             [item["status"] for item in normal["items"]],
-            ["blocked", "skipped", "completed", "completed", "blocked"],
+            ["blocked", "skipped", "completed", "completed", "completed", "blocked"],
         )
 
         failed = coordinator_for(
@@ -784,7 +791,86 @@ class PlanCoordinatorTests(unittest.TestCase):
         self.assertEqual(coordinator.source, "model")
         self.assertEqual(coordinator.items, existing_items)
 
-    def test_successful_tool_result_stays_running_until_server_terminalizes_run(self):
+    def test_answer_preview_is_reversible_when_a_late_tool_call_arrives(self):
+        coordinator = PlanCoordinator(run_id="run-answer-preview", mode="on")
+        self.assertTrue(
+            coordinator.apply_model_update(
+                {
+                    "reason": "先搜索再回答",
+                    "items": [
+                        {
+                            "id": "search",
+                            "title": "搜索资料",
+                            "status": "running",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理答案",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["search"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        coordinator.mark_tool_results({"search": "completed"})
+
+        preview = coordinator.preview_answer_started()
+
+        self.assertEqual(
+            {item["id"]: item["status"] for item in preview["items"]},
+            {"search": "pending", "answer": "running"},
+        )
+        self.assertEqual(coordinator.plan_item_id_for_tool("web_search"), "search")
+
+        resumed = coordinator.mark_tools_started(["search"])
+
+        self.assertEqual(
+            {item["id"]: item["status"] for item in resumed["items"]},
+            {"search": "running", "answer": "pending"},
+        )
+        self.assertLessEqual(
+            sum(item["status"] == "running" for item in resumed["items"]),
+            1,
+        )
+
+    def test_model_plan_without_answer_phase_is_rejected(self):
+        coordinator = PlanCoordinator(run_id="run-missing-answer", mode="on")
+
+        result = coordinator.apply_model_update(
+            {
+                "reason": "只声明两个工具阶段",
+                "items": [
+                    {
+                        "id": "search",
+                        "title": "搜索资料",
+                        "status": "running",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "read",
+                        "title": "核验来源",
+                        "status": "pending",
+                        "kind": "read",
+                        "depends_on": ["search"],
+                        "planned_tools": ["url_read"],
+                    },
+                ],
+            }
+        )
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "missing_answer_phase")
+        self.assertFalse(coordinator.has_valid_model_plan)
+
+    def test_successful_tool_result_stays_running_until_answer_commit_advances_plan(self):
         coordinator = PlanCoordinator(run_id="run-tool-progress", mode="on")
         self.assertTrue(
             coordinator.apply_model_update(
@@ -822,10 +908,15 @@ class PlanCoordinatorTests(unittest.TestCase):
         self.assertEqual(coordinator.unexecuted_plan_item_ids_for_tool("web_search"), ["search"])
         coordinator.mark_tool_results({"search": "completed"})
 
-        terminal = coordinator.terminalize("stop", has_final_answer=True)
+        answering = coordinator.commit_answer_started()
+
         self.assertEqual(
-            {item["id"]: item["status"] for item in terminal["items"]},
-            {"search": "completed", "answer": "completed"},
+            {item["id"]: item["status"] for item in answering["items"]},
+            {"search": "completed", "answer": "running"},
+        )
+        self.assertLessEqual(
+            sum(item["status"] == "running" for item in answering["items"]),
+            1,
         )
 
     def test_model_echo_of_server_terminal_status_is_merged_without_regression(self):

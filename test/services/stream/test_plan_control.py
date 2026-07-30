@@ -297,6 +297,45 @@ class PlanControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("url_read", response["hint"])
         self.assertIn("独立步骤", response["hint"])
 
+    async def test_missing_answer_phase_returns_executable_repair_hint(self):
+        coordinator = PlanCoordinator(run_id="run-missing-answer", mode="on")
+
+        result = await process_plan_control_calls(
+            tool_calls=[
+                _update_call(
+                    arguments={
+                        "reason": "只声明查询阶段",
+                        "items": [
+                            {
+                                "id": "search",
+                                "title": "搜索资料",
+                                "status": "running",
+                                "kind": "search",
+                                "depends_on": [],
+                                "planned_tools": ["web_search"],
+                            },
+                            {
+                                "id": "read",
+                                "title": "核验来源",
+                                "status": "pending",
+                                "kind": "read",
+                                "depends_on": ["search"],
+                                "planned_tools": ["url_read"],
+                            },
+                        ],
+                    }
+                )
+            ],
+            coordinator=coordinator,
+            emitter=AsyncMock(),
+        )
+
+        response = json.loads(result.tool_responses["plan-1"])
+        self.assertEqual(response["reason"], "missing_answer_phase")
+        self.assertIn("answer", response["hint"])
+        self.assertIn("synthesis", response["hint"])
+        self.assertIn("planned_tools", response["hint"])
+
     async def test_rejection_log_only_records_server_whitelisted_tool_counts(self):
         coordinator = PlanCoordinator(run_id="run-1", mode="on")
         coordinator.configure_initial_tool_requirements(

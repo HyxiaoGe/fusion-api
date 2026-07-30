@@ -248,15 +248,7 @@ async def _replace_deferred_product_answer(
     if clarification:
         grounded_answer = build_grounded_product_answer(request.state.content_blocks)
         answer = "\n\n".join(part for part in (grounded_answer, clarification) if part)
-        await append_chunk(
-            request.runtime.conversation_id,
-            "answering",
-            answer,
-            request.step_context.text_block_id,
-            task_id=request.runtime.task_id,
-            run_id=request.runtime.run_id,
-            step_id=request.step_context.step_id,
-        )
+        await _append_committed_answer(request, answer)
         return _with_replaced_answer(request, answer)
 
     if not request.round_result.output_deferred:
@@ -265,15 +257,7 @@ async def _replace_deferred_product_answer(
     if request.runtime.task_mode == "deep_research":
         answer = request.round_result.content_buf.strip()
         if answer:
-            await append_chunk(
-                request.runtime.conversation_id,
-                "answering",
-                answer,
-                request.step_context.text_block_id,
-                task_id=request.runtime.task_id,
-                run_id=request.runtime.run_id,
-                step_id=request.step_context.step_id,
-            )
+            await _append_committed_answer(request, answer)
         return _with_replaced_answer(request, answer)
 
     candidate = neutralize_product_provider_mentions(
@@ -322,16 +306,27 @@ async def _replace_deferred_product_answer(
                 answer = "已展示本次查询的结构化结果，请以卡片信息为准。"
     answer = neutralize_product_provider_mentions(answer, request.state.content_blocks)
     if answer:
-        await append_chunk(
-            request.runtime.conversation_id,
-            "answering",
-            answer,
-            request.step_context.text_block_id,
-            task_id=request.runtime.task_id,
-            run_id=request.runtime.run_id,
-            step_id=request.step_context.step_id,
-        )
+        await _append_committed_answer(request, answer)
     return _with_replaced_answer(request, answer)
+
+
+async def _append_committed_answer(
+    request: AgentRoundOutcomeRequest,
+    answer: str,
+) -> None:
+    snapshot = request.state.plan_coordinator.commit_answer_started()
+    emit_snapshot = getattr(request.runtime.emitter, "plan_snapshot", None)
+    if snapshot is not None and emit_snapshot is not None:
+        await emit_snapshot(**snapshot)
+    await append_chunk(
+        request.runtime.conversation_id,
+        "answering",
+        answer,
+        request.step_context.text_block_id,
+        task_id=request.runtime.task_id,
+        run_id=request.runtime.run_id,
+        step_id=request.step_context.step_id,
+    )
 
 
 def _with_replaced_answer(

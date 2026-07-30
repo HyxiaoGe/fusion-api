@@ -29,7 +29,7 @@ from app.services.stream.tool_call_lifecycle import (
     execute_tool_with_lifecycle,
 )
 from app.services.stream.tool_execution_result import ToolExecutionRecord
-from app.services.stream_state_service import StreamWriteTerminalError, append_chunk
+from app.services.stream_state_service import StreamWriteTerminalError, StreamWriteUnavailableError, append_chunk
 
 if TYPE_CHECKING:
     from app.services.stream.network_budget import NetworkToolBudget
@@ -38,6 +38,8 @@ if TYPE_CHECKING:
 AGENT_TOOL_TIMEOUT = 30
 # 瞬时故障重试次数
 AGENT_TOOL_MAX_RETRIES = 1
+# 权威计划快照沿用 Stream 的连续失败阈值，但在返回前必须取得写入确认。
+AGENT_EVENT_AUTHORITATIVE_WRITE_ATTEMPTS = 3
 
 _RETRYABLE_TOOL_ERROR_CODES = frozenset(
     {
@@ -113,13 +115,20 @@ class AgentEventRedisWriter:
     """
 
     async def append_chunk(self, conversation_id: str, task_id: str, chunk_type: str, payload: dict) -> None:
-        await append_chunk(
-            conversation_id,
-            chunk_type,
-            json.dumps(payload, ensure_ascii=False),
-            "",  # block_id 不适用于 agent_event chunk
-            task_id=task_id,
-        )
+        is_authoritative_plan_snapshot = payload.get("type") == "plan_snapshot"
+        attempts = AGENT_EVENT_AUTHORITATIVE_WRITE_ATTEMPTS if is_authoritative_plan_snapshot else 1
+        for _ in range(attempts):
+            entry_id = await append_chunk(
+                conversation_id,
+                chunk_type,
+                json.dumps(payload, ensure_ascii=False),
+                "",  # block_id 不适用于 agent_event chunk
+                task_id=task_id,
+            )
+            if entry_id is not None:
+                return
+        if is_authoritative_plan_snapshot:
+            raise StreamWriteUnavailableError("权威计划快照未写入 Redis，已终止本次生成")
 
 
 class AgentEventCompositeWriter:

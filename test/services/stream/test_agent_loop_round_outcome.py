@@ -838,6 +838,91 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(warnings, [])
         complete_step_fn.assert_awaited_once()
 
+    async def test_deferred_answer_commits_plan_snapshot_before_answering_chunk(self):
+        coordinator = PlanCoordinator(run_id="run-deferred-plan", mode="on")
+        self.assertTrue(
+            coordinator.apply_model_update(
+                {
+                    "reason": "先查询再回答",
+                    "items": [
+                        {
+                            "id": "search",
+                            "title": "查询地点",
+                            "status": "running",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["local_place_search"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理建议",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["search"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        coordinator.mark_tool_results({"search": "completed"})
+        state = AgentLoopState(plan_coordinator=coordinator)
+        state.mark_current_step("step-deferred-plan")
+        state.content_blocks.append(
+            PlaceResultsBlock(
+                type="place_results",
+                schema_version=1,
+                provider="amap",
+                query="烤肉",
+                status="success",
+                result_count=1,
+                places=[PlaceResult(name="炭火一号", rating=4.7)],
+                limitations=["不包含实时排队或空位信息"],
+            )
+        )
+        events: list[tuple[str, dict | None]] = []
+        emitter = AsyncMock()
+
+        async def record_snapshot(**snapshot):
+            events.append(("plan_snapshot", snapshot))
+
+        async def record_answer(*_args, **_kwargs):
+            events.append(("answering", None))
+
+        emitter.plan_snapshot.side_effect = record_snapshot
+        with patch(
+            "app.services.stream.agent_loop_round_outcome.append_chunk",
+            side_effect=record_answer,
+        ):
+            outcome = await handle_agent_round_outcome(
+                request=AgentRoundOutcomeRequest(
+                    db="db",
+                    messages=[{"role": "user", "content": "找一家烤肉店"}],
+                    state=state,
+                    runtime=_runtime(
+                        complete_step_fn=AsyncMock(),
+                        emitter=emitter,
+                    ),
+                    step_number=2,
+                    step_context=_step_context("step-deferred-plan"),
+                    round_result=AgentRoundResult(
+                        reasoning_buf="",
+                        content_buf="可以优先查看炭火一号；实时排队和空位本次无法确认。",
+                        tool_calls=[],
+                        finish_reason="stop",
+                        accumulated_usage=Usage(input_tokens=2, output_tokens=12),
+                        output_deferred=True,
+                    ),
+                )
+            )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        self.assertEqual([event[0] for event in events], ["plan_snapshot", "answering"])
+        self.assertEqual(
+            {item["id"]: item["status"] for item in events[0][1]["items"]},
+            {"search": "completed", "answer": "running"},
+        )
+
     async def test_valid_deferred_product_answer_neutralizes_provider_attribution_but_keeps_place_name(self):
         state = AgentLoopState()
         state.mark_current_step("step-product-provider-neutral")

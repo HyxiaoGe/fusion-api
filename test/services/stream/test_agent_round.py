@@ -34,6 +34,7 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
             text_block_id="blk-text",
         )
         received_kwargs = {}
+        on_answer_started = AsyncMock()
 
         async def stream_round_fn(*_args, **kwargs):
             received_kwargs.update(kwargs)
@@ -66,10 +67,12 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
                 stream_round_fn=stream_round_fn,
                 log_round_summary_fn=lambda **_kwargs: None,
                 defer_output=True,
+                on_answer_started=on_answer_started,
             )
 
         self.assertTrue(received_kwargs["defer_output"])
         self.assertEqual(received_kwargs["provider"], "openai")
+        self.assertIs(received_kwargs["on_answer_started"], on_answer_started)
         self.assertTrue(result.output_deferred)
 
     async def test_run_agent_round_emits_estimated_and_final_context_status(self):

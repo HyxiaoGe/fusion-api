@@ -9,6 +9,7 @@ spec §4.2。stream_round 把 litellm streaming response 消费成
 import asyncio
 import json
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -98,6 +99,7 @@ class LLMStreamRequest:
     run_id: Optional[str] = None
     step_id: Optional[str] = None
     defer_output: bool = False
+    on_answer_started: Callable[[], Awaitable[None]] | None = None
 
 
 @dataclass
@@ -113,6 +115,7 @@ class LLMStreamState:
     reasoning_transport_mode: str = "probing"
     reasoning_probe_chunks: list[str] = field(default_factory=list)
     reasoning_snapshot_revision_logged: bool = False
+    answer_started_notified: bool = False
 
 
 @dataclass(frozen=True)
@@ -538,6 +541,10 @@ async def append_reasoning_and_content(
     if content_delta:
         state.content_buf += content_delta
         if not request.defer_output:
+            if not state.answer_started_notified:
+                if request.on_answer_started is not None:
+                    await request.on_answer_started()
+                state.answer_started_notified = True
             await append_stream_delta(
                 request=request,
                 chunk_type="answering",
@@ -669,6 +676,7 @@ async def stream_round(
     run_id: Optional[str] = None,
     step_id: Optional[str] = None,
     defer_output: bool = False,
+    on_answer_started: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[str, str, list[dict], str, Optional[Usage]]:
     """
     通用 LLM 流式响应处理。
@@ -690,6 +698,7 @@ async def stream_round(
             run_id=run_id,
             step_id=step_id,
             defer_output=defer_output,
+            on_answer_started=on_answer_started,
         ),
     )
     return StreamRoundTuple(
