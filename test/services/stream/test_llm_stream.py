@@ -247,7 +247,6 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
             defer_output=True,
         )
         append_chunk = AsyncMock()
-
         with (
             patch("app.services.stream.llm_stream.append_chunk", append_chunk),
             patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),

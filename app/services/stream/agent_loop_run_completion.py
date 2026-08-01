@@ -17,6 +17,9 @@ FinalizeStreamFn = Callable[..., Awaitable[Any]]
 TerminalRunFn = Callable[..., Awaitable[Any]]
 WarningFn = Callable[[str], None]
 DurationMsFactory = Callable[[], int]
+ClaimSuggestedQuestionsFn = Callable[..., Any]
+GenerateSuggestedQuestionsFn = Callable[..., Any]
+FailSuggestedQuestionsFn = Callable[..., Any]
 
 AGENT_RUN_FAILED_MESSAGE = "生成服务暂时不可用，请稍后重试"
 AGENT_RUN_FAILED_ERROR_CODE = "agent_run_failed"
@@ -74,7 +77,12 @@ async def finalize_completed_run(
     persist_message_fn: PersistMessageFn,
     complete_agent_run_fn: TerminalRunFn,
     finalize_stream_fn: FinalizeStreamFn,
+    claim_suggested_questions_fn: ClaimSuggestedQuestionsFn | None = None,
+    generate_suggested_questions_fn: GenerateSuggestedQuestionsFn | None = None,
+    fail_suggested_questions_fn: FailSuggestedQuestionsFn | None = None,
+    warning_fn: WarningFn | None = None,
 ) -> None:
+    suggestion_claim = None
     try:
         await _emit_terminal_plan(context, terminal_state.run_finish_reason)
         persist_run_message(context=context, persist_message_fn=persist_message_fn, partial=False)
@@ -88,7 +96,28 @@ async def finalize_completed_run(
             limit_reason=context.state.limit_reason,
         )
         context.state.mark_terminal_emitted()
-        await finalize_stream_fn(context.conversation_id, success=True, task_id=context.task_id)
+        if claim_suggested_questions_fn is not None and _has_formal_text(context.state.content_blocks):
+            try:
+                suggestion_claim = claim_suggested_questions_fn(
+                    db=context.db,
+                    assistant_message_id=context.assistant_message_id,
+                    run_id=context.run_id,
+                )
+            except Exception as error:  # noqa: BLE001 — 推荐问题绝不能阻塞 SSE 终态
+                if warning_fn is not None:
+                    warning_fn(f"领取推荐问题版本失败: error_type={type(error).__name__}")
+        try:
+            await finalize_stream_fn(context.conversation_id, success=True, task_id=context.task_id)
+        except BaseException:
+            if suggestion_claim is not None and fail_suggested_questions_fn is not None:
+                fail_suggested_questions_fn(claim=suggestion_claim)
+            raise
+        if suggestion_claim is not None and generate_suggested_questions_fn is not None:
+            try:
+                generate_suggested_questions_fn(claim=suggestion_claim)
+            except Exception as error:  # noqa: BLE001 — SSE 已终态，辅助任务异常仅记录
+                if warning_fn is not None:
+                    warning_fn(f"终态后调度推荐问题失败: error_type={type(error).__name__}")
     finally:
         _emit_itinerary_observation(
             context,
@@ -96,6 +125,14 @@ async def finalize_completed_run(
             finish_reason=terminal_state.run_finish_reason,
             limit_reason=context.state.limit_reason,
         )
+
+
+def _has_formal_text(content_blocks: list[Any]) -> bool:
+    return any(
+        (block.get("type") if isinstance(block, dict) else getattr(block, "type", None)) == "text"
+        and bool(str(block.get("text", "") if isinstance(block, dict) else getattr(block, "text", "")).strip())
+        for block in content_blocks
+    )
 
 
 async def finalize_superseded_run(

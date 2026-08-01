@@ -182,6 +182,11 @@ class Message(Base):
     # 仅 assistant 消息填充，持久化推荐问题（只保留最新一批）
     # 结构: ["问题1", "问题2", "问题3"]
     suggested_questions = Column(JSONB, nullable=True)
+    # 推荐问题采用独立 revision 做 CAS，防止自动生成的迟到结果覆盖用户“换一批”。
+    suggested_questions_revision = Column(Integer, nullable=False, default=0, server_default="0")
+    suggested_questions_status = Column(String(20), nullable=False, default="idle", server_default="idle")
+    # 记录已领取自动生成的 agent run；continuation 复用消息 ID 时仍可按新 run 刷新。
+    suggested_questions_auto_run_id = Column(String, nullable=True)
 
     created_at = Column(DateTime(timezone=True), default=utc_now, server_default=func.now(), nullable=False)
 
@@ -190,6 +195,12 @@ class Message(Base):
     __table_args__ = (
         Index("ix_messages_conversation_created_id", "conversation_id", "created_at", "id"),
         Index("ux_messages_sequence", "sequence", unique=True),
+        Index(
+            "ix_messages_suggested_questions_pending",
+            "created_at",
+            "id",
+            postgresql_where=text("suggested_questions_status = 'pending'"),
+        ),
     )
 
 

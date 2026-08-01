@@ -40,7 +40,6 @@ from app.services.chat.message_builder import (
     inject_file_content,
     is_image_file,
 )
-from app.services.chat.utils import ChatUtils
 from app.services.conversation_service import ConversationService
 from app.services.file_service import FileService, is_image_mime
 from app.services.storage import get_storage_for_backend
@@ -54,6 +53,10 @@ from app.services.stream.agent_task_policy import resolve_agent_task_policy
 from app.services.stream.persistence import acquire_message_persistence_lock, merge_partial_content_blocks
 from app.services.stream.runner import _agent_loop_limits
 from app.services.stream_state_service import StreamInitResult, finalize_stream, get_stream_meta, init_stream
+from app.services.suggested_question_service import (
+    SuggestedQuestionGenerationResult,
+    SuggestedQuestionService,
+)
 from app.services.task_manager import register_task
 
 
@@ -117,6 +120,7 @@ class ChatService:
         self.conversation_service = ConversationService(db)
         self.file_repo = FileRepository(db)
         self.stream_handler = StreamHandler()
+        self.suggested_question_service = SuggestedQuestionService(db)
 
     def _validate_message_files(self, file_ids: List[str], user_id: str, conversation_id: str) -> List[Any]:
         """校验本次消息引用的文件，并按传入顺序返回文件记录。"""
@@ -631,8 +635,6 @@ class ChatService:
     # 标题最终会截断到 30 字，但 deepseek-chat 会先消耗 reasoning token；
     # 128 在真实回归中仍可能只返回 reasoning、正文为空，因此与推荐问题统一留足 512。
     TITLE_MAX_TOKENS = 512
-    # deepseek-chat 可能把一部分 completion token 用在 reasoning 上，200 容易截断第三个推荐问题。
-    SUGGESTED_QUESTIONS_MAX_TOKENS = 512
 
     def _resolve_utility_model(self, conversation_model_id: str) -> tuple:
         """解析辅助功能模型，固定用轻量模型，找不到则回退对话模型"""
@@ -709,76 +711,64 @@ class ChatService:
         self,
         user_id: str,
         conversation_id: str,
+        assistant_message_id: str | None = None,
+        force_refresh: bool = True,
         options: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
-        """基于会话内容生成推荐问题"""
-        conversation = self.conversation_service.get_conversation(conversation_id, user_id)
-        if not conversation:
-            raise ValueError(f"找不到会话: {conversation_id}")
+        """兼容旧调用：生成并返回问题列表。"""
+        result = await self.generate_suggested_questions_result(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            assistant_message_id=assistant_message_id,
+            force_refresh=force_refresh,
+            options=options,
+        )
+        return result.questions
 
-        # 提取最近一轮对话内容
-        dialog_content = self._build_recent_dialog_content(conversation)
-
-        fallback_questions = [
-            "您对这个主题还有其他问题吗？",
-            "您想了解更多相关信息吗？",
-            "您想要探讨这个话题的哪些方面？",
-        ]
-
-        if not dialog_content:
-            return ["有什么我可以帮您解答的问题吗？", "您想了解更多哪方面的信息？", "还有其他我能帮助您的事情吗？"]
-
-        try:
-            prompt, prompt_metadata = prompt_manager.format_prompt_with_metadata(
-                "generate_suggested_questions",
-                content=dialog_content,
+    async def generate_suggested_questions_result(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        assistant_message_id: str | None = None,
+        force_refresh: bool = True,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> SuggestedQuestionGenerationResult:
+        """锁定 assistant message 生成推荐问题，并返回持久化状态。"""
+        request_claim = self.suggested_question_service.claim_request_generation(
+            conversation_id=conversation_id,
+            user_id=user_id,
+            assistant_message_id=assistant_message_id,
+            force_refresh=force_refresh,
+        )
+        if request_claim.claim is None:
+            return SuggestedQuestionGenerationResult(
+                questions=request_claim.questions,
+                message_id=request_claim.message_id,
+                revision=request_claim.revision,
+                status=request_claim.status,
+                applied=False,
             )
-            litellm_model, _, litellm_kwargs = self._resolve_utility_model(conversation.model_id)
-            response = await litellm.acompletion(
-                model=litellm_model,
-                messages=[{"role": "user", "content": prompt}],
-                stream=False,
-                max_tokens=self.SUGGESTED_QUESTIONS_MAX_TOKENS,
-                timeout=self.UTILITY_LLM_TIMEOUT,
-                **merge_litellm_kwargs(
-                    "suggest_questions",
-                    litellm_kwargs,
-                    prompt_metadata=prompt_metadata,
-                ),
-            )
-            raw = response.choices[0].message.content or ""
-            questions = ChatUtils.parse_questions(raw)[:3]
-            if not questions:
-                questions = fallback_questions
-        except Exception as e:
-            logger.error(f"生成推荐问题失败: {e}")
-            questions = fallback_questions
+        return await self.suggested_question_service.generate_claimed_questions(
+            request_claim.claim,
+            options=options,
+        )
 
-        # 统一持久化：happy / 解析空 / except 三条路径都写 DB，刷新不丢
-        last_msg = self.conversation_service.repo.get_last_assistant_message(conversation_id)
-        if last_msg:
-            self.conversation_service.repo.update_message_suggested_questions(last_msg.id, questions)
-            self.db.commit()
-
-        return questions
-
-    def _build_recent_dialog_content(self, conversation: Conversation) -> str:
-        """提取最近一轮用户/助手对话内容"""
+    @staticmethod
+    def _build_recent_dialog_content(conversation: Conversation) -> str:
+        """保留旧扩展兼容；正式生成路径由目标 message ID 锁定上下文。"""
         latest_user = ""
         latest_ai = ""
-
-        for msg in reversed(conversation.messages):
-            text_parts = [b.text for b in msg.content if b.type == "text"]
-            text = "\n".join(text_parts)
+        for message in reversed(conversation.messages):
+            text = "\n".join(block.text for block in message.content if block.type == "text")
             if not text:
                 continue
-            if not latest_ai and msg.role == "assistant":
+            if not latest_ai and message.role == "assistant":
                 latest_ai = text
-            elif not latest_user and msg.role == "user":
+            elif not latest_user and message.role == "user":
                 latest_user = text
             if latest_user and latest_ai:
                 break
-
         lines = []
         if latest_user:
             lines.append(f"用户: {latest_user}")

@@ -27,6 +27,10 @@ from app.services.stream_state_service import (
     read_stream_partial_content,
     release_stream_stop_guard,
 )
+from app.services.suggested_question_service import (
+    SuggestedQuestionTargetInvalidError,
+    SuggestedQuestionTargetNotFoundError,
+)
 from app.services.task_manager import cancel_task
 
 router = APIRouter()
@@ -278,13 +282,27 @@ async def suggest_questions(
     conversation = chat_service.get_conversation(sq_request.conversation_id, user_id=current_user.id)
     if not conversation:
         raise ApiException.not_found("会话不存在或无权访问")
-    questions = await chat_service.generate_suggested_questions(
-        user_id=current_user.id,
-        conversation_id=sq_request.conversation_id,
-        options=sq_request.options,
-    )
+    try:
+        result = await chat_service.generate_suggested_questions_result(
+            user_id=current_user.id,
+            conversation_id=sq_request.conversation_id,
+            assistant_message_id=sq_request.assistant_message_id,
+            # 旧 UI 没有 force_refresh 字段，但其历史行为就是每次点击都重新生成。
+            force_refresh=True if sq_request.force_refresh is None else sq_request.force_refresh,
+            options=sq_request.options,
+        )
+    except SuggestedQuestionTargetNotFoundError as error:
+        raise ApiException.not_found(str(error)) from error
+    except SuggestedQuestionTargetInvalidError as error:
+        raise ApiException.bad_request(str(error)) from error
     return success(
-        data={"questions": questions, "conversation_id": sq_request.conversation_id},
+        data={
+            "questions": result.questions,
+            "conversation_id": sq_request.conversation_id,
+            "assistant_message_id": result.message_id,
+            "revision": result.revision,
+            "status": result.status,
+        },
         request_id=request.state.request_id,
     )
 

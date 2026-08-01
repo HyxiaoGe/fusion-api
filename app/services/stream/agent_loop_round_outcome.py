@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from app.schemas.chat import ThinkingBlock
 from app.services.final_answer_evidence import build_used_final_answer_evidence
 from app.services.mcp.amap_product_tools import AMAP_PRODUCT_TOOL_NAMES
 from app.services.mcp.flyai_travel_tools import FLYAI_TRAVEL_TOOL_NAMES
@@ -286,6 +287,8 @@ async def _repair_research_completion(
 async def _complete_plan_required_round(request: AgentRoundOutcomeRequest) -> None:
     """丢弃未经过强制计划门禁的正文，并给下一轮加入内部修正指令。"""
 
+    _append_round_blocks(request)
+    _persist_visible_plan_reasoning_checkpoint(request)
     await complete_text_response_step(
         context=request.step_context,
         emitter=request.runtime.emitter,
@@ -311,6 +314,36 @@ def _remove_plan_required_retry_prompt(messages: list[dict]) -> None:
         for message in messages
         if not (message.get("role") == "system" and message.get("content") == PLAN_REQUIRED_RETRY_PROMPT)
     ]
+
+
+def _persist_visible_plan_reasoning_checkpoint(request: AgentRoundOutcomeRequest) -> None:
+    if (
+        not request.round_result.output_deferred
+        or not request.round_result.allow_deferred_reasoning_output
+        or not request.round_result.reasoning_buf
+    ):
+        return
+    request.state.content_blocks.append(
+        ThinkingBlock(
+            type="thinking",
+            id=request.step_context.thinking_block_id,
+            thinking=request.round_result.reasoning_buf,
+        )
+    )
+    persistence_kwargs = (
+        {"sequence": request.runtime.assistant_message_sequence}
+        if request.runtime.assistant_message_sequence is not None
+        else {}
+    )
+    request.runtime.persist_message_fn(
+        request.db,
+        request.runtime.assistant_message_id,
+        request.runtime.conversation_id,
+        request.runtime.model_id,
+        request.state.content_blocks,
+        partial=True,
+        **persistence_kwargs,
+    )
 
 
 async def _repair_missing_required_plan(

@@ -19,6 +19,10 @@ from app.schemas.response import ApiException, generate_request_id
 from app.services.mcp.runtime import get_mcp_client_manager
 from app.services.scheduler_service import start_scheduler, stop_scheduler
 from app.services.storage import init_storage
+from app.services.suggested_question_worker import (
+    recover_pending_suggested_questions,
+    stop_suggested_question_workers,
+)
 
 ASIA_SHANGHAI = timezone(timedelta(hours=8))
 
@@ -73,9 +77,11 @@ async def lifespan(app: FastAPI):
     app_logger.info(f"存储后端初始化完成: {settings.STORAGE_BACKEND}")
     await start_scheduler()
     await litellm_health.start()
+    await recover_pending_suggested_questions()
 
     yield
 
+    await stop_suggested_question_workers()
     await litellm_health.stop()
     await litellm_cleanup.close_async_clients()
     await get_mcp_client_manager().close()

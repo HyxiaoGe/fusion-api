@@ -382,6 +382,8 @@ class ConversationRepository:
             model_id=db_message.model_id,
             usage=Usage(**db_message.usage) if db_message.usage else None,
             suggested_questions=db_message.suggested_questions or None,
+            suggested_questions_revision=db_message.suggested_questions_revision or 0,
+            suggested_questions_status=db_message.suggested_questions_status or "idle",
             agent_run=agent_run,
             created_at=db_message.created_at,
         )

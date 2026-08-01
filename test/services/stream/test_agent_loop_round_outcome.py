@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from app.schemas.chat import (
     PlaceResult,
@@ -340,6 +340,87 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(message.get("role") == "assistant" for message in messages))
         self.assertIn("必须先调用计划控制工具", messages[-1]["content"])
         self.assertEqual(complete_step.await_count, 3)
+
+    async def test_on_mode_plan_gate_persists_streamed_reasoning_but_discards_answering(self):
+        state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-plan", mode="on"))
+        messages = [{"role": "user", "content": "制定一个计划"}]
+        persist_message = Mock()
+
+        outcome = await handle_agent_round_outcome(
+            request=AgentRoundOutcomeRequest(
+                db="db",
+                messages=messages,
+                state=state,
+                runtime=_runtime(
+                    complete_step_fn=AsyncMock(return_value=1),
+                    persist_message_fn=persist_message,
+                    plan_mode="on",
+                ),
+                step_number=1,
+                step_context=_step_context("step-plan-visible-reasoning"),
+                round_result=AgentRoundResult(
+                    reasoning_buf="先拆解任务，再建立计划。",
+                    content_buf="这段正文不能提前展示。",
+                    tool_calls=[],
+                    finish_reason="stop",
+                    accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+                    output_deferred=True,
+                    allow_deferred_reasoning_output=True,
+                ),
+            )
+        )
+
+        self.assertIsNone(outcome)
+        self.assertEqual(len(state.content_blocks), 1)
+        self.assertEqual(state.content_blocks[0].type, "thinking")
+        self.assertEqual(state.content_blocks[0].thinking, "先拆解任务，再建立计划。")
+        self.assertFalse(any(block.type == "text" for block in state.content_blocks))
+        self.assertIn("必须先调用计划控制工具", messages[-1]["content"])
+        persist_message.assert_called_once()
+        self.assertTrue(persist_message.call_args.kwargs["partial"])
+
+    async def test_plan_gate_does_not_discard_answering_block_that_was_never_streamed(self):
+        emitter = AsyncMock()
+        handle_tool_calls = AsyncMock(
+            return_value=ToolRoundOutcome(
+                tool_call_count=0,
+                tool_names=[],
+                product_result_count=0,
+            )
+        )
+        state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-plan", mode="on"))
+
+        await handle_agent_round_outcome(
+            request=AgentRoundOutcomeRequest(
+                db="db",
+                messages=[{"role": "user", "content": "制定计划"}],
+                state=state,
+                runtime=_runtime(
+                    emitter=emitter,
+                    handle_tool_calls_round_fn=handle_tool_calls,
+                    plan_mode="on",
+                ),
+                step_number=1,
+                step_context=_step_context("step-plan-tool"),
+                round_result=AgentRoundResult(
+                    reasoning_buf="正在创建计划。",
+                    content_buf="过程性正文",
+                    tool_calls=[
+                        {
+                            "id": "call-plan",
+                            "name": "update_plan",
+                            "arguments": '{"plan":[]}',
+                        }
+                    ],
+                    finish_reason="tool_calls",
+                    accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+                    output_deferred=True,
+                    allow_deferred_reasoning_output=True,
+                ),
+            )
+        )
+
+        emitter.content_block_discarded.assert_not_awaited()
 
     async def test_deep_research_hidden_stop_adopts_fallback_plan_after_retries(self):
         state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-research", mode="on"))

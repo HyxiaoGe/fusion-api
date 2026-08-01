@@ -54,6 +54,9 @@ class AgentLoopLifecycleDependencies:
     info_fn: LogFn
     error_fn: LogFn
     warning_fn: LogFn
+    claim_suggested_questions_fn: Callable[..., Any] | None = None
+    generate_suggested_questions_fn: Callable[..., Any] | None = None
+    fail_suggested_questions_fn: Callable[..., Any] | None = None
 
 
 async def run_agent_loop_lifecycle(
@@ -213,6 +216,10 @@ async def _finalize_completed(
         persist_message_fn=dependencies.persist_message_fn,
         complete_agent_run_fn=dependencies.complete_agent_run_fn,
         finalize_stream_fn=dependencies.finalize_stream_fn,
+        claim_suggested_questions_fn=dependencies.claim_suggested_questions_fn,
+        generate_suggested_questions_fn=dependencies.generate_suggested_questions_fn,
+        fail_suggested_questions_fn=dependencies.fail_suggested_questions_fn,
+        warning_fn=dependencies.warning_fn,
     )
 
 

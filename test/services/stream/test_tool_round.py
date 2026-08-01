@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 from typing import Literal
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from pydantic import BaseModel
 
@@ -17,6 +17,7 @@ from app.schemas.chat import (
     UrlBlock,
 )
 from app.schemas.content_block_registry import CONTENT_BLOCK_REGISTRY, ContentBlockRegistration
+from app.services.agent.plan_coordinator import PlanUpdateResult
 from app.services.source_evidence_ledger import stable_web_evidence_id
 from app.services.stream import tool_round as tool_round_module
 from app.services.stream.agent_loop_state import AgentLoopState
@@ -190,6 +191,8 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
         state.plan_coordinator.run_id = "run-1"
         state.plan_coordinator.mode = "on"
         state.plan_coordinator.repair_attempt_count = 2
+        reset_repair_attempts = Mock(wraps=state.plan_coordinator.reset_repair_attempts)
+        state.plan_coordinator.reset_repair_attempts = reset_repair_attempts
         request = tool_round_module.ToolRoundRequest(
             db="db",
             assistant_message_id="msg-1",
@@ -230,6 +233,7 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(outcome.tool_call_count, 1)
         self.assertEqual(state.total_tool_calls, 1)
+        self.assertEqual(reset_repair_attempts.call_count, 2)
         self.assertEqual(executed_calls[0]["plan_item_id"], "search")
         self.assertEqual(state.plan_coordinator.items[0]["status"], "completed")
         self.assertEqual(state.plan_coordinator.repair_attempt_count, 0)
@@ -266,7 +270,6 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
             ).accepted
         )
         state.plan_coordinator.repair_attempt_count = 2
-
         handler = Mock()
         handler.format_llm_context.return_value = "搜索结果"
         handler.build_content_block.return_value = None
@@ -433,6 +436,107 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         self.assertEqual(removed.reason, "terminal_item_removed")
+
+    async def test_failed_tool_execution_does_not_reset_repair_threshold(self):
+        valid_plan = {
+            "reason": "先搜索再回答",
+            "items": [
+                {
+                    "id": "search",
+                    "title": "搜索资料",
+                    "status": "running",
+                    "kind": "search",
+                    "depends_on": [],
+                    "planned_tools": ["web_search"],
+                },
+                {
+                    "id": "answer",
+                    "title": "整理回答",
+                    "status": "pending",
+                    "kind": "answer",
+                    "depends_on": ["search"],
+                    "planned_tools": [],
+                },
+            ],
+        }
+        invalid_update = {
+            "id": "tc-plan-invalid",
+            "name": "update_plan",
+            "arguments": {
+                **valid_plan,
+                "items": [
+                    valid_plan["items"][0],
+                    {**valid_plan["items"][1], "status": "running"},
+                ],
+            },
+        }
+        external_call = {
+            "id": "tc-search",
+            "name": "web_search",
+            "arguments": {"query": "深圳天气", "_plan_item_id": "search"},
+        }
+
+        async def execute_tools_fn(tool_calls, *_args, **_kwargs):
+            return [
+                ToolExecutionRecord(
+                    tool_call=tool_calls[0],
+                    result=ToolResult(status="failed", error_message="上游失败"),
+                    handler=Mock(),
+                    block_id="blk-search-failed",
+                    log_id="log-search-failed",
+                )
+            ]
+
+        state = AgentLoopState()
+        state.plan_coordinator.run_id = "run-failed-progress"
+        state.plan_coordinator.mode = "on"
+        self.assertTrue(state.plan_coordinator.apply_model_update(valid_plan).accepted)
+        state.plan_coordinator.repair_attempt_count = 4
+        request = tool_round_module.ToolRoundRequest(
+            db="db",
+            assistant_message_id="msg-failed-progress",
+            conversation_id="conv-failed-progress",
+            user_id="user-1",
+            model_id="gpt-4",
+            provider="openai",
+            content_blocks=[],
+            messages=[{"role": "user", "content": "深圳天气"}],
+            tool_calls=[invalid_update, external_call],
+            reasoning_buf="",
+            should_use_reasoning=False,
+            step_context=AgentStepContext(
+                step_id="step-failed-progress",
+                run_id="run-failed-progress",
+                step_number=1,
+                started_at=1.0,
+                thinking_block_id="thinking-failed-progress",
+                text_block_id="text-failed-progress",
+            ),
+            step_number=1,
+            run_id="run-failed-progress",
+            emitter=AsyncMock(),
+            session_cache=object(),
+            network_budget=object(),
+            call_kwargs={},
+            persist_message_fn=Mock(),
+            execute_tools_fn=execute_tools_fn,
+            complete_step_fn=AsyncMock(),
+            completed_tool_calls=0,
+            max_tool_calls=20,
+            announced_tool_names=frozenset({"update_plan", "web_search"}),
+            agent_state=state,
+        )
+
+        with patch.object(
+            state.plan_coordinator,
+            "apply_model_update",
+            return_value=PlanUpdateResult(False, "multiple_running_items"),
+        ):
+            outcome = await handle_tool_calls_round(request=request)
+
+        self.assertEqual(outcome.tool_call_count, 1)
+        self.assertTrue(outcome.control_repair_exhausted)
+        self.assertEqual(state.plan_coordinator.repair_attempt_count, 5)
 
     def test_plan_item_status_aggregates_all_results_and_includes_reused_success(self):
         def record(
