@@ -15,6 +15,8 @@ PlanKind = Literal["reasoning", "search", "read", "synthesis", "answer", "other"
 
 _PLAN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 _SYSTEM_FALLBACK_REASON = "system_fallback"
+_INITIAL_PLAN_REPAIR_ATTEMPT_LIMIT = 3
+_ACTIVE_PLAN_REPAIR_ATTEMPT_LIMIT = 5
 
 
 class ModelPlanItem(BaseModel):
@@ -60,6 +62,8 @@ class PlanUpdateResult:
 class PlanRepairResult:
     exhausted: bool
     fallback: PlanUpdateResult | None = None
+    attempt_count: int = 0
+    attempt_limit: int = 0
 
 
 @dataclass
@@ -159,24 +163,63 @@ class PlanCoordinator:
         self.source = "model"
         self.reason = "model_update"
         self.items = [item.model_dump() for item in update.items]
+        self.reset_repair_attempts()
         return PlanUpdateResult(True, "model_update", self.snapshot())
 
     def _reject_repair(self, reason: str) -> PlanUpdateResult:
         return PlanUpdateResult(False, reason)
 
-    def record_repair_round(self) -> bool:
-        self.repair_attempt_count += 1
-        return self.repair_attempt_count > 2
+    def repair_attempt_limit(self, *, tolerate_status_drift: bool = False) -> int:
+        """仅对已有计划的并发/终态漂移放宽阈值，其他错误保持原门禁。"""
 
-    def record_repair_round_with_fallback(self) -> PlanRepairResult:
+        if self.has_valid_model_plan and tolerate_status_drift:
+            return _ACTIVE_PLAN_REPAIR_ATTEMPT_LIMIT
+        return _INITIAL_PLAN_REPAIR_ATTEMPT_LIMIT
+
+    def record_repair_round(self, *, tolerate_status_drift: bool = False) -> bool:
+        self.repair_attempt_count += 1
+        return self.repair_attempt_count >= self.repair_attempt_limit(
+            tolerate_status_drift=tolerate_status_drift,
+        )
+
+    def reset_repair_attempts(self) -> None:
+        """有效计划更新或真实工具执行后，重新计算连续修复失败。"""
+
+        self.repair_attempt_count = 0
+
+    def record_repair_round_with_fallback(
+        self,
+        *,
+        tolerate_status_drift: bool = False,
+    ) -> PlanRepairResult:
         """记录一次计划修复，并仅在尚无有效计划时采用研究兜底计划。"""
 
-        if not self.record_repair_round():
-            return PlanRepairResult(exhausted=False)
+        exhausted = self.record_repair_round(
+            tolerate_status_drift=tolerate_status_drift,
+        )
+        attempt_count = self.repair_attempt_count
+        attempt_limit = self.repair_attempt_limit(
+            tolerate_status_drift=tolerate_status_drift,
+        )
+        if not exhausted:
+            return PlanRepairResult(
+                exhausted=False,
+                attempt_count=attempt_count,
+                attempt_limit=attempt_limit,
+            )
         fallback = self.adopt_research_fallback()
         if fallback.accepted:
-            return PlanRepairResult(exhausted=False, fallback=fallback)
-        return PlanRepairResult(exhausted=True)
+            return PlanRepairResult(
+                exhausted=False,
+                fallback=fallback,
+                attempt_count=attempt_count,
+                attempt_limit=attempt_limit,
+            )
+        return PlanRepairResult(
+            exhausted=True,
+            attempt_count=attempt_count,
+            attempt_limit=attempt_limit,
+        )
 
     def adopt_research_fallback(self) -> PlanUpdateResult:
         """连续计划修复失败后采用最小研究计划，避免无证据直接收尾。"""
@@ -226,7 +269,7 @@ class PlanCoordinator:
         self.source = "observed"
         self.reason = _SYSTEM_FALLBACK_REASON
         self.items = [item.model_dump() for item in update.items]
-        self.repair_attempt_count = 0
+        self.reset_repair_attempts()
         return PlanUpdateResult(True, _SYSTEM_FALLBACK_REASON, self.snapshot())
 
     def configure_initial_tool_requirements(self, requirements: dict[str, int]) -> None:

@@ -251,7 +251,7 @@ class PlanControlTests(unittest.IsolatedAsyncioTestCase):
                 emitter=AsyncMock(),
             )
 
-        rendered_log_arguments = repr(log_info.call_args.args)
+        rendered_log_arguments = repr([call.args for call in log_info.call_args_list])
         self.assertNotIn(secret_marker, rendered_log_arguments)
         self.assertIn("{'web_search': 1, 'url_read': 0}", rendered_log_arguments)
 
@@ -298,7 +298,7 @@ class PlanControlTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn(
             "{'web_search': 0, 'url_read': 0}",
-            repr(log_info.call_args.args),
+            repr([call.args for call in log_info.call_args_list]),
         )
 
     async def test_off_mode_does_not_gate_external_tools(self):
@@ -352,15 +352,18 @@ class PlanControlTests(unittest.IsolatedAsyncioTestCase):
             coordinator=coordinator,
             emitter=emitter,
         )
-        third = await process_plan_control_calls(
-            tool_calls=invalid,
-            coordinator=coordinator,
-            emitter=emitter,
-        )
+        with patch("app.services.stream.plan_control.logger.info") as log_info:
+            third = await process_plan_control_calls(
+                tool_calls=invalid,
+                coordinator=coordinator,
+                emitter=emitter,
+            )
 
         self.assertFalse(first.repair_exhausted)
         self.assertFalse(second.repair_exhausted)
         self.assertFalse(third.repair_exhausted)
+        self.assertEqual((third.repair_attempt_count, third.repair_attempt_limit), (3, 3))
+        self.assertEqual(log_info.call_args.args[4:6], (True, True))
         self.assertTrue(coordinator.has_valid_model_plan)
         self.assertEqual(coordinator.source, "observed")
         self.assertEqual(coordinator.reason, "system_fallback")
@@ -369,6 +372,94 @@ class PlanControlTests(unittest.IsolatedAsyncioTestCase):
             [["web_search"], ["url_read"], []],
         )
         emitter.plan_snapshot.assert_awaited_once()
+
+    async def test_existing_plan_tolerates_five_consecutive_repair_rounds(self):
+        coordinator = PlanCoordinator(run_id="run-existing-plan", mode="on")
+        self.assertTrue(coordinator.apply_model_update(_update_call()["arguments"]).accepted)
+        invalid_update = _update_call(
+            arguments={
+                "reason": "错误地同时推进多个步骤",
+                "items": [
+                    {
+                        "id": "route",
+                        "title": "查询路线",
+                        "status": "running",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["route_compare"],
+                    },
+                    {
+                        "id": "answer",
+                        "title": "比较结果",
+                        "status": "running",
+                        "kind": "answer",
+                        "depends_on": ["route"],
+                        "planned_tools": [],
+                    },
+                ],
+            }
+        )
+
+        attempts = [
+            await process_plan_control_calls(
+                tool_calls=[invalid_update],
+                coordinator=coordinator,
+                emitter=AsyncMock(),
+            )
+            for _ in range(5)
+        ]
+
+        self.assertTrue(all(not attempt.repair_exhausted for attempt in attempts[:4]))
+        self.assertTrue(attempts[4].repair_exhausted)
+        self.assertEqual(coordinator.repair_attempt_count, 5)
+
+    async def test_existing_plan_keeps_default_limit_for_unrelated_rejection(self):
+        coordinator = PlanCoordinator(run_id="run-strict-plan", mode="on")
+        self.assertTrue(coordinator.apply_model_update(_update_call()["arguments"]).accepted)
+
+        attempts = [
+            await process_plan_control_calls(
+                tool_calls=[_update_call(arguments={"broken": True})],
+                coordinator=coordinator,
+                emitter=AsyncMock(),
+            )
+            for _ in range(3)
+        ]
+
+        self.assertTrue(attempts[2].repair_exhausted)
+        self.assertEqual(
+            (attempts[2].repair_attempt_count, attempts[2].repair_attempt_limit),
+            (3, 3),
+        )
+
+    async def test_terminal_status_regression_uses_tolerated_limit(self):
+        coordinator = PlanCoordinator(run_id="run-terminal-drift", mode="on")
+        payload = _update_call()["arguments"]
+        self.assertTrue(coordinator.apply_model_update(payload).accepted)
+        coordinator.mark_tool_results({"route": "completed"})
+        regressed_payload = {
+            **payload,
+            "items": [
+                {**payload["items"][0], "status": "running"},
+                payload["items"][1],
+            ],
+        }
+
+        attempts = [
+            await process_plan_control_calls(
+                tool_calls=[_update_call(arguments=regressed_payload)],
+                coordinator=coordinator,
+                emitter=AsyncMock(),
+            )
+            for _ in range(5)
+        ]
+
+        self.assertTrue(all(not attempt.repair_exhausted for attempt in attempts[:4]))
+        self.assertTrue(attempts[4].repair_exhausted)
+        self.assertEqual(
+            (attempts[4].repair_attempt_count, attempts[4].repair_attempt_limit),
+            (5, 5),
+        )
 
     async def test_accepted_control_makes_same_round_non_repairable(self):
         coordinator = PlanCoordinator(run_id="run-1", mode="on")

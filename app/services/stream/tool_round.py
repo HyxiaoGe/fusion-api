@@ -569,6 +569,20 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
         run_id=request.run_id,
     )
     executed_results = [record for record in results if not record.reused]
+    executed_count = _actual_tool_execution_count(executable_tool_calls, results)
+    has_successful_tool_progress = any(
+        not record.reused and record.result.status == "success"
+        for record in results
+    )
+    if request.agent_state is not None and has_successful_tool_progress:
+        if control_result.repair_attempt_count > 0:
+            logger.info(
+                "真实工具执行后重置计划修复计数: run_id=%s previous_attempt=%s limit=%s",
+                request.run_id,
+                control_result.repair_attempt_count,
+                control_result.repair_attempt_limit,
+            )
+        request.agent_state.plan_coordinator.reset_repair_attempts()
     _record_tool_repairs(request.agent_state, executed_results)
     _record_itinerary_tool_observations(request.agent_state, executed_results)
     reused_limited_tool_calls, not_executed_tool_calls = _partition_successfully_reusable_calls(
@@ -630,7 +644,6 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
     if itinerary_result is not None:
         await emit_itinerary_result_block(request, itinerary_result)
 
-    executed_count = _actual_tool_execution_count(executable_tool_calls, results)
     tool_names = await complete_tool_round_step(request, executed_results, executed_count=executed_count)
     restore_reasoning_after_tool_decision(request.call_kwargs)
     return ToolRoundOutcome(
@@ -643,7 +656,9 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
         product_result_count=sum(is_registered_rich_content_block(block) for block in built_content_blocks.values()),
         itinerary_result_count=1 if itinerary_result is not None else 0,
         product_outcomes=product_outcomes,
-        control_repair_exhausted=control_result.repair_exhausted,
+        control_repair_exhausted=(
+            control_result.repair_exhausted and not has_successful_tool_progress
+        ),
     )
 
 

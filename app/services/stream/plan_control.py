@@ -11,6 +11,12 @@ from app.services.agent.plan_coordinator import PlanCoordinator
 
 UPDATE_PLAN_TOOL_NAME = "update_plan"
 PLAN_ITEM_ARGUMENT_NAME = "_plan_item_id"
+_STATUS_DRIFT_REPAIR_REASONS = frozenset(
+    {
+        "multiple_running_items",
+        "terminal_status_regression",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -19,6 +25,8 @@ class PlanControlResult:
     tool_responses: dict[str, str] = field(default_factory=dict)
     plan_item_ids: dict[str, str] = field(default_factory=dict)
     repair_exhausted: bool = False
+    repair_attempt_count: int = 0
+    repair_attempt_limit: int = 0
 
 
 def _parse_arguments(raw: Any) -> dict[str, Any] | None:
@@ -122,6 +130,7 @@ async def process_plan_control_calls(
     responses: dict[str, str] = {}
     accepted_control = False
     repairable_rejection = False
+    repair_reasons: set[str] = set()
 
     for call in control_calls:
         call_id = str(call.get("id", ""))
@@ -148,17 +157,21 @@ async def process_plan_control_calls(
             hint=None if result.accepted else _control_rejection_hint(result.reason, coordinator),
         )
         accepted_control = accepted_control or result.accepted
-        repairable_rejection = repairable_rejection or (
+        is_repairable_rejection = (
             not result.accepted
             and result.reason != "plan_mode_off"
             and not (result.reason == "control_update_limit_reached" and coordinator.has_valid_model_plan)
         )
+        repairable_rejection = repairable_rejection or is_repairable_rejection
+        if is_repairable_rejection:
+            repair_reasons.add(result.reason)
         if result.accepted and result.snapshot is not None:
             await emitter.plan_snapshot(**result.snapshot)
 
     round_failed = repairable_rejection and not accepted_control
     if coordinator.mode == "on" and external_calls and not coordinator.has_valid_model_plan:
         round_failed = True
+        repair_reasons.add("plan_required")
         for call in external_calls:
             responses[str(call.get("id", ""))] = _response(
                 status="not_executed",
@@ -200,6 +213,7 @@ async def process_plan_control_calls(
             or (coordinator.mode == "on" and coordinator.has_valid_model_plan)
         ):
             round_failed = True
+            repair_reasons.add("plan_item_required")
             responses[str(call.get("id", ""))] = _response(
                 status="not_executed",
                 reason="plan_item_required",
@@ -213,7 +227,27 @@ async def process_plan_control_calls(
         executable_external_calls.append(call)
     external_calls = executable_external_calls
 
-    repair_result = coordinator.record_repair_round_with_fallback() if round_failed else None
+    tolerate_status_drift = bool(repair_reasons) and repair_reasons.issubset(
+        _STATUS_DRIFT_REPAIR_REASONS
+    )
+    repair_result = (
+        coordinator.record_repair_round_with_fallback(
+            tolerate_status_drift=tolerate_status_drift,
+        )
+        if round_failed
+        else None
+    )
+    if repair_result is not None:
+        logger.info(
+            "计划修复轮次已记录: run_id=%s attempt=%s limit=%s threshold_reached=%s "
+            "fallback_adopted=%s has_valid_plan=%s",
+            coordinator.run_id,
+            repair_result.attempt_count,
+            repair_result.attempt_limit,
+            repair_result.attempt_count >= repair_result.attempt_limit,
+            repair_result.fallback is not None,
+            coordinator.has_valid_model_plan,
+        )
     if repair_result is not None and repair_result.fallback is not None:
         fallback = repair_result.fallback
         if fallback.snapshot is not None:
@@ -234,4 +268,6 @@ async def process_plan_control_calls(
         tool_responses=responses,
         plan_item_ids=plan_item_ids,
         repair_exhausted=repair_result.exhausted if repair_result is not None else False,
+        repair_attempt_count=repair_result.attempt_count if repair_result is not None else 0,
+        repair_attempt_limit=repair_result.attempt_limit if repair_result is not None else 0,
     )

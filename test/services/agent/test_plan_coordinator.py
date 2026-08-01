@@ -695,7 +695,7 @@ class PlanCoordinatorTests(unittest.TestCase):
         ).terminalize("stop", has_final_answer=False)
         self.assertEqual([item["status"] for item in empty_answer["items"]], ["blocked", "blocked"])
 
-    def test_six_valid_updates_and_two_repairs_are_independent(self):
+    def test_six_valid_updates_and_tolerated_repairs_are_independent(self):
         coordinator = PlanCoordinator(run_id="run-1", mode="on")
         payload = {
             "reason": "更新",
@@ -721,9 +721,11 @@ class PlanCoordinatorTests(unittest.TestCase):
         for _ in range(6):
             self.assertTrue(coordinator.apply_model_update(payload).accepted)
         self.assertEqual(coordinator.apply_model_update(payload).reason, "control_update_limit_reached")
-        self.assertFalse(coordinator.record_repair_round())
-        self.assertFalse(coordinator.record_repair_round())
-        self.assertTrue(coordinator.record_repair_round())
+        repair_results = [
+            coordinator.record_repair_round(tolerate_status_drift=True)
+            for _ in range(5)
+        ]
+        self.assertEqual(repair_results, [False, False, False, False, True])
 
     def test_research_fallback_never_replaces_an_existing_valid_plan(self):
         coordinator = PlanCoordinator(run_id="run-research", mode="on")
@@ -768,14 +770,53 @@ class PlanCoordinatorTests(unittest.TestCase):
         coordinator.mark_tool_results({"search": "completed"})
         existing_items = [dict(item) for item in coordinator.items]
 
-        self.assertFalse(coordinator.record_repair_round_with_fallback().exhausted)
-        self.assertFalse(coordinator.record_repair_round_with_fallback().exhausted)
-        third = coordinator.record_repair_round_with_fallback()
+        attempts = [
+            coordinator.record_repair_round_with_fallback(
+                tolerate_status_drift=True,
+            )
+            for _ in range(5)
+        ]
 
-        self.assertTrue(third.exhausted)
-        self.assertIsNone(third.fallback)
+        self.assertTrue(all(not attempt.exhausted for attempt in attempts[:4]))
+        self.assertTrue(attempts[4].exhausted)
+        self.assertIsNone(attempts[4].fallback)
+        self.assertEqual(
+            coordinator.repair_attempt_limit(tolerate_status_drift=True),
+            5,
+        )
         self.assertEqual(coordinator.source, "model")
         self.assertEqual(coordinator.items, existing_items)
+
+    def test_valid_plan_update_resets_consecutive_repair_attempts(self):
+        coordinator = PlanCoordinator(run_id="run-reset", mode="on")
+        payload = {
+            "reason": "先搜索再回答",
+            "items": [
+                {
+                    "id": "search",
+                    "title": "搜索",
+                    "status": "running",
+                    "kind": "search",
+                    "depends_on": [],
+                    "planned_tools": ["web_search"],
+                },
+                {
+                    "id": "answer",
+                    "title": "回答",
+                    "status": "pending",
+                    "kind": "answer",
+                    "depends_on": ["search"],
+                    "planned_tools": [],
+                },
+            ],
+        }
+        self.assertTrue(coordinator.apply_model_update(payload).accepted)
+        self.assertFalse(coordinator.record_repair_round())
+        self.assertFalse(coordinator.record_repair_round())
+
+        self.assertTrue(coordinator.apply_model_update(payload).accepted)
+
+        self.assertEqual(coordinator.repair_attempt_count, 0)
 
 
 if __name__ == "__main__":
