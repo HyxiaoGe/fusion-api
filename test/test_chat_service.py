@@ -882,69 +882,45 @@ class ChatServiceTests(unittest.TestCase):
         self.assertEqual([UUID(message.id).version for message in generated_messages], [4, 4])
         self.assertNotEqual(generated_messages[0].id, generated_messages[1].id)
 
-    def test_generate_suggested_questions_limits_output_to_three(self):
+    def test_generate_suggested_questions_delegates_to_message_scoped_service(self):
         service = object.__new__(ChatService)
         service.db = MagicMock()
         service.conversation_service = MagicMock()
         service.file_repo = MagicMock()
-
-        conversation = Conversation(
-            id="conv-1",
-            user_id="user-1",
-            title="hello",
-            model_id="qwen-max-latest",
-            messages=[
-                Message(
-                    id="user-msg-1",
-                    role="user",
-                    content=[TextBlock(type="text", text="Explain this answer")],
-                ),
-                Message(
-                    id="assistant-msg-1",
-                    role="assistant",
-                    content=[TextBlock(type="text", text="Here is the answer")],
-                    model_id="qwen-max-latest",
-                ),
-            ],
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
+        service.suggested_question_service = MagicMock()
+        claim = SimpleNamespace(message_id="assistant-msg-1", revision=2)
+        service.suggested_question_service.claim_request_generation.return_value = SimpleNamespace(
+            claim=claim,
+            questions=[],
+            message_id="assistant-msg-1",
+            revision=2,
+            status="pending",
         )
-        service.conversation_service.get_conversation.return_value = conversation
-
-        mock_response = SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content="1. Follow-up A\n2. Follow-up B\n3. Follow-up C\n4. Follow-up D")
-                )
-            ]
-        )
-
-        with (
-            patch("app.services.chat_service.litellm") as mock_litellm,
-            patch("app.services.chat_service.llm_manager") as mock_manager,
-        ):
-            mock_manager.resolve_model.return_value = ("openai/qwen-max-latest", "qwen", {})
-            mock_litellm.acompletion = AsyncMock(return_value=mock_response)
-
-            questions = asyncio.run(
-                service.generate_suggested_questions(
-                    user_id="user-1",
-                    conversation_id="conv-1",
-                )
+        service.suggested_question_service.generate_claimed_questions = AsyncMock(
+            return_value=SimpleNamespace(
+                questions=["Follow-up A", "Follow-up B", "Follow-up C"],
             )
+        )
 
-        self.assertEqual(len(questions), 3)
+        questions = asyncio.run(
+            service.generate_suggested_questions(
+                user_id="user-1",
+                conversation_id="conv-1",
+                assistant_message_id="assistant-msg-1",
+                force_refresh=True,
+            )
+        )
+
         self.assertEqual(questions, ["Follow-up A", "Follow-up B", "Follow-up C"])
-        self.assertEqual(mock_litellm.acompletion.await_args.kwargs["max_tokens"], 512)
-        self.assertEqual(
-            mock_litellm.acompletion.await_args.kwargs["extra_body"],
-            {
-                "metadata": {
-                    "tags": ["app:fusion", "phase:suggest_questions"],
-                    "prompt_slug": "generate-suggested-questions",
-                    "prompt_version": "code-default",
-                }
-            },
+        service.suggested_question_service.claim_request_generation.assert_called_once_with(
+            conversation_id="conv-1",
+            user_id="user-1",
+            assistant_message_id="assistant-msg-1",
+            force_refresh=True,
+        )
+        service.suggested_question_service.generate_claimed_questions.assert_awaited_once_with(
+            claim,
+            options=None,
         )
 
     def test_generate_title_persists_title_to_database(self):

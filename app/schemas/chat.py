@@ -844,6 +844,8 @@ class Message(BaseModel):
     usage: Optional[Usage] = None
     # 仅 assistant 消息填充，持久化推荐问题
     suggested_questions: Optional[List[str]] = None
+    suggested_questions_revision: int = 0
+    suggested_questions_status: Literal["idle", "pending", "ready", "failed"] = "idle"
     # 仅 assistant 消息填充，最近一次 agent run 摘要
     agent_run: Optional[AgentRunSummary] = None
     created_at: datetime = Field(default_factory=utc_now)
@@ -1004,12 +1006,18 @@ class TitleGenerationResponse(BaseModel):
 
 class SuggestedQuestionsRequest(BaseModel):
     conversation_id: str
+    assistant_message_id: Optional[str] = None
+    # None 表示旧 UI 未传该字段；为保持“每次请求都换一批”的历史语义，API 按 True 处理。
+    force_refresh: Optional[bool] = None
     options: Optional[Dict[str, Any]] = None
 
 
 class SuggestedQuestionsResponse(BaseModel):
     questions: List[str]
     conversation_id: str
+    assistant_message_id: Optional[str] = None
+    revision: int = 0
+    status: Literal["idle", "pending", "ready", "failed"] = "idle"
 
 
 # ============================================================

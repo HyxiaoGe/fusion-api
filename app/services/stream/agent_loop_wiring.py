@@ -119,6 +119,9 @@ class AgentLoopWiringDependencies:
     info_fn: LogFn
     error_fn: LogFn
     warning_fn: LogFn
+    claim_suggested_questions_fn: Callable[..., Any] | None = None
+    generate_suggested_questions_fn: Callable[..., Any] | None = None
+    fail_suggested_questions_fn: Callable[..., Any] | None = None
     load_dynamic_tools_fn: Callable[..., Any] | None = None
 
     def to_execution_dependencies(self) -> AgentLoopDependencies:
@@ -159,6 +162,9 @@ class AgentLoopWiringDependencies:
             info_fn=self.info_fn,
             error_fn=self.error_fn,
             warning_fn=self.warning_fn,
+            claim_suggested_questions_fn=self.claim_suggested_questions_fn,
+            generate_suggested_questions_fn=self.generate_suggested_questions_fn,
+            fail_suggested_questions_fn=self.fail_suggested_questions_fn,
         )
 
 

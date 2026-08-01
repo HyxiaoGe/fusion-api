@@ -52,6 +52,11 @@ from app.services.stream_state_service import (
     append_chunk,
     finalize_stream,
 )
+from app.services.suggested_question_service import claim_auto_suggested_questions
+from app.services.suggested_question_worker import (
+    fail_claimed_suggested_questions,
+    schedule_suggested_question_generation,
+)
 
 # Agent Loop 限制
 AGENT_MAX_STEPS = 8  # LLM 调用轮次上限
@@ -122,6 +127,9 @@ def _agent_loop_wiring_dependencies() -> AgentLoopWiringDependencies:
         info_fn=logger.info,
         error_fn=logger.error,
         warning_fn=logger.warning,
+        claim_suggested_questions_fn=claim_auto_suggested_questions,
+        generate_suggested_questions_fn=schedule_suggested_question_generation,
+        fail_suggested_questions_fn=fail_claimed_suggested_questions,
         load_dynamic_tools_fn=load_mcp_agent_tools,
     )
 
