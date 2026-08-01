@@ -5,11 +5,12 @@ from unittest.mock import AsyncMock, patch
 from app.schemas.chat import PlaceResult, PlaceResultsBlock, SourceReference, TextBlock, UrlBlock, Usage
 from app.services.agent.plan_coordinator import PlanCoordinator
 from app.services.stream.agent_loop_driver import AgentLoopExit, _run_limit_summary, _run_round, run_agent_loop
+from app.services.stream.agent_loop_outcome import AgentLoopOutcome
 from app.services.stream.agent_loop_policy import AgentLoopLimits, map_run_terminal_state
 from app.services.stream.agent_loop_runtime import AgentLoopRuntime
 from app.services.stream.agent_loop_state import AgentLoopState
 from app.services.stream.agent_round import AgentRoundResult
-from app.services.stream.limit_summary import LimitSummaryOutcome
+from app.services.stream.limit_summary import LimitSummaryOutcome, build_limit_summary_call_kwargs
 from app.services.stream.research_evidence import ResearchSource
 from app.services.stream.step_lifecycle import AgentStepContext
 from app.services.stream.tool_round import ToolRoundOutcome
@@ -81,23 +82,516 @@ def _tool_names(call_kwargs: dict) -> list[str]:
     return [tool["function"]["name"] for tool in call_kwargs.get("tools", [])]
 
 
-def _planned_research_state() -> AgentLoopState:
+def _planned_research_state(
+    *,
+    read_steps: int = 1,
+    include_repair_search: bool = False,
+    include_followup_search: bool = False,
+) -> AgentLoopState:
     state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-stage", mode="on"))
-    state.plan_coordinator.source = "model"
-    state.plan_coordinator.revision = 1
-    state.plan_coordinator.items = [
+    items = [
         {
-            "id": "research",
-            "status": "running",
-            "planned_tools": ["web_search", "url_read"],
+            "id": "search",
+            "title": "搜索候选来源",
+            "status": "pending",
+            "kind": "search",
+            "depends_on": [],
+            "planned_tools": ["web_search"],
         }
     ]
+    previous_item_id = "search"
+    if include_repair_search:
+        items.append(
+            {
+                "id": "repair-search",
+                "title": "补充候选来源",
+                "status": "pending",
+                "kind": "search",
+                "depends_on": [previous_item_id],
+                "planned_tools": ["web_search"],
+            }
+        )
+        previous_item_id = "repair-search"
+    for index in range(1, read_steps + 1):
+        item_id = "read" if read_steps == 1 else f"read-{index}"
+        items.append(
+            {
+                "id": item_id,
+                "title": f"核验关键来源 {index}",
+                "status": "pending",
+                "kind": "read",
+                "depends_on": [previous_item_id],
+                "planned_tools": ["url_read"],
+            }
+        )
+        previous_item_id = item_id
+    if include_followup_search:
+        items.append(
+            {
+                "id": "followup-search",
+                "title": "补充搜索候选来源",
+                "status": "pending",
+                "kind": "search",
+                "depends_on": [previous_item_id],
+                "planned_tools": ["web_search"],
+            }
+        )
+        previous_item_id = "followup-search"
+    items.append(
+        {
+            "id": "answer",
+            "title": "整理研究结论",
+            "status": "pending",
+            "kind": "answer",
+            "depends_on": [previous_item_id],
+            "planned_tools": [],
+        }
+    )
+    update = state.plan_coordinator.apply_model_update(
+        {
+            "reason": "先搜索候选来源，再逐项核验并整理结论",
+            "items": items,
+        }
+    )
+    if not update.accepted:
+        raise AssertionError(f"研究计划 fixture 无效: {update.reason}")
     return state
 
 
 class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
-    async def test_round_answer_callback_emits_preview_snapshot_before_body_streams(self):
-        state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-answer-preview", mode="on"))
+    async def test_forced_plan_mode_only_exposes_control_tool_before_valid_plan(self):
+        captured = []
+
+        async def run_round_fn(**kwargs):
+            captured.append(kwargs["call_kwargs"])
+            return AgentRoundResult(
+                reasoning_buf="",
+                content_buf="",
+                tool_calls=[],
+                finish_reason="stop",
+                accumulated_usage=Usage(input_tokens=1, output_tokens=1),
+                output_deferred=kwargs.get("defer_output", False),
+            )
+
+        await _run_round(
+            messages=[{"role": "user", "content": "比较通勤路线"}],
+            state=AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-plan-first", mode="on")),
+            runtime=_runtime(
+                plan_mode="on",
+                call_kwargs={
+                    "tools": [
+                        _tool_definition("web_search"),
+                        _tool_definition("route_compare"),
+                        _tool_definition("update_plan"),
+                    ],
+                    "tool_choice": "auto",
+                },
+                run_round_fn=run_round_fn,
+            ),
+            step_number=1,
+            step_context=AgentStepContext(
+                step_id="step-plan-first",
+                step_number=1,
+                started_at=1.0,
+                thinking_block_id="thinking-plan-first",
+                text_block_id="text-plan-first",
+            ),
+        )
+
+        self.assertEqual(_tool_names(captured[0]), ["update_plan"])
+        self.assertEqual(
+            captured[0]["tool_choice"],
+            {"type": "function", "function": {"name": "update_plan"}},
+        )
+
+    async def test_moonshot_forced_plan_uses_required_instead_of_specified_tool_choice(self):
+        captured = []
+
+        async def run_round_fn(**kwargs):
+            captured.append(kwargs["call_kwargs"])
+            return AgentRoundResult(
+                reasoning_buf="",
+                content_buf="",
+                tool_calls=[],
+                finish_reason="stop",
+                accumulated_usage=Usage(input_tokens=1, output_tokens=1),
+                output_deferred=kwargs.get("defer_output", False),
+            )
+
+        await _run_round(
+            messages=[{"role": "user", "content": "比较通勤路线"}],
+            state=AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-moonshot-plan", mode="on")),
+            runtime=_runtime(
+                model_id="kimi-k3",
+                provider="moonshot",
+                litellm_model="moonshot/kimi-k3",
+                plan_mode="on",
+                call_kwargs={
+                    "tools": [
+                        _tool_definition("route_compare"),
+                        _tool_definition("update_plan"),
+                    ],
+                    "tool_choice": "auto",
+                },
+                run_round_fn=run_round_fn,
+            ),
+            step_number=1,
+            step_context=AgentStepContext(
+                step_id="step-moonshot-plan",
+                step_number=1,
+                started_at=1.0,
+                thinking_block_id="thinking-moonshot-plan",
+                text_block_id="text-moonshot-plan",
+            ),
+        )
+
+        self.assertEqual(_tool_names(captured[0]), ["update_plan"])
+        self.assertEqual(captured[0]["tool_choice"], "required")
+
+    async def test_valid_plan_only_exposes_dependency_ready_tools_and_constrains_item_ids(self):
+        coordinator = PlanCoordinator(
+            run_id="run-route-stage",
+            mode="on",
+            allowed_tool_names=frozenset({"route_compare", "web_search"}),
+        )
+        accepted = coordinator.apply_model_update(
+            {
+                "items": [
+                    {
+                        "id": "route",
+                        "step": "比较通勤路线",
+                        "status": "pending",
+                        "kind": "other",
+                        "depends_on": [],
+                        "planned_tools": ["route_compare"],
+                    },
+                    {
+                        "id": "research",
+                        "step": "补充公开资料",
+                        "status": "pending",
+                        "kind": "search",
+                        "depends_on": ["route"],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "answer",
+                        "step": "整理建议",
+                        "status": "pending",
+                        "kind": "answer",
+                        "depends_on": ["research"],
+                        "planned_tools": [],
+                    },
+                ]
+            }
+        )
+        self.assertTrue(accepted.accepted)
+        captured = []
+
+        async def run_round_fn(**kwargs):
+            captured.append(kwargs["call_kwargs"])
+            return AgentRoundResult(
+                reasoning_buf="",
+                content_buf="",
+                tool_calls=[],
+                finish_reason="stop",
+                accumulated_usage=Usage(input_tokens=1, output_tokens=1),
+                output_deferred=kwargs.get("defer_output", False),
+            )
+
+        await _run_round(
+            messages=[{"role": "user", "content": "比较通勤路线"}],
+            state=AgentLoopState(plan_coordinator=coordinator),
+            runtime=_runtime(
+                plan_mode="on",
+                call_kwargs={
+                    "tools": [
+                        _tool_definition("web_search"),
+                        _tool_definition("route_compare"),
+                        _tool_definition("update_plan"),
+                    ],
+                    "tool_choice": "auto",
+                },
+                run_round_fn=run_round_fn,
+            ),
+            step_number=2,
+            step_context=AgentStepContext(
+                step_id="step-route-stage",
+                step_number=2,
+                started_at=1.0,
+                thinking_block_id="thinking-route-stage",
+                text_block_id="text-route-stage",
+            ),
+        )
+
+        self.assertEqual(_tool_names(captured[0]), ["route_compare"])
+        self.assertEqual(
+            captured[0]["tool_choice"],
+            {"type": "function", "function": {"name": "route_compare"}},
+        )
+        route_tool = next(tool for tool in captured[0]["tools"] if tool["function"]["name"] == "route_compare")
+        binding = route_tool["function"]["parameters"]["properties"]["_plan_item_id"]
+        self.assertEqual(binding["enum"], ["route"])
+        self.assertIn("_plan_item_id", route_tool["function"]["parameters"]["required"])
+
+    async def test_repeated_identical_plan_suppresses_control_but_keeps_active_external_tool(self):
+        coordinator = PlanCoordinator(
+            run_id="run-plan-no-progress",
+            mode="on",
+            allowed_tool_names=frozenset({"web_search"}),
+        )
+        payload = {
+            "reason": "搜索后回答",
+            "items": [
+                {
+                    "id": "search",
+                    "title": "搜索资料",
+                    "status": "pending",
+                    "kind": "search",
+                    "depends_on": [],
+                    "planned_tools": ["web_search"],
+                },
+                {
+                    "id": "answer",
+                    "title": "整理回答",
+                    "status": "pending",
+                    "kind": "answer",
+                    "depends_on": ["search"],
+                    "planned_tools": [],
+                },
+            ],
+        }
+        self.assertTrue(coordinator.apply_model_update(payload).accepted)
+        self.assertEqual(coordinator.apply_model_update(payload).reason, "no_change")
+        self.assertEqual(coordinator.apply_model_update(payload).reason, "no_change")
+        self.assertTrue(coordinator.plan_control_suppressed)
+        captured = []
+
+        async def run_round_fn(**kwargs):
+            captured.append(kwargs["call_kwargs"])
+            return AgentRoundResult(
+                reasoning_buf="",
+                content_buf="",
+                tool_calls=[],
+                finish_reason="stop",
+                accumulated_usage=Usage(input_tokens=1, output_tokens=1),
+                output_deferred=kwargs.get("defer_output", False),
+            )
+
+        await _run_round(
+            messages=[{"role": "user", "content": "继续执行当前搜索任务"}],
+            state=AgentLoopState(plan_coordinator=coordinator),
+            runtime=_runtime(
+                plan_mode="on",
+                call_kwargs={
+                    "tools": [
+                        _tool_definition("update_plan"),
+                        _tool_definition("web_search"),
+                    ],
+                    "tool_choice": "auto",
+                },
+                run_round_fn=run_round_fn,
+            ),
+            step_number=3,
+            step_context=AgentStepContext(
+                step_id="step-plan-no-progress",
+                step_number=3,
+                started_at=1.0,
+                thinking_block_id="thinking-plan-no-progress",
+                text_block_id="text-plan-no-progress",
+            ),
+        )
+
+        self.assertEqual(_tool_names(captured[0]), ["web_search"])
+        self.assertEqual(
+            captured[0]["tool_choice"],
+            {"type": "function", "function": {"name": "web_search"}},
+        )
+        binding = captured[0]["tools"][0]["function"]["parameters"]["properties"]["_plan_item_id"]
+        self.assertEqual(binding["enum"], ["search"])
+
+    async def test_exhausted_dynamic_tool_blocks_standard_owner_and_enters_synthesis_before_model_call(self):
+        coordinator = PlanCoordinator(
+            run_id="run-exhausted-standard",
+            mode="on",
+            allowed_tool_names=frozenset({"route_compare"}),
+        )
+        self.assertTrue(
+            coordinator.apply_model_update(
+                {
+                    "reason": "比较路线后回答",
+                    "items": [
+                        {
+                            "id": "route",
+                            "title": "比较路线",
+                            "status": "pending",
+                            "kind": "other",
+                            "depends_on": [],
+                            "planned_tools": ["route_compare"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理建议",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["route"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        state = AgentLoopState(plan_coordinator=coordinator)
+        handler = AsyncMock()
+        handler.is_run_budget_exhausted = AsyncMock(return_value=True)
+        emitter = AsyncMock()
+        run_round_fn = AsyncMock(side_effect=AssertionError("预算耗尽后不应再调用模型常规轮次"))
+        summary = AsyncMock(
+            return_value=LimitSummaryOutcome(
+                accumulated_usage=Usage(input_tokens=1, output_tokens=1),
+            )
+        )
+
+        outcome = await run_agent_loop(
+            db=object(),
+            messages=[{"role": "user", "content": "比较路线"}],
+            state=state,
+            runtime=_runtime(
+                emitter=emitter,
+                plan_mode="on",
+                dynamic_tool_handlers={"route_compare": handler},
+                call_kwargs={
+                    "tools": [
+                        _tool_definition("route_compare"),
+                        _tool_definition("update_plan"),
+                    ],
+                    "tool_choice": "auto",
+                },
+                run_round_fn=run_round_fn,
+                run_limit_summary_step_fn=summary,
+            ),
+        )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        run_round_fn.assert_not_awaited()
+        summary.assert_awaited_once()
+        self.assertEqual(
+            {item["id"]: item["status"] for item in coordinator.items},
+            {"route": "blocked", "answer": "running"},
+        )
+        self.assertGreaterEqual(emitter.plan_snapshot.await_count, 2)
+
+    async def test_exhausted_dynamic_tool_rechecks_product_fallback_before_model_call(self):
+        coordinator = PlanCoordinator(
+            run_id="run-exhausted-product",
+            mode="on",
+            allowed_tool_names=frozenset({"route_compare"}),
+        )
+        self.assertTrue(
+            coordinator.apply_model_update(
+                {
+                    "reason": "比较路线后回答",
+                    "items": [
+                        {
+                            "id": "route",
+                            "title": "比较路线",
+                            "status": "pending",
+                            "kind": "other",
+                            "depends_on": [],
+                            "planned_tools": ["route_compare"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理建议",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["route"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        state = AgentLoopState(
+            plan_coordinator=coordinator,
+            product_tool_attempted=True,
+        )
+        handler = AsyncMock()
+        handler.is_run_budget_exhausted = AsyncMock(return_value=True)
+        run_round_fn = AsyncMock(side_effect=AssertionError("预算耗尽后不应再调用模型常规轮次"))
+
+        with patch(
+            "app.services.stream.agent_loop_driver._complete_product_result_without_llm",
+            new=AsyncMock(),
+        ) as complete_product:
+            outcome = await run_agent_loop(
+                db=object(),
+                messages=[{"role": "user", "content": "比较路线"}],
+                state=state,
+                runtime=_runtime(
+                    emitter=AsyncMock(),
+                    plan_mode="on",
+                    dynamic_tool_handlers={"route_compare": handler},
+                    run_round_fn=run_round_fn,
+                    run_limit_summary_step_fn=AsyncMock(),
+                ),
+            )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        run_round_fn.assert_not_awaited()
+        complete_product.assert_awaited_once()
+        self.assertEqual(
+            {item["id"]: item["status"] for item in coordinator.items},
+            {"route": "blocked", "answer": "pending"},
+        )
+
+    async def test_exhausted_dynamic_tool_blocks_deep_research_chain_without_deferred_empty_round(self):
+        state = _planned_research_state()
+        state.configure_research_mode(network_required=True)
+        handler = AsyncMock()
+        handler.is_run_budget_exhausted = AsyncMock(return_value=True)
+        emitter = AsyncMock()
+        run_round_fn = AsyncMock(side_effect=AssertionError("预算耗尽后不应进入无工具 defer 轮次"))
+        summary = AsyncMock(
+            return_value=LimitSummaryOutcome(
+                accumulated_usage=Usage(input_tokens=1, output_tokens=1),
+                incomplete=False,
+            )
+        )
+
+        outcome = await run_agent_loop(
+            db=object(),
+            messages=[{"role": "user", "content": "深度研究问题"}],
+            state=state,
+            runtime=_runtime(
+                emitter=emitter,
+                task_mode="deep_research",
+                plan_mode="on",
+                dynamic_tool_handlers={"web_search": handler},
+                call_kwargs={
+                    "tools": [
+                        _tool_definition("update_plan"),
+                        _tool_definition("web_search"),
+                        _tool_definition("url_read"),
+                    ],
+                    "tool_choice": "auto",
+                },
+                run_round_fn=run_round_fn,
+                run_limit_summary_step_fn=summary,
+            ),
+        )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        run_round_fn.assert_not_awaited()
+        summary.assert_awaited_once()
+        self.assertEqual(summary.await_args.kwargs["request"].summary_finish_reason, "dynamic_tool_budget_exhausted")
+        self.assertTrue(state.unknown_terminated)
+        self.assertEqual(
+            {item["id"]: item["status"] for item in state.plan_coordinator.items},
+            {"search": "blocked", "read": "blocked", "answer": "running"},
+        )
+
+    async def test_plan_synthesis_snapshot_precedes_first_answer_chunk_and_has_no_tools(self):
+        state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-answer-only", mode="on"))
         self.assertTrue(
             state.plan_coordinator.apply_model_update(
                 {
@@ -123,8 +617,10 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
                 }
             ).accepted
         )
-        state.plan_coordinator.mark_tool_results({"search": "completed"})
-        events: list[tuple[str, dict | None]] = []
+        state.plan_coordinator.items[0]["status"] = "completed"
+        state.plan_coordinator.successful_tool_item_ids.add("search")
+        events: list[tuple[str, object]] = []
+        captured: list[object] = []
         emitter = AsyncMock()
 
         async def record_snapshot(**snapshot):
@@ -132,46 +628,53 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
 
         emitter.plan_snapshot.side_effect = record_snapshot
 
-        async def run_round_fn(**kwargs):
-            await kwargs["on_answer_started"]()
-            events.append(("answering", None))
-            return AgentRoundResult(
-                reasoning_buf="",
-                content_buf="最终回答",
-                tool_calls=[],
-                finish_reason="stop",
-                accumulated_usage=Usage(input_tokens=2, output_tokens=3),
-            )
+        async def run_limit_summary_step_fn(*, request):
+            captured.append(request)
+            final_call_kwargs = build_limit_summary_call_kwargs(request.call_kwargs)
+            self.assertNotIn("tools", final_call_kwargs)
+            self.assertNotIn("tool_choice", final_call_kwargs)
+            events.append(("validation_complete", "协议与事实校验通过"))
+            events.append(("answering", "首个正文 chunk"))
+            return LimitSummaryOutcome(accumulated_usage=Usage(input_tokens=2, output_tokens=3))
 
-        await _run_round(
-            messages=[{"role": "user", "content": "请回答"}],
+        await _run_limit_summary(
             state=state,
             runtime=_runtime(
                 emitter=emitter,
-                run_round_fn=run_round_fn,
+                run_limit_summary_step_fn=run_limit_summary_step_fn,
+                plan_mode="on",
+                call_kwargs={
+                    "tools": [
+                        _tool_definition("update_plan"),
+                        _tool_definition("web_search"),
+                        _tool_definition("url_read"),
+                    ],
+                    "tool_choice": "auto",
+                },
             ),
-            step_number=2,
-            step_context=AgentStepContext(
-                step_id="step-answer-preview",
-                step_number=2,
-                started_at=1.0,
-                thinking_block_id="blk-thinking",
-                text_block_id="blk-text",
-            ),
+            messages=[{"role": "user", "content": "请回答"}],
+            summary_finish_reason="plan_synthesis",
         )
 
-        self.assertEqual([event[0] for event in events], ["plan_snapshot", "answering"])
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].summary_finish_reason, "plan_synthesis")
+        self.assertTrue(captured[0].defer_output)
         self.assertEqual(
-            {item["id"]: item["status"] for item in events[0][1]["items"]},
-            {"search": "pending", "answer": "running"},
+            [event[0] for event in events],
+            ["plan_snapshot", "validation_complete", "answering"],
+        )
+        self.assertEqual(events[0][1]["reason"], "synthesis_started")
+        self.assertEqual(
+            {item["id"]: item["status"] for item in state.plan_coordinator.items},
+            {"search": "completed", "answer": "running"},
         )
 
-    async def test_limit_summary_emits_answering_plan_snapshot_before_summary_starts(self):
-        state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-limit-plan", mode="on"))
+    async def test_standard_plan_summary_injects_candidate_search_context(self):
+        coordinator = PlanCoordinator(run_id="run-standard-candidate-summary", mode="on")
         self.assertTrue(
-            state.plan_coordinator.apply_model_update(
+            coordinator.apply_model_update(
                 {
-                    "reason": "先搜索再综合回答",
+                    "reason": "先搜索，再整理结论",
                     "items": [
                         {
                             "id": "search",
@@ -183,7 +686,7 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
                         },
                         {
                             "id": "answer",
-                            "title": "综合回答",
+                            "title": "整理结论",
                             "status": "pending",
                             "kind": "answer",
                             "depends_on": ["search"],
@@ -193,38 +696,260 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
                 }
             ).accepted
         )
-        state.plan_coordinator.mark_tool_results({"search": "completed"})
-        events: list[tuple[str, dict | None]] = []
-        emitter = AsyncMock()
-
-        async def record_snapshot(**snapshot):
-            events.append(("plan_snapshot", snapshot))
-
-        emitter.plan_snapshot.side_effect = record_snapshot
-
-        async def run_limit_summary_step_fn(**_kwargs):
-            events.append(("summary_started", None))
-            return LimitSummaryOutcome(accumulated_usage=Usage(input_tokens=3, output_tokens=5))
+        coordinator.mark_tool_results({"search": "completed"})
+        state = AgentLoopState(plan_coordinator=coordinator)
+        state.research_workset.successful_searches = 1
+        state.research_workset.sources["ev-candidate"] = ResearchSource(
+            evidence_id="ev-candidate",
+            citation_index=1,
+            title="候选官方公告",
+            url="https://example.com/candidate",
+            kind="search",
+            summary="候选搜索摘要必须进入普通计划最终综合",
+            key_findings=("候选关键发现",),
+        )
+        summary = AsyncMock(
+            return_value=LimitSummaryOutcome(accumulated_usage=Usage(input_tokens=2, output_tokens=3))
+        )
 
         await _run_limit_summary(
             state=state,
             runtime=_runtime(
-                emitter=emitter,
-                run_limit_summary_step_fn=run_limit_summary_step_fn,
+                emitter=AsyncMock(),
+                plan_mode="on",
+                task_mode="standard",
+                run_limit_summary_step_fn=summary,
             ),
-            messages=[{"role": "user", "content": "请总结"}],
+            messages=[
+                {"role": "user", "content": "调研 Redis 更新"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"id": "call-search", "name": "web_search", "arguments": "{}"}],
+                },
+                {"role": "tool", "tool_call_id": "call-search", "content": "原始搜索结果"},
+            ],
+            summary_finish_reason="plan_synthesis",
         )
 
-        self.assertEqual([event[0] for event in events], ["plan_snapshot", "summary_started"])
-        snapshot = events[0][1]
-        self.assertEqual(
-            {item["id"]: item["status"] for item in snapshot["items"]},
-            {"search": "completed", "answer": "running"},
+        request = summary.await_args.kwargs["request"]
+        web_contexts = [
+            str(message.get("content", ""))
+            for message in request.messages
+            if message.get("role") == "user" and "<web_context " in str(message.get("content", ""))
+        ]
+        self.assertEqual(len(web_contexts), 1)
+        self.assertIn("候选官方公告", web_contexts[0])
+        self.assertIn("候选搜索摘要必须进入普通计划最终综合", web_contexts[0])
+        self.assertIn("候选关键发现", web_contexts[0])
+
+    async def test_deep_research_summary_injects_only_read_source_context(self):
+        coordinator = PlanCoordinator(run_id="run-deep-read-summary", mode="on")
+        self.assertTrue(
+            coordinator.apply_model_update(
+                {
+                    "reason": "搜索并读取来源后整理结论",
+                    "items": [
+                        {
+                            "id": "search",
+                            "title": "搜索资料",
+                            "status": "running",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理结论",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["search"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
         )
-        self.assertLessEqual(
-            sum(item["status"] == "running" for item in snapshot["items"]),
-            1,
+        coordinator.mark_tool_results({"search": "completed"})
+        state = AgentLoopState(plan_coordinator=coordinator)
+        state.research_workset.successful_searches = 1
+        state.research_workset.sources = {
+            "ev-candidate": ResearchSource(
+                evidence_id="ev-candidate",
+                citation_index=1,
+                title="未读候选公告",
+                url="https://example.com/candidate",
+                kind="search",
+                summary="未读候选摘要不得进入深研最终综合",
+            ),
+            "ev-read": ResearchSource(
+                evidence_id="ev-read",
+                citation_index=2,
+                title="已读官方公告",
+                url="https://example.com/read",
+                kind="url_read",
+                summary="已读来源摘要应进入深研最终综合",
+                key_findings=("已读关键发现",),
+            ),
+        }
+        state.research_workset.successful_read_urls.add("https://example.com/read")
+        summary = AsyncMock(
+            return_value=LimitSummaryOutcome(accumulated_usage=Usage(input_tokens=2, output_tokens=3))
         )
+
+        await _run_limit_summary(
+            state=state,
+            runtime=_runtime(
+                emitter=AsyncMock(),
+                plan_mode="on",
+                task_mode="deep_research",
+                run_limit_summary_step_fn=summary,
+            ),
+            messages=[{"role": "user", "content": "深度调研 Redis 更新"}],
+            summary_finish_reason="plan_synthesis",
+        )
+
+        request = summary.await_args.kwargs["request"]
+        web_contexts = [
+            str(message.get("content", ""))
+            for message in request.messages
+            if message.get("role") == "user" and "<web_context " in str(message.get("content", ""))
+        ]
+        self.assertEqual(len(web_contexts), 1)
+        self.assertIn("已读官方公告", web_contexts[0])
+        self.assertIn("已读来源摘要应进入深研最终综合", web_contexts[0])
+        self.assertNotIn("未读候选公告", web_contexts[0])
+        self.assertNotIn("未读候选摘要", web_contexts[0])
+
+    async def test_terminal_plan_with_product_guards_does_not_short_circuit_to_plan_synthesis(self):
+        cases = (
+            ("product_result_block", {"product_result_block": True}),
+            ("product_tool_attempted", {"product_tool_attempted": True}),
+            (
+                "retryable_repair",
+                {
+                    "pending_tool_repairs": {
+                        "repair-route": {
+                            "required_fields": ["destination"],
+                            "retryable": True,
+                            "requires_user_input": False,
+                        }
+                    }
+                },
+            ),
+            (
+                "requires_user_input",
+                {
+                    "pending_tool_repairs": {
+                        "repair-location": {
+                            "required_fields": ["location"],
+                            "retryable": False,
+                            "requires_user_input": True,
+                        }
+                    }
+                },
+            ),
+        )
+
+        for case_name, flags in cases:
+            with self.subTest(case=case_name):
+                coordinator = PlanCoordinator(run_id=f"run-{case_name}", mode="on")
+                self.assertTrue(
+                    coordinator.apply_model_update(
+                        {
+                            "reason": "先查工具再回答",
+                            "items": [
+                                {
+                                    "id": "tool",
+                                    "title": "调用工具",
+                                    "status": "pending",
+                                    "kind": "other",
+                                    "depends_on": [],
+                                    "planned_tools": ["route_compare"],
+                                },
+                                {
+                                    "id": "answer",
+                                    "title": "整理回答",
+                                    "status": "pending",
+                                    "kind": "answer",
+                                    "depends_on": ["tool"],
+                                    "planned_tools": [],
+                                },
+                            ],
+                        }
+                    ).accepted
+                )
+                coordinator.mark_tools_started(["tool"])
+                coordinator.mark_tool_results({"tool": "completed"})
+                state = AgentLoopState(
+                    plan_coordinator=coordinator,
+                    product_tool_attempted=flags.get("product_tool_attempted", False),
+                    pending_tool_repairs=flags.get("pending_tool_repairs", {}),
+                )
+                if flags.get("product_result_block"):
+                    state.content_blocks.append(
+                        PlaceResultsBlock(
+                            type="place_results",
+                            schema_version=1,
+                            provider="amap",
+                            query="附近咖啡",
+                            status="success",
+                            result_count=1,
+                            places=[PlaceResult(name="示例咖啡")],
+                        )
+                    )
+                round_calls: list[int] = []
+
+                async def start_step_fn(**kwargs):
+                    context = AgentStepContext(
+                        step_id=f"step-{case_name}-{kwargs['step_number']}",
+                        step_number=kwargs["step_number"],
+                        started_at=kwargs["clock"](),
+                        thinking_block_id=f"thinking-{case_name}",
+                        text_block_id=f"text-{case_name}",
+                    )
+                    kwargs["on_step_started"](context.step_id)
+                    return context
+
+                async def run_round_fn(**kwargs):
+                    round_calls.append(kwargs["step_number"])
+                    return AgentRoundResult(
+                        reasoning_buf="",
+                        content_buf="",
+                        tool_calls=[],
+                        finish_reason="stop",
+                        accumulated_usage=Usage(input_tokens=1, output_tokens=1),
+                        output_deferred=bool(kwargs.get("defer_output")),
+                    )
+
+                summary = AsyncMock(
+                    return_value=LimitSummaryOutcome(accumulated_usage=Usage(input_tokens=1, output_tokens=1))
+                )
+                with patch(
+                    "app.services.stream.agent_loop_driver.handle_agent_round_outcome",
+                    new=AsyncMock(
+                        side_effect=[
+                            None,
+                            AgentLoopOutcome(exit=AgentLoopExit.COMPLETED),
+                        ]
+                    ),
+                ):
+                    outcome = await run_agent_loop(
+                        db=object(),
+                        messages=[{"role": "user", "content": "继续"}],
+                        state=state,
+                        runtime=_runtime(
+                            plan_mode="on",
+                            start_step_fn=start_step_fn,
+                            run_round_fn=run_round_fn,
+                            run_limit_summary_step_fn=summary,
+                        ),
+                    )
+
+                self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+                self.assertEqual(round_calls[0], 1)
+                summary.assert_not_awaited()
+                self.assertFalse(coordinator.synthesis_started)
 
     async def test_incomplete_deep_summary_marks_run_unknown_terminated(self):
         state = AgentLoopState()
@@ -243,6 +968,27 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
             ),
             messages=[{"role": "user", "content": "研究问题"}],
             summary_finish_reason="plan_repair_exhausted",
+        )
+
+        self.assertTrue(state.unknown_terminated)
+
+    async def test_incomplete_standard_summary_marks_run_unknown_terminated(self):
+        state = AgentLoopState()
+        summary = AsyncMock(
+            return_value=LimitSummaryOutcome(
+                accumulated_usage=Usage(input_tokens=3, output_tokens=5),
+                incomplete=True,
+            )
+        )
+
+        await _run_limit_summary(
+            state=state,
+            runtime=_runtime(
+                task_mode="standard",
+                run_limit_summary_step_fn=summary,
+            ),
+            messages=[{"role": "user", "content": "分析问题"}],
+            summary_finish_reason="no_progress_summary",
         )
 
         self.assertTrue(state.unknown_terminated)
@@ -314,6 +1060,10 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(_tool_names(captured[0]["call_kwargs"]), ["update_plan"])
+        self.assertEqual(
+            captured[0]["call_kwargs"]["tool_choice"],
+            {"type": "function", "function": {"name": "update_plan"}},
+        )
         system_text = "\n".join(
             message["content"] for message in captured[0]["messages"] if message["role"] == "system"
         )
@@ -323,7 +1073,9 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
     async def test_deep_research_read_stage_only_allows_plan_repair_when_plan_omits_url_read(self):
         captured = []
         state = _planned_research_state()
-        state.plan_coordinator.items[0]["planned_tools"] = ["web_search"]
+        state.plan_coordinator.mark_tools_started(["search"])
+        state.plan_coordinator.mark_tool_results({"search": "completed"})
+        state.plan_coordinator.items[1]["planned_tools"] = ["local_place_search"]
         state.research_workset.successful_searches = 1
         state.research_workset.sources["ev-candidate"] = ResearchSource(
             evidence_id="ev-candidate",
@@ -451,6 +1203,10 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(_tool_names(captured[0]["call_kwargs"]), ["web_search"])
+        self.assertEqual(
+            captured[0]["call_kwargs"]["tool_choice"],
+            {"type": "function", "function": {"name": "web_search"}},
+        )
         system_text = "\n".join(
             message["content"] for message in captured[0]["messages"] if message["role"] == "system"
         )
@@ -462,10 +1218,23 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
         coordinator.configure_initial_tool_requirements(
             {
                 "web_search": 1,
-                "url_read": 1,
+                "url_read": 2,
             }
         )
         self.assertTrue(coordinator.adopt_research_fallback().accepted)
+        self.assertEqual(
+            [item["planned_tools"] for item in coordinator.items],
+            [["web_search"], ["url_read"], ["url_read"], []],
+        )
+        search_id = coordinator.items[0]["id"]
+        first_read_id = coordinator.items[1]["id"]
+        second_read_id = coordinator.items[2]["id"]
+        answer_id = coordinator.items[3]["id"]
+        self.assertEqual(
+            [item["depends_on"] for item in coordinator.items],
+            [[], [search_id], [search_id], [first_read_id, second_read_id]],
+        )
+        state = AgentLoopState(plan_coordinator=coordinator)
 
         async def run_round_fn(**kwargs):
             captured.append(kwargs)
@@ -479,7 +1248,7 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
 
         await _run_round(
             messages=[{"role": "user", "content": "研究问题"}],
-            state=AgentLoopState(plan_coordinator=coordinator),
+            state=state,
             runtime=_runtime(
                 task_mode="deep_research",
                 plan_mode="on",
@@ -505,28 +1274,72 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(_tool_names(captured[0]["call_kwargs"]), ["web_search"])
         binding_schema = captured[0]["call_kwargs"]["tools"][0]["function"]["parameters"]["properties"]["_plan_item_id"]
-        self.assertEqual(binding_schema["enum"], ["research-search"])
+        self.assertEqual(binding_schema["enum"], [search_id])
+
+        coordinator.mark_tools_started([search_id])
+        coordinator.mark_tool_results({search_id: "completed"})
+        coordinator.mark_tools_started([first_read_id])
+        coordinator.mark_tool_results({first_read_id: "completed"})
+        state.research_workset.successful_searches = 1
+        state.research_workset.sources = {
+            "ev-one": ResearchSource(
+                evidence_id="ev-one",
+                citation_index=1,
+                title="来源一",
+                url="https://example.com/one",
+                kind="search",
+            ),
+            "ev-two": ResearchSource(
+                evidence_id="ev-two",
+                citation_index=2,
+                title="来源二",
+                url="https://example.com/two",
+                kind="search",
+            ),
+        }
+        state.research_workset.attempted_read_urls.add("https://example.com/one")
+        state.research_workset.successful_read_urls.add("https://example.com/one")
+
+        await _run_round(
+            messages=[{"role": "user", "content": "继续读取第二个独立来源"}],
+            state=state,
+            runtime=_runtime(
+                task_mode="deep_research",
+                plan_mode="on",
+                call_kwargs={
+                    "tools": [
+                        _tool_definition("update_plan"),
+                        _tool_definition("web_search"),
+                        _tool_definition("url_read"),
+                    ],
+                    "tool_choice": "auto",
+                },
+                run_round_fn=run_round_fn,
+            ),
+            step_number=5,
+            step_context=AgentStepContext(
+                step_id="step-fallback-read-2",
+                step_number=5,
+                started_at=1.0,
+                thinking_block_id="thinking-fallback-read-2",
+                text_block_id="text-fallback-read-2",
+            ),
+        )
+
+        self.assertEqual(_tool_names(captured[1]["call_kwargs"]), ["url_read"])
+        second_binding_schema = captured[1]["call_kwargs"]["tools"][0]["function"]["parameters"]["properties"][
+            "_plan_item_id"
+        ]
+        self.assertEqual(second_binding_schema["enum"], [second_read_id])
+        self.assertNotIn("update_plan", _tool_names(captured[1]["call_kwargs"]))
+        self.assertEqual(coordinator.items[-1]["id"], answer_id)
 
     async def test_deep_research_with_unread_candidates_blocks_repeated_plan_and_search(self):
         captured = []
-        state = _planned_research_state()
-        state.plan_coordinator.items = [
-            {
-                "id": "completed-search",
-                "status": "completed",
-                "planned_tools": ["web_search", "url_read"],
-            },
-            {
-                "id": "current-read",
-                "status": "running",
-                "planned_tools": ["url_read"],
-            },
-            {
-                "id": "next-read",
-                "status": "pending",
-                "planned_tools": ["url_read"],
-            },
-        ]
+        state = _planned_research_state(read_steps=2)
+        state.plan_coordinator.mark_tools_started(["search"])
+        state.plan_coordinator.mark_tool_results({"search": "completed"})
+        state.plan_coordinator.mark_tools_started(["read-1"])
         state.research_workset.successful_searches = 1
         state.research_workset.sources["ev-candidate"] = ResearchSource(
             evidence_id="ev-candidate",
@@ -574,7 +1387,7 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(_tool_names(captured[0]["call_kwargs"]), ["url_read"])
         binding_schema = captured[0]["call_kwargs"]["tools"][0]["function"]["parameters"]["properties"]["_plan_item_id"]
-        self.assertEqual(binding_schema["enum"], ["current-read", "next-read"])
+        self.assertEqual(binding_schema["enum"], ["read-1"])
         self.assertIn(
             "_plan_item_id",
             captured[0]["call_kwargs"]["tools"][0]["function"]["parameters"]["required"],
@@ -583,15 +1396,17 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
             message["content"] for message in captured[0]["messages"] if message["role"] == "system"
         )
         self.assertIn("当前阶段只能调用 url_read", system_text)
-        self.assertIn("current-read", system_text)
-        self.assertIn("next-read", system_text)
-        self.assertNotIn("completed-search", system_text)
+        self.assertIn("read-1", system_text)
+        self.assertNotIn("read-2", system_text)
+        self.assertNotIn("`search`", system_text)
         self.assertNotIn("不应进入阶段控制提示的外部标题", system_text)
         self.assertNotIn("outside.example", system_text)
 
     async def test_deep_research_without_unread_candidate_falls_back_to_search_repair(self):
         captured = []
-        state = _planned_research_state()
+        state = _planned_research_state(include_repair_search=True)
+        state.plan_coordinator.mark_tools_started(["search"])
+        state.plan_coordinator.mark_tool_results({"search": "completed"})
         state.research_workset.successful_searches = 1
 
         async def run_round_fn(**kwargs):
@@ -631,6 +1446,8 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(_tool_names(captured[0]["call_kwargs"]), ["web_search"])
+        binding_schema = captured[0]["call_kwargs"]["tools"][0]["function"]["parameters"]["properties"]["_plan_item_id"]
+        self.assertEqual(binding_schema["enum"], ["repair-search"])
         system_text = "\n".join(
             message["content"] for message in captured[0]["messages"] if message["role"] == "system"
         )
@@ -639,12 +1456,15 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
     async def test_deep_research_synthesis_stage_removes_all_tools_after_two_distinct_reads(self):
         captured = []
         state = _planned_research_state()
+        state.plan_coordinator.mark_tools_started(["search"])
+        state.plan_coordinator.mark_tool_results({"search": "completed"})
+        state.plan_coordinator.mark_tools_started(["read"])
+        state.plan_coordinator.mark_tool_results({"read": "completed"})
         state.research_workset.successful_searches = 1
         state.research_workset.successful_read_urls = {
             "https://example.com/one",
             "https://example.com/two",
         }
-        state.plan_coordinator.successful_tool_item_ids.add("research")
 
         async def run_round_fn(**kwargs):
             captured.append(kwargs)
@@ -687,14 +1507,16 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_deep_research_keeps_planned_search_open_after_minimum_evidence_gate(self):
         captured = []
-        state = _planned_research_state()
+        state = _planned_research_state(include_followup_search=True)
+        state.plan_coordinator.mark_tools_started(["search"])
+        state.plan_coordinator.mark_tool_results({"search": "completed"})
+        state.plan_coordinator.mark_tools_started(["read"])
+        state.plan_coordinator.mark_tool_results({"read": "completed"})
         state.research_workset.successful_searches = 1
         state.research_workset.successful_read_urls = {
             "https://example.com/one",
             "https://example.com/two",
         }
-        state.plan_coordinator.mark_tool_results({"research": "completed"})
-        state.plan_coordinator.mark_tool_results({"research": "running"})
 
         async def run_round_fn(**kwargs):
             captured.append(kwargs)
@@ -733,8 +1555,13 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(_tool_names(captured[0]["call_kwargs"]), ["web_search"])
+        first_binding_schema = captured[0]["call_kwargs"]["tools"][0]["function"]["parameters"]["properties"][
+            "_plan_item_id"
+        ]
+        self.assertEqual(first_binding_schema["enum"], ["followup-search"])
 
-        state.plan_coordinator.mark_tool_results({"research": "completed"})
+        state.plan_coordinator.mark_tools_started(["followup-search"])
+        state.plan_coordinator.mark_tool_results({"followup-search": "completed"})
         await _run_round(
             messages=[{"role": "user", "content": "完成计划并综合"}],
             state=state,
@@ -865,6 +1692,111 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(captured[0]["defer_output"])
         self.assertTrue(result.output_deferred)
+
+    async def test_product_protocol_error_uses_one_deterministic_completion_step_without_limit_summary(self):
+        coordinator = PlanCoordinator(run_id="run-product-protocol-driver", mode="on")
+        self.assertTrue(
+            coordinator.apply_model_update(
+                {
+                    "reason": "先查询地点，再整理结果",
+                    "items": [
+                        {
+                            "id": "place",
+                            "title": "查询地点",
+                            "status": "running",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["local_place_search"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理结果",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["place"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        coordinator.mark_tool_results({"place": "completed"})
+        self.assertIsNotNone(coordinator.begin_synthesis())
+        state = AgentLoopState(
+            plan_coordinator=coordinator,
+            content_blocks=[
+                PlaceResultsBlock(
+                    type="place_results",
+                    schema_version=1,
+                    provider="amap",
+                    query="咖啡店",
+                    status="success",
+                    result_count=1,
+                    places=[PlaceResult(name="真实咖啡店")],
+                )
+            ],
+        )
+        started_steps: list[str] = []
+        completed_steps: list[str] = []
+        llm_steps: list[int] = []
+
+        async def start_step_fn(**kwargs):
+            step_id = f"step-product-protocol-{kwargs['step_number']}"
+            started_steps.append(step_id)
+            context = AgentStepContext(
+                step_id=step_id,
+                step_number=kwargs["step_number"],
+                started_at=kwargs["clock"](),
+                thinking_block_id=f"{step_id}-thinking",
+                text_block_id=f"{step_id}-text",
+            )
+            kwargs["on_step_started"](context.step_id)
+            return context
+
+        async def complete_step_fn(**kwargs):
+            completed_steps.append(kwargs["context"].step_id)
+
+        async def run_round_fn(**kwargs):
+            llm_steps.append(kwargs["step_number"])
+            self.assertTrue(kwargs["defer_output"])
+            return AgentRoundResult(
+                reasoning_buf="",
+                content_buf="我先整理一下查询结果：",
+                tool_calls=[],
+                finish_reason="tool_protocol_error",
+                accumulated_usage=Usage(input_tokens=5, output_tokens=5),
+                output_deferred=True,
+            )
+
+        append_chunk = AsyncMock()
+        limit_summary = AsyncMock(side_effect=AssertionError("产品结果不得进入通用 limit summary"))
+        with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
+            outcome = await run_agent_loop(
+                db=object(),
+                messages=[{"role": "user", "content": "附近有什么咖啡店"}],
+                state=state,
+                runtime=_runtime(
+                    plan_mode="on",
+                    start_step_fn=start_step_fn,
+                    complete_step_fn=complete_step_fn,
+                    run_round_fn=run_round_fn,
+                    run_limit_summary_step_fn=limit_summary,
+                ),
+            )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        self.assertEqual(llm_steps, [1])
+        self.assertEqual(
+            started_steps,
+            ["step-product-protocol-1", "step-product-protocol-2"],
+        )
+        self.assertEqual(completed_steps, started_steps)
+        append_chunk.assert_awaited_once()
+        self.assertIn("真实咖啡店", append_chunk.await_args.args[2])
+        self.assertNotIn("我先整理一下查询结果", append_chunk.await_args.args[2])
+        limit_summary.assert_not_awaited()
+        self.assertIsNone(state.current_step_id)
+        self.assertEqual([block.type for block in state.content_blocks], ["place_results", "text"])
 
     async def test_required_user_input_uses_deterministic_clarification_without_second_llm_round(self):
         state = AgentLoopState()
@@ -1024,7 +1956,10 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("步行五分钟", grounded_answer)
         self.assertEqual(state.total_tool_calls, 2)
         self.assertEqual(state.accumulated_usage, Usage(input_tokens=7, output_tokens=9))
-        self.assertEqual([block.type for block in state.content_blocks], ["place_results", "place_results", "text"])
+        self.assertEqual(
+            [block.type for block in state.content_blocks],
+            ["place_results", "place_results", "text"],
+        )
 
     async def test_existing_product_result_defers_next_round_model_output(self):
         state = AgentLoopState(

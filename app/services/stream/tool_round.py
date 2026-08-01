@@ -35,6 +35,7 @@ from app.services.stream.agent_loop_state import AgentLoopState, ProductToolOutc
 from app.services.stream.itinerary_observability import build_itinerary_tool_observation
 from app.services.stream.itinerary_result_composer import compose_itinerary_result
 from app.services.stream.plan_control import process_plan_control_calls
+from app.services.stream.reasoning_transport import allows_deferred_reasoning_output
 from app.services.stream.step_lifecycle import AgentStepContext, mark_tool_round_started
 from app.services.stream.tool_context import (
     BlockedToolContext,
@@ -65,6 +66,7 @@ class ToolRoundOutcome:
     itinerary_result_count: int = 0
     product_outcomes: tuple[ProductToolOutcome, ...] = ()
     control_repair_exhausted: bool = False
+    unavailable_tool_call_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -102,6 +104,7 @@ class ToolRoundRequest:
     task_id: str = ""
     agent_state: AgentLoopState | None = None
     output_deferred: bool = False
+    allow_deferred_reasoning_output: bool = False
     resolve_tool_context_fn: Callable[..., Awaitable[ToolContextResolution]] = resolve_tool_context
 
 
@@ -131,7 +134,9 @@ def build_assistant_tool_message(
     return message
 
 
-def restore_reasoning_after_tool_decision(call_kwargs: dict) -> None:
+def restore_reasoning_after_tool_decision(call_kwargs: dict, *, provider: str | None = None) -> None:
+    if provider == "deepseek":
+        return
     extra_body = call_kwargs.get("extra_body")
     if not isinstance(extra_body, dict):
         return
@@ -142,7 +147,11 @@ def restore_reasoning_after_tool_decision(call_kwargs: dict) -> None:
 
 
 def append_tool_round_reasoning(request: ToolRoundRequest) -> None:
-    if request.reasoning_buf:
+    should_persist_reasoning = not request.output_deferred or (
+        request.allow_deferred_reasoning_output
+        and allows_deferred_reasoning_output(request.model_id)
+    )
+    if request.reasoning_buf and should_persist_reasoning:
         request.content_blocks.append(
             ThinkingBlock(
                 type="thinking",
@@ -484,23 +493,22 @@ async def complete_tool_round_step(
 
 
 async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutcome:
-    if not request.output_deferred:
-        append_tool_round_reasoning(request)
-        persist_tool_round_checkpoint(request)
+    append_tool_round_reasoning(request)
+    persist_tool_round_checkpoint(request)
 
+    announced_round_calls, unavailable_tool_calls = _partition_tool_calls_by_announcement(request)
     control_result = await process_plan_control_calls(
-        tool_calls=request.tool_calls,
+        tool_calls=announced_round_calls,
         coordinator=request.agent_state.plan_coordinator
         if request.agent_state is not None
         else AgentLoopState().plan_coordinator,
         emitter=request.emitter,
     )
-    if request.agent_state is not None and request.agent_state.plan_coordinator.has_valid_model_plan:
-        object.__setattr__(request.step_context, "model_plan_managed", True)
-    announced_tool_calls, unavailable_tool_calls = _partition_tool_calls_by_announcement(
+    announced_tool_calls, unavailable_external_calls = _partition_tool_calls_by_announcement(
         request,
         tool_calls=control_result.external_tool_calls,
     )
+    unavailable_tool_calls = [*unavailable_tool_calls, *unavailable_external_calls]
     selected_tool_calls = _select_tool_calls_within_limit(request, announced_tool_calls)
     context_resolution = ToolContextResolution(executable_calls=selected_tool_calls[0])
     if request.agent_state is not None and selected_tool_calls[0]:
@@ -572,12 +580,30 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
     executed_count = _actual_tool_execution_count(executable_tool_calls, results)
     if request.agent_state is not None and executed_count > 0:
         request.agent_state.plan_coordinator.reset_repair_attempts()
-    _record_tool_repairs(request.agent_state, executed_results)
-    _record_itinerary_tool_observations(request.agent_state, executed_results)
     reused_limited_tool_calls, not_executed_tool_calls = _partition_successfully_reusable_calls(
         request,
         selected_tool_calls[1],
     )
+    if request.agent_state is not None:
+        tool_statuses = _plan_item_statuses_from_batch(
+            results,
+            missing_result_tool_calls=missing_result_tool_calls,
+            blocked_tool_calls=[
+                *not_executed_tool_calls,
+                *unavailable_tool_calls,
+                *[
+                    tool_call
+                    for tool_call in selected_tool_calls[0]
+                    if str(tool_call.get("id", "")) in context_resolution.blocked_calls
+                ],
+            ],
+            completed_without_execution=reused_limited_tool_calls,
+        )
+        result_snapshot = request.agent_state.plan_coordinator.mark_tool_results(tool_statuses)
+        if result_snapshot is not None:
+            await request.emitter.plan_snapshot(**result_snapshot)
+    _record_tool_repairs(request.agent_state, executed_results)
+    _record_itinerary_tool_observations(request.agent_state, executed_results)
     source_plan = _build_source_selection_plan(executed_results)
     record_network_budget_feedback(request, executed_results, source_plan=source_plan)
     await emit_selected_source_evidence(request, executed_results, source_plan=source_plan)
@@ -595,14 +621,6 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
         control_tool_responses=control_result.tool_responses,
     )
     _record_research_workset(request.agent_state, results, built_content_blocks=built_content_blocks)
-    if request.agent_state is not None:
-        tool_statuses = _plan_item_statuses_from_results(
-            results,
-            agent_state=request.agent_state,
-        )
-        result_snapshot = request.agent_state.plan_coordinator.mark_tool_results(tool_statuses)
-        if result_snapshot is not None:
-            await request.emitter.plan_snapshot(**result_snapshot)
     await _emit_citation_source_evidence(
         request,
         results=results,
@@ -634,7 +652,7 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
         await emit_itinerary_result_block(request, itinerary_result)
 
     tool_names = await complete_tool_round_step(request, executed_results, executed_count=executed_count)
-    restore_reasoning_after_tool_decision(request.call_kwargs)
+    restore_reasoning_after_tool_decision(request.call_kwargs, provider=request.provider)
     return ToolRoundOutcome(
         tool_call_count=executed_count,
         tool_names=tool_names,
@@ -646,15 +664,18 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
         itinerary_result_count=1 if itinerary_result is not None else 0,
         product_outcomes=product_outcomes,
         control_repair_exhausted=control_result.repair_exhausted and executed_count == 0,
+        unavailable_tool_call_count=len(unavailable_tool_calls),
     )
 
 
-def _plan_item_statuses_from_results(
+def _plan_item_statuses_from_batch(
     results: list[ToolExecutionRecord],
     *,
-    agent_state: AgentLoopState | None = None,
+    missing_result_tool_calls: list[dict] | None = None,
+    blocked_tool_calls: list[dict] | None = None,
+    completed_without_execution: list[dict] | None = None,
 ) -> dict[str, str]:
-    """聚合本轮工具结果；计划终态由 PlanCoordinator 在运行收口时决定。"""
+    """按本轮真实执行批次聚合计划项终态，缺失或未执行不得伪装成成功。"""
 
     candidates: dict[str, list[str]] = {}
     for record in results:
@@ -663,7 +684,13 @@ def _plan_item_statuses_from_results(
             continue
         data = record.result.data if isinstance(record.result.data, dict) else {}
         repair = data.get("repair") if isinstance(data, dict) else None
-        if isinstance(repair, dict) and repair.get("retryable") is True:
+        repair_retryable = (
+            isinstance(repair, dict)
+            and repair.get("retryable") is True
+            and repair.get("retry_exhausted") is not True
+            and repair.get("requires_user_input") is not True
+        )
+        if repair_retryable:
             status = "running"
         elif record.result.status == "degraded" and record.tool_name in {"web_search", "url_read"}:
             status = "failed"
@@ -673,8 +700,32 @@ def _plan_item_statuses_from_results(
             status = "failed"
         candidates.setdefault(plan_item_id, []).append(status)
 
-    priority = {"completed": 1, "running": 2, "failed": 3}
+    for tool_call in missing_result_tool_calls or []:
+        plan_item_id = tool_call.get("plan_item_id")
+        if isinstance(plan_item_id, str):
+            candidates.setdefault(plan_item_id, []).append("failed")
+    for tool_call in blocked_tool_calls or []:
+        plan_item_id = tool_call.get("plan_item_id")
+        if isinstance(plan_item_id, str):
+            candidates.setdefault(plan_item_id, []).append("blocked")
+    for tool_call in completed_without_execution or []:
+        plan_item_id = tool_call.get("plan_item_id")
+        if isinstance(plan_item_id, str):
+            candidates.setdefault(plan_item_id, []).append("completed")
+
+    priority = {"completed": 1, "running": 2, "blocked": 3, "failed": 4}
     return {item_id: max(statuses, key=priority.__getitem__) for item_id, statuses in candidates.items()}
+
+
+def _plan_item_statuses_from_results(
+    results: list[ToolExecutionRecord],
+    *,
+    agent_state: AgentLoopState | None = None,
+) -> dict[str, str]:
+    """保留纯结果聚合入口；计划状态仍只写入 PlanCoordinator。"""
+
+    del agent_state
+    return _plan_item_statuses_from_batch(results)
 
 
 def _record_tool_repairs(

@@ -2,12 +2,30 @@
 
 from __future__ import annotations
 
+from functools import partial
+from inspect import Parameter, signature
+
 from app.services.stream.agent_loop_runtime import AgentLoopRuntime
 from app.services.stream.agent_loop_state import AgentLoopState
 from app.services.stream.agent_round import AgentRoundResult
 from app.services.stream.limit_summary import LimitSummaryStepRequest
 from app.services.stream.step_lifecycle import AgentStepContext
 from app.services.stream.tool_round import ToolRoundRequest
+
+
+def _stream_round_with_model_id(runtime: AgentLoopRuntime):
+    """为总结轮绑定模型 ID，让运输层仍能精确区分 K3 与其它模型。"""
+
+    try:
+        parameters = signature(runtime.stream_round_fn).parameters
+    except (TypeError, ValueError):
+        return partial(runtime.stream_round_fn, model_id=runtime.model_id)
+    accepts_model_id = "model_id" in parameters or any(
+        parameter.kind == Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+    if not accepts_model_id:
+        return runtime.stream_round_fn
+    return partial(runtime.stream_round_fn, model_id=runtime.model_id)
 
 
 def build_tool_round_request(
@@ -54,6 +72,7 @@ def build_tool_round_request(
         task_id=runtime.task_id,
         agent_state=state,
         output_deferred=round_result.output_deferred,
+        allow_deferred_reasoning_output=round_result.allow_deferred_reasoning_output,
     )
 
 
@@ -85,7 +104,7 @@ def build_limit_summary_step_request(
         start_step_fn=runtime.start_step_fn,
         complete_step_fn=runtime.complete_step_fn,
         llm_call_fn=runtime.llm_call_fn,
-        stream_round_fn=runtime.stream_round_fn,
+        stream_round_fn=_stream_round_with_model_id(runtime),
         log_round_summary_fn=runtime.log_round_summary_fn,
         warning_fn=runtime.warning_fn,
         clock=runtime.clock,
@@ -96,4 +115,5 @@ def build_limit_summary_step_request(
         task_mode=runtime.task_mode,
         evidence_policy=runtime.evidence_policy,
         research_workset=state.research_workset,
+        defer_output=True,
     )

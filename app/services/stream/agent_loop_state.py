@@ -9,6 +9,7 @@ from app.schemas.chat import ContextUsage, Usage
 from app.services.agent.plan_coordinator import PlanCoordinator
 from app.services.stream.agent_loop_policy import AgentLoopLimitReason
 from app.services.stream.itinerary_observability import ItineraryToolObservation
+from app.services.stream.product_result_answer import has_product_result_blocks
 from app.services.stream.research_evidence import MAX_RESEARCH_REPAIRS, ResearchEvidenceWorkset
 from app.services.stream.run_finalizer import AgentRunStats
 
@@ -51,7 +52,6 @@ class AgentLoopState:
     limit_reason: AgentLoopLimitReason | None = None
     unknown_terminated: bool = False
     terminal_emitted: bool = False
-    plan_items: dict[str, dict] = field(default_factory=dict)
     consecutive_no_progress_search_results: int = 0
     context_wait_seconds: float = 0.0
     runtime_contexts: dict[str, Any] = field(default_factory=dict)
@@ -73,9 +73,6 @@ class AgentLoopState:
 
     def mark_current_step(self, step_id: str) -> None:
         self.current_step_id = step_id
-
-    def set_plan_items(self, items: list[dict]) -> None:
-        self.plan_items = {str(item.get("id")): dict(item) for item in items if item.get("id")}
 
     def clear_current_step(self) -> None:
         self.current_step_id = None
@@ -117,6 +114,24 @@ class AgentLoopState:
     def should_summarize_no_progress_search(self) -> bool:
         return self.consecutive_no_progress_search_results >= NO_PROGRESS_SEARCH_SUMMARY_THRESHOLD
 
+    def ready_for_plan_synthesis(self) -> bool:
+        """产品结果与待修参数必须先走既有确定性门禁，不能被普通综合截走。"""
+
+        research_evidence_ready = (
+            not self.research_network_required
+            or (
+                self.research_workset.successful_searches >= 1
+                and len(self.research_workset.successful_read_urls) >= 2
+            )
+        )
+        return (
+            self.plan_coordinator.execution_items_terminal()
+            and research_evidence_ready
+            and not has_product_result_blocks(self.content_blocks)
+            and not self.product_tool_attempted
+            and not self.pending_tool_repairs
+        )
+
     def update_usage(self, usage: Usage) -> None:
         self.accumulated_usage = usage
 
@@ -137,11 +152,6 @@ class AgentLoopState:
         summaries: dict[str, tuple[str, list[str]]] | None = None,
         allow_read_success: bool = True,
     ) -> None:
-        if any(
-            (block.get("type") if isinstance(block, dict) else getattr(block, "type", None)) in {"search", "url_read"}
-            for block in content_blocks
-        ):
-            self.research_network_required = True
         self.research_workset.record_content_blocks(
             content_blocks,
             summaries=summaries,

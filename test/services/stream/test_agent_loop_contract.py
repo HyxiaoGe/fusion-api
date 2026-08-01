@@ -1063,38 +1063,12 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             capabilities={"functionCalling": True, "deepThinking": True},
         )
 
-        self.assertEqual(
-            result.event_types,
-            [
-                "run_started",
-                "step_started",
-                "context_status_updated",
-                "context_status_updated",
-                "plan_snapshot",
-                "plan_step_updated",
-                "plan_step_updated",
-                "run_progress_updated",
-                "tool_call_started",
-                "tool_call_completed",
-                "tool_result_digest",
-                "evidence_item_upserted",
-                "evidence_item_upserted",
-                "step_completed",
-                "plan_step_updated",
-                "plan_step_updated",
-                "run_progress_updated",
-                "step_started",
-                "plan_step_updated",
-                "plan_step_updated",
-                "run_progress_updated",
-                "context_status_updated",
-                "context_status_updated",
-                "step_completed",
-                "plan_step_updated",
-                "run_progress_updated",
-                "run_completed",
-            ],
-        )
+        self.assertEqual(result.event_types[0], "run_started")
+        self.assertEqual(result.event_types[-1], "run_completed")
+        self.assertFalse(any(event_type in {"plan_snapshot", "plan_step_updated"} for event_type in result.event_types))
+        self.assertLess(result.event_types.index("tool_call_started"), result.event_types.index("tool_call_completed"))
+        self.assertLess(result.event_types.index("tool_call_completed"), result.event_types.index("tool_result_digest"))
+        self.assertLess(result.event_types.index("tool_result_digest"), result.event_types.index("step_completed"))
         context_events = [event for event in result.events if event["type"] == "context_status_updated"]
         self.assertEqual(
             [(event["phase"], event["round_index"], event["message_id"]) for event in context_events],
@@ -1105,22 +1079,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 ("final", 2, "msg-contract"),
             ],
         )
-        self.assertEqual(
-            [
-                (event["revision"], event["item"]["id"], event["item"]["status"])
-                for event in result.events
-                if event["type"] == "plan_step_updated"
-            ],
-            [
-                (3, "understand", "completed"),
-                (4, "search", "running"),
-                (5, "search", "completed"),
-                (6, "read", "running"),
-                (12, "read", "completed"),
-                (13, "answer", "running"),
-                (19, "answer", "completed"),
-            ],
-        )
+        self.assertFalse(any(event["type"] == "plan_step_updated" for event in result.events))
         self.assertEqual(
             [
                 (
@@ -1134,10 +1093,8 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 if event["type"] == "run_progress_updated"
             ],
             [
-                ("researching", "正在查找资料", 1, 0, 20),
-                ("reading", "正在读取关键来源", 2, 1, 20),
-                ("synthesizing", "正在整理回答", 3, 1, 20),
-                ("answering", "已完成回答整理", 4, 1, 20),
+                ("researching", "正在调用外部工具", None, 0, 20),
+                ("researching", "已完成外部工具调用", None, 1, 20),
             ],
         )
         self.assertEqual([event["sequence"] for event in result.events], list(range(len(result.events))))
@@ -1148,7 +1105,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.tool_execute_calls[0]["step_number"], 1)
         self.assertEqual(result.persist_calls[-1]["partial"], False)
 
-    async def test_multi_tool_round_plan_returns_from_answer_to_reading_for_url_read(self):
+    async def test_new_multi_tool_run_never_publishes_legacy_observed_plan(self):
         search_call = {"id": "tc-search", "name": "web_search", "arguments": '{"query":"OpenAI"}'}
         url_read_call = {
             "id": "tc-read",
@@ -1182,57 +1139,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             capabilities={"functionCalling": True, "deepThinking": True},
         )
 
-        plan_updates = [
-            (
-                event["revision"],
-                event["item"]["id"],
-                event["item"]["title"],
-                event["item"]["status"],
-                event["item"].get("summary"),
-                event["item"].get("tool_names", []),
-            )
-            for event in result.events
-            if event["type"] == "plan_step_updated"
-        ]
-        self.assertEqual(
-            plan_updates,
-            [
-                (3, "understand", "理解问题", "completed", "已完成问题理解", []),
-                (4, "search", "搜索：OpenAI", "running", "正在搜索：OpenAI", ["web_search"]),
-                (5, "search", "搜索：OpenAI", "completed", "完成 1 个工具调用", ["web_search"]),
-                (6, "read", "读取关键来源", "running", "正在整理关键来源", []),
-                (12, "read", "读取关键来源", "completed", "已完成关键来源读取", []),
-                (13, "answer", "整理回答", "running", "基于可用依据给出结论、推荐和不确定性", []),
-                (14, "answer", "整理回答", "pending", "基于可用依据给出结论、推荐和不确定性", []),
-                (15, "read", "读取关键来源", "running", "正在读取 1 个关键来源", ["url_read"]),
-                (16, "read", "读取关键来源", "completed", "已完成关键来源读取", ["url_read"]),
-                (22, "read", "读取关键来源", "completed", "已完成关键来源读取", []),
-                (23, "answer", "整理回答", "running", "基于可用依据给出结论、推荐和不确定性", []),
-                (29, "answer", "整理回答", "completed", "已完成回答整理", []),
-            ],
-        )
-        self.assertEqual(
-            [
-                (
-                    event["phase"],
-                    event["label"],
-                    event["completed_steps"],
-                    event["completed_tool_calls"],
-                    event["max_tool_calls"],
-                )
-                for event in result.events
-                if event["type"] == "run_progress_updated"
-            ],
-            [
-                ("researching", "正在查找资料", 1, 0, 20),
-                ("reading", "正在读取关键来源", 2, 1, 20),
-                ("synthesizing", "正在整理回答", 3, 1, 20),
-                ("reading", "正在读取关键来源", 2, 1, 20),
-                ("reading", "已完成关键来源读取", 2, 2, 20),
-                ("synthesizing", "正在整理回答", 3, 2, 20),
-                ("answering", "已完成回答整理", 4, 2, 20),
-            ],
-        )
+        self.assertFalse(any(event["type"] in {"plan_snapshot", "plan_step_updated"} for event in result.events))
         self.assertEqual([call["step_number"] for call in result.tool_execute_calls], [1, 2])
         self.assertEqual([call["args"][0][0]["name"] for call in result.tool_execute_calls], ["web_search", "url_read"])
 

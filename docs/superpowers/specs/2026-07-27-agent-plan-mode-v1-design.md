@@ -11,7 +11,7 @@ snapshot 持久化到 `agent_progress_snapshots`。当前计划由工具生命�
 本阶段在现有 Agent loop 内增加通用计划控制能力，不新增独立 Planner 请求，
 不解析 reasoning 文本，也不先引入 DAG 调度器。模型通过内部控制工具
 `update_plan` 提交或修订计划，PlanCoordinator 负责验证、revision、状态迁移
-和事件发送。
+和事件发送。新 run 不再生成工具生命周期推断的 observed 计划。
 
 ## 目标
 
@@ -19,7 +19,7 @@ snapshot 持久化到 `agent_progress_snapshots`。当前计划由工具生命�
 - 复杂任务可在首次外部工具调用前产生语义计划。
 - 计划修订、工具执行、断线重连和历史刷新使用同一个计划状态。
 - 控制工具不计入外部工具额度，计划修订使用独立的小额度。
-- 已有 observed 计划和旧客户端保持兼容。
+- 新 run 只允许 PlanCoordinator 产生计划状态；历史 observed 快照只由读取端展示。
 - 计划内容只包含安全的任务摘要，不持久化 reasoning、原始工具参数或结果。
 
 ## 非目标
@@ -39,7 +39,7 @@ snapshot 持久化到 `agent_progress_snapshots`。当前计划由工具生命�
 - `on`：首次外部工具调用前必须存在有效的 model plan。没有计划时，外部工具
   不解锁；模型直接回答、返回空工具调用或协议异常时同样进入有界结构修复。
   外部工具必须显式提交所属计划项 ID，不能依赖服务端猜测。
-- `off`：不向模型提供 `update_plan`，保留当前 observed plan 行为。
+- `off`：不向模型提供 `update_plan`，新 run 不产生计划。
 
 前端提供计划模式开关，默认使用 `auto`，用户可显式开启 `on`。模型不支持
 function calling 时，前端和后端都会把请求安全降级为 `off`，不会展示一个实际
@@ -53,7 +53,7 @@ function calling 时，前端和后端都会把请求安全降级为 `off`，不
 
 `plan_snapshot` 增加：
 
-- `source`: `observed | model`
+- `source`: `model`（新 run 的系统研究兜底也进入同一权威来源）
 - `mode`: `auto | on | off`
 - `reason`: 服务端生成的安全状态原因，如 `model_update`、`tool_progress`、
   `terminal_stop`。
@@ -66,10 +66,14 @@ function calling 时，前端和后端都会把请求安全降级为 `off`，不
 - `planned_tools`: 模型计划使用的公开工具别名数组。
 
 控制工具对模型采用 `explanation + plan[]` 结构；每个计划项必须提交 `id`、
-`step`、非终态 `status`（`pending | in_progress`）和 `planned_tools`，可选提交
-`kind` 与 `depends_on`。服务端
-归一化为内部 `reason + items[]` 状态。`id` 接受数字、字母、下划线和连字符，
-必须在同一 plan 内稳定。模型修订标题或状态时不得无故更换 ID。
+`step` 和 `planned_tools`，可选提交兼容字段 `status`、`kind` 与 `depends_on`。
+模型提交的 `status` 不参与权威状态推进：既有项始终保留服务端状态，新增项一律
+初始化为 `pending`。每个执行项的 `planned_tools` 最多包含一个工具别名；
+每个执行项表示一个独立工具任务，同一批次的不同调用必须拆成独立步骤。若同一
+任务被服务端标记为 `retryable/running`，允许在后续模型轮次继续绑定原执行项，
+直到取得终态或触发现有重试上限；不新增 repeatable 计数器。服务端归一化为
+内部 `reason + items[]` 状态。`id` 接受数字、字母、下划线和连字符，必须在
+同一 plan 内稳定。
 时间戳、可选步骤和结果摘要留到计划交互阶段再扩展，v1 不提前增加未消费字段。
 
 ### 工具关联
@@ -101,58 +105,86 @@ function calling 时，前端和后端都会把请求安全降级为 `off`，不
 
 PlanCoordinator 校验：
 
-- 计划项数量 2 到 12。
+- 计划项数量 2 到 6。
 - ID、标题、状态、依赖和 planned tools 均使用白名单与长度上限。
+- 每个带 `planned_tools` 的执行项只允许一个工具别名；多工具执行项在计划更新
+  阶段拒绝并进入既有模型修复流程。
 - 依赖只能引用同一快照内 ID，拒绝自依赖和环。
-- 同一时刻最多一个 `running` 项。
-- `completed/failed/skipped/blocked` 不得在模型修订中无依据回退为
-  `pending`。
+- 模型修订不能改变任何既有项的 `pending/running/terminal` 状态，也不能把
+  新增项声明为 `running` 或终态；运行态只由服务端工具开始和综合门禁推进，
+  终态只由真实工具结果或 run 收口推进。
 - 已尝试或终态项的标题、类型、依赖和预计工具由服务端锁定；模型后续修订出现
-  轻微回声漂移时保留服务端 canonical 元数据，只接受安全状态更新。删除既有
+  轻微回声漂移时保留服务端 canonical 元数据与全部状态。删除既有
   执行项或破坏稳定 ID 仍拒绝，并返回当前 canonical 计划帮助模型修复。
 - revision 由服务端生成，忽略模型提交的 revision。
+- 深度研究初始计划必须包含一个 `web_search` 执行项和两个独立的
+  `url_read` 执行项；每个读取来源使用自己的计划项，两个读取项均可依赖搜索
+  项，最终回答同时依赖两个读取项。不得依靠重复调用同一个读取项表示多来源
+  核验。连续计划修复失败时，系统研究兜底使用同样的四项结构。
 
 ## 执行状态
 
-PlanCoordinator 是 model plan 的 revision 和状态唯一所有者：
+PlanCoordinator 是新 run 计划 revision 和状态的唯一所有者：
 
 1. 有效 `update_plan` 生成全量 `plan_snapshot`。
    有效计划必须至少包含一个 `answer` 或 `synthesis` 阶段；缺少回答阶段的
    计划进入既有修复流程，不能成为可执行 canonical plan。
-2. 外部工具开始时，以显式或安全映射的 `plan_item_id` 把对应项推进到
-   `running`。
-3. 工具结束按同一计划项记录服务端执行证据，但在模型仍可能继续调用工具时，
-   计划项保持 `running`；复用的成功结果同样计入。被公告门禁、额度或上下文
-   门禁拦截的调用不能先标 `running`。
-4. 首个真实可见回答 chunk 写入前，Agent loop 必须先通知 PlanCoordinator：
-   - 流式正文只进入可逆 preview：当前非终态项退回 `pending`，最终
-     `answer/synthesis` 项进入 `running`；若同一轮随后出现工具调用，
-     preview 必须撤回并恢复对应工具项，且全量计划最多一个 `running`。
-   - 已确定不再调用工具的 deferred、确定性回答和 limit summary 进入 commit：
-     成功工具项按服务端证据进入 `completed`，失败或尝试未成功项进入
-     `blocked`，最终 `answer/synthesis` 项进入 `running`。
-   - preview 不能删除或改写成功、失败和尝试证据；前端不得通过正文、定时器或
-     工具事件猜测计划阶段。
-   - 回答阶段的权威 `plan_snapshot` 必须取得 Redis 写入确认；单次瞬时失败
-     可在既有连续失败阈值内对同一 revision 做有界重试，仍未确认时必须在
-     正文前终止本次生成，不能让后续回答事件越过丢失的阶段快照。
-5. run 正常完成前，仍为 `running` 的项必须由服务端终态化：
+2. 工具绑定与开始统一由 PlanCoordinator 按依赖推进：
+   - 工具项只有全部依赖均为 `completed` 时才可绑定。
+   - 尚未完成的工具依赖会阻止后序执行；`failed/blocked/skipped` 依赖会让
+     后续真实执行项和普通中间里程碑递归进入 `blocked`。最终
+     `answer/synthesis` 阶段保持 `pending`，待所有执行项终态后由
+     `begin_synthesis` 推进为 `running`，从而与真实最终回答保持同步。
+   - 仅有无工具 `reasoning/other` 前置仍为 `pending` 时，可在真实后续工具
+     启动的同一 revision 自动把这些前置推进为 `completed`。
+   - 已存在 `running` 项时只能继续该项，其他项不可绑定；初始同批包含多个
+     独立执行项时最多将首项推进为 `running`，其余保持 `pending` 并由真实批次
+     结果直接进入终态，任何 `running` 或终态都不得退回 `pending`。
+3. 工具批次结束后立即按服务端实际结果推进计划项终态：
+   - 成功或可接受降级进入 `completed`。
+   - 失败或结果记录缺失进入 `failed`。
+   - 被公告、额度、上下文或执行门禁拦截进入 `blocked`。
+   - 同一计划项在同批次被不同调用重复绑定时，后续调用不执行并进入结构修复；
+     多个独立工具任务必须分别绑定独立计划项。
+   - 服务端标记为 `retryable/running` 的同一任务可在后续轮次继续绑定原计划
+     项并执行有界重试；这不代表该计划项可以承载另一个独立调用，也不改变既有
+     参数修复和重试额度。
+4. Plan Mode 的每个模型回合都先缓存在服务端，finish reason 分类前不写用户
+   正文。`tool_calls` 回合的过程正文直接丢弃，不再使用“先展示再撤回”的
+   preview 状态。
+5. 所有带 `planned_tools` 的执行项进入终态后，Agent loop 不再开放工具：
+   - 若存在产品结果块、产品工具已尝试或待修参数，先继续既有产品校验、确定性
+     回答或修参路径，不得被普通 `plan_synthesis` 截走。
+   - PlanCoordinator 单向进入 `synthesis_started`，将最终
+     `answer/synthesis` 项推进为唯一 `running`。
+   - 使用显式无工具 `plan_synthesis` 请求基于已有工具结果与证据生成最终答复。
+   - `plan_synthesis` 完整响应继续缓存在服务端；只有 finish reason、夹带工具
+     协议与事实门禁全部通过后才写入 Redis 回答流。空响应、超时或协议重试失败
+     必须写入安全 fallback，不得出现 completed run 与空回答。
+   - `plan_synthesis` 只接受 `content` 作为最终答复；`reasoning` 始终属于内部
+     过程，既不能写入用户正文，也不能持久化为 ThinkingBlock。只有 reasoning
+     而没有 content 时按空答处理，写安全 fallback 并标记 incomplete。
+   - 进入 synthesis 后不得回到工具执行或接受新的计划修订。
+   - 回答阶段的权威 `plan_snapshot` 必须取得 Redis 写入确认；仍未确认时必须
+     在正文前终止生成。
+6. run 正常完成前，仍为 `running` 的项必须由服务端终态化：
    - 有成功工具证据且没有尚未修复失败的工具项进入 `completed`。
    - 只有失败证据的工具项进入 `blocked`。
    - 已形成最终回答时，模型计划中无 `planned_tools` 的 `other` 里程碑视为
      已由本轮综合覆盖并进入 `completed`；带工具步骤仍只认服务端执行证据。
    - 即使 run 因限制或计划修复耗尽进入 `incomplete`，已有成功工具证据仍
-     保持 `completed`；已经生成最终正文时，回答、整理和推理步骤可完成。
+     保持 `completed`；只有通过当前回答门禁的真实最终正文，才可让回答、整理
+     和推理步骤完成。`unknown_terminated` 时写入的安全 fallback 仅用于用户
+     提示，不构成最终回答证据，未完成的 `answer/synthesis` 必须进入
+     `blocked`。
    - model plan 保留后端最终状态，不由前端推断。
    - 回答、整理和推理步骤可随正常回答完成。
    - 未执行的搜索、读取和工具步骤变为 `skipped`，仍在修复中的步骤变为
      `blocked`。
-5. 失败时运行项变为 `failed`；取消或被取代时未完成项变为 `skipped`；
+7. 失败时运行项变为 `failed`；取消或被取代时未完成项变为 `skipped`；
    触顶和不完整终态的未完成项变为 `blocked`。已有 terminal 状态不得被终态
-   收口覆盖。
-
-旧 observed plan 继续走现有工具生命周期逻辑，`source=observed`；它的固定
-revision 规则只作为兼容路径，不能用于 model plan。
+   收口覆盖，也不得回退为 `pending/running`。同一个 run 只允许单向终态
+   snapshot；后续异常收尾不能复活执行项。
 
 ## 持久化与性能
 
@@ -168,7 +200,7 @@ revision 规则只作为兼容路径，不能用于 model plan。
 
 - 按 `run_id + sequence` 防重放，按 `plan_id + revision` 防计划倒退。
 - `source=model` 的终态完全信任服务端，不执行 `kind=other` 自动完成推断。
-- `source=observed` 保留旧兼容归一化。
+- 历史 `source=observed` 只在 hydration 时保留展示兼容，新 run 不再产生。
 - live、Redis replay 和历史 hydration 使用同一个 `AgentPlanState`。
 - 成功完成的 model plan 仍应可见；不能被 `ExecutionProcess` 直接替换。
 - 计划面板使用环形进度总览，hover / focus 可查看步骤、依赖和状态；窄屏和
@@ -214,8 +246,11 @@ revision 规则只作为兼容路径，不能用于 model plan。
 | SSE 重放乱序/重复 | UI 与数据库快照保持最新 revision |
 | 刷新历史 | model plan、状态和关联信息恢复一致 |
 | 用户取消/请求被取代 | 运行中计划项不会显示为 completed |
-| 首个回答正文出现 | 回答事件之前已收到 `answer/synthesis=running` 的计划快照 |
-| 正文后又出现工具调用 | 回答 preview 可撤回，工具项恢复为唯一 `running` |
+| 工具回合含过程正文 | finish reason 分类前不释放，用户始终看不到过程正文 |
+| 所有执行项终态 | 先收到 `answer/synthesis=running` 快照，再进入无工具综合 |
+| 已进入综合后模型输出工具协议 | 不执行工具，执行一次无工具修正或安全收口 |
+| 综合为空、超时或仅有 reasoning | 写安全 fallback 并标 incomplete，回答计划项为 blocked |
+| 深度研究首个读取完成 | 第二个独立 url_read 计划项仍可绑定，不复用首个读取项 |
 | 正常完成 | 必需计划项状态可信，成功页面仍展示计划 |
 | 豆包、Kimi、DeepSeek | 不泄漏内部控制协议；数字 ID 和结构异常可恢复 |
 | 通用研究任务 | 不依赖行程专用字段 |

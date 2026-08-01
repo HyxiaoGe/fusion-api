@@ -250,7 +250,7 @@ def _safe_structured_error_code(error: Exception) -> str:
 
 
 async def _emit_terminal_plan(context: AgentLoopRunCompletionContext, outcome: str) -> None:
-    has_final_answer = any(
+    has_final_answer = not context.state.unknown_terminated and any(
         (block.get("type") if isinstance(block, dict) else getattr(block, "type", None)) == "text"
         and bool(str(block.get("text", "") if isinstance(block, dict) else getattr(block, "text", "")).strip())
         for block in context.state.content_blocks

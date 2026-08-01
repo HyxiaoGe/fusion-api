@@ -15,6 +15,7 @@ from app.services.stream.agent_loop_run_completion import (
 )
 from app.services.stream.agent_loop_state import AgentLoopState
 from app.services.stream.itinerary_observability import ItineraryToolObservation
+from app.services.stream.limit_summary import SUMMARY_PROTOCOL_FALLBACK_TEXT
 
 
 def _context(state: AgentLoopState | None = None) -> AgentLoopRunCompletionContext:
@@ -34,6 +35,88 @@ def _context(state: AgentLoopState | None = None) -> AgentLoopRunCompletionConte
 
 
 class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_every_run_terminal_emits_closed_model_plan_before_run_terminal_event(self):
+        for terminal_kind in ("completed", "superseded", "cancelled", "failed"):
+            with self.subTest(terminal_kind=terminal_kind):
+                state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id=f"run-{terminal_kind}", mode="on"))
+                self.assertTrue(
+                    state.plan_coordinator.apply_model_update(
+                        {
+                            "reason": "先搜索再回答",
+                            "items": [
+                                {
+                                    "id": "search",
+                                    "title": "搜索资料",
+                                    "status": "running",
+                                    "kind": "search",
+                                    "depends_on": [],
+                                    "planned_tools": ["web_search"],
+                                },
+                                {
+                                    "id": "answer",
+                                    "title": "整理回答",
+                                    "status": "pending",
+                                    "kind": "answer",
+                                    "depends_on": ["search"],
+                                    "planned_tools": [],
+                                },
+                            ],
+                        }
+                    ).accepted
+                )
+                events: list[tuple[str, dict]] = []
+                emitter = AsyncMock()
+
+                async def record_plan(**snapshot):
+                    events.append(("plan_snapshot", snapshot))
+
+                async def record_run_terminal(**payload):
+                    events.append(("run_terminal", payload))
+
+                emitter.plan_snapshot.side_effect = record_plan
+                run_terminal = AsyncMock(side_effect=record_run_terminal)
+                context = replace(_context(state), emitter=emitter)
+                common = {
+                    "context": context,
+                    "persist_message_fn": lambda *_args: None,
+                    "finalize_stream_fn": AsyncMock(),
+                }
+
+                if terminal_kind == "completed":
+                    await finalize_completed_run(
+                        **common,
+                        terminal_state=SimpleNamespace(
+                            session_status="completed",
+                            run_finish_reason="stop",
+                        ),
+                        complete_agent_run_fn=run_terminal,
+                    )
+                elif terminal_kind == "superseded":
+                    await finalize_superseded_run(
+                        **common,
+                        error_msg=None,
+                        interrupt_agent_run_fn=run_terminal,
+                    )
+                elif terminal_kind == "cancelled":
+                    await finalize_cancelled_run(
+                        **common,
+                        interrupt_agent_run_fn=run_terminal,
+                        warning_fn=lambda _message: None,
+                    )
+                else:
+                    await finalize_failed_run(
+                        **common,
+                        error=RuntimeError("upstream failed"),
+                        fail_agent_run_fn=run_terminal,
+                        warning_fn=lambda _message: None,
+                    )
+
+                self.assertEqual([event[0] for event in events], ["plan_snapshot", "run_terminal"])
+                self.assertNotIn(
+                    "running",
+                    [item["status"] for item in events[0][1]["items"]],
+                )
+
     async def test_finalize_cancelled_continues_session_interrupt_after_terminal_plan_ownership_lost(self):
         from app.services.stream_state_service import StreamOwnershipLostError
 
@@ -349,6 +432,123 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
         snapshot = emitter.plan_snapshot.await_args.kwargs
         self.assertEqual([item["status"] for item in snapshot["items"]], ["blocked", "blocked"])
 
+    async def test_incomplete_plan_synthesis_never_completes_answer_from_fallback_text(self):
+        for case, content_blocks in (
+            (
+                "safe_fallback",
+                [TextBlock(type="text", id="txt-fallback", text=SUMMARY_PROTOCOL_FALLBACK_TEXT)],
+            ),
+            ("empty_answer", []),
+            (
+                "timeout_fallback",
+                [TextBlock(type="text", id="txt-timeout", text=SUMMARY_PROTOCOL_FALLBACK_TEXT)],
+            ),
+        ):
+            with self.subTest(case=case):
+                state = AgentLoopState(
+                    plan_coordinator=PlanCoordinator(run_id=f"run-{case}", mode="on"),
+                    content_blocks=list(content_blocks),
+                )
+                self.assertTrue(
+                    state.plan_coordinator.apply_model_update(
+                        {
+                            "reason": "先搜索再综合",
+                            "items": [
+                                {
+                                    "id": "search",
+                                    "title": "搜索资料",
+                                    "status": "pending",
+                                    "kind": "search",
+                                    "depends_on": [],
+                                    "planned_tools": ["web_search"],
+                                },
+                                {
+                                    "id": "answer",
+                                    "title": "整理回答",
+                                    "status": "pending",
+                                    "kind": "answer",
+                                    "depends_on": ["search"],
+                                    "planned_tools": [],
+                                },
+                            ],
+                        }
+                    ).accepted
+                )
+                state.plan_coordinator.mark_tools_started(["search"])
+                state.plan_coordinator.mark_tool_results({"search": "completed"})
+                state.plan_coordinator.begin_synthesis()
+                state.mark_unknown_terminated()
+                emitter = AsyncMock()
+
+                await finalize_completed_run(
+                    context=replace(_context(state), emitter=emitter),
+                    terminal_state=SimpleNamespace(
+                        session_status="incomplete",
+                        run_finish_reason="incomplete",
+                    ),
+                    persist_message_fn=lambda *_args: None,
+                    complete_agent_run_fn=AsyncMock(),
+                    finalize_stream_fn=AsyncMock(),
+                )
+
+                snapshot = emitter.plan_snapshot.await_args.kwargs
+                self.assertEqual(
+                    {item["id"]: item["status"] for item in snapshot["items"]},
+                    {"search": "completed", "answer": "blocked"},
+                )
+
+    async def test_valid_plan_synthesis_still_completes_answer(self):
+        state = AgentLoopState(
+            plan_coordinator=PlanCoordinator(run_id="run-valid-synthesis", mode="on"),
+            content_blocks=[TextBlock(type="text", id="txt-valid", text="有效综合回答")],
+        )
+        self.assertTrue(
+            state.plan_coordinator.apply_model_update(
+                {
+                    "reason": "先搜索再综合",
+                    "items": [
+                        {
+                            "id": "search",
+                            "title": "搜索资料",
+                            "status": "pending",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理回答",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["search"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        state.plan_coordinator.mark_tools_started(["search"])
+        state.plan_coordinator.mark_tool_results({"search": "completed"})
+        state.plan_coordinator.begin_synthesis()
+        emitter = AsyncMock()
+
+        await finalize_completed_run(
+            context=replace(_context(state), emitter=emitter),
+            terminal_state=SimpleNamespace(
+                session_status="completed",
+                run_finish_reason="stop",
+            ),
+            persist_message_fn=lambda *_args: None,
+            complete_agent_run_fn=AsyncMock(),
+            finalize_stream_fn=AsyncMock(),
+        )
+
+        snapshot = emitter.plan_snapshot.await_args.kwargs
+        self.assertEqual(
+            {item["id"]: item["status"] for item in snapshot["items"]},
+            {"search": "completed", "answer": "completed"},
+        )
+
     async def test_plan_repair_exhausted_preserves_successful_tools_and_completed_final_answer(self):
         state = AgentLoopState()
         state.content_blocks.append(TextBlock(type="text", id="txt-final", text="基于已取得资料的最终回答"))
@@ -402,7 +602,7 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
             {item["id"]: item["status"] for item in snapshot["items"]},
             {
                 "search-success": "completed",
-                "search-failed": "blocked",
+                "search-failed": "failed",
                 "answer": "completed",
             },
         )

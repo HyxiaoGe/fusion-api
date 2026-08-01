@@ -39,6 +39,22 @@ _INTERNAL_TOOL_NAME_RE = re.compile(
 _PLAN_CONTROL_FIELD_RE = re.compile(
     rf"(?<![A-Za-z0-9_])(?:{'|'.join(re.escape(name) for name in _PLAN_CONTROL_FIELD_NAMES)})(?![A-Za-z0-9_])"
 )
+_INTERNAL_REASONING_CONTROL_MARKERS = (
+    "according to the autonomous web search rules",
+    "according to the rules",
+    "autonomous web search rules",
+    "this is a knowledge/opinion/analysis question",
+    "there's a mandatory plan mode rule",
+    "mandatory plan mode",
+    "forced planning mode",
+    'the user message also says "please select a tool to handle the current issue',
+    "根据自主联网判断规则",
+    "不应调用联网搜索的情况",
+    "强制计划模式",
+    "强制计划模式的要求",
+    "本轮启用了强制计划模式",
+    "回答或调用任何外部工具前，必须先创建执行计划",
+)
 
 
 def _pending_mcp_alias_start(text: str) -> int | None:
@@ -95,6 +111,79 @@ def _pending_tool_visible_start(text: str, tool_start: int) -> int:
 
 def _replace_internal_tool_name(match: re.Match[str]) -> str:
     return _INTERNAL_TOOL_LABELS[match.group(0)]
+
+
+def _reasoning_control_marker_match(text: str) -> tuple[int, int] | None:
+    lowered = text.lower()
+    matches = [
+        (index, index + len(marker))
+        for marker in _INTERNAL_REASONING_CONTROL_MARKERS
+        if (index := lowered.find(marker.lower())) >= 0
+    ]
+    return min(matches, default=None)
+
+
+def _paragraph_start(text: str, index: int) -> int:
+    separator = text.rfind("\n\n", 0, index)
+    return 0 if separator < 0 else separator + 2
+
+
+def _pending_reasoning_control_marker_start(text: str) -> int | None:
+    lowered = text.lower()
+    pending_starts: list[int] = []
+    for marker in _INTERNAL_REASONING_CONTROL_MARKERS:
+        lowered_marker = marker.lower()
+        max_prefix_length = min(len(lowered), len(lowered_marker) - 1)
+        for prefix_length in range(max_prefix_length, 3, -1):
+            if lowered.endswith(lowered_marker[:prefix_length]):
+                pending_starts.append(len(text) - prefix_length)
+                break
+    return min(pending_starts, default=None)
+
+
+def strip_internal_reasoning_control_text(
+    text: str,
+    *,
+    final: bool = False,
+    buffer_trailing_paragraph: bool = False,
+) -> str:
+    """移除模型复述的内部搜索/计划控制段，并处理跨 chunk 的半截标记。"""
+
+    sanitized = text
+    while (match := _reasoning_control_marker_match(sanitized)) is not None:
+        marker_start, marker_end = match
+        paragraph_start = _paragraph_start(sanitized, marker_start)
+        next_separator = sanitized.find("\n\n", marker_end)
+        paragraph_end = len(sanitized) if next_separator < 0 else next_separator + 2
+        sanitized = f"{sanitized[:paragraph_start]}{sanitized[paragraph_end:]}"
+
+    pending_start = _pending_reasoning_control_marker_start(sanitized)
+    if pending_start is not None:
+        if final or buffer_trailing_paragraph:
+            pending_start = _paragraph_start(sanitized, pending_start)
+        return sanitized[:pending_start]
+    if final:
+        return sanitized
+    if buffer_trailing_paragraph:
+        trailing_paragraph_start = _paragraph_start(sanitized, len(sanitized))
+        return sanitized[:trailing_paragraph_start]
+    return sanitized
+
+
+def sanitize_user_visible_reasoning(
+    text: str,
+    *,
+    final: bool = False,
+    buffer_trailing_paragraph: bool = False,
+) -> str:
+    """生成可持久化、可流式追加的用户可见推理副本。"""
+
+    visible_reasoning = strip_internal_reasoning_control_text(
+        text,
+        final=final,
+        buffer_trailing_paragraph=buffer_trailing_paragraph,
+    )
+    return sanitize_internal_tool_names(visible_reasoning, final=final)
 
 
 def _normalize_tool_label_spacing(text: str) -> str:

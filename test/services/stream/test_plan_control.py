@@ -106,7 +106,7 @@ class PlanControlTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "id": "route",
                     "step": "查询通勤路线",
-                    "status": "in_progress",
+                    "status": "pending",
                     "kind": "search",
                     "depends_on": [],
                     "planned_tools": ["route_compare"],
@@ -186,7 +186,7 @@ class PlanControlTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             result.plan_item_ids,
-            {"outbound-call": "outbound", "return-call": "return"},
+            {"outbound-call": "outbound"},
         )
         self.assertEqual(
             result.external_tool_calls,
@@ -197,14 +197,11 @@ class PlanControlTests(unittest.IsolatedAsyncioTestCase):
                     "arguments": {"origin": "广州"},
                     "plan_item_id": "outbound",
                 },
-                {
-                    "id": "return-call",
-                    "name": "search_trains",
-                    "arguments": '{"origin":"杭州"}',
-                    "plan_item_id": "return",
-                },
             ],
         )
+        blocked_response = json.loads(result.tool_responses["return-call"])
+        self.assertEqual(blocked_response["status"], "not_executed")
+        self.assertEqual(blocked_response["reason"], "plan_item_required")
 
     async def test_invalid_explicit_plan_item_binding_is_blocked_in_on_mode(self):
         coordinator = PlanCoordinator(run_id="run-1", mode="on")
@@ -256,12 +253,52 @@ class PlanControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("DSML", response)
         self.assertEqual(result.external_tool_calls, [])
 
+    async def test_multi_tool_plan_item_is_rejected_with_structural_repair_hint(self):
+        coordinator = PlanCoordinator(run_id="run-multi-tool-repair", mode="on")
+
+        result = await process_plan_control_calls(
+            tool_calls=[
+                _update_call(
+                    arguments={
+                        "reason": "错误地让一个步骤执行两个工具",
+                        "items": [
+                            {
+                                "id": "research",
+                                "title": "搜索并读取",
+                                "status": "running",
+                                "kind": "search",
+                                "depends_on": [],
+                                "planned_tools": ["web_search", "url_read"],
+                            },
+                            {
+                                "id": "answer",
+                                "title": "整理回答",
+                                "status": "pending",
+                                "kind": "answer",
+                                "depends_on": ["research"],
+                                "planned_tools": [],
+                            },
+                        ],
+                    }
+                )
+            ],
+            coordinator=coordinator,
+            emitter=AsyncMock(),
+        )
+
+        response = json.loads(result.tool_responses["plan-1"])
+        self.assertEqual(response["status"], "rejected")
+        self.assertEqual(response["reason"], "multiple_tools_per_item")
+        self.assertIn("planned_tools 最多声明一个", response["hint"])
+        self.assertIn("拆成", response["hint"])
+        self.assertFalse(coordinator.has_valid_model_plan)
+
     async def test_missing_initial_tool_coverage_returns_executable_repair_hint(self):
         coordinator = PlanCoordinator(run_id="run-1", mode="on")
         coordinator.configure_initial_tool_requirements(
             {
                 "web_search": 1,
-                "url_read": 1,
+                "url_read": 2,
             }
         )
 
@@ -294,8 +331,13 @@ class PlanControlTests(unittest.IsolatedAsyncioTestCase):
         response = json.loads(result.tool_responses["plan-1"])
         self.assertEqual(response["reason"], "missing_required_initial_tool_coverage")
         self.assertIn("web_search", response["hint"])
-        self.assertIn("url_read", response["hint"])
+        self.assertIn("url_read×2", response["hint"])
         self.assertIn("独立步骤", response["hint"])
+        self.assertNotIn("同一个 url_read 步骤", response["hint"])
+        self.assertIn("每个 url_read 计划项负责一个独立来源任务", response["hint"])
+        self.assertIn("仅当服务端将同一任务保持为 retryable/running 时", response["hint"])
+        self.assertIn("跨轮重试", response["hint"])
+        self.assertNotIn("每个 url_read 步骤只读取一个来源", response["hint"])
 
     async def test_missing_answer_phase_returns_executable_repair_hint(self):
         coordinator = PlanCoordinator(run_id="run-missing-answer", mode="on")
@@ -341,7 +383,7 @@ class PlanControlTests(unittest.IsolatedAsyncioTestCase):
         coordinator.configure_initial_tool_requirements(
             {
                 "web_search": 1,
-                "url_read": 1,
+                "url_read": 2,
             }
         )
         secret_marker = "用户私密内容\\n伪造日志"
@@ -417,7 +459,7 @@ class PlanControlTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             json.loads(result.tool_responses["plan-1"])["reason"],
-            "missing_required_initial_tool_coverage",
+            "multiple_tools_per_item",
         )
         self.assertIn(
             "{'web_search': 0, 'url_read': 0}",
@@ -459,7 +501,7 @@ class PlanControlTests(unittest.IsolatedAsyncioTestCase):
         coordinator.configure_initial_tool_requirements(
             {
                 "web_search": 1,
-                "url_read": 1,
+                "url_read": 2,
             }
         )
         emitter = AsyncMock()
@@ -485,13 +527,22 @@ class PlanControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(second.repair_exhausted)
         self.assertFalse(third.repair_exhausted)
         self.assertTrue(coordinator.has_valid_model_plan)
-        self.assertEqual(coordinator.source, "observed")
+        self.assertEqual(coordinator.source, "model")
         self.assertEqual(coordinator.reason, "system_fallback")
         self.assertEqual(
             [item["planned_tools"] for item in coordinator.items],
-            [["web_search"], ["url_read"], []],
+            [["web_search"], ["url_read"], ["url_read"], []],
+        )
+        search_id = coordinator.items[0]["id"]
+        read_ids = [item["id"] for item in coordinator.items[1:3]]
+        self.assertEqual(
+            [item["depends_on"] for item in coordinator.items],
+            [[], [search_id], [search_id], read_ids],
         )
         emitter.plan_snapshot.assert_awaited_once()
+        emitted_snapshot = emitter.plan_snapshot.await_args.kwargs
+        self.assertEqual(emitted_snapshot["source"], "model")
+        self.assertEqual(emitted_snapshot["reason"], "system_fallback")
 
     async def test_accepted_control_makes_same_round_non_repairable(self):
         coordinator = PlanCoordinator(run_id="run-1", mode="on")
@@ -614,7 +665,19 @@ class PlanControlTests(unittest.IsolatedAsyncioTestCase):
 
         result = await process_plan_control_calls(
             tool_calls=[
-                _update_call(call_id="plan-2"),
+                _update_call(
+                    call_id="plan-2",
+                    arguments={
+                        **_update_call()["arguments"],
+                        "items": [
+                            _update_call()["arguments"]["items"][0],
+                            {
+                                **_update_call()["arguments"]["items"][1],
+                                "title": "比较结果新版",
+                            },
+                        ],
+                    },
+                ),
                 {
                     "id": "tool-1",
                     "name": "route_compare",
@@ -660,7 +723,7 @@ class PlanControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all("plan_item_id" not in call for call in mapped.external_tool_calls))
         self.assertNotIn("plan_item_id", single.external_tool_calls[0])
 
-    async def test_single_candidate_maps_all_same_tool_calls_and_blocked_candidate_is_ignored(self):
+    async def test_single_candidate_maps_first_call_and_rejects_duplicate_binding(self):
         coordinator = PlanCoordinator(run_id="run-1", mode="auto")
         coordinator.source = "model"
         coordinator.revision = 1
@@ -679,7 +742,95 @@ class PlanControlTests(unittest.IsolatedAsyncioTestCase):
             emitter=AsyncMock(),
         )
 
-        self.assertEqual([call["plan_item_id"] for call in result.external_tool_calls], ["active", "active"])
+        self.assertEqual([call["plan_item_id"] for call in result.external_tool_calls], ["active"])
+        rejected = json.loads(result.tool_responses["b"])
+        self.assertEqual(rejected["status"], "not_executed")
+        self.assertEqual(rejected["reason"], "plan_item_already_bound")
+        self.assertIn("同一批次", rejected["hint"])
+        self.assertIn("后续轮次", rejected["hint"])
+        self.assertIn("retryable/running", rejected["hint"])
+        self.assertNotIn("同一计划项只允许一次真实工具调用", rejected["hint"])
+
+    async def test_same_plan_item_rejects_second_call_in_batch_but_allows_next_round_retry(self):
+        coordinator = PlanCoordinator(run_id="run-cross-round-retry", mode="on")
+        self.assertTrue(
+            coordinator.apply_model_update(
+                {
+                    "reason": "执行一个可重试的独立搜索任务",
+                    "items": [
+                        {
+                            "id": "search",
+                            "title": "搜索可靠来源",
+                            "status": "pending",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理答案",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["search"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        first_batch = [
+            {
+                "id": "search-first",
+                "name": "web_search",
+                "arguments": {"query": "第一种表达", "_plan_item_id": "search"},
+            },
+            {
+                "id": "search-duplicate",
+                "name": "web_search",
+                "arguments": {"query": "第二种表达", "_plan_item_id": "search"},
+            },
+        ]
+
+        first_round = await process_plan_control_calls(
+            tool_calls=first_batch,
+            coordinator=coordinator,
+            emitter=AsyncMock(),
+        )
+
+        self.assertEqual(
+            [call["id"] for call in first_round.external_tool_calls],
+            ["search-first"],
+        )
+        duplicate = json.loads(first_round.tool_responses["search-duplicate"])
+        self.assertEqual(duplicate["reason"], "plan_item_already_bound")
+
+        coordinator.mark_tools_started(["search"])
+        retryable = coordinator.mark_tool_results({"search": "running"})
+        self.assertEqual(retryable["items"][0]["status"], "running")
+
+        second_round = await process_plan_control_calls(
+            tool_calls=[
+                {
+                    "id": "search-retry",
+                    "name": "web_search",
+                    "arguments": {"query": "修正后的表达", "_plan_item_id": "search"},
+                }
+            ],
+            coordinator=coordinator,
+            emitter=AsyncMock(),
+        )
+
+        self.assertEqual(
+            [call["id"] for call in second_round.external_tool_calls],
+            ["search-retry"],
+        )
+        self.assertNotIn("search-retry", second_round.tool_responses)
+        coordinator.mark_tools_started(["search"])
+        completed = coordinator.mark_tool_results({"search": "completed"})
+        self.assertEqual(
+            {item["id"]: item["status"] for item in completed["items"]},
+            {"search": "completed", "answer": "pending"},
+        )
 
 
 if __name__ == "__main__":

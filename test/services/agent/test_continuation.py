@@ -101,7 +101,7 @@ class AgentContinuationTests(unittest.TestCase):
 
         self.assertEqual(blocks, [TextBlock(type="text", id="blk_old", text="旧回答")])
 
-    def test_deserialize_content_blocks_sanitizes_legacy_thinking_tool_names(self):
+    def test_deserialize_content_blocks_keeps_legacy_thinking_verbatim(self):
         blocks = deserialize_content_blocks(
             [
                 {
@@ -114,7 +114,13 @@ class AgentContinuationTests(unittest.TestCase):
 
         self.assertEqual(
             blocks,
-            [ThinkingBlock(type="thinking", id="thinking-old", thinking="调用联网搜索，再用网页读取读取网页。")],
+            [
+                ThinkingBlock(
+                    type="thinking",
+                    id="thinking-old",
+                    thinking="调用 web_search，再用 url_read 读取网页。",
+                )
+            ],
         )
 
     def test_inject_continuation_prompt_after_existing_system_messages(self):

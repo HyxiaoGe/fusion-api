@@ -9,7 +9,6 @@ spec §4.2。stream_round 把 litellm streaming response 消费成
 import asyncio
 import json
 import re
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -20,8 +19,13 @@ import litellm
 from app.ai.llm_observability import merge_litellm_kwargs
 from app.core.logger import app_logger as logger
 from app.schemas.chat import Usage
+from app.services.stream.reasoning_transport import (
+    ReasoningTransportMode,
+    allows_deferred_reasoning_output,
+    initial_reasoning_transport_mode,
+)
 from app.services.stream_state_service import append_chunk, check_lock_owner
-from app.utils.user_visible_content import sanitize_internal_tool_names
+from app.utils.user_visible_content import sanitize_internal_tool_names, sanitize_user_visible_reasoning
 
 # 每 N 个 chunk 检查一次锁状态
 LOCK_CHECK_INTERVAL = 20
@@ -72,6 +76,10 @@ _CLOSE_THINK_TAG_RE = re.compile(r"</think\s*>", re.IGNORECASE)
 _DSML_TOOL_CALLS_OPEN = "<｜｜DSML｜｜tool_calls>"
 _DSML_TOOL_CALLS_CLOSE = "</｜｜DSML｜｜tool_calls>"
 _DSML_DISTINCT_PREFIX = "<｜｜DSML"
+_GENERIC_TOOL_CALL_OPEN = "<tool_call"
+_GENERIC_TOOL_CALL_PREFIX_RE = re.compile(r"<tool_call\b", re.IGNORECASE)
+_GENERIC_FUNCTION_OPEN_PREFIX = "<function="
+_GENERIC_FUNCTION_OPEN_RE = re.compile(r"<function=[A-Za-z0-9_.:-]+>", re.IGNORECASE)
 _DSML_INVOKE_RE = re.compile(
     r'<｜｜DSML｜｜invoke\s+name="(?P<name>[A-Za-z0-9_.:-]+)">'
     r"(?P<body>.*?)"
@@ -96,10 +104,12 @@ class LLMStreamRequest:
     thinking_block_id: str
     text_block_id: str
     provider: Optional[str] = None
+    model_id: Optional[str] = None
+    reasoning_transport_mode: Optional[ReasoningTransportMode] = None
     run_id: Optional[str] = None
     step_id: Optional[str] = None
     defer_output: bool = False
-    on_answer_started: Callable[[], Awaitable[None]] | None = None
+    allow_deferred_reasoning_output: bool = False
 
 
 @dataclass
@@ -112,10 +122,9 @@ class LLMStreamState:
     chunk_count: int = 0
     finish_reason: str = "stop"
     tool_calls_acc: dict[int, dict] = field(default_factory=dict)
-    reasoning_transport_mode: str = "probing"
+    reasoning_transport_mode: ReasoningTransportMode = "delta"
     reasoning_probe_chunks: list[str] = field(default_factory=list)
     reasoning_snapshot_revision_logged: bool = False
-    answer_started_notified: bool = False
 
 
 @dataclass(frozen=True)
@@ -296,14 +305,24 @@ def strip_reasoning_tag_blocks(text: str) -> str:
     return "".join(output)
 
 
-def strip_pending_dsml_tool_protocol(text: str) -> str:
-    """隐藏 DSML 工具协议及末尾尚未收全的跨 chunk 前缀。"""
-    marker_index = text.find(_DSML_TOOL_CALLS_OPEN)
-    if marker_index >= 0:
-        return text[:marker_index]
+def strip_pending_dsml_tool_protocol(text: str, *, final: bool = False) -> str:
+    """隐藏正文工具协议及末尾尚未收全的跨 chunk 前缀。"""
+    hidden_starts: list[int] = []
+    dsml_marker_index = text.find(_DSML_TOOL_CALLS_OPEN)
+    if dsml_marker_index >= 0:
+        hidden_starts.append(dsml_marker_index)
+    elif (dsml_pending_start := _pending_dsml_tool_protocol_start(text)) is not None:
+        pending_candidate = text[dsml_pending_start:]
+        if not final or pending_candidate.startswith(_DSML_DISTINCT_PREFIX):
+            hidden_starts.append(dsml_pending_start)
 
-    pending_start = _pending_dsml_tool_protocol_start(text)
-    return text if pending_start is None else text[:pending_start]
+    generic_candidate = _generic_tool_protocol_candidate(text)
+    if generic_candidate is not None:
+        generic_start, generic_status = generic_candidate
+        if not final or _generic_protocol_is_malformed(generic_status):
+            hidden_starts.append(generic_start)
+
+    return text if not hidden_starts else text[: min(hidden_starts)]
 
 
 def sanitize_internal_mcp_aliases(text: str, *, final: bool = False) -> str:
@@ -318,12 +337,6 @@ def _visible_delta(visible_text: str, emitted_text: str, *, channel: str) -> str
 
     logger.warning(f"{channel} 内容过滤出现非单调输出，已忽略不可追加部分")
     return ""
-
-
-def _uses_cumulative_reasoning_snapshots(provider: str | None) -> bool:
-    """仅 Moonshot reasoning_content 进入有限探测，其它提供商遵循标准 delta。"""
-
-    return bool(provider and provider.strip().lower() == "moonshot")
 
 
 def _common_prefix_length(left: str, right: str) -> int:
@@ -372,14 +385,7 @@ def _resolve_reasoning_probe(state: LLMStreamState, *, final: bool = False) -> N
 def _merge_reasoning_delta(
     state: LLMStreamState,
     incoming: str,
-    *,
-    provider: str | None,
 ) -> None:
-    if not _uses_cumulative_reasoning_snapshots(provider):
-        state.reasoning_transport_mode = "delta"
-        state.raw_reasoning_buf += incoming
-        return
-
     if state.reasoning_transport_mode == "delta":
         state.raw_reasoning_buf += incoming
         return
@@ -403,11 +409,56 @@ def _merge_reasoning_delta(
 
 
 def _pending_dsml_tool_protocol_start(text: str) -> int | None:
-    max_prefix_length = min(len(text), len(_DSML_TOOL_CALLS_OPEN) - 1)
+    return _pending_protocol_prefix_start(text, _DSML_TOOL_CALLS_OPEN)
+
+
+def _pending_protocol_prefix_start(text: str, prefix: str) -> int | None:
+    max_prefix_length = min(len(text), len(prefix) - 1)
     for prefix_length in range(max_prefix_length, 0, -1):
-        if text.endswith(_DSML_TOOL_CALLS_OPEN[:prefix_length]):
+        if text.endswith(prefix[:prefix_length]):
             return len(text) - prefix_length
     return None
+
+
+def _generic_tool_protocol_candidate(text: str) -> tuple[int, str] | None:
+    search_start = 0
+    while (match := _GENERIC_TOOL_CALL_PREFIX_RE.search(text, search_start)) is not None:
+        marker_start = match.start()
+        if _is_markdown_code_position(text, marker_start):
+            search_start = match.end()
+            continue
+
+        tag_end = text.find(">", match.end())
+        if tag_end < 0:
+            return marker_start, "pending_tag"
+
+        body = text[tag_end + 1 :].lstrip()
+        if not body:
+            return marker_start, "pending_body"
+        lowered_body = body.lower()
+        if _GENERIC_FUNCTION_OPEN_PREFIX.startswith(lowered_body):
+            return marker_start, "pending_function"
+        if lowered_body.startswith(_GENERIC_FUNCTION_OPEN_PREFIX):
+            status = "confirmed" if _GENERIC_FUNCTION_OPEN_RE.match(body) else "pending_function"
+            return marker_start, status
+        search_start = match.end()
+
+    partial_start = _pending_protocol_prefix_start(text.lower(), _GENERIC_TOOL_CALL_OPEN)
+    if partial_start is not None and not _is_markdown_code_position(text, partial_start):
+        return partial_start, "partial_prefix"
+    return None
+
+
+def _generic_protocol_is_malformed(status: str) -> bool:
+    return status in {"confirmed", "pending_body", "pending_function", "pending_tag", "partial_prefix"}
+
+
+def _is_markdown_code_position(text: str, index: int) -> bool:
+    before = text[:index]
+    if before.count("```") % 2 == 1:
+        return True
+    without_fences = before.replace("```", "")
+    return without_fences.count("`") % 2 == 1
 
 
 def _decode_dsml_parameter(value: str, *, is_string: bool):
@@ -479,22 +530,25 @@ def filter_reasoning_tag_content_delta(state: LLMStreamState, content_delta: str
 def filter_internal_mcp_reasoning_delta(
     state: LLMStreamState,
     reasoning_delta: str,
-    *,
-    provider: str | None,
 ) -> str:
     if not reasoning_delta:
         return ""
-    _merge_reasoning_delta(state, reasoning_delta, provider=provider)
-    visible_reasoning = sanitize_internal_tool_names(state.raw_reasoning_buf)
+    _merge_reasoning_delta(state, reasoning_delta)
+    visible_reasoning = strip_pending_dsml_tool_protocol(state.raw_reasoning_buf)
+    visible_reasoning = sanitize_user_visible_reasoning(
+        visible_reasoning,
+        buffer_trailing_paragraph=state.reasoning_transport_mode == "probing",
+    )
     return _visible_delta(visible_reasoning, state.reasoning_buf, channel="reasoning")
 
 
 async def flush_pending_internal_mcp_aliases(*, request: LLMStreamRequest, state: LLMStreamState) -> None:
     if state.reasoning_transport_mode == "probing":
         _resolve_reasoning_probe(state, final=True)
-    final_reasoning = sanitize_internal_tool_names(state.raw_reasoning_buf, final=True)
+    final_reasoning = strip_pending_dsml_tool_protocol(state.raw_reasoning_buf, final=True)
+    final_reasoning = sanitize_user_visible_reasoning(final_reasoning, final=True)
     final_content = strip_reasoning_tag_blocks(state.raw_content_buf)
-    final_content = strip_pending_dsml_tool_protocol(final_content)
+    final_content = strip_pending_dsml_tool_protocol(final_content, final=True)
     final_content = sanitize_internal_mcp_aliases(final_content, final=True)
     await append_reasoning_and_content(
         request=request,
@@ -531,7 +585,11 @@ async def append_reasoning_and_content(
 ) -> None:
     if reasoning_delta:
         state.reasoning_buf += reasoning_delta
-        if not request.defer_output:
+        deferred_reasoning_is_allowed = (
+            request.allow_deferred_reasoning_output
+            and allows_deferred_reasoning_output(request.model_id)
+        )
+        if not request.defer_output or deferred_reasoning_is_allowed:
             await append_stream_delta(
                 request=request,
                 chunk_type="reasoning",
@@ -541,10 +599,6 @@ async def append_reasoning_and_content(
     if content_delta:
         state.content_buf += content_delta
         if not request.defer_output:
-            if not state.answer_started_notified:
-                if request.on_answer_started is not None:
-                    await request.on_answer_started()
-                state.answer_started_notified = True
             await append_stream_delta(
                 request=request,
                 chunk_type="answering",
@@ -585,7 +639,6 @@ async def process_stream_choice(*, request: LLMStreamRequest, state: LLMStreamSt
     reasoning_delta = filter_internal_mcp_reasoning_delta(
         state,
         raw_reasoning_delta,
-        provider=request.provider,
     )
     content_delta = filter_reasoning_tag_content_delta(state, content_delta)
     await append_reasoning_and_content(
@@ -605,7 +658,12 @@ async def process_stream_choice(*, request: LLMStreamRequest, state: LLMStreamSt
 
 
 async def consume_stream_round(response, request: LLMStreamRequest) -> LLMStreamOutcome:
-    state = LLMStreamState()
+    state = LLMStreamState(
+        reasoning_transport_mode=initial_reasoning_transport_mode(
+            model_id=request.model_id,
+            explicit_mode=request.reasoning_transport_mode,
+        )
+    )
     async for chunk in response:
         choice = get_first_choice(chunk)
         if choice is None:
@@ -620,21 +678,16 @@ async def consume_stream_round(response, request: LLMStreamRequest) -> LLMStream
     await flush_pending_internal_mcp_aliases(request=request, state=state)
 
     visible_content = strip_reasoning_tag_blocks(state.raw_content_buf)
-    marker_index = visible_content.find(_DSML_TOOL_CALLS_OPEN)
-    pending_start = _pending_dsml_tool_protocol_start(visible_content) if marker_index < 0 else None
-    has_malformed_protocol = marker_index >= 0
-    if marker_index < 0 and pending_start is not None:
-        pending_candidate = visible_content[pending_start:]
-        has_malformed_protocol = pending_candidate.startswith(_DSML_DISTINCT_PREFIX)
-        if not has_malformed_protocol:
-            safe_visible_content = sanitize_internal_mcp_aliases(visible_content, final=True)
-            pending_delta = safe_visible_content[len(state.content_buf) :]
-            await append_reasoning_and_content(
-                request=request,
-                state=state,
-                reasoning_delta="",
-                content_delta=pending_delta,
-            )
+    dsml_marker_index = visible_content.find(_DSML_TOOL_CALLS_OPEN)
+    dsml_pending_start = _pending_dsml_tool_protocol_start(visible_content) if dsml_marker_index < 0 else None
+    generic_candidate = _generic_tool_protocol_candidate(visible_content)
+    has_malformed_protocol = dsml_marker_index >= 0 or (
+        dsml_pending_start is not None
+        and visible_content[dsml_pending_start:].startswith(_DSML_DISTINCT_PREFIX)
+    )
+    if generic_candidate is not None:
+        _generic_start, generic_status = generic_candidate
+        has_malformed_protocol = has_malformed_protocol or _generic_protocol_is_malformed(generic_status)
 
     tool_calls = build_tool_calls_list(state.tool_calls_acc)
     if not tool_calls:
@@ -673,10 +726,12 @@ async def stream_round(
     thinking_block_id: str,
     text_block_id: str,
     provider: Optional[str] = None,
+    model_id: Optional[str] = None,
+    reasoning_transport_mode: Optional[ReasoningTransportMode] = None,
     run_id: Optional[str] = None,
     step_id: Optional[str] = None,
     defer_output: bool = False,
-    on_answer_started: Callable[[], Awaitable[None]] | None = None,
+    allow_deferred_reasoning_output: bool = False,
 ) -> tuple[str, str, list[dict], str, Optional[Usage]]:
     """
     通用 LLM 流式响应处理。
@@ -695,10 +750,12 @@ async def stream_round(
             thinking_block_id=thinking_block_id,
             text_block_id=text_block_id,
             provider=provider,
+            model_id=model_id,
+            reasoning_transport_mode=reasoning_transport_mode,
             run_id=run_id,
             step_id=step_id,
             defer_output=defer_output,
-            on_answer_started=on_answer_started,
+            allow_deferred_reasoning_output=allow_deferred_reasoning_output,
         ),
     )
     return StreamRoundTuple(

@@ -90,6 +90,29 @@ class MessageRepositoryTests(unittest.TestCase):
 
         self.assertEqual(message.content[0].thinking, "调用路线比较，再用地点搜索核对。")
 
+    def test_convert_message_removes_legacy_internal_reasoning_control_paragraph(self):
+        db_message = MessageModel(
+            id="msg-thinking-control",
+            conversation_id="conv-1",
+            role="assistant",
+            content=[
+                {
+                    "type": "thinking",
+                    "id": "thinking-control",
+                    "thinking": (
+                        "先比较方案风险。\n\n"
+                        "According to the autonomous web search rules: do not search. "
+                        "本轮启用了强制计划模式。"
+                    ),
+                }
+            ],
+            created_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
+        )
+
+        message = ConversationRepository(None)._convert_message_to_schema(db_message)
+
+        self.assertEqual(message.content[0].thinking, "先比较方案风险。\n\n")
+
     def test_convert_message_restores_nested_context_and_accepts_legacy_usage(self):
         current = MessageModel(
             id="msg-current",

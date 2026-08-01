@@ -58,7 +58,7 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
             execution.state.plan_coordinator.required_initial_tool_counts,
             {
                 "web_search": 1,
-                "url_read": 1,
+                "url_read": 2,
             },
         )
         result = execution.state.plan_coordinator.apply_model_update(
@@ -74,8 +74,16 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
                         "planned_tools": ["web_search"],
                     },
                     {
-                        "id": "read",
-                        "title": "核验多个来源原文",
+                        "id": "read-1",
+                        "title": "核验来源一原文",
+                        "status": "pending",
+                        "kind": "read",
+                        "depends_on": ["search"],
+                        "planned_tools": ["url_read"],
+                    },
+                    {
+                        "id": "read-2",
+                        "title": "核验来源二原文",
                         "status": "pending",
                         "kind": "read",
                         "depends_on": ["search"],
@@ -86,7 +94,7 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
                         "title": "整理结论与建议",
                         "status": "pending",
                         "kind": "answer",
-                        "depends_on": ["read"],
+                        "depends_on": ["read-1", "read-2"],
                         "planned_tools": [],
                     },
                 ],
@@ -535,7 +543,7 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual([event["type"] for event in emitted], ["run_started"])
-        self.assertEqual(execution.state.plan_items, {})
+        self.assertFalse(hasattr(execution.state, "plan_items"))
 
     async def test_lifecycle_passes_continuation_inputs_and_preserves_existing_blocks_first(self):
         call_order = []

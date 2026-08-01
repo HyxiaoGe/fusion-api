@@ -34,7 +34,6 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
             text_block_id="blk-text",
         )
         received_kwargs = {}
-        on_answer_started = AsyncMock()
 
         async def stream_round_fn(*_args, **kwargs):
             received_kwargs.update(kwargs)
@@ -67,13 +66,14 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
                 stream_round_fn=stream_round_fn,
                 log_round_summary_fn=lambda **_kwargs: None,
                 defer_output=True,
-                on_answer_started=on_answer_started,
             )
 
         self.assertTrue(received_kwargs["defer_output"])
+        self.assertTrue(received_kwargs["allow_deferred_reasoning_output"])
         self.assertEqual(received_kwargs["provider"], "openai")
-        self.assertIs(received_kwargs["on_answer_started"], on_answer_started)
+        self.assertNotIn("on_answer_started", received_kwargs)
         self.assertTrue(result.output_deferred)
+        self.assertFalse(result.allow_deferred_reasoning_output)
 
     async def test_run_agent_round_emits_estimated_and_final_context_status(self):
         emitter = AsyncMock()
@@ -497,6 +497,8 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
             thinking_block_id,
             text_block_id,
             *,
+            model_id,
+            allow_deferred_reasoning_output,
             run_id,
             step_id,
         ):
@@ -509,6 +511,8 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
                     should_use_reasoning,
                     thinking_block_id,
                     text_block_id,
+                    model_id,
+                    allow_deferred_reasoning_output,
                     run_id,
                     step_id,
                 )
@@ -519,6 +523,7 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
             conversation_id="conv-1",
             task_id="task-1",
             run_id="run-1",
+            model_id="kimi-k3",
             litellm_model="openai/gpt-4",
             litellm_kwargs={"metadata": {"trace": "x"}},
             messages=messages,
@@ -527,6 +532,7 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
             step_context=step_context,
             llm_call_fn=llm_call_fn,
             stream_round_fn=stream_round_fn,
+            allow_deferred_reasoning_output=True,
         )
 
         self.assertEqual(
@@ -553,6 +559,8 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
                 True,
                 "blk-thinking",
                 "blk-text",
+                "kimi-k3",
+                True,
                 "run-1",
                 "step-collect",
             ),

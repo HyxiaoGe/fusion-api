@@ -203,6 +203,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         self.finalize_mock = AsyncMock()
         self._patchers = [
             patch("app.services.stream.runner.append_chunk", side_effect=_capture_append),
+            patch("app.services.stream.limit_summary.append_chunk", side_effect=_capture_append),
             # AgentEventRedisWriter (tool_executor.py:38) 通过本地 import 引用 append_chunk，
             # patch 必须打在 tool_executor 命名空间才会生效，patch stream_state_service 是无效的。
             patch("app.services.stream.tool_executor.append_chunk", side_effect=_capture_append),

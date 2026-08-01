@@ -1,4 +1,5 @@
 import unittest
+from functools import partial
 
 from app.schemas.chat import TextBlock, Usage
 from app.services.stream.agent_loop_policy import AgentLoopLimits
@@ -73,6 +74,8 @@ class AgentLoopStepRequestTests(unittest.TestCase):
             finish_reason="tool_calls",
             accumulated_usage=Usage(input_tokens=3, output_tokens=4),
             announced_tool_names=frozenset({"web_search"}),
+            output_deferred=True,
+            allow_deferred_reasoning_output=True,
         )
         runtime = _runtime()
 
@@ -101,6 +104,8 @@ class AgentLoopStepRequestTests(unittest.TestCase):
         self.assertEqual(request.protocol_reasoning_buf, "需要 web_search")
         self.assertEqual(request.announced_tool_names, frozenset({"web_search"}))
         self.assertEqual(request.task_id, "task-req")
+        self.assertTrue(request.output_deferred)
+        self.assertTrue(request.allow_deferred_reasoning_output)
         self.assertIs(request.agent_state, state)
         self.assertIs(request.on_tools_executed.__self__, state)
         self.assertIs(request.on_tools_executed.__func__, state.record_executed_tool_calls.__func__)
@@ -131,15 +136,46 @@ class AgentLoopStepRequestTests(unittest.TestCase):
         self.assertIs(request.start_step_fn, runtime.start_step_fn)
         self.assertIs(request.complete_step_fn, runtime.complete_step_fn)
         self.assertIs(request.llm_call_fn, runtime.llm_call_fn)
-        self.assertIs(request.stream_round_fn, runtime.stream_round_fn)
+        self.assertIsInstance(request.stream_round_fn, partial)
+        self.assertIs(request.stream_round_fn.func, runtime.stream_round_fn)
+        self.assertEqual(request.stream_round_fn.keywords["model_id"], "gpt-4")
         self.assertIs(request.log_round_summary_fn, runtime.log_round_summary_fn)
         self.assertIs(request.warning_fn, runtime.warning_fn)
         self.assertIs(request.clock, runtime.clock)
         self.assertEqual(request.task_mode, "standard")
         self.assertEqual(request.evidence_policy, "standard")
+        self.assertTrue(request.defer_output)
         self.assertIs(request.research_workset, state.research_workset)
         self.assertIs(request.on_step_started.__self__, state)
         self.assertIs(request.on_step_started.__func__, state.mark_current_step.__func__)
+
+    def test_limit_summary_binds_k3_and_non_k3_model_ids_to_stream_transport(self):
+        for model_id in ("moonshot/kimi-k3", "moonshot/kimi-k2.7-code"):
+            with self.subTest(model_id=model_id):
+                runtime = _runtime(model_id=model_id, provider="moonshot")
+
+                request = build_limit_summary_step_request(
+                    state=AgentLoopState(),
+                    runtime=runtime,
+                    messages=[{"role": "user", "content": "总结"}],
+                )
+
+                self.assertIsInstance(request.stream_round_fn, partial)
+                self.assertEqual(request.stream_round_fn.keywords["model_id"], model_id)
+
+    def test_limit_summary_keeps_legacy_stream_callable_without_model_id_keyword(self):
+        async def legacy_stream_round(response):
+            return response
+
+        runtime = _runtime(stream_round_fn=legacy_stream_round)
+
+        request = build_limit_summary_step_request(
+            state=AgentLoopState(),
+            runtime=runtime,
+            messages=[],
+        )
+
+        self.assertIs(request.stream_round_fn, legacy_stream_round)
 
 
 if __name__ == "__main__":

@@ -104,6 +104,8 @@ def _build_execution_parts(
             plan_coordinator=PlanCoordinator(
                 run_id=run_id,
                 mode=getattr(request.call_config, "plan_mode", "auto"),
+                allowed_tool_names=frozenset(getattr(request.call_config, "announced_tools", [])),
+                required_initial_tool_counts=dict(getattr(request.call_config, "required_initial_tool_counts", {})),
             )
         ),
         network_budget=NetworkToolBudget(profile=getattr(request.call_config, "network_profile", "standard")),

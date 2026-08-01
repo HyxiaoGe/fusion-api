@@ -28,6 +28,7 @@ from app.services.mcp.flyai_travel_tools import (
     FLYAI_TRAVEL_FACT_BOUNDARY_SYSTEM_PROMPT,
     FLYAI_TRAVEL_TOOL_NAMES,
 )
+from app.services.stream.agent_plan_tool_policy import AgentPlanToolPolicy, resolve_agent_plan_tool_policy
 from app.services.stream.agent_task_policy import resolve_agent_task_policy
 from app.services.stream.persistence import preprocess_url_in_message
 
@@ -51,10 +52,17 @@ class AgentLoopCallConfig:
     task_mode: str = "standard"
     network_profile: str = "standard"
     evidence_policy: str = "standard"
+    required_initial_tool_counts: dict[str, int] = field(default_factory=dict)
+    plan_tool_policy_reason: str | None = None
 
 
-def build_update_plan_tool() -> dict[str, Any]:
+def build_update_plan_tool(allowed_tool_names: list[str] | None = None) -> dict[str, Any]:
     """仅供 Agent Loop 控制面消费，不映射到任何外部 handler。"""
+
+    planned_tool_schema: dict[str, Any] = {"type": "string"}
+    normalized_allowed_tool_names = list(dict.fromkeys(allowed_tool_names or []))
+    if normalized_allowed_tool_names:
+        planned_tool_schema["enum"] = normalized_allowed_tool_names
 
     return {
         "type": "function",
@@ -86,13 +94,22 @@ def build_update_plan_tool() -> dict[str, Any]:
                                 "status": {
                                     "type": "string",
                                     "enum": ["pending", "in_progress"],
+                                    "description": (
+                                        "为兼容提供商接受 pending/in_progress；请始终提交 pending，"
+                                        "真实运行态和终态由服务端推进。"
+                                    ),
                                 },
                                 "kind": {
                                     "type": "string",
                                     "enum": ["reasoning", "search", "read", "synthesis", "answer", "other"],
                                 },
                                 "depends_on": {"type": "array", "items": {"type": "string"}},
-                                "planned_tools": {"type": "array", "items": {"type": "string"}},
+                                "planned_tools": {
+                                    "type": "array",
+                                    "items": planned_tool_schema,
+                                    "maxItems": 1,
+                                    "description": ("执行步骤最多声明一个当前已提供的真实工具；多工具拆成独立步骤。"),
+                                },
                             },
                             "required": ["id", "step", "status", "planned_tools"],
                         },
@@ -188,6 +205,8 @@ def build_agent_loop_call_config(
     additional_tools: list[dict] | None = None,
     dynamic_tool_handlers: dict[str, Any] | None = None,
     tool_bindings: list[dict[str, Any]] | None = None,
+    original_message: str | None = None,
+    task_context_messages: list[object] | None = None,
 ) -> AgentLoopCallConfig:
     options = options or {}
     capabilities = capabilities or {}
@@ -215,9 +234,25 @@ def build_agent_loop_call_config(
     provided_handlers = dynamic_tool_handlers or {}
     if supports_dynamic_tools:
         tools.extend(tool for tool in (additional_tools or []) if _tool_definition_name(tool) in provided_handlers)
+    external_tool_names = [_tool_definition_name(tool) for tool in tools if _tool_definition_name(tool)]
+    if task_policy.task_mode == "deep_research":
+        schedulable_names = frozenset({"web_search", "url_read"}).intersection(external_tool_names)
+        plan_tool_policy = AgentPlanToolPolicy(
+            allowed_tool_names=frozenset(schedulable_names),
+            reason="deep_research_schedulable_tools",
+        )
+    else:
+        plan_tool_policy = resolve_agent_plan_tool_policy(
+            original_message=original_message,
+            announced_tool_names=external_tool_names,
+            task_context_messages=task_context_messages,
+        )
+    if requested_plan_mode != "off" and plan_tool_policy.allowed_tool_names is not None:
+        tools = [tool for tool in tools if _tool_definition_name(tool) in plan_tool_policy.allowed_tool_names]
+        external_tool_names = [_tool_definition_name(tool) for tool in tools if _tool_definition_name(tool)]
     control_tool_names: frozenset[str] = frozenset()
     if supports_control_tools and plan_mode != "off":
-        tools.append(build_update_plan_tool())
+        tools.append(build_update_plan_tool(external_tool_names))
         control_tool_names = frozenset({"update_plan"})
         tools = [
             _with_plan_item_binding(tool, required=plan_mode == "on")
@@ -228,7 +263,10 @@ def build_agent_loop_call_config(
     if tools:
         call_kwargs["tools"] = tools
         call_kwargs["tool_choice"] = "auto"
-        if should_use_reasoning and provider in volcengine_providers:
+        if should_use_reasoning and (
+            provider in volcengine_providers
+            or (provider == "deepseek" and plan_mode != "off")
+        ):
             merge_extra_body(call_kwargs, {"thinking": {"type": "disabled"}})
 
     announced_tools = [
@@ -252,6 +290,8 @@ def build_agent_loop_call_config(
         task_mode=task_policy.task_mode,
         network_profile=task_policy.network_profile,
         evidence_policy=task_policy.evidence_policy,
+        required_initial_tool_counts=dict(plan_tool_policy.required_initial_tool_counts),
+        plan_tool_policy_reason=plan_tool_policy.reason,
     )
 
 

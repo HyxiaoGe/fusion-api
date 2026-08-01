@@ -173,6 +173,8 @@ class AgentLoopWiringTests(unittest.TestCase):
                 "additional_tools": dynamic_tool_set.definitions,
                 "dynamic_tool_handlers": dynamic_tool_set.handlers,
                 "tool_bindings": dynamic_tool_set.audit_bindings,
+                "original_message": "hi",
+                "task_context_messages": [{"role": "user", "content": "hi"}],
             },
         )
         self.assertEqual(captured["dynamic_tools_db"], "db-wiring")

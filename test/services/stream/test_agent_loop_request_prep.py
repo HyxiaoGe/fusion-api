@@ -1,6 +1,8 @@
 import unittest
 
 from app.schemas.chat import TextBlock
+from app.services.agent.plan_coordinator import PlanCoordinator
+from app.services.mcp.amap_product_tools import AMAP_PRODUCT_DEFINITIONS
 from app.services.stream.agent_loop_request_prep import (
     build_agent_loop_call_config,
     inject_amap_fact_boundary,
@@ -21,6 +23,112 @@ class FakeFileRepository:
 
 
 class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
+    def test_explicit_commute_plan_only_announces_route_tool_and_constrains_plan_schema(self):
+        handlers = {tool["function"]["name"]: object() for tool in AMAP_PRODUCT_DEFINITIONS}
+        config = build_agent_loop_call_config(
+            provider="deepseek",
+            options={"plan_mode": "on"},
+            capabilities={
+                "functionCalling": True,
+                "searchCapable": True,
+                "agentTools": True,
+            },
+            additional_tools=AMAP_PRODUCT_DEFINITIONS,
+            dynamic_tool_handlers=handlers,
+            original_message=("我住在南景新村，公司在双子塔，请帮我比较驾车、公交和地铁的通勤路线，并给出推荐选择。"),
+        )
+
+        self.assertEqual(config.announced_tools, ["route_compare"])
+        self.assertEqual(config.required_initial_tool_counts, {"route_compare": 1})
+        self.assertEqual(config.plan_tool_policy_reason, "explicit_route_task")
+        update_plan = next(tool for tool in config.call_kwargs["tools"] if tool["function"]["name"] == "update_plan")
+        planned_tool_schema = update_plan["function"]["parameters"]["properties"]["plan"]["items"]["properties"][
+            "planned_tools"
+        ]["items"]
+        self.assertEqual(planned_tool_schema["enum"], ["route_compare"])
+
+    def test_deep_research_only_announces_stage_executable_tools_and_rejects_route_plan(self):
+        handlers = {tool["function"]["name"]: object() for tool in AMAP_PRODUCT_DEFINITIONS}
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={"task_mode": "deep_research"},
+            capabilities={
+                "functionCalling": True,
+                "searchCapable": True,
+                "agentTools": True,
+            },
+            additional_tools=AMAP_PRODUCT_DEFINITIONS,
+            dynamic_tool_handlers=handlers,
+            original_message="深度研究从南景新村到双子塔的地铁和驾车通勤路线。",
+        )
+
+        self.assertEqual(config.announced_tools, ["web_search", "url_read"])
+        self.assertNotIn("route_compare", config.announced_tools)
+        self.assertEqual(config.required_initial_tool_counts, {})
+        self.assertEqual(config.plan_tool_policy_reason, "deep_research_schedulable_tools")
+        update_plan = next(tool for tool in config.call_kwargs["tools"] if tool["function"]["name"] == "update_plan")
+        planned_tool_schema = update_plan["function"]["parameters"]["properties"]["plan"]["items"]["properties"][
+            "planned_tools"
+        ]["items"]
+        self.assertEqual(planned_tool_schema["enum"], ["web_search", "url_read"])
+
+        coordinator = PlanCoordinator(
+            run_id="run-deep-tool-policy",
+            mode="on",
+            allowed_tool_names=frozenset(config.announced_tools),
+            required_initial_tool_counts={"web_search": 1, "url_read": 2},
+        )
+        route_plan = coordinator.apply_model_update(
+            {
+                "reason": "错误地把阶段调度器不会开放的路线工具写入研究计划",
+                "items": [
+                    {
+                        "id": "search",
+                        "title": "搜索候选来源",
+                        "status": "pending",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "read-1",
+                        "title": "核验来源一",
+                        "status": "pending",
+                        "kind": "read",
+                        "depends_on": ["search"],
+                        "planned_tools": ["url_read"],
+                    },
+                    {
+                        "id": "read-2",
+                        "title": "核验来源二",
+                        "status": "pending",
+                        "kind": "read",
+                        "depends_on": ["search"],
+                        "planned_tools": ["url_read"],
+                    },
+                    {
+                        "id": "route",
+                        "title": "比较路线",
+                        "status": "pending",
+                        "kind": "other",
+                        "depends_on": [],
+                        "planned_tools": ["route_compare"],
+                    },
+                    {
+                        "id": "answer",
+                        "title": "整理研究结论",
+                        "status": "pending",
+                        "kind": "answer",
+                        "depends_on": ["read-1", "read-2", "route"],
+                        "planned_tools": [],
+                    },
+                ],
+            }
+        )
+
+        self.assertFalse(route_plan.accepted)
+        self.assertEqual(route_plan.reason, "unannounced_planned_tool")
+
     def test_plan_mode_defaults_auto_and_control_tool_is_hidden_from_user_tool_list(self):
         config = build_agent_loop_call_config(
             provider="openai",
@@ -72,9 +180,13 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("【深度研究执行约束】", research_messages[0]["content"])
         self.assertIn("互补查询", research_messages[0]["content"])
         self.assertIn("正文使用 [n] 引用", research_messages[0]["content"])
-        self.assertIn("planned_tools 必须覆盖 web_search", research_messages[0]["content"])
-        self.assertIn("至少一个未完成步骤包含 url_read", research_messages[0]["content"])
-        self.assertIn("同一个读取步骤可以读取多个独立来源", research_messages[0]["content"])
+        self.assertIn("planned_tools 必须覆盖一个 web_search 步骤", research_messages[0]["content"])
+        self.assertIn("至少两个独立的 url_read 步骤", research_messages[0]["content"])
+        self.assertNotIn("同一个读取步骤可以读取多个独立来源", research_messages[0]["content"])
+        self.assertIn("每个读取步骤负责一个独立来源任务", research_messages[0]["content"])
+        self.assertIn("只有服务端将同一任务保持为 retryable/running 时", research_messages[0]["content"])
+        self.assertIn("跨轮重试", research_messages[0]["content"])
+        self.assertNotIn("每个读取步骤只读取一个来源", research_messages[0]["content"])
         self.assertIn("web_search 与 url_read 必须由不同计划步骤负责", research_messages[0]["content"])
         self.assertEqual(standard_messages, [{"role": "user", "content": "调研"}])
 
@@ -368,6 +480,50 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.call_kwargs["tool_choice"], "auto")
         self.assertEqual(config.call_kwargs["tools"][0]["function"]["name"], "web_search")
         self.assertEqual(config.call_kwargs["extra_body"], {"thinking": {"type": "disabled"}})
+
+    def test_deepseek_plan_mode_keeps_thinking_disabled_for_the_whole_run(self):
+        config = build_agent_loop_call_config(
+            provider="deepseek",
+            options={"plan_mode": "on"},
+            capabilities={
+                "functionCalling": True,
+                "agentTools": True,
+                "searchCapable": True,
+                "deepThinking": True,
+            },
+        )
+
+        self.assertTrue(config.should_use_reasoning)
+        self.assertEqual(config.call_kwargs["extra_body"], {"thinking": {"type": "disabled"}})
+
+    def test_moonshot_plan_mode_keeps_native_thinking_configuration(self):
+        config = build_agent_loop_call_config(
+            provider="moonshot",
+            options={"plan_mode": "on"},
+            capabilities={
+                "functionCalling": True,
+                "agentTools": True,
+                "searchCapable": True,
+                "deepThinking": True,
+            },
+        )
+
+        self.assertTrue(config.should_use_reasoning)
+        self.assertNotIn("extra_body", config.call_kwargs)
+
+    def test_deepseek_non_plan_search_keeps_native_thinking_mode(self):
+        config = build_agent_loop_call_config(
+            provider="deepseek",
+            options={"plan_mode": "off"},
+            capabilities={
+                "functionCalling": True,
+                "agentTools": True,
+                "searchCapable": True,
+                "deepThinking": True,
+            },
+        )
+
+        self.assertNotIn("extra_body", config.call_kwargs)
 
     def test_build_call_config_respects_explicit_reasoning_override(self):
         config = build_agent_loop_call_config(

@@ -35,6 +35,42 @@ async def run_agent_loop(
         if await _stop_if_limit_reached(state=state, runtime=runtime):
             break
 
+        exhausted_plan_changed = await _reconcile_exhausted_dynamic_tool_owners(
+            state=state,
+            runtime=runtime,
+        )
+        if exhausted_plan_changed and state.plan_coordinator.execution_items_terminal():
+            if (
+                has_product_result_blocks(state.content_blocks)
+                or state.product_tool_attempted
+                or state.pending_tool_repairs
+            ):
+                await _complete_product_result_without_llm(
+                    db=db,
+                    messages=messages,
+                    state=state,
+                    runtime=runtime,
+                )
+                break
+            if state.ready_for_plan_synthesis():
+                state.finish_reason = "plan_synthesis"
+                await _run_limit_summary(
+                    state=state,
+                    runtime=runtime,
+                    messages=messages,
+                    summary_finish_reason="plan_synthesis",
+                )
+                break
+            state.finish_reason = "dynamic_tool_budget_exhausted"
+            state.mark_unknown_terminated()
+            await _run_limit_summary(
+                state=state,
+                runtime=runtime,
+                messages=messages,
+                summary_finish_reason="dynamic_tool_budget_exhausted",
+            )
+            break
+
         step_number, step_context = await _start_next_step(state=state, runtime=runtime)
         round_result = await _run_round(
             messages=messages,
@@ -55,6 +91,15 @@ async def run_agent_loop(
             ),
         )
         if outcome is None:
+            if state.ready_for_plan_synthesis():
+                state.finish_reason = "plan_synthesis"
+                await _run_limit_summary(
+                    state=state,
+                    runtime=runtime,
+                    messages=messages,
+                    summary_finish_reason="plan_synthesis",
+                )
+                break
             continue
         if outcome.exit == AgentLoopExit.SUPERSEDED:
             return outcome
@@ -161,10 +206,6 @@ async def _start_next_step(
         "clock": runtime.clock,
         "on_step_started": state.mark_current_step,
     }
-    if _accepts_keyword(runtime.start_step_fn, "plan_items"):
-        start_step_kwargs["plan_items"] = state.plan_items
-    if _accepts_keyword(runtime.start_step_fn, "model_plan_managed"):
-        start_step_kwargs["model_plan_managed"] = state.plan_coordinator.has_valid_model_plan
     step_context = await runtime.start_step_fn(**start_step_kwargs)
     state.mark_current_step(step_context.step_id)
     return step_number, step_context
@@ -187,15 +228,34 @@ async def _run_round(
     step_number: int,
     step_context: AgentStepContext,
 ) -> AgentRoundResult:
-    async def on_answer_started() -> None:
-        snapshot = state.plan_coordinator.preview_answer_started()
-        if snapshot is not None:
-            await runtime.emitter.plan_snapshot(**snapshot)
-
     call_kwargs = await _filter_exhausted_dynamic_tools(
         call_kwargs=runtime.call_kwargs,
         dynamic_tool_handlers=runtime.dynamic_tool_handlers,
     )
+    if runtime.task_mode != "deep_research" and runtime.plan_mode == "on":
+        if not state.plan_coordinator.has_valid_model_plan:
+            call_kwargs = _filter_tools_for_research_stage(
+                call_kwargs,
+                allowed_tool_names=frozenset({"update_plan"}),
+            )
+            call_kwargs = _require_tool_call(
+                call_kwargs,
+                preferred_tool_name="update_plan",
+                provider=runtime.provider,
+            )
+        else:
+            active_tool_names = state.plan_coordinator.active_plan_tool_names()
+            call_kwargs = _filter_tools_for_research_stage(
+                call_kwargs,
+                allowed_tool_names=frozenset(active_tool_names),
+            )
+            for tool_name in active_tool_names:
+                call_kwargs = _constrain_research_stage_plan_binding(
+                    call_kwargs,
+                    tool_name=tool_name,
+                    active_plan_item_ids=state.plan_coordinator.active_plan_item_ids_for_tool(tool_name),
+                )
+            call_kwargs = _require_tool_call(call_kwargs, provider=runtime.provider)
     research_stage = None
     plan_repair_tool = None
     active_plan_item_ids: list[str] = []
@@ -226,6 +286,11 @@ async def _run_round(
                 tool_name=required_tool,
                 active_plan_item_ids=active_plan_item_ids,
             )
+        call_kwargs = _require_tool_call(
+            call_kwargs,
+            preferred_tool_name="update_plan" if research_stage == "planning" or plan_repair_tool else required_tool,
+            provider=runtime.provider,
+        )
     effective_messages = _messages_with_research_workset(
         messages,
         state=state,
@@ -255,14 +320,14 @@ async def _run_round(
         emitter=runtime.emitter,
         on_context_updated=state.update_context,
     )
-    if _accepts_keyword(runtime.run_round_fn, "on_answer_started"):
-        run_round_kwargs["on_answer_started"] = on_answer_started
     must_defer_until_plan = runtime.plan_mode == "on" and not state.plan_coordinator.has_valid_model_plan
     should_defer_output = (
         has_product_result_blocks(state.content_blocks)
         or state.product_tool_attempted
         or state.pending_tool_repairs
         or must_defer_until_plan
+        or runtime.plan_mode == "on"
+        or state.plan_coordinator.has_valid_model_plan
         or runtime.task_mode == "deep_research"
     )
     if should_defer_output and _accepts_keyword(runtime.run_round_fn, "defer_output"):
@@ -295,6 +360,45 @@ def _filter_tools_for_research_stage(
     else:
         filtered_call_kwargs.pop("tools", None)
         filtered_call_kwargs.pop("tool_choice", None)
+    return filtered_call_kwargs
+
+
+def _require_tool_call(
+    call_kwargs: dict,
+    *,
+    preferred_tool_name: str | None = None,
+    provider: str | None = None,
+) -> dict:
+    """计划与执行阶段由服务端锁定工具选择，禁止模型用正文绕过状态机。"""
+
+    tools = call_kwargs.get("tools")
+    if not isinstance(tools, list) or not tools:
+        filtered_call_kwargs = dict(call_kwargs)
+        filtered_call_kwargs.pop("tool_choice", None)
+        return filtered_call_kwargs
+
+    available_names = []
+    for tool in tools:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        name = function.get("name") if isinstance(function, dict) else None
+        if isinstance(name, str) and name:
+            available_names.append(name)
+
+    filtered_call_kwargs = dict(call_kwargs)
+    if provider == "moonshot":
+        filtered_call_kwargs["tool_choice"] = "required"
+    elif preferred_tool_name in available_names:
+        filtered_call_kwargs["tool_choice"] = {
+            "type": "function",
+            "function": {"name": preferred_tool_name},
+        }
+    elif len(available_names) == 1:
+        filtered_call_kwargs["tool_choice"] = {
+            "type": "function",
+            "function": {"name": available_names[0]},
+        }
+    else:
+        filtered_call_kwargs["tool_choice"] = "required"
     return filtered_call_kwargs
 
 
@@ -342,11 +446,7 @@ async def _filter_exhausted_dynamic_tools(
     if not dynamic_tool_handlers or not call_kwargs.get("tools"):
         return call_kwargs
 
-    exhausted_aliases: set[str] = set()
-    for alias, handler in dynamic_tool_handlers.items():
-        is_exhausted = getattr(handler, "is_run_budget_exhausted", None)
-        if is_exhausted is not None and await is_exhausted():
-            exhausted_aliases.add(alias)
+    exhausted_aliases = await _exhausted_dynamic_tool_aliases(dynamic_tool_handlers)
     if not exhausted_aliases:
         return call_kwargs
 
@@ -366,6 +466,39 @@ async def _filter_exhausted_dynamic_tools(
     return filtered_call_kwargs
 
 
+async def _exhausted_dynamic_tool_aliases(
+    dynamic_tool_handlers: dict[str, object] | None,
+) -> set[str]:
+    if not dynamic_tool_handlers:
+        return set()
+    exhausted_aliases: set[str] = set()
+    for alias, handler in dynamic_tool_handlers.items():
+        is_exhausted = getattr(handler, "is_run_budget_exhausted", None)
+        if is_exhausted is not None and await is_exhausted():
+            exhausted_aliases.add(alias)
+    return exhausted_aliases
+
+
+async def _reconcile_exhausted_dynamic_tool_owners(
+    *,
+    state: AgentLoopState,
+    runtime: AgentLoopRuntime,
+) -> bool:
+    """模型调用前先把预算耗尽工具的计划 owner 收口，避免隐藏 schema 后无工具空转。"""
+
+    exhausted_aliases = await _exhausted_dynamic_tool_aliases(runtime.dynamic_tool_handlers)
+    if not exhausted_aliases:
+        return False
+    snapshot = state.plan_coordinator.block_tool_owners(
+        exhausted_aliases,
+        reason="dynamic_tool_budget_exhausted",
+    )
+    if snapshot is None:
+        return False
+    await runtime.emitter.plan_snapshot(**snapshot)
+    return True
+
+
 async def _run_limit_summary(
     *,
     state: AgentLoopState,
@@ -373,25 +506,34 @@ async def _run_limit_summary(
     messages: list[dict],
     summary_finish_reason: str = "limit_summary",
 ) -> None:
-    snapshot = state.plan_coordinator.commit_answer_started()
+    if not state.plan_coordinator.execution_items_terminal():
+        blocked_snapshot = state.plan_coordinator.block_pending_execution(
+            reason=f"{summary_finish_reason}_execution_blocked"
+        )
+        if blocked_snapshot is not None:
+            await runtime.emitter.plan_snapshot(**blocked_snapshot)
+    snapshot = state.plan_coordinator.begin_synthesis()
     if snapshot is not None:
         await runtime.emitter.plan_snapshot(**snapshot)
     summary_outcome = await runtime.run_limit_summary_step_fn(
         request=build_limit_summary_step_request(
             state=state,
             runtime=runtime,
-            messages=_messages_with_research_workset(
-                messages,
-                state=state,
-                runtime=runtime,
-                include_candidates=False,
+            messages=deepcopy(
+                _messages_with_research_workset(
+                    messages,
+                    state=state,
+                    runtime=runtime,
+                    include_candidates=runtime.task_mode != "deep_research",
+                    terminal_summary=True,
+                )
             ),
             summary_finish_reason=summary_finish_reason,
         ),
     )
     state.update_usage(summary_outcome.accumulated_usage)
     state.update_context(summary_outcome.context)
-    if summary_outcome.incomplete:
+    if summary_outcome.incomplete and state.limit_reason is None:
         state.mark_unknown_terminated()
     if summary_finish_reason == "plan_repair_exhausted":
         state.mark_unknown_terminated()
@@ -407,9 +549,25 @@ def _messages_with_research_workset(
     research_stage: str | None = None,
     plan_repair_tool: str | None = None,
     active_plan_item_ids: list[str] | None = None,
+    terminal_summary: bool = False,
 ) -> list[dict]:
     if runtime.task_mode != "deep_research":
-        return messages
+        if not terminal_summary:
+            return messages
+        untrusted_messages = build_research_untrusted_context_messages(
+            state.research_workset,
+            include_candidates=True,
+        )
+        if not untrusted_messages:
+            return messages
+        insert_at = 0
+        while insert_at < len(messages) and messages[insert_at].get("role") == "system":
+            insert_at += 1
+        return [
+            *messages[:insert_at],
+            *untrusted_messages,
+            *messages[insert_at:],
+        ]
     stage_prompt = (
         build_deep_research_stage_prompt(
             research_stage,

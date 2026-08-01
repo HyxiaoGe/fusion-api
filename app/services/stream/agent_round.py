@@ -12,6 +12,7 @@ from app.ai.llm_round_observability import create_llm_round_observation
 from app.schemas.chat import ContextUsage, Usage
 from app.services.chat.context_manager import ContextManagementError, ContextPlan, prepare_context
 from app.services.stream.context_status import build_context_usage, emit_context_status
+from app.services.stream.reasoning_transport import allows_deferred_reasoning_output
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,7 @@ class AgentRoundResult:
     context: ContextUsage | None = None
     announced_tool_names: frozenset[str] | None = None
     output_deferred: bool = False
+    allow_deferred_reasoning_output: bool = False
 
 
 StreamRoundResult = tuple[str, str, list[dict], str, Usage | None]
@@ -87,6 +89,7 @@ async def collect_agent_round_stream(
     task_id: str,
     run_id: str,
     provider: str | None = None,
+    model_id: str | None = None,
     litellm_model: str,
     litellm_kwargs: dict,
     messages: list[dict],
@@ -97,7 +100,7 @@ async def collect_agent_round_stream(
     stream_round_fn: Callable[..., Awaitable[StreamRoundResult]],
     observation: Any | None = None,
     defer_output: bool = False,
-    on_answer_started: Callable[[], Awaitable[None]] | None = None,
+    allow_deferred_reasoning_output: bool = False,
 ) -> StreamRoundResult:
     response = await llm_call_fn(
         litellm_model,
@@ -110,10 +113,15 @@ async def collect_agent_round_stream(
     stream_kwargs = {"run_id": run_id, "step_id": step_context.step_id}
     if provider is not None and _accepts_keyword(stream_round_fn, "provider"):
         stream_kwargs["provider"] = provider
+    if model_id is not None and _accepts_keyword(stream_round_fn, "model_id"):
+        stream_kwargs["model_id"] = model_id
     if defer_output and _accepts_keyword(stream_round_fn, "defer_output"):
         stream_kwargs["defer_output"] = True
-    if on_answer_started is not None and _accepts_keyword(stream_round_fn, "on_answer_started"):
-        stream_kwargs["on_answer_started"] = on_answer_started
+    if allow_deferred_reasoning_output and _accepts_keyword(
+        stream_round_fn,
+        "allow_deferred_reasoning_output",
+    ):
+        stream_kwargs["allow_deferred_reasoning_output"] = True
     return await stream_round_fn(
         response,
         conversation_id,
@@ -179,7 +187,6 @@ async def run_agent_round(
     emitter: Any | None = None,
     on_context_updated: Callable[[ContextUsage], None] | None = None,
     defer_output: bool = False,
-    on_answer_started: Callable[[], Awaitable[None]] | None = None,
 ) -> AgentRoundResult:
     try:
         context_plan = await prepare_context(
@@ -233,6 +240,7 @@ async def run_agent_round(
             task_id=task_id,
             run_id=run_id,
             provider=provider,
+            model_id=model_id,
             litellm_model=litellm_model,
             litellm_kwargs=litellm_kwargs,
             messages=effective_messages,
@@ -243,7 +251,7 @@ async def run_agent_round(
             stream_round_fn=stream_round_fn,
             observation=observation,
             defer_output=defer_output,
-            on_answer_started=on_answer_started,
+            allow_deferred_reasoning_output=defer_output,
         )
     except BaseException as exc:
         await observation.finish_error(exc)
@@ -275,4 +283,9 @@ async def run_agent_round(
         context=final_context,
         announced_tool_names=_announced_tool_names(call_kwargs),
         output_deferred=defer_output and _accepts_keyword(stream_round_fn, "defer_output"),
+        allow_deferred_reasoning_output=(
+            defer_output
+            and allows_deferred_reasoning_output(model_id)
+            and _accepts_keyword(stream_round_fn, "allow_deferred_reasoning_output")
+        ),
     )

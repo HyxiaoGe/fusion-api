@@ -282,7 +282,7 @@ class ResearchEvidenceTests(unittest.TestCase):
         coordinator.configure_initial_tool_requirements(
             {
                 "web_search": 1,
-                "url_read": 1,
+                "url_read": 2,
             }
         )
         self.assertTrue(coordinator.adopt_research_fallback().accepted)
@@ -360,6 +360,25 @@ class ResearchEvidenceTests(unittest.TestCase):
                 unexecuted_plan_tool_names=set(),
             ),
             "synthesis",
+        )
+
+    def test_rejected_non_stage_tool_plan_cannot_enter_synthesis(self):
+        workset = ResearchEvidenceWorkset()
+        workset.record_content_blocks(
+            [
+                _search_block(),
+                _read_block("https://example.com/a", evidence_id="ev-a", citation_index=2),
+                _read_block("https://example.com/b", evidence_id="ev-b", citation_index=3),
+            ]
+        )
+
+        self.assertEqual(
+            resolve_deep_research_stage(
+                workset,
+                has_valid_plan=False,
+                unexecuted_plan_tool_names={"route_compare"},
+            ),
+            "planning",
         )
 
 

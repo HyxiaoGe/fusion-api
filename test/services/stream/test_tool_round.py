@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from typing import Literal
 from unittest.mock import AsyncMock, Mock
 
@@ -38,7 +39,7 @@ class FutureRegisteredResultBlock(BaseModel):
 
 
 class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
-    async def test_deferred_plan_control_round_does_not_persist_hidden_reasoning(self):
+    async def test_deferred_plan_control_round_persists_visible_reasoning_but_returns_raw_to_model(self):
         update_call = {
             "id": "tc-plan",
             "name": "update_plan",
@@ -73,12 +74,13 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
             assistant_message_id="msg-deferred",
             conversation_id="conv-deferred",
             user_id="user-1",
-            model_id="gpt-4",
-            provider="openai",
+            model_id="kimi-k3",
+            provider="moonshot",
             content_blocks=[],
             messages=[{"role": "user", "content": "制定计划"}],
             tool_calls=[update_call],
-            reasoning_buf="内部 _plan_item_id 推理",
+            reasoning_buf="内部对应计划步骤推理",
+            protocol_reasoning_buf="内部 _plan_item_id 推理",
             should_use_reasoning=True,
             step_context=AgentStepContext(
                 step_id="step-deferred",
@@ -100,13 +102,38 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
             announced_tool_names=frozenset({"update_plan"}),
             agent_state=state,
             output_deferred=True,
+            allow_deferred_reasoning_output=True,
         )
 
         await handle_tool_calls_round(request=request)
 
-        self.assertFalse(any(isinstance(block, ThinkingBlock) for block in request.content_blocks))
-        for call in persisted.call_args_list:
-            self.assertFalse(any(isinstance(block, ThinkingBlock) for block in call.args[4]))
+        thinking_blocks = [
+            block for block in request.content_blocks if isinstance(block, ThinkingBlock)
+        ]
+        self.assertEqual(len(thinking_blocks), 1)
+        self.assertEqual(thinking_blocks[0].thinking, "内部对应计划步骤推理")
+        self.assertTrue(
+            any(
+                any(isinstance(block, ThinkingBlock) for block in call.args[4])
+                for call in persisted.call_args_list
+            )
+        )
+        assistant_message = next(message for message in request.messages if message.get("role") == "assistant")
+        self.assertEqual(assistant_message["reasoning_content"], "内部 _plan_item_id 推理")
+
+    def test_non_k3_deferred_round_does_not_add_visible_reasoning_block(self):
+        request = SimpleNamespace(
+            reasoning_buf="只供内部继续调用的推理",
+            output_deferred=True,
+            allow_deferred_reasoning_output=True,
+            model_id="gpt-4",
+            content_blocks=[],
+            step_context=SimpleNamespace(thinking_block_id="thinking-non-k3"),
+        )
+
+        tool_round_module.append_tool_round_reasoning(request)
+
+        self.assertEqual(request.content_blocks, [])
 
     async def test_mixed_plan_and_external_calls_are_all_paired_but_only_external_counts(self):
         update_call = {
@@ -204,7 +231,7 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.tool_call_count, 1)
         self.assertEqual(state.total_tool_calls, 1)
         self.assertEqual(executed_calls[0]["plan_item_id"], "search")
-        self.assertEqual(state.plan_coordinator.items[0]["status"], "running")
+        self.assertEqual(state.plan_coordinator.items[0]["status"], "completed")
         self.assertEqual(state.plan_coordinator.repair_attempt_count, 0)
         paired_ids = [message["tool_call_id"] for message in request.messages if message.get("role") == "tool"]
         self.assertEqual(paired_ids, ["tc-plan", "tc-search"])
@@ -405,7 +432,7 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
                 ],
             }
         )
-        self.assertEqual(removed.reason, "attempted_item_removed")
+        self.assertEqual(removed.reason, "terminal_item_removed")
 
     def test_plan_item_status_aggregates_all_results_and_includes_reused_success(self):
         def record(
@@ -452,6 +479,64 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(statuses, {"research": "failed", "cached": "completed"})
 
+    def test_retryable_failure_stays_running_then_same_plan_item_can_complete(self):
+        def record(*, tool_call_id: str, status: str, retryable: bool = False) -> ToolExecutionRecord:
+            data = {"repair": {"retryable": True}} if retryable else {}
+            return ToolExecutionRecord(
+                tool_call={
+                    "id": tool_call_id,
+                    "name": "web_search",
+                    "plan_item_id": "search",
+                },
+                result=ToolResult(status=status, data=data),
+                handler=None,
+                block_id=f"blk-{tool_call_id}",
+                log_id=f"log-{tool_call_id}",
+            )
+
+        retryable = tool_round_module._plan_item_statuses_from_results(
+            [record(tool_call_id="tc-retryable", status="failed", retryable=True)]
+        )
+        repaired = tool_round_module._plan_item_statuses_from_results(
+            [record(tool_call_id="tc-success", status="success")]
+        )
+
+        self.assertEqual(retryable, {"search": "running"})
+        self.assertEqual(repaired, {"search": "completed"})
+
+    def test_missing_result_and_non_retryable_failure_never_complete_plan_item(self):
+        missing = tool_round_module._plan_item_statuses_from_batch(
+            [],
+            missing_result_tool_calls=[
+                {
+                    "id": "tc-missing",
+                    "name": "web_search",
+                    "plan_item_id": "missing",
+                }
+            ],
+        )
+        failed = tool_round_module._plan_item_statuses_from_results(
+            [
+                ToolExecutionRecord(
+                    tool_call={
+                        "id": "tc-failed",
+                        "name": "web_search",
+                        "plan_item_id": "failed",
+                    },
+                    result=ToolResult(
+                        status="failed",
+                        data={"repair": {"retryable": False}},
+                    ),
+                    handler=None,
+                    block_id="blk-failed",
+                    log_id="log-failed",
+                )
+            ]
+        )
+
+        self.assertNotEqual(missing["missing"], "completed")
+        self.assertNotEqual(failed["failed"], "completed")
+
     def test_degraded_network_result_does_not_complete_plan_item(self):
         def record(tool_name: str, plan_item_id: str) -> ToolExecutionRecord:
             return ToolExecutionRecord(
@@ -483,7 +568,7 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-    def test_successful_plan_tool_result_never_terminalizes_item_mid_run(self):
+    def test_successful_plan_tool_result_maps_to_completed_immediately(self):
         state = AgentLoopState()
         state.plan_coordinator.configure_initial_tool_requirements(
             {
@@ -688,7 +773,7 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
             state.research_workset.unread_candidate_urls,
             {"https://example.com/postgresql-18"},
         )
-        self.assertEqual(state.plan_coordinator.items[0]["status"], "running")
+        self.assertEqual(state.plan_coordinator.items[0]["status"], "completed")
 
     async def test_on_mode_pairs_but_does_not_execute_unplanned_external_call(self):
         state = AgentLoopState()
@@ -786,6 +871,60 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("invalid_plan_structure", response["content"])
         self.assertNotIn("DSML", response["content"])
         self.assertEqual(request.content_blocks, [])
+
+    async def test_unannounced_control_call_cannot_mutate_plan_or_consume_repair_budget(self):
+        state = AgentLoopState()
+        state.plan_coordinator.run_id = "run-unannounced-control"
+        request = tool_round_module.ToolRoundRequest(
+            db="db",
+            assistant_message_id="msg-unannounced-control",
+            conversation_id="conv-unannounced-control",
+            user_id="user-unannounced-control",
+            model_id="mimo",
+            provider="openai",
+            content_blocks=[],
+            messages=[{"role": "user", "content": "整理已有检索结果"}],
+            tool_calls=[
+                {
+                    "id": "tc-stale-plan",
+                    "name": "update_plan",
+                    "arguments": {"step": "错误的单步状态更新"},
+                }
+            ],
+            reasoning_buf="",
+            should_use_reasoning=False,
+            step_context=AgentStepContext(
+                step_id="step-unannounced-control",
+                run_id="run-unannounced-control",
+                step_number=3,
+                started_at=1.0,
+                thinking_block_id="thinking-unannounced-control",
+                text_block_id="text-unannounced-control",
+            ),
+            step_number=3,
+            run_id="run-unannounced-control",
+            emitter=AsyncMock(),
+            session_cache=object(),
+            network_budget=object(),
+            call_kwargs={},
+            persist_message_fn=Mock(),
+            execute_tools_fn=AsyncMock(),
+            complete_step_fn=AsyncMock(),
+            on_tools_executed=state.record_executed_tool_calls,
+            completed_tool_calls=1,
+            max_tool_calls=20,
+            announced_tool_names=frozenset(),
+            agent_state=state,
+        )
+
+        outcome = await handle_tool_calls_round(request=request)
+
+        self.assertEqual(outcome.tool_call_count, 0)
+        self.assertEqual(outcome.unavailable_tool_call_count, 1)
+        self.assertEqual(state.plan_coordinator.repair_attempt_count, 0)
+        response = next(message for message in request.messages if message.get("role") == "tool")
+        self.assertEqual(response["tool_call_id"], "tc-stale-plan")
+        self.assertIn("tool_not_announced_this_round", response["content"])
 
     def test_pending_repairs_are_keyed_and_only_matching_success_resolves_them(self):
         state = AgentLoopState()
@@ -1311,7 +1450,27 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
             "extra_body": {"thinking": {"type": "disabled"}},
         }
 
-        restore_reasoning_after_tool_decision(call_kwargs)
+        restore_reasoning_after_tool_decision(call_kwargs, provider="openai")
+
+        self.assertNotIn("extra_body", call_kwargs)
+
+    def test_deepseek_plan_run_keeps_disabled_thinking_protocol_after_tool_decision(self):
+        call_kwargs = {
+            "tools": [{"function": {"name": "update_plan"}}],
+            "extra_body": {"thinking": {"type": "disabled"}},
+        }
+
+        restore_reasoning_after_tool_decision(call_kwargs, provider="deepseek")
+
+        self.assertEqual(call_kwargs["extra_body"], {"thinking": {"type": "disabled"}})
+
+    def test_moonshot_removes_temporary_disabled_thinking_after_tool_decision(self):
+        call_kwargs = {
+            "tools": [{"function": {"name": "update_plan"}}],
+            "extra_body": {"thinking": {"type": "disabled"}},
+        }
+
+        restore_reasoning_after_tool_decision(call_kwargs, provider="moonshot")
 
         self.assertNotIn("extra_body", call_kwargs)
 

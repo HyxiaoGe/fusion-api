@@ -138,6 +138,8 @@ def resolve_deep_research_stage(
         return "search"
     if len(workset.successful_read_urls) >= 2:
         remaining_tools = unexecuted_plan_tool_names or set()
+        if remaining_tools - {"web_search", "url_read"}:
+            return "planning"
         if "web_search" in remaining_tools:
             return "search"
         if "url_read" in remaining_tools:

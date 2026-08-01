@@ -1,0 +1,146 @@
+import unittest
+from types import SimpleNamespace
+
+from app.services.stream.agent_plan_tool_policy import resolve_agent_plan_tool_policy
+
+
+class AgentPlanToolPolicyTests(unittest.TestCase):
+    def test_explicit_commute_comparison_requires_route_tool_and_blocks_generic_substitutes(self):
+        policy = resolve_agent_plan_tool_policy(
+            original_message=("我住在南景新村，公司在双子塔，请帮我比较驾车、公交和地铁的通勤路线，并给出推荐选择。"),
+            announced_tool_names=[
+                "web_search",
+                "local_place_search",
+                "route_compare",
+                "weather_forecast",
+            ],
+        )
+
+        self.assertEqual(policy.required_initial_tool_counts, {"route_compare": 1})
+        self.assertEqual(policy.allowed_tool_names, frozenset({"route_compare"}))
+        self.assertEqual(policy.reason, "explicit_route_task")
+
+    def test_route_news_question_is_not_misclassified_as_route_planning(self):
+        policy = resolve_agent_plan_tool_policy(
+            original_message="深圳公交路线最近有什么调整？请联网查下新闻。",
+            announced_tool_names=["web_search", "route_compare"],
+        )
+
+        self.assertEqual(policy.required_initial_tool_counts, {})
+        self.assertIsNone(policy.allowed_tool_names)
+
+    def test_policy_or_environmental_research_is_not_misclassified_as_route_planning(self):
+        messages = [
+            "请联网研究深圳绿色通勤政策，包括公交、步行和骑行路线的环保影响。",
+            "从环保角度分析公交路线、步行和驾车的碳排放差异，不需要规划具体行程。",
+        ]
+
+        for message in messages:
+            with self.subTest(message=message):
+                policy = resolve_agent_plan_tool_policy(
+                    original_message=message,
+                    announced_tool_names=["web_search", "route_compare"],
+                )
+
+                self.assertEqual(policy.required_initial_tool_counts, {})
+                self.assertIsNone(policy.allowed_tool_names)
+
+    def test_current_message_explicit_route_ignores_generic_network_word(self):
+        policy = resolve_agent_plan_tool_policy(
+            original_message="请联网查询从南景新村到双子塔怎么走，比较驾车和地铁路线。",
+            announced_tool_names=["web_search", "route_compare"],
+        )
+
+        self.assertEqual(policy.required_initial_tool_counts, {"route_compare": 1})
+        self.assertEqual(policy.allowed_tool_names, frozenset({"route_compare"}))
+        self.assertEqual(policy.reason, "explicit_route_task")
+
+    def test_followup_route_mode_uses_adjacent_structured_route_result(self):
+        policy = resolve_agent_plan_tool_policy(
+            original_message="那公交和驾车哪个更合适？",
+            announced_tool_names=["web_search", "route_compare"],
+            task_context_messages=[
+                {"role": "user", "content": "我想从南景新村到双子塔"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "route_results", "schema_version": 1},
+                        {"type": "text", "text": "已为你完成路线比较。"},
+                    ],
+                },
+                {"role": "user", "content": "那公交和驾车哪个更合适？"},
+            ],
+        )
+
+        self.assertEqual(policy.required_initial_tool_counts, {})
+        self.assertEqual(policy.allowed_tool_names, frozenset({"route_compare"}))
+        self.assertEqual(policy.reason, "adjacent_route_followup")
+
+    def test_elliptical_followup_reads_real_content_block_message_shape(self):
+        policy = resolve_agent_plan_tool_policy(
+            original_message="那你更推荐哪个？",
+            announced_tool_names=["web_search", "route_compare"],
+            task_context_messages=[
+                SimpleNamespace(
+                    role="user",
+                    content=[
+                        SimpleNamespace(
+                            type="text",
+                            text="我住在南景新村，公司在双子塔，请比较驾车、公交和地铁通勤方案。",
+                        )
+                    ],
+                ),
+                SimpleNamespace(
+                    role="assistant",
+                    content=[
+                        SimpleNamespace(type="route_results", schema_version=1),
+                        SimpleNamespace(type="text", text="已为你完成路线比较。"),
+                    ],
+                ),
+                SimpleNamespace(
+                    role="user",
+                    content=[SimpleNamespace(type="text", text="那你更推荐哪个？")],
+                ),
+            ],
+        )
+
+        self.assertEqual(policy.required_initial_tool_counts, {})
+        self.assertEqual(policy.allowed_tool_names, frozenset({"route_compare"}))
+        self.assertEqual(policy.reason, "adjacent_route_followup")
+
+    def test_old_route_result_does_not_leak_across_a_completed_topic_change(self):
+        policy = resolve_agent_plan_tool_policy(
+            original_message="那地铁和开车哪个更环保？",
+            announced_tool_names=["web_search", "route_compare"],
+            task_context_messages=[
+                {"role": "user", "content": "从南景新村到双子塔怎么走？"},
+                {"role": "assistant", "content": [{"type": "route_results", "schema_version": 1}]},
+                {"role": "user", "content": "讲讲 Python 3.14"},
+                {"role": "assistant", "content": [{"type": "text", "text": "Python 3.14 的主要变化如下。"}]},
+                {"role": "user", "content": "那地铁和开车哪个更环保？"},
+            ],
+        )
+
+        self.assertEqual(policy.required_initial_tool_counts, {})
+        self.assertIsNone(policy.allowed_tool_names)
+
+    def test_route_and_weather_request_keeps_both_structured_tools(self):
+        policy = resolve_agent_plan_tool_policy(
+            original_message="从南景新村到双子塔怎么走？比较地铁和驾车，也看看今天的天气。",
+            announced_tool_names=["web_search", "route_compare", "weather_forecast"],
+        )
+
+        self.assertEqual(policy.required_initial_tool_counts, {"route_compare": 1})
+        self.assertEqual(
+            policy.allowed_tool_names,
+            frozenset({"route_compare", "weather_forecast"}),
+        )
+
+    def test_ambiguous_itinerary_request_is_left_to_model(self):
+        policy = resolve_agent_plan_tool_policy(
+            original_message="帮我规划广州一日游。",
+            announced_tool_names=["web_search", "local_place_search", "route_compare"],
+        )
+
+        self.assertEqual(policy.required_initial_tool_counts, {})
+        self.assertIsNone(policy.allowed_tool_names)

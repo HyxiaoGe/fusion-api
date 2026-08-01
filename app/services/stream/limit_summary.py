@@ -14,12 +14,13 @@ from app.ai.prompts.agent_loop import LIMIT_SUMMARY_PROMPT as _LIMIT_SUMMARY_PRO
 from app.ai.prompts.agent_loop import (
     NO_PROGRESS_SUMMARY_PROMPT,
     PLAN_REPAIR_SUMMARY_PROMPT,
+    PLAN_SYNTHESIS_PROMPT,
     RESEARCH_EVIDENCE_SUMMARY_PROMPT,
     SUMMARY_NON_DISCLOSURE_PROMPT,
     get_limit_summary_prompt,
 )
 from app.core.logger import app_logger as logger
-from app.schemas.chat import ContextUsage, TextBlock, ThinkingBlock, Usage
+from app.schemas.chat import ContextUsage, TextBlock, Usage
 from app.services.chat.context_manager import ContextManagementError, ContextPlan, prepare_context
 from app.services.final_answer_evidence import build_used_final_answer_evidence
 from app.services.stream.context_status import build_context_usage, emit_context_status
@@ -91,6 +92,7 @@ class LimitSummaryStepRequest:
     task_mode: str = "standard"
     evidence_policy: str = "standard"
     research_workset: ResearchEvidenceWorkset | None = None
+    defer_output: bool = True
 
 
 def build_limit_summary_call_kwargs(call_kwargs: dict) -> dict:
@@ -107,7 +109,9 @@ def append_limit_summary_prompt(
     summary_finish_reason: str = "limit_summary",
     task_mode: str = "standard",
 ) -> None:
-    if summary_finish_reason == "no_progress_summary":
+    if summary_finish_reason == "plan_synthesis":
+        prompt = PLAN_SYNTHESIS_PROMPT
+    elif summary_finish_reason == "no_progress_summary":
         prompt = NO_PROGRESS_SUMMARY_PROMPT
     elif summary_finish_reason == "plan_repair_exhausted":
         prompt = PLAN_REPAIR_SUMMARY_PROMPT
@@ -126,31 +130,82 @@ def remove_conflicting_tool_usage_contract(
     messages: list[dict],
     *,
     task_mode: str = "standard",
+    final_synthesis: bool = False,
 ) -> None:
     """收尾总结移除会继续诱发工具协议的旧契约与事务历史。"""
 
-    deep_research_control_markers = (
+    del final_synthesis  # 终局总结统一清理控制契约，不再按结束原因分叉。
+    terminal_control_markers = (
         "【自主联网判断规则】",
         "【工具调用一致性规则】",
         "【执行计划控制规则】",
+        "【计划控制修正】",
+        "【计划执行修正】",
+    )
+    deep_research_control_markers = (
         "【深度研究执行约束】",
         "【深度研究阶段控制】",
         "【深度研究完成校验】",
-        "【计划控制修正】",
     )
+    strip_tool_transactions = task_mode == "deep_research" or _only_recoverable_tool_transactions(messages)
     filtered: list[dict] = []
     for message in messages:
         role = message.get("role")
         content = str(message.get("content", ""))
-        if role == "system" and "【工具调用一致性规则】" in content:
+        if role == "system" and any(marker in content for marker in terminal_control_markers):
             continue
-        if task_mode == "deep_research":
-            if role in {"assistant", "tool"}:
-                continue
-            if role == "system" and any(marker in content for marker in deep_research_control_markers):
-                continue
+        if task_mode == "deep_research" and role == "system" and any(
+            marker in content for marker in deep_research_control_markers
+        ):
+            continue
+        if strip_tool_transactions and role == "assistant" and message.get("tool_calls"):
+            continue
+        if strip_tool_transactions and role == "tool":
+            continue
         filtered.append(message)
     messages[:] = filtered
+
+
+def _only_recoverable_tool_transactions(messages: list[dict]) -> bool:
+    """仅当全部事务都有服务端安全投影时，才从普通总结上下文移除原始协议。"""
+
+    recoverable_tool_names = {"update_plan", "web_search", "url_read"}
+    tool_call_names: list[str] = []
+    tool_call_ids: set[str] = set()
+    tool_message_ids: set[str] = set()
+    for message in messages:
+        if message.get("role") == "tool":
+            tool_call_id = str(message.get("tool_call_id") or "")
+            if not tool_call_id:
+                return False
+            tool_message_ids.add(tool_call_id)
+        if message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list) or not tool_calls:
+            continue
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                return False
+            function = tool_call.get("function")
+            if isinstance(function, dict):
+                tool_name = str(function.get("name") or "")
+            else:
+                tool_name = str(tool_call.get("name") or "")
+            if not tool_name:
+                return False
+            tool_call_id = str(tool_call.get("id") or "")
+            if not tool_call_id:
+                return False
+            tool_call_ids.add(tool_call_id)
+            tool_call_names.append(tool_name)
+
+    if not tool_call_names:
+        return False
+    return (
+        tool_call_ids == tool_message_ids
+        and all(tool_name in recoverable_tool_names for tool_name in tool_call_names)
+    )
 
 
 SUMMARY_TOOL_PROTOCOL_RETRY_PROMPT = (
@@ -172,12 +227,13 @@ def _create_limit_summary_observation(
     call_kwargs: dict,
     estimator_status: str | None = None,
 ) -> Any:
+    round_kind = "plan_synthesis" if request.summary_finish_reason == "plan_synthesis" else "limit_summary"
     return create_llm_round_observation(
         conversation_id=request.conversation_id,
         run_id=request.run_id,
         round_index=request.step_number,
         step_id=step_id,
-        round_kind="limit_summary",
+        round_kind=round_kind,
         model_id=request.model_id,
         provider=request.provider,
         litellm_model=request.litellm_model,
@@ -243,7 +299,9 @@ async def call_limit_summary_round(
         stream_kwargs = {"run_id": request.run_id, "step_id": step_id}
         if _accepts_keyword(request.stream_round_fn, "provider"):
             stream_kwargs["provider"] = request.provider
-        if request.task_mode == "deep_research" and _accepts_keyword(request.stream_round_fn, "defer_output"):
+        if (request.defer_output or request.task_mode == "deep_research") and _accepts_keyword(
+            request.stream_round_fn, "defer_output"
+        ):
             stream_kwargs["defer_output"] = True
         reasoning_buf, content_buf, tool_calls, finish_reason, usage_data = await request.stream_round_fn(
             response,
@@ -295,19 +353,11 @@ def accumulate_summary_usage(accumulated_usage: Usage, usage_data: Usage | None)
 def append_summary_content_blocks(
     *,
     content_blocks: list,
-    reasoning_buf: str,
     content_buf: str,
-    thinking_block_id: str,
     text_block_id: str,
 ) -> None:
     if content_buf:
-        if reasoning_buf:
-            content_blocks.append(ThinkingBlock(type="thinking", id=thinking_block_id, thinking=reasoning_buf))
         content_blocks.append(TextBlock(type="text", id=text_block_id, text=content_buf))
-        return
-
-    if reasoning_buf:
-        content_blocks.append(TextBlock(type="text", id=text_block_id, text=reasoning_buf))
 
 
 async def complete_limit_summary_step(
@@ -462,10 +512,7 @@ async def _repair_deep_research_summary_citations(
             timeout=remaining,
         )
     except asyncio.TimeoutError:
-        warning(
-            "深度研究收尾引用修正超出剩余预算: "
-            f"conv_id={request.conversation_id}, budget={remaining}s"
-        )
+        warning(f"深度研究收尾引用修正超出剩余预算: conv_id={request.conversation_id}, budget={remaining}s")
         return result
     if _is_summary_tool_protocol_violation(repaired):
         warning(
@@ -521,6 +568,7 @@ async def run_limit_summary_step(
     remove_conflicting_tool_usage_contract(
         request.messages,
         task_mode=request.task_mode,
+        final_synthesis=True,
     )
     append_limit_summary_prompt(
         request.messages,
@@ -549,17 +597,49 @@ async def run_limit_summary_step(
         incomplete = await _complete_deep_research_summary(
             request=request,
             round_result=round_result,
+            thinking_block_id=thinking_block_id,
             text_block_id=text_block_id,
             step_id=summary_context.step_id,
         )
+    elif request.summary_finish_reason == "plan_synthesis":
+        answer = round_result.content_buf.strip()
+        incomplete = round_result.finish_reason == "protocol_fallback" or not answer
+        if not answer:
+            answer = SUMMARY_PROTOCOL_FALLBACK_TEXT
+        if request.defer_output:
+            await append_chunk(
+                request.conversation_id,
+                "answering",
+                answer,
+                text_block_id,
+                task_id=request.task_id,
+                run_id=request.run_id,
+                step_id=summary_context.step_id,
+            )
+        request.content_blocks.append(TextBlock(type="text", id=text_block_id, text=answer))
     else:
-        append_summary_content_blocks(
-            content_blocks=request.content_blocks,
-            reasoning_buf=round_result.reasoning_buf,
-            content_buf=round_result.content_buf,
-            thinking_block_id=thinking_block_id,
-            text_block_id=text_block_id,
-        )
+        answer = round_result.content_buf.strip()
+        incomplete = round_result.finish_reason == "protocol_fallback" or not answer
+        if not answer:
+            answer = SUMMARY_PROTOCOL_FALLBACK_TEXT
+        if request.defer_output:
+            await append_chunk(
+                request.conversation_id,
+                "answering",
+                answer,
+                text_block_id,
+                task_id=request.task_id,
+                run_id=request.run_id,
+                step_id=summary_context.step_id,
+            )
+        if round_result.content_buf.strip():
+            append_summary_content_blocks(
+                content_blocks=request.content_blocks,
+                content_buf=round_result.content_buf,
+                text_block_id=text_block_id,
+            )
+        else:
+            request.content_blocks.append(TextBlock(type="text", id=text_block_id, text=answer))
     await complete_limit_summary_step(
         summary_context=summary_context,
         emitter=request.emitter,
@@ -578,6 +658,7 @@ async def _complete_deep_research_summary(
     *,
     request: LimitSummaryStepRequest,
     round_result: LimitSummaryRoundResult,
+    thinking_block_id: str,
     text_block_id: str,
     step_id: str,
 ) -> bool:
@@ -600,7 +681,11 @@ async def _complete_deep_research_summary(
         run_id=request.run_id,
         step_id=step_id,
     )
-    request.content_blocks.append(TextBlock(type="text", id=text_block_id, text=answer))
+    append_summary_content_blocks(
+        content_blocks=request.content_blocks,
+        content_buf=answer,
+        text_block_id=text_block_id,
+    )
     if not validation.is_valid:
         return True
     await _emit_deep_summary_used_evidence(

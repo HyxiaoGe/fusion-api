@@ -195,6 +195,16 @@ def build_agent_loop_lifecycle_call(
         additional_tools=list(getattr(dynamic_tool_set, "definitions", []) or []),
         dynamic_tool_handlers=dict(getattr(dynamic_tool_set, "handlers", {}) or {}),
         tool_bindings=list(getattr(dynamic_tool_set, "audit_bindings", []) or []),
+        **(
+            {"original_message": run_input.original_message}
+            if _accepts_keyword(dependencies.build_call_config_fn, "original_message")
+            else {}
+        ),
+        **(
+            {"task_context_messages": run_input.raw_messages}
+            if _accepts_keyword(dependencies.build_call_config_fn, "task_context_messages")
+            else {}
+        ),
     )
     execution = dependencies.build_execution_fn(
         request=run_input.to_execution_request(db=db, call_config=call_config),
@@ -218,3 +228,10 @@ def _load_dynamic_tools(load_fn: Callable[..., Any], *, db: Any, user_id: str) -
     if supports_user_id:
         return load_fn(db, user_id=user_id)
     return load_fn(db)
+
+
+def _accepts_keyword(fn: Callable[..., Any], keyword: str) -> bool:
+    parameters = inspect.signature(fn).parameters.values()
+    return any(parameter.name == keyword for parameter in parameters) or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters
+    )

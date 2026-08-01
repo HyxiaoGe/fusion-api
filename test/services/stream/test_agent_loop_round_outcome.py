@@ -81,6 +81,41 @@ def _step_context(step_id="step-outcome"):
     )
 
 
+def _synthesis_state(*, run_id: str, step_id: str, **state_kwargs) -> AgentLoopState:
+    coordinator = PlanCoordinator(run_id=run_id, mode="on")
+    update = coordinator.apply_model_update(
+        {
+            "reason": "先执行查询，再整理结论",
+            "items": [
+                {
+                    "id": "query",
+                    "title": "执行查询",
+                    "status": "running",
+                    "kind": "search",
+                    "depends_on": [],
+                    "planned_tools": ["web_search"],
+                },
+                {
+                    "id": "answer",
+                    "title": "整理结论",
+                    "status": "pending",
+                    "kind": "answer",
+                    "depends_on": ["query"],
+                    "planned_tools": [],
+                },
+            ],
+        }
+    )
+    if not update.accepted:
+        raise AssertionError(f"综合阶段计划 fixture 无效: {update.reason}")
+    coordinator.mark_tool_results({"query": "completed"})
+    if coordinator.begin_synthesis() is None:
+        raise AssertionError("综合阶段计划 fixture 未进入 synthesis")
+    state = AgentLoopState(plan_coordinator=coordinator, **state_kwargs)
+    state.mark_current_step(step_id)
+    return state
+
+
 class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
     async def test_deep_synthesis_unannounced_tool_protocol_goes_directly_to_safe_summary(self):
         state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-synthesis", mode="on"))
@@ -311,7 +346,7 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         state.plan_coordinator.configure_initial_tool_requirements(
             {
                 "web_search": 1,
-                "url_read": 1,
+                "url_read": 2,
             }
         )
         messages = [{"role": "user", "content": "调研数据库升级风险"}]
@@ -355,7 +390,7 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.plan_coordinator.repair_attempt_count, 0)
         self.assertEqual(
             [item["planned_tools"] for item in state.plan_coordinator.items],
-            [["web_search"], ["url_read"], []],
+            [["web_search"], ["url_read"], ["url_read"], []],
         )
         self.assertFalse(
             any(
@@ -785,7 +820,7 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
         self.assertIn("示例咖啡", append_chunk.await_args.args[2])
 
-    async def test_valid_deferred_model_answer_is_emitted_and_kept_for_persistence(self):
+    async def test_non_k3_deferred_answer_refresh_history_has_no_thinking_block(self):
         state = AgentLoopState()
         state.mark_current_step("step-product-valid")
         state.content_blocks.append(
@@ -834,9 +869,590 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
         self.assertEqual(append_chunk.await_args.args[2], model_answer)
         self.assertEqual(state.content_blocks[-1].text, model_answer)
-        self.assertEqual([block.type for block in state.content_blocks], ["place_results", "text"])
+        self.assertEqual(
+            [block.type for block in state.content_blocks],
+            ["place_results", "text"],
+        )
         self.assertEqual(warnings, [])
         complete_step_fn.assert_awaited_once()
+
+    async def test_plan_mode_deferred_web_research_answer_bypasses_product_validation(self):
+        coordinator = PlanCoordinator(run_id="run-web-research-answer", mode="on")
+        self.assertTrue(
+            coordinator.apply_model_update(
+                {
+                    "reason": "先联网检索，再整理结论",
+                    "items": [
+                        {
+                            "id": "search",
+                            "title": "检索官方资料",
+                            "status": "running",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理研究结论",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["search"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        coordinator.mark_tool_results({"search": "completed"})
+        self.assertIsNotNone(coordinator.begin_synthesis())
+        state = AgentLoopState(plan_coordinator=coordinator)
+        state.mark_current_step("step-web-research-answer")
+        state.content_blocks.append(
+            SearchBlock(
+                type="search",
+                id="blk-web-research",
+                query="Redis 版本更新",
+                sources=[SearchSourceSummary(title="Redis 官方文档", url="https://redis.io/docs")],
+                source_refs=[
+                    SourceReference(kind="search", title="Redis 官方文档", url="https://redis.io/docs")
+                ],
+                source_count=1,
+            )
+        )
+        model_answer = "Redis 的最新版本变更应以官方文档为准；本次检索到的依据见来源。[1]"
+        append_chunk = AsyncMock()
+        complete_step_fn = AsyncMock()
+
+        with (
+            patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk),
+            patch(
+                "app.services.stream.agent_loop_round_outcome.validate_product_answer",
+                side_effect=AssertionError("普通联网研究正文不应进入产品结果校验器"),
+            ) as validate_product_answer,
+        ):
+            outcome = await handle_agent_round_outcome(
+                request=AgentRoundOutcomeRequest(
+                    db="db",
+                    messages=[{"role": "user", "content": "调研 Redis 版本更新"}],
+                    state=state,
+                    runtime=_runtime(
+                        complete_step_fn=complete_step_fn,
+                        plan_mode="on",
+                        model_id="kimi-k3",
+                        provider="moonshot",
+                        litellm_model="moonshot/kimi-k3",
+                    ),
+                    step_number=3,
+                    step_context=_step_context("step-web-research-answer"),
+                    round_result=AgentRoundResult(
+                        reasoning_buf="先核对官方来源，再整理结论。",
+                        content_buf=model_answer,
+                        tool_calls=[],
+                        finish_reason="stop",
+                        accumulated_usage=Usage(input_tokens=5, output_tokens=18),
+                        output_deferred=True,
+                        allow_deferred_reasoning_output=True,
+                    ),
+                )
+            )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        validate_product_answer.assert_not_called()
+        self.assertEqual(append_chunk.await_args.args[2], model_answer)
+        self.assertEqual(state.content_blocks[-1].text, model_answer)
+        self.assertEqual(
+            [block.type for block in state.content_blocks],
+            ["search", "thinking", "text"],
+        )
+        self.assertEqual(state.content_blocks[-2].thinking, "先核对官方来源，再整理结论。")
+        complete_step_fn.assert_awaited_once()
+
+    async def test_plan_synthesis_protocol_error_discards_safe_prefix_and_requests_summary(self):
+        coordinator = PlanCoordinator(run_id="run-synthesis-protocol-error", mode="on")
+        self.assertTrue(
+            coordinator.apply_model_update(
+                {
+                    "reason": "先联网检索，再整理结论",
+                    "items": [
+                        {
+                            "id": "search",
+                            "title": "检索官方资料",
+                            "status": "running",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理研究结论",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["search"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        coordinator.mark_tool_results({"search": "completed"})
+        self.assertIsNotNone(coordinator.begin_synthesis())
+        state = AgentLoopState(plan_coordinator=coordinator)
+        state.mark_current_step("step-synthesis-protocol-error")
+        append_chunk = AsyncMock()
+        complete_step_fn = AsyncMock()
+
+        with (
+            patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk),
+            patch(
+                "app.services.stream.agent_loop_round_outcome.validate_product_answer",
+            ) as validate_product_answer,
+        ):
+            outcome = await handle_agent_round_outcome(
+                request=AgentRoundOutcomeRequest(
+                    db="db",
+                    messages=[{"role": "user", "content": "调研 Redis 版本更新"}],
+                    state=state,
+                    runtime=_runtime(
+                        complete_step_fn=complete_step_fn,
+                        plan_mode="on",
+                    ),
+                    step_number=3,
+                    step_context=_step_context("step-synthesis-protocol-error"),
+                    round_result=AgentRoundResult(
+                        reasoning_buf="",
+                        content_buf="我先整理一下检索结果：",
+                        tool_calls=[],
+                        finish_reason="tool_protocol_error",
+                        accumulated_usage=Usage(input_tokens=5, output_tokens=5),
+                        output_deferred=True,
+                    ),
+                )
+            )
+
+        complete_step_fn.assert_awaited_once()
+        self.assertIsNone(state.current_step_id)
+        self.assertEqual(outcome.exit, AgentLoopExit.SUMMARY_REQUIRED)
+        self.assertEqual(outcome.summary_finish_reason, "plan_synthesis")
+        validate_product_answer.assert_not_called()
+        append_chunk.assert_not_awaited()
+        self.assertEqual(state.content_blocks, [])
+        self.assertFalse(state.unknown_terminated)
+
+    async def test_unannounced_control_after_terminal_execution_goes_to_complete_plan_synthesis(self):
+        coordinator = PlanCoordinator(run_id="run-unannounced-control", mode="on")
+        self.assertTrue(
+            coordinator.apply_model_update(
+                {
+                    "reason": "先检索，再整理结论",
+                    "items": [
+                        {
+                            "id": "search",
+                            "title": "检索可靠资料",
+                            "status": "running",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理最终结论",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["search"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        coordinator.mark_tool_results({"search": "completed"})
+        state = AgentLoopState(plan_coordinator=coordinator)
+        state.mark_current_step("step-unannounced-control")
+
+        async def handle_tool_calls_round_fn(**_kwargs):
+            return ToolRoundOutcome(
+                tool_call_count=0,
+                tool_names=[],
+                unavailable_tool_call_count=1,
+            )
+
+        outcome = await handle_agent_round_outcome(
+            request=AgentRoundOutcomeRequest(
+                db="db",
+                messages=[{"role": "user", "content": "整理已有检索结果"}],
+                state=state,
+                runtime=_runtime(
+                    handle_tool_calls_round_fn=handle_tool_calls_round_fn,
+                    plan_mode="on",
+                ),
+                step_number=3,
+                step_context=_step_context("step-unannounced-control"),
+                round_result=AgentRoundResult(
+                    reasoning_buf="",
+                    content_buf="",
+                    tool_calls=[
+                        {
+                            "id": "tc-stale-plan",
+                            "name": "update_plan",
+                            "arguments": {"step": "错误的单步状态更新"},
+                        }
+                    ],
+                    finish_reason="tool_calls",
+                    accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+                    announced_tool_names=frozenset(),
+                    output_deferred=True,
+                ),
+            )
+        )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.SUMMARY_REQUIRED)
+        self.assertEqual(outcome.summary_finish_reason, "plan_synthesis")
+        self.assertIsNone(state.current_step_id)
+        self.assertFalse(state.unknown_terminated)
+
+    async def test_unannounced_control_does_not_bypass_deep_research_evidence_gate(self):
+        coordinator = PlanCoordinator(run_id="run-deep-unannounced-control", mode="on")
+        self.assertTrue(
+            coordinator.apply_model_update(
+                {
+                    "reason": "检索并核验来源后回答",
+                    "items": [
+                        {
+                            "id": "search",
+                            "title": "检索候选来源",
+                            "status": "running",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "read",
+                            "title": "核验关键来源",
+                            "status": "pending",
+                            "kind": "read",
+                            "depends_on": ["search"],
+                            "planned_tools": ["url_read"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理研究结论",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["read"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        coordinator.mark_tool_results({"search": "failed", "read": "blocked"})
+        state = AgentLoopState(plan_coordinator=coordinator)
+        state.configure_research_mode(network_required=True)
+        state.mark_current_step("step-deep-unannounced-control")
+
+        async def handle_tool_calls_round_fn(**_kwargs):
+            return ToolRoundOutcome(
+                tool_call_count=0,
+                tool_names=[],
+                unavailable_tool_call_count=1,
+            )
+
+        outcome = await handle_agent_round_outcome(
+            request=AgentRoundOutcomeRequest(
+                db="db",
+                messages=[{"role": "user", "content": "深入调研监管要求"}],
+                state=state,
+                runtime=_runtime(
+                    handle_tool_calls_round_fn=handle_tool_calls_round_fn,
+                    plan_mode="on",
+                    task_mode="deep_research",
+                ),
+                step_number=4,
+                step_context=_step_context("step-deep-unannounced-control"),
+                round_result=AgentRoundResult(
+                    reasoning_buf="",
+                    content_buf="",
+                    tool_calls=[{"id": "tc-stale-plan", "name": "update_plan", "arguments": {}}],
+                    finish_reason="tool_calls",
+                    accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+                    announced_tool_names=frozenset(),
+                    output_deferred=True,
+                ),
+            )
+        )
+
+        self.assertIsNone(outcome)
+        self.assertIsNone(state.current_step_id)
+        self.assertFalse(state.ready_for_plan_synthesis())
+        self.assertFalse(state.unknown_terminated)
+
+    async def test_unannounced_control_with_existing_product_context_uses_product_result_path(self):
+        coordinator = PlanCoordinator(run_id="run-product-unannounced-control", mode="on")
+        self.assertTrue(
+            coordinator.apply_model_update(
+                {
+                    "reason": "查询地点后回答",
+                    "items": [
+                        {
+                            "id": "place",
+                            "title": "查询地点",
+                            "status": "running",
+                            "kind": "other",
+                            "depends_on": [],
+                            "planned_tools": ["local_place_search"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理推荐",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["place"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        coordinator.mark_tool_results({"place": "completed"})
+        state = AgentLoopState(
+            plan_coordinator=coordinator,
+            product_tool_attempted=True,
+        )
+        state.mark_current_step("step-product-unannounced-control")
+
+        async def handle_tool_calls_round_fn(**_kwargs):
+            return ToolRoundOutcome(
+                tool_call_count=0,
+                tool_names=[],
+                unavailable_tool_call_count=1,
+            )
+
+        outcome = await handle_agent_round_outcome(
+            request=AgentRoundOutcomeRequest(
+                db="db",
+                messages=[{"role": "user", "content": "推荐附近地点"}],
+                state=state,
+                runtime=_runtime(
+                    handle_tool_calls_round_fn=handle_tool_calls_round_fn,
+                    plan_mode="on",
+                ),
+                step_number=3,
+                step_context=_step_context("step-product-unannounced-control"),
+                round_result=AgentRoundResult(
+                    reasoning_buf="",
+                    content_buf="",
+                    tool_calls=[{"id": "tc-stale-plan", "name": "update_plan", "arguments": {}}],
+                    finish_reason="tool_calls",
+                    accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+                    announced_tool_names=frozenset(),
+                    output_deferred=True,
+                ),
+            )
+        )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.PRODUCT_RESULT_READY)
+        self.assertIsNone(state.current_step_id)
+        self.assertFalse(state.unknown_terminated)
+
+    async def test_unannounced_control_does_not_skip_pending_product_execution(self):
+        coordinator = PlanCoordinator(run_id="run-pending-product-unannounced-control", mode="on")
+        self.assertTrue(
+            coordinator.apply_model_update(
+                {
+                    "reason": "先查地点和天气，再整理推荐",
+                    "items": [
+                        {
+                            "id": "place",
+                            "title": "查询地点",
+                            "status": "running",
+                            "kind": "other",
+                            "depends_on": [],
+                            "planned_tools": ["local_place_search"],
+                        },
+                        {
+                            "id": "weather",
+                            "title": "查询天气",
+                            "status": "pending",
+                            "kind": "other",
+                            "depends_on": ["place"],
+                            "planned_tools": ["weather_forecast"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理推荐",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["weather"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        coordinator.mark_tool_results({"place": "completed"})
+        state = AgentLoopState(
+            plan_coordinator=coordinator,
+            product_tool_attempted=True,
+        )
+        state.mark_current_step("step-pending-product-unannounced-control")
+
+        async def handle_tool_calls_round_fn(**_kwargs):
+            return ToolRoundOutcome(
+                tool_call_count=0,
+                tool_names=[],
+                unavailable_tool_call_count=1,
+            )
+
+        outcome = await handle_agent_round_outcome(
+            request=AgentRoundOutcomeRequest(
+                db="db",
+                messages=[{"role": "user", "content": "结合地点和天气给出推荐"}],
+                state=state,
+                runtime=_runtime(
+                    handle_tool_calls_round_fn=handle_tool_calls_round_fn,
+                    plan_mode="on",
+                ),
+                step_number=3,
+                step_context=_step_context("step-pending-product-unannounced-control"),
+                round_result=AgentRoundResult(
+                    reasoning_buf="",
+                    content_buf="",
+                    tool_calls=[{"id": "tc-stale-plan", "name": "update_plan", "arguments": {}}],
+                    finish_reason="tool_calls",
+                    accumulated_usage=Usage(input_tokens=2, output_tokens=3),
+                    announced_tool_names=frozenset({"weather_forecast"}),
+                    output_deferred=True,
+                ),
+            )
+        )
+
+        self.assertIsNone(outcome)
+        self.assertFalse(state.plan_coordinator.execution_items_terminal())
+        self.assertEqual(
+            state.plan_coordinator.active_plan_tool_names(),
+            {"weather_forecast"},
+        )
+        self.assertIsNone(state.current_step_id)
+
+    async def test_plan_synthesis_protocol_error_with_product_block_returns_product_result_ready(self):
+        state = _synthesis_state(
+            run_id="run-product-block-protocol-error",
+            step_id="step-product-block-protocol-error",
+        )
+        state.content_blocks.append(
+            PlaceResultsBlock(
+                type="place_results",
+                schema_version=1,
+                provider="amap",
+                query="咖啡",
+                status="success",
+                result_count=1,
+                places=[PlaceResult(name="示例咖啡")],
+            )
+        )
+        append_chunk = AsyncMock()
+        complete_step_fn = AsyncMock()
+
+        with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
+            outcome = await handle_agent_round_outcome(
+                request=AgentRoundOutcomeRequest(
+                    db="db",
+                    messages=[{"role": "user", "content": "附近有什么咖啡店"}],
+                    state=state,
+                    runtime=_runtime(complete_step_fn=complete_step_fn, plan_mode="on"),
+                    step_number=3,
+                    step_context=_step_context("step-product-block-protocol-error"),
+                    round_result=AgentRoundResult(
+                        reasoning_buf="",
+                        content_buf="我先整理一下查询结果：",
+                        tool_calls=[],
+                        finish_reason="tool_protocol_error",
+                        accumulated_usage=Usage(input_tokens=5, output_tokens=5),
+                        output_deferred=True,
+                    ),
+                )
+            )
+
+        complete_step_fn.assert_awaited_once()
+        self.assertIsNone(state.current_step_id)
+        self.assertEqual(outcome.exit, AgentLoopExit.PRODUCT_RESULT_READY)
+        append_chunk.assert_not_awaited()
+        self.assertEqual([block.type for block in state.content_blocks], ["place_results"])
+
+    async def test_plan_synthesis_protocol_error_after_product_attempt_returns_product_result_ready(self):
+        state = _synthesis_state(
+            run_id="run-product-attempt-protocol-error",
+            step_id="step-product-attempt-protocol-error",
+            product_tool_attempted=True,
+        )
+        append_chunk = AsyncMock()
+        complete_step_fn = AsyncMock()
+
+        with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
+            outcome = await handle_agent_round_outcome(
+                request=AgentRoundOutcomeRequest(
+                    db="db",
+                    messages=[{"role": "user", "content": "比较通勤路线"}],
+                    state=state,
+                    runtime=_runtime(complete_step_fn=complete_step_fn, plan_mode="on"),
+                    step_number=3,
+                    step_context=_step_context("step-product-attempt-protocol-error"),
+                    round_result=AgentRoundResult(
+                        reasoning_buf="",
+                        content_buf="我先整理一下查询结果：",
+                        tool_calls=[],
+                        finish_reason="tool_protocol_error",
+                        accumulated_usage=Usage(input_tokens=5, output_tokens=5),
+                        output_deferred=True,
+                    ),
+                )
+            )
+
+        complete_step_fn.assert_awaited_once()
+        self.assertIsNone(state.current_step_id)
+        self.assertEqual(outcome.exit, AgentLoopExit.PRODUCT_RESULT_READY)
+        append_chunk.assert_not_awaited()
+        self.assertEqual(state.content_blocks, [])
+
+    async def test_plan_synthesis_protocol_error_with_pending_repair_returns_product_result_ready(self):
+        state = _synthesis_state(
+            run_id="run-pending-repair-protocol-error",
+            step_id="step-pending-repair-protocol-error",
+            pending_tool_repairs={
+                "weather_forecast": {
+                    "required_fields": ["location"],
+                    "requires_user_input": True,
+                }
+            },
+        )
+        append_chunk = AsyncMock()
+        complete_step_fn = AsyncMock()
+
+        with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
+            outcome = await handle_agent_round_outcome(
+                request=AgentRoundOutcomeRequest(
+                    db="db",
+                    messages=[{"role": "user", "content": "我这里明天天气如何"}],
+                    state=state,
+                    runtime=_runtime(complete_step_fn=complete_step_fn, plan_mode="on"),
+                    step_number=3,
+                    step_context=_step_context("step-pending-repair-protocol-error"),
+                    round_result=AgentRoundResult(
+                        reasoning_buf="",
+                        content_buf="我先整理一下查询结果：",
+                        tool_calls=[],
+                        finish_reason="tool_protocol_error",
+                        accumulated_usage=Usage(input_tokens=5, output_tokens=5),
+                        output_deferred=True,
+                    ),
+                )
+            )
+
+        complete_step_fn.assert_awaited_once()
+        self.assertIsNone(state.current_step_id)
+        self.assertEqual(outcome.exit, AgentLoopExit.PRODUCT_RESULT_READY)
+        append_chunk.assert_not_awaited()
+        self.assertEqual(state.content_blocks, [])
 
     async def test_deferred_answer_commits_plan_snapshot_before_answering_chunk(self):
         coordinator = PlanCoordinator(run_id="run-deferred-plan", mode="on")
@@ -1386,8 +2002,33 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(execution_started)
         emitter.content_block_discarded.assert_awaited_once_with(block_id="step-tool-preamble-text")
 
-    async def test_deferred_tool_call_round_does_not_discard_unemitted_content(self):
-        state = AgentLoopState()
+    async def test_plan_mode_tool_round_uses_deferred_content_without_discard_fallback(self):
+        state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-deferred-tool", mode="on"))
+        self.assertTrue(
+            state.plan_coordinator.apply_model_update(
+                {
+                    "reason": "先查询再回答",
+                    "items": [
+                        {
+                            "id": "route",
+                            "title": "查询路线",
+                            "status": "running",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["route_compare"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理建议",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["route"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
         state.mark_current_step("step-deferred-tool")
         emitter = SimpleNamespace(content_block_discarded=AsyncMock())
 
@@ -1402,6 +2043,7 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
                 runtime=_runtime(
                     emitter=emitter,
                     handle_tool_calls_round_fn=handle_tool_calls_round_fn,
+                    plan_mode="on",
                 ),
                 step_number=2,
                 step_context=_step_context("step-deferred-tool"),

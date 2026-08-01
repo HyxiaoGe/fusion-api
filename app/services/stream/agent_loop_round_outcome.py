@@ -20,6 +20,7 @@ from app.services.stream.product_result_answer import (
     build_grounded_product_answer,
     build_product_tool_failure_answer,
     build_tool_repair_clarification,
+    has_product_result_blocks,
     neutralize_product_provider_mentions,
 )
 from app.services.stream.research_evidence import (
@@ -35,6 +36,10 @@ PLAN_REQUIRED_RETRY_PROMPT = (
     "【计划控制修正】当前为强制计划模式，上一轮未建立有效计划，不能直接回答。"
     "必须先调用计划控制工具创建 2 至 6 个步骤，再继续回答或调用外部工具。"
     "只静默修正，不要向用户解释这条内部规则。"
+)
+PLAN_EXECUTION_REQUIRED_RETRY_PROMPT = (
+    "【计划执行修正】当前执行计划仍有未完成的工具步骤。不要输出最终回答；"
+    "请只调用这些步骤声明的真实工具，并为每次调用填写对应的 _plan_item_id。"
 )
 
 
@@ -60,8 +65,14 @@ async def handle_agent_round_outcome(
     if finish_reason == "stop":
         if _requires_plan_before_stop(request):
             return await _repair_missing_required_plan(request)
+        if _requires_execution_before_stop(request):
+            await _repair_incomplete_execution(request)
+            return None
         if _requires_research_completion_repair(request):
             return await _repair_research_completion(request)
+        if _requires_plan_synthesis(request):
+            await _complete_round_before_plan_synthesis(request)
+            return None
         if _needs_empty_answer_summary(request):
             await _complete_empty_round_before_summary(request)
             return AgentLoopOutcome(exit=AgentLoopExit.SUMMARY_REQUIRED)
@@ -77,8 +88,16 @@ async def handle_agent_round_outcome(
 
     if _requires_plan_before_stop(request):
         return await _repair_missing_required_plan(request)
+    if _requires_execution_before_stop(request):
+        await _repair_incomplete_execution(request)
+        return None
     if _requires_research_completion_repair(request):
         return await _repair_research_completion(request)
+    if _requires_plan_synthesis(request):
+        await _complete_round_before_plan_synthesis(request)
+        return None
+    if finish_reason == "tool_protocol_error":
+        return await _complete_tool_protocol_error_round(request)
 
     await _complete_unknown_round(request)
     return AgentLoopOutcome(exit=AgentLoopExit.COMPLETED)
@@ -93,7 +112,10 @@ def _requires_deep_synthesis_protocol_summary(request: AgentRoundOutcomeRequest)
         and workset.successful_searches >= 1
         and len(workset.successful_read_urls) >= 2
         and request.round_result.announced_tool_names == frozenset()
-        and bool(request.round_result.tool_calls)
+        and (
+            bool(request.round_result.tool_calls)
+            or request.round_result.finish_reason == "tool_protocol_error"
+        )
     )
 
 
@@ -121,8 +143,103 @@ async def _complete_deep_synthesis_protocol_round(
     )
 
 
+async def _complete_tool_protocol_error_round(
+    request: AgentRoundOutcomeRequest,
+) -> AgentLoopOutcome:
+    """协议前缀不是最终答案，统一交给无工具总结做有界重试。"""
+
+    request.runtime.warning_fn(
+        "模型工具协议无法解析，切换到无工具安全收口: "
+        f"conv_id={request.runtime.conversation_id}, run_id={request.runtime.run_id}, "
+        f"step={request.step_number}"
+    )
+    await complete_text_response_step(
+        context=request.step_context,
+        emitter=request.runtime.emitter,
+        session_cache=request.runtime.session_cache,
+        complete_step_fn=request.runtime.complete_step_fn,
+        completed_tool_calls=request.state.total_tool_calls,
+        max_tool_calls=request.runtime.limits.max_tool_calls,
+        clock=request.runtime.clock,
+    )
+    request.state.clear_current_step()
+    if _has_product_answer_context(request.state):
+        return AgentLoopOutcome(exit=AgentLoopExit.PRODUCT_RESULT_READY)
+    summary_finish_reason = (
+        "plan_synthesis"
+        if request.state.plan_coordinator.has_valid_model_plan
+        else "tool_protocol_error"
+    )
+    return AgentLoopOutcome(
+        exit=AgentLoopExit.SUMMARY_REQUIRED,
+        summary_finish_reason=summary_finish_reason,
+    )
+
+
 def _requires_plan_before_stop(request: AgentRoundOutcomeRequest) -> bool:
     return request.runtime.plan_mode == "on" and not request.state.plan_coordinator.has_valid_model_plan
+
+
+def _requires_execution_before_stop(request: AgentRoundOutcomeRequest) -> bool:
+    coordinator = request.state.plan_coordinator
+    return (
+        coordinator.has_valid_model_plan
+        and not coordinator.synthesis_started
+        and not coordinator.execution_items_terminal()
+    )
+
+
+def _requires_plan_synthesis(request: AgentRoundOutcomeRequest) -> bool:
+    coordinator = request.state.plan_coordinator
+    return (
+        coordinator.has_valid_model_plan
+        and not coordinator.synthesis_started
+        and request.state.ready_for_plan_synthesis()
+    )
+
+
+async def _complete_round_before_plan_synthesis(request: AgentRoundOutcomeRequest) -> None:
+    """计划执行完成后的普通回合只负责收 step，正文统一交给显式综合阶段。"""
+
+    await complete_text_response_step(
+        context=request.step_context,
+        emitter=request.runtime.emitter,
+        session_cache=request.runtime.session_cache,
+        complete_step_fn=request.runtime.complete_step_fn,
+        completed_tool_calls=request.state.total_tool_calls,
+        max_tool_calls=request.runtime.limits.max_tool_calls,
+        clock=request.runtime.clock,
+    )
+    request.state.clear_current_step()
+
+
+async def _repair_incomplete_execution(request: AgentRoundOutcomeRequest) -> None:
+    """计划执行未终态时丢弃正文，下一轮只允许继续执行既定工具步骤。"""
+
+    await complete_text_response_step(
+        context=request.step_context,
+        emitter=request.runtime.emitter,
+        session_cache=request.runtime.session_cache,
+        complete_step_fn=request.runtime.complete_step_fn,
+        completed_tool_calls=request.state.total_tool_calls,
+        max_tool_calls=request.runtime.limits.max_tool_calls,
+        clock=request.runtime.clock,
+    )
+    pending_items = request.state.plan_coordinator.pending_execution_items()
+    pending_summary = [
+        {
+            "id": item.get("id"),
+            "planned_tools": list(item.get("planned_tools") or []),
+        }
+        for item in pending_items
+    ]
+    request.messages.append(
+        {
+            "role": "system",
+            "content": f"{PLAN_EXECUTION_REQUIRED_RETRY_PROMPT}\n待执行步骤：{pending_summary}",
+        }
+    )
+    request.state.clear_current_step()
 
 
 def _requires_research_completion_repair(request: AgentRoundOutcomeRequest) -> bool:
@@ -225,7 +342,7 @@ def _append_round_blocks(request: AgentRoundOutcomeRequest) -> None:
 
 
 async def _complete_text_round(request: AgentRoundOutcomeRequest) -> None:
-    request = await _replace_deferred_product_answer(request)
+    request = await _commit_deferred_answer(request)
     _append_round_blocks(request)
     await _emit_final_answer_used_evidence(request)
     await complete_text_response_step(
@@ -237,11 +354,10 @@ async def _complete_text_round(request: AgentRoundOutcomeRequest) -> None:
         max_tool_calls=request.runtime.limits.max_tool_calls,
         clock=request.runtime.clock,
     )
-    _sync_plan_items(request)
     request.state.clear_current_step()
 
 
-async def _replace_deferred_product_answer(
+async def _commit_deferred_answer(
     request: AgentRoundOutcomeRequest,
 ) -> AgentRoundOutcomeRequest:
     clarification = build_tool_repair_clarification(request.state.pending_tool_repairs)
@@ -254,12 +370,18 @@ async def _replace_deferred_product_answer(
     if not request.round_result.output_deferred:
         return request
 
-    if request.runtime.task_mode == "deep_research":
+    if request.runtime.task_mode == "deep_research" or not _has_product_answer_context(request.state):
         answer = request.round_result.content_buf.strip()
         if answer:
             await _append_committed_answer(request, answer)
         return _with_replaced_answer(request, answer)
 
+    return await _commit_deferred_product_answer(request)
+
+
+async def _commit_deferred_product_answer(
+    request: AgentRoundOutcomeRequest,
+) -> AgentRoundOutcomeRequest:
     candidate = neutralize_product_provider_mentions(
         request.round_result.content_buf.strip(),
         request.state.content_blocks,
@@ -310,11 +432,19 @@ async def _replace_deferred_product_answer(
     return _with_replaced_answer(request, answer)
 
 
+def _has_product_answer_context(state: AgentLoopState) -> bool:
+    return (
+        has_product_result_blocks(state.content_blocks)
+        or state.product_tool_attempted
+        or bool(state.pending_tool_repairs)
+    )
+
+
 async def _append_committed_answer(
     request: AgentRoundOutcomeRequest,
     answer: str,
 ) -> None:
-    snapshot = request.state.plan_coordinator.commit_answer_started()
+    snapshot = request.state.plan_coordinator.begin_synthesis()
     emit_snapshot = getattr(request.runtime.emitter, "plan_snapshot", None)
     if snapshot is not None and emit_snapshot is not None:
         await emit_snapshot(**snapshot)
@@ -333,6 +463,9 @@ def _with_replaced_answer(
     request: AgentRoundOutcomeRequest,
     answer: str,
 ) -> AgentRoundOutcomeRequest:
+    visible_reasoning = request.round_result.reasoning_buf
+    if request.round_result.output_deferred and not request.round_result.allow_deferred_reasoning_output:
+        visible_reasoning = ""
     return AgentRoundOutcomeRequest(
         db=request.db,
         messages=request.messages,
@@ -341,7 +474,7 @@ def _with_replaced_answer(
         step_number=request.step_number,
         step_context=request.step_context,
         round_result=AgentRoundResult(
-            reasoning_buf="",
+            reasoning_buf=visible_reasoning,
             protocol_reasoning_buf=request.round_result.protocol_reasoning_buf,
             content_buf=answer,
             tool_calls=request.round_result.tool_calls,
@@ -350,12 +483,13 @@ def _with_replaced_answer(
             context=request.round_result.context,
             announced_tool_names=request.round_result.announced_tool_names,
             output_deferred=False,
+            allow_deferred_reasoning_output=request.round_result.allow_deferred_reasoning_output,
         ),
     )
 
 
 def _needs_empty_answer_summary(request: AgentRoundOutcomeRequest) -> bool:
-    if request.round_result.output_deferred:
+    if request.round_result.output_deferred and _has_product_answer_context(request.state):
         return False
     return (
         request.state.total_tool_calls > 0
@@ -380,7 +514,6 @@ async def _complete_empty_round_before_summary(request: AgentRoundOutcomeRequest
         max_tool_calls=request.runtime.limits.max_tool_calls,
         clock=request.runtime.clock,
     )
-    _sync_plan_items(request)
     request.state.clear_current_step()
 
 
@@ -407,18 +540,38 @@ async def _handle_tool_calls_round(request: AgentRoundOutcomeRequest) -> AgentLo
             )
         )
         if outcome.control_repair_exhausted:
-            _sync_plan_items(request)
             request.state.clear_current_step()
             return AgentLoopOutcome(
                 exit=AgentLoopExit.SUMMARY_REQUIRED,
                 summary_finish_reason="plan_repair_exhausted",
             )
-    _sync_plan_items(request)
     request.state.clear_current_step()
     if _requires_user_input(request.state):
         return AgentLoopOutcome(exit=AgentLoopExit.PRODUCT_RESULT_READY)
     if isinstance(outcome, ToolRoundOutcome) and outcome.product_result_count > 0:
         return None
+    unavailable_only = (
+        isinstance(outcome, ToolRoundOutcome)
+        and outcome.tool_call_count == 0
+        and outcome.unavailable_tool_call_count > 0
+        and request.state.plan_coordinator.has_valid_model_plan
+    )
+    if (
+        unavailable_only
+        and request.state.plan_coordinator.execution_items_terminal()
+        and _has_product_answer_context(request.state)
+    ):
+        return AgentLoopOutcome(exit=AgentLoopExit.PRODUCT_RESULT_READY)
+    if unavailable_only and request.state.ready_for_plan_synthesis():
+        request.runtime.warning_fn(
+            "计划执行完成后模型返回未公告工具，切换到无工具综合: "
+            f"conv_id={request.runtime.conversation_id}, run_id={request.runtime.run_id}, "
+            f"step={request.step_number}"
+        )
+        return AgentLoopOutcome(
+            exit=AgentLoopExit.SUMMARY_REQUIRED,
+            summary_finish_reason="plan_synthesis",
+        )
     should_summarize = request.state.should_summarize_no_progress_search()
     if should_summarize:
         request.runtime.warning_fn(
@@ -473,15 +626,3 @@ async def _emit_final_answer_used_evidence(request: AgentRoundOutcomeRequest) ->
         raise
     except Exception as exc:  # noqa: BLE001 — 非写入故障的 used 判定不能阻断主回答完成
         request.runtime.warning_fn(f"发送最终回答 used evidence 失败: {exc}")
-
-
-def _sync_plan_items(request: AgentRoundOutcomeRequest) -> None:
-    if not request.step_context.plan_items:
-        return
-    request.state.plan_coordinator.adopt_observed_items(
-        list(request.step_context.plan_items.values()),
-        reason="legacy_observed",
-    )
-    if request.state.plan_coordinator.has_valid_model_plan:
-        return
-    request.state.plan_items = {str(item_id): dict(item) for item_id, item in request.step_context.plan_items.items()}
