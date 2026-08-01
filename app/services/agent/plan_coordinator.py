@@ -180,7 +180,10 @@ class PlanCoordinator:
                     if any(getattr(item, field) != previous_item.get(field) for field in locked_fields):
                         return self._reject_repair("attempted_item_mutated")
 
-        normalized_items = [item.model_dump() for item in update.items]
+        normalized_items = _assign_user_visible_phases(
+            [item.model_dump() for item in update.items],
+            previous_items=self.items,
+        )
         if self.has_valid_model_plan and normalized_items == self.items:
             self.consecutive_no_progress_updates += 1
             return PlanUpdateResult(True, "no_change", self.snapshot(reason="no_change"))
@@ -319,7 +322,9 @@ class PlanCoordinator:
         self.revision += 1
         self.source = "model"
         self.reason = _SYSTEM_FALLBACK_REASON
-        self.items = [item.model_dump() for item in update.items]
+        self.items = _assign_user_visible_phases(
+            [item.model_dump() for item in update.items]
+        )
         self.reset_repair_attempts()
         return PlanUpdateResult(True, _SYSTEM_FALLBACK_REASON, self.snapshot())
 
@@ -764,6 +769,115 @@ class PlanCoordinator:
 
 def normalize_plan_mode(value: Any) -> PlanMode:
     return value if value in {"auto", "on", "off"} else "auto"
+
+
+def _assign_user_visible_phases(
+    items: list[dict[str, Any]],
+    *,
+    previous_items: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """把连续同类执行任务归入稳定阶段，并保证阶段 ID 在快照内唯一连续。"""
+
+    previous_by_id = {
+        str(item.get("id")): item
+        for item in previous_items or []
+        if item.get("id")
+    }
+    current_item_ids = {str(item.get("id")) for item in items if item.get("id")}
+    previous_phase_anchors: dict[str, str] = {}
+    for item in previous_items or []:
+        phase_id = item.get("phase_id")
+        item_id = item.get("id")
+        if phase_id and item_id and str(item_id) in current_item_ids:
+            previous_phase_anchors.setdefault(str(phase_id), str(item_id))
+
+    grouped_items: list[list[dict[str, Any]]] = []
+    for item in items:
+        phase_kind = _user_visible_phase_kind(item.get("kind"))
+        previous_phase_id = previous_by_id.get(str(item.get("id")), {}).get("phase_id")
+        current_previous_phase_ids = (
+            {
+                str(previous_by_id.get(str(grouped_item.get("id")), {}).get("phase_id"))
+                for grouped_item in grouped_items[-1]
+                if previous_by_id.get(str(grouped_item.get("id")), {}).get("phase_id")
+            }
+            if grouped_items
+            else set()
+        )
+        keeps_existing_phase_boundary = (
+            previous_phase_id is not None
+            and bool(current_previous_phase_ids)
+            and str(previous_phase_id) not in current_previous_phase_ids
+        )
+        if (
+            grouped_items
+            and _user_visible_phase_kind(grouped_items[-1][0].get("kind")) == phase_kind
+            and not keeps_existing_phase_boundary
+        ):
+            grouped_items[-1].append(item)
+        else:
+            grouped_items.append([item])
+
+    normalized: list[dict[str, Any]] = []
+    reserved_previous_phase_ids = set(previous_phase_anchors)
+    used_phase_ids: set[str] = set()
+    for group in grouped_items:
+        first = group[0]
+        group_item_ids = {str(item.get("id")) for item in group}
+        reusable_phase_id = next(
+            (
+                phase_id
+                for phase_id, anchor_item_id in previous_phase_anchors.items()
+                if anchor_item_id in group_item_ids and phase_id not in used_phase_ids
+            ),
+            None,
+        )
+        phase_id = reusable_phase_id or _new_user_visible_phase_id(
+            str(first.get("id") or "task"),
+            unavailable_phase_ids=reserved_previous_phase_ids | used_phase_ids,
+        )
+        used_phase_ids.add(phase_id)
+        phase_title = _user_visible_phase_title(group)
+        for item in group:
+            normalized.append(
+                {
+                    **item,
+                    "phase_id": phase_id,
+                    "phase_title": phase_title,
+                }
+            )
+    return normalized
+
+
+def _new_user_visible_phase_id(
+    first_item_id: str,
+    *,
+    unavailable_phase_ids: set[str],
+) -> str:
+    base_phase_id = f"phase-{first_item_id}"
+    phase_id = base_phase_id
+    suffix = 2
+    while phase_id in unavailable_phase_ids:
+        phase_id = f"{base_phase_id}-{suffix}"
+        suffix += 1
+    return phase_id
+
+
+def _user_visible_phase_kind(kind: Any) -> str:
+    return "synthesis" if kind in {"answer", "synthesis"} else str(kind or "other")
+
+
+def _user_visible_phase_title(group: list[dict[str, Any]]) -> str:
+    if len(group) == 1:
+        return str(group[0].get("title") or "执行任务")[:80]
+    phase_kind = _user_visible_phase_kind(group[0].get("kind"))
+    return {
+        "reasoning": "分析任务并制定方案",
+        "search": "搜索并收集资料",
+        "read": "读取并核验关键来源",
+        "synthesis": "综合证据并输出结论",
+        "other": "执行相关任务",
+    }.get(phase_kind, "执行相关任务")
 
 
 def _terminal_answer_phase(

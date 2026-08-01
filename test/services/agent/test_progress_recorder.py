@@ -60,6 +60,8 @@ def test_recorder_upserts_snapshot_for_v2_event():
                     {
                         "id": "understand",
                         "title": "理解问题",
+                        "phase_id": "phase-understand",
+                        "phase_title": "分析任务并制定方案",
                         "status": "running",
                         "kind": "reasoning",
                         "tool_names": [],
@@ -76,6 +78,8 @@ def test_recorder_upserts_snapshot_for_v2_event():
         assert row.protocol_version == 2
         assert row.state["progress"]["label"] == "正在理解问题"
         assert row.state["plan"]["plan_id"] == "plan-r1"
+        assert row.state["plan"]["items"][0]["phase_id"] == "phase-understand"
+        assert row.state["plan"]["items"][0]["phase_title"] == "分析任务并制定方案"
     finally:
         db.close()
         engine.dispose()

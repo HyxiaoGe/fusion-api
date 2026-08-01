@@ -120,6 +120,8 @@ def test_plan_snapshot_replaces_existing_plan():
                 {
                     "id": "understand",
                     "title": "理解问题",
+                    "phase_id": "phase-understand",
+                    "phase_title": "分析任务",
                     "status": "running",
                     "kind": "reasoning",
                     "tool_names": [],
@@ -139,6 +141,8 @@ def test_plan_snapshot_replaces_existing_plan():
                 {
                     "id": "answer",
                     "title": "整理回答",
+                    "phase_id": "phase-answer",
+                    "phase_title": "整理回答",
                     "status": "pending",
                     "kind": "answer",
                     "tool_names": [],
@@ -150,6 +154,8 @@ def test_plan_snapshot_replaces_existing_plan():
 
     assert state["plan"]["revision"] == 2
     assert [item["id"] for item in state["plan"]["items"]] == ["answer"]
+    assert state["plan"]["items"][0]["phase_id"] == "phase-answer"
+    assert state["plan"]["items"][0]["phase_title"] == "整理回答"
 
 
 def test_plan_snapshot_rejects_stale_same_plan_but_accepts_new_plan_revision_reset():

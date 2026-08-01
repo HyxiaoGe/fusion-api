@@ -2041,6 +2041,8 @@ class PlanCoordinatorTests(unittest.TestCase):
                 "kind": "search",
                 "depends_on": [],
                 "planned_tools": ["web_search"],
+                "phase_id": "phase-search-primary",
+                "phase_title": "搜索并收集资料",
             },
         )
 
@@ -2107,6 +2109,367 @@ class PlanCoordinatorTests(unittest.TestCase):
             {item["id"]: item["status"] for item in terminal["items"]},
             {"search": "completed", "answer": "completed"},
         )
+
+    def test_parallel_tool_tasks_are_grouped_into_stable_user_visible_phases(self):
+        coordinator = PlanCoordinator(run_id="run-phases", mode="on")
+
+        result = coordinator.apply_model_update(
+            {
+                "reason": "并行搜索后读取并总结",
+                "items": [
+                    {
+                        "id": "search-a",
+                        "title": "搜索官方说明",
+                        "status": "pending",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "search-b",
+                        "title": "搜索社区反馈",
+                        "status": "pending",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "search-c",
+                        "title": "搜索性能数据",
+                        "status": "pending",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "read-a",
+                        "title": "读取官方来源",
+                        "status": "pending",
+                        "kind": "read",
+                        "depends_on": ["search-a", "search-b", "search-c"],
+                        "planned_tools": ["url_read"],
+                    },
+                    {
+                        "id": "read-b",
+                        "title": "读取独立来源",
+                        "status": "pending",
+                        "kind": "read",
+                        "depends_on": ["search-a", "search-b", "search-c"],
+                        "planned_tools": ["url_read"],
+                    },
+                    {
+                        "id": "answer",
+                        "title": "综合证据并输出结论",
+                        "status": "pending",
+                        "kind": "answer",
+                        "depends_on": ["read-a", "read-b"],
+                        "planned_tools": [],
+                    },
+                ],
+            }
+        )
+
+        self.assertTrue(result.accepted)
+        items = result.snapshot["items"]
+        self.assertEqual(
+            [item["phase_id"] for item in items],
+            [
+                "phase-search-a",
+                "phase-search-a",
+                "phase-search-a",
+                "phase-read-a",
+                "phase-read-a",
+                "phase-answer",
+            ],
+        )
+        self.assertEqual(
+            [item["phase_title"] for item in items],
+            [
+                "搜索并收集资料",
+                "搜索并收集资料",
+                "搜索并收集资料",
+                "读取并核验关键来源",
+                "读取并核验关键来源",
+                "综合证据并输出结论",
+            ],
+        )
+
+    def test_single_task_phase_keeps_model_title_and_phase_id_survives_status_updates(self):
+        coordinator = PlanCoordinator(run_id="run-single-phase", mode="on")
+        result = coordinator.apply_model_update(
+            {
+                "reason": "查询后回答",
+                "items": [
+                    {
+                        "id": "search",
+                        "title": "查询天气",
+                        "status": "pending",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "answer",
+                        "title": "整理建议",
+                        "status": "pending",
+                        "kind": "answer",
+                        "depends_on": ["search"],
+                        "planned_tools": [],
+                    },
+                ],
+            }
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.snapshot["items"][0]["phase_title"], "查询天气")
+        started = coordinator.mark_tools_started(["search"])
+        completed = coordinator.mark_tool_results({"search": "completed"})
+
+        self.assertEqual(started["items"][0]["phase_id"], "phase-search")
+        self.assertEqual(completed["items"][0]["phase_id"], "phase-search")
+
+    def test_existing_phase_id_survives_inserting_a_new_task_before_locked_item(self):
+        coordinator = PlanCoordinator(run_id="run-phase-revision", mode="on")
+        initial = {
+            "reason": "先搜索再回答",
+            "items": [
+                {
+                    "id": "search-old",
+                    "title": "搜索既有资料",
+                    "status": "pending",
+                    "kind": "search",
+                    "depends_on": [],
+                    "planned_tools": ["web_search"],
+                },
+                {
+                    "id": "answer",
+                    "title": "整理回答",
+                    "status": "pending",
+                    "kind": "answer",
+                    "depends_on": ["search-old"],
+                    "planned_tools": [],
+                },
+            ],
+        }
+        self.assertTrue(coordinator.apply_model_update(initial).accepted)
+        coordinator.mark_tool_results({"search-old": "completed"})
+        previous_phase_id = coordinator.items[0]["phase_id"]
+
+        updated = coordinator.apply_model_update(
+            {
+                "reason": "补充一个搜索任务",
+                "items": [
+                    {
+                        "id": "search-new",
+                        "title": "搜索补充资料",
+                        "status": "pending",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["web_search"],
+                    },
+                    initial["items"][0],
+                    {
+                        **initial["items"][1],
+                        "depends_on": ["search-new", "search-old"],
+                    },
+                ],
+            }
+        )
+
+        self.assertTrue(updated.accepted)
+        phases_by_id = {item["id"]: item["phase_id"] for item in updated.snapshot["items"]}
+        self.assertEqual(phases_by_id["search-old"], previous_phase_id)
+        self.assertEqual(phases_by_id["search-new"], previous_phase_id)
+
+    def test_revision_split_assigns_each_contiguous_group_a_unique_phase_id(self):
+        coordinator = PlanCoordinator(run_id="run-phase-split", mode="on")
+        initial = {
+            "reason": "并行搜索后回答",
+            "items": [
+                {
+                    "id": "search-a",
+                    "title": "搜索官方资料",
+                    "status": "pending",
+                    "kind": "search",
+                    "depends_on": [],
+                    "planned_tools": ["web_search"],
+                },
+                {
+                    "id": "search-b",
+                    "title": "搜索社区资料",
+                    "status": "pending",
+                    "kind": "search",
+                    "depends_on": [],
+                    "planned_tools": ["web_search"],
+                },
+                {
+                    "id": "answer",
+                    "title": "整理回答",
+                    "status": "pending",
+                    "kind": "answer",
+                    "depends_on": ["search-a", "search-b"],
+                    "planned_tools": [],
+                },
+            ],
+        }
+        initial_result = coordinator.apply_model_update(initial)
+        self.assertTrue(initial_result.accepted)
+        previous_phase_id = initial_result.snapshot["items"][0]["phase_id"]
+
+        updated = coordinator.apply_model_update(
+            {
+                "reason": "在两组搜索之间补充读取",
+                "items": [
+                    initial["items"][0],
+                    {
+                        "id": "read-new",
+                        "title": "读取阶段性来源",
+                        "status": "pending",
+                        "kind": "read",
+                        "depends_on": ["search-a"],
+                        "planned_tools": ["url_read"],
+                    },
+                    initial["items"][1],
+                    {
+                        **initial["items"][2],
+                        "depends_on": ["read-new", "search-b"],
+                    },
+                ],
+            }
+        )
+
+        self.assertTrue(updated.accepted)
+        items = updated.snapshot["items"]
+        phase_ids = [item["phase_id"] for item in items]
+        self.assertEqual(phase_ids[0], previous_phase_id)
+        self.assertNotEqual(phase_ids[0], phase_ids[2])
+        self.assertEqual(len(set(phase_ids)), 4)
+        titles_by_phase: dict[str, set[str]] = {}
+        for item in items:
+            titles_by_phase.setdefault(item["phase_id"], set()).add(item["phase_title"])
+        self.assertTrue(all(len(titles) == 1 for titles in titles_by_phase.values()))
+
+    def test_earliest_surviving_task_inherits_phase_id_when_original_anchor_is_removed(self):
+        coordinator = PlanCoordinator(run_id="run-phase-anchor-removed", mode="on")
+        initial = {
+            "reason": "并行搜索后回答",
+            "items": [
+                {
+                    "id": "search-a",
+                    "title": "搜索临时资料",
+                    "status": "pending",
+                    "kind": "search",
+                    "depends_on": [],
+                    "planned_tools": ["web_search"],
+                },
+                {
+                    "id": "search-b",
+                    "title": "搜索保留资料",
+                    "status": "pending",
+                    "kind": "search",
+                    "depends_on": [],
+                    "planned_tools": ["web_search"],
+                },
+                {
+                    "id": "answer",
+                    "title": "整理回答",
+                    "status": "pending",
+                    "kind": "answer",
+                    "depends_on": ["search-a", "search-b"],
+                    "planned_tools": [],
+                },
+            ],
+        }
+        initial_result = coordinator.apply_model_update(initial)
+        self.assertTrue(initial_result.accepted)
+        previous_phase_id = initial_result.snapshot["items"][0]["phase_id"]
+        coordinator.mark_tool_results({"search-b": "completed"})
+
+        updated = coordinator.apply_model_update(
+            {
+                "reason": "删除未执行的临时搜索",
+                "items": [
+                    initial["items"][1],
+                    {
+                        **initial["items"][2],
+                        "depends_on": ["search-b"],
+                    },
+                ],
+            }
+        )
+
+        self.assertTrue(updated.accepted)
+        self.assertEqual(updated.snapshot["items"][0]["id"], "search-b")
+        self.assertEqual(updated.snapshot["items"][0]["phase_id"], previous_phase_id)
+        self.assertEqual(updated.snapshot["items"][0]["status"], "completed")
+
+    def test_model_cannot_override_server_derived_phase_metadata(self):
+        coordinator = PlanCoordinator(run_id="run-forged-phase", mode="on")
+
+        result = coordinator.apply_model_update(
+            {
+                "reason": "尝试提交展示阶段字段",
+                "items": [
+                    {
+                        "id": "search",
+                        "title": "搜索资料",
+                        "phase_id": "forged-phase",
+                        "phase_title": "伪造阶段",
+                        "status": "pending",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "answer",
+                        "title": "整理回答",
+                        "phase_id": "forged-answer",
+                        "phase_title": "伪造回答",
+                        "status": "pending",
+                        "kind": "answer",
+                        "depends_on": ["search"],
+                        "planned_tools": [],
+                    },
+                ],
+            }
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.snapshot["items"][0]["phase_id"], "phase-search")
+        self.assertEqual(result.snapshot["items"][0]["phase_title"], "搜索资料")
+        self.assertEqual(result.snapshot["items"][1]["phase_id"], "phase-answer")
+        self.assertEqual(result.snapshot["items"][1]["phase_title"], "整理回答")
+
+    def test_single_task_phase_title_is_stable_across_snapshot_persistence_limit(self):
+        coordinator = PlanCoordinator(run_id="run-phase-title-limit", mode="on")
+        long_title = "搜索" * 50
+
+        result = coordinator.apply_model_update(
+            {
+                "reason": "验证阶段标题长度",
+                "items": [
+                    {
+                        "id": "search",
+                        "title": long_title,
+                        "status": "pending",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "answer",
+                        "title": "整理回答",
+                        "status": "pending",
+                        "kind": "answer",
+                        "depends_on": ["search"],
+                        "planned_tools": [],
+                    },
+                ],
+            }
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.snapshot["items"][0]["phase_title"], long_title[:80])
 
 if __name__ == "__main__":
     unittest.main()

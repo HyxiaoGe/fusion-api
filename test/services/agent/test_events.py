@@ -229,6 +229,8 @@ class AgentProgressV2EventModelTests(unittest.TestCase):
                 {
                     "id": "route",
                     "title": "查询路线",
+                    "phase_id": "phase-route",
+                    "phase_title": "查询路线",
                     "status": "running",
                     "kind": "search",
                     "depends_on": [],
@@ -240,6 +242,8 @@ class AgentProgressV2EventModelTests(unittest.TestCase):
 
         self.assertEqual(event.source, "model")
         self.assertEqual(event.items[0].planned_tools, ["route_compare"])
+        self.assertEqual(event.items[0].phase_id, "phase-route")
+        self.assertEqual(event.items[0].phase_title, "查询路线")
 
     def test_tool_result_digest_model(self):
         ev = ToolResultDigest(

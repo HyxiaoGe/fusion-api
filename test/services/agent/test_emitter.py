@@ -231,6 +231,8 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "id": "understand",
                     "title": "理解问题",
+                    "phase_id": "phase-understand",
+                    "phase_title": "分析任务并制定方案",
                     "status": "running",
                     "kind": "reasoning",
                     "tool_names": [],
@@ -245,6 +247,8 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[1]["protocol_version"], 2)
         self.assertIsNone(events[1]["step_id"])
         self.assertEqual(events[2]["type"], "plan_snapshot")
+        self.assertEqual(events[2]["items"][0]["phase_id"], "phase-understand")
+        self.assertEqual(events[2]["items"][0]["phase_title"], "分析任务并制定方案")
 
     async def test_context_status_update_is_safe_and_replayable(self):
         writer = AsyncMock()

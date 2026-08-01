@@ -136,6 +136,8 @@ def _normalize_plan_item(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": str(item.get("id", "")),
         "title": _truncate(item.get("title"), 80),
+        "phase_id": str(item.get("phase_id")) if item.get("phase_id") else None,
+        "phase_title": _truncate(item.get("phase_title"), 80) if item.get("phase_title") else None,
         "status": item.get("status", "pending"),
         "kind": item.get("kind", "other"),
         "summary": _truncate(item.get("summary"), 120) if item.get("summary") else None,

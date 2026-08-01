@@ -104,6 +104,8 @@ class AgentPlanItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str
     title: str
+    phase_id: str | None = None
+    phase_title: str | None = None
     status: AgentPlanItemStatus
     kind: AgentPlanItemKind
     summary: str | None = None

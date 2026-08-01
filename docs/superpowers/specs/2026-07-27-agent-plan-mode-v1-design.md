@@ -64,6 +64,8 @@ function calling 时，前端和后端都会把请求安全降级为 `off`，不
 
 - `depends_on`: 稳定计划项 ID 数组。
 - `planned_tools`: 模型计划使用的公开工具别名数组。
+- `phase_id`: 服务端推导的稳定展示阶段 ID；同一快照内只对应一个连续任务组。
+- `phase_title`: 服务端推导的阶段标题；同一 `phase_id` 下保持一致。
 
 控制工具对模型采用 `explanation + plan[]` 结构；每个计划项必须提交 `id`、
 `step` 和 `planned_tools`，可选提交兼容字段 `status`、`kind` 与 `depends_on`。
@@ -74,7 +76,11 @@ function calling 时，前端和后端都会把请求安全降级为 `off`，不
 直到取得终态或触发现有重试上限；不新增 repeatable 计数器。服务端归一化为
 内部 `reason + items[]` 状态。`id` 接受数字、字母、下划线和连字符，必须在
 同一 plan 内稳定。
-时间戳、可选步骤和结果摘要留到计划交互阶段再扩展，v1 不提前增加未消费字段。
+模型把属于同一工作阶段的任务使用相同 `kind` 相邻排列；服务端在保留每个任务
+独立 `id` 与工具绑定的前提下，为连续同类任务推导 `phase_id/phase_title`。
+该阶段只用于展示分类，不代表并行批次，也不参与依赖或执行状态推进。
+计划修订优先保留包含原阶段锚点任务的阶段 ID；如果修订把原阶段拆成多个不连续
+任务组，其余任务组获得新的阶段 ID，避免前端把不连续任务重新合并。
 
 ### 工具关联
 
@@ -202,6 +208,11 @@ PlanCoordinator 是新 run 计划 revision 和状态的唯一所有者：
 - `source=model` 的终态完全信任服务端，不执行 `kind=other` 自动完成推断。
 - 历史 `source=observed` 只在 hydration 时保留展示兼容，新 run 不再产生。
 - live、Redis replay 和历史 hydration 使用同一个 `AgentPlanState`。
+- 顶层进度按 `phase_id` 汇总，阶段详情保留各任务状态；并行搜索或读取完成时
+  只推进一个顶层阶段，不按内部调用数跳过多个步骤。
+- 缺少 `phase_id` 的旧快照按“一任务一阶段”展示，不根据标题或工具名猜测分组。
+- 阶段终态由内部任务状态聚合；终态 run 不得合成 `running`，失败和阻塞优先
+  于未完成状态，`completed + skipped` 视为阶段完成。
 - 成功完成的 model plan 仍应可见；不能被 `ExecutionProcess` 直接替换。
 - 计划面板使用环形进度总览，hover / focus 可查看步骤、依赖和状态；窄屏和
   `prefers-reduced-motion` 保留可访问降级。
