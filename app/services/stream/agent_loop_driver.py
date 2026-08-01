@@ -247,15 +247,20 @@ async def _run_round(
         on_context_updated=state.update_context,
     )
     must_defer_until_plan = runtime.plan_mode == "on" and not state.plan_coordinator.has_valid_model_plan
-    should_defer_output = (
+    should_defer_all_output = (
         has_product_result_blocks(state.content_blocks)
         or state.product_tool_attempted
         or state.pending_tool_repairs
-        or must_defer_until_plan
         or runtime.task_mode == "deep_research"
     )
-    if should_defer_output and _accepts_keyword(runtime.run_round_fn, "defer_output"):
+    if should_defer_all_output and _accepts_keyword(runtime.run_round_fn, "defer_output"):
         run_round_kwargs["defer_output"] = True
+    elif must_defer_until_plan:
+        if _accepts_keyword(runtime.run_round_fn, "defer_answering"):
+            run_round_kwargs["defer_answering"] = True
+        elif _accepts_keyword(runtime.run_round_fn, "defer_output"):
+            # 兼容尚未支持分通道门禁的注入实现，宁可继续全隐藏也不能泄漏正文。
+            run_round_kwargs["defer_output"] = True
     round_result = await runtime.run_round_fn(**run_round_kwargs)
     state.finish_reason = round_result.finish_reason
     state.update_usage(round_result.accumulated_usage)

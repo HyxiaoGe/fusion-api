@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from app.schemas.chat import ThinkingBlock
 from app.services.final_answer_evidence import build_used_final_answer_evidence
 from app.services.mcp.amap_product_tools import AMAP_PRODUCT_TOOL_NAMES
 from app.services.mcp.flyai_travel_tools import FLYAI_TRAVEL_TOOL_NAMES
@@ -169,6 +170,8 @@ async def _repair_research_completion(
 async def _complete_plan_required_round(request: AgentRoundOutcomeRequest) -> None:
     """丢弃未经过强制计划门禁的正文，并给下一轮加入内部修正指令。"""
 
+    _append_round_blocks(request)
+    _persist_visible_plan_reasoning_checkpoint(request)
     await complete_text_response_step(
         context=request.step_context,
         emitter=request.runtime.emitter,
@@ -196,6 +199,25 @@ def _remove_plan_required_retry_prompt(messages: list[dict]) -> None:
     ]
 
 
+def _persist_visible_plan_reasoning_checkpoint(request: AgentRoundOutcomeRequest) -> None:
+    if not request.round_result.answering_deferred or not request.round_result.reasoning_buf:
+        return
+    persistence_kwargs = (
+        {"sequence": request.runtime.assistant_message_sequence}
+        if request.runtime.assistant_message_sequence is not None
+        else {}
+    )
+    request.runtime.persist_message_fn(
+        request.db,
+        request.runtime.assistant_message_id,
+        request.runtime.conversation_id,
+        request.runtime.model_id,
+        request.state.content_blocks,
+        partial=True,
+        **persistence_kwargs,
+    )
+
+
 async def _repair_missing_required_plan(
     request: AgentRoundOutcomeRequest,
 ) -> AgentLoopOutcome | None:
@@ -214,6 +236,16 @@ async def _repair_missing_required_plan(
 
 def _append_round_blocks(request: AgentRoundOutcomeRequest) -> None:
     if request.round_result.output_deferred:
+        return
+    if request.round_result.answering_deferred:
+        if request.round_result.reasoning_buf:
+            request.state.content_blocks.append(
+                ThinkingBlock(
+                    type="thinking",
+                    id=request.step_context.thinking_block_id,
+                    thinking=request.round_result.reasoning_buf,
+                )
+            )
         return
     append_round_content_blocks(
         request.state.content_blocks,
@@ -355,6 +387,7 @@ def _with_replaced_answer(
             context=request.round_result.context,
             announced_tool_names=request.round_result.announced_tool_names,
             output_deferred=False,
+            answering_deferred=False,
         ),
     )
 
@@ -448,7 +481,11 @@ def _requires_user_input(state: AgentLoopState) -> bool:
 async def _discard_streamed_tool_round_content(request: AgentRoundOutcomeRequest) -> None:
     """工具决策前的正文只是过程性话术，工具调用成立后精确撤回。"""
 
-    if request.round_result.output_deferred or not request.round_result.content_buf:
+    if (
+        request.round_result.output_deferred
+        or request.round_result.answering_deferred
+        or not request.round_result.content_buf
+    ):
         return
     discard = getattr(request.runtime.emitter, "content_block_discarded", None)
     if discard is None:

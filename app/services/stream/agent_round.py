@@ -24,10 +24,20 @@ class AgentRoundResult:
     protocol_reasoning_buf: str | None = None
     context: ContextUsage | None = None
     announced_tool_names: frozenset[str] | None = None
+    # 完整延迟用于产品/证据门禁；仅正文延迟用于强制计划建立前的可见思考。
     output_deferred: bool = False
+    answering_deferred: bool = False
 
 
 StreamRoundResult = tuple[str, str, list[dict], str, Usage | None]
+
+
+@dataclass(frozen=True)
+class StreamDeferPolicy:
+    """把调用方的门禁意图解析成当前流处理器实际支持的安全策略。"""
+
+    defer_output: bool = False
+    defer_answering: bool = False
 
 
 def _create_agent_round_observation(
@@ -97,7 +107,14 @@ async def collect_agent_round_stream(
     stream_round_fn: Callable[..., Awaitable[StreamRoundResult]],
     observation: Any | None = None,
     defer_output: bool = False,
+    defer_answering: bool = False,
+    defer_policy: StreamDeferPolicy | None = None,
 ) -> StreamRoundResult:
+    effective_defer_policy = defer_policy or resolve_stream_defer_policy(
+        stream_round_fn,
+        defer_output=defer_output,
+        defer_answering=defer_answering,
+    )
     response = await llm_call_fn(
         litellm_model,
         litellm_kwargs,
@@ -109,8 +126,10 @@ async def collect_agent_round_stream(
     stream_kwargs = {"run_id": run_id, "step_id": step_context.step_id}
     if provider is not None and _accepts_keyword(stream_round_fn, "provider"):
         stream_kwargs["provider"] = provider
-    if defer_output and _accepts_keyword(stream_round_fn, "defer_output"):
+    if effective_defer_policy.defer_output:
         stream_kwargs["defer_output"] = True
+    if effective_defer_policy.defer_answering:
+        stream_kwargs["defer_answering"] = True
     return await stream_round_fn(
         response,
         conversation_id,
@@ -128,6 +147,29 @@ def _accepts_keyword(fn: Callable[..., Any], keyword: str) -> bool:
     except (TypeError, ValueError):
         return True
     return keyword in parameters or any(parameter.kind == Parameter.VAR_KEYWORD for parameter in parameters.values())
+
+
+def resolve_stream_defer_policy(
+    stream_round_fn: Callable[..., Awaitable[StreamRoundResult]],
+    *,
+    defer_output: bool,
+    defer_answering: bool,
+) -> StreamDeferPolicy:
+    """门禁能力不足时只允许安全降级，不能静默放行尚未审核的正文。"""
+
+    supports_defer_output = _accepts_keyword(stream_round_fn, "defer_output")
+    supports_defer_answering = _accepts_keyword(stream_round_fn, "defer_answering")
+    if defer_output:
+        if not supports_defer_output:
+            raise RuntimeError("流处理器不支持完整输出门禁")
+        return StreamDeferPolicy(defer_output=True)
+    if defer_answering:
+        if supports_defer_answering:
+            return StreamDeferPolicy(defer_answering=True)
+        if supports_defer_output:
+            return StreamDeferPolicy(defer_output=True)
+        raise RuntimeError("流处理器不支持正文输出门禁")
+    return StreamDeferPolicy()
 
 
 def log_agent_round_summary(
@@ -176,6 +218,7 @@ async def run_agent_round(
     emitter: Any | None = None,
     on_context_updated: Callable[[ContextUsage], None] | None = None,
     defer_output: bool = False,
+    defer_answering: bool = False,
 ) -> AgentRoundResult:
     try:
         context_plan = await prepare_context(
@@ -224,6 +267,11 @@ async def run_agent_round(
     )
     observation.start()
     try:
+        defer_policy = resolve_stream_defer_policy(
+            stream_round_fn,
+            defer_output=defer_output,
+            defer_answering=defer_answering,
+        )
         stream_result = await collect_agent_round_stream(
             conversation_id=conversation_id,
             task_id=task_id,
@@ -239,6 +287,8 @@ async def run_agent_round(
             stream_round_fn=stream_round_fn,
             observation=observation,
             defer_output=defer_output,
+            defer_answering=defer_answering,
+            defer_policy=defer_policy,
         )
     except BaseException as exc:
         await observation.finish_error(exc)
@@ -269,5 +319,6 @@ async def run_agent_round(
         accumulated_usage=accumulate_usage(accumulated_usage, usage_data),
         context=final_context,
         announced_tool_names=_announced_tool_names(call_kwargs),
-        output_deferred=defer_output and _accepts_keyword(stream_round_fn, "defer_output"),
+        output_deferred=defer_policy.defer_output,
+        answering_deferred=defer_policy.defer_answering,
     )

@@ -97,7 +97,9 @@ class LLMStreamRequest:
     provider: Optional[str] = None
     run_id: Optional[str] = None
     step_id: Optional[str] = None
+    # defer_output 同时抑制 reasoning/answering；defer_answering 仅拦截尚未过门禁的正文。
     defer_output: bool = False
+    defer_answering: bool = False
 
 
 @dataclass
@@ -482,14 +484,16 @@ def filter_internal_mcp_reasoning_delta(
     if not reasoning_delta:
         return ""
     _merge_reasoning_delta(state, reasoning_delta, provider=provider)
-    visible_reasoning = sanitize_internal_tool_names(state.raw_reasoning_buf)
+    visible_reasoning = strip_pending_dsml_tool_protocol(state.raw_reasoning_buf)
+    visible_reasoning = sanitize_internal_tool_names(visible_reasoning)
     return _visible_delta(visible_reasoning, state.reasoning_buf, channel="reasoning")
 
 
 async def flush_pending_internal_mcp_aliases(*, request: LLMStreamRequest, state: LLMStreamState) -> None:
     if state.reasoning_transport_mode == "probing":
         _resolve_reasoning_probe(state, final=True)
-    final_reasoning = sanitize_internal_tool_names(state.raw_reasoning_buf, final=True)
+    final_reasoning = strip_pending_dsml_tool_protocol(state.raw_reasoning_buf)
+    final_reasoning = sanitize_internal_tool_names(final_reasoning, final=True)
     final_content = strip_reasoning_tag_blocks(state.raw_content_buf)
     final_content = strip_pending_dsml_tool_protocol(final_content)
     final_content = sanitize_internal_mcp_aliases(final_content, final=True)
@@ -537,7 +541,7 @@ async def append_reasoning_and_content(
             )
     if content_delta:
         state.content_buf += content_delta
-        if not request.defer_output:
+        if not request.defer_output and not request.defer_answering:
             await append_stream_delta(
                 request=request,
                 chunk_type="answering",
@@ -669,6 +673,7 @@ async def stream_round(
     run_id: Optional[str] = None,
     step_id: Optional[str] = None,
     defer_output: bool = False,
+    defer_answering: bool = False,
 ) -> tuple[str, str, list[dict], str, Optional[Usage]]:
     """
     通用 LLM 流式响应处理。
@@ -690,6 +695,7 @@ async def stream_round(
             run_id=run_id,
             step_id=step_id,
             defer_output=defer_output,
+            defer_answering=defer_answering,
         ),
     )
     return StreamRoundTuple(

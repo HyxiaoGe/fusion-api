@@ -112,6 +112,105 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.content_buf, "方便停车，驾车更合适。")
         append_chunk.assert_not_awaited()
 
+    async def test_consume_stream_round_streams_reasoning_while_deferring_answering_for_plan_gate(self):
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-plan",
+            task_id="task-plan",
+            should_use_reasoning=True,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+            run_id="run-plan",
+            step_id="step-plan",
+            provider="moonshot",
+            defer_answering=True,
+        )
+        append_chunk = AsyncMock()
+
+        async def gated_response():
+            yield make_chunk(
+                delta=SimpleNamespace(content=None, reasoning_content="先建立"),
+                finish_reason=None,
+            )
+            yield make_chunk(
+                delta=SimpleNamespace(content=None, reasoning_content="执行计划"),
+                finish_reason=None,
+            )
+            self.assertEqual(append_chunk.await_count, 1)
+            self.assertEqual(append_chunk.await_args.args[1], "reasoning")
+            yield make_chunk(
+                delta=SimpleNamespace(content="这段正文不能提前展示。", reasoning_content=None),
+                finish_reason="stop",
+            )
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            outcome = await llm_stream_module.consume_stream_round(
+                gated_response(),
+                request,
+            )
+
+        self.assertEqual(outcome.reasoning_buf, "先建立执行计划")
+        self.assertEqual(outcome.content_buf, "这段正文不能提前展示。")
+        append_chunk.assert_awaited_once()
+        self.assertEqual(append_chunk.await_args.args[1], "reasoning")
+        self.assertEqual(append_chunk.await_args.args[2], "先建立执行计划")
+
+    async def test_plan_gate_hides_split_dsml_from_reasoning_but_keeps_raw_protocol(self):
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-plan-dsml",
+            task_id="task-plan-dsml",
+            should_use_reasoning=True,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+            run_id="run-plan-dsml",
+            step_id="step-plan-dsml",
+            provider="moonshot",
+            defer_answering=True,
+        )
+        raw_reasoning = (
+            "先制定计划。"
+            '<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="update_plan">'
+            '<｜｜DSML｜｜parameter name="plan" string="true">内部参数</｜｜DSML｜｜parameter>'
+            "</｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>"
+        )
+        append_chunk = AsyncMock()
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            outcome = await llm_stream_module.consume_stream_round(
+                async_response(
+                    [
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content=raw_reasoning[:12]),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content=None, reasoning_content=raw_reasoning[12:]),
+                            finish_reason=None,
+                        ),
+                        make_chunk(
+                            delta=SimpleNamespace(content="正文仍在门禁内。", reasoning_content=None),
+                            finish_reason="stop",
+                        ),
+                    ]
+                ),
+                request,
+            )
+
+        emitted_reasoning = "".join(
+            call.args[2] for call in append_chunk.await_args_list if call.args[1] == "reasoning"
+        )
+        self.assertEqual(outcome.reasoning_buf, "先制定计划。")
+        self.assertEqual(emitted_reasoning, outcome.reasoning_buf)
+        self.assertEqual(outcome.raw_reasoning_buf, raw_reasoning)
+        self.assertIn("DSML", outcome.raw_reasoning_buf)
+        self.assertNotIn("DSML", emitted_reasoning)
+        self.assertFalse(any(call.args[1] == "answering" for call in append_chunk.await_args_list))
+
     async def test_consume_stream_round_redacts_split_internal_mcp_alias_from_reasoning_and_answer(self):
         request = llm_stream_module.LLMStreamRequest(
             conversation_id="conv-mcp",

@@ -72,6 +72,101 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(received_kwargs["provider"], "openai")
         self.assertTrue(result.output_deferred)
 
+    async def test_run_agent_round_marks_and_forwards_deferred_answering(self):
+        step_context = AgentStepContext(
+            step_id="step-plan",
+            step_number=1,
+            started_at=100.0,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+        )
+        received_kwargs = {}
+
+        async def stream_round_fn(*_args, **kwargs):
+            received_kwargs.update(kwargs)
+            return "规划思考", "不应提前展示", [], "stop", None
+
+        context_plan = MagicMock(
+            messages=[{"role": "user", "content": "制定计划"}],
+            estimated_tokens_after=10,
+        )
+        context_plan.telemetry.return_value = {"context_management_status": "no_op"}
+        with patch(
+            "app.services.stream.agent_round.prepare_context",
+            new=AsyncMock(return_value=context_plan),
+        ):
+            result = await run_agent_round(
+                conversation_id="conv-plan",
+                task_id="task-plan",
+                run_id="run-plan",
+                step_number=1,
+                model_id="kimi-k3",
+                provider="moonshot",
+                litellm_model="litellm_proxy/kimi-k3",
+                litellm_kwargs={},
+                messages=context_plan.messages,
+                should_use_reasoning=True,
+                call_kwargs={},
+                accumulated_usage=Usage(),
+                step_context=step_context,
+                llm_call_fn=AsyncMock(return_value="response"),
+                stream_round_fn=stream_round_fn,
+                log_round_summary_fn=lambda **_kwargs: None,
+                defer_answering=True,
+            )
+
+        self.assertTrue(received_kwargs["defer_answering"])
+        self.assertFalse(received_kwargs.get("defer_output", False))
+        self.assertTrue(result.answering_deferred)
+        self.assertFalse(result.output_deferred)
+
+    async def test_run_agent_round_safely_falls_back_to_full_defer_for_legacy_stream_handler(self):
+        step_context = AgentStepContext(
+            step_id="step-plan-legacy",
+            step_number=1,
+            started_at=100.0,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+        )
+        received_kwargs = {}
+
+        async def legacy_stream_round_fn(*_args, run_id=None, step_id=None, defer_output=False):
+            received_kwargs["defer_output"] = defer_output
+            return "规划思考", "不应提前展示", [], "stop", None
+
+        context_plan = MagicMock(
+            messages=[{"role": "user", "content": "制定计划"}],
+            estimated_tokens_after=10,
+        )
+        context_plan.telemetry.return_value = {"context_management_status": "no_op"}
+        with patch(
+            "app.services.stream.agent_round.prepare_context",
+            new=AsyncMock(return_value=context_plan),
+        ):
+            result = await run_agent_round(
+                conversation_id="conv-plan-legacy",
+                task_id="task-plan-legacy",
+                run_id="run-plan-legacy",
+                step_number=1,
+                model_id="kimi-k3",
+                provider="moonshot",
+                litellm_model="litellm_proxy/kimi-k3",
+                litellm_kwargs={},
+                messages=context_plan.messages,
+                should_use_reasoning=True,
+                call_kwargs={},
+                accumulated_usage=Usage(),
+                step_context=step_context,
+                llm_call_fn=AsyncMock(return_value="response"),
+                stream_round_fn=legacy_stream_round_fn,
+                log_round_summary_fn=lambda **_kwargs: None,
+                defer_answering=True,
+            )
+
+        self.assertTrue(received_kwargs["defer_output"])
+        self.assertTrue(result.output_deferred)
+        self.assertFalse(result.answering_deferred)
+
     async def test_run_agent_round_emits_estimated_and_final_context_status(self):
         emitter = AsyncMock()
         step_context = AgentStepContext(
