@@ -277,13 +277,14 @@ def prepare_tool_arguments(
     tool_name: str,
     args: dict,
     network_budget: "NetworkToolBudget | None",
+    plan_item_id: str | None = None,
 ):
     if network_budget is None:
         return args, None
     if tool_name == "web_search":
         return network_budget.prepare_web_search_args(args)
     if tool_name == "url_read":
-        return network_budget.prepare_url_read_args(args)
+        return network_budget.prepare_url_read_args(args, plan_item_id=plan_item_id)
     return args, None
 
 
@@ -554,6 +555,11 @@ async def execute_one_tool_call(request: ToolExecutionBatchRequest, tool_call: d
         tool_name=tool_call["name"],
         args=args,
         network_budget=request.network_budget,
+        plan_item_id=(
+            tool_call.get("plan_item_id")
+            if isinstance(tool_call.get("plan_item_id"), str)
+            else None
+        ),
     )
     executable_args = strip_internal_tool_arguments(args)
     if budget_result is not None:

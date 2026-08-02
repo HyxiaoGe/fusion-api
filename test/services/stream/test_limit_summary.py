@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,6 +25,7 @@ from app.services.stream.limit_summary import (
 )
 from app.services.stream.research_evidence import ResearchEvidenceWorkset
 from app.services.stream.step_lifecycle import AgentStepContext
+from app.services.stream_state_service import StreamOwnershipLostError
 
 
 def _deep_summary_evidence() -> tuple[ResearchEvidenceWorkset, list]:
@@ -298,6 +300,20 @@ class LimitSummaryHelpersTests(unittest.TestCase):
 
         self.assertEqual(messages, expected)
 
+    def test_standard_final_summary_removes_verified_research_plan_contract(self):
+        messages = [
+            {"role": "system", "content": "【可核验证据计划规则】先搜索再读取"},
+            {"role": "user", "content": "请综合结论"},
+        ]
+
+        remove_conflicting_tool_usage_contract(
+            messages,
+            task_mode="standard",
+            final_synthesis=True,
+        )
+
+        self.assertEqual(messages, [{"role": "user", "content": "请综合结论"}])
+
     def test_standard_final_summary_keeps_entire_parallel_mixed_tool_transaction(self):
         messages = [
             {"role": "user", "content": "同时搜索公告并查询官方库文档"},
@@ -436,6 +452,165 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         )
         return request, stream_kwargs, events, prepare_context_fn
 
+    async def test_standard_plan_synthesis_streams_round_and_never_bulk_appends_answer(self):
+        request, stream_kwargs, _events, prepare_context_fn = self._plan_synthesis_request(
+            round_results=[("综合推理", "第一段第二段", [], "stop", Usage(input_tokens=2, output_tokens=3))]
+        )
+
+        with (
+            patch("app.services.stream.limit_summary.prepare_context", new=prepare_context_fn),
+            patch("app.services.stream.limit_summary.append_chunk", new=AsyncMock()) as append_chunk,
+        ):
+            outcome = await run_limit_summary_step(request=request)
+
+        self.assertFalse(stream_kwargs[0]["defer_output"])
+        append_chunk.assert_not_awaited()
+        self.assertFalse(outcome.incomplete)
+        self.assertEqual([block.type for block in request.content_blocks], ["thinking", "text"])
+        self.assertEqual(request.content_blocks[-2].thinking, "综合推理")
+        self.assertEqual(request.content_blocks[-1].text, "第一段第二段")
+
+    async def test_standard_plan_synthesis_timeout_persists_exact_streamed_partial_without_fallback(self):
+        async def prepare_context_fn(**kwargs):
+            return ContextPlan(
+                messages=list(kwargs["messages"]),
+                status="no_op",
+                context_window_tokens=1000,
+                context_window_source="test",
+                context_window_status="known",
+                estimated_tokens_before=100,
+                estimated_tokens_after=100,
+            )
+
+        async def response():
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content=None, reasoning_content="部分综合推理"),
+                        finish_reason=None,
+                    )
+                ]
+            )
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="部分正文  ", reasoning_content=None),
+                        finish_reason=None,
+                    )
+                ]
+            )
+            await asyncio.Event().wait()
+
+        async def start_step_fn(**_kwargs):
+            return AgentStepContext(
+                step_id="step-timeout",
+                step_number=3,
+                started_at=100.0,
+                thinking_block_id="thinking-timeout",
+                text_block_id="text-timeout",
+            )
+
+        request = LimitSummaryStepRequest(
+            conversation_id="conv-timeout",
+            task_id="task-timeout",
+            run_id="run-timeout",
+            step_number=3,
+            model_id="kimi-k3",
+            provider="moonshot",
+            litellm_model="moonshot/kimi-k3",
+            litellm_kwargs={},
+            messages=[{"role": "user", "content": "总结"}],
+            should_use_reasoning=True,
+            content_blocks=[],
+            call_kwargs={},
+            accumulated_usage=Usage(input_tokens=0, output_tokens=0),
+            emitter=AsyncMock(),
+            session_cache=object(),
+            total_timeout_s=300,
+            run_start=100.0,
+            start_step_fn=start_step_fn,
+            complete_step_fn=AsyncMock(),
+            llm_call_fn=AsyncMock(return_value=response()),
+            stream_round_fn=partial(
+                llm_stream_module.stream_round,
+                model_id="kimi-k3",
+                reasoning_transport_mode="delta",
+            ),
+            log_round_summary_fn=lambda **_kwargs: None,
+            clock=lambda: 120.0,
+            summary_finish_reason="plan_synthesis",
+        )
+        observation = SimpleNamespace(
+            start=lambda: None,
+            wrap_response=lambda value: value,
+            finish_error=AsyncMock(),
+            finish_success=AsyncMock(),
+        )
+        stream_append = AsyncMock()
+
+        with (
+            patch("app.services.stream.limit_summary.prepare_context", new=prepare_context_fn),
+            patch("app.services.stream.limit_summary.compute_summary_timeout", return_value=0.02),
+            patch("app.services.stream.limit_summary._create_limit_summary_observation", return_value=observation),
+            patch("app.services.stream.llm_stream.append_chunk", new=stream_append),
+            patch("app.services.stream.llm_stream.check_lock_owner", new=AsyncMock(return_value=True)),
+            patch("app.services.stream.limit_summary.append_chunk", new=AsyncMock()) as summary_append,
+        ):
+            outcome = await run_limit_summary_step(request=request)
+
+        self.assertEqual(
+            [(call.args[1], call.args[2]) for call in stream_append.await_args_list],
+            [("reasoning", "部分综合推理"), ("answering", "部分正文")],
+        )
+        summary_append.assert_not_awaited()
+        self.assertTrue(outcome.incomplete)
+        self.assertEqual([block.type for block in request.content_blocks], ["thinking", "text"])
+        self.assertEqual(request.content_blocks[-2].thinking, "部分综合推理")
+        self.assertEqual(request.content_blocks[-1].text, "部分正文")
+
+    async def test_standard_plan_synthesis_stream_error_persists_sent_partial(self):
+        warnings = []
+        request, _stream_kwargs, _events, prepare_context_fn = self._plan_synthesis_request(
+            round_results=[]
+        )
+
+        async def stream_round_fn(*_args, partial_output=None, **_kwargs):
+            partial_output["reasoning_buf"] = "异常前已发送推理"
+            partial_output["content_buf"] = "异常前已发送正文"
+            raise RuntimeError("provider stream disconnected")
+
+        request = replace(
+            request,
+            stream_round_fn=stream_round_fn,
+            warning_fn=warnings.append,
+        )
+        with (
+            patch("app.services.stream.limit_summary.prepare_context", new=prepare_context_fn),
+            patch("app.services.stream.limit_summary.append_chunk", new=AsyncMock()) as append_chunk,
+        ):
+            outcome = await run_limit_summary_step(request=request)
+
+        self.assertTrue(outcome.incomplete)
+        append_chunk.assert_not_awaited()
+        self.assertEqual([block.type for block in request.content_blocks], ["thinking", "text"])
+        self.assertEqual(request.content_blocks[0].thinking, "异常前已发送推理")
+        self.assertEqual(request.content_blocks[1].text, "异常前已发送正文")
+        self.assertTrue(any("RuntimeError" in warning for warning in warnings))
+
+    async def test_standard_plan_synthesis_ownership_loss_is_never_converted_to_partial(self):
+        request, _stream_kwargs, _events, prepare_context_fn = self._plan_synthesis_request(
+            round_results=[]
+        )
+
+        async def stream_round_fn(*_args, partial_output=None, **_kwargs):
+            partial_output["content_buf"] = "旧任务片段"
+            raise StreamOwnershipLostError("任务已被替代")
+
+        request = replace(request, stream_round_fn=stream_round_fn)
+        with patch("app.services.stream.limit_summary.prepare_context", new=prepare_context_fn):
+            with self.assertRaises(StreamOwnershipLostError):
+                await run_limit_summary_step(request=request)
+
     def _deep_request(
         self,
         *,
@@ -503,26 +678,19 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         )
         return request, emitter, stream_kwargs, prepare_context_fn
 
-    async def test_plan_synthesis_with_text_then_tool_protocol_never_leaks_preview(self):
+    async def test_streamed_plan_synthesis_with_late_tool_protocol_does_not_retry_or_bulk_append(self):
         events = []
         request, stream_kwargs, events, prepare_context_fn = self._plan_synthesis_request(
             round_results=[
                 (
-                    "",
-                    "这段草稿后面夹带了工具协议，不得展示。",
+                    "已流式发送的安全推理。",
+                    "已流式发送的安全正文。",
                     [{"id": "tc-late", "name": "web_search", "arguments": "{}"}],
                     "tool_calls",
                     Usage(input_tokens=2, output_tokens=3),
                 ),
-                (
-                    "仅供内部使用的最终综合推理",
-                    "协议与事实校验后的最终回答。",
-                    [],
-                    "stop",
-                    Usage(input_tokens=2, output_tokens=3),
-                ),
             ],
-            llm_call_fn=AsyncMock(side_effect=["response-1", "response-2"]),
+            llm_call_fn=AsyncMock(return_value="response-1"),
             events=events,
         )
 
@@ -537,17 +705,14 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         ):
             outcome = await run_limit_summary_step(request=request)
 
-        self.assertTrue(all(kwargs["defer_output"] for kwargs in stream_kwargs))
-        self.assertFalse(outcome.incomplete)
-        append_chunk.assert_awaited_once()
-        self.assertEqual(append_chunk.await_args.args[2], "协议与事实校验后的最终回答。")
-        self.assertNotIn("草稿", append_chunk.await_args.args[2])
-        self.assertEqual([block.type for block in request.content_blocks], ["text"])
-        self.assertEqual(request.content_blocks[-1].text, "协议与事实校验后的最终回答。")
-        self.assertEqual(
-            [event[0] for event in events],
-            ["round_complete", "round_complete", "answering"],
-        )
+        self.assertEqual(len(stream_kwargs), 1)
+        self.assertFalse(stream_kwargs[0]["defer_output"])
+        self.assertTrue(outcome.incomplete)
+        append_chunk.assert_not_awaited()
+        self.assertEqual([block.type for block in request.content_blocks], ["thinking", "text"])
+        self.assertEqual(request.content_blocks[-2].thinking, "已流式发送的安全推理。")
+        self.assertEqual(request.content_blocks[-1].text, "已流式发送的安全正文。")
+        self.assertEqual([event[0] for event in events], ["round_complete"])
 
     async def test_empty_plan_synthesis_emits_safe_fallback_and_marks_incomplete(self):
         request, stream_kwargs, _events, prepare_context_fn = self._plan_synthesis_request(
@@ -560,13 +725,13 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         ):
             outcome = await run_limit_summary_step(request=request)
 
-        self.assertTrue(stream_kwargs[0]["defer_output"])
+        self.assertFalse(stream_kwargs[0]["defer_output"])
         self.assertTrue(outcome.incomplete)
         append_chunk.assert_awaited_once()
         self.assertEqual(append_chunk.await_args.args[2], SUMMARY_PROTOCOL_FALLBACK_TEXT)
         self.assertEqual(request.content_blocks[-1].text, SUMMARY_PROTOCOL_FALLBACK_TEXT)
 
-    async def test_reasoning_only_plan_synthesis_discards_reasoning_and_persists_fallback(self):
+    async def test_reasoning_only_plan_synthesis_persists_reasoning_and_appends_safe_fallback(self):
         request, stream_kwargs, _events, prepare_context_fn = self._plan_synthesis_request(
             round_results=[("仅供内部使用的推理", "", [], "stop", None)]
         )
@@ -577,7 +742,95 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         ):
             outcome = await run_limit_summary_step(request=request)
 
-        self.assertTrue(stream_kwargs[0]["defer_output"])
+        self.assertFalse(stream_kwargs[0]["defer_output"])
+        self.assertTrue(outcome.incomplete)
+        append_chunk.assert_awaited_once()
+        self.assertEqual(append_chunk.await_args.args[2], SUMMARY_PROTOCOL_FALLBACK_TEXT)
+        self.assertEqual([block.type for block in request.content_blocks], ["thinking", "text"])
+        self.assertEqual(request.content_blocks[0].thinking, "仅供内部使用的推理")
+        self.assertEqual(request.content_blocks[1].text, SUMMARY_PROTOCOL_FALLBACK_TEXT)
+
+    async def test_reasoning_only_timed_out_plan_synthesis_keeps_thinking_and_appends_fallback(self):
+        request, _stream_kwargs, _events, prepare_context_fn = self._plan_synthesis_request(
+            round_results=[]
+        )
+
+        async def stream_round_fn(*_args, partial_output=None, **_kwargs):
+            partial_output["reasoning_buf"] = "超时前已发送的推理"
+            await asyncio.Event().wait()
+
+        request = replace(request, stream_round_fn=stream_round_fn)
+        with (
+            patch("app.services.stream.limit_summary.prepare_context", new=prepare_context_fn),
+            patch("app.services.stream.limit_summary.compute_summary_timeout", return_value=0.01),
+            patch("app.services.stream.limit_summary.append_chunk", new=AsyncMock()) as append_chunk,
+        ):
+            outcome = await run_limit_summary_step(request=request)
+
+        self.assertTrue(outcome.incomplete)
+        append_chunk.assert_awaited_once()
+        self.assertEqual(append_chunk.await_args.args[2], SUMMARY_PROTOCOL_FALLBACK_TEXT)
+        self.assertEqual([block.type for block in request.content_blocks], ["thinking", "text"])
+        self.assertEqual(request.content_blocks[0].thinking, "超时前已发送的推理")
+        self.assertEqual(request.content_blocks[1].text, SUMMARY_PROTOCOL_FALLBACK_TEXT)
+
+    async def test_reasoning_only_repeated_protocol_keeps_thinking_and_appends_fallback(self):
+        protocol_call = [{"id": "tc-protocol", "name": "web_search", "arguments": "{}"}]
+        request, stream_kwargs, _events, prepare_context_fn = self._plan_synthesis_request(
+            round_results=[
+                ("首轮已发送推理", "", protocol_call, "tool_calls", None),
+                ("重试已发送推理", "", protocol_call, "tool_calls", None),
+            ],
+            llm_call_fn=AsyncMock(side_effect=["response-1", "response-2"]),
+        )
+
+        with (
+            patch("app.services.stream.limit_summary.prepare_context", new=prepare_context_fn),
+            patch("app.services.stream.limit_summary.append_chunk", new=AsyncMock()) as append_chunk,
+        ):
+            outcome = await run_limit_summary_step(request=request)
+
+        self.assertTrue(all(not kwargs["defer_output"] for kwargs in stream_kwargs))
+        self.assertTrue(outcome.incomplete)
+        append_chunk.assert_awaited_once()
+        self.assertEqual(append_chunk.await_args.args[2], SUMMARY_PROTOCOL_FALLBACK_TEXT)
+        self.assertEqual([block.type for block in request.content_blocks], ["thinking", "text"])
+        self.assertEqual(request.content_blocks[0].thinking, "首轮已发送推理重试已发送推理")
+        self.assertEqual(request.content_blocks[1].text, SUMMARY_PROTOCOL_FALLBACK_TEXT)
+
+    async def test_empty_repeated_protocol_appends_and_persists_one_fallback(self):
+        protocol_call = [{"id": "tc-protocol", "name": "web_search", "arguments": "{}"}]
+        request, _stream_kwargs, _events, prepare_context_fn = self._plan_synthesis_request(
+            round_results=[
+                ("", "", protocol_call, "tool_calls", None),
+                ("", "", protocol_call, "tool_calls", None),
+            ],
+            llm_call_fn=AsyncMock(side_effect=["response-1", "response-2"]),
+        )
+
+        with (
+            patch("app.services.stream.limit_summary.prepare_context", new=prepare_context_fn),
+            patch("app.services.stream.limit_summary.append_chunk", new=AsyncMock()) as append_chunk,
+        ):
+            outcome = await run_limit_summary_step(request=request)
+
+        self.assertTrue(outcome.incomplete)
+        append_chunk.assert_awaited_once()
+        self.assertEqual(append_chunk.await_args.args[2], SUMMARY_PROTOCOL_FALLBACK_TEXT)
+        self.assertEqual([block.type for block in request.content_blocks], ["text"])
+        self.assertEqual(request.content_blocks[0].text, SUMMARY_PROTOCOL_FALLBACK_TEXT)
+
+    async def test_whitespace_only_plan_synthesis_appends_and_persists_fallback(self):
+        request, _stream_kwargs, _events, prepare_context_fn = self._plan_synthesis_request(
+            round_results=[("", "   ", [], "stop", None)]
+        )
+
+        with (
+            patch("app.services.stream.limit_summary.prepare_context", new=prepare_context_fn),
+            patch("app.services.stream.limit_summary.append_chunk", new=AsyncMock()) as append_chunk,
+        ):
+            outcome = await run_limit_summary_step(request=request)
+
         self.assertTrue(outcome.incomplete)
         append_chunk.assert_awaited_once()
         self.assertEqual(append_chunk.await_args.args[2], SUMMARY_PROTOCOL_FALLBACK_TEXT)
@@ -977,7 +1230,7 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("工具协议" in warning for warning in warnings))
         self.assertTrue(any("不要输出任何工具调用" in str(message.get("content", "")) for message in request.messages))
 
-    async def test_k3_plan_synthesis_and_limit_summary_only_emit_final_answering(self):
+    async def test_k3_plan_synthesis_streams_normally_while_limit_summary_stays_deferred(self):
         async def prepare_context_fn(**kwargs):
             return ContextPlan(
                 messages=list(kwargs["messages"]),
@@ -1083,11 +1336,26 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
                 ):
                     outcome = await run_limit_summary_step(request=request)
 
-                stream_append.assert_not_awaited()
-                summary_append.assert_awaited_once()
-                self.assertEqual(summary_append.await_args.args[1:3], ("answering", "最终答复"))
+                if summary_finish_reason == "plan_synthesis":
+                    self.assertEqual(
+                        [(call.args[1], call.args[2]) for call in stream_append.await_args_list],
+                        [
+                            ("reasoning", "候选协议推理"),
+                            ("answering", "最终答复"),
+                            ("reasoning", "最终综合推理"),
+                        ],
+                    )
+                    summary_append.assert_not_awaited()
+                else:
+                    stream_append.assert_not_awaited()
+                    summary_append.assert_awaited_once()
+                    self.assertEqual(summary_append.await_args.args[1:3], ("answering", "最终答复"))
                 self.assertFalse(outcome.incomplete)
-                self.assertEqual([block.type for block in content_blocks], ["text"])
+                if summary_finish_reason == "plan_synthesis":
+                    self.assertEqual([block.type for block in content_blocks], ["thinking", "text"])
+                    self.assertEqual(content_blocks[-2].thinking, "候选协议推理最终综合推理")
+                else:
+                    self.assertEqual([block.type for block in content_blocks], ["text"])
 
     async def test_no_progress_summary_uses_safe_fallback_after_repeated_tool_protocol(self):
         content_blocks = []

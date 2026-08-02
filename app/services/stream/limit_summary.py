@@ -20,7 +20,7 @@ from app.ai.prompts.agent_loop import (
     get_limit_summary_prompt,
 )
 from app.core.logger import app_logger as logger
-from app.schemas.chat import ContextUsage, TextBlock, Usage
+from app.schemas.chat import ContextUsage, TextBlock, ThinkingBlock, Usage
 from app.services.chat.context_manager import ContextManagementError, ContextPlan, prepare_context
 from app.services.final_answer_evidence import build_used_final_answer_evidence
 from app.services.stream.context_status import build_context_usage, emit_context_status
@@ -95,6 +95,18 @@ class LimitSummaryStepRequest:
     defer_output: bool = True
 
 
+def _streams_standard_plan_synthesis(request: LimitSummaryStepRequest) -> bool:
+    """普通计划最终综合直接透传正文；深度研究仍需缓存全文完成校验。"""
+
+    return request.summary_finish_reason == "plan_synthesis" and request.task_mode != "deep_research"
+
+
+def _should_defer_summary_output(request: LimitSummaryStepRequest) -> bool:
+    if _streams_standard_plan_synthesis(request):
+        return False
+    return request.defer_output or request.task_mode == "deep_research"
+
+
 def build_limit_summary_call_kwargs(call_kwargs: dict) -> dict:
     return {key: value for key, value in call_kwargs.items() if key not in ("tools", "tool_choice")}
 
@@ -139,6 +151,7 @@ def remove_conflicting_tool_usage_contract(
         "【自主联网判断规则】",
         "【工具调用一致性规则】",
         "【执行计划控制规则】",
+        "【可核验证据计划规则】",
         "【计划控制修正】",
         "【计划执行修正】",
     )
@@ -252,6 +265,7 @@ async def call_limit_summary_round(
     thinking_block_id: str,
     text_block_id: str,
     step_id: str,
+    partial_output: dict[str, str] | None = None,
 ) -> LimitSummaryRoundResult:
     final_call_kwargs = build_limit_summary_call_kwargs(request.call_kwargs)
     try:
@@ -299,10 +313,10 @@ async def call_limit_summary_round(
         stream_kwargs = {"run_id": request.run_id, "step_id": step_id}
         if _accepts_keyword(request.stream_round_fn, "provider"):
             stream_kwargs["provider"] = request.provider
-        if (request.defer_output or request.task_mode == "deep_research") and _accepts_keyword(
-            request.stream_round_fn, "defer_output"
-        ):
-            stream_kwargs["defer_output"] = True
+        if _accepts_keyword(request.stream_round_fn, "defer_output"):
+            stream_kwargs["defer_output"] = _should_defer_summary_output(request)
+        if partial_output is not None and _accepts_keyword(request.stream_round_fn, "partial_output"):
+            stream_kwargs["partial_output"] = partial_output
         reasoning_buf, content_buf, tool_calls, finish_reason, usage_data = await request.stream_round_fn(
             response,
             request.conversation_id,
@@ -398,6 +412,7 @@ async def run_summary_round_with_timeout(
     remaining: float,
 ) -> LimitSummaryRoundResult:
     started_at = time.monotonic()
+    first_partial: dict[str, str] = {}
     try:
         first_result = await asyncio.wait_for(
             call_limit_summary_round(
@@ -405,16 +420,44 @@ async def run_summary_round_with_timeout(
                 thinking_block_id=thinking_block_id,
                 text_block_id=text_block_id,
                 step_id=summary_context.step_id,
+                partial_output=first_partial if _streams_standard_plan_synthesis(request) else None,
             ),
             timeout=remaining,
         )
     except asyncio.TimeoutError:
         warning = request.warning_fn if request.warning_fn is not None else logger.warning
         warning(f"触顶总结超出剩余预算: conv_id={request.conversation_id}, budget={remaining}s")
-        return LimitSummaryRoundResult(reasoning_buf="", content_buf="", usage_data=None)
+        return _build_timeout_partial_result(first_partial)
+    except StreamWriteTerminalError:
+        raise
+    except Exception as error:
+        partial_result = _build_stream_error_partial_result(first_partial)
+        if partial_result is None:
+            raise
+        warning = request.warning_fn if request.warning_fn is not None else logger.warning
+        warning(
+            "流式计划综合异常中止，保留已发送的安全片段: "
+            f"conv_id={request.conversation_id}, run_id={request.run_id}, "
+            f"step={request.step_number}, error_type={type(error).__name__}"
+        )
+        return partial_result
 
     if not _is_summary_tool_protocol_violation(first_result):
         result = first_result
+    elif _streams_standard_plan_synthesis(request) and first_result.content_buf:
+        warning = request.warning_fn if request.warning_fn is not None else logger.warning
+        warning(
+            "流式计划综合返回了工具协议，保留已发送的安全正文并终止综合: "
+            f"conv_id={request.conversation_id}, run_id={request.run_id}, step={request.step_number}"
+        )
+        result = LimitSummaryRoundResult(
+            reasoning_buf=first_result.reasoning_buf,
+            content_buf=first_result.content_buf,
+            usage_data=first_result.usage_data,
+            context=first_result.context,
+            tool_calls=(),
+            finish_reason="protocol_fallback",
+        )
     else:
         warning = request.warning_fn if request.warning_fn is not None else logger.warning
         warning(
@@ -424,8 +467,12 @@ async def run_summary_round_with_timeout(
         request.messages.append({"role": "system", "content": SUMMARY_TOOL_PROTOCOL_RETRY_PROMPT})
         retry_remaining = remaining - (time.monotonic() - started_at)
         if retry_remaining <= 0:
-            return _build_summary_protocol_fallback(first_result)
+            return _build_streamed_retry_failure(
+                request=request,
+                first_result=first_result,
+            )
 
+        retry_partial: dict[str, str] = {}
         try:
             retry_result = await asyncio.wait_for(
                 call_limit_summary_round(
@@ -433,6 +480,7 @@ async def run_summary_round_with_timeout(
                     thinking_block_id=thinking_block_id,
                     text_block_id=text_block_id,
                     step_id=summary_context.step_id,
+                    partial_output=retry_partial if _streams_standard_plan_synthesis(request) else None,
                 ),
                 timeout=retry_remaining,
             )
@@ -441,7 +489,30 @@ async def run_summary_round_with_timeout(
                 "无工具收尾重试超出剩余预算，使用安全失败文案: "
                 f"conv_id={request.conversation_id}, budget={retry_remaining}s"
             )
-            return _build_summary_protocol_fallback(first_result)
+            return _build_streamed_retry_failure(
+                request=request,
+                first_result=first_result,
+                retry_partial=retry_partial,
+            )
+        except StreamWriteTerminalError:
+            raise
+        except Exception as error:
+            if not _streams_standard_plan_synthesis(request):
+                raise
+            partial_result = _build_streamed_retry_failure(
+                request=request,
+                first_result=first_result,
+                retry_partial=retry_partial,
+                finish_reason="stream_error_partial",
+            )
+            if not partial_result.reasoning_buf and not partial_result.content_buf:
+                raise
+            warning(
+                "流式计划综合重试异常中止，保留已发送的安全片段: "
+                f"conv_id={request.conversation_id}, run_id={request.run_id}, "
+                f"step={request.step_number}, error_type={type(error).__name__}"
+            )
+            return partial_result
 
         usage_data = _combine_optional_usage(first_result.usage_data, retry_result.usage_data)
         if _is_summary_tool_protocol_violation(retry_result):
@@ -449,15 +520,30 @@ async def run_summary_round_with_timeout(
                 "无工具收尾重试仍返回工具协议，使用安全失败文案: "
                 f"conv_id={request.conversation_id}, run_id={request.run_id}, step={request.step_number}"
             )
-            return _build_summary_protocol_fallback(retry_result, usage_data=usage_data)
-        result = LimitSummaryRoundResult(
-            reasoning_buf=retry_result.reasoning_buf,
-            content_buf=retry_result.content_buf,
-            usage_data=usage_data,
-            context=retry_result.context,
-            tool_calls=(),
-            finish_reason=retry_result.finish_reason,
-        )
+            return _build_streamed_retry_failure(
+                request=request,
+                first_result=first_result,
+                retry_result=retry_result,
+                usage_data=usage_data,
+            )
+        if _streams_standard_plan_synthesis(request):
+            result = LimitSummaryRoundResult(
+                reasoning_buf=first_result.reasoning_buf + retry_result.reasoning_buf,
+                content_buf=first_result.content_buf + retry_result.content_buf,
+                usage_data=usage_data,
+                context=retry_result.context,
+                tool_calls=(),
+                finish_reason=retry_result.finish_reason,
+            )
+        else:
+            result = LimitSummaryRoundResult(
+                reasoning_buf=retry_result.reasoning_buf,
+                content_buf=retry_result.content_buf,
+                usage_data=usage_data,
+                context=retry_result.context,
+                tool_calls=(),
+                finish_reason=retry_result.finish_reason,
+            )
 
     return await _repair_deep_research_summary_citations(
         request=request,
@@ -559,6 +645,77 @@ def _build_summary_protocol_fallback(
     )
 
 
+def _build_timeout_partial_result(partial_output: dict[str, str]) -> LimitSummaryRoundResult:
+    reasoning_buf = partial_output.get("reasoning_buf", "")
+    content_buf = partial_output.get("content_buf", "")
+    return LimitSummaryRoundResult(
+        reasoning_buf=reasoning_buf,
+        content_buf=content_buf,
+        usage_data=None,
+        finish_reason="timeout_partial" if reasoning_buf or content_buf else "timeout",
+    )
+
+
+def _build_stream_error_partial_result(
+    partial_output: dict[str, str],
+) -> LimitSummaryRoundResult | None:
+    reasoning_buf = partial_output.get("reasoning_buf", "")
+    content_buf = partial_output.get("content_buf", "")
+    if not reasoning_buf and not content_buf:
+        return None
+    return LimitSummaryRoundResult(
+        reasoning_buf=reasoning_buf,
+        content_buf=content_buf,
+        usage_data=None,
+        finish_reason="stream_error_partial",
+    )
+
+
+def _build_streamed_retry_failure(
+    *,
+    request: LimitSummaryStepRequest,
+    first_result: LimitSummaryRoundResult,
+    retry_partial: dict[str, str] | None = None,
+    retry_result: LimitSummaryRoundResult | None = None,
+    usage_data: Usage | None = None,
+    finish_reason: str = "protocol_fallback",
+) -> LimitSummaryRoundResult:
+    if not _streams_standard_plan_synthesis(request):
+        return _build_summary_protocol_fallback(
+            retry_result or first_result,
+            usage_data=usage_data,
+        )
+    retry_reasoning = (
+        retry_result.reasoning_buf
+        if retry_result is not None
+        else (retry_partial or {}).get("reasoning_buf", "")
+    )
+    retry_content = (
+        retry_result.content_buf
+        if retry_result is not None
+        else (retry_partial or {}).get("content_buf", "")
+    )
+    reasoning_buf = first_result.reasoning_buf + retry_reasoning
+    content_buf = first_result.content_buf + retry_content
+    if not reasoning_buf and not content_buf:
+        return LimitSummaryRoundResult(
+            reasoning_buf="",
+            content_buf="",
+            usage_data=usage_data if usage_data is not None else first_result.usage_data,
+            context=(retry_result or first_result).context,
+            tool_calls=(),
+            finish_reason=finish_reason,
+        )
+    return LimitSummaryRoundResult(
+        reasoning_buf=reasoning_buf,
+        content_buf=content_buf,
+        usage_data=usage_data if usage_data is not None else first_result.usage_data,
+        context=(retry_result or first_result).context,
+        tool_calls=(),
+        finish_reason=finish_reason,
+    )
+
+
 async def run_limit_summary_step(
     *,
     request: LimitSummaryStepRequest,
@@ -602,11 +759,16 @@ async def run_limit_summary_step(
             step_id=summary_context.step_id,
         )
     elif request.summary_finish_reason == "plan_synthesis":
-        answer = round_result.content_buf.strip()
-        incomplete = round_result.finish_reason == "protocol_fallback" or not answer
-        if not answer:
-            answer = SUMMARY_PROTOCOL_FALLBACK_TEXT
-        if request.defer_output:
+        has_answer = bool(round_result.content_buf.strip())
+        has_streamed_content = _streams_standard_plan_synthesis(request) and bool(round_result.content_buf.strip())
+        incomplete = round_result.finish_reason in {
+            "protocol_fallback",
+            "timeout",
+            "timeout_partial",
+            "stream_error_partial",
+        } or not has_answer
+        answer = round_result.content_buf if has_streamed_content else SUMMARY_PROTOCOL_FALLBACK_TEXT
+        if not has_streamed_content:
             await append_chunk(
                 request.conversation_id,
                 "answering",
@@ -616,7 +778,16 @@ async def run_limit_summary_step(
                 run_id=request.run_id,
                 step_id=summary_context.step_id,
             )
-        request.content_blocks.append(TextBlock(type="text", id=text_block_id, text=answer))
+        if _streams_standard_plan_synthesis(request) and round_result.reasoning_buf:
+            request.content_blocks.append(
+                ThinkingBlock(
+                    type="thinking",
+                    id=thinking_block_id,
+                    thinking=round_result.reasoning_buf,
+                )
+            )
+        if answer:
+            request.content_blocks.append(TextBlock(type="text", id=text_block_id, text=answer))
     else:
         answer = round_result.content_buf.strip()
         incomplete = round_result.finish_reason == "protocol_fallback" or not answer

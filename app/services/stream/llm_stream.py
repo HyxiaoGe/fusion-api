@@ -110,6 +110,7 @@ class LLMStreamRequest:
     step_id: Optional[str] = None
     defer_output: bool = False
     allow_deferred_reasoning_output: bool = False
+    partial_output: dict[str, str] | None = None
 
 
 @dataclass
@@ -596,6 +597,8 @@ async def append_reasoning_and_content(
                 content=reasoning_delta,
                 block_id=request.thinking_block_id,
             )
+        if request.partial_output is not None:
+            request.partial_output["reasoning_buf"] = state.reasoning_buf
     if content_delta:
         state.content_buf += content_delta
         if not request.defer_output:
@@ -605,6 +608,8 @@ async def append_reasoning_and_content(
                 content=content_delta,
                 block_id=request.text_block_id,
             )
+        if request.partial_output is not None:
+            request.partial_output["content_buf"] = state.content_buf
 
 
 async def maybe_check_lock_owner(*, request: LLMStreamRequest, state: LLMStreamState) -> bool:
@@ -732,6 +737,7 @@ async def stream_round(
     step_id: Optional[str] = None,
     defer_output: bool = False,
     allow_deferred_reasoning_output: bool = False,
+    partial_output: dict[str, str] | None = None,
 ) -> tuple[str, str, list[dict], str, Optional[Usage]]:
     """
     通用 LLM 流式响应处理。
@@ -756,6 +762,7 @@ async def stream_round(
             step_id=step_id,
             defer_output=defer_output,
             allow_deferred_reasoning_output=allow_deferred_reasoning_output,
+            partial_output=partial_output,
         ),
     )
     return StreamRoundTuple(

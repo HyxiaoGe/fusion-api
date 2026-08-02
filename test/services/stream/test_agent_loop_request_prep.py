@@ -140,11 +140,79 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.plan_mode, "auto")
         self.assertIn("update_plan", model_tool_names)
         self.assertIn("web_search", model_tool_names)
+        self.assertIn("url_read", model_tool_names)
+        self.assertEqual(config.announced_tools, ["web_search", "url_read"])
         self.assertNotIn("update_plan", config.announced_tools)
         self.assertEqual(config.control_tool_names, frozenset({"update_plan"}))
         update_plan = next(tool for tool in config.call_kwargs["tools"] if tool["function"]["name"] == "update_plan")
         status_schema = update_plan["function"]["parameters"]["properties"]["plan"]["items"]["properties"]["status"]
         self.assertEqual(status_schema["enum"], ["pending", "in_progress"])
+
+    def test_standard_verified_research_constrains_first_plan_to_search_and_reads(self):
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={"plan_mode": "on"},
+            capabilities={"functionCalling": True, "searchCapable": True},
+            original_message="请联网调研韩国股市，梳理主要争议并给出可靠来源。",
+        )
+
+        self.assertEqual(config.announced_tools, ["web_search", "url_read"])
+        self.assertEqual(
+            config.required_initial_tool_counts,
+            {"web_search": 1, "url_read": 2},
+        )
+        self.assertEqual(config.plan_tool_policy_reason, "verified_research_request")
+        update_plan = next(tool for tool in config.call_kwargs["tools"] if tool["function"]["name"] == "update_plan")
+        planned_tools = update_plan["function"]["parameters"]["properties"]["plan"]["items"]["properties"][
+            "planned_tools"
+        ]["items"]
+        self.assertEqual(planned_tools["enum"], ["web_search", "url_read"])
+
+    async def test_verified_research_injects_initial_research_dag_contract_only_for_matching_policy(self):
+        async def build_llm_messages_fn(
+            _raw_messages, _has_vision, _repo, _user_system_prompt, *, user_id=None, conversation_id=None
+        ):
+            return [{"role": "user", "content": "原问题"}]
+
+        async def prepare(message: str):
+            return await prepare_agent_loop_messages(
+                db=object(),
+                user_id="user-1",
+                raw_messages=[],
+                has_vision=False,
+                file_ids=None,
+                original_message=message,
+                call_config=build_agent_loop_call_config(
+                    provider="openai",
+                    options={"plan_mode": "on"},
+                    capabilities={"functionCalling": True, "searchCapable": True},
+                    original_message=message,
+                ),
+                file_repo_factory=lambda _db: object(),
+                load_user_system_prompt_fn=lambda _db, _user_id: None,
+                build_llm_messages_fn=build_llm_messages_fn,
+                preprocess_user_input=False,
+            )
+
+        verified = await prepare("请联网调研韩国股市，并给出可靠来源。")
+        simple = await prepare("KOSPI 今天多少点？")
+        verified_system_text = "\n".join(
+            str(message.get("content", ""))
+            for message in verified.messages
+            if message.get("role") == "system"
+        )
+        simple_system_text = "\n".join(
+            str(message.get("content", ""))
+            for message in simple.messages
+            if message.get("role") == "system"
+        )
+
+        self.assertIn("【可核验证据计划规则】", verified_system_text)
+        self.assertIn("至少 1 个 web_search", verified_system_text)
+        self.assertIn("至少 2 个独立的 url_read", verified_system_text)
+        self.assertIn("直接或间接依赖 web_search", verified_system_text)
+        self.assertIn("最终 answer 或 synthesis", verified_system_text)
+        self.assertNotIn("【可核验证据计划规则】", simple_system_text)
 
     def test_deep_research_forces_plan_mode_and_records_task_policy(self):
         config = build_agent_loop_call_config(
@@ -534,7 +602,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(config.should_use_reasoning)
         self.assertTrue(config.supports_function_calling)
-        self.assertEqual(config.announced_tools, ["web_search"])
+        self.assertEqual(config.announced_tools, ["web_search", "url_read"])
         self.assertNotIn("extra_body", config.call_kwargs)
 
     def test_build_call_config_disables_agent_tools_when_agent_tools_capability_is_false(self):
@@ -797,7 +865,8 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(original_message, "请看 https://example.com/a")
             self.assertTrue(supports_function_calling)
             self.assertEqual(call_kwargs["tools"][0]["function"]["name"], "web_search")
-            call_kwargs["tools"].append({"type": "function", "function": {"name": "url_read"}})
+            if not any(tool["function"]["name"] == "url_read" for tool in call_kwargs["tools"]):
+                call_kwargs["tools"].append({"type": "function", "function": {"name": "url_read"}})
             return (
                 TextBlock(type="text", id="url-block", text="URL 摘要"),
                 {"role": "user", "content": "<web_context>网页正文</web_context>"},
@@ -845,7 +914,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("【无联网工具边界规则】", prepared.messages[3]["content"])
         self.assertIn("<web_context>", prepared.messages[4]["content"])
         self.assertIn("文档正文", prepared.messages[5]["content"])
-        self.assertEqual(call_config.announced_tools, ["web_search"])
+        self.assertEqual(call_config.announced_tools, ["web_search", "url_read"])
 
     def test_tool_usage_contract_uses_centralized_prompt(self):
         from app.ai.prompts.agent_loop import NETWORK_DECISION_PROMPT, TOOL_USAGE_CONTRACT_PROMPT

@@ -13,6 +13,7 @@ from app.services.search_budget import (
     is_duplicate_search_query,
     resolve_search_intent,
 )
+from app.services.source_evidence_ledger import canonicalize_evidence_url
 from app.services.tool_handlers.base import ToolResult
 
 MAX_SEARCH_CALLS = 4
@@ -37,6 +38,7 @@ class NetworkToolBudget:
     """限制一次 assistant run 内的联网工具调用次数。"""
 
     profile: str = "standard"
+    require_distinct_read_urls: bool = False
     web_search_calls: int = 0
     url_read_calls: int = 0
     web_search_queries: list[str] = field(default_factory=list)
@@ -46,6 +48,7 @@ class NetworkToolBudget:
     read_failure_pending: bool = False
     candidate_read_urls: set[str] = field(default_factory=set)
     attempted_read_urls: set[str] = field(default_factory=set)
+    read_url_plan_items: dict[str, str] = field(default_factory=dict)
 
     def prepare_web_search_args(self, args: dict) -> tuple[dict, ToolResult | None]:
         strategy_config, _meta = get_agent_strategy_config()
@@ -289,7 +292,12 @@ class NetworkToolBudget:
             self.pending_search_repair_reason_code = None
         return normalized, None
 
-    def prepare_url_read_args(self, args: dict) -> tuple[dict, ToolResult | None]:
+    def prepare_url_read_args(
+        self,
+        args: dict,
+        *,
+        plan_item_id: str | None = None,
+    ) -> tuple[dict, ToolResult | None]:
         strategy_config, _meta = get_agent_strategy_config()
         network_config = _network_config(strategy_config)
         normalized = dict(args or {})
@@ -305,7 +313,33 @@ class NetworkToolBudget:
                 },
             )
 
+        canonical_url = canonicalize_evidence_url(str(normalized.get("url") or ""))
+        existing_owner = self.read_url_plan_items.get(canonical_url) if canonical_url else None
+        if (
+            self.require_distinct_read_urls
+            and canonical_url
+            and canonical_url in self.attempted_read_urls
+            and (not plan_item_id or existing_owner != plan_item_id)
+        ):
+            return normalized, ToolResult(
+                status="degraded",
+                error_message="该来源已由其他核验步骤读取，请改用不同来源",
+                data={
+                    "url": normalized.get("url", ""),
+                    "reason": normalized.get("reason"),
+                    "budget_limited": False,
+                    "duplicate_read_source": True,
+                    "error_code": "duplicate_read_source",
+                    "degraded_reason": "duplicate_read_source",
+                    "retryable": True,
+                },
+            )
+
         self.url_read_calls += 1
+        if self.require_distinct_read_urls and canonical_url:
+            self.attempted_read_urls.add(canonical_url)
+            if plan_item_id:
+                self.read_url_plan_items.setdefault(canonical_url, plan_item_id)
         return normalized, None
 
     def record_tool_results(self, results: list, *, source_plan=None) -> None:
@@ -345,8 +379,12 @@ class NetworkToolBudget:
 
     def _record_url_read_result(self, record, result) -> None:
         url = _record_url(record, result)
-        if url:
-            self.attempted_read_urls.add(url)
+        canonical_url = canonicalize_evidence_url(url)
+        if canonical_url:
+            self.attempted_read_urls.add(canonical_url)
+            plan_item_id = getattr(record, "tool_call", {}).get("plan_item_id")
+            if isinstance(plan_item_id, str) and plan_item_id:
+                self.read_url_plan_items.setdefault(canonical_url, plan_item_id)
         if result.status != "success":
             self.read_failure_pending = True
         elif url:

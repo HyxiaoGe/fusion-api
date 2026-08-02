@@ -608,6 +608,29 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(retryable, {"search": "running"})
         self.assertEqual(repaired, {"search": "completed"})
 
+    def test_duplicate_verified_read_source_keeps_plan_item_running_for_new_url(self):
+        record = ToolExecutionRecord(
+            tool_call={
+                "id": "tc-duplicate-read",
+                "name": "url_read",
+                "plan_item_id": "read-two",
+            },
+            result=ToolResult(
+                status="degraded",
+                data={
+                    "duplicate_read_source": True,
+                    "retryable": True,
+                },
+            ),
+            handler=None,
+            block_id="blk-duplicate-read",
+            log_id="log-duplicate-read",
+        )
+
+        statuses = tool_round_module._plan_item_statuses_from_results([record])
+
+        self.assertEqual(statuses, {"read-two": "running"})
+
     def test_missing_result_and_non_retryable_failure_never_complete_plan_item(self):
         missing = tool_round_module._plan_item_statuses_from_batch(
             [],

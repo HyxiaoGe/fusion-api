@@ -108,3 +108,41 @@ def test_recorder_rolls_back_and_swallows_db_failure():
     )
 
     db.rollback.assert_called_once()
+
+
+def test_recorder_ignores_suggested_questions_pending_after_run_completed():
+    db = Mock()
+    recorder = AgentProgressRecorder(
+        db=db,
+        run_id="r1",
+        conversation_id="c1",
+        message_id="m1",
+        user_id="u1",
+    )
+    recorder.record_chunk(
+        "c1",
+        "agent_event",
+        {
+            "type": "run_completed",
+            "finish_reason": "stop",
+        },
+    )
+    completed_state = recorder._state
+    db.reset_mock()
+
+    recorder.record_chunk(
+        "c1",
+        "agent_event",
+        {
+            "type": "suggested_questions_pending",
+            "protocol_version": 2,
+            "message_id": "m1",
+            "revision": 1,
+            "status": "pending",
+        },
+    )
+
+    assert recorder._state is completed_state
+    assert recorder._state["status"] == "completed"
+    db.add.assert_not_called()
+    db.commit.assert_not_called()

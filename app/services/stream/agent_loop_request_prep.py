@@ -36,6 +36,8 @@ VOLCENGINE_PROVIDERS = {"volcengine"}
 MAX_CONTROLLED_OUTPUT_TOKENS = 4096
 PLAN_ITEM_ARGUMENT_NAME = "_plan_item_id"
 PLAN_ITEM_ID_PATTERN = "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+VERIFIED_RESEARCH_PLAN_CONTRACT_PROMPT = """【可核验证据计划规则】
+当前请求需要建立可核验的证据链。首个 update_plan 必须包含至少 1 个 web_search 步骤和至少 2 个独立的 url_read 来源核验步骤。每个 url_read 步骤必须通过 depends_on 直接或间接依赖 web_search，不能作为首批可执行步骤。最终 answer 或 synthesis 步骤必须依赖全部读取步骤。先搜索候选来源，再读取原文，最后综合结论。"""
 
 
 @dataclass(frozen=True)
@@ -229,7 +231,7 @@ def build_agent_loop_call_config(
     tools: list[dict] = []
     if supports_function_calling:
         tools.append(build_web_search_tool_fn())
-        if task_policy.task_mode == "deep_research":
+        if plan_mode != "off":
             tools.append(build_url_read_tool_fn())
     provided_handlers = dynamic_tool_handlers or {}
     if supports_dynamic_tools:
@@ -371,6 +373,7 @@ async def prepare_agent_loop_messages(
     messages = inject_amap_fact_boundary(messages, call_config.call_kwargs)
     messages = inject_flyai_travel_fact_boundary(messages, call_config.call_kwargs)
     messages = inject_plan_control_contract(messages, call_config)
+    messages = inject_verified_research_plan_contract(messages, call_config)
     messages = inject_deep_research_contract(messages, call_config)
     messages = inject_no_tool_network_boundary(messages, call_config.call_kwargs)
     return AgentLoopPreparedMessages(
@@ -516,6 +519,30 @@ def inject_plan_control_contract(
         "content": get_agent_plan_control_prompt(call_config.plan_mode),
     }
     return [*messages[:insert_at], contract_msg, *messages[insert_at:]]
+
+
+def inject_verified_research_plan_contract(
+    messages: list[dict],
+    call_config: AgentLoopCallConfig,
+) -> list[dict]:
+    """仅为高置信可核验研究请求前置首计划 DAG 约束。"""
+
+    policy_reasons = set((getattr(call_config, "plan_tool_policy_reason", "") or "").split("+"))
+    if "verified_research_request" not in policy_reasons:
+        return messages
+    if any(
+        message.get("role") == "system" and "【可核验证据计划规则】" in str(message.get("content", ""))
+        for message in messages
+    ):
+        return messages
+    insert_at = 0
+    while insert_at < len(messages) and messages[insert_at].get("role") == "system":
+        insert_at += 1
+    return [
+        *messages[:insert_at],
+        {"role": "system", "content": VERIFIED_RESEARCH_PLAN_CONTRACT_PROMPT},
+        *messages[insert_at:],
+    ]
 
 
 def inject_deep_research_contract(

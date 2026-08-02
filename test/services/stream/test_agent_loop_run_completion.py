@@ -405,8 +405,15 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
         async def finalize_stream_fn(*_args, **_kwargs):
             calls.append(("finalize", None))
 
+        emitter = AsyncMock()
+
+        async def emit_suggested_questions_pending(**kwargs):
+            calls.append(("pending_event", kwargs))
+
+        emitter.suggested_questions_pending.side_effect = emit_suggested_questions_pending
+
         await finalize_completed_run(
-            context=_context(state),
+            context=replace(_context(state), emitter=emitter),
             terminal_state=SimpleNamespace(session_status="completed", run_finish_reason="stop"),
             persist_message_fn=lambda *_args: calls.append(("persist", None)),
             complete_agent_run_fn=complete_agent_run_fn,
@@ -418,12 +425,43 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [name for name, _payload in calls],
-            ["persist", "complete", "claim", "finalize", "dispatch"],
+            ["persist", "complete", "claim", "pending_event", "finalize", "dispatch"],
         )
         self.assertEqual(calls[2][1]["assistant_message_id"], "msg-1")
         self.assertEqual(calls[2][1]["run_id"], "run-1")
-        self.assertIs(calls[4][1]["claim"], claim)
-        self.assertNotIn("db", calls[4][1])
+        self.assertEqual(
+            calls[3][1],
+            {"message_id": "msg-1", "revision": 1},
+        )
+        self.assertIs(calls[5][1]["claim"], claim)
+        self.assertNotIn("db", calls[5][1])
+
+    async def test_suggestion_claim_failure_does_not_block_completed_stream_terminal(self):
+        state = AgentLoopState()
+        state.content_blocks.append(TextBlock(type="text", id="txt-1", text="正式回答"))
+        calls = []
+        emitter = AsyncMock()
+
+        def claim_suggested_questions_fn(**_kwargs):
+            calls.append("claim")
+            raise RuntimeError("claim failed")
+
+        async def finalize_stream_fn(*_args, **_kwargs):
+            calls.append("finalize")
+
+        await finalize_completed_run(
+            context=replace(_context(state), emitter=emitter),
+            terminal_state=SimpleNamespace(session_status="completed", run_finish_reason="stop"),
+            persist_message_fn=lambda *_args: None,
+            complete_agent_run_fn=AsyncMock(),
+            finalize_stream_fn=finalize_stream_fn,
+            claim_suggested_questions_fn=claim_suggested_questions_fn,
+            generate_suggested_questions_fn=lambda **_kwargs: calls.append("dispatch"),
+            warning_fn=lambda _message: calls.append("warning"),
+        )
+
+        self.assertEqual(calls, ["claim", "warning", "finalize"])
+        emitter.suggested_questions_pending.assert_not_awaited()
 
     async def test_suggestion_generation_failure_never_changes_completed_stream_terminal(self):
         state = AgentLoopState()

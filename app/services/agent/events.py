@@ -1,4 +1,4 @@
-"""agent_event 协议 — 10 个事件模型 + 共享 envelope."""
+"""agent_event 协议模型与共享 envelope。"""
 
 from __future__ import annotations
 
@@ -91,6 +91,16 @@ class RunCompleted(AgentEventBase):
     # incomplete: LLM 返回 unknown finish_reason 退化时（雷点 3 修复路径），
     # 保留已 emit 的 reasoning/content 并报 incomplete，让前端区分于正常 stop。
     finish_reason: Literal["stop", "limit_reached", "incomplete"]
+
+
+class SuggestedQuestionsPending(AgentEventBase):
+    """推荐问题已领取版本，生成任务将在 SSE 终态后异步执行。"""
+
+    type: Literal["suggested_questions_pending"]
+    protocol_version: Literal[2]
+    message_id: str
+    revision: int = Field(ge=1)
+    status: Literal["pending"] = "pending"
 
 
 AgentProgressPhase = Literal[
@@ -250,6 +260,7 @@ AnyAgentEvent = Annotated[
     | RunInterrupted
     | RunFailed
     | RunCompleted
+    | SuggestedQuestionsPending
     | RunProgressUpdated
     | PlanSnapshot
     | PlanStepUpdated

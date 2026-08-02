@@ -108,7 +108,13 @@ def _build_execution_parts(
                 required_initial_tool_counts=dict(getattr(request.call_config, "required_initial_tool_counts", {})),
             )
         ),
-        network_budget=NetworkToolBudget(profile=getattr(request.call_config, "network_profile", "standard")),
+        network_budget=NetworkToolBudget(
+            profile=getattr(request.call_config, "network_profile", "standard"),
+            require_distinct_read_urls=(
+                "verified_research_request"
+                in set((getattr(request.call_config, "plan_tool_policy_reason", "") or "").split("+"))
+            ),
+        ),
         emitter=emitter,
     )
 

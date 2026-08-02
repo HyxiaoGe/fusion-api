@@ -14,6 +14,7 @@ from app.services.mcp.flyai_travel_tools import (
     FLYAI_SEARCH_FLIGHTS,
     FLYAI_SEARCH_TRAINS,
 )
+from app.services.search_budget import infer_search_intent
 
 _COMMUTE_RE = re.compile(r"通勤")
 _ROUTE_ACTION_RE = re.compile(r"路线|怎么走|如何去|如何到|导航|到达")
@@ -27,6 +28,26 @@ _WEATHER_RE = re.compile(r"天气|气温|温度|降雨|下雨|下雪|风力")
 _FLIGHT_RE = re.compile(r"航班|飞机|机场|机票")
 _TRAIN_RE = re.compile(r"高铁|动车|火车|列车|车次")
 _PLACE_RE = re.compile(r"附近|周边|餐厅|饭店|酒店|景点|地点|推荐.*(?:吃|玩|住)")
+_VERIFIED_RESEARCH_TOOL_NAMES = frozenset({"web_search", "url_read"})
+_RESEARCH_REQUEST_RE = re.compile(
+    r"(?:联网|深入|全面|系统|专题)?调研|(?:深入|全面|系统|专题)研究|"
+    r"\b(?:research|investigate|investigation)\b"
+)
+_VERIFIED_EVIDENCE_RE = re.compile(
+    r"(?:可靠|权威|可信|一手).{0,12}(?:来源|资料|证据|原文|出处)|"
+    r"(?:来源|资料|证据|原文|出处).{0,12}(?:可靠|权威|可信|一手)"
+)
+_CONTROVERSY_VERIFICATION_RE = re.compile(
+    r"(?:核验|查证|验证|交叉验证).{0,16}(?:争议|说法|来源|证据|事实)|"
+    r"(?:争议|说法|来源|证据|事实).{0,16}(?:核验|查证|验证|交叉验证)"
+)
+_NEGATED_EVIDENCE_RE = re.compile(
+    r"(?:不需要|无需|不用|不要|不必)(?:再|做|进行|展开)?"
+    r"(?:联网|深入|全面|系统|专题)?(?:调研|研究)|"
+    r"(?:不需要|无需|不用|不要|不必)(?:提供|查找|给出|引用|附上)?(?:任何)?"
+    r"(?:可靠|权威|可信|一手)?(?:来源|资料|证据|原文|出处)|"
+    r"(?:不需要|无需|不用|不要|不必)(?:再|做|进行)?(?:核验|查证|验证|交叉验证)"
+)
 
 
 @dataclass(frozen=True)
@@ -48,9 +69,25 @@ def resolve_agent_plan_tool_policy(
 
     message = _normalize_message(original_message)
     announced = frozenset(name for name in announced_tool_names if name)
-    has_adjacent_route_context = _has_adjacent_route_result_context(task_context_messages)
-    if not message or AMAP_ROUTE_COMPARE not in announced:
+    if not message:
         return AgentPlanToolPolicy()
+    is_verified_research = _VERIFIED_RESEARCH_TOOL_NAMES.issubset(announced) and _is_verified_research_request(
+        message
+    )
+    is_explicit_route = AMAP_ROUTE_COMPARE in announced and _is_explicit_route_task(message)
+    if is_verified_research:
+        required_counts = {"web_search": 1, "url_read": 2}
+        reason = "verified_research_request"
+        if is_explicit_route:
+            required_counts[AMAP_ROUTE_COMPARE] = 1
+            reason = f"{reason}+explicit_route_task"
+        return AgentPlanToolPolicy(
+            required_initial_tool_counts=required_counts,
+            reason=reason,
+        )
+    if AMAP_ROUTE_COMPARE not in announced:
+        return AgentPlanToolPolicy()
+    has_adjacent_route_context = _has_adjacent_route_result_context(task_context_messages)
     if has_adjacent_route_context and _is_route_followup(message):
         return AgentPlanToolPolicy(
             allowed_tool_names=frozenset({AMAP_ROUTE_COMPARE}),
@@ -79,6 +116,20 @@ def _normalize_message(value: str | None) -> str:
     if not isinstance(value, str):
         return ""
     return re.sub(r"\s+", " ", value).strip().lower()
+
+
+def _is_verified_research_request(message: str) -> bool:
+    """仅对高置信研究请求启用强制证据阶段，避免放大单次事实查询。"""
+
+    search_intent = infer_search_intent(message)
+    if _NEGATED_EVIDENCE_RE.search(message):
+        return False
+    explicit_research = bool(_RESEARCH_REQUEST_RE.search(message)) and search_intent != "quick_fact"
+    if explicit_research:
+        return True
+    return bool(
+        _VERIFIED_EVIDENCE_RE.search(message) or _CONTROVERSY_VERIFICATION_RE.search(message)
+    )
 
 
 def _has_adjacent_route_result_context(messages: list[object] | None) -> bool:

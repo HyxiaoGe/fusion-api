@@ -19,6 +19,7 @@ from app.services.agent.events import (
     RunStarted,
     StepCompleted,
     StepStarted,
+    SuggestedQuestionsPending,
     ToolCallCompleted,
     ToolCallDelta,
     ToolCallStarted,
@@ -149,6 +150,48 @@ class AgentEventModelTests(unittest.TestCase):
                 purpose="bogus",
                 reason="x",
                 expires_at=123.5,
+                **self._common(),
+            )
+
+    def test_suggested_questions_pending_has_strict_revision_contract(self):
+        event = SuggestedQuestionsPending(
+            type="suggested_questions_pending",
+            protocol_version=2,
+            message_id="msg-1",
+            revision=3,
+            status="pending",
+            **self._common(),
+        )
+
+        self.assertEqual(
+            event.model_dump(),
+            {
+                **self._common(),
+                "parent_run_id": None,
+                "parent_step_id": None,
+                "type": "suggested_questions_pending",
+                "protocol_version": 2,
+                "message_id": "msg-1",
+                "revision": 3,
+                "status": "pending",
+            },
+        )
+        with self.assertRaises(ValidationError):
+            SuggestedQuestionsPending(
+                type="suggested_questions_pending",
+                protocol_version=2,
+                message_id="msg-1",
+                revision=0,
+                status="pending",
+                **self._common(),
+            )
+        with self.assertRaises(ValidationError):
+            SuggestedQuestionsPending(
+                type="suggested_questions_pending",
+                protocol_version=2,
+                message_id="msg-1",
+                revision=3,
+                status="ready",
                 **self._common(),
             )
 

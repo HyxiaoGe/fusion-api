@@ -106,6 +106,17 @@ async def finalize_completed_run(
             except Exception as error:  # noqa: BLE001 — 推荐问题绝不能阻塞 SSE 终态
                 if warning_fn is not None:
                     warning_fn(f"领取推荐问题版本失败: error_type={type(error).__name__}")
+        if suggestion_claim is not None:
+            emit_pending = getattr(context.emitter, "suggested_questions_pending", None)
+            if emit_pending is not None:
+                try:
+                    await emit_pending(
+                        message_id=getattr(suggestion_claim, "message_id", context.assistant_message_id),
+                        revision=suggestion_claim.revision,
+                    )
+                except Exception as error:  # noqa: BLE001 — 辅助事件不能阻塞 SSE 终态
+                    if warning_fn is not None:
+                        warning_fn(f"发送推荐问题 pending 事件失败: error_type={type(error).__name__}")
         try:
             await finalize_stream_fn(context.conversation_id, success=True, task_id=context.task_id)
         except BaseException:

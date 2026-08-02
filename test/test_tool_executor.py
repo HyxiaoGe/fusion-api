@@ -1167,6 +1167,48 @@ class DynamicToolExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(not record.reused for record in records))
         self.assertEqual([record.result.status for record in records], ["failed", "success"])
 
+    async def test_verified_research_same_batch_rejects_duplicate_canonical_read_source(self):
+        from app.services.stream.network_budget import NetworkToolBudget
+        from app.services.tool_handlers.url_read import UrlReadHandler
+
+        handler = UrlReadHandler()
+        handler.execute = AsyncMock(
+            return_value=ToolResult(
+                status="success",
+                data={"url": "https://example.com/report?a=1&b=2"},
+            )
+        )
+        handler.log = AsyncMock()
+        calls = [
+            {
+                "id": "call-read-one",
+                "name": "url_read",
+                "arguments": {"url": "https://www.example.com/report?b=2&a=1&utm_source=test#section"},
+                "plan_item_id": "read-one",
+            },
+            {
+                "id": "call-read-two",
+                "name": "url_read",
+                "arguments": {"url": "https://example.com/report?a=1&b=2"},
+                "plan_item_id": "read-two",
+            },
+        ]
+
+        records = await execute_tools_parallel(
+            calls,
+            "conv-1",
+            "user-1",
+            "model-1",
+            "openai",
+            network_budget=NetworkToolBudget(require_distinct_read_urls=True),
+            tool_handlers={"url_read": handler},
+        )
+
+        self.assertEqual(handler.execute.await_count, 1)
+        self.assertEqual([record.result.status for record in records], ["success", "degraded"])
+        self.assertTrue(records[1].result.data["duplicate_read_source"])
+        self.assertTrue(records[1].result.data["retryable"])
+
     async def test_runtime_location_is_only_forwarded_to_handler_not_events_or_logs(self):
         handler = MagicMock()
         handler.tool_name = "local_place_search"

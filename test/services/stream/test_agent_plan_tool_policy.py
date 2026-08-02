@@ -5,6 +5,77 @@ from app.services.stream.agent_plan_tool_policy import resolve_agent_plan_tool_p
 
 
 class AgentPlanToolPolicyTests(unittest.TestCase):
+    def test_verified_research_requires_search_and_two_independent_reads(self):
+        messages = [
+            "帮我调研一下韩国股市近几年的起伏，重点说说主要原因和争议。",
+            "请围绕韩国股市进行联网调研，给出关键结论。",
+            "请全面调研并对比两家公司的技术路线。",
+            "请联网调研官方公告并整理时间线。",
+            "请分析这个政策，并提供可靠来源和可核验原文。",
+            "请核验各方争议说法，给出权威证据。",
+        ]
+
+        for message in messages:
+            with self.subTest(message=message):
+                policy = resolve_agent_plan_tool_policy(
+                    original_message=message,
+                    announced_tool_names=["web_search", "url_read", "route_compare"],
+                )
+
+                self.assertEqual(
+                    policy.required_initial_tool_counts,
+                    {"web_search": 1, "url_read": 2},
+                )
+                self.assertIsNone(policy.allowed_tool_names)
+                self.assertEqual(policy.reason, "verified_research_request")
+
+    def test_single_fact_lookup_does_not_force_verified_research_plan(self):
+        messages = [
+            "KOSPI 今天多少点？",
+            "帮我查一下 OpenAI 官网地址。",
+            "Python 3.14 是什么？",
+            "不要深入调研，简单回答即可。",
+            "不用核验争议说法，概括已有信息即可。",
+        ]
+
+        for message in messages:
+            with self.subTest(message=message):
+                policy = resolve_agent_plan_tool_policy(
+                    original_message=message,
+                    announced_tool_names=["web_search", "url_read"],
+                )
+
+                self.assertEqual(policy.required_initial_tool_counts, {})
+                self.assertIsNone(policy.allowed_tool_names)
+
+        reliable_source_policy = resolve_agent_plan_tool_policy(
+            original_message="不要使用不可靠来源，请给出权威原文。",
+            announced_tool_names=["web_search", "url_read"],
+        )
+        self.assertEqual(
+            reliable_source_policy.required_initial_tool_counts,
+            {"web_search": 1, "url_read": 2},
+        )
+
+    def test_verified_route_research_merges_route_and_evidence_requirements(self):
+        policy = resolve_agent_plan_tool_policy(
+            original_message=(
+                "请联网调研从南景新村到双子塔的驾车和地铁路线，"
+                "核验争议说法并给出权威来源。"
+            ),
+            announced_tool_names=["web_search", "url_read", "route_compare"],
+        )
+
+        self.assertEqual(
+            policy.required_initial_tool_counts,
+            {"web_search": 1, "url_read": 2, "route_compare": 1},
+        )
+        self.assertIsNone(policy.allowed_tool_names)
+        self.assertEqual(
+            policy.reason,
+            "verified_research_request+explicit_route_task",
+        )
+
     def test_explicit_commute_comparison_requires_route_tool_and_blocks_generic_substitutes(self):
         policy = resolve_agent_plan_tool_policy(
             original_message=("我住在南景新村，公司在双子塔，请帮我比较驾车、公交和地铁的通勤路线，并给出推荐选择。"),

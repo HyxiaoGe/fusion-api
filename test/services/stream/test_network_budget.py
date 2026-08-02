@@ -31,11 +31,21 @@ def _search_record(args: dict, *, status: str, sources: list[SearchSource] | Non
     )
 
 
-def _url_read_record(url: str, *, status: str) -> ToolExecutionRecord:
+def _url_read_record(
+    url: str,
+    *,
+    status: str,
+    plan_item_id: str | None = None,
+) -> ToolExecutionRecord:
     handler = Mock()
     handler.tool_name = "url_read"
     return ToolExecutionRecord(
-        tool_call={"id": f"tc-read-{status}", "name": "url_read", "arguments": {"url": url}},
+        tool_call={
+            "id": f"tc-read-{status}",
+            "name": "url_read",
+            "arguments": {"url": url},
+            **({"plan_item_id": plan_item_id} if plan_item_id else {}),
+        },
         result=ToolResult(status=status, data={"url": url}),
         handler=handler,
         block_id="blk-read",
@@ -617,6 +627,68 @@ class NetworkToolBudgetTests(unittest.TestCase):
         self.assertIsNotNone(degraded)
         self.assertEqual(degraded.status, "degraded")
         self.assertTrue(degraded.data["budget_limited"])
+
+    def test_verified_research_rejects_same_batch_canonical_url_for_different_plan_items(self):
+        budget = NetworkToolBudget(require_distinct_read_urls=True)
+
+        first_args, first_degraded = budget.prepare_url_read_args(
+            {"url": "https://www.example.com/report?b=2&a=1&utm_source=test#section"},
+            plan_item_id="read-one",
+        )
+        duplicate_args, duplicate = budget.prepare_url_read_args(
+            {"url": "https://example.com/report?a=1&b=2"},
+            plan_item_id="read-two",
+        )
+
+        self.assertIsNone(first_degraded)
+        self.assertEqual(first_args["url"], "https://www.example.com/report?b=2&a=1&utm_source=test#section")
+        self.assertIsNotNone(duplicate)
+        self.assertEqual(duplicate.status, "degraded")
+        self.assertTrue(duplicate.data["duplicate_read_source"])
+        self.assertTrue(duplicate.data["retryable"])
+        self.assertEqual(duplicate_args["url"], "https://example.com/report?a=1&b=2")
+        self.assertEqual(budget.url_read_calls, 1)
+
+    def test_verified_research_rejects_cross_round_canonical_url_for_different_plan_item(self):
+        budget = NetworkToolBudget(require_distinct_read_urls=True)
+        budget.record_tool_results(
+            [
+                _url_read_record(
+                    "https://www.example.com/report?b=2&a=1&utm_source=test#section",
+                    status="failed",
+                    plan_item_id="read-one",
+                )
+            ]
+        )
+
+        _duplicate_args, duplicate = budget.prepare_url_read_args(
+            {"url": "https://example.com/report?a=1&b=2"},
+            plan_item_id="read-two",
+        )
+        _retry_args, retry = budget.prepare_url_read_args(
+            {"url": "https://example.com/report?a=1&b=2#retry"},
+            plan_item_id="read-one",
+        )
+
+        self.assertIsNotNone(duplicate)
+        self.assertTrue(duplicate.data["duplicate_read_source"])
+        self.assertIsNone(retry)
+
+    def test_verified_research_allows_same_retryable_plan_item_to_retry_same_url(self):
+        budget = NetworkToolBudget(require_distinct_read_urls=True)
+
+        _first_args, first_degraded = budget.prepare_url_read_args(
+            {"url": "https://example.com/report#first"},
+            plan_item_id="read-one",
+        )
+        _retry_args, retry_degraded = budget.prepare_url_read_args(
+            {"url": "https://www.example.com/report"},
+            plan_item_id="read-one",
+        )
+
+        self.assertIsNone(first_degraded)
+        self.assertIsNone(retry_degraded)
+        self.assertEqual(budget.url_read_calls, 2)
 
 
 if __name__ == "__main__":

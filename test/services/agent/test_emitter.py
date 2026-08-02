@@ -173,6 +173,32 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
         completed_args = writer.append_chunk.call_args_list[-1].args
         self.assertIsNone(completed_args[3]["step_id"])
 
+    async def test_suggested_questions_pending_follows_run_completed_in_same_event_stream(self):
+        writer = AsyncMock()
+        em = AgentEventEmitter(
+            run_id="r1",
+            trace_id="r1",
+            conversation_id="c1",
+            task_id="task-1",
+            redis_writer=writer,
+        )
+        await em.step_started(step_number=1)
+        await em.run_completed(total_steps=1, total_tool_calls=0, finish_reason="stop")
+
+        await em.suggested_questions_pending(message_id="msg-1", revision=2)
+
+        events = [call.args[3] for call in writer.append_chunk.call_args_list]
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["step_started", "run_completed", "suggested_questions_pending"],
+        )
+        self.assertEqual([event["sequence"] for event in events], [0, 1, 2])
+        self.assertEqual(events[-1]["protocol_version"], 2)
+        self.assertEqual(events[-1]["message_id"], "msg-1")
+        self.assertEqual(events[-1]["revision"], 2)
+        self.assertEqual(events[-1]["status"], "pending")
+        self.assertIsNone(events[-1]["step_id"])
+
     async def test_sequence_monotonic_under_concurrency(self):
         writer = AsyncMock()
 

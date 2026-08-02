@@ -81,6 +81,11 @@ def _control_rejection_hint(reason: str, coordinator: PlanCoordinator) -> str | 
             "每个 url_read 计划项负责一个独立来源任务，多个来源必须拆成多个计划项；"
             "仅当服务端将同一任务保持为 retryable/running 时，才可跨轮重试该计划项。"
         )
+    if reason == "research_read_missing_search_dependency":
+        return (
+            "重新提交计划：每个 url_read 步骤都必须通过 depends_on 直接或间接依赖至少一个 "
+            "web_search 步骤，不能把 url_read 放在首批可执行步骤中；最终回答需依赖全部读取步骤。"
+        )
     if reason == "invalid_plan_structure":
         return "重新提交 2 至 6 个步骤；每项包含稳定 id、非空 step、pending 状态，以及 planned_tools 数组。"
     if reason == "multiple_tools_per_item":

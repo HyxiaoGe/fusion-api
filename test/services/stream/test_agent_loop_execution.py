@@ -172,6 +172,33 @@ class AgentLoopExecutionTests(unittest.TestCase):
         self.assertEqual(execution.runtime.run_id, execution.run_id)
         self.assertEqual(execution.completion_context.run_id, execution.run_id)
 
+    def test_verified_research_execution_requires_distinct_read_urls(self):
+        call_config = SimpleNamespace(
+            should_use_reasoning=False,
+            call_kwargs={},
+            plan_tool_policy_reason="verified_research_request+explicit_route_task",
+        )
+
+        execution = build_agent_loop_execution(
+            request=AgentLoopExecutionRequest(
+                db="db",
+                conversation_id="conv-research",
+                user_id="user-research",
+                model_id="gpt-4",
+                litellm_model="openai/gpt-4",
+                litellm_kwargs={},
+                provider="openai",
+                assistant_message_id="msg-research",
+                task_id="task-research",
+                call_config=call_config,
+                trace_id="run-research",
+            ),
+            limits=AgentLoopLimits(max_steps=1, max_tool_calls=1, total_timeout_s=1),
+            dependencies=self._dependencies(clock=lambda: 10.0),
+        )
+
+        self.assertTrue(execution.network_budget.require_distinct_read_urls)
+
     def test_build_agent_loop_runtime_accepts_prebuilt_execution_parts(self):
         call_kwargs = {"temperature": 0.1}
         call_config = SimpleNamespace(

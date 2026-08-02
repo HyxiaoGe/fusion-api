@@ -703,7 +703,12 @@ def _plan_item_statuses_from_batch(
             and repair.get("retry_exhausted") is not True
             and repair.get("requires_user_input") is not True
         )
-        if repair_retryable:
+        distinct_source_retryable = (
+            record.tool_name == "url_read"
+            and data.get("duplicate_read_source") is True
+            and data.get("retryable") is True
+        )
+        if repair_retryable or distinct_source_retryable:
             status = "running"
         elif record.result.status == "degraded" and record.tool_name in {"web_search", "url_read"}:
             status = "failed"

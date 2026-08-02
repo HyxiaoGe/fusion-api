@@ -473,6 +473,100 @@ class PlanCoordinatorTests(unittest.TestCase):
 
         self.assertTrue(corrected.accepted)
 
+    def test_verified_research_reads_must_descend_from_search(self):
+        coordinator = PlanCoordinator(
+            run_id="run-research-dag",
+            mode="on",
+            required_initial_tool_counts={"web_search": 1, "url_read": 2},
+        )
+
+        invalid = coordinator.apply_model_update(
+            {
+                "reason": "错误地并发搜索和读取",
+                "items": [
+                    {
+                        "id": "search",
+                        "title": "搜索候选来源",
+                        "status": "pending",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "read-one",
+                        "title": "读取首个来源",
+                        "status": "pending",
+                        "kind": "read",
+                        "depends_on": [],
+                        "planned_tools": ["url_read"],
+                    },
+                    {
+                        "id": "read-two",
+                        "title": "读取第二个来源",
+                        "status": "pending",
+                        "kind": "read",
+                        "depends_on": ["read-one"],
+                        "planned_tools": ["url_read"],
+                    },
+                    {
+                        "id": "answer",
+                        "title": "综合研究结论",
+                        "status": "pending",
+                        "kind": "answer",
+                        "depends_on": ["search", "read-two"],
+                        "planned_tools": [],
+                    },
+                ],
+            }
+        )
+
+        self.assertFalse(invalid.accepted)
+        self.assertEqual(invalid.reason, "research_read_missing_search_dependency")
+        self.assertFalse(coordinator.has_valid_model_plan)
+
+        valid = coordinator.apply_model_update(
+            {
+                "reason": "先搜索，再读取两个来源，最后综合",
+                "items": [
+                    {
+                        "id": "search",
+                        "title": "搜索候选来源",
+                        "status": "pending",
+                        "kind": "search",
+                        "depends_on": [],
+                        "planned_tools": ["web_search"],
+                    },
+                    {
+                        "id": "read-one",
+                        "title": "读取首个来源",
+                        "status": "pending",
+                        "kind": "read",
+                        "depends_on": ["search"],
+                        "planned_tools": ["url_read"],
+                    },
+                    {
+                        "id": "read-two",
+                        "title": "读取第二个来源",
+                        "status": "pending",
+                        "kind": "read",
+                        "depends_on": ["read-one"],
+                        "planned_tools": ["url_read"],
+                    },
+                    {
+                        "id": "answer",
+                        "title": "综合研究结论",
+                        "status": "pending",
+                        "kind": "answer",
+                        "depends_on": ["read-two"],
+                        "planned_tools": [],
+                    },
+                ],
+            }
+        )
+
+        self.assertTrue(valid.accepted)
+        self.assertTrue(coordinator.has_valid_model_plan)
+
     def test_initial_required_tools_must_have_distinct_plan_owners(self):
         coordinator = PlanCoordinator(run_id="run-1", mode="on")
         coordinator.configure_initial_tool_requirements(

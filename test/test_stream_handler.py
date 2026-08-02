@@ -363,8 +363,8 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         # session 终态
         self.assertEqual(self.session_statuses[-1]["status"], "completed")
 
-    async def test_run_started_uses_initial_tools_before_url_prep_mutation(self):
-        """run_started 保持既有时序：URL 预处理追加的 url_read 不回填到初始 tools。"""
+    async def test_run_started_declares_plan_mode_url_read_once_before_url_prep(self):
+        """普通计划模式初始即声明 url_read，URL 预处理不得重复回填。"""
         from app.services.external.reader_client import UrlReadResult
 
         with patch(
@@ -389,7 +389,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
 
         run_started = self._agent_events()[0]
         self.assertEqual(run_started["type"], "run_started")
-        self.assertEqual(run_started["tools"], ["web_search"])
+        self.assertEqual(run_started["tools"], ["web_search", "url_read"])
 
     async def test_tool_mode_injects_web_search_contract_prompt(self):
         """工具模式：调用 LLM 前注入契约，避免 thinking 口头搜索但不发 tool_call。"""

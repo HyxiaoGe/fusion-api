@@ -223,6 +223,18 @@ class AgentEventEmitter:
             )
         )
 
+    async def suggested_questions_pending(self, *, message_id: str, revision: int) -> None:
+        await self._emit(
+            ev.SuggestedQuestionsPending(
+                type="suggested_questions_pending",
+                protocol_version=2,
+                message_id=message_id,
+                revision=revision,
+                status="pending",
+                **self._envelope(step_id=None),
+            )
+        )
+
     async def run_progress_updated(
         self,
         *,

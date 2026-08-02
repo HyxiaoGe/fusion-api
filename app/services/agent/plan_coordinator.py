@@ -165,6 +165,8 @@ class PlanCoordinator:
                 for tool_name, required_count in self.required_initial_tool_counts.items()
             ):
                 return self._reject_repair("missing_required_initial_tool_coverage")
+        if _research_dependency_error(update.items, self.required_initial_tool_counts) is not None:
+            return self._reject_repair("research_read_missing_search_dependency")
         if self.has_valid_model_plan:
             previous_status = {str(item.get("id")): item.get("status") for item in self.items}
             previous_items_by_id = {str(item.get("id")): item for item in self.items}
@@ -941,6 +943,42 @@ def _terminal_answer_phase(
         if candidates:
             return None, candidates[-1]
     return "missing_terminal_answer_phase", None
+
+
+def _research_dependency_error(
+    items: list[ModelPlanItem],
+    required_initial_tool_counts: dict[str, int],
+) -> str | None:
+    """研究证据计划中的读取步骤必须位于搜索步骤之后。"""
+
+    if not {"web_search", "url_read"}.issubset(required_initial_tool_counts):
+        return None
+    items_by_id = {item.id: item for item in items}
+    search_item_ids = {
+        item.id for item in items if "web_search" in item.planned_tools
+    }
+
+    def has_search_ancestor(item: ModelPlanItem) -> bool:
+        visited: set[str] = set()
+        stack = list(item.depends_on)
+        while stack:
+            dependency_id = stack.pop()
+            if dependency_id in visited:
+                continue
+            visited.add(dependency_id)
+            if dependency_id in search_item_ids:
+                return True
+            dependency = items_by_id.get(dependency_id)
+            if dependency is not None:
+                stack.extend(dependency.depends_on)
+        return False
+
+    if any(
+        "url_read" in item.planned_tools and not has_search_ancestor(item)
+        for item in items
+    ):
+        return "research_read_missing_search_dependency"
+    return None
 
 
 def _normalize_model_plan_payload(
