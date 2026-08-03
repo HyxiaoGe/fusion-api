@@ -69,6 +69,7 @@ class AgentLoopStepRequestTests(unittest.TestCase):
         round_result = AgentRoundResult(
             reasoning_buf="需要 联网搜索",
             protocol_reasoning_buf="需要 web_search",
+            protocol_content_buf="<think>需要 web_search</think>",
             content_buf="",
             tool_calls=[{"id": "tc-1", "name": "web_search", "arguments": "{}"}],
             finish_reason="tool_calls",
@@ -102,6 +103,7 @@ class AgentLoopStepRequestTests(unittest.TestCase):
         self.assertEqual(request.tool_calls, round_result.tool_calls)
         self.assertEqual(request.reasoning_buf, "需要 联网搜索")
         self.assertEqual(request.protocol_reasoning_buf, "需要 web_search")
+        self.assertEqual(request.protocol_content_buf, "<think>需要 web_search</think>")
         self.assertEqual(request.announced_tool_names, frozenset({"web_search"}))
         self.assertEqual(request.task_id, "task-req")
         self.assertTrue(request.output_deferred)

@@ -19,6 +19,7 @@ _TERMINAL_STATUSES = frozenset({"completed", "failed", "skipped", "blocked"})
 _FAILED_DEPENDENCY_STATUSES = frozenset({"failed", "skipped", "blocked"})
 _INITIAL_PLAN_REPAIR_ATTEMPT_LIMIT = 3
 _ACTIVE_PLAN_REPAIR_ATTEMPT_LIMIT = 5
+_MAX_SERVER_RECOVERY_ITEMS_PER_TOOL = 2
 
 
 class ModelPlanItem(BaseModel):
@@ -87,6 +88,7 @@ class PlanCoordinator:
     attempted_tool_item_ids: set[str] = field(default_factory=set)
     successful_tool_item_ids: set[str] = field(default_factory=set)
     failed_tool_item_ids: set[str] = field(default_factory=set)
+    server_recovery_item_ids: set[str] = field(default_factory=set)
     synthesis_started: bool = False
     terminal_outcome: str | None = None
 
@@ -94,7 +96,12 @@ class PlanCoordinator:
     def has_valid_model_plan(self) -> bool:
         return self.source == "model" and self.revision > 0 and bool(self.items)
 
-    def apply_model_update(self, payload: Any) -> PlanUpdateResult:
+    def apply_model_update(
+        self,
+        payload: Any,
+        *,
+        required_active_tool_name: str | None = None,
+    ) -> PlanUpdateResult:
         if self.mode == "off":
             return PlanUpdateResult(False, "plan_mode_off")
         if self.terminal_outcome is not None:
@@ -186,6 +193,11 @@ class PlanCoordinator:
             [item.model_dump() for item in update.items],
             previous_items=self.items,
         )
+        if required_active_tool_name and not self._items_have_active_tool_owner(
+            normalized_items,
+            required_active_tool_name,
+        ):
+            return self._reject_repair("missing_required_recovery_owner")
         if self.has_valid_model_plan and normalized_items == self.items:
             self.consecutive_no_progress_updates += 1
             return PlanUpdateResult(True, "no_change", self.snapshot(reason="no_change"))
@@ -324,9 +336,7 @@ class PlanCoordinator:
         self.revision += 1
         self.source = "model"
         self.reason = _SYSTEM_FALLBACK_REASON
-        self.items = _assign_user_visible_phases(
-            [item.model_dump() for item in update.items]
-        )
+        self.items = _assign_user_visible_phases([item.model_dump() for item in update.items])
         self.reset_repair_attempts()
         return PlanUpdateResult(True, _SYSTEM_FALLBACK_REASON, self.snapshot())
 
@@ -368,6 +378,105 @@ class PlanCoordinator:
             for item in self.items
             if item.get("id") and item.get("title")
         ]
+
+    def add_server_recovery_item(self, tool_name: str) -> dict[str, Any] | None:
+        """为失败后的同阶段工作补一个服务端可执行任务，不改写既有终态。"""
+
+        if (
+            not self.has_valid_model_plan
+            or self.synthesis_started
+            or self.terminal_outcome is not None
+            or self.active_plan_item_ids_for_tool(tool_name)
+            or (self.allowed_tool_names is not None and tool_name not in self.allowed_tool_names)
+        ):
+            return None
+        tool_owners = [item for item in self.items if item.get("planned_tools") == [tool_name]]
+        if not tool_owners:
+            return None
+        failed_owners = [item for item in tool_owners if item.get("status") in {"failed", "skipped", "blocked"}]
+        recovery_prefix = f"recovery-{tool_name.replace('_', '-')}"
+        recovery_count = sum(str(item.get("id", "")).startswith(recovery_prefix) for item in self.items)
+        if recovery_count >= _MAX_SERVER_RECOVERY_ITEMS_PER_TOOL:
+            return None
+
+        recovery_id = f"{recovery_prefix}-{recovery_count + 1}"
+        existing_ids = {str(item.get("id")) for item in self.items}
+        while recovery_id in existing_ids:
+            recovery_count += 1
+            recovery_id = f"{recovery_prefix}-{recovery_count + 1}"
+
+        template = failed_owners[-1] if failed_owners else tool_owners[-1]
+        recovery_depends_on = list(template.get("depends_on") or [])
+        insertion_template = template
+        if self._auto_completable_prerequisites(str(template.get("id"))) is None and tool_name == "url_read":
+            successful_search_owner = next(
+                (
+                    item
+                    for item in reversed(self.items)
+                    if item.get("planned_tools") == ["web_search"]
+                    and str(item.get("id")) in self.successful_tool_item_ids
+                ),
+                None,
+            )
+            if successful_search_owner is None:
+                return None
+            recovery_depends_on = [str(successful_search_owner.get("id"))]
+            insertion_template = successful_search_owner
+        recovery_item = {
+            "id": recovery_id,
+            "title": "读取替补来源" if tool_name == "url_read" else "补充执行失败任务",
+            "status": "pending",
+            "kind": template.get("kind", "other"),
+            "depends_on": recovery_depends_on,
+            "planned_tools": [tool_name],
+        }
+        answer_item_id = self._answer_phase_item_id()
+        template_phase_id = insertion_template.get("phase_id")
+        template_index = self.items.index(insertion_template)
+        insertion_index = template_index + 1
+        if template_phase_id:
+            matching_phase_indexes = [
+                index for index, item in enumerate(self.items) if item.get("phase_id") == template_phase_id
+            ]
+            if matching_phase_indexes:
+                insertion_index = max(matching_phase_indexes) + 1
+        updated_items: list[dict[str, Any]] = []
+        for index, item in enumerate(self.items):
+            if index == insertion_index:
+                updated_items.append(recovery_item)
+            updated_item = dict(item)
+            if str(item.get("id")) == answer_item_id:
+                updated_item["depends_on"] = [
+                    *list(item.get("depends_on") or []),
+                    recovery_id,
+                ]
+            updated_items.append(updated_item)
+        if insertion_index == len(self.items):
+            updated_items.append(recovery_item)
+        if answer_item_id is None:
+            return None
+
+        self.items = _assign_user_visible_phases(
+            updated_items,
+            previous_items=self.items,
+        )
+        self.server_recovery_item_ids.add(recovery_id)
+        self.revision += 1
+        self.reason = "server_recovery_item_added"
+        self.reset_repair_attempts()
+        return self.snapshot()
+
+    def _items_have_active_tool_owner(
+        self,
+        items: list[dict[str, Any]],
+        tool_name: str,
+    ) -> bool:
+        previous_items = self.items
+        self.items = items
+        try:
+            return bool(self.active_plan_item_ids_for_tool(tool_name))
+        finally:
+            self.items = previous_items
 
     def terminalize(self, outcome: str, *, has_final_answer: bool = False) -> dict[str, Any] | None:
         if not self.has_valid_model_plan or self.terminal_outcome is not None:
@@ -521,6 +630,15 @@ class PlanCoordinator:
         """返回当前工具可绑定的未完成计划项 ID，供工具 schema 收窄取值。"""
 
         return [str(item.get("id")) for item in self.items if self._tool_item_is_bindable(item, tool_name)]
+
+    def sole_server_recovery_item_id_for_tool(self, tool_name: str) -> str | None:
+        """唯一可执行项由服务端创建时，允许协议层纠正模型遗留的旧绑定。"""
+
+        active_item_ids = self.active_plan_item_ids_for_tool(tool_name)
+        if len(active_item_ids) != 1:
+            return None
+        item_id = active_item_ids[0]
+        return item_id if item_id in self.server_recovery_item_ids else None
 
     def unexecuted_plan_item_ids_for_tool(self, tool_name: str) -> list[str]:
         """返回尚未取得成功执行证据的未完成工具步骤。"""
@@ -780,11 +898,7 @@ def _assign_user_visible_phases(
 ) -> list[dict[str, Any]]:
     """把连续同类执行任务归入稳定阶段，并保证阶段 ID 在快照内唯一连续。"""
 
-    previous_by_id = {
-        str(item.get("id")): item
-        for item in previous_items or []
-        if item.get("id")
-    }
+    previous_by_id = {str(item.get("id")): item for item in previous_items or [] if item.get("id")}
     current_item_ids = {str(item.get("id")) for item in items if item.get("id")}
     previous_phase_anchors: dict[str, str] = {}
     for item in previous_items or []:
@@ -954,9 +1068,7 @@ def _research_dependency_error(
     if not {"web_search", "url_read"}.issubset(required_initial_tool_counts):
         return None
     items_by_id = {item.id: item for item in items}
-    search_item_ids = {
-        item.id for item in items if "web_search" in item.planned_tools
-    }
+    search_item_ids = {item.id for item in items if "web_search" in item.planned_tools}
 
     def has_search_ancestor(item: ModelPlanItem) -> bool:
         visited: set[str] = set()
@@ -973,10 +1085,7 @@ def _research_dependency_error(
                 stack.extend(dependency.depends_on)
         return False
 
-    if any(
-        "url_read" in item.planned_tools and not has_search_ancestor(item)
-        for item in items
-    ):
+    if any("url_read" in item.planned_tools and not has_search_ancestor(item) for item in items):
         return "research_read_missing_search_dependency"
     return None
 

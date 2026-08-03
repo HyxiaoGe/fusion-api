@@ -197,14 +197,10 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         verified = await prepare("请联网调研韩国股市，并给出可靠来源。")
         simple = await prepare("KOSPI 今天多少点？")
         verified_system_text = "\n".join(
-            str(message.get("content", ""))
-            for message in verified.messages
-            if message.get("role") == "system"
+            str(message.get("content", "")) for message in verified.messages if message.get("role") == "system"
         )
         simple_system_text = "\n".join(
-            str(message.get("content", ""))
-            for message in simple.messages
-            if message.get("role") == "system"
+            str(message.get("content", "")) for message in simple.messages if message.get("role") == "system"
         )
 
         self.assertIn("【可核验证据计划规则】", verified_system_text)
@@ -549,7 +545,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.call_kwargs["tools"][0]["function"]["name"], "web_search")
         self.assertEqual(config.call_kwargs["extra_body"], {"thinking": {"type": "disabled"}})
 
-    def test_deepseek_plan_mode_keeps_thinking_disabled_for_the_whole_run(self):
+    def test_deepseek_plan_mode_enables_thinking_and_removes_incompatible_tool_choice(self):
         config = build_agent_loop_call_config(
             provider="deepseek",
             options={"plan_mode": "on"},
@@ -562,7 +558,8 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(config.should_use_reasoning)
-        self.assertEqual(config.call_kwargs["extra_body"], {"thinking": {"type": "disabled"}})
+        self.assertEqual(config.call_kwargs["extra_body"], {"thinking": {"type": "enabled"}})
+        self.assertNotIn("tool_choice", config.call_kwargs)
 
     def test_moonshot_plan_mode_keeps_native_thinking_configuration(self):
         config = build_agent_loop_call_config(
@@ -579,7 +576,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(config.should_use_reasoning)
         self.assertNotIn("extra_body", config.call_kwargs)
 
-    def test_deepseek_non_plan_search_keeps_native_thinking_mode(self):
+    def test_deepseek_non_plan_search_uses_explicit_thinking_protocol(self):
         config = build_agent_loop_call_config(
             provider="deepseek",
             options={"plan_mode": "off"},
@@ -591,7 +588,24 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        self.assertNotIn("extra_body", config.call_kwargs)
+        self.assertEqual(config.call_kwargs["extra_body"], {"thinking": {"type": "enabled"}})
+        self.assertNotIn("tool_choice", config.call_kwargs)
+
+    def test_gemini_reasoning_models_request_visible_thought_summaries(self):
+        config = build_agent_loop_call_config(
+            provider="gemini",
+            options={"plan_mode": "on"},
+            capabilities={
+                "functionCalling": True,
+                "agentTools": True,
+                "searchCapable": True,
+                "deepThinking": True,
+            },
+        )
+
+        self.assertTrue(config.should_use_reasoning)
+        self.assertEqual(config.call_kwargs["reasoning_effort"], "high")
+        self.assertEqual(config.call_kwargs["tool_choice"], "auto")
 
     def test_build_call_config_respects_explicit_reasoning_override(self):
         config = build_agent_loop_call_config(

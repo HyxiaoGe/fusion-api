@@ -35,7 +35,6 @@ from app.services.stream.agent_loop_state import AgentLoopState, ProductToolOutc
 from app.services.stream.itinerary_observability import build_itinerary_tool_observation
 from app.services.stream.itinerary_result_composer import compose_itinerary_result
 from app.services.stream.plan_control import process_plan_control_calls
-from app.services.stream.reasoning_transport import allows_deferred_reasoning_output
 from app.services.stream.step_lifecycle import AgentStepContext, mark_tool_round_started
 from app.services.stream.tool_context import (
     BlockedToolContext,
@@ -93,6 +92,7 @@ class ToolRoundRequest:
     execute_tools_fn: Callable[..., Awaitable[list[ToolExecutionRecord]]]
     complete_step_fn: Callable[..., Awaitable[Any]]
     protocol_reasoning_buf: str | None = None
+    protocol_content_buf: str | None = None
     assistant_message_sequence: int | None = None
     on_tools_executed: Callable[[int], None] | None = None
     completed_tool_calls: int | None = None
@@ -113,10 +113,12 @@ def build_assistant_tool_message(
     tool_calls: list[dict],
     reasoning_buf: str,
     should_use_reasoning: bool,
+    protocol_content_buf: str | None = None,
 ) -> dict:
+    protocol_content = protocol_content_buf if isinstance(protocol_content_buf, str) else ""
     message = {
         "role": "assistant",
-        "content": None,
+        "content": protocol_content,
         "tool_calls": [
             {
                 "id": tool_call["id"],
@@ -129,13 +131,14 @@ def build_assistant_tool_message(
             for tool_call in tool_calls
         ],
     }
-    if should_use_reasoning and reasoning_buf:
+    if should_use_reasoning and reasoning_buf and "<think" not in protocol_content.lower():
         message["reasoning_content"] = reasoning_buf
     return message
 
 
 def restore_reasoning_after_tool_decision(call_kwargs: dict, *, provider: str | None = None) -> None:
-    if provider == "deepseek":
+    del provider
+    if call_kwargs.get("tools"):
         return
     extra_body = call_kwargs.get("extra_body")
     if not isinstance(extra_body, dict):
@@ -143,14 +146,15 @@ def restore_reasoning_after_tool_decision(call_kwargs: dict, *, provider: str | 
 
     thinking = extra_body.get("thinking")
     if isinstance(thinking, dict) and thinking.get("type") == "disabled":
-        call_kwargs.pop("extra_body", None)
+        next_extra_body = {key: value for key, value in extra_body.items() if key != "thinking"}
+        if next_extra_body:
+            call_kwargs["extra_body"] = next_extra_body
+        else:
+            call_kwargs.pop("extra_body", None)
 
 
 def append_tool_round_reasoning(request: ToolRoundRequest) -> None:
-    should_persist_reasoning = not request.output_deferred or (
-        request.allow_deferred_reasoning_output
-        and allows_deferred_reasoning_output(request.model_id)
-    )
+    should_persist_reasoning = not request.output_deferred or (request.allow_deferred_reasoning_output)
     if request.reasoning_buf and should_persist_reasoning:
         request.content_blocks.append(
             ThinkingBlock(
@@ -259,6 +263,7 @@ def append_tool_round_messages_with_plan(
             tool_calls=request.tool_calls,
             reasoning_buf=getattr(request, "protocol_reasoning_buf", None) or request.reasoning_buf,
             should_use_reasoning=request.should_use_reasoning,
+            protocol_content_buf=getattr(request, "protocol_content_buf", None),
         )
     )
 
@@ -503,6 +508,9 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
         if request.agent_state is not None
         else AgentLoopState().plan_coordinator,
         emitter=request.emitter,
+        required_recovery_tool_name=(
+            request.agent_state.required_plan_repair_tool if request.agent_state is not None else None
+        ),
     )
     announced_tool_calls, unavailable_external_calls = _partition_tool_calls_by_announcement(
         request,
@@ -578,10 +586,7 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
     )
     executed_results = [record for record in results if not record.reused]
     executed_count = _actual_tool_execution_count(executable_tool_calls, results)
-    has_successful_tool_progress = any(
-        not record.reused and record.result.status == "success"
-        for record in results
-    )
+    has_successful_tool_progress = any(not record.reused and record.result.status == "success" for record in results)
     if request.agent_state is not None and has_successful_tool_progress:
         if control_result.repair_attempt_count > 0:
             logger.info(
@@ -674,9 +679,7 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
         product_result_count=sum(is_registered_rich_content_block(block) for block in built_content_blocks.values()),
         itinerary_result_count=1 if itinerary_result is not None else 0,
         product_outcomes=product_outcomes,
-        control_repair_exhausted=(
-            control_result.repair_exhausted and not has_successful_tool_progress
-        ),
+        control_repair_exhausted=(control_result.repair_exhausted and not has_successful_tool_progress),
         unavailable_tool_call_count=len(unavailable_tool_calls),
     )
 

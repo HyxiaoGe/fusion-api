@@ -26,9 +26,3 @@ def initial_reasoning_transport_mode(
     if explicit_mode is not None:
         return explicit_mode
     return "probing" if is_k3_reasoning_model(model_id) else "delta"
-
-
-def allows_deferred_reasoning_output(model_id: str | None) -> bool:
-    """计划前只允许 K3 展示推理；其它模型保持既有 defer 语义。"""
-
-    return is_k3_reasoning_model(model_id)

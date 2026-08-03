@@ -705,6 +705,142 @@ class PlanCoordinatorTests(unittest.TestCase):
             ["current"],
         )
 
+    def test_server_read_recovery_uses_completed_owner_template_and_keeps_original_phase(self):
+        coordinator = PlanCoordinator(run_id="run-read-recovery", mode="on")
+        self.assertTrue(
+            coordinator.apply_model_update(
+                {
+                    "reason": "搜索、读取、补充搜索后回答",
+                    "items": [
+                        {
+                            "id": "search",
+                            "title": "搜索候选来源",
+                            "status": "pending",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "read-1",
+                            "title": "读取来源一",
+                            "status": "pending",
+                            "kind": "read",
+                            "depends_on": ["search"],
+                            "planned_tools": ["url_read"],
+                        },
+                        {
+                            "id": "read-2",
+                            "title": "读取来源二",
+                            "status": "pending",
+                            "kind": "read",
+                            "depends_on": ["search"],
+                            "planned_tools": ["url_read"],
+                        },
+                        {
+                            "id": "followup-search",
+                            "title": "补充搜索资料",
+                            "status": "pending",
+                            "kind": "search",
+                            "depends_on": ["search"],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理研究结论",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["read-1", "read-2", "followup-search"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        coordinator.mark_tools_started(["search"])
+        coordinator.mark_tool_results({"search": "completed"})
+        coordinator.mark_tools_started(["read-1", "read-2"])
+        coordinator.mark_tool_results({"read-1": "completed", "read-2": "completed"})
+        read_phase_id = next(item["phase_id"] for item in coordinator.items if item["id"] == "read-1")
+
+        snapshot = coordinator.add_server_recovery_item("url_read")
+
+        self.assertIsNotNone(snapshot)
+        recovery_item = next(item for item in coordinator.items if item["id"] == "recovery-url-read-1")
+        answer_item = next(item for item in coordinator.items if item["id"] == "answer")
+        item_ids = [item["id"] for item in coordinator.items]
+        self.assertEqual(recovery_item["phase_id"], read_phase_id)
+        self.assertLess(item_ids.index("recovery-url-read-1"), item_ids.index("followup-search"))
+        self.assertIn("recovery-url-read-1", answer_item["depends_on"])
+        self.assertEqual(coordinator.active_plan_item_ids_for_tool("url_read"), ["recovery-url-read-1"])
+
+        coordinator.mark_tools_started(["recovery-url-read-1"])
+        coordinator.mark_tool_results({"recovery-url-read-1": "failed"})
+        self.assertIsNotNone(coordinator.add_server_recovery_item("url_read"))
+        coordinator.mark_tools_started(["recovery-url-read-2"])
+        coordinator.mark_tool_results({"recovery-url-read-2": "failed"})
+
+        self.assertIsNone(coordinator.add_server_recovery_item("url_read"))
+        self.assertEqual(
+            [item["id"] for item in coordinator.items if item["id"].startswith("recovery-url-read-")],
+            ["recovery-url-read-1", "recovery-url-read-2"],
+        )
+
+    def test_server_read_recovery_rebinds_blocked_template_to_successful_search(self):
+        coordinator = PlanCoordinator(run_id="run-blocked-read-recovery", mode="on")
+        self.assertTrue(
+            coordinator.apply_model_update(
+                {
+                    "reason": "失败搜索后用另一条搜索分支恢复读取",
+                    "items": [
+                        {
+                            "id": "search-failed",
+                            "title": "搜索来源一",
+                            "status": "pending",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "read-blocked",
+                            "title": "读取来源一",
+                            "status": "pending",
+                            "kind": "read",
+                            "depends_on": ["search-failed"],
+                            "planned_tools": ["url_read"],
+                        },
+                        {
+                            "id": "search-success",
+                            "title": "搜索来源二",
+                            "status": "pending",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理研究结论",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["read-blocked", "search-success"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        coordinator.mark_tools_started(["search-failed"])
+        coordinator.mark_tool_results({"search-failed": "failed"})
+        self.assertEqual(next(item for item in coordinator.items if item["id"] == "read-blocked")["status"], "blocked")
+        coordinator.mark_tools_started(["search-success"])
+        coordinator.mark_tool_results({"search-success": "completed"})
+
+        snapshot = coordinator.add_server_recovery_item("url_read")
+
+        self.assertIsNotNone(snapshot)
+        recovery_item = next(item for item in coordinator.items if item["id"] == "recovery-url-read-1")
+        self.assertEqual(recovery_item["depends_on"], ["search-success"])
+        self.assertEqual(coordinator.active_plan_item_ids_for_tool("url_read"), ["recovery-url-read-1"])
+
     def test_numeric_string_plan_ids_remain_stable_for_tool_binding(self):
         coordinator = PlanCoordinator(run_id="run-1", mode="on")
 
@@ -1541,10 +1677,7 @@ class PlanCoordinatorTests(unittest.TestCase):
             self.assertTrue(coordinator.apply_model_update(payload).accepted)
         payload["items"][1]["title"] = "回答 7"
         self.assertEqual(coordinator.apply_model_update(payload).reason, "control_update_limit_reached")
-        repair_results = [
-            coordinator.record_repair_round(tolerate_status_drift=True)
-            for _ in range(5)
-        ]
+        repair_results = [coordinator.record_repair_round(tolerate_status_drift=True) for _ in range(5)]
         self.assertEqual(repair_results, [False, False, False, False, True])
 
     def test_research_fallback_never_replaces_an_existing_valid_plan(self):
@@ -2564,6 +2697,7 @@ class PlanCoordinatorTests(unittest.TestCase):
 
         self.assertTrue(result.accepted)
         self.assertEqual(result.snapshot["items"][0]["phase_title"], long_title[:80])
+
 
 if __name__ == "__main__":
     unittest.main()

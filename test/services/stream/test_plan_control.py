@@ -39,6 +39,223 @@ def _update_call(*, call_id: str = "plan-1", arguments: object | None = None) ->
 
 
 class PlanControlTests(unittest.IsolatedAsyncioTestCase):
+    async def test_no_change_plan_remains_accepted_when_required_owner_is_executable(self):
+        coordinator = PlanCoordinator(run_id="run-active-owner", mode="on")
+        coordinator.configure_initial_tool_requirements({"route_compare": 1})
+        self.assertTrue(coordinator.apply_model_update(_update_call()["arguments"]).accepted)
+
+        result = await process_plan_control_calls(
+            tool_calls=[
+                _update_call(
+                    call_id="plan-active-owner",
+                    arguments={
+                        "reason": "继续执行既有路线任务",
+                        "items": coordinator.canonical_plan_for_model(),
+                    },
+                )
+            ],
+            coordinator=coordinator,
+            emitter=AsyncMock(),
+        )
+
+        response = json.loads(result.tool_responses["plan-active-owner"])
+        self.assertEqual(response["status"], "accepted")
+        self.assertEqual(response["reason"], "no_change")
+
+    async def test_failed_non_research_owner_does_not_enable_research_recovery_rejection(self):
+        coordinator = PlanCoordinator(run_id="run-failed-route", mode="on")
+        coordinator.configure_initial_tool_requirements({"route_compare": 1})
+        self.assertTrue(coordinator.apply_model_update(_update_call()["arguments"]).accepted)
+        coordinator.mark_tools_started(["route"])
+        coordinator.mark_tool_results({"route": "failed"})
+
+        result = await process_plan_control_calls(
+            tool_calls=[
+                _update_call(
+                    call_id="plan-failed-route",
+                    arguments={
+                        "reason": "保留路线执行结果",
+                        "items": coordinator.canonical_plan_for_model(),
+                    },
+                )
+            ],
+            coordinator=coordinator,
+            emitter=AsyncMock(),
+        )
+
+        response = json.loads(result.tool_responses["plan-failed-route"])
+        self.assertEqual(response["status"], "accepted")
+        self.assertEqual(response["reason"], "no_change")
+
+    async def test_no_change_plan_cannot_be_accepted_as_failed_read_recovery(self):
+        coordinator = PlanCoordinator(run_id="run-read-recovery", mode="on")
+        coordinator.configure_initial_tool_requirements({"web_search": 1, "url_read": 2})
+        initial_plan = {
+            "reason": "搜索后并行读取两个独立来源，最后整理结论",
+            "items": [
+                {
+                    "id": "search",
+                    "title": "搜索候选来源",
+                    "status": "pending",
+                    "kind": "search",
+                    "depends_on": [],
+                    "planned_tools": ["web_search"],
+                },
+                {
+                    "id": "read-success",
+                    "title": "读取来源一",
+                    "status": "pending",
+                    "kind": "read",
+                    "depends_on": ["search"],
+                    "planned_tools": ["url_read"],
+                },
+                {
+                    "id": "read-degraded",
+                    "title": "读取来源二",
+                    "status": "pending",
+                    "kind": "read",
+                    "depends_on": ["search"],
+                    "planned_tools": ["url_read"],
+                },
+                {
+                    "id": "answer",
+                    "title": "整理研究结论",
+                    "status": "pending",
+                    "kind": "answer",
+                    "depends_on": ["read-success", "read-degraded"],
+                    "planned_tools": [],
+                },
+            ],
+        }
+        self.assertTrue(coordinator.apply_model_update(initial_plan).accepted)
+        coordinator.mark_tools_started(["search"])
+        coordinator.mark_tool_results({"search": "completed"})
+        coordinator.mark_tools_started(["read-success", "read-degraded"])
+        coordinator.mark_tool_results({"read-success": "completed", "read-degraded": "failed"})
+        self.assertEqual(coordinator.active_plan_item_ids_for_tool("url_read"), [])
+
+        result = await process_plan_control_calls(
+            tool_calls=[
+                _update_call(
+                    call_id="plan-no-progress-recovery",
+                    arguments={
+                        "reason": "继续执行读取恢复",
+                        "items": coordinator.canonical_plan_for_model(),
+                    },
+                )
+            ],
+            coordinator=coordinator,
+            emitter=AsyncMock(),
+            required_recovery_tool_name="url_read",
+        )
+
+        response = json.loads(result.tool_responses["plan-no-progress-recovery"])
+        self.assertEqual(response["status"], "rejected")
+        self.assertEqual(response["reason"], "missing_required_recovery_owner")
+        self.assertIn("新增一个 pending 工具步骤", response["hint"])
+        self.assertEqual(result.repair_attempt_count, 1)
+
+        changed_plan = coordinator.canonical_plan_for_model()
+        next(item for item in changed_plan if item["id"] == "answer")["step"] = "换一个回答标题"
+        changed_result = await process_plan_control_calls(
+            tool_calls=[
+                _update_call(
+                    call_id="plan-irrelevant-change",
+                    arguments={
+                        "reason": "只调整回答标题",
+                        "items": changed_plan,
+                    },
+                )
+            ],
+            coordinator=coordinator,
+            emitter=AsyncMock(),
+            required_recovery_tool_name="url_read",
+        )
+
+        changed_response = json.loads(changed_result.tool_responses["plan-irrelevant-change"])
+        self.assertEqual(changed_response["status"], "rejected")
+        self.assertEqual(changed_response["reason"], "missing_required_recovery_owner")
+        self.assertEqual(next(item for item in coordinator.items if item["id"] == "answer")["title"], "整理研究结论")
+
+    async def test_server_recovery_owner_rebinds_stale_model_plan_item_id(self):
+        coordinator = PlanCoordinator(run_id="run-server-recovery-binding", mode="on")
+        coordinator.configure_initial_tool_requirements({"web_search": 1, "url_read": 2})
+        self.assertTrue(
+            coordinator.apply_model_update(
+                {
+                    "reason": "搜索后读取两个独立来源并回答",
+                    "items": [
+                        {
+                            "id": "search",
+                            "title": "搜索候选来源",
+                            "status": "pending",
+                            "kind": "search",
+                            "depends_on": [],
+                            "planned_tools": ["web_search"],
+                        },
+                        {
+                            "id": "read-success",
+                            "title": "读取来源一",
+                            "status": "pending",
+                            "kind": "read",
+                            "depends_on": ["search"],
+                            "planned_tools": ["url_read"],
+                        },
+                        {
+                            "id": "read-failed",
+                            "title": "读取来源二",
+                            "status": "pending",
+                            "kind": "read",
+                            "depends_on": ["search"],
+                            "planned_tools": ["url_read"],
+                        },
+                        {
+                            "id": "answer",
+                            "title": "整理研究结论",
+                            "status": "pending",
+                            "kind": "answer",
+                            "depends_on": ["read-success", "read-failed"],
+                            "planned_tools": [],
+                        },
+                    ],
+                }
+            ).accepted
+        )
+        coordinator.mark_tools_started(["search"])
+        coordinator.mark_tool_results({"search": "completed"})
+        coordinator.mark_tools_started(["read-success", "read-failed"])
+        coordinator.mark_tool_results({"read-success": "completed", "read-failed": "failed"})
+        self.assertIsNotNone(coordinator.add_server_recovery_item("url_read"))
+
+        result = await process_plan_control_calls(
+            tool_calls=[
+                {
+                    "id": "read-recovery",
+                    "name": "url_read",
+                    "arguments": {
+                        "url": "https://example.com/recovery",
+                        "_plan_item_id": "read-failed",
+                    },
+                }
+            ],
+            coordinator=coordinator,
+            emitter=AsyncMock(),
+        )
+
+        self.assertEqual(result.repair_attempt_count, 0)
+        self.assertEqual(result.tool_responses, {})
+        self.assertEqual(
+            result.external_tool_calls,
+            [
+                {
+                    "id": "read-recovery",
+                    "name": "url_read",
+                    "arguments": {"url": "https://example.com/recovery"},
+                    "plan_item_id": "recovery-url-read-1",
+                }
+            ],
+        )
+
     async def test_identity_rejection_returns_current_canonical_plan_for_repair(self):
         coordinator = PlanCoordinator(run_id="run-canonical-repair", mode="on")
         self.assertTrue(

@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from app.ai.prompts.agent_loop import VISIBLE_RESPONSE_LANGUAGE_PROMPT
 from app.schemas.chat import ContextUsage, Usage
 from app.services.chat.context_manager import ContextBudgetExceededError, ContextPlan
 from app.services.stream.agent_round import accumulate_usage, collect_agent_round_stream, run_agent_round
@@ -25,6 +26,77 @@ class AgentRoundUsageTests(unittest.TestCase):
 
 
 class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_agent_round_finalizes_language_contract_before_budget_and_model_call(self):
+        step_context = AgentStepContext(
+            step_id="step-language",
+            step_number=1,
+            started_at=100.0,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+        )
+        prepared_messages = []
+        sent_messages = []
+
+        async def prepare_context_fn(**kwargs):
+            prepared_messages.extend(kwargs["messages"])
+            return ContextPlan(
+                messages=kwargs["messages"],
+                status="no_op_fast_path",
+                context_window_tokens=128_000,
+                context_window_source="registry",
+                context_window_status="known",
+            )
+
+        async def llm_call_fn(_model, _kwargs, call_messages, **_call_kwargs):
+            sent_messages.extend(call_messages)
+            return "response"
+
+        async def stream_round_fn(*_args, **_kwargs):
+            return "中文思考", "中文回答", [], "stop", None
+
+        observation = MagicMock()
+        observation.finish_success = AsyncMock()
+        observation.finish_error = AsyncMock()
+        observation.wrap_response.side_effect = lambda response: response
+        messages = [
+            {"role": "system", "content": "身份规则"},
+            {"role": "user", "content": "分析具身智能产业"},
+            {"role": "system", "content": "当前执行搜索阶段"},
+        ]
+
+        with (
+            patch("app.services.stream.agent_round.prepare_context", new=prepare_context_fn),
+            patch(
+                "app.services.stream.agent_round.create_llm_round_observation",
+                return_value=observation,
+            ),
+        ):
+            await run_agent_round(
+                conversation_id="conv-language",
+                task_id="task-language",
+                run_id="run-language",
+                step_number=1,
+                model_id="deepseek-v4",
+                provider="deepseek",
+                litellm_model="deepseek/deepseek-v4",
+                litellm_kwargs={},
+                messages=messages,
+                should_use_reasoning=True,
+                call_kwargs={},
+                accumulated_usage=Usage(),
+                step_context=step_context,
+                llm_call_fn=llm_call_fn,
+                stream_round_fn=stream_round_fn,
+                log_round_summary_fn=lambda **_kwargs: None,
+            )
+
+        self.assertEqual(sent_messages, prepared_messages)
+        self.assertTrue(sent_messages[-1]["content"].endswith(VISIBLE_RESPONSE_LANGUAGE_PROMPT))
+        self.assertEqual(
+            sum(str(item.get("content") or "").count(VISIBLE_RESPONSE_LANGUAGE_PROMPT) for item in sent_messages),
+            1,
+        )
+
     async def test_run_agent_round_marks_and_forwards_deferred_output(self):
         step_context = AgentStepContext(
             step_id="step-product",
@@ -73,7 +145,7 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(received_kwargs["provider"], "openai")
         self.assertNotIn("on_answer_started", received_kwargs)
         self.assertTrue(result.output_deferred)
-        self.assertFalse(result.allow_deferred_reasoning_output)
+        self.assertTrue(result.allow_deferred_reasoning_output)
 
     async def test_run_agent_round_emits_estimated_and_final_context_status(self):
         emitter = AsyncMock()
@@ -638,15 +710,12 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.accumulated_usage, Usage(input_tokens=7, output_tokens=10))
         self.assertEqual(result.announced_tool_names, frozenset({"web_search"}))
         self.assertEqual([event[0] for event in events], ["llm", "stream", "log"])
+        self.assertEqual(events[0][:3], ("llm", "openai/gpt-4", {"metadata": {"trace": "x"}}))
+        self.assertEqual(events[0][3][-1], messages[0])
+        self.assertEqual(events[0][3][0]["content"], VISIBLE_RESPONSE_LANGUAGE_PROMPT)
         self.assertEqual(
-            events[0],
-            (
-                "llm",
-                "openai/gpt-4",
-                {"metadata": {"trace": "x"}},
-                messages,
-                {"temperature": 0.1, "tools": [{"function": {"name": "web_search"}}]},
-            ),
+            events[0][4],
+            {"temperature": 0.1, "tools": [{"function": {"name": "web_search"}}]},
         )
         self.assertEqual(
             events[1],

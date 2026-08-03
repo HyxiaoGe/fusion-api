@@ -1,5 +1,5 @@
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, patch
 
 from app.schemas.chat import PlaceResult, PlaceResultsBlock, SourceReference, TextBlock, UrlBlock, Usage
@@ -19,9 +19,13 @@ from app.services.stream.tool_round import ToolRoundOutcome
 @dataclass
 class DummyEmitter:
     limit_reasons: list[str]
+    plan_snapshots: list[dict] = field(default_factory=list)
 
     async def run_limit_reached(self, *, reason):
         self.limit_reasons.append(reason)
+
+    async def plan_snapshot(self, **snapshot):
+        self.plan_snapshots.append(snapshot)
 
 
 async def _unused_async(**_kwargs):
@@ -247,6 +251,51 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(_tool_names(captured[0]), ["update_plan"])
         self.assertEqual(captured[0]["tool_choice"], "required")
+
+    async def test_deepseek_thinking_plan_never_sends_tool_choice(self):
+        captured = []
+
+        async def run_round_fn(**kwargs):
+            captured.append(kwargs["call_kwargs"])
+            return AgentRoundResult(
+                reasoning_buf="",
+                content_buf="",
+                tool_calls=[],
+                finish_reason="stop",
+                accumulated_usage=Usage(input_tokens=1, output_tokens=1),
+            )
+
+        await _run_round(
+            messages=[{"role": "user", "content": "制定调研计划"}],
+            state=AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-deepseek", mode="on")),
+            runtime=_runtime(
+                provider="deepseek",
+                model_id="deepseek-chat",
+                plan_mode="on",
+                should_use_reasoning=True,
+                call_kwargs={
+                    "tools": [
+                        _tool_definition("web_search"),
+                        _tool_definition("update_plan"),
+                    ],
+                    "tool_choice": "auto",
+                    "extra_body": {"thinking": {"type": "enabled"}},
+                },
+                run_round_fn=run_round_fn,
+            ),
+            step_number=1,
+            step_context=AgentStepContext(
+                step_id="step-deepseek-plan",
+                step_number=1,
+                started_at=1.0,
+                thinking_block_id="thinking-deepseek-plan",
+                text_block_id="text-deepseek-plan",
+            ),
+        )
+
+        self.assertEqual(_tool_names(captured[0]), ["update_plan"])
+        self.assertNotIn("tool_choice", captured[0])
+        self.assertEqual(captured[0]["extra_body"], {"thinking": {"type": "enabled"}})
 
     async def test_valid_plan_only_exposes_dependency_ready_tools_and_constrains_item_ids(self):
         coordinator = PlanCoordinator(
@@ -708,9 +757,7 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
             summary="候选搜索摘要必须进入普通计划最终综合",
             key_findings=("候选关键发现",),
         )
-        summary = AsyncMock(
-            return_value=LimitSummaryOutcome(accumulated_usage=Usage(input_tokens=2, output_tokens=3))
-        )
+        summary = AsyncMock(return_value=LimitSummaryOutcome(accumulated_usage=Usage(input_tokens=2, output_tokens=3)))
 
         await _run_limit_summary(
             state=state,
@@ -793,9 +840,7 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
             ),
         }
         state.research_workset.successful_read_urls.add("https://example.com/read")
-        summary = AsyncMock(
-            return_value=LimitSummaryOutcome(accumulated_usage=Usage(input_tokens=2, output_tokens=3))
-        )
+        summary = AsyncMock(return_value=LimitSummaryOutcome(accumulated_usage=Usage(input_tokens=2, output_tokens=3)))
 
         await _run_limit_summary(
             state=state,
@@ -1401,6 +1446,219 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("`search`", system_text)
         self.assertNotIn("不应进入阶段控制提示的外部标题", system_text)
         self.assertNotIn("outside.example", system_text)
+
+    async def test_deep_research_failed_parallel_read_restores_executable_substitute_owner(self):
+        captured = []
+        coordinator = PlanCoordinator(run_id="run-read-recovery", mode="on")
+        coordinator.configure_initial_tool_requirements({"web_search": 1, "url_read": 2})
+        initial_plan = {
+            "reason": "搜索后并行读取两个独立来源，最后整理结论",
+            "items": [
+                {
+                    "id": "search",
+                    "title": "搜索候选来源",
+                    "status": "pending",
+                    "kind": "search",
+                    "depends_on": [],
+                    "planned_tools": ["web_search"],
+                },
+                {
+                    "id": "read-success",
+                    "title": "读取来源一",
+                    "status": "pending",
+                    "kind": "read",
+                    "depends_on": ["search"],
+                    "planned_tools": ["url_read"],
+                },
+                {
+                    "id": "read-degraded",
+                    "title": "读取来源二",
+                    "status": "pending",
+                    "kind": "read",
+                    "depends_on": ["search"],
+                    "planned_tools": ["url_read"],
+                },
+                {
+                    "id": "answer",
+                    "title": "整理研究结论",
+                    "status": "pending",
+                    "kind": "answer",
+                    "depends_on": ["read-success", "read-degraded"],
+                    "planned_tools": [],
+                },
+            ],
+        }
+        self.assertTrue(coordinator.apply_model_update(initial_plan).accepted)
+        coordinator.mark_tools_started(["search"])
+        coordinator.mark_tool_results({"search": "completed"})
+        coordinator.mark_tools_started(["read-success", "read-degraded"])
+        coordinator.mark_tool_results({"read-success": "completed", "read-degraded": "failed"})
+        self.assertEqual(coordinator.active_plan_item_ids_for_tool("url_read"), [])
+
+        state = AgentLoopState(plan_coordinator=coordinator)
+        state.configure_research_mode(network_required=True)
+        state.research_workset.successful_searches = 1
+        state.research_workset.sources = {
+            "ev-read-success": ResearchSource(
+                evidence_id="ev-read-success",
+                citation_index=1,
+                title="已成功读取的来源",
+                url="https://example.com/read-success",
+                kind="url_read",
+            ),
+            "ev-read-degraded": ResearchSource(
+                evidence_id="ev-read-degraded",
+                citation_index=2,
+                title="读取降级的来源",
+                url="https://example.com/read-degraded",
+                kind="url_read",
+            ),
+            "ev-substitute": ResearchSource(
+                evidence_id="ev-substitute",
+                citation_index=3,
+                title="仍未读取的替补来源",
+                url="https://example.com/substitute",
+                kind="search",
+            ),
+        }
+        state.research_workset.attempted_read_urls = {
+            "https://example.com/read-success",
+            "https://example.com/read-degraded",
+        }
+        state.research_workset.successful_read_urls = {"https://example.com/read-success"}
+        self.assertEqual(
+            state.research_workset.unread_candidate_urls,
+            {"https://example.com/substitute"},
+        )
+
+        async def run_round_fn(**kwargs):
+            captured.append(kwargs)
+            return AgentRoundResult(
+                reasoning_buf="",
+                content_buf="",
+                tool_calls=[],
+                finish_reason="stop",
+                accumulated_usage=Usage(input_tokens=1, output_tokens=1),
+            )
+
+        runtime = _runtime(
+            task_mode="deep_research",
+            plan_mode="on",
+            call_kwargs={
+                "tools": [
+                    _tool_definition("update_plan"),
+                    _tool_definition("web_search"),
+                    _tool_definition("url_read"),
+                ],
+                "tool_choice": "auto",
+            },
+            run_round_fn=run_round_fn,
+        )
+        await _run_round(
+            messages=[{"role": "user", "content": "继续读取尚未读取的候选来源"}],
+            state=state,
+            runtime=runtime,
+            step_number=5,
+            step_context=AgentStepContext(
+                step_id="step-read-recovery",
+                step_number=5,
+                started_at=1.0,
+                thinking_block_id="thinking-read-recovery",
+                text_block_id="text-read-recovery",
+            ),
+        )
+
+        self.assertEqual(_tool_names(captured[0]["call_kwargs"]), ["url_read"])
+        binding = captured[0]["call_kwargs"]["tools"][0]["function"]["parameters"]["properties"]["_plan_item_id"]
+        self.assertEqual(len(binding["enum"]), 1)
+        self.assertEqual(binding["enum"], coordinator.active_plan_item_ids_for_tool("url_read"))
+        self.assertTrue(set(binding["enum"]).isdisjoint({"read-success", "read-degraded"}))
+        recovery_id = binding["enum"][0]
+        recovery_item = next(item for item in coordinator.items if item["id"] == recovery_id)
+        failed_item = next(item for item in coordinator.items if item["id"] == "read-degraded")
+        answer_item = next(item for item in coordinator.items if item["id"] == "answer")
+        self.assertEqual(recovery_item["phase_id"], failed_item["phase_id"])
+        self.assertIn(recovery_id, answer_item["depends_on"])
+        self.assertEqual(len({item["phase_id"] for item in coordinator.items}), 3)
+        self.assertEqual(runtime.emitter.plan_snapshots[-1]["reason"], "server_recovery_item_added")
+        self.assertEqual(
+            captured[0]["call_kwargs"]["tool_choice"],
+            {"type": "function", "function": {"name": "url_read"}},
+        )
+
+    async def test_deep_research_same_url_successes_still_create_distinct_read_recovery(self):
+        captured = []
+        state = _planned_research_state(read_steps=2)
+        coordinator = state.plan_coordinator
+        coordinator.mark_tools_started(["search"])
+        coordinator.mark_tool_results({"search": "completed"})
+        coordinator.mark_tools_started(["read-1"])
+        coordinator.mark_tool_results({"read-1": "completed"})
+        coordinator.mark_tools_started(["read-2"])
+        coordinator.mark_tool_results({"read-2": "completed"})
+        self.assertEqual(coordinator.active_plan_item_ids_for_tool("url_read"), [])
+
+        state.configure_research_mode(network_required=True)
+        state.research_workset.successful_searches = 1
+        state.research_workset.sources = {
+            "ev-same": ResearchSource(
+                evidence_id="ev-same",
+                citation_index=1,
+                title="两个任务实际命中的同一来源",
+                url="https://example.com/same",
+                kind="url_read",
+            ),
+            "ev-substitute": ResearchSource(
+                evidence_id="ev-substitute",
+                citation_index=2,
+                title="尚未读取的独立来源",
+                url="https://example.com/substitute",
+                kind="search",
+            ),
+        }
+        state.research_workset.attempted_read_urls = {"https://example.com/same"}
+        state.research_workset.successful_read_urls = {"https://example.com/same"}
+
+        async def run_round_fn(**kwargs):
+            captured.append(kwargs)
+            return AgentRoundResult(
+                reasoning_buf="",
+                content_buf="",
+                tool_calls=[],
+                finish_reason="stop",
+                accumulated_usage=Usage(input_tokens=1, output_tokens=1),
+            )
+
+        await _run_round(
+            messages=[{"role": "user", "content": "继续核验第二个独立来源"}],
+            state=state,
+            runtime=_runtime(
+                task_mode="deep_research",
+                plan_mode="on",
+                call_kwargs={
+                    "tools": [
+                        _tool_definition("update_plan"),
+                        _tool_definition("web_search"),
+                        _tool_definition("url_read"),
+                    ],
+                    "tool_choice": "auto",
+                },
+                run_round_fn=run_round_fn,
+            ),
+            step_number=6,
+            step_context=AgentStepContext(
+                step_id="step-same-url-recovery",
+                step_number=6,
+                started_at=1.0,
+                thinking_block_id="thinking-same-url-recovery",
+                text_block_id="text-same-url-recovery",
+            ),
+        )
+
+        self.assertEqual(_tool_names(captured[0]["call_kwargs"]), ["url_read"])
+        binding = captured[0]["call_kwargs"]["tools"][0]["function"]["parameters"]["properties"]["_plan_item_id"]
+        self.assertEqual(binding["enum"], ["recovery-url-read-1"])
+        self.assertIsNone(state.required_plan_repair_tool)
 
     async def test_deep_research_without_unread_candidate_falls_back_to_search_repair(self):
         captured = []

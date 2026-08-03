@@ -13,6 +13,7 @@ from app.services.stream.agent_loop_state import AgentLoopState
 from app.services.stream.agent_loop_step_requests import build_limit_summary_step_request
 from app.services.stream.agent_round import AgentRoundResult
 from app.services.stream.product_result_answer import has_product_result_blocks
+from app.services.stream.reasoning_policy import configure_reasoning_call_kwargs
 from app.services.stream.research_evidence import (
     build_deep_research_stage_prompt,
     build_research_untrusted_context_messages,
@@ -258,6 +259,7 @@ async def _run_round(
             call_kwargs = _require_tool_call(call_kwargs, provider=runtime.provider)
     research_stage = None
     plan_repair_tool = None
+    state.required_plan_repair_tool = None
     active_plan_item_ids: list[str] = []
     if runtime.task_mode == "deep_research":
         unexecuted_plan_tool_names = state.plan_coordinator.unexecuted_plan_tool_names()
@@ -271,8 +273,14 @@ async def _run_round(
             active_plan_item_ids = state.plan_coordinator.unexecuted_plan_item_ids_for_tool(required_tool)
             if not active_plan_item_ids:
                 active_plan_item_ids = state.plan_coordinator.active_plan_item_ids_for_tool(required_tool)
+            if not active_plan_item_ids and research_stage == "read" and state.research_workset.unread_candidate_urls:
+                recovery_snapshot = state.plan_coordinator.add_server_recovery_item(required_tool)
+                if recovery_snapshot is not None:
+                    await runtime.emitter.plan_snapshot(**recovery_snapshot)
+                    active_plan_item_ids = state.plan_coordinator.unexecuted_plan_item_ids_for_tool(required_tool)
             if not active_plan_item_ids:
                 plan_repair_tool = required_tool
+        state.required_plan_repair_tool = plan_repair_tool
         allowed_tool_names = deep_research_stage_tool_names(research_stage)
         if research_stage == "planning" or plan_repair_tool:
             allowed_tool_names = frozenset({"update_plan"})
@@ -291,6 +299,11 @@ async def _run_round(
             preferred_tool_name="update_plan" if research_stage == "planning" or plan_repair_tool else required_tool,
             provider=runtime.provider,
         )
+    call_kwargs = configure_reasoning_call_kwargs(
+        call_kwargs,
+        provider=runtime.provider,
+        should_use_reasoning=runtime.should_use_reasoning,
+    )
     effective_messages = _messages_with_research_workset(
         messages,
         state=state,

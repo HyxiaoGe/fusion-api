@@ -5,6 +5,7 @@ from functools import partial
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from app.ai.prompts.agent_loop import VISIBLE_RESPONSE_LANGUAGE_PROMPT
 from app.schemas.chat import ContextUsage, SearchBlock, SearchSourceSummary, SourceReference, UrlBlock, Usage
 from app.services.chat.context_manager import ContextPlan
 from app.services.chat.context_manager import prepare_context as prepare_context_real
@@ -570,9 +571,7 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_standard_plan_synthesis_stream_error_persists_sent_partial(self):
         warnings = []
-        request, _stream_kwargs, _events, prepare_context_fn = self._plan_synthesis_request(
-            round_results=[]
-        )
+        request, _stream_kwargs, _events, prepare_context_fn = self._plan_synthesis_request(round_results=[])
 
         async def stream_round_fn(*_args, partial_output=None, **_kwargs):
             partial_output["reasoning_buf"] = "异常前已发送推理"
@@ -598,9 +597,7 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("RuntimeError" in warning for warning in warnings))
 
     async def test_standard_plan_synthesis_ownership_loss_is_never_converted_to_partial(self):
-        request, _stream_kwargs, _events, prepare_context_fn = self._plan_synthesis_request(
-            round_results=[]
-        )
+        request, _stream_kwargs, _events, prepare_context_fn = self._plan_synthesis_request(round_results=[])
 
         async def stream_round_fn(*_args, partial_output=None, **_kwargs):
             partial_output["content_buf"] = "旧任务片段"
@@ -658,7 +655,7 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
             litellm_model=f"moonshot/{model_id}" if model_id == "kimi-k3" else f"openai/{model_id}",
             litellm_kwargs={},
             messages=[{"role": "user", "content": "深度研究"}],
-            should_use_reasoning=False,
+            should_use_reasoning=bool(reasoning_buf),
             content_blocks=content_blocks,
             call_kwargs={},
             accumulated_usage=Usage(input_tokens=1, output_tokens=1),
@@ -751,9 +748,7 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.content_blocks[1].text, SUMMARY_PROTOCOL_FALLBACK_TEXT)
 
     async def test_reasoning_only_timed_out_plan_synthesis_keeps_thinking_and_appends_fallback(self):
-        request, _stream_kwargs, _events, prepare_context_fn = self._plan_synthesis_request(
-            round_results=[]
-        )
+        request, _stream_kwargs, _events, prepare_context_fn = self._plan_synthesis_request(round_results=[])
 
         async def stream_round_fn(*_args, partial_output=None, **_kwargs):
             partial_output["reasoning_buf"] = "超时前已发送的推理"
@@ -875,11 +870,11 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.content_blocks[-1].text, "综合结论来自两个已读来源。[2][3]")
         self.assertEqual(emitter.evidence_item_upserted.await_count, 2)
 
-    async def test_deep_summary_persists_only_text_for_k3_and_non_k3(self):
+    async def test_deep_summary_streams_and_persists_reasoning_for_k3_and_non_k3(self):
         for model_id in ("kimi-k3", "gpt-4"):
             with self.subTest(model_id=model_id):
                 workset, blocks = _deep_summary_evidence()
-                request, _emitter, _stream_kwargs, prepare_context_fn = self._deep_request(
+                request, _emitter, stream_kwargs, prepare_context_fn = self._deep_request(
                     workset=workset,
                     content_blocks=blocks,
                     answer="综合结论来自两个已读来源。[2][3]",
@@ -894,8 +889,11 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
                     outcome = await run_limit_summary_step(request=request)
 
                 self.assertFalse(outcome.incomplete)
+                self.assertTrue(stream_kwargs[0]["allow_deferred_reasoning_output"])
                 self.assertEqual(request.content_blocks[-1].type, "text")
-                self.assertFalse(any(block.type == "thinking" for block in request.content_blocks))
+                thinking_blocks = [block for block in request.content_blocks if block.type == "thinking"]
+                self.assertEqual(len(thinking_blocks), 1)
+                self.assertEqual(thinking_blocks[0].thinking, "只供总结调用内部使用的推理")
 
     async def test_deep_summary_replaces_invalid_or_insufficient_answer_with_deterministic_text(self):
         complete_workset, complete_blocks = _deep_summary_evidence()
@@ -951,6 +949,19 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(outcome.incomplete)
                 self.assertEqual(len(stream_kwargs), 2)
                 self.assertEqual(request.llm_call_fn.await_count, 2)
+                sent_snapshots = [call.args[2] for call in request.llm_call_fn.await_args_list]
+                self.assertTrue(
+                    all(
+                        sum(str(item.get("content") or "").count(VISIBLE_RESPONSE_LANGUAGE_PROMPT) for item in snapshot)
+                        == 1
+                        for snapshot in sent_snapshots
+                    )
+                )
+                self.assertIn("深度研究完成校验", sent_snapshots[1][-1]["content"])
+                self.assertTrue(sent_snapshots[1][-1]["content"].endswith(VISIBLE_RESPONSE_LANGUAGE_PROMPT))
+                self.assertFalse(
+                    any(VISIBLE_RESPONSE_LANGUAGE_PROMPT in str(item.get("content") or "") for item in request.messages)
+                )
                 append_chunk.assert_awaited_once()
                 self.assertEqual(append_chunk.await_args.args[2], repaired_answer)
                 self.assertEqual(request.content_blocks[-1].text, repaired_answer)
@@ -1134,9 +1145,7 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertFalse(any(message.get("role") == "tool" for message in captured_messages))
                 control_text = "\n".join(
-                    str(message.get("content", ""))
-                    for message in captured_messages
-                    if message.get("role") == "system"
+                    str(message.get("content", "")) for message in captured_messages if message.get("role") == "system"
                 )
                 for marker in (
                     "【自主联网判断规则】",
@@ -1183,7 +1192,12 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
                 ("最终总结推理", "最终答复", [], "stop", Usage(input_tokens=3, output_tokens=4)),
             ]
         )
-        llm_call_fn = AsyncMock(side_effect=["response-1", "response-2"])
+        sent_snapshots = []
+
+        async def llm_call_fn(_model, _kwargs, call_messages, **_call_kwargs):
+            sent_snapshots.append([dict(message) for message in call_messages])
+            return f"response-{len(sent_snapshots)}"
+
         request = LimitSummaryStepRequest(
             conversation_id="conv-1",
             task_id="task-1",
@@ -1218,15 +1232,26 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         ):
             outcome = await run_limit_summary_step(request=request)
 
-        self.assertEqual(llm_call_fn.await_count, 2)
+        self.assertEqual(len(sent_snapshots), 2)
+        self.assertTrue(
+            all(
+                sum(str(item.get("content") or "").count(VISIBLE_RESPONSE_LANGUAGE_PROMPT) for item in snapshot) == 1
+                for snapshot in sent_snapshots
+            )
+        )
+        self.assertIn("不要输出任何工具调用", sent_snapshots[1][-1]["content"])
+        self.assertTrue(sent_snapshots[1][-1]["content"].endswith(VISIBLE_RESPONSE_LANGUAGE_PROMPT))
+        self.assertFalse(
+            any(VISIBLE_RESPONSE_LANGUAGE_PROMPT in str(item.get("content") or "") for item in request.messages)
+        )
         self.assertTrue(all(call.kwargs["defer_output"] for call in stream_round_fn.await_args_list))
         append_chunk.assert_awaited_once()
         self.assertEqual(append_chunk.await_args.args[2], "最终答复")
         self.assertEqual(outcome.accumulated_usage, Usage(input_tokens=10, output_tokens=14))
-        self.assertEqual([block.type for block in content_blocks], ["text"])
-        self.assertEqual(content_blocks[0].text, "最终答复")
-        self.assertNotIn("内部工具规划", content_blocks[0].text)
-        self.assertNotIn("工具协议前缀", content_blocks[0].text)
+        self.assertEqual([block.type for block in content_blocks], ["thinking", "text"])
+        self.assertEqual(content_blocks[0].thinking, "内部工具规划最终总结推理")
+        self.assertEqual(content_blocks[1].text, "最终答复")
+        self.assertNotIn("工具协议前缀", content_blocks[1].text)
         self.assertTrue(any("工具协议" in warning for warning in warnings))
         self.assertTrue(any("不要输出任何工具调用" in str(message.get("content", "")) for message in request.messages))
 
@@ -1329,7 +1354,9 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
 
                 with (
                     patch("app.services.stream.limit_summary.prepare_context", new=prepare_context_fn),
-                    patch("app.services.stream.limit_summary._create_limit_summary_observation", return_value=observation),
+                    patch(
+                        "app.services.stream.limit_summary._create_limit_summary_observation", return_value=observation
+                    ),
                     patch("app.services.stream.llm_stream.append_chunk", new=stream_append),
                     patch("app.services.stream.llm_stream.check_lock_owner", new=AsyncMock(return_value=True)),
                     patch("app.services.stream.limit_summary.append_chunk", new=summary_append),
@@ -1347,7 +1374,13 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
                     )
                     summary_append.assert_not_awaited()
                 else:
-                    stream_append.assert_not_awaited()
+                    self.assertEqual(
+                        [(call.args[1], call.args[2]) for call in stream_append.await_args_list],
+                        [
+                            ("reasoning", "候选协议推理"),
+                            ("reasoning", "最终综合推理"),
+                        ],
+                    )
                     summary_append.assert_awaited_once()
                     self.assertEqual(summary_append.await_args.args[1:3], ("answering", "最终答复"))
                 self.assertFalse(outcome.incomplete)
@@ -1355,7 +1388,8 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual([block.type for block in content_blocks], ["thinking", "text"])
                     self.assertEqual(content_blocks[-2].thinking, "候选协议推理最终综合推理")
                 else:
-                    self.assertEqual([block.type for block in content_blocks], ["text"])
+                    self.assertEqual([block.type for block in content_blocks], ["thinking", "text"])
+                    self.assertEqual(content_blocks[-2].thinking, "候选协议推理最终综合推理")
 
     async def test_no_progress_summary_uses_safe_fallback_after_repeated_tool_protocol(self):
         content_blocks = []
@@ -1423,10 +1457,10 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         append_chunk.assert_awaited_once()
         self.assertEqual(append_chunk.await_args.args[2], SUMMARY_PROTOCOL_FALLBACK_TEXT)
         self.assertTrue(outcome.incomplete)
-        self.assertEqual([block.type for block in content_blocks], ["text"])
-        self.assertIn("未能生成可靠的最终答复", content_blocks[0].text)
-        self.assertNotIn("内部工具规划", content_blocks[0].text)
-        self.assertNotIn("DSML", content_blocks[0].text)
+        self.assertEqual([block.type for block in content_blocks], ["thinking", "text"])
+        self.assertEqual(content_blocks[0].thinking, "内部工具规划内部工具规划")
+        self.assertIn("未能生成可靠的最终答复", content_blocks[1].text)
+        self.assertNotIn("DSML", content_blocks[1].text)
 
     async def test_limit_summary_replaces_previous_round_context_with_final_summary_round(self):
         emitter = AsyncMock()
@@ -1585,7 +1619,12 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([message["role"] for message in sent_messages], ["user", "system"])
         self.assertEqual(sent_messages[0]["content"], "最新问题")
-        self.assertEqual(sent_messages[-1]["content"], LIMIT_SUMMARY_PROMPT)
+        self.assertTrue(sent_messages[-1]["content"].startswith(LIMIT_SUMMARY_PROMPT))
+        self.assertTrue(sent_messages[-1]["content"].endswith(VISIBLE_RESPONSE_LANGUAGE_PROMPT))
+        self.assertEqual(
+            sum(str(item.get("content") or "").count(VISIBLE_RESPONSE_LANGUAGE_PROMPT) for item in sent_messages),
+            1,
+        )
         self.assertEqual(len(messages), 4)
         self.assertEqual(messages[-1]["content"], LIMIT_SUMMARY_PROMPT)
 
@@ -1737,35 +1776,35 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.services.stream.limit_summary.append_chunk", new=AsyncMock()) as append_chunk:
             outcome = await run_limit_summary_step(
                 request=LimitSummaryStepRequest(
-                conversation_id="conv-1",
-                task_id="task-1",
-                run_id="run-1",
-                step_number=4,
-                model_id="gpt-4",
-                provider="openai",
-                litellm_model="openai/gpt-4",
-                litellm_kwargs={"metadata": {"trace": "x"}},
-                messages=messages,
-                should_use_reasoning=True,
-                content_blocks=content_blocks,
-                call_kwargs={
-                    "tools": [{"function": {"name": "web_search"}}],
-                    "tool_choice": "auto",
-                    "temperature": 0.1,
-                },
-                accumulated_usage=accumulated_usage,
-                emitter=emitter,
-                session_cache=session_cache,
-                total_timeout_s=300,
-                run_start=100.0,
-                start_step_fn=start_step_fn,
-                complete_step_fn=complete_step_fn,
-                llm_call_fn=llm_call_fn,
-                stream_round_fn=stream_round_fn,
-                log_round_summary_fn=log_round_summary_fn,
-                warning_fn=warnings.append,
-                clock=clock,
-                on_step_started=marked_step_ids.append,
+                    conversation_id="conv-1",
+                    task_id="task-1",
+                    run_id="run-1",
+                    step_number=4,
+                    model_id="gpt-4",
+                    provider="openai",
+                    litellm_model="openai/gpt-4",
+                    litellm_kwargs={"metadata": {"trace": "x"}},
+                    messages=messages,
+                    should_use_reasoning=True,
+                    content_blocks=content_blocks,
+                    call_kwargs={
+                        "tools": [{"function": {"name": "web_search"}}],
+                        "tool_choice": "auto",
+                        "temperature": 0.1,
+                    },
+                    accumulated_usage=accumulated_usage,
+                    emitter=emitter,
+                    session_cache=session_cache,
+                    total_timeout_s=300,
+                    run_start=100.0,
+                    start_step_fn=start_step_fn,
+                    complete_step_fn=complete_step_fn,
+                    llm_call_fn=llm_call_fn,
+                    stream_round_fn=stream_round_fn,
+                    log_round_summary_fn=log_round_summary_fn,
+                    warning_fn=warnings.append,
+                    clock=clock,
+                    on_step_started=marked_step_ids.append,
                 ),
             )
 
@@ -1775,10 +1814,13 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(outcome.incomplete)
         self.assertEqual(messages[-1], {"role": "system", "content": LIMIT_SUMMARY_PROMPT})
         self.assertEqual(outcome.accumulated_usage, Usage(input_tokens=7, output_tokens=10))
-        self.assertEqual(len(content_blocks), 1)
-        self.assertEqual(content_blocks[0].type, "text")
-        self.assertEqual(content_blocks[0].id, "blk-text")
-        self.assertEqual(content_blocks[0].text, "总结正文")
+        self.assertEqual(len(content_blocks), 2)
+        self.assertEqual(content_blocks[0].type, "thinking")
+        self.assertEqual(content_blocks[0].id, "blk-thinking")
+        self.assertEqual(content_blocks[0].thinking, "推理")
+        self.assertEqual(content_blocks[1].type, "text")
+        self.assertEqual(content_blocks[1].id, "blk-text")
+        self.assertEqual(content_blocks[1].text, "总结正文")
         self.assertEqual(warnings, [])
 
         self.assertEqual([event[0] for event in events], ["start", "llm", "stream", "log", "complete"])
@@ -1845,31 +1887,31 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.services.stream.limit_summary.append_chunk", new=AsyncMock()) as append_chunk:
             outcome = await run_limit_summary_step(
                 request=LimitSummaryStepRequest(
-                conversation_id="conv-1",
-                task_id="task-1",
-                run_id="run-1",
-                step_number=5,
-                model_id="gpt-4",
-                provider="openai",
-                litellm_model="openai/gpt-4",
-                litellm_kwargs={},
-                messages=messages,
-                should_use_reasoning=False,
-                content_blocks=content_blocks,
-                call_kwargs={"tools": [], "tool_choice": "auto"},
-                accumulated_usage=accumulated_usage,
-                emitter=emitter,
-                session_cache=session_cache,
-                total_timeout_s=2,
-                run_start=0.0,
-                start_step_fn=start_step_fn,
-                complete_step_fn=complete_step_fn,
-                llm_call_fn=llm_call_fn,
-                stream_round_fn=stream_round_fn,
-                log_round_summary_fn=log_round_summary_fn,
-                warning_fn=warnings.append,
-                clock=lambda: 10.0,
-                on_step_started=marked_step_ids.append,
+                    conversation_id="conv-1",
+                    task_id="task-1",
+                    run_id="run-1",
+                    step_number=5,
+                    model_id="gpt-4",
+                    provider="openai",
+                    litellm_model="openai/gpt-4",
+                    litellm_kwargs={},
+                    messages=messages,
+                    should_use_reasoning=False,
+                    content_blocks=content_blocks,
+                    call_kwargs={"tools": [], "tool_choice": "auto"},
+                    accumulated_usage=accumulated_usage,
+                    emitter=emitter,
+                    session_cache=session_cache,
+                    total_timeout_s=2,
+                    run_start=0.0,
+                    start_step_fn=start_step_fn,
+                    complete_step_fn=complete_step_fn,
+                    llm_call_fn=llm_call_fn,
+                    stream_round_fn=stream_round_fn,
+                    log_round_summary_fn=log_round_summary_fn,
+                    warning_fn=warnings.append,
+                    clock=lambda: 10.0,
+                    on_step_started=marked_step_ids.append,
                 ),
             )
 

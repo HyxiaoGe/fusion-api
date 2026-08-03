@@ -66,6 +66,7 @@ class AgentLoopState:
     research_workset: ResearchEvidenceWorkset = field(default_factory=ResearchEvidenceWorkset)
     research_network_required: bool = False
     research_repair_attempts: int = 0
+    required_plan_repair_tool: str | None = None
 
     def next_step_number(self) -> int:
         self.step += 1
@@ -117,12 +118,8 @@ class AgentLoopState:
     def ready_for_plan_synthesis(self) -> bool:
         """产品结果与待修参数必须先走既有确定性门禁，不能被普通综合截走。"""
 
-        research_evidence_ready = (
-            not self.research_network_required
-            or (
-                self.research_workset.successful_searches >= 1
-                and len(self.research_workset.successful_read_urls) >= 2
-            )
+        research_evidence_ready = not self.research_network_required or (
+            self.research_workset.successful_searches >= 1 and len(self.research_workset.successful_read_urls) >= 2
         )
         return (
             self.plan_coordinator.execution_items_terminal()

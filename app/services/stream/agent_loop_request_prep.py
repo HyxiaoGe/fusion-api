@@ -7,7 +7,6 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.ai.litellm_utils import merge_extra_body
 from app.ai.prompts.agent_loop import (
     DEEP_RESEARCH_CONTRACT_PROMPT,
     get_agent_plan_control_prompt,
@@ -31,6 +30,7 @@ from app.services.mcp.flyai_travel_tools import (
 from app.services.stream.agent_plan_tool_policy import AgentPlanToolPolicy, resolve_agent_plan_tool_policy
 from app.services.stream.agent_task_policy import resolve_agent_task_policy
 from app.services.stream.persistence import preprocess_url_in_message
+from app.services.stream.reasoning_policy import configure_reasoning_call_kwargs
 
 VOLCENGINE_PROVIDERS = {"volcengine"}
 MAX_CONTROLLED_OUTPUT_TOKENS = 4096
@@ -265,11 +265,12 @@ def build_agent_loop_call_config(
     if tools:
         call_kwargs["tools"] = tools
         call_kwargs["tool_choice"] = "auto"
-        if should_use_reasoning and (
-            provider in volcengine_providers
-            or (provider == "deepseek" and plan_mode != "off")
-        ):
-            merge_extra_body(call_kwargs, {"thinking": {"type": "disabled"}})
+    effective_provider = "volcengine" if provider in volcengine_providers else provider
+    call_kwargs = configure_reasoning_call_kwargs(
+        call_kwargs,
+        provider=effective_provider,
+        should_use_reasoning=should_use_reasoning,
+    )
 
     announced_tools = [
         name for name in announced_tool_names_from_call_kwargs(call_kwargs) if name not in control_tool_names

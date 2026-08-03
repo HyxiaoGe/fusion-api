@@ -108,21 +108,16 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
 
         await handle_tool_calls_round(request=request)
 
-        thinking_blocks = [
-            block for block in request.content_blocks if isinstance(block, ThinkingBlock)
-        ]
+        thinking_blocks = [block for block in request.content_blocks if isinstance(block, ThinkingBlock)]
         self.assertEqual(len(thinking_blocks), 1)
         self.assertEqual(thinking_blocks[0].thinking, "内部对应计划步骤推理")
         self.assertTrue(
-            any(
-                any(isinstance(block, ThinkingBlock) for block in call.args[4])
-                for call in persisted.call_args_list
-            )
+            any(any(isinstance(block, ThinkingBlock) for block in call.args[4]) for call in persisted.call_args_list)
         )
         assistant_message = next(message for message in request.messages if message.get("role") == "assistant")
         self.assertEqual(assistant_message["reasoning_content"], "内部 _plan_item_id 推理")
 
-    def test_non_k3_deferred_round_does_not_add_visible_reasoning_block(self):
+    def test_non_k3_deferred_round_adds_visible_reasoning_block(self):
         request = SimpleNamespace(
             reasoning_buf="只供内部继续调用的推理",
             output_deferred=True,
@@ -134,7 +129,8 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
 
         tool_round_module.append_tool_round_reasoning(request)
 
-        self.assertEqual(request.content_blocks, [])
+        self.assertEqual(len(request.content_blocks), 1)
+        self.assertEqual(request.content_blocks[0].thinking, "只供内部继续调用的推理")
 
     async def test_mixed_plan_and_external_calls_are_all_paired_but_only_external_counts(self):
         update_call = {
@@ -1540,7 +1536,7 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
             message,
             {
                 "role": "assistant",
-                "content": None,
+                "content": "",
                 "tool_calls": [
                     {
                         "id": "tc-1",
@@ -1571,35 +1567,46 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("reasoning_content", empty_reasoning)
 
-    def test_restore_reasoning_after_tool_decision_removes_disabled_extra_body(self):
+        raw_content = build_assistant_tool_message(
+            tool_calls=tool_calls,
+            reasoning_buf="标签内思考",
+            should_use_reasoning=True,
+            protocol_content_buf="<think>标签内思考</think>",
+        )
+        self.assertEqual(raw_content["content"], "<think>标签内思考</think>")
+        self.assertNotIn("reasoning_content", raw_content)
+
+    def test_restore_reasoning_after_tool_decision_keeps_tool_round_compatibility(self):
         call_kwargs = {
             "tools": [{"function": {"name": "web_search"}}],
-            "extra_body": {"thinking": {"type": "disabled"}},
+            "extra_body": {"thinking": {"type": "disabled"}, "trace": "kept"},
         }
 
         restore_reasoning_after_tool_decision(call_kwargs, provider="openai")
 
-        self.assertNotIn("extra_body", call_kwargs)
+        self.assertEqual(
+            call_kwargs["extra_body"],
+            {"thinking": {"type": "disabled"}, "trace": "kept"},
+        )
 
-    def test_deepseek_plan_run_keeps_disabled_thinking_protocol_after_tool_decision(self):
+    def test_restore_reasoning_after_tool_decision_only_removes_disabled_thinking_without_tools(self):
+        call_kwargs = {
+            "extra_body": {"thinking": {"type": "disabled"}, "trace": "kept"},
+        }
+
+        restore_reasoning_after_tool_decision(call_kwargs, provider="volcengine")
+
+        self.assertEqual(call_kwargs["extra_body"], {"trace": "kept"})
+
+    def test_deepseek_enabled_thinking_is_never_removed(self):
         call_kwargs = {
             "tools": [{"function": {"name": "update_plan"}}],
-            "extra_body": {"thinking": {"type": "disabled"}},
+            "extra_body": {"thinking": {"type": "enabled"}},
         }
 
         restore_reasoning_after_tool_decision(call_kwargs, provider="deepseek")
 
-        self.assertEqual(call_kwargs["extra_body"], {"thinking": {"type": "disabled"}})
-
-    def test_moonshot_removes_temporary_disabled_thinking_after_tool_decision(self):
-        call_kwargs = {
-            "tools": [{"function": {"name": "update_plan"}}],
-            "extra_body": {"thinking": {"type": "disabled"}},
-        }
-
-        restore_reasoning_after_tool_decision(call_kwargs, provider="moonshot")
-
-        self.assertNotIn("extra_body", call_kwargs)
+        self.assertEqual(call_kwargs["extra_body"], {"thinking": {"type": "enabled"}})
 
     async def test_handle_tool_calls_round_accepts_request_and_preserves_sequence(self):
         request_cls = getattr(tool_round_module, "ToolRoundRequest")
@@ -1937,7 +1944,7 @@ class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
             messages[1],
             {
                 "role": "assistant",
-                "content": None,
+                "content": "",
                 "tool_calls": [
                     {
                         "id": "tc-1",

@@ -22,8 +22,10 @@ from app.ai.prompts.agent_loop import (
 from app.core.logger import app_logger as logger
 from app.schemas.chat import ContextUsage, TextBlock, ThinkingBlock, Usage
 from app.services.chat.context_manager import ContextManagementError, ContextPlan, prepare_context
+from app.services.chat.model_call_language_policy import finalize_model_call_language_policy
 from app.services.final_answer_evidence import build_used_final_answer_evidence
 from app.services.stream.context_status import build_context_usage, emit_context_status
+from app.services.stream.reasoning_policy import configure_reasoning_call_kwargs
 from app.services.stream.research_evidence import (
     ResearchEvidenceWorkset,
     build_research_repair_prompt,
@@ -167,8 +169,10 @@ def remove_conflicting_tool_usage_contract(
         content = str(message.get("content", ""))
         if role == "system" and any(marker in content for marker in terminal_control_markers):
             continue
-        if task_mode == "deep_research" and role == "system" and any(
-            marker in content for marker in deep_research_control_markers
+        if (
+            task_mode == "deep_research"
+            and role == "system"
+            and any(marker in content for marker in deep_research_control_markers)
         ):
             continue
         if strip_tool_transactions and role == "assistant" and message.get("tool_calls"):
@@ -215,9 +219,8 @@ def _only_recoverable_tool_transactions(messages: list[dict]) -> bool:
 
     if not tool_call_names:
         return False
-    return (
-        tool_call_ids == tool_message_ids
-        and all(tool_name in recoverable_tool_names for tool_name in tool_call_names)
+    return tool_call_ids == tool_message_ids and all(
+        tool_name in recoverable_tool_names for tool_name in tool_call_names
     )
 
 
@@ -267,10 +270,15 @@ async def call_limit_summary_round(
     step_id: str,
     partial_output: dict[str, str] | None = None,
 ) -> LimitSummaryRoundResult:
-    final_call_kwargs = build_limit_summary_call_kwargs(request.call_kwargs)
+    final_call_kwargs = configure_reasoning_call_kwargs(
+        build_limit_summary_call_kwargs(request.call_kwargs),
+        provider=request.provider,
+        should_use_reasoning=request.should_use_reasoning,
+    )
+    finalized_messages = finalize_model_call_language_policy(request.messages)
     try:
         context_plan = await prepare_context(
-            messages=request.messages,
+            messages=finalized_messages,
             model_id=request.model_id,
             litellm_model=request.litellm_model,
             call_kwargs=final_call_kwargs,
@@ -315,6 +323,12 @@ async def call_limit_summary_round(
             stream_kwargs["provider"] = request.provider
         if _accepts_keyword(request.stream_round_fn, "defer_output"):
             stream_kwargs["defer_output"] = _should_defer_summary_output(request)
+        if (
+            request.should_use_reasoning
+            and _should_defer_summary_output(request)
+            and _accepts_keyword(request.stream_round_fn, "allow_deferred_reasoning_output")
+        ):
+            stream_kwargs["allow_deferred_reasoning_output"] = True
         if partial_output is not None and _accepts_keyword(request.stream_round_fn, "partial_output"):
             stream_kwargs["partial_output"] = partial_output
         reasoning_buf, content_buf, tool_calls, finish_reason, usage_data = await request.stream_round_fn(
@@ -537,7 +551,7 @@ async def run_summary_round_with_timeout(
             )
         else:
             result = LimitSummaryRoundResult(
-                reasoning_buf=retry_result.reasoning_buf,
+                reasoning_buf=first_result.reasoning_buf + retry_result.reasoning_buf,
                 content_buf=retry_result.content_buf,
                 usage_data=usage_data,
                 context=retry_result.context,
@@ -636,7 +650,7 @@ def _build_summary_protocol_fallback(
     usage_data: Usage | None = None,
 ) -> LimitSummaryRoundResult:
     return LimitSummaryRoundResult(
-        reasoning_buf="",
+        reasoning_buf=result.reasoning_buf,
         content_buf=SUMMARY_PROTOCOL_FALLBACK_TEXT,
         usage_data=result.usage_data if usage_data is None else usage_data,
         context=result.context,
@@ -681,19 +695,25 @@ def _build_streamed_retry_failure(
     finish_reason: str = "protocol_fallback",
 ) -> LimitSummaryRoundResult:
     if not _streams_standard_plan_synthesis(request):
+        fallback_result = retry_result or first_result
+        if retry_result is not None:
+            fallback_result = LimitSummaryRoundResult(
+                reasoning_buf=first_result.reasoning_buf + retry_result.reasoning_buf,
+                content_buf=retry_result.content_buf,
+                usage_data=retry_result.usage_data,
+                context=retry_result.context,
+                tool_calls=(),
+                finish_reason=retry_result.finish_reason,
+            )
         return _build_summary_protocol_fallback(
-            retry_result or first_result,
+            fallback_result,
             usage_data=usage_data,
         )
     retry_reasoning = (
-        retry_result.reasoning_buf
-        if retry_result is not None
-        else (retry_partial or {}).get("reasoning_buf", "")
+        retry_result.reasoning_buf if retry_result is not None else (retry_partial or {}).get("reasoning_buf", "")
     )
     retry_content = (
-        retry_result.content_buf
-        if retry_result is not None
-        else (retry_partial or {}).get("content_buf", "")
+        retry_result.content_buf if retry_result is not None else (retry_partial or {}).get("content_buf", "")
     )
     reasoning_buf = first_result.reasoning_buf + retry_reasoning
     content_buf = first_result.content_buf + retry_content
@@ -748,6 +768,15 @@ async def run_limit_summary_step(
         remaining=remaining,
     )
 
+    if round_result.reasoning_buf:
+        request.content_blocks.append(
+            ThinkingBlock(
+                type="thinking",
+                id=thinking_block_id,
+                thinking=round_result.reasoning_buf,
+            )
+        )
+
     next_usage = accumulate_summary_usage(request.accumulated_usage, round_result.usage_data)
     incomplete = False
     if request.task_mode == "deep_research":
@@ -761,12 +790,16 @@ async def run_limit_summary_step(
     elif request.summary_finish_reason == "plan_synthesis":
         has_answer = bool(round_result.content_buf.strip())
         has_streamed_content = _streams_standard_plan_synthesis(request) and bool(round_result.content_buf.strip())
-        incomplete = round_result.finish_reason in {
-            "protocol_fallback",
-            "timeout",
-            "timeout_partial",
-            "stream_error_partial",
-        } or not has_answer
+        incomplete = (
+            round_result.finish_reason
+            in {
+                "protocol_fallback",
+                "timeout",
+                "timeout_partial",
+                "stream_error_partial",
+            }
+            or not has_answer
+        )
         answer = round_result.content_buf if has_streamed_content else SUMMARY_PROTOCOL_FALLBACK_TEXT
         if not has_streamed_content:
             await append_chunk(
@@ -777,14 +810,6 @@ async def run_limit_summary_step(
                 task_id=request.task_id,
                 run_id=request.run_id,
                 step_id=summary_context.step_id,
-            )
-        if _streams_standard_plan_synthesis(request) and round_result.reasoning_buf:
-            request.content_blocks.append(
-                ThinkingBlock(
-                    type="thinking",
-                    id=thinking_block_id,
-                    thinking=round_result.reasoning_buf,
-                )
             )
         if answer:
             request.content_blocks.append(TextBlock(type="text", id=text_block_id, text=answer))

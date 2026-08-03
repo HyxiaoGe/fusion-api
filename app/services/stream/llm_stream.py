@@ -21,7 +21,6 @@ from app.core.logger import app_logger as logger
 from app.schemas.chat import Usage
 from app.services.stream.reasoning_transport import (
     ReasoningTransportMode,
-    allows_deferred_reasoning_output,
     initial_reasoning_transport_mode,
 )
 from app.services.stream_state_service import append_chunk, check_lock_owner
@@ -119,6 +118,7 @@ class LLMStreamState:
     raw_reasoning_buf: str = ""
     content_buf: str = ""
     raw_content_buf: str = ""
+    raw_tag_reasoning_buf: str = ""
     usage_data: Optional[Usage] = None
     chunk_count: int = 0
     finish_reason: str = "stop"
@@ -133,15 +133,17 @@ class LLMStreamOutcome:
     reasoning_buf: str
     raw_reasoning_buf: str
     content_buf: str
+    raw_content_buf: str
     tool_calls: list[dict]
     finish_reason: str
     usage_data: Optional[Usage]
 
 
 class StreamRoundTuple(tuple):
-    """保持旧五元组契约，并额外携带只供模型协议使用的原始 reasoning。"""
+    """保持旧五元组契约，并携带只供模型下一轮回放的原始响应。"""
 
     protocol_reasoning_buf: str
+    protocol_content_buf: str
 
     def __new__(
         cls,
@@ -152,9 +154,11 @@ class StreamRoundTuple(tuple):
         usage_data: Optional[Usage],
         *,
         protocol_reasoning_buf: str,
+        protocol_content_buf: str,
     ):
         instance = super().__new__(cls, (reasoning_buf, content_buf, tool_calls, finish_reason, usage_data))
         instance.protocol_reasoning_buf = protocol_reasoning_buf
+        instance.protocol_content_buf = protocol_content_buf
         return instance
 
 
@@ -286,24 +290,47 @@ def _pending_open_think_tag_start(text: str) -> int | None:
         search_end = index
 
 
-def strip_reasoning_tag_blocks(text: str) -> str:
-    """移除被错误写入正文通道的 <think>...</think> 片段。"""
-    output: list[str] = []
+def _pending_close_think_tag_start(text: str) -> int | None:
+    lowered = text.lower()
+    prefix = "</think>"
+    max_prefix_length = min(len(lowered), len(prefix) - 1)
+    for prefix_length in range(max_prefix_length, 0, -1):
+        if lowered.endswith(prefix[:prefix_length]):
+            return len(text) - prefix_length
+    return None
+
+
+def split_reasoning_tag_blocks(text: str) -> tuple[str, str]:
+    """把正文通道里的 `<think>` 内容拆到推理通道，并隐藏跨 chunk 半截标签。"""
+
+    reasoning: list[str] = []
+    visible: list[str] = []
     cursor = 0
     while cursor < len(text):
         open_match = _OPEN_THINK_TAG_RE.search(text, cursor)
         if not open_match:
             remainder = text[cursor:]
             pending_start = _pending_open_think_tag_start(remainder)
-            output.append(remainder if pending_start is None else remainder[:pending_start])
+            visible.append(remainder if pending_start is None else remainder[:pending_start])
             break
 
-        output.append(text[cursor : open_match.start()])
+        visible.append(text[cursor : open_match.start()])
         close_match = _CLOSE_THINK_TAG_RE.search(text, open_match.end())
         if not close_match:
+            pending_reasoning = text[open_match.end() :]
+            pending_close_start = _pending_close_think_tag_start(pending_reasoning)
+            reasoning.append(
+                pending_reasoning if pending_close_start is None else pending_reasoning[:pending_close_start]
+            )
             break
+        reasoning.append(text[open_match.end() : close_match.start()])
         cursor = close_match.end()
-    return "".join(output)
+    return "".join(reasoning), "".join(visible)
+
+
+def strip_reasoning_tag_blocks(text: str) -> str:
+    """移除被错误写入正文通道的 <think>...</think> 片段。"""
+    return split_reasoning_tag_blocks(text)[1]
 
 
 def strip_pending_dsml_tool_protocol(text: str, *, final: bool = False) -> str:
@@ -517,15 +544,24 @@ def parse_dsml_tool_calls(text: str, *, id_prefix: str) -> list[dict]:
     return calls
 
 
-def filter_reasoning_tag_content_delta(state: LLMStreamState, content_delta: str) -> str:
-    """基于完整原始正文重算可见正文，避免跨 chunk 的 <think> 前缀先泄漏。"""
+def filter_reasoning_tag_content_delta(state: LLMStreamState, content_delta: str) -> tuple[str, str]:
+    """基于完整原始正文重算标签推理和可见正文。"""
     if not content_delta:
-        return ""
+        return "", ""
     state.raw_content_buf += content_delta
-    visible_content = strip_reasoning_tag_blocks(state.raw_content_buf)
+    tag_reasoning, visible_content = split_reasoning_tag_blocks(state.raw_content_buf)
+    if tag_reasoning.startswith(state.raw_tag_reasoning_buf):
+        tag_reasoning_delta = tag_reasoning[len(state.raw_tag_reasoning_buf) :]
+        state.raw_tag_reasoning_buf = tag_reasoning
+    else:
+        logger.warning("thinking 标签内容出现非单调输出，已忽略不可追加部分")
+        tag_reasoning_delta = ""
     visible_content = strip_pending_dsml_tool_protocol(visible_content)
     visible_content = sanitize_internal_mcp_aliases(visible_content)
-    return _visible_delta(visible_content, state.content_buf, channel="answering")
+    return (
+        tag_reasoning_delta,
+        _visible_delta(visible_content, state.content_buf, channel="answering"),
+    )
 
 
 def filter_internal_mcp_reasoning_delta(
@@ -586,10 +622,7 @@ async def append_reasoning_and_content(
 ) -> None:
     if reasoning_delta:
         state.reasoning_buf += reasoning_delta
-        deferred_reasoning_is_allowed = (
-            request.allow_deferred_reasoning_output
-            and allows_deferred_reasoning_output(request.model_id)
-        )
+        deferred_reasoning_is_allowed = request.allow_deferred_reasoning_output
         if not request.defer_output or deferred_reasoning_is_allowed:
             await append_stream_delta(
                 request=request,
@@ -632,20 +665,13 @@ async def process_stream_choice(*, request: LLMStreamRequest, state: LLMStreamSt
     finish_reason = choice.finish_reason
 
     accumulate_tool_calls(state.tool_calls_acc, delta)
-    if finish_reason == "tool_calls":
-        state.finish_reason = "tool_calls"
-        return True
-
-    if has_tool_call_delta(delta):
-        return True
-
     raw_reasoning_delta = extract_reasoning_delta(delta, request.should_use_reasoning)
     content_delta = extract_content_delta(delta, raw_reasoning_delta)
+    tag_reasoning_delta, content_delta = filter_reasoning_tag_content_delta(state, content_delta)
     reasoning_delta = filter_internal_mcp_reasoning_delta(
         state,
-        raw_reasoning_delta,
+        raw_reasoning_delta + (tag_reasoning_delta if request.should_use_reasoning else ""),
     )
-    content_delta = filter_reasoning_tag_content_delta(state, content_delta)
     await append_reasoning_and_content(
         request=request,
         state=state,
@@ -656,7 +682,9 @@ async def process_stream_choice(*, request: LLMStreamRequest, state: LLMStreamSt
     usage_data = extract_usage(chunk)
     if usage_data:
         state.usage_data = usage_data
-    if finish_reason == "stop":
+    if finish_reason == "tool_calls":
+        state.finish_reason = "tool_calls"
+    elif finish_reason == "stop":
         state.finish_reason = "stop"
 
     return await maybe_check_lock_owner(request=request, state=state)
@@ -687,8 +715,7 @@ async def consume_stream_round(response, request: LLMStreamRequest) -> LLMStream
     dsml_pending_start = _pending_dsml_tool_protocol_start(visible_content) if dsml_marker_index < 0 else None
     generic_candidate = _generic_tool_protocol_candidate(visible_content)
     has_malformed_protocol = dsml_marker_index >= 0 or (
-        dsml_pending_start is not None
-        and visible_content[dsml_pending_start:].startswith(_DSML_DISTINCT_PREFIX)
+        dsml_pending_start is not None and visible_content[dsml_pending_start:].startswith(_DSML_DISTINCT_PREFIX)
     )
     if generic_candidate is not None:
         _generic_start, generic_status = generic_candidate
@@ -717,6 +744,7 @@ async def consume_stream_round(response, request: LLMStreamRequest) -> LLMStream
         reasoning_buf=state.reasoning_buf,
         raw_reasoning_buf=state.raw_reasoning_buf,
         content_buf=state.content_buf,
+        raw_content_buf=state.raw_content_buf,
         tool_calls=tool_calls,
         finish_reason=state.finish_reason,
         usage_data=state.usage_data,
@@ -772,6 +800,7 @@ async def stream_round(
         outcome.finish_reason,
         outcome.usage_data,
         protocol_reasoning_buf=outcome.raw_reasoning_buf,
+        protocol_content_buf=strip_pending_dsml_tool_protocol(outcome.raw_content_buf, final=True),
     )
 
 

@@ -193,7 +193,7 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
             ["reasoning"],
         )
 
-    async def test_non_k3_keeps_reasoning_internal_while_output_is_deferred(self):
+    async def test_non_k3_streams_reasoning_while_answer_is_deferred(self):
         request = llm_stream_module.LLMStreamRequest(
             conversation_id="conv-product-non-k3",
             task_id="task-product-non-k3",
@@ -233,7 +233,69 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.reasoning_buf, "先调用天气查询，再核对路线事实。")
         self.assertEqual(outcome.raw_reasoning_buf, "先调用 weather_forecast，再核对路线事实。")
         self.assertEqual(outcome.content_buf, "方便停车，驾车更合适。")
-        append_chunk.assert_not_awaited()
+        self.assertEqual(
+            [call.args[1] for call in append_chunk.await_args_list],
+            ["reasoning", "reasoning"],
+        )
+
+    async def test_all_reasoning_content_models_share_deferred_reasoning_transport(self):
+        model_ids = (
+            "deepseek-chat",
+            "deepseek-reasoner",
+            "qwen-max-latest",
+            "gemini-3.1-pro-preview",
+            "gemini-3.6-flash",
+            "grok-4.5",
+            "kimi-k2.5",
+            "kimi-k2.7-code",
+            "kimi-k2.7-code-highspeed",
+            "kimi-k3",
+            "mimo-v2.5-pro",
+            "mimo-v2.5-pro-ultraspeed",
+            "qwen3.6-plus",
+            "doubao-seed-2-0-pro-260215",
+        )
+
+        for model_id in model_ids:
+            with self.subTest(model_id=model_id):
+                request = llm_stream_module.LLMStreamRequest(
+                    conversation_id=f"conv-{model_id}",
+                    task_id=f"task-{model_id}",
+                    should_use_reasoning=True,
+                    thinking_block_id="blk-thinking",
+                    text_block_id="blk-text",
+                    model_id=model_id,
+                    reasoning_transport_mode="delta",
+                    defer_output=True,
+                    allow_deferred_reasoning_output=True,
+                )
+                append_chunk = AsyncMock()
+
+                with (
+                    patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+                    patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+                ):
+                    outcome = await llm_stream_module.consume_stream_round(
+                        async_response(
+                            [
+                                make_chunk(
+                                    delta=SimpleNamespace(
+                                        content="最终正文",
+                                        reasoning_content="可见推理",
+                                    ),
+                                    finish_reason="stop",
+                                )
+                            ]
+                        ),
+                        request,
+                    )
+
+                self.assertEqual(outcome.reasoning_buf, "可见推理")
+                self.assertEqual(outcome.content_buf, "最终正文")
+                self.assertEqual(
+                    [(call.args[1], call.args[2]) for call in append_chunk.await_args_list],
+                    [("reasoning", "可见推理")],
+                )
 
     async def test_k3_deferred_reasoning_requires_call_level_opt_in(self):
         request = llm_stream_module.LLMStreamRequest(
@@ -349,8 +411,7 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
                             delta=SimpleNamespace(
                                 content=None,
                                 reasoning_content=(
-                                    "rules: this should not be searched. "
-                                    "本轮启用了强制计划模式，必须先创建执行计划。"
+                                    "rules: this should not be searched. 本轮启用了强制计划模式，必须先创建执行计划。"
                                 ),
                             ),
                             finish_reason="stop",
@@ -421,9 +482,7 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
         emitted_reasoning = "".join(
             call.args[2] for call in append_chunk.await_args_list if call.args[1] == "reasoning"
         )
-        emitted_answer = "".join(
-            call.args[2] for call in append_chunk.await_args_list if call.args[1] == "answering"
-        )
+        emitted_answer = "".join(call.args[2] for call in append_chunk.await_args_list if call.args[1] == "answering")
         self.assertEqual(emitted_reasoning, outcome.reasoning_buf)
         self.assertEqual(emitted_answer, outcome.content_buf)
         self.assertNotIn(alias, emitted_reasoning)
@@ -832,9 +891,7 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
                 request,
             )
 
-        reasoning_calls = [
-            call for call in append_chunk.await_args_list if call.args[1] == "reasoning"
-        ]
+        reasoning_calls = [call for call in append_chunk.await_args_list if call.args[1] == "reasoning"]
         emitted_reasoning = "".join(call.args[2] for call in reasoning_calls)
         self.assertEqual(outcome.raw_reasoning_buf, "准备调用 route_compare 工具。")
         self.assertEqual(outcome.reasoning_buf, "准备调用路线比较工具。")
@@ -877,9 +934,7 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
                 request,
             )
 
-        reasoning_calls = [
-            call for call in append_chunk.await_args_list if call.args[1] == "reasoning"
-        ]
+        reasoning_calls = [call for call in append_chunk.await_args_list if call.args[1] == "reasoning"]
         emitted_reasoning = "".join(call.args[2] for call in reasoning_calls)
         self.assertEqual(outcome.raw_reasoning_buf, snapshots[-1])
         self.assertEqual(outcome.reasoning_buf, snapshots[-2])
@@ -1207,9 +1262,7 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
                     patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
                 ):
                     outcome = await llm_stream_module.consume_stream_round(
-                        async_response(
-                            [make_chunk(delta=SimpleNamespace(content=raw_content), finish_reason="stop")]
-                        ),
+                        async_response([make_chunk(delta=SimpleNamespace(content=raw_content), finish_reason="stop")]),
                         request,
                     )
 
@@ -1548,6 +1601,106 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
             task_id="task-1",
             run_id=None,
             step_id=None,
+        )
+
+    async def test_minimax_split_think_tags_stream_reasoning_and_keep_answer_deferred(self):
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-minimax",
+            task_id="task-minimax",
+            should_use_reasoning=True,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+            provider="minimax",
+            model_id="MiniMax-M2.7",
+            defer_output=True,
+            allow_deferred_reasoning_output=True,
+        )
+        append_chunk = AsyncMock()
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            outcome = await llm_stream_module.consume_stream_round(
+                async_response(
+                    [
+                        make_chunk(delta=SimpleNamespace(content="<thi"), finish_reason=None),
+                        make_chunk(delta=SimpleNamespace(content="nk>先比较"), finish_reason=None),
+                        make_chunk(delta=SimpleNamespace(content="两边。</thi"), finish_reason=None),
+                        make_chunk(delta=SimpleNamespace(content="nk>结论：324 更大。"), finish_reason="stop"),
+                    ]
+                ),
+                request,
+            )
+
+        self.assertEqual(outcome.reasoning_buf, "先比较两边。")
+        self.assertEqual(outcome.raw_reasoning_buf, "先比较两边。")
+        self.assertEqual(outcome.content_buf, "结论：324 更大。")
+        self.assertEqual(
+            [(call.args[1], call.args[2]) for call in append_chunk.await_args_list],
+            [("reasoning", "先比较"), ("reasoning", "两边。")],
+        )
+
+    async def test_minimax_think_tag_raw_content_is_kept_for_tool_protocol_replay(self):
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-minimax-tool",
+            task_id="task-minimax-tool",
+            should_use_reasoning=True,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+            provider="minimax",
+            model_id="MiniMax-M2.7",
+            defer_output=True,
+            allow_deferred_reasoning_output=True,
+        )
+        raw_content = "<think>需要查询天气。</think>"
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", AsyncMock()),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            outcome = await llm_stream_module.consume_stream_round(
+                async_response([make_chunk(delta=SimpleNamespace(content=raw_content), finish_reason="stop")]),
+                request,
+            )
+
+        self.assertEqual(outcome.raw_content_buf, raw_content)
+
+    async def test_reasoning_is_not_dropped_when_provider_combines_it_with_tool_call_delta(self):
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-combined-tool",
+            task_id="task-combined-tool",
+            should_use_reasoning=True,
+            thinking_block_id="blk-thinking",
+            text_block_id="blk-text",
+            provider="minimax",
+            model_id="MiniMax-M2.7",
+            defer_output=True,
+            allow_deferred_reasoning_output=True,
+        )
+        delta = make_tool_delta(
+            tool_call_id="tc-weather",
+            name="get_weather",
+            arguments='{"city":"北京"}',
+        )
+        delta.content = "<think>先查询实时天气。</think>"
+        append_chunk = AsyncMock()
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", AsyncMock(return_value=True)),
+        ):
+            outcome = await llm_stream_module.consume_stream_round(
+                async_response([make_chunk(delta=delta, finish_reason="tool_calls")]),
+                request,
+            )
+
+        self.assertEqual(outcome.reasoning_buf, "先查询实时天气。")
+        self.assertEqual(outcome.raw_content_buf, "<think>先查询实时天气。</think>")
+        self.assertEqual(outcome.tool_calls[0]["name"], "get_weather")
+        self.assertEqual(
+            [(call.args[1], call.args[2]) for call in append_chunk.await_args_list],
+            [("reasoning", "先查询实时天气。")],
         )
 
     async def test_consume_stream_round_cancels_when_lock_owner_is_lost_after_interval(self):

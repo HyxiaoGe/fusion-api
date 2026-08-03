@@ -134,7 +134,7 @@ def _pending_reasoning_control_marker_start(text: str) -> int | None:
     for marker in _INTERNAL_REASONING_CONTROL_MARKERS:
         lowered_marker = marker.lower()
         max_prefix_length = min(len(lowered), len(lowered_marker) - 1)
-        for prefix_length in range(max_prefix_length, 3, -1):
+        for prefix_length in range(max_prefix_length, 0, -1):
             if lowered.endswith(lowered_marker[:prefix_length]):
                 pending_starts.append(len(text) - prefix_length)
                 break
@@ -152,15 +152,17 @@ def strip_internal_reasoning_control_text(
     sanitized = text
     while (match := _reasoning_control_marker_match(sanitized)) is not None:
         marker_start, marker_end = match
-        paragraph_start = _paragraph_start(sanitized, marker_start)
         next_separator = sanitized.find("\n\n", marker_end)
         paragraph_end = len(sanitized) if next_separator < 0 else next_separator + 2
-        sanitized = f"{sanitized[:paragraph_start]}{sanitized[paragraph_end:]}"
+        # 已经流给前端的同段前缀不能回退；只从控制标记开始隐藏到段落末尾。
+        sanitized = f"{sanitized[:marker_start]}{sanitized[paragraph_end:]}"
 
     pending_start = _pending_reasoning_control_marker_start(sanitized)
     if pending_start is not None:
-        if final or buffer_trailing_paragraph:
-            pending_start = _paragraph_start(sanitized, pending_start)
+        # 流结束时不再可能补成完整控制标记；歧义尾缀必须原样释放，
+        # 否则正常句尾（例如 according、回答或调用）会被永久吞掉。
+        if final:
+            return sanitized
         return sanitized[:pending_start]
     if final:
         return sanitized

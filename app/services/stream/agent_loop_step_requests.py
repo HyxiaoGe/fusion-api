@@ -51,6 +51,7 @@ def build_tool_round_request(
         tool_calls=round_result.tool_calls,
         reasoning_buf=round_result.reasoning_buf,
         protocol_reasoning_buf=round_result.protocol_reasoning_buf,
+        protocol_content_buf=round_result.protocol_content_buf,
         should_use_reasoning=runtime.should_use_reasoning,
         step_context=step_context,
         step_number=step_number,

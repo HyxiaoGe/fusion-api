@@ -11,8 +11,8 @@ from app.ai import litellm_health
 from app.ai.llm_round_observability import create_llm_round_observation
 from app.schemas.chat import ContextUsage, Usage
 from app.services.chat.context_manager import ContextManagementError, ContextPlan, prepare_context
+from app.services.chat.model_call_language_policy import finalize_model_call_language_policy
 from app.services.stream.context_status import build_context_usage, emit_context_status
-from app.services.stream.reasoning_transport import allows_deferred_reasoning_output
 
 
 @dataclass(frozen=True)
@@ -23,6 +23,7 @@ class AgentRoundResult:
     finish_reason: str
     accumulated_usage: Usage
     protocol_reasoning_buf: str | None = None
+    protocol_content_buf: str | None = None
     context: ContextUsage | None = None
     announced_tool_names: frozenset[str] | None = None
     output_deferred: bool = False
@@ -188,9 +189,10 @@ async def run_agent_round(
     on_context_updated: Callable[[ContextUsage], None] | None = None,
     defer_output: bool = False,
 ) -> AgentRoundResult:
+    finalized_messages = finalize_model_call_language_policy(messages)
     try:
         context_plan = await prepare_context(
-            messages=messages,
+            messages=finalized_messages,
             model_id=model_id,
             litellm_model=litellm_model,
             call_kwargs=call_kwargs,
@@ -276,6 +278,7 @@ async def run_agent_round(
     return AgentRoundResult(
         reasoning_buf=reasoning_buf,
         protocol_reasoning_buf=getattr(stream_result, "protocol_reasoning_buf", reasoning_buf),
+        protocol_content_buf=getattr(stream_result, "protocol_content_buf", content_buf),
         content_buf=content_buf,
         tool_calls=tool_calls,
         finish_reason=finish_reason,
@@ -284,8 +287,6 @@ async def run_agent_round(
         announced_tool_names=_announced_tool_names(call_kwargs),
         output_deferred=defer_output and _accepts_keyword(stream_round_fn, "defer_output"),
         allow_deferred_reasoning_output=(
-            defer_output
-            and allows_deferred_reasoning_output(model_id)
-            and _accepts_keyword(stream_round_fn, "allow_deferred_reasoning_output")
+            defer_output and _accepts_keyword(stream_round_fn, "allow_deferred_reasoning_output")
         ),
     )

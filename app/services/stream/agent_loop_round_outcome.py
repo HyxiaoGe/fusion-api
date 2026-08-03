@@ -113,10 +113,7 @@ def _requires_deep_synthesis_protocol_summary(request: AgentRoundOutcomeRequest)
         and workset.successful_searches >= 1
         and len(workset.successful_read_urls) >= 2
         and request.round_result.announced_tool_names == frozenset()
-        and (
-            bool(request.round_result.tool_calls)
-            or request.round_result.finish_reason == "tool_protocol_error"
-        )
+        and (bool(request.round_result.tool_calls) or request.round_result.finish_reason == "tool_protocol_error")
     )
 
 
@@ -167,9 +164,7 @@ async def _complete_tool_protocol_error_round(
     if _has_product_answer_context(request.state):
         return AgentLoopOutcome(exit=AgentLoopExit.PRODUCT_RESULT_READY)
     summary_finish_reason = (
-        "plan_synthesis"
-        if request.state.plan_coordinator.has_valid_model_plan
-        else "tool_protocol_error"
+        "plan_synthesis" if request.state.plan_coordinator.has_valid_model_plan else "tool_protocol_error"
     )
     return AgentLoopOutcome(
         exit=AgentLoopExit.SUMMARY_REQUIRED,
@@ -509,6 +504,7 @@ def _with_replaced_answer(
         round_result=AgentRoundResult(
             reasoning_buf=visible_reasoning,
             protocol_reasoning_buf=request.round_result.protocol_reasoning_buf,
+            protocol_content_buf=request.round_result.protocol_content_buf,
             content_buf=answer,
             tool_calls=request.round_result.tool_calls,
             finish_reason=request.round_result.finish_reason,

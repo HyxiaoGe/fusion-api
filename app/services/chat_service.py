@@ -40,6 +40,7 @@ from app.services.chat.message_builder import (
     inject_file_content,
     is_image_file,
 )
+from app.services.chat.model_call_language_policy import finalize_model_call_language_policy
 from app.services.conversation_service import ConversationService
 from app.services.file_service import FileService, is_image_mime
 from app.services.storage import get_storage_for_backend
@@ -573,9 +574,10 @@ class ChatService:
         if max_tokens is not None:
             controlled_call_kwargs["max_tokens"] = max_tokens
         final_call_kwargs = merge_litellm_kwargs("chat_non_stream", controlled_call_kwargs)
+        finalized_messages = finalize_model_call_language_policy(messages)
         try:
             context_plan = await prepare_context(
-                messages=messages,
+                messages=finalized_messages,
                 model_id=model_id,
                 litellm_model=litellm_model,
                 call_kwargs=final_call_kwargs,

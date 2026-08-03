@@ -2,6 +2,7 @@
 网页读取服务客户端 — 封装对 reader-service 的 HTTP 调用
 """
 
+import re
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlsplit
@@ -77,6 +78,11 @@ _FAILURE_MESSAGES = {
     "unknown": "网页读取发生异常，已跳过该来源",
 }
 
+_WRAPPED_UPSTREAM_ERROR_RE = re.compile(
+    r"^Warning:\s*Target URL returned error\s+(?P<status>[45]\d{2})(?::.*)?$",
+    re.IGNORECASE,
+)
+
 
 def _failure(
     kind: str,
@@ -142,6 +148,48 @@ def _structured_failure_from_response(response: httpx.Response | None) -> UrlRea
     )
 
 
+def _wrapped_upstream_failure(data: dict) -> UrlReadFailure | None:
+    """识别 reader 以 HTTP 200 包装的上游 4xx/5xx 错误页。"""
+
+    content = data.get("content")
+    if not isinstance(content, str) or not content:
+        return None
+    lines = [line.strip() for line in content[:1200].splitlines() if line.strip()]
+    markdown_index = next(
+        (index for index, line in enumerate(lines) if line.lower() == "markdown content:"),
+        len(lines),
+    )
+    header_lines = lines[: min(markdown_index, 20)]
+    url_source_index = next(
+        (index for index, line in enumerate(header_lines) if line.lower().startswith("url source:")),
+        None,
+    )
+    if url_source_index is None:
+        return None
+    warning_match = next(
+        (
+            match
+            for line in header_lines[url_source_index + 1 :]
+            if (match := _WRAPPED_UPSTREAM_ERROR_RE.fullmatch(line)) is not None
+        ),
+        None,
+    )
+    if warning_match is None:
+        return None
+    status = int(warning_match.group("status"))
+    return _failure(
+        "http_status",
+        retryable=status in {408, 425, 429} or status >= 500,
+        upstream_status=status,
+        attempts=_bounded_int(data.get("attempts"), default=1, minimum=1, maximum=10),
+        reader_duration_ms=_optional_bounded_int(
+            data.get("fetch_ms"),
+            minimum=0,
+            maximum=300_000,
+        ),
+    )
+
+
 def _log_failure(
     failure: UrlReadFailure,
     *,
@@ -183,6 +231,16 @@ async def read_url_with_diagnostics(url: str, timeout: float | None = None) -> U
             resp.raise_for_status()
             try:
                 data = resp.json()
+                if not isinstance(data, dict):
+                    raise TypeError("reader 响应必须是对象")
+                wrapped_failure = _wrapped_upstream_failure(data)
+                if wrapped_failure is not None:
+                    _log_failure(
+                        wrapped_failure,
+                        domain=domain,
+                        service_status=resp.status_code,
+                    )
+                    return UrlReadResponse(result=None, failure=wrapped_failure)
                 return UrlReadResponse(result=_build_result(data))
             except (ValueError, KeyError, TypeError):
                 failure = _failure("parse_error")

@@ -87,6 +87,110 @@ class ReadUrlTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.attempts, 2)
 
+    async def test_reader_http_200_wrapping_upstream_error_page_is_degraded(self):
+        response = self._http_error_response(
+            200,
+            {
+                "url": "http://caict.ac.cn/report.pdf",
+                "title": None,
+                "content": (
+                    "Title: \n\n"
+                    "URL Source: http://caict.ac.cn/report.pdf\n\n"
+                    "Warning: Target URL returned error 400: Bad Request\n\n"
+                    "Markdown Content:\n## 出错啦！"
+                ),
+                "favicon": None,
+                "content_length": 180,
+                "fetch_ms": 3146,
+                "attempts": 1,
+            },
+        )
+        mock_client = self._mock_client_for_response(response)
+
+        with (
+            patch("app.services.external.reader_client.httpx.AsyncClient", return_value=mock_client),
+            patch("app.services.external.reader_client.logger") as mock_logger,
+        ):
+            result = await self._read_url_with_diagnostics()("http://caict.ac.cn/report.pdf")
+
+        self.assertIsNone(result.result)
+        self.assertEqual(result.failure.kind, "http_status")
+        self.assertEqual(result.failure.upstream_status, 400)
+        self.assertFalse(result.failure.retryable)
+        warning_text = str(mock_logger.warning.call_args)
+        self.assertIn("service_status=200", warning_text)
+        self.assertIn("upstream_status=400", warning_text)
+        self.assertNotIn("出错啦", warning_text)
+
+    async def test_reader_http_200_wrapped_error_allows_extra_header_fields(self):
+        response = self._http_error_response(
+            200,
+            {
+                "url": "https://example.com/report",
+                "title": None,
+                "content": (
+                    "Title: Report\n\n"
+                    "URL Source: https://example.com/report\n\n"
+                    "Published Time: 2026-08-03\n\n"
+                    "Author: Example\n\n"
+                    "Warning: Target URL returned error 503: Service Unavailable\n\n"
+                    "Markdown Content:\nUnavailable"
+                ),
+                "content_length": 220,
+                "fetch_ms": 900,
+                "attempts": 2,
+            },
+        )
+        mock_client = self._mock_client_for_response(response)
+
+        with (
+            patch("app.services.external.reader_client.httpx.AsyncClient", return_value=mock_client),
+            patch("app.services.external.reader_client.logger"),
+        ):
+            result = await self._read_url_with_diagnostics()("https://example.com/report")
+
+        self.assertIsNone(result.result)
+        self.assertEqual(result.failure.kind, "http_status")
+        self.assertEqual(result.failure.upstream_status, 503)
+        self.assertTrue(result.failure.retryable)
+
+    async def test_reader_http_200_body_warning_example_is_not_misclassified(self):
+        response = self._http_error_response(
+            200,
+            {
+                "url": "https://example.com/docs",
+                "title": "Docs",
+                "content": (
+                    "Title: Docs\n\n"
+                    "URL Source: https://example.com/docs\n\n"
+                    "Markdown Content:\n"
+                    "Warning: Target URL returned error 400: example only"
+                ),
+                "content_length": 150,
+                "fetch_ms": 300,
+            },
+        )
+        mock_client = self._mock_client_for_response(response)
+
+        with patch("app.services.external.reader_client.httpx.AsyncClient", return_value=mock_client):
+            result = await self._read_url_with_diagnostics()("https://example.com/docs")
+
+        self.assertIsNotNone(result.result)
+        self.assertIsNone(result.failure)
+
+    async def test_reader_http_200_non_object_json_is_parse_error(self):
+        response = self._http_error_response(200, ["unexpected"])
+        mock_client = self._mock_client_for_response(response)
+
+        with (
+            patch("app.services.external.reader_client.httpx.AsyncClient", return_value=mock_client),
+            patch("app.services.external.reader_client.logger"),
+        ):
+            result = await self._read_url_with_diagnostics()("https://example.com/docs")
+
+        self.assertIsNone(result.result)
+        self.assertEqual(result.failure.kind, "parse_error")
+
     async def test_read_url_with_diagnostics_timeout_classifies_failure(self):
         """诊断读取超时时返回 timeout 失败原因"""
         read_url_with_diagnostics = self._read_url_with_diagnostics()

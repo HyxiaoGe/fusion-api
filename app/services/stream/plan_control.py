@@ -86,6 +86,11 @@ def _control_rejection_hint(reason: str, coordinator: PlanCoordinator) -> str | 
             "重新提交计划：每个 url_read 步骤都必须通过 depends_on 直接或间接依赖至少一个 "
             "web_search 步骤，不能把 url_read 放在首批可执行步骤中；最终回答需依赖全部读取步骤。"
         )
+    if reason == "missing_required_recovery_owner":
+        return (
+            "原计划没有恢复失败任务所需的可执行步骤；请保留全部既有终态步骤，"
+            "并新增一个 pending 工具步骤，将它接入原依赖图和最终回答步骤。"
+        )
     if reason == "invalid_plan_structure":
         return "重新提交 2 至 6 个步骤；每项包含稳定 id、非空 step、pending 状态，以及 planned_tools 数组。"
     if reason == "multiple_tools_per_item":
@@ -147,6 +152,7 @@ async def process_plan_control_calls(
     tool_calls: list[dict],
     coordinator: PlanCoordinator,
     emitter: Any,
+    required_recovery_tool_name: str | None = None,
 ) -> PlanControlResult:
     """先应用控制调用，再决定同轮外部调用；回执只含安全状态码。"""
 
@@ -160,15 +166,20 @@ async def process_plan_control_calls(
     for call in control_calls:
         call_id = str(call.get("id", ""))
         payload = _parse_arguments(call.get("arguments"))
-        result = coordinator.apply_model_update(payload)
-        if not result.accepted:
+        result = coordinator.apply_model_update(
+            payload,
+            required_active_tool_name=required_recovery_tool_name,
+        )
+        accepted = result.accepted
+        reason = result.reason
+        if not accepted:
             items = payload.get("plan") if isinstance(payload, dict) else None
             if not isinstance(items, list) and isinstance(payload, dict):
                 items = payload.get("items")
             logger.info(
                 "计划控制更新被拒绝: run_id=%s reason=%s item_count=%s required_tool_coverage=%s",
                 coordinator.run_id,
-                result.reason,
+                reason,
                 min(len(items), 7) if isinstance(items, list) else None,
                 _required_tool_coverage_summary(
                     items if isinstance(items, list) else None,
@@ -176,26 +187,24 @@ async def process_plan_control_calls(
                 ),
             )
         responses[call_id] = _response(
-            status="accepted" if result.accepted else "rejected",
-            reason=result.reason,
+            status="accepted" if accepted else "rejected",
+            reason=reason,
             revision=coordinator.revision,
-            hint=None if result.accepted else _control_rejection_hint(result.reason, coordinator),
+            hint=None if accepted else _control_rejection_hint(reason, coordinator),
             canonical_plan=(
-                coordinator.canonical_plan_for_model()
-                if not result.accepted and coordinator.has_valid_model_plan
-                else None
+                coordinator.canonical_plan_for_model() if not accepted and coordinator.has_valid_model_plan else None
             ),
         )
-        accepted_control = accepted_control or result.accepted
+        accepted_control = accepted_control or accepted
         is_repairable_rejection = (
-            not result.accepted
-            and result.reason != "plan_mode_off"
-            and not (result.reason == "control_update_limit_reached" and coordinator.has_valid_model_plan)
+            not accepted
+            and reason != "plan_mode_off"
+            and not (reason == "control_update_limit_reached" and coordinator.has_valid_model_plan)
         )
         repairable_rejection = repairable_rejection or is_repairable_rejection
         if is_repairable_rejection:
-            repair_reasons.add(result.reason)
-        if result.accepted and result.snapshot is not None:
+            repair_reasons.add(reason)
+        if accepted and result.snapshot is not None:
             await emitter.plan_snapshot(**result.snapshot)
 
     round_failed = repairable_rejection and not accepted_control
@@ -232,8 +241,16 @@ async def process_plan_control_calls(
         mapped_item_ids,
         requested_item_ids,
     ):
+        server_recovery_item_id = None
+        if plan_item_id is None or requested_item_id is None:
+            server_recovery_item_id = coordinator.sole_server_recovery_item_id_for_tool(str(call.get("name", "")))
+        if server_recovery_item_id is not None:
+            plan_item_id = server_recovery_item_id
         missing_required_binding = (
-            coordinator.mode == "on" and coordinator.has_valid_model_plan and requested_item_id is None
+            coordinator.mode == "on"
+            and coordinator.has_valid_model_plan
+            and requested_item_id is None
+            and server_recovery_item_id is None
         )
         if plan_item_id is not None and not missing_required_binding:
             if plan_item_id in round_bound_item_ids:
@@ -276,9 +293,7 @@ async def process_plan_control_calls(
         executable_external_calls.append(call)
     external_calls = executable_external_calls
 
-    tolerate_status_drift = bool(repair_reasons) and repair_reasons.issubset(
-        _STATUS_DRIFT_REPAIR_REASONS
-    )
+    tolerate_status_drift = bool(repair_reasons) and repair_reasons.issubset(_STATUS_DRIFT_REPAIR_REASONS)
     repair_result = (
         coordinator.record_repair_round_with_fallback(
             tolerate_status_drift=tolerate_status_drift,

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
+from app.ai.prompts.agent_loop import VISIBLE_RESPONSE_LANGUAGE_PROMPT
 from app.schemas.chat import Conversation, Message, TextBlock
 from app.schemas.response import ApiException
 from app.services.chat.context_manager import ContextPlan
@@ -704,12 +705,17 @@ class ChatServiceTests(unittest.TestCase):
             usage=None,
         )
 
-        context_plan = MagicMock(messages=[{"role": "user", "content": "有效问题"}])
+        prepared_messages = []
+
+        async def prepare_context_fn(**kwargs):
+            prepared_messages.extend(kwargs["messages"])
+            return MagicMock(messages=kwargs["messages"])
+
         with (
             patch("app.services.chat_service.litellm.acompletion", new=AsyncMock(return_value=mock_response)) as call,
             patch(
                 "app.services.chat_service.prepare_context",
-                new=AsyncMock(return_value=context_plan),
+                new=AsyncMock(side_effect=prepare_context_fn),
             ) as prepare,
         ):
             asyncio.run(
@@ -717,14 +723,20 @@ class ChatServiceTests(unittest.TestCase):
                     "litellm_proxy/model-1",
                     "model-1",
                     {},
-                    [{"role": "user", "content": "问题"}],
+                    [{"role": "user", "content": "Explain optimistic locking."}],
                     "conv-1",
                     {"max_tokens": 9999},
                 )
             )
 
         self.assertEqual(call.await_args.kwargs["max_tokens"], 4096)
-        self.assertEqual(call.await_args.kwargs["messages"], context_plan.messages)
+        self.assertEqual(call.await_args.kwargs["messages"], prepared_messages)
+        self.assertEqual(prepared_messages[0]["role"], "system")
+        self.assertEqual(prepared_messages[0]["content"], VISIBLE_RESPONSE_LANGUAGE_PROMPT)
+        self.assertEqual(
+            prepared_messages[1],
+            {"role": "user", "content": "Explain optimistic locking."},
+        )
         self.assertEqual(prepare.await_args.kwargs["model_id"], "model-1")
         self.assertEqual(prepare.await_args.kwargs["litellm_model"], "litellm_proxy/model-1")
 
