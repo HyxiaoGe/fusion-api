@@ -154,12 +154,15 @@ jobs:
 
           docker buildx inspect $builder *> $null
           if ($LASTEXITCODE -eq 0) {
-            docker buildx prune `
-              --builder $builder `
-              --force `
-              --max-used-space 10gb `
-              --reserved-space 4gb `
-              --min-free-space 30gb
+            $pruneArgs = @(
+              "buildx", "prune",
+              "--builder", $builder,
+              "--force",
+              "--max-used-space", "10gb",
+              "--reserved-space", "4gb",
+              "--min-free-space", "30gb"
+            )
+            docker @pruneArgs
             if ($LASTEXITCODE -ne 0) {
               Write-Warning "清理 Buildx builder $builder 的缓存失败"
             }
