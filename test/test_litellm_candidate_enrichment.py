@@ -526,6 +526,47 @@ class CandidateEnrichmentTests(unittest.TestCase):
         self.assertEqual(candidate["metadata_evidence"]["cost_map_key"], "qwen/qwen-new")
         self.assertEqual(candidate["metadata"]["pricing"]["input"], 1.0)
 
+    def test_qwen_registry_uses_dashscope_cost_map_namespace(self):
+        report = candidate_report()
+        report["providers"] = {
+            "qwen": {
+                "status": "ok",
+                "report": {
+                    "provider": {"key": "qwen", "display": "通义千问"},
+                    "new": [
+                        {
+                            "provider_key": "qwen",
+                            "model_id": "qwen3.7-max",
+                            "litellm_model": "openai/qwen3.7-max",
+                            "isolation_status": "candidate",
+                        }
+                    ],
+                },
+            }
+        }
+        path = Path(__file__).resolve().parents[1] / "ops/litellm/provider-registry.example.json"
+        provider_registry = json.loads(path.read_text(encoding="utf-8"))
+
+        result = enrich(
+            candidate_report=report,
+            registry=provider_registry,
+            cost_map={
+                "dashscope/qwen3.7-max": {
+                    "litellm_provider": "dashscope",
+                    "input_cost_per_token": 0.000001,
+                    "output_cost_per_token": 0.000003,
+                    "supports_function_calling": True,
+                }
+            },
+        )
+
+        candidate = result["providers"]["qwen"]["report"]["new"][0]
+        self.assertEqual(
+            candidate["metadata_evidence"]["cost_map_key"],
+            "dashscope/qwen3.7-max",
+        )
+        self.assertEqual(candidate["metadata"]["pricing"]["input"], 1.0)
+
     def test_shared_openai_cost_entry_cannot_cross_provider_boundary(self):
         report = candidate_report()
         report["providers"] = {

@@ -138,6 +138,17 @@ python -m scripts.orchestrate_litellm_model_candidates \
 
 协调器只执行 GET，并原子更新候选报告。任何厂商缺 key、请求失败或返回空列表时都会 fail-closed：不注册模型，也不会把现有模型批量判定为 removed。
 
+聚合型厂商目录应声明 `catalog_scope: aggregated`，并把“模型仍在上游目录中”
+“归属当前 provider”“适合进入 Fusion 候选队列”分开配置和判断：
+`discovery.owned_model_prefixes` 只声明厂商
+归属，`discovery.candidate_model_patterns` 再按完整正则筛选产品候选。产品策略
+未接纳的模型记录为 `unknown(source=product_policy)`，不会进入 `new`；但其上游
+存在证据仍会阻止错误的 `removed` 判定。正式配置默认只接纳稳定业务别名；日期
+快照、preview、图片、语音、Embedding 等模型必须显式增加产品规则，不能因名称
+前缀相同自动进入收费预检。旧的单值 `api_model_prefix` 继续兼容，
+与新多前缀配置同时存在时按声明顺序合并去重。聚合目录缺少任一归属或产品规则
+都会在请求厂商目录前 fail-closed；共享 `openai/` 目录也必须至少声明归属前缀。
+
 报告中的 `new` 只代表候选。候选必须完成能力、费用和 Fusion 产品验收，之后才能单独生成 `/model/new` 与 virtual key allowlist 变更计划。
 
 ## 成本表快照与候选富化

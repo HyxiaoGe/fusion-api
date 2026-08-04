@@ -56,13 +56,44 @@ def _build_adapter(config: Mapping[str, Any]) -> ProviderAdapter:
         return MoonshotProviderAdapter()
     if adapter != "openai-compatible":
         raise ValueError("不支持的 provider adapter")
-    discovery = config.get("discovery")
-    discovery = discovery if isinstance(discovery, Mapping) else {}
+    catalog_scope = str(config.get("catalog_scope") or "provider").strip().lower()
+    if catalog_scope not in {"provider", "aggregated"}:
+        raise ValueError("catalog_scope 只支持 provider 或 aggregated")
+    raw_discovery = config.get("discovery")
+    if raw_discovery is not None and not isinstance(raw_discovery, Mapping):
+        raise ValueError("discovery 必须是对象")
+    discovery = raw_discovery if isinstance(raw_discovery, Mapping) else {}
+    owned_model_prefixes = discovery.get("owned_model_prefixes")
+    candidate_model_patterns = discovery.get("candidate_model_patterns")
+    if owned_model_prefixes is None:
+        owned_model_prefixes = []
+    if candidate_model_patterns is None:
+        candidate_model_patterns = []
+    if not isinstance(owned_model_prefixes, list) or not all(
+        isinstance(item, str) and item.strip() for item in owned_model_prefixes
+    ):
+        raise ValueError("discovery.owned_model_prefixes 必须是字符串列表")
+    if not isinstance(candidate_model_patterns, list) or not all(
+        isinstance(item, str) and item.strip() for item in candidate_model_patterns
+    ):
+        raise ValueError("discovery.candidate_model_patterns 必须是字符串列表")
+    legacy_prefix = str(config.get("api_model_prefix") or "").strip()
+    ownership_prefixes = [legacy_prefix, *owned_model_prefixes]
+    ownership_prefixes = [prefix for prefix in ownership_prefixes if prefix]
+    litellm_prefix = str(config.get("litellm_prefix") or "").strip().strip("/")
+    if litellm_prefix.lower() == "openai" and not ownership_prefixes:
+        raise ValueError("共享 openai 目录必须声明模型归属前缀")
+    if catalog_scope == "aggregated" and (
+        not isinstance(raw_discovery, Mapping) or not owned_model_prefixes or not candidate_model_patterns
+    ):
+        raise ValueError("聚合目录必须声明非空归属前缀和产品候选策略")
     return OpenAICompatibleProviderAdapter(
         provider_key=str(config.get("provider_key") or ""),
         provider_display=str(config.get("provider_display") or ""),
-        litellm_prefix=str(config.get("litellm_prefix") or ""),
-        api_model_prefix=str(config.get("api_model_prefix") or ""),
+        litellm_prefix=litellm_prefix,
+        api_model_prefix=legacy_prefix,
+        api_model_prefixes=owned_model_prefixes,
+        candidate_model_patterns=candidate_model_patterns,
         upstream_id_field=str(discovery.get("id_field") or "id"),
         upstream_strip_prefix=str(discovery.get("strip_prefix") or ""),
         required_generation_method=str(discovery.get("required_generation_method") or ""),
@@ -421,6 +452,10 @@ def coordinate_candidates(
             continue
         try:
             adapter = _build_adapter(provider)
+        except ValueError:
+            results[key] = _error_result(key, "invalid_provider_config")
+            continue
+        try:
             upstream = _fetch_model_catalog(
                 provider=provider,
                 api_key=api_key,

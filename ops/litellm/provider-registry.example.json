@@ -37,11 +37,25 @@
       "provider_key": "qwen",
       "provider_display": "通义千问",
       "litellm_prefix": "openai",
-      "cost_map_prefix": "qwen",
-      "api_model_prefix": "qwen-",
+      "cost_map_prefix": "dashscope",
+      "catalog_scope": "aggregated",
       "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
       "api_key_env": "QWEN_API_KEY",
       "credential_generation": "initial",
+      "discovery": {
+        "owned_model_prefixes": [
+          "qwen",
+          "qwq-",
+          "qvq-",
+          "text-embedding-"
+        ],
+        "candidate_model_patterns": [
+          "qwen3\\.\\d+-(?:max|plus|flash)",
+          "qwen3-(?:max|coder-(?:plus|flash)|vl-(?:max|plus|flash))",
+          "qwen-(?:max|plus|flash)",
+          "qwen-vl-(?:max|plus)"
+        ]
+      },
       "candidate_preflight": {
         "route_model_name": "candidate/qwen/*",
         "route_litellm_model": "openai/*"

@@ -106,7 +106,150 @@ def google_config():
     }
 
 
+def qwen_config():
+    path = Path(__file__).resolve().parents[1] / "ops/litellm/provider-registry.example.json"
+    registry_payload = json.loads(path.read_text(encoding="utf-8"))
+    provider = next(item for item in registry_payload["providers"] if item.get("provider_key") == "qwen")
+    provider["base_url"] = "https://dashscope.example/compatible-mode/v1"
+    provider["credential_generation"] = "test-v1"
+    return provider
+
+
 class ModelCandidateOrchestratorTests(unittest.TestCase):
+    def test_qwen_catalog_separates_provider_ownership_from_product_candidates(self):
+        client = FakeHttpClient(
+            {
+                "http://litellm.internal:4000/model/info": FakeResponse(
+                    {
+                        "data": [
+                            {
+                                "model_name": "qwen-max-latest",
+                                "litellm_params": {"model": "openai/qwen3.7-max"},
+                                "model_info": {
+                                    "db_model": True,
+                                    "metadata": {"provider_key": "qwen"},
+                                },
+                            },
+                            {
+                                "model_name": "qwen3.6-plus",
+                                "litellm_params": {"model": "openai/qwen3.6-plus"},
+                                "model_info": {
+                                    "db_model": True,
+                                    "metadata": {"provider_key": "qwen"},
+                                },
+                            },
+                        ]
+                    }
+                ),
+                "https://dashscope.example/compatible-mode/v1/models": FakeResponse(
+                    {
+                        "data": [
+                            {"id": "qwen3.8-max"},
+                            {"id": "qwen3.7-max"},
+                            {"id": "qwen3.6-plus"},
+                            {"id": "qwen-image-2.0"},
+                            {"id": "qwen3-tts-instruct-flash"},
+                            {"id": "qwen3.7-text-embedding"},
+                            {"id": "text-embedding-v4"},
+                            {"id": "qwen3.8-max-image"},
+                            {"id": "qwen3.7-max-preview"},
+                            {"id": "deepseek-v4-pro"},
+                            {"id": "kimi/kimi-k3"},
+                        ]
+                    }
+                ),
+            }
+        )
+
+        report = orchestrator.coordinate_candidates(
+            registry=registry(qwen_config()),
+            environ={
+                "LITELLM_MASTER_KEY": "litellm-secret",
+                "QWEN_API_KEY": "qwen-secret",
+            },
+            client=client,
+        )
+
+        provider = report["providers"]["qwen"]["report"]
+        self.assertEqual([item["model_id"] for item in provider["new"]], ["qwen3.8-max"])
+        self.assertEqual(
+            [item["model_id"] for item in provider["existing"]],
+            ["qwen3.6-plus", "qwen3.7-max"],
+        )
+        self.assertEqual(provider["removed"], [])
+        self.assertEqual(
+            [(item["source"], item["model_id"]) for item in provider["unknown"]],
+            [
+                ("product_policy", "qwen-image-2.0"),
+                ("product_policy", "qwen3-tts-instruct-flash"),
+                ("product_policy", "qwen3.7-text-embedding"),
+                ("product_policy", "text-embedding-v4"),
+                ("product_policy", "qwen3.8-max-image"),
+                ("product_policy", "qwen3.7-max-preview"),
+                ("upstream", "deepseek-v4-pro"),
+                ("upstream", "kimi/kimi-k3"),
+            ],
+        )
+
+    def test_invalid_provider_candidate_regex_is_reported_without_catalog_request(self):
+        provider = qwen_config()
+        provider["discovery"]["candidate_model_patterns"] = ["["]
+        client = FakeHttpClient(
+            {
+                "http://litellm.internal:4000/model/info": FakeResponse({"data": []}),
+            }
+        )
+
+        report = orchestrator.coordinate_candidates(
+            registry=registry(provider),
+            environ={
+                "LITELLM_MASTER_KEY": "litellm-secret",
+                "QWEN_API_KEY": "qwen-secret",
+            },
+            client=client,
+        )
+
+        self.assertEqual(report["providers"]["qwen"]["error"]["code"], "invalid_provider_config")
+        self.assertEqual([call[0] for call in client.calls], ["http://litellm.internal:4000/model/info"])
+
+    def test_aggregated_qwen_catalog_requires_nonempty_ownership_and_product_policy(self):
+        invalid_discovery_values = [
+            None,
+            "invalid",
+            [],
+            {},
+            {"owned_model_prefixes": [], "candidate_model_patterns": []},
+            {"owned_model_prefixes": ["qwen"], "candidate_model_patterns": []},
+        ]
+
+        for invalid_discovery in invalid_discovery_values:
+            with self.subTest(discovery=invalid_discovery):
+                provider = qwen_config()
+                provider["discovery"] = invalid_discovery
+                client = FakeHttpClient(
+                    {
+                        "http://litellm.internal:4000/model/info": FakeResponse({"data": []}),
+                    }
+                )
+
+                report = orchestrator.coordinate_candidates(
+                    registry=registry(provider),
+                    environ={
+                        "LITELLM_MASTER_KEY": "litellm-secret",
+                        "QWEN_API_KEY": "qwen-secret",
+                    },
+                    client=client,
+                )
+
+                self.assertEqual(
+                    report["providers"]["qwen"]["error"]["code"],
+                    "invalid_provider_config",
+                )
+                self.assertEqual(
+                    [call[0] for call in client.calls],
+                    ["http://litellm.internal:4000/model/info"],
+                )
+
     def test_minimax_without_discovery_config_uses_standard_v1_models_catalog(self):
         provider = {
             **acme_config(),
