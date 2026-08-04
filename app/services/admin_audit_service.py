@@ -49,6 +49,7 @@ class AdminAuditService:
         target_user_id: str | None = None,
         reason: str | None = None,
         metadata: dict[str, Any] | None = None,
+        commit: bool = True,
     ) -> None:
         audit_metadata = {}
         for key, value in (metadata or {}).items():
@@ -79,6 +80,7 @@ class AdminAuditService:
                 request_id=request_id,
                 reason=safe_reason or None,
                 extra_metadata=safe_metadata,
+                commit=commit,
             )
         except Exception as exc:
             self.repository.db.rollback()

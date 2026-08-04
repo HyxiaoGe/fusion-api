@@ -248,6 +248,7 @@ jobs:
           # dev 中 auth-service 只在 Docker 网络内暴露，未发布宿主机 8100。
           # 显式覆盖旧 .env 里的宿主机地址，避免 fusion-api JWKS/userinfo 校验连到不可达地址。
           export AUTH_SERVICE_INTERNAL_BASE_URL="http://auth-service:8100"
+          test -d "${LITELLM_GOVERNANCE_ROOT_HOST:-/home/heyanxiao/backups/litellm-governance}"
           mkdir -p ./fusion-api/storage/files
           if docker container inspect fusion-api >/dev/null 2>&1; then
             if docker inspect fusion-api --format '{{range .Mounts}}{{println .Destination}}{{end}}' | grep -qx '/app/storage/files'; then
@@ -289,6 +290,7 @@ jobs:
               volumes:
                 - ./fusion-api/logs:/app/logs
                 - ./fusion-api/storage/files:/app/storage/files
+                - ${LITELLM_GOVERNANCE_ROOT_HOST:-/home/heyanxiao/backups/litellm-governance}:/var/lib/fusion/litellm-governance:ro
               environment:
                 - DATABASE_URL=${DATABASE_URL}
                 - SERVER_HOST=${SERVER_HOST}
@@ -323,6 +325,12 @@ jobs:
                 - MOONSHOT_API_KEY=${MOONSHOT_API_KEY:-}
                 - LITELLM_PROXY_URL=${LITELLM_PROXY_URL:-http://litellm-proxy:4000}
                 - LITELLM_API_KEY=${LITELLM_API_KEY:-}
+                - LITELLM_GOVERNANCE_ROOT=/var/lib/fusion/litellm-governance
+                - LITELLM_GOVERNANCE_MAX_AGE_SECONDS=${LITELLM_GOVERNANCE_MAX_AGE_SECONDS:-86400}
+                - LITELLM_MODEL_MANAGEMENT_ENABLED=${LITELLM_MODEL_MANAGEMENT_ENABLED:-false}
+                - LITELLM_MODEL_ADMISSION_WORKER_ENABLED=${LITELLM_MODEL_ADMISSION_WORKER_ENABLED:-false}
+                - LITELLM_MODEL_ADMISSION_WORKER_TOKEN=${LITELLM_MODEL_ADMISSION_WORKER_TOKEN:-}
+                - LITELLM_MODEL_ADMISSION_LEASE_SECONDS=${LITELLM_MODEL_ADMISSION_LEASE_SECONDS:-600}
                 - PROMPTHUB_SYNC_MODE=${PROMPTHUB_SYNC_MODE:-disabled}
                 - PROMPTHUB_BASE_URL=${PROMPTHUB_BASE_URL:-http://prompthub-backend:8000}
                 - PROMPTHUB_API_KEY=${PROMPTHUB_API_KEY:-}
@@ -432,6 +440,16 @@ jobs:
           PY
 
           docker inspect fusion-api --format '{{range .Mounts}}{{println .Destination}}{{end}}' | grep -qx '/app/storage/files'
+          docker inspect fusion-api --format '{{range .Mounts}}{{println .Destination}}{{end}}' | grep -qx '/var/lib/fusion/litellm-governance'
+          docker exec -i fusion-api python - <<'PY'
+          from app.core.config import settings
+
+          if settings.LITELLM_GOVERNANCE_ROOT != "/var/lib/fusion/litellm-governance":
+              raise SystemExit("LiteLLM governance mount path mismatch")
+          if settings.LITELLM_GOVERNANCE_MAX_AGE_SECONDS <= 0:
+              raise SystemExit("LiteLLM governance max age must be positive")
+          print("LiteLLM model management read-only boundary ok")
+          PY
           docker exec -i fusion-api python - <<'PY'
           import asyncio
           import urllib.request

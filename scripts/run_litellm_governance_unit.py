@@ -20,9 +20,12 @@ from scripts.check_litellm_governance_runtime import runtime_status
 
 ENV_NAME_PATTERN = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 GOVERNANCE_ENV_NAMES = {
+    "FUSION_MODEL_MANAGEMENT_BASE_URL",
+    "LITELLM_MODEL_ADMISSION_WORKER_TOKEN",
     "LITELLM_BASE_URL",
     "LITELLM_PROXY_URL",
     "LITELLM_CANDIDATE_KEY",
+    "LITELLM_VIRTUAL_KEY",
 }
 SAFE_INHERITED_ENV_NAMES = {
     "HOME",

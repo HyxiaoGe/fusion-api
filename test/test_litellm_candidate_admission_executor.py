@@ -306,6 +306,7 @@ def execute(
     confirm_model_id="kimi-k3",
     fingerprint="a" * 64,
     audit_fn=None,
+    catalog_invalidation_fn=None,
 ):
     return executor.execute_admission(
         plan=admission_plan(),
@@ -320,6 +321,7 @@ def execute(
         environ={"MOONSHOT_API_KEY": "provider-super-secret"},
         client=client,
         audit_fn=audit_fn or (lambda **_: True),
+        catalog_invalidation_fn=catalog_invalidation_fn,
     )
 
 
@@ -586,6 +588,43 @@ class CandidateAdmissionExecutorTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "succeeded")
         self.assertEqual(sleep.call_count, 2)
+
+    def test_catalog_is_invalidated_before_fusion_readback(self):
+        client = StatefulClient()
+        callback_observations = []
+
+        def invalidate_catalog():
+            callback_observations.append(
+                {
+                    "allowlisted": "kimi-k3" in client.key_models,
+                    "fusion_reads": len(
+                        [call for call in client.calls if call[0] == "GET" and call[1].endswith("/api/models/")]
+                    ),
+                }
+            )
+
+        result = execute(client, catalog_invalidation_fn=invalidate_catalog)
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(callback_observations, [{"allowlisted": True, "fusion_reads": 0}])
+        self.assertEqual(
+            result["completed_phases"],
+            ["model_new", "verify", "key_update", "catalog_invalidation", "fusion_readback", "audit"],
+        )
+
+    def test_catalog_invalidation_failure_is_compensated(self):
+        client = StatefulClient()
+
+        def fail_invalidation():
+            raise RuntimeError("sensitive internal failure")
+
+        result = execute(client, catalog_invalidation_fn=fail_invalidation)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"]["code"], "fusion_catalog_invalidation_failed")
+        self.assertTrue(result["compensation"]["key_restored"])
+        self.assertTrue(result["compensation"]["model_deleted"])
+        self.assertNotIn("sensitive internal failure", json.dumps(result))
 
     def test_each_mutating_stage_failure_rolls_back_model_and_allowlist(self):
         for stage in ("verify", "key_update", "fusion_readback", "audit"):

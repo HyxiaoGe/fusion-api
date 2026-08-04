@@ -20,6 +20,16 @@ def _populated_query(db):
 
 
 class ChatServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.registered_model_patcher = patch(
+            "app.services.chat_service.litellm_catalog.get_model_entry",
+            side_effect=lambda _model_id: {"db_model": True},
+        )
+        self.registered_model_patcher.start()
+
+    def tearDown(self):
+        self.registered_model_patcher.stop()
+
     def test_deep_research_capability_gate_runs_before_conversation_or_message_persistence(self):
         service = ChatService(MagicMock())
         service._get_or_create_conversation = MagicMock()
@@ -48,6 +58,102 @@ class ChatServiceTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "MODEL_UNAVAILABLE")
         service._get_or_create_conversation.assert_not_called()
         service.conversation_service.create_message.assert_not_called()
+
+    def test_existing_conversation_ignores_client_model_override_and_hidden_model_remains_routable(self):
+        service = ChatService(MagicMock())
+        service.conversation_service = MagicMock()
+        service.conversation_service.get_conversation.return_value = SimpleNamespace(
+            id="conv-1",
+            model_id="saved/model",
+        )
+        service.model_control_repository = MagicMock()
+        service.model_control_repository.get.return_value = SimpleNamespace(selectable=False, routable=True)
+        service._get_or_create_conversation = MagicMock()
+
+        with (
+            patch(
+                "app.services.chat_service.llm_manager.resolve_model",
+                return_value=("openai/saved-model", "saved", {}),
+            ) as resolve_model,
+            patch(
+                "app.services.chat_service.litellm_catalog.get_capabilities",
+                return_value={"functionCalling": True, "searchCapable": True},
+            ),
+            self.assertRaises(ApiException) as raised,
+        ):
+            asyncio.run(
+                service.process_message(
+                    model_id="attacker/override",
+                    message="继续对话",
+                    user_id="user-1",
+                    conversation_id="conv-1",
+                    stream=False,
+                    options={"task_mode": "deep_research"},
+                )
+            )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        resolve_model.assert_called_once_with("saved/model")
+        service.model_control_repository.get.assert_called_once_with("saved/model")
+        service._get_or_create_conversation.assert_not_called()
+
+    def test_new_conversation_rejects_hidden_or_unregistered_model_before_generation(self):
+        hidden = ChatService(MagicMock())
+        hidden.model_control_repository = MagicMock()
+        hidden.model_control_repository.get.return_value = SimpleNamespace(selectable=False, routable=True)
+        with (
+            patch("app.services.chat_service.llm_manager.resolve_model") as resolve_model,
+            self.assertRaises(ApiException) as raised,
+        ):
+            asyncio.run(
+                hidden.process_message(
+                    model_id="hidden/model",
+                    message="新会话",
+                    user_id="user-1",
+                )
+            )
+        self.assertEqual(raised.exception.code, "MODEL_UNAVAILABLE")
+        resolve_model.assert_not_called()
+
+        unregistered = ChatService(MagicMock())
+        with (
+            patch("app.services.chat_service.litellm_catalog.get_model_entry", return_value=None),
+            patch("app.services.chat_service.llm_manager.resolve_model") as resolve_model,
+            self.assertRaises(ApiException) as raised,
+        ):
+            asyncio.run(
+                unregistered.process_message(
+                    model_id="unknown/model",
+                    message="新会话",
+                    user_id="user-1",
+                )
+            )
+        self.assertEqual(raised.exception.code, "MODEL_UNAVAILABLE")
+        resolve_model.assert_not_called()
+
+    def test_existing_conversation_rejects_non_routable_model(self):
+        service = ChatService(MagicMock())
+        service.conversation_service = MagicMock()
+        service.conversation_service.get_conversation.return_value = SimpleNamespace(
+            id="conv-1",
+            model_id="disabled/model",
+        )
+        service.model_control_repository = MagicMock()
+        service.model_control_repository.get.return_value = SimpleNamespace(selectable=True, routable=False)
+        with (
+            patch("app.services.chat_service.llm_manager.resolve_model") as resolve_model,
+            self.assertRaises(ApiException) as raised,
+        ):
+            asyncio.run(
+                service.process_message(
+                    model_id="other/model",
+                    message="继续对话",
+                    user_id="user-1",
+                    conversation_id="conv-1",
+                )
+            )
+        self.assertEqual(raised.exception.code, "MODEL_UNAVAILABLE")
+        resolve_model.assert_not_called()
 
     def test_stop_guard_init_failure_returns_explicit_retryable_message(self):
         with self.assertRaises(ApiException) as raised:

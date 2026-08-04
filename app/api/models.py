@@ -11,9 +11,12 @@
 
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 
 from app.ai import litellm_catalog, litellm_health
+from app.api.deps import get_model_catalog_control_repository
+from app.db.model_catalog_control_repository import ModelCatalogControlRepository
+from app.db.models import ModelCatalogControl
 from app.schemas.response import success
 from app.services.agent_strategy_config import get_agent_tools_disabled_aliases
 from app.services.model_presentation import build_model_capability_presentation
@@ -47,7 +50,11 @@ def _normalize_provider_key(metadata: Dict[str, Any], underlying: str) -> str:
     return "litellm"
 
 
-def _entry_to_card(alias: str, entry: Dict[str, Any]) -> Dict[str, Any]:
+def _entry_to_card(
+    alias: str,
+    entry: Dict[str, Any],
+    control: ModelCatalogControl | None = None,
+) -> Dict[str, Any]:
     """LiteLLM 单条 model_info → 前端模型卡片。"""
     metadata = entry.get("metadata") or {}
     underlying = entry.get("underlying") or ""
@@ -83,6 +90,8 @@ def _entry_to_card(alias: str, entry: Dict[str, Any]) -> Dict[str, Any]:
             "unit": pricing.get("unit") or "USD",
         },
         "enabled": True,  # LiteLLM 里能查到就算注册成功；可不可调由 health 决定
+        "selectable": bool(control.selectable) if control is not None else True,
+        "routable": True,
         # health 由后台轮询 LiteLLM /health 得到，FE 用来决定是否灰显
         "health": litellm_health.get_health(alias),
         "description": metadata.get("description") or "",
@@ -119,6 +128,7 @@ async def get_models(
     provider: Optional[str] = None,
     enabled: Optional[bool] = None,
     capability: Optional[str] = None,
+    controls: ModelCatalogControlRepository = Depends(get_model_catalog_control_repository),
 ):
     """返回 LiteLLM 注册的所有模型（前端用，兼容旧字段）。
 
@@ -128,8 +138,10 @@ async def get_models(
         capability: 只返回支持指定能力的模型（'vision' / 'functionCalling' / ...）
     """
     catalog = litellm_catalog.list_aliases()
+    db_aliases = [alias for alias, entry in catalog.items() if entry.get("db_model")]
+    controls_by_model = controls.get_by_model_ids(db_aliases)
     # 只展示 db_model=true 的别名，避免把 LiteLLM 自身的 wildcard 路由暴露给前端
-    cards = [_entry_to_card(alias, entry) for alias, entry in catalog.items() if entry.get("db_model")]
+    cards = [_entry_to_card(alias, catalog[alias], controls_by_model.get(alias)) for alias in db_aliases]
 
     if provider:
         cards = [c for c in cards if c["provider"] == provider]
@@ -149,11 +161,16 @@ async def get_models(
 
 
 @router.get("/{model_id}")
-async def get_model(model_id: str, request: Request):
+async def get_model(
+    model_id: str,
+    request: Request,
+    controls: ModelCatalogControlRepository = Depends(get_model_catalog_control_repository),
+):
     """按 alias 查单个模型详情。"""
     entry = litellm_catalog.get_model_entry(model_id)
     if not entry or not entry.get("db_model"):
         from app.schemas.response import ApiException
 
         raise ApiException.not_found(f"模型 {model_id} 不存在")
-    return success(data=_entry_to_card(model_id, entry), request_id=request.state.request_id)
+    control = controls.get(model_id)
+    return success(data=_entry_to_card(model_id, entry, control), request_id=request.state.request_id)

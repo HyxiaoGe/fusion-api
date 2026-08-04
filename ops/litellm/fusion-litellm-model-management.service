@@ -1,0 +1,38 @@
+[Unit]
+Description=Fusion LiteLLM 模型准入 Worker
+After=network-online.target
+Wants=network-online.target
+AssertPathExists=%h/project/fusion/fusion-api/scripts/run_litellm_model_management_worker.py
+AssertPathExists=%h/project/fusion/fusion-api/scripts/run_litellm_governance_unit.py
+AssertPathExists=%h/project/litellm-proxy/.env
+AssertPathExists=%h/.config/fusion/litellm-provider-registry.json
+AssertPathExists=%h/.config/fusion/litellm-governance.env
+AssertPathIsDirectory=%h/backups/litellm-governance
+AssertPathIsDirectory=%h/.local/state/fusion/litellm-model-management
+AssertFileIsExecutable=%h/.local/share/fusion/litellm-governance-venv/bin/python
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/project/fusion/fusion-api
+Environment=PYTHONNOUSERSITE=1
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+UnsetEnvironment=PYTHONPATH PYTHONHOME LD_PRELOAD
+UMask=0077
+ExecStart=%h/.local/share/fusion/litellm-governance-venv/bin/python -m scripts.run_litellm_governance_unit \
+  --proxy-env %h/project/litellm-proxy/.env \
+  --governance-env %h/.config/fusion/litellm-governance.env \
+  --registry %h/.config/fusion/litellm-provider-registry.json \
+  --require-env LITELLM_MASTER_KEY \
+  --require-env LITELLM_VIRTUAL_KEY \
+  --require-env LITELLM_MODEL_ADMISSION_WORKER_TOKEN \
+  -- \
+  %h/.local/share/fusion/litellm-governance-venv/bin/python -m scripts.run_litellm_model_management_worker \
+    --governance-root %h/backups/litellm-governance \
+    --state-dir %h/.local/state/fusion/litellm-model-management \
+    --governance-max-age-seconds 86400
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=%h/backups/litellm-governance %h/.config/fusion
+ReadWritePaths=%h/.local/state/fusion/litellm-model-management

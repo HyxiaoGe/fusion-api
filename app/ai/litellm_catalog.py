@@ -19,7 +19,9 @@ import time
 from typing import Any, Dict, Optional
 
 import httpx
+import redis
 
+from app.core.config import settings
 from app.core.logger import app_logger as logger
 
 _LITELLM_BASE_URL = os.environ.get("LITELLM_PROXY_URL", "http://litellm-proxy:4000").rstrip("/")
@@ -29,12 +31,66 @@ _DEFAULT_AGENT_TOOLS_DISABLED_ALIASES = {"qwen-vl-max"}
 # 缓存生效时间——LiteLLM 模型变更频次低，60s 足够
 _CACHE_TTL_SECONDS = 60.0
 _FAILED_FETCH_BACKOFF_SECONDS = float(os.environ.get("LITELLM_CATALOG_FAILURE_BACKOFF_SECONDS", "30"))
+_GENERATION_CHECK_INTERVAL_SECONDS = float(
+    os.environ.get("LITELLM_CATALOG_GENERATION_CHECK_INTERVAL_SECONDS", "1")
+)
+_CATALOG_GENERATION_KEY = "fusion:litellm:catalog:generation"
 
 _cache_lock = threading.Lock()
 _cache_payload: Optional[Dict[str, Dict[str, Any]]] = None
 _cache_loaded_at: float = 0.0
 _cache_last_attempt_at: float | None = None
 _cache_last_attempt_failed = False
+_cache_generation: str | None = None
+_last_generation_check_at = 0.0
+_generation_redis: redis.Redis | None = None
+_generation_error_logged = False
+
+
+def _get_generation_redis() -> redis.Redis:
+    global _generation_redis
+    if _generation_redis is None:
+        _generation_redis = redis.from_url(
+            settings.REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=0.25,
+            socket_timeout=0.25,
+        )
+    return _generation_redis
+
+
+def _read_catalog_generation() -> str | None:
+    global _generation_error_logged
+    try:
+        value = _get_generation_redis().get(_CATALOG_GENERATION_KEY)
+    except Exception:
+        if not _generation_error_logged:
+            logger.warning("litellm_catalog: Redis generation unavailable")
+            _generation_error_logged = True
+        return None
+    _generation_error_logged = False
+    return str(value or "0")
+
+
+def _sync_distributed_generation(now: float) -> None:
+    """发现其他进程推进目录代次时，在使用 TTL 缓存前先清掉本地副本。"""
+    global _cache_generation, _last_generation_check_at
+    if now - _last_generation_check_at < _GENERATION_CHECK_INTERVAL_SECONDS:
+        return
+    _last_generation_check_at = now
+    generation = _read_catalog_generation()
+    if generation is None:
+        return
+    if _cache_generation is None:
+        with _cache_lock:
+            has_unversioned_cache = _cache_payload is not None
+        if has_unversioned_cache:
+            _clear_local_cache(generation=generation)
+        else:
+            _cache_generation = generation
+        return
+    if generation != _cache_generation:
+        _clear_local_cache(generation=generation)
 
 
 def _fetch_catalog() -> Dict[str, Dict[str, Any]]:
@@ -76,6 +132,7 @@ def _ensure_loaded() -> Dict[str, Dict[str, Any]]:
     """返回当前缓存内容，过期时同步刷新。"""
     global _cache_payload, _cache_loaded_at, _cache_last_attempt_at, _cache_last_attempt_failed
     now = time.monotonic()
+    _sync_distributed_generation(now)
     with _cache_lock:
         if _cache_payload is not None and now - _cache_loaded_at < _CACHE_TTL_SECONDS:
             return _cache_payload
@@ -196,11 +253,28 @@ def get_cache_status() -> dict[str, Any]:
         }
 
 
-def invalidate() -> None:
-    """主动清缓存（测试用 / 模型变更后）。"""
-    global _cache_payload, _cache_loaded_at, _cache_last_attempt_at, _cache_last_attempt_failed
+def _clear_local_cache(*, generation: str | None = None) -> None:
+    global _cache_payload, _cache_loaded_at, _cache_last_attempt_at, _cache_last_attempt_failed, _cache_generation
     with _cache_lock:
         _cache_payload = None
         _cache_loaded_at = 0.0
         _cache_last_attempt_at = None
         _cache_last_attempt_failed = False
+        if generation is not None:
+            _cache_generation = generation
+
+
+def invalidate() -> None:
+    """主动清除当前进程缓存；不推进跨进程目录代次。"""
+    global _cache_generation, _last_generation_check_at, _generation_error_logged
+    _clear_local_cache()
+    _cache_generation = None
+    _last_generation_check_at = 0.0
+    _generation_error_logged = False
+
+
+def bump_generation() -> str:
+    """推进 Redis 目录代次并立即清除当前进程缓存。"""
+    generation = str(_get_generation_redis().incr(_CATALOG_GENERATION_KEY))
+    _clear_local_cache(generation=generation)
+    return generation

@@ -28,6 +28,9 @@ class LiteLLMGovernanceUnitRunnerTests(unittest.TestCase):
                 [
                     "LITELLM_BASE_URL=http://127.0.0.1:4000",
                     "LITELLM_CANDIDATE_KEY=candidate",
+                    "LITELLM_VIRTUAL_KEY=virtual",
+                    "FUSION_MODEL_MANAGEMENT_BASE_URL=http://127.0.0.1:8002",
+                    "LITELLM_MODEL_ADMISSION_WORKER_TOKEN=worker-token",
                 ]
             ),
             encoding="utf-8",
@@ -58,6 +61,8 @@ class LiteLLMGovernanceUnitRunnerTests(unittest.TestCase):
                 required_env_names=[
                     "LITELLM_MASTER_KEY",
                     "LITELLM_CANDIDATE_KEY",
+                    "LITELLM_VIRTUAL_KEY",
+                    "LITELLM_MODEL_ADMISSION_WORKER_TOKEN",
                 ],
                 inherited={
                     "HOME": "/home/test",
@@ -72,6 +77,12 @@ class LiteLLMGovernanceUnitRunnerTests(unittest.TestCase):
         self.assertEqual(execute_env["LITELLM_MASTER_KEY"], "master")
         self.assertEqual(execute_env["MOONSHOT_API_KEY"], "moonshot")
         self.assertEqual(execute_env["LITELLM_CANDIDATE_KEY"], "candidate")
+        self.assertEqual(execute_env["LITELLM_VIRTUAL_KEY"], "virtual")
+        self.assertEqual(
+            execute_env["FUSION_MODEL_MANAGEMENT_BASE_URL"],
+            "http://127.0.0.1:8002",
+        )
+        self.assertEqual(execute_env["LITELLM_MODEL_ADMISSION_WORKER_TOKEN"], "worker-token")
         self.assertNotIn("PYTHONPATH", execute_env)
         self.assertNotIn("LD_PRELOAD", execute_env)
         self.assertEqual(execute_env["PYTHONNOUSERSITE"], "1")

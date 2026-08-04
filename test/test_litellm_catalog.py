@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app.ai import litellm_catalog
 
@@ -74,6 +74,7 @@ class LiteLLMCatalogTests(unittest.TestCase):
         litellm_catalog.invalidate()
         with (
             patch.object(litellm_catalog, "_fetch_catalog", return_value={}) as fetch,
+            patch.object(litellm_catalog, "_read_catalog_generation", return_value="0"),
             patch.object(litellm_catalog.time, "monotonic", side_effect=[100.0, 101.0, 131.0]),
         ):
             self.assertEqual(litellm_catalog.list_aliases(), {})
@@ -90,8 +91,10 @@ class LiteLLMCatalogTests(unittest.TestCase):
         stale = {"deepseek-chat": {"db_model": True, "metadata": {}}}
         litellm_catalog._cache_payload = stale
         litellm_catalog._cache_loaded_at = 1.0
+        litellm_catalog._cache_generation = "0"
         with (
             patch.object(litellm_catalog, "_fetch_catalog", return_value={}) as fetch,
+            patch.object(litellm_catalog, "_read_catalog_generation", return_value="0"),
             patch.object(litellm_catalog.time, "monotonic", side_effect=[100.0, 101.0]),
         ):
             self.assertEqual(litellm_catalog.list_aliases(), stale)
@@ -102,6 +105,49 @@ class LiteLLMCatalogTests(unittest.TestCase):
             self.assertEqual(litellm_catalog.list_aliases(), stale)
 
         fetch.assert_called_once_with()
+
+    def test_redis_generation_change_invalidates_preheated_process_cache(self):
+        litellm_catalog._cache_payload = {"old-model": {"db_model": True, "metadata": {}}}
+        litellm_catalog._cache_loaded_at = 100.0
+        litellm_catalog._cache_generation = "41"
+        refreshed = {"new-model": {"db_model": True, "metadata": {}}}
+
+        with (
+            patch.object(litellm_catalog, "_read_catalog_generation", return_value="42"),
+            patch.object(litellm_catalog, "_fetch_catalog", return_value=refreshed) as fetch,
+            patch.object(litellm_catalog.time, "monotonic", return_value=101.0),
+        ):
+            self.assertEqual(litellm_catalog.list_aliases(), refreshed)
+
+        fetch.assert_called_once_with()
+        self.assertEqual(litellm_catalog._cache_generation, "42")
+
+    def test_first_generation_seen_invalidates_unversioned_cache(self):
+        litellm_catalog._cache_payload = {"old-model": {"db_model": True, "metadata": {}}}
+        litellm_catalog._cache_loaded_at = 100.0
+        litellm_catalog._cache_generation = None
+        refreshed = {"new-model": {"db_model": True, "metadata": {}}}
+
+        with (
+            patch.object(litellm_catalog, "_read_catalog_generation", return_value="5"),
+            patch.object(litellm_catalog, "_fetch_catalog", return_value=refreshed),
+            patch.object(litellm_catalog.time, "monotonic", return_value=101.0),
+        ):
+            self.assertEqual(litellm_catalog.list_aliases(), refreshed)
+
+        self.assertEqual(litellm_catalog._cache_generation, "5")
+
+    def test_bump_generation_invalidates_local_cache(self):
+        redis_client = Mock()
+        redis_client.incr.return_value = 7
+        litellm_catalog._cache_payload = {"old-model": {"db_model": True, "metadata": {}}}
+
+        with patch.object(litellm_catalog, "_get_generation_redis", return_value=redis_client):
+            generation = litellm_catalog.bump_generation()
+
+        self.assertEqual(generation, "7")
+        self.assertIsNone(litellm_catalog._cache_payload)
+        self.assertEqual(litellm_catalog._cache_generation, "7")
 
 
 if __name__ == "__main__":

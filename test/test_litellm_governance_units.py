@@ -8,6 +8,8 @@ SERVICE = ROOT / "ops/litellm/fusion-litellm-governance.service"
 TIMER = ROOT / "ops/litellm/fusion-litellm-governance.timer"
 COST_SERVICE = ROOT / "ops/litellm/fusion-litellm-cost-sync.service"
 COST_TIMER = ROOT / "ops/litellm/fusion-litellm-cost-sync.timer"
+MODEL_MANAGEMENT_SERVICE = ROOT / "ops/litellm/fusion-litellm-model-management.service"
+MODEL_MANAGEMENT_TIMER = ROOT / "ops/litellm/fusion-litellm-model-management.timer"
 REQUIREMENTS = ROOT / "ops/litellm/requirements-governance.txt"
 GOVERNANCE_ENV = ROOT / "ops/litellm/litellm-governance.env.example"
 
@@ -21,6 +23,7 @@ class LiteLLMGovernanceUnitTests(unittest.TestCase):
             "scripts.orchestrate_litellm_model_candidates",
             "scripts.enrich_litellm_model_candidates",
             "scripts.execute_litellm_candidate_admission",
+            "scripts.run_litellm_model_management_worker",
         )
 
         for module in modules:
@@ -92,11 +95,32 @@ class LiteLLMGovernanceUnitTests(unittest.TestCase):
         self.assertIn("httpx==0.28.1", content)
         self.assertNotIn(">=", content)
 
+    def test_model_management_worker_is_isolated_and_timer_driven(self):
+        service = MODEL_MANAGEMENT_SERVICE.read_text(encoding="utf-8")
+        timer = MODEL_MANAGEMENT_TIMER.read_text(encoding="utf-8")
+
+        self.assertIn("run_litellm_model_management_worker", service)
+        self.assertIn("run_litellm_governance_unit", service)
+        self.assertIn("--require-env LITELLM_MASTER_KEY", service)
+        self.assertIn("--require-env LITELLM_VIRTUAL_KEY", service)
+        self.assertIn("--require-env LITELLM_MODEL_ADMISSION_WORKER_TOKEN", service)
+        self.assertNotIn("EnvironmentFile=", service)
+        self.assertIn("ProtectSystem=strict", service)
+        self.assertIn("ProtectHome=read-only", service)
+        self.assertIn("NoNewPrivileges=true", service)
+        self.assertIn("%h/backups/litellm-governance", service)
+        self.assertIn("%h/.local/state/fusion/litellm-model-management", service)
+        self.assertIn("ReadWritePaths=", service)
+        self.assertIn("OnCalendar=*-*-* *:*:00 Asia/Shanghai", timer)
+        self.assertIn("Persistent=true", timer)
+
     def test_governance_env_does_not_duplicate_provider_or_master_keys(self):
         content = GOVERNANCE_ENV.read_text(encoding="utf-8")
 
         self.assertIn("LITELLM_BASE_URL=", content)
         self.assertIn("LITELLM_CANDIDATE_KEY=", content)
+        self.assertIn("LITELLM_VIRTUAL_KEY=", content)
+        self.assertIn("LITELLM_MODEL_ADMISSION_WORKER_TOKEN=", content)
         self.assertNotIn("LITELLM_MASTER_KEY=", content)
         self.assertNotIn("MOONSHOT_API_KEY=", content)
         self.assertNotIn("QWEN_API_KEY=", content)

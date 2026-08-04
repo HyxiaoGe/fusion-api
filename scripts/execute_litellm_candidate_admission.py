@@ -543,6 +543,7 @@ def execute_admission(
     environ: Mapping[str, str] | None = None,
     client: HttpClient | None = None,
     audit_fn: Callable[..., bool] = _default_audit,
+    catalog_invalidation_fn: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """执行单候选事务；dry-run 路径不触发任何 HTTP。"""
     try:
@@ -573,6 +574,7 @@ def execute_admission(
         virtual_key=virtual_key,
         environ=environ or {},
         audit_fn=audit_fn,
+        catalog_invalidation_fn=catalog_invalidation_fn,
     )
 
 
@@ -618,6 +620,7 @@ def _execute_apply(
     virtual_key: str,
     environ: Mapping[str, str],
     audit_fn: Callable[..., bool],
+    catalog_invalidation_fn: Callable[[], None] | None,
 ) -> dict[str, Any]:
     created_uuid = ""
     before_key_models: list[str] = []
@@ -697,6 +700,15 @@ def _execute_apply(
             phase="key_update",
         )
         result["completed_phases"].append("key_update")
+        if catalog_invalidation_fn is not None:
+            try:
+                catalog_invalidation_fn()
+            except Exception as exc:
+                raise TransactionFailure(
+                    "fusion_catalog_invalidation_failed",
+                    "catalog_invalidation",
+                ) from exc
+            result["completed_phases"].append("catalog_invalidation")
         fusion_models = _wait_for_fusion_model(
             client,
             fusion_base_url,

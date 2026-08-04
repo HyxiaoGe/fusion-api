@@ -343,6 +343,37 @@ bash scripts/validate_litellm_db_env_reference.sh
 
 ## 受控准入事务
 
+设置页的模型管理 V1 不会在管理员 HTTP 请求内执行下述事务。管理员提交只会
+创建 PostgreSQL 持久任务并返回 `202 + operation_id`；独立的
+`fusion-litellm-model-management.timer` 每分钟唤醒受信 Worker 领取一个任务。
+API 容器仅以只读方式挂载治理根目录，不得注入 LiteLLM master/provider key。
+
+Worker 继续通过 `run_litellm_governance_unit.py` 从既有两份 `0600` 配置按白名单
+加载凭据。治理专用配置还需要设置：
+
+```dotenv
+LITELLM_VIRTUAL_KEY=<Fusion 使用的 LiteLLM 虚拟密钥>
+FUSION_MODEL_MANAGEMENT_BASE_URL=http://127.0.0.1:8002
+LITELLM_MODEL_ADMISSION_WORKER_TOKEN=<与 fusion-api 同名配置一致的随机 token>
+```
+
+启用前创建仅当前用户可读写的恢复目录，并安装用户级单元：
+
+```bash
+install -d -m 0700 "$HOME/.local/state/fusion/litellm-model-management"
+install -m 0644 \
+  ops/litellm/fusion-litellm-model-management.service \
+  ops/litellm/fusion-litellm-model-management.timer \
+  "$HOME/.config/systemd/user/"
+systemctl --user daemon-reload
+systemctl --user enable --now fusion-litellm-model-management.timer
+```
+
+Worker 在进入外部事务前写入 `0600` 恢复记录，终态被 API 接受后才删除。若进程
+在外部事务中被杀，下一次启动会保守落为 `worker_execution_interrupted` 并要求
+人工核对，禁止自动重跑造成重复注册。目录失效在 Fusion readback 前通过 Redis
+generation 跨 API 进程推进；完成回调短暂失败时会从恢复记录重试。
+
 `execute_litellm_candidate_admission.py` 的 dry-run 可以读取人工提取的单个
 admission plan，且不发任何 HTTP：
 
