@@ -20,10 +20,25 @@ from urllib.parse import quote
 
 import httpx
 
+from scripts.check_litellm_candidate_preflight import (
+    candidate_contract_fingerprint,
+    parse_candidate,
+    run_preflight,
+    serialize_report,
+)
 from scripts.execute_litellm_candidate_admission import (
     VerifiedPlanError,
     execute_admission,
     load_verified_admission_plan,
+)
+from scripts.plan_litellm_candidate_admission import (
+    build_admission_plan,
+    candidate_static_gate_reasons,
+)
+from scripts.verify_litellm_governance_snapshot import (
+    GovernanceSnapshotError,
+    canonical_sha256,
+    load_verified_governance_snapshot,
 )
 
 WORKER_TOKEN_HEADER = "X-Fusion-Worker-Token"
@@ -36,69 +51,6 @@ class WorkerProtocolError(RuntimeError):
     """内部 Worker 协议不满足安全合同。"""
 
 
-def canonical_sha256(value: Any) -> str:
-    import hashlib
-
-    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _read_json(path: Path, *, code: str) -> Mapping[str, Any]:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise VerifiedPlanError(code) from exc
-    if not isinstance(payload, Mapping):
-        raise VerifiedPlanError(code)
-    return payload
-
-
-def _load_verified_summary(
-    root: Path,
-    *,
-    pointer_name: str,
-    expected_status: str,
-) -> tuple[Mapping[str, Any], datetime] | None:
-    pointer_path = root / pointer_name
-    if not pointer_path.exists() and pointer_name == "latest-failure.json":
-        return None
-    pointer = _read_json(pointer_path, code=f"{pointer_name.removesuffix('.json').replace('-', '_')}_invalid")
-    run_id = pointer.get("run_id")
-    run_path = pointer.get("run_path")
-    if not isinstance(run_id, str) or not run_id or not isinstance(run_path, str):
-        raise VerifiedPlanError("governance_pointer_invalid")
-    relative_path = Path(run_path)
-    if relative_path.is_absolute() or relative_path.parts != ("runs", run_id):
-        raise VerifiedPlanError("run_path_invalid")
-    try:
-        run_dir = (root / relative_path).resolve(strict=True)
-        run_dir.relative_to(root)
-    except (OSError, ValueError) as exc:
-        raise VerifiedPlanError("run_path_invalid") from exc
-    manifest = _read_json(run_dir / "manifest.json", code="manifest_invalid")
-    summary = _read_json(run_dir / "cycle-summary.json", code="cycle_summary_invalid")
-    if pointer.get("manifest_sha256") != canonical_sha256(manifest):
-        raise VerifiedPlanError("manifest_sha256_mismatch")
-    if pointer.get("summary_sha256") != canonical_sha256(summary):
-        raise VerifiedPlanError("cycle_summary_sha256_mismatch")
-    artifacts = manifest.get("artifacts")
-    summary_artifact = artifacts.get("cycle-summary.json") if isinstance(artifacts, Mapping) else None
-    if not isinstance(summary_artifact, Mapping) or summary_artifact.get("sha256") != canonical_sha256(summary):
-        raise VerifiedPlanError("cycle_summary_manifest_mismatch")
-    if summary.get("run_id") != run_id or summary.get("status") != expected_status:
-        raise VerifiedPlanError("cycle_summary_contract_invalid")
-    started_at = summary.get("started_at")
-    if not isinstance(started_at, str):
-        raise VerifiedPlanError("cycle_started_at_invalid")
-    try:
-        parsed_started_at = datetime.fromisoformat(started_at)
-    except ValueError as exc:
-        raise VerifiedPlanError("cycle_started_at_invalid") from exc
-    if parsed_started_at.tzinfo is None:
-        raise VerifiedPlanError("cycle_started_at_invalid")
-    return summary, parsed_started_at.astimezone(UTC)
-
-
 def validate_governance_freshness(
     *,
     governance_root: Path,
@@ -106,28 +58,87 @@ def validate_governance_freshness(
     max_age_seconds: int,
     now: datetime | None = None,
 ) -> None:
-    """再次校验治理周期的新鲜度，并拒绝成功周期之后出现的失败周期。"""
-    if max_age_seconds <= 0:
-        raise VerifiedPlanError("governance_max_age_invalid")
+    """复用 API 的严格快照校验，并将任何降级态视为不可准入。"""
     try:
-        root = governance_root.resolve(strict=True)
-    except OSError as exc:
-        raise VerifiedPlanError("governance_root_invalid") from exc
-    success = _load_verified_summary(root, pointer_name="latest-success.json", expected_status="success")
-    if success is None:
-        raise VerifiedPlanError("latest_success_invalid")
-    summary, success_started_at = success
-    if summary.get("run_id") != expected_run_id:
+        snapshot = load_verified_governance_snapshot(
+            governance_root=governance_root,
+            max_age_seconds=max_age_seconds,
+            now=now or datetime.now(UTC),
+            include_queue=False,
+        )
+    except GovernanceSnapshotError as exc:
+        raise VerifiedPlanError(exc.code) from exc
+    if snapshot.run_id != expected_run_id:
         raise VerifiedPlanError("governance_run_changed")
-    current_time = (now or datetime.now(UTC)).astimezone(UTC)
-    age_seconds = (current_time - success_started_at).total_seconds()
-    if age_seconds < -300:
-        raise VerifiedPlanError("governance_run_from_future")
-    if age_seconds > max_age_seconds:
-        raise VerifiedPlanError("governance_run_stale")
-    failure = _load_verified_summary(root, pointer_name="latest-failure.json", expected_status="failed")
-    if failure is not None and failure[1] > success_started_at:
+    if snapshot.degraded_reason == "latest_run_failed":
         raise VerifiedPlanError("newer_governance_failure")
+    if snapshot.degraded_reason is not None:
+        raise VerifiedPlanError(snapshot.degraded_reason)
+
+
+def _load_verified_candidate(
+    *,
+    governance_root: Path,
+    expected_run_id: str,
+    candidate_fingerprint: str,
+    model_id: str,
+    max_age_seconds: int,
+    now: datetime | None = None,
+) -> Mapping[str, Any]:
+    """从严格验真的同一治理运行中定位唯一候选。"""
+    try:
+        snapshot = load_verified_governance_snapshot(
+            governance_root=governance_root,
+            max_age_seconds=max_age_seconds,
+            now=now or datetime.now(UTC),
+            include_queue=True,
+        )
+    except GovernanceSnapshotError as exc:
+        raise VerifiedPlanError(exc.code) from exc
+    if snapshot.run_id != expected_run_id:
+        raise VerifiedPlanError("governance_run_changed")
+    if snapshot.degraded_reason == "latest_run_failed":
+        raise VerifiedPlanError("newer_governance_failure")
+    if snapshot.degraded_reason is not None:
+        raise VerifiedPlanError(snapshot.degraded_reason)
+    matches = [
+        item
+        for item in snapshot.queue
+        if item.get("candidate_fingerprint") == candidate_fingerprint and item.get("model_id") == model_id
+    ]
+    if len(matches) != 1:
+        raise VerifiedPlanError("candidate_claim_mismatch")
+    record = matches[0]
+    if record.get("state") not in {"preflight_required", "admission_ready"}:
+        raise VerifiedPlanError("candidate_state_not_admissible")
+    candidate = record.get("candidate")
+    if not isinstance(candidate, Mapping):
+        raise VerifiedPlanError("candidate_contract_invalid")
+    if record.get("candidate_snapshot_sha256") != canonical_sha256(candidate):
+        raise VerifiedPlanError("candidate_snapshot_sha256_mismatch")
+    try:
+        calculated_fingerprint = candidate_contract_fingerprint(candidate)
+    except ValueError as exc:
+        raise VerifiedPlanError("candidate_contract_invalid") from exc
+    if calculated_fingerprint != candidate_fingerprint:
+        raise VerifiedPlanError("candidate_fingerprint_mismatch")
+    provider_key = record.get("provider_key")
+    if (
+        not isinstance(provider_key, str)
+        or not provider_key
+        or candidate.get("provider_key") != provider_key
+        or candidate.get("model_id") != model_id
+    ):
+        raise VerifiedPlanError("candidate_contract_mismatch")
+    if record.get("state") == "preflight_required":
+        try:
+            static_reasons = candidate_static_gate_reasons(candidate, provider_key=provider_key)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise VerifiedPlanError("candidate_contract_invalid") from exc
+        record_reasons = record.get("reasons")
+        if static_reasons or not isinstance(record_reasons, list) or record_reasons:
+            raise VerifiedPlanError("candidate_static_gate_failed")
+    return record
 
 
 def _worker_headers(worker_token: str, lease_token: str | None = None) -> dict[str, str]:
@@ -148,7 +159,9 @@ def _claim(client: Any, fusion_base_url: str, worker_token: str) -> Mapping[str,
     response.raise_for_status()
     payload = response.json()
     required = ("operation_id", "lease_token", "run_id", "candidate_fingerprint", "model_id")
-    if not isinstance(payload, Mapping) or any(not isinstance(payload.get(name), str) or not payload[name] for name in required):
+    if not isinstance(payload, Mapping) or any(
+        not isinstance(payload.get(name), str) or not payload[name] for name in required
+    ):
         raise WorkerProtocolError("claim_contract_invalid")
     fingerprint = str(payload["candidate_fingerprint"])
     if len(fingerprint) != 64 or any(character not in "0123456789abcdef" for character in fingerprint.lower()):
@@ -168,7 +181,9 @@ def _safe_result(result: Mapping[str, Any]) -> dict[str, Any]:
         "status": "succeeded" if result.get("status") == "succeeded" else "failed",
         "phase": str(result.get("phase") or "unknown")[:80],
         "error_code": error_code[:120] if error_code else None,
-        "completed_phases": [str(item)[:80] for item in (result.get("completed_phases") or []) if isinstance(item, str)],
+        "completed_phases": [
+            str(item)[:80] for item in (result.get("completed_phases") or []) if isinstance(item, str)
+        ],
         "writes_performed": bool(result.get("writes_performed")),
         "compensation": {
             "attempted": bool(compensation.get("attempted")),
@@ -259,6 +274,164 @@ def _ensure_secure_state_dir(state_dir: Path, *, create: bool) -> bool:
     ):
         raise WorkerProtocolError("worker_state_directory_insecure")
     return True
+
+
+def _ensure_secure_acceptance_dir(acceptance_dir: Path) -> None:
+    """验收目录必须预先创建，且仅当前 Worker 用户可访问。"""
+    try:
+        directory_stat = acceptance_dir.lstat()
+    except OSError as exc:
+        raise VerifiedPlanError("candidate_acceptance_directory_unavailable") from exc
+    if (
+        not stat.S_ISDIR(directory_stat.st_mode)
+        or directory_stat.st_uid != os.getuid()
+        or stat.S_IMODE(directory_stat.st_mode) & 0o077
+    ):
+        raise VerifiedPlanError("candidate_acceptance_directory_insecure")
+
+
+def _write_acceptance_atomic(
+    acceptance_dir: Path,
+    *,
+    candidate_fingerprint: str,
+    acceptance: Mapping[str, Any],
+) -> Path:
+    """以 0600 权限原子落盘脱敏验收摘要。"""
+    _ensure_secure_acceptance_dir(acceptance_dir)
+    path = acceptance_dir / f"{candidate_fingerprint}.json"
+    try:
+        existing = path.lstat()
+    except FileNotFoundError:
+        existing = None
+    except (OSError, TypeError, ValueError) as exc:
+        raise VerifiedPlanError("candidate_acceptance_write_failed") from exc
+    if existing is not None and (
+        not stat.S_ISREG(existing.st_mode)
+        or existing.st_uid != os.getuid()
+        or stat.S_IMODE(existing.st_mode) & 0o177
+    ):
+        raise VerifiedPlanError("candidate_acceptance_file_insecure")
+
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=acceptance_dir,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            os.chmod(temporary, 0o600)
+            json.dump(acceptance, handle, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+        directory_fd = os.open(acceptance_dir, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return path
+    except (OSError, TypeError, ValueError) as exc:
+        raise VerifiedPlanError("candidate_acceptance_write_failed") from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _single_candidate_report(record: Mapping[str, Any]) -> dict[str, Any]:
+    provider_key = str(record["provider_key"])
+    candidate = dict(record["candidate"])
+    provider_display = str(candidate.get("provider_display") or provider_key)
+    return {
+        "mode": "read_only",
+        "providers": {
+            provider_key: {
+                "status": "ok",
+                "error": None,
+                "report": {
+                    "provider": {"key": provider_key, "display": provider_display},
+                    "new": [candidate],
+                    "existing": [],
+                    "removed": [],
+                    "unknown": [],
+                },
+            }
+        },
+    }
+
+
+def _run_candidate_preflight_and_build_plan(
+    *,
+    record: Mapping[str, Any],
+    expected_run_id: str,
+    candidate_fingerprint: str,
+    model_id: str,
+    litellm_base_url: str,
+    candidate_key: str,
+    acceptance_dir: Path,
+    client: Any,
+) -> Mapping[str, Any]:
+    if not candidate_key:
+        raise VerifiedPlanError("candidate_preflight_credential_missing")
+    try:
+        candidate = parse_candidate(record["candidate"])
+        report = run_preflight(
+            candidate=candidate,
+            base_url=litellm_base_url,
+            api_key=candidate_key,
+            apply=True,
+            client=client,
+        )
+    except Exception as exc:
+        raise VerifiedPlanError("candidate_preflight_request_failed") from exc
+    if report.dry_run is not False or report.healthy is not True:
+        raise VerifiedPlanError("candidate_preflight_failed")
+
+    try:
+        acceptance = serialize_report(
+            report,
+            context={
+                "litellm_base_url": litellm_base_url,
+                "credential_source": "LITELLM_CANDIDATE_KEY",
+            },
+        )
+    except Exception as exc:
+        raise VerifiedPlanError("candidate_acceptance_serialization_failed") from exc
+    if (
+        acceptance.get("healthy") is not True
+        or acceptance.get("dry_run") is not False
+        or acceptance.get("candidate_fingerprint") != candidate_fingerprint
+    ):
+        raise VerifiedPlanError("candidate_acceptance_contract_mismatch")
+    _write_acceptance_atomic(
+        acceptance_dir,
+        candidate_fingerprint=candidate_fingerprint,
+        acceptance=acceptance,
+    )
+    try:
+        plan = build_admission_plan(
+            candidate_report=_single_candidate_report(record),
+            candidate_acceptance_summary=acceptance,
+        )
+    except Exception as exc:
+        raise VerifiedPlanError("candidate_admission_plan_build_failed") from exc
+    plan = {**plan, "run_id": expected_run_id}
+    eligible = plan.get("eligible")
+    if (
+        plan.get("status") != "complete"
+        or not isinstance(eligible, list)
+        or len(eligible) != 1
+        or not isinstance(eligible[0], Mapping)
+        or eligible[0].get("model_id") != model_id
+        or plan.get("isolated")
+    ):
+        raise VerifiedPlanError("candidate_admission_plan_invalid")
+    return plan
 
 
 def _write_spool(
@@ -353,21 +526,39 @@ def process_once(
     virtual_key: str,
     environ: Mapping[str, str],
     state_dir: Path | None = None,
+    candidate_key: str = "",
+    acceptance_dir: Path | None = None,
 ) -> dict[str, Any]:
     claim = _claim(client, fusion_base_url, worker_token)
     if claim is None:
         return {"status": "idle"}
     spool_path = _write_spool(state_dir, claim=claim, result=None) if state_dir is not None else None
     try:
-        plan = load_verified_admission_plan(
-            governance_root=governance_root,
-            candidate_fingerprint=claim["candidate_fingerprint"],
-        )
-        validate_governance_freshness(
+        candidate_record = _load_verified_candidate(
             governance_root=governance_root,
             expected_run_id=claim["run_id"],
+            candidate_fingerprint=claim["candidate_fingerprint"],
+            model_id=claim["model_id"],
             max_age_seconds=governance_max_age_seconds,
         )
+        if candidate_record.get("state") == "admission_ready":
+            plan = load_verified_admission_plan(
+                governance_root=governance_root,
+                candidate_fingerprint=claim["candidate_fingerprint"],
+            )
+        else:
+            if acceptance_dir is None:
+                raise VerifiedPlanError("candidate_acceptance_directory_missing")
+            plan = _run_candidate_preflight_and_build_plan(
+                record=candidate_record,
+                expected_run_id=claim["run_id"],
+                candidate_fingerprint=claim["candidate_fingerprint"],
+                model_id=claim["model_id"],
+                litellm_base_url=litellm_base_url,
+                candidate_key=candidate_key,
+                acceptance_dir=acceptance_dir,
+                client=client,
+            )
     except VerifiedPlanError as exc:
         result = _verification_failure(exc.code)
     else:
@@ -419,17 +610,23 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
         type=Path,
         default=Path.home() / ".local/state/fusion/litellm-model-management",
     )
+    parser.add_argument("--acceptance-dir", type=Path, required=True)
     parser.add_argument(
         "--governance-max-age-seconds",
         type=int,
-        default=int(os.environ.get("MODEL_MANAGEMENT_GOVERNANCE_MAX_AGE_SECONDS", "86400")),
+        default=os.environ.get("LITELLM_GOVERNANCE_MAX_AGE_SECONDS"),
     )
     parser.add_argument(
         "--fusion-base-url",
         default=os.environ.get("FUSION_MODEL_MANAGEMENT_BASE_URL", "http://127.0.0.1:8002"),
     )
     parser.add_argument("--litellm-base-url", default=os.environ.get("LITELLM_BASE_URL", "http://127.0.0.1:4000"))
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.governance_max_age_seconds is None:
+        parser.error("必须配置 LITELLM_GOVERNANCE_MAX_AGE_SECONDS 或 --governance-max-age-seconds")
+    if args.governance_max_age_seconds <= 0:
+        parser.error("governance max age 必须为正整数")
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -437,10 +634,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     worker_token = os.environ.get("LITELLM_MODEL_ADMISSION_WORKER_TOKEN", "")
     master_key = os.environ.get("LITELLM_MASTER_KEY", "")
     virtual_key = os.environ.get("LITELLM_VIRTUAL_KEY", "")
-    if not worker_token or not master_key or not virtual_key:
+    candidate_key = os.environ.get("LITELLM_CANDIDATE_KEY", "")
+    if not worker_token or not master_key or not virtual_key or not candidate_key:
         print(json.dumps({"status": "failed", "error": {"code": "required_environment_missing"}}))
         return 1
     try:
+        _ensure_secure_acceptance_dir(args.acceptance_dir)
         with httpx.Client() as client:
             flush_spooled_results(
                 client,
@@ -457,11 +656,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 litellm_base_url=args.litellm_base_url,
                 master_key=master_key,
                 virtual_key=virtual_key,
+                candidate_key=candidate_key,
+                acceptance_dir=args.acceptance_dir,
                 environ=os.environ,
                 state_dir=args.state_dir,
             )
-    except (WorkerProtocolError, httpx.HTTPError) as exc:
-        print(json.dumps({"status": "failed", "error": {"code": type(exc).__name__}}))
+    except (WorkerProtocolError, VerifiedPlanError, httpx.HTTPError) as exc:
+        code = exc.code if isinstance(exc, VerifiedPlanError) else type(exc).__name__
+        print(json.dumps({"status": "failed", "error": {"code": code}}))
         return 1
     print(json.dumps({"status": result.get("status")}, sort_keys=True))
     return 0 if result.get("status") in {"idle", "succeeded"} else 1

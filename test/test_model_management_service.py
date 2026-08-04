@@ -176,7 +176,11 @@ class ModelManagementServiceTests(unittest.TestCase):
             set(snapshot),
             {"generated_at", "governance", "capabilities", "models", "candidates", "operations"},
         )
-        self.assertEqual(snapshot["governance"], {"available": True, "run_id": self.run_id})
+        self.assertEqual(
+            snapshot["governance"],
+            {"available": True, "status": "available", "run_id": self.run_id},
+        )
+        self.assertTrue(snapshot["capabilities"]["admission_enabled"])
         self.assertEqual(
             set(snapshot["models"][0]),
             {
@@ -214,9 +218,77 @@ class ModelManagementServiceTests(unittest.TestCase):
         self.assertNotIn(self.temp_dir.name, serialized)
         self.assertNotIn("MOONSHOT_API_KEY", serialized)
 
-    def test_governance_missing_tampered_stale_or_newer_verified_failure_degrades(self):
+    def test_newer_verified_failure_keeps_candidates_read_only_and_blocks_admission(self):
+        _write_governance_run(
+            self.governance_root,
+            self.now - timedelta(seconds=30),
+            status="failed",
+        )
+
+        snapshot = self.build_service().get_snapshot()
+
+        self.assertEqual(
+            snapshot["governance"],
+            {
+                "available": True,
+                "status": "degraded",
+                "run_id": self.run_id,
+                "reason": "latest_run_failed",
+                "message": "最新治理运行失败，当前展示上一次有效快照；模型准入已暂停。",
+            },
+        )
+        self.assertEqual([item["model_id"] for item in snapshot["candidates"]], ["kimi-k3"])
+        self.assertFalse(snapshot["capabilities"]["admission_enabled"])
+        with self.assertRaises(ApiException) as raised:
+            self._request_admission(self.build_service())
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(self.db.query(ModelAdmissionOperation).count(), 0)
+
+    def test_unverified_failure_pointer_keeps_candidates_read_only_and_blocks_admission(self):
+        (self.governance_root / "latest-failure.json").write_text("{}", encoding="utf-8")
+
+        snapshot = self.build_service().get_snapshot()
+
+        self.assertEqual(snapshot["governance"]["status"], "degraded")
+        self.assertEqual(snapshot["governance"]["reason"], "latest_failure_unverified")
+        self.assertTrue(snapshot["governance"]["available"])
+        self.assertEqual([item["model_id"] for item in snapshot["candidates"]], ["kimi-k3"])
+        self.assertFalse(snapshot["capabilities"]["admission_enabled"])
+        with self.assertRaises(ApiException) as raised:
+            self._request_admission(self.build_service())
+        self.assertEqual(raised.exception.status_code, 503)
+
+    def test_pending_operation_is_not_claimed_after_governance_degrades(self):
+        service = self.build_service()
+        operation = self._request_admission(service)
+        _write_governance_run(
+            self.governance_root,
+            self.now - timedelta(seconds=30),
+            status="failed",
+        )
+
+        with self.assertRaises(ApiException) as raised:
+            service.claim_operation()
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.db.refresh(operation)
+        self.assertEqual(operation.status, "pending")
+        self.assertEqual(operation.attempts, 0)
+
+    def test_governance_success_missing_tampered_or_stale_is_unavailable(self):
         (self.run_dir / "cycle-summary.json").write_text("{}", encoding="utf-8")
-        self.assertFalse(self.build_service().get_snapshot()["governance"]["available"])
+        tampered = self.build_service().get_snapshot()
+        self.assertEqual(
+            tampered["governance"],
+            {
+                "available": False,
+                "status": "unavailable",
+                "reason": "success_snapshot_unavailable",
+                "message": "治理候选暂时不可用",
+            },
+        )
+        self.assertEqual(tampered["candidates"], [])
+        self.assertFalse(tampered["capabilities"]["admission_enabled"])
 
         self.temp_dir.cleanup()
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -227,23 +299,18 @@ class ModelManagementServiceTests(unittest.TestCase):
             status="success",
             queue=self.queue,
         )
-        self.assertFalse(self.build_service().get_snapshot()["governance"]["available"])
+        stale = self.build_service().get_snapshot()
+        self.assertEqual(stale["governance"]["status"], "unavailable")
+        self.assertFalse(stale["governance"]["available"])
+        self.assertFalse(stale["capabilities"]["admission_enabled"])
 
         self.temp_dir.cleanup()
         self.temp_dir = tempfile.TemporaryDirectory()
         self.governance_root = Path(self.temp_dir.name)
-        self.run_id, self.run_dir = _write_governance_run(
-            self.governance_root,
-            self.now - timedelta(minutes=2),
-            status="success",
-            queue=self.queue,
-        )
-        _write_governance_run(
-            self.governance_root,
-            self.now - timedelta(minutes=1),
-            status="failed",
-        )
-        self.assertFalse(self.build_service().get_snapshot()["governance"]["available"])
+        missing = self.build_service().get_snapshot()
+        self.assertEqual(missing["governance"]["status"], "unavailable")
+        self.assertFalse(missing["governance"]["available"])
+        self.assertFalse(missing["capabilities"]["admission_enabled"])
 
     def test_recent_operations_remain_visible_when_governance_degrades(self):
         service = self.build_service()
@@ -319,6 +386,39 @@ class ModelManagementServiceTests(unittest.TestCase):
         self.assertIsNone(retried.lease_token_hash)
         self.assertEqual(retried.result, {})
         self.assertEqual(self.db.query(AdminAuditEvent).count(), 2)
+
+    def test_preflight_required_candidate_can_request_validation_and_publish_without_existing_plan(self):
+        self.queue[0]["state"] = "preflight_required"
+        self.queue[0]["candidate_snapshot_sha256"] = _sha256(self.queue[0]["candidate"])
+        self.run_id, _ = _write_governance_run(
+            self.governance_root,
+            self.now - timedelta(seconds=30),
+            status="success",
+            queue=self.queue,
+        )
+        plan_loader = Mock(side_effect=AssertionError("预检候选不应要求已有准入计划"))
+
+        operation = self._request_admission(self.build_service(plan_loader=plan_loader))
+
+        self.assertEqual(operation.status, "pending")
+        self.assertEqual(operation.model_id, "kimi-k3")
+        self.assertEqual(operation.candidate_fingerprint, self.fingerprint)
+        plan_loader.assert_not_called()
+
+    def test_candidate_in_non_admissible_state_is_rejected(self):
+        self.queue[0]["state"] = "quarantined"
+        self.run_id, _ = _write_governance_run(
+            self.governance_root,
+            self.now - timedelta(seconds=30),
+            status="success",
+            queue=self.queue,
+        )
+
+        with self.assertRaises(ApiException) as raised:
+            self._request_admission(self.build_service())
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(self.db.query(ModelAdmissionOperation).count(), 0)
 
     def test_admission_fails_closed_before_persisting(self):
         disabled = self.build_service(config={"management_enabled": False})

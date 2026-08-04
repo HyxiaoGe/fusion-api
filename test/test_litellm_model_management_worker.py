@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
@@ -6,6 +7,16 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts import run_litellm_model_management_worker as worker
+from scripts.check_litellm_candidate_preflight import (
+    CaseResult,
+    PreflightReport,
+    candidate_contract_fingerprint,
+    parse_candidate,
+)
+from scripts.verify_litellm_governance_snapshot import (
+    VerifiedGovernanceSnapshot,
+    canonical_sha256,
+)
 
 
 class FakeResponse:
@@ -43,14 +54,102 @@ class RecordingClient:
         raise AssertionError(f"unexpected POST {url}")
 
 
-def claim_payload():
+def claim_payload(*, fingerprint="a" * 64, model_id="qwen3.8-max"):
     return {
         "operation_id": "op-123",
         "lease_token": "lease-secret",
         "run_id": "20260804T010000000000Z",
-        "candidate_fingerprint": "a" * 64,
-        "model_id": "qwen3.8-max",
+        "candidate_fingerprint": fingerprint,
+        "model_id": model_id,
     }
+
+
+def candidate_contract():
+    capabilities = {
+        "imageGen": False,
+        "deepThinking": False,
+        "fileSupport": False,
+        "functionCalling": False,
+        "vision": False,
+        "webSearch": False,
+    }
+    return {
+        "provider_key": "moonshot",
+        "provider_display": "Moonshot",
+        "model_id": "kimi-k3",
+        "litellm_model": "moonshot/kimi-k3",
+        "preflight_model": "candidate/moonshot/kimi-k3",
+        "preflight_route": {
+            "status": "ready",
+            "route_model_name": "candidate/moonshot/*",
+            "route_litellm_model": "moonshot/*",
+            "api_base": "https://api.moonshot.cn/v1",
+            "api_key_env": "MOONSHOT_API_KEY",
+            "credential_generation": "test-v1",
+            "reasons": [],
+        },
+        "isolation_status": "candidate",
+        "metadata": {
+            "display_name": "Kimi K3",
+            "provider_key": "moonshot",
+            "provider_display": "Moonshot",
+            "capabilities": capabilities,
+            "pricing": {"input": 0.6, "output": 2.5, "unit": "USD/1M tokens"},
+        },
+        "metadata_evidence": {
+            "cost_map_matched": True,
+            "reviewed_override_applied": False,
+        },
+        "registration": {
+            "api_base": "https://api.moonshot.cn/v1",
+            "api_key_env": "MOONSHOT_API_KEY",
+            "endpoint_status": "verified",
+        },
+    }
+
+
+def candidate_record(*, state="preflight_required"):
+    candidate = candidate_contract()
+    fingerprint = candidate_contract_fingerprint(candidate)
+    return {
+        "provider_key": "moonshot",
+        "model_id": "kimi-k3",
+        "state": state,
+        "reasons": [],
+        "candidate_snapshot_sha256": canonical_sha256(candidate),
+        "candidate_fingerprint": fingerprint,
+        "acceptance_file": f"{fingerprint}.json",
+        "candidate": candidate,
+    }
+
+
+def successful_preflight(candidate):
+    return PreflightReport(
+        healthy=True,
+        dry_run=False,
+        candidate=parse_candidate(candidate),
+        cases=[
+            CaseResult(
+                name="text",
+                status="passed",
+                usage_present=True,
+                cost_present=True,
+                output_present=True,
+            ),
+            CaseResult(
+                name="stream",
+                status="passed",
+                usage_present=True,
+                cost_present=True,
+                output_present=True,
+                stream_done=True,
+            ),
+            CaseResult(name="tool_calling", status="skipped"),
+            CaseResult(name="vision", status="skipped"),
+            CaseResult(name="reasoning", status="skipped"),
+            CaseResult(name="preserved_tool_round", status="skipped"),
+        ],
+    )
 
 
 def succeeded_result():
@@ -72,6 +171,163 @@ def succeeded_result():
 
 
 class ModelManagementWorkerTests(unittest.TestCase):
+    def test_preflight_required_runs_real_preflight_writes_redacted_acceptance_then_admits(self):
+        record = candidate_record()
+        claim = claim_payload(
+            fingerprint=record["candidate_fingerprint"],
+            model_id=record["model_id"],
+        )
+        client = RecordingClient(claim)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            acceptance_dir = Path(temp_dir)
+            os.chmod(acceptance_dir, 0o700)
+            with (
+                patch.object(worker, "_load_verified_candidate", return_value=record),
+                patch.object(
+                    worker,
+                    "run_preflight",
+                    return_value=successful_preflight(record["candidate"]),
+                ) as preflight,
+                patch.object(worker, "execute_admission", return_value=succeeded_result()) as execute,
+            ):
+                result = worker.process_once(
+                    client=client,
+                    fusion_base_url="http://127.0.0.1:8002",
+                    worker_token="worker-secret",
+                    governance_root=Path("/governance"),
+                    governance_max_age_seconds=86400,
+                    litellm_base_url="http://127.0.0.1:4000",
+                    master_key="master-secret",
+                    virtual_key="virtual-secret",
+                    candidate_key="candidate-secret",
+                    acceptance_dir=acceptance_dir,
+                    environ={"MOONSHOT_API_KEY": "provider-secret"},
+                )
+
+            self.assertEqual(result["status"], "succeeded")
+            preflight.assert_called_once()
+            self.assertEqual(preflight.call_args.kwargs["api_key"], "candidate-secret")
+            execute.assert_called_once()
+            plan = execute.call_args.kwargs["plan"]
+            self.assertEqual(plan["run_id"], claim["run_id"])
+            self.assertEqual([item["model_id"] for item in plan["eligible"]], ["kimi-k3"])
+            acceptance_path = acceptance_dir / f'{record["candidate_fingerprint"]}.json'
+            acceptance_text = acceptance_path.read_text(encoding="utf-8")
+            self.assertNotIn("candidate-secret", acceptance_text)
+            self.assertNotIn("master-secret", acceptance_text)
+            self.assertNotIn("provider-secret", acceptance_text)
+            self.assertEqual(os.stat(acceptance_path).st_mode & 0o777, 0o600)
+            self.assertEqual(list(acceptance_dir.glob(f".{acceptance_path.name}.*")), [])
+
+    def test_preflight_failure_performs_no_admission_writes(self):
+        record = candidate_record()
+        claim = claim_payload(
+            fingerprint=record["candidate_fingerprint"],
+            model_id=record["model_id"],
+        )
+        failed = PreflightReport(
+            healthy=False,
+            dry_run=False,
+            candidate=parse_candidate(record["candidate"]),
+            cases=[CaseResult(name="text", status="failed", issues=("missing_output",))],
+        )
+        client = RecordingClient(claim)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            acceptance_dir = Path(temp_dir)
+            os.chmod(acceptance_dir, 0o700)
+            with (
+                patch.object(worker, "_load_verified_candidate", return_value=record),
+                patch.object(worker, "run_preflight", return_value=failed),
+                patch.object(worker, "execute_admission") as execute,
+            ):
+                result = worker.process_once(
+                    client=client,
+                    fusion_base_url="http://127.0.0.1:8002",
+                    worker_token="worker-secret",
+                    governance_root=Path("/governance"),
+                    governance_max_age_seconds=86400,
+                    litellm_base_url="http://127.0.0.1:4000",
+                    master_key="master-secret",
+                    virtual_key="virtual-secret",
+                    candidate_key="candidate-secret",
+                    acceptance_dir=acceptance_dir,
+                    environ={},
+                )
+
+            execute.assert_not_called()
+            self.assertEqual(result["error"]["code"], "candidate_preflight_failed")
+            self.assertFalse(result["writes_performed"])
+            self.assertEqual(list(acceptance_dir.iterdir()), [])
+
+    def test_verified_candidate_rejects_fingerprint_model_and_state_mismatch(self):
+        record = candidate_record()
+        snapshot = VerifiedGovernanceSnapshot(
+            run_id=claim_payload()["run_id"],
+            started_at=datetime.now(UTC),
+            queue=[record],
+        )
+        with patch.object(worker, "load_verified_governance_snapshot", return_value=snapshot):
+            with self.assertRaisesRegex(worker.VerifiedPlanError, "candidate_claim_mismatch"):
+                worker._load_verified_candidate(
+                    governance_root=Path("/governance"),
+                    expected_run_id=snapshot.run_id,
+                    candidate_fingerprint="b" * 64,
+                    model_id=record["model_id"],
+                    max_age_seconds=86400,
+                )
+
+            with self.assertRaisesRegex(worker.VerifiedPlanError, "candidate_claim_mismatch"):
+                worker._load_verified_candidate(
+                    governance_root=Path("/governance"),
+                    expected_run_id=snapshot.run_id,
+                    candidate_fingerprint=record["candidate_fingerprint"],
+                    model_id="other-model",
+                    max_age_seconds=86400,
+                )
+
+            invalid_state = {**record, "state": "quarantined"}
+            snapshot = VerifiedGovernanceSnapshot(
+                run_id=claim_payload()["run_id"],
+                started_at=datetime.now(UTC),
+                queue=[invalid_state],
+            )
+            with (
+                patch.object(worker, "load_verified_governance_snapshot", return_value=snapshot),
+                self.assertRaisesRegex(worker.VerifiedPlanError, "candidate_state_not_admissible"),
+            ):
+                worker._load_verified_candidate(
+                    governance_root=Path("/governance"),
+                    expected_run_id=snapshot.run_id,
+                    candidate_fingerprint=record["candidate_fingerprint"],
+                    model_id=record["model_id"],
+                    max_age_seconds=86400,
+                )
+
+    def test_acceptance_atomic_failure_leaves_no_partial_file_and_insecure_directory_is_rejected(self):
+        record = candidate_record()
+        acceptance = {"healthy": True, "candidate_fingerprint": record["candidate_fingerprint"]}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            acceptance_dir = Path(temp_dir)
+            os.chmod(acceptance_dir, 0o700)
+            with (
+                patch.object(worker.os, "replace", side_effect=OSError("disk failure")),
+                self.assertRaisesRegex(worker.VerifiedPlanError, "candidate_acceptance_write_failed"),
+            ):
+                worker._write_acceptance_atomic(
+                    acceptance_dir,
+                    candidate_fingerprint=record["candidate_fingerprint"],
+                    acceptance=acceptance,
+                )
+            self.assertEqual(list(acceptance_dir.iterdir()), [])
+
+            os.chmod(acceptance_dir, 0o755)
+            with self.assertRaisesRegex(worker.VerifiedPlanError, "candidate_acceptance_directory_insecure"):
+                worker._write_acceptance_atomic(
+                    acceptance_dir,
+                    candidate_fingerprint=record["candidate_fingerprint"],
+                    acceptance=acceptance,
+                )
+
     def test_idle_claim_exits_without_executor(self):
         client = RecordingClient(None)
 
@@ -100,8 +356,8 @@ class ModelManagementWorkerTests(unittest.TestCase):
             return succeeded_result()
 
         with (
+            patch.object(worker, "_load_verified_candidate", return_value={"state": "admission_ready"}),
             patch.object(worker, "load_verified_admission_plan", return_value={"run_id": claim_payload()["run_id"]}),
-            patch.object(worker, "validate_governance_freshness"),
             patch.object(worker, "execute_admission", side_effect=execute) as executor,
         ):
             result = worker.process_once(
@@ -133,6 +389,7 @@ class ModelManagementWorkerTests(unittest.TestCase):
         client = RecordingClient(claim_payload())
 
         with (
+            patch.object(worker, "_load_verified_candidate", return_value={"state": "admission_ready"}),
             patch.object(
                 worker,
                 "load_verified_admission_plan",
@@ -162,8 +419,8 @@ class ModelManagementWorkerTests(unittest.TestCase):
         client.complete_failures = 2
 
         with (
+            patch.object(worker, "_load_verified_candidate", return_value={"state": "admission_ready"}),
             patch.object(worker, "load_verified_admission_plan", return_value={"run_id": claim_payload()["run_id"]}),
-            patch.object(worker, "validate_governance_freshness"),
             patch.object(worker, "execute_admission", return_value=succeeded_result()),
             patch.object(worker.time, "sleep") as sleep,
         ):
@@ -213,7 +470,7 @@ class ModelManagementWorkerTests(unittest.TestCase):
                     "load_verified_admission_plan",
                     return_value={"run_id": claim_payload()["run_id"]},
                 ),
-                patch.object(worker, "validate_governance_freshness"),
+                patch.object(worker, "_load_verified_candidate", return_value={"state": "admission_ready"}),
                 patch.object(worker, "execute_admission", return_value=succeeded_result()),
                 patch.object(worker.time, "sleep"),
                 self.assertRaisesRegex(worker.WorkerProtocolError, "operation_complete_failed"),
@@ -246,13 +503,17 @@ class ModelManagementWorkerTests(unittest.TestCase):
         now = datetime(2026, 8, 4, 1, 0, tzinfo=UTC)
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            self._write_summary(root, "success-run", "success", now - timedelta(hours=1), "latest-success.json")
-            self._write_summary(root, "failure-run", "failed", now - timedelta(minutes=5), "latest-failure.json")
+            success_time = now - timedelta(hours=1)
+            failure_time = now - timedelta(minutes=5)
+            success_run_id = success_time.strftime("%Y%m%dT%H%M%S%fZ")
+            failure_run_id = failure_time.strftime("%Y%m%dT%H%M%S%fZ")
+            self._write_summary(root, success_run_id, "success", success_time, "latest-success.json")
+            self._write_summary(root, failure_run_id, "failed", failure_time, "latest-failure.json")
 
             with self.assertRaisesRegex(worker.VerifiedPlanError, "newer_governance_failure"):
                 worker.validate_governance_freshness(
                     governance_root=root,
-                    expected_run_id="success-run",
+                    expected_run_id=success_run_id,
                     max_age_seconds=86400,
                     now=now,
                 )
@@ -261,15 +522,75 @@ class ModelManagementWorkerTests(unittest.TestCase):
         now = datetime(2026, 8, 4, 1, 0, tzinfo=UTC)
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            self._write_summary(root, "success-run", "success", now - timedelta(days=2), "latest-success.json")
+            success_time = now - timedelta(days=2)
+            success_run_id = success_time.strftime("%Y%m%dT%H%M%S%fZ")
+            self._write_summary(root, success_run_id, "success", success_time, "latest-success.json")
 
             with self.assertRaisesRegex(worker.VerifiedPlanError, "governance_run_stale"):
                 worker.validate_governance_freshness(
                     governance_root=root,
-                    expected_run_id="success-run",
+                    expected_run_id=success_run_id,
                     max_age_seconds=86400,
                     now=now,
                 )
+
+    def test_freshness_rejects_run_id_and_started_at_mismatch_like_api(self):
+        now = datetime(2026, 8, 4, 1, 0, tzinfo=UTC)
+        run_time = now - timedelta(minutes=2)
+        run_id = run_time.strftime("%Y%m%dT%H%M%S%fZ")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_summary(
+                root,
+                run_id,
+                "success",
+                run_time + timedelta(seconds=1),
+                "latest-success.json",
+            )
+
+            with self.assertRaisesRegex(worker.VerifiedPlanError, "governance_start_time_mismatch"):
+                worker.validate_governance_freshness(
+                    governance_root=root,
+                    expected_run_id=run_id,
+                    max_age_seconds=86400,
+                    now=now,
+                )
+
+    def test_freshness_rejects_schema_api_would_reject(self):
+        now = datetime(2026, 8, 4, 1, 0, tzinfo=UTC)
+        run_time = now - timedelta(minutes=2)
+        run_id = run_time.strftime("%Y%m%dT%H%M%S%fZ")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_summary(root, run_id, "success", run_time, "latest-success.json")
+            pointer_path = root / "latest-success.json"
+            pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+            pointer["schema_version"] = 2
+            pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+
+            with self.assertRaisesRegex(worker.VerifiedPlanError, "governance_pointer_schema_invalid"):
+                worker.validate_governance_freshness(
+                    governance_root=root,
+                    expected_run_id=run_id,
+                    max_age_seconds=86400,
+                    now=now,
+                )
+
+    def test_worker_max_age_uses_same_required_environment_name_as_api(self):
+        with patch.dict(
+            "os.environ",
+            {"LITELLM_GOVERNANCE_MAX_AGE_SECONDS": "7200"},
+            clear=True,
+        ):
+            args = worker._parse_args(
+                ["--governance-root", "/governance", "--acceptance-dir", "/acceptance"]
+            )
+        self.assertEqual(args.governance_max_age_seconds, 7200)
+
+        with patch.dict("os.environ", {}, clear=True), self.assertRaises(SystemExit):
+            worker._parse_args(
+                ["--governance-root", "/governance", "--acceptance-dir", "/acceptance"]
+            )
 
     @staticmethod
     def _write_summary(root, run_id, status, started_at, pointer_name):
@@ -285,7 +606,7 @@ class ModelManagementWorkerTests(unittest.TestCase):
             "schema_version": 1,
             "artifacts": {
                 "cycle-summary.json": {
-                    "sha256": worker.canonical_sha256(summary),
+                    "sha256": canonical_sha256(summary),
                     "record_count": 1,
                 }
             },
@@ -296,8 +617,8 @@ class ModelManagementWorkerTests(unittest.TestCase):
             "schema_version": 1,
             "run_id": run_id,
             "run_path": f"runs/{run_id}",
-            "summary_sha256": worker.canonical_sha256(summary),
-            "manifest_sha256": worker.canonical_sha256(manifest),
+            "summary_sha256": canonical_sha256(summary),
+            "manifest_sha256": canonical_sha256(manifest),
         }
         (root / pointer_name).write_text(json.dumps(pointer), encoding="utf-8")
 

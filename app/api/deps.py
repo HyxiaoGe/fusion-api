@@ -76,17 +76,19 @@ def get_model_management_service(db: Session = Depends(get_db)) -> ModelManageme
     )
 
 
-def require_model_admission_worker(
+def require_model_admission_worker_token(
     worker_token: str | None = Header(None, alias="X-Fusion-Worker-Token"),
 ) -> None:
     expected = settings.LITELLM_MODEL_ADMISSION_WORKER_TOKEN
-    if (
-        not settings.LITELLM_MODEL_ADMISSION_WORKER_ENABLED
-        or not expected
-        or not worker_token
-        or not secrets.compare_digest(worker_token, expected)
-    ):
+    if not expected or not worker_token or not secrets.compare_digest(worker_token, expected):
         raise HTTPException(status_code=401, detail="Worker 鉴权失败")
+
+
+def require_model_admission_worker(
+    _token: None = Depends(require_model_admission_worker_token),
+) -> None:
+    if not settings.LITELLM_MODEL_MANAGEMENT_ENABLED or not settings.LITELLM_MODEL_ADMISSION_WORKER_ENABLED:
+        raise HTTPException(status_code=401, detail="模型准入 Worker 未启用")
 
 
 def get_current_admin_user(

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import secrets
 import uuid
 from dataclasses import dataclass
@@ -20,11 +19,11 @@ from app.schemas.response import ApiException
 from app.services.admin_audit_service import AdminAuditService
 from app.utils.time import utc_now
 from scripts.execute_litellm_candidate_admission import VerifiedPlanError, load_verified_admission_plan
-
-
-def _canonical_sha256(value: Any) -> str:
-    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()
-    return hashlib.sha256(payload).hexdigest()
+from scripts.verify_litellm_governance_snapshot import (
+    GovernanceSnapshotError,
+    VerifiedGovernanceSnapshot,
+    load_verified_governance_snapshot,
+)
 
 
 def _token_hash(value: str) -> str:
@@ -43,13 +42,6 @@ class ModelManagementConfig:
     @property
     def admission_ready(self) -> bool:
         return bool(self.management_enabled and self.governance_root and self.worker_enabled and self.worker_token)
-
-
-@dataclass(frozen=True)
-class VerifiedGovernanceSnapshot:
-    run_id: str
-    started_at: datetime
-    queue: list[Mapping[str, Any]]
 
 
 class ModelManagementService:
@@ -78,19 +70,39 @@ class ModelManagementService:
 
     def get_snapshot(self) -> dict[str, Any]:
         verified = self._try_verified_snapshot()
-        governance: dict[str, Any] = {"available": verified is not None}
+        governance: dict[str, Any]
         candidates: list[dict[str, Any]] = []
         operations = [self.operation_payload(operation) for operation in self.operation_repository.list_recent(100)]
         if verified is None:
-            governance["message"] = "治理候选暂时不可用"
+            governance = {
+                "available": False,
+                "status": "unavailable",
+                "reason": "success_snapshot_unavailable",
+                "message": "治理候选暂时不可用",
+            }
+        elif verified.degraded_reason is not None:
+            governance = {
+                "available": True,
+                "status": "degraded",
+                "run_id": verified.run_id,
+                "reason": verified.degraded_reason,
+                "message": self._degraded_message(verified.degraded_reason),
+            }
+            candidates = [self._candidate_item(item) for item in verified.queue]
         else:
-            governance["run_id"] = verified.run_id
+            governance = {
+                "available": True,
+                "status": "available",
+                "run_id": verified.run_id,
+            }
             candidates = [self._candidate_item(item) for item in verified.queue]
         return {
             "generated_at": self._as_utc(self.clock()).isoformat(),
             "governance": governance,
             "capabilities": {
-                "admission_enabled": self.config.admission_ready,
+                "admission_enabled": bool(
+                    self.config.admission_ready and verified is not None and verified.degraded_reason is None
+                ),
                 "hard_delete_enabled": False,
             },
             "models": self.list_registered_models(),
@@ -177,11 +189,12 @@ class ModelManagementService:
             raise ApiException.service_unavailable("模型准入写操作未启用")
         if not self.config.admission_ready:
             raise ApiException.service_unavailable("模型准入 Worker 未就绪")
-        snapshot = self._require_verified_snapshot()
+        snapshot = self._require_admission_snapshot()
         if snapshot.run_id != expected_run_id:
             raise ApiException.conflict("治理运行版本已变化")
-        self._require_ready_candidate(snapshot, fingerprint=fingerprint, model_id=model_id)
-        self._require_verified_plan(fingerprint=fingerprint, model_id=model_id, run_id=expected_run_id)
+        candidate = self._require_admission_candidate(snapshot, fingerprint=fingerprint, model_id=model_id)
+        if candidate.get("state") == "admission_ready":
+            self._require_verified_plan(fingerprint=fingerprint, model_id=model_id, run_id=expected_run_id)
         existing = self.operation_repository.get_by_candidate_run(fingerprint, expected_run_id)
         if existing is not None:
             if existing.model_id != model_id:
@@ -236,6 +249,9 @@ class ModelManagementService:
             raise
 
     def claim_operation(self) -> tuple[ModelAdmissionOperation, str] | None:
+        if not self.config.admission_ready:
+            raise ApiException.service_unavailable("模型准入 Worker 未就绪")
+        self._require_admission_snapshot()
         now = self.clock()
         raw_lease = secrets.token_urlsafe(32)
         try:
@@ -311,6 +327,8 @@ class ModelManagementService:
             raise
 
     def invalidate_catalog(self, *, operation_id: str, lease_token: str) -> Any:
+        if not self.config.management_enabled:
+            raise ApiException.service_unavailable("模型准入写操作未启用")
         try:
             row = self._lock_running_operation(operation_id, lease_token)
             generation = str(self.catalog.bump_generation())
@@ -404,141 +422,49 @@ class ModelManagementService:
     def _try_verified_snapshot(self) -> VerifiedGovernanceSnapshot | None:
         try:
             return self._load_verified_snapshot()
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        except GovernanceSnapshotError:
             return None
 
-    def _require_verified_snapshot(self) -> VerifiedGovernanceSnapshot:
+    def _require_admission_snapshot(self) -> VerifiedGovernanceSnapshot:
         snapshot = self._try_verified_snapshot()
         if snapshot is None:
             raise ApiException.service_unavailable("治理候选暂时不可用")
+        if snapshot.degraded_reason is not None:
+            raise ApiException.service_unavailable("治理候选处于只读降级状态，模型准入已暂停")
         return snapshot
 
     def _load_verified_snapshot(self) -> VerifiedGovernanceSnapshot:
         root = self.config.governance_root
         if root is None:
-            raise ValueError("governance root missing")
-        resolved_root = root.resolve(strict=True)
-        success = self._load_verified_run(
-            resolved_root,
-            pointer_name="latest-success.json",
-            expected_status="success",
+            raise GovernanceSnapshotError("governance_root_missing")
+        return load_verified_governance_snapshot(
+            governance_root=root,
+            max_age_seconds=self.config.governance_max_age_seconds,
+            now=self._as_utc(self.clock()),
             include_queue=True,
         )
-        self._require_fresh_run(success.started_at)
-        failure_path = resolved_root / "latest-failure.json"
-        if failure_path.exists():
-            failure = self._load_verified_run(
-                resolved_root,
-                pointer_name="latest-failure.json",
-                expected_status="failed",
-                include_queue=False,
-            )
-            if failure.run_id > success.run_id:
-                raise ValueError("newer failed governance run")
-        return success
-
-    def _load_verified_run(
-        self,
-        root: Path,
-        *,
-        pointer_name: str,
-        expected_status: str,
-        include_queue: bool,
-    ) -> VerifiedGovernanceSnapshot:
-        pointer = self._read_mapping(root / pointer_name)
-        if pointer.get("schema_version") != 1:
-            raise ValueError("unsupported governance pointer")
-        run_id = self._pointer_run_id(pointer)
-        run_started_at = self._run_id_time(run_id)
-        run_path = pointer.get("run_path")
-        if not isinstance(run_path, str):
-            raise ValueError("invalid run path")
-        relative = Path(run_path)
-        if relative.is_absolute() or relative.parts != ("runs", run_id):
-            raise ValueError("invalid run path")
-        run_dir = (root / relative).resolve(strict=True)
-        run_dir.relative_to(root)
-        manifest = self._read_mapping(run_dir / "manifest.json")
-        if manifest.get("schema_version") != 1:
-            raise ValueError("unsupported governance manifest")
-        if pointer.get("manifest_sha256") != _canonical_sha256(manifest):
-            raise ValueError("manifest hash mismatch")
-
-        summary = self._read_mapping(run_dir / "cycle-summary.json")
-        if pointer.get("summary_sha256") != _canonical_sha256(summary):
-            raise ValueError("summary hash mismatch")
-        if self._artifact_sha256(manifest, "cycle-summary.json") != _canonical_sha256(summary):
-            raise ValueError("summary manifest hash mismatch")
-        if (
-            summary.get("schema_version") != 1
-            or summary.get("run_id") != run_id
-            or summary.get("status") != expected_status
-        ):
-            raise ValueError("governance summary mismatch")
-        started_at = self._parse_started_at(summary.get("started_at"))
-        if started_at != run_started_at:
-            raise ValueError("governance start time mismatch")
-
-        queue: list[Mapping[str, Any]] = []
-        if include_queue:
-            queue_payload = self._read_json(run_dir / "candidate-queue.json")
-            if not isinstance(queue_payload, list) or not all(isinstance(item, Mapping) for item in queue_payload):
-                raise ValueError("candidate queue invalid")
-            if self._artifact_sha256(manifest, "candidate-queue.json") != _canonical_sha256(queue_payload):
-                raise ValueError("candidate queue hash mismatch")
-            queue = list(queue_payload)
-        return VerifiedGovernanceSnapshot(run_id=run_id, started_at=started_at, queue=queue)
 
     @staticmethod
-    def _artifact_sha256(manifest: Mapping[str, Any], artifact_name: str) -> str:
-        artifacts = manifest.get("artifacts")
-        metadata = artifacts.get(artifact_name) if isinstance(artifacts, Mapping) else None
-        digest = metadata.get("sha256") if isinstance(metadata, Mapping) else None
-        if not isinstance(digest, str) or len(digest) != 64:
-            raise ValueError("governance artifact missing")
-        return digest
+    def _degraded_message(reason: str) -> str:
+        if reason == "latest_run_failed":
+            return "最新治理运行失败，当前展示上一次有效快照；模型准入已暂停。"
+        return "最新治理失败状态无法校验，当前展示上一次有效快照；模型准入已暂停。"
 
-    @staticmethod
-    def _run_id_time(run_id: str) -> datetime:
-        try:
-            parsed = datetime.strptime(run_id, "%Y%m%dT%H%M%S%fZ").replace(tzinfo=UTC)
-        except ValueError as exc:
-            raise ValueError("invalid governance run id") from exc
-        if parsed.strftime("%Y%m%dT%H%M%S%fZ") != run_id:
-            raise ValueError("invalid governance run id")
-        return parsed
-
-    @staticmethod
-    def _parse_started_at(value: Any) -> datetime:
-        if not isinstance(value, str):
-            raise ValueError("invalid governance start time")
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise ValueError("invalid governance start time") from exc
-        if parsed.tzinfo is None:
-            raise ValueError("invalid governance start time")
-        return parsed.astimezone(UTC)
-
-    def _require_fresh_run(self, started_at: datetime) -> None:
-        age = (self._as_utc(self.clock()) - started_at).total_seconds()
-        if age < -300 or age > self.config.governance_max_age_seconds:
-            raise ValueError("stale governance run")
-
-    def _require_ready_candidate(
+    def _require_admission_candidate(
         self,
         snapshot: VerifiedGovernanceSnapshot,
         *,
         fingerprint: str,
         model_id: str,
-    ) -> None:
+    ) -> Mapping[str, Any]:
         matches = [
             item
             for item in snapshot.queue
             if item.get("candidate_fingerprint") == fingerprint and item.get("model_id") == model_id
         ]
-        if len(matches) != 1 or matches[0].get("state") != "admission_ready":
+        if len(matches) != 1 or matches[0].get("state") not in {"preflight_required", "admission_ready"}:
             raise ApiException.conflict("候选模型尚未满足准入条件")
+        return matches[0]
 
     def _require_verified_plan(self, *, fingerprint: str, model_id: str, run_id: str) -> None:
         try:
@@ -660,26 +586,6 @@ class ModelManagementService:
             "writes_performed": bool(writes_performed),
             "compensation": safe_compensation,
         }
-
-    @staticmethod
-    def _read_json(path: Path) -> Any:
-        if path.stat().st_size > 10 * 1024 * 1024:
-            raise ValueError("governance artifact too large")
-        return json.loads(path.read_text(encoding="utf-8"))
-
-    @classmethod
-    def _read_mapping(cls, path: Path) -> Mapping[str, Any]:
-        payload = cls._read_json(path)
-        if not isinstance(payload, Mapping):
-            raise ValueError("governance artifact must be object")
-        return payload
-
-    @staticmethod
-    def _pointer_run_id(pointer: Mapping[str, Any]) -> str:
-        run_id = pointer.get("run_id")
-        if not isinstance(run_id, str) or not run_id:
-            raise ValueError("invalid governance run id")
-        return run_id
 
     def _candidate_item(
         self,

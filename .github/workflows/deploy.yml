@@ -145,6 +145,24 @@ jobs:
           ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
           ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
 
+      - name: Pause model management worker before API deploy
+        env:
+          DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED: ${{ vars.LITELLM_MODEL_MANAGEMENT_ENABLED || 'false' }}
+          DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED: ${{ vars.LITELLM_MODEL_ADMISSION_WORKER_ENABLED || 'false' }}
+        run: |
+          set -euo pipefail
+          management_enabled="$(printf '%s' "${DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED}" | tr '[:upper:]' '[:lower:]')"
+          worker_enabled="$(printf '%s' "${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED}" | tr '[:upper:]' '[:lower:]')"
+          case "${management_enabled}:${worker_enabled}" in
+            true:true|true:false|false:false) ;;
+            *) echo "模型管理开关必须为 true 或 false，且 Worker 不能单独启用"; exit 1 ;;
+          esac
+          systemctl --user stop fusion-litellm-model-management.timer >/dev/null 2>&1 || true
+          if systemctl --user is-active --quiet fusion-litellm-model-management.service; then
+            echo "模型准入 Worker 仍在执行，拒绝部署 API；定时器已安全暂停"
+            exit 1
+          fi
+
       - name: Apply alembic migrations
         run: |
           cd ~/project/fusion
@@ -186,6 +204,10 @@ jobs:
           DEPLOY_AMAP_MCP_API_KEY: ${{ secrets.AMAP_MCP_API_KEY }}
           DEPLOY_CONTEXT7_API_KEY: ${{ secrets.CONTEXT7_API_KEY }}
           DEPLOY_FLYAI_API_KEY: ${{ secrets.FLYAI_API_KEY }}
+          DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED: ${{ vars.LITELLM_MODEL_MANAGEMENT_ENABLED || 'false' }}
+          DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED: ${{ vars.LITELLM_MODEL_ADMISSION_WORKER_ENABLED || 'false' }}
+          DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS: ${{ vars.LITELLM_GOVERNANCE_MAX_AGE_SECONDS || '86400' }}
+          DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN: ${{ secrets.LITELLM_MODEL_ADMISSION_WORKER_TOKEN }}
         run: |
           cd ~/project/fusion
           set -o pipefail
@@ -211,6 +233,21 @@ jobs:
           export DASHSCOPE_API_KEY="${DEPLOY_DASHSCOPE_API_KEY:-${DASHSCOPE_API_KEY:-}}"
           export AMAP_MCP_API_KEY="${DEPLOY_AMAP_MCP_API_KEY:-${AMAP_MCP_API_KEY:-}}"
           export CONTEXT7_API_KEY="${DEPLOY_CONTEXT7_API_KEY:-${CONTEXT7_API_KEY:-}}"
+          export LITELLM_MODEL_MANAGEMENT_ENABLED="$(printf '%s' "${DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')"
+          export LITELLM_MODEL_ADMISSION_WORKER_ENABLED="$(printf '%s' "${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')"
+          export LITELLM_GOVERNANCE_MAX_AGE_SECONDS="${DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS:-86400}"
+          export LITELLM_MODEL_ADMISSION_WORKER_TOKEN="${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN:-}"
+          case "${LITELLM_GOVERNANCE_MAX_AGE_SECONDS}" in
+            ''|*[!0-9]*|0) echo "治理快照最大年龄必须是正整数"; exit 1 ;;
+          esac
+          case "${LITELLM_MODEL_MANAGEMENT_ENABLED}:${LITELLM_MODEL_ADMISSION_WORKER_ENABLED}" in
+            true:true|true:false|false:false) ;;
+            *) echo "模型管理开关必须为 true 或 false，且 Worker 不能单独启用"; exit 1 ;;
+          esac
+          if [ "${LITELLM_MODEL_ADMISSION_WORKER_ENABLED}" = "true" ] && [ -z "${LITELLM_MODEL_ADMISSION_WORKER_TOKEN}" ]; then
+            echo "模型准入 Worker 已启用，但发布密钥未配置"
+            exit 1
+          fi
           append_csv_value() {
             current="$1"
             required="$2"
@@ -448,6 +485,10 @@ jobs:
               raise SystemExit("LiteLLM governance mount path mismatch")
           if settings.LITELLM_GOVERNANCE_MAX_AGE_SECONDS <= 0:
               raise SystemExit("LiteLLM governance max age must be positive")
+          if settings.LITELLM_MODEL_ADMISSION_WORKER_ENABLED and not settings.LITELLM_MODEL_MANAGEMENT_ENABLED:
+              raise SystemExit("LiteLLM admission worker cannot be enabled while model management is disabled")
+          if settings.LITELLM_MODEL_ADMISSION_WORKER_ENABLED and not settings.LITELLM_MODEL_ADMISSION_WORKER_TOKEN:
+              raise SystemExit("LiteLLM admission worker token is missing")
           print("LiteLLM model management read-only boundary ok")
           PY
           docker exec -i fusion-api python - <<'PY'
@@ -607,6 +648,182 @@ jobs:
               f"mode={mode} prompts={len(prompts)} revision={revision[:12]}... persisted=true"
           )
           PY
+
+      - name: Install LiteLLM governance discovery
+        run: |
+          set -euo pipefail
+          release_dir="${HOME}/.local/share/fusion/litellm-governance-src-${GITHUB_SHA}"
+          current_link="${HOME}/.local/share/fusion/litellm-governance-current"
+          config_dir="${HOME}/.config/fusion"
+          registry_target="${config_dir}/litellm-provider-registry.json"
+          unit_dir="${HOME}/.config/systemd/user"
+          install -d -m 0755 "${release_dir}/scripts" "${release_dir}/ops/litellm" "${unit_dir}"
+          install -d -m 0700 "${config_dir}"
+          systemctl --user stop fusion-litellm-governance.timer >/dev/null 2>&1 || true
+          if systemctl --user is-active --quiet fusion-litellm-governance.service; then
+            echo "LiteLLM 治理周期仍在执行，拒绝切换发现版本；定时器已安全暂停"
+            exit 1
+          fi
+          for script in \
+            check_litellm_candidate_preflight.py \
+            check_litellm_governance_runtime.py \
+            discover_litellm_model_candidates.py \
+            enrich_litellm_model_candidates.py \
+            fetch_litellm_cost_map.py \
+            orchestrate_litellm_model_candidates.py \
+            plan_litellm_candidate_admission.py \
+            run_litellm_governance_cycle.py \
+            run_litellm_governance_unit.py; do
+            install -m 0644 "${GITHUB_WORKSPACE}/scripts/${script}" "${release_dir}/scripts/${script}"
+          done
+          install -m 0644 \
+            "${GITHUB_WORKSPACE}/ops/litellm/candidate-overrides.json" \
+            "${release_dir}/ops/litellm/candidate-overrides.json"
+          if [ -e "${current_link}" ] && [ ! -L "${current_link}" ]; then
+            echo "LiteLLM 治理当前版本路径不是符号链接，拒绝覆盖"
+            exit 1
+          fi
+          if [ -e "${registry_target}" ] && [ -L "${registry_target}" ]; then
+            echo "LiteLLM provider registry 不能是符号链接"
+            exit 1
+          fi
+          registry_temp="$(mktemp "${config_dir}/.litellm-provider-registry.XXXXXX")"
+          trap 'rm -f "${registry_temp}"' EXIT
+          install -m 0600 \
+            "${GITHUB_WORKSPACE}/ops/litellm/provider-registry.example.json" \
+            "${registry_temp}"
+          python3 - "${registry_temp}" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if not isinstance(payload, dict) or not isinstance(payload.get("providers"), list):
+              raise SystemExit("LiteLLM provider registry 结构无效")
+          PY
+          mv -f "${registry_temp}" "${registry_target}"
+          trap - EXIT
+          install -m 0644 \
+            "${GITHUB_WORKSPACE}/ops/litellm/fusion-litellm-governance.service" \
+            "${GITHUB_WORKSPACE}/ops/litellm/fusion-litellm-governance.timer" \
+            "${unit_dir}/"
+          ln -sfn "${release_dir}" "${current_link}"
+          systemctl --user daemon-reload
+          systemd-analyze --user verify \
+            "${unit_dir}/fusion-litellm-governance.service" \
+            "${unit_dir}/fusion-litellm-governance.timer"
+          systemctl --user enable --now fusion-litellm-governance.timer
+          systemctl --user is-active --quiet fusion-litellm-governance.timer
+
+      - name: Install model management worker
+        env:
+          DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED: ${{ vars.LITELLM_MODEL_MANAGEMENT_ENABLED || 'false' }}
+          DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED: ${{ vars.LITELLM_MODEL_ADMISSION_WORKER_ENABLED || 'false' }}
+          DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS: ${{ vars.LITELLM_GOVERNANCE_MAX_AGE_SECONDS || '86400' }}
+          DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN: ${{ secrets.LITELLM_MODEL_ADMISSION_WORKER_TOKEN }}
+        run: |
+          set -euo pipefail
+          management_enabled="$(printf '%s' "${DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED}" | tr '[:upper:]' '[:lower:]')"
+          worker_enabled="$(printf '%s' "${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED}" | tr '[:upper:]' '[:lower:]')"
+          release_dir="${HOME}/.local/share/fusion/litellm-model-management-src-${GITHUB_SHA}"
+          current_link="${HOME}/.local/share/fusion/litellm-model-management-current"
+          state_dir="${HOME}/.local/state/fusion/litellm-model-management"
+          acceptance_dir="${HOME}/.local/share/fusion/litellm-acceptance"
+          unit_dir="${HOME}/.config/systemd/user"
+          install -d -m 0755 "${release_dir}/scripts" "${unit_dir}"
+          install -d -m 0700 "${state_dir}" "${acceptance_dir}"
+          systemctl --user stop fusion-litellm-model-management.timer >/dev/null 2>&1 || true
+          if systemctl --user is-active --quiet fusion-litellm-model-management.service; then
+            echo "模型准入 Worker 仍在执行，拒绝切换运行版本；定时器已安全暂停"
+            exit 1
+          fi
+          for script in \
+            audit_litellm_model_catalog.py \
+            check_litellm_candidate_preflight.py \
+            check_litellm_governance_runtime.py \
+            check_litellm_model_management_worker_env.py \
+            configure_litellm_model_management_worker_env.py \
+            execute_litellm_candidate_admission.py \
+            plan_litellm_candidate_admission.py \
+            run_litellm_governance_unit.py \
+            run_litellm_model_management_worker.py \
+            verify_litellm_governance_snapshot.py; do
+            install -m 0644 "${GITHUB_WORKSPACE}/scripts/${script}" "${release_dir}/scripts/${script}"
+          done
+          install -m 0644 \
+            "${GITHUB_WORKSPACE}/ops/litellm/fusion-litellm-model-management.service" \
+            "${GITHUB_WORKSPACE}/ops/litellm/fusion-litellm-model-management.timer" \
+            "${unit_dir}/"
+          if [ -e "${current_link}" ] && [ ! -L "${current_link}" ]; then
+            echo "模型准入 Worker 当前版本路径不是符号链接，拒绝覆盖"
+            exit 1
+          fi
+          ln -sfn "${release_dir}" "${current_link}"
+          systemctl --user daemon-reload
+          systemd-analyze --user verify \
+            "${unit_dir}/fusion-litellm-model-management.service" \
+            "${unit_dir}/fusion-litellm-model-management.timer"
+
+          if [ "${management_enabled}" != "true" ] || [ "${worker_enabled}" != "true" ]; then
+            systemctl --user disable --now fusion-litellm-model-management.timer >/dev/null 2>&1 || true
+            echo "模型准入 Worker 未启用；已安装版本化运行文件并保持定时器关闭"
+            exit 0
+          fi
+          if [ -z "${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN}" ]; then
+            echo "模型准入 Worker 已启用，但发布密钥未配置"
+            exit 1
+          fi
+
+          proxy_env="${HOME}/project/litellm-proxy/.env"
+          governance_env="${HOME}/.config/fusion/litellm-governance.env"
+          python3 - "${proxy_env}" "${governance_env}" <<'PY'
+          import os
+          import pathlib
+          import stat
+          import sys
+
+          for raw_path in sys.argv[1:]:
+              path = pathlib.Path(raw_path)
+              file_stat = path.lstat()
+              if path.is_symlink() or not stat.S_ISREG(file_stat.st_mode):
+                  raise SystemExit(f"治理密钥文件不是普通文件: {path}")
+              if file_stat.st_uid != os.getuid():
+                  raise SystemExit(f"治理密钥文件 owner 不匹配: {path}")
+              os.chmod(path, 0o600, follow_symlinks=False)
+          PY
+
+          set +u
+          set -a
+          source "${HOME}/project/fusion/.env"
+          set +a
+          set -u
+          export LITELLM_VIRTUAL_KEY="${LITELLM_API_KEY:-}"
+          export LITELLM_MODEL_ADMISSION_WORKER_TOKEN="${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN}"
+          export FUSION_MODEL_MANAGEMENT_BASE_URL="http://127.0.0.1:8002"
+          export LITELLM_GOVERNANCE_MAX_AGE_SECONDS="${DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS}"
+          expected_token_sha256="$(printf '%s' "${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN}" | sha256sum | awk '{print $1}')"
+          cd "${current_link}"
+          "${HOME}/.local/share/fusion/litellm-governance-venv/bin/python" \
+            -m scripts.configure_litellm_model_management_worker_env \
+            --env-file "${governance_env}"
+          "${HOME}/.local/share/fusion/litellm-governance-venv/bin/python" \
+            -m scripts.run_litellm_governance_unit \
+            --proxy-env "${proxy_env}" \
+            --governance-env "${governance_env}" \
+            --registry "${HOME}/.config/fusion/litellm-provider-registry.json" \
+            --require-env LITELLM_MASTER_KEY \
+            --require-env LITELLM_VIRTUAL_KEY \
+            --require-env LITELLM_MODEL_ADMISSION_WORKER_TOKEN \
+            --require-env LITELLM_GOVERNANCE_MAX_AGE_SECONDS \
+            --require-env LITELLM_CANDIDATE_KEY \
+            -- \
+            "${HOME}/.local/share/fusion/litellm-governance-venv/bin/python" \
+              -m scripts.check_litellm_model_management_worker_env \
+              --expected-token-sha256 "${expected_token_sha256}" \
+              --expected-base-url http://127.0.0.1:8002 \
+              --expected-governance-max-age-seconds "${LITELLM_GOVERNANCE_MAX_AGE_SECONDS}"
+          systemctl --user enable --now fusion-litellm-model-management.timer
+          systemctl --user is-active --quiet fusion-litellm-model-management.timer
 
       - name: Run deployment smoke
         run: |

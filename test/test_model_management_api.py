@@ -49,7 +49,11 @@ class FakeModelManagementService:
         operation = self.operation_payload(self.operation)
         return {
             "generated_at": "2026-08-04T00:00:00+00:00",
-            "governance": {"available": True, "run_id": self.operation.governance_run_id},
+            "governance": {
+                "available": True,
+                "status": "available",
+                "run_id": self.operation.governance_run_id,
+            },
             "capabilities": {"admission_enabled": True, "hard_delete_enabled": False},
             "models": [
                 {
@@ -156,14 +160,20 @@ class ModelManagementApiTests(unittest.TestCase):
             "app.api.deps.settings.LITELLM_MODEL_ADMISSION_WORKER_ENABLED",
             True,
         )
+        self.management_enabled_patcher = patch(
+            "app.api.deps.settings.LITELLM_MODEL_MANAGEMENT_ENABLED",
+            True,
+        )
         self.worker_token_patcher = patch(
             "app.api.deps.settings.LITELLM_MODEL_ADMISSION_WORKER_TOKEN",
             "worker-secret",
         )
         self.worker_enabled_patcher.start()
+        self.management_enabled_patcher.start()
         self.worker_token_patcher.start()
 
     def tearDown(self):
+        self.management_enabled_patcher.stop()
         self.worker_token_patcher.stop()
         self.worker_enabled_patcher.stop()
         self.main.app.dependency_overrides.clear()
@@ -177,6 +187,14 @@ class ModelManagementApiTests(unittest.TestCase):
         self.assertEqual(
             set(data),
             {"generated_at", "governance", "capabilities", "models", "candidates", "operations"},
+        )
+        self.assertEqual(
+            data["governance"],
+            {
+                "available": True,
+                "status": "available",
+                "run_id": "20260804T010203456789Z",
+            },
         )
         self.assertEqual(
             set(data["models"][0]),
@@ -311,6 +329,43 @@ class ModelManagementApiTests(unittest.TestCase):
             headers={"X-Fusion-Worker-Token": "wrong"},
         )
         self.assertEqual(unauthorized.status_code, 401)
+
+    def test_emergency_disable_blocks_claim_and_invalidation_but_allows_completion(self):
+        worker_headers = {
+            "X-Fusion-Worker-Token": "worker-secret",
+            "X-Operation-Lease": "one-time-lease",
+        }
+        with (
+            patch("app.api.deps.settings.LITELLM_MODEL_MANAGEMENT_ENABLED", False),
+            patch("app.api.deps.settings.LITELLM_MODEL_ADMISSION_WORKER_ENABLED", False),
+        ):
+            claimed = self.client.post(
+                "/api/internal/model-management/admissions/claim",
+                headers=worker_headers,
+            )
+            invalidated = self.client.post(
+                "/api/internal/model-management/admissions/operation-1/invalidate-catalog",
+                headers=worker_headers,
+            )
+            completed = self.client.post(
+                "/api/internal/model-management/admissions/operation-1/complete",
+                headers=worker_headers,
+                json={
+                    "status": "failed",
+                    "phase": "emergency_disabled",
+                    "error_code": "management_disabled",
+                    "completed_phases": [],
+                    "writes_performed": False,
+                    "compensation": {"attempted": False},
+                },
+            )
+
+        self.assertEqual(claimed.status_code, 401)
+        self.assertEqual(invalidated.status_code, 401)
+        self.assertEqual(completed.status_code, 200)
+        self.assertNotIn("claim", [name for name, _ in self.service.calls])
+        self.assertNotIn("invalidate", [name for name, _ in self.service.calls])
+        self.assertIn("complete", [name for name, _ in self.service.calls])
 
     def test_admin_endpoint_is_superuser_only(self):
         from app.api.deps import get_current_admin_user, get_current_user

@@ -23,6 +23,8 @@ class LiteLLMGovernanceUnitTests(unittest.TestCase):
             "scripts.orchestrate_litellm_model_candidates",
             "scripts.enrich_litellm_model_candidates",
             "scripts.execute_litellm_candidate_admission",
+            "scripts.check_litellm_model_management_worker_env",
+            "scripts.configure_litellm_model_management_worker_env",
             "scripts.run_litellm_model_management_worker",
         )
 
@@ -104,10 +106,13 @@ class LiteLLMGovernanceUnitTests(unittest.TestCase):
         self.assertIn("--require-env LITELLM_MASTER_KEY", service)
         self.assertIn("--require-env LITELLM_VIRTUAL_KEY", service)
         self.assertIn("--require-env LITELLM_MODEL_ADMISSION_WORKER_TOKEN", service)
+        self.assertIn("--require-env LITELLM_GOVERNANCE_MAX_AGE_SECONDS", service)
         self.assertNotIn("EnvironmentFile=", service)
         self.assertIn("ProtectSystem=strict", service)
         self.assertIn("ProtectHome=read-only", service)
         self.assertIn("NoNewPrivileges=true", service)
+        self.assertIn("%h/.local/share/fusion/litellm-model-management-current", service)
+        self.assertNotIn("%h/project/fusion/fusion-api/scripts/run_litellm_model_management_worker.py", service)
         self.assertIn("%h/backups/litellm-governance", service)
         self.assertIn("%h/.local/state/fusion/litellm-model-management", service)
         self.assertIn("ReadWritePaths=", service)
@@ -121,6 +126,7 @@ class LiteLLMGovernanceUnitTests(unittest.TestCase):
         self.assertIn("LITELLM_CANDIDATE_KEY=", content)
         self.assertIn("LITELLM_VIRTUAL_KEY=", content)
         self.assertIn("LITELLM_MODEL_ADMISSION_WORKER_TOKEN=", content)
+        self.assertIn("LITELLM_GOVERNANCE_MAX_AGE_SECONDS=", content)
         self.assertNotIn("LITELLM_MASTER_KEY=", content)
         self.assertNotIn("MOONSHOT_API_KEY=", content)
         self.assertNotIn("QWEN_API_KEY=", content)

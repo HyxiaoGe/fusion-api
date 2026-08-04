@@ -31,6 +31,7 @@ class LiteLLMGovernanceUnitRunnerTests(unittest.TestCase):
                     "LITELLM_VIRTUAL_KEY=virtual",
                     "FUSION_MODEL_MANAGEMENT_BASE_URL=http://127.0.0.1:8002",
                     "LITELLM_MODEL_ADMISSION_WORKER_TOKEN=worker-token",
+                    "LITELLM_GOVERNANCE_MAX_AGE_SECONDS=7200",
                 ]
             ),
             encoding="utf-8",
@@ -63,6 +64,7 @@ class LiteLLMGovernanceUnitRunnerTests(unittest.TestCase):
                     "LITELLM_CANDIDATE_KEY",
                     "LITELLM_VIRTUAL_KEY",
                     "LITELLM_MODEL_ADMISSION_WORKER_TOKEN",
+                    "LITELLM_GOVERNANCE_MAX_AGE_SECONDS",
                 ],
                 inherited={
                     "HOME": "/home/test",
@@ -83,6 +85,7 @@ class LiteLLMGovernanceUnitRunnerTests(unittest.TestCase):
             "http://127.0.0.1:8002",
         )
         self.assertEqual(execute_env["LITELLM_MODEL_ADMISSION_WORKER_TOKEN"], "worker-token")
+        self.assertEqual(execute_env["LITELLM_GOVERNANCE_MAX_AGE_SECONDS"], "7200")
         self.assertNotIn("PYTHONPATH", execute_env)
         self.assertNotIn("LD_PRELOAD", execute_env)
         self.assertEqual(execute_env["PYTHONNOUSERSITE"], "1")

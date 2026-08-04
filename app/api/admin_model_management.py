@@ -4,6 +4,7 @@ from app.api.deps import (
     get_current_admin_user,
     get_model_management_service,
     require_model_admission_worker,
+    require_model_admission_worker_token,
 )
 from app.db.models import User
 from app.schemas.model_management import (
@@ -110,7 +111,7 @@ def complete_candidate_admission(
     operation_id: str,
     payload: AdmissionCompletionRequest,
     operation_lease: str = Header(..., alias="X-Operation-Lease"),
-    _worker: None = Depends(require_model_admission_worker),
+    _worker: None = Depends(require_model_admission_worker_token),
     service: ModelManagementService = Depends(get_model_management_service),
 ):
     operation = service.complete_operation(
