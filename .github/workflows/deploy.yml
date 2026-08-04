@@ -40,8 +40,11 @@ jobs:
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           $dockerConfig = Join-Path $env:RUNNER_TEMP ".docker-$env:GITHUB_RUN_ID-$env:GITHUB_JOB"
+          $buildxConfig = Join-Path (Split-Path $env:RUNNER_TEMP -Parent) ".buildx-fusion-api"
           New-Item -ItemType Directory -Force -Path $dockerConfig | Out-Null
+          New-Item -ItemType Directory -Force -Path $buildxConfig | Out-Null
           "DOCKER_CONFIG=$dockerConfig" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "BUILDX_CONFIG=$buildxConfig" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Push CI/CD active metric
         if: github.ref == 'refs/heads/master'
@@ -82,19 +85,36 @@ jobs:
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           $ErrorActionPreference = "Stop"
+          $runnerKey = '${{ runner.name }}' -replace '[^A-Za-z0-9_.-]', '-'
+          if (-not $runnerKey) { $runnerKey = "runner" }
+          $builder = "fusion-api-ci-$runnerKey"
           $image = "${env:IMAGE_NAME}:${env:GITHUB_SHA}"
           $adapterImage = "${env:FLYAI_ADAPTER_IMAGE_NAME}:${env:GITHUB_SHA}"
 
-          docker build --target production -t $image .
+          cmd /c "docker buildx inspect $builder >NUL 2>NUL"
+          if ($LASTEXITCODE -ne 0) {
+            docker buildx create --name $builder --driver docker-container --use
+            if ($LASTEXITCODE -ne 0) {
+              cmd /c "docker buildx inspect $builder >NUL 2>NUL"
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+          }
+
+          docker buildx use $builder
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          docker buildx inspect --builder $builder --bootstrap
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          docker buildx build --builder $builder --target production --load --provenance=false -t $image .
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           docker run --rm $image sh -lc "timeout 300s python -m pip install --default-timeout=30 --no-cache-dir -r requirements-ci.txt && python scripts/check_architecture.py && ruff check . && timeout 270s python -u -m unittest discover -s test -t . -v"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          docker build --target test -t "${adapterImage}-test" ./flyai-adapter
+          docker buildx build --builder $builder --target test --load --provenance=false -t "${adapterImage}-test" ./flyai-adapter
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          docker build --target production -t $adapterImage ./flyai-adapter
+          docker buildx build --builder $builder --target production --load --provenance=false -t $adapterImage ./flyai-adapter
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Login to ACR
@@ -111,11 +131,43 @@ jobs:
 
       - name: Cleanup local Docker artifacts
         if: always()
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
-          docker image rm "%IMAGE_NAME%:%GITHUB_SHA%" 2>NUL
-          docker image rm "%FLYAI_ADAPTER_IMAGE_NAME%:%GITHUB_SHA%" 2>NUL
-          docker image rm "%FLYAI_ADAPTER_IMAGE_NAME%:%GITHUB_SHA%-test" 2>NUL
-          docker builder prune --filter "until=72h" -f
+          docker image rm "${env:IMAGE_NAME}:${env:GITHUB_SHA}" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "清理 API 镜像失败，继续执行后续清理"
+          }
+
+          docker image rm "${env:FLYAI_ADAPTER_IMAGE_NAME}:${env:GITHUB_SHA}" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "清理 FlyAI Adapter 镜像失败，继续执行后续清理"
+          }
+
+          docker image rm "${env:FLYAI_ADAPTER_IMAGE_NAME}:${env:GITHUB_SHA}-test" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "清理 FlyAI Adapter 测试镜像失败，继续执行后续清理"
+          }
+
+          $runnerKey = '${{ runner.name }}' -replace '[^A-Za-z0-9_.-]', '-'
+          if (-not $runnerKey) { $runnerKey = "runner" }
+          $builder = "fusion-api-ci-$runnerKey"
+
+          docker buildx inspect $builder *> $null
+          if ($LASTEXITCODE -eq 0) {
+            docker buildx prune `
+              --builder $builder `
+              --force `
+              --max-used-space 10gb `
+              --reserved-space 4gb `
+              --min-free-space 30gb
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "清理 Buildx builder $builder 的缓存失败"
+            }
+          } else {
+            Write-Warning "Buildx builder $builder 不存在，跳过缓存清理"
+          }
+
+          exit 0
 
   deploy-dev:
     name: Deploy master on dev server
