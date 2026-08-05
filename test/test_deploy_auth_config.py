@@ -8,6 +8,9 @@ class DeployAuthConfigTests(unittest.TestCase):
         self.app_config = (root / "app" / "core" / "config.py").read_text(encoding="utf-8")
         self.env_example = (root / ".env.example").read_text(encoding="utf-8")
         self.workflow = (root / ".github" / "workflows" / "deploy.yml").read_text(encoding="utf-8")
+        self.ci_build_script = (
+            root / ".github" / "scripts" / "windows-build-and-test.ps1"
+        ).read_text(encoding="utf-8")
         self.compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
         self.ci_requirements = (root / "requirements-ci.txt").read_text(encoding="utf-8")
 
@@ -51,14 +54,14 @@ class DeployAuthConfigTests(unittest.TestCase):
     def test_ci_runs_tests_with_process_timeout_and_verbose_output(self):
         self.assertIn(
             "timeout 270s python -u -m unittest discover -s test -t . -v",
-            self.workflow,
+            self.ci_build_script,
         )
 
     def test_ci_lint_install_has_process_and_network_timeouts(self):
         self.assertIn("ruff==", self.ci_requirements)
         self.assertIn(
             "timeout 300s python -m pip install --default-timeout=30 --no-cache-dir -r requirements-ci.txt",
-            self.workflow,
+            self.ci_build_script,
         )
 
     def test_windows_acr_login_uses_docker_login_action(self):

@@ -1,0 +1,142 @@
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+PR_WORKFLOW = ROOT / ".github" / "workflows" / "pr-ci.yml"
+RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "deploy.yml"
+CLEANUP_SCRIPT = ROOT / ".github" / "scripts" / "windows-cleanup.ps1"
+BUILD_SCRIPT = ROOT / ".github" / "scripts" / "windows-build-and-test.ps1"
+LINUX_BUILD_SCRIPT = ROOT / ".github" / "scripts" / "linux-build-and-test.sh"
+
+
+class CICDPermissionBoundaryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.pr_workflow = PR_WORKFLOW.read_text(encoding="utf-8")
+        self.release_workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.cleanup_script = CLEANUP_SCRIPT.read_text(encoding="utf-8")
+        self.build_script = BUILD_SCRIPT.read_text(encoding="utf-8")
+        self.linux_build_script = LINUX_BUILD_SCRIPT.read_text(encoding="utf-8")
+
+    def test_pr_workflow_only_targets_master_pull_requests(self) -> None:
+        self.assertRegex(
+            self.pr_workflow,
+            r"(?ms)^on:\n\s+pull_request:\n\s+branches:\s*\[master\]",
+        )
+        self.assertNotRegex(self.pr_workflow, r"(?m)^\s{2}(push|workflow_dispatch):")
+
+    def test_pr_workflow_has_no_release_privileges(self) -> None:
+        self.assertEqual(self.pr_workflow.count("name: Build on Windows runner"), 1)
+        self.assertIn("过渡检查名", self.pr_workflow)
+        self.assertIn("runs-on: ubuntu-latest", self.pr_workflow)
+        self.assertNotIn("runs-on: [self-hosted, Windows, X64]", self.pr_workflow)
+        self.assertNotIn("environment:", self.pr_workflow)
+        self.assertNotIn("secrets.", self.pr_workflow)
+        self.assertNotIn("docker/login-action", self.pr_workflow)
+        self.assertNotRegex(self.pr_workflow, r"(?m)^\s*docker push\b")
+        self.assertNotIn("deploy-dev:", self.pr_workflow)
+        self.assertIn(".github/scripts/linux-build-and-test.sh", self.pr_workflow)
+        self.assertIn("persist-credentials: false", self.pr_workflow)
+        self.assertNotIn("windows-cleanup.ps1", self.pr_workflow)
+        self.assertNotIn("builder prune", self.pr_workflow)
+        self.assertNotIn("secrets.", self.linux_build_script)
+        self.assertNotRegex(self.linux_build_script, r"(?mi)^\s*docker login\b")
+        self.assertNotRegex(self.linux_build_script, r"(?mi)^\s*docker push\b")
+
+    def test_release_workflow_only_runs_for_master(self) -> None:
+        self.assertRegex(
+            self.release_workflow,
+            r"(?ms)^on:\n\s+push:\n\s+branches:\s*\[master\]\n\s+workflow_dispatch:",
+        )
+        self.assertNotIn("pull_request:", self.release_workflow)
+        publish_job = self.release_workflow[
+            self.release_workflow.index("  publish:") : self.release_workflow.index("  deploy-dev:")
+        ]
+        self.assertIn("if: github.ref == 'refs/heads/master'", publish_job)
+        self.assertEqual(publish_job.count("name: Publish master images on Windows runner"), 1)
+        self.assertNotIn("name: Build on Windows runner", publish_job)
+
+    def test_release_runs_are_never_cancelled_mid_deployment(self) -> None:
+        self.assertRegex(
+            self.release_workflow,
+            r"(?ms)^concurrency:\n\s+group: fusion-api-windows-ci-.*\n\s+cancel-in-progress: false$",
+        )
+        self.assertIn("cancel-in-progress: true", self.pr_workflow)
+
+    def test_all_checkouts_disable_credential_persistence(self) -> None:
+        checkout_without_credentials = (
+            "uses: actions/checkout@v6\n"
+            "        with:\n"
+            "          persist-credentials: false"
+        )
+        self.assertEqual(self.pr_workflow.count(checkout_without_credentials), 1)
+        self.assertEqual(self.release_workflow.count(checkout_without_credentials), 2)
+        self.assertEqual(self.pr_workflow.count("uses: actions/checkout@v6"), 1)
+        self.assertEqual(self.release_workflow.count("uses: actions/checkout@v6"), 2)
+
+    def test_windows_publish_removes_only_isolated_docker_credentials(self) -> None:
+        self.assertIn("$env:RUNNER_TEMP", self.cleanup_script)
+        self.assertIn("$env:DOCKER_CONFIG", self.cleanup_script)
+        self.assertIn('".docker-*"', self.cleanup_script)
+        self.assertIn(
+            "Remove-Item -LiteralPath $dockerConfigPath -Recurse -Force",
+            self.cleanup_script,
+        )
+        self.assertLess(
+            self.cleanup_script.index("$env:RUNNER_TEMP"),
+            self.cleanup_script.index("Remove-Item -LiteralPath"),
+        )
+
+    def test_linux_deploy_isolates_and_removes_docker_credentials(self) -> None:
+        deploy_job = self.release_workflow[self.release_workflow.index("  deploy-dev:") :]
+        configure_step = "Configure Docker credential directory"
+        login_step = "Login to ACR"
+        cleanup_step = "Cleanup Docker credential directory"
+        self.assertLess(deploy_job.index(configure_step), deploy_job.index(login_step))
+        self.assertIn(
+            'docker_config="${RUNNER_TEMP}/.docker-${GITHUB_RUN_ID}-${GITHUB_JOB}"',
+            deploy_job,
+        )
+        self.assertIn('"DOCKER_CONFIG=${docker_config}" >> "${GITHUB_ENV}"', deploy_job)
+        self.assertIn(f"- name: {cleanup_step}\n        if: always()", deploy_job)
+        self.assertIn('"${RUNNER_TEMP}"/.docker-*', deploy_job)
+        self.assertIn('rm -rf -- "${DOCKER_CONFIG}"', deploy_job)
+        self.assertTrue(
+            self.release_workflow.rstrip().endswith('rm -rf -- "${DOCKER_CONFIG}"'),
+            "Docker 凭据目录清理必须是部署 workflow 的最后一步",
+        )
+
+    def test_release_publish_uses_dev_secrets_without_creating_deployment(self) -> None:
+        publish_job = self.release_workflow[
+            self.release_workflow.index("  publish:") : self.release_workflow.index("  deploy-dev:")
+        ]
+        self.assertRegex(
+            publish_job,
+            r"(?ms)^\s{4}environment:\n\s{6}name: dev\n\s{6}deployment: false$",
+        )
+        self.assertIn("uses: docker/login-action@v3", publish_job)
+        self.assertIn("username: ${{ secrets.ACR_USERNAME }}", publish_job)
+        self.assertIn("password: ${{ secrets.ACR_PASSWORD }}", publish_job)
+        self.assertIn("logout: false", publish_job)
+        self.assertRegex(publish_job, r"(?m)^\s*docker push\b")
+
+    def test_deploy_job_depends_on_release_build_and_uses_dev_environment(self) -> None:
+        deploy_job = self.release_workflow[self.release_workflow.index("  deploy-dev:") :]
+        self.assertIn("needs: publish", deploy_job)
+        self.assertNotIn("needs.build.outputs", deploy_job)
+        self.assertIn("needs.publish.outputs", deploy_job)
+        self.assertRegex(deploy_job, r"(?m)^\s{4}environment: dev$")
+        self.assertIn("Apply alembic migrations", deploy_job)
+        self.assertIn("Run deployment smoke", deploy_job)
+        self.assertIn("Push CI/CD metrics", deploy_job)
+        self.assertIn("通知飞书(部署结果)", deploy_job)
+
+    def test_release_keeps_buildkit_cache_governance(self) -> None:
+        shared_script = ".github/scripts/windows-cleanup.ps1"
+        self.assertIn(shared_script, self.release_workflow)
+        self.assertIn('"--max-used-space", "10gb"', self.cleanup_script)
+        self.assertIn('"--reserved-space", "4gb"', self.cleanup_script)
+        self.assertIn('"--min-free-space", "30gb"', self.cleanup_script)
+
+
+if __name__ == "__main__":
+    unittest.main()

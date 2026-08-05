@@ -2,6 +2,7 @@ name: Fusion API Windows CI
 
 on:
   push:
+    branches: [master]
   workflow_dispatch:
 
 permissions:
@@ -9,7 +10,8 @@ permissions:
 
 concurrency:
   group: fusion-api-windows-ci-${{ github.ref }}
-  cancel-in-progress: true
+  # 发布可能正在执行 Alembic 或容器重启，后续 push 只能排队，不能中途取消。
+  cancel-in-progress: false
 
 # 镜像源:阿里云 ACR 个人版(深圳,境内端点);改仓名只动 IMAGE_NAME 一行
 env:
@@ -18,10 +20,14 @@ env:
   FLYAI_ADAPTER_IMAGE_NAME: crpi-77w10wlykpqilmmb.cn-shenzhen.personal.cr.aliyuncs.com/seanfield/fusion-flyai-adapter
 
 jobs:
-  build:
-    name: Build on Windows runner
+  publish:
+    name: Publish master images on Windows runner
+    if: github.ref == 'refs/heads/master'
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 40
+    environment:
+      name: dev
+      deployment: false
     outputs:
       started_at: ${{ steps.pipeline_start.outputs.started_at }}
       runner_name: ${{ steps.pipeline_start.outputs.runner_name }}
@@ -71,6 +77,8 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Verify Docker access
         run: |
@@ -81,21 +89,10 @@ jobs:
         timeout-minutes: 15
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
-          $ErrorActionPreference = "Stop"
-          $image = "${env:IMAGE_NAME}:${env:GITHUB_SHA}"
-          $adapterImage = "${env:FLYAI_ADAPTER_IMAGE_NAME}:${env:GITHUB_SHA}"
-
-          docker build --target production -t $image .
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          docker run --rm $image sh -lc "timeout 300s python -m pip install --default-timeout=30 --no-cache-dir -r requirements-ci.txt && python scripts/check_architecture.py && ruff check . && timeout 270s python -u -m unittest discover -s test -t . -v"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          docker build --target test -t "${adapterImage}-test" ./flyai-adapter
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          docker build --target production -t $adapterImage ./flyai-adapter
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ".github/scripts/windows-build-and-test.ps1" `
+            -ImageName "${env:IMAGE_NAME}" `
+            -AdapterImageName "${env:FLYAI_ADAPTER_IMAGE_NAME}" `
+            -ImageTag "${env:GITHUB_SHA}"
 
       - name: Login to ACR
         uses: docker/login-action@v3
@@ -103,6 +100,8 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
+          # 凭据目录由 always cleanup 统一删除，避免 post-action 在目录删除后重新创建。
+          logout: false
 
       - name: Push Docker image
         run: |
@@ -113,41 +112,18 @@ jobs:
         if: always()
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
-          docker image rm "${env:IMAGE_NAME}:${env:GITHUB_SHA}" 2>$null
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "清理 API 镜像失败，继续执行后续清理"
-          }
-
-          docker image rm "${env:FLYAI_ADAPTER_IMAGE_NAME}:${env:GITHUB_SHA}" 2>$null
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "清理 FlyAI Adapter 镜像失败，继续执行后续清理"
-          }
-
-          docker image rm "${env:FLYAI_ADAPTER_IMAGE_NAME}:${env:GITHUB_SHA}-test" 2>$null
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "清理 FlyAI Adapter 测试镜像失败，继续执行后续清理"
-          }
-
-          $pruneArgs = @(
-            "builder", "prune",
-            "--force",
-            "--max-used-space", "10gb",
-            "--reserved-space", "4gb",
-            "--min-free-space", "30gb"
-          )
-          docker @pruneArgs
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "清理默认 builder 的缓存失败"
-          }
-
-          exit 0
+          & ".github/scripts/windows-cleanup.ps1" `
+            -ImageName "${env:IMAGE_NAME}" `
+            -AdapterImageName "${env:FLYAI_ADAPTER_IMAGE_NAME}" `
+            -ImageTag "${env:GITHUB_SHA}"
 
   deploy-dev:
     name: Deploy master on dev server
     if: github.ref == 'refs/heads/master'
-    needs: build
+    needs: publish
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 10
+    environment: dev
 
     steps:
       - name: Record deploy start time
@@ -155,6 +131,18 @@ jobs:
 
       - name: Checkout smoke scripts
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Configure Docker credential directory
+        run: |
+          docker_config="${RUNNER_TEMP}/.docker-${GITHUB_RUN_ID}-${GITHUB_JOB}"
+          case "${docker_config}" in
+            "${RUNNER_TEMP}"/.docker-*) ;;
+            *) echo "Docker 凭据目录未落在 RUNNER_TEMP 的隔离路径中"; exit 1 ;;
+          esac
+          mkdir -p -- "${docker_config}"
+          printf '%s\n' "DOCKER_CONFIG=${docker_config}" >> "${GITHUB_ENV}"
 
       - name: Login to ACR
         run: |
@@ -646,10 +634,10 @@ jobs:
             "${{ github.ref_name }}" \
             dev \
             "${{ job.status }}" \
-            "${{ needs.build.outputs.started_at }}" \
+            "${{ needs.publish.outputs.started_at }}" \
             "${{ env.IMAGE_NAME }}:${{ github.sha }}" \
             "${{ github.sha }}" \
-            "${{ needs.build.outputs.runner_name }}" \
+            "${{ needs.publish.outputs.runner_name }}" \
             fusion-api \
             "${{ env.DEPLOY_START }}"; then
             echo "CI/CD metrics push failed, ignored"
@@ -724,3 +712,17 @@ jobs:
           except Exception as e:
               print(f"飞书通知失败(忽略): {e!r}")
           PY
+
+      - name: Cleanup Docker credential directory
+        if: always()
+        run: |
+          expected="${RUNNER_TEMP}/.docker-${GITHUB_RUN_ID}-${GITHUB_JOB}"
+          if [ -z "${DOCKER_CONFIG:-}" ] || [ "${DOCKER_CONFIG}" != "${expected}" ]; then
+            echo "DOCKER_CONFIG 与当前 job 的隔离目录不一致，拒绝删除: ${DOCKER_CONFIG:-<empty>}"
+            exit 1
+          fi
+          case "${DOCKER_CONFIG}" in
+            "${RUNNER_TEMP}"/.docker-*) ;;
+            *) echo "DOCKER_CONFIG 未落在 RUNNER_TEMP 的 .docker-* 路径中，拒绝删除"; exit 1 ;;
+          esac
+          rm -rf -- "${DOCKER_CONFIG}"
