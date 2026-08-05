@@ -111,11 +111,36 @@ jobs:
 
       - name: Cleanup local Docker artifacts
         if: always()
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
-          docker image rm "%IMAGE_NAME%:%GITHUB_SHA%" 2>NUL
-          docker image rm "%FLYAI_ADAPTER_IMAGE_NAME%:%GITHUB_SHA%" 2>NUL
-          docker image rm "%FLYAI_ADAPTER_IMAGE_NAME%:%GITHUB_SHA%-test" 2>NUL
-          docker builder prune --filter "until=72h" -f
+          docker image rm "${env:IMAGE_NAME}:${env:GITHUB_SHA}" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "清理 API 镜像失败，继续执行后续清理"
+          }
+
+          docker image rm "${env:FLYAI_ADAPTER_IMAGE_NAME}:${env:GITHUB_SHA}" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "清理 FlyAI Adapter 镜像失败，继续执行后续清理"
+          }
+
+          docker image rm "${env:FLYAI_ADAPTER_IMAGE_NAME}:${env:GITHUB_SHA}-test" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "清理 FlyAI Adapter 测试镜像失败，继续执行后续清理"
+          }
+
+          $pruneArgs = @(
+            "builder", "prune",
+            "--force",
+            "--max-used-space", "10gb",
+            "--reserved-space", "4gb",
+            "--min-free-space", "30gb"
+          )
+          docker @pruneArgs
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "清理默认 builder 的缓存失败"
+          }
+
+          exit 0
 
   deploy-dev:
     name: Deploy master on dev server
