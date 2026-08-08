@@ -65,7 +65,10 @@ class DeployAuthConfigTests(unittest.TestCase):
         )
 
     def test_windows_acr_login_uses_docker_login_action(self):
-        self.assertIn("uses: docker/login-action@v3", self.workflow)
+        self.assertIn(
+            "uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0",
+            self.workflow,
+        )
         self.assertIn("registry: ${{ env.REGISTRY }}", self.workflow)
         self.assertIn("username: ${{ secrets.ACR_USERNAME }}", self.workflow)
         self.assertIn("password: ${{ secrets.ACR_PASSWORD }}", self.workflow)

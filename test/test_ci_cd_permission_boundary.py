@@ -1,3 +1,4 @@
+import re
 import unittest
 from pathlib import Path
 
@@ -7,6 +8,18 @@ RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "deploy.yml"
 CLEANUP_SCRIPT = ROOT / ".github" / "scripts" / "windows-cleanup.ps1"
 BUILD_SCRIPT = ROOT / ".github" / "scripts" / "windows-build-and-test.ps1"
 LINUX_BUILD_SCRIPT = ROOT / ".github" / "scripts" / "linux-build-and-test.sh"
+CHECKOUT_ACTION = "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6"
+LOGIN_ACTION = "docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0"
+
+
+def github_action_documents() -> list[Path]:
+    workflow_directory = ROOT / ".github" / "workflows"
+    action_directory = ROOT / ".github" / "actions"
+    workflows = sorted((*workflow_directory.glob("*.yml"), *workflow_directory.glob("*.yaml")))
+    actions = []
+    if action_directory.exists():
+        actions = sorted((*action_directory.rglob("action.yml"), *action_directory.rglob("action.yaml")))
+    return [*workflows, *actions]
 
 
 class CICDPermissionBoundaryTests(unittest.TestCase):
@@ -25,8 +38,9 @@ class CICDPermissionBoundaryTests(unittest.TestCase):
         self.assertNotRegex(self.pr_workflow, r"(?m)^\s{2}(push|workflow_dispatch):")
 
     def test_pr_workflow_has_no_release_privileges(self) -> None:
-        self.assertEqual(self.pr_workflow.count("name: Build on Windows runner"), 1)
-        self.assertIn("过渡检查名", self.pr_workflow)
+        self.assertEqual(self.pr_workflow.count("name: PR container validation"), 1)
+        self.assertNotIn("name: Build on Windows runner", self.pr_workflow)
+        self.assertNotIn("过渡检查名", self.pr_workflow)
         self.assertIn("runs-on: ubuntu-latest", self.pr_workflow)
         self.assertNotIn("runs-on: [self-hosted, Windows, X64]", self.pr_workflow)
         self.assertNotIn("environment:", self.pr_workflow)
@@ -63,15 +77,42 @@ class CICDPermissionBoundaryTests(unittest.TestCase):
         self.assertIn("cancel-in-progress: true", self.pr_workflow)
 
     def test_all_checkouts_disable_credential_persistence(self) -> None:
-        checkout_without_credentials = (
-            "uses: actions/checkout@v6\n"
-            "        with:\n"
-            "          persist-credentials: false"
-        )
+        checkout_without_credentials = f"uses: {CHECKOUT_ACTION}\n        with:\n          persist-credentials: false"
         self.assertEqual(self.pr_workflow.count(checkout_without_credentials), 1)
         self.assertEqual(self.release_workflow.count(checkout_without_credentials), 2)
-        self.assertEqual(self.pr_workflow.count("uses: actions/checkout@v6"), 1)
-        self.assertEqual(self.release_workflow.count("uses: actions/checkout@v6"), 2)
+        self.assertEqual(self.pr_workflow.count(f"uses: {CHECKOUT_ACTION}"), 1)
+        self.assertEqual(self.release_workflow.count(f"uses: {CHECKOUT_ACTION}"), 2)
+
+    def test_active_workflows_pin_external_actions_to_full_commit_sha(self) -> None:
+        uses_key_pattern = re.compile(r"^\s*(?:-\s*)?uses\s*:")
+        uses_value_pattern = re.compile(r"""^\s*(?:-\s*)?uses\s*:\s*(['"]?)([^'"#\s]+)\1(?:\s+#\s*(.*\S))?\s*$""")
+        external_action_count = 0
+
+        for action_document in github_action_documents():
+            workflow = action_document.read_text(encoding="utf-8")
+            for line_number, line in enumerate(workflow.splitlines(), start=1):
+                if uses_key_pattern.match(line) is None:
+                    continue
+                action = uses_value_pattern.match(line)
+                self.assertIsNotNone(
+                    action,
+                    f"{action_document.relative_to(ROOT)}:{line_number} 的 uses 语法未纳入安全校验",
+                )
+                reference = action.group(2)
+                if reference.startswith("./"):
+                    continue
+                external_action_count += 1
+                self.assertRegex(
+                    reference,
+                    r"^[^@\s]+@[0-9a-f]{40}$",
+                    f"{action_document.name} 的 {reference} 必须锁定完整 commit SHA",
+                )
+                self.assertRegex(
+                    action.group(3) or "",
+                    r"^v\d",
+                    f"{action_document.name} 的 {reference} 应保留版本注释",
+                )
+        self.assertGreater(external_action_count, 0, "仓库应至少包含一个外部 Action")
 
     def test_windows_publish_removes_only_isolated_docker_credentials(self) -> None:
         self.assertIn("$env:RUNNER_TEMP", self.cleanup_script)
@@ -113,7 +154,7 @@ class CICDPermissionBoundaryTests(unittest.TestCase):
             publish_job,
             r"(?ms)^\s{4}environment:\n\s{6}name: dev\n\s{6}deployment: false$",
         )
-        self.assertIn("uses: docker/login-action@v3", publish_job)
+        self.assertIn(f"uses: {LOGIN_ACTION}", publish_job)
         self.assertIn("username: ${{ secrets.ACR_USERNAME }}", publish_job)
         self.assertIn("password: ${{ secrets.ACR_PASSWORD }}", publish_job)
         self.assertIn("logout: false", publish_job)
