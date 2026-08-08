@@ -197,7 +197,6 @@ jobs:
           DEPLOY_MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS: ${{ vars.MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS }}
           DEPLOY_DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           DEPLOY_AMAP_MCP_API_KEY: ${{ secrets.AMAP_MCP_API_KEY }}
-          DEPLOY_CONTEXT7_API_KEY: ${{ secrets.CONTEXT7_API_KEY }}
           DEPLOY_FLYAI_API_KEY: ${{ secrets.FLYAI_API_KEY }}
         run: |
           cd ~/project/fusion
@@ -205,6 +204,7 @@ jobs:
           set -a
           source .env
           set +a
+          export CONTEXT7_API_KEY=""
           export PROMPTHUB_API_KEY="${DEPLOY_PROMPTHUB_API_KEY:-}"
           export PROMPTHUB_SYNC_MODE="${DEPLOY_PROMPTHUB_SYNC_MODE:-disabled}"
           export MCP_ALLOWED_HOSTS="${DEPLOY_MCP_ALLOWED_HOSTS:-${MCP_ALLOWED_HOSTS:-learn.microsoft.com,dashscope.aliyuncs.com,mcp.amap.com,mcp.context7.com}}"
@@ -223,7 +223,6 @@ jobs:
           export MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS="${DEPLOY_MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS:-${MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS:-30}}"
           export DASHSCOPE_API_KEY="${DEPLOY_DASHSCOPE_API_KEY:-${DASHSCOPE_API_KEY:-}}"
           export AMAP_MCP_API_KEY="${DEPLOY_AMAP_MCP_API_KEY:-${AMAP_MCP_API_KEY:-}}"
-          export CONTEXT7_API_KEY="${DEPLOY_CONTEXT7_API_KEY:-${CONTEXT7_API_KEY:-}}"
           append_csv_value() {
             current="$1"
             required="$2"

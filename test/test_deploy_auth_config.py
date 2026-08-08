@@ -8,9 +8,7 @@ class DeployAuthConfigTests(unittest.TestCase):
         self.app_config = (root / "app" / "core" / "config.py").read_text(encoding="utf-8")
         self.env_example = (root / ".env.example").read_text(encoding="utf-8")
         self.workflow = (root / ".github" / "workflows" / "deploy.yml").read_text(encoding="utf-8")
-        self.ci_build_script = (
-            root / ".github" / "scripts" / "windows-build-and-test.ps1"
-        ).read_text(encoding="utf-8")
+        self.ci_build_script = (root / ".github" / "scripts" / "windows-build-and-test.ps1").read_text(encoding="utf-8")
         self.compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
         self.ci_requirements = (root / "requirements-ci.txt").read_text(encoding="utf-8")
 
@@ -79,10 +77,11 @@ class DeployAuthConfigTests(unittest.TestCase):
             self.workflow,
         )
 
-    def test_deploy_passes_mcp_policy_and_credentials_without_erasing_server_env(self):
+    def test_deploy_passes_mcp_policy_and_configured_credentials_without_erasing_server_env(self):
         self.assertIn("DEPLOY_DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}", self.workflow)
         self.assertIn("DEPLOY_AMAP_MCP_API_KEY: ${{ secrets.AMAP_MCP_API_KEY }}", self.workflow)
-        self.assertIn("DEPLOY_CONTEXT7_API_KEY: ${{ secrets.CONTEXT7_API_KEY }}", self.workflow)
+        self.assertNotIn("${{ secrets.CONTEXT7_API_KEY }}", self.workflow)
+        self.assertNotIn("DEPLOY_CONTEXT7_API_KEY", self.workflow)
         self.assertIn(
             'export DASHSCOPE_API_KEY="${DEPLOY_DASHSCOPE_API_KEY:-${DASHSCOPE_API_KEY:-}}"',
             self.workflow,
@@ -91,10 +90,7 @@ class DeployAuthConfigTests(unittest.TestCase):
             'export AMAP_MCP_API_KEY="${DEPLOY_AMAP_MCP_API_KEY:-${AMAP_MCP_API_KEY:-}}"',
             self.workflow,
         )
-        self.assertIn(
-            'export CONTEXT7_API_KEY="${DEPLOY_CONTEXT7_API_KEY:-${CONTEXT7_API_KEY:-}}"',
-            self.workflow,
-        )
+        self.assertIn('export CONTEXT7_API_KEY=""', self.workflow)
         self.assertIn("append_csv_value()", self.workflow)
         self.assertIn(
             'export MCP_ALLOWED_HOSTS="$(append_csv_value "${MCP_ALLOWED_HOSTS}" "mcp.context7.com")"',
