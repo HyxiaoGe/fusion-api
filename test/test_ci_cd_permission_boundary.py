@@ -171,6 +171,29 @@ class CICDPermissionBoundaryTests(unittest.TestCase):
         self.assertIn("Push CI/CD metrics", deploy_job)
         self.assertIn("通知飞书(部署结果)", deploy_job)
 
+    def test_deploy_verifies_running_container_images_before_health_and_smoke(self) -> None:
+        deploy_job = self.release_workflow[self.release_workflow.index("  deploy-dev:") :]
+        identity_step_name = "      - name: Verify deployed image identity"
+        health_step_name = "      - name: Verify health"
+        smoke_step_name = "      - name: Run deployment smoke"
+        self.assertIn(identity_step_name, deploy_job)
+        self.assertLess(deploy_job.index(identity_step_name), deploy_job.index(health_step_name))
+        self.assertLess(deploy_job.index(identity_step_name), deploy_job.index(smoke_step_name))
+
+        identity_step = deploy_job[deploy_job.index(identity_step_name) : deploy_job.index(health_step_name)]
+        active_shell = "\n".join(line for line in identity_step.splitlines() if not line.lstrip().startswith("#"))
+        expected_commands = (
+            'expected_api_image="${IMAGE_NAME}:${GITHUB_SHA}"',
+            "actual_api_image=\"$(docker inspect fusion-api --format '{{.Config.Image}}')\"",
+            'if [ "${actual_api_image}" != "${expected_api_image}" ]; then',
+            'expected_adapter_image="${FLYAI_ADAPTER_IMAGE_NAME}:${GITHUB_SHA}"',
+            "actual_adapter_image=\"$(docker inspect fusion-flyai-adapter --format '{{.Config.Image}}')\"",
+            'if [ "${actual_adapter_image}" != "${expected_adapter_image}" ]; then',
+        )
+        for command in expected_commands:
+            self.assertRegex(active_shell, rf"(?m)^\s*{re.escape(command)}\s*$")
+        self.assertGreaterEqual(active_shell.count("exit 1"), 2)
+
     def test_release_keeps_buildkit_cache_governance(self) -> None:
         shared_script = ".github/scripts/windows-cleanup.ps1"
         self.assertIn(shared_script, self.release_workflow)

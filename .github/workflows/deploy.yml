@@ -392,6 +392,22 @@ jobs:
             || docker network create fusion-prompthub >/dev/null
           docker compose -f docker-compose.fusion-api-ghcr.yml up -d
 
+      - name: Verify deployed image identity
+        run: |
+          expected_api_image="${IMAGE_NAME}:${GITHUB_SHA}"
+          actual_api_image="$(docker inspect fusion-api --format '{{.Config.Image}}')"
+          if [ "${actual_api_image}" != "${expected_api_image}" ]; then
+            echo "fusion-api 镜像不匹配: expected=${expected_api_image} actual=${actual_api_image}"
+            exit 1
+          fi
+
+          expected_adapter_image="${FLYAI_ADAPTER_IMAGE_NAME}:${GITHUB_SHA}"
+          actual_adapter_image="$(docker inspect fusion-flyai-adapter --format '{{.Config.Image}}')"
+          if [ "${actual_adapter_image}" != "${expected_adapter_image}" ]; then
+            echo "fusion-flyai-adapter 镜像不匹配: expected=${expected_adapter_image} actual=${actual_adapter_image}"
+            exit 1
+          fi
+
       - name: Verify health
         run: |
           healthy=0
