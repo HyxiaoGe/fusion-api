@@ -5,6 +5,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PR_WORKFLOW = ROOT / ".github" / "workflows" / "pr-ci.yml"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "deploy.yml"
+DRIFT_AUDIT_WORKFLOW = ROOT / ".github" / "workflows" / "baseline-drift-audit.yml"
 CLEANUP_SCRIPT = ROOT / ".github" / "scripts" / "windows-cleanup.ps1"
 BUILD_SCRIPT = ROOT / ".github" / "scripts" / "windows-build-and-test.ps1"
 LINUX_BUILD_SCRIPT = ROOT / ".github" / "scripts" / "linux-build-and-test.sh"
@@ -52,6 +53,26 @@ class CICDPermissionBoundaryTests(unittest.TestCase):
             'export MCP_ALLOWED_CREDENTIAL_REFS="$(append_csv_value "${MCP_ALLOWED_CREDENTIAL_REFS}" "CONTEXT7_API_KEY")"',
             restart_step,
         )
+
+    def test_scheduled_drift_audit_uses_caller_read_only_token(self) -> None:
+        workflow = DRIFT_AUDIT_WORKFLOW.read_text(encoding="utf-8")
+        self.assertRegex(
+            workflow,
+            r"(?ms)^on:\n\s+schedule:\n.*\n\s+workflow_dispatch:",
+        )
+        self.assertRegex(
+            workflow,
+            r"(?ms)^permissions:\n\s+actions: read\n\s+contents: read$",
+        )
+        self.assertIn("runs-on: ubuntu-latest", workflow)
+        self.assertIn("cancel-in-progress: false", workflow)
+        self.assertIn(
+            "uses: HyxiaoGe/engineering-baseline/.github/actions/audit@a87c78c4ff6594b4351678bea354ff1f171645e9 # v1.1.0",
+            workflow,
+        )
+        self.assertIn("repository: ${{ github.repository }}", workflow)
+        for forbidden in ("pull_request:", "  push:", "secrets.", "environment:", "self-hosted"):
+            self.assertNotIn(forbidden, workflow)
 
     def test_pr_workflow_only_targets_master_pull_requests(self) -> None:
         self.assertRegex(
