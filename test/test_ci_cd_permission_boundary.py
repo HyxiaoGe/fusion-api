@@ -30,6 +30,29 @@ class CICDPermissionBoundaryTests(unittest.TestCase):
         self.build_script = BUILD_SCRIPT.read_text(encoding="utf-8")
         self.linux_build_script = LINUX_BUILD_SCRIPT.read_text(encoding="utf-8")
 
+    def assert_context7_has_no_secret_or_runner_fallback(self, workflow: str) -> None:
+        deploy_job = workflow[workflow.index("  deploy-dev:") :]
+        restart_step_name = "      - name: Pull and restart fusion-api"
+        identity_step_name = "      - name: Verify deployed image identity"
+        restart_step = deploy_job[deploy_job.index(restart_step_name) : deploy_job.index(identity_step_name)]
+        compose_heredoc = "cat > docker-compose.fusion-api-ghcr.yml <<'EOF'"
+        executable_prefix = restart_step[: restart_step.index(compose_heredoc)]
+        active_shell = "\n".join(line for line in executable_prefix.splitlines() if not line.lstrip().startswith("#"))
+
+        self.assertNotIn("${{ secrets.CONTEXT7_API_KEY }}", workflow)
+        self.assertNotIn("DEPLOY_CONTEXT7_API_KEY", restart_step)
+        self.assertRegex(active_shell, r'(?m)^\s*export CONTEXT7_API_KEY=""\s*$')
+        self.assertLess(active_shell.index("source .env"), active_shell.index('export CONTEXT7_API_KEY=""'))
+        self.assertNotRegex(
+            active_shell,
+            r"(?m)^\s*export CONTEXT7_API_KEY=.*\$\{(?:DEPLOY_CONTEXT7_API_KEY|CONTEXT7_API_KEY)",
+        )
+        self.assertIn("- CONTEXT7_API_KEY=${CONTEXT7_API_KEY:-}", restart_step)
+        self.assertIn(
+            'export MCP_ALLOWED_CREDENTIAL_REFS="$(append_csv_value "${MCP_ALLOWED_CREDENTIAL_REFS}" "CONTEXT7_API_KEY")"',
+            restart_step,
+        )
+
     def test_pr_workflow_only_targets_master_pull_requests(self) -> None:
         self.assertRegex(
             self.pr_workflow,
@@ -170,6 +193,43 @@ class CICDPermissionBoundaryTests(unittest.TestCase):
         self.assertIn("Run deployment smoke", deploy_job)
         self.assertIn("Push CI/CD metrics", deploy_job)
         self.assertIn("通知飞书(部署结果)", deploy_job)
+
+    def test_deploy_verifies_running_container_images_before_health_and_smoke(self) -> None:
+        deploy_job = self.release_workflow[self.release_workflow.index("  deploy-dev:") :]
+        identity_step_name = "      - name: Verify deployed image identity"
+        health_step_name = "      - name: Verify health"
+        smoke_step_name = "      - name: Run deployment smoke"
+        self.assertIn(identity_step_name, deploy_job)
+        self.assertLess(deploy_job.index(identity_step_name), deploy_job.index(health_step_name))
+        self.assertLess(deploy_job.index(identity_step_name), deploy_job.index(smoke_step_name))
+
+        identity_step = deploy_job[deploy_job.index(identity_step_name) : deploy_job.index(health_step_name)]
+        active_shell = "\n".join(line for line in identity_step.splitlines() if not line.lstrip().startswith("#"))
+        expected_commands = (
+            'expected_api_image="${IMAGE_NAME}:${GITHUB_SHA}"',
+            "actual_api_image=\"$(docker inspect fusion-api --format '{{.Config.Image}}')\"",
+            'if [ "${actual_api_image}" != "${expected_api_image}" ]; then',
+            'expected_adapter_image="${FLYAI_ADAPTER_IMAGE_NAME}:${GITHUB_SHA}"',
+            "actual_adapter_image=\"$(docker inspect fusion-flyai-adapter --format '{{.Config.Image}}')\"",
+            'if [ "${actual_adapter_image}" != "${expected_adapter_image}" ]; then',
+        )
+        for command in expected_commands:
+            self.assertRegex(active_shell, rf"(?m)^\s*{re.escape(command)}\s*$")
+        self.assertGreaterEqual(active_shell.count("exit 1"), 2)
+
+    def test_deploy_does_not_reference_or_inherit_unconfigured_context7_secret(self) -> None:
+        self.assert_context7_has_no_secret_or_runner_fallback(self.release_workflow)
+
+        compose_heredoc = "          cat > docker-compose.fusion-api-ghcr.yml <<'EOF'"
+        forged_workflow = self.release_workflow.replace('          export CONTEXT7_API_KEY=""\n', "")
+        forged_workflow = forged_workflow.replace("          unset CONTEXT7_API_KEY\n", "")
+        forged_workflow = forged_workflow.replace(
+            compose_heredoc,
+            f"{compose_heredoc}\n          x-context7-contract-decoy: 'export CONTEXT7_API_KEY=\"\"'",
+        )
+
+        with self.assertRaises(AssertionError):
+            self.assert_context7_has_no_secret_or_runner_fallback(forged_workflow)
 
     def test_release_keeps_buildkit_cache_governance(self) -> None:
         shared_script = ".github/scripts/windows-cleanup.ps1"
