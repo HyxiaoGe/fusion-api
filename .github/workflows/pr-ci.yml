@@ -17,14 +17,14 @@ env:
 
 jobs:
   build:
-    # 过渡检查名：branch protection 当前依赖此名称，实际执行器已隔离为临时 Linux runner。
-    name: Build on Windows runner
+    # PR 仅在 GitHub 托管的临时 Linux runner 执行容器验证，不接触发布凭据。
+    name: PR container validation
     runs-on: ubuntu-latest
     timeout-minutes: 40
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
 
