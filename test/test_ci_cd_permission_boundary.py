@@ -57,7 +57,7 @@ class CICDPermissionBoundaryTests(unittest.TestCase):
     def test_drift_audit_is_owned_by_central_baseline_repository(self) -> None:
         self.assertFalse(
             DRIFT_AUDIT_WORKFLOW.exists(),
-            "漂移审计应由私有 engineering-baseline 中央工作流统一执行",
+            "漂移审计应由 engineering-baseline 中央工作流统一执行",
         )
         active_workflows = "\n".join(
             path.read_text(encoding="utf-8") for path in (ROOT / ".github" / "workflows").glob("*.yml")
