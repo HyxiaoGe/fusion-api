@@ -54,25 +54,15 @@ class CICDPermissionBoundaryTests(unittest.TestCase):
             restart_step,
         )
 
-    def test_scheduled_drift_audit_uses_caller_read_only_token(self) -> None:
-        workflow = DRIFT_AUDIT_WORKFLOW.read_text(encoding="utf-8")
-        self.assertRegex(
-            workflow,
-            r"(?ms)^on:\n\s+schedule:\n.*\n\s+workflow_dispatch:",
+    def test_drift_audit_is_owned_by_central_baseline_repository(self) -> None:
+        self.assertFalse(
+            DRIFT_AUDIT_WORKFLOW.exists(),
+            "漂移审计应由 engineering-baseline 中央工作流统一执行",
         )
-        self.assertRegex(
-            workflow,
-            r"(?ms)^permissions:\n\s+actions: read\n\s+contents: read$",
+        active_workflows = "\n".join(
+            path.read_text(encoding="utf-8") for path in (ROOT / ".github" / "workflows").glob("*.yml")
         )
-        self.assertIn("runs-on: ubuntu-latest", workflow)
-        self.assertIn("cancel-in-progress: false", workflow)
-        self.assertIn(
-            "uses: HyxiaoGe/engineering-baseline/.github/actions/audit@a87c78c4ff6594b4351678bea354ff1f171645e9 # v1.1.0",
-            workflow,
-        )
-        self.assertIn("repository: ${{ github.repository }}", workflow)
-        for forbidden in ("pull_request:", "  push:", "secrets.", "environment:", "self-hosted"):
-            self.assertNotIn(forbidden, workflow)
+        self.assertNotIn("engineering-baseline/.github/actions/audit", active_workflows)
 
     def test_pr_workflow_only_targets_master_pull_requests(self) -> None:
         self.assertRegex(
