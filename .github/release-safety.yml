@@ -1,0 +1,43 @@
+version: "1"
+workflow: .github/workflows/deploy.yml
+contract_test:
+  path: .github/scripts/release-safety-contract.sh
+  pr_step: release_safety_contract
+jobs:
+  prepare: prepare
+  publish: publish
+  deploy: deploy-dev
+  finalize: finalize
+steps:
+  target: deployment_request
+  target_job: prepare
+  capture: capture_rollback_target
+  migrations: [apply_migrations]
+  candidate: deploy_candidate
+  verify: [verify_image_identity, verify_health, deployment_smoke]
+  rollback: rollback_failed_deployment
+  cleanup: cleanup_old_images
+  failure: null
+  finalize: finalize_release_result
+  finalize_failure: null
+needs:
+  publish: [prepare]
+  deploy: [prepare, publish]
+  finalize: [prepare, publish, deploy]
+conditions:
+  prepare: null
+  publish: >-
+    github.ref == 'refs/heads/master' && needs.prepare.outputs.rollback_requested != 'true'
+  deploy: >-
+    always() && github.ref == 'refs/heads/master' &&
+    needs.prepare.result == 'success' &&
+    ((needs.prepare.outputs.rollback_requested == 'true' && needs.publish.result == 'skipped') ||
+    (needs.prepare.outputs.rollback_requested != 'true' && needs.publish.result == 'success'))
+  migration: needs.prepare.outputs.rollback_requested != 'true'
+  rollback: >-
+    failure() && steps.capture_rollback_target.outcome == 'success' &&
+    steps.deploy_candidate.outcome != 'skipped'
+  cleanup: success()
+  failure: null
+  finalize: always() && github.ref == 'refs/heads/master'
+  finalize_failure: null

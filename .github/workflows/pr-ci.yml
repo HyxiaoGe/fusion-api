@@ -28,6 +28,13 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install release safety contract dependency
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.2
+
+      - name: Run release safety contract
+        id: release_safety_contract
+        run: .github/scripts/release-safety-contract.sh
+
       - name: Verify Docker access
         run: |
           docker version

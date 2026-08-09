@@ -4,6 +4,15 @@ on:
   push:
     branches: [master]
   workflow_dispatch:
+    inputs:
+      rollback_sha:
+        description: 要恢复的已发布镜像 SHA（40 位小写 Git SHA；留空表示正常发布）
+        required: false
+        type: string
+      rollback_reason:
+        description: 手动回滚原因（填写 rollback_sha 时必填）
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -20,9 +29,59 @@ env:
   FLYAI_ADAPTER_IMAGE_NAME: crpi-77w10wlykpqilmmb.cn-shenzhen.personal.cr.aliyuncs.com/seanfield/fusion-flyai-adapter
 
 jobs:
+  prepare:
+    name: Validate deployment request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      started_at: ${{ steps.deployment_request.outputs.started_at }}
+      target_sha: ${{ steps.deployment_request.outputs.target_sha }}
+      rollback_requested: ${{ steps.deployment_request.outputs.rollback_requested }}
+
+    steps:
+      - name: Validate deployment request
+        id: deployment_request
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_ROLLBACK_SHA: ${{ github.event.inputs.rollback_sha }}
+          REQUESTED_ROLLBACK_REASON: ${{ github.event.inputs.rollback_reason }}
+        run: |
+          rollback_sha="${REQUESTED_ROLLBACK_SHA:-}"
+          rollback_reason="${REQUESTED_ROLLBACK_REASON:-}"
+          target_sha="${GITHUB_SHA}"
+          rollback_requested="false"
+
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            if [ -n "${rollback_sha}" ]; then
+              if [[ ! "${rollback_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "rollback_sha 必须是 40 位小写 Git SHA"
+                exit 1
+              fi
+              if [[ ! "${rollback_reason}" =~ [^[:space:]] ]]; then
+                echo "填写 rollback_sha 时 rollback_reason 必填"
+                exit 1
+              fi
+              target_sha="${rollback_sha}"
+              rollback_requested="true"
+            elif [[ "${rollback_reason}" =~ [^[:space:]] ]]; then
+              echo "rollback_reason 不能在 rollback_sha 为空时单独填写"
+              exit 1
+            fi
+          elif [ -n "${rollback_sha}" ] || [[ "${rollback_reason}" =~ [^[:space:]] ]]; then
+            echo "push 事件不得携带手动回滚参数"
+            exit 1
+          fi
+
+          {
+            printf '%s\n' "started_at=$(date +%s)"
+            printf '%s\n' "target_sha=${target_sha}"
+            printf '%s\n' "rollback_requested=${rollback_requested}"
+          } >> "${GITHUB_OUTPUT}"
+
   publish:
     name: Publish master images on Windows runner
-    if: github.ref == 'refs/heads/master'
+    if: github.ref == 'refs/heads/master' && needs.prepare.outputs.rollback_requested != 'true'
+    needs: prepare
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 40
     environment:
@@ -119,11 +178,17 @@ jobs:
 
   deploy-dev:
     name: Deploy master on dev server
-    if: github.ref == 'refs/heads/master'
-    needs: publish
+    if: >-
+      ${{ always() && github.ref == 'refs/heads/master' &&
+      needs.prepare.result == 'success' &&
+      ((needs.prepare.outputs.rollback_requested == 'true' && needs.publish.result == 'skipped') ||
+      (needs.prepare.outputs.rollback_requested != 'true' && needs.publish.result == 'success')) }}
+    needs: [prepare, publish]
     runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 10
+    timeout-minutes: 15
     environment: dev
+    env:
+      DEPLOY_TARGET_SHA: ${{ needs.prepare.outputs.target_sha }}
 
     steps:
       - name: Record deploy start time
@@ -144,6 +209,57 @@ jobs:
           mkdir -p -- "${docker_config}"
           printf '%s\n' "DOCKER_CONFIG=${docker_config}" >> "${GITHUB_ENV}"
 
+      - name: Capture current deployment for rollback
+        id: capture_rollback_target
+        run: |
+          set -o pipefail
+          if [[ ! "${DEPLOY_TARGET_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "部署目标不是 40 位小写 Git SHA，拒绝变更部署"
+            exit 1
+          fi
+          if ! docker container inspect fusion-api >/dev/null 2>&1; then
+            echo "fusion-api 不存在，拒绝在缺少回滚目标时变更部署"
+            exit 1
+          fi
+          if ! docker container inspect fusion-flyai-adapter >/dev/null 2>&1; then
+            echo "fusion-flyai-adapter 不存在，拒绝在缺少回滚目标时变更部署"
+            exit 1
+          fi
+
+          api_image_ref="$(docker inspect fusion-api --format '{{.Config.Image}}')"
+          api_image_id="$(docker inspect fusion-api --format '{{.Image}}')"
+          adapter_image_ref="$(docker inspect fusion-flyai-adapter --format '{{.Config.Image}}')"
+          adapter_image_id="$(docker inspect fusion-flyai-adapter --format '{{.Image}}')"
+          api_image_prefix="${IMAGE_NAME}:"
+          case "${api_image_ref}" in
+            "${api_image_prefix}"*) api_sha="${api_image_ref#"${api_image_prefix}"}" ;;
+            *) echo "fusion-api 镜像仓库不受当前 workflow 管理: ${api_image_ref}"; exit 1 ;;
+          esac
+          if [[ ! "${api_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "fusion-api 镜像标签不是 40 位小写 Git SHA: ${api_image_ref}"
+            exit 1
+          fi
+          expected_adapter_ref="${FLYAI_ADAPTER_IMAGE_NAME}:${api_sha}"
+          if [ "${adapter_image_ref}" != "${expected_adapter_ref}" ]; then
+            echo "fusion-flyai-adapter 与 fusion-api 未运行同一 SHA: expected=${expected_adapter_ref} actual=${adapter_image_ref}"
+            exit 1
+          fi
+          if [[ ! "${api_image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "fusion-api 内容 ID 格式无效: ${api_image_id}"
+            exit 1
+          fi
+          if [[ ! "${adapter_image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "fusion-flyai-adapter 内容 ID 格式无效: ${adapter_image_id}"
+            exit 1
+          fi
+
+          {
+            printf '%s\n' "api_image_ref=${api_image_ref}"
+            printf '%s\n' "api_image_id=${api_image_id}"
+            printf '%s\n' "adapter_image_ref=${adapter_image_ref}"
+            printf '%s\n' "adapter_image_id=${adapter_image_id}"
+          } >> "${GITHUB_OUTPUT}"
+
       - name: Login to ACR
         run: |
           # 登录失败时重试退避（境内 ACR 通常稳定，保留重试作防御）
@@ -159,13 +275,15 @@ jobs:
           ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
 
       - name: Apply alembic migrations
+        id: apply_migrations
+        if: needs.prepare.outputs.rollback_requested != 'true'
         run: |
           cd ~/project/fusion
           set -a
           source .env
           set +a
           n=0
-          until docker pull ${{ env.IMAGE_NAME }}:${{ github.sha }}; do
+          until docker pull "${IMAGE_NAME}:${DEPLOY_TARGET_SHA}"; do
             n=$((n+1))
             if [ $n -ge 6 ]; then echo "docker pull 重试 $n 次仍失败"; exit 1; fi
             echo "docker pull 失败（网络抖动），第 $n 次，10s 后重试..."
@@ -174,10 +292,11 @@ jobs:
           docker run --rm \
             --network postgres_default \
             -e DATABASE_URL="${DATABASE_URL}" \
-            ${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            "${IMAGE_NAME}:${DEPLOY_TARGET_SHA}" \
             alembic upgrade head
 
       - name: Pull and restart fusion-api
+        id: deploy_candidate
         env:
           DEPLOY_PROMPTHUB_API_KEY: ${{ secrets.PROMPTHUB_API_KEY }}
           DEPLOY_PROMPTHUB_SYNC_MODE: ${{ vars.PROMPTHUB_SYNC_MODE || 'disabled' }}
@@ -243,15 +362,17 @@ jobs:
             exit 1
           fi
           export FLYAI_ADAPTER_TOKEN="$(python3 -c 'import hashlib,hmac,os; print(hmac.new(os.environ["FLYAI_API_KEY"].encode(), b"fusion-deploy-flyai-adapter-v1", hashlib.sha256).hexdigest(), end="")')"
+          export DEPLOY_API_IMAGE="${IMAGE_NAME}:${DEPLOY_TARGET_SHA}"
+          export DEPLOY_ADAPTER_IMAGE="${FLYAI_ADAPTER_IMAGE_NAME}:${DEPLOY_TARGET_SHA}"
           n=0
-          until docker pull ${{ env.IMAGE_NAME }}:${{ github.sha }}; do
+          until docker pull "${DEPLOY_API_IMAGE}"; do
             n=$((n+1))
             if [ $n -ge 6 ]; then echo "docker pull 重试 $n 次仍失败"; exit 1; fi
             echo "docker pull 失败（网络抖动），第 $n 次，10s 后重试..."
             sleep 10
           done
           n=0
-          until docker pull ${{ env.FLYAI_ADAPTER_IMAGE_NAME }}:${{ github.sha }}; do
+          until docker pull "${DEPLOY_ADAPTER_IMAGE}"; do
             n=$((n+1))
             if [ $n -ge 6 ]; then echo "FlyAI adapter 镜像拉取重试 $n 次仍失败"; exit 1; fi
             echo "FlyAI adapter 镜像拉取失败（网络抖动），第 $n 次，10s 后重试..."
@@ -271,7 +392,7 @@ jobs:
           cat > docker-compose.fusion-api-ghcr.yml <<'EOF'
           services:
             flyai-adapter:
-              image: ${{ env.FLYAI_ADAPTER_IMAGE_NAME }}:${{ github.sha }}
+              image: ${DEPLOY_ADAPTER_IMAGE}
               container_name: fusion-flyai-adapter
               restart: always
               read_only: true
@@ -292,7 +413,7 @@ jobs:
                 - fusion-flyai
 
             fusion-api:
-              image: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+              image: ${DEPLOY_API_IMAGE}
               container_name: fusion-api
               command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
               restart: always
@@ -392,22 +513,36 @@ jobs:
           docker compose -f docker-compose.fusion-api-ghcr.yml up -d
 
       - name: Verify deployed image identity
+        id: verify_image_identity
         run: |
-          expected_api_image="${IMAGE_NAME}:${GITHUB_SHA}"
+          expected_api_image="${IMAGE_NAME}:${DEPLOY_TARGET_SHA}"
           actual_api_image="$(docker inspect fusion-api --format '{{.Config.Image}}')"
           if [ "${actual_api_image}" != "${expected_api_image}" ]; then
             echo "fusion-api 镜像不匹配: expected=${expected_api_image} actual=${actual_api_image}"
             exit 1
           fi
+          expected_api_id="$(docker image inspect "${expected_api_image}" --format '{{.Id}}')"
+          actual_api_id="$(docker inspect fusion-api --format '{{.Image}}')"
+          if [ "${actual_api_id}" != "${expected_api_id}" ]; then
+            echo "fusion-api 内容 ID 不匹配: expected=${expected_api_id} actual=${actual_api_id}"
+            exit 1
+          fi
 
-          expected_adapter_image="${FLYAI_ADAPTER_IMAGE_NAME}:${GITHUB_SHA}"
+          expected_adapter_image="${FLYAI_ADAPTER_IMAGE_NAME}:${DEPLOY_TARGET_SHA}"
           actual_adapter_image="$(docker inspect fusion-flyai-adapter --format '{{.Config.Image}}')"
           if [ "${actual_adapter_image}" != "${expected_adapter_image}" ]; then
             echo "fusion-flyai-adapter 镜像不匹配: expected=${expected_adapter_image} actual=${actual_adapter_image}"
             exit 1
           fi
+          expected_adapter_id="$(docker image inspect "${expected_adapter_image}" --format '{{.Id}}')"
+          actual_adapter_id="$(docker inspect fusion-flyai-adapter --format '{{.Image}}')"
+          if [ "${actual_adapter_id}" != "${expected_adapter_id}" ]; then
+            echo "fusion-flyai-adapter 内容 ID 不匹配: expected=${expected_adapter_id} actual=${actual_adapter_id}"
+            exit 1
+          fi
 
       - name: Verify health
+        id: verify_health
         run: |
           healthy=0
           for attempt in $(seq 1 30); do
@@ -619,6 +754,7 @@ jobs:
           PY
 
       - name: Run deployment smoke
+        id: deployment_smoke
         run: |
           # scripts/deployment_smoke.py checks /health and /api/models/.
           if ! python3 scripts/deployment_smoke.py --base-url http://127.0.0.1:8002; then
@@ -627,11 +763,172 @@ jobs:
             exit 1
           fi
 
-      - name: Cleanup old images
-        if: always()
+      - name: Roll back failed deployment
+        id: rollback_failed_deployment
+        if: ${{ failure() && steps.capture_rollback_target.outcome == 'success' && steps.deploy_candidate.outcome != 'skipped' }}
+        env:
+          ROLLBACK_API_IMAGE_REF: ${{ steps.capture_rollback_target.outputs.api_image_ref }}
+          ROLLBACK_API_IMAGE_ID: ${{ steps.capture_rollback_target.outputs.api_image_id }}
+          ROLLBACK_ADAPTER_IMAGE_REF: ${{ steps.capture_rollback_target.outputs.adapter_image_ref }}
+          ROLLBACK_ADAPTER_IMAGE_ID: ${{ steps.capture_rollback_target.outputs.adapter_image_id }}
+          DEPLOY_PROMPTHUB_API_KEY: ${{ secrets.PROMPTHUB_API_KEY }}
+          DEPLOY_PROMPTHUB_SYNC_MODE: ${{ vars.PROMPTHUB_SYNC_MODE || 'disabled' }}
+          DEPLOY_MCP_ALLOWED_HOSTS: ${{ vars.MCP_ALLOWED_HOSTS }}
+          DEPLOY_MCP_ALLOWED_CREDENTIAL_REFS: ${{ vars.MCP_ALLOWED_CREDENTIAL_REFS }}
+          DEPLOY_MCP_CONNECT_TIMEOUT_SECONDS: ${{ vars.MCP_CONNECT_TIMEOUT_SECONDS }}
+          DEPLOY_MCP_CALL_TIMEOUT_SECONDS: ${{ vars.MCP_CALL_TIMEOUT_SECONDS }}
+          DEPLOY_MCP_IDEMPOTENT_TOTAL_TIMEOUT_SECONDS: ${{ vars.MCP_IDEMPOTENT_TOTAL_TIMEOUT_SECONDS }}
+          DEPLOY_MCP_ADMIN_OPERATION_TIMEOUT_SECONDS: ${{ vars.MCP_ADMIN_OPERATION_TIMEOUT_SECONDS }}
+          DEPLOY_MCP_MAX_DISCOVERY_PAGES: ${{ vars.MCP_MAX_DISCOVERY_PAGES }}
+          DEPLOY_MCP_MAX_DISCOVERED_TOOLS: ${{ vars.MCP_MAX_DISCOVERED_TOOLS }}
+          DEPLOY_MCP_MAX_TOOL_DESCRIPTION_CHARS: ${{ vars.MCP_MAX_TOOL_DESCRIPTION_CHARS }}
+          DEPLOY_MCP_MAX_TOOL_SCHEMA_BYTES: ${{ vars.MCP_MAX_TOOL_SCHEMA_BYTES }}
+          DEPLOY_MCP_MAX_RESPONSE_BYTES: ${{ vars.MCP_MAX_RESPONSE_BYTES }}
+          DEPLOY_MCP_MAX_TOOL_CALLS_PER_SERVER_PER_RUN: ${{ vars.MCP_MAX_TOOL_CALLS_PER_SERVER_PER_RUN }}
+          DEPLOY_MCP_SERVER_CIRCUIT_FAILURE_THRESHOLD: ${{ vars.MCP_SERVER_CIRCUIT_FAILURE_THRESHOLD }}
+          DEPLOY_MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS: ${{ vars.MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS }}
+          DEPLOY_DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          DEPLOY_AMAP_MCP_API_KEY: ${{ secrets.AMAP_MCP_API_KEY }}
+          DEPLOY_FLYAI_API_KEY: ${{ secrets.FLYAI_API_KEY }}
         run: |
-          current="${{ env.IMAGE_NAME }}:${{ github.sha }}"
-          adapter_current="${{ env.FLYAI_ADAPTER_IMAGE_NAME }}:${{ github.sha }}"
+          cd ~/project/fusion
+          set -o pipefail
+          set -a
+          source .env
+          set +a
+          export CONTEXT7_API_KEY=""
+          export PROMPTHUB_API_KEY="${DEPLOY_PROMPTHUB_API_KEY:-}"
+          export PROMPTHUB_SYNC_MODE="${DEPLOY_PROMPTHUB_SYNC_MODE:-disabled}"
+          export MCP_ALLOWED_HOSTS="${DEPLOY_MCP_ALLOWED_HOSTS:-${MCP_ALLOWED_HOSTS:-learn.microsoft.com,dashscope.aliyuncs.com,mcp.amap.com,mcp.context7.com}}"
+          export MCP_ALLOWED_CREDENTIAL_REFS="${DEPLOY_MCP_ALLOWED_CREDENTIAL_REFS:-${MCP_ALLOWED_CREDENTIAL_REFS:-DASHSCOPE_API_KEY,AMAP_MCP_API_KEY,CONTEXT7_API_KEY}}"
+          export MCP_CONNECT_TIMEOUT_SECONDS="${DEPLOY_MCP_CONNECT_TIMEOUT_SECONDS:-${MCP_CONNECT_TIMEOUT_SECONDS:-5}}"
+          export MCP_CALL_TIMEOUT_SECONDS="${DEPLOY_MCP_CALL_TIMEOUT_SECONDS:-${MCP_CALL_TIMEOUT_SECONDS:-15}}"
+          export MCP_IDEMPOTENT_TOTAL_TIMEOUT_SECONDS="${DEPLOY_MCP_IDEMPOTENT_TOTAL_TIMEOUT_SECONDS:-${MCP_IDEMPOTENT_TOTAL_TIMEOUT_SECONDS:-12}}"
+          export MCP_ADMIN_OPERATION_TIMEOUT_SECONDS="${DEPLOY_MCP_ADMIN_OPERATION_TIMEOUT_SECONDS:-${MCP_ADMIN_OPERATION_TIMEOUT_SECONDS:-35}}"
+          export MCP_MAX_DISCOVERY_PAGES="${DEPLOY_MCP_MAX_DISCOVERY_PAGES:-${MCP_MAX_DISCOVERY_PAGES:-5}}"
+          export MCP_MAX_DISCOVERED_TOOLS="${DEPLOY_MCP_MAX_DISCOVERED_TOOLS:-${MCP_MAX_DISCOVERED_TOOLS:-50}}"
+          export MCP_MAX_TOOL_DESCRIPTION_CHARS="${DEPLOY_MCP_MAX_TOOL_DESCRIPTION_CHARS:-${MCP_MAX_TOOL_DESCRIPTION_CHARS:-2000}}"
+          export MCP_MAX_TOOL_SCHEMA_BYTES="${DEPLOY_MCP_MAX_TOOL_SCHEMA_BYTES:-${MCP_MAX_TOOL_SCHEMA_BYTES:-32768}}"
+          export MCP_MAX_RESPONSE_BYTES="${DEPLOY_MCP_MAX_RESPONSE_BYTES:-${MCP_MAX_RESPONSE_BYTES:-262144}}"
+          export MCP_MAX_TOOL_CALLS_PER_SERVER_PER_RUN="${DEPLOY_MCP_MAX_TOOL_CALLS_PER_SERVER_PER_RUN:-${MCP_MAX_TOOL_CALLS_PER_SERVER_PER_RUN:-8}}"
+          export MCP_SERVER_CIRCUIT_FAILURE_THRESHOLD="${DEPLOY_MCP_SERVER_CIRCUIT_FAILURE_THRESHOLD:-${MCP_SERVER_CIRCUIT_FAILURE_THRESHOLD:-3}}"
+          export MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS="${DEPLOY_MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS:-${MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS:-30}}"
+          export DASHSCOPE_API_KEY="${DEPLOY_DASHSCOPE_API_KEY:-${DASHSCOPE_API_KEY:-}}"
+          export AMAP_MCP_API_KEY="${DEPLOY_AMAP_MCP_API_KEY:-${AMAP_MCP_API_KEY:-}}"
+          append_csv_value() {
+            current="$1"
+            required="$2"
+            if [ -z "${current}" ]; then
+              printf '%s' "${required}"
+              return
+            fi
+            case ",${current}," in
+              *",${required},"*) printf '%s' "${current}" ;;
+              *) printf '%s,%s' "${current}" "${required}" ;;
+            esac
+          }
+          export MCP_ALLOWED_HOSTS="$(append_csv_value "${MCP_ALLOWED_HOSTS}" "mcp.context7.com")"
+          export MCP_ALLOWED_CREDENTIAL_REFS="$(append_csv_value "${MCP_ALLOWED_CREDENTIAL_REFS}" "CONTEXT7_API_KEY")"
+          export FLYAI_API_KEY="${DEPLOY_FLYAI_API_KEY:-}"
+          if [ -z "${FLYAI_API_KEY}" ]; then
+            echo "FlyAI 发布密钥未配置，无法恢复原部署"
+            exit 1
+          fi
+          export FLYAI_ADAPTER_TOKEN="$(python3 -c 'import hashlib,hmac,os; print(hmac.new(os.environ["FLYAI_API_KEY"].encode(), b"fusion-deploy-flyai-adapter-v1", hashlib.sha256).hexdigest(), end="")')"
+          export AUTH_SERVICE_INTERNAL_BASE_URL="http://auth-service:8100"
+          export DEPLOY_API_IMAGE="${ROLLBACK_API_IMAGE_REF}"
+          export DEPLOY_ADAPTER_IMAGE="${ROLLBACK_ADAPTER_IMAGE_REF}"
+
+          ensure_rollback_image() {
+            image_ref="$1"
+            expected_id="$2"
+            actual_id="$(docker image inspect "${image_ref}" --format '{{.Id}}' 2>/dev/null || true)"
+            if [ "${actual_id}" != "${expected_id}" ]; then
+              docker pull "${image_ref}"
+              actual_id="$(docker image inspect "${image_ref}" --format '{{.Id}}')"
+            fi
+            if [ -z "${expected_id}" ] || [ "${actual_id}" != "${expected_id}" ]; then
+              echo "回滚镜像内容 ID 不匹配: ref=${image_ref} expected=${expected_id} actual=${actual_id:-<empty>}"
+              exit 1
+            fi
+          }
+
+          ensure_rollback_image "${ROLLBACK_API_IMAGE_REF}" "${ROLLBACK_API_IMAGE_ID}"
+          ensure_rollback_image "${ROLLBACK_ADAPTER_IMAGE_REF}" "${ROLLBACK_ADAPTER_IMAGE_ID}"
+
+          current_api_ref="$(docker inspect fusion-api --format '{{.Config.Image}}' 2>/dev/null || true)"
+          current_api_id="$(docker inspect fusion-api --format '{{.Image}}' 2>/dev/null || true)"
+          current_adapter_ref="$(docker inspect fusion-flyai-adapter --format '{{.Config.Image}}' 2>/dev/null || true)"
+          current_adapter_id="$(docker inspect fusion-flyai-adapter --format '{{.Image}}' 2>/dev/null || true)"
+          if [ "${current_api_ref}" != "${ROLLBACK_API_IMAGE_REF}" ] \
+            || [ "${current_api_id}" != "${ROLLBACK_API_IMAGE_ID}" ] \
+            || [ "${current_adapter_ref}" != "${ROLLBACK_ADAPTER_IMAGE_REF}" ] \
+            || [ "${current_adapter_id}" != "${ROLLBACK_ADAPTER_IMAGE_ID}" ]; then
+            if [ ! -f docker-compose.fusion-api-ghcr.yml ]; then
+              echo "候选部署未生成 compose 文件且容器身份已变化，无法安全回滚"
+              exit 1
+            fi
+            docker compose -f docker-compose.fusion-api-ghcr.yml up -d
+          else
+            echo "候选失败发生在容器变更前，原部署无需重建"
+          fi
+
+          restored_api_ref="$(docker inspect fusion-api --format '{{.Config.Image}}')"
+          restored_api_id="$(docker inspect fusion-api --format '{{.Image}}')"
+          restored_adapter_ref="$(docker inspect fusion-flyai-adapter --format '{{.Config.Image}}')"
+          restored_adapter_id="$(docker inspect fusion-flyai-adapter --format '{{.Image}}')"
+          if [ "${restored_api_ref}" != "${ROLLBACK_API_IMAGE_REF}" ] \
+            || [ "${restored_api_id}" != "${ROLLBACK_API_IMAGE_ID}" ]; then
+            echo "fusion-api 回滚身份校验失败"
+            exit 1
+          fi
+          if [ "${restored_adapter_ref}" != "${ROLLBACK_ADAPTER_IMAGE_REF}" ] \
+            || [ "${restored_adapter_id}" != "${ROLLBACK_ADAPTER_IMAGE_ID}" ]; then
+            echo "fusion-flyai-adapter 回滚身份校验失败"
+            exit 1
+          fi
+
+          api_healthy=0
+          for attempt in $(seq 1 30); do
+            if docker exec fusion-api python -c \
+              "import json,urllib.request; body=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)); raise SystemExit(0 if body.get('status') == 'healthy' else 1)"; then
+              api_healthy=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "${api_healthy}" != "1" ]; then
+            docker logs --tail=120 fusion-api || true
+            exit 1
+          fi
+
+          adapter_healthy=0
+          for attempt in $(seq 1 30); do
+            if docker exec fusion-flyai-adapter node -e \
+              "fetch('http://127.0.0.1:8080/health',{signal:AbortSignal.timeout(2000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then
+              adapter_healthy=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "${adapter_healthy}" != "1" ]; then
+            docker logs --tail=120 fusion-flyai-adapter || true
+            exit 1
+          fi
+
+          if ! python3 scripts/deployment_smoke.py --base-url http://127.0.0.1:8002; then
+            echo "fusion-api rollback deployment smoke failed"
+            docker logs --tail=120 fusion-api || true
+            exit 1
+          fi
+          echo "旧镜像已恢复且回滚后验收通过；原始发布失败状态保持不变"
+
+      - name: Cleanup old images
+        id: cleanup_old_images
+        if: success()
+        run: |
+          current="${IMAGE_NAME}:${DEPLOY_TARGET_SHA}"
+          adapter_current="${FLYAI_ADAPTER_IMAGE_NAME}:${DEPLOY_TARGET_SHA}"
           docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' ${{ env.IMAGE_NAME }} \
             | awk -v current="$current" '$1 != current {print $2}' \
             | sort -u \
@@ -649,10 +946,10 @@ jobs:
             "${{ github.ref_name }}" \
             dev \
             "${{ job.status }}" \
-            "${{ needs.publish.outputs.started_at }}" \
-            "${{ env.IMAGE_NAME }}:${{ github.sha }}" \
-            "${{ github.sha }}" \
-            "${{ needs.publish.outputs.runner_name }}" \
+            "${{ needs.publish.outputs.started_at || needs.prepare.outputs.started_at }}" \
+            "${IMAGE_NAME}:${DEPLOY_TARGET_SHA}" \
+            "${DEPLOY_TARGET_SHA}" \
+            "${{ needs.publish.outputs.runner_name || runner.name }}" \
             fusion-api \
             "${{ env.DEPLOY_START }}"; then
             echo "CI/CD metrics push failed, ignored"
@@ -667,6 +964,8 @@ jobs:
           REPO: ${{ github.repository }}
           REF_NAME: ${{ github.ref_name }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TARGET_SHA: ${{ needs.prepare.outputs.target_sha }}
+          ROLLBACK_REASON: ${{ github.event.inputs.rollback_reason }}
           # 提交信息可含任意字符,只经 env 传入 python(os.environ→json),绝不进 shell,杜绝注入。
           COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
@@ -674,18 +973,22 @@ jobs:
             echo "FEISHU_INFRA_WEBHOOK 未配置,跳过飞书通知"
             exit 0
           fi
-          export SHORT_SHA="${GITHUB_SHA:0:7}"
           export DEPLOY_TS="$(date -u '+%Y-%m-%d %H:%M UTC')"
           python3 - <<'PY'
           import json, os, urllib.request
           ok = os.environ.get("JOB_STATUS") == "success"
           repo = os.environ.get("REPO", "")
           ref = os.environ.get("REF_NAME", "")
-          sha = os.environ.get("SHORT_SHA", "")
+          sha = os.environ.get("TARGET_SHA", "")[:7]
           status = os.environ.get("JOB_STATUS", "")
           ts = os.environ.get("DEPLOY_TS", "")
           run_url = os.environ.get("RUN_URL", "")
-          raw = os.environ.get("COMMIT_MSG", "") or ""
+          rollback_reason = os.environ.get("ROLLBACK_REASON", "").strip()
+          raw = (
+              f"手动回滚：{rollback_reason}"
+              if rollback_reason
+              else os.environ.get("COMMIT_MSG", "") or ""
+          )
           lines = [ln for ln in raw.splitlines() if ln.strip()]
           msg = "\n".join(lines[:3]) if lines else "(无提交信息)"
           if len(msg) > 240:
@@ -741,3 +1044,40 @@ jobs:
             *) echo "DOCKER_CONFIG 未落在 RUNNER_TEMP 的 .docker-* 路径中，拒绝删除"; exit 1 ;;
           esac
           rm -rf -- "${DOCKER_CONFIG}"
+
+  finalize:
+    name: Finalize release result
+    if: ${{ always() && github.ref == 'refs/heads/master' }}
+    needs: [prepare, publish, deploy-dev]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Finalize release result
+        id: finalize_release_result
+        env:
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          DEPLOY_RESULT: ${{ needs.deploy-dev.result }}
+          ROLLBACK_REQUESTED: ${{ needs.prepare.outputs.rollback_requested }}
+        run: |
+          if [ "${PREPARE_RESULT}" != "success" ]; then
+            echo "部署请求校验失败或未执行: ${PREPARE_RESULT}"
+            exit 1
+          fi
+
+          if [ "${ROLLBACK_REQUESTED}" = "true" ]; then
+            if [ "${PUBLISH_RESULT}" = "skipped" ] && [ "${DEPLOY_RESULT}" = "success" ]; then
+              echo "手动回滚成功，Windows publish 按设计跳过"
+              exit 0
+            fi
+            echo "手动回滚失败: publish=${PUBLISH_RESULT} deploy=${DEPLOY_RESULT}"
+            exit 1
+          fi
+
+          if [ "${PUBLISH_RESULT}" = "success" ] && [ "${DEPLOY_RESULT}" = "success" ]; then
+            echo "正常发布成功"
+            exit 0
+          fi
+          echo "正常发布失败: publish=${PUBLISH_RESULT} deploy=${DEPLOY_RESULT}"
+          exit 1
