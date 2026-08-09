@@ -64,6 +64,34 @@ docker-compose up -d
 http://localhost:8000/docs
 ```
 
+### 发布安全与回滚
+
+`master` push 和未填写回滚参数的手动运行都属于正常发布。dev 部署在任何 migration 或候选
+容器变更前，会同时保存 `fusion-api`、`fusion-flyai-adapter` 两个运行中容器的完整镜像引用
+（`.Config.Image`）和实际内容 ID（`.Image`）；任一回滚目标缺失时 fail-closed。
+
+候选部署开始后，镜像身份、健康检查或 deployment smoke 任一失败都会恢复两个旧镜像。恢复后
+必须精确核对旧镜像引用与内容 ID，并重新执行容器内 API/adapter health 和
+`scripts/deployment_smoke.py`。自动回滚成功不会掩盖原发布失败，回滚失败也不会被忽略。旧镜像
+只在整次发布成功后清理本地副本，ACR 中的 SHA 标签继续作为手动回滚来源。
+
+手动回滚时，在 GitHub Actions 的 `Fusion API Windows CI` 中填写已经成功发布过的 40 位小写
+`rollback_sha` 和非空 `rollback_reason`。该路径跳过 Windows runner 上的构建、registry 登录、
+镜像推送及 Alembic migration；整个 Windows publish job 不会排队，因此 Windows runner 离线不
+阻断手动回滚。GitHub-hosted prepare job 负责校验输入，finalize job 只把“回滚模式、publish
+skipped、deploy success”判为成功；普通发布仍必须同时满足 publish 与 deploy success。部署、
+指标和通知统一记录实际回滚 SHA。
+
+```bash
+gh workflow run deploy.yml --ref master \
+  -f rollback_sha=0123456789abcdef0123456789abcdef01234567 \
+  -f rollback_reason='候选版本健康检查失败'
+```
+
+数据库只允许 expand/contract 演进：先发布兼容 schema 扩展，确认所有可回滚版本不再依赖旧
+结构后再独立删除。镜像回滚绝不执行 `alembic downgrade`，手动回滚前必须确认目标 SHA 与当前
+schema 兼容。
+
 ### 手动安装
 
 1. 安装依赖

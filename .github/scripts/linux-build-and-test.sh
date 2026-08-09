@@ -9,7 +9,9 @@ adapter_image="${adapter_image_name}:${image_tag}"
 
 docker build --target production -t "${image}" .
 
-docker run --rm "${image}" sh -lc "timeout 300s python -m pip install --default-timeout=30 --no-cache-dir -r requirements-ci.txt && python scripts/check_architecture.py && ruff check . && timeout 270s python -u -m unittest discover -s test -t . -v"
+docker run --rm \
+  --mount "type=bind,source=${PWD}/README.md,target=/app/README.md,readonly" \
+  "${image}" sh -lc "timeout 300s python -m pip install --default-timeout=30 --no-cache-dir -r requirements-ci.txt && python scripts/check_architecture.py && ruff check . && timeout 270s python -u -m unittest discover -s test -t . -v"
 
 docker build --target test -t "${adapter_image}-test" ./flyai-adapter
 docker build --target production -t "${adapter_image}" ./flyai-adapter
