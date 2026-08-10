@@ -154,8 +154,8 @@ def _validate_existing_table(
             if unique_constraints.get(constraint_name) != expected_column_names:
                 raise RuntimeError(f"已有表 {table_name} 的唯一约束 {constraint_name} 不兼容")
 
+    indexes = {index.get("name"): index for index in inspector.get_indexes(table_name) if index.get("name")}
     if expected_indexes:
-        indexes = {index.get("name"): index for index in inspector.get_indexes(table_name) if index.get("name")}
         for index_name, (expected_column_names, expected_unique, expected_predicate) in expected_indexes.items():
             index = indexes.get(index_name)
             actual_column_names = tuple(index.get("column_names") or []) if index else ()
@@ -173,16 +173,16 @@ def _validate_existing_table(
             ):
                 raise RuntimeError(f"已有表 {table_name} 的索引 {index_name} 不兼容")
 
-        allowed_unique_indexes = {
-            index_name for index_name, (_, unique, _) in expected_indexes.items() if unique
-        } | set(expected_unique_constraints or {})
-        unexpected_unique_indexes = {
-            index_name
-            for index_name, index in indexes.items()
-            if bool(index.get("unique")) and index_name not in allowed_unique_indexes
-        }
-        if unexpected_unique_indexes:
-            raise RuntimeError(f"已有表 {table_name} 包含迁移定义外的唯一索引：{sorted(unexpected_unique_indexes)}")
+    allowed_unique_indexes = {
+        index_name for index_name, (_, unique, _) in (expected_indexes or {}).items() if unique
+    } | set(expected_unique_constraints or {})
+    unexpected_unique_indexes = {
+        index_name
+        for index_name, index in indexes.items()
+        if bool(index.get("unique")) and index_name not in allowed_unique_indexes
+    }
+    if unexpected_unique_indexes:
+        raise RuntimeError(f"已有表 {table_name} 包含迁移定义外的唯一索引：{sorted(unexpected_unique_indexes)}")
 
     if inspector.get_foreign_keys(table_name):
         raise RuntimeError(f"已有表 {table_name} 包含迁移定义外的外键")

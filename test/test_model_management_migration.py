@@ -96,24 +96,28 @@ def compatible_inspector() -> Mock:
             }
         ]
     )
-    inspector.get_indexes.return_value = [
-        {
-            "name": "uq_model_admission_operation_candidate_run",
-            "column_names": ["candidate_fingerprint", "governance_run_id"],
-            "unique": True,
-        },
-        {
-            "name": "ix_model_admission_operations_status_created",
-            "column_names": ["status", "created_at", "id"],
-            "unique": False,
-        },
-        {
-            "name": "uq_model_admission_operations_single_running",
-            "column_names": ["status"],
-            "unique": True,
-            "dialect_options": {"postgresql_where": "status = 'running'"},
-        },
-    ]
+    inspector.get_indexes.side_effect = lambda table_name: (
+        []
+        if table_name == "model_catalog_controls"
+        else [
+            {
+                "name": "uq_model_admission_operation_candidate_run",
+                "column_names": ["candidate_fingerprint", "governance_run_id"],
+                "unique": True,
+            },
+            {
+                "name": "ix_model_admission_operations_status_created",
+                "column_names": ["status", "created_at", "id"],
+                "unique": False,
+            },
+            {
+                "name": "uq_model_admission_operations_single_running",
+                "column_names": ["status"],
+                "unique": True,
+                "dialect_options": {"postgresql_where": "status = 'running'"},
+            },
+        ]
+    )
     inspector.get_foreign_keys.return_value = []
     return inspector
 
@@ -209,7 +213,11 @@ class ModelManagementMigrationTest(unittest.TestCase):
     def test_same_partial_index_name_with_opposite_predicate_is_rejected(self):
         migration = load_migration()
         inspector = compatible_inspector()
-        inspector.get_indexes.return_value[-1]["dialect_options"] = {"postgresql_where": "status <> 'running'"}
+        operation_indexes = inspector.get_indexes("model_admission_operations")
+        operation_indexes[-1]["dialect_options"] = {"postgresql_where": "status <> 'running'"}
+        inspector.get_indexes.side_effect = lambda table_name: (
+            [] if table_name == "model_catalog_controls" else operation_indexes
+        )
 
         with (
             patch.object(migration, "op"),
@@ -243,13 +251,55 @@ class ModelManagementMigrationTest(unittest.TestCase):
     def test_full_index_with_partial_predicate_is_rejected(self):
         migration = load_migration()
         inspector = compatible_inspector()
-        inspector.get_indexes.return_value[1]["dialect_options"] = {"postgresql_where": "status = 'pending'"}
+        operation_indexes = inspector.get_indexes("model_admission_operations")
+        operation_indexes[1]["dialect_options"] = {"postgresql_where": "status = 'pending'"}
+        inspector.get_indexes.side_effect = lambda table_name: (
+            [] if table_name == "model_catalog_controls" else operation_indexes
+        )
 
         with (
             patch.object(migration, "op"),
             patch.object(migration.context, "is_offline_mode", return_value=False),
             patch.object(migration.sa, "inspect", return_value=inspector),
             self.assertRaisesRegex(RuntimeError, "索引 .* 不兼容"),
+        ):
+            migration.upgrade()
+
+    def test_extra_unique_index_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        inspector.get_indexes.side_effect = lambda table_name: (
+            [
+                {
+                    "name": "uq_model_catalog_controls_updated_by",
+                    "column_names": ["updated_by"],
+                    "unique": True,
+                }
+            ]
+            if table_name == "model_catalog_controls"
+            else compatible_inspector().get_indexes(table_name)
+        )
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "迁移定义外的唯一索引"),
+        ):
+            migration.upgrade()
+
+    def test_extra_foreign_key_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        inspector.get_foreign_keys.side_effect = lambda table_name: (
+            [{"name": "fk_model_catalog_controls_user"}] if table_name == "model_catalog_controls" else []
+        )
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "迁移定义外的外键"),
         ):
             migration.upgrade()
 
