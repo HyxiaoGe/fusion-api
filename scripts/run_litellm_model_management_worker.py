@@ -649,7 +649,21 @@ def process_once(
         operation_id=claim["operation_id"],
         lease_token=claim["lease_token"],
     )
-    heartbeat.start()
+    try:
+        heartbeat.start()
+    except Exception as exc:
+        if state_dir is not None:
+            error_code = (
+                "operation_lease_stale"
+                if isinstance(exc, StaleOperationLeaseError)
+                else "operation_lease_renewal_failed"
+            )
+            _write_spool(
+                state_dir,
+                claim=claim,
+                result=_verification_failure(error_code),
+            )
+        raise
     try:
         try:
             candidate_record = _load_verified_candidate(

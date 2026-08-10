@@ -40,6 +40,7 @@ class RecordingClient:
         self.complete_failures = 0
         self.stale_complete_operation_ids: set[str] = set()
         self.renew_calls = 0
+        self.renew_failures = 0
         self.renewed_twice = Event()
 
     def post(self, url, **kwargs):
@@ -52,6 +53,9 @@ class RecordingClient:
             return FakeResponse({"generation": "9"})
         if url.endswith("/renew"):
             self.renew_calls += 1
+            if self.renew_failures > 0:
+                self.renew_failures -= 1
+                return FakeResponse({"detail": "temporary"}, status_code=503)
             if self.renew_calls >= 2:
                 self.renewed_twice.set()
             return FakeResponse({"lease_expires_at": "2026-08-04T01:12:03+00:00"})
@@ -183,6 +187,32 @@ def succeeded_result():
 
 
 class ModelManagementWorkerTests(unittest.TestCase):
+    def test_initial_lease_renewal_failure_spools_known_no_write_result(self):
+        client = RecordingClient(claim_payload())
+        client.renew_failures = 1
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir)
+
+            with self.assertRaisesRegex(worker.WorkerProtocolError, "operation_lease_renewal_failed"):
+                worker.process_once(
+                    client=client,
+                    fusion_base_url="http://127.0.0.1:8002",
+                    worker_token="worker-secret",
+                    governance_root=Path("/governance"),
+                    governance_max_age_seconds=86400,
+                    litellm_base_url="http://127.0.0.1:4000",
+                    master_key="master-secret",
+                    virtual_key="virtual-secret",
+                    environ={},
+                    state_dir=state_dir,
+                )
+
+            payload = json.loads(next(state_dir.glob("*.json")).read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["result"]["error_code"], "operation_lease_renewal_failed")
+        self.assertFalse(payload["result"]["writes_performed"])
+        self.assertFalse(payload["result"]["compensation"]["manual_cleanup_required"])
+
     def test_lease_heartbeat_renews_during_long_running_operation(self):
         client = RecordingClient(claim_payload())
         heartbeat = worker.OperationLeaseHeartbeat(
@@ -634,6 +664,24 @@ class ModelManagementWorkerTests(unittest.TestCase):
                     max_age_seconds=86400,
                     now=now,
                 )
+
+    def test_freshness_ignores_verified_failure_from_future(self):
+        now = datetime(2026, 8, 4, 1, 0, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            success_time = now - timedelta(minutes=5)
+            failure_time = now + timedelta(hours=1)
+            success_run_id = success_time.strftime("%Y%m%dT%H%M%S%fZ")
+            failure_run_id = failure_time.strftime("%Y%m%dT%H%M%S%fZ")
+            self._write_summary(root, success_run_id, "success", success_time, "latest-success.json")
+            self._write_summary(root, failure_run_id, "failed", failure_time, "latest-failure.json")
+
+            worker.validate_governance_freshness(
+                governance_root=root,
+                expected_run_id=success_run_id,
+                max_age_seconds=86400,
+                now=now,
+            )
 
     def test_freshness_rejects_stale_success(self):
         now = datetime(2026, 8, 4, 1, 0, tzinfo=UTC)

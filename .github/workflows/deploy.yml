@@ -198,6 +198,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+          ref: ${{ needs.prepare.outputs.target_sha }}
 
       - name: Configure Docker credential directory
         run: |
@@ -963,7 +964,7 @@ jobs:
           ROLLBACK_GOVERNANCE_TIMER_ACTIVE: ${{ steps.capture_rollback_target.outputs.governance_timer_active }}
         run: |
           set -euo pipefail
-          release_dir="${HOME}/.local/share/fusion/litellm-governance-src-${GITHUB_SHA}"
+          release_dir="${HOME}/.local/share/fusion/litellm-governance-src-${DEPLOY_TARGET_SHA}"
           current_link="${HOME}/.local/share/fusion/litellm-governance-current"
           config_dir="${HOME}/.config/fusion"
           registry_target="${config_dir}/litellm-provider-registry.json"
@@ -1052,7 +1053,7 @@ jobs:
           set -euo pipefail
           management_enabled="$(printf '%s' "${DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED}" | tr '[:upper:]' '[:lower:]')"
           worker_enabled="$(printf '%s' "${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED}" | tr '[:upper:]' '[:lower:]')"
-          release_dir="${HOME}/.local/share/fusion/litellm-model-management-src-${GITHUB_SHA}"
+          release_dir="${HOME}/.local/share/fusion/litellm-model-management-src-${DEPLOY_TARGET_SHA}"
           current_link="${HOME}/.local/share/fusion/litellm-model-management-current"
           state_dir="${HOME}/.local/state/fusion/litellm-model-management"
           acceptance_dir="${HOME}/.local/share/fusion/litellm-acceptance"
@@ -1182,6 +1183,9 @@ jobs:
           esac
           current_link="${HOME}/.local/share/fusion/litellm-model-management-current"
           target_release="${HOME}/.local/share/fusion/litellm-model-management-src-${DEPLOY_TARGET_SHA}"
+          unit_dir="${HOME}/.config/systemd/user"
+          target_service_unit="${GITHUB_WORKSPACE}/ops/litellm/fusion-litellm-model-management.service"
+          target_timer_unit="${GITHUB_WORKSPACE}/ops/litellm/fusion-litellm-model-management.timer"
           systemctl --user stop fusion-litellm-model-management.timer >/dev/null 2>&1 || true
           if systemctl --user is-active --quiet fusion-litellm-model-management.service; then
             echo "模型准入 Worker 仍在执行，拒绝切换回滚版本；定时器已安全暂停"
@@ -1196,13 +1200,18 @@ jobs:
             echo "手动回滚目标未启用模型准入 Worker；定时器保持关闭"
             exit 0
           fi
-          if [ ! -d "${target_release}" ]; then
+          if [ ! -d "${target_release}" ] || [ ! -f "${target_service_unit}" ] || [ ! -f "${target_timer_unit}" ]; then
             systemctl --user disable --now fusion-litellm-model-management.timer >/dev/null 2>&1 || true
-            echo "手动回滚目标没有配套的模型准入 Worker 版本；已安全关闭定时器"
+            echo "手动回滚目标没有完整配套的模型准入 Worker 资产；已安全关闭定时器"
             exit 0
           fi
+          install -d -m 0755 "${unit_dir}"
+          install -m 0644 "${target_service_unit}" "${target_timer_unit}" "${unit_dir}/"
           ln -sfn "${target_release}" "${current_link}"
           systemctl --user daemon-reload
+          systemd-analyze --user verify \
+            "${unit_dir}/fusion-litellm-model-management.service" \
+            "${unit_dir}/fusion-litellm-model-management.timer"
           systemctl --user enable --now fusion-litellm-model-management.timer
           systemctl --user is-active --quiet fusion-litellm-model-management.timer
 
@@ -1252,6 +1261,22 @@ jobs:
           DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS: ${{ vars.LITELLM_GOVERNANCE_MAX_AGE_SECONDS || '86400' }}
           DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN: ${{ secrets.LITELLM_MODEL_ADMISSION_WORKER_TOKEN }}
         run: |
+          systemctl --user stop fusion-litellm-model-management.timer >/dev/null 2>&1 || true
+          systemctl --user stop fusion-litellm-governance.timer >/dev/null 2>&1 || true
+          wait_for_user_service() {
+            service_name="$1"
+            display_name="$2"
+            for attempt in $(seq 1 120); do
+              if ! systemctl --user is-active --quiet "${service_name}"; then
+                return 0
+              fi
+              sleep 5
+            done
+            echo "${display_name} 在回滚等待窗口内仍未结束，拒绝并发恢复运行资产"
+            return 1
+          }
+          wait_for_user_service fusion-litellm-model-management.service "模型准入 Worker"
+          wait_for_user_service fusion-litellm-governance.service "LiteLLM 治理周期"
           cd ~/project/fusion
           set -o pipefail
           set -a

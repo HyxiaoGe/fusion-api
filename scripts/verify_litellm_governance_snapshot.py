@@ -180,6 +180,10 @@ def load_verified_governance_snapshot(
         )
     except GovernanceSnapshotError:
         return _degraded_snapshot(success, reason="latest_failure_unverified")
+    failure_age = (now.astimezone(UTC) - failure.started_at).total_seconds()
+    if failure_age < -300:
+        # 宿主机时钟恢复后，未来失败指针不能永久压住已验证的正常成功快照。
+        return success
     if failure.run_id > success.run_id:
         return _degraded_snapshot(success, reason="latest_run_failed")
     return success

@@ -31,7 +31,7 @@ class ModelManagementDeployConfigTests(unittest.TestCase):
 
         self.assertIn("Install model management worker", workflow)
         self.assertIn("Pause model management worker before API deploy", workflow)
-        self.assertIn("litellm-model-management-src-${GITHUB_SHA}", workflow)
+        self.assertIn("litellm-model-management-src-${DEPLOY_TARGET_SHA}", workflow)
         self.assertIn("litellm-model-management-current", workflow)
         self.assertIn("fusion-litellm-model-management.service", workflow)
         self.assertIn("fusion-litellm-model-management.timer", workflow)
@@ -85,11 +85,15 @@ class ModelManagementDeployConfigTests(unittest.TestCase):
         )
         self.assertIn("Restore model management worker after automatic rollback", workflow)
         self.assertIn("Restore model management worker for manual rollback", workflow)
+        self.assertIn("ref: ${{ needs.prepare.outputs.target_sha }}", workflow)
         self.assertIn("id: pause_model_management_worker", workflow)
         self.assertIn("steps.pause_model_management_worker.outcome != 'skipped'", workflow)
         self.assertIn(
             'target_release="${HOME}/.local/share/fusion/litellm-model-management-src-${DEPLOY_TARGET_SHA}"', workflow
         )
+        self.assertIn('target_service_unit="${GITHUB_WORKSPACE}/ops/litellm/fusion-litellm-model-management.service"', workflow)
+        self.assertIn('target_timer_unit="${GITHUB_WORKSPACE}/ops/litellm/fusion-litellm-model-management.timer"', workflow)
+        self.assertIn('install -m 0644 "${target_service_unit}" "${target_timer_unit}" "${unit_dir}/"', workflow)
         self.assertIn("if: needs.prepare.outputs.rollback_requested != 'true'", workflow)
         self.assertIn("if: needs.prepare.outputs.rollback_requested == 'true'", workflow)
         self.assertLess(
@@ -125,13 +129,21 @@ class ModelManagementDeployConfigTests(unittest.TestCase):
         )
         self.assertIn('"model_management_enabled=${rollback_model_management_enabled}"', workflow)
         self.assertIn('"model_admission_worker_enabled=${rollback_model_admission_worker_enabled}"', workflow)
+        self.assertLess(
+            rollback_step["run"].index("systemctl --user stop fusion-litellm-model-management.timer"),
+            rollback_step["run"].index("ensure_rollback_image"),
+        )
+        self.assertLess(
+            rollback_step["run"].index("wait_for_user_service fusion-litellm-model-management.service"),
+            rollback_step["run"].index("ensure_rollback_image"),
+        )
 
     def test_dev_deploy_manages_discovery_registry_and_governance_timer(self):
         workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
         unit = (ROOT / "ops/litellm/fusion-litellm-governance.service").read_text(encoding="utf-8")
 
         self.assertIn("Install LiteLLM governance discovery", workflow)
-        self.assertIn("litellm-governance-src-${GITHUB_SHA}", workflow)
+        self.assertIn("litellm-governance-src-${DEPLOY_TARGET_SHA}", workflow)
         self.assertIn("litellm-governance-current", workflow)
         self.assertIn("provider-registry.example.json", workflow)
         self.assertIn("litellm-provider-registry.json", workflow)

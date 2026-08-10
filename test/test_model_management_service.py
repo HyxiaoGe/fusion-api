@@ -592,6 +592,35 @@ class ModelManagementServiceTests(unittest.TestCase):
         self.assertNotIn("private_detail", completed.result["compensation"])
         self.assertEqual(self.db.query(AdminAuditEvent).count(), 2)
 
+    def test_operation_payload_exposes_only_safe_manual_cleanup_evidence(self):
+        service = self.build_service()
+        operation = self._request_admission(service)
+        operation.status = "failed"
+        operation.result = {
+            "phase": "compensation",
+            "error_code": "rollback_key_failed",
+            "writes_performed": True,
+            "private_detail": "drop-me",
+            "compensation": {
+                "attempted": True,
+                "key_restored": False,
+                "model_deleted": True,
+                "catalog_invalidated": True,
+                "model_ownership_unverified": False,
+                "manual_cleanup_required": True,
+                "errors": ["rollback_key_failed"],
+                "private_detail": "drop-me",
+            },
+        }
+
+        payload = service.operation_payload(operation)
+
+        self.assertTrue(payload["writes_performed"])
+        self.assertTrue(payload["compensation"]["manual_cleanup_required"])
+        self.assertEqual(payload["compensation"]["errors"], ["rollback_key_failed"])
+        self.assertNotIn("private_detail", payload)
+        self.assertNotIn("private_detail", payload["compensation"])
+
     def test_worker_can_renew_only_current_unexpired_lease(self):
         clock = Mock(return_value=self.now)
         service = self.build_service(clock=clock, config={"lease_seconds": 600})

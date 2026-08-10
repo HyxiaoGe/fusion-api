@@ -428,6 +428,9 @@ class ModelManagementService:
 
     def operation_payload(self, row: ModelAdmissionOperation) -> dict[str, Any]:
         result = row.result if isinstance(row.result, Mapping) else {}
+        compensation = result.get("compensation")
+        compensation = compensation if isinstance(compensation, Mapping) else {}
+        compensation_errors = compensation.get("errors")
         return {
             "operation_id": row.id,
             "candidate_fingerprint": row.candidate_fingerprint,
@@ -435,6 +438,20 @@ class ModelManagementService:
             "status": row.status,
             "phase": result.get("phase"),
             "error_code": result.get("error_code"),
+            "writes_performed": bool(result.get("writes_performed")),
+            "compensation": {
+                "attempted": bool(compensation.get("attempted")),
+                "key_restored": bool(compensation.get("key_restored")),
+                "model_deleted": bool(compensation.get("model_deleted")),
+                "catalog_invalidated": bool(compensation.get("catalog_invalidated")),
+                "model_ownership_unverified": bool(compensation.get("model_ownership_unverified")),
+                "manual_cleanup_required": bool(compensation.get("manual_cleanup_required")),
+                "errors": [
+                    str(item)[:100]
+                    for item in (compensation_errors or [])[:20]
+                    if isinstance(item, str)
+                ] if isinstance(compensation_errors, list) else [],
+            },
             "created_at": row.created_at,
             "updated_at": row.updated_at,
         }
