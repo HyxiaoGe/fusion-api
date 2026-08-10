@@ -380,6 +380,7 @@ jobs:
         env:
           DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED: ${{ vars.LITELLM_MODEL_MANAGEMENT_ENABLED || 'false' }}
           DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED: ${{ vars.LITELLM_MODEL_ADMISSION_WORKER_ENABLED || 'false' }}
+          ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE: ${{ steps.capture_rollback_target.outputs.model_management_timer_active }}
         run: |
           set -euo pipefail
           management_enabled="$(printf '%s' "${DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED}" | tr '[:upper:]' '[:lower:]')"
@@ -390,7 +391,11 @@ jobs:
           esac
           systemctl --user stop fusion-litellm-model-management.timer >/dev/null 2>&1 || true
           if systemctl --user is-active --quiet fusion-litellm-model-management.service; then
-            echo "模型准入 Worker 仍在执行，拒绝部署 API；定时器已安全暂停"
+            if [ "${ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE}" = "true" ]; then
+              systemctl --user start fusion-litellm-model-management.timer
+              systemctl --user is-active --quiet fusion-litellm-model-management.timer
+            fi
+            echo "模型准入 Worker 仍在执行，拒绝部署 API；定时器已恢复部署前状态"
             exit 1
           fi
 
@@ -922,6 +927,8 @@ jobs:
           PY
 
       - name: Install LiteLLM governance discovery
+        env:
+          ROLLBACK_GOVERNANCE_TIMER_ACTIVE: ${{ steps.capture_rollback_target.outputs.governance_timer_active }}
         run: |
           set -euo pipefail
           release_dir="${HOME}/.local/share/fusion/litellm-governance-src-${GITHUB_SHA}"
@@ -933,7 +940,11 @@ jobs:
           install -d -m 0700 "${config_dir}"
           systemctl --user stop fusion-litellm-governance.timer >/dev/null 2>&1 || true
           if systemctl --user is-active --quiet fusion-litellm-governance.service; then
-            echo "LiteLLM 治理周期仍在执行，拒绝切换发现版本；定时器已安全暂停"
+            if [ "${ROLLBACK_GOVERNANCE_TIMER_ACTIVE}" = "true" ]; then
+              systemctl --user start fusion-litellm-governance.timer
+              systemctl --user is-active --quiet fusion-litellm-governance.timer
+            fi
+            echo "LiteLLM 治理周期仍在执行，拒绝切换发现版本；定时器已恢复部署前状态"
             exit 1
           fi
           for script in \
@@ -1004,6 +1015,7 @@ jobs:
           DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED: ${{ vars.LITELLM_MODEL_ADMISSION_WORKER_ENABLED || 'false' }}
           DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS: ${{ vars.LITELLM_GOVERNANCE_MAX_AGE_SECONDS || '86400' }}
           DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN: ${{ secrets.LITELLM_MODEL_ADMISSION_WORKER_TOKEN }}
+          ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE: ${{ steps.capture_rollback_target.outputs.model_management_timer_active }}
         run: |
           set -euo pipefail
           management_enabled="$(printf '%s' "${DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED}" | tr '[:upper:]' '[:lower:]')"
@@ -1017,7 +1029,11 @@ jobs:
           install -d -m 0700 "${state_dir}" "${acceptance_dir}"
           systemctl --user stop fusion-litellm-model-management.timer >/dev/null 2>&1 || true
           if systemctl --user is-active --quiet fusion-litellm-model-management.service; then
-            echo "模型准入 Worker 仍在执行，拒绝切换运行版本；定时器已安全暂停"
+            if [ "${ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE}" = "true" ]; then
+              systemctl --user start fusion-litellm-model-management.timer
+              systemctl --user is-active --quiet fusion-litellm-model-management.timer
+            fi
+            echo "模型准入 Worker 仍在执行，拒绝切换运行版本；定时器已恢复部署前状态"
             exit 1
           fi
           for script in \

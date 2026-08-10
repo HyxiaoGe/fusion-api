@@ -408,7 +408,9 @@ systemctl --user enable --now fusion-litellm-model-management.timer
 Worker 在进入外部事务前写入 `0600` 恢复记录，终态被 API 接受后才删除。若进程
 在外部事务中被杀，下一次启动会保守落为 `worker_execution_interrupted` 并要求
 人工核对，禁止自动重跑造成重复注册。目录失效在 Fusion readback 前通过 Redis
-generation 跨 API 进程推进；完成回调短暂失败时会从恢复记录重试。
+generation 跨 API 进程推进；完成回调短暂失败时会从恢复记录重试。若 API 因租约
+已经失效而拒绝旧恢复记录，Worker 会把记录移入同目录下权限隔离的 `quarantine/`
+并输出 `stale_spool_quarantined` 告警，继续处理后续任务；隔离记录需人工审计。
 
 `execute_litellm_candidate_admission.py` 的 dry-run 可以读取人工提取的单个
 admission plan，且不发任何 HTTP：

@@ -51,6 +51,10 @@ class WorkerProtocolError(RuntimeError):
     """内部 Worker 协议不满足安全合同。"""
 
 
+class StaleOperationLeaseError(WorkerProtocolError):
+    """恢复记录的旧租约已不能提交，必须隔离后继续处理队列。"""
+
+
 def validate_governance_freshness(
     *,
     governance_root: Path,
@@ -216,8 +220,12 @@ def _complete(
                 json=_safe_result(result),
                 timeout=10.0,
             )
+            if response.status_code == 409:
+                raise StaleOperationLeaseError("operation_lease_stale")
             response.raise_for_status()
             return
+        except StaleOperationLeaseError:
+            raise
         except Exception as exc:
             last_error = exc
             if attempt + 1 < COMPLETE_ATTEMPTS:
@@ -492,6 +500,20 @@ def _read_spool(path: Path) -> tuple[dict[str, str], dict[str, Any]]:
     return {name: str(claim[name]) for name in required}, dict(result)
 
 
+def _quarantine_stale_spool(state_dir: Path, path: Path) -> Path:
+    quarantine_dir = state_dir / "quarantine"
+    _ensure_secure_state_dir(quarantine_dir, create=True)
+    target = quarantine_dir / f"{path.stem}.{time.time_ns()}.json"
+    os.replace(path, target)
+    for directory in (state_dir, quarantine_dir):
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    return target
+
+
 def flush_spooled_results(
     client: Any,
     *,
@@ -504,14 +526,29 @@ def flush_spooled_results(
     completed = 0
     for path in sorted(state_dir.glob("*.json")):
         claim, result = _read_spool(path)
-        _complete(
-            client,
-            fusion_base_url=fusion_base_url,
-            worker_token=worker_token,
-            operation_id=claim["operation_id"],
-            lease_token=claim["lease_token"],
-            result=result,
-        )
+        try:
+            _complete(
+                client,
+                fusion_base_url=fusion_base_url,
+                worker_token=worker_token,
+                operation_id=claim["operation_id"],
+                lease_token=claim["lease_token"],
+                result=result,
+            )
+        except StaleOperationLeaseError:
+            quarantined_path = _quarantine_stale_spool(state_dir, path)
+            print(
+                json.dumps(
+                    {
+                        "status": "warning",
+                        "error": {"code": "stale_spool_quarantined"},
+                        "spool_id": quarantined_path.stem,
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
+            continue
         path.unlink()
         completed += 1
     return completed

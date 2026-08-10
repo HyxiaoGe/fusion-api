@@ -158,6 +158,18 @@ class ModelManagementDeployConfigTests(unittest.TestCase):
         self.assertNotIn('python3 - "${registry_temp}"', workflow)
         self.assertIn("LiteLLM provider registry 权限过宽", workflow)
 
+    def test_deploy_refusal_restores_active_governance_and_worker_timers(self):
+        workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
+
+        self.assertGreaterEqual(
+            workflow.count('if [ "${ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE}" = "true" ]; then'),
+            2,
+        )
+        self.assertIn('systemctl --user start fusion-litellm-model-management.timer', workflow)
+        self.assertIn('if [ "${ROLLBACK_GOVERNANCE_TIMER_ACTIVE}" = "true" ]; then', workflow)
+        self.assertIn('systemctl --user start fusion-litellm-governance.timer', workflow)
+        self.assertIn("定时器已恢复部署前状态", workflow)
+
     def test_dev_deploy_uses_repository_vars_for_feature_flags(self):
         workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
 

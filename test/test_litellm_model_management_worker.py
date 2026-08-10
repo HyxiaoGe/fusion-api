@@ -37,6 +37,7 @@ class RecordingClient:
         self.claim_payload = claim_payload
         self.calls = []
         self.complete_failures = 0
+        self.stale_complete_operation_ids: set[str] = set()
 
     def post(self, url, **kwargs):
         self.calls.append((url, kwargs))
@@ -47,6 +48,8 @@ class RecordingClient:
         if url.endswith("/invalidate-catalog"):
             return FakeResponse({"generation": "9"})
         if url.endswith("/complete"):
+            if any(f"/{operation_id}/complete" in url for operation_id in self.stale_complete_operation_ids):
+                return FakeResponse({"detail": "stale lease"}, status_code=409)
             if self.complete_failures > 0:
                 self.complete_failures -= 1
                 return FakeResponse({"detail": "temporary"}, status_code=503)
@@ -54,9 +57,9 @@ class RecordingClient:
         raise AssertionError(f"unexpected POST {url}")
 
 
-def claim_payload(*, fingerprint="a" * 64, model_id="qwen3.8-max"):
+def claim_payload(*, fingerprint="a" * 64, model_id="qwen3.8-max", operation_id="op-123"):
     return {
-        "operation_id": "op-123",
+        "operation_id": operation_id,
         "lease_token": "lease-secret",
         "run_id": "20260804T010000000000Z",
         "candidate_fingerprint": fingerprint,
@@ -467,6 +470,40 @@ class ModelManagementWorkerTests(unittest.TestCase):
                 worker._write_spool(state_dir, claim=claim_payload(), result=None)
 
         self.assertEqual(fsync.call_count, 2)
+
+    def test_stale_spool_is_quarantined_without_blocking_later_results(self):
+        client = RecordingClient(None)
+        client.stale_complete_operation_ids.add("op-stale")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir)
+            worker._write_spool(
+                state_dir,
+                claim=claim_payload(operation_id="op-stale"),
+                result=worker._verification_failure("stale"),
+            )
+            worker._write_spool(
+                state_dir,
+                claim=claim_payload(operation_id="op-current"),
+                result=worker._verification_failure("current"),
+            )
+
+            with patch.object(worker, "print") as journal_warning:
+                completed = worker.flush_spooled_results(
+                    client,
+                    state_dir=state_dir,
+                    fusion_base_url="http://127.0.0.1:8002",
+                    worker_token="worker-secret",
+                )
+
+            self.assertEqual(completed, 1)
+            self.assertEqual(list(state_dir.glob("*.json")), [])
+            quarantined = list((state_dir / "quarantine").glob("*.json"))
+            self.assertEqual(len(quarantined), 1)
+            self.assertIn("op-stale", quarantined[0].read_text(encoding="utf-8"))
+            warning = json.loads(journal_warning.call_args.args[0])
+            self.assertEqual(warning["error"]["code"], "stale_spool_quarantined")
+            self.assertNotIn("op-stale", journal_warning.call_args.args[0])
+            self.assertIs(journal_warning.call_args.kwargs["file"], worker.sys.stderr)
 
     def test_governance_is_revalidated_after_preflight_before_admission(self):
         record = candidate_record()
