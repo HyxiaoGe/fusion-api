@@ -732,12 +732,12 @@ def process_once(
                     client=client,
                     catalog_invalidation_fn=invalidate_catalog,
                 )
+        if state_dir is not None:
+            spool_path = _write_spool(state_dir, claim=claim, result=result)
         heartbeat.ensure_healthy()
         heartbeat.renew()
     finally:
         heartbeat.stop()
-    if state_dir is not None:
-        spool_path = _write_spool(state_dir, claim=claim, result=result)
     _complete(
         client,
         fusion_base_url=fusion_base_url,

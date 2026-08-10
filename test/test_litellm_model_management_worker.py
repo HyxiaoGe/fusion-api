@@ -233,6 +233,48 @@ class ModelManagementWorkerTests(unittest.TestCase):
 
         self.assertGreaterEqual(client.renew_calls, 2)
 
+    def test_completed_result_is_spooled_before_final_heartbeat_failure(self):
+        client = RecordingClient(claim_payload())
+        completed_result = succeeded_result()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir)
+            with (
+                patch.object(worker, "_load_verified_candidate", return_value={"state": "admission_ready"}),
+                patch.object(
+                    worker,
+                    "load_verified_admission_plan",
+                    return_value={"run_id": claim_payload()["run_id"]},
+                ),
+                patch.object(worker, "execute_admission", return_value=completed_result),
+                patch.object(worker.OperationLeaseHeartbeat, "start"),
+                patch.object(
+                    worker.OperationLeaseHeartbeat,
+                    "ensure_healthy",
+                    side_effect=[None, worker.WorkerProtocolError("operation_lease_renewal_failed")],
+                ),
+                patch.object(worker.OperationLeaseHeartbeat, "stop"),
+                self.assertRaisesRegex(worker.WorkerProtocolError, "operation_lease_renewal_failed"),
+            ):
+                worker.process_once(
+                    client=client,
+                    fusion_base_url="http://127.0.0.1:8002",
+                    worker_token="worker-secret",
+                    governance_root=Path("/governance"),
+                    governance_max_age_seconds=86400,
+                    litellm_base_url="http://127.0.0.1:4000",
+                    master_key="master-secret",
+                    virtual_key="virtual-secret",
+                    environ={},
+                    state_dir=state_dir,
+                )
+
+            payload = json.loads(next(state_dir.glob("*.json")).read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["result"]["status"], "succeeded")
+        self.assertEqual(payload["result"]["phase"], "complete")
+        self.assertEqual(payload["result"]["completed_phases"], completed_result["completed_phases"])
+        self.assertFalse(payload["result"]["compensation"]["manual_cleanup_required"])
+
     def test_preflight_required_runs_real_preflight_writes_redacted_acceptance_then_admits(self):
         record = candidate_record()
         claim = claim_payload(

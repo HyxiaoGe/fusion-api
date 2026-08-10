@@ -139,13 +139,19 @@ class ModelManagementDeployConfigTests(unittest.TestCase):
             rollback_step["run"].index("ensure_rollback_image"),
         )
         self.assertLess(
-            rollback_step["run"].index("wait_for_user_service fusion-litellm-model-management.service"),
+            rollback_step["run"].index("wait_for_user_services"),
             rollback_step["run"].index("ensure_rollback_image"),
         )
 
     def test_dev_deploy_manages_discovery_registry_and_governance_timer(self):
         workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
+        document = yaml.safe_load(workflow)
         unit = (ROOT / "ops/litellm/fusion-litellm-governance.service").read_text(encoding="utf-8")
+        install_step = next(
+            step
+            for step in document["jobs"]["deploy-dev"]["steps"]
+            if step.get("name") == "Install LiteLLM governance discovery"
+        )
 
         self.assertIn("Install LiteLLM governance discovery", workflow)
         self.assertIn("litellm-governance-src-${DEPLOY_TARGET_SHA}", workflow)
@@ -178,6 +184,49 @@ class ModelManagementDeployConfigTests(unittest.TestCase):
         self.assertEqual(workflow.count("restore_governance_unit \\"), 4)
         self.assertIn("%h/.local/share/fusion/litellm-governance-current", unit)
         self.assertNotIn("%h/project/fusion/fusion-api/scripts", unit)
+        install_script = install_step["run"]
+        self.assertIn('proxy_env="${HOME}/project/litellm-proxy/.env"', install_script)
+        self.assertIn('governance_env="${HOME}/.config/fusion/litellm-governance.env"', install_script)
+        self.assertIn("os.chmod(path, 0o600, follow_symlinks=False)", install_script)
+        self.assertIn("systemctl --user start fusion-litellm-governance.service", install_script)
+        self.assertIn(
+            "systemctl --user show fusion-litellm-governance.service --property=Result --value",
+            install_script,
+        )
+        self.assertLess(
+            install_script.index("os.chmod(path, 0o600, follow_symlinks=False)"),
+            install_script.index("systemctl --user start fusion-litellm-governance.service"),
+        )
+        self.assertLess(
+            install_script.index("systemctl --user start fusion-litellm-governance.service"),
+            install_script.index("systemctl --user enable --now fusion-litellm-governance.timer"),
+        )
+
+    def test_manual_rollback_health_probe_tolerates_pre_governance_images(self):
+        workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
+        document = yaml.safe_load(workflow)
+        verify_step = next(
+            step for step in document["jobs"]["deploy-dev"]["steps"] if step.get("name") == "Verify health"
+        )
+
+        self.assertEqual(
+            verify_step["env"]["ROLLBACK_REQUESTED"],
+            "${{ needs.prepare.outputs.rollback_requested }}",
+        )
+        self.assertIn('FUSION_ROLLBACK_REQUESTED="${ROLLBACK_REQUESTED}"', verify_step["run"])
+        self.assertIn("getattr(settings, name, None)", verify_step["run"])
+        self.assertIn("旧版回滚目标不含模型治理配置，跳过该项兼容性探针", verify_step["run"])
+
+    def test_automatic_rollback_wait_budget_fits_deploy_job(self):
+        workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
+        document = yaml.safe_load(workflow)
+        deploy_job = document["jobs"]["deploy-dev"]
+        rollback_step = next(step for step in deploy_job["steps"] if step.get("name") == "Roll back failed deployment")
+
+        self.assertGreaterEqual(deploy_job["timeout-minutes"], 30)
+        self.assertIn("wait_for_user_services", rollback_step["run"])
+        self.assertIn("seq 1 24", rollback_step["run"])
+        self.assertNotIn("seq 1 120", rollback_step["run"])
 
     def test_dev_deploy_preserves_existing_provider_registry(self):
         workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")

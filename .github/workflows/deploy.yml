@@ -185,7 +185,7 @@ jobs:
       (needs.prepare.outputs.rollback_requested != 'true' && needs.publish.result == 'success')) }}
     needs: [prepare, publish]
     runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 15
+    timeout-minutes: 30
     environment: dev
     env:
       DEPLOY_TARGET_SHA: ${{ needs.prepare.outputs.target_sha }}
@@ -735,6 +735,8 @@ jobs:
 
       - name: Verify health
         id: verify_health
+        env:
+          ROLLBACK_REQUESTED: ${{ needs.prepare.outputs.rollback_requested }}
         run: |
           healthy=0
           for attempt in $(seq 1 30); do
@@ -788,16 +790,36 @@ jobs:
 
           docker inspect fusion-api --format '{{range .Mounts}}{{println .Destination}}{{end}}' | grep -qx '/app/storage/files'
           docker inspect fusion-api --format '{{range .Mounts}}{{println .Destination}}{{end}}' | grep -qx '/var/lib/fusion/litellm-governance'
-          docker exec -i fusion-api python - <<'PY'
+          docker exec -e FUSION_ROLLBACK_REQUESTED="${ROLLBACK_REQUESTED}" -i fusion-api python - <<'PY'
+          import os
+
           from app.core.config import settings
 
-          if settings.LITELLM_GOVERNANCE_ROOT != "/var/lib/fusion/litellm-governance":
+          required_names = (
+              "LITELLM_GOVERNANCE_ROOT",
+              "LITELLM_GOVERNANCE_MAX_AGE_SECONDS",
+              "LITELLM_MODEL_ADMISSION_WORKER_ENABLED",
+              "LITELLM_MODEL_MANAGEMENT_ENABLED",
+              "LITELLM_MODEL_ADMISSION_WORKER_TOKEN",
+          )
+          missing_names = [name for name in required_names if getattr(settings, name, None) is None]
+          rollback_requested = os.environ.get("FUSION_ROLLBACK_REQUESTED") == "true"
+          if missing_names:
+              if rollback_requested:
+                  print("旧版回滚目标不含模型治理配置，跳过该项兼容性探针")
+                  raise SystemExit(0)
+              raise SystemExit(f"LiteLLM model management settings missing: {', '.join(missing_names)}")
+
+          if getattr(settings, "LITELLM_GOVERNANCE_ROOT", None) != "/var/lib/fusion/litellm-governance":
               raise SystemExit("LiteLLM governance mount path mismatch")
-          if settings.LITELLM_GOVERNANCE_MAX_AGE_SECONDS <= 0:
+          if getattr(settings, "LITELLM_GOVERNANCE_MAX_AGE_SECONDS", 0) <= 0:
               raise SystemExit("LiteLLM governance max age must be positive")
-          if settings.LITELLM_MODEL_ADMISSION_WORKER_ENABLED and not settings.LITELLM_MODEL_MANAGEMENT_ENABLED:
+          worker_enabled = bool(getattr(settings, "LITELLM_MODEL_ADMISSION_WORKER_ENABLED", False))
+          management_enabled = bool(getattr(settings, "LITELLM_MODEL_MANAGEMENT_ENABLED", False))
+          worker_token = getattr(settings, "LITELLM_MODEL_ADMISSION_WORKER_TOKEN", "")
+          if worker_enabled and not management_enabled:
               raise SystemExit("LiteLLM admission worker cannot be enabled while model management is disabled")
-          if settings.LITELLM_MODEL_ADMISSION_WORKER_ENABLED and not settings.LITELLM_MODEL_ADMISSION_WORKER_TOKEN:
+          if worker_enabled and not worker_token:
               raise SystemExit("LiteLLM admission worker token is missing")
           print("LiteLLM model management read-only boundary ok")
           PY
@@ -968,9 +990,13 @@ jobs:
           current_link="${HOME}/.local/share/fusion/litellm-governance-current"
           config_dir="${HOME}/.config/fusion"
           registry_target="${config_dir}/litellm-provider-registry.json"
+          proxy_env="${HOME}/project/litellm-proxy/.env"
+          governance_env="${HOME}/.config/fusion/litellm-governance.env"
+          governance_output_dir="${HOME}/backups/litellm-governance"
+          acceptance_dir="${HOME}/.local/share/fusion/litellm-acceptance"
           unit_dir="${HOME}/.config/systemd/user"
           install -d -m 0755 "${release_dir}/scripts" "${release_dir}/ops/litellm" "${unit_dir}"
-          install -d -m 0700 "${config_dir}"
+          install -d -m 0700 "${config_dir}" "${governance_output_dir}" "${acceptance_dir}"
           systemctl --user stop fusion-litellm-governance.timer >/dev/null 2>&1 || true
           if systemctl --user is-active --quiet fusion-litellm-governance.service; then
             if [ "${ROLLBACK_GOVERNANCE_TIMER_ACTIVE}" = "true" ]; then
@@ -1029,6 +1055,21 @@ jobs:
           if not isinstance(payload, dict) or not isinstance(payload.get("providers"), list):
               raise SystemExit("LiteLLM provider registry 结构无效")
           PY
+          python3 - "${proxy_env}" "${governance_env}" <<'PY'
+          import os
+          import pathlib
+          import stat
+          import sys
+
+          for raw_path in sys.argv[1:]:
+              path = pathlib.Path(raw_path)
+              file_stat = path.lstat()
+              if path.is_symlink() or not stat.S_ISREG(file_stat.st_mode):
+                  raise SystemExit(f"治理密钥文件不是普通文件: {path}")
+              if file_stat.st_uid != os.getuid():
+                  raise SystemExit(f"治理密钥文件 owner 不匹配: {path}")
+              os.chmod(path, 0o600, follow_symlinks=False)
+          PY
           install -m 0644 \
             "${GITHUB_WORKSPACE}/ops/litellm/fusion-litellm-governance.service" \
             "${GITHUB_WORKSPACE}/ops/litellm/fusion-litellm-governance.timer" \
@@ -1038,6 +1079,17 @@ jobs:
           systemd-analyze --user verify \
             "${unit_dir}/fusion-litellm-governance.service" \
             "${unit_dir}/fusion-litellm-governance.timer"
+          systemctl --user reset-failed fusion-litellm-governance.service >/dev/null 2>&1 || true
+          if ! systemctl --user start fusion-litellm-governance.service; then
+            journalctl --user -u fusion-litellm-governance.service -n 120 --no-pager || true
+            exit 1
+          fi
+          governance_result="$(systemctl --user show fusion-litellm-governance.service --property=Result --value)"
+          if [ "${governance_result}" != "success" ]; then
+            journalctl --user -u fusion-litellm-governance.service -n 120 --no-pager || true
+            echo "LiteLLM 治理 service smoke 未成功: ${governance_result}"
+            exit 1
+          fi
           systemctl --user enable --now fusion-litellm-governance.timer
           systemctl --user is-active --quiet fusion-litellm-governance.timer
 
@@ -1279,20 +1331,25 @@ jobs:
         run: |
           systemctl --user stop fusion-litellm-model-management.timer >/dev/null 2>&1 || true
           systemctl --user stop fusion-litellm-governance.timer >/dev/null 2>&1 || true
-          wait_for_user_service() {
-            service_name="$1"
-            display_name="$2"
-            for attempt in $(seq 1 120); do
-              if ! systemctl --user is-active --quiet "${service_name}"; then
+          wait_for_user_services() {
+            for attempt in $(seq 1 24); do
+              worker_active="false"
+              governance_active="false"
+              if systemctl --user is-active --quiet fusion-litellm-model-management.service; then
+                worker_active="true"
+              fi
+              if systemctl --user is-active --quiet fusion-litellm-governance.service; then
+                governance_active="true"
+              fi
+              if [ "${worker_active}:${governance_active}" = "false:false" ]; then
                 return 0
               fi
               sleep 5
             done
-            echo "${display_name} 在回滚等待窗口内仍未结束，拒绝并发恢复运行资产"
+            echo "模型准入 Worker 或 LiteLLM 治理周期在回滚等待窗口内仍未结束，拒绝并发恢复运行资产"
             return 1
           }
-          wait_for_user_service fusion-litellm-model-management.service "模型准入 Worker"
-          wait_for_user_service fusion-litellm-governance.service "LiteLLM 治理周期"
+          wait_for_user_services
           cd ~/project/fusion
           set -o pipefail
           set -a
