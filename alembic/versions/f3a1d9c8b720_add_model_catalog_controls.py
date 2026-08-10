@@ -18,7 +18,8 @@ down_revision: Union[str, Sequence[str], None] = "e8b4c2d7f901"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
-CREATED_TABLE_COMMENT = "fusion-created-by-alembic:f3a1d9c8b720"
+ORIGIN_REGISTRY_TABLE = "_fusion_alembic_f3a1d9c8b720_origins"
+MANAGED_TABLES = ("model_catalog_controls", "model_admission_operations")
 
 
 MODEL_CATALOG_CONTROL_COLUMNS = {
@@ -107,6 +108,20 @@ def _validate_existing_table(
     allowed_redundant_unique_constraint_columns: set[frozenset[str]] | None = None,
     expected_indexes: dict[str, tuple[tuple[str, ...], bool, str | None]] | None = None,
 ) -> None:
+    relation_state_row = inspector.bind.execute(
+        sa.text(
+            """
+            SELECT relkind, relpersistence
+            FROM pg_catalog.pg_class
+            WHERE oid = to_regclass(:table_name)
+            """
+        ),
+        {"table_name": table_name},
+    ).one_or_none()
+    relation_state = tuple(relation_state_row) if relation_state_row is not None else None
+    if relation_state != ("r", "p"):
+        raise RuntimeError(f"已有表 {table_name} 必须是 PostgreSQL 持久普通表：actual={relation_state}")
+
     actual_columns = {column["name"]: column for column in inspector.get_columns(table_name)}
     if set(actual_columns) != set(expected_columns):
         raise RuntimeError(
@@ -205,6 +220,31 @@ def _validate_existing_table(
                 raise RuntimeError(f"已有表 {table_name} 的唯一约束 {constraint_name} 不兼容")
 
     indexes = {index.get("name"): index for index in inspector.get_indexes(table_name) if index.get("name")}
+    index_states = {
+        row["index_name"]: (
+            bool(row["indisvalid"]),
+            bool(row["indisready"]),
+            bool(row["indislive"]),
+        )
+        for row in inspector.bind.execute(
+            sa.text(
+                """
+                SELECT index_class.relname AS index_name,
+                       pg_index.indisvalid,
+                       pg_index.indisready,
+                       pg_index.indislive
+                FROM pg_catalog.pg_index
+                JOIN pg_catalog.pg_class AS index_class
+                  ON index_class.oid = pg_index.indexrelid
+                WHERE pg_index.indrelid = to_regclass(:table_name)
+                """
+            ),
+            {"table_name": table_name},
+        ).mappings()
+    }
+    invalid_indexes = {index_name for index_name in indexes if index_states.get(index_name) != (True, True, True)}
+    if invalid_indexes:
+        raise RuntimeError(f"已有表 {table_name} 包含无效或未就绪索引：{sorted(invalid_indexes)}")
     if expected_indexes:
         for index_name, (expected_column_names, expected_unique, expected_predicate) in expected_indexes.items():
             index = indexes.get(index_name)
@@ -253,7 +293,6 @@ def _create_model_catalog_controls() -> None:
         sa.CheckConstraint("revision > 0", name="ck_model_catalog_controls_revision_positive"),
         sa.PrimaryKeyConstraint("model_id"),
     )
-    op.execute(sa.text(f"COMMENT ON TABLE model_catalog_controls IS '{CREATED_TABLE_COMMENT}'"))
 
 
 def _create_model_admission_operations() -> None:
@@ -303,17 +342,40 @@ def _create_model_admission_operations() -> None:
         unique=True,
         postgresql_where=sa.text("status = 'running'"),
     )
-    op.execute(sa.text(f"COMMENT ON TABLE model_admission_operations IS '{CREATED_TABLE_COMMENT}'"))
+
+
+def _create_origin_registry(created_tables: set[str]) -> None:
+    op.create_table(
+        ORIGIN_REGISTRY_TABLE,
+        sa.Column("object_name", sa.String(length=100), nullable=False),
+        sa.Column("created_by_migration", sa.Boolean(), nullable=False),
+        sa.CheckConstraint(
+            "object_name IN ('model_catalog_controls', 'model_admission_operations')",
+            name="ck_f3a1d9c8b720_origin_object_name",
+        ),
+        sa.PrimaryKeyConstraint("object_name"),
+    )
+    values = ", ".join(
+        f"('{table_name}', {'true' if table_name in created_tables else 'false'})" for table_name in MANAGED_TABLES
+    )
+    op.execute(sa.text(f"INSERT INTO {ORIGIN_REGISTRY_TABLE} (object_name, created_by_migration) VALUES {values}"))
 
 
 def upgrade() -> None:
     if context.is_offline_mode():
+        _create_origin_registry(set(MANAGED_TABLES))
         _create_model_catalog_controls()
         _create_model_admission_operations()
         return
 
     inspector = sa.inspect(op.get_bind())
-    if inspector.has_table("model_catalog_controls"):
+    if inspector.has_table(ORIGIN_REGISTRY_TABLE):
+        raise RuntimeError(f"迁移来源登记表已存在，拒绝覆盖：{ORIGIN_REGISTRY_TABLE}")
+
+    catalog_exists = inspector.has_table("model_catalog_controls")
+    operation_exists = inspector.has_table("model_admission_operations")
+
+    if catalog_exists:
         _validate_existing_table(
             inspector,
             "model_catalog_controls",
@@ -326,10 +388,8 @@ def upgrade() -> None:
             expected_unique_constraints={},
             allowed_redundant_unique_constraint_columns={frozenset({"model_id"})},
         )
-    else:
-        _create_model_catalog_controls()
 
-    if inspector.has_table("model_admission_operations"):
+    if operation_exists:
         _validate_existing_table(
             inspector,
             "model_admission_operations",
@@ -364,7 +424,19 @@ def upgrade() -> None:
                 ),
             },
         )
-    else:
+
+    created_tables = {
+        table_name
+        for table_name, exists in (
+            ("model_catalog_controls", catalog_exists),
+            ("model_admission_operations", operation_exists),
+        )
+        if not exists
+    }
+    _create_origin_registry(created_tables)
+    if not catalog_exists:
+        _create_model_catalog_controls()
+    if not operation_exists:
         _create_model_admission_operations()
 
 
@@ -373,17 +445,35 @@ def downgrade() -> None:
         sa.text(
             f"""
             DO $fusion$
+            DECLARE
+              operation_created boolean;
+              catalog_created boolean;
             BEGIN
-              IF to_regclass('model_admission_operations') IS NOT NULL
-                 AND obj_description(to_regclass('model_admission_operations'), 'pg_class')
-                     = '{CREATED_TABLE_COMMENT}' THEN
+              IF to_regclass('{ORIGIN_REGISTRY_TABLE}') IS NULL THEN
+                RAISE EXCEPTION '缺少迁移来源登记表：{ORIGIN_REGISTRY_TABLE}';
+              END IF;
+
+              SELECT created_by_migration INTO operation_created
+              FROM {ORIGIN_REGISTRY_TABLE}
+              WHERE object_name = 'model_admission_operations';
+              IF NOT FOUND THEN
+                RAISE EXCEPTION '缺少 model_admission_operations 来源记录';
+              END IF;
+
+              SELECT created_by_migration INTO catalog_created
+              FROM {ORIGIN_REGISTRY_TABLE}
+              WHERE object_name = 'model_catalog_controls';
+              IF NOT FOUND THEN
+                RAISE EXCEPTION '缺少 model_catalog_controls 来源记录';
+              END IF;
+
+              IF operation_created THEN
                 DROP TABLE model_admission_operations;
               END IF;
-              IF to_regclass('model_catalog_controls') IS NOT NULL
-                 AND obj_description(to_regclass('model_catalog_controls'), 'pg_class')
-                     = '{CREATED_TABLE_COMMENT}' THEN
+              IF catalog_created THEN
                 DROP TABLE model_catalog_controls;
               END IF;
+              DROP TABLE {ORIGIN_REGISTRY_TABLE};
             END
             $fusion$
             """

@@ -61,7 +61,7 @@ def compatible_columns(table_name: str):
 
 def compatible_inspector() -> Mock:
     inspector = Mock()
-    inspector.has_table.return_value = True
+    inspector.has_table.side_effect = lambda table_name: table_name != "_fusion_alembic_f3a1d9c8b720_origins"
     inspector.get_columns.side_effect = compatible_columns
     inspector.get_pk_constraint.side_effect = lambda table_name: {
         "constrained_columns": ["model_id"] if table_name == "model_catalog_controls" else ["id"]
@@ -119,6 +119,26 @@ def compatible_inspector() -> Mock:
         ]
     )
     inspector.get_foreign_keys.return_value = []
+
+    def execute_catalog_query(statement, parameters):
+        query = str(statement)
+        result = Mock()
+        if "relpersistence" in query:
+            result.one_or_none.return_value = ("r", "p")
+            return result
+        table_name = parameters["table_name"]
+        result.mappings.return_value = [
+            {
+                "index_name": index["name"],
+                "indisvalid": True,
+                "indisready": True,
+                "indislive": True,
+            }
+            for index in inspector.get_indexes(table_name)
+        ]
+        return result
+
+    inspector.bind.execute.side_effect = execute_catalog_query
     return inspector
 
 
@@ -135,9 +155,9 @@ class ModelManagementMigrationTest(unittest.TestCase):
         ):
             migration.upgrade()
 
-        self.assertEqual(operation.create_table.call_count, 2)
+        self.assertEqual(operation.create_table.call_count, 3)
         self.assertEqual(operation.create_index.call_count, 2)
-        self.assertEqual(operation.execute.call_count, 2)
+        self.assertEqual(operation.execute.call_count, 1)
 
     def test_compatible_existing_schema_is_adopted_without_ddl(self):
         migration = load_migration()
@@ -150,9 +170,10 @@ class ModelManagementMigrationTest(unittest.TestCase):
         ):
             migration.upgrade()
 
-        operation.create_table.assert_not_called()
+        self.assertEqual(operation.create_table.call_count, 1)
+        self.assertEqual(operation.create_table.call_args.args[0], migration.ORIGIN_REGISTRY_TABLE)
         operation.create_index.assert_not_called()
-        operation.execute.assert_not_called()
+        operation.execute.assert_called_once()
 
     def test_incompatible_existing_schema_fails_instead_of_blindly_stamping(self):
         migration = load_migration()
@@ -184,9 +205,9 @@ class ModelManagementMigrationTest(unittest.TestCase):
             migration.upgrade()
 
         inspect_database.assert_not_called()
-        self.assertEqual(operation.create_table.call_count, 2)
+        self.assertEqual(operation.create_table.call_count, 3)
         self.assertEqual(operation.create_index.call_count, 2)
-        self.assertEqual(operation.execute.call_count, 2)
+        self.assertEqual(operation.execute.call_count, 1)
 
     def test_redundant_unique_constraint_on_catalog_primary_key_is_adopted(self):
         migration = load_migration()
@@ -223,7 +244,8 @@ class ModelManagementMigrationTest(unittest.TestCase):
         ):
             migration.upgrade()
 
-        operation.create_table.assert_not_called()
+        self.assertEqual(operation.create_table.call_count, 1)
+        self.assertEqual(operation.create_table.call_args.args[0], migration.ORIGIN_REGISTRY_TABLE)
         operation.create_index.assert_not_called()
 
     def test_same_check_name_with_drifted_expression_is_rejected(self):
@@ -346,6 +368,54 @@ class ModelManagementMigrationTest(unittest.TestCase):
         ):
             migration.upgrade()
 
+    def test_invalid_index_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        original_execute = inspector.bind.execute.side_effect
+
+        def execute_catalog_query(statement, parameters):
+            result = original_execute(statement, parameters)
+            if "pg_index.indisvalid" in str(statement) and parameters["table_name"] == "model_admission_operations":
+                index_states = list(result.mappings())
+                next(
+                    state
+                    for state in index_states
+                    if state["index_name"] == "uq_model_admission_operations_single_running"
+                )["indisvalid"] = False
+                result.mappings.return_value = index_states
+            return result
+
+        inspector.bind.execute.side_effect = execute_catalog_query
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "无效或未就绪索引"),
+        ):
+            migration.upgrade()
+
+    def test_unlogged_table_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        original_execute = inspector.bind.execute.side_effect
+
+        def execute_catalog_query(statement, parameters):
+            result = original_execute(statement, parameters)
+            if "relpersistence" in str(statement) and parameters["table_name"] == "model_catalog_controls":
+                result.one_or_none.return_value = ("r", "u")
+            return result
+
+        inspector.bind.execute.side_effect = execute_catalog_query
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "必须是 PostgreSQL 持久普通表"),
+        ):
+            migration.upgrade()
+
     def test_extra_foreign_key_is_rejected(self):
         migration = load_migration()
         inspector = compatible_inspector()
@@ -460,8 +530,8 @@ class ModelManagementMigrationTest(unittest.TestCase):
         operation.drop_table.assert_not_called()
         operation.execute.assert_called_once()
         downgrade_sql = str(operation.execute.call_args.args[0])
-        self.assertIn("obj_description", downgrade_sql)
-        self.assertIn(migration.CREATED_TABLE_COMMENT, downgrade_sql)
+        self.assertIn(migration.ORIGIN_REGISTRY_TABLE, downgrade_sql)
+        self.assertIn("缺少迁移来源登记表", downgrade_sql)
         self.assertIn("DROP TABLE model_admission_operations", downgrade_sql)
         self.assertIn("DROP TABLE model_catalog_controls", downgrade_sql)
 
