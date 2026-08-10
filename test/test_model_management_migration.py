@@ -20,35 +20,43 @@ def load_migration():
 def compatible_columns(table_name: str):
     if table_name == "model_catalog_controls":
         definitions = [
-            ("model_id", sa.String(200), False),
-            ("selectable", sa.Boolean(), False),
-            ("routable", sa.Boolean(), False),
-            ("revision", sa.Integer(), False),
-            ("reason", sa.String(300), False),
-            ("updated_by", sa.String(), False),
-            ("created_at", sa.DateTime(timezone=True), False),
-            ("updated_at", sa.DateTime(timezone=True), False),
+            ("model_id", sa.String(200), False, None),
+            ("selectable", sa.Boolean(), False, "true"),
+            ("routable", sa.Boolean(), False, "true"),
+            ("revision", sa.Integer(), False, "1"),
+            ("reason", sa.String(300), False, None),
+            ("updated_by", sa.String(), False, None),
+            ("created_at", sa.DateTime(timezone=True), False, "now()"),
+            ("updated_at", sa.DateTime(timezone=True), False, "now()"),
         ]
     else:
         definitions = [
-            ("id", sa.String(), False),
-            ("model_id", sa.String(200), False),
-            ("candidate_fingerprint", sa.String(64), False),
-            ("governance_run_id", sa.String(32), False),
-            ("status", sa.String(20), False),
-            ("requested_by", sa.String(), False),
-            ("request_id", sa.String(), False),
-            ("reason", sa.String(300), False),
-            ("attempts", sa.Integer(), False),
-            ("lease_token_hash", sa.String(64), True),
-            ("lease_expires_at", sa.DateTime(timezone=True), True),
-            ("catalog_invalidated_at", sa.DateTime(timezone=True), True),
-            ("result", postgresql.JSONB(), False),
-            ("created_at", sa.DateTime(timezone=True), False),
-            ("updated_at", sa.DateTime(timezone=True), False),
-            ("terminal_at", sa.DateTime(timezone=True), True),
+            ("id", sa.String(), False, None),
+            ("model_id", sa.String(200), False, None),
+            ("candidate_fingerprint", sa.String(64), False, None),
+            ("governance_run_id", sa.String(32), False, None),
+            ("status", sa.String(20), False, "'pending'::character varying"),
+            ("requested_by", sa.String(), False, None),
+            ("request_id", sa.String(), False, None),
+            ("reason", sa.String(300), False, None),
+            ("attempts", sa.Integer(), False, "0"),
+            ("lease_token_hash", sa.String(64), True, None),
+            ("lease_expires_at", sa.DateTime(timezone=True), True, None),
+            ("catalog_invalidated_at", sa.DateTime(timezone=True), True, None),
+            ("result", postgresql.JSONB(), False, "'{}'::jsonb"),
+            ("created_at", sa.DateTime(timezone=True), False, "now()"),
+            ("updated_at", sa.DateTime(timezone=True), False, "now()"),
+            ("terminal_at", sa.DateTime(timezone=True), True, None),
         ]
-    return [{"name": name, "type": column_type, "nullable": nullable} for name, column_type, nullable in definitions]
+    return [
+        {
+            "name": name,
+            "type": column_type,
+            "nullable": nullable,
+            "default": default,
+        }
+        for name, column_type, nullable, default in definitions
+    ]
 
 
 def compatible_inspector() -> Mock:
@@ -78,13 +86,22 @@ def compatible_inspector() -> Mock:
             }
         ]
     )
-    inspector.get_unique_constraints.return_value = [
+    inspector.get_unique_constraints.side_effect = lambda table_name: (
+        []
+        if table_name == "model_catalog_controls"
+        else [
+            {
+                "name": "uq_model_admission_operation_candidate_run",
+                "column_names": ["candidate_fingerprint", "governance_run_id"],
+            }
+        ]
+    )
+    inspector.get_indexes.return_value = [
         {
             "name": "uq_model_admission_operation_candidate_run",
             "column_names": ["candidate_fingerprint", "governance_run_id"],
-        }
-    ]
-    inspector.get_indexes.return_value = [
+            "unique": True,
+        },
         {
             "name": "ix_model_admission_operations_status_created",
             "column_names": ["status", "created_at", "id"],
@@ -97,6 +114,7 @@ def compatible_inspector() -> Mock:
             "dialect_options": {"postgresql_where": "status = 'running'"},
         },
     ]
+    inspector.get_foreign_keys.return_value = []
     return inspector
 
 
@@ -198,6 +216,57 @@ class ModelManagementMigrationTest(unittest.TestCase):
             patch.object(migration.context, "is_offline_mode", return_value=False),
             patch.object(migration.sa, "inspect", return_value=inspector),
             self.assertRaisesRegex(RuntimeError, "索引 .* 不兼容"),
+        ):
+            migration.upgrade()
+
+    def test_extra_restrictive_check_constraint_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        original_get_checks = inspector.get_check_constraints.side_effect
+        inspector.get_check_constraints.side_effect = lambda table_name: (
+            original_get_checks(table_name)
+            if table_name == "model_catalog_controls"
+            else [
+                *original_get_checks(table_name),
+                {"name": "ck_model_admission_operations_attempts", "sqltext": "attempts < 3"},
+            ]
+        )
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "检查约束集合不兼容"),
+        ):
+            migration.upgrade()
+
+    def test_full_index_with_partial_predicate_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        inspector.get_indexes.return_value[1]["dialect_options"] = {"postgresql_where": "status = 'pending'"}
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "索引 .* 不兼容"),
+        ):
+            migration.upgrade()
+
+    def test_column_default_drift_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        operation_columns = compatible_columns("model_admission_operations")
+        next(column for column in operation_columns if column["name"] == "attempts")["default"] = "1"
+        inspector.get_columns.side_effect = lambda table_name: (
+            compatible_columns(table_name) if table_name == "model_catalog_controls" else operation_columns
+        )
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "默认值不兼容"),
         ):
             migration.upgrade()
 

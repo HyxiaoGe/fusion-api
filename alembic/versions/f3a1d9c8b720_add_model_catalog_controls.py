@@ -20,40 +20,40 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 MODEL_CATALOG_CONTROL_COLUMNS = {
-    "model_id": (sa.String, 200, False),
-    "selectable": (sa.Boolean, None, False),
-    "routable": (sa.Boolean, None, False),
-    "revision": (sa.Integer, None, False),
-    "reason": (sa.String, 300, False),
-    "updated_by": (sa.String, None, False),
-    "created_at": (sa.DateTime, None, False),
-    "updated_at": (sa.DateTime, None, False),
+    "model_id": (sa.String, 200, False, None),
+    "selectable": (sa.Boolean, None, False, "true"),
+    "routable": (sa.Boolean, None, False, "true"),
+    "revision": (sa.Integer, None, False, "1"),
+    "reason": (sa.String, 300, False, None),
+    "updated_by": (sa.String, None, False, None),
+    "created_at": (sa.DateTime, None, False, "now()"),
+    "updated_at": (sa.DateTime, None, False, "now()"),
 }
 
 MODEL_ADMISSION_OPERATION_COLUMNS = {
-    "id": (sa.String, None, False),
-    "model_id": (sa.String, 200, False),
-    "candidate_fingerprint": (sa.String, 64, False),
-    "governance_run_id": (sa.String, 32, False),
-    "status": (sa.String, 20, False),
-    "requested_by": (sa.String, None, False),
-    "request_id": (sa.String, None, False),
-    "reason": (sa.String, 300, False),
-    "attempts": (sa.Integer, None, False),
-    "lease_token_hash": (sa.String, 64, True),
-    "lease_expires_at": (sa.DateTime, None, True),
-    "catalog_invalidated_at": (sa.DateTime, None, True),
-    "result": (postgresql.JSONB, None, False),
-    "created_at": (sa.DateTime, None, False),
-    "updated_at": (sa.DateTime, None, False),
-    "terminal_at": (sa.DateTime, None, True),
+    "id": (sa.String, None, False, None),
+    "model_id": (sa.String, 200, False, None),
+    "candidate_fingerprint": (sa.String, 64, False, None),
+    "governance_run_id": (sa.String, 32, False, None),
+    "status": (sa.String, 20, False, "'pending'"),
+    "requested_by": (sa.String, None, False, None),
+    "request_id": (sa.String, None, False, None),
+    "reason": (sa.String, 300, False, None),
+    "attempts": (sa.Integer, None, False, "0"),
+    "lease_token_hash": (sa.String, 64, True, None),
+    "lease_expires_at": (sa.DateTime, None, True, None),
+    "catalog_invalidated_at": (sa.DateTime, None, True, None),
+    "result": (postgresql.JSONB, None, False, "'{}'"),
+    "created_at": (sa.DateTime, None, False, "now()"),
+    "updated_at": (sa.DateTime, None, False, "now()"),
+    "terminal_at": (sa.DateTime, None, True, None),
 }
 
 
 def _normalize_sql_expression(expression: object) -> str:
     normalized = str(expression).lower()
     normalized = re.sub(
-        r"::(?:character varying|text|boolean|integer)(?:\[\])?",
+        r"::(?:character varying|text|boolean|integer|jsonb)(?:\[\])?",
         "",
         normalized,
     )
@@ -63,7 +63,10 @@ def _normalize_sql_expression(expression: object) -> str:
 def _validate_existing_table(
     inspector: sa.Inspector,
     table_name: str,
-    expected_columns: dict[str, tuple[type[sa.types.TypeEngine], int | None, bool]],
+    expected_columns: dict[
+        str,
+        tuple[type[sa.types.TypeEngine], int | None, bool, str | None],
+    ],
     *,
     expected_primary_key: set[str],
     expected_checks: dict[str, str],
@@ -77,7 +80,12 @@ def _validate_existing_table(
             f"actual={sorted(actual_columns)} expected={sorted(expected_columns)}"
         )
 
-    for column_name, (expected_type, expected_length, expected_nullable) in expected_columns.items():
+    for column_name, (
+        expected_type,
+        expected_length,
+        expected_nullable,
+        expected_default,
+    ) in expected_columns.items():
         column = actual_columns[column_name]
         actual_type = column["type"]
         if not isinstance(actual_type, expected_type):
@@ -97,6 +105,19 @@ def _validate_existing_table(
                 f"已有表 {table_name}.{column_name} 的 nullable 不兼容："
                 f"actual={column.get('nullable')} expected={expected_nullable}"
             )
+        actual_default = column.get("default")
+        if (
+            (expected_default is None and actual_default is not None)
+            or (expected_default is not None and actual_default is None)
+            or (
+                expected_default is not None
+                and actual_default is not None
+                and _normalize_sql_expression(actual_default) != _normalize_sql_expression(expected_default)
+            )
+        ):
+            raise RuntimeError(
+                f"已有表 {table_name}.{column_name} 的默认值不兼容：actual={actual_default} expected={expected_default}"
+            )
 
     primary_key = set(inspector.get_pk_constraint(table_name).get("constrained_columns") or [])
     if primary_key != expected_primary_key:
@@ -109,19 +130,26 @@ def _validate_existing_table(
         for constraint in inspector.get_check_constraints(table_name)
         if constraint.get("name")
     }
+    if set(checks) != set(expected_checks):
+        raise RuntimeError(
+            f"已有表 {table_name} 的检查约束集合不兼容：actual={sorted(checks)} expected={sorted(expected_checks)}"
+        )
     for check_name, expected_expression in expected_checks.items():
-        actual_expression = checks.get(check_name)
-        if actual_expression is None:
-            raise RuntimeError(f"已有表 {table_name} 缺少检查约束：{check_name}")
+        actual_expression = checks[check_name]
         if _normalize_sql_expression(actual_expression) != _normalize_sql_expression(expected_expression):
             raise RuntimeError(f"已有表 {table_name} 的检查约束 {check_name} 表达式不兼容")
 
-    if expected_unique_constraints:
+    if expected_unique_constraints is not None:
         unique_constraints = {
             constraint.get("name"): set(constraint.get("column_names") or [])
             for constraint in inspector.get_unique_constraints(table_name)
             if constraint.get("name")
         }
+        if set(unique_constraints) != set(expected_unique_constraints):
+            raise RuntimeError(
+                f"已有表 {table_name} 的唯一约束集合不兼容："
+                f"actual={sorted(unique_constraints)} expected={sorted(expected_unique_constraints)}"
+            )
         for constraint_name, expected_column_names in expected_unique_constraints.items():
             if unique_constraints.get(constraint_name) != expected_column_names:
                 raise RuntimeError(f"已有表 {table_name} 的唯一约束 {constraint_name} 不兼容")
@@ -135,12 +163,29 @@ def _validate_existing_table(
             dialect_options = index.get("dialect_options") or {} if index else {}
             predicate = dialect_options.get("postgresql_where")
             predicate_text = _normalize_sql_expression(predicate) if predicate is not None else ""
+            expected_predicate_text = (
+                _normalize_sql_expression(expected_predicate) if expected_predicate is not None else ""
+            )
             if (
                 actual_column_names != expected_column_names
                 or actual_unique is not expected_unique
-                or (expected_predicate is not None and predicate_text != _normalize_sql_expression(expected_predicate))
+                or predicate_text != expected_predicate_text
             ):
                 raise RuntimeError(f"已有表 {table_name} 的索引 {index_name} 不兼容")
+
+        allowed_unique_indexes = {
+            index_name for index_name, (_, unique, _) in expected_indexes.items() if unique
+        } | set(expected_unique_constraints or {})
+        unexpected_unique_indexes = {
+            index_name
+            for index_name, index in indexes.items()
+            if bool(index.get("unique")) and index_name not in allowed_unique_indexes
+        }
+        if unexpected_unique_indexes:
+            raise RuntimeError(f"已有表 {table_name} 包含迁移定义外的唯一索引：{sorted(unexpected_unique_indexes)}")
+
+    if inspector.get_foreign_keys(table_name):
+        raise RuntimeError(f"已有表 {table_name} 包含迁移定义外的外键")
 
 
 def _create_model_catalog_controls() -> None:
@@ -157,7 +202,6 @@ def _create_model_catalog_controls() -> None:
         sa.CheckConstraint("routable IS TRUE", name="ck_model_catalog_controls_routable_true"),
         sa.CheckConstraint("revision > 0", name="ck_model_catalog_controls_revision_positive"),
         sa.PrimaryKeyConstraint("model_id"),
-        sa.UniqueConstraint("model_id"),
     )
 
 
@@ -227,6 +271,7 @@ def upgrade() -> None:
                 "ck_model_catalog_controls_routable_true": "routable IS TRUE",
                 "ck_model_catalog_controls_revision_positive": "revision > 0",
             },
+            expected_unique_constraints={},
         )
     else:
         _create_model_catalog_controls()
