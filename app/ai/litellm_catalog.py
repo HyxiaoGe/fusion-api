@@ -19,7 +19,9 @@ import time
 from typing import Any, Dict, Optional
 
 import httpx
+import redis
 
+from app.core.config import settings
 from app.core.logger import app_logger as logger
 
 _LITELLM_BASE_URL = os.environ.get("LITELLM_PROXY_URL", "http://litellm-proxy:4000").rstrip("/")
@@ -29,12 +31,100 @@ _DEFAULT_AGENT_TOOLS_DISABLED_ALIASES = {"qwen-vl-max"}
 # 缓存生效时间——LiteLLM 模型变更频次低，60s 足够
 _CACHE_TTL_SECONDS = 60.0
 _FAILED_FETCH_BACKOFF_SECONDS = float(os.environ.get("LITELLM_CATALOG_FAILURE_BACKOFF_SECONDS", "30"))
+_GENERATION_CHECK_INTERVAL_SECONDS = float(os.environ.get("LITELLM_CATALOG_GENERATION_CHECK_INTERVAL_SECONDS", "1"))
+_CATALOG_GENERATION_KEY = "fusion:litellm:catalog:generation"
 
 _cache_lock = threading.Lock()
 _cache_payload: Optional[Dict[str, Dict[str, Any]]] = None
 _cache_loaded_at: float = 0.0
 _cache_last_attempt_at: float | None = None
 _cache_last_attempt_failed = False
+_cache_generation: str | None = None
+_last_generation_check_at = 0.0
+_generation_redis: redis.Redis | None = None
+_generation_error_logged = False
+_generation_check_in_flight = False
+_generation_check_epoch = 0
+_generation_check_thread: threading.Thread | None = None
+
+
+def _get_generation_redis() -> redis.Redis:
+    global _generation_redis
+    if _generation_redis is None:
+        _generation_redis = redis.from_url(
+            settings.REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=0.25,
+            socket_timeout=0.25,
+        )
+    return _generation_redis
+
+
+def _read_catalog_generation() -> str | None:
+    global _generation_error_logged
+    try:
+        value = _get_generation_redis().get(_CATALOG_GENERATION_KEY)
+    except Exception:
+        if not _generation_error_logged:
+            logger.warning("litellm_catalog: Redis generation unavailable")
+            _generation_error_logged = True
+        return None
+    _generation_error_logged = False
+    return str(value or "0")
+
+
+def _sync_distributed_generation(now: float) -> None:
+    """后台检查跨进程目录代次，避免同步 Redis I/O 阻塞请求事件循环。"""
+    global _generation_check_in_flight, _generation_check_thread, _last_generation_check_at
+    with _cache_lock:
+        if (
+            _generation_check_in_flight
+            or now - _last_generation_check_at < _GENERATION_CHECK_INTERVAL_SECONDS
+        ):
+            return
+        _last_generation_check_at = now
+        _generation_check_in_flight = True
+        epoch = _generation_check_epoch
+    thread = threading.Thread(
+        target=_refresh_distributed_generation,
+        args=(epoch,),
+        name="litellm-catalog-generation",
+        daemon=True,
+    )
+    _generation_check_thread = thread
+    try:
+        thread.start()
+    except Exception as exc:
+        with _cache_lock:
+            _generation_check_in_flight = False
+            _generation_check_thread = None
+        logger.warning(f"litellm_catalog: generation background check failed to start: {exc}")
+
+
+def _refresh_distributed_generation(epoch: int) -> None:
+    global _cache_generation, _cache_last_attempt_at, _cache_last_attempt_failed
+    global _cache_loaded_at, _cache_payload, _generation_check_in_flight
+    try:
+        generation = _read_catalog_generation()
+        if generation is None:
+            return
+        with _cache_lock:
+            if epoch != _generation_check_epoch:
+                return
+            if _cache_generation is None:
+                if _cache_payload is None:
+                    _cache_generation = generation
+                    return
+            elif generation == _cache_generation:
+                return
+            _cache_payload = None
+            _cache_loaded_at = 0.0
+            _cache_last_attempt_at = None
+            _cache_last_attempt_failed = False
+            _cache_generation = generation
+    finally:
+        with _cache_lock:
+            _generation_check_in_flight = False
 
 
 def _fetch_catalog() -> Dict[str, Dict[str, Any]]:
@@ -76,6 +166,7 @@ def _ensure_loaded() -> Dict[str, Dict[str, Any]]:
     """返回当前缓存内容，过期时同步刷新。"""
     global _cache_payload, _cache_loaded_at, _cache_last_attempt_at, _cache_last_attempt_failed
     now = time.monotonic()
+    _sync_distributed_generation(now)
     with _cache_lock:
         if _cache_payload is not None and now - _cache_loaded_at < _CACHE_TTL_SECONDS:
             return _cache_payload
@@ -196,11 +287,30 @@ def get_cache_status() -> dict[str, Any]:
         }
 
 
-def invalidate() -> None:
-    """主动清缓存（测试用 / 模型变更后）。"""
-    global _cache_payload, _cache_loaded_at, _cache_last_attempt_at, _cache_last_attempt_failed
+def _clear_local_cache(*, generation: str | None = None) -> None:
+    global _cache_payload, _cache_loaded_at, _cache_last_attempt_at, _cache_last_attempt_failed, _cache_generation
+    global _generation_check_epoch
     with _cache_lock:
+        _generation_check_epoch += 1
         _cache_payload = None
         _cache_loaded_at = 0.0
         _cache_last_attempt_at = None
         _cache_last_attempt_failed = False
+        if generation is not None:
+            _cache_generation = generation
+
+
+def invalidate() -> None:
+    """主动清除当前进程缓存；不推进跨进程目录代次。"""
+    global _cache_generation, _last_generation_check_at, _generation_error_logged
+    _clear_local_cache()
+    _cache_generation = None
+    _last_generation_check_at = 0.0
+    _generation_error_logged = False
+
+
+def bump_generation() -> str:
+    """推进 Redis 目录代次并立即清除当前进程缓存。"""
+    generation = str(_get_generation_redis().incr(_CATALOG_GENERATION_KEY))
+    _clear_local_cache(generation=generation)
+    return generation

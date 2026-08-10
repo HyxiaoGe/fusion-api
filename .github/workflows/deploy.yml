@@ -185,7 +185,7 @@ jobs:
       (needs.prepare.outputs.rollback_requested != 'true' && needs.publish.result == 'success')) }}
     needs: [prepare, publish]
     runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 15
+    timeout-minutes: 30
     environment: dev
     env:
       DEPLOY_TARGET_SHA: ${{ needs.prepare.outputs.target_sha }}
@@ -198,6 +198,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+          ref: ${{ needs.prepare.outputs.target_sha }}
 
       - name: Configure Docker credential directory
         run: |
@@ -253,11 +254,144 @@ jobs:
             exit 1
           fi
 
+          capture_container_bool_env() {
+            key="$1"
+            docker inspect fusion-api --format '{{json .Config.Env}}' | python3 -c '
+          import json
+          import sys
+
+          key = sys.argv[1]
+          entries = json.load(sys.stdin)
+          values = [entry.split("=", 1)[1] for entry in entries if entry.startswith(f"{key}=")]
+          if len(values) > 1:
+              raise SystemExit("duplicate container boolean environment")
+          value = values[0].strip().lower() if values else "false"
+          if value not in {"true", "false"}:
+              raise SystemExit("invalid container boolean environment")
+          print(value)
+          ' "${key}"
+          }
+          rollback_model_management_enabled="$(capture_container_bool_env LITELLM_MODEL_MANAGEMENT_ENABLED)" || {
+            echo "无法读取部署前的模型管理开关"
+            exit 1
+          }
+          rollback_model_admission_worker_enabled="$(capture_container_bool_env LITELLM_MODEL_ADMISSION_WORKER_ENABLED)" || {
+            echo "无法读取部署前的模型准入 Worker 开关"
+            exit 1
+          }
+          case "${rollback_model_management_enabled}:${rollback_model_admission_worker_enabled}" in
+            true:true|true:false|false:false) ;;
+            *) echo "部署前的模型管理开关组合无效，拒绝在无法安全回滚时部署"; exit 1 ;;
+          esac
+
+          model_management_current_link="${HOME}/.local/share/fusion/litellm-model-management-current"
+          model_management_current_target=""
+          if [ -L "${model_management_current_link}" ]; then
+            model_management_current_target="$(readlink -f -- "${model_management_current_link}")"
+            case "${model_management_current_target}" in
+              "${HOME}/.local/share/fusion/litellm-model-management-src-"*) ;;
+              *) echo "模型准入 Worker 当前版本不在受管目录中: ${model_management_current_target:-<empty>}"; exit 1 ;;
+            esac
+          elif [ -e "${model_management_current_link}" ]; then
+            echo "模型准入 Worker 当前版本路径不是符号链接，拒绝部署"
+            exit 1
+          fi
+          model_management_timer_enabled="false"
+          model_management_timer_active="false"
+          if systemctl --user is-enabled --quiet fusion-litellm-model-management.timer; then
+            model_management_timer_enabled="true"
+          fi
+          if systemctl --user is-active --quiet fusion-litellm-model-management.timer; then
+            model_management_timer_active="true"
+          fi
+
+          governance_current_link="${HOME}/.local/share/fusion/litellm-governance-current"
+          governance_current_target=""
+          if [ -L "${governance_current_link}" ]; then
+            governance_current_target="$(readlink -f -- "${governance_current_link}")"
+            case "${governance_current_target}" in
+              "${HOME}/.local/share/fusion/litellm-governance-src-"*) ;;
+              *) echo "LiteLLM 治理当前版本不在受管目录中: ${governance_current_target:-<empty>}"; exit 1 ;;
+            esac
+          elif [ -e "${governance_current_link}" ]; then
+            echo "LiteLLM 治理当前版本路径不是符号链接，拒绝部署"
+            exit 1
+          fi
+          governance_timer_enabled="false"
+          governance_timer_active="false"
+          if systemctl --user is-enabled --quiet fusion-litellm-governance.timer; then
+            governance_timer_enabled="true"
+          fi
+          if systemctl --user is-active --quiet fusion-litellm-governance.timer; then
+            governance_timer_active="true"
+          fi
+          governance_unit_dir="${HOME}/.config/systemd/user"
+          governance_service_unit="${governance_unit_dir}/fusion-litellm-governance.service"
+          governance_timer_unit="${governance_unit_dir}/fusion-litellm-governance.timer"
+          governance_service_unit_existed="false"
+          governance_timer_unit_existed="false"
+          governance_service_unit_b64=""
+          governance_timer_unit_b64=""
+          if [ -e "${governance_service_unit}" ]; then
+            if [ ! -f "${governance_service_unit}" ] || [ -L "${governance_service_unit}" ]; then
+              echo "LiteLLM 治理 service unit 不是受管普通文件"
+              exit 1
+            fi
+            governance_service_unit_existed="true"
+            governance_service_unit_b64="$(base64 -w0 "${governance_service_unit}")"
+          fi
+          if [ -e "${governance_timer_unit}" ]; then
+            if [ ! -f "${governance_timer_unit}" ] || [ -L "${governance_timer_unit}" ]; then
+              echo "LiteLLM 治理 timer unit 不是受管普通文件"
+              exit 1
+            fi
+            governance_timer_unit_existed="true"
+            governance_timer_unit_b64="$(base64 -w0 "${governance_timer_unit}")"
+          fi
+          model_management_service_unit="${governance_unit_dir}/fusion-litellm-model-management.service"
+          model_management_timer_unit="${governance_unit_dir}/fusion-litellm-model-management.timer"
+          model_management_service_unit_existed="false"
+          model_management_timer_unit_existed="false"
+          model_management_service_unit_b64=""
+          model_management_timer_unit_b64=""
+          if [ -e "${model_management_service_unit}" ]; then
+            if [ ! -f "${model_management_service_unit}" ] || [ -L "${model_management_service_unit}" ]; then
+              echo "模型准入 Worker service unit 不是受管普通文件"
+              exit 1
+            fi
+            model_management_service_unit_existed="true"
+            model_management_service_unit_b64="$(base64 -w0 "${model_management_service_unit}")"
+          fi
+          if [ -e "${model_management_timer_unit}" ]; then
+            if [ ! -f "${model_management_timer_unit}" ] || [ -L "${model_management_timer_unit}" ]; then
+              echo "模型准入 Worker timer unit 不是受管普通文件"
+              exit 1
+            fi
+            model_management_timer_unit_existed="true"
+            model_management_timer_unit_b64="$(base64 -w0 "${model_management_timer_unit}")"
+          fi
+
           {
             printf '%s\n' "api_image_ref=${api_image_ref}"
             printf '%s\n' "api_image_id=${api_image_id}"
             printf '%s\n' "adapter_image_ref=${adapter_image_ref}"
             printf '%s\n' "adapter_image_id=${adapter_image_id}"
+            printf '%s\n' "model_management_enabled=${rollback_model_management_enabled}"
+            printf '%s\n' "model_admission_worker_enabled=${rollback_model_admission_worker_enabled}"
+            printf '%s\n' "model_management_current_target=${model_management_current_target}"
+            printf '%s\n' "model_management_timer_enabled=${model_management_timer_enabled}"
+            printf '%s\n' "model_management_timer_active=${model_management_timer_active}"
+            printf '%s\n' "governance_current_target=${governance_current_target}"
+            printf '%s\n' "governance_timer_enabled=${governance_timer_enabled}"
+            printf '%s\n' "governance_timer_active=${governance_timer_active}"
+            printf '%s\n' "governance_service_unit_existed=${governance_service_unit_existed}"
+            printf '%s\n' "governance_timer_unit_existed=${governance_timer_unit_existed}"
+            printf '%s\n' "governance_service_unit_b64=${governance_service_unit_b64}"
+            printf '%s\n' "governance_timer_unit_b64=${governance_timer_unit_b64}"
+            printf '%s\n' "model_management_service_unit_existed=${model_management_service_unit_existed}"
+            printf '%s\n' "model_management_timer_unit_existed=${model_management_timer_unit_existed}"
+            printf '%s\n' "model_management_service_unit_b64=${model_management_service_unit_b64}"
+            printf '%s\n' "model_management_timer_unit_b64=${model_management_timer_unit_b64}"
           } >> "${GITHUB_OUTPUT}"
 
       - name: Login to ACR
@@ -273,6 +407,30 @@ jobs:
         env:
           ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
           ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Pause model management worker before API deploy
+        id: pause_model_management_worker
+        env:
+          DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED: ${{ vars.LITELLM_MODEL_MANAGEMENT_ENABLED || 'false' }}
+          DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED: ${{ vars.LITELLM_MODEL_ADMISSION_WORKER_ENABLED || 'false' }}
+          ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE: ${{ steps.capture_rollback_target.outputs.model_management_timer_active }}
+        run: |
+          set -euo pipefail
+          management_enabled="$(printf '%s' "${DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED}" | tr '[:upper:]' '[:lower:]')"
+          worker_enabled="$(printf '%s' "${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED}" | tr '[:upper:]' '[:lower:]')"
+          case "${management_enabled}:${worker_enabled}" in
+            true:true|true:false|false:false) ;;
+            *) echo "模型管理开关必须为 true 或 false，且 Worker 不能单独启用"; exit 1 ;;
+          esac
+          systemctl --user stop fusion-litellm-model-management.timer >/dev/null 2>&1 || true
+          if systemctl --user is-active --quiet fusion-litellm-model-management.service; then
+            if [ "${ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE}" = "true" ]; then
+              systemctl --user start fusion-litellm-model-management.timer
+              systemctl --user is-active --quiet fusion-litellm-model-management.timer
+            fi
+            echo "模型准入 Worker 仍在执行，拒绝部署 API；定时器已恢复部署前状态"
+            exit 1
+          fi
 
       - name: Apply alembic migrations
         id: apply_migrations
@@ -317,6 +475,10 @@ jobs:
           DEPLOY_DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           DEPLOY_AMAP_MCP_API_KEY: ${{ secrets.AMAP_MCP_API_KEY }}
           DEPLOY_FLYAI_API_KEY: ${{ secrets.FLYAI_API_KEY }}
+          DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED: ${{ vars.LITELLM_MODEL_MANAGEMENT_ENABLED || 'false' }}
+          DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED: ${{ vars.LITELLM_MODEL_ADMISSION_WORKER_ENABLED || 'false' }}
+          DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS: ${{ vars.LITELLM_GOVERNANCE_MAX_AGE_SECONDS || '86400' }}
+          DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN: ${{ secrets.LITELLM_MODEL_ADMISSION_WORKER_TOKEN }}
         run: |
           cd ~/project/fusion
           set -o pipefail
@@ -342,6 +504,21 @@ jobs:
           export MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS="${DEPLOY_MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS:-${MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS:-30}}"
           export DASHSCOPE_API_KEY="${DEPLOY_DASHSCOPE_API_KEY:-${DASHSCOPE_API_KEY:-}}"
           export AMAP_MCP_API_KEY="${DEPLOY_AMAP_MCP_API_KEY:-${AMAP_MCP_API_KEY:-}}"
+          export LITELLM_MODEL_MANAGEMENT_ENABLED="$(printf '%s' "${DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')"
+          export LITELLM_MODEL_ADMISSION_WORKER_ENABLED="$(printf '%s' "${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')"
+          export LITELLM_GOVERNANCE_MAX_AGE_SECONDS="${DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS:-86400}"
+          export LITELLM_MODEL_ADMISSION_WORKER_TOKEN="${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN:-}"
+          case "${LITELLM_GOVERNANCE_MAX_AGE_SECONDS}" in
+            ''|*[!0-9]*|0) echo "治理快照最大年龄必须是正整数"; exit 1 ;;
+          esac
+          case "${LITELLM_MODEL_MANAGEMENT_ENABLED}:${LITELLM_MODEL_ADMISSION_WORKER_ENABLED}" in
+            true:true|true:false|false:false) ;;
+            *) echo "模型管理开关必须为 true 或 false，且 Worker 不能单独启用"; exit 1 ;;
+          esac
+          if [ "${LITELLM_MODEL_ADMISSION_WORKER_ENABLED}" = "true" ] && [ -z "${LITELLM_MODEL_ADMISSION_WORKER_TOKEN}" ]; then
+            echo "模型准入 Worker 已启用，但发布密钥未配置"
+            exit 1
+          fi
           append_csv_value() {
             current="$1"
             required="$2"
@@ -381,6 +558,14 @@ jobs:
           # dev 中 auth-service 只在 Docker 网络内暴露，未发布宿主机 8100。
           # 显式覆盖旧 .env 里的宿主机地址，避免 fusion-api JWKS/userinfo 校验连到不可达地址。
           export AUTH_SERVICE_INTERNAL_BASE_URL="http://auth-service:8100"
+          expected_governance_root="${HOME}/backups/litellm-governance"
+          governance_root="${LITELLM_GOVERNANCE_ROOT_HOST:-${expected_governance_root}}"
+          if [ "${governance_root}" != "${expected_governance_root}" ]; then
+            echo "LITELLM_GOVERNANCE_ROOT_HOST 必须与 systemd 治理服务目录一致: ${expected_governance_root}"
+            exit 1
+          fi
+          export LITELLM_GOVERNANCE_ROOT_HOST="${expected_governance_root}"
+          test -d "${LITELLM_GOVERNANCE_ROOT_HOST}"
           mkdir -p ./fusion-api/storage/files
           if docker container inspect fusion-api >/dev/null 2>&1; then
             if docker inspect fusion-api --format '{{range .Mounts}}{{println .Destination}}{{end}}' | grep -qx '/app/storage/files'; then
@@ -422,6 +607,7 @@ jobs:
               volumes:
                 - ./fusion-api/logs:/app/logs
                 - ./fusion-api/storage/files:/app/storage/files
+                - ${LITELLM_GOVERNANCE_ROOT_HOST}:/var/lib/fusion/litellm-governance:ro
               environment:
                 - DATABASE_URL=${DATABASE_URL}
                 - SERVER_HOST=${SERVER_HOST}
@@ -456,6 +642,12 @@ jobs:
                 - MOONSHOT_API_KEY=${MOONSHOT_API_KEY:-}
                 - LITELLM_PROXY_URL=${LITELLM_PROXY_URL:-http://litellm-proxy:4000}
                 - LITELLM_API_KEY=${LITELLM_API_KEY:-}
+                - LITELLM_GOVERNANCE_ROOT=/var/lib/fusion/litellm-governance
+                - LITELLM_GOVERNANCE_MAX_AGE_SECONDS=${LITELLM_GOVERNANCE_MAX_AGE_SECONDS:-86400}
+                - LITELLM_MODEL_MANAGEMENT_ENABLED=${LITELLM_MODEL_MANAGEMENT_ENABLED:-false}
+                - LITELLM_MODEL_ADMISSION_WORKER_ENABLED=${LITELLM_MODEL_ADMISSION_WORKER_ENABLED:-false}
+                - LITELLM_MODEL_ADMISSION_WORKER_TOKEN=${LITELLM_MODEL_ADMISSION_WORKER_TOKEN:-}
+                - LITELLM_MODEL_ADMISSION_LEASE_SECONDS=${LITELLM_MODEL_ADMISSION_LEASE_SECONDS:-600}
                 - PROMPTHUB_SYNC_MODE=${PROMPTHUB_SYNC_MODE:-disabled}
                 - PROMPTHUB_BASE_URL=${PROMPTHUB_BASE_URL:-http://prompthub-backend:8000}
                 - PROMPTHUB_API_KEY=${PROMPTHUB_API_KEY:-}
@@ -543,6 +735,8 @@ jobs:
 
       - name: Verify health
         id: verify_health
+        env:
+          ROLLBACK_REQUESTED: ${{ needs.prepare.outputs.rollback_requested }}
         run: |
           healthy=0
           for attempt in $(seq 1 30); do
@@ -595,6 +789,40 @@ jobs:
           PY
 
           docker inspect fusion-api --format '{{range .Mounts}}{{println .Destination}}{{end}}' | grep -qx '/app/storage/files'
+          docker inspect fusion-api --format '{{range .Mounts}}{{println .Destination}}{{end}}' | grep -qx '/var/lib/fusion/litellm-governance'
+          docker exec -e FUSION_ROLLBACK_REQUESTED="${ROLLBACK_REQUESTED}" -i fusion-api python - <<'PY'
+          import os
+
+          from app.core.config import settings
+
+          required_names = (
+              "LITELLM_GOVERNANCE_ROOT",
+              "LITELLM_GOVERNANCE_MAX_AGE_SECONDS",
+              "LITELLM_MODEL_ADMISSION_WORKER_ENABLED",
+              "LITELLM_MODEL_MANAGEMENT_ENABLED",
+              "LITELLM_MODEL_ADMISSION_WORKER_TOKEN",
+          )
+          missing_names = [name for name in required_names if getattr(settings, name, None) is None]
+          rollback_requested = os.environ.get("FUSION_ROLLBACK_REQUESTED") == "true"
+          if missing_names:
+              if rollback_requested:
+                  print("旧版回滚目标不含模型治理配置，跳过该项兼容性探针")
+                  raise SystemExit(0)
+              raise SystemExit(f"LiteLLM model management settings missing: {', '.join(missing_names)}")
+
+          if getattr(settings, "LITELLM_GOVERNANCE_ROOT", None) != "/var/lib/fusion/litellm-governance":
+              raise SystemExit("LiteLLM governance mount path mismatch")
+          if getattr(settings, "LITELLM_GOVERNANCE_MAX_AGE_SECONDS", 0) <= 0:
+              raise SystemExit("LiteLLM governance max age must be positive")
+          worker_enabled = bool(getattr(settings, "LITELLM_MODEL_ADMISSION_WORKER_ENABLED", False))
+          management_enabled = bool(getattr(settings, "LITELLM_MODEL_MANAGEMENT_ENABLED", False))
+          worker_token = getattr(settings, "LITELLM_MODEL_ADMISSION_WORKER_TOKEN", "")
+          if worker_enabled and not management_enabled:
+              raise SystemExit("LiteLLM admission worker cannot be enabled while model management is disabled")
+          if worker_enabled and not worker_token:
+              raise SystemExit("LiteLLM admission worker token is missing")
+          print("LiteLLM model management read-only boundary ok")
+          PY
           docker exec -i fusion-api python - <<'PY'
           import asyncio
           import urllib.request
@@ -753,6 +981,235 @@ jobs:
           )
           PY
 
+      - name: Install LiteLLM governance discovery
+        env:
+          ROLLBACK_GOVERNANCE_TIMER_ACTIVE: ${{ steps.capture_rollback_target.outputs.governance_timer_active }}
+        run: |
+          set -euo pipefail
+          release_dir="${HOME}/.local/share/fusion/litellm-governance-src-${DEPLOY_TARGET_SHA}"
+          current_link="${HOME}/.local/share/fusion/litellm-governance-current"
+          config_dir="${HOME}/.config/fusion"
+          registry_target="${config_dir}/litellm-provider-registry.json"
+          proxy_env="${HOME}/project/litellm-proxy/.env"
+          governance_env="${HOME}/.config/fusion/litellm-governance.env"
+          governance_output_dir="${HOME}/backups/litellm-governance"
+          acceptance_dir="${HOME}/.local/share/fusion/litellm-acceptance"
+          unit_dir="${HOME}/.config/systemd/user"
+          install -d -m 0755 "${release_dir}/scripts" "${release_dir}/ops/litellm" "${unit_dir}"
+          install -d -m 0700 "${config_dir}" "${governance_output_dir}" "${acceptance_dir}"
+          systemctl --user stop fusion-litellm-governance.timer >/dev/null 2>&1 || true
+          if systemctl --user is-active --quiet fusion-litellm-governance.service; then
+            if [ "${ROLLBACK_GOVERNANCE_TIMER_ACTIVE}" = "true" ]; then
+              systemctl --user start fusion-litellm-governance.timer
+              systemctl --user is-active --quiet fusion-litellm-governance.timer
+            fi
+            echo "LiteLLM 治理周期仍在执行，拒绝切换发现版本；定时器已恢复部署前状态"
+            exit 1
+          fi
+          for script in \
+            check_litellm_candidate_preflight.py \
+            check_litellm_governance_runtime.py \
+            discover_litellm_model_candidates.py \
+            enrich_litellm_model_candidates.py \
+            fetch_litellm_cost_map.py \
+            orchestrate_litellm_model_candidates.py \
+            plan_litellm_candidate_admission.py \
+            run_litellm_governance_cycle.py \
+            run_litellm_governance_unit.py; do
+            install -m 0644 "${GITHUB_WORKSPACE}/scripts/${script}" "${release_dir}/scripts/${script}"
+          done
+          install -m 0644 \
+            "${GITHUB_WORKSPACE}/ops/litellm/candidate-overrides.json" \
+            "${release_dir}/ops/litellm/candidate-overrides.json"
+          if [ -e "${current_link}" ] && [ ! -L "${current_link}" ]; then
+            echo "LiteLLM 治理当前版本路径不是符号链接，拒绝覆盖"
+            exit 1
+          fi
+          if [ -e "${registry_target}" ] && [ -L "${registry_target}" ]; then
+            echo "LiteLLM provider registry 不能是符号链接"
+            exit 1
+          fi
+          if [ ! -e "${registry_target}" ]; then
+            registry_temp="$(mktemp "${config_dir}/.litellm-provider-registry.XXXXXX")"
+            trap 'rm -f "${registry_temp}"' EXIT
+            install -m 0600 \
+              "${GITHUB_WORKSPACE}/ops/litellm/provider-registry.example.json" \
+              "${registry_temp}"
+            mv -f "${registry_temp}" "${registry_target}"
+            trap - EXIT
+          fi
+          python3 - "${registry_target}" <<'PY'
+          import json
+          import os
+          import pathlib
+          import stat
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          file_stat = path.lstat()
+          if path.is_symlink() or not stat.S_ISREG(file_stat.st_mode) or file_stat.st_uid != os.getuid():
+              raise SystemExit("LiteLLM provider registry 必须是当前用户拥有的普通文件")
+          if stat.S_IMODE(file_stat.st_mode) & 0o077:
+              raise SystemExit("LiteLLM provider registry 权限过宽")
+          payload = json.loads(path.read_text(encoding="utf-8"))
+          if not isinstance(payload, dict) or not isinstance(payload.get("providers"), list):
+              raise SystemExit("LiteLLM provider registry 结构无效")
+          PY
+          python3 - "${proxy_env}" "${governance_env}" <<'PY'
+          import os
+          import pathlib
+          import stat
+          import sys
+
+          for raw_path in sys.argv[1:]:
+              path = pathlib.Path(raw_path)
+              file_stat = path.lstat()
+              if path.is_symlink() or not stat.S_ISREG(file_stat.st_mode):
+                  raise SystemExit(f"治理密钥文件不是普通文件: {path}")
+              if file_stat.st_uid != os.getuid():
+                  raise SystemExit(f"治理密钥文件 owner 不匹配: {path}")
+              os.chmod(path, 0o600, follow_symlinks=False)
+          PY
+          install -m 0644 \
+            "${GITHUB_WORKSPACE}/ops/litellm/fusion-litellm-governance.service" \
+            "${GITHUB_WORKSPACE}/ops/litellm/fusion-litellm-governance.timer" \
+            "${unit_dir}/"
+          ln -sfn "${release_dir}" "${current_link}"
+          systemctl --user daemon-reload
+          systemd-analyze --user verify \
+            "${unit_dir}/fusion-litellm-governance.service" \
+            "${unit_dir}/fusion-litellm-governance.timer"
+          systemctl --user reset-failed fusion-litellm-governance.service >/dev/null 2>&1 || true
+          if ! systemctl --user start fusion-litellm-governance.service; then
+            journalctl --user -u fusion-litellm-governance.service -n 120 --no-pager || true
+            exit 1
+          fi
+          governance_result="$(systemctl --user show fusion-litellm-governance.service --property=Result --value)"
+          if [ "${governance_result}" != "success" ]; then
+            journalctl --user -u fusion-litellm-governance.service -n 120 --no-pager || true
+            echo "LiteLLM 治理 service smoke 未成功: ${governance_result}"
+            exit 1
+          fi
+          systemctl --user enable --now fusion-litellm-governance.timer
+          systemctl --user is-active --quiet fusion-litellm-governance.timer
+
+      - name: Install model management worker
+        if: needs.prepare.outputs.rollback_requested != 'true'
+        env:
+          DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED: ${{ vars.LITELLM_MODEL_MANAGEMENT_ENABLED || 'false' }}
+          DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED: ${{ vars.LITELLM_MODEL_ADMISSION_WORKER_ENABLED || 'false' }}
+          DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS: ${{ vars.LITELLM_GOVERNANCE_MAX_AGE_SECONDS || '86400' }}
+          DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN: ${{ secrets.LITELLM_MODEL_ADMISSION_WORKER_TOKEN }}
+          ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE: ${{ steps.capture_rollback_target.outputs.model_management_timer_active }}
+        run: |
+          set -euo pipefail
+          management_enabled="$(printf '%s' "${DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED}" | tr '[:upper:]' '[:lower:]')"
+          worker_enabled="$(printf '%s' "${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED}" | tr '[:upper:]' '[:lower:]')"
+          release_dir="${HOME}/.local/share/fusion/litellm-model-management-src-${DEPLOY_TARGET_SHA}"
+          current_link="${HOME}/.local/share/fusion/litellm-model-management-current"
+          state_dir="${HOME}/.local/state/fusion/litellm-model-management"
+          acceptance_dir="${HOME}/.local/share/fusion/litellm-acceptance"
+          unit_dir="${HOME}/.config/systemd/user"
+          install -d -m 0755 "${release_dir}/scripts" "${unit_dir}"
+          install -d -m 0700 "${state_dir}" "${acceptance_dir}"
+          systemctl --user stop fusion-litellm-model-management.timer >/dev/null 2>&1 || true
+          if systemctl --user is-active --quiet fusion-litellm-model-management.service; then
+            if [ "${ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE}" = "true" ]; then
+              systemctl --user start fusion-litellm-model-management.timer
+              systemctl --user is-active --quiet fusion-litellm-model-management.timer
+            fi
+            echo "模型准入 Worker 仍在执行，拒绝切换运行版本；定时器已恢复部署前状态"
+            exit 1
+          fi
+          for script in \
+            audit_litellm_model_catalog.py \
+            check_litellm_candidate_preflight.py \
+            check_litellm_governance_runtime.py \
+            check_litellm_model_management_worker_env.py \
+            configure_litellm_model_management_worker_env.py \
+            execute_litellm_candidate_admission.py \
+            plan_litellm_candidate_admission.py \
+            run_litellm_governance_unit.py \
+            run_litellm_model_management_worker.py \
+            verify_litellm_governance_snapshot.py; do
+            install -m 0644 "${GITHUB_WORKSPACE}/scripts/${script}" "${release_dir}/scripts/${script}"
+          done
+          install -m 0644 \
+            "${GITHUB_WORKSPACE}/ops/litellm/fusion-litellm-model-management.service" \
+            "${GITHUB_WORKSPACE}/ops/litellm/fusion-litellm-model-management.timer" \
+            "${unit_dir}/"
+          if [ -e "${current_link}" ] && [ ! -L "${current_link}" ]; then
+            echo "模型准入 Worker 当前版本路径不是符号链接，拒绝覆盖"
+            exit 1
+          fi
+          ln -sfn "${release_dir}" "${current_link}"
+          systemctl --user daemon-reload
+          systemd-analyze --user verify \
+            "${unit_dir}/fusion-litellm-model-management.service" \
+            "${unit_dir}/fusion-litellm-model-management.timer"
+
+          if [ "${management_enabled}" != "true" ] || [ "${worker_enabled}" != "true" ]; then
+            systemctl --user disable --now fusion-litellm-model-management.timer >/dev/null 2>&1 || true
+            echo "模型准入 Worker 未启用；已安装版本化运行文件并保持定时器关闭"
+            exit 0
+          fi
+          if [ -z "${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN}" ]; then
+            echo "模型准入 Worker 已启用，但发布密钥未配置"
+            exit 1
+          fi
+
+          proxy_env="${HOME}/project/litellm-proxy/.env"
+          governance_env="${HOME}/.config/fusion/litellm-governance.env"
+          python3 - "${proxy_env}" "${governance_env}" <<'PY'
+          import os
+          import pathlib
+          import stat
+          import sys
+
+          for raw_path in sys.argv[1:]:
+              path = pathlib.Path(raw_path)
+              file_stat = path.lstat()
+              if path.is_symlink() or not stat.S_ISREG(file_stat.st_mode):
+                  raise SystemExit(f"治理密钥文件不是普通文件: {path}")
+              if file_stat.st_uid != os.getuid():
+                  raise SystemExit(f"治理密钥文件 owner 不匹配: {path}")
+              os.chmod(path, 0o600, follow_symlinks=False)
+          PY
+
+          set +u
+          set -a
+          source "${HOME}/project/fusion/.env"
+          set +a
+          set -u
+          export LITELLM_VIRTUAL_KEY="${LITELLM_API_KEY:-}"
+          export LITELLM_MODEL_ADMISSION_WORKER_TOKEN="${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN}"
+          export FUSION_MODEL_MANAGEMENT_BASE_URL="http://127.0.0.1:8002"
+          export LITELLM_GOVERNANCE_MAX_AGE_SECONDS="${DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS}"
+          expected_token_sha256="$(printf '%s' "${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN}" | sha256sum | awk '{print $1}')"
+          cd "${current_link}"
+          "${HOME}/.local/share/fusion/litellm-governance-venv/bin/python" \
+            -m scripts.configure_litellm_model_management_worker_env \
+            --env-file "${governance_env}"
+          "${HOME}/.local/share/fusion/litellm-governance-venv/bin/python" \
+            -m scripts.run_litellm_governance_unit \
+            --proxy-env "${proxy_env}" \
+            --governance-env "${governance_env}" \
+            --registry "${HOME}/.config/fusion/litellm-provider-registry.json" \
+            --require-env LITELLM_MASTER_KEY \
+            --require-env LITELLM_VIRTUAL_KEY \
+            --require-env LITELLM_MODEL_ADMISSION_WORKER_TOKEN \
+            --require-env LITELLM_GOVERNANCE_MAX_AGE_SECONDS \
+            --require-env FUSION_MODEL_MANAGEMENT_BASE_URL \
+            --require-env LITELLM_CANDIDATE_KEY \
+            -- \
+            "${HOME}/.local/share/fusion/litellm-governance-venv/bin/python" \
+              -m scripts.check_litellm_model_management_worker_env \
+              --expected-token-sha256 "${expected_token_sha256}" \
+              --expected-base-url http://127.0.0.1:8002 \
+              --expected-governance-max-age-seconds "${LITELLM_GOVERNANCE_MAX_AGE_SECONDS}"
+          systemctl --user enable --now fusion-litellm-model-management.timer
+          systemctl --user is-active --quiet fusion-litellm-model-management.timer
+
       - name: Run deployment smoke
         id: deployment_smoke
         run: |
@@ -763,6 +1220,69 @@ jobs:
             exit 1
           fi
 
+      - name: Restore model management worker for manual rollback
+        if: needs.prepare.outputs.rollback_requested == 'true'
+        env:
+          DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED: ${{ vars.LITELLM_MODEL_MANAGEMENT_ENABLED || 'false' }}
+          DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED: ${{ vars.LITELLM_MODEL_ADMISSION_WORKER_ENABLED || 'false' }}
+        run: |
+          set -euo pipefail
+          management_enabled="$(printf '%s' "${DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED}" | tr '[:upper:]' '[:lower:]')"
+          worker_enabled="$(printf '%s' "${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED}" | tr '[:upper:]' '[:lower:]')"
+          case "${management_enabled}:${worker_enabled}" in
+            true:true|true:false|false:false) ;;
+            *) echo "模型管理开关必须为 true 或 false，且 Worker 不能单独启用"; exit 1 ;;
+          esac
+          current_link="${HOME}/.local/share/fusion/litellm-model-management-current"
+          target_release="${HOME}/.local/share/fusion/litellm-model-management-src-${DEPLOY_TARGET_SHA}"
+          unit_dir="${HOME}/.config/systemd/user"
+          target_service_unit="${GITHUB_WORKSPACE}/ops/litellm/fusion-litellm-model-management.service"
+          target_timer_unit="${GITHUB_WORKSPACE}/ops/litellm/fusion-litellm-model-management.timer"
+          systemctl --user stop fusion-litellm-model-management.timer >/dev/null 2>&1 || true
+          if systemctl --user is-active --quiet fusion-litellm-model-management.service; then
+            echo "模型准入 Worker 仍在执行，拒绝切换回滚版本；定时器已安全暂停"
+            exit 1
+          fi
+          if [ -e "${current_link}" ] && [ ! -L "${current_link}" ]; then
+            echo "模型准入 Worker 当前版本路径不是符号链接，拒绝覆盖"
+            exit 1
+          fi
+          if [ "${management_enabled}" != "true" ] || [ "${worker_enabled}" != "true" ]; then
+            systemctl --user disable --now fusion-litellm-model-management.timer >/dev/null 2>&1 || true
+            echo "手动回滚目标未启用模型准入 Worker；定时器保持关闭"
+            exit 0
+          fi
+          if [ ! -d "${target_release}" ] || [ ! -f "${target_service_unit}" ] || [ ! -f "${target_timer_unit}" ]; then
+            systemctl --user disable --now fusion-litellm-model-management.timer >/dev/null 2>&1 || true
+            echo "手动回滚目标没有完整配套的模型准入 Worker 资产；已安全关闭定时器"
+            exit 0
+          fi
+          install -d -m 0755 "${unit_dir}"
+          install -m 0644 "${target_service_unit}" "${target_timer_unit}" "${unit_dir}/"
+          ln -sfn "${target_release}" "${current_link}"
+          systemctl --user daemon-reload
+          systemd-analyze --user verify \
+            "${unit_dir}/fusion-litellm-model-management.service" \
+            "${unit_dir}/fusion-litellm-model-management.timer"
+          systemctl --user enable --now fusion-litellm-model-management.timer
+          systemctl --user is-active --quiet fusion-litellm-model-management.timer
+
+      - name: Restore model management worker after pre-deploy failure
+        if: >-
+          ${{ failure() && steps.capture_rollback_target.outcome == 'success' &&
+          steps.pause_model_management_worker.outcome == 'success' &&
+          steps.deploy_candidate.outcome == 'skipped' }}
+        env:
+          ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE: ${{ steps.capture_rollback_target.outputs.model_management_timer_active }}
+        run: |
+          set -euo pipefail
+          if [ "${ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE}" = "true" ]; then
+            systemctl --user start fusion-litellm-model-management.timer
+            systemctl --user is-active --quiet fusion-litellm-model-management.timer
+          else
+            systemctl --user stop fusion-litellm-model-management.timer >/dev/null 2>&1 || true
+          fi
+
       - name: Roll back failed deployment
         id: rollback_failed_deployment
         if: ${{ failure() && steps.capture_rollback_target.outcome == 'success' && steps.deploy_candidate.outcome != 'skipped' }}
@@ -771,6 +1291,20 @@ jobs:
           ROLLBACK_API_IMAGE_ID: ${{ steps.capture_rollback_target.outputs.api_image_id }}
           ROLLBACK_ADAPTER_IMAGE_REF: ${{ steps.capture_rollback_target.outputs.adapter_image_ref }}
           ROLLBACK_ADAPTER_IMAGE_ID: ${{ steps.capture_rollback_target.outputs.adapter_image_id }}
+          ROLLBACK_MODEL_MANAGEMENT_CURRENT_TARGET: ${{ steps.capture_rollback_target.outputs.model_management_current_target }}
+          ROLLBACK_MODEL_MANAGEMENT_TIMER_ENABLED: ${{ steps.capture_rollback_target.outputs.model_management_timer_enabled }}
+          ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE: ${{ steps.capture_rollback_target.outputs.model_management_timer_active }}
+          ROLLBACK_GOVERNANCE_CURRENT_TARGET: ${{ steps.capture_rollback_target.outputs.governance_current_target }}
+          ROLLBACK_GOVERNANCE_TIMER_ENABLED: ${{ steps.capture_rollback_target.outputs.governance_timer_enabled }}
+          ROLLBACK_GOVERNANCE_TIMER_ACTIVE: ${{ steps.capture_rollback_target.outputs.governance_timer_active }}
+          ROLLBACK_GOVERNANCE_SERVICE_UNIT_EXISTED: ${{ steps.capture_rollback_target.outputs.governance_service_unit_existed }}
+          ROLLBACK_GOVERNANCE_TIMER_UNIT_EXISTED: ${{ steps.capture_rollback_target.outputs.governance_timer_unit_existed }}
+          ROLLBACK_GOVERNANCE_SERVICE_UNIT_B64: ${{ steps.capture_rollback_target.outputs.governance_service_unit_b64 }}
+          ROLLBACK_GOVERNANCE_TIMER_UNIT_B64: ${{ steps.capture_rollback_target.outputs.governance_timer_unit_b64 }}
+          ROLLBACK_MODEL_MANAGEMENT_SERVICE_UNIT_EXISTED: ${{ steps.capture_rollback_target.outputs.model_management_service_unit_existed }}
+          ROLLBACK_MODEL_MANAGEMENT_TIMER_UNIT_EXISTED: ${{ steps.capture_rollback_target.outputs.model_management_timer_unit_existed }}
+          ROLLBACK_MODEL_MANAGEMENT_SERVICE_UNIT_B64: ${{ steps.capture_rollback_target.outputs.model_management_service_unit_b64 }}
+          ROLLBACK_MODEL_MANAGEMENT_TIMER_UNIT_B64: ${{ steps.capture_rollback_target.outputs.model_management_timer_unit_b64 }}
           DEPLOY_PROMPTHUB_API_KEY: ${{ secrets.PROMPTHUB_API_KEY }}
           DEPLOY_PROMPTHUB_SYNC_MODE: ${{ vars.PROMPTHUB_SYNC_MODE || 'disabled' }}
           DEPLOY_MCP_ALLOWED_HOSTS: ${{ vars.MCP_ALLOWED_HOSTS }}
@@ -790,7 +1324,32 @@ jobs:
           DEPLOY_DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           DEPLOY_AMAP_MCP_API_KEY: ${{ secrets.AMAP_MCP_API_KEY }}
           DEPLOY_FLYAI_API_KEY: ${{ secrets.FLYAI_API_KEY }}
+          ROLLBACK_LITELLM_MODEL_MANAGEMENT_ENABLED: ${{ steps.capture_rollback_target.outputs.model_management_enabled }}
+          ROLLBACK_LITELLM_MODEL_ADMISSION_WORKER_ENABLED: ${{ steps.capture_rollback_target.outputs.model_admission_worker_enabled }}
+          DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS: ${{ vars.LITELLM_GOVERNANCE_MAX_AGE_SECONDS || '86400' }}
+          DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN: ${{ secrets.LITELLM_MODEL_ADMISSION_WORKER_TOKEN }}
         run: |
+          systemctl --user stop fusion-litellm-model-management.timer >/dev/null 2>&1 || true
+          systemctl --user stop fusion-litellm-governance.timer >/dev/null 2>&1 || true
+          wait_for_user_services() {
+            for attempt in $(seq 1 24); do
+              worker_active="false"
+              governance_active="false"
+              if systemctl --user is-active --quiet fusion-litellm-model-management.service; then
+                worker_active="true"
+              fi
+              if systemctl --user is-active --quiet fusion-litellm-governance.service; then
+                governance_active="true"
+              fi
+              if [ "${worker_active}:${governance_active}" = "false:false" ]; then
+                return 0
+              fi
+              sleep 5
+            done
+            echo "模型准入 Worker 或 LiteLLM 治理周期在回滚等待窗口内仍未结束，拒绝并发恢复运行资产"
+            return 1
+          }
+          wait_for_user_services
           cd ~/project/fusion
           set -o pipefail
           set -a
@@ -815,6 +1374,21 @@ jobs:
           export MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS="${DEPLOY_MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS:-${MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS:-30}}"
           export DASHSCOPE_API_KEY="${DEPLOY_DASHSCOPE_API_KEY:-${DASHSCOPE_API_KEY:-}}"
           export AMAP_MCP_API_KEY="${DEPLOY_AMAP_MCP_API_KEY:-${AMAP_MCP_API_KEY:-}}"
+          export LITELLM_MODEL_MANAGEMENT_ENABLED="$(printf '%s' "${ROLLBACK_LITELLM_MODEL_MANAGEMENT_ENABLED}" | tr '[:upper:]' '[:lower:]')"
+          export LITELLM_MODEL_ADMISSION_WORKER_ENABLED="$(printf '%s' "${ROLLBACK_LITELLM_MODEL_ADMISSION_WORKER_ENABLED}" | tr '[:upper:]' '[:lower:]')"
+          export LITELLM_GOVERNANCE_MAX_AGE_SECONDS="${DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS:-86400}"
+          export LITELLM_MODEL_ADMISSION_WORKER_TOKEN="${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN:-}"
+          case "${LITELLM_GOVERNANCE_MAX_AGE_SECONDS}" in
+            ''|*[!0-9]*|0) echo "治理快照最大年龄必须是正整数"; exit 1 ;;
+          esac
+          case "${LITELLM_MODEL_MANAGEMENT_ENABLED}:${LITELLM_MODEL_ADMISSION_WORKER_ENABLED}" in
+            true:true|true:false|false:false) ;;
+            *) echo "模型管理开关必须为 true 或 false，且 Worker 不能单独启用"; exit 1 ;;
+          esac
+          if [ "${LITELLM_MODEL_ADMISSION_WORKER_ENABLED}" = "true" ] && [ -z "${LITELLM_MODEL_ADMISSION_WORKER_TOKEN}" ]; then
+            echo "模型准入 Worker 已启用，但回滚发布密钥未配置"
+            exit 1
+          fi
           append_csv_value() {
             current="$1"
             required="$2"
@@ -836,6 +1410,13 @@ jobs:
           fi
           export FLYAI_ADAPTER_TOKEN="$(python3 -c 'import hashlib,hmac,os; print(hmac.new(os.environ["FLYAI_API_KEY"].encode(), b"fusion-deploy-flyai-adapter-v1", hashlib.sha256).hexdigest(), end="")')"
           export AUTH_SERVICE_INTERNAL_BASE_URL="http://auth-service:8100"
+          expected_governance_root="${HOME}/backups/litellm-governance"
+          governance_root="${LITELLM_GOVERNANCE_ROOT_HOST:-${expected_governance_root}}"
+          if [ "${governance_root}" != "${expected_governance_root}" ]; then
+            echo "LITELLM_GOVERNANCE_ROOT_HOST 必须与 systemd 治理服务目录一致: ${expected_governance_root}"
+            exit 1
+          fi
+          export LITELLM_GOVERNANCE_ROOT_HOST="${expected_governance_root}"
           export DEPLOY_API_IMAGE="${ROLLBACK_API_IMAGE_REF}"
           export DEPLOY_ADAPTER_IMAGE="${ROLLBACK_ADAPTER_IMAGE_REF}"
 
@@ -920,6 +1501,136 @@ jobs:
             echo "fusion-api rollback deployment smoke failed"
             docker logs --tail=120 fusion-api || true
             exit 1
+          fi
+
+          echo "Restore LiteLLM governance discovery after automatic rollback"
+          governance_current_link="${HOME}/.local/share/fusion/litellm-governance-current"
+          systemctl --user stop fusion-litellm-governance.timer >/dev/null 2>&1 || true
+          if systemctl --user is-active --quiet fusion-litellm-governance.service; then
+            echo "LiteLLM 治理周期仍在执行，无法恢复回滚前版本"
+            exit 1
+          fi
+          case "${ROLLBACK_GOVERNANCE_TIMER_ENABLED}:${ROLLBACK_GOVERNANCE_TIMER_ACTIVE}" in
+            true:true|true:false|false:true|false:false) ;;
+            *) echo "LiteLLM 治理定时器回滚状态无效"; exit 1 ;;
+          esac
+          if [ -n "${ROLLBACK_GOVERNANCE_CURRENT_TARGET}" ]; then
+            case "${ROLLBACK_GOVERNANCE_CURRENT_TARGET}" in
+              "${HOME}/.local/share/fusion/litellm-governance-src-"*) ;;
+              *) echo "LiteLLM 治理回滚版本不在受管目录中"; exit 1 ;;
+            esac
+            if [ ! -d "${ROLLBACK_GOVERNANCE_CURRENT_TARGET}" ]; then
+              echo "LiteLLM 治理回滚版本不存在: ${ROLLBACK_GOVERNANCE_CURRENT_TARGET}"
+              exit 1
+            fi
+            if [ -e "${governance_current_link}" ] && [ ! -L "${governance_current_link}" ]; then
+              echo "LiteLLM 治理当前版本路径不是符号链接，无法恢复"
+              exit 1
+            fi
+            ln -sfn "${ROLLBACK_GOVERNANCE_CURRENT_TARGET}" "${governance_current_link}"
+          elif [ -L "${governance_current_link}" ]; then
+            unlink "${governance_current_link}"
+          elif [ -e "${governance_current_link}" ]; then
+            echo "LiteLLM 治理当前版本路径不是符号链接，无法清理"
+            exit 1
+          fi
+          governance_unit_dir="${HOME}/.config/systemd/user"
+          install -d -m 0755 "${governance_unit_dir}"
+          restore_governance_unit() {
+            unit_name="$1"
+            existed="$2"
+            encoded="$3"
+            target="${governance_unit_dir}/${unit_name}"
+            case "${existed}" in
+              true)
+                if [ -z "${encoded}" ]; then
+                  echo "LiteLLM 治理 unit 回滚内容缺失: ${unit_name}"
+                  exit 1
+                fi
+                unit_temp="$(mktemp "${governance_unit_dir}/.${unit_name}.XXXXXX")"
+                trap 'rm -f "${unit_temp}"' RETURN
+                printf '%s' "${encoded}" | base64 --decode > "${unit_temp}"
+                chmod 0644 "${unit_temp}"
+                mv -f "${unit_temp}" "${target}"
+                trap - RETURN
+                ;;
+              false)
+                rm -f "${target}"
+                ;;
+              *) echo "LiteLLM 治理 unit 回滚状态无效: ${unit_name}"; exit 1 ;;
+            esac
+          }
+          restore_governance_unit \
+            fusion-litellm-governance.service \
+            "${ROLLBACK_GOVERNANCE_SERVICE_UNIT_EXISTED}" \
+            "${ROLLBACK_GOVERNANCE_SERVICE_UNIT_B64}"
+          restore_governance_unit \
+            fusion-litellm-governance.timer \
+            "${ROLLBACK_GOVERNANCE_TIMER_UNIT_EXISTED}" \
+            "${ROLLBACK_GOVERNANCE_TIMER_UNIT_B64}"
+          restore_governance_unit \
+            fusion-litellm-model-management.service \
+            "${ROLLBACK_MODEL_MANAGEMENT_SERVICE_UNIT_EXISTED}" \
+            "${ROLLBACK_MODEL_MANAGEMENT_SERVICE_UNIT_B64}"
+          restore_governance_unit \
+            fusion-litellm-model-management.timer \
+            "${ROLLBACK_MODEL_MANAGEMENT_TIMER_UNIT_EXISTED}" \
+            "${ROLLBACK_MODEL_MANAGEMENT_TIMER_UNIT_B64}"
+          systemctl --user daemon-reload
+          if [ "${ROLLBACK_GOVERNANCE_TIMER_ENABLED}" = "true" ]; then
+            systemctl --user enable fusion-litellm-governance.timer
+          else
+            systemctl --user disable fusion-litellm-governance.timer >/dev/null 2>&1 || true
+          fi
+          if [ "${ROLLBACK_GOVERNANCE_TIMER_ACTIVE}" = "true" ]; then
+            systemctl --user start fusion-litellm-governance.timer
+            systemctl --user is-active --quiet fusion-litellm-governance.timer
+          else
+            systemctl --user stop fusion-litellm-governance.timer >/dev/null 2>&1 || true
+          fi
+
+          echo "Restore model management worker after automatic rollback"
+          model_management_current_link="${HOME}/.local/share/fusion/litellm-model-management-current"
+          systemctl --user stop fusion-litellm-model-management.timer >/dev/null 2>&1 || true
+          if systemctl --user is-active --quiet fusion-litellm-model-management.service; then
+            echo "模型准入 Worker 仍在执行，无法恢复回滚前版本"
+            exit 1
+          fi
+          case "${ROLLBACK_MODEL_MANAGEMENT_TIMER_ENABLED}:${ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE}" in
+            true:true|true:false|false:true|false:false) ;;
+            *) echo "模型准入 Worker 回滚状态无效"; exit 1 ;;
+          esac
+          if [ -n "${ROLLBACK_MODEL_MANAGEMENT_CURRENT_TARGET}" ]; then
+            case "${ROLLBACK_MODEL_MANAGEMENT_CURRENT_TARGET}" in
+              "${HOME}/.local/share/fusion/litellm-model-management-src-"*) ;;
+              *) echo "模型准入 Worker 回滚版本不在受管目录中"; exit 1 ;;
+            esac
+            if [ ! -d "${ROLLBACK_MODEL_MANAGEMENT_CURRENT_TARGET}" ]; then
+              echo "模型准入 Worker 回滚版本不存在: ${ROLLBACK_MODEL_MANAGEMENT_CURRENT_TARGET}"
+              exit 1
+            fi
+            if [ -e "${model_management_current_link}" ] && [ ! -L "${model_management_current_link}" ]; then
+              echo "模型准入 Worker 当前版本路径不是符号链接，无法恢复"
+              exit 1
+            fi
+            ln -sfn "${ROLLBACK_MODEL_MANAGEMENT_CURRENT_TARGET}" "${model_management_current_link}"
+          elif [ -L "${model_management_current_link}" ]; then
+            unlink "${model_management_current_link}"
+          elif [ -e "${model_management_current_link}" ]; then
+            echo "模型准入 Worker 当前版本路径不是符号链接，无法清理"
+            exit 1
+          fi
+          systemctl --user daemon-reload
+          if [ "${ROLLBACK_MODEL_MANAGEMENT_TIMER_ENABLED}" = "true" ]; then
+            systemctl --user enable fusion-litellm-model-management.timer
+          else
+            systemctl --user disable fusion-litellm-model-management.timer >/dev/null 2>&1 || true
+          fi
+          if [ "${ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE}" = "true" ]; then
+            systemctl --user start fusion-litellm-model-management.timer
+            systemctl --user is-active --quiet fusion-litellm-model-management.timer
+          else
+            systemctl --user stop fusion-litellm-model-management.timer >/dev/null 2>&1 || true
           fi
           echo "旧镜像已恢复且回滚后验收通过；原始发布失败状态保持不变"
 

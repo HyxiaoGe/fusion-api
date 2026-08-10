@@ -5,13 +5,19 @@ API 层依赖注入工厂
 路由层通过 Depends() 注入，不再手动 new。
 """
 
-from fastapi import Depends, HTTPException
+import secrets
+from pathlib import Path
+
+from fastapi import Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.security import get_current_user  # noqa: F401 — re-export
 from app.db.admin_audit_repository import AdminAuditRepository
 from app.db.database import get_db  # noqa: F401 — re-export
 from app.db.mcp_server_repository import McpServerRepository
+from app.db.model_admission_operation_repository import ModelAdmissionOperationRepository
+from app.db.model_catalog_control_repository import ModelCatalogControlRepository
 from app.db.models import User as UserModel
 from app.db.repositories import UserRepository
 from app.services.admin_audit_service import AdminAuditService
@@ -19,6 +25,7 @@ from app.services.chat_service import ChatService
 from app.services.file_service import FileService
 from app.services.mcp.runtime import get_mcp_client_manager
 from app.services.mcp.server_service import McpServerService
+from app.services.model_management_service import ModelManagementConfig, ModelManagementService
 from app.services.network_diagnostics_service import NetworkDiagnosticsService
 
 
@@ -44,6 +51,44 @@ def get_admin_audit_service(db: Session = Depends(get_db)) -> AdminAuditService:
 
 def get_mcp_server_service(db: Session = Depends(get_db)) -> McpServerService:
     return McpServerService(McpServerRepository(db), get_mcp_client_manager())
+
+
+def get_model_catalog_control_repository(
+    db: Session = Depends(get_db),
+) -> ModelCatalogControlRepository:
+    return ModelCatalogControlRepository(db)
+
+
+def get_model_management_service(db: Session = Depends(get_db)) -> ModelManagementService:
+    governance_root = Path(settings.LITELLM_GOVERNANCE_ROOT) if settings.LITELLM_GOVERNANCE_ROOT.strip() else None
+    return ModelManagementService(
+        control_repository=ModelCatalogControlRepository(db),
+        operation_repository=ModelAdmissionOperationRepository(db),
+        audit_service=AdminAuditService(AdminAuditRepository(db)),
+        config=ModelManagementConfig(
+            governance_root=governance_root,
+            management_enabled=settings.LITELLM_MODEL_MANAGEMENT_ENABLED,
+            governance_max_age_seconds=settings.LITELLM_GOVERNANCE_MAX_AGE_SECONDS,
+            worker_enabled=settings.LITELLM_MODEL_ADMISSION_WORKER_ENABLED,
+            worker_token=settings.LITELLM_MODEL_ADMISSION_WORKER_TOKEN,
+            lease_seconds=settings.LITELLM_MODEL_ADMISSION_LEASE_SECONDS,
+        ),
+    )
+
+
+def require_model_admission_worker_token(
+    worker_token: str | None = Header(None, alias="X-Fusion-Worker-Token"),
+) -> None:
+    expected = settings.LITELLM_MODEL_ADMISSION_WORKER_TOKEN
+    if not expected or not worker_token or not secrets.compare_digest(worker_token, expected):
+        raise HTTPException(status_code=401, detail="Worker 鉴权失败")
+
+
+def require_model_admission_worker(
+    _token: None = Depends(require_model_admission_worker_token),
+) -> None:
+    if not settings.LITELLM_MODEL_MANAGEMENT_ENABLED or not settings.LITELLM_MODEL_ADMISSION_WORKER_ENABLED:
+        raise HTTPException(status_code=401, detail="模型准入 Worker 未启用")
 
 
 def get_current_admin_user(

@@ -15,6 +15,14 @@ class Settings(BaseSettings):
 
     # 模型配置
     DEFAULT_MODEL: str = "qwen"  # 默认使用的模型
+    LITELLM_GOVERNANCE_ROOT: str = os.getenv("LITELLM_GOVERNANCE_ROOT", "")
+    LITELLM_GOVERNANCE_MAX_AGE_SECONDS: int = int(os.getenv("LITELLM_GOVERNANCE_MAX_AGE_SECONDS", "86400"))
+    LITELLM_MODEL_MANAGEMENT_ENABLED: bool = os.getenv("LITELLM_MODEL_MANAGEMENT_ENABLED", "false").lower() == "true"
+    LITELLM_MODEL_ADMISSION_WORKER_ENABLED: bool = (
+        os.getenv("LITELLM_MODEL_ADMISSION_WORKER_ENABLED", "false").lower() == "true"
+    )
+    LITELLM_MODEL_ADMISSION_WORKER_TOKEN: str = os.getenv("LITELLM_MODEL_ADMISSION_WORKER_TOKEN", "")
+    LITELLM_MODEL_ADMISSION_LEASE_SECONDS: int = int(os.getenv("LITELLM_MODEL_ADMISSION_LEASE_SECONDS", "600"))
 
     # 数据库配置
     DATABASE_URL: str = os.getenv("DATABASE_URL")

@@ -217,6 +217,9 @@ class StatefulClient:
         readback_mismatch=None,
         final_readback_mismatch=False,
         fusion_missing_reads=0,
+        conflicting_alias_after_create=False,
+        rollback_key_failure=False,
+        rollback_delete_failure=False,
     ):
         self.fail_stage = fail_stage
         self.cas_conflict = cas_conflict
@@ -225,6 +228,9 @@ class StatefulClient:
         self.readback_mismatch = readback_mismatch
         self.final_readback_mismatch = final_readback_mismatch
         self.fusion_missing_reads = fusion_missing_reads
+        self.conflicting_alias_after_create = conflicting_alias_after_create
+        self.rollback_key_failure = rollback_key_failure
+        self.rollback_delete_failure = rollback_delete_failure
         self.entries = [model_entry("deepseek-chat", "deepseek/deepseek-chat", "uuid-deepseek")]
         self.key_models = ["deepseek-chat"]
         self.calls = []
@@ -278,6 +284,8 @@ class StatefulClient:
                     max_input_tokens=payload["model_info"].get("max_input_tokens"),
                 )
             )
+            if self.conflicting_alias_after_create:
+                self.entries.append(model_entry("kimi-k3", "moonshot/other-model", "uuid-conflict"))
             if self.fail_stage == "model_new":
                 if self.concurrent_key_change:
                     self.key_models.append("external-model")
@@ -287,11 +295,15 @@ class StatefulClient:
             return FakeResponse({"model_info": {"id": "uuid-kimi-k3"}})
         if url.endswith("/key/update"):
             self.key_updates += 1
+            if self.rollback_key_failure and self.key_updates > 1:
+                raise RuntimeError("rollback key failed")
             self.key_models = list(kwargs["json"]["models"])
             if self.fail_stage == "key_update" and self.key_updates == 1:
                 raise RuntimeError("key update failed after write")
             return FakeResponse({"status": "ok"})
         if url.endswith("/model/delete"):
+            if self.rollback_delete_failure:
+                raise RuntimeError("rollback delete failed")
             model_uuid = kwargs["json"]["id"]
             self.entries = [item for item in self.entries if item["model_info"]["id"] != model_uuid]
             return FakeResponse({"status": "ok"})
@@ -306,6 +318,7 @@ def execute(
     confirm_model_id="kimi-k3",
     fingerprint="a" * 64,
     audit_fn=None,
+    catalog_invalidation_fn=None,
 ):
     return executor.execute_admission(
         plan=admission_plan(),
@@ -320,6 +333,7 @@ def execute(
         environ={"MOONSHOT_API_KEY": "provider-super-secret"},
         client=client,
         audit_fn=audit_fn or (lambda **_: True),
+        catalog_invalidation_fn=catalog_invalidation_fn,
     )
 
 
@@ -587,6 +601,74 @@ class CandidateAdmissionExecutorTests(unittest.TestCase):
         self.assertEqual(result["status"], "succeeded")
         self.assertEqual(sleep.call_count, 2)
 
+    def test_catalog_is_invalidated_before_fusion_readback(self):
+        client = StatefulClient()
+        callback_observations = []
+
+        def invalidate_catalog():
+            callback_observations.append(
+                {
+                    "allowlisted": "kimi-k3" in client.key_models,
+                    "fusion_reads": len(
+                        [call for call in client.calls if call[0] == "GET" and call[1].endswith("/api/models/")]
+                    ),
+                }
+            )
+
+        result = execute(client, catalog_invalidation_fn=invalidate_catalog)
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(callback_observations, [{"allowlisted": True, "fusion_reads": 0}])
+        self.assertEqual(
+            result["completed_phases"],
+            ["model_new", "verify", "key_update", "catalog_invalidation", "fusion_readback", "audit"],
+        )
+
+    def test_catalog_invalidation_failure_is_compensated(self):
+        client = StatefulClient()
+
+        def fail_invalidation():
+            raise RuntimeError("sensitive internal failure")
+
+        result = execute(client, catalog_invalidation_fn=fail_invalidation)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"]["code"], "fusion_catalog_invalidation_failed")
+        self.assertTrue(result["compensation"]["key_restored"])
+        self.assertTrue(result["compensation"]["model_deleted"])
+        self.assertFalse(result["compensation"]["catalog_invalidated"])
+        self.assertTrue(result["compensation"]["manual_cleanup_required"])
+        self.assertIn("rollback_catalog_invalidation_failed", result["compensation"]["errors"])
+        self.assertNotIn("sensitive internal failure", json.dumps(result))
+
+    def test_audit_failure_invalidates_catalog_again_after_compensation(self):
+        client = StatefulClient()
+        callback_observations = []
+
+        def invalidate_catalog():
+            callback_observations.append(
+                {
+                    "allowlisted": "kimi-k3" in client.key_models,
+                    "model_exists": any(item["model_name"] == "kimi-k3" for item in client.entries),
+                }
+            )
+
+        result = execute(
+            client,
+            audit_fn=lambda **_: False,
+            catalog_invalidation_fn=invalidate_catalog,
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(
+            callback_observations,
+            [
+                {"allowlisted": True, "model_exists": True},
+                {"allowlisted": False, "model_exists": False},
+            ],
+        )
+        self.assertTrue(result["compensation"]["catalog_invalidated"])
+
     def test_each_mutating_stage_failure_rolls_back_model_and_allowlist(self):
         for stage in ("verify", "key_update", "fusion_readback", "audit"):
             with self.subTest(stage=stage):
@@ -656,6 +738,29 @@ class CandidateAdmissionExecutorTests(unittest.TestCase):
                 self.assertEqual(result["phase"], "verify")
                 self.assertEqual(key_update_calls, [])
                 self.assertTrue(result["compensation"]["model_deleted"])
+
+    def test_concurrent_same_alias_registration_is_rejected_and_only_owned_model_is_deleted(self):
+        client = StatefulClient(conflicting_alias_after_create=True)
+
+        result = execute(client)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["phase"], "verify")
+        self.assertEqual(result["error"]["code"], "model_verify_failed")
+        self.assertFalse(any(_entry["model_info"]["id"] == "uuid-kimi-k3" for _entry in client.entries))
+        self.assertTrue(any(_entry["model_info"]["id"] == "uuid-conflict" for _entry in client.entries))
+
+    def test_incomplete_compensation_requires_manual_cleanup(self):
+        for client, expected_error in (
+            (StatefulClient(rollback_key_failure=True), "rollback_key_failed"),
+            (StatefulClient(rollback_delete_failure=True), "rollback_model_delete_failed"),
+        ):
+            with self.subTest(expected_error=expected_error):
+                result = execute(client, audit_fn=lambda **_: False)
+
+                self.assertEqual(result["status"], "failed")
+                self.assertIn(expected_error, result["compensation"]["errors"])
+                self.assertTrue(result["compensation"]["manual_cleanup_required"])
 
     def test_final_pre_audit_readback_mismatch_rolls_back(self):
         client = StatefulClient(final_readback_mismatch=True)

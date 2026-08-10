@@ -138,6 +138,17 @@ python -m scripts.orchestrate_litellm_model_candidates \
 
 协调器只执行 GET，并原子更新候选报告。任何厂商缺 key、请求失败或返回空列表时都会 fail-closed：不注册模型，也不会把现有模型批量判定为 removed。
 
+聚合型厂商目录应声明 `catalog_scope: aggregated`，并把“模型仍在上游目录中”
+“归属当前 provider”“适合进入 Fusion 候选队列”分开配置和判断：
+`discovery.owned_model_prefixes` 只声明厂商
+归属，`discovery.candidate_model_patterns` 再按完整正则筛选产品候选。产品策略
+未接纳的模型记录为 `unknown(source=product_policy)`，不会进入 `new`；但其上游
+存在证据仍会阻止错误的 `removed` 判定。正式配置默认只接纳稳定业务别名；日期
+快照、preview、图片、语音、Embedding 等模型必须显式增加产品规则，不能因名称
+前缀相同自动进入收费预检。旧的单值 `api_model_prefix` 继续兼容，
+与新多前缀配置同时存在时按声明顺序合并去重。聚合目录缺少任一归属或产品规则
+都会在请求厂商目录前 fail-closed；共享 `openai/` 目录也必须至少声明归属前缀。
+
 报告中的 `new` 只代表候选。候选必须完成能力、费用和 Fusion 产品验收，之后才能单独生成 `/model/new` 与 virtual key allowlist 变更计划。
 
 ## 成本表快照与候选富化
@@ -207,9 +218,11 @@ completion、注册模型、修改 allowlist 或调用其他写 API。每次运�
 - `removed` 只进入 `retirement-review.json`，永远不会自动删除。
 
 `fusion-litellm-governance.service` 和 `.timer` 是 user systemd 模板，每 6 小时
-按 Asia/Shanghai 运行，并带持久补跑和随机抖动。安装前先建立目录并替换模板
-中的仓库路径。两个 service 固定使用独立 Python 3.11+ venv，不能依赖宿主
-`/usr/bin/python3`：
+按 Asia/Shanghai 运行，并带持久补跑和随机抖动。`master` 发布流水线会把治理脚本
+复制到带提交 SHA 的版本目录，原子切换
+`~/.local/share/fusion/litellm-governance-current`，同步受控 provider registry 并
+安装 timer；运行单元不再依赖可漂移的项目工作区。两个 service 固定使用独立
+Python 3.11+ venv，不能依赖宿主 `/usr/bin/python3`。首次安装或灾备恢复时准备：
 
 ```bash
 python3.11 -m venv "$HOME/.local/share/fusion/litellm-governance-venv"
@@ -262,7 +275,7 @@ chmod 0600 \
 wrapper 不输出文件内容；缺失文件、符号链接、owner 不匹配以及任何
 group/other 权限都会在解析前失败。通过后也只向目标任务注入
 `LITELLM_MASTER_KEY`、registry 声明且以 `_API_KEY` 结尾的 provider key，
-以及三个治理变量；`PYTHONPATH`、`PYTHONHOME`、`LD_PRELOAD` 和其他任意
+以及受控治理专用变量；`PYTHONPATH`、`PYTHONHOME`、`LD_PRELOAD` 和其他任意
 `.env` 变量不会进入目标环境。治理 env 若重复保存 master/provider key 同样
 失败。registry 也用同样的 no-follow/owner/权限门禁读取，并被复制到只读 sealed
 memfd；wrapper 和治理子进程消费同一份不可修改快照，避免密钥白名单与 endpoint
@@ -331,6 +344,73 @@ bash scripts/validate_litellm_db_env_reference.sh
 ```
 
 ## 受控准入事务
+
+设置页的模型管理 V1 不会在管理员 HTTP 请求内执行下述事务。管理员提交只会
+创建 PostgreSQL 持久任务并返回 `202 + operation_id`；独立的
+`fusion-litellm-model-management.timer` 每分钟唤醒受信 Worker 领取一个任务。
+API 容器仅以只读方式挂载治理根目录，不得注入 LiteLLM master/provider key。
+
+Worker 继续通过 `run_litellm_governance_unit.py` 从既有两份 `0600` 配置按白名单
+加载凭据。治理专用配置还需要设置：
+
+```dotenv
+LITELLM_CANDIDATE_KEY=<只允许 candidate/provider/* 路由的专用 key>
+LITELLM_VIRTUAL_KEY=<Fusion 使用的 LiteLLM 虚拟密钥>
+FUSION_MODEL_MANAGEMENT_BASE_URL=http://127.0.0.1:8002
+LITELLM_MODEL_ADMISSION_WORKER_TOKEN=<与 fusion-api 同名配置一致的随机 token>
+LITELLM_GOVERNANCE_MAX_AGE_SECONDS=86400
+```
+
+管理页对 `preflight_required` 候选展示“验证并上线”：管理员确认后只创建持久任务，
+Worker 使用候选专用 key 执行真实收费预检。全部用例通过后，Worker 将脱敏 acceptance
+以 `0600` 权限原子写入独立目录，从同一 run、fingerprint 和候选契约即时构造单候选
+准入计划，再执行注册、allowlist 与 Fusion 回读；任何预检或计划校验失败都不会进入
+外部注册事务。已有 `admission_ready` 候选仍只消费治理周期生成并验真的计划产物。
+
+`master` 发布流水线负责把 Worker 所需脚本复制到带提交 SHA 的只读版本目录，
+原子更新 `~/.local/share/fusion/litellm-model-management-current`，并安装用户级
+service/timer。发布配置使用以下 GitHub Variables 和 Secret：
+
+```text
+LITELLM_MODEL_MANAGEMENT_ENABLED=true
+LITELLM_MODEL_ADMISSION_WORKER_ENABLED=true
+LITELLM_MODEL_ADMISSION_WORKER_TOKEN=<随机 token，Secret>
+```
+
+流水线只在两个开关同时启用时，才把 GitHub Secret 中的 Worker token、宿主机现有
+`LITELLM_API_KEY` 对应的虚拟 key、与 API 相同的治理快照有效期，以及固定的 loopback Fusion 地址原子写入权限为
+`0600` 的 `~/.config/fusion/litellm-governance.env`。更新脚本拒绝符号链接、非当前
+owner、权限过宽、重复字段和包含换行的值，且不会输出凭据。随后安全 wrapper 再
+校验两侧 token 的 SHA-256、一致的 Fusion 地址、虚拟 key 与非空候选专用 key；
+校验失败则发布失败且不会启动 Worker。任一功能开关关闭时，流水线只安装版本化
+运行文件，并保持 timer 关闭。
+
+手工灾备恢复时，先创建仅当前用户可读写的恢复目录和版本化源码目录，再安装用户级
+单元；不能继续让 service 直接依赖可能漂移的项目工作区：
+
+```bash
+install -d -m 0700 \
+  "$HOME/.local/state/fusion/litellm-model-management" \
+  "$HOME/.local/share/fusion/litellm-acceptance"
+release_dir="$HOME/.local/share/fusion/litellm-model-management-src-<commit-sha>"
+install -d -m 0755 "$release_dir/scripts"
+install -m 0644 scripts/*.py "$release_dir/scripts/"
+ln -sfn "$release_dir" \
+  "$HOME/.local/share/fusion/litellm-model-management-current"
+install -m 0644 \
+  ops/litellm/fusion-litellm-model-management.service \
+  ops/litellm/fusion-litellm-model-management.timer \
+  "$HOME/.config/systemd/user/"
+systemctl --user daemon-reload
+systemctl --user enable --now fusion-litellm-model-management.timer
+```
+
+Worker 在进入外部事务前写入 `0600` 恢复记录，终态被 API 接受后才删除。若进程
+在外部事务中被杀，下一次启动会保守落为 `worker_execution_interrupted` 并要求
+人工核对，禁止自动重跑造成重复注册。目录失效在 Fusion readback 前通过 Redis
+generation 跨 API 进程推进；完成回调短暂失败时会从恢复记录重试。若 API 因租约
+已经失效而拒绝旧恢复记录，Worker 会把记录移入同目录下权限隔离的 `quarantine/`
+并输出 `stale_spool_quarantined` 告警，继续处理后续任务；隔离记录需人工审计。
 
 `execute_litellm_candidate_admission.py` 的 dry-run 可以读取人工提取的单个
 admission plan，且不发任何 HTTP：

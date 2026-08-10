@@ -1,0 +1,12 @@
+[Unit]
+Description=每分钟处理一个 Fusion LiteLLM 模型准入任务
+
+[Timer]
+OnBootSec=2m
+OnCalendar=*-*-* *:*:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=10s
+Unit=fusion-litellm-model-management.service
+
+[Install]
+WantedBy=timers.target

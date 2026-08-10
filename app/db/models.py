@@ -438,6 +438,81 @@ class AdminAuditEvent(Base):
     )
 
 
+class ModelCatalogControl(Base):
+    """模型选择器可见性控制；不承载 LiteLLM 路由开关。"""
+
+    __tablename__ = "model_catalog_controls"
+
+    model_id = Column(String(200), primary_key=True, unique=True)
+    selectable = Column(Boolean, nullable=False, default=True, server_default="true")
+    routable = Column(Boolean, nullable=False, default=True, server_default="true")
+    revision = Column(Integer, nullable=False, default=1, server_default="1")
+    reason = Column(String(300), nullable=False)
+    updated_by = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utc_now, server_default=func.now(), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=utc_now,
+        server_default=func.now(),
+        onupdate=utc_now,
+        nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint("routable IS TRUE", name="ck_model_catalog_controls_routable_true"),
+        CheckConstraint("revision > 0", name="ck_model_catalog_controls_revision_positive"),
+    )
+
+
+class ModelAdmissionOperation(Base):
+    """管理员请求、隔离 Worker 执行的模型准入持久任务。"""
+
+    __tablename__ = "model_admission_operations"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    model_id = Column(String(200), nullable=False)
+    candidate_fingerprint = Column(String(64), nullable=False)
+    governance_run_id = Column(String(32), nullable=False)
+    status = Column(String(20), nullable=False, default="pending", server_default="pending")
+    requested_by = Column(String, nullable=False)
+    request_id = Column(String, nullable=False)
+    reason = Column(String(300), nullable=False)
+    attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    lease_token_hash = Column(String(64), nullable=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True)
+    catalog_invalidated_at = Column(DateTime(timezone=True), nullable=True)
+    result = Column(JSONB, nullable=False, default=dict, server_default=text("'{}'"))
+    created_at = Column(DateTime(timezone=True), default=utc_now, server_default=func.now(), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=utc_now,
+        server_default=func.now(),
+        onupdate=utc_now,
+        nullable=False,
+    )
+    terminal_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "candidate_fingerprint",
+            "governance_run_id",
+            name="uq_model_admission_operation_candidate_run",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'running', 'succeeded', 'failed')",
+            name="ck_model_admission_operations_status",
+        ),
+        Index("ix_model_admission_operations_status_created", "status", "created_at", "id"),
+        Index(
+            "uq_model_admission_operations_single_running",
+            "status",
+            unique=True,
+            postgresql_where=text("status = 'running'"),
+            sqlite_where=text("status = 'running'"),
+        ),
+    )
+
+
 class PerformanceRun(Base):
     """管理员显式导入的脱敏压测汇总。"""
 

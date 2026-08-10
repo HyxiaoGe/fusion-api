@@ -1,7 +1,7 @@
 # app/services/chat_service.py
 import asyncio
 import uuid as uuid_mod
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Mapping, Optional, Union
 
 import litellm
 from fastapi.responses import StreamingResponse
@@ -13,6 +13,7 @@ from app.ai.llm_observability import merge_litellm_kwargs
 from app.ai.prompts import prompt_manager
 from app.core.config import settings
 from app.core.logger import app_logger as logger
+from app.db.model_catalog_control_repository import ModelCatalogControlRepository
 from app.db.repositories import ConversationRepository, FileRepository
 from app.schemas.chat import (
     ChatResponse,
@@ -120,6 +121,7 @@ class ChatService:
         self.db = db
         self.conversation_service = ConversationService(db)
         self.file_repo = FileRepository(db)
+        self.model_control_repository = ModelCatalogControlRepository(db)
         self.stream_handler = StreamHandler()
         self.suggested_question_service = SuggestedQuestionService(db)
 
@@ -252,6 +254,32 @@ class ChatService:
         if options is None:
             options = {}
 
+        existing_conversation = None
+        if conversation_id:
+            candidate = self.conversation_service.get_conversation(conversation_id, user_id)
+            if candidate is not None and isinstance(getattr(candidate, "model_id", None), str):
+                existing_conversation = candidate
+
+        # 已有会话的模型绑定由服务端持久记录决定，忽略客户端覆盖；新会话才接受请求模型。
+        effective_model_id = existing_conversation.model_id if existing_conversation is not None else model_id
+        catalog_entry = litellm_catalog.get_model_entry(effective_model_id)
+        if not isinstance(catalog_entry, Mapping) or not catalog_entry.get("db_model"):
+            catalog_status = litellm_catalog.get_cache_status()
+            if catalog_status.get("availability") == "available" or catalog_status.get("has_cache"):
+                raise ApiException.service_unavailable("当前模型尚未注册", code=ErrorCode.MODEL_UNAVAILABLE)
+        control = self.model_control_repository.get(effective_model_id)
+        if control is not None and getattr(control, "routable", True) is False:
+            raise ApiException.service_unavailable("当前模型暂不可调用", code=ErrorCode.MODEL_UNAVAILABLE)
+        existing_messages = getattr(existing_conversation, "messages", None)
+        is_upload_placeholder = existing_conversation is not None and isinstance(existing_messages, list) and not existing_messages
+        if (
+            (existing_conversation is None or is_upload_placeholder)
+            and control is not None
+            and getattr(control, "selectable", True) is False
+        ):
+            raise ApiException.service_unavailable("当前模型不可用于新会话", code=ErrorCode.MODEL_UNAVAILABLE)
+        model_id = effective_model_id
+
         # 解析模型调用参数（薄代理 LiteLLM，不再走本地 DB）
         litellm_model, provider, litellm_kwargs = llm_manager.resolve_model(model_id)
 
@@ -264,9 +292,12 @@ class ChatService:
             raise ApiException.bad_request("深度研究模式仅支持流式对话")
 
         # 获取或创建会话
-        conversation, is_new_conversation = self._get_or_create_conversation(
-            conversation_id, user_id, model_id, message
-        )
+        if existing_conversation is not None:
+            conversation, is_new_conversation = existing_conversation, False
+        else:
+            conversation, is_new_conversation = self._get_or_create_conversation(
+                conversation_id, user_id, model_id, message
+            )
 
         # 构造用户消息 content blocks
         validated_files = self._validate_message_files(file_ids or [], user_id, conversation.id)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -48,7 +49,11 @@ class ProviderAdapter(Protocol):
 
     def source_model_id(self, entry: Mapping[str, Any]) -> str: ...
 
+    def normalized_source_model_id(self, entry: Mapping[str, Any]) -> str: ...
+
     def adapt_upstream_model(self, entry: Mapping[str, Any]) -> tuple[ModelCandidate | None, str | None]: ...
+
+    def candidate_policy_reason(self, candidate: ModelCandidate) -> str | None: ...
 
     def owns_litellm_entry(self, entry: Mapping[str, Any]) -> bool: ...
 
@@ -67,14 +72,31 @@ class OpenAICompatibleProviderAdapter:
         provider_display: str,
         litellm_prefix: str,
         api_model_prefix: str = "",
+        api_model_prefixes: Sequence[str] = (),
+        candidate_model_patterns: Sequence[str] = (),
         upstream_id_field: str = "id",
         upstream_strip_prefix: str = "",
         required_generation_method: str = "",
     ) -> None:
+        if isinstance(api_model_prefixes, (str, bytes)) or any(
+            not isinstance(prefix, str) or not prefix.strip() for prefix in api_model_prefixes
+        ):
+            raise ValueError("api_model_prefixes 必须是非空字符串序列")
+        if isinstance(candidate_model_patterns, (str, bytes)) or any(
+            not isinstance(pattern, str) or not pattern.strip() for pattern in candidate_model_patterns
+        ):
+            raise ValueError("candidate_model_patterns 必须是非空字符串序列")
         self.provider_key = provider_key.strip().lower()
         self.provider_display = provider_display.strip()
         self.litellm_prefix = litellm_prefix.strip().strip("/")
-        self.api_model_prefix = api_model_prefix.strip()
+        prefixes = [api_model_prefix, *api_model_prefixes]
+        self.api_model_prefixes = tuple(
+            dict.fromkeys(prefix.strip() for prefix in prefixes if isinstance(prefix, str) and prefix.strip())
+        )
+        try:
+            self.candidate_model_patterns = tuple(re.compile(pattern) for pattern in candidate_model_patterns)
+        except re.error as exc:
+            raise ValueError(f"candidate_model_patterns 包含无效正则: {exc}") from exc
         self.upstream_id_field = upstream_id_field.strip()
         self.upstream_strip_prefix = upstream_strip_prefix.strip()
         self.required_generation_method = required_generation_method.strip()
@@ -83,6 +105,12 @@ class OpenAICompatibleProviderAdapter:
 
     def source_model_id(self, entry: Mapping[str, Any]) -> str:
         return _nonempty_string(entry.get(self.upstream_id_field))
+
+    def normalized_source_model_id(self, entry: Mapping[str, Any]) -> str:
+        model_id = self.source_model_id(entry)
+        if self.upstream_strip_prefix and model_id.startswith(self.upstream_strip_prefix):
+            return _nonempty_string(model_id[len(self.upstream_strip_prefix) :])
+        return model_id
 
     def adapt_upstream_model(self, entry: Mapping[str, Any]) -> tuple[ModelCandidate | None, str | None]:
         model_id = self.source_model_id(entry)
@@ -94,13 +122,20 @@ class OpenAICompatibleProviderAdapter:
             model_id = _nonempty_string(model_id[len(self.upstream_strip_prefix) :])
             if not model_id:
                 return None, "模型 id 去除前缀后为空"
-        if self.api_model_prefix and not model_id.startswith(self.api_model_prefix):
-            return None, f"模型 id 不符合前缀 {self.api_model_prefix}"
+        if self.api_model_prefixes and not any(model_id.startswith(prefix) for prefix in self.api_model_prefixes):
+            return None, f"模型 id 不符合提供商前缀 {', '.join(self.api_model_prefixes)}"
         if self.required_generation_method:
             generation_methods = entry.get("supportedGenerationMethods")
             if not isinstance(generation_methods, list) or self.required_generation_method not in generation_methods:
                 return None, f"模型不支持 {self.required_generation_method}"
         return self.build_candidate(model_id), None
+
+    def candidate_policy_reason(self, candidate: ModelCandidate) -> str | None:
+        if self.candidate_model_patterns and not any(
+            pattern.fullmatch(candidate.model_id) for pattern in self.candidate_model_patterns
+        ):
+            return "模型不符合产品候选策略"
+        return None
 
     def owns_litellm_entry(self, entry: Mapping[str, Any]) -> bool:
         metadata = _entry_metadata(entry)
@@ -111,8 +146,8 @@ class OpenAICompatibleProviderAdapter:
         model_id = self._strip_litellm_prefix(underlying)
         if not model_id:
             return False
-        if self.api_model_prefix:
-            return model_id.startswith(self.api_model_prefix)
+        if self.api_model_prefixes:
+            return any(model_id.startswith(prefix) for prefix in self.api_model_prefixes)
         # `openai/*` 常被多个兼容厂商共用；没有 metadata 或模型前缀时不能安全认领。
         return self.litellm_prefix.lower() == self.provider_key
 
@@ -150,7 +185,7 @@ class MoonshotProviderAdapter(OpenAICompatibleProviderAdapter):
         model_id = _nonempty_string(entry.get("id"))
         if not model_id:
             return None, "模型条目缺少非空 id"
-        if not model_id.startswith(self.api_model_prefix):
+        if not any(model_id.startswith(prefix) for prefix in self.api_model_prefixes):
             return None, "Moonshot 适配器不接纳非 Kimi 模型"
         return self.build_candidate(model_id), None
 
@@ -202,10 +237,20 @@ def _snapshot_entries(snapshot: Any, *, source: str) -> tuple[list[Mapping[str, 
 def _discover_upstream(
     adapter: ProviderAdapter,
     snapshot: Any,
-) -> tuple[dict[str, ModelCandidate], list[UnknownCandidate]]:
+) -> tuple[
+    dict[str, ModelCandidate],
+    dict[str, ModelCandidate],
+    set[str],
+    list[UnknownCandidate],
+]:
     entries, unknown = _snapshot_entries(snapshot, source="upstream")
-    candidates: dict[str, ModelCandidate] = {}
+    observed: dict[str, ModelCandidate] = {}
+    eligible: dict[str, ModelCandidate] = {}
+    seen_model_ids: set[str] = set()
     for entry in entries:
+        normalized_source_id = adapter.normalized_source_model_id(entry)
+        if normalized_source_id:
+            seen_model_ids.add(normalized_source_id)
         candidate, reason = adapter.adapt_upstream_model(entry)
         if candidate is None:
             unknown.append(
@@ -216,7 +261,7 @@ def _discover_upstream(
                 )
             )
             continue
-        if candidate.model_id in candidates:
+        if candidate.model_id in observed:
             unknown.append(
                 UnknownCandidate(
                     source="upstream",
@@ -225,8 +270,19 @@ def _discover_upstream(
                 )
             )
             continue
-        candidates[candidate.model_id] = candidate
-    return candidates, unknown
+        observed[candidate.model_id] = candidate
+        policy_reason = adapter.candidate_policy_reason(candidate)
+        if policy_reason:
+            unknown.append(
+                UnknownCandidate(
+                    source="product_policy",
+                    model_id=candidate.model_id,
+                    reason=policy_reason,
+                )
+            )
+            continue
+        eligible[candidate.model_id] = candidate
+    return observed, eligible, seen_model_ids, unknown
 
 
 def _discover_litellm(
@@ -279,9 +335,12 @@ def discover_candidates(
     litellm_snapshot: Any,
 ) -> CandidateReport:
     """对比厂商快照与 LiteLLM 目录，返回只读候选分类。"""
-    upstream, upstream_unknown = _discover_upstream(adapter, upstream_snapshot)
+    upstream_observed, upstream_eligible, upstream_seen_ids, upstream_unknown = _discover_upstream(
+        adapter,
+        upstream_snapshot,
+    )
     litellm, litellm_unknown = _discover_litellm(adapter, litellm_snapshot)
-    if not upstream:
+    if not upstream_observed:
         return CandidateReport(
             provider_key=adapter.provider_key,
             provider_display=adapter.provider_display,
@@ -295,11 +354,12 @@ def discover_candidates(
                 *litellm_unknown,
             ],
         )
-    upstream_ids = set(upstream)
+    upstream_observed_ids = set(upstream_observed)
+    upstream_eligible_ids = set(upstream_eligible)
     litellm_ids = set(litellm)
     alias_targets = _all_litellm_alias_targets(litellm_snapshot)
-    new_ids = upstream_ids - litellm_ids
-    existing_ids = upstream_ids & litellm_ids
+    new_ids = upstream_eligible_ids - litellm_ids
+    existing_ids = upstream_observed_ids & litellm_ids
     alias_conflicts: list[UnknownCandidate] = []
     for model_id in sorted(new_ids):
         targets = alias_targets.get(model_id, set())
@@ -314,9 +374,11 @@ def discover_candidates(
         )
         new_ids.remove(model_id)
 
-    new = [upstream[model_id] for model_id in sorted(new_ids)]
+    new = [upstream_eligible[model_id] for model_id in sorted(new_ids)]
     existing = [adapter.build_candidate(model_id, litellm.get(model_id, [])) for model_id in sorted(existing_ids)]
-    removed = [adapter.build_candidate(model_id, litellm[model_id]) for model_id in sorted(litellm_ids - upstream_ids)]
+    removed = [
+        adapter.build_candidate(model_id, litellm[model_id]) for model_id in sorted(litellm_ids - upstream_seen_ids)
+    ]
     return CandidateReport(
         provider_key=adapter.provider_key,
         provider_display=adapter.provider_display,
@@ -383,6 +445,8 @@ def _build_adapter(args: argparse.Namespace) -> ProviderAdapter:
         provider_display=args.provider_display,
         litellm_prefix=args.litellm_prefix,
         api_model_prefix=args.api_model_prefix,
+        api_model_prefixes=args.owned_model_prefix,
+        candidate_model_patterns=args.candidate_model_pattern,
     )
 
 
@@ -395,6 +459,8 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--provider-display", default="")
     parser.add_argument("--litellm-prefix", default="")
     parser.add_argument("--api-model-prefix", default="")
+    parser.add_argument("--owned-model-prefix", action="append", default=[])
+    parser.add_argument("--candidate-model-pattern", action="append", default=[])
     return parser.parse_args(argv)
 
 

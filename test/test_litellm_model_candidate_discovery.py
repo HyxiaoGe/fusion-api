@@ -23,6 +23,176 @@ def litellm_entry(
 
 
 class ModelCandidateDiscoveryTests(unittest.TestCase):
+    def test_qwen_new_naming_and_product_policy_do_not_trigger_false_retirement(self):
+        adapter = discovery.OpenAICompatibleProviderAdapter(
+            provider_key="qwen",
+            provider_display="通义千问",
+            litellm_prefix="openai",
+            api_model_prefixes=("qwen", "qwq-", "qvq-", "text-embedding-"),
+            candidate_model_patterns=(
+                r"qwen3\.\d+-(?:max|plus|flash)",
+                r"qwen-(?:max|plus|flash)",
+            ),
+        )
+
+        report = discovery.discover_candidates(
+            adapter=adapter,
+            upstream_snapshot={
+                "data": [
+                    {"id": "qwen3.8-max"},
+                    {"id": "qwen3.7-max"},
+                    {"id": "qwen3.6-plus"},
+                    {"id": "qwen-image-2.0"},
+                    {"id": "qwen3-tts-instruct-flash"},
+                    {"id": "qwen3.7-text-embedding"},
+                    {"id": "text-embedding-v4"},
+                    {"id": "qwen3.8-max-image"},
+                    {"id": "qwen3.7-max-preview"},
+                    {"id": "deepseek-v4-pro"},
+                    {"id": "kimi/kimi-k3"},
+                ]
+            },
+            litellm_snapshot={
+                "data": [
+                    litellm_entry("qwen-max-latest", "openai/qwen3.7-max", provider_key="qwen"),
+                    litellm_entry("qwen3.6-plus", "openai/qwen3.6-plus", provider_key="qwen"),
+                    litellm_entry("qwen-image", "openai/qwen-image-2.0", provider_key="qwen"),
+                    litellm_entry(
+                        "text-embedding-v4",
+                        "openai/text-embedding-v4",
+                        provider_key="qwen",
+                    ),
+                ]
+            },
+        )
+
+        self.assertEqual([item.model_id for item in report.new], ["qwen3.8-max"])
+        self.assertEqual(
+            [item.model_id for item in report.existing],
+            ["qwen-image-2.0", "qwen3.6-plus", "qwen3.7-max", "text-embedding-v4"],
+        )
+        self.assertEqual(report.removed, [])
+        self.assertEqual(
+            [(item.source, item.model_id) for item in report.unknown],
+            [
+                ("product_policy", "qwen-image-2.0"),
+                ("product_policy", "qwen3-tts-instruct-flash"),
+                ("product_policy", "qwen3.7-text-embedding"),
+                ("product_policy", "text-embedding-v4"),
+                ("product_policy", "qwen3.8-max-image"),
+                ("product_policy", "qwen3.7-max-preview"),
+                ("upstream", "deepseek-v4-pro"),
+                ("upstream", "kimi/kimi-k3"),
+            ],
+        )
+
+    def test_unknown_upstream_model_still_proves_existing_model_has_not_been_removed(self):
+        adapter = discovery.OpenAICompatibleProviderAdapter(
+            provider_key="qwen",
+            provider_display="通义千问",
+            litellm_prefix="openai",
+            api_model_prefix="qwen-",
+        )
+
+        report = discovery.discover_candidates(
+            adapter=adapter,
+            upstream_snapshot={"data": [{"id": "qwen3.7-max"}]},
+            litellm_snapshot={
+                "data": [
+                    litellm_entry("qwen-max-latest", "openai/qwen3.7-max", provider_key="qwen"),
+                ]
+            },
+        )
+
+        self.assertEqual(report.new, [])
+        self.assertEqual(report.existing, [])
+        self.assertEqual(report.removed, [])
+        self.assertEqual(report.unknown[0].model_id, "qwen3.7-max")
+        self.assertIn("qwen-", report.unknown[0].reason)
+
+    def test_product_policy_uses_stripped_upstream_id_without_false_retirement(self):
+        adapter = discovery.OpenAICompatibleProviderAdapter(
+            provider_key="xai",
+            provider_display="xAI",
+            litellm_prefix="openrouter/x-ai",
+            upstream_strip_prefix="x-ai/",
+            candidate_model_patterns=(r"grok-4\.5",),
+        )
+
+        report = discovery.discover_candidates(
+            adapter=adapter,
+            upstream_snapshot={"data": [{"id": "x-ai/grok-4.20-beta"}]},
+            litellm_snapshot={
+                "data": [
+                    litellm_entry(
+                        "grok-4.20-beta",
+                        "openrouter/x-ai/grok-4.20-beta",
+                        provider_key="xai",
+                    )
+                ]
+            },
+        )
+
+        self.assertEqual(report.new, [])
+        self.assertEqual([item.model_id for item in report.existing], ["grok-4.20-beta"])
+        self.assertEqual(report.removed, [])
+        self.assertEqual(
+            [(item.source, item.model_id) for item in report.unknown],
+            [("product_policy", "grok-4.20-beta")],
+        )
+
+    def test_third_party_model_mislabeled_as_qwen_is_not_claimed_or_retired(self):
+        adapter = discovery.OpenAICompatibleProviderAdapter(
+            provider_key="qwen",
+            provider_display="通义千问",
+            litellm_prefix="openai",
+            api_model_prefixes=("qwen", "qwq-", "qvq-"),
+        )
+
+        report = discovery.discover_candidates(
+            adapter=adapter,
+            upstream_snapshot={
+                "data": [
+                    {"id": "qwen3.8-max"},
+                    {"id": "deepseek-v4-pro"},
+                ]
+            },
+            litellm_snapshot={
+                "data": [
+                    litellm_entry(
+                        "wrong-provider-model",
+                        "openai/deepseek-v4-pro",
+                        provider_key="qwen",
+                    )
+                ]
+            },
+        )
+
+        self.assertEqual([item.model_id for item in report.new], ["qwen3.8-max"])
+        self.assertEqual(report.existing, [])
+        self.assertEqual(report.removed, [])
+        self.assertEqual(report.unknown[0].model_id, "deepseek-v4-pro")
+
+    def test_legacy_and_multi_prefixes_are_merged_and_invalid_policy_regex_fails_closed(self):
+        adapter = discovery.OpenAICompatibleProviderAdapter(
+            provider_key="acme",
+            provider_display="Acme",
+            litellm_prefix="openai",
+            api_model_prefix="acme-",
+            api_model_prefixes=("acme3.", "acme-"),
+        )
+
+        self.assertIsNotNone(adapter.adapt_upstream_model({"id": "acme-chat"})[0])
+        self.assertIsNotNone(adapter.adapt_upstream_model({"id": "acme3.1-chat"})[0])
+        self.assertEqual(adapter.api_model_prefixes, ("acme-", "acme3."))
+        with self.assertRaisesRegex(ValueError, "无效正则"):
+            discovery.OpenAICompatibleProviderAdapter(
+                provider_key="acme",
+                provider_display="Acme",
+                litellm_prefix="openai",
+                candidate_model_patterns=("[",),
+            )
+
     def test_moonshot_adapter_classifies_new_existing_removed_and_unknown_candidates(self):
         upstream_snapshot = {
             "object": "list",

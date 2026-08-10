@@ -246,6 +246,7 @@ def _result_base(plan: Mapping[str, Any], candidate: Mapping[str, Any], *, mode:
             "attempted": False,
             "key_restored": False,
             "model_deleted": False,
+            "catalog_invalidated": False,
             "model_ownership_unverified": False,
             "manual_cleanup_required": False,
             "errors": [],
@@ -471,6 +472,7 @@ def _compensate(
     before_key_models: Sequence[str],
     candidate: Mapping[str, Any],
     created_uuid: str,
+    catalog_invalidation_fn: Callable[[], None] | None,
 ) -> None:
     compensation = result["compensation"]
     compensation["attempted"] = True
@@ -504,10 +506,13 @@ def _compensate(
                 compensation["errors"].append("rollback_key_failed")
         else:
             compensation["errors"].append("rollback_key_cas_conflict")
+    if not compensation["key_restored"]:
+        compensation["manual_cleanup_required"] = True
     if not created_uuid:
         compensation["model_ownership_unverified"] = True
         compensation["manual_cleanup_required"] = True
         compensation["errors"].append("rollback_model_ownership_unverified")
+        _invalidate_catalog_after_compensation(compensation, catalog_invalidation_fn)
         return
     try:
         _post_json(
@@ -521,6 +526,22 @@ def _compensate(
         compensation["model_deleted"] = True
     except TransactionFailure:
         compensation["errors"].append("rollback_model_delete_failed")
+        compensation["manual_cleanup_required"] = True
+    _invalidate_catalog_after_compensation(compensation, catalog_invalidation_fn)
+
+
+def _invalidate_catalog_after_compensation(
+    compensation: dict[str, Any],
+    catalog_invalidation_fn: Callable[[], None] | None,
+) -> None:
+    if catalog_invalidation_fn is None or not (compensation["key_restored"] or compensation["model_deleted"]):
+        return
+    try:
+        catalog_invalidation_fn()
+        compensation["catalog_invalidated"] = True
+    except Exception:
+        compensation["errors"].append("rollback_catalog_invalidation_failed")
+        compensation["manual_cleanup_required"] = True
 
 
 def _expected_key_models(before_key_models: Sequence[str], model_id: str) -> list[str]:
@@ -543,6 +564,7 @@ def execute_admission(
     environ: Mapping[str, str] | None = None,
     client: HttpClient | None = None,
     audit_fn: Callable[..., bool] = _default_audit,
+    catalog_invalidation_fn: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """执行单候选事务；dry-run 路径不触发任何 HTTP。"""
     try:
@@ -573,6 +595,7 @@ def execute_admission(
         virtual_key=virtual_key,
         environ=environ or {},
         audit_fn=audit_fn,
+        catalog_invalidation_fn=catalog_invalidation_fn,
     )
 
 
@@ -594,6 +617,7 @@ def _invalid_plan_result(plan: Mapping[str, Any], *, mode: str) -> dict[str, Any
             "attempted": False,
             "key_restored": False,
             "model_deleted": False,
+            "catalog_invalidated": False,
             "model_ownership_unverified": False,
             "manual_cleanup_required": False,
             "errors": [],
@@ -618,6 +642,7 @@ def _execute_apply(
     virtual_key: str,
     environ: Mapping[str, str],
     audit_fn: Callable[..., bool],
+    catalog_invalidation_fn: Callable[[], None] | None,
 ) -> dict[str, Any]:
     created_uuid = ""
     before_key_models: list[str] = []
@@ -697,6 +722,15 @@ def _execute_apply(
             phase="key_update",
         )
         result["completed_phases"].append("key_update")
+        if catalog_invalidation_fn is not None:
+            try:
+                catalog_invalidation_fn()
+            except Exception as exc:
+                raise TransactionFailure(
+                    "fusion_catalog_invalidation_failed",
+                    "catalog_invalidation",
+                ) from exc
+            result["completed_phases"].append("catalog_invalidation")
         fusion_models = _wait_for_fusion_model(
             client,
             fusion_base_url,
@@ -737,6 +771,7 @@ def _execute_apply(
                 before_key_models=before_key_models,
                 candidate=candidate,
                 created_uuid=created_uuid,
+                catalog_invalidation_fn=catalog_invalidation_fn,
             )
         return result
 
@@ -787,9 +822,16 @@ def _verify_created_model(
         phase=phase,
     )
     payload = candidate["model_new_plan"]["payload"]
+    expected_alias = str(payload.get("model_name") or "")
+    alias_entries = [entry for entry in entries if _entry_identity(entry)[0] == expected_alias]
     exact_entries = [entry for entry in entries if _entry_matches_expected(entry, payload)]
     owned_entries = [entry for entry in entries if _entry_identity(entry)[2] == created_uuid]
-    if len(owned_entries) != 1 or owned_entries[0] not in exact_entries or len(exact_entries) != 1:
+    if (
+        len(alias_entries) != 1
+        or len(owned_entries) != 1
+        or owned_entries[0] not in exact_entries
+        or len(exact_entries) != 1
+    ):
         raise TransactionFailure("model_verify_failed", phase)
     return owned_entries[0]
 
@@ -816,8 +858,7 @@ def _entry_matches_expected(entry: Mapping[str, Any], payload: Mapping[str, Any]
     actual_costs = {key: info.get(key) for key in expected_costs}
     expected_max_input_tokens = expected_info.get("max_input_tokens")
     max_input_tokens_match = (
-        "max_input_tokens" not in expected_info
-        or info.get("max_input_tokens") == expected_max_input_tokens
+        "max_input_tokens" not in expected_info or info.get("max_input_tokens") == expected_max_input_tokens
     )
     return (
         entry.get("model_name") == payload.get("model_name")
@@ -922,6 +963,7 @@ def _verification_error_result(*, candidate_fingerprint: str, code: str) -> dict
             "attempted": False,
             "key_restored": False,
             "model_deleted": False,
+            "catalog_invalidated": False,
             "model_ownership_unverified": False,
             "manual_cleanup_required": False,
             "errors": [],

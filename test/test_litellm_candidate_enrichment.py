@@ -149,18 +149,14 @@ class CandidateEnrichmentTests(unittest.TestCase):
         for invalid_value in (True, 0, -1, 262144.0, "262144"):
             with self.subTest(invalid_value=invalid_value):
                 invalid_payload = copy.deepcopy(payload)
-                invalid_payload["providers"]["moonshot"]["models"]["kimi-k2.7-code"][
-                    "context_window_tokens"
-                ] = invalid_value
-                invalid_payload["approval"]["providers_sha256"] = cost_map_sha256(
-                    invalid_payload["providers"]
+                invalid_payload["providers"]["moonshot"]["models"]["kimi-k2.7-code"]["context_window_tokens"] = (
+                    invalid_value
                 )
+                invalid_payload["approval"]["providers_sha256"] = cost_map_sha256(invalid_payload["providers"])
                 document = {
                     "schema_version": invalid_payload["schema_version"],
                     "approval": {
-                        key: value
-                        for key, value in invalid_payload["approval"].items()
-                        if key != "document_sha256"
+                        key: value for key, value in invalid_payload["approval"].items() if key != "document_sha256"
                     },
                     "providers": invalid_payload["providers"],
                 }
@@ -255,18 +251,14 @@ class CandidateEnrichmentTests(unittest.TestCase):
         self.assertEqual(candidate["metadata"]["pricing"]["input"], 0.95)
 
         invalid_providers = copy.deepcopy(providers)
-        invalid_providers["moonshot"]["models"]["kimi-k2.7-code"]["pricing_provenance"][
-            "billing_rates"
-        ]["output"] = 35.0
+        invalid_providers["moonshot"]["models"]["kimi-k2.7-code"]["pricing_provenance"]["billing_rates"]["output"] = (
+            35.0
+        )
         invalid_approval = copy.deepcopy(approval)
         invalid_approval["providers_sha256"] = cost_map_sha256(invalid_providers)
         invalid_document = {
             "schema_version": 2,
-            "approval": {
-                key: value
-                for key, value in invalid_approval.items()
-                if key != "document_sha256"
-            },
+            "approval": {key: value for key, value in invalid_approval.items() if key != "document_sha256"},
             "providers": invalid_providers,
         }
         invalid_approval["document_sha256"] = cost_map_sha256(invalid_document)
@@ -524,6 +516,47 @@ class CandidateEnrichmentTests(unittest.TestCase):
 
         candidate = result["providers"]["qwen"]["report"]["new"][0]
         self.assertEqual(candidate["metadata_evidence"]["cost_map_key"], "qwen/qwen-new")
+        self.assertEqual(candidate["metadata"]["pricing"]["input"], 1.0)
+
+    def test_qwen_registry_uses_dashscope_cost_map_namespace(self):
+        report = candidate_report()
+        report["providers"] = {
+            "qwen": {
+                "status": "ok",
+                "report": {
+                    "provider": {"key": "qwen", "display": "通义千问"},
+                    "new": [
+                        {
+                            "provider_key": "qwen",
+                            "model_id": "qwen3.7-max",
+                            "litellm_model": "openai/qwen3.7-max",
+                            "isolation_status": "candidate",
+                        }
+                    ],
+                },
+            }
+        }
+        path = Path(__file__).resolve().parents[1] / "ops/litellm/provider-registry.example.json"
+        provider_registry = json.loads(path.read_text(encoding="utf-8"))
+
+        result = enrich(
+            candidate_report=report,
+            registry=provider_registry,
+            cost_map={
+                "dashscope/qwen3.7-max": {
+                    "litellm_provider": "dashscope",
+                    "input_cost_per_token": 0.000001,
+                    "output_cost_per_token": 0.000003,
+                    "supports_function_calling": True,
+                }
+            },
+        )
+
+        candidate = result["providers"]["qwen"]["report"]["new"][0]
+        self.assertEqual(
+            candidate["metadata_evidence"]["cost_map_key"],
+            "dashscope/qwen3.7-max",
+        )
         self.assertEqual(candidate["metadata"]["pricing"]["input"], 1.0)
 
     def test_shared_openai_cost_entry_cannot_cross_provider_boundary(self):

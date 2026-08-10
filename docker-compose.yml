@@ -34,6 +34,7 @@ services:
       - .:/app
       - ./logs:/app/logs
       - ~/.cache/huggingface:/root/.cache/huggingface
+      - ${LITELLM_GOVERNANCE_ROOT_HOST:-./ops/litellm/local-governance}:/var/lib/fusion/litellm-governance:ro
     environment:
       - DATABASE_URL=${DATABASE_URL}
       - SERVER_HOST=${SERVER_HOST:-http://localhost:8000}
@@ -70,6 +71,12 @@ services:
       - MINIMAX_API_KEY=${MINIMAX_API_KEY:-}
       - LITELLM_PROXY_URL=${LITELLM_PROXY_URL:-http://litellm-proxy:4000}
       - LITELLM_API_KEY=${LITELLM_API_KEY:-}
+      - LITELLM_GOVERNANCE_ROOT=/var/lib/fusion/litellm-governance
+      - LITELLM_GOVERNANCE_MAX_AGE_SECONDS=${LITELLM_GOVERNANCE_MAX_AGE_SECONDS:-86400}
+      - LITELLM_MODEL_MANAGEMENT_ENABLED=${LITELLM_MODEL_MANAGEMENT_ENABLED:-false}
+      - LITELLM_MODEL_ADMISSION_WORKER_ENABLED=${LITELLM_MODEL_ADMISSION_WORKER_ENABLED:-false}
+      - LITELLM_MODEL_ADMISSION_WORKER_TOKEN=${LITELLM_MODEL_ADMISSION_WORKER_TOKEN:-}
+      - LITELLM_MODEL_ADMISSION_LEASE_SECONDS=${LITELLM_MODEL_ADMISSION_LEASE_SECONDS:-600}
       - ENABLE_FLYAI_TRAVEL_TOOLS=${ENABLE_FLYAI_TRAVEL_TOOLS:-false}
       - FLYAI_ADAPTER_BASE_URL=${FLYAI_ADAPTER_BASE_URL:-http://flyai-adapter:8080}
       - FLYAI_ADAPTER_TOKEN=${FLYAI_ADAPTER_TOKEN:-}

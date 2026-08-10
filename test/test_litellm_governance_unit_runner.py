@@ -28,6 +28,10 @@ class LiteLLMGovernanceUnitRunnerTests(unittest.TestCase):
                 [
                     "LITELLM_BASE_URL=http://127.0.0.1:4000",
                     "LITELLM_CANDIDATE_KEY=candidate",
+                    "LITELLM_VIRTUAL_KEY=virtual",
+                    "FUSION_MODEL_MANAGEMENT_BASE_URL=http://127.0.0.1:8002",
+                    "LITELLM_MODEL_ADMISSION_WORKER_TOKEN=worker-token",
+                    "LITELLM_GOVERNANCE_MAX_AGE_SECONDS=7200",
                 ]
             ),
             encoding="utf-8",
@@ -58,6 +62,10 @@ class LiteLLMGovernanceUnitRunnerTests(unittest.TestCase):
                 required_env_names=[
                     "LITELLM_MASTER_KEY",
                     "LITELLM_CANDIDATE_KEY",
+                    "LITELLM_VIRTUAL_KEY",
+                    "LITELLM_MODEL_ADMISSION_WORKER_TOKEN",
+                    "LITELLM_GOVERNANCE_MAX_AGE_SECONDS",
+                    "FUSION_MODEL_MANAGEMENT_BASE_URL",
                 ],
                 inherited={
                     "HOME": "/home/test",
@@ -72,9 +80,46 @@ class LiteLLMGovernanceUnitRunnerTests(unittest.TestCase):
         self.assertEqual(execute_env["LITELLM_MASTER_KEY"], "master")
         self.assertEqual(execute_env["MOONSHOT_API_KEY"], "moonshot")
         self.assertEqual(execute_env["LITELLM_CANDIDATE_KEY"], "candidate")
+        self.assertEqual(execute_env["LITELLM_VIRTUAL_KEY"], "virtual")
+        self.assertEqual(
+            execute_env["FUSION_MODEL_MANAGEMENT_BASE_URL"],
+            "http://127.0.0.1:8002",
+        )
+        self.assertEqual(execute_env["LITELLM_MODEL_ADMISSION_WORKER_TOKEN"], "worker-token")
+        self.assertEqual(execute_env["LITELLM_GOVERNANCE_MAX_AGE_SECONDS"], "7200")
         self.assertNotIn("PYTHONPATH", execute_env)
         self.assertNotIn("LD_PRELOAD", execute_env)
         self.assertEqual(execute_env["PYTHONNOUSERSITE"], "1")
+
+    def test_read_only_governance_process_does_not_receive_worker_credentials(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            proxy_env, governance_env, registry = self._files(Path(temp_dir))
+
+            execute_env, issues, _ = runner.build_exec_environment(
+                proxy_env=proxy_env,
+                governance_env=governance_env,
+                registry=registry,
+                required_env_names=["LITELLM_MASTER_KEY", "LITELLM_CANDIDATE_KEY"],
+                inherited={"HOME": "/home/test", "PATH": "/usr/bin:/bin"},
+            )
+
+        self.assertEqual(issues, [])
+        self.assertNotIn("LITELLM_VIRTUAL_KEY", execute_env)
+        self.assertNotIn("LITELLM_MODEL_ADMISSION_WORKER_TOKEN", execute_env)
+        self.assertNotIn("LITELLM_GOVERNANCE_MAX_AGE_SECONDS", execute_env)
+        self.assertNotIn("FUSION_MODEL_MANAGEMENT_BASE_URL", execute_env)
+
+    def test_required_environment_cannot_expand_managed_allowlist(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            proxy_env, governance_env, registry = self._files(Path(temp_dir))
+            with self.assertRaisesRegex(ValueError, "未受管变量"):
+                runner.build_exec_environment(
+                    proxy_env=proxy_env,
+                    governance_env=governance_env,
+                    registry=registry,
+                    required_env_names=["PYTHONPATH"],
+                    inherited={},
+                )
 
     def test_governance_env_cannot_duplicate_upstream_credentials(self):
         with tempfile.TemporaryDirectory() as temp_dir:
