@@ -60,11 +60,23 @@ def compatible_inspector() -> Mock:
     }
     inspector.get_check_constraints.side_effect = lambda table_name: (
         [
-            {"name": "ck_model_catalog_controls_routable_true"},
-            {"name": "ck_model_catalog_controls_revision_positive"},
+            {"name": "ck_model_catalog_controls_routable_true", "sqltext": "routable IS TRUE"},
+            {"name": "ck_model_catalog_controls_revision_positive", "sqltext": "revision > 0"},
         ]
         if table_name == "model_catalog_controls"
-        else [{"name": "ck_model_admission_operations_status"}]
+        else [
+            {
+                "name": "ck_model_admission_operations_status",
+                "sqltext": (
+                    "status::text = ANY (ARRAY["
+                    "'pending'::character varying, "
+                    "'running'::character varying, "
+                    "'succeeded'::character varying, "
+                    "'failed'::character varying"
+                    "]::text[])"
+                ),
+            }
+        ]
     )
     inspector.get_unique_constraints.return_value = [
         {
@@ -96,6 +108,7 @@ class ModelManagementMigrationTest(unittest.TestCase):
 
         with (
             patch.object(migration, "op") as operation,
+            patch.object(migration.context, "is_offline_mode", return_value=False),
             patch.object(migration.sa, "inspect", return_value=inspector),
         ):
             migration.upgrade()
@@ -109,6 +122,7 @@ class ModelManagementMigrationTest(unittest.TestCase):
 
         with (
             patch.object(migration, "op") as operation,
+            patch.object(migration.context, "is_offline_mode", return_value=False),
             patch.object(migration.sa, "inspect", return_value=inspector),
         ):
             migration.upgrade()
@@ -127,12 +141,65 @@ class ModelManagementMigrationTest(unittest.TestCase):
 
         with (
             patch.object(migration, "op") as operation,
+            patch.object(migration.context, "is_offline_mode", return_value=False),
             patch.object(migration.sa, "inspect", return_value=inspector),
             self.assertRaisesRegex(RuntimeError, "字段集合与迁移定义不一致"),
         ):
             migration.upgrade()
 
         operation.create_table.assert_not_called()
+
+    def test_offline_sql_generation_never_reflects_database(self):
+        migration = load_migration()
+
+        with (
+            patch.object(migration, "op") as operation,
+            patch.object(migration.context, "is_offline_mode", return_value=True),
+            patch.object(migration.sa, "inspect") as inspect_database,
+        ):
+            migration.upgrade()
+
+        inspect_database.assert_not_called()
+        self.assertEqual(operation.create_table.call_count, 2)
+        self.assertEqual(operation.create_index.call_count, 2)
+
+    def test_same_check_name_with_drifted_expression_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        inspector.get_check_constraints.side_effect = lambda table_name: (
+            [
+                {"name": "ck_model_catalog_controls_routable_true", "sqltext": "routable IS TRUE"},
+                {"name": "ck_model_catalog_controls_revision_positive", "sqltext": "revision > 0"},
+            ]
+            if table_name == "model_catalog_controls"
+            else [
+                {
+                    "name": "ck_model_admission_operations_status",
+                    "sqltext": "status IN ('pending', 'running')",
+                }
+            ]
+        )
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "检查约束 .* 表达式不兼容"),
+        ):
+            migration.upgrade()
+
+    def test_same_partial_index_name_with_opposite_predicate_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        inspector.get_indexes.return_value[-1]["dialect_options"] = {"postgresql_where": "status <> 'running'"}
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "索引 .* 不兼容"),
+        ):
+            migration.upgrade()
 
 
 if __name__ == "__main__":

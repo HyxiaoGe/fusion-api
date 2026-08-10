@@ -5,12 +5,13 @@ Revises: e8b4c2d7f901
 Create Date: 2026-08-04 00:00:00.000000
 """
 
+import re
 from typing import Sequence, Union
 
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-from alembic import op
+from alembic import context, op
 
 revision: str = "f3a1d9c8b720"
 down_revision: Union[str, Sequence[str], None] = "e8b4c2d7f901"
@@ -49,13 +50,23 @@ MODEL_ADMISSION_OPERATION_COLUMNS = {
 }
 
 
+def _normalize_sql_expression(expression: object) -> str:
+    normalized = str(expression).lower()
+    normalized = re.sub(
+        r"::(?:character varying|text|boolean|integer)(?:\[\])?",
+        "",
+        normalized,
+    )
+    return re.sub(r"[\s()]", "", normalized)
+
+
 def _validate_existing_table(
     inspector: sa.Inspector,
     table_name: str,
     expected_columns: dict[str, tuple[type[sa.types.TypeEngine], int | None, bool]],
     *,
     expected_primary_key: set[str],
-    expected_checks: set[str],
+    expected_checks: dict[str, str],
     expected_unique_constraints: dict[str, set[str]] | None = None,
     expected_indexes: dict[str, tuple[tuple[str, ...], bool, str | None]] | None = None,
 ) -> None:
@@ -93,12 +104,17 @@ def _validate_existing_table(
             f"已有表 {table_name} 的主键不兼容：actual={sorted(primary_key)} expected={sorted(expected_primary_key)}"
         )
 
-    check_names = {
-        constraint.get("name") for constraint in inspector.get_check_constraints(table_name) if constraint.get("name")
+    checks = {
+        constraint.get("name"): constraint.get("sqltext")
+        for constraint in inspector.get_check_constraints(table_name)
+        if constraint.get("name")
     }
-    missing_checks = expected_checks - check_names
-    if missing_checks:
-        raise RuntimeError(f"已有表 {table_name} 缺少检查约束：{sorted(missing_checks)}")
+    for check_name, expected_expression in expected_checks.items():
+        actual_expression = checks.get(check_name)
+        if actual_expression is None:
+            raise RuntimeError(f"已有表 {table_name} 缺少检查约束：{check_name}")
+        if _normalize_sql_expression(actual_expression) != _normalize_sql_expression(expected_expression):
+            raise RuntimeError(f"已有表 {table_name} 的检查约束 {check_name} 表达式不兼容")
 
     if expected_unique_constraints:
         unique_constraints = {
@@ -112,17 +128,17 @@ def _validate_existing_table(
 
     if expected_indexes:
         indexes = {index.get("name"): index for index in inspector.get_indexes(table_name) if index.get("name")}
-        for index_name, (expected_column_names, expected_unique, predicate_token) in expected_indexes.items():
+        for index_name, (expected_column_names, expected_unique, expected_predicate) in expected_indexes.items():
             index = indexes.get(index_name)
             actual_column_names = tuple(index.get("column_names") or []) if index else ()
             actual_unique = bool(index.get("unique")) if index else False
             dialect_options = index.get("dialect_options") or {} if index else {}
             predicate = dialect_options.get("postgresql_where")
-            predicate_text = str(predicate) if predicate is not None else ""
+            predicate_text = _normalize_sql_expression(predicate) if predicate is not None else ""
             if (
                 actual_column_names != expected_column_names
                 or actual_unique is not expected_unique
-                or (predicate_token is not None and predicate_token not in predicate_text)
+                or (expected_predicate is not None and predicate_text != _normalize_sql_expression(expected_predicate))
             ):
                 raise RuntimeError(f"已有表 {table_name} 的索引 {index_name} 不兼容")
 
@@ -195,6 +211,11 @@ def _create_model_admission_operations() -> None:
 
 
 def upgrade() -> None:
+    if context.is_offline_mode():
+        _create_model_catalog_controls()
+        _create_model_admission_operations()
+        return
+
     inspector = sa.inspect(op.get_bind())
     if inspector.has_table("model_catalog_controls"):
         _validate_existing_table(
@@ -203,8 +224,8 @@ def upgrade() -> None:
             MODEL_CATALOG_CONTROL_COLUMNS,
             expected_primary_key={"model_id"},
             expected_checks={
-                "ck_model_catalog_controls_routable_true",
-                "ck_model_catalog_controls_revision_positive",
+                "ck_model_catalog_controls_routable_true": "routable IS TRUE",
+                "ck_model_catalog_controls_revision_positive": "revision > 0",
             },
         )
     else:
@@ -216,7 +237,16 @@ def upgrade() -> None:
             "model_admission_operations",
             MODEL_ADMISSION_OPERATION_COLUMNS,
             expected_primary_key={"id"},
-            expected_checks={"ck_model_admission_operations_status"},
+            expected_checks={
+                "ck_model_admission_operations_status": (
+                    "status::text = ANY (ARRAY["
+                    "'pending'::character varying, "
+                    "'running'::character varying, "
+                    "'succeeded'::character varying, "
+                    "'failed'::character varying"
+                    "]::text[])"
+                ),
+            },
             expected_unique_constraints={
                 "uq_model_admission_operation_candidate_run": {
                     "candidate_fingerprint",
@@ -229,7 +259,11 @@ def upgrade() -> None:
                     False,
                     None,
                 ),
-                "uq_model_admission_operations_single_running": (("status",), True, "running"),
+                "uq_model_admission_operations_single_running": (
+                    ("status",),
+                    True,
+                    "status = 'running'",
+                ),
             },
         )
     else:
