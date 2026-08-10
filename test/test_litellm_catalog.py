@@ -1,3 +1,4 @@
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -117,6 +118,8 @@ class LiteLLMCatalogTests(unittest.TestCase):
             patch.object(litellm_catalog, "_fetch_catalog", return_value=refreshed) as fetch,
             patch.object(litellm_catalog.time, "monotonic", return_value=101.0),
         ):
+            litellm_catalog.list_aliases()
+            litellm_catalog._generation_check_thread.join(timeout=1)
             self.assertEqual(litellm_catalog.list_aliases(), refreshed)
 
         fetch.assert_called_once_with()
@@ -133,9 +136,50 @@ class LiteLLMCatalogTests(unittest.TestCase):
             patch.object(litellm_catalog, "_fetch_catalog", return_value=refreshed),
             patch.object(litellm_catalog.time, "monotonic", return_value=101.0),
         ):
+            litellm_catalog.list_aliases()
+            litellm_catalog._generation_check_thread.join(timeout=1)
             self.assertEqual(litellm_catalog.list_aliases(), refreshed)
 
         self.assertEqual(litellm_catalog._cache_generation, "5")
+
+    def test_generation_read_runs_in_background_without_blocking_catalog_request(self):
+        release = threading.Event()
+        started = threading.Event()
+        litellm_catalog._cache_payload = {"cached-model": {"db_model": True, "metadata": {}}}
+        litellm_catalog._cache_loaded_at = 100.0
+        litellm_catalog._cache_generation = "1"
+
+        def slow_generation_read():
+            started.set()
+            release.wait(timeout=1)
+            return "1"
+
+        with (
+            patch.object(litellm_catalog, "_read_catalog_generation", side_effect=slow_generation_read),
+            patch.object(litellm_catalog.time, "monotonic", return_value=101.0),
+        ):
+            self.assertEqual(
+                litellm_catalog.list_aliases(),
+                {"cached-model": {"db_model": True, "metadata": {}}},
+            )
+            self.assertTrue(started.wait(timeout=1))
+            release.set()
+            litellm_catalog._generation_check_thread.join(timeout=1)
+
+    def test_generation_thread_start_failure_does_not_break_catalog_request(self):
+        litellm_catalog._cache_payload = {"cached-model": {"db_model": True, "metadata": {}}}
+        litellm_catalog._cache_loaded_at = 100.0
+
+        with (
+            patch.object(threading.Thread, "start", side_effect=RuntimeError("thread unavailable")),
+            patch.object(litellm_catalog.time, "monotonic", return_value=101.0),
+        ):
+            self.assertEqual(
+                litellm_catalog.list_aliases(),
+                {"cached-model": {"db_model": True, "metadata": {}}},
+            )
+
+        self.assertFalse(litellm_catalog._generation_check_in_flight)
 
     def test_bump_generation_invalidates_local_cache(self):
         redis_client = Mock()

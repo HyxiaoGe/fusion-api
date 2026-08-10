@@ -506,6 +506,8 @@ def _compensate(
                 compensation["errors"].append("rollback_key_failed")
         else:
             compensation["errors"].append("rollback_key_cas_conflict")
+    if not compensation["key_restored"]:
+        compensation["manual_cleanup_required"] = True
     if not created_uuid:
         compensation["model_ownership_unverified"] = True
         compensation["manual_cleanup_required"] = True
@@ -524,6 +526,7 @@ def _compensate(
         compensation["model_deleted"] = True
     except TransactionFailure:
         compensation["errors"].append("rollback_model_delete_failed")
+        compensation["manual_cleanup_required"] = True
     _invalidate_catalog_after_compensation(compensation, catalog_invalidation_fn)
 
 
@@ -819,9 +822,16 @@ def _verify_created_model(
         phase=phase,
     )
     payload = candidate["model_new_plan"]["payload"]
+    expected_alias = str(payload.get("model_name") or "")
+    alias_entries = [entry for entry in entries if _entry_identity(entry)[0] == expected_alias]
     exact_entries = [entry for entry in entries if _entry_matches_expected(entry, payload)]
     owned_entries = [entry for entry in entries if _entry_identity(entry)[2] == created_uuid]
-    if len(owned_entries) != 1 or owned_entries[0] not in exact_entries or len(exact_entries) != 1:
+    if (
+        len(alias_entries) != 1
+        or len(owned_entries) != 1
+        or owned_entries[0] not in exact_entries
+        or len(exact_entries) != 1
+    ):
         raise TransactionFailure("model_verify_failed", phase)
     return owned_entries[0]
 

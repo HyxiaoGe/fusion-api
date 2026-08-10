@@ -131,6 +131,8 @@ class ModelManagementService:
             raise ApiException.bad_request("变更原因不能为空")
         if len(normalized_reason) > 300:
             raise ApiException.bad_request("变更原因不能超过 300 个字符")
+        if not self.config.management_enabled:
+            raise ApiException.service_unavailable("模型管理写操作未启用")
         entry = self.catalog.get_model_entry(model_id)
         if not entry or not entry.get("db_model"):
             raise ApiException.not_found("模型不存在或尚未注册")

@@ -361,6 +361,39 @@ class ModelManagementServiceTests(unittest.TestCase):
         self.assertFalse(self.db.query(ModelCatalogControl).one().selectable)
         self.assertEqual(self.db.query(AdminAuditEvent).count(), 1)
 
+    def test_visibility_write_is_rejected_when_management_is_read_only(self):
+        service = self.build_service(config={"management_enabled": False})
+
+        with self.assertRaises(ApiException) as raised:
+            service.set_visibility(
+                model_id="qwen-max-latest",
+                selectable=False,
+                expected_revision=None,
+                reason="尝试隐藏",
+                admin=self.admin,
+                request_id="req-read-only",
+            )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(self.db.query(ModelCatalogControl).count(), 0)
+        self.assertEqual(self.db.query(AdminAuditEvent).count(), 0)
+
+    def test_locked_operation_query_refreshes_identity_map_state(self):
+        query = Mock()
+        query.execution_options.return_value = query
+        query.filter.return_value = query
+        query.with_for_update.return_value = query
+        expected = Mock()
+        query.first.return_value = expected
+        db = Mock()
+        db.query.return_value = query
+
+        result = ModelAdmissionOperationRepository(db).lock("operation-1")
+
+        self.assertIs(result, expected)
+        query.execution_options.assert_called_once_with(populate_existing=True)
+        query.with_for_update.assert_called_once_with()
+
     def test_admission_request_is_persistent_idempotent_and_failed_retry_resets_same_row(self):
         service = self.build_service()
         created = self._request_admission(service)

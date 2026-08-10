@@ -27,6 +27,7 @@ ExecStart=%h/.local/share/fusion/litellm-governance-venv/bin/python -m scripts.r
   --require-env LITELLM_VIRTUAL_KEY \
   --require-env LITELLM_MODEL_ADMISSION_WORKER_TOKEN \
   --require-env LITELLM_GOVERNANCE_MAX_AGE_SECONDS \
+  --require-env FUSION_MODEL_MANAGEMENT_BASE_URL \
   --require-env LITELLM_CANDIDATE_KEY \
   -- \
   %h/.local/share/fusion/litellm-governance-venv/bin/python -m scripts.run_litellm_model_management_worker \

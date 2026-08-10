@@ -88,6 +88,7 @@ class ModelAdmissionOperationRepository:
     def lock(self, operation_id: str) -> ModelAdmissionOperation | None:
         return (
             self.db.query(ModelAdmissionOperation)
+            .execution_options(populate_existing=True)
             .filter(ModelAdmissionOperation.id == operation_id)
             .with_for_update()
             .first()

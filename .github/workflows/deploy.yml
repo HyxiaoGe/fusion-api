@@ -294,6 +294,51 @@ jobs:
           if systemctl --user is-active --quiet fusion-litellm-governance.timer; then
             governance_timer_active="true"
           fi
+          governance_unit_dir="${HOME}/.config/systemd/user"
+          governance_service_unit="${governance_unit_dir}/fusion-litellm-governance.service"
+          governance_timer_unit="${governance_unit_dir}/fusion-litellm-governance.timer"
+          governance_service_unit_existed="false"
+          governance_timer_unit_existed="false"
+          governance_service_unit_b64=""
+          governance_timer_unit_b64=""
+          if [ -e "${governance_service_unit}" ]; then
+            if [ ! -f "${governance_service_unit}" ] || [ -L "${governance_service_unit}" ]; then
+              echo "LiteLLM 治理 service unit 不是受管普通文件"
+              exit 1
+            fi
+            governance_service_unit_existed="true"
+            governance_service_unit_b64="$(base64 -w0 "${governance_service_unit}")"
+          fi
+          if [ -e "${governance_timer_unit}" ]; then
+            if [ ! -f "${governance_timer_unit}" ] || [ -L "${governance_timer_unit}" ]; then
+              echo "LiteLLM 治理 timer unit 不是受管普通文件"
+              exit 1
+            fi
+            governance_timer_unit_existed="true"
+            governance_timer_unit_b64="$(base64 -w0 "${governance_timer_unit}")"
+          fi
+          model_management_service_unit="${governance_unit_dir}/fusion-litellm-model-management.service"
+          model_management_timer_unit="${governance_unit_dir}/fusion-litellm-model-management.timer"
+          model_management_service_unit_existed="false"
+          model_management_timer_unit_existed="false"
+          model_management_service_unit_b64=""
+          model_management_timer_unit_b64=""
+          if [ -e "${model_management_service_unit}" ]; then
+            if [ ! -f "${model_management_service_unit}" ] || [ -L "${model_management_service_unit}" ]; then
+              echo "模型准入 Worker service unit 不是受管普通文件"
+              exit 1
+            fi
+            model_management_service_unit_existed="true"
+            model_management_service_unit_b64="$(base64 -w0 "${model_management_service_unit}")"
+          fi
+          if [ -e "${model_management_timer_unit}" ]; then
+            if [ ! -f "${model_management_timer_unit}" ] || [ -L "${model_management_timer_unit}" ]; then
+              echo "模型准入 Worker timer unit 不是受管普通文件"
+              exit 1
+            fi
+            model_management_timer_unit_existed="true"
+            model_management_timer_unit_b64="$(base64 -w0 "${model_management_timer_unit}")"
+          fi
 
           {
             printf '%s\n' "api_image_ref=${api_image_ref}"
@@ -306,6 +351,14 @@ jobs:
             printf '%s\n' "governance_current_target=${governance_current_target}"
             printf '%s\n' "governance_timer_enabled=${governance_timer_enabled}"
             printf '%s\n' "governance_timer_active=${governance_timer_active}"
+            printf '%s\n' "governance_service_unit_existed=${governance_service_unit_existed}"
+            printf '%s\n' "governance_timer_unit_existed=${governance_timer_unit_existed}"
+            printf '%s\n' "governance_service_unit_b64=${governance_service_unit_b64}"
+            printf '%s\n' "governance_timer_unit_b64=${governance_timer_unit_b64}"
+            printf '%s\n' "model_management_service_unit_existed=${model_management_service_unit_existed}"
+            printf '%s\n' "model_management_timer_unit_existed=${model_management_timer_unit_existed}"
+            printf '%s\n' "model_management_service_unit_b64=${model_management_service_unit_b64}"
+            printf '%s\n' "model_management_timer_unit_b64=${model_management_timer_unit_b64}"
           } >> "${GITHUB_OUTPUT}"
 
       - name: Login to ACR
@@ -906,22 +959,32 @@ jobs:
             echo "LiteLLM provider registry 不能是符号链接"
             exit 1
           fi
-          registry_temp="$(mktemp "${config_dir}/.litellm-provider-registry.XXXXXX")"
-          trap 'rm -f "${registry_temp}"' EXIT
-          install -m 0600 \
-            "${GITHUB_WORKSPACE}/ops/litellm/provider-registry.example.json" \
-            "${registry_temp}"
-          python3 - "${registry_temp}" <<'PY'
+          if [ ! -e "${registry_target}" ]; then
+            registry_temp="$(mktemp "${config_dir}/.litellm-provider-registry.XXXXXX")"
+            trap 'rm -f "${registry_temp}"' EXIT
+            install -m 0600 \
+              "${GITHUB_WORKSPACE}/ops/litellm/provider-registry.example.json" \
+              "${registry_temp}"
+            mv -f "${registry_temp}" "${registry_target}"
+            trap - EXIT
+          fi
+          python3 - "${registry_target}" <<'PY'
           import json
+          import os
           import pathlib
+          import stat
           import sys
 
-          payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          path = pathlib.Path(sys.argv[1])
+          file_stat = path.lstat()
+          if path.is_symlink() or not stat.S_ISREG(file_stat.st_mode) or file_stat.st_uid != os.getuid():
+              raise SystemExit("LiteLLM provider registry 必须是当前用户拥有的普通文件")
+          if stat.S_IMODE(file_stat.st_mode) & 0o077:
+              raise SystemExit("LiteLLM provider registry 权限过宽")
+          payload = json.loads(path.read_text(encoding="utf-8"))
           if not isinstance(payload, dict) or not isinstance(payload.get("providers"), list):
               raise SystemExit("LiteLLM provider registry 结构无效")
           PY
-          mv -f "${registry_temp}" "${registry_target}"
-          trap - EXIT
           install -m 0644 \
             "${GITHUB_WORKSPACE}/ops/litellm/fusion-litellm-governance.service" \
             "${GITHUB_WORKSPACE}/ops/litellm/fusion-litellm-governance.timer" \
@@ -1035,6 +1098,7 @@ jobs:
             --require-env LITELLM_VIRTUAL_KEY \
             --require-env LITELLM_MODEL_ADMISSION_WORKER_TOKEN \
             --require-env LITELLM_GOVERNANCE_MAX_AGE_SECONDS \
+            --require-env FUSION_MODEL_MANAGEMENT_BASE_URL \
             --require-env LITELLM_CANDIDATE_KEY \
             -- \
             "${HOME}/.local/share/fusion/litellm-governance-venv/bin/python" \
@@ -1108,6 +1172,14 @@ jobs:
           ROLLBACK_GOVERNANCE_CURRENT_TARGET: ${{ steps.capture_rollback_target.outputs.governance_current_target }}
           ROLLBACK_GOVERNANCE_TIMER_ENABLED: ${{ steps.capture_rollback_target.outputs.governance_timer_enabled }}
           ROLLBACK_GOVERNANCE_TIMER_ACTIVE: ${{ steps.capture_rollback_target.outputs.governance_timer_active }}
+          ROLLBACK_GOVERNANCE_SERVICE_UNIT_EXISTED: ${{ steps.capture_rollback_target.outputs.governance_service_unit_existed }}
+          ROLLBACK_GOVERNANCE_TIMER_UNIT_EXISTED: ${{ steps.capture_rollback_target.outputs.governance_timer_unit_existed }}
+          ROLLBACK_GOVERNANCE_SERVICE_UNIT_B64: ${{ steps.capture_rollback_target.outputs.governance_service_unit_b64 }}
+          ROLLBACK_GOVERNANCE_TIMER_UNIT_B64: ${{ steps.capture_rollback_target.outputs.governance_timer_unit_b64 }}
+          ROLLBACK_MODEL_MANAGEMENT_SERVICE_UNIT_EXISTED: ${{ steps.capture_rollback_target.outputs.model_management_service_unit_existed }}
+          ROLLBACK_MODEL_MANAGEMENT_TIMER_UNIT_EXISTED: ${{ steps.capture_rollback_target.outputs.model_management_timer_unit_existed }}
+          ROLLBACK_MODEL_MANAGEMENT_SERVICE_UNIT_B64: ${{ steps.capture_rollback_target.outputs.model_management_service_unit_b64 }}
+          ROLLBACK_MODEL_MANAGEMENT_TIMER_UNIT_B64: ${{ steps.capture_rollback_target.outputs.model_management_timer_unit_b64 }}
           DEPLOY_PROMPTHUB_API_KEY: ${{ secrets.PROMPTHUB_API_KEY }}
           DEPLOY_PROMPTHUB_SYNC_MODE: ${{ vars.PROMPTHUB_SYNC_MODE || 'disabled' }}
           DEPLOY_MCP_ALLOWED_HOSTS: ${{ vars.MCP_ALLOWED_HOSTS }}
@@ -1316,6 +1388,48 @@ jobs:
             echo "LiteLLM 治理当前版本路径不是符号链接，无法清理"
             exit 1
           fi
+          governance_unit_dir="${HOME}/.config/systemd/user"
+          install -d -m 0755 "${governance_unit_dir}"
+          restore_governance_unit() {
+            unit_name="$1"
+            existed="$2"
+            encoded="$3"
+            target="${governance_unit_dir}/${unit_name}"
+            case "${existed}" in
+              true)
+                if [ -z "${encoded}" ]; then
+                  echo "LiteLLM 治理 unit 回滚内容缺失: ${unit_name}"
+                  exit 1
+                fi
+                unit_temp="$(mktemp "${governance_unit_dir}/.${unit_name}.XXXXXX")"
+                trap 'rm -f "${unit_temp}"' RETURN
+                printf '%s' "${encoded}" | base64 --decode > "${unit_temp}"
+                chmod 0644 "${unit_temp}"
+                mv -f "${unit_temp}" "${target}"
+                trap - RETURN
+                ;;
+              false)
+                rm -f "${target}"
+                ;;
+              *) echo "LiteLLM 治理 unit 回滚状态无效: ${unit_name}"; exit 1 ;;
+            esac
+          }
+          restore_governance_unit \
+            fusion-litellm-governance.service \
+            "${ROLLBACK_GOVERNANCE_SERVICE_UNIT_EXISTED}" \
+            "${ROLLBACK_GOVERNANCE_SERVICE_UNIT_B64}"
+          restore_governance_unit \
+            fusion-litellm-governance.timer \
+            "${ROLLBACK_GOVERNANCE_TIMER_UNIT_EXISTED}" \
+            "${ROLLBACK_GOVERNANCE_TIMER_UNIT_B64}"
+          restore_governance_unit \
+            fusion-litellm-model-management.service \
+            "${ROLLBACK_MODEL_MANAGEMENT_SERVICE_UNIT_EXISTED}" \
+            "${ROLLBACK_MODEL_MANAGEMENT_SERVICE_UNIT_B64}"
+          restore_governance_unit \
+            fusion-litellm-model-management.timer \
+            "${ROLLBACK_MODEL_MANAGEMENT_TIMER_UNIT_EXISTED}" \
+            "${ROLLBACK_MODEL_MANAGEMENT_TIMER_UNIT_B64}"
           systemctl --user daemon-reload
           if [ "${ROLLBACK_GOVERNANCE_TIMER_ENABLED}" = "true" ]; then
             systemctl --user enable fusion-litellm-governance.timer

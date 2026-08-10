@@ -107,6 +107,7 @@ class LiteLLMGovernanceUnitTests(unittest.TestCase):
         self.assertIn("--require-env LITELLM_VIRTUAL_KEY", service)
         self.assertIn("--require-env LITELLM_MODEL_ADMISSION_WORKER_TOKEN", service)
         self.assertIn("--require-env LITELLM_GOVERNANCE_MAX_AGE_SECONDS", service)
+        self.assertIn("--require-env FUSION_MODEL_MANAGEMENT_BASE_URL", service)
         self.assertNotIn("EnvironmentFile=", service)
         self.assertIn("ProtectSystem=strict", service)
         self.assertIn("ProtectHome=read-only", service)

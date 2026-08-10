@@ -58,6 +58,7 @@ class ModelManagementDeployConfigTests(unittest.TestCase):
         self.assertIn("os.chmod(path, 0o600, follow_symlinks=False)", workflow)
         self.assertIn("--require-env LITELLM_CANDIDATE_KEY", workflow)
         self.assertIn("--require-env LITELLM_GOVERNANCE_MAX_AGE_SECONDS", unit)
+        self.assertIn("--require-env FUSION_MODEL_MANAGEMENT_BASE_URL", unit)
         self.assertIn("--require-env LITELLM_CANDIDATE_KEY", unit)
         self.assertIn("--acceptance-dir %h/.local/share/fusion/litellm-acceptance", unit)
         self.assertIn("ReadWritePaths=%h/.local/share/fusion/litellm-acceptance", unit)
@@ -136,8 +137,26 @@ class ModelManagementDeployConfigTests(unittest.TestCase):
         self.assertIn("Restore LiteLLM governance discovery after automatic rollback", workflow)
         self.assertIn("ROLLBACK_GOVERNANCE_TIMER_ENABLED", workflow)
         self.assertIn("ROLLBACK_GOVERNANCE_TIMER_ACTIVE", workflow)
+        self.assertIn("governance_service_unit_b64=", workflow)
+        self.assertIn("governance_timer_unit_b64=", workflow)
+        self.assertIn("ROLLBACK_GOVERNANCE_SERVICE_UNIT_B64", workflow)
+        self.assertIn("ROLLBACK_GOVERNANCE_TIMER_UNIT_B64", workflow)
+        self.assertIn("ROLLBACK_MODEL_MANAGEMENT_SERVICE_UNIT_B64", workflow)
+        self.assertIn("ROLLBACK_MODEL_MANAGEMENT_TIMER_UNIT_B64", workflow)
+        self.assertIn("restore_governance_unit", workflow)
+        self.assertIn("base64 --decode", workflow)
+        self.assertIn('rm -f "${target}"', workflow)
+        self.assertEqual(workflow.count("restore_governance_unit \\"), 4)
         self.assertIn("%h/.local/share/fusion/litellm-governance-current", unit)
         self.assertNotIn("%h/project/fusion/fusion-api/scripts", unit)
+
+    def test_dev_deploy_preserves_existing_provider_registry(self):
+        workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
+
+        self.assertIn('if [ ! -e "${registry_target}" ]; then', workflow)
+        self.assertIn('python3 - "${registry_target}"', workflow)
+        self.assertNotIn('python3 - "${registry_temp}"', workflow)
+        self.assertIn("LiteLLM provider registry 权限过宽", workflow)
 
     def test_dev_deploy_uses_repository_vars_for_feature_flags(self):
         workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")

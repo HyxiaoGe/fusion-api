@@ -20,12 +20,14 @@ from scripts.check_litellm_governance_runtime import runtime_status
 
 ENV_NAME_PATTERN = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 GOVERNANCE_ENV_NAMES = {
-    "FUSION_MODEL_MANAGEMENT_BASE_URL",
-    "LITELLM_GOVERNANCE_MAX_AGE_SECONDS",
-    "LITELLM_MODEL_ADMISSION_WORKER_TOKEN",
     "LITELLM_BASE_URL",
     "LITELLM_PROXY_URL",
     "LITELLM_CANDIDATE_KEY",
+}
+WORKER_ENV_NAMES = {
+    "FUSION_MODEL_MANAGEMENT_BASE_URL",
+    "LITELLM_GOVERNANCE_MAX_AGE_SECONDS",
+    "LITELLM_MODEL_ADMISSION_WORKER_TOKEN",
     "LITELLM_VIRTUAL_KEY",
 }
 SAFE_INHERITED_ENV_NAMES = {
@@ -131,8 +133,20 @@ def build_exec_environment(
         issues.append("governance_env_duplicates_upstream_credentials")
 
     allowed_proxy_names = {"LITELLM_MASTER_KEY", *provider_names}
+    supported_required_names = {
+        *allowed_proxy_names,
+        *GOVERNANCE_ENV_NAMES,
+        *WORKER_ENV_NAMES,
+    }
+    unsupported_required_names = set(required_env_names) - supported_required_names
+    if unsupported_required_names:
+        raise ValueError("required_env_names 包含未受管变量")
     selected = {name: value for name, value in proxy_values.items() if name in allowed_proxy_names}
-    selected.update({name: value for name, value in governance_values.items() if name in GOVERNANCE_ENV_NAMES})
+    allowed_governance_names = {
+        *GOVERNANCE_ENV_NAMES,
+        *(set(required_env_names) & WORKER_ENV_NAMES),
+    }
+    selected.update({name: value for name, value in governance_values.items() if name in allowed_governance_names})
     for name in {*required_env_names, *provider_names}:
         if not selected.get(name):
             issues.append("required_environment_missing")
