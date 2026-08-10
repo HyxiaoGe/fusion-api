@@ -11,9 +11,11 @@ class ModelManagementDeployConfigTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
 
         self.assertIn(
-            "${LITELLM_GOVERNANCE_ROOT_HOST:-/home/heyanxiao/backups/litellm-governance}:/var/lib/fusion/litellm-governance:ro",
+            "${LITELLM_GOVERNANCE_ROOT_HOST}:/var/lib/fusion/litellm-governance:ro",
             workflow,
         )
+        self.assertIn('expected_governance_root="${HOME}/backups/litellm-governance"', workflow)
+        self.assertIn('if [ "${governance_root}" != "${expected_governance_root}" ]', workflow)
         self.assertIn("LITELLM_GOVERNANCE_ROOT=/var/lib/fusion/litellm-governance", workflow)
         self.assertIn("LITELLM_MODEL_MANAGEMENT_ENABLED=${LITELLM_MODEL_MANAGEMENT_ENABLED:-false}", workflow)
         self.assertIn(
@@ -123,6 +125,17 @@ class ModelManagementDeployConfigTests(unittest.TestCase):
         self.assertIn("fusion-litellm-governance.service", workflow)
         self.assertIn("fusion-litellm-governance.timer", workflow)
         self.assertIn("systemctl --user enable --now fusion-litellm-governance.timer", workflow)
+        self.assertIn('governance_current_target="$(readlink -f -- "${governance_current_link}")"', workflow)
+        self.assertIn('"governance_timer_enabled=${governance_timer_enabled}"', workflow)
+        self.assertIn('"governance_timer_active=${governance_timer_active}"', workflow)
+        self.assertIn(
+            "ROLLBACK_GOVERNANCE_CURRENT_TARGET: "
+            "${{ steps.capture_rollback_target.outputs.governance_current_target }}",
+            workflow,
+        )
+        self.assertIn("Restore LiteLLM governance discovery after automatic rollback", workflow)
+        self.assertIn("ROLLBACK_GOVERNANCE_TIMER_ENABLED", workflow)
+        self.assertIn("ROLLBACK_GOVERNANCE_TIMER_ACTIVE", workflow)
         self.assertIn("%h/.local/share/fusion/litellm-governance-current", unit)
         self.assertNotIn("%h/project/fusion/fusion-api/scripts", unit)
 

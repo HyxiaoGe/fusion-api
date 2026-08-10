@@ -462,6 +462,11 @@ def _write_spool(
             os.fsync(handle.fileno())
         os.replace(temporary, path)
         temporary = None
+        directory_fd = os.open(state_dir, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
         return path
     finally:
         if temporary is not None:
@@ -560,31 +565,42 @@ def process_once(
     except VerifiedPlanError as exc:
         result = _verification_failure(exc.code)
     else:
-
-        def invalidate_catalog() -> None:
-            operation_path = quote(claim["operation_id"], safe="")
-            response = client.post(
-                f"{fusion_base_url.rstrip('/')}/api/internal/model-management/admissions/"
-                f"{operation_path}/invalidate-catalog",
-                headers=_worker_headers(worker_token, claim["lease_token"]),
-                timeout=10.0,
+        try:
+            _load_verified_candidate(
+                governance_root=governance_root,
+                expected_run_id=claim["run_id"],
+                candidate_fingerprint=claim["candidate_fingerprint"],
+                model_id=claim["model_id"],
+                max_age_seconds=governance_max_age_seconds,
             )
-            response.raise_for_status()
+        except VerifiedPlanError as exc:
+            result = _verification_failure(exc.code)
+        else:
 
-        result = execute_admission(
-            plan=plan,
-            apply=True,
-            expected_run_id=claim["run_id"],
-            confirm_model_id=claim["model_id"],
-            confirm_fingerprint=claim["candidate_fingerprint"],
-            litellm_base_url=litellm_base_url,
-            fusion_base_url=fusion_base_url,
-            master_key=master_key,
-            virtual_key=virtual_key,
-            environ=environ,
-            client=client,
-            catalog_invalidation_fn=invalidate_catalog,
-        )
+            def invalidate_catalog() -> None:
+                operation_path = quote(claim["operation_id"], safe="")
+                response = client.post(
+                    f"{fusion_base_url.rstrip('/')}/api/internal/model-management/admissions/"
+                    f"{operation_path}/invalidate-catalog",
+                    headers=_worker_headers(worker_token, claim["lease_token"]),
+                    timeout=10.0,
+                )
+                response.raise_for_status()
+
+            result = execute_admission(
+                plan=plan,
+                apply=True,
+                expected_run_id=claim["run_id"],
+                confirm_model_id=claim["model_id"],
+                confirm_fingerprint=claim["candidate_fingerprint"],
+                litellm_base_url=litellm_base_url,
+                fusion_base_url=fusion_base_url,
+                master_key=master_key,
+                virtual_key=virtual_key,
+                environ=environ,
+                client=client,
+                catalog_invalidation_fn=invalidate_catalog,
+            )
     if state_dir is not None:
         spool_path = _write_spool(state_dir, claim=claim, result=result)
     _complete(

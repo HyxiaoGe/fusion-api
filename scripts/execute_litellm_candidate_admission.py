@@ -246,6 +246,7 @@ def _result_base(plan: Mapping[str, Any], candidate: Mapping[str, Any], *, mode:
             "attempted": False,
             "key_restored": False,
             "model_deleted": False,
+            "catalog_invalidated": False,
             "model_ownership_unverified": False,
             "manual_cleanup_required": False,
             "errors": [],
@@ -471,6 +472,7 @@ def _compensate(
     before_key_models: Sequence[str],
     candidate: Mapping[str, Any],
     created_uuid: str,
+    catalog_invalidation_fn: Callable[[], None] | None,
 ) -> None:
     compensation = result["compensation"]
     compensation["attempted"] = True
@@ -508,6 +510,7 @@ def _compensate(
         compensation["model_ownership_unverified"] = True
         compensation["manual_cleanup_required"] = True
         compensation["errors"].append("rollback_model_ownership_unverified")
+        _invalidate_catalog_after_compensation(compensation, catalog_invalidation_fn)
         return
     try:
         _post_json(
@@ -521,6 +524,21 @@ def _compensate(
         compensation["model_deleted"] = True
     except TransactionFailure:
         compensation["errors"].append("rollback_model_delete_failed")
+    _invalidate_catalog_after_compensation(compensation, catalog_invalidation_fn)
+
+
+def _invalidate_catalog_after_compensation(
+    compensation: dict[str, Any],
+    catalog_invalidation_fn: Callable[[], None] | None,
+) -> None:
+    if catalog_invalidation_fn is None or not (compensation["key_restored"] or compensation["model_deleted"]):
+        return
+    try:
+        catalog_invalidation_fn()
+        compensation["catalog_invalidated"] = True
+    except Exception:
+        compensation["errors"].append("rollback_catalog_invalidation_failed")
+        compensation["manual_cleanup_required"] = True
 
 
 def _expected_key_models(before_key_models: Sequence[str], model_id: str) -> list[str]:
@@ -596,6 +614,7 @@ def _invalid_plan_result(plan: Mapping[str, Any], *, mode: str) -> dict[str, Any
             "attempted": False,
             "key_restored": False,
             "model_deleted": False,
+            "catalog_invalidated": False,
             "model_ownership_unverified": False,
             "manual_cleanup_required": False,
             "errors": [],
@@ -749,6 +768,7 @@ def _execute_apply(
                 before_key_models=before_key_models,
                 candidate=candidate,
                 created_uuid=created_uuid,
+                catalog_invalidation_fn=catalog_invalidation_fn,
             )
         return result
 
@@ -933,6 +953,7 @@ def _verification_error_result(*, candidate_fingerprint: str, code: str) -> dict
             "attempted": False,
             "key_restored": False,
             "model_deleted": False,
+            "catalog_invalidated": False,
             "model_ownership_unverified": False,
             "manual_cleanup_required": False,
             "errors": [],

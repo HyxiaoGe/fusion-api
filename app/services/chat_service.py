@@ -264,11 +264,19 @@ class ChatService:
         effective_model_id = existing_conversation.model_id if existing_conversation is not None else model_id
         catalog_entry = litellm_catalog.get_model_entry(effective_model_id)
         if not isinstance(catalog_entry, Mapping) or not catalog_entry.get("db_model"):
-            raise ApiException.service_unavailable("当前模型尚未注册", code=ErrorCode.MODEL_UNAVAILABLE)
+            catalog_status = litellm_catalog.get_cache_status()
+            if catalog_status.get("availability") == "available" or catalog_status.get("has_cache"):
+                raise ApiException.service_unavailable("当前模型尚未注册", code=ErrorCode.MODEL_UNAVAILABLE)
         control = self.model_control_repository.get(effective_model_id)
         if control is not None and getattr(control, "routable", True) is False:
             raise ApiException.service_unavailable("当前模型暂不可调用", code=ErrorCode.MODEL_UNAVAILABLE)
-        if existing_conversation is None and control is not None and getattr(control, "selectable", True) is False:
+        existing_messages = getattr(existing_conversation, "messages", None)
+        is_upload_placeholder = existing_conversation is not None and isinstance(existing_messages, list) and not existing_messages
+        if (
+            (existing_conversation is None or is_upload_placeholder)
+            and control is not None
+            and getattr(control, "selectable", True) is False
+        ):
             raise ApiException.service_unavailable("当前模型不可用于新会话", code=ErrorCode.MODEL_UNAVAILABLE)
         model_id = effective_model_id
 

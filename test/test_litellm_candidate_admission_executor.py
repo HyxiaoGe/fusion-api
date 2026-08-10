@@ -624,7 +624,38 @@ class CandidateAdmissionExecutorTests(unittest.TestCase):
         self.assertEqual(result["error"]["code"], "fusion_catalog_invalidation_failed")
         self.assertTrue(result["compensation"]["key_restored"])
         self.assertTrue(result["compensation"]["model_deleted"])
+        self.assertFalse(result["compensation"]["catalog_invalidated"])
+        self.assertTrue(result["compensation"]["manual_cleanup_required"])
+        self.assertIn("rollback_catalog_invalidation_failed", result["compensation"]["errors"])
         self.assertNotIn("sensitive internal failure", json.dumps(result))
+
+    def test_audit_failure_invalidates_catalog_again_after_compensation(self):
+        client = StatefulClient()
+        callback_observations = []
+
+        def invalidate_catalog():
+            callback_observations.append(
+                {
+                    "allowlisted": "kimi-k3" in client.key_models,
+                    "model_exists": any(item["model_name"] == "kimi-k3" for item in client.entries),
+                }
+            )
+
+        result = execute(
+            client,
+            audit_fn=lambda **_: False,
+            catalog_invalidation_fn=invalidate_catalog,
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(
+            callback_observations,
+            [
+                {"allowlisted": True, "model_exists": True},
+                {"allowlisted": False, "model_exists": False},
+            ],
+        )
+        self.assertTrue(result["compensation"]["catalog_invalidated"])
 
     def test_each_mutating_stage_failure_rolls_back_model_and_allowlist(self):
         for stage in ("verify", "key_update", "fusion_readback", "audit"):

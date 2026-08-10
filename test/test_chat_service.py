@@ -118,6 +118,10 @@ class ChatServiceTests(unittest.TestCase):
         unregistered = ChatService(MagicMock())
         with (
             patch("app.services.chat_service.litellm_catalog.get_model_entry", return_value=None),
+            patch(
+                "app.services.chat_service.litellm_catalog.get_cache_status",
+                return_value={"availability": "available", "has_cache": True},
+            ),
             patch("app.services.chat_service.llm_manager.resolve_model") as resolve_model,
             self.assertRaises(ApiException) as raised,
         ):
@@ -128,6 +132,70 @@ class ChatServiceTests(unittest.TestCase):
                     user_id="user-1",
                 )
             )
+        self.assertEqual(raised.exception.code, "MODEL_UNAVAILABLE")
+        resolve_model.assert_not_called()
+
+    def test_catalog_cold_start_failure_falls_back_to_model_resolver(self):
+        service = ChatService(MagicMock())
+        service.model_control_repository = MagicMock()
+        service.model_control_repository.get.return_value = None
+        service._get_or_create_conversation = MagicMock()
+
+        with (
+            patch("app.services.chat_service.litellm_catalog.get_model_entry", return_value=None),
+            patch(
+                "app.services.chat_service.litellm_catalog.get_cache_status",
+                return_value={"availability": "degraded", "has_cache": False},
+            ),
+            patch(
+                "app.services.chat_service.llm_manager.resolve_model",
+                return_value=("openai/fallback-model", "fallback", {}),
+            ) as resolve_model,
+            patch(
+                "app.services.chat_service.litellm_catalog.get_capabilities",
+                return_value={"functionCalling": True, "searchCapable": True},
+            ),
+            self.assertRaises(ApiException) as raised,
+        ):
+            asyncio.run(
+                service.process_message(
+                    model_id="fallback/model",
+                    message="继续服务",
+                    user_id="user-1",
+                    stream=False,
+                    options={"task_mode": "deep_research"},
+                )
+            )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertNotEqual(raised.exception.code, "MODEL_UNAVAILABLE")
+        resolve_model.assert_called_once_with("fallback/model")
+        service._get_or_create_conversation.assert_not_called()
+
+    def test_empty_upload_placeholder_still_rejects_hidden_model_for_first_message(self):
+        service = ChatService(MagicMock())
+        service.conversation_service = MagicMock()
+        service.conversation_service.get_conversation.return_value = SimpleNamespace(
+            id="conv-upload",
+            model_id="hidden/model",
+            messages=[],
+        )
+        service.model_control_repository = MagicMock()
+        service.model_control_repository.get.return_value = SimpleNamespace(selectable=False, routable=True)
+
+        with (
+            patch("app.services.chat_service.llm_manager.resolve_model") as resolve_model,
+            self.assertRaises(ApiException) as raised,
+        ):
+            asyncio.run(
+                service.process_message(
+                    model_id="hidden/model",
+                    message="带附件开始对话",
+                    user_id="user-1",
+                    conversation_id="conv-upload",
+                )
+            )
+
         self.assertEqual(raised.exception.code, "MODEL_UNAVAILABLE")
         resolve_model.assert_not_called()
 

@@ -274,6 +274,27 @@ jobs:
             model_management_timer_active="true"
           fi
 
+          governance_current_link="${HOME}/.local/share/fusion/litellm-governance-current"
+          governance_current_target=""
+          if [ -L "${governance_current_link}" ]; then
+            governance_current_target="$(readlink -f -- "${governance_current_link}")"
+            case "${governance_current_target}" in
+              "${HOME}/.local/share/fusion/litellm-governance-src-"*) ;;
+              *) echo "LiteLLM 治理当前版本不在受管目录中: ${governance_current_target:-<empty>}"; exit 1 ;;
+            esac
+          elif [ -e "${governance_current_link}" ]; then
+            echo "LiteLLM 治理当前版本路径不是符号链接，拒绝部署"
+            exit 1
+          fi
+          governance_timer_enabled="false"
+          governance_timer_active="false"
+          if systemctl --user is-enabled --quiet fusion-litellm-governance.timer; then
+            governance_timer_enabled="true"
+          fi
+          if systemctl --user is-active --quiet fusion-litellm-governance.timer; then
+            governance_timer_active="true"
+          fi
+
           {
             printf '%s\n' "api_image_ref=${api_image_ref}"
             printf '%s\n' "api_image_id=${api_image_id}"
@@ -282,6 +303,9 @@ jobs:
             printf '%s\n' "model_management_current_target=${model_management_current_target}"
             printf '%s\n' "model_management_timer_enabled=${model_management_timer_enabled}"
             printf '%s\n' "model_management_timer_active=${model_management_timer_active}"
+            printf '%s\n' "governance_current_target=${governance_current_target}"
+            printf '%s\n' "governance_timer_enabled=${governance_timer_enabled}"
+            printf '%s\n' "governance_timer_active=${governance_timer_active}"
           } >> "${GITHUB_OUTPUT}"
 
       - name: Login to ACR
@@ -443,7 +467,14 @@ jobs:
           # dev 中 auth-service 只在 Docker 网络内暴露，未发布宿主机 8100。
           # 显式覆盖旧 .env 里的宿主机地址，避免 fusion-api JWKS/userinfo 校验连到不可达地址。
           export AUTH_SERVICE_INTERNAL_BASE_URL="http://auth-service:8100"
-          test -d "${LITELLM_GOVERNANCE_ROOT_HOST:-/home/heyanxiao/backups/litellm-governance}"
+          expected_governance_root="${HOME}/backups/litellm-governance"
+          governance_root="${LITELLM_GOVERNANCE_ROOT_HOST:-${expected_governance_root}}"
+          if [ "${governance_root}" != "${expected_governance_root}" ]; then
+            echo "LITELLM_GOVERNANCE_ROOT_HOST 必须与 systemd 治理服务目录一致: ${expected_governance_root}"
+            exit 1
+          fi
+          export LITELLM_GOVERNANCE_ROOT_HOST="${expected_governance_root}"
+          test -d "${LITELLM_GOVERNANCE_ROOT_HOST}"
           mkdir -p ./fusion-api/storage/files
           if docker container inspect fusion-api >/dev/null 2>&1; then
             if docker inspect fusion-api --format '{{range .Mounts}}{{println .Destination}}{{end}}' | grep -qx '/app/storage/files'; then
@@ -485,7 +516,7 @@ jobs:
               volumes:
                 - ./fusion-api/logs:/app/logs
                 - ./fusion-api/storage/files:/app/storage/files
-                - ${LITELLM_GOVERNANCE_ROOT_HOST:-/home/heyanxiao/backups/litellm-governance}:/var/lib/fusion/litellm-governance:ro
+                - ${LITELLM_GOVERNANCE_ROOT_HOST}:/var/lib/fusion/litellm-governance:ro
               environment:
                 - DATABASE_URL=${DATABASE_URL}
                 - SERVER_HOST=${SERVER_HOST}
@@ -1074,6 +1105,9 @@ jobs:
           ROLLBACK_MODEL_MANAGEMENT_CURRENT_TARGET: ${{ steps.capture_rollback_target.outputs.model_management_current_target }}
           ROLLBACK_MODEL_MANAGEMENT_TIMER_ENABLED: ${{ steps.capture_rollback_target.outputs.model_management_timer_enabled }}
           ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE: ${{ steps.capture_rollback_target.outputs.model_management_timer_active }}
+          ROLLBACK_GOVERNANCE_CURRENT_TARGET: ${{ steps.capture_rollback_target.outputs.governance_current_target }}
+          ROLLBACK_GOVERNANCE_TIMER_ENABLED: ${{ steps.capture_rollback_target.outputs.governance_timer_enabled }}
+          ROLLBACK_GOVERNANCE_TIMER_ACTIVE: ${{ steps.capture_rollback_target.outputs.governance_timer_active }}
           DEPLOY_PROMPTHUB_API_KEY: ${{ secrets.PROMPTHUB_API_KEY }}
           DEPLOY_PROMPTHUB_SYNC_MODE: ${{ vars.PROMPTHUB_SYNC_MODE || 'disabled' }}
           DEPLOY_MCP_ALLOWED_HOSTS: ${{ vars.MCP_ALLOWED_HOSTS }}
@@ -1158,6 +1192,13 @@ jobs:
           fi
           export FLYAI_ADAPTER_TOKEN="$(python3 -c 'import hashlib,hmac,os; print(hmac.new(os.environ["FLYAI_API_KEY"].encode(), b"fusion-deploy-flyai-adapter-v1", hashlib.sha256).hexdigest(), end="")')"
           export AUTH_SERVICE_INTERNAL_BASE_URL="http://auth-service:8100"
+          expected_governance_root="${HOME}/backups/litellm-governance"
+          governance_root="${LITELLM_GOVERNANCE_ROOT_HOST:-${expected_governance_root}}"
+          if [ "${governance_root}" != "${expected_governance_root}" ]; then
+            echo "LITELLM_GOVERNANCE_ROOT_HOST 必须与 systemd 治理服务目录一致: ${expected_governance_root}"
+            exit 1
+          fi
+          export LITELLM_GOVERNANCE_ROOT_HOST="${expected_governance_root}"
           export DEPLOY_API_IMAGE="${ROLLBACK_API_IMAGE_REF}"
           export DEPLOY_ADAPTER_IMAGE="${ROLLBACK_ADAPTER_IMAGE_REF}"
 
@@ -1242,6 +1283,50 @@ jobs:
             echo "fusion-api rollback deployment smoke failed"
             docker logs --tail=120 fusion-api || true
             exit 1
+          fi
+
+          echo "Restore LiteLLM governance discovery after automatic rollback"
+          governance_current_link="${HOME}/.local/share/fusion/litellm-governance-current"
+          systemctl --user stop fusion-litellm-governance.timer >/dev/null 2>&1 || true
+          if systemctl --user is-active --quiet fusion-litellm-governance.service; then
+            echo "LiteLLM 治理周期仍在执行，无法恢复回滚前版本"
+            exit 1
+          fi
+          case "${ROLLBACK_GOVERNANCE_TIMER_ENABLED}:${ROLLBACK_GOVERNANCE_TIMER_ACTIVE}" in
+            true:true|true:false|false:true|false:false) ;;
+            *) echo "LiteLLM 治理定时器回滚状态无效"; exit 1 ;;
+          esac
+          if [ -n "${ROLLBACK_GOVERNANCE_CURRENT_TARGET}" ]; then
+            case "${ROLLBACK_GOVERNANCE_CURRENT_TARGET}" in
+              "${HOME}/.local/share/fusion/litellm-governance-src-"*) ;;
+              *) echo "LiteLLM 治理回滚版本不在受管目录中"; exit 1 ;;
+            esac
+            if [ ! -d "${ROLLBACK_GOVERNANCE_CURRENT_TARGET}" ]; then
+              echo "LiteLLM 治理回滚版本不存在: ${ROLLBACK_GOVERNANCE_CURRENT_TARGET}"
+              exit 1
+            fi
+            if [ -e "${governance_current_link}" ] && [ ! -L "${governance_current_link}" ]; then
+              echo "LiteLLM 治理当前版本路径不是符号链接，无法恢复"
+              exit 1
+            fi
+            ln -sfn "${ROLLBACK_GOVERNANCE_CURRENT_TARGET}" "${governance_current_link}"
+          elif [ -L "${governance_current_link}" ]; then
+            unlink "${governance_current_link}"
+          elif [ -e "${governance_current_link}" ]; then
+            echo "LiteLLM 治理当前版本路径不是符号链接，无法清理"
+            exit 1
+          fi
+          systemctl --user daemon-reload
+          if [ "${ROLLBACK_GOVERNANCE_TIMER_ENABLED}" = "true" ]; then
+            systemctl --user enable fusion-litellm-governance.timer
+          else
+            systemctl --user disable fusion-litellm-governance.timer >/dev/null 2>&1 || true
+          fi
+          if [ "${ROLLBACK_GOVERNANCE_TIMER_ACTIVE}" = "true" ]; then
+            systemctl --user start fusion-litellm-governance.timer
+            systemctl --user is-active --quiet fusion-litellm-governance.timer
+          else
+            systemctl --user stop fusion-litellm-governance.timer >/dev/null 2>&1 || true
           fi
 
           echo "Restore model management worker after automatic rollback"

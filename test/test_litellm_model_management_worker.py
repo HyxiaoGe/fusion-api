@@ -459,6 +459,57 @@ class ModelManagementWorkerTests(unittest.TestCase):
         self.assertTrue(payload["writes_performed"])
         self.assertTrue(payload["compensation"]["manual_cleanup_required"])
 
+    def test_spool_fsyncs_file_and_parent_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir)
+            original_fsync = os.fsync
+            with patch.object(worker.os, "fsync", wraps=original_fsync) as fsync:
+                worker._write_spool(state_dir, claim=claim_payload(), result=None)
+
+        self.assertEqual(fsync.call_count, 2)
+
+    def test_governance_is_revalidated_after_preflight_before_admission(self):
+        record = candidate_record()
+        claim = claim_payload(
+            fingerprint=record["candidate_fingerprint"],
+            model_id=record["model_id"],
+        )
+        client = RecordingClient(claim)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            acceptance_dir = Path(temp_dir)
+            os.chmod(acceptance_dir, 0o700)
+            with (
+                patch.object(
+                    worker,
+                    "_load_verified_candidate",
+                    side_effect=[record, worker.VerifiedPlanError("governance_run_changed")],
+                ) as load_candidate,
+                patch.object(
+                    worker,
+                    "run_preflight",
+                    return_value=successful_preflight(record["candidate"]),
+                ),
+                patch.object(worker, "execute_admission") as execute,
+            ):
+                result = worker.process_once(
+                    client=client,
+                    fusion_base_url="http://127.0.0.1:8002",
+                    worker_token="worker-secret",
+                    governance_root=Path("/governance"),
+                    governance_max_age_seconds=86400,
+                    litellm_base_url="http://127.0.0.1:4000",
+                    master_key="master-secret",
+                    virtual_key="virtual-secret",
+                    candidate_key="candidate-secret",
+                    acceptance_dir=acceptance_dir,
+                    environ={"MOONSHOT_API_KEY": "provider-secret"},
+                )
+
+        self.assertEqual(load_candidate.call_count, 2)
+        execute.assert_not_called()
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"]["code"], "governance_run_changed")
+
     def test_terminal_result_stays_spooled_until_api_accepts_it(self):
         client = RecordingClient(claim_payload())
         client.complete_failures = worker.COMPLETE_ATTEMPTS
