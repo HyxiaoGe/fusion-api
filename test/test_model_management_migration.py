@@ -227,6 +227,23 @@ class ModelManagementMigrationTest(unittest.TestCase):
         ):
             migration.upgrade()
 
+    def test_partial_index_string_literal_case_is_preserved(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        operation_indexes = inspector.get_indexes("model_admission_operations")
+        operation_indexes[-1]["dialect_options"] = {"postgresql_where": "status = 'RUNNING'"}
+        inspector.get_indexes.side_effect = lambda table_name: (
+            [] if table_name == "model_catalog_controls" else operation_indexes
+        )
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "索引 .* 不兼容"),
+        ):
+            migration.upgrade()
+
     def test_extra_restrictive_check_constraint_is_rejected(self):
         migration = load_migration()
         inspector = compatible_inspector()
@@ -317,6 +334,43 @@ class ModelManagementMigrationTest(unittest.TestCase):
             patch.object(migration.context, "is_offline_mode", return_value=False),
             patch.object(migration.sa, "inspect", return_value=inspector),
             self.assertRaisesRegex(RuntimeError, "默认值不兼容"),
+        ):
+            migration.upgrade()
+
+    def test_computed_column_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        operation_columns = compatible_columns("model_admission_operations")
+        next(column for column in operation_columns if column["name"] == "reason")["computed"] = {
+            "sqltext": "'legacy'",
+            "persisted": True,
+        }
+        inspector.get_columns.side_effect = lambda table_name: (
+            compatible_columns(table_name) if table_name == "model_catalog_controls" else operation_columns
+        )
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "不能是生成列或 identity 列"),
+        ):
+            migration.upgrade()
+
+    def test_identity_column_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        operation_columns = compatible_columns("model_admission_operations")
+        next(column for column in operation_columns if column["name"] == "attempts")["identity"] = {"always": True}
+        inspector.get_columns.side_effect = lambda table_name: (
+            compatible_columns(table_name) if table_name == "model_catalog_controls" else operation_columns
+        )
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "不能是生成列或 identity 列"),
         ):
             migration.upgrade()
 

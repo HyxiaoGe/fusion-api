@@ -50,14 +50,45 @@ MODEL_ADMISSION_OPERATION_COLUMNS = {
 }
 
 
-def _normalize_sql_expression(expression: object) -> str:
-    normalized = str(expression).lower()
+def _normalize_unquoted_sql(segment: str) -> str:
     normalized = re.sub(
         r"::(?:character varying|text|boolean|integer|jsonb)(?:\[\])?",
         "",
-        normalized,
+        segment,
+        flags=re.IGNORECASE,
     )
-    return re.sub(r"[\s()]", "", normalized)
+    return re.sub(r"[\s()]", "", normalized.lower())
+
+
+def _normalize_sql_expression(expression: object) -> str:
+    sql = str(expression)
+    normalized: list[str] = []
+    unquoted_start = 0
+    index = 0
+
+    while index < len(sql):
+        quote = sql[index]
+        if quote not in {"'", '"'}:
+            index += 1
+            continue
+
+        normalized.append(_normalize_unquoted_sql(sql[unquoted_start:index]))
+        quoted_end = index + 1
+        while quoted_end < len(sql):
+            if sql[quoted_end] != quote:
+                quoted_end += 1
+                continue
+            if quoted_end + 1 < len(sql) and sql[quoted_end + 1] == quote:
+                quoted_end += 2
+                continue
+            quoted_end += 1
+            break
+        normalized.append(sql[index:quoted_end])
+        index = quoted_end
+        unquoted_start = index
+
+    normalized.append(_normalize_unquoted_sql(sql[unquoted_start:]))
+    return "".join(normalized)
 
 
 def _validate_existing_table(
@@ -88,6 +119,8 @@ def _validate_existing_table(
     ) in expected_columns.items():
         column = actual_columns[column_name]
         actual_type = column["type"]
+        if column.get("computed") is not None or column.get("identity") is not None:
+            raise RuntimeError(f"已有表 {table_name}.{column_name} 不能是生成列或 identity 列")
         if not isinstance(actual_type, expected_type):
             raise RuntimeError(
                 f"已有表 {table_name}.{column_name} 的类型不兼容："

@@ -443,7 +443,7 @@ class ModelCatalogControl(Base):
 
     __tablename__ = "model_catalog_controls"
 
-    model_id = Column(String(200), primary_key=True, unique=True)
+    model_id = Column(String(200), primary_key=True)
     selectable = Column(Boolean, nullable=False, default=True, server_default="true")
     routable = Column(Boolean, nullable=False, default=True, server_default="true")
     revision = Column(Integer, nullable=False, default=1, server_default="1")

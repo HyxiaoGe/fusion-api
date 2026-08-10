@@ -32,7 +32,8 @@ class AdminAuditModelTests(unittest.TestCase):
         self.assertNotIn("DELETE FROM agent_steps", migration)
 
     def test_model_catalog_control_is_visibility_only_and_migration_never_deletes_models(self):
-        self.assertTrue(ModelCatalogControl.__table__.c.model_id.unique)
+        self.assertTrue(ModelCatalogControl.__table__.c.model_id.primary_key)
+        self.assertFalse(ModelCatalogControl.__table__.c.model_id.unique)
         self.assertIn("selectable", ModelCatalogControl.__table__.c)
         self.assertIn("routable", ModelCatalogControl.__table__.c)
         self.assertIn("revision", ModelCatalogControl.__table__.c)
