@@ -106,6 +106,20 @@ def invalidate_catalog_for_admission(
     return {"generation": generation}
 
 
+@internal_router.post("/admissions/{operation_id}/renew")
+def renew_candidate_admission_lease(
+    operation_id: str,
+    operation_lease: str = Header(..., alias="X-Operation-Lease"),
+    _worker: None = Depends(require_model_admission_worker),
+    service: ModelManagementService = Depends(get_model_management_service),
+):
+    operation = service.renew_operation_lease(
+        operation_id=operation_id,
+        lease_token=operation_lease,
+    )
+    return {"lease_expires_at": operation.lease_expires_at}
+
+
 @internal_router.post("/admissions/{operation_id}/complete")
 def complete_candidate_admission(
     operation_id: str,

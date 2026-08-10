@@ -295,6 +295,10 @@ class ModelManagementService:
         if row.status != "failed":
             self.db.rollback()
             return row
+        retry_block_reason = self._failed_operation_retry_block_reason(row.result)
+        if retry_block_reason is not None:
+            self.db.rollback()
+            raise ApiException.conflict(retry_block_reason)
         row.status = "pending"
         row.requested_by = str(admin.id)
         row.request_id = request_id
@@ -338,6 +342,20 @@ class ModelManagementService:
             row.updated_at = self.clock()
             self.db.commit()
             return generation
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def renew_operation_lease(self, *, operation_id: str, lease_token: str) -> ModelAdmissionOperation:
+        """续租仍由当前 Worker 持有且尚未过期的准入操作。"""
+        try:
+            row = self._lock_running_operation(operation_id, lease_token)
+            now = self.clock()
+            row.lease_expires_at = now + timedelta(seconds=max(self.config.lease_seconds, 600))
+            row.updated_at = now
+            self.db.commit()
+            self.db.refresh(row)
+            return row
         except Exception:
             self.db.rollback()
             raise
@@ -573,6 +591,7 @@ class ModelManagementService:
                 "attempted",
                 "key_restored",
                 "model_deleted",
+                "catalog_invalidated",
                 "model_ownership_unverified",
                 "manual_cleanup_required",
                 "errors",
@@ -588,6 +607,38 @@ class ModelManagementService:
             "writes_performed": bool(writes_performed),
             "compensation": safe_compensation,
         }
+
+    @staticmethod
+    def _failed_operation_retry_block_reason(result: Any) -> str | None:
+        """仅允许无外部写入或已有完整补偿证据的失败操作重试。"""
+        safe_result = result if isinstance(result, Mapping) else {}
+        if not bool(safe_result.get("writes_performed")):
+            return None
+        compensation = safe_result.get("compensation")
+        compensation = compensation if isinstance(compensation, Mapping) else {}
+        if bool(compensation.get("manual_cleanup_required")):
+            return "准入操作需要人工清理，禁止直接重试"
+        errors = compensation.get("errors")
+        completed_phases = {
+            str(item)
+            for item in (safe_result.get("completed_phases") or [])
+            if isinstance(item, str)
+        }
+        model_was_created = "model_new" in completed_phases
+        key_was_updated = "key_update" in completed_phases
+        compensation_complete = (
+            bool(compensation.get("attempted"))
+            and not bool(compensation.get("model_ownership_unverified"))
+            and isinstance(errors, list)
+            and not errors
+            and model_was_created
+            and bool(compensation.get("model_deleted"))
+            and (not key_was_updated or bool(compensation.get("key_restored")))
+            and bool(compensation.get("catalog_invalidated"))
+        )
+        if compensation_complete:
+            return None
+        return "准入操作已执行外部写入且未证明完整补偿，禁止直接重试"
 
     def _candidate_item(
         self,

@@ -12,6 +12,7 @@ import os
 import stat
 import sys
 import tempfile
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -45,6 +46,7 @@ WORKER_TOKEN_HEADER = "X-Fusion-Worker-Token"
 LEASE_TOKEN_HEADER = "X-Operation-Lease"
 COMPLETE_ATTEMPTS = 3
 COMPLETE_RETRY_SECONDS = 2.0
+LEASE_RENEW_INTERVAL_SECONDS = 60.0
 
 
 class WorkerProtocolError(RuntimeError):
@@ -53,6 +55,72 @@ class WorkerProtocolError(RuntimeError):
 
 class StaleOperationLeaseError(WorkerProtocolError):
     """恢复记录的旧租约已不能提交，必须隔离后继续处理队列。"""
+
+
+class OperationLeaseHeartbeat:
+    """在长时预检与准入事务期间持续续租，并向主流程传播续租失败。"""
+
+    def __init__(
+        self,
+        client: Any,
+        *,
+        fusion_base_url: str,
+        worker_token: str,
+        operation_id: str,
+        lease_token: str,
+        interval_seconds: float = LEASE_RENEW_INTERVAL_SECONDS,
+    ) -> None:
+        self.client = client
+        self.endpoint = (
+            f"{fusion_base_url.rstrip('/')}/api/internal/model-management/admissions/"
+            f"{quote(operation_id, safe='')}/renew"
+        )
+        self.headers = _worker_headers(worker_token, lease_token)
+        self.interval_seconds = interval_seconds
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._error: Exception | None = None
+        self._error_lock = threading.Lock()
+
+    def renew(self) -> None:
+        try:
+            response = self.client.post(self.endpoint, headers=self.headers, timeout=10.0)
+            if response.status_code == 409:
+                raise StaleOperationLeaseError("operation_lease_stale")
+            response.raise_for_status()
+        except StaleOperationLeaseError:
+            raise
+        except Exception as exc:
+            raise WorkerProtocolError("operation_lease_renewal_failed") from exc
+
+    def start(self) -> None:
+        self.renew()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="model-admission-lease-heartbeat",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self.interval_seconds):
+            try:
+                self.renew()
+            except Exception as exc:
+                with self._error_lock:
+                    self._error = exc
+                return
+
+    def ensure_healthy(self) -> None:
+        with self._error_lock:
+            error = self._error
+        if error is not None:
+            raise error
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
 
 
 def validate_governance_freshness(
@@ -193,6 +261,7 @@ def _safe_result(result: Mapping[str, Any]) -> dict[str, Any]:
             "attempted": bool(compensation.get("attempted")),
             "key_restored": bool(compensation.get("key_restored")),
             "model_deleted": bool(compensation.get("model_deleted")),
+            "catalog_invalidated": bool(compensation.get("catalog_invalidated")),
             "model_ownership_unverified": bool(compensation.get("model_ownership_unverified")),
             "manual_cleanup_required": bool(compensation.get("manual_cleanup_required")),
             "errors": [str(item)[:120] for item in (compensation_errors or []) if isinstance(item, str)],
@@ -573,71 +642,86 @@ def process_once(
     if claim is None:
         return {"status": "idle"}
     spool_path = _write_spool(state_dir, claim=claim, result=None) if state_dir is not None else None
+    heartbeat = OperationLeaseHeartbeat(
+        client,
+        fusion_base_url=fusion_base_url,
+        worker_token=worker_token,
+        operation_id=claim["operation_id"],
+        lease_token=claim["lease_token"],
+    )
+    heartbeat.start()
     try:
-        candidate_record = _load_verified_candidate(
-            governance_root=governance_root,
-            expected_run_id=claim["run_id"],
-            candidate_fingerprint=claim["candidate_fingerprint"],
-            model_id=claim["model_id"],
-            max_age_seconds=governance_max_age_seconds,
-        )
-        if candidate_record.get("state") == "admission_ready":
-            plan = load_verified_admission_plan(
-                governance_root=governance_root,
-                candidate_fingerprint=claim["candidate_fingerprint"],
-            )
-        else:
-            if acceptance_dir is None:
-                raise VerifiedPlanError("candidate_acceptance_directory_missing")
-            plan = _run_candidate_preflight_and_build_plan(
-                record=candidate_record,
-                expected_run_id=claim["run_id"],
-                candidate_fingerprint=claim["candidate_fingerprint"],
-                model_id=claim["model_id"],
-                litellm_base_url=litellm_base_url,
-                candidate_key=candidate_key,
-                acceptance_dir=acceptance_dir,
-                client=client,
-            )
-    except VerifiedPlanError as exc:
-        result = _verification_failure(exc.code)
-    else:
         try:
-            _load_verified_candidate(
+            candidate_record = _load_verified_candidate(
                 governance_root=governance_root,
                 expected_run_id=claim["run_id"],
                 candidate_fingerprint=claim["candidate_fingerprint"],
                 model_id=claim["model_id"],
                 max_age_seconds=governance_max_age_seconds,
             )
+            if candidate_record.get("state") == "admission_ready":
+                plan = load_verified_admission_plan(
+                    governance_root=governance_root,
+                    candidate_fingerprint=claim["candidate_fingerprint"],
+                )
+            else:
+                if acceptance_dir is None:
+                    raise VerifiedPlanError("candidate_acceptance_directory_missing")
+                plan = _run_candidate_preflight_and_build_plan(
+                    record=candidate_record,
+                    expected_run_id=claim["run_id"],
+                    candidate_fingerprint=claim["candidate_fingerprint"],
+                    model_id=claim["model_id"],
+                    litellm_base_url=litellm_base_url,
+                    candidate_key=candidate_key,
+                    acceptance_dir=acceptance_dir,
+                    client=client,
+                )
         except VerifiedPlanError as exc:
             result = _verification_failure(exc.code)
         else:
-
-            def invalidate_catalog() -> None:
-                operation_path = quote(claim["operation_id"], safe="")
-                response = client.post(
-                    f"{fusion_base_url.rstrip('/')}/api/internal/model-management/admissions/"
-                    f"{operation_path}/invalidate-catalog",
-                    headers=_worker_headers(worker_token, claim["lease_token"]),
-                    timeout=10.0,
+            try:
+                _load_verified_candidate(
+                    governance_root=governance_root,
+                    expected_run_id=claim["run_id"],
+                    candidate_fingerprint=claim["candidate_fingerprint"],
+                    model_id=claim["model_id"],
+                    max_age_seconds=governance_max_age_seconds,
                 )
-                response.raise_for_status()
+            except VerifiedPlanError as exc:
+                result = _verification_failure(exc.code)
+            else:
 
-            result = execute_admission(
-                plan=plan,
-                apply=True,
-                expected_run_id=claim["run_id"],
-                confirm_model_id=claim["model_id"],
-                confirm_fingerprint=claim["candidate_fingerprint"],
-                litellm_base_url=litellm_base_url,
-                fusion_base_url=fusion_base_url,
-                master_key=master_key,
-                virtual_key=virtual_key,
-                environ=environ,
-                client=client,
-                catalog_invalidation_fn=invalidate_catalog,
-            )
+                def invalidate_catalog() -> None:
+                    heartbeat.ensure_healthy()
+                    operation_path = quote(claim["operation_id"], safe="")
+                    response = client.post(
+                        f"{fusion_base_url.rstrip('/')}/api/internal/model-management/admissions/"
+                        f"{operation_path}/invalidate-catalog",
+                        headers=_worker_headers(worker_token, claim["lease_token"]),
+                        timeout=10.0,
+                    )
+                    response.raise_for_status()
+
+                heartbeat.ensure_healthy()
+                result = execute_admission(
+                    plan=plan,
+                    apply=True,
+                    expected_run_id=claim["run_id"],
+                    confirm_model_id=claim["model_id"],
+                    confirm_fingerprint=claim["candidate_fingerprint"],
+                    litellm_base_url=litellm_base_url,
+                    fusion_base_url=fusion_base_url,
+                    master_key=master_key,
+                    virtual_key=virtual_key,
+                    environ=environ,
+                    client=client,
+                    catalog_invalidation_fn=invalidate_catalog,
+                )
+        heartbeat.ensure_healthy()
+        heartbeat.renew()
+    finally:
+        heartbeat.stop()
     if state_dir is not None:
         spool_path = _write_spool(state_dir, claim=claim, result=result)
     _complete(

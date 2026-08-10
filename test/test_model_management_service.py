@@ -408,7 +408,11 @@ class ModelManagementServiceTests(unittest.TestCase):
         created.lease_token_hash = "old"
         created.lease_expires_at = self.now
         created.catalog_invalidated_at = self.now
-        created.result = {"phase": "failed", "secret": "do-not-project"}
+        created.result = {
+            "phase": "failed",
+            "writes_performed": False,
+            "secret": "do-not-project",
+        }
         created.terminal_at = self.now
         self.db.commit()
 
@@ -419,6 +423,53 @@ class ModelManagementServiceTests(unittest.TestCase):
         self.assertIsNone(retried.lease_token_hash)
         self.assertEqual(retried.result, {})
         self.assertEqual(self.db.query(AdminAuditEvent).count(), 2)
+
+    def test_failed_admission_retry_preserves_manual_cleanup_and_requires_complete_compensation(self):
+        service = self.build_service()
+        created = self._request_admission(service)
+        created.status = "failed"
+        created.result = {
+            "completed_phases": ["model_new", "key_update"],
+            "writes_performed": True,
+            "compensation": {
+                "attempted": True,
+                "key_restored": False,
+                "model_deleted": True,
+                "catalog_invalidated": True,
+                "model_ownership_unverified": False,
+                "manual_cleanup_required": True,
+                "errors": ["rollback_key_failed"],
+            },
+        }
+        created.terminal_at = self.now
+        self.db.commit()
+
+        with self.assertRaises(ApiException) as manual_cleanup:
+            self._request_admission(service, request_id="req-manual-cleanup")
+
+        self.assertEqual(manual_cleanup.exception.status_code, 409)
+        self.db.refresh(created)
+        self.assertEqual(created.status, "failed")
+        self.assertTrue(created.result["compensation"]["manual_cleanup_required"])
+
+        created.result = {
+            **created.result,
+            "compensation": {
+                "attempted": True,
+                "key_restored": True,
+                "model_deleted": True,
+                "catalog_invalidated": True,
+                "model_ownership_unverified": False,
+                "manual_cleanup_required": False,
+                "errors": [],
+            },
+        }
+        self.db.commit()
+
+        retried = self._request_admission(service, request_id="req-compensated")
+
+        self.assertEqual(retried.status, "pending")
+        self.assertEqual(retried.result, {})
 
     def test_preflight_required_candidate_can_request_validation_and_publish_without_existing_plan(self):
         self.queue[0]["state"] = "preflight_required"
@@ -540,6 +591,24 @@ class ModelManagementServiceTests(unittest.TestCase):
         self.assertEqual(completed.id, repeated.id)
         self.assertNotIn("private_detail", completed.result["compensation"])
         self.assertEqual(self.db.query(AdminAuditEvent).count(), 2)
+
+    def test_worker_can_renew_only_current_unexpired_lease(self):
+        clock = Mock(return_value=self.now)
+        service = self.build_service(clock=clock, config={"lease_seconds": 600})
+        self._request_admission(service)
+        operation, lease_token = service.claim_operation()
+        first_expiry = service._as_utc(operation.lease_expires_at)
+        clock.return_value = self.now + timedelta(minutes=5)
+
+        renewed = service.renew_operation_lease(
+            operation_id=operation.id,
+            lease_token=lease_token,
+        )
+
+        self.assertGreater(service._as_utc(renewed.lease_expires_at), first_expiry)
+        with self.assertRaises(ApiException) as stale:
+            service.renew_operation_lease(operation_id=operation.id, lease_token="wrong-token")
+        self.assertEqual(stale.exception.status_code, 409)
 
     def test_expired_lease_can_complete_until_operation_is_reclaimed(self):
         service = self.build_service()

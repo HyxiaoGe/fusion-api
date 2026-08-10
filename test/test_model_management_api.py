@@ -112,6 +112,11 @@ class FakeModelManagementService:
         self.calls.append(("invalidate", kwargs))
         return "42"
 
+    def renew_operation_lease(self, **kwargs):
+        self.calls.append(("renew", kwargs))
+        self.operation.lease_expires_at = "2026-08-04T01:12:03+00:00"
+        return self.operation
+
     def complete_operation(self, **kwargs):
         self.calls.append(("complete", kwargs))
         self.operation.status = kwargs["status"]
@@ -283,6 +288,12 @@ class ModelManagementApiTests(unittest.TestCase):
             headers={**worker_headers, "X-Operation-Lease": "one-time-lease"},
         )
         self.assertEqual(invalidated.json(), {"generation": "42"})
+
+        renewed = self.client.post(
+            "/api/internal/model-management/admissions/operation-1/renew",
+            headers={**worker_headers, "X-Operation-Lease": "one-time-lease"},
+        )
+        self.assertEqual(renewed.json(), {"lease_expires_at": "2026-08-04T01:12:03+00:00"})
 
         completed = self.client.post(
             "/api/internal/model-management/admissions/operation-1/complete",

@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event
 from unittest.mock import patch
 
 from scripts import run_litellm_model_management_worker as worker
@@ -38,6 +39,8 @@ class RecordingClient:
         self.calls = []
         self.complete_failures = 0
         self.stale_complete_operation_ids: set[str] = set()
+        self.renew_calls = 0
+        self.renewed_twice = Event()
 
     def post(self, url, **kwargs):
         self.calls.append((url, kwargs))
@@ -47,6 +50,11 @@ class RecordingClient:
             return FakeResponse(self.claim_payload)
         if url.endswith("/invalidate-catalog"):
             return FakeResponse({"generation": "9"})
+        if url.endswith("/renew"):
+            self.renew_calls += 1
+            if self.renew_calls >= 2:
+                self.renewed_twice.set()
+            return FakeResponse({"lease_expires_at": "2026-08-04T01:12:03+00:00"})
         if url.endswith("/complete"):
             if any(f"/{operation_id}/complete" in url for operation_id in self.stale_complete_operation_ids):
                 return FakeResponse({"detail": "stale lease"}, status_code=409)
@@ -166,6 +174,7 @@ def succeeded_result():
             "attempted": False,
             "key_restored": False,
             "model_deleted": False,
+            "catalog_invalidated": False,
             "model_ownership_unverified": False,
             "manual_cleanup_required": False,
             "errors": [],
@@ -174,6 +183,26 @@ def succeeded_result():
 
 
 class ModelManagementWorkerTests(unittest.TestCase):
+    def test_lease_heartbeat_renews_during_long_running_operation(self):
+        client = RecordingClient(claim_payload())
+        heartbeat = worker.OperationLeaseHeartbeat(
+            client,
+            fusion_base_url="http://127.0.0.1:8002",
+            worker_token="worker-secret",
+            operation_id="op-123",
+            lease_token="lease-secret",
+            interval_seconds=0.01,
+        )
+
+        heartbeat.start()
+        try:
+            self.assertTrue(client.renewed_twice.wait(timeout=0.5))
+            heartbeat.ensure_healthy()
+        finally:
+            heartbeat.stop()
+
+        self.assertGreaterEqual(client.renew_calls, 2)
+
     def test_preflight_required_runs_real_preflight_writes_redacted_acceptance_then_admits(self):
         record = candidate_record()
         claim = claim_payload(
