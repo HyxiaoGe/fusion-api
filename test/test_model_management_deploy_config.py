@@ -101,18 +101,30 @@ class ModelManagementDeployConfigTests(unittest.TestCase):
             workflow.index("Restore model management worker for manual rollback"),
         )
         self.assertEqual(
-            rollback_step["env"]["DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED"],
-            "${{ vars.LITELLM_MODEL_MANAGEMENT_ENABLED || 'false' }}",
+            rollback_step["env"]["ROLLBACK_LITELLM_MODEL_MANAGEMENT_ENABLED"],
+            "${{ steps.capture_rollback_target.outputs.model_management_enabled }}",
         )
         self.assertEqual(
-            rollback_step["env"]["DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED"],
-            "${{ vars.LITELLM_MODEL_ADMISSION_WORKER_ENABLED || 'false' }}",
+            rollback_step["env"]["ROLLBACK_LITELLM_MODEL_ADMISSION_WORKER_ENABLED"],
+            "${{ steps.capture_rollback_target.outputs.model_admission_worker_enabled }}",
         )
         self.assertIn(
             "export LITELLM_MODEL_MANAGEMENT_ENABLED=\"$(printf '%s' "
-            "\"${DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED:-false}\" | tr '[:upper:]' '[:lower:]')\"",
+            "\"${ROLLBACK_LITELLM_MODEL_MANAGEMENT_ENABLED}\" | tr '[:upper:]' '[:lower:]')\"",
             rollback_step["run"],
         )
+        self.assertIn("capture_container_bool_env()", workflow)
+        self.assertIn(
+            'rollback_model_management_enabled="$(capture_container_bool_env LITELLM_MODEL_MANAGEMENT_ENABLED)"',
+            workflow,
+        )
+        self.assertIn(
+            'rollback_model_admission_worker_enabled="$(capture_container_bool_env '
+            'LITELLM_MODEL_ADMISSION_WORKER_ENABLED)"',
+            workflow,
+        )
+        self.assertIn('"model_management_enabled=${rollback_model_management_enabled}"', workflow)
+        self.assertIn('"model_admission_worker_enabled=${rollback_model_admission_worker_enabled}"', workflow)
 
     def test_dev_deploy_manages_discovery_registry_and_governance_timer(self):
         workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")

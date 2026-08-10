@@ -253,6 +253,36 @@ jobs:
             exit 1
           fi
 
+          capture_container_bool_env() {
+            key="$1"
+            docker inspect fusion-api --format '{{json .Config.Env}}' | python3 -c '
+          import json
+          import sys
+
+          key = sys.argv[1]
+          entries = json.load(sys.stdin)
+          values = [entry.split("=", 1)[1] for entry in entries if entry.startswith(f"{key}=")]
+          if len(values) > 1:
+              raise SystemExit("duplicate container boolean environment")
+          value = values[0].strip().lower() if values else "false"
+          if value not in {"true", "false"}:
+              raise SystemExit("invalid container boolean environment")
+          print(value)
+          ' "${key}"
+          }
+          rollback_model_management_enabled="$(capture_container_bool_env LITELLM_MODEL_MANAGEMENT_ENABLED)" || {
+            echo "无法读取部署前的模型管理开关"
+            exit 1
+          }
+          rollback_model_admission_worker_enabled="$(capture_container_bool_env LITELLM_MODEL_ADMISSION_WORKER_ENABLED)" || {
+            echo "无法读取部署前的模型准入 Worker 开关"
+            exit 1
+          }
+          case "${rollback_model_management_enabled}:${rollback_model_admission_worker_enabled}" in
+            true:true|true:false|false:false) ;;
+            *) echo "部署前的模型管理开关组合无效，拒绝在无法安全回滚时部署"; exit 1 ;;
+          esac
+
           model_management_current_link="${HOME}/.local/share/fusion/litellm-model-management-current"
           model_management_current_target=""
           if [ -L "${model_management_current_link}" ]; then
@@ -345,6 +375,8 @@ jobs:
             printf '%s\n' "api_image_id=${api_image_id}"
             printf '%s\n' "adapter_image_ref=${adapter_image_ref}"
             printf '%s\n' "adapter_image_id=${adapter_image_id}"
+            printf '%s\n' "model_management_enabled=${rollback_model_management_enabled}"
+            printf '%s\n' "model_admission_worker_enabled=${rollback_model_admission_worker_enabled}"
             printf '%s\n' "model_management_current_target=${model_management_current_target}"
             printf '%s\n' "model_management_timer_enabled=${model_management_timer_enabled}"
             printf '%s\n' "model_management_timer_active=${model_management_timer_active}"
@@ -1215,8 +1247,8 @@ jobs:
           DEPLOY_DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           DEPLOY_AMAP_MCP_API_KEY: ${{ secrets.AMAP_MCP_API_KEY }}
           DEPLOY_FLYAI_API_KEY: ${{ secrets.FLYAI_API_KEY }}
-          DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED: ${{ vars.LITELLM_MODEL_MANAGEMENT_ENABLED || 'false' }}
-          DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED: ${{ vars.LITELLM_MODEL_ADMISSION_WORKER_ENABLED || 'false' }}
+          ROLLBACK_LITELLM_MODEL_MANAGEMENT_ENABLED: ${{ steps.capture_rollback_target.outputs.model_management_enabled }}
+          ROLLBACK_LITELLM_MODEL_ADMISSION_WORKER_ENABLED: ${{ steps.capture_rollback_target.outputs.model_admission_worker_enabled }}
           DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS: ${{ vars.LITELLM_GOVERNANCE_MAX_AGE_SECONDS || '86400' }}
           DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN: ${{ secrets.LITELLM_MODEL_ADMISSION_WORKER_TOKEN }}
         run: |
@@ -1244,8 +1276,8 @@ jobs:
           export MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS="${DEPLOY_MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS:-${MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS:-30}}"
           export DASHSCOPE_API_KEY="${DEPLOY_DASHSCOPE_API_KEY:-${DASHSCOPE_API_KEY:-}}"
           export AMAP_MCP_API_KEY="${DEPLOY_AMAP_MCP_API_KEY:-${AMAP_MCP_API_KEY:-}}"
-          export LITELLM_MODEL_MANAGEMENT_ENABLED="$(printf '%s' "${DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')"
-          export LITELLM_MODEL_ADMISSION_WORKER_ENABLED="$(printf '%s' "${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')"
+          export LITELLM_MODEL_MANAGEMENT_ENABLED="$(printf '%s' "${ROLLBACK_LITELLM_MODEL_MANAGEMENT_ENABLED}" | tr '[:upper:]' '[:lower:]')"
+          export LITELLM_MODEL_ADMISSION_WORKER_ENABLED="$(printf '%s' "${ROLLBACK_LITELLM_MODEL_ADMISSION_WORKER_ENABLED}" | tr '[:upper:]' '[:lower:]')"
           export LITELLM_GOVERNANCE_MAX_AGE_SECONDS="${DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS:-86400}"
           export LITELLM_MODEL_ADMISSION_WORKER_TOKEN="${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN:-}"
           case "${LITELLM_GOVERNANCE_MAX_AGE_SECONDS}" in

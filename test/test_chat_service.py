@@ -148,10 +148,6 @@ class ChatServiceTests(unittest.TestCase):
                 return_value={"availability": "degraded", "has_cache": False},
             ),
             patch(
-                "app.services.chat_service.llm_manager.resolve_model",
-                return_value=("openai/fallback-model", "fallback", {}),
-            ) as resolve_model,
-            patch(
                 "app.services.chat_service.litellm_catalog.get_capabilities",
                 return_value={"functionCalling": True, "searchCapable": True},
             ),
@@ -169,7 +165,6 @@ class ChatServiceTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.status_code, 400)
         self.assertNotEqual(raised.exception.code, "MODEL_UNAVAILABLE")
-        resolve_model.assert_called_once_with("fallback/model")
         service._get_or_create_conversation.assert_not_called()
 
     def test_empty_upload_placeholder_still_rejects_hidden_model_for_first_message(self):

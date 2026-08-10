@@ -46,11 +46,13 @@ class LLMManager:
             - kwargs: 含 api_key/api_base，让 litellm 走 fusion 的 LiteLLM Proxy
 
         Raises:
-            ValueError: alias 不在 LiteLLM 目录里
+            ValueError: 可用目录确认 alias 不存在，或降级时已有缓存且 alias 不在其中
         """
         entry = litellm_catalog.get_model_entry(model_id)
         if not entry:
-            raise ValueError(f"未找到模型: {model_id}（不在 LiteLLM Proxy 注册表里）")
+            catalog_status = litellm_catalog.get_cache_status()
+            if catalog_status.get("availability") == "available" or catalog_status.get("has_cache"):
+                raise ValueError(f"未找到模型: {model_id}（不在 LiteLLM Proxy 注册表里）")
 
         provider = litellm_catalog.get_underlying_provider(model_id, fallback="litellm")
 
