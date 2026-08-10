@@ -306,9 +306,7 @@ def _write_acceptance_atomic(
     except (OSError, TypeError, ValueError) as exc:
         raise VerifiedPlanError("candidate_acceptance_write_failed") from exc
     if existing is not None and (
-        not stat.S_ISREG(existing.st_mode)
-        or existing.st_uid != os.getuid()
-        or stat.S_IMODE(existing.st_mode) & 0o177
+        not stat.S_ISREG(existing.st_mode) or existing.st_uid != os.getuid() or stat.S_IMODE(existing.st_mode) & 0o177
     ):
         raise VerifiedPlanError("candidate_acceptance_file_insecure")
 

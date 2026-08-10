@@ -828,8 +828,7 @@ def _entry_matches_expected(entry: Mapping[str, Any], payload: Mapping[str, Any]
     actual_costs = {key: info.get(key) for key in expected_costs}
     expected_max_input_tokens = expected_info.get("max_input_tokens")
     max_input_tokens_match = (
-        "max_input_tokens" not in expected_info
-        or info.get("max_input_tokens") == expected_max_input_tokens
+        "max_input_tokens" not in expected_info or info.get("max_input_tokens") == expected_max_input_tokens
     )
     return (
         entry.get("model_name") == payload.get("model_name")

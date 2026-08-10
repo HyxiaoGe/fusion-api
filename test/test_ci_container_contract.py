@@ -42,15 +42,32 @@ class CIContainerContractTest(unittest.TestCase):
         self.assertNotIn("ruff", production)
         self.assertNotRegex(dockerfile, r"(?m)^\s*git\s*\\?\s*$")
 
-    def test_windows_workflow_tests_ephemeral_production_container(self) -> None:
-        workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
-        build_job = workflow[workflow.index("  build:") : workflow.index("  deploy-dev:")]
+    def test_pr_and_release_workflows_run_equivalent_container_tests(self) -> None:
+        release_workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
+        pr_workflow = (ROOT / ".github/workflows/pr-ci.yml").read_text(encoding="utf-8")
+        windows_build_script = (ROOT / ".github/scripts/windows-build-and-test.ps1").read_text(encoding="utf-8")
+        linux_build_script = (ROOT / ".github/scripts/linux-build-and-test.sh").read_text(encoding="utf-8")
 
-        self.assertIn("docker build --target production", build_job)
-        self.assertIn("pip install --default-timeout=30 --no-cache-dir -r requirements-ci.txt", build_job)
-        self.assertIn("python scripts/check_architecture.py", build_job)
-        self.assertIn("ruff check .", build_job)
-        self.assertIn("python -u -m unittest discover -s test -t . -v", build_job)
+        self.assertIn(".github/scripts/windows-build-and-test.ps1", release_workflow)
+        self.assertIn(".github/scripts/linux-build-and-test.sh", pr_workflow)
+        for build_script in (windows_build_script, linux_build_script):
+            self.assertIn("docker build --target production", build_script)
+            self.assertIn(
+                "pip install --default-timeout=30 --no-cache-dir -r requirements-ci.txt",
+                build_script,
+            )
+            self.assertIn("python scripts/check_architecture.py", build_script)
+            self.assertIn("ruff check .", build_script)
+            self.assertIn("python -u -m unittest discover -s test -t . -v", build_script)
+
+        self.assertIn(
+            '--mount "type=bind,source=${PWD}/README.md,target=/app/README.md,readonly"',
+            linux_build_script,
+        )
+        self.assertIn(
+            '--mount "type=bind,source=$((Get-Location).Path)\\README.md,target=/app/README.md,readonly"',
+            windows_build_script,
+        )
 
 
 if __name__ == "__main__":

@@ -36,6 +36,12 @@ docker-compose up -d                     # Docker 启动
 10. **CI/CD 收尾**：按正常 Git 流程中文提交并包含 `Co-Authored-By`，push 后持续监控 GitHub Actions 和 dev 部署；失败时拉日志定位并修复。
 11. **下一步建议必须查执行记录**：用户问“下一步”“接下来做什么”“还有什么优化”“还能怎么加强”时，必须先读 [docs/EXECUTION_LEDGER.md](docs/EXECUTION_LEDGER.md)，再查 `fusion-api` / `fusion-ui` 最近 `git log` 和相关 `docs/superpowers`。禁止凭 memory 或印象回答，禁止重复建议台账里已经完成的方向。可使用 repo skill `fusion-next-step`。
 
+## Code Review Rules
+
+- 只报告本 PR 引入且有具体触发路径和实际影响的问题，尤其关注正确性、性能、安全、兼容、可维护性与发布风险；核对失败/回滚路径与测试能否拒绝错误实现，忽略风格、既有问题和无影响猜测。
+- 保持 `API → Service → AI → Data` 单向依赖，禁止数据库、AI 或 Service 层反向依赖上层。
+- 聊天流改动必须保持后台生成与 HTTP 连接解耦、Redis Stream 断点续读和终态持久化；客户端断线不得取消后台生成。
+
 ## 常见开发任务
 
 - **添加新 LLM 提供商** → [docs/DEVELOPMENT_GUIDE.md](docs/DEVELOPMENT_GUIDE.md#添加新-llm-提供商)

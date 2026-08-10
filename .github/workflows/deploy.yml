@@ -2,14 +2,25 @@ name: Fusion API Windows CI
 
 on:
   push:
+    branches: [master]
   workflow_dispatch:
+    inputs:
+      rollback_sha:
+        description: 要恢复的已发布镜像 SHA（40 位小写 Git SHA；留空表示正常发布）
+        required: false
+        type: string
+      rollback_reason:
+        description: 手动回滚原因（填写 rollback_sha 时必填）
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
   group: fusion-api-windows-ci-${{ github.ref }}
-  cancel-in-progress: true
+  # 发布可能正在执行 Alembic 或容器重启，后续 push 只能排队，不能中途取消。
+  cancel-in-progress: false
 
 # 镜像源:阿里云 ACR 个人版(深圳,境内端点);改仓名只动 IMAGE_NAME 一行
 env:
@@ -18,10 +29,64 @@ env:
   FLYAI_ADAPTER_IMAGE_NAME: crpi-77w10wlykpqilmmb.cn-shenzhen.personal.cr.aliyuncs.com/seanfield/fusion-flyai-adapter
 
 jobs:
-  build:
-    name: Build on Windows runner
+  prepare:
+    name: Validate deployment request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      started_at: ${{ steps.deployment_request.outputs.started_at }}
+      target_sha: ${{ steps.deployment_request.outputs.target_sha }}
+      rollback_requested: ${{ steps.deployment_request.outputs.rollback_requested }}
+
+    steps:
+      - name: Validate deployment request
+        id: deployment_request
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_ROLLBACK_SHA: ${{ github.event.inputs.rollback_sha }}
+          REQUESTED_ROLLBACK_REASON: ${{ github.event.inputs.rollback_reason }}
+        run: |
+          rollback_sha="${REQUESTED_ROLLBACK_SHA:-}"
+          rollback_reason="${REQUESTED_ROLLBACK_REASON:-}"
+          target_sha="${GITHUB_SHA}"
+          rollback_requested="false"
+
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            if [ -n "${rollback_sha}" ]; then
+              if [[ ! "${rollback_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "rollback_sha 必须是 40 位小写 Git SHA"
+                exit 1
+              fi
+              if [[ ! "${rollback_reason}" =~ [^[:space:]] ]]; then
+                echo "填写 rollback_sha 时 rollback_reason 必填"
+                exit 1
+              fi
+              target_sha="${rollback_sha}"
+              rollback_requested="true"
+            elif [[ "${rollback_reason}" =~ [^[:space:]] ]]; then
+              echo "rollback_reason 不能在 rollback_sha 为空时单独填写"
+              exit 1
+            fi
+          elif [ -n "${rollback_sha}" ] || [[ "${rollback_reason}" =~ [^[:space:]] ]]; then
+            echo "push 事件不得携带手动回滚参数"
+            exit 1
+          fi
+
+          {
+            printf '%s\n' "started_at=$(date +%s)"
+            printf '%s\n' "target_sha=${target_sha}"
+            printf '%s\n' "rollback_requested=${rollback_requested}"
+          } >> "${GITHUB_OUTPUT}"
+
+  publish:
+    name: Publish master images on Windows runner
+    if: github.ref == 'refs/heads/master' && needs.prepare.outputs.rollback_requested != 'true'
+    needs: prepare
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 40
+    environment:
+      name: dev
+      deployment: false
     outputs:
       started_at: ${{ steps.pipeline_start.outputs.started_at }}
       runner_name: ${{ steps.pipeline_start.outputs.runner_name }}
@@ -70,7 +135,9 @@ jobs:
           }
 
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: Verify Docker access
         run: |
@@ -81,28 +148,19 @@ jobs:
         timeout-minutes: 15
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
-          $ErrorActionPreference = "Stop"
-          $image = "${env:IMAGE_NAME}:${env:GITHUB_SHA}"
-          $adapterImage = "${env:FLYAI_ADAPTER_IMAGE_NAME}:${env:GITHUB_SHA}"
-
-          docker build --target production -t $image .
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          docker run --rm $image sh -lc "timeout 300s python -m pip install --default-timeout=30 --no-cache-dir -r requirements-ci.txt && python scripts/check_architecture.py && ruff check . && timeout 270s python -u -m unittest discover -s test -t . -v"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          docker build --target test -t "${adapterImage}-test" ./flyai-adapter
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          docker build --target production -t $adapterImage ./flyai-adapter
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ".github/scripts/windows-build-and-test.ps1" `
+            -ImageName "${env:IMAGE_NAME}" `
+            -AdapterImageName "${env:FLYAI_ADAPTER_IMAGE_NAME}" `
+            -ImageTag "${env:GITHUB_SHA}"
 
       - name: Login to ACR
-        uses: docker/login-action@v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
+          # 凭据目录由 always cleanup 统一删除，避免 post-action 在目录删除后重新创建。
+          logout: false
 
       - name: Push Docker image
         run: |
@@ -111,25 +169,120 @@ jobs:
 
       - name: Cleanup local Docker artifacts
         if: always()
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
-          docker image rm "%IMAGE_NAME%:%GITHUB_SHA%" 2>NUL
-          docker image rm "%FLYAI_ADAPTER_IMAGE_NAME%:%GITHUB_SHA%" 2>NUL
-          docker image rm "%FLYAI_ADAPTER_IMAGE_NAME%:%GITHUB_SHA%-test" 2>NUL
-          docker builder prune --filter "until=72h" -f
+          & ".github/scripts/windows-cleanup.ps1" `
+            -ImageName "${env:IMAGE_NAME}" `
+            -AdapterImageName "${env:FLYAI_ADAPTER_IMAGE_NAME}" `
+            -ImageTag "${env:GITHUB_SHA}"
 
   deploy-dev:
     name: Deploy master on dev server
-    if: github.ref == 'refs/heads/master'
-    needs: build
+    if: >-
+      ${{ always() && github.ref == 'refs/heads/master' &&
+      needs.prepare.result == 'success' &&
+      ((needs.prepare.outputs.rollback_requested == 'true' && needs.publish.result == 'skipped') ||
+      (needs.prepare.outputs.rollback_requested != 'true' && needs.publish.result == 'success')) }}
+    needs: [prepare, publish]
     runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 10
+    timeout-minutes: 15
+    environment: dev
+    env:
+      DEPLOY_TARGET_SHA: ${{ needs.prepare.outputs.target_sha }}
 
     steps:
       - name: Record deploy start time
         run: echo "DEPLOY_START=$(date +%s)" >> "$GITHUB_ENV"
 
       - name: Checkout smoke scripts
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Configure Docker credential directory
+        run: |
+          docker_config="${RUNNER_TEMP}/.docker-${GITHUB_RUN_ID}-${GITHUB_JOB}"
+          case "${docker_config}" in
+            "${RUNNER_TEMP}"/.docker-*) ;;
+            *) echo "Docker 凭据目录未落在 RUNNER_TEMP 的隔离路径中"; exit 1 ;;
+          esac
+          mkdir -p -- "${docker_config}"
+          printf '%s\n' "DOCKER_CONFIG=${docker_config}" >> "${GITHUB_ENV}"
+
+      - name: Capture current deployment for rollback
+        id: capture_rollback_target
+        run: |
+          set -o pipefail
+          if [[ ! "${DEPLOY_TARGET_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "部署目标不是 40 位小写 Git SHA，拒绝变更部署"
+            exit 1
+          fi
+          if ! docker container inspect fusion-api >/dev/null 2>&1; then
+            echo "fusion-api 不存在，拒绝在缺少回滚目标时变更部署"
+            exit 1
+          fi
+          if ! docker container inspect fusion-flyai-adapter >/dev/null 2>&1; then
+            echo "fusion-flyai-adapter 不存在，拒绝在缺少回滚目标时变更部署"
+            exit 1
+          fi
+
+          api_image_ref="$(docker inspect fusion-api --format '{{.Config.Image}}')"
+          api_image_id="$(docker inspect fusion-api --format '{{.Image}}')"
+          adapter_image_ref="$(docker inspect fusion-flyai-adapter --format '{{.Config.Image}}')"
+          adapter_image_id="$(docker inspect fusion-flyai-adapter --format '{{.Image}}')"
+          api_image_prefix="${IMAGE_NAME}:"
+          case "${api_image_ref}" in
+            "${api_image_prefix}"*) api_sha="${api_image_ref#"${api_image_prefix}"}" ;;
+            *) echo "fusion-api 镜像仓库不受当前 workflow 管理: ${api_image_ref}"; exit 1 ;;
+          esac
+          if [[ ! "${api_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "fusion-api 镜像标签不是 40 位小写 Git SHA: ${api_image_ref}"
+            exit 1
+          fi
+          expected_adapter_ref="${FLYAI_ADAPTER_IMAGE_NAME}:${api_sha}"
+          if [ "${adapter_image_ref}" != "${expected_adapter_ref}" ]; then
+            echo "fusion-flyai-adapter 与 fusion-api 未运行同一 SHA: expected=${expected_adapter_ref} actual=${adapter_image_ref}"
+            exit 1
+          fi
+          if [[ ! "${api_image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "fusion-api 内容 ID 格式无效: ${api_image_id}"
+            exit 1
+          fi
+          if [[ ! "${adapter_image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "fusion-flyai-adapter 内容 ID 格式无效: ${adapter_image_id}"
+            exit 1
+          fi
+
+          model_management_current_link="${HOME}/.local/share/fusion/litellm-model-management-current"
+          model_management_current_target=""
+          if [ -L "${model_management_current_link}" ]; then
+            model_management_current_target="$(readlink -f -- "${model_management_current_link}")"
+            case "${model_management_current_target}" in
+              "${HOME}/.local/share/fusion/litellm-model-management-src-"*) ;;
+              *) echo "模型准入 Worker 当前版本不在受管目录中: ${model_management_current_target:-<empty>}"; exit 1 ;;
+            esac
+          elif [ -e "${model_management_current_link}" ]; then
+            echo "模型准入 Worker 当前版本路径不是符号链接，拒绝部署"
+            exit 1
+          fi
+          model_management_timer_enabled="false"
+          model_management_timer_active="false"
+          if systemctl --user is-enabled --quiet fusion-litellm-model-management.timer; then
+            model_management_timer_enabled="true"
+          fi
+          if systemctl --user is-active --quiet fusion-litellm-model-management.timer; then
+            model_management_timer_active="true"
+          fi
+
+          {
+            printf '%s\n' "api_image_ref=${api_image_ref}"
+            printf '%s\n' "api_image_id=${api_image_id}"
+            printf '%s\n' "adapter_image_ref=${adapter_image_ref}"
+            printf '%s\n' "adapter_image_id=${adapter_image_id}"
+            printf '%s\n' "model_management_current_target=${model_management_current_target}"
+            printf '%s\n' "model_management_timer_enabled=${model_management_timer_enabled}"
+            printf '%s\n' "model_management_timer_active=${model_management_timer_active}"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Login to ACR
         run: |
@@ -146,6 +299,7 @@ jobs:
           ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
 
       - name: Pause model management worker before API deploy
+        id: pause_model_management_worker
         env:
           DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED: ${{ vars.LITELLM_MODEL_MANAGEMENT_ENABLED || 'false' }}
           DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED: ${{ vars.LITELLM_MODEL_ADMISSION_WORKER_ENABLED || 'false' }}
@@ -164,13 +318,15 @@ jobs:
           fi
 
       - name: Apply alembic migrations
+        id: apply_migrations
+        if: needs.prepare.outputs.rollback_requested != 'true'
         run: |
           cd ~/project/fusion
           set -a
           source .env
           set +a
           n=0
-          until docker pull ${{ env.IMAGE_NAME }}:${{ github.sha }}; do
+          until docker pull "${IMAGE_NAME}:${DEPLOY_TARGET_SHA}"; do
             n=$((n+1))
             if [ $n -ge 6 ]; then echo "docker pull 重试 $n 次仍失败"; exit 1; fi
             echo "docker pull 失败（网络抖动），第 $n 次，10s 后重试..."
@@ -179,10 +335,11 @@ jobs:
           docker run --rm \
             --network postgres_default \
             -e DATABASE_URL="${DATABASE_URL}" \
-            ${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            "${IMAGE_NAME}:${DEPLOY_TARGET_SHA}" \
             alembic upgrade head
 
       - name: Pull and restart fusion-api
+        id: deploy_candidate
         env:
           DEPLOY_PROMPTHUB_API_KEY: ${{ secrets.PROMPTHUB_API_KEY }}
           DEPLOY_PROMPTHUB_SYNC_MODE: ${{ vars.PROMPTHUB_SYNC_MODE || 'disabled' }}
@@ -202,7 +359,6 @@ jobs:
           DEPLOY_MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS: ${{ vars.MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS }}
           DEPLOY_DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           DEPLOY_AMAP_MCP_API_KEY: ${{ secrets.AMAP_MCP_API_KEY }}
-          DEPLOY_CONTEXT7_API_KEY: ${{ secrets.CONTEXT7_API_KEY }}
           DEPLOY_FLYAI_API_KEY: ${{ secrets.FLYAI_API_KEY }}
           DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED: ${{ vars.LITELLM_MODEL_MANAGEMENT_ENABLED || 'false' }}
           DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED: ${{ vars.LITELLM_MODEL_ADMISSION_WORKER_ENABLED || 'false' }}
@@ -214,6 +370,7 @@ jobs:
           set -a
           source .env
           set +a
+          export CONTEXT7_API_KEY=""
           export PROMPTHUB_API_KEY="${DEPLOY_PROMPTHUB_API_KEY:-}"
           export PROMPTHUB_SYNC_MODE="${DEPLOY_PROMPTHUB_SYNC_MODE:-disabled}"
           export MCP_ALLOWED_HOSTS="${DEPLOY_MCP_ALLOWED_HOSTS:-${MCP_ALLOWED_HOSTS:-learn.microsoft.com,dashscope.aliyuncs.com,mcp.amap.com,mcp.context7.com}}"
@@ -232,7 +389,6 @@ jobs:
           export MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS="${DEPLOY_MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS:-${MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS:-30}}"
           export DASHSCOPE_API_KEY="${DEPLOY_DASHSCOPE_API_KEY:-${DASHSCOPE_API_KEY:-}}"
           export AMAP_MCP_API_KEY="${DEPLOY_AMAP_MCP_API_KEY:-${AMAP_MCP_API_KEY:-}}"
-          export CONTEXT7_API_KEY="${DEPLOY_CONTEXT7_API_KEY:-${CONTEXT7_API_KEY:-}}"
           export LITELLM_MODEL_MANAGEMENT_ENABLED="$(printf '%s' "${DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')"
           export LITELLM_MODEL_ADMISSION_WORKER_ENABLED="$(printf '%s' "${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')"
           export LITELLM_GOVERNANCE_MAX_AGE_SECONDS="${DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS:-86400}"
@@ -268,15 +424,17 @@ jobs:
             exit 1
           fi
           export FLYAI_ADAPTER_TOKEN="$(python3 -c 'import hashlib,hmac,os; print(hmac.new(os.environ["FLYAI_API_KEY"].encode(), b"fusion-deploy-flyai-adapter-v1", hashlib.sha256).hexdigest(), end="")')"
+          export DEPLOY_API_IMAGE="${IMAGE_NAME}:${DEPLOY_TARGET_SHA}"
+          export DEPLOY_ADAPTER_IMAGE="${FLYAI_ADAPTER_IMAGE_NAME}:${DEPLOY_TARGET_SHA}"
           n=0
-          until docker pull ${{ env.IMAGE_NAME }}:${{ github.sha }}; do
+          until docker pull "${DEPLOY_API_IMAGE}"; do
             n=$((n+1))
             if [ $n -ge 6 ]; then echo "docker pull 重试 $n 次仍失败"; exit 1; fi
             echo "docker pull 失败（网络抖动），第 $n 次，10s 后重试..."
             sleep 10
           done
           n=0
-          until docker pull ${{ env.FLYAI_ADAPTER_IMAGE_NAME }}:${{ github.sha }}; do
+          until docker pull "${DEPLOY_ADAPTER_IMAGE}"; do
             n=$((n+1))
             if [ $n -ge 6 ]; then echo "FlyAI adapter 镜像拉取重试 $n 次仍失败"; exit 1; fi
             echo "FlyAI adapter 镜像拉取失败（网络抖动），第 $n 次，10s 后重试..."
@@ -297,7 +455,7 @@ jobs:
           cat > docker-compose.fusion-api-ghcr.yml <<'EOF'
           services:
             flyai-adapter:
-              image: ${{ env.FLYAI_ADAPTER_IMAGE_NAME }}:${{ github.sha }}
+              image: ${DEPLOY_ADAPTER_IMAGE}
               container_name: fusion-flyai-adapter
               restart: always
               read_only: true
@@ -318,7 +476,7 @@ jobs:
                 - fusion-flyai
 
             fusion-api:
-              image: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+              image: ${DEPLOY_API_IMAGE}
               container_name: fusion-api
               command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
               restart: always
@@ -424,7 +582,37 @@ jobs:
             || docker network create fusion-prompthub >/dev/null
           docker compose -f docker-compose.fusion-api-ghcr.yml up -d
 
+      - name: Verify deployed image identity
+        id: verify_image_identity
+        run: |
+          expected_api_image="${IMAGE_NAME}:${DEPLOY_TARGET_SHA}"
+          actual_api_image="$(docker inspect fusion-api --format '{{.Config.Image}}')"
+          if [ "${actual_api_image}" != "${expected_api_image}" ]; then
+            echo "fusion-api 镜像不匹配: expected=${expected_api_image} actual=${actual_api_image}"
+            exit 1
+          fi
+          expected_api_id="$(docker image inspect "${expected_api_image}" --format '{{.Id}}')"
+          actual_api_id="$(docker inspect fusion-api --format '{{.Image}}')"
+          if [ "${actual_api_id}" != "${expected_api_id}" ]; then
+            echo "fusion-api 内容 ID 不匹配: expected=${expected_api_id} actual=${actual_api_id}"
+            exit 1
+          fi
+
+          expected_adapter_image="${FLYAI_ADAPTER_IMAGE_NAME}:${DEPLOY_TARGET_SHA}"
+          actual_adapter_image="$(docker inspect fusion-flyai-adapter --format '{{.Config.Image}}')"
+          if [ "${actual_adapter_image}" != "${expected_adapter_image}" ]; then
+            echo "fusion-flyai-adapter 镜像不匹配: expected=${expected_adapter_image} actual=${actual_adapter_image}"
+            exit 1
+          fi
+          expected_adapter_id="$(docker image inspect "${expected_adapter_image}" --format '{{.Id}}')"
+          actual_adapter_id="$(docker inspect fusion-flyai-adapter --format '{{.Image}}')"
+          if [ "${actual_adapter_id}" != "${expected_adapter_id}" ]; then
+            echo "fusion-flyai-adapter 内容 ID 不匹配: expected=${expected_adapter_id} actual=${actual_adapter_id}"
+            exit 1
+          fi
+
       - name: Verify health
+        id: verify_health
         run: |
           healthy=0
           for attempt in $(seq 1 30); do
@@ -716,6 +904,7 @@ jobs:
           systemctl --user is-active --quiet fusion-litellm-governance.timer
 
       - name: Install model management worker
+        if: needs.prepare.outputs.rollback_requested != 'true'
         env:
           DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED: ${{ vars.LITELLM_MODEL_MANAGEMENT_ENABLED || 'false' }}
           DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED: ${{ vars.LITELLM_MODEL_ADMISSION_WORKER_ENABLED || 'false' }}
@@ -826,6 +1015,7 @@ jobs:
           systemctl --user is-active --quiet fusion-litellm-model-management.timer
 
       - name: Run deployment smoke
+        id: deployment_smoke
         run: |
           # scripts/deployment_smoke.py checks /health and /api/models/.
           if ! python3 scripts/deployment_smoke.py --base-url http://127.0.0.1:8002; then
@@ -834,11 +1024,277 @@ jobs:
             exit 1
           fi
 
-      - name: Cleanup old images
-        if: always()
+      - name: Restore model management worker for manual rollback
+        if: needs.prepare.outputs.rollback_requested == 'true'
+        env:
+          DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED: ${{ vars.LITELLM_MODEL_MANAGEMENT_ENABLED || 'false' }}
+          DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED: ${{ vars.LITELLM_MODEL_ADMISSION_WORKER_ENABLED || 'false' }}
         run: |
-          current="${{ env.IMAGE_NAME }}:${{ github.sha }}"
-          adapter_current="${{ env.FLYAI_ADAPTER_IMAGE_NAME }}:${{ github.sha }}"
+          set -euo pipefail
+          management_enabled="$(printf '%s' "${DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED}" | tr '[:upper:]' '[:lower:]')"
+          worker_enabled="$(printf '%s' "${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED}" | tr '[:upper:]' '[:lower:]')"
+          case "${management_enabled}:${worker_enabled}" in
+            true:true|true:false|false:false) ;;
+            *) echo "模型管理开关必须为 true 或 false，且 Worker 不能单独启用"; exit 1 ;;
+          esac
+          current_link="${HOME}/.local/share/fusion/litellm-model-management-current"
+          target_release="${HOME}/.local/share/fusion/litellm-model-management-src-${DEPLOY_TARGET_SHA}"
+          systemctl --user stop fusion-litellm-model-management.timer >/dev/null 2>&1 || true
+          if systemctl --user is-active --quiet fusion-litellm-model-management.service; then
+            echo "模型准入 Worker 仍在执行，拒绝切换回滚版本；定时器已安全暂停"
+            exit 1
+          fi
+          if [ -e "${current_link}" ] && [ ! -L "${current_link}" ]; then
+            echo "模型准入 Worker 当前版本路径不是符号链接，拒绝覆盖"
+            exit 1
+          fi
+          if [ "${management_enabled}" != "true" ] || [ "${worker_enabled}" != "true" ]; then
+            systemctl --user disable --now fusion-litellm-model-management.timer >/dev/null 2>&1 || true
+            echo "手动回滚目标未启用模型准入 Worker；定时器保持关闭"
+            exit 0
+          fi
+          if [ ! -d "${target_release}" ]; then
+            systemctl --user disable --now fusion-litellm-model-management.timer >/dev/null 2>&1 || true
+            echo "手动回滚目标没有配套的模型准入 Worker 版本；已安全关闭定时器"
+            exit 0
+          fi
+          ln -sfn "${target_release}" "${current_link}"
+          systemctl --user daemon-reload
+          systemctl --user enable --now fusion-litellm-model-management.timer
+          systemctl --user is-active --quiet fusion-litellm-model-management.timer
+
+      - name: Roll back failed deployment
+        id: rollback_failed_deployment
+        if: ${{ failure() && steps.capture_rollback_target.outcome == 'success' && steps.pause_model_management_worker.outcome != 'skipped' }}
+        env:
+          ROLLBACK_API_IMAGE_REF: ${{ steps.capture_rollback_target.outputs.api_image_ref }}
+          ROLLBACK_API_IMAGE_ID: ${{ steps.capture_rollback_target.outputs.api_image_id }}
+          ROLLBACK_ADAPTER_IMAGE_REF: ${{ steps.capture_rollback_target.outputs.adapter_image_ref }}
+          ROLLBACK_ADAPTER_IMAGE_ID: ${{ steps.capture_rollback_target.outputs.adapter_image_id }}
+          ROLLBACK_MODEL_MANAGEMENT_CURRENT_TARGET: ${{ steps.capture_rollback_target.outputs.model_management_current_target }}
+          ROLLBACK_MODEL_MANAGEMENT_TIMER_ENABLED: ${{ steps.capture_rollback_target.outputs.model_management_timer_enabled }}
+          ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE: ${{ steps.capture_rollback_target.outputs.model_management_timer_active }}
+          DEPLOY_PROMPTHUB_API_KEY: ${{ secrets.PROMPTHUB_API_KEY }}
+          DEPLOY_PROMPTHUB_SYNC_MODE: ${{ vars.PROMPTHUB_SYNC_MODE || 'disabled' }}
+          DEPLOY_MCP_ALLOWED_HOSTS: ${{ vars.MCP_ALLOWED_HOSTS }}
+          DEPLOY_MCP_ALLOWED_CREDENTIAL_REFS: ${{ vars.MCP_ALLOWED_CREDENTIAL_REFS }}
+          DEPLOY_MCP_CONNECT_TIMEOUT_SECONDS: ${{ vars.MCP_CONNECT_TIMEOUT_SECONDS }}
+          DEPLOY_MCP_CALL_TIMEOUT_SECONDS: ${{ vars.MCP_CALL_TIMEOUT_SECONDS }}
+          DEPLOY_MCP_IDEMPOTENT_TOTAL_TIMEOUT_SECONDS: ${{ vars.MCP_IDEMPOTENT_TOTAL_TIMEOUT_SECONDS }}
+          DEPLOY_MCP_ADMIN_OPERATION_TIMEOUT_SECONDS: ${{ vars.MCP_ADMIN_OPERATION_TIMEOUT_SECONDS }}
+          DEPLOY_MCP_MAX_DISCOVERY_PAGES: ${{ vars.MCP_MAX_DISCOVERY_PAGES }}
+          DEPLOY_MCP_MAX_DISCOVERED_TOOLS: ${{ vars.MCP_MAX_DISCOVERED_TOOLS }}
+          DEPLOY_MCP_MAX_TOOL_DESCRIPTION_CHARS: ${{ vars.MCP_MAX_TOOL_DESCRIPTION_CHARS }}
+          DEPLOY_MCP_MAX_TOOL_SCHEMA_BYTES: ${{ vars.MCP_MAX_TOOL_SCHEMA_BYTES }}
+          DEPLOY_MCP_MAX_RESPONSE_BYTES: ${{ vars.MCP_MAX_RESPONSE_BYTES }}
+          DEPLOY_MCP_MAX_TOOL_CALLS_PER_SERVER_PER_RUN: ${{ vars.MCP_MAX_TOOL_CALLS_PER_SERVER_PER_RUN }}
+          DEPLOY_MCP_SERVER_CIRCUIT_FAILURE_THRESHOLD: ${{ vars.MCP_SERVER_CIRCUIT_FAILURE_THRESHOLD }}
+          DEPLOY_MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS: ${{ vars.MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS }}
+          DEPLOY_DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          DEPLOY_AMAP_MCP_API_KEY: ${{ secrets.AMAP_MCP_API_KEY }}
+          DEPLOY_FLYAI_API_KEY: ${{ secrets.FLYAI_API_KEY }}
+          DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED: ${{ vars.LITELLM_MODEL_MANAGEMENT_ENABLED || 'false' }}
+          DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED: ${{ vars.LITELLM_MODEL_ADMISSION_WORKER_ENABLED || 'false' }}
+          DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS: ${{ vars.LITELLM_GOVERNANCE_MAX_AGE_SECONDS || '86400' }}
+          DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN: ${{ secrets.LITELLM_MODEL_ADMISSION_WORKER_TOKEN }}
+        run: |
+          cd ~/project/fusion
+          set -o pipefail
+          set -a
+          source .env
+          set +a
+          export CONTEXT7_API_KEY=""
+          export PROMPTHUB_API_KEY="${DEPLOY_PROMPTHUB_API_KEY:-}"
+          export PROMPTHUB_SYNC_MODE="${DEPLOY_PROMPTHUB_SYNC_MODE:-disabled}"
+          export MCP_ALLOWED_HOSTS="${DEPLOY_MCP_ALLOWED_HOSTS:-${MCP_ALLOWED_HOSTS:-learn.microsoft.com,dashscope.aliyuncs.com,mcp.amap.com,mcp.context7.com}}"
+          export MCP_ALLOWED_CREDENTIAL_REFS="${DEPLOY_MCP_ALLOWED_CREDENTIAL_REFS:-${MCP_ALLOWED_CREDENTIAL_REFS:-DASHSCOPE_API_KEY,AMAP_MCP_API_KEY,CONTEXT7_API_KEY}}"
+          export MCP_CONNECT_TIMEOUT_SECONDS="${DEPLOY_MCP_CONNECT_TIMEOUT_SECONDS:-${MCP_CONNECT_TIMEOUT_SECONDS:-5}}"
+          export MCP_CALL_TIMEOUT_SECONDS="${DEPLOY_MCP_CALL_TIMEOUT_SECONDS:-${MCP_CALL_TIMEOUT_SECONDS:-15}}"
+          export MCP_IDEMPOTENT_TOTAL_TIMEOUT_SECONDS="${DEPLOY_MCP_IDEMPOTENT_TOTAL_TIMEOUT_SECONDS:-${MCP_IDEMPOTENT_TOTAL_TIMEOUT_SECONDS:-12}}"
+          export MCP_ADMIN_OPERATION_TIMEOUT_SECONDS="${DEPLOY_MCP_ADMIN_OPERATION_TIMEOUT_SECONDS:-${MCP_ADMIN_OPERATION_TIMEOUT_SECONDS:-35}}"
+          export MCP_MAX_DISCOVERY_PAGES="${DEPLOY_MCP_MAX_DISCOVERY_PAGES:-${MCP_MAX_DISCOVERY_PAGES:-5}}"
+          export MCP_MAX_DISCOVERED_TOOLS="${DEPLOY_MCP_MAX_DISCOVERED_TOOLS:-${MCP_MAX_DISCOVERED_TOOLS:-50}}"
+          export MCP_MAX_TOOL_DESCRIPTION_CHARS="${DEPLOY_MCP_MAX_TOOL_DESCRIPTION_CHARS:-${MCP_MAX_TOOL_DESCRIPTION_CHARS:-2000}}"
+          export MCP_MAX_TOOL_SCHEMA_BYTES="${DEPLOY_MCP_MAX_TOOL_SCHEMA_BYTES:-${MCP_MAX_TOOL_SCHEMA_BYTES:-32768}}"
+          export MCP_MAX_RESPONSE_BYTES="${DEPLOY_MCP_MAX_RESPONSE_BYTES:-${MCP_MAX_RESPONSE_BYTES:-262144}}"
+          export MCP_MAX_TOOL_CALLS_PER_SERVER_PER_RUN="${DEPLOY_MCP_MAX_TOOL_CALLS_PER_SERVER_PER_RUN:-${MCP_MAX_TOOL_CALLS_PER_SERVER_PER_RUN:-8}}"
+          export MCP_SERVER_CIRCUIT_FAILURE_THRESHOLD="${DEPLOY_MCP_SERVER_CIRCUIT_FAILURE_THRESHOLD:-${MCP_SERVER_CIRCUIT_FAILURE_THRESHOLD:-3}}"
+          export MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS="${DEPLOY_MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS:-${MCP_SERVER_CIRCUIT_COOLDOWN_SECONDS:-30}}"
+          export DASHSCOPE_API_KEY="${DEPLOY_DASHSCOPE_API_KEY:-${DASHSCOPE_API_KEY:-}}"
+          export AMAP_MCP_API_KEY="${DEPLOY_AMAP_MCP_API_KEY:-${AMAP_MCP_API_KEY:-}}"
+          export LITELLM_MODEL_MANAGEMENT_ENABLED="$(printf '%s' "${DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')"
+          export LITELLM_MODEL_ADMISSION_WORKER_ENABLED="$(printf '%s' "${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')"
+          export LITELLM_GOVERNANCE_MAX_AGE_SECONDS="${DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS:-86400}"
+          export LITELLM_MODEL_ADMISSION_WORKER_TOKEN="${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN:-}"
+          case "${LITELLM_GOVERNANCE_MAX_AGE_SECONDS}" in
+            ''|*[!0-9]*|0) echo "治理快照最大年龄必须是正整数"; exit 1 ;;
+          esac
+          case "${LITELLM_MODEL_MANAGEMENT_ENABLED}:${LITELLM_MODEL_ADMISSION_WORKER_ENABLED}" in
+            true:true|true:false|false:false) ;;
+            *) echo "模型管理开关必须为 true 或 false，且 Worker 不能单独启用"; exit 1 ;;
+          esac
+          if [ "${LITELLM_MODEL_ADMISSION_WORKER_ENABLED}" = "true" ] && [ -z "${LITELLM_MODEL_ADMISSION_WORKER_TOKEN}" ]; then
+            echo "模型准入 Worker 已启用，但回滚发布密钥未配置"
+            exit 1
+          fi
+          append_csv_value() {
+            current="$1"
+            required="$2"
+            if [ -z "${current}" ]; then
+              printf '%s' "${required}"
+              return
+            fi
+            case ",${current}," in
+              *",${required},"*) printf '%s' "${current}" ;;
+              *) printf '%s,%s' "${current}" "${required}" ;;
+            esac
+          }
+          export MCP_ALLOWED_HOSTS="$(append_csv_value "${MCP_ALLOWED_HOSTS}" "mcp.context7.com")"
+          export MCP_ALLOWED_CREDENTIAL_REFS="$(append_csv_value "${MCP_ALLOWED_CREDENTIAL_REFS}" "CONTEXT7_API_KEY")"
+          export FLYAI_API_KEY="${DEPLOY_FLYAI_API_KEY:-}"
+          if [ -z "${FLYAI_API_KEY}" ]; then
+            echo "FlyAI 发布密钥未配置，无法恢复原部署"
+            exit 1
+          fi
+          export FLYAI_ADAPTER_TOKEN="$(python3 -c 'import hashlib,hmac,os; print(hmac.new(os.environ["FLYAI_API_KEY"].encode(), b"fusion-deploy-flyai-adapter-v1", hashlib.sha256).hexdigest(), end="")')"
+          export AUTH_SERVICE_INTERNAL_BASE_URL="http://auth-service:8100"
+          export DEPLOY_API_IMAGE="${ROLLBACK_API_IMAGE_REF}"
+          export DEPLOY_ADAPTER_IMAGE="${ROLLBACK_ADAPTER_IMAGE_REF}"
+
+          ensure_rollback_image() {
+            image_ref="$1"
+            expected_id="$2"
+            actual_id="$(docker image inspect "${image_ref}" --format '{{.Id}}' 2>/dev/null || true)"
+            if [ "${actual_id}" != "${expected_id}" ]; then
+              docker pull "${image_ref}"
+              actual_id="$(docker image inspect "${image_ref}" --format '{{.Id}}')"
+            fi
+            if [ -z "${expected_id}" ] || [ "${actual_id}" != "${expected_id}" ]; then
+              echo "回滚镜像内容 ID 不匹配: ref=${image_ref} expected=${expected_id} actual=${actual_id:-<empty>}"
+              exit 1
+            fi
+          }
+
+          ensure_rollback_image "${ROLLBACK_API_IMAGE_REF}" "${ROLLBACK_API_IMAGE_ID}"
+          ensure_rollback_image "${ROLLBACK_ADAPTER_IMAGE_REF}" "${ROLLBACK_ADAPTER_IMAGE_ID}"
+
+          current_api_ref="$(docker inspect fusion-api --format '{{.Config.Image}}' 2>/dev/null || true)"
+          current_api_id="$(docker inspect fusion-api --format '{{.Image}}' 2>/dev/null || true)"
+          current_adapter_ref="$(docker inspect fusion-flyai-adapter --format '{{.Config.Image}}' 2>/dev/null || true)"
+          current_adapter_id="$(docker inspect fusion-flyai-adapter --format '{{.Image}}' 2>/dev/null || true)"
+          if [ "${current_api_ref}" != "${ROLLBACK_API_IMAGE_REF}" ] \
+            || [ "${current_api_id}" != "${ROLLBACK_API_IMAGE_ID}" ] \
+            || [ "${current_adapter_ref}" != "${ROLLBACK_ADAPTER_IMAGE_REF}" ] \
+            || [ "${current_adapter_id}" != "${ROLLBACK_ADAPTER_IMAGE_ID}" ]; then
+            if [ ! -f docker-compose.fusion-api-ghcr.yml ]; then
+              echo "候选部署未生成 compose 文件且容器身份已变化，无法安全回滚"
+              exit 1
+            fi
+            docker compose -f docker-compose.fusion-api-ghcr.yml up -d
+          else
+            echo "候选失败发生在容器变更前，原部署无需重建"
+          fi
+
+          restored_api_ref="$(docker inspect fusion-api --format '{{.Config.Image}}')"
+          restored_api_id="$(docker inspect fusion-api --format '{{.Image}}')"
+          restored_adapter_ref="$(docker inspect fusion-flyai-adapter --format '{{.Config.Image}}')"
+          restored_adapter_id="$(docker inspect fusion-flyai-adapter --format '{{.Image}}')"
+          if [ "${restored_api_ref}" != "${ROLLBACK_API_IMAGE_REF}" ] \
+            || [ "${restored_api_id}" != "${ROLLBACK_API_IMAGE_ID}" ]; then
+            echo "fusion-api 回滚身份校验失败"
+            exit 1
+          fi
+          if [ "${restored_adapter_ref}" != "${ROLLBACK_ADAPTER_IMAGE_REF}" ] \
+            || [ "${restored_adapter_id}" != "${ROLLBACK_ADAPTER_IMAGE_ID}" ]; then
+            echo "fusion-flyai-adapter 回滚身份校验失败"
+            exit 1
+          fi
+
+          api_healthy=0
+          for attempt in $(seq 1 30); do
+            if docker exec fusion-api python -c \
+              "import json,urllib.request; body=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)); raise SystemExit(0 if body.get('status') == 'healthy' else 1)"; then
+              api_healthy=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "${api_healthy}" != "1" ]; then
+            docker logs --tail=120 fusion-api || true
+            exit 1
+          fi
+
+          adapter_healthy=0
+          for attempt in $(seq 1 30); do
+            if docker exec fusion-flyai-adapter node -e \
+              "fetch('http://127.0.0.1:8080/health',{signal:AbortSignal.timeout(2000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then
+              adapter_healthy=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "${adapter_healthy}" != "1" ]; then
+            docker logs --tail=120 fusion-flyai-adapter || true
+            exit 1
+          fi
+
+          if ! python3 scripts/deployment_smoke.py --base-url http://127.0.0.1:8002; then
+            echo "fusion-api rollback deployment smoke failed"
+            docker logs --tail=120 fusion-api || true
+            exit 1
+          fi
+
+          echo "Restore model management worker after automatic rollback"
+          model_management_current_link="${HOME}/.local/share/fusion/litellm-model-management-current"
+          systemctl --user stop fusion-litellm-model-management.timer >/dev/null 2>&1 || true
+          if systemctl --user is-active --quiet fusion-litellm-model-management.service; then
+            echo "模型准入 Worker 仍在执行，无法恢复回滚前版本"
+            exit 1
+          fi
+          case "${ROLLBACK_MODEL_MANAGEMENT_TIMER_ENABLED}:${ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE}" in
+            true:true|true:false|false:true|false:false) ;;
+            *) echo "模型准入 Worker 回滚状态无效"; exit 1 ;;
+          esac
+          if [ -n "${ROLLBACK_MODEL_MANAGEMENT_CURRENT_TARGET}" ]; then
+            case "${ROLLBACK_MODEL_MANAGEMENT_CURRENT_TARGET}" in
+              "${HOME}/.local/share/fusion/litellm-model-management-src-"*) ;;
+              *) echo "模型准入 Worker 回滚版本不在受管目录中"; exit 1 ;;
+            esac
+            if [ ! -d "${ROLLBACK_MODEL_MANAGEMENT_CURRENT_TARGET}" ]; then
+              echo "模型准入 Worker 回滚版本不存在: ${ROLLBACK_MODEL_MANAGEMENT_CURRENT_TARGET}"
+              exit 1
+            fi
+            if [ -e "${model_management_current_link}" ] && [ ! -L "${model_management_current_link}" ]; then
+              echo "模型准入 Worker 当前版本路径不是符号链接，无法恢复"
+              exit 1
+            fi
+            ln -sfn "${ROLLBACK_MODEL_MANAGEMENT_CURRENT_TARGET}" "${model_management_current_link}"
+          elif [ -L "${model_management_current_link}" ]; then
+            unlink "${model_management_current_link}"
+          elif [ -e "${model_management_current_link}" ]; then
+            echo "模型准入 Worker 当前版本路径不是符号链接，无法清理"
+            exit 1
+          fi
+          systemctl --user daemon-reload
+          if [ "${ROLLBACK_MODEL_MANAGEMENT_TIMER_ENABLED}" = "true" ]; then
+            systemctl --user enable fusion-litellm-model-management.timer
+          else
+            systemctl --user disable fusion-litellm-model-management.timer >/dev/null 2>&1 || true
+          fi
+          if [ "${ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE}" = "true" ]; then
+            systemctl --user start fusion-litellm-model-management.timer
+            systemctl --user is-active --quiet fusion-litellm-model-management.timer
+          else
+            systemctl --user stop fusion-litellm-model-management.timer >/dev/null 2>&1 || true
+          fi
+          echo "旧镜像已恢复且回滚后验收通过；原始发布失败状态保持不变"
+
+      - name: Cleanup old images
+        id: cleanup_old_images
+        if: success()
+        run: |
+          current="${IMAGE_NAME}:${DEPLOY_TARGET_SHA}"
+          adapter_current="${FLYAI_ADAPTER_IMAGE_NAME}:${DEPLOY_TARGET_SHA}"
           docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' ${{ env.IMAGE_NAME }} \
             | awk -v current="$current" '$1 != current {print $2}' \
             | sort -u \
@@ -856,10 +1312,10 @@ jobs:
             "${{ github.ref_name }}" \
             dev \
             "${{ job.status }}" \
-            "${{ needs.build.outputs.started_at }}" \
-            "${{ env.IMAGE_NAME }}:${{ github.sha }}" \
-            "${{ github.sha }}" \
-            "${{ needs.build.outputs.runner_name }}" \
+            "${{ needs.publish.outputs.started_at || needs.prepare.outputs.started_at }}" \
+            "${IMAGE_NAME}:${DEPLOY_TARGET_SHA}" \
+            "${DEPLOY_TARGET_SHA}" \
+            "${{ needs.publish.outputs.runner_name || runner.name }}" \
             fusion-api \
             "${{ env.DEPLOY_START }}"; then
             echo "CI/CD metrics push failed, ignored"
@@ -874,6 +1330,8 @@ jobs:
           REPO: ${{ github.repository }}
           REF_NAME: ${{ github.ref_name }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TARGET_SHA: ${{ needs.prepare.outputs.target_sha }}
+          ROLLBACK_REASON: ${{ github.event.inputs.rollback_reason }}
           # 提交信息可含任意字符,只经 env 传入 python(os.environ→json),绝不进 shell,杜绝注入。
           COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
@@ -881,18 +1339,22 @@ jobs:
             echo "FEISHU_INFRA_WEBHOOK 未配置,跳过飞书通知"
             exit 0
           fi
-          export SHORT_SHA="${GITHUB_SHA:0:7}"
           export DEPLOY_TS="$(date -u '+%Y-%m-%d %H:%M UTC')"
           python3 - <<'PY'
           import json, os, urllib.request
           ok = os.environ.get("JOB_STATUS") == "success"
           repo = os.environ.get("REPO", "")
           ref = os.environ.get("REF_NAME", "")
-          sha = os.environ.get("SHORT_SHA", "")
+          sha = os.environ.get("TARGET_SHA", "")[:7]
           status = os.environ.get("JOB_STATUS", "")
           ts = os.environ.get("DEPLOY_TS", "")
           run_url = os.environ.get("RUN_URL", "")
-          raw = os.environ.get("COMMIT_MSG", "") or ""
+          rollback_reason = os.environ.get("ROLLBACK_REASON", "").strip()
+          raw = (
+              f"手动回滚：{rollback_reason}"
+              if rollback_reason
+              else os.environ.get("COMMIT_MSG", "") or ""
+          )
           lines = [ln for ln in raw.splitlines() if ln.strip()]
           msg = "\n".join(lines[:3]) if lines else "(无提交信息)"
           if len(msg) > 240:
@@ -934,3 +1396,54 @@ jobs:
           except Exception as e:
               print(f"飞书通知失败(忽略): {e!r}")
           PY
+
+      - name: Cleanup Docker credential directory
+        if: always()
+        run: |
+          expected="${RUNNER_TEMP}/.docker-${GITHUB_RUN_ID}-${GITHUB_JOB}"
+          if [ -z "${DOCKER_CONFIG:-}" ] || [ "${DOCKER_CONFIG}" != "${expected}" ]; then
+            echo "DOCKER_CONFIG 与当前 job 的隔离目录不一致，拒绝删除: ${DOCKER_CONFIG:-<empty>}"
+            exit 1
+          fi
+          case "${DOCKER_CONFIG}" in
+            "${RUNNER_TEMP}"/.docker-*) ;;
+            *) echo "DOCKER_CONFIG 未落在 RUNNER_TEMP 的 .docker-* 路径中，拒绝删除"; exit 1 ;;
+          esac
+          rm -rf -- "${DOCKER_CONFIG}"
+
+  finalize:
+    name: Finalize release result
+    if: ${{ always() && github.ref == 'refs/heads/master' }}
+    needs: [prepare, publish, deploy-dev]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Finalize release result
+        id: finalize_release_result
+        env:
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          DEPLOY_RESULT: ${{ needs.deploy-dev.result }}
+          ROLLBACK_REQUESTED: ${{ needs.prepare.outputs.rollback_requested }}
+        run: |
+          if [ "${PREPARE_RESULT}" != "success" ]; then
+            echo "部署请求校验失败或未执行: ${PREPARE_RESULT}"
+            exit 1
+          fi
+
+          if [ "${ROLLBACK_REQUESTED}" = "true" ]; then
+            if [ "${PUBLISH_RESULT}" = "skipped" ] && [ "${DEPLOY_RESULT}" = "success" ]; then
+              echo "手动回滚成功，Windows publish 按设计跳过"
+              exit 0
+            fi
+            echo "手动回滚失败: publish=${PUBLISH_RESULT} deploy=${DEPLOY_RESULT}"
+            exit 1
+          fi
+
+          if [ "${PUBLISH_RESULT}" = "success" ] && [ "${DEPLOY_RESULT}" = "success" ]; then
+            echo "正常发布成功"
+            exit 0
+          fi
+          echo "正常发布失败: publish=${PUBLISH_RESULT} deploy=${DEPLOY_RESULT}"
+          exit 1

@@ -1,0 +1,49 @@
+name: Fusion API Pull Request CI
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fusion-api-pr-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CI_IMAGE_NAME: fusion-api-ci
+  CI_FLYAI_ADAPTER_IMAGE_NAME: fusion-flyai-adapter-ci
+
+jobs:
+  build:
+    # PR 仅在 GitHub 托管的临时 Linux runner 执行容器验证，不接触发布凭据。
+    name: PR container validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install release safety contract dependency
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.2
+
+      - name: Run release safety contract
+        id: release_safety_contract
+        run: .github/scripts/release-safety-contract.sh
+
+      - name: Verify Docker access
+        run: |
+          docker version
+          docker ps
+
+      - name: Test and build Docker image
+        timeout-minutes: 15
+        run: |
+          bash .github/scripts/linux-build-and-test.sh \
+            "${CI_IMAGE_NAME}" \
+            "${CI_FLYAI_ADAPTER_IMAGE_NAME}" \
+            "${GITHUB_SHA}"

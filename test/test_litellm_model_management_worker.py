@@ -211,7 +211,7 @@ class ModelManagementWorkerTests(unittest.TestCase):
             plan = execute.call_args.kwargs["plan"]
             self.assertEqual(plan["run_id"], claim["run_id"])
             self.assertEqual([item["model_id"] for item in plan["eligible"]], ["kimi-k3"])
-            acceptance_path = acceptance_dir / f'{record["candidate_fingerprint"]}.json'
+            acceptance_path = acceptance_dir / f"{record['candidate_fingerprint']}.json"
             acceptance_text = acceptance_path.read_text(encoding="utf-8")
             self.assertNotIn("candidate-secret", acceptance_text)
             self.assertNotIn("master-secret", acceptance_text)
@@ -582,15 +582,11 @@ class ModelManagementWorkerTests(unittest.TestCase):
             {"LITELLM_GOVERNANCE_MAX_AGE_SECONDS": "7200"},
             clear=True,
         ):
-            args = worker._parse_args(
-                ["--governance-root", "/governance", "--acceptance-dir", "/acceptance"]
-            )
+            args = worker._parse_args(["--governance-root", "/governance", "--acceptance-dir", "/acceptance"])
         self.assertEqual(args.governance_max_age_seconds, 7200)
 
         with patch.dict("os.environ", {}, clear=True), self.assertRaises(SystemExit):
-            worker._parse_args(
-                ["--governance-root", "/governance", "--acceptance-dir", "/acceptance"]
-            )
+            worker._parse_args(["--governance-root", "/governance", "--acceptance-dir", "/acceptance"])
 
     @staticmethod
     def _write_summary(root, run_id, status, started_at, pointer_name):

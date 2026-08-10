@@ -149,18 +149,14 @@ class CandidateEnrichmentTests(unittest.TestCase):
         for invalid_value in (True, 0, -1, 262144.0, "262144"):
             with self.subTest(invalid_value=invalid_value):
                 invalid_payload = copy.deepcopy(payload)
-                invalid_payload["providers"]["moonshot"]["models"]["kimi-k2.7-code"][
-                    "context_window_tokens"
-                ] = invalid_value
-                invalid_payload["approval"]["providers_sha256"] = cost_map_sha256(
-                    invalid_payload["providers"]
+                invalid_payload["providers"]["moonshot"]["models"]["kimi-k2.7-code"]["context_window_tokens"] = (
+                    invalid_value
                 )
+                invalid_payload["approval"]["providers_sha256"] = cost_map_sha256(invalid_payload["providers"])
                 document = {
                     "schema_version": invalid_payload["schema_version"],
                     "approval": {
-                        key: value
-                        for key, value in invalid_payload["approval"].items()
-                        if key != "document_sha256"
+                        key: value for key, value in invalid_payload["approval"].items() if key != "document_sha256"
                     },
                     "providers": invalid_payload["providers"],
                 }
@@ -255,18 +251,14 @@ class CandidateEnrichmentTests(unittest.TestCase):
         self.assertEqual(candidate["metadata"]["pricing"]["input"], 0.95)
 
         invalid_providers = copy.deepcopy(providers)
-        invalid_providers["moonshot"]["models"]["kimi-k2.7-code"]["pricing_provenance"][
-            "billing_rates"
-        ]["output"] = 35.0
+        invalid_providers["moonshot"]["models"]["kimi-k2.7-code"]["pricing_provenance"]["billing_rates"]["output"] = (
+            35.0
+        )
         invalid_approval = copy.deepcopy(approval)
         invalid_approval["providers_sha256"] = cost_map_sha256(invalid_providers)
         invalid_document = {
             "schema_version": 2,
-            "approval": {
-                key: value
-                for key, value in invalid_approval.items()
-                if key != "document_sha256"
-            },
+            "approval": {key: value for key, value in invalid_approval.items() if key != "document_sha256"},
             "providers": invalid_providers,
         }
         invalid_approval["document_sha256"] = cost_map_sha256(invalid_document)

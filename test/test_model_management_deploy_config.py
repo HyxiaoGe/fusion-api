@@ -1,6 +1,8 @@
 import unittest
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -51,13 +53,63 @@ class ModelManagementDeployConfigTests(unittest.TestCase):
         self.assertIn("DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN", workflow)
         self.assertIn('acceptance_dir="${HOME}/.local/share/fusion/litellm-acceptance"', workflow)
         self.assertIn('install -d -m 0700 "${state_dir}" "${acceptance_dir}"', workflow)
-        self.assertIn('os.chmod(path, 0o600, follow_symlinks=False)', workflow)
+        self.assertIn("os.chmod(path, 0o600, follow_symlinks=False)", workflow)
         self.assertIn("--require-env LITELLM_CANDIDATE_KEY", workflow)
         self.assertIn("--require-env LITELLM_GOVERNANCE_MAX_AGE_SECONDS", unit)
         self.assertIn("--require-env LITELLM_CANDIDATE_KEY", unit)
         self.assertIn("--acceptance-dir %h/.local/share/fusion/litellm-acceptance", unit)
         self.assertIn("ReadWritePaths=%h/.local/share/fusion/litellm-acceptance", unit)
         self.assertNotIn("--governance-max-age-seconds 86400", unit)
+
+    def test_deploy_restores_worker_lifecycle_when_deployment_rolls_back(self):
+        workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
+        document = yaml.safe_load(workflow)
+        rollback_step = next(
+            step
+            for step in document["jobs"]["deploy-dev"]["steps"]
+            if step.get("name") == "Roll back failed deployment"
+        )
+
+        self.assertIn(
+            'model_management_current_target="$(readlink -f -- "${model_management_current_link}")"', workflow
+        )
+        self.assertIn('"model_management_timer_enabled=${model_management_timer_enabled}"', workflow)
+        self.assertIn('"model_management_timer_active=${model_management_timer_active}"', workflow)
+        self.assertIn(
+            "ROLLBACK_MODEL_MANAGEMENT_CURRENT_TARGET: "
+            "${{ steps.capture_rollback_target.outputs.model_management_current_target }}",
+            workflow,
+        )
+        self.assertIn("Restore model management worker after automatic rollback", workflow)
+        self.assertIn("Restore model management worker for manual rollback", workflow)
+        self.assertIn("id: pause_model_management_worker", workflow)
+        self.assertIn("steps.pause_model_management_worker.outcome != 'skipped'", workflow)
+        self.assertIn(
+            'target_release="${HOME}/.local/share/fusion/litellm-model-management-src-${DEPLOY_TARGET_SHA}"', workflow
+        )
+        self.assertIn("if: needs.prepare.outputs.rollback_requested != 'true'", workflow)
+        self.assertIn("if: needs.prepare.outputs.rollback_requested == 'true'", workflow)
+        self.assertLess(
+            workflow.index("Capture current deployment for rollback"),
+            workflow.index("Pause model management worker before API deploy"),
+        )
+        self.assertLess(
+            workflow.index("Run deployment smoke"),
+            workflow.index("Restore model management worker for manual rollback"),
+        )
+        self.assertEqual(
+            rollback_step["env"]["DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED"],
+            "${{ vars.LITELLM_MODEL_MANAGEMENT_ENABLED || 'false' }}",
+        )
+        self.assertEqual(
+            rollback_step["env"]["DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED"],
+            "${{ vars.LITELLM_MODEL_ADMISSION_WORKER_ENABLED || 'false' }}",
+        )
+        self.assertIn(
+            "export LITELLM_MODEL_MANAGEMENT_ENABLED=\"$(printf '%s' "
+            "\"${DEPLOY_LITELLM_MODEL_MANAGEMENT_ENABLED:-false}\" | tr '[:upper:]' '[:lower:]')\"",
+            rollback_step["run"],
+        )
 
     def test_dev_deploy_manages_discovery_registry_and_governance_timer(self):
         workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
