@@ -18,6 +18,8 @@ down_revision: Union[str, Sequence[str], None] = "e8b4c2d7f901"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
+CREATED_TABLE_COMMENT = "fusion-created-by-alembic:f3a1d9c8b720"
+
 
 MODEL_CATALOG_CONTROL_COLUMNS = {
     "model_id": (sa.String, 200, False, None),
@@ -102,6 +104,7 @@ def _validate_existing_table(
     expected_primary_key: set[str],
     expected_checks: dict[str, str],
     expected_unique_constraints: dict[str, set[str]] | None = None,
+    allowed_redundant_unique_constraint_columns: set[frozenset[str]] | None = None,
     expected_indexes: dict[str, tuple[tuple[str, ...], bool, str | None]] | None = None,
 ) -> None:
     actual_columns = {column["name"]: column for column in inspector.get_columns(table_name)}
@@ -121,6 +124,8 @@ def _validate_existing_table(
         actual_type = column["type"]
         if column.get("computed") is not None or column.get("identity") is not None:
             raise RuntimeError(f"已有表 {table_name}.{column_name} 不能是生成列或 identity 列")
+        if issubclass(expected_type, sa.String) and isinstance(actual_type, sa.CHAR):
+            raise RuntimeError(f"已有表 {table_name}.{column_name} 不能使用定长 CHAR 类型")
         if not isinstance(actual_type, expected_type):
             raise RuntimeError(
                 f"已有表 {table_name}.{column_name} 的类型不兼容："
@@ -158,11 +163,10 @@ def _validate_existing_table(
             f"已有表 {table_name} 的主键不兼容：actual={sorted(primary_key)} expected={sorted(expected_primary_key)}"
         )
 
-    checks = {
-        constraint.get("name"): constraint.get("sqltext")
-        for constraint in inspector.get_check_constraints(table_name)
-        if constraint.get("name")
-    }
+    reflected_checks = [
+        constraint for constraint in inspector.get_check_constraints(table_name) if constraint.get("name")
+    ]
+    checks = {constraint.get("name"): constraint.get("sqltext") for constraint in reflected_checks}
     if set(checks) != set(expected_checks):
         raise RuntimeError(
             f"已有表 {table_name} 的检查约束集合不兼容：actual={sorted(checks)} expected={sorted(expected_checks)}"
@@ -171,6 +175,10 @@ def _validate_existing_table(
         actual_expression = checks[check_name]
         if _normalize_sql_expression(actual_expression) != _normalize_sql_expression(expected_expression):
             raise RuntimeError(f"已有表 {table_name} 的检查约束 {check_name} 表达式不兼容")
+    for constraint in reflected_checks:
+        dialect_options = constraint.get("dialect_options") or {}
+        if dialect_options.get("not_valid") or dialect_options.get("no_inherit"):
+            raise RuntimeError(f"已有表 {table_name} 的检查约束 {constraint['name']} 尚未完整验证")
 
     if expected_unique_constraints is not None:
         unique_constraints = {
@@ -178,10 +186,19 @@ def _validate_existing_table(
             for constraint in inspector.get_unique_constraints(table_name)
             if constraint.get("name")
         }
-        if set(unique_constraints) != set(expected_unique_constraints):
+        allowed_redundant_columns = allowed_redundant_unique_constraint_columns or set()
+        unexpected_unique_constraints = {
+            constraint_name: column_names
+            for constraint_name, column_names in unique_constraints.items()
+            if constraint_name not in expected_unique_constraints
+            and frozenset(column_names) not in allowed_redundant_columns
+        }
+        missing_unique_constraints = set(expected_unique_constraints) - set(unique_constraints)
+        if unexpected_unique_constraints or missing_unique_constraints:
             raise RuntimeError(
                 f"已有表 {table_name} 的唯一约束集合不兼容："
-                f"actual={sorted(unique_constraints)} expected={sorted(expected_unique_constraints)}"
+                f"unexpected={sorted(unexpected_unique_constraints)} "
+                f"missing={sorted(missing_unique_constraints)}"
             )
         for constraint_name, expected_column_names in expected_unique_constraints.items():
             if unique_constraints.get(constraint_name) != expected_column_names:
@@ -208,7 +225,7 @@ def _validate_existing_table(
 
     allowed_unique_indexes = {
         index_name for index_name, (_, unique, _) in (expected_indexes or {}).items() if unique
-    } | set(expected_unique_constraints or {})
+    } | set(unique_constraints if expected_unique_constraints is not None else {})
     unexpected_unique_indexes = {
         index_name
         for index_name, index in indexes.items()
@@ -236,6 +253,7 @@ def _create_model_catalog_controls() -> None:
         sa.CheckConstraint("revision > 0", name="ck_model_catalog_controls_revision_positive"),
         sa.PrimaryKeyConstraint("model_id"),
     )
+    op.execute(sa.text(f"COMMENT ON TABLE model_catalog_controls IS '{CREATED_TABLE_COMMENT}'"))
 
 
 def _create_model_admission_operations() -> None:
@@ -285,6 +303,7 @@ def _create_model_admission_operations() -> None:
         unique=True,
         postgresql_where=sa.text("status = 'running'"),
     )
+    op.execute(sa.text(f"COMMENT ON TABLE model_admission_operations IS '{CREATED_TABLE_COMMENT}'"))
 
 
 def upgrade() -> None:
@@ -305,6 +324,7 @@ def upgrade() -> None:
                 "ck_model_catalog_controls_revision_positive": "revision > 0",
             },
             expected_unique_constraints={},
+            allowed_redundant_unique_constraint_columns={frozenset({"model_id"})},
         )
     else:
         _create_model_catalog_controls()
@@ -349,7 +369,23 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index("uq_model_admission_operations_single_running", table_name="model_admission_operations")
-    op.drop_index("ix_model_admission_operations_status_created", table_name="model_admission_operations")
-    op.drop_table("model_admission_operations")
-    op.drop_table("model_catalog_controls")
+    op.execute(
+        sa.text(
+            f"""
+            DO $fusion$
+            BEGIN
+              IF to_regclass('model_admission_operations') IS NOT NULL
+                 AND obj_description(to_regclass('model_admission_operations'), 'pg_class')
+                     = '{CREATED_TABLE_COMMENT}' THEN
+                DROP TABLE model_admission_operations;
+              END IF;
+              IF to_regclass('model_catalog_controls') IS NOT NULL
+                 AND obj_description(to_regclass('model_catalog_controls'), 'pg_class')
+                     = '{CREATED_TABLE_COMMENT}' THEN
+                DROP TABLE model_catalog_controls;
+              END IF;
+            END
+            $fusion$
+            """
+        )
+    )

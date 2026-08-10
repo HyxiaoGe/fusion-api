@@ -137,6 +137,7 @@ class ModelManagementMigrationTest(unittest.TestCase):
 
         self.assertEqual(operation.create_table.call_count, 2)
         self.assertEqual(operation.create_index.call_count, 2)
+        self.assertEqual(operation.execute.call_count, 2)
 
     def test_compatible_existing_schema_is_adopted_without_ddl(self):
         migration = load_migration()
@@ -151,6 +152,7 @@ class ModelManagementMigrationTest(unittest.TestCase):
 
         operation.create_table.assert_not_called()
         operation.create_index.assert_not_called()
+        operation.execute.assert_not_called()
 
     def test_incompatible_existing_schema_fails_instead_of_blindly_stamping(self):
         migration = load_migration()
@@ -184,6 +186,45 @@ class ModelManagementMigrationTest(unittest.TestCase):
         inspect_database.assert_not_called()
         self.assertEqual(operation.create_table.call_count, 2)
         self.assertEqual(operation.create_index.call_count, 2)
+        self.assertEqual(operation.execute.call_count, 2)
+
+    def test_redundant_unique_constraint_on_catalog_primary_key_is_adopted(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        original_get_unique_constraints = inspector.get_unique_constraints.side_effect
+        original_get_indexes = inspector.get_indexes.side_effect
+        inspector.get_unique_constraints.side_effect = lambda table_name: (
+            [
+                {
+                    "name": "model_catalog_controls_model_id_key",
+                    "column_names": ["model_id"],
+                }
+            ]
+            if table_name == "model_catalog_controls"
+            else original_get_unique_constraints(table_name)
+        )
+        inspector.get_indexes.side_effect = lambda table_name: (
+            [
+                {
+                    "name": "model_catalog_controls_model_id_key",
+                    "column_names": ["model_id"],
+                    "unique": True,
+                    "duplicates_constraint": "model_catalog_controls_model_id_key",
+                }
+            ]
+            if table_name == "model_catalog_controls"
+            else original_get_indexes(table_name)
+        )
+
+        with (
+            patch.object(migration, "op") as operation,
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+        ):
+            migration.upgrade()
+
+        operation.create_table.assert_not_called()
+        operation.create_index.assert_not_called()
 
     def test_same_check_name_with_drifted_expression_is_rejected(self):
         migration = load_migration()
@@ -337,6 +378,41 @@ class ModelManagementMigrationTest(unittest.TestCase):
         ):
             migration.upgrade()
 
+    def test_char_column_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        catalog_columns = compatible_columns("model_catalog_controls")
+        next(column for column in catalog_columns if column["name"] == "model_id")["type"] = sa.CHAR(200)
+        inspector.get_columns.side_effect = lambda table_name: (
+            catalog_columns if table_name == "model_catalog_controls" else compatible_columns(table_name)
+        )
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "不能使用定长 CHAR 类型"),
+        ):
+            migration.upgrade()
+
+    def test_not_valid_check_constraint_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        original_get_checks = inspector.get_check_constraints.side_effect
+        catalog_checks = original_get_checks("model_catalog_controls")
+        catalog_checks[0]["dialect_options"] = {"not_valid": True}
+        inspector.get_check_constraints.side_effect = lambda table_name: (
+            catalog_checks if table_name == "model_catalog_controls" else original_get_checks(table_name)
+        )
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "尚未完整验证"),
+        ):
+            migration.upgrade()
+
     def test_computed_column_is_rejected(self):
         migration = load_migration()
         inspector = compatible_inspector()
@@ -373,6 +449,21 @@ class ModelManagementMigrationTest(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "不能是生成列或 identity 列"),
         ):
             migration.upgrade()
+
+    def test_downgrade_only_drops_tables_marked_as_created_by_this_migration(self):
+        migration = load_migration()
+
+        with patch.object(migration, "op") as operation:
+            migration.downgrade()
+
+        operation.drop_index.assert_not_called()
+        operation.drop_table.assert_not_called()
+        operation.execute.assert_called_once()
+        downgrade_sql = str(operation.execute.call_args.args[0])
+        self.assertIn("obj_description", downgrade_sql)
+        self.assertIn(migration.CREATED_TABLE_COMMENT, downgrade_sql)
+        self.assertIn("DROP TABLE model_admission_operations", downgrade_sql)
+        self.assertIn("DROP TABLE model_catalog_controls", downgrade_sql)
 
 
 if __name__ == "__main__":
