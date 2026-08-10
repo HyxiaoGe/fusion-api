@@ -87,12 +87,17 @@ class ModelManagementDeployConfigTests(unittest.TestCase):
         self.assertIn("Restore model management worker for manual rollback", workflow)
         self.assertIn("ref: ${{ needs.prepare.outputs.target_sha }}", workflow)
         self.assertIn("id: pause_model_management_worker", workflow)
-        self.assertIn("steps.pause_model_management_worker.outcome != 'skipped'", workflow)
+        self.assertIn("Restore model management worker after pre-deploy failure", workflow)
+        self.assertIn("steps.deploy_candidate.outcome != 'skipped'", workflow)
         self.assertIn(
             'target_release="${HOME}/.local/share/fusion/litellm-model-management-src-${DEPLOY_TARGET_SHA}"', workflow
         )
-        self.assertIn('target_service_unit="${GITHUB_WORKSPACE}/ops/litellm/fusion-litellm-model-management.service"', workflow)
-        self.assertIn('target_timer_unit="${GITHUB_WORKSPACE}/ops/litellm/fusion-litellm-model-management.timer"', workflow)
+        self.assertIn(
+            'target_service_unit="${GITHUB_WORKSPACE}/ops/litellm/fusion-litellm-model-management.service"', workflow
+        )
+        self.assertIn(
+            'target_timer_unit="${GITHUB_WORKSPACE}/ops/litellm/fusion-litellm-model-management.timer"', workflow
+        )
         self.assertIn('install -m 0644 "${target_service_unit}" "${target_timer_unit}" "${unit_dir}/"', workflow)
         self.assertIn("if: needs.prepare.outputs.rollback_requested != 'true'", workflow)
         self.assertIn("if: needs.prepare.outputs.rollback_requested == 'true'", workflow)
@@ -189,9 +194,9 @@ class ModelManagementDeployConfigTests(unittest.TestCase):
             workflow.count('if [ "${ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE}" = "true" ]; then'),
             2,
         )
-        self.assertIn('systemctl --user start fusion-litellm-model-management.timer', workflow)
+        self.assertIn("systemctl --user start fusion-litellm-model-management.timer", workflow)
         self.assertIn('if [ "${ROLLBACK_GOVERNANCE_TIMER_ACTIVE}" = "true" ]; then', workflow)
-        self.assertIn('systemctl --user start fusion-litellm-governance.timer', workflow)
+        self.assertIn("systemctl --user start fusion-litellm-governance.timer", workflow)
         self.assertIn("定时器已恢复部署前状态", workflow)
 
     def test_dev_deploy_uses_repository_vars_for_feature_flags(self):

@@ -1,9 +1,14 @@
+import inspect
 import unittest
 
-from app.api.models import _entry_to_card
+from app.api.models import _entry_to_card, get_model, get_models
 
 
 class ModelsApiTests(unittest.TestCase):
+    def test_model_catalog_routes_run_in_fastapi_threadpool(self):
+        self.assertFalse(inspect.iscoroutinefunction(get_models))
+        self.assertFalse(inspect.iscoroutinefunction(get_model))
+
     def test_entry_to_card_exposes_context_token_limits(self):
         card = _entry_to_card(
             "xiaomi/mimo-v2.5-pro",

@@ -109,8 +109,24 @@ class CICDPermissionBoundaryTests(unittest.TestCase):
         self.assertEqual(
             normalized_condition(condition),
             "failure() && steps.capture_rollback_target.outcome == 'success' && "
-            "steps.pause_model_management_worker.outcome != 'skipped'",
+            "steps.deploy_candidate.outcome != 'skipped'",
         )
+
+    def assert_predeploy_worker_restore_contract(self, step: dict) -> None:
+        self.assertEqual(
+            normalized_condition(step["if"]),
+            "failure() && steps.capture_rollback_target.outcome == 'success' && "
+            "steps.pause_model_management_worker.outcome == 'success' && "
+            "steps.deploy_candidate.outcome == 'skipped'",
+        )
+        self.assertEqual(
+            step["env"]["ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE"],
+            "${{ steps.capture_rollback_target.outputs.model_management_timer_active }}",
+        )
+        commands = active_commands(step["run"])
+        self.assertIn('if [ "${ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE}" = "true" ]; then', commands)
+        self.assertIn("systemctl --user start fusion-litellm-model-management.timer", commands)
+        self.assertIn("systemctl --user is-active --quiet fusion-litellm-model-management.timer", commands)
 
     def assert_cleanup_success_guard(self, step: dict) -> None:
         self.assertEqual(normalized_condition(step.get("if", "")), "success()")
@@ -295,7 +311,7 @@ class CICDPermissionBoundaryTests(unittest.TestCase):
                     "migration": "needs.prepare.outputs.rollback_requested != 'true'",
                     "rollback": (
                         "failure() && steps.capture_rollback_target.outcome == 'success' && "
-                        "steps.pause_model_management_worker.outcome != 'skipped'"
+                        "steps.deploy_candidate.outcome != 'skipped'"
                     ),
                     "cleanup": "success()",
                     "failure": None,
@@ -640,6 +656,14 @@ class CICDPermissionBoundaryTests(unittest.TestCase):
         )
         with self.assertRaises(AssertionError):
             self.assert_rollback_restore_contract(forged_compare)
+
+    def test_predeploy_failure_only_restores_paused_worker_timer(self) -> None:
+        deploy_job = self.release_document["jobs"]["deploy-dev"]
+        restore_step = workflow_step(deploy_job, "Restore model management worker after pre-deploy failure")
+        rollback_step = workflow_step(deploy_job, "Roll back failed deployment")
+
+        self.assert_predeploy_worker_restore_contract(restore_step)
+        self.assertLess(deploy_job["steps"].index(restore_step), deploy_job["steps"].index(rollback_step))
 
     def test_cleanup_only_runs_after_success_and_rollback_never_downgrades_database(self) -> None:
         deploy_job = self.release_document["jobs"]["deploy-dev"]

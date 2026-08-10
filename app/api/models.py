@@ -123,7 +123,7 @@ def _collect_providers(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 @router.get("/")
-async def get_models(
+def get_models(
     request: Request,
     provider: Optional[str] = None,
     enabled: Optional[bool] = None,
@@ -161,7 +161,7 @@ async def get_models(
 
 
 @router.get("/{model_id}")
-async def get_model(
+def get_model(
     model_id: str,
     request: Request,
     controls: ModelCatalogControlRepository = Depends(get_model_catalog_control_repository),

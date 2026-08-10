@@ -1215,9 +1215,25 @@ jobs:
           systemctl --user enable --now fusion-litellm-model-management.timer
           systemctl --user is-active --quiet fusion-litellm-model-management.timer
 
+      - name: Restore model management worker after pre-deploy failure
+        if: >-
+          ${{ failure() && steps.capture_rollback_target.outcome == 'success' &&
+          steps.pause_model_management_worker.outcome == 'success' &&
+          steps.deploy_candidate.outcome == 'skipped' }}
+        env:
+          ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE: ${{ steps.capture_rollback_target.outputs.model_management_timer_active }}
+        run: |
+          set -euo pipefail
+          if [ "${ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE}" = "true" ]; then
+            systemctl --user start fusion-litellm-model-management.timer
+            systemctl --user is-active --quiet fusion-litellm-model-management.timer
+          else
+            systemctl --user stop fusion-litellm-model-management.timer >/dev/null 2>&1 || true
+          fi
+
       - name: Roll back failed deployment
         id: rollback_failed_deployment
-        if: ${{ failure() && steps.capture_rollback_target.outcome == 'success' && steps.pause_model_management_worker.outcome != 'skipped' }}
+        if: ${{ failure() && steps.capture_rollback_target.outcome == 'success' && steps.deploy_candidate.outcome != 'skipped' }}
         env:
           ROLLBACK_API_IMAGE_REF: ${{ steps.capture_rollback_target.outputs.api_image_ref }}
           ROLLBACK_API_IMAGE_ID: ${{ steps.capture_rollback_target.outputs.api_image_id }}
