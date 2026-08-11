@@ -124,7 +124,7 @@ def compatible_inspector() -> Mock:
         query = str(statement)
         result = Mock()
         if "relpersistence" in query:
-            result.one_or_none.return_value = ("r", "p", False, False, False, False)
+            result.one_or_none.return_value = ("r", "p", False, False, False, False, False)
             return result
         if "uses_type_default_collation" in query:
             result.mappings.return_value = [
@@ -403,7 +403,31 @@ class ModelManagementMigrationTest(unittest.TestCase):
             patch.object(migration, "op"),
             patch.object(migration.context, "is_offline_mode", return_value=False),
             patch.object(migration.sa, "inspect", return_value=inspector),
-            self.assertRaisesRegex(RuntimeError, "迁移定义外的唯一索引"),
+            self.assertRaisesRegex(RuntimeError, "迁移定义外的索引"),
+        ):
+            migration.upgrade()
+
+    def test_extra_non_unique_expression_index_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        operation_indexes = inspector.get_indexes("model_admission_operations")
+        operation_indexes.append(
+            {
+                "name": "ix_model_admission_operations_divide_attempts",
+                "column_names": [None],
+                "expressions": ["1 / attempts"],
+                "unique": False,
+            }
+        )
+        inspector.get_indexes.side_effect = lambda table_name: (
+            [] if table_name == "model_catalog_controls" else operation_indexes
+        )
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "迁移定义外的索引"),
         ):
             migration.upgrade()
 
@@ -515,6 +539,27 @@ class ModelManagementMigrationTest(unittest.TestCase):
             patch.object(migration.context, "is_offline_mode", return_value=False),
             patch.object(migration.sa, "inspect", return_value=inspector),
             self.assertRaisesRegex(RuntimeError, "不能参与表继承"),
+        ):
+            migration.upgrade()
+
+    def test_table_with_rewrite_rule_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        original_execute = inspector.bind.execute.side_effect
+
+        def execute_catalog_query(statement, parameters):
+            result = original_execute(statement, parameters)
+            if "relpersistence" in str(statement) and parameters["table_name"] == "model_admission_operations":
+                result.one_or_none.return_value = ("r", "p", False, False, False, False, True)
+            return result
+
+        inspector.bind.execute.side_effect = execute_catalog_query
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "不能包含 rewrite rule"),
         ):
             migration.upgrade()
 

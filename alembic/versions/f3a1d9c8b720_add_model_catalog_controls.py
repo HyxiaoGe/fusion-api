@@ -153,7 +153,12 @@ def _validate_existing_table(
                      SELECT 1
                      FROM pg_catalog.pg_trigger
                      WHERE tgrelid = relation.oid AND NOT tgisinternal
-                   ) AS has_user_triggers
+                   ) AS has_user_triggers,
+                   EXISTS (
+                     SELECT 1
+                     FROM pg_catalog.pg_rewrite
+                     WHERE ev_class = relation.oid
+                   ) AS has_rewrite_rules
             FROM pg_catalog.pg_class AS relation
             WHERE relation.oid = to_regclass(:table_name)
             """
@@ -169,6 +174,8 @@ def _validate_existing_table(
         raise RuntimeError(f"已有表 {table_name} 不能参与表继承")
     if relation_state[5]:
         raise RuntimeError(f"已有表 {table_name} 不能包含用户触发器")
+    if relation_state[6]:
+        raise RuntimeError(f"已有表 {table_name} 不能包含 rewrite rule")
 
     actual_columns = {column["name"]: column for column in inspector.get_columns(table_name)}
     if set(actual_columns) != set(expected_columns):
@@ -337,16 +344,12 @@ def _validate_existing_table(
             ):
                 raise RuntimeError(f"已有表 {table_name} 的索引 {index_name} 不兼容")
 
-    allowed_unique_indexes = {
-        index_name for index_name, (_, unique, _) in (expected_indexes or {}).items() if unique
-    } | set(unique_constraints if expected_unique_constraints is not None else {})
-    unexpected_unique_indexes = {
-        index_name
-        for index_name, index in indexes.items()
-        if bool(index.get("unique")) and index_name not in allowed_unique_indexes
-    }
-    if unexpected_unique_indexes:
-        raise RuntimeError(f"已有表 {table_name} 包含迁移定义外的唯一索引：{sorted(unexpected_unique_indexes)}")
+    allowed_indexes = set(expected_indexes or {}) | set(
+        unique_constraints if expected_unique_constraints is not None else {}
+    )
+    unexpected_indexes = set(indexes) - allowed_indexes
+    if unexpected_indexes:
+        raise RuntimeError(f"已有表 {table_name} 包含迁移定义外的索引：{sorted(unexpected_indexes)}")
 
     if inspector.get_foreign_keys(table_name):
         raise RuntimeError(f"已有表 {table_name} 包含迁移定义外的外键")
