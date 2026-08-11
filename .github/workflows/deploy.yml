@@ -199,6 +199,7 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ needs.prepare.outputs.target_sha }}
+          fetch-depth: 0
 
       - name: Configure user systemd bus
         run: |
@@ -1511,7 +1512,21 @@ jobs:
             exit 1
           fi
 
-          if ! python3 "${GITHUB_WORKSPACE}/scripts/deployment_smoke.py" --base-url http://127.0.0.1:8002; then
+          rollback_api_prefix="${IMAGE_NAME}:"
+          case "${ROLLBACK_API_IMAGE_REF}" in
+            "${rollback_api_prefix}"*) rollback_api_sha="${ROLLBACK_API_IMAGE_REF#"${rollback_api_prefix}"}" ;;
+            *) echo "fusion-api 回滚镜像仓库不受当前 workflow 管理: ${ROLLBACK_API_IMAGE_REF}"; exit 1 ;;
+          esac
+          if [[ ! "${rollback_api_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "fusion-api 回滚镜像标签不是 40 位小写 Git SHA: ${ROLLBACK_API_IMAGE_REF}"
+            exit 1
+          fi
+          if ! git -C "${GITHUB_WORKSPACE}" cat-file -e "${rollback_api_sha}^{commit}"; then
+            echo "fusion-api 回滚提交不在当前仓库历史中: ${rollback_api_sha}"
+            exit 1
+          fi
+          if ! git -C "${GITHUB_WORKSPACE}" show "${rollback_api_sha}:scripts/deployment_smoke.py" \
+            | python3 - --base-url http://127.0.0.1:8002; then
             echo "fusion-api rollback deployment smoke failed"
             docker logs --tail=120 fusion-api || true
             exit 1

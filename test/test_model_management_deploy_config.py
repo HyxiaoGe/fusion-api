@@ -85,9 +85,10 @@ class ModelManagementDeployConfigTests(unittest.TestCase):
     def test_deploy_restores_worker_lifecycle_when_deployment_rolls_back(self):
         workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
         document = yaml.safe_load(workflow)
+        steps = document["jobs"]["deploy-dev"]["steps"]
         rollback_step = next(
             step
-            for step in document["jobs"]["deploy-dev"]["steps"]
+            for step in steps
             if step.get("name") == "Roll back failed deployment"
         )
 
@@ -161,10 +162,12 @@ class ModelManagementDeployConfigTests(unittest.TestCase):
             rollback_step["run"].index("ensure_rollback_image"),
         )
         self.assertIn(
-            'python3 "${GITHUB_WORKSPACE}/scripts/deployment_smoke.py" '
-            "--base-url http://127.0.0.1:8002",
+            'git -C "${GITHUB_WORKSPACE}" show "${rollback_api_sha}:scripts/deployment_smoke.py"',
             rollback_step["run"],
         )
+        self.assertIn("| python3 - --base-url http://127.0.0.1:8002", rollback_step["run"])
+        checkout_step = next(step for step in steps if step.get("name") == "Checkout smoke scripts")
+        self.assertEqual(0, checkout_step["with"]["fetch-depth"])
 
     def test_dev_deploy_manages_discovery_registry_and_governance_timer(self):
         workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
