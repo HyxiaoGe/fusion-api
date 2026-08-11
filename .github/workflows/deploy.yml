@@ -200,6 +200,20 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.prepare.outputs.target_sha }}
 
+      - name: Configure user systemd bus
+        run: |
+          set -euo pipefail
+          runtime_dir="/run/user/$(id -u)"
+          test -d "${runtime_dir}"
+          test -S "${runtime_dir}/bus"
+          {
+            printf '%s\n' "XDG_RUNTIME_DIR=${runtime_dir}"
+            printf '%s\n' "DBUS_SESSION_BUS_ADDRESS=unix:path=${runtime_dir}/bus"
+          } >> "${GITHUB_ENV}"
+          XDG_RUNTIME_DIR="${runtime_dir}" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=${runtime_dir}/bus" \
+            systemctl --user show-environment >/dev/null
+
       - name: Configure Docker credential directory
         run: |
           docker_config="${RUNNER_TEMP}/.docker-${GITHUB_RUN_ID}-${GITHUB_JOB}"
@@ -1214,7 +1228,7 @@ jobs:
         id: deployment_smoke
         run: |
           # scripts/deployment_smoke.py checks /health and /api/models/.
-          if ! python3 scripts/deployment_smoke.py --base-url http://127.0.0.1:8002; then
+          if ! python3 "${GITHUB_WORKSPACE}/scripts/deployment_smoke.py" --base-url http://127.0.0.1:8002; then
             echo "fusion-api deployment smoke failed"
             docker logs --tail=120 fusion-api || true
             exit 1
@@ -1497,7 +1511,7 @@ jobs:
             exit 1
           fi
 
-          if ! python3 scripts/deployment_smoke.py --base-url http://127.0.0.1:8002; then
+          if ! python3 "${GITHUB_WORKSPACE}/scripts/deployment_smoke.py" --base-url http://127.0.0.1:8002; then
             echo "fusion-api rollback deployment smoke failed"
             docker logs --tail=120 fusion-api || true
             exit 1

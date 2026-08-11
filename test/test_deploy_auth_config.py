@@ -28,7 +28,13 @@ class DeployAuthConfigTests(unittest.TestCase):
 
     def test_deploy_runs_api_surface_smoke_after_health(self):
         self.assertIn("Run deployment smoke", self.workflow)
-        self.assertIn("python3 scripts/deployment_smoke.py --base-url http://127.0.0.1:8002", self.workflow)
+        self.assertEqual(
+            2,
+            self.workflow.count(
+                'python3 "${GITHUB_WORKSPACE}/scripts/deployment_smoke.py" '
+                "--base-url http://127.0.0.1:8002"
+            ),
+        )
         self.assertIn("/api/models/", self.workflow)
 
     def test_deploy_mounts_persistent_file_storage(self):
