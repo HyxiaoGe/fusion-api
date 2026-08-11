@@ -38,6 +38,13 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 
+def include_object(_object, name: str | None, type_: str, _reflected: bool, _compare_to) -> bool:
+    """排除仅由特定迁移管理、不会进入 ORM 元数据的内部对象。"""
+    if type_ == "table" and name == "_fusion_alembic_f3a1d9c8b720_origins":
+        return False
+    return True
+
+
 def run_migrations_offline() -> None:
     """离线模式：不连 DB，只输出 SQL。
 
@@ -49,6 +56,7 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        include_object=include_object,
     )
 
     with context.begin_transaction():
@@ -74,6 +82,7 @@ def run_migrations_online() -> None:
             compare_server_default=True,
             # 比较类型变更
             compare_type=True,
+            include_object=include_object,
         )
 
         with context.begin_transaction():
