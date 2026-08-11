@@ -69,6 +69,18 @@ class CIContainerContractTest(unittest.TestCase):
             windows_build_script,
         )
 
+    def test_windows_release_build_disables_registry_incompatible_attestations(self) -> None:
+        windows_build_script = (ROOT / ".github/scripts/windows-build-and-test.ps1").read_text(encoding="utf-8")
+        build_commands = [
+            line.strip()
+            for line in windows_build_script.splitlines()
+            if line.strip().startswith("docker build ")
+        ]
+
+        self.assertEqual(3, len(build_commands))
+        for command in build_commands:
+            self.assertIn("--provenance=false", command)
+
 
 if __name__ == "__main__":
     unittest.main()
