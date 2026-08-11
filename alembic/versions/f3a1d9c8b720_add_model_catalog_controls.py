@@ -158,7 +158,10 @@ def _validate_existing_table(
                      SELECT 1
                      FROM pg_catalog.pg_rewrite
                      WHERE ev_class = relation.oid
-                   ) AS has_rewrite_rules
+                   ) AS has_rewrite_rules,
+                   has_table_privilege(relation.oid, 'SELECT')
+                     AND has_table_privilege(relation.oid, 'INSERT')
+                     AND has_table_privilege(relation.oid, 'UPDATE') AS has_required_privileges
             FROM pg_catalog.pg_class AS relation
             WHERE relation.oid = to_regclass(:table_name)
             """
@@ -176,6 +179,8 @@ def _validate_existing_table(
         raise RuntimeError(f"已有表 {table_name} 不能包含用户触发器")
     if relation_state[6]:
         raise RuntimeError(f"已有表 {table_name} 不能包含 rewrite rule")
+    if not relation_state[7]:
+        raise RuntimeError(f"已有表 {table_name} 缺少应用所需的表权限：SELECT、INSERT、UPDATE")
 
     actual_columns = {column["name"]: column for column in inspector.get_columns(table_name)}
     if set(actual_columns) != set(expected_columns):
@@ -184,13 +189,17 @@ def _validate_existing_table(
             f"actual={sorted(actual_columns)} expected={sorted(expected_columns)}"
         )
 
-    default_collations = {
-        row["column_name"]: bool(row["uses_type_default_collation"])
+    column_metadata = {
+        row["column_name"]: row
         for row in inspector.bind.execute(
             sa.text(
                 """
                 SELECT attribute.attname AS column_name,
-                       attribute.attcollation = data_type.typcollation AS uses_type_default_collation
+                       attribute.attcollation = data_type.typcollation AS uses_type_default_collation,
+                       information_schema._pg_datetime_precision(
+                         attribute.atttypid,
+                         attribute.atttypmod
+                       ) AS datetime_precision
                 FROM pg_catalog.pg_attribute AS attribute
                 JOIN pg_catalog.pg_type AS data_type
                   ON data_type.oid = attribute.atttypid
@@ -211,12 +220,18 @@ def _validate_existing_table(
     ) in expected_columns.items():
         column = actual_columns[column_name]
         actual_type = column["type"]
+        metadata = column_metadata.get(column_name) or {}
         if column.get("computed") is not None or column.get("identity") is not None:
             raise RuntimeError(f"已有表 {table_name}.{column_name} 不能是生成列或 identity 列")
         if issubclass(expected_type, sa.String) and isinstance(actual_type, sa.CHAR):
             raise RuntimeError(f"已有表 {table_name}.{column_name} 不能使用定长 CHAR 类型")
-        if issubclass(expected_type, sa.String) and not default_collations.get(column_name, False):
+        if issubclass(expected_type, sa.String) and not metadata.get("uses_type_default_collation", False):
             raise RuntimeError(f"已有表 {table_name}.{column_name} 的排序规则不兼容")
+        if issubclass(expected_type, sa.DateTime) and metadata.get("datetime_precision") != 6:
+            raise RuntimeError(
+                f"已有表 {table_name}.{column_name} 的时间戳精度不兼容："
+                f"actual={metadata.get('datetime_precision')} expected=6"
+            )
         if expected_type is sa.Integer and isinstance(actual_type, sa.SmallInteger):
             raise RuntimeError(
                 f"已有表 {table_name}.{column_name} 的整数类型宽度不兼容："
@@ -306,6 +321,7 @@ def _validate_existing_table(
             bool(row["indisvalid"]),
             bool(row["indisready"]),
             bool(row["indislive"]),
+            bool(row["indisexclusion"]),
         )
         for row in inspector.bind.execute(
             sa.text(
@@ -313,7 +329,8 @@ def _validate_existing_table(
                 SELECT index_class.relname AS index_name,
                        pg_index.indisvalid,
                        pg_index.indisready,
-                       pg_index.indislive
+                       pg_index.indislive,
+                       pg_index.indisexclusion
                 FROM pg_catalog.pg_index
                 JOIN pg_catalog.pg_class AS index_class
                   ON index_class.oid = pg_index.indexrelid
@@ -323,9 +340,11 @@ def _validate_existing_table(
             {"table_name": table_name},
         ).mappings()
     }
-    invalid_indexes = {index_name for index_name in indexes if index_states.get(index_name) != (True, True, True)}
+    invalid_indexes = {
+        index_name for index_name in indexes if index_states.get(index_name) != (True, True, True, False)
+    }
     if invalid_indexes:
-        raise RuntimeError(f"已有表 {table_name} 包含无效或未就绪索引：{sorted(invalid_indexes)}")
+        raise RuntimeError(f"已有表 {table_name} 包含无效、未就绪或排斥约束索引：{sorted(invalid_indexes)}")
     if expected_indexes:
         for index_name, (expected_column_names, expected_unique, expected_predicate) in expected_indexes.items():
             index = indexes.get(index_name)

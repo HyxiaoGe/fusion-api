@@ -124,13 +124,14 @@ def compatible_inspector() -> Mock:
         query = str(statement)
         result = Mock()
         if "relpersistence" in query:
-            result.one_or_none.return_value = ("r", "p", False, False, False, False, False)
+            result.one_or_none.return_value = ("r", "p", False, False, False, False, False, True)
             return result
         if "uses_type_default_collation" in query:
             result.mappings.return_value = [
                 {
                     "column_name": column["name"],
                     "uses_type_default_collation": True,
+                    "datetime_precision": 6 if isinstance(column["type"], sa.DateTime) else None,
                 }
                 for column in compatible_columns(parameters["table_name"])
             ]
@@ -142,6 +143,7 @@ def compatible_inspector() -> Mock:
                 "indisvalid": True,
                 "indisready": True,
                 "indislive": True,
+                "indisexclusion": False,
             }
             for index in inspector.get_indexes(table_name)
         ]
@@ -454,7 +456,34 @@ class ModelManagementMigrationTest(unittest.TestCase):
             patch.object(migration, "op"),
             patch.object(migration.context, "is_offline_mode", return_value=False),
             patch.object(migration.sa, "inspect", return_value=inspector),
-            self.assertRaisesRegex(RuntimeError, "无效或未就绪索引"),
+            self.assertRaisesRegex(RuntimeError, "无效、未就绪或排斥约束索引"),
+        ):
+            migration.upgrade()
+
+    def test_exclusion_constraint_index_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        original_execute = inspector.bind.execute.side_effect
+
+        def execute_catalog_query(statement, parameters):
+            result = original_execute(statement, parameters)
+            if "pg_index.indisvalid" in str(statement) and parameters["table_name"] == "model_admission_operations":
+                index_states = list(result.mappings())
+                next(
+                    state
+                    for state in index_states
+                    if state["index_name"] == "ix_model_admission_operations_status_created"
+                )["indisexclusion"] = True
+                result.mappings.return_value = index_states
+            return result
+
+        inspector.bind.execute.side_effect = execute_catalog_query
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "排斥约束索引"),
         ):
             migration.upgrade()
 
@@ -563,6 +592,27 @@ class ModelManagementMigrationTest(unittest.TestCase):
         ):
             migration.upgrade()
 
+    def test_table_without_required_application_privileges_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        original_execute = inspector.bind.execute.side_effect
+
+        def execute_catalog_query(statement, parameters):
+            result = original_execute(statement, parameters)
+            if "relpersistence" in str(statement) and parameters["table_name"] == "model_admission_operations":
+                result.one_or_none.return_value = ("r", "p", False, False, False, False, False, False)
+            return result
+
+        inspector.bind.execute.side_effect = execute_catalog_query
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "缺少应用所需的表权限"),
+        ):
+            migration.upgrade()
+
     def test_extra_foreign_key_is_rejected(self):
         migration = load_migration()
         inspector = compatible_inspector()
@@ -641,6 +691,7 @@ class ModelManagementMigrationTest(unittest.TestCase):
                     {
                         "column_name": column["name"],
                         "uses_type_default_collation": column["name"] != "status",
+                        "datetime_precision": 6 if isinstance(column["type"], sa.DateTime) else None,
                     }
                     for column in compatible_columns(parameters["table_name"])
                 ]
@@ -653,6 +704,34 @@ class ModelManagementMigrationTest(unittest.TestCase):
             patch.object(migration.context, "is_offline_mode", return_value=False),
             patch.object(migration.sa, "inspect", return_value=inspector),
             self.assertRaisesRegex(RuntimeError, "排序规则不兼容"),
+        ):
+            migration.upgrade()
+
+    def test_non_default_timestamp_precision_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        original_execute = inspector.bind.execute.side_effect
+
+        def execute_catalog_query(statement, parameters):
+            result = original_execute(statement, parameters)
+            if "uses_type_default_collation" in str(statement):
+                result.mappings.return_value = [
+                    {
+                        "column_name": column["name"],
+                        "uses_type_default_collation": True,
+                        "datetime_precision": 0 if column["name"] == "lease_expires_at" else 6,
+                    }
+                    for column in compatible_columns(parameters["table_name"])
+                ]
+            return result
+
+        inspector.bind.execute.side_effect = execute_catalog_query
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "时间戳精度不兼容"),
         ):
             migration.upgrade()
 
