@@ -114,7 +114,7 @@ def compatible_inspector() -> Mock:
                 "name": "uq_model_admission_operations_single_running",
                 "column_names": ["status"],
                 "unique": True,
-                "dialect_options": {"postgresql_where": "status = 'running'"},
+                "dialect_options": {"postgresql_where": "(status)::text = 'running'::text"},
             },
         ]
     )
@@ -124,7 +124,7 @@ def compatible_inspector() -> Mock:
         query = str(statement)
         result = Mock()
         if "relpersistence" in query:
-            result.one_or_none.return_value = ("r", "p")
+            result.one_or_none.return_value = ("r", "p", False, False)
             return result
         table_name = parameters["table_name"]
         result.mappings.return_value = [
@@ -261,6 +261,36 @@ class ModelManagementMigrationTest(unittest.TestCase):
                 {
                     "name": "ck_model_admission_operations_status",
                     "sqltext": "status IN ('pending', 'running')",
+                }
+            ]
+        )
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "检查约束 .* 表达式不兼容"),
+        ):
+            migration.upgrade()
+
+    def test_semantic_cast_in_check_expression_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        original_get_checks = inspector.get_check_constraints.side_effect
+        inspector.get_check_constraints.side_effect = lambda table_name: (
+            original_get_checks(table_name)
+            if table_name == "model_catalog_controls"
+            else [
+                {
+                    "name": "ck_model_admission_operations_status",
+                    "sqltext": (
+                        "status::boolean::text = ANY (ARRAY["
+                        "'pending'::character varying, "
+                        "'running'::character varying, "
+                        "'succeeded'::character varying, "
+                        "'failed'::character varying"
+                        "]::text[])"
+                    ),
                 }
             ]
         )
@@ -416,6 +446,27 @@ class ModelManagementMigrationTest(unittest.TestCase):
         ):
             migration.upgrade()
 
+    def test_rls_enabled_table_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        original_execute = inspector.bind.execute.side_effect
+
+        def execute_catalog_query(statement, parameters):
+            result = original_execute(statement, parameters)
+            if "relpersistence" in str(statement) and parameters["table_name"] == "model_catalog_controls":
+                result.one_or_none.return_value = ("r", "p", True, True)
+            return result
+
+        inspector.bind.execute.side_effect = execute_catalog_query
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "不能启用行级安全"),
+        ):
+            migration.upgrade()
+
     def test_extra_foreign_key_is_rejected(self):
         migration = load_migration()
         inspector = compatible_inspector()
@@ -464,6 +515,29 @@ class ModelManagementMigrationTest(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "不能使用定长 CHAR 类型"),
         ):
             migration.upgrade()
+
+    def test_small_integer_column_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        catalog_columns = compatible_columns("model_catalog_controls")
+        next(column for column in catalog_columns if column["name"] == "revision")["type"] = sa.SmallInteger()
+        inspector.get_columns.side_effect = lambda table_name: (
+            catalog_columns if table_name == "model_catalog_controls" else compatible_columns(table_name)
+        )
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "整数类型宽度不兼容"),
+        ):
+            migration.upgrade()
+
+    def test_origin_registry_is_excluded_from_alembic_autogenerate(self):
+        env_source = (MIGRATION_PATH.parent.parent / "env.py").read_text(encoding="utf-8")
+
+        self.assertIn('name == "_fusion_alembic_f3a1d9c8b720_origins"', env_source)
+        self.assertEqual(env_source.count("include_object=include_object"), 2)
 
     def test_not_valid_check_constraint_is_rejected(self):
         migration = load_migration()

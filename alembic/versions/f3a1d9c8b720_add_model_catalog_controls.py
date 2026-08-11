@@ -38,7 +38,7 @@ MODEL_ADMISSION_OPERATION_COLUMNS = {
     "model_id": (sa.String, 200, False, None),
     "candidate_fingerprint": (sa.String, 64, False, None),
     "governance_run_id": (sa.String, 32, False, None),
-    "status": (sa.String, 20, False, "'pending'"),
+    "status": (sa.String, 20, False, "'pending'::character varying"),
     "requested_by": (sa.String, None, False, None),
     "request_id": (sa.String, None, False, None),
     "reason": (sa.String, 300, False, None),
@@ -46,7 +46,7 @@ MODEL_ADMISSION_OPERATION_COLUMNS = {
     "lease_token_hash": (sa.String, 64, True, None),
     "lease_expires_at": (sa.DateTime, None, True, None),
     "catalog_invalidated_at": (sa.DateTime, None, True, None),
-    "result": (postgresql.JSONB, None, False, "'{}'"),
+    "result": (postgresql.JSONB, None, False, "'{}'::jsonb"),
     "created_at": (sa.DateTime, None, False, "now()"),
     "updated_at": (sa.DateTime, None, False, "now()"),
     "terminal_at": (sa.DateTime, None, True, None),
@@ -54,13 +54,40 @@ MODEL_ADMISSION_OPERATION_COLUMNS = {
 
 
 def _normalize_unquoted_sql(segment: str) -> str:
-    normalized = re.sub(
-        r"::(?:character varying|text|boolean|integer|jsonb)(?:\[\])?",
-        "",
-        segment,
-        flags=re.IGNORECASE,
-    )
-    return re.sub(r"[\s()]", "", normalized.lower())
+    return re.sub(r"\s", "", segment.lower())
+
+
+def _strip_redundant_outer_parentheses(expression: str) -> str:
+    normalized = expression
+    while normalized.startswith("(") and normalized.endswith(")"):
+        depth = 0
+        quote: str | None = None
+        closes_at_end = True
+        index = 0
+        while index < len(normalized):
+            char = normalized[index]
+            if quote is not None:
+                if char == quote:
+                    if index + 1 < len(normalized) and normalized[index + 1] == quote:
+                        index += 2
+                        continue
+                    quote = None
+                index += 1
+                continue
+            if char in {"'", '"'}:
+                quote = char
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0 and index != len(normalized) - 1:
+                    closes_at_end = False
+                    break
+            index += 1
+        if not closes_at_end or depth != 0:
+            break
+        normalized = normalized[1:-1]
+    return normalized
 
 
 def _normalize_sql_expression(expression: object) -> str:
@@ -91,7 +118,9 @@ def _normalize_sql_expression(expression: object) -> str:
         unquoted_start = index
 
     normalized.append(_normalize_unquoted_sql(sql[unquoted_start:]))
-    return "".join(normalized)
+    normalized_sql = "".join(normalized)
+    normalized_sql = re.sub(r"\(([a-z_][a-z0-9_.]*)\)(?=::)", r"\1", normalized_sql)
+    return _strip_redundant_outer_parentheses(normalized_sql)
 
 
 def _validate_existing_table(
@@ -111,7 +140,7 @@ def _validate_existing_table(
     relation_state_row = inspector.bind.execute(
         sa.text(
             """
-            SELECT relkind, relpersistence
+            SELECT relkind, relpersistence, relrowsecurity, relforcerowsecurity
             FROM pg_catalog.pg_class
             WHERE oid = to_regclass(:table_name)
             """
@@ -119,8 +148,10 @@ def _validate_existing_table(
         {"table_name": table_name},
     ).one_or_none()
     relation_state = tuple(relation_state_row) if relation_state_row is not None else None
-    if relation_state != ("r", "p"):
+    if relation_state is None or relation_state[:2] != ("r", "p"):
         raise RuntimeError(f"已有表 {table_name} 必须是 PostgreSQL 持久普通表：actual={relation_state}")
+    if relation_state[2:] != (False, False):
+        raise RuntimeError(f"已有表 {table_name} 不能启用行级安全：actual={relation_state[2:]}")
 
     actual_columns = {column["name"]: column for column in inspector.get_columns(table_name)}
     if set(actual_columns) != set(expected_columns):
@@ -141,6 +172,11 @@ def _validate_existing_table(
             raise RuntimeError(f"已有表 {table_name}.{column_name} 不能是生成列或 identity 列")
         if issubclass(expected_type, sa.String) and isinstance(actual_type, sa.CHAR):
             raise RuntimeError(f"已有表 {table_name}.{column_name} 不能使用定长 CHAR 类型")
+        if expected_type is sa.Integer and isinstance(actual_type, sa.SmallInteger):
+            raise RuntimeError(
+                f"已有表 {table_name}.{column_name} 的整数类型宽度不兼容："
+                f"actual={actual_type} expected={expected_type.__name__}"
+            )
         if not isinstance(actual_type, expected_type):
             raise RuntimeError(
                 f"已有表 {table_name}.{column_name} 的类型不兼容："
@@ -420,7 +456,7 @@ def upgrade() -> None:
                 "uq_model_admission_operations_single_running": (
                     ("status",),
                     True,
-                    "status = 'running'",
+                    "status::text = 'running'::text",
                 ),
             },
         )
