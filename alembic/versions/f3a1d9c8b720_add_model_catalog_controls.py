@@ -140,9 +140,22 @@ def _validate_existing_table(
     relation_state_row = inspector.bind.execute(
         sa.text(
             """
-            SELECT relkind, relpersistence, relrowsecurity, relforcerowsecurity
-            FROM pg_catalog.pg_class
-            WHERE oid = to_regclass(:table_name)
+            SELECT relation.relkind,
+                   relation.relpersistence,
+                   relation.relrowsecurity,
+                   relation.relforcerowsecurity,
+                   EXISTS (
+                     SELECT 1
+                     FROM pg_catalog.pg_inherits
+                     WHERE inhparent = relation.oid OR inhrelid = relation.oid
+                   ) AS has_inheritance,
+                   EXISTS (
+                     SELECT 1
+                     FROM pg_catalog.pg_trigger
+                     WHERE tgrelid = relation.oid AND NOT tgisinternal
+                   ) AS has_user_triggers
+            FROM pg_catalog.pg_class AS relation
+            WHERE relation.oid = to_regclass(:table_name)
             """
         ),
         {"table_name": table_name},
@@ -150,8 +163,12 @@ def _validate_existing_table(
     relation_state = tuple(relation_state_row) if relation_state_row is not None else None
     if relation_state is None or relation_state[:2] != ("r", "p"):
         raise RuntimeError(f"已有表 {table_name} 必须是 PostgreSQL 持久普通表：actual={relation_state}")
-    if relation_state[2:] != (False, False):
-        raise RuntimeError(f"已有表 {table_name} 不能启用行级安全：actual={relation_state[2:]}")
+    if relation_state[2:4] != (False, False):
+        raise RuntimeError(f"已有表 {table_name} 不能启用行级安全：actual={relation_state[2:4]}")
+    if relation_state[4]:
+        raise RuntimeError(f"已有表 {table_name} 不能参与表继承")
+    if relation_state[5]:
+        raise RuntimeError(f"已有表 {table_name} 不能包含用户触发器")
 
     actual_columns = {column["name"]: column for column in inspector.get_columns(table_name)}
     if set(actual_columns) != set(expected_columns):
@@ -159,6 +176,25 @@ def _validate_existing_table(
             f"已有表 {table_name} 的字段集合与迁移定义不一致："
             f"actual={sorted(actual_columns)} expected={sorted(expected_columns)}"
         )
+
+    default_collations = {
+        row["column_name"]: bool(row["uses_type_default_collation"])
+        for row in inspector.bind.execute(
+            sa.text(
+                """
+                SELECT attribute.attname AS column_name,
+                       attribute.attcollation = data_type.typcollation AS uses_type_default_collation
+                FROM pg_catalog.pg_attribute AS attribute
+                JOIN pg_catalog.pg_type AS data_type
+                  ON data_type.oid = attribute.atttypid
+                WHERE attribute.attrelid = to_regclass(:table_name)
+                  AND attribute.attnum > 0
+                  AND NOT attribute.attisdropped
+                """
+            ),
+            {"table_name": table_name},
+        ).mappings()
+    }
 
     for column_name, (
         expected_type,
@@ -172,6 +208,8 @@ def _validate_existing_table(
             raise RuntimeError(f"已有表 {table_name}.{column_name} 不能是生成列或 identity 列")
         if issubclass(expected_type, sa.String) and isinstance(actual_type, sa.CHAR):
             raise RuntimeError(f"已有表 {table_name}.{column_name} 不能使用定长 CHAR 类型")
+        if issubclass(expected_type, sa.String) and not default_collations.get(column_name, False):
+            raise RuntimeError(f"已有表 {table_name}.{column_name} 的排序规则不兼容")
         if expected_type is sa.Integer and isinstance(actual_type, sa.SmallInteger):
             raise RuntimeError(
                 f"已有表 {table_name}.{column_name} 的整数类型宽度不兼容："
@@ -510,8 +548,8 @@ def downgrade() -> None:
                 DROP TABLE model_catalog_controls;
               END IF;
               DROP TABLE {ORIGIN_REGISTRY_TABLE};
-            END
-            $fusion$
+            END;
+            $fusion$;
             """
         )
     )

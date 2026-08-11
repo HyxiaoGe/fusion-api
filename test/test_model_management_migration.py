@@ -124,7 +124,16 @@ def compatible_inspector() -> Mock:
         query = str(statement)
         result = Mock()
         if "relpersistence" in query:
-            result.one_or_none.return_value = ("r", "p", False, False)
+            result.one_or_none.return_value = ("r", "p", False, False, False, False)
+            return result
+        if "uses_type_default_collation" in query:
+            result.mappings.return_value = [
+                {
+                    "column_name": column["name"],
+                    "uses_type_default_collation": True,
+                }
+                for column in compatible_columns(parameters["table_name"])
+            ]
             return result
         table_name = parameters["table_name"]
         result.mappings.return_value = [
@@ -467,6 +476,48 @@ class ModelManagementMigrationTest(unittest.TestCase):
         ):
             migration.upgrade()
 
+    def test_table_with_user_trigger_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        original_execute = inspector.bind.execute.side_effect
+
+        def execute_catalog_query(statement, parameters):
+            result = original_execute(statement, parameters)
+            if "relpersistence" in str(statement) and parameters["table_name"] == "model_admission_operations":
+                result.one_or_none.return_value = ("r", "p", False, False, False, True)
+            return result
+
+        inspector.bind.execute.side_effect = execute_catalog_query
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "不能包含用户触发器"),
+        ):
+            migration.upgrade()
+
+    def test_table_with_inheritance_relationship_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        original_execute = inspector.bind.execute.side_effect
+
+        def execute_catalog_query(statement, parameters):
+            result = original_execute(statement, parameters)
+            if "relpersistence" in str(statement) and parameters["table_name"] == "model_admission_operations":
+                result.one_or_none.return_value = ("r", "p", False, False, True, False)
+            return result
+
+        inspector.bind.execute.side_effect = execute_catalog_query
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "不能参与表继承"),
+        ):
+            migration.upgrade()
+
     def test_extra_foreign_key_is_rejected(self):
         migration = load_migration()
         inspector = compatible_inspector()
@@ -530,6 +581,33 @@ class ModelManagementMigrationTest(unittest.TestCase):
             patch.object(migration.context, "is_offline_mode", return_value=False),
             patch.object(migration.sa, "inspect", return_value=inspector),
             self.assertRaisesRegex(RuntimeError, "整数类型宽度不兼容"),
+        ):
+            migration.upgrade()
+
+    def test_non_default_string_collation_is_rejected(self):
+        migration = load_migration()
+        inspector = compatible_inspector()
+        original_execute = inspector.bind.execute.side_effect
+
+        def execute_catalog_query(statement, parameters):
+            result = original_execute(statement, parameters)
+            if "uses_type_default_collation" in str(statement):
+                result.mappings.return_value = [
+                    {
+                        "column_name": column["name"],
+                        "uses_type_default_collation": column["name"] != "status",
+                    }
+                    for column in compatible_columns(parameters["table_name"])
+                ]
+            return result
+
+        inspector.bind.execute.side_effect = execute_catalog_query
+
+        with (
+            patch.object(migration, "op"),
+            patch.object(migration.context, "is_offline_mode", return_value=False),
+            patch.object(migration.sa, "inspect", return_value=inspector),
+            self.assertRaisesRegex(RuntimeError, "排序规则不兼容"),
         ):
             migration.upgrade()
 
@@ -608,6 +686,7 @@ class ModelManagementMigrationTest(unittest.TestCase):
         self.assertIn("缺少迁移来源登记表", downgrade_sql)
         self.assertIn("DROP TABLE model_admission_operations", downgrade_sql)
         self.assertIn("DROP TABLE model_catalog_controls", downgrade_sql)
+        self.assertIn("END;\n            $fusion$;", downgrade_sql)
 
 
 if __name__ == "__main__":
