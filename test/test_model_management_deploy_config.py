@@ -7,6 +7,24 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ModelManagementDeployConfigTests(unittest.TestCase):
+    def test_dev_deploy_exports_user_systemd_bus_before_lifecycle_operations(self):
+        workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
+        document = yaml.safe_load(workflow)
+        steps = document["jobs"]["deploy-dev"]["steps"]
+        step_names = [step.get("name") for step in steps]
+        configure_step = next(step for step in steps if step.get("name") == "Configure user systemd bus")
+
+        self.assertLess(
+            step_names.index("Configure user systemd bus"),
+            step_names.index("Capture current deployment for rollback"),
+        )
+        self.assertIn('runtime_dir="/run/user/$(id -u)"', configure_step["run"])
+        self.assertIn('test -S "${runtime_dir}/bus"', configure_step["run"])
+        self.assertIn('XDG_RUNTIME_DIR=${runtime_dir}', configure_step["run"])
+        self.assertIn('DBUS_SESSION_BUS_ADDRESS=unix:path=${runtime_dir}/bus', configure_step["run"])
+        self.assertIn('>> "${GITHUB_ENV}"', configure_step["run"])
+        self.assertIn("systemctl --user show-environment", configure_step["run"])
+
     def test_dev_deploy_mounts_only_governance_root_read_only(self):
         workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
 
@@ -67,9 +85,10 @@ class ModelManagementDeployConfigTests(unittest.TestCase):
     def test_deploy_restores_worker_lifecycle_when_deployment_rolls_back(self):
         workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
         document = yaml.safe_load(workflow)
+        steps = document["jobs"]["deploy-dev"]["steps"]
         rollback_step = next(
             step
-            for step in document["jobs"]["deploy-dev"]["steps"]
+            for step in steps
             if step.get("name") == "Roll back failed deployment"
         )
 
@@ -142,6 +161,13 @@ class ModelManagementDeployConfigTests(unittest.TestCase):
             rollback_step["run"].index("wait_for_user_services"),
             rollback_step["run"].index("ensure_rollback_image"),
         )
+        self.assertIn(
+            'git -C "${GITHUB_WORKSPACE}" show "${rollback_api_sha}:scripts/deployment_smoke.py"',
+            rollback_step["run"],
+        )
+        self.assertIn("| python3 - --base-url http://127.0.0.1:8002", rollback_step["run"])
+        checkout_step = next(step for step in steps if step.get("name") == "Checkout smoke scripts")
+        self.assertEqual(0, checkout_step["with"]["fetch-depth"])
 
     def test_dev_deploy_manages_discovery_registry_and_governance_timer(self):
         workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
