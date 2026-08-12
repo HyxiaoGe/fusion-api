@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 _ACTIVE_STORAGE_UPLOAD_LIFECYCLES: set[asyncio.Task[None]] = set()
 
 
+class StorageUploadFenceLost(RuntimeError):
+    """对象上传返回时，持久 intent 已无法阻止 cleanup Worker 接管。"""
+
+
 class GuardedStorageUpload:
     """把不可取消的对象上传与请求生命周期、持久清理 intent 解耦。
 
@@ -50,6 +54,7 @@ class GuardedStorageUpload:
         self._terminal = asyncio.Event()
         self._stop_renewal = asyncio.Event()
         self._terminal_state: str | None = None
+        self._fence_lost = False
         self._upload_result: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         self._task = asyncio.create_task(
             self._run(),
@@ -94,7 +99,22 @@ class GuardedStorageUpload:
                 if not self._upload_result.done():
                     self._upload_result.set_exception(exc)
             else:
-                if not self._upload_result.done():
+                # SDK 返回时用新事务重新取得持久 fence。数据库失联期间 intent 可能
+                # 已过期且 cleanup Worker 已接管；此时绝不能继续提交文档记录。
+                try:
+                    fence_renewed = await asyncio.to_thread(self._renew_once)
+                except Exception:
+                    logger.exception(
+                        "知识库上传返回后无法确认持久 fence: task_id=%s intent_id=%s",
+                        self.registration.task_id,
+                        self.registration.intent_id,
+                    )
+                    fence_renewed = False
+                if self._fence_lost or not fence_renewed:
+                    self._fence_lost = True
+                    if not self._upload_result.done():
+                        self._upload_result.set_exception(StorageUploadFenceLost("对象上传完成时持久清理 fence 已失效"))
+                elif not self._upload_result.done():
                     self._upload_result.set_result(result)
 
             # SDK 返回并不代表请求侧数据库事务已经结束。正常请求必须继续持有 intent，
@@ -124,8 +144,9 @@ class GuardedStorageUpload:
             try:
                 renewed = await asyncio.to_thread(self._renew_once)
                 if not renewed and not self._terminal.is_set():
+                    self._fence_lost = True
                     logger.warning(
-                        "知识库上传 intent 已不存在，等待请求终态: task_id=%s intent_id=%s",
+                        "知识库上传 intent 已失效，禁止提交文档并等待清理: task_id=%s intent_id=%s",
                         self.registration.task_id,
                         self.registration.intent_id,
                     )

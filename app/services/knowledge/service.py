@@ -44,7 +44,7 @@ from app.services.knowledge.milvus import (
     MilvusKnowledgeStore,
 )
 from app.services.knowledge.parser import KnowledgeDocumentParser
-from app.services.knowledge.storage_upload_guard import start_guarded_storage_upload
+from app.services.knowledge.storage_upload_guard import StorageUploadFenceLost, start_guarded_storage_upload
 from app.services.storage import get_storage
 
 EmbeddingProfileKey = tuple[str, str, int, str, str, str]
@@ -223,7 +223,14 @@ class KnowledgeService:
         try:
             # 上传由独立 lifecycle 持有。wait_for 取消请求时，真实 SDK 线程和 intent
             # 续租仍会继续，直到 detached finalizer 完成精确引用复核。
-            await upload_lifecycle.wait_upload()
+            try:
+                await upload_lifecycle.wait_upload()
+            except StorageUploadFenceLost as exc:
+                raise ApiException(
+                    ErrorCode.KNOWLEDGE_STORAGE_BUSY,
+                    "对象上传期间存储清理 fence 已失效，请稍后重试",
+                    503,
+                ) from exc
             profile = self._base_profile(knowledge_base)
             document = KnowledgeDocument(
                 id=document_id,
@@ -863,8 +870,8 @@ class KnowledgeService:
 
     async def _delete_uploaded_object(self, storage_key: str) -> bool:
         try:
-            if await self.storage.delete(storage_key):
-                return True
-            return not await self.storage.exists(storage_key)
+            # 只有实际发出并确认 delete 才能完成补偿；单次 not-found 无法排除
+            # 数据库失联期间仍在进行的迟到 PUT，必须保留持久任务继续复核。
+            return await self.storage.delete(storage_key)
         except Exception:
             return False

@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 from fastapi import UploadFile
 from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from starlette.datastructures import Headers
@@ -17,11 +18,13 @@ from starlette.datastructures import Headers
 from app.db.database import Base
 from app.db.models import (
     KnowledgeBase,
+    KnowledgeDocument,
     KnowledgeStorageCleanupTask,
     KnowledgeStorageUploadIntent,
     User,
 )
 from app.db.storage_cleanup_repository import StorageCleanupRepository
+from app.schemas.response import ApiException
 from app.services.knowledge.service import KnowledgeService
 from app.services.knowledge.storage_cleanup_worker import KnowledgeStorageCleanupWorker
 from app.services.knowledge.storage_upload_guard import (
@@ -67,6 +70,17 @@ class _BlockingThreadStorage:
 class _ImmediateStorage:
     async def upload(self, key: str, _content: bytes, _mimetype: str) -> str:
         return key
+
+
+class _ToggleSessionFactory:
+    def __init__(self, factory):
+        self.factory = factory
+        self.available = False
+
+    def __call__(self):
+        if not self.available:
+            raise OperationalError("connect", {}, RuntimeError("database unavailable"))
+        return self.factory()
 
 
 class KnowledgeStorageUploadGuardTests(unittest.IsolatedAsyncioTestCase):
@@ -225,6 +239,77 @@ class KnowledgeStorageUploadGuardTests(unittest.IsolatedAsyncioTestCase):
         with self.Session() as db:
             cleanup_task = db.get(KnowledgeStorageCleanupTask, registration_task_id)
             self.assertEqual(cleanup_task.status, "completed")
+
+    async def test_database_outage_cannot_commit_after_cleanup_takes_over_upload_fence(self):
+        content = b"database outage upload"
+        storage = _BlockingThreadStorage()
+        lifecycle_sessions = _ToggleSessionFactory(self.Session)
+        service_db = self.Session()
+        service = KnowledgeService(
+            service_db,
+            storage=storage,
+            embedding=MagicMock(),
+            vector_store=MagicMock(),
+            session_factory=lifecycle_sessions,
+            storage_upload_hold_seconds=1,
+        )
+        service.vector_store.collection_name.return_value = "knowledge_v1_d2"
+        upload = UploadFile(
+            filename="manual.txt",
+            file=io.BytesIO(content),
+            headers=Headers({"content-type": "text/plain"}),
+        )
+        worker = KnowledgeStorageCleanupWorker(self.Session, worker_id="cleanup-outage")
+
+        try:
+            with (
+                patch("app.services.knowledge.service.settings.KNOWLEDGE_BASE_ENABLED", True),
+                patch("app.services.knowledge.service.settings.STORAGE_BACKEND", "local"),
+                patch.object(service, "_require_enabled", return_value=None),
+                patch(
+                    "app.services.knowledge.storage_cleanup_worker.get_storage_for_backend",
+                    return_value=storage,
+                ),
+                patch("app.services.knowledge.storage_upload_guard.logger.exception"),
+            ):
+                request_task = asyncio.create_task(service.upload_document("user-1", "kb-1", upload))
+                self.assertTrue(await asyncio.to_thread(storage.upload_started.wait, 2))
+                await asyncio.sleep(1.1)
+
+                # DB 恢复后 cleanup 先取得过期任务。对象尚不可见不能完成，只能退避复核。
+                self.assertTrue(await worker.run_once())
+                with self.Session() as db:
+                    task = db.query(KnowledgeStorageCleanupTask).one()
+                    self.assertIn(task.status, {"retry", "failed"})
+                    self.assertEqual(task.error_code, "KNOWLEDGE_STORAGE_DELETE_UNCERTAIN")
+                    self.assertEqual(db.query(KnowledgeStorageUploadIntent).count(), 0)
+
+                lifecycle_sessions.available = True
+                storage.upload_release.set()
+                with self.assertRaises(ApiException) as raised:
+                    await request_task
+                self.assertEqual(raised.exception.code, "KNOWLEDGE_STORAGE_BUSY")
+                self.assertEqual(raised.exception.status_code, 503)
+                await drain_storage_upload_lifecycles()
+        finally:
+            service_db.close()
+
+        # fresh-session finalizer 将失去 fence 的代际重新置为待清理；迟到 PUT 出现后删除。
+        self.assertTrue(storage.object_exists)
+        with self.Session() as db:
+            task = db.query(KnowledgeStorageCleanupTask).one()
+            self.assertEqual(task.status, "pending")
+            self.assertEqual(db.query(KnowledgeDocument).count(), 0)
+            task.available_at = utc_now()
+            db.commit()
+        with patch(
+            "app.services.knowledge.storage_cleanup_worker.get_storage_for_backend",
+            return_value=storage,
+        ):
+            self.assertTrue(await worker.run_once())
+        self.assertFalse(storage.object_exists)
+        with self.Session() as db:
+            self.assertEqual(db.query(KnowledgeStorageCleanupTask).one().status, "completed")
 
     @staticmethod
     def _as_utc(value):

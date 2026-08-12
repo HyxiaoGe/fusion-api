@@ -38,7 +38,7 @@ class KnowledgeStorageCleanupWorker:
             try:
                 # MinIO/OSS 的 SDK 删除在线程中不可取消。事务行锁必须覆盖到真实返回，
                 # 不能因 asyncio 超时提前释放同 key fencing。
-                await self._delete_idempotently(task.storage_backend, task.storage_key)
+                deleted = await self._delete_idempotently(task.storage_backend, task.storage_key)
             except Exception as exc:
                 retry_delay = min(
                     settings.KNOWLEDGE_WORKER_RETRY_BASE_SECONDS * (2 ** max(claimed.task.attempt_count - 1, 0)),
@@ -59,16 +59,29 @@ class KnowledgeStorageCleanupWorker:
                     type(exc).__name__,
                 )
             else:
+                if not deleted:
+                    retry_delay = min(
+                        settings.KNOWLEDGE_WORKER_RETRY_BASE_SECONDS * (2 ** max(claimed.task.attempt_count - 1, 0)),
+                        settings.KNOWLEDGE_WORKER_RETRY_MAX_SECONDS,
+                    )
+                    repo.fail_delete(
+                        task,
+                        claimed.lease_token,
+                        error_code="KNOWLEDGE_STORAGE_DELETE_UNCERTAIN",
+                        error_summary="对象当前不可见，等待迟到上传或精确引用收敛",
+                        retry_delay_seconds=retry_delay,
+                    )
+                    return True
                 repo.complete_delete(task, claimed.lease_token)
         return True
 
     @staticmethod
-    async def _delete_idempotently(storage_backend: str, storage_key: str) -> None:
+    async def _delete_idempotently(storage_backend: str, storage_key: str) -> bool:
         storage = get_storage_for_backend(storage_backend)
         if not await storage.exists(storage_key):
-            return
+            return False
         if await storage.delete(storage_key):
-            return
+            return True
         if not await storage.exists(storage_key):
-            return
+            return True
         raise RuntimeError("storage object still exists after delete")
