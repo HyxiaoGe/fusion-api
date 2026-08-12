@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi import UploadFile
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 from starlette.datastructures import Headers
 
 from app.db.database import Base
@@ -17,11 +18,16 @@ from app.schemas.knowledge import KnowledgeBaseCreate, KnowledgeBaseUpdate, Know
 from app.schemas.response import ApiException
 from app.services.knowledge.milvus import KnowledgeVectorError, KnowledgeVectorHit
 from app.services.knowledge.service import KnowledgeService
+from app.services.knowledge.storage_upload_guard import drain_storage_upload_lifecycles
 
 
 class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.engine = create_engine("sqlite:///:memory:")
+        self.engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
         Base.metadata.create_all(self.engine)
         self.db = sessionmaker(bind=self.engine, expire_on_commit=False)()
         self.db.add_all(
@@ -74,6 +80,9 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
         ]
         for patcher in self.settings_patchers:
             patcher.start()
+
+    async def asyncTearDown(self):
+        await drain_storage_upload_lifecycles()
 
     def tearDown(self):
         for patcher in reversed(self.settings_patchers):

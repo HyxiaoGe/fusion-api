@@ -299,6 +299,118 @@ class KnowledgeStorageCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(first.lease_token, reclaimed.lease_token)
         self.assertEqual(reclaimed.task.attempt_count, 2)
 
+    def test_last_attempt_crash_is_reconciled_once_with_backoff_and_skip_locked(self):
+        registration = self._register(key="knowledge/last-attempt-crash", hold_seconds=1, max_attempts=1)
+        self._activate(registration)
+        claim_at = utc_now() + timedelta(seconds=2)
+        with self.Session() as db:
+            repo = StorageCleanupRepository(db)
+            first = repo.claim_task(
+                worker_id="worker-1",
+                lease_seconds=10,
+                now=claim_at,
+            )
+        self.assertIsNotNone(first)
+        self.assertEqual(first.task.attempt_count, 1)
+        self.assertEqual(first.task.max_attempts, 1)
+
+        reconcile_at = claim_at + timedelta(seconds=11)
+        with self.Session() as db:
+            repo = StorageCleanupRepository(db)
+            with patch.object(self.engine.dialect, "name", "postgresql"):
+                statement = repo._expired_exhausted_tasks_query(reconcile_at).statement
+            compiled = str(statement.compile(dialect=postgresql.dialect()))
+            self.assertIn("FOR UPDATE SKIP LOCKED", compiled)
+
+            self.assertIsNone(
+                repo.claim_task(
+                    worker_id="worker-2",
+                    lease_seconds=10,
+                    retry_base_seconds=5,
+                    retry_max_seconds=60,
+                    now=reconcile_at,
+                )
+            )
+            task = db.get(KnowledgeStorageCleanupTask, registration.task_id)
+            self.assertEqual(task.status, "retry")
+            self.assertEqual(task.attempt_count, 1)
+            self.assertEqual(task.max_attempts, 2)
+            self.assertEqual(task.error_code, "KNOWLEDGE_STORAGE_CLEANUP_INTERRUPTED")
+            self.assertIsNone(task.lease_owner)
+            self.assertIsNone(task.lease_token_hash)
+            retry_at = task.available_at
+
+        with self.Session() as db:
+            repo = StorageCleanupRepository(db)
+            self.assertIsNone(
+                repo.claim_task(
+                    worker_id="worker-2",
+                    lease_seconds=10,
+                    retry_base_seconds=5,
+                    retry_max_seconds=60,
+                    now=reconcile_at + timedelta(seconds=1),
+                )
+            )
+            task = db.get(KnowledgeStorageCleanupTask, registration.task_id)
+            self.assertEqual(task.attempt_count, 1)
+            self.assertEqual(task.max_attempts, 2)
+            self.assertEqual(task.available_at, retry_at)
+
+    def test_external_call_past_last_lease_is_reclaimed_and_eventually_completes(self):
+        registration = self._register(key="knowledge/slow-external-call", hold_seconds=1, max_attempts=1)
+        self._activate(registration)
+        claim_at = utc_now() + timedelta(seconds=2)
+        with self.Session() as db:
+            repo = StorageCleanupRepository(db)
+            first = repo.claim_task(worker_id="worker-1", lease_seconds=10, now=claim_at)
+        self.assertIsNotNone(first)
+
+        # 模拟不可取消的外部删除超过 lease 后才返回：旧 token 不能完成任务。
+        with self.Session() as db:
+            task = db.get(KnowledgeStorageCleanupTask, registration.task_id)
+            task.lease_expires_at = utc_now() - timedelta(seconds=1)
+            db.commit()
+            self.assertFalse(StorageCleanupRepository(db).complete_delete(task, first.lease_token))
+
+        reconcile_at = utc_now()
+        with self.Session() as db:
+            repo = StorageCleanupRepository(db)
+            self.assertIsNone(
+                repo.claim_task(
+                    worker_id="worker-2",
+                    lease_seconds=10,
+                    retry_base_seconds=1,
+                    retry_max_seconds=1,
+                    now=reconcile_at,
+                )
+            )
+            task = db.get(KnowledgeStorageCleanupTask, registration.task_id)
+            self.assertEqual(task.status, "retry")
+            self.assertEqual(task.attempt_count, 1)
+            self.assertEqual(task.max_attempts, 2)
+            retry_at = task.available_at
+
+        with self.Session() as db:
+            repo = StorageCleanupRepository(db)
+            reclaimed = repo.claim_task(
+                worker_id="worker-2",
+                lease_seconds=10,
+                retry_base_seconds=1,
+                retry_max_seconds=1,
+                now=retry_at,
+            )
+            self.assertIsNotNone(reclaimed)
+            self.assertEqual(reclaimed.task.attempt_count, 2)
+            decision, task = repo.prepare_delete(reclaimed.task.id, reclaimed.lease_token)
+            self.assertEqual(decision, "delete")
+            self.assertTrue(repo.complete_delete(task, reclaimed.lease_token))
+
+        with self.Session() as db:
+            completed = db.get(KnowledgeStorageCleanupTask, registration.task_id)
+            self.assertEqual(completed.status, "completed")
+            self.assertEqual(completed.attempt_count, 2)
+            self.assertEqual(completed.max_attempts, 2)
+
     async def test_api_rejects_upload_while_same_key_cleanup_is_running(self):
         content = b"knowledge content"
         checksum = hashlib.sha256(content).hexdigest()

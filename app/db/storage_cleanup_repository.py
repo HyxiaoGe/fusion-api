@@ -148,6 +148,7 @@ class StorageCleanupRepository:
         now: datetime | None = None,
     ) -> ClaimedStorageCleanupTask | None:
         now = now or utc_now()
+        self._fail_exhausted_expired_tasks(now)
         self._reconcile_failed_tasks(
             now,
             retry_base_seconds=retry_base_seconds,
@@ -274,6 +275,45 @@ class StorageCleanupRepository:
             else query.with_for_update()
         )
         return query
+
+    def _expired_exhausted_tasks_query(self, now: datetime):
+        query = (
+            self.db.query(KnowledgeStorageCleanupTask)
+            .filter(
+                KnowledgeStorageCleanupTask.status == "running",
+                KnowledgeStorageCleanupTask.lease_expires_at < now,
+                KnowledgeStorageCleanupTask.attempt_count >= KnowledgeStorageCleanupTask.max_attempts,
+            )
+            .order_by(
+                KnowledgeStorageCleanupTask.lease_expires_at.asc(),
+                KnowledgeStorageCleanupTask.updated_at.asc(),
+                KnowledgeStorageCleanupTask.id.asc(),
+            )
+            .populate_existing()
+            .limit(100)
+        )
+        return (
+            query.with_for_update(skip_locked=True)
+            if self.db.get_bind().dialect.name == "postgresql"
+            else query.with_for_update()
+        )
+
+    def _fail_exhausted_expired_tasks(self, now: datetime) -> None:
+        for task in self._expired_exhausted_tasks_query(now).all():
+            if (
+                task.status != "running"
+                or task.lease_expires_at is None
+                or self._as_utc(task.lease_expires_at) >= self._as_utc(now)
+                or task.attempt_count < task.max_attempts
+            ):
+                continue
+            task.status = "failed"
+            task.available_at = now
+            task.error_code = "KNOWLEDGE_STORAGE_CLEANUP_INTERRUPTED"
+            task.error_summary = "孤立对象清理 Worker 在最后一次尝试中断"
+            task.completed_at = now
+            task.updated_at = now
+            self._clear_lease(task)
 
     def _lock_task(self, task_id: str) -> KnowledgeStorageCleanupTask | None:
         return (

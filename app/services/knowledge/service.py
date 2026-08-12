@@ -5,11 +5,12 @@ import hashlib
 import unicodedata
 import uuid
 from collections import defaultdict
+from collections.abc import Callable
 from pathlib import PurePath
 
 from fastapi import UploadFile
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.ai.embeddings.base import EmbeddingAdapter, EmbeddingError, EmbeddingProfile
 from app.ai.embeddings.litellm_embedding import LiteLLMEmbeddingAdapter
@@ -43,6 +44,7 @@ from app.services.knowledge.milvus import (
     MilvusKnowledgeStore,
 )
 from app.services.knowledge.parser import KnowledgeDocumentParser
+from app.services.knowledge.storage_upload_guard import start_guarded_storage_upload
 from app.services.storage import get_storage
 
 EmbeddingProfileKey = tuple[str, str, int, str, str, str]
@@ -62,12 +64,24 @@ class KnowledgeService:
         embedding: EmbeddingAdapter | None = None,
         vector_store: MilvusKnowledgeStore | None = None,
         storage=None,
+        session_factory: Callable[[], Session] | None = None,
+        storage_upload_hold_seconds: float | None = None,
     ):
         self.db = db
         self.repo = KnowledgeRepository(db)
         self.embedding = embedding or LiteLLMEmbeddingAdapter()
         self.vector_store = vector_store or MilvusKnowledgeStore()
         self.storage = storage or get_storage()
+        self.session_factory = session_factory or sessionmaker(
+            bind=db.get_bind(),
+            autoflush=False,
+            expire_on_commit=False,
+        )
+        self.storage_upload_hold_seconds = (
+            max(1, settings.FILE_UPLOAD_TIMEOUT_SECONDS) + 30
+            if storage_upload_hold_seconds is None
+            else storage_upload_hold_seconds
+        )
 
     def create_knowledge_base(self, user_id: str, payload: KnowledgeBaseCreate) -> KnowledgeBaseView:
         self._require_enabled()
@@ -188,7 +202,7 @@ class KnowledgeService:
             cleanup_registration = StorageCleanupRepository(self.db).register_upload_intent(
                 storage_backend=settings.STORAGE_BACKEND,
                 storage_key=storage_key,
-                hold_seconds=max(1, settings.FILE_UPLOAD_TIMEOUT_SECONDS) + 30,
+                hold_seconds=self.storage_upload_hold_seconds,
                 max_attempts=settings.KNOWLEDGE_WORKER_MAX_ATTEMPTS,
             )
         except StorageCleanupBusy as exc:
@@ -197,94 +211,121 @@ class KnowledgeService:
                 "相同文档的存储清理正在进行，请稍后重试",
                 503,
             ) from exc
-        # 对象存储 SDK 在线程中执行且不可取消；必须等待真实返回，不能由 asyncio 超时
-        # 留下仍在后台写入、却已被 cleanup Worker 判定完成的孤立对象。
-        await self.storage.upload(storage_key, content, mimetype)
-        profile = self._base_profile(knowledge_base)
-        document = KnowledgeDocument(
-            id=document_id,
-            knowledge_base_id=knowledge_base_id,
-            user_id=user_id,
-            original_filename=filename,
-            mimetype=mimetype,
-            size=len(content),
-            checksum_sha256=checksum,
-            dedupe_key=checksum,
-            storage_backend=settings.STORAGE_BACKEND,
+        upload_lifecycle = start_guarded_storage_upload(
+            registration=cleanup_registration,
+            session_factory=self.session_factory,
+            storage=self.storage,
             storage_key=storage_key,
-            status="queued",
-            parser_version=settings.KNOWLEDGE_PARSER_VERSION,
-            chunker_version=settings.KNOWLEDGE_CHUNKER_VERSION,
-            embedding_provider=profile.provider,
-            embedding_model=profile.model,
-            embedding_revision=profile.revision,
-            embedding_dimension=profile.dimension,
-            distance_metric=profile.distance_metric,
-            desired_index_version=version_id,
-        )
-        version = KnowledgeIndexVersion(
-            id=version_id,
-            knowledge_base_id=knowledge_base_id,
-            document_id=document_id,
-            user_id=user_id,
-            status="building",
-            parser_version=settings.KNOWLEDGE_PARSER_VERSION,
-            chunker_version=settings.KNOWLEDGE_CHUNKER_VERSION,
-            chunk_size=settings.KNOWLEDGE_CHUNK_SIZE,
-            chunk_overlap=settings.KNOWLEDGE_CHUNK_OVERLAP,
-            embedding_provider=profile.provider,
-            embedding_model=profile.model,
-            embedding_revision=profile.revision,
-            embedding_dimension=profile.dimension,
-            distance_metric=profile.distance_metric,
-            collection_name=self.vector_store.collection_name(profile.dimension),
-        )
-        task = KnowledgeIndexTask(
-            knowledge_base_id=knowledge_base_id,
-            document_id=document_id,
-            user_id=user_id,
-            task_type="index_document",
-            index_version=version_id,
-            max_attempts=settings.KNOWLEDGE_WORKER_MAX_ATTEMPTS,
+            content=content,
+            mimetype=mimetype,
+            hold_seconds=self.storage_upload_hold_seconds,
         )
         try:
-            saved_document, _saved_version, saved_task = self.repo.create_document_with_task(
-                document,
-                version,
-                task,
-                max_documents=settings.KNOWLEDGE_MAX_DOCUMENTS_PER_BASE,
+            # 上传由独立 lifecycle 持有。wait_for 取消请求时，真实 SDK 线程和 intent
+            # 续租仍会继续，直到 detached finalizer 完成精确引用复核。
+            await upload_lifecycle.wait_upload()
+            profile = self._base_profile(knowledge_base)
+            document = KnowledgeDocument(
+                id=document_id,
+                knowledge_base_id=knowledge_base_id,
+                user_id=user_id,
+                original_filename=filename,
+                mimetype=mimetype,
+                size=len(content),
+                checksum_sha256=checksum,
+                dedupe_key=checksum,
+                storage_backend=settings.STORAGE_BACKEND,
+                storage_key=storage_key,
+                status="queued",
+                parser_version=settings.KNOWLEDGE_PARSER_VERSION,
+                chunker_version=settings.KNOWLEDGE_CHUNKER_VERSION,
+                embedding_provider=profile.provider,
+                embedding_model=profile.model,
+                embedding_revision=profile.revision,
+                embedding_dimension=profile.dimension,
+                distance_metric=profile.distance_metric,
+                desired_index_version=version_id,
             )
-        except KnowledgeBaseWriteConflict as exc:
-            cleanup_succeeded = False
-            if exc.cleanup_storage:
+            version = KnowledgeIndexVersion(
+                id=version_id,
+                knowledge_base_id=knowledge_base_id,
+                document_id=document_id,
+                user_id=user_id,
+                status="building",
+                parser_version=settings.KNOWLEDGE_PARSER_VERSION,
+                chunker_version=settings.KNOWLEDGE_CHUNKER_VERSION,
+                chunk_size=settings.KNOWLEDGE_CHUNK_SIZE,
+                chunk_overlap=settings.KNOWLEDGE_CHUNK_OVERLAP,
+                embedding_provider=profile.provider,
+                embedding_model=profile.model,
+                embedding_revision=profile.revision,
+                embedding_dimension=profile.dimension,
+                distance_metric=profile.distance_metric,
+                collection_name=self.vector_store.collection_name(profile.dimension),
+            )
+            task = KnowledgeIndexTask(
+                knowledge_base_id=knowledge_base_id,
+                document_id=document_id,
+                user_id=user_id,
+                task_type="index_document",
+                index_version=version_id,
+                max_attempts=settings.KNOWLEDGE_WORKER_MAX_ATTEMPTS,
+            )
+            try:
+                saved_document, _saved_version, saved_task = self.repo.create_document_with_task(
+                    document,
+                    version,
+                    task,
+                    max_documents=settings.KNOWLEDGE_MAX_DOCUMENTS_PER_BASE,
+                )
+            except KnowledgeBaseWriteConflict as exc:
+                cleanup_succeeded = False
+                if exc.cleanup_storage:
+                    cleanup_succeeded = await self._delete_uploaded_object(storage_key)
+                StorageCleanupRepository(self.db).resolve_known_conflict(
+                    cleanup_registration,
+                    cleanup_succeeded=cleanup_succeeded,
+                )
+                upload_lifecycle.mark_request_resolved()
+                await upload_lifecycle.wait_finished()
+                if exc.duplicate:
+                    raise ApiException(
+                        ErrorCode.KNOWLEDGE_DOCUMENT_DUPLICATE,
+                        str(exc),
+                        409,
+                    ) from exc
+                raise ApiException.conflict(str(exc)) from exc
+            except IntegrityError as exc:
                 cleanup_succeeded = await self._delete_uploaded_object(storage_key)
-            StorageCleanupRepository(self.db).resolve_known_conflict(
-                cleanup_registration,
-                cleanup_succeeded=cleanup_succeeded,
-            )
-            if exc.duplicate:
+                StorageCleanupRepository(self.db).resolve_known_conflict(
+                    cleanup_registration,
+                    cleanup_succeeded=cleanup_succeeded,
+                )
+                upload_lifecycle.mark_request_resolved()
+                await upload_lifecycle.wait_finished()
                 raise ApiException(
                     ErrorCode.KNOWLEDGE_DOCUMENT_DUPLICATE,
-                    str(exc),
+                    "相同内容的活动文档已存在于该知识库",
                     409,
                 ) from exc
-            raise ApiException.conflict(str(exc)) from exc
-        except IntegrityError as exc:
-            cleanup_succeeded = await self._delete_uploaded_object(storage_key)
-            StorageCleanupRepository(self.db).resolve_known_conflict(
-                cleanup_registration,
-                cleanup_succeeded=cleanup_succeeded,
+            committed = StorageCleanupRepository(self.db).mark_document_committed(cleanup_registration)
+            if committed:
+                upload_lifecycle.mark_request_resolved()
+                await upload_lifecycle.wait_finished()
+            else:
+                # 文档事务虽已返回，但 intent 未能确认引用时交给 fresh-session finalizer
+                # 再次精确复核，避免请求 session 的异常状态泄漏到后台。
+                upload_lifecycle.detach_request()
+            return KnowledgeDocumentUploadResult(
+                document=self._document_view(saved_document),
+                task=self._task_view(saved_task),
             )
-            raise ApiException(
-                ErrorCode.KNOWLEDGE_DOCUMENT_DUPLICATE,
-                "相同内容的活动文档已存在于该知识库",
-                409,
-            ) from exc
-        StorageCleanupRepository(self.db).mark_document_committed(cleanup_registration)
-        return KnowledgeDocumentUploadResult(
-            document=self._document_view(saved_document),
-            task=self._task_view(saved_task),
-        )
+        except asyncio.CancelledError:
+            upload_lifecycle.detach_request()
+            raise
+        except BaseException:
+            upload_lifecycle.detach_request()
+            raise
 
     def list_documents(
         self,
