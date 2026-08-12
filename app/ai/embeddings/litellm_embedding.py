@@ -48,14 +48,26 @@ class LiteLLMEmbeddingAdapter(EmbeddingAdapter):
                 "Embedding 返回数量与请求不一致",
                 retryable=False,
             )
-        ordered = sorted(raw_items, key=lambda item: int(self._read(item, "index", 0)))
-        indices = [int(self._read(item, "index", index)) for index, item in enumerate(ordered)]
+        missing_index = object()
+        indexed_items: list[tuple[int, Any]] = []
+        for item in raw_items:
+            raw_index = self._read(item, "index", missing_index)
+            if not isinstance(raw_index, int) or isinstance(raw_index, bool):
+                raise EmbeddingError(
+                    "KNOWLEDGE_EMBEDDING_COUNT_MISMATCH",
+                    "Embedding 返回缺少有效索引",
+                    retryable=False,
+                )
+            indexed_items.append((raw_index, item))
+        indexed_items.sort(key=lambda pair: pair[0])
+        indices = [index for index, _item in indexed_items]
         if indices != list(range(len(texts))):
             raise EmbeddingError(
                 "KNOWLEDGE_EMBEDDING_COUNT_MISMATCH",
                 "Embedding 返回索引不连续",
                 retryable=False,
             )
+        ordered = [item for _index, item in indexed_items]
         vectors = [list(self._read(item, "embedding", [])) for item in ordered]
         self.validate_vectors(vectors, expected_count=len(texts), dimension=profile.dimension)
         return vectors

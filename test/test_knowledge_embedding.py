@@ -93,6 +93,33 @@ class KnowledgeEmbeddingAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "KNOWLEDGE_EMBEDDING_UNAVAILABLE")
         self.assertTrue(raised.exception.retryable)
 
+    async def test_batch_response_without_explicit_indices_is_rejected(self):
+        response = {
+            "data": [
+                {"embedding": [1.0, 0.5]},
+                {"embedding": [0.5, 1.0]},
+            ]
+        }
+        profile = EmbeddingProfile("litellm", "embedding-v1", 2, revision="embedding-r1")
+        with (
+            patch("app.ai.embeddings.litellm_embedding.settings.LITELLM_PROXY_URL", "http://proxy:4000"),
+            patch("app.ai.embeddings.litellm_embedding.settings.LITELLM_API_KEY", "proxy-key"),
+            patch("app.ai.embeddings.litellm_embedding.settings.KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS", 15),
+            patch(
+                "app.ai.embeddings.litellm_embedding.settings.KNOWLEDGE_EMBEDDING_REVISION_ROUTES",
+                json.dumps({"embedding-v1@embedding-r1": "embedding-v1-r1-immutable"}),
+            ),
+            patch(
+                "app.ai.embeddings.litellm_embedding.litellm.aembedding",
+                new=AsyncMock(return_value=response),
+            ),
+            self.assertRaises(EmbeddingError) as raised,
+        ):
+            await LiteLLMEmbeddingAdapter().embed(["正文一", "正文二"], profile)
+
+        self.assertEqual(raised.exception.code, "KNOWLEDGE_EMBEDDING_COUNT_MISMATCH")
+        self.assertFalse(raised.exception.retryable)
+
 
 if __name__ == "__main__":
     unittest.main()

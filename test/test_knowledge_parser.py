@@ -26,6 +26,12 @@ class KnowledgeDocumentParserTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "KNOWLEDGE_DOCUMENT_ENCODING_UNSUPPORTED")
 
+    def test_nul_in_parsed_text_is_rejected_as_invalid_document(self):
+        with self.assertRaisesRegex(KnowledgeParseError, "NUL") as raised:
+            self.parser.parse(b"safe\x00unsafe", mimetype="text/plain", filename="note.txt")
+
+        self.assertEqual(raised.exception.code, "KNOWLEDGE_DOCUMENT_INVALID")
+
     def test_scanned_pdf_is_rejected_without_ocr(self):
         import PyPDF2
 

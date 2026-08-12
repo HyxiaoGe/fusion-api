@@ -116,6 +116,8 @@ class KnowledgeDocumentParser:
             raise KnowledgeParseError("KNOWLEDGE_DOCUMENT_UNSUPPORTED", "当前知识库版本不支持该文档格式")
         normalized = []
         for section in sections:
+            if "\x00" in section.text:
+                raise KnowledgeParseError("KNOWLEDGE_DOCUMENT_INVALID", "文档正文包含不支持的 NUL 字符")
             text = self._normalize_text(section.text)
             if text:
                 normalized.append(ParsedSection(text, section.page, section.section))
