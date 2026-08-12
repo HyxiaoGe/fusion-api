@@ -180,7 +180,7 @@ class KnowledgeRepository:
             .count()
         )
 
-    def _has_content_addressed_object_reference(self, document: KnowledgeDocument) -> bool:
+    def _has_active_checksum_reference(self, document: KnowledgeDocument) -> bool:
         return (
             self.db.query(KnowledgeDocument.id)
             .filter(
@@ -188,7 +188,6 @@ class KnowledgeRepository:
                 KnowledgeDocument.status != "deleted",
                 KnowledgeDocument.checksum_sha256 == document.checksum_sha256,
                 KnowledgeDocument.storage_backend == document.storage_backend,
-                KnowledgeDocument.storage_key == document.storage_key,
             )
             .first()
             is not None
@@ -225,11 +224,12 @@ class KnowledgeRepository:
                 .count()
             )
             if active_count >= max_documents:
-                duplicate = self._has_content_addressed_object_reference(document)
+                duplicate = self._has_active_checksum_reference(document)
                 self.db.rollback()
                 raise KnowledgeBaseWriteConflict(
                     "相同内容的活动文档已存在于该知识库" if duplicate else "已达到每个知识库的文档数量上限",
-                    cleanup_storage=not duplicate,
+                    # 每次上传使用独立 document_id 代际 key，重复内容也可安全清理本次对象。
+                    cleanup_storage=True,
                     duplicate=duplicate,
                 )
         self.db.add_all([document, version, task])
@@ -530,7 +530,12 @@ class KnowledgeRepository:
         now: datetime | None = None,
     ) -> ClaimedKnowledgeTask | None:
         now = now or utc_now()
+        self._reconcile_failed_index_cleanup_tasks(
+            now,
+            base_delay_seconds=external_write_grace_seconds,
+        )
         self._fail_exhausted_expired_tasks(now, external_write_grace_seconds=external_write_grace_seconds)
+        index_reclaim_before = now - timedelta(seconds=max(0, external_write_grace_seconds))
         claimable = or_(
             and_(
                 KnowledgeIndexTask.status.in_(("pending", "retry")),
@@ -538,7 +543,16 @@ class KnowledgeRepository:
             ),
             and_(
                 KnowledgeIndexTask.status == "running",
-                KnowledgeIndexTask.lease_expires_at < now,
+                or_(
+                    and_(
+                        KnowledgeIndexTask.task_type == "index_document",
+                        KnowledgeIndexTask.lease_expires_at < index_reclaim_before,
+                    ),
+                    and_(
+                        KnowledgeIndexTask.task_type != "index_document",
+                        KnowledgeIndexTask.lease_expires_at < now,
+                    ),
+                ),
             ),
         )
         running_index_task = aliased(KnowledgeIndexTask)
@@ -556,6 +570,16 @@ class KnowledgeRepository:
                 exists().where(
                     running_index_task.knowledge_base_id == KnowledgeIndexTask.knowledge_base_id,
                     running_index_task.task_type == "index_document",
+                    running_index_task.status == "running",
+                ),
+            ),
+            and_(
+                KnowledgeIndexTask.task_type == "delete_index_version",
+                exists().where(
+                    running_index_task.index_version == KnowledgeIndexTask.index_version,
+                    running_index_task.task_type == "index_document",
+                    # 即使租约已过期也保持串行；索引任务在 grace 后先重领并收敛，
+                    # 避免清理与旧不可取消的 Milvus upsert 或重领 Worker 并发。
                     running_index_task.status == "running",
                 ),
             ),
@@ -1005,14 +1029,96 @@ class KnowledgeRepository:
             return query.with_for_update(skip_locked=True)
         return query.with_for_update()
 
+    def _failed_index_cleanup_tasks_query(self):
+        query = (
+            self.db.query(KnowledgeIndexTask)
+            .filter(
+                KnowledgeIndexTask.task_type == "delete_index_version",
+                KnowledgeIndexTask.status == "failed",
+                KnowledgeIndexTask.index_version.is_not(None),
+            )
+            .order_by(
+                KnowledgeIndexTask.index_version.asc(),
+                KnowledgeIndexTask.updated_at.asc(),
+                KnowledgeIndexTask.id.asc(),
+            )
+            .populate_existing()
+            .limit(100)
+        )
+        if self.db.get_bind().dialect.name == "postgresql":
+            return query.with_for_update(skip_locked=True)
+        return query.with_for_update()
+
+    def _reconcile_failed_index_cleanup_tasks(self, now: datetime, *, base_delay_seconds: int) -> None:
+        rows: Iterable[KnowledgeIndexTask] = self._failed_index_cleanup_tasks_query().all()
+        for task in rows:
+            if task.status != "failed" or task.task_type != "delete_index_version" or not task.index_version:
+                continue
+            version = (
+                self.db.query(KnowledgeIndexVersion)
+                .filter(
+                    KnowledgeIndexVersion.id == task.index_version,
+                    KnowledgeIndexVersion.status == "deleting",
+                )
+                .populate_existing()
+                .with_for_update()
+                .first()
+            )
+            if version is None:
+                continue
+            active_cleanup = (
+                self.db.query(KnowledgeIndexTask.id)
+                .filter(
+                    KnowledgeIndexTask.id != task.id,
+                    KnowledgeIndexTask.task_type == "delete_index_version",
+                    KnowledgeIndexTask.index_version == task.index_version,
+                    KnowledgeIndexTask.status.in_(("pending", "running", "retry")),
+                )
+                .first()
+            )
+            if active_cleanup is not None:
+                continue
+            task.status = "retry"
+            task.phase = "queued"
+            # Reconciler 每轮只授予一次额外尝试，保留累计尝试次数且避免失败时热循环。
+            task.max_attempts = max(task.max_attempts, task.attempt_count + 1)
+            task.available_at = now + timedelta(
+                seconds=self._cleanup_reconcile_delay_seconds(
+                    attempt_count=task.attempt_count,
+                    base_delay_seconds=base_delay_seconds,
+                )
+            )
+            task.completed_at = None
+            task.updated_at = now
+            task.lease_owner = None
+            task.lease_token_hash = None
+            task.lease_expires_at = None
+            task.heartbeat_at = None
+
+    @staticmethod
+    def _cleanup_reconcile_delay_seconds(*, attempt_count: int, base_delay_seconds: int) -> int:
+        base = max(1, base_delay_seconds)
+        exponent = min(max(attempt_count - 1, 0), 8)
+        return min(3600, base * (2**exponent))
+
     def _fail_exhausted_expired_tasks(self, now: datetime, *, external_write_grace_seconds: int) -> None:
         rows: Iterable[KnowledgeIndexTask] = self._expired_exhausted_tasks_query(now).all()
         for task in rows:
+            grace_boundary = (
+                self._as_utc(task.lease_expires_at) + timedelta(seconds=max(0, external_write_grace_seconds))
+                if task.lease_expires_at is not None
+                else None
+            )
             if (
                 task.status != "running"
                 or task.attempt_count < task.max_attempts
                 or task.lease_expires_at is None
                 or self._as_utc(task.lease_expires_at) >= self._as_utc(now)
+                or (
+                    task.task_type == "index_document"
+                    and grace_boundary is not None
+                    and grace_boundary >= self._as_utc(now)
+                )
             ):
                 continue
             task.status = "failed"

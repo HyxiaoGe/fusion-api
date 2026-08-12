@@ -20,6 +20,7 @@ from app.db.knowledge_repository import (
     KnowledgeRepository,
 )
 from app.db.models import KnowledgeBase, KnowledgeDocument, KnowledgeIndexTask, KnowledgeIndexVersion
+from app.db.storage_cleanup_repository import StorageCleanupBusy, StorageCleanupRepository
 from app.schemas.knowledge import (
     KNOWLEDGE_BASE_NORMALIZED_NAME_MAX_LENGTH,
     KnowledgeBaseCreate,
@@ -48,6 +49,7 @@ EmbeddingProfileKey = tuple[str, str, int, str, str, str]
 VectorHitKey = tuple[str, str, str, str]
 FILENAME_MAX_CHARACTERS = 255
 FILENAME_MAX_UTF8_BYTES = 500
+SEARCH_PROFILE_CONCURRENCY = 4
 
 
 class KnowledgeService:
@@ -157,7 +159,6 @@ class KnowledgeService:
         if self.repo.count_documents(knowledge_base_id) >= settings.KNOWLEDGE_MAX_DOCUMENTS_PER_BASE:
             raise ApiException.bad_request("已达到每个知识库的文档数量上限")
         mimetype = self._normalize_mimetype(upload.content_type)
-        filename = self._safe_filename(upload.filename or "document", mimetype)
         allowed_mime_types = {value.strip().lower() for value in settings.RESOLVED_KNOWLEDGE_ALLOWED_MIME_TYPES}
         if mimetype not in allowed_mime_types:
             raise ApiException(
@@ -165,6 +166,9 @@ class KnowledgeService:
                 "当前知识库版本不支持该文档格式",
                 400,
             )
+        raw_filename = upload.filename or "document"
+        self._validate_filename_suffix(raw_filename, mimetype)
+        filename = self._safe_filename(raw_filename, mimetype)
         content = await upload.read(settings.KNOWLEDGE_MAX_FILE_SIZE + 1)
         if len(content) > settings.KNOWLEDGE_MAX_FILE_SIZE:
             raise ApiException(ErrorCode.FILE_TOO_LARGE, "知识库文档超过文件大小上限", 413)
@@ -177,9 +181,24 @@ class KnowledgeService:
             )
         document_id = str(uuid.uuid4())
         version_id = str(uuid.uuid4())
-        # 同一 KB 的对象键按内容寻址。并发重复上传会覆盖为相同字节；唯一约束失败的一方
-        # 不得删除该键，否则可能删掉已经提交成功的文档原件。
-        storage_key = f"knowledge/v1/users/{user_id}/bases/{knowledge_base_id}/objects/{checksum}"
+        # checksum 保留内容归组能力，document_id 提供上传代际隔离；旧补偿的晚到 delete
+        # 永远不会命中新一次或并发上传的对象。
+        storage_key = f"knowledge/v1/users/{user_id}/bases/{knowledge_base_id}/objects/{checksum}/{document_id}"
+        try:
+            cleanup_registration = StorageCleanupRepository(self.db).register_upload_intent(
+                storage_backend=settings.STORAGE_BACKEND,
+                storage_key=storage_key,
+                hold_seconds=max(1, settings.FILE_UPLOAD_TIMEOUT_SECONDS) + 30,
+                max_attempts=settings.KNOWLEDGE_WORKER_MAX_ATTEMPTS,
+            )
+        except StorageCleanupBusy as exc:
+            raise ApiException(
+                ErrorCode.KNOWLEDGE_STORAGE_BUSY,
+                "相同文档的存储清理正在进行，请稍后重试",
+                503,
+            ) from exc
+        # 对象存储 SDK 在线程中执行且不可取消；必须等待真实返回，不能由 asyncio 超时
+        # 留下仍在后台写入、却已被 cleanup Worker 判定完成的孤立对象。
         await self.storage.upload(storage_key, content, mimetype)
         profile = self._base_profile(knowledge_base)
         document = KnowledgeDocument(
@@ -236,8 +255,13 @@ class KnowledgeService:
                 max_documents=settings.KNOWLEDGE_MAX_DOCUMENTS_PER_BASE,
             )
         except KnowledgeBaseWriteConflict as exc:
+            cleanup_succeeded = False
             if exc.cleanup_storage:
-                await self._delete_uploaded_object(storage_key)
+                cleanup_succeeded = await self._delete_uploaded_object(storage_key)
+            StorageCleanupRepository(self.db).resolve_known_conflict(
+                cleanup_registration,
+                cleanup_succeeded=cleanup_succeeded,
+            )
             if exc.duplicate:
                 raise ApiException(
                     ErrorCode.KNOWLEDGE_DOCUMENT_DUPLICATE,
@@ -246,11 +270,17 @@ class KnowledgeService:
                 ) from exc
             raise ApiException.conflict(str(exc)) from exc
         except IntegrityError as exc:
+            cleanup_succeeded = await self._delete_uploaded_object(storage_key)
+            StorageCleanupRepository(self.db).resolve_known_conflict(
+                cleanup_registration,
+                cleanup_succeeded=cleanup_succeeded,
+            )
             raise ApiException(
                 ErrorCode.KNOWLEDGE_DOCUMENT_DUPLICATE,
                 "相同内容的活动文档已存在于该知识库",
                 409,
             ) from exc
+        StorageCleanupRepository(self.db).mark_document_committed(cleanup_registration)
         return KnowledgeDocumentUploadResult(
             document=self._document_view(saved_document),
             task=self._task_view(saved_task),
@@ -490,9 +520,11 @@ class KnowledgeService:
         documents_by_profile: dict[EmbeddingProfileKey, list[KnowledgeDocument]],
         limit: int,
     ) -> list[tuple[EmbeddingProfileKey, list[KnowledgeVectorHit]]]:
+        semaphore = asyncio.Semaphore(SEARCH_PROFILE_CONCURRENCY)
         tasks = [
             asyncio.create_task(
-                self._search_profile(
+                self._search_profile_bounded(
+                    semaphore=semaphore,
                     user_id=user_id,
                     query=query,
                     profile_key=profile_key,
@@ -509,6 +541,25 @@ class KnowledgeService:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
+
+    async def _search_profile_bounded(
+        self,
+        *,
+        semaphore: asyncio.Semaphore,
+        user_id: str,
+        query: str,
+        profile_key: EmbeddingProfileKey,
+        documents: list[KnowledgeDocument],
+        limit: int,
+    ) -> tuple[EmbeddingProfileKey, list[KnowledgeVectorHit]]:
+        async with semaphore:
+            return await self._search_profile(
+                user_id=user_id,
+                query=query,
+                profile_key=profile_key,
+                documents=documents,
+                limit=limit,
+            )
 
     async def _search_profile(
         self,
@@ -688,6 +739,18 @@ class KnowledgeService:
         return normalized or "application/octet-stream"
 
     @staticmethod
+    def _validate_filename_suffix(filename: str, mimetype: str) -> None:
+        normalized_path = unicodedata.normalize("NFKC", filename).replace("\\", "/")
+        suffix = PurePath(normalized_path).suffix.lower()
+        allowed_suffixes = KnowledgeDocumentParser.MIME_SUFFIXES.get(mimetype, set())
+        if not suffix or suffix not in allowed_suffixes:
+            raise ApiException(
+                ErrorCode.KNOWLEDGE_DOCUMENT_TYPE_MISMATCH,
+                "文档 MIME 与扩展名不一致",
+                400,
+            )
+
+    @staticmethod
     def _safe_filename(filename: str, mimetype: str) -> str:
         normalized_path = unicodedata.normalize("NFKC", filename).replace("\\", "/")
         basename = PurePath(normalized_path).name
@@ -757,8 +820,10 @@ class KnowledgeService:
                 503,
             ) from exc
 
-    async def _delete_uploaded_object(self, storage_key: str) -> None:
+    async def _delete_uploaded_object(self, storage_key: str) -> bool:
         try:
-            await self.storage.delete(storage_key)
+            if await self.storage.delete(storage_key):
+                return True
+            return not await self.storage.exists(storage_key)
         except Exception:
-            pass
+            return False

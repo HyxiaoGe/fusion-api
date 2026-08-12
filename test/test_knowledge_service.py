@@ -232,6 +232,23 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(document.original_filename, "manual.txt")
         self.assertEqual(self.storage.upload.await_args.args[2], "text/plain")
 
+    async def test_upload_rejects_missing_or_mismatched_suffix_before_storage(self):
+        knowledge_base = self._create_base()
+        for filename in ("README", "note.md"):
+            upload = UploadFile(
+                filename=filename,
+                file=io.BytesIO(b"knowledge content"),
+                headers=Headers({"content-type": "text/plain"}),
+            )
+            upload.read = AsyncMock(return_value=b"knowledge content")
+            with self.subTest(filename=filename), self.assertRaises(ApiException) as raised:
+                await self.service.upload_document("user-1", knowledge_base.id, upload)
+            self.assertEqual(raised.exception.code, "KNOWLEDGE_DOCUMENT_TYPE_MISMATCH")
+            self.assertEqual(raised.exception.status_code, 400)
+            upload.read.assert_not_awaited()
+        self.storage.upload.assert_not_awaited()
+        self.assertEqual(self.service.repo.count_documents(knowledge_base.id), 0)
+
     def test_safe_filename_preserves_supported_suffix_with_character_and_byte_limits(self):
         ascii_name = self.service._safe_filename(f"nested/{'a' * 400}.PDF", "application/pdf")
         unicode_name = self.service._safe_filename(
@@ -247,7 +264,7 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("\\", filename)
         self.assertEqual(sanitized_name, "document.pdf")
 
-    async def test_uncertain_database_failure_never_deletes_content_addressed_object(self):
+    async def test_uncertain_database_failure_leaves_generation_for_guarded_recovery(self):
         knowledge_base = self._create_base()
         upload = UploadFile(
             filename="manual.txt",
@@ -272,7 +289,7 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
         self.service.repo.create_document_with_task = MagicMock(
             side_effect=KnowledgeBaseWriteConflict(
                 "相同内容的活动文档已存在于该知识库",
-                cleanup_storage=False,
+                cleanup_storage=True,
                 duplicate=True,
             )
         )
@@ -282,7 +299,7 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(duplicate.exception.code, "KNOWLEDGE_DOCUMENT_DUPLICATE")
         self.assertEqual(duplicate.exception.status_code, 409)
-        self.storage.delete.assert_not_awaited()
+        self.storage.delete.assert_awaited_once()
 
     async def test_retrieval_fails_closed_if_any_base_is_not_owned(self):
         owned = self._create_base()
@@ -495,6 +512,45 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.code, "KNOWLEDGE_VECTOR_UNAVAILABLE")
         self.assertEqual(raised.exception.status_code, 503)
+
+    async def test_profile_search_concurrency_is_bounded_and_failure_cancels_waiters(self):
+        active = 0
+        peak = 0
+        started: list[str] = []
+        release = asyncio.Event()
+
+        async def bounded_search(**kwargs):
+            nonlocal active, peak
+            model = kwargs["profile_key"][1]
+            started.append(model)
+            active += 1
+            peak = max(peak, active)
+            try:
+                if model == "embed-0":
+                    await asyncio.sleep(0)
+                    raise KnowledgeVectorError("KNOWLEDGE_VECTOR_UNAVAILABLE", "向量检索失败", retryable=True)
+                await release.wait()
+                return kwargs["profile_key"], []
+            finally:
+                active -= 1
+
+        documents_by_profile = {
+            ("litellm", f"embed-{index}", 2, "COSINE", f"collection-{index}", f"revision-{index}"): []
+            for index in range(12)
+        }
+        self.service._search_profile = bounded_search
+
+        with self.assertRaises(KnowledgeVectorError):
+            await self.service._search_profiles(
+                user_id="user-1",
+                query="配置",
+                documents_by_profile=documents_by_profile,
+                limit=2,
+            )
+
+        self.assertLessEqual(peak, 4)
+        self.assertLess(len(started), len(documents_by_profile))
+        self.assertEqual(active, 0)
 
     async def test_retrieval_fails_if_active_version_changes_after_milvus_search(self):
         knowledge_base, document = await self._create_ready_document(

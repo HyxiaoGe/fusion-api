@@ -432,6 +432,64 @@ class KnowledgeIndexTask(Base):
     )
 
 
+class KnowledgeStorageCleanupTask(Base):
+    """对象上传与数据库提交脱节时的持久删除补偿。"""
+
+    __tablename__ = "knowledge_storage_cleanup_tasks"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    storage_backend = Column(String(20), nullable=False)
+    storage_key = Column(String(600), nullable=False)
+    status = Column(String(20), nullable=False, default="pending", server_default="pending")
+    attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
+    max_attempts = Column(Integer, nullable=False, default=5, server_default="5")
+    available_at = Column(DateTime(timezone=True), default=utc_now, server_default=func.now(), nullable=False)
+    lease_owner = Column(String(120), nullable=True)
+    lease_token_hash = Column(String(64), nullable=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True)
+    heartbeat_at = Column(DateTime(timezone=True), nullable=True)
+    error_code = Column(String(120), nullable=True)
+    error_summary = Column(String(500), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, server_default=func.now(), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=utc_now,
+        server_default=func.now(),
+        onupdate=utc_now,
+        nullable=False,
+    )
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("storage_backend", "storage_key", name="uq_knowledge_storage_cleanup_object"),
+        CheckConstraint("attempt_count >= 0", name="ck_knowledge_storage_cleanup_attempt_count"),
+        CheckConstraint("max_attempts > 0", name="ck_knowledge_storage_cleanup_max_attempts"),
+        CheckConstraint(
+            "status IN ('pending', 'running', 'retry', 'completed', 'failed')",
+            name="ck_knowledge_storage_cleanup_status",
+        ),
+        Index("ix_knowledge_storage_cleanup_claim", "status", "available_at", "created_at", "id"),
+    )
+
+
+class KnowledgeStorageUploadIntent(Base):
+    """短期保护正在上传或等待数据库提交的对象，避免补偿 Worker 提前删除。"""
+
+    __tablename__ = "knowledge_storage_upload_intents"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    cleanup_task_id = Column(
+        String,
+        ForeignKey("knowledge_storage_cleanup_tasks.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utc_now, server_default=func.now(), nullable=False)
+
+    __table_args__ = (Index("ix_knowledge_storage_upload_intents_guard", "cleanup_task_id", "expires_at"),)
+
+
 class Message(Base):
     __tablename__ = "messages"
 

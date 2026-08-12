@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
+from app.schemas.response import ApiException, ErrorCode
+
 os.environ.setdefault("DATABASE_URL", "sqlite:///./fusion-test.db")
 
 
@@ -165,14 +167,14 @@ class KnowledgeBasesApiTests(unittest.TestCase):
         deleted = self.client.delete("/api/knowledge-bases/kb-1")
         uploaded = self.client.post(
             "/api/knowledge-bases/kb-1/documents",
-            files={"file": ("manual.txt", b"content", "text/plain")},
+            files={"file": ("manual.TXT", b"content", "text/plain")},
         )
 
         self.assertEqual(created.status_code, 201)
         self.assertEqual(listed.status_code, 200)
         self.assertEqual(deleted.status_code, 202)
         self.assertEqual(uploaded.status_code, 202)
-        self.assertIn(("upload", "user-1", "kb-1", "manual.txt"), self.service.calls)
+        self.assertIn(("upload", "user-1", "kb-1", "manual.TXT"), self.service.calls)
 
     def test_search_route_is_not_shadowed_by_dynamic_detail_route(self):
         response = self.client.post(
@@ -230,6 +232,24 @@ class KnowledgeBasesApiTests(unittest.TestCase):
         self.assertEqual(updated.status_code, 422)
         self.assertEqual(created.json()["code"], "INVALID_PARAM")
         self.assertEqual(updated.json()["code"], "INVALID_PARAM")
+
+    def test_upload_type_mismatch_uses_stable_api_error(self):
+        async def reject_upload(*_args):
+            raise ApiException(
+                ErrorCode.KNOWLEDGE_DOCUMENT_TYPE_MISMATCH,
+                "文档 MIME 与扩展名不一致",
+                400,
+            )
+
+        self.service.upload_document = reject_upload
+
+        for filename in ("README", "note.md"):
+            response = self.client.post(
+                "/api/knowledge-bases/kb-1/documents",
+                files={"file": (filename, b"content", "text/plain")},
+            )
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.json()["code"], "KNOWLEDGE_DOCUMENT_TYPE_MISMATCH")
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ from sqlalchemy import text
 from app.core.config import settings
 from app.core.logger import app_logger as logger
 from app.db.database import SessionLocal
+from app.services.knowledge.storage_cleanup_worker import KnowledgeStorageCleanupWorker
 from app.services.knowledge.worker import KnowledgeWorker
 from app.services.storage import init_storage
 
@@ -106,6 +107,44 @@ async def _refresh_health(
             )
 
 
+async def _run_once_work(
+    cleanup_worker: KnowledgeStorageCleanupWorker,
+    worker: KnowledgeWorker,
+) -> int:
+    """单次模式跨两类队列总计最多处理一个任务。"""
+    cleanup_handled = await cleanup_worker.run_once()
+    if cleanup_handled:
+        return 1
+    index_handled = await worker.run_once()
+    return int(index_handled)
+
+
+async def _run_cleanup_loop(
+    stop_event: asyncio.Event,
+    cleanup_worker: KnowledgeStorageCleanupWorker,
+    *,
+    on_processed: Callable[[], None],
+    poll_seconds: float | None = None,
+) -> None:
+    """独立清理循环避免不可取消的对象删除阻塞索引任务队列。"""
+    interval = settings.KNOWLEDGE_WORKER_POLL_SECONDS if poll_seconds is None else poll_seconds
+    while not stop_event.is_set():
+        try:
+            handled = await cleanup_worker.run_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("知识库孤立对象清理循环异常")
+            handled = False
+        if handled:
+            on_processed()
+            continue
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except TimeoutError:
+            pass
+
+
 async def run_worker(*, once: bool) -> int:
     if not settings.KNOWLEDGE_BASE_ENABLED:
         worker_id = f"{socket.gethostname()}-{os.getpid()}"
@@ -130,6 +169,10 @@ async def run_worker(*, once: bool) -> int:
         return 2
     await init_storage()
     worker = KnowledgeWorker(SessionLocal, worker_id=f"{socket.gethostname()}-{os.getpid()}")
+    cleanup_worker = KnowledgeStorageCleanupWorker(
+        SessionLocal,
+        worker_id=f"{worker.worker_id}-storage-cleanup",
+    )
     await worker.vector_store.health()
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -137,6 +180,11 @@ async def run_worker(*, once: bool) -> int:
         with suppress(NotImplementedError):
             loop.add_signal_handler(sig, stop_event.set)
     processed = 0
+
+    def record_cleanup() -> None:
+        nonlocal processed
+        processed += 1
+
     _write_health(status="running", worker_id=worker.worker_id, processed=processed)
     health_refresh = asyncio.create_task(
         _refresh_health(
@@ -146,14 +194,24 @@ async def run_worker(*, once: bool) -> int:
             vector_health=worker.vector_store.health,
         )
     )
+    cleanup_loop = None
+    if not once:
+        cleanup_loop = asyncio.create_task(
+            _run_cleanup_loop(
+                stop_event,
+                cleanup_worker,
+                on_processed=record_cleanup,
+            )
+        )
     try:
+        if once:
+            processed += await _run_once_work(cleanup_worker, worker)
+            return 0
         while not stop_event.is_set():
             handled = await worker.run_once()
             if handled:
                 processed += 1
-            if once:
-                break
-            if not handled:
+            else:
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=settings.KNOWLEDGE_WORKER_POLL_SECONDS)
                 except TimeoutError:
@@ -161,6 +219,10 @@ async def run_worker(*, once: bool) -> int:
         return 0
     finally:
         stop_event.set()
+        # cleanup 删除不可取消；保持任务和数据库行锁直到 SDK 真正返回。
+        if cleanup_loop is not None:
+            with suppress(asyncio.CancelledError):
+                await cleanup_loop
         health_refresh.cancel()
         with suppress(asyncio.CancelledError):
             await health_refresh

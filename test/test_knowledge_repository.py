@@ -197,17 +197,17 @@ class KnowledgeRepositoryTests(unittest.TestCase):
         self.assertIn("#deleted#", knowledge_base.name_normalized)
         self.assertLessEqual(len(knowledge_base.name_normalized), 200)
 
-    def test_document_limit_cleans_only_unreferenced_content_addressed_object(self):
+    def test_document_limit_detects_duplicate_checksum_and_cleans_its_generation(self):
         repo = KnowledgeRepository(self.db)
         repo.create_knowledge_base(self._base())
-        shared_key = "knowledge/v1/users/user-1/bases/kb-1/objects/" + "a" * 64
+        shared_key = "knowledge/v1/users/user-1/bases/kb-1/objects/" + "a" * 64 + "/doc-1"
         document, version, task = self._document_bundle(storage_key=shared_key)
         repo.create_document_with_task(document, version, task, max_documents=1)
 
         shared_document, shared_version, shared_task = self._document_bundle(
             document_id="doc-shared",
             checksum="a" * 64,
-            storage_key=shared_key,
+            storage_key="knowledge/v1/users/user-1/bases/kb-1/objects/" + "a" * 64 + "/doc-shared",
         )
         with self.assertRaises(KnowledgeBaseWriteConflict) as shared_conflict:
             repo.create_document_with_task(
@@ -216,13 +216,13 @@ class KnowledgeRepositoryTests(unittest.TestCase):
                 shared_task,
                 max_documents=1,
             )
-        self.assertFalse(shared_conflict.exception.cleanup_storage)
+        self.assertTrue(shared_conflict.exception.cleanup_storage)
         self.assertTrue(shared_conflict.exception.duplicate)
 
         unreferenced_document, unreferenced_version, unreferenced_task = self._document_bundle(
             document_id="doc-unreferenced",
             checksum="b" * 64,
-            storage_key="knowledge/v1/users/user-1/bases/kb-1/objects/" + "b" * 64,
+            storage_key="knowledge/v1/users/user-1/bases/kb-1/objects/" + "b" * 64 + "/doc-unreferenced",
         )
         with self.assertRaises(KnowledgeBaseWriteConflict) as unreferenced_conflict:
             repo.create_document_with_task(
@@ -265,6 +265,18 @@ class KnowledgeRepositoryTests(unittest.TestCase):
         self.assertIn("KNOWLEDGE_INDEX_TASKS.LEASE_EXPIRES_AT <", sql)
         self.assertIn("KNOWLEDGE_INDEX_TASKS.ATTEMPT_COUNT >= KNOWLEDGE_INDEX_TASKS.MAX_ATTEMPTS", sql)
 
+    def test_failed_cleanup_reconciler_uses_postgres_skip_locked(self):
+        repo = KnowledgeRepository(self.db)
+
+        with patch.object(self.engine.dialect, "name", "postgresql"):
+            statement = repo._failed_index_cleanup_tasks_query().statement
+
+        sql = str(statement.compile(dialect=postgresql.dialect())).upper()
+        self.assertIn("FOR UPDATE SKIP LOCKED", sql)
+        self.assertIn("KNOWLEDGE_INDEX_TASKS.TASK_TYPE =", sql)
+        self.assertIn("KNOWLEDGE_INDEX_TASKS.STATUS =", sql)
+        self.assertIn("KNOWLEDGE_INDEX_TASKS.INDEX_VERSION IS NOT NULL", sql)
+
     def test_expired_lease_is_reclaimed_and_old_token_is_fenced(self):
         repo = KnowledgeRepository(self.db)
         repo.create_knowledge_base(self._base())
@@ -282,6 +294,184 @@ class KnowledgeRepositoryTests(unittest.TestCase):
         self.assertNotEqual(first.lease_token, second.lease_token)
         self.assertFalse(repo.complete_task(task.id, first.lease_token))
         self.assertTrue(repo.complete_task(task.id, second.lease_token))
+
+    def test_expired_index_task_waits_for_external_write_grace_before_reclaim(self):
+        repo = KnowledgeRepository(self.db)
+        repo.create_knowledge_base(self._base())
+        document, version, task = self._document_bundle()
+        repo.create_document_with_task(document, version, task)
+        started_at = utc_now() + timedelta(seconds=1)
+        first = repo.claim_task(
+            worker_id="worker-1",
+            lease_seconds=10,
+            external_write_grace_seconds=20,
+            now=started_at,
+        )
+        self.assertIsNotNone(first)
+        lease_expires_at = first.task.lease_expires_at
+
+        self.assertIsNone(
+            repo.claim_task(
+                worker_id="worker-2",
+                lease_seconds=10,
+                external_write_grace_seconds=20,
+                now=lease_expires_at + timedelta(seconds=1),
+            )
+        )
+        self.db.refresh(task)
+        self.assertEqual(task.status, "running")
+        self.assertEqual(task.attempt_count, 1)
+        self.assertEqual(task.lease_owner, "worker-1")
+
+        second = repo.claim_task(
+            worker_id="worker-2",
+            lease_seconds=10,
+            external_write_grace_seconds=20,
+            now=lease_expires_at + timedelta(seconds=21),
+        )
+
+        self.assertIsNotNone(second)
+        self.assertEqual(second.task.id, task.id)
+        self.assertEqual(second.task.attempt_count, 2)
+        self.assertFalse(repo.complete_task(task.id, first.lease_token))
+
+    def test_index_cleanup_waits_for_running_index_grace_and_reclaim_convergence(self):
+        repo = KnowledgeRepository(self.db)
+        repo.create_knowledge_base(self._base())
+        document, version, index_task = self._document_bundle()
+        repo.create_document_with_task(document, version, index_task)
+        started_at = utc_now() + timedelta(seconds=1)
+        first = repo.claim_task(
+            worker_id="index-worker-1",
+            lease_seconds=10,
+            external_write_grace_seconds=20,
+            now=started_at,
+        )
+        self.assertIsNotNone(first)
+        cleanup_task = KnowledgeIndexTask(
+            id="cleanup-task-running-index",
+            knowledge_base_id=document.knowledge_base_id,
+            document_id=document.id,
+            user_id=document.user_id,
+            task_type="delete_index_version",
+            index_version=version.id,
+            status="pending",
+            phase="queued",
+            max_attempts=3,
+            available_at=started_at,
+        )
+        self.db.add(cleanup_task)
+        self.db.commit()
+        lease_expires_at = first.task.lease_expires_at
+
+        self.assertIsNone(
+            repo.claim_task(
+                worker_id="cleanup-worker-early",
+                lease_seconds=10,
+                external_write_grace_seconds=20,
+                now=lease_expires_at + timedelta(seconds=1),
+            )
+        )
+
+        reclaimed = repo.claim_task(
+            worker_id="index-worker-2",
+            lease_seconds=10,
+            external_write_grace_seconds=20,
+            now=lease_expires_at + timedelta(seconds=21),
+        )
+        self.assertIsNotNone(reclaimed)
+        self.assertEqual(reclaimed.task.id, index_task.id)
+        self.assertTrue(repo.complete_task(index_task.id, reclaimed.lease_token))
+
+        cleanup = repo.claim_task(
+            worker_id="cleanup-worker-late",
+            lease_seconds=10,
+            external_write_grace_seconds=20,
+            now=lease_expires_at + timedelta(seconds=22),
+        )
+        self.assertIsNotNone(cleanup)
+        self.assertEqual(cleanup.task.id, cleanup_task.id)
+
+    def test_failed_index_cleanup_is_periodically_reconciled_with_bounded_retry(self):
+        repo = KnowledgeRepository(self.db)
+        repo.create_knowledge_base(self._base())
+        document, version, index_task = self._document_bundle()
+        repo.create_document_with_task(document, version, index_task)
+        now = utc_now() + timedelta(seconds=1)
+        index_task.status = "cancelled"
+        index_task.completed_at = now
+        version.status = "deleting"
+        cleanup_task = KnowledgeIndexTask(
+            id="cleanup-task-1",
+            knowledge_base_id=document.knowledge_base_id,
+            document_id=document.id,
+            user_id=document.user_id,
+            task_type="delete_index_version",
+            index_version=version.id,
+            status="failed",
+            phase="deleting",
+            attempt_count=3,
+            max_attempts=3,
+            available_at=now,
+            completed_at=now,
+            error_code="KNOWLEDGE_VECTOR_UNAVAILABLE",
+            error_summary="Milvus 暂时不可用",
+        )
+        self.db.add(cleanup_task)
+        self.db.commit()
+
+        self.assertIsNone(
+            repo.claim_task(
+                worker_id="worker-1",
+                lease_seconds=60,
+                external_write_grace_seconds=10,
+                now=now,
+            )
+        )
+        self.db.refresh(cleanup_task)
+        self.assertEqual(cleanup_task.status, "retry")
+        self.assertEqual(cleanup_task.attempt_count, 3)
+        self.assertEqual(cleanup_task.max_attempts, 4)
+        self.assertIsNone(cleanup_task.completed_at)
+        retry_delay = cleanup_task.available_at - now.replace(tzinfo=None)
+        self.assertGreater(retry_delay, timedelta(0))
+        self.assertLessEqual(retry_delay, timedelta(hours=1))
+
+        claimed = repo.claim_task(
+            worker_id="worker-2",
+            lease_seconds=60,
+            external_write_grace_seconds=10,
+            now=cleanup_task.available_at + timedelta(seconds=1),
+        )
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.task.id, cleanup_task.id)
+        self.assertEqual(claimed.task.attempt_count, 4)
+        self.assertTrue(
+            repo.fail_task(
+                cleanup_task.id,
+                claimed.lease_token,
+                error_code="KNOWLEDGE_VECTOR_UNAVAILABLE",
+                error_summary="Milvus 暂时不可用",
+                retryable=True,
+                retry_delay_seconds=1,
+            )
+        )
+        self.db.refresh(cleanup_task)
+        self.assertEqual(cleanup_task.status, "failed")
+
+        next_reconcile_at = cleanup_task.available_at + timedelta(days=1)
+        self.assertIsNone(
+            repo.claim_task(
+                worker_id="worker-3",
+                lease_seconds=60,
+                external_write_grace_seconds=10,
+                now=next_reconcile_at,
+            )
+        )
+        self.db.refresh(cleanup_task)
+        self.assertEqual(cleanup_task.status, "retry")
+        self.assertEqual(cleanup_task.attempt_count, 4)
+        self.assertEqual(cleanup_task.max_attempts, 5)
 
     def test_document_delete_waits_for_running_index_task(self):
         repo = KnowledgeRepository(self.db)
@@ -327,7 +517,8 @@ class KnowledgeRepositoryTests(unittest.TestCase):
         task.max_attempts = 1
         repo.create_document_with_task(document, version, task)
         claimed = repo.claim_task(worker_id="worker-1", lease_seconds=60)
-        claimed.task.lease_expires_at = utc_now() - timedelta(seconds=1)
+        lease_expires_at = utc_now() - timedelta(seconds=1)
+        claimed.task.lease_expires_at = lease_expires_at
         self.db.commit()
 
         self.assertIsNone(
@@ -335,6 +526,22 @@ class KnowledgeRepositoryTests(unittest.TestCase):
                 worker_id="worker-2",
                 lease_seconds=60,
                 external_write_grace_seconds=20,
+                now=lease_expires_at + timedelta(seconds=1),
+            )
+        )
+        self.db.refresh(task)
+        self.db.refresh(document)
+        self.db.refresh(version)
+        self.assertEqual(task.status, "running")
+        self.assertEqual(document.status, "queued")
+        self.assertEqual(version.status, "building")
+
+        self.assertIsNone(
+            repo.claim_task(
+                worker_id="worker-2",
+                lease_seconds=60,
+                external_write_grace_seconds=20,
+                now=lease_expires_at + timedelta(seconds=21),
             )
         )
 

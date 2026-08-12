@@ -34,6 +34,11 @@ heartbeat、过期回收和终态 fencing 防止旧 Worker 写入新状态。Red
 当前激活版本和 chunk manifest，最终正文与来源也以 PostgreSQL 为准；任一指定知识库不可用时整体失败，
 不返回部分结果。
 
+原始对象 key 使用 `.../objects/{checksum}/{document_id}`：checksum 用于内容归组，document_id 隔离每次
+上传代际。对象上传前先写入带过期保护的持久 cleanup intent；文档和索引任务提交成功后清除 intent，
+配额/唯一冲突的同步删除失败或数据库结果不确定时由独立 Worker 通过租约、引用复查和退避重试收敛。
+代际隔离保证旧清理请求即使晚到，也不会删除并发或后续上传的对象。
+
 v1 支持 UTF-8 TXT、Markdown、CSV、带文字层的 PDF 和 DOCX，不支持 OCR、扫描 PDF、旧版 DOC、
 网页抓取、音视频、图片理解、rerank 或聊天知识库选择器。
 

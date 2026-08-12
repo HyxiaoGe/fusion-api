@@ -58,6 +58,28 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
             env={**os.environ, **environment},
         )
 
+    def _run_revision_routes_assignment(self, value: str | None) -> subprocess.CompletedProcess[str]:
+        lines = self.workflow.splitlines()
+        start = next(
+            index
+            for index, line in enumerate(lines)
+            if 'if [ -n "${DEPLOY_KNOWLEDGE_EMBEDDING_REVISION_ROUTES:-}" ]; then' in line
+        )
+        end = next(index for index in range(start, len(lines)) if lines[index].strip() == "fi")
+        script = textwrap.dedent("\n".join(lines[start : end + 1]))
+        script += "\nprintf '%s' \"${KNOWLEDGE_EMBEDDING_REVISION_ROUTES}\"\n"
+        environment = dict(os.environ)
+        if value is None:
+            environment.pop("DEPLOY_KNOWLEDGE_EMBEDDING_REVISION_ROUTES", None)
+        else:
+            environment["DEPLOY_KNOWLEDGE_EMBEDDING_REVISION_ROUTES"] = value
+        return subprocess.run(
+            ["bash", "-c", script],
+            text=True,
+            capture_output=True,
+            env=environment,
+        )
+
     def test_real_acceptance_stack_pins_private_authenticated_milvus(self):
         self.assertIn("milvusdb/milvus:v2.6.21", self.milvus_compose)
         self.assertIn('COMMON_SECURITY_AUTHORIZATIONENABLED: "true"', self.milvus_compose)
@@ -92,6 +114,15 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         for marker in required:
             self.assertIn(marker, self.workflow)
         self.assertNotIn("MILVUS_BOOTSTRAP_PASSWORD", self.workflow)
+
+    def test_expand_only_migration_runs_before_cleanup_capable_worker_restart(self):
+        migration_step = self.workflow.index("- name: Apply alembic migrations")
+        deploy_step = self.workflow.index("- name: Pull and restart fusion-api")
+        worker_restart = self.workflow.index("--profile knowledge-worker up -d")
+
+        self.assertLess(migration_step, deploy_step)
+        self.assertLess(deploy_step, worker_restart)
+        self.assertIn("alembic upgrade head", self.workflow[migration_step:deploy_step])
 
     def test_automatic_rollback_restores_secure_knowledge_configuration_snapshot(self):
         capture = self.workflow.split("- name: Capture current deployment for rollback", 1)[1].split(
@@ -205,6 +236,19 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         self.assertIn("knowledge embedding revision routes invalid", missing_route.stderr)
         self.assertNotEqual(missing_current_route.returncode, 0)
         self.assertIn("knowledge embedding revision route missing", missing_current_route.stderr)
+
+    def test_revision_routes_bash_assignment_preserves_json_and_defaults_empty_value(self):
+        configured_json = '{"embedding-v1@embedding-r1":"embedding-v1-r1-immutable"}'
+        configured = self._run_revision_routes_assignment(configured_json)
+        empty = self._run_revision_routes_assignment("")
+        missing = self._run_revision_routes_assignment(None)
+
+        for completed in (configured, empty, missing):
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stderr, "")
+        self.assertEqual(configured.stdout, configured_json)
+        self.assertEqual(empty.stdout, "{}")
+        self.assertEqual(missing.stdout, "{}")
 
 
 if __name__ == "__main__":
