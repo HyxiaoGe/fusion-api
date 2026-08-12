@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
+from app.schemas.knowledge import normalize_knowledge_base_name
 from app.schemas.response import ApiException, ErrorCode
 
 os.environ.setdefault("DATABASE_URL", "sqlite:///./fusion-test.db")
@@ -35,7 +36,8 @@ class FakeKnowledgeService:
         return self._base("手册", knowledge_base_id)
 
     def update_knowledge_base(self, user_id, knowledge_base_id, payload):
-        return self._base(payload.name, knowledge_base_id)
+        self.calls.append(("update", user_id, knowledge_base_id, payload))
+        return self._base(payload.name or "手册", knowledge_base_id)
 
     def delete_knowledge_base(self, user_id, knowledge_base_id):
         return self._task("task-delete-base", "delete_knowledge_base")
@@ -232,6 +234,61 @@ class KnowledgeBasesApiTests(unittest.TestCase):
         self.assertEqual(updated.status_code, 422)
         self.assertEqual(created.json()["code"], "INVALID_PARAM")
         self.assertEqual(updated.json()["code"], "INVALID_PARAM")
+
+    def test_knowledge_text_fields_reject_nul_with_validation_envelope(self):
+        create_payload = {"name": "手册", "description": "说明", "business_type": "product"}
+        for field in ("name", "description", "business_type"):
+            payload = dict(create_payload)
+            payload[field] += "\x00invalid"
+            response = self.client.post("/api/knowledge-bases/", json=payload)
+
+            self.assertEqual(response.status_code, 422, field)
+            self.assertEqual(response.json()["code"], "INVALID_PARAM", field)
+            self.assertIsNone(response.json()["data"], field)
+
+        for field, value in (
+            ("name", "手册\x00invalid"),
+            ("description", "说明\x00invalid"),
+            ("business_type", "product\x00invalid"),
+        ):
+            response = self.client.patch(
+                "/api/knowledge-bases/kb-1",
+                json={field: value},
+            )
+
+            self.assertEqual(response.status_code, 422, field)
+            self.assertEqual(response.json()["code"], "INVALID_PARAM", field)
+            self.assertIsNone(response.json()["data"], field)
+
+        for payload in (
+            {"knowledge_base_ids": ["kb-1"], "query": "配置\x00invalid", "top_k": 5},
+            {"knowledge_base_ids": ["kb-1\x00invalid"], "query": "配置", "top_k": 5},
+        ):
+            response = self.client.post("/api/knowledge-bases/search", json=payload)
+
+            self.assertEqual(response.status_code, 422)
+            self.assertEqual(response.json()["code"], "INVALID_PARAM")
+            self.assertIsNone(response.json()["data"])
+
+        self.assertEqual(self.service.calls, [])
+
+    def test_knowledge_text_normalization_contract_is_preserved(self):
+        created = self.client.post(
+            "/api/knowledge-bases/",
+            json={"name": "  ＡＢＣ  ", "description": "  说明  ", "business_type": "product"},
+        )
+        searched = self.client.post(
+            "/api/knowledge-bases/search",
+            json={"knowledge_base_ids": ["kb-1"], "query": "  配置方法  ", "top_k": 5},
+        )
+
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(created.json()["data"]["knowledge_base"]["name"], "ＡＢＣ")
+        self.assertEqual(searched.status_code, 200)
+        self.assertEqual(searched.json()["data"]["query"], "配置方法")
+        self.assertEqual(normalize_knowledge_base_name("  ＡＢＣ  "), "abc")
+        create_call = next(call for call in self.service.calls if call[0] == "create")
+        self.assertEqual(create_call[2].description, "说明")
 
     def test_upload_type_mismatch_uses_stable_api_error(self):
         async def reject_upload(*_args):

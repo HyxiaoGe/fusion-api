@@ -7,6 +7,8 @@ from urllib.parse import urlparse
 from pydantic import Field
 from pydantic_settings import BaseSettings
 
+KNOWLEDGE_SEARCH_PROFILE_CONCURRENCY = 4
+
 
 class Settings(BaseSettings):
     APP_NAME: str = "AI桌面聊天应用"
@@ -90,9 +92,10 @@ class Settings(BaseSettings):
         ),
     )
     KNOWLEDGE_PARSER_VERSION: str = os.getenv("KNOWLEDGE_PARSER_VERSION", "parser-v1")
-    KNOWLEDGE_CHUNKER_VERSION: str = os.getenv("KNOWLEDGE_CHUNKER_VERSION", "chunker-v1")
+    KNOWLEDGE_CHUNKER_VERSION: str = os.getenv("KNOWLEDGE_CHUNKER_VERSION", "chunker-v2")
     KNOWLEDGE_CHUNK_SIZE: int = int(os.getenv("KNOWLEDGE_CHUNK_SIZE", "1200"))
     KNOWLEDGE_CHUNK_OVERLAP: int = int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "200"))
+    KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT: int = int(os.getenv("KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT", "10000"))
     KNOWLEDGE_PARSE_TIMEOUT_SECONDS: int = int(os.getenv("KNOWLEDGE_PARSE_TIMEOUT_SECONDS", "60"))
     KNOWLEDGE_EMBEDDING_PROVIDER: str = os.getenv("KNOWLEDGE_EMBEDDING_PROVIDER", "litellm")
     KNOWLEDGE_EMBEDDING_MODEL: str = os.getenv("KNOWLEDGE_EMBEDDING_MODEL", "")
@@ -102,6 +105,7 @@ class Settings(BaseSettings):
     KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS: str = os.getenv("KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS", "1024")
     KNOWLEDGE_EMBEDDING_BATCH_SIZE: int = int(os.getenv("KNOWLEDGE_EMBEDDING_BATCH_SIZE", "32"))
     KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS: float = float(os.getenv("KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS", "30"))
+    KNOWLEDGE_SEARCH_MAX_PROFILES: int = int(os.getenv("KNOWLEDGE_SEARCH_MAX_PROFILES", "8"))
     KNOWLEDGE_DISTANCE_METRIC: str = os.getenv("KNOWLEDGE_DISTANCE_METRIC", "COSINE").upper()
     KNOWLEDGE_WORKER_POLL_SECONDS: float = float(os.getenv("KNOWLEDGE_WORKER_POLL_SECONDS", "2"))
     KNOWLEDGE_WORKER_LEASE_SECONDS: int = int(os.getenv("KNOWLEDGE_WORKER_LEASE_SECONDS", "180"))
@@ -187,7 +191,7 @@ class Settings(BaseSettings):
             errors.append("KNOWLEDGE_EMBEDDING_PROVIDER 必须为 litellm")
         if self.KNOWLEDGE_PARSER_VERSION != "parser-v1":
             errors.append("KNOWLEDGE_PARSER_VERSION 必须与当前解析器实现一致")
-        if self.KNOWLEDGE_CHUNKER_VERSION != "chunker-v1":
+        if self.KNOWLEDGE_CHUNKER_VERSION != "chunker-v2":
             errors.append("KNOWLEDGE_CHUNKER_VERSION 必须与当前切片器实现一致")
         if not self.KNOWLEDGE_EMBEDDING_MODEL.strip():
             errors.append("KNOWLEDGE_EMBEDDING_MODEL 不能为空")
@@ -227,8 +231,12 @@ class Settings(BaseSettings):
             errors.append("KNOWLEDGE_MAX_FILE_SIZE 必须在 1 到 52428800 字节之间")
         if not 1 <= self.KNOWLEDGE_PARSE_TIMEOUT_SECONDS <= 300:
             errors.append("KNOWLEDGE_PARSE_TIMEOUT_SECONDS 必须在 1 到 300 之间")
-        if self.KNOWLEDGE_EMBEDDING_BATCH_SIZE <= 0:
-            errors.append("KNOWLEDGE_EMBEDDING_BATCH_SIZE 必须大于 0")
+        if not 1 <= self.KNOWLEDGE_EMBEDDING_BATCH_SIZE <= 128:
+            errors.append("KNOWLEDGE_EMBEDDING_BATCH_SIZE 必须在 1 到 128 之间")
+        if not 1 <= self.KNOWLEDGE_SEARCH_MAX_PROFILES <= 16:
+            errors.append("KNOWLEDGE_SEARCH_MAX_PROFILES 必须在 1 到 16 之间")
+        if not 1 <= self.KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT <= 10_000:
+            errors.append("KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT 必须在 1 到 10000 之间")
         if not 1 <= self.KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS <= 120:
             errors.append("KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS 必须在 1 到 120 秒之间")
         if not 0 < self.KNOWLEDGE_WORKER_POLL_SECONDS <= 60:

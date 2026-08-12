@@ -20,12 +20,15 @@ def enabled_settings(**overrides):
         "KNOWLEDGE_EMBEDDING_DIMENSION": 1024,
         "KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS": "1024,1536",
         "KNOWLEDGE_DISTANCE_METRIC": "COSINE",
+        "KNOWLEDGE_CHUNKER_VERSION": "chunker-v2",
         "KNOWLEDGE_CHUNK_SIZE": 1200,
         "KNOWLEDGE_CHUNK_OVERLAP": 200,
         "KNOWLEDGE_WORKER_LEASE_SECONDS": 180,
         "KNOWLEDGE_WORKER_HEARTBEAT_SECONDS": 30,
         "KNOWLEDGE_WORKER_RETRY_BASE_SECONDS": 5,
         "KNOWLEDGE_WORKER_RETRY_MAX_SECONDS": 300,
+        "KNOWLEDGE_SEARCH_MAX_PROFILES": 8,
+        "KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT": 10_000,
         "MILVUS_URI": "http://milvus:19530",
         "MILVUS_USERNAME": "fusion_knowledge",
         "MILVUS_PASSWORD": "secret",
@@ -71,6 +74,12 @@ class KnowledgeConfigTests(unittest.TestCase):
             ("KNOWLEDGE_WORKER_POLL_SECONDS", 61, "POLL_SECONDS"),
             ("KNOWLEDGE_WORKER_RETRY_BASE_SECONDS", 0, "RETRY_BASE_SECONDS"),
             ("KNOWLEDGE_WORKER_RETRY_MAX_SECONDS", 3601, "RETRY_MAX_SECONDS"),
+            ("KNOWLEDGE_EMBEDDING_BATCH_SIZE", 0, "EMBEDDING_BATCH_SIZE"),
+            ("KNOWLEDGE_EMBEDDING_BATCH_SIZE", 129, "EMBEDDING_BATCH_SIZE"),
+            ("KNOWLEDGE_SEARCH_MAX_PROFILES", 0, "SEARCH_MAX_PROFILES"),
+            ("KNOWLEDGE_SEARCH_MAX_PROFILES", 17, "SEARCH_MAX_PROFILES"),
+            ("KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT", 0, "MAX_CHUNKS_PER_DOCUMENT"),
+            ("KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT", 10_001, "MAX_CHUNKS_PER_DOCUMENT"),
             ("KNOWLEDGE_CHUNK_OVERLAP", 601, "CHUNK_OVERLAP"),
         )
         for name, value, message in invalid_cases:
@@ -94,7 +103,16 @@ class KnowledgeConfigTests(unittest.TestCase):
         enabled_settings(
             KNOWLEDGE_WORKER_RETRY_BASE_SECONDS=3600,
             KNOWLEDGE_WORKER_RETRY_MAX_SECONDS=3600,
+            KNOWLEDGE_EMBEDDING_BATCH_SIZE=128,
+            KNOWLEDGE_SEARCH_MAX_PROFILES=16,
+            KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT=10_000,
         ).validate_knowledge_base_configuration()
+
+    def test_legacy_chunker_version_is_rejected_for_new_writes(self):
+        with self.assertRaises(ValueError) as raised:
+            enabled_settings(KNOWLEDGE_CHUNKER_VERSION="chunker-v1").validate_knowledge_base_configuration()
+
+        self.assertIn("KNOWLEDGE_CHUNKER_VERSION", str(raised.exception))
 
     def test_embedding_timeout_and_revision_registry_fail_closed(self):
         invalid_cases = (

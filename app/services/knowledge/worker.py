@@ -15,7 +15,7 @@ from app.ai.embeddings.litellm_embedding import LiteLLMEmbeddingAdapter
 from app.core.config import settings
 from app.db.knowledge_repository import ClaimedKnowledgeTask, KnowledgeRepository
 from app.db.models import KnowledgeDocument, KnowledgeIndexVersion
-from app.services.knowledge.chunker import DeterministicKnowledgeChunker
+from app.services.knowledge.chunker import DeterministicKnowledgeChunker, KnowledgeChunkLimitExceeded
 from app.services.knowledge.milvus import (
     KnowledgeVectorError,
     KnowledgeVectorRecord,
@@ -186,7 +186,10 @@ class KnowledgeWorker:
         version = context.version
         if document is None or version is None or context.index_version is None:
             raise KnowledgeWorkerError("KNOWLEDGE_TASK_RESOURCE_MISSING", "索引任务资源不存在", retryable=False)
-        if version.parser_version != self.parser.VERSION or version.chunker_version != DeterministicKnowledgeChunker.VERSION:
+        if (
+            version.parser_version != self.parser.VERSION
+            or version.chunker_version != DeterministicKnowledgeChunker.VERSION
+        ):
             raise KnowledgeWorkerError(
                 "KNOWLEDGE_INDEX_VERSION_UNSUPPORTED",
                 "Worker 不支持该解析或切片版本",
@@ -232,26 +235,10 @@ class KnowledgeWorker:
             sections,
             document_id=document.id,
             index_version=context.index_version,
+            max_chunks=settings.KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT,
         )
         self._phase(context.task_id, lease_token, "embedding")
         profile = self._version_profile(version)
-        vectors = []
-        for offset in range(0, len(chunks), settings.KNOWLEDGE_EMBEDDING_BATCH_SIZE):
-            batch = chunks[offset : offset + settings.KNOWLEDGE_EMBEDDING_BATCH_SIZE]
-            vectors.extend(await self.embedding.embed([chunk.text for chunk in batch], profile))
-        self._phase(context.task_id, lease_token, "writing")
-        records = [
-            KnowledgeVectorRecord(
-                chunk=chunk,
-                vector=vector,
-                user_id=document.user_id,
-                knowledge_base_id=document.knowledge_base_id,
-                document_id=document.id,
-                index_version=context.index_version,
-                filename=document.original_filename,
-            )
-            for chunk, vector in zip(chunks, vectors, strict=True)
-        ]
         write_state = self._index_write_state(context, lease_token)
         if write_state == "stale":
             await self._cleanup_stale_version(context, version, lease_token)
@@ -265,9 +252,38 @@ class KnowledgeWorker:
                 version=version,
                 filename=document.original_filename,
                 chunks=chunks,
+                batch_size=settings.KNOWLEDGE_EMBEDDING_BATCH_SIZE,
             ):
                 raise KnowledgeWorkerError("KNOWLEDGE_TASK_LEASE_LOST", "知识库任务租约已失效", retryable=True)
-        await self.vector_store.upsert(profile, records)
+        collection = await self.vector_store.ensure_collection(profile)
+        writing_phase_started = False
+        batch_size = settings.KNOWLEDGE_EMBEDDING_BATCH_SIZE
+        for offset in range(0, len(chunks), batch_size):
+            batch = chunks[offset : offset + batch_size]
+            vectors = await self.embedding.embed([chunk.text for chunk in batch], profile)
+            records = [
+                KnowledgeVectorRecord(
+                    chunk=chunk,
+                    vector=vector,
+                    user_id=document.user_id,
+                    knowledge_base_id=document.knowledge_base_id,
+                    document_id=document.id,
+                    index_version=context.index_version,
+                    filename=document.original_filename,
+                )
+                for chunk, vector in zip(batch, vectors, strict=True)
+            ]
+            if not writing_phase_started:
+                self._phase(context.task_id, lease_token, "writing")
+                writing_phase_started = True
+            write_state = self._index_write_state(context, lease_token)
+            if write_state == "stale":
+                await self._cleanup_stale_version(context, version, lease_token)
+                return False
+            if write_state != "allowed":
+                raise KnowledgeWorkerError("KNOWLEDGE_TASK_LEASE_LOST", "知识库任务租约已失效", retryable=True)
+            await self.vector_store.upsert_prepared(profile, collection, records)
+            del batch, vectors, records
         with self.session_factory() as db:
             finalized = KnowledgeRepository(db).finalize_document_index(
                 task_id=context.task_id,
@@ -431,6 +447,12 @@ class KnowledgeWorker:
             return exc
         if isinstance(exc, KnowledgeParseError):
             return KnowledgeWorkerError(exc.code, exc.summary, retryable=False)
+        if isinstance(exc, KnowledgeChunkLimitExceeded):
+            return KnowledgeWorkerError(
+                "KNOWLEDGE_DOCUMENT_CHUNK_LIMIT_EXCEEDED",
+                "文档切片数量超过上限",
+                retryable=False,
+            )
         if isinstance(exc, EmbeddingError):
             return KnowledgeWorkerError(exc.code, exc.summary, retryable=exc.retryable)
         if isinstance(exc, KnowledgeVectorError):

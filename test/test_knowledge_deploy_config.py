@@ -40,9 +40,13 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         environment = {
             "KNOWLEDGE_BASE_ENABLED": "true",
             "KNOWLEDGE_MAX_FILE_SIZE": "10485760",
+            "KNOWLEDGE_CHUNKER_VERSION": "chunker-v2",
             "KNOWLEDGE_CHUNK_SIZE": "1200",
             "KNOWLEDGE_CHUNK_OVERLAP": "200",
+            "KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT": "10000",
+            "KNOWLEDGE_EMBEDDING_BATCH_SIZE": "32",
             "KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS": "30",
+            "KNOWLEDGE_SEARCH_MAX_PROFILES": "8",
             "KNOWLEDGE_WORKER_POLL_SECONDS": "2",
             "KNOWLEDGE_WORKER_RETRY_BASE_SECONDS": "5",
             "KNOWLEDGE_WORKER_RETRY_MAX_SECONDS": "300",
@@ -77,6 +81,35 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
             environment.pop("DEPLOY_KNOWLEDGE_EMBEDDING_REVISION_ROUTES", None)
         else:
             environment["DEPLOY_KNOWLEDGE_EMBEDDING_REVISION_ROUTES"] = value
+        return subprocess.run(
+            ["bash", "-c", script],
+            text=True,
+            capture_output=True,
+            env=environment,
+        )
+
+    def _run_chunker_version_assignment(
+        self,
+        *,
+        deploy_value: str | None,
+        inherited_value: str | None,
+    ) -> subprocess.CompletedProcess[str]:
+        line = next(
+            line
+            for line in self.workflow.splitlines()
+            if line.strip().startswith('export KNOWLEDGE_CHUNKER_VERSION="${DEPLOY_')
+        )
+        script = textwrap.dedent(line)
+        script += "\nprintf '%s' \"${KNOWLEDGE_CHUNKER_VERSION}\"\n"
+        environment = dict(os.environ)
+        for name, value in (
+            ("DEPLOY_KNOWLEDGE_CHUNKER_VERSION", deploy_value),
+            ("KNOWLEDGE_CHUNKER_VERSION", inherited_value),
+        ):
+            if value is None:
+                environment.pop(name, None)
+            else:
+                environment[name] = value
         return subprocess.run(
             ["bash", "-c", script],
             text=True,
@@ -140,9 +173,13 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
             "DEPLOY_KNOWLEDGE_EMBEDDING_REVISION_ROUTES: ${{ vars.KNOWLEDGE_EMBEDDING_REVISION_ROUTES }}",
             "DEPLOY_KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS: ${{ vars.KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS || '30' }}",
             "DEPLOY_KNOWLEDGE_MAX_FILE_SIZE: ${{ vars.KNOWLEDGE_MAX_FILE_SIZE || '10485760' }}",
+            "DEPLOY_KNOWLEDGE_CHUNKER_VERSION: ${{ vars.KNOWLEDGE_CHUNKER_VERSION || 'chunker-v2' }}",
+            "DEPLOY_KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT: ${{ vars.KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT || '10000' }}",
+            "DEPLOY_KNOWLEDGE_SEARCH_MAX_PROFILES: ${{ vars.KNOWLEDGE_SEARCH_MAX_PROFILES || '8' }}",
             "DEPLOY_KNOWLEDGE_WORKER_POLL_SECONDS: ${{ vars.KNOWLEDGE_WORKER_POLL_SECONDS || '2' }}",
             "DEPLOY_MILVUS_TIMEOUT_SECONDS: ${{ vars.MILVUS_TIMEOUT_SECONDS || '10' }}",
             "knowledge deployment bounds invalid",
+            "knowledge chunker version invalid",
             "knowledge embedding revision route missing",
             "knowledge embedding revision routes history changed",
         )
@@ -175,8 +212,12 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         self.assertIn('"MILVUS_PASSWORD"', capture)
         for name in (
             "KNOWLEDGE_MAX_BASES_PER_USER",
+            "KNOWLEDGE_CHUNKER_VERSION",
             "KNOWLEDGE_EMBEDDING_REVISION_ROUTES",
             "KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS",
+            "KNOWLEDGE_EMBEDDING_BATCH_SIZE",
+            "KNOWLEDGE_SEARCH_MAX_PROFILES",
+            "KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT",
             "KNOWLEDGE_WORKER_RETRY_MAX_SECONDS",
             "KNOWLEDGE_WORKER_HEALTH_FILE",
             "MILVUS_TIMEOUT_SECONDS",
@@ -190,6 +231,7 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         self.assertNotIn("MILVUS_", github_output)
         self.assertIn('source "${ROLLBACK_KNOWLEDGE_CONFIG_FILE}"', rollback)
         self.assertNotIn("knowledge embedding revision routes history changed", rollback)
+        self.assertNotIn("knowledge chunker version invalid", rollback)
         self.assertNotIn("DEPLOY_MILVUS_PASSWORD", rollback)
         self.assertNotIn("DEPLOY_KNOWLEDGE_EMBEDDING_MODEL", rollback)
         self.assertIn('rm -f -- "${rollback_knowledge_config_file}"', cleanup)
@@ -217,6 +259,7 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         self.assertEqual(syntax.stderr, "")
         self.assertEqual(mode, 0o600)
         self.assertIn("export KNOWLEDGE_BASE_ENABLED=false", contents)
+        self.assertIn("export KNOWLEDGE_CHUNKER_VERSION=chunker-v1", contents)
         self.assertIn("export MILVUS_PASSWORD=''", contents)
 
     def test_rollback_snapshot_preserves_enabled_worker_secret_without_logging(self):
@@ -225,6 +268,7 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
             "KNOWLEDGE_BASE_ENABLED=true",
             "KNOWLEDGE_EMBEDDING_MODEL=text-embedding-v4",
             "KNOWLEDGE_EMBEDDING_REVISION=2026-08-12",
+            "KNOWLEDGE_CHUNKER_VERSION=chunker-v2",
             "MILVUS_URI=http://standalone:19530",
             "MILVUS_USERNAME=fusion_app",
             f"MILVUS_PASSWORD={secret}",
@@ -250,6 +294,7 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         self.assertNotIn(secret, completed.stdout + completed.stderr)
         self.assertEqual(mode, 0o600)
         self.assertIn("export KNOWLEDGE_BASE_ENABLED=true", contents)
+        self.assertIn("export KNOWLEDGE_CHUNKER_VERSION=chunker-v2", contents)
         self.assertIn("export MILVUS_PASSWORD=", contents)
         self.assertIn("fusion_knowledge_milvus", contents)
 
@@ -306,6 +351,10 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
     def test_candidate_deploy_validation_rejects_bounds_and_missing_revision_route(self):
         valid = self._run_candidate_knowledge_validation()
         invalid_size = self._run_candidate_knowledge_validation(KNOWLEDGE_MAX_FILE_SIZE="0")
+        legacy_chunker = self._run_candidate_knowledge_validation(KNOWLEDGE_CHUNKER_VERSION="chunker-v1")
+        invalid_chunks = self._run_candidate_knowledge_validation(KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT="10001")
+        invalid_batch = self._run_candidate_knowledge_validation(KNOWLEDGE_EMBEDDING_BATCH_SIZE="129")
+        invalid_profiles = self._run_candidate_knowledge_validation(KNOWLEDGE_SEARCH_MAX_PROFILES="17")
         invalid_poll = self._run_candidate_knowledge_validation(KNOWLEDGE_WORKER_POLL_SECONDS="61")
         invalid_retry_base = self._run_candidate_knowledge_validation(KNOWLEDGE_WORKER_RETRY_BASE_SECONDS="0")
         invalid_retry_order = self._run_candidate_knowledge_validation(
@@ -321,8 +370,13 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
 
         self.assertEqual(valid.returncode, 0)
         self.assertEqual(valid.stdout, '{"embedding-v1@embedding-r1":"embedding-v1-r1-immutable"}')
+        self.assertNotEqual(legacy_chunker.returncode, 0)
+        self.assertIn("knowledge chunker version invalid", legacy_chunker.stderr)
         for completed in (
             invalid_size,
+            invalid_chunks,
+            invalid_batch,
+            invalid_profiles,
             invalid_poll,
             invalid_retry_base,
             invalid_retry_order,
@@ -335,6 +389,20 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         self.assertIn("knowledge embedding revision routes invalid", missing_route.stderr)
         self.assertNotEqual(missing_current_route.returncode, 0)
         self.assertIn("knowledge embedding revision route missing", missing_current_route.stderr)
+
+    def test_compose_injects_search_and_document_resource_limits_into_api_and_worker(self):
+        for name in (
+            "KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT",
+            "KNOWLEDGE_SEARCH_MAX_PROFILES",
+        ):
+            self.assertEqual(self.workflow.count(f"- {name}=${{{name}}}"), 2)
+            self.assertEqual(self.fusion_override.count(f"- {name}=${{{name}:-"), 2)
+
+        self.assertEqual(self.workflow.count("- KNOWLEDGE_CHUNKER_VERSION=${KNOWLEDGE_CHUNKER_VERSION}"), 2)
+        self.assertEqual(
+            self.fusion_override.count("- KNOWLEDGE_CHUNKER_VERSION=${KNOWLEDGE_CHUNKER_VERSION:-chunker-v2}"),
+            2,
+        )
 
     def test_candidate_revision_registry_is_append_only_against_current_deployment(self):
         historical = {"embedding-v0@embedding-r0": "embedding-v0-r0-immutable"}
@@ -386,6 +454,21 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         self.assertEqual(configured.stdout, configured_json)
         self.assertEqual(empty.stdout, "{}")
         self.assertEqual(missing.stdout, "{}")
+
+    def test_candidate_chunker_assignment_ignores_legacy_dotenv_value(self):
+        inherited_legacy = self._run_chunker_version_assignment(
+            deploy_value=None,
+            inherited_value="chunker-v1",
+        )
+        configured = self._run_chunker_version_assignment(
+            deploy_value="chunker-v2",
+            inherited_value="chunker-v1",
+        )
+
+        for completed in (inherited_legacy, configured):
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stderr, "")
+            self.assertEqual(completed.stdout, "chunker-v2")
 
 
 if __name__ == "__main__":

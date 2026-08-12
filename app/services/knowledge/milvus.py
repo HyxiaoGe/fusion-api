@@ -85,6 +85,30 @@ class MilvusKnowledgeStore:
         if not records:
             return
         collection = await self.ensure_collection(profile)
+        await self.upsert_prepared(profile, collection, records)
+
+    async def upsert_prepared(
+        self,
+        profile: EmbeddingProfile,
+        collection: str,
+        records: Sequence[KnowledgeVectorRecord],
+    ) -> None:
+        """复用已完成 schema 校验的 collection，并保持公共入口相同的分批防线。"""
+        if collection != self._profile_collection(profile):
+            raise KnowledgeVectorError(
+                "KNOWLEDGE_VECTOR_CONFIG_INVALID",
+                "已准备的 Milvus collection 与 Embedding profile 不一致",
+                retryable=False,
+            )
+        batch_size = settings.KNOWLEDGE_EMBEDDING_BATCH_SIZE
+        for offset in range(0, len(records), batch_size):
+            await self._upsert_batch(collection, records[offset : offset + batch_size])
+
+    async def _upsert_batch(
+        self,
+        collection: str,
+        records: Sequence[KnowledgeVectorRecord],
+    ) -> None:
         data = [self._record_payload(record) for record in records]
         result = await self._call(
             lambda client: client.upsert(
@@ -102,7 +126,7 @@ class MilvusKnowledgeStore:
                     retryable=True,
                 )
         expected_ids = {record.chunk.chunk_id for record in records}
-        actual_ids = await self._readback_chunk_ids(profile, sorted(expected_ids))
+        actual_ids = await self._readback_chunk_ids(collection, sorted(expected_ids))
         if not expected_ids.issubset(actual_ids):
             raise KnowledgeVectorError(
                 "KNOWLEDGE_VECTOR_WRITE_INCOMPLETE",
@@ -173,11 +197,11 @@ class MilvusKnowledgeStore:
 
         await self._call(delete)
 
-    async def _readback_chunk_ids(self, profile: EmbeddingProfile, chunk_ids: Sequence[str]) -> set[str]:
-        collection = self._profile_collection(profile)
+    async def _readback_chunk_ids(self, collection: str, chunk_ids: Sequence[str]) -> set[str]:
         actual_ids: set[str] = set()
-        for offset in range(0, len(chunk_ids), 1000):
-            batch = list(chunk_ids[offset : offset + 1000])
+        batch_size = settings.KNOWLEDGE_EMBEDDING_BATCH_SIZE
+        for offset in range(0, len(chunk_ids), batch_size):
+            batch = list(chunk_ids[offset : offset + batch_size])
             rows = await self._call(
                 lambda client, ids=batch: client.get(
                     collection_name=collection,

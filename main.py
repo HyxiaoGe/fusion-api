@@ -1,4 +1,5 @@
 import asyncio
+import math
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -23,7 +24,7 @@ from app.api import (
     models,
     prompts,
 )
-from app.core.config import settings
+from app.core.config import KNOWLEDGE_SEARCH_PROFILE_CONCURRENCY, settings
 from app.core.logger import app_logger
 from app.core.redis import close_redis, get_redis_pool, init_redis
 from app.db.database import SessionLocal
@@ -56,7 +57,11 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
         key = (request.method.upper(), request.scope.get("path", ""))
         path = key[1]
         if key == ("POST", "/api/knowledge-bases/search"):
-            return settings.KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS + settings.MILVUS_TIMEOUT_SECONDS + 5
+            profile_batches = math.ceil(settings.KNOWLEDGE_SEARCH_MAX_PROFILES / KNOWLEDGE_SEARCH_PROFILE_CONCURRENCY)
+            return (
+                profile_batches * (settings.KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS + 2 * settings.MILVUS_TIMEOUT_SECONDS)
+                + 5
+            )
         path_segments = path.strip("/").split("/")
         if (
             key[0] == "POST"

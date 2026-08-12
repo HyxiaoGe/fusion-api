@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Iterable, Sequence
 
-from sqlalchemy import and_, exists, func, not_, or_
+from sqlalchemy import and_, exists, func, insert, not_, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 
@@ -412,36 +412,45 @@ class KnowledgeRepository:
         version: KnowledgeIndexVersion,
         filename: str,
         chunks: Sequence[object],
+        batch_size: int = 500,
     ) -> bool:
+        if batch_size < 1:
+            raise ValueError("manifest 批量写入大小必须大于零")
         task = self._lock_task(task_id)
         if not self._lease_matches(task, lease_token, utc_now()):
             self.db.rollback()
             return False
-        self.db.query(KnowledgeChunkManifest).filter(KnowledgeChunkManifest.index_version == version.id).delete(
-            synchronize_session=False
-        )
-        self.db.add_all(
-            [
-                KnowledgeChunkManifest(
-                    chunk_id=chunk.chunk_id,
-                    knowledge_base_id=version.knowledge_base_id,
-                    document_id=version.document_id,
-                    user_id=version.user_id,
-                    index_version=version.id,
-                    ordinal=chunk.ordinal,
-                    text=chunk.text,
-                    text_sha256=hashlib.sha256(chunk.text.encode("utf-8")).hexdigest(),
-                    filename=filename,
-                    char_start=chunk.char_start,
-                    char_end=chunk.char_end,
-                    page=chunk.page,
-                    section=chunk.section,
-                )
-                for chunk in chunks
-            ]
-        )
-        self.db.commit()
-        return True
+        try:
+            self.db.query(KnowledgeChunkManifest).filter(KnowledgeChunkManifest.index_version == version.id).delete(
+                synchronize_session=False
+            )
+            manifest_table = KnowledgeChunkManifest.__table__
+            for offset in range(0, len(chunks), batch_size):
+                batch = chunks[offset : offset + batch_size]
+                rows = [
+                    {
+                        "chunk_id": chunk.chunk_id,
+                        "knowledge_base_id": version.knowledge_base_id,
+                        "document_id": version.document_id,
+                        "user_id": version.user_id,
+                        "index_version": version.id,
+                        "ordinal": chunk.ordinal,
+                        "text": chunk.text,
+                        "text_sha256": hashlib.sha256(chunk.text.encode("utf-8")).hexdigest(),
+                        "filename": filename,
+                        "char_start": chunk.char_start,
+                        "char_end": chunk.char_end,
+                        "page": chunk.page,
+                        "section": chunk.section,
+                    }
+                    for chunk in batch
+                ]
+                self.db.execute(insert(manifest_table), rows)
+            self.db.commit()
+            return True
+        except Exception:
+            self.db.rollback()
+            raise
 
     def enqueue_document_delete(self, document: KnowledgeDocument, *, max_attempts: int) -> KnowledgeIndexTask:
         document.status = "deleting"

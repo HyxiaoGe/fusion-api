@@ -1,3 +1,4 @@
+import hashlib
 import unittest
 from datetime import timedelta
 from unittest.mock import patch
@@ -15,6 +16,7 @@ from app.db.knowledge_repository import (
 )
 from app.db.models import (
     KnowledgeBase,
+    KnowledgeChunkManifest,
     KnowledgeDocument,
     KnowledgeIndexTask,
     KnowledgeIndexVersion,
@@ -23,6 +25,7 @@ from app.db.models import (
     User,
 )
 from app.db.storage_cleanup_repository import StorageCleanupRepository, StorageUploadFenceConflict
+from app.services.knowledge.chunker import KnowledgeChunk
 from app.utils.time import utc_now
 
 
@@ -118,6 +121,21 @@ class KnowledgeRepositoryTests(unittest.TestCase):
         )
         return document, version, task
 
+    @staticmethod
+    def _chunks(count, *, prefix="chunk"):
+        return [
+            KnowledgeChunk(
+                chunk_id=hashlib.sha256(f"{prefix}-{index}".encode()).hexdigest(),
+                ordinal=index,
+                text=f"正文-{index}",
+                char_start=index * 10,
+                char_end=index * 10 + 4,
+                page=None,
+                section=None,
+            )
+            for index in range(count)
+        ]
+
     def test_names_are_unique_per_user_only(self):
         repo = KnowledgeRepository(self.db)
         repo.create_knowledge_base(self._base())
@@ -195,6 +213,109 @@ class KnowledgeRepositoryTests(unittest.TestCase):
         self.assertEqual(loaded_versions, expected_versions)
         self.assertEqual(len(statements), 1)
         self.assertEqual(repo.get_ready_documents("user-2", ["kb-1"]), [])
+
+    def test_replace_chunk_manifest_uses_bounded_core_batches(self):
+        repo = KnowledgeRepository(self.db)
+        repo.create_knowledge_base(self._base())
+        document, version, task = self._document_bundle()
+        repo.create_document_with_task(document, version, task)
+        claimed = repo.claim_task(worker_id="worker-1", lease_seconds=60)
+        insert_sizes = []
+
+        def capture_insert(_connection, _cursor, statement, parameters, _context, executemany):
+            if statement.lstrip().upper().startswith("INSERT INTO KNOWLEDGE_CHUNK_MANIFESTS"):
+                insert_sizes.append(len(parameters) if executemany else 1)
+
+        event.listen(self.engine, "before_cursor_execute", capture_insert)
+        try:
+            replaced = repo.replace_chunk_manifest(
+                task_id=task.id,
+                lease_token=claimed.lease_token,
+                version=version,
+                filename=document.original_filename,
+                chunks=self._chunks(5),
+                batch_size=2,
+            )
+        finally:
+            event.remove(self.engine, "before_cursor_execute", capture_insert)
+
+        self.assertTrue(replaced)
+        self.assertEqual(insert_sizes, [2, 2, 1])
+        self.assertEqual(self.db.query(KnowledgeChunkManifest).count(), 5)
+
+    def test_replace_chunk_manifest_lost_lease_never_writes(self):
+        repo = KnowledgeRepository(self.db)
+        repo.create_knowledge_base(self._base())
+        document, version, task = self._document_bundle()
+        repo.create_document_with_task(document, version, task)
+        repo.claim_task(worker_id="worker-1", lease_seconds=60)
+        insert_count = 0
+
+        def capture_insert(_connection, _cursor, statement, _parameters, _context, _executemany):
+            nonlocal insert_count
+            if statement.lstrip().upper().startswith("INSERT INTO KNOWLEDGE_CHUNK_MANIFESTS"):
+                insert_count += 1
+
+        event.listen(self.engine, "before_cursor_execute", capture_insert)
+        try:
+            replaced = repo.replace_chunk_manifest(
+                task_id=task.id,
+                lease_token="invalid-lease-token",
+                version=version,
+                filename=document.original_filename,
+                chunks=self._chunks(3),
+                batch_size=2,
+            )
+        finally:
+            event.remove(self.engine, "before_cursor_execute", capture_insert)
+
+        self.assertFalse(replaced)
+        self.assertEqual(insert_count, 0)
+        self.assertEqual(self.db.query(KnowledgeChunkManifest).count(), 0)
+
+    def test_replace_chunk_manifest_rolls_back_all_batches_on_later_failure(self):
+        repo = KnowledgeRepository(self.db)
+        repo.create_knowledge_base(self._base())
+        document, version, task = self._document_bundle()
+        repo.create_document_with_task(document, version, task)
+        claimed = repo.claim_task(worker_id="worker-1", lease_seconds=60)
+        old_chunks = self._chunks(1, prefix="old")
+        self.assertTrue(
+            repo.replace_chunk_manifest(
+                task_id=task.id,
+                lease_token=claimed.lease_token,
+                version=version,
+                filename=document.original_filename,
+                chunks=old_chunks,
+                batch_size=1,
+            )
+        )
+        insert_number = 0
+
+        def fail_second_insert(_connection, _cursor, statement, _parameters, _context, _executemany):
+            nonlocal insert_number
+            if not statement.lstrip().upper().startswith("INSERT INTO KNOWLEDGE_CHUNK_MANIFESTS"):
+                return
+            insert_number += 1
+            if insert_number == 2:
+                raise RuntimeError("模拟后续 manifest 批次写入失败")
+
+        event.listen(self.engine, "before_cursor_execute", fail_second_insert)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "后续 manifest 批次"):
+                repo.replace_chunk_manifest(
+                    task_id=task.id,
+                    lease_token=claimed.lease_token,
+                    version=version,
+                    filename=document.original_filename,
+                    chunks=self._chunks(5, prefix="new"),
+                    batch_size=2,
+                )
+        finally:
+            event.remove(self.engine, "before_cursor_execute", fail_second_insert)
+
+        remaining = self.db.query(KnowledgeChunkManifest).all()
+        self.assertEqual([row.chunk_id for row in remaining], [old_chunks[0].chunk_id])
 
     def test_soft_deleted_document_releases_checksum_for_new_upload(self):
         repo = KnowledgeRepository(self.db)

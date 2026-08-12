@@ -484,9 +484,10 @@ class ChatCoreSurfaceTests(unittest.TestCase):
             patch.object(self.main.settings, "FILE_UPLOAD_TIMEOUT_SECONDS", 137),
             patch.object(self.main.settings, "KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS", 41),
             patch.object(self.main.settings, "MILVUS_TIMEOUT_SECONDS", 7.5),
+            patch.object(self.main.settings, "KNOWLEDGE_SEARCH_MAX_PROFILES", 9),
         ):
             self.assertEqual(middleware._resolve_timeout_seconds(upload_request), 137)
-            self.assertEqual(middleware._resolve_timeout_seconds(search_request), 53.5)
+            self.assertEqual(middleware._resolve_timeout_seconds(search_request), 173)
             self.assertEqual(middleware._resolve_timeout_seconds(retry_request), 10)
 
     def test_timeout_middleware_uses_coordinated_budget_for_mcp_admin_operation(self):

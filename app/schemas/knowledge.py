@@ -30,6 +30,12 @@ def validate_normalized_name_length(name: str) -> str:
     return name
 
 
+def reject_nul_character(value: str) -> str:
+    if isinstance(value, str) and "\x00" in value:
+        raise ValueError("字段不能包含 NUL 字符")
+    return value
+
+
 class KnowledgeBaseCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     description: str = Field(default="", max_length=2000)
@@ -38,7 +44,13 @@ class KnowledgeBaseCreate(BaseModel):
     @field_validator("name", "description", mode="before")
     @classmethod
     def strip_text(cls, value: str) -> str:
+        value = reject_nul_character(value)
         return value.strip() if isinstance(value, str) else value
+
+    @field_validator("business_type", mode="before")
+    @classmethod
+    def reject_nul_business_type(cls, value: str) -> str:
+        return reject_nul_character(value)
 
     _validate_normalized_name_length = field_validator("name")(validate_normalized_name_length)
 
@@ -53,6 +65,7 @@ class KnowledgeBaseUpdate(BaseModel):
     def strip_optional_text(cls, value: str | None) -> str | None:
         if value is None:
             raise ValueError("字段不能为 null")
+        value = reject_nul_character(value)
         return value.strip() if isinstance(value, str) else value
 
     @field_validator("business_type", mode="before")
@@ -60,7 +73,7 @@ class KnowledgeBaseUpdate(BaseModel):
     def reject_null_business_type(cls, value: str | None) -> str | None:
         if value is None:
             raise ValueError("字段不能为 null")
-        return value
+        return reject_nul_character(value)
 
     _validate_normalized_name_length = field_validator("name")(validate_normalized_name_length)
 
@@ -174,11 +187,14 @@ class KnowledgeRetrievalRequest(BaseModel):
     @field_validator("query", mode="before")
     @classmethod
     def strip_query(cls, value: str) -> str:
+        value = reject_nul_character(value)
         return value.strip() if isinstance(value, str) else value
 
     @field_validator("knowledge_base_ids")
     @classmethod
     def unique_knowledge_base_ids(cls, values: list[str]) -> list[str]:
+        for value in values:
+            reject_nul_character(value)
         if len(set(values)) != len(values):
             raise ValueError("knowledge_base_ids 不能重复")
         return values

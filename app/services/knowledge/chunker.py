@@ -17,16 +17,26 @@ class KnowledgeChunk:
     section: str | None
 
 
+class KnowledgeChunkLimitExceeded(ValueError):
+    """文档切片数量超过 Worker 的有界处理上限。"""
+
+    def __init__(self, max_chunks: int):
+        self.max_chunks = max_chunks
+        super().__init__(f"文档切片数量超过上限 {max_chunks}")
+
+
 class DeterministicKnowledgeChunker:
     """固定字符窗切片；相同文档、版本与参数总是产生相同 ID。"""
 
-    VERSION = "chunker-v1"
+    VERSION = "chunker-v2"
 
     def __init__(self, *, chunk_size: int, overlap: int):
         if chunk_size < 100 or overlap < 0 or overlap * 2 > chunk_size or chunk_size - overlap < 100:
             raise ValueError("知识库切片参数无效")
         self.chunk_size = chunk_size
         self.overlap = overlap
+        # 边界偏好只能在安全窗口内回退，避免病态标点令 start 每轮仅推进一个字符。
+        self.minimum_start_advance = max(100, (chunk_size - overlap) // 2)
 
     def chunk(
         self,
@@ -34,7 +44,10 @@ class DeterministicKnowledgeChunker:
         *,
         document_id: str,
         index_version: str,
+        max_chunks: int | None = None,
     ) -> list[KnowledgeChunk]:
+        if max_chunks is not None and max_chunks < 1:
+            raise ValueError("文档切片数量上限必须大于零")
         chunks: list[KnowledgeChunk] = []
         global_offset = 0
         for section in sections:
@@ -42,8 +55,13 @@ class DeterministicKnowledgeChunker:
             while start < len(section.text):
                 hard_end = min(start + self.chunk_size, len(section.text))
                 end = self._prefer_boundary(section.text, start, hard_end)
+                if hard_end < len(section.text):
+                    minimum_end = start + self.overlap + self.minimum_start_advance
+                    end = max(end, min(minimum_end, hard_end))
                 text = section.text[start:end].strip()
                 if text:
+                    if max_chunks is not None and len(chunks) >= max_chunks:
+                        raise KnowledgeChunkLimitExceeded(max_chunks)
                     ordinal = len(chunks)
                     chunk_id = self._chunk_id(document_id, index_version, ordinal, text)
                     left_trim = len(section.text[start:end]) - len(section.text[start:end].lstrip())

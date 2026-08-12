@@ -1,6 +1,10 @@
 import unittest
+from unittest.mock import patch
 
-from app.services.knowledge.chunker import DeterministicKnowledgeChunker
+from app.services.knowledge.chunker import (
+    DeterministicKnowledgeChunker,
+    KnowledgeChunkLimitExceeded,
+)
 from app.services.knowledge.parser import ParsedSection
 
 
@@ -23,6 +27,43 @@ class DeterministicKnowledgeChunkerTests(unittest.TestCase):
         for chunk_size, overlap in ((100, 100), (1000, 501), (150, 60)):
             with self.subTest(chunk_size=chunk_size, overlap=overlap), self.assertRaises(ValueError):
                 DeterministicKnowledgeChunker(chunk_size=chunk_size, overlap=overlap)
+
+    def test_pathological_boundary_keeps_safe_progress_for_near_two_million_characters(self):
+        chunker = DeterministicKnowledgeChunker(chunk_size=1200, overlap=500)
+        text = "x" * 1_999_999
+
+        with patch.object(
+            chunker,
+            "_prefer_boundary",
+            side_effect=lambda value, start, hard_end: (
+                len(value) if hard_end >= len(value) else start + chunker.overlap + 1
+            ),
+        ):
+            chunks = chunker.chunk(
+                [ParsedSection(text, page=None, section="large")],
+                document_id="doc-large",
+                index_version="version-large",
+                max_chunks=10_000,
+            )
+
+        starts = [chunk.char_start for chunk in chunks]
+        self.assertTrue(
+            all(current - previous >= chunker.minimum_start_advance for previous, current in zip(starts, starts[1:]))
+        )
+        self.assertLess(len(chunks), 10_000)
+
+    def test_chunk_limit_stops_before_unbounded_manifest_allocation(self):
+        chunker = DeterministicKnowledgeChunker(chunk_size=100, overlap=0)
+
+        with self.assertRaises(KnowledgeChunkLimitExceeded) as raised:
+            chunker.chunk(
+                [ParsedSection("x" * 501, page=None, section=None)],
+                document_id="doc-limit",
+                index_version="version-limit",
+                max_chunks=5,
+            )
+
+        self.assertEqual(raised.exception.max_chunks, 5)
 
 
 if __name__ == "__main__":

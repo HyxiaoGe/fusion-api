@@ -48,13 +48,17 @@ v1 支持 UTF-8 TXT、Markdown、CSV、带文字层的 PDF 和 DOCX，不支持 
 
 ```dotenv
 KNOWLEDGE_BASE_ENABLED=true
+KNOWLEDGE_CHUNKER_VERSION=chunker-v2
 KNOWLEDGE_EMBEDDING_PROVIDER=litellm
 KNOWLEDGE_EMBEDDING_MODEL=embedding-v1
 KNOWLEDGE_EMBEDDING_REVISION=embedding-r1
 KNOWLEDGE_EMBEDDING_REVISION_ROUTES={"embedding-v1@embedding-r1":"embedding-v1-r1-immutable"}
 KNOWLEDGE_EMBEDDING_DIMENSION=1024
 KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS=1024
+KNOWLEDGE_EMBEDDING_BATCH_SIZE=32
 KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS=30
+KNOWLEDGE_SEARCH_MAX_PROFILES=8
+KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT=10000
 KNOWLEDGE_WORKER_RETRY_BASE_SECONDS=5
 KNOWLEDGE_WORKER_RETRY_MAX_SECONDS=300
 MILVUS_URI=http://fusion-knowledge-milvus:19530
@@ -72,11 +76,22 @@ Embedding 请求会按每个索引版本的持久化键解析 registry 后再调
 发布 preflight 会把候选 registry 与部署前从 API/Worker 捕获的 registry 对账，任何历史键删除或值改写都会
 fail closed；pre-#41 镜像按空 registry 兼容，自动回滚仍恢复部署前完整快照。
 
-启用时会集中校验上传上限、chunk 大小/重叠比例/最小步长、batch、Worker poll、lease/heartbeat/retry、
+当前边界偏好与最小推进算法的不可变标识是 `chunker-v2`。候选部署始终从 Environment Variable 注入
+该版本，不继承服务器旧 `.env` 中的 `chunker-v1`；配置为其他值时 preflight fail closed。历史 active
+`chunker-v1` 索引仍可检索，因为检索读取其已落库的 manifest 与向量；历史 building v1 任务不能按 v2
+算法原地续跑，Worker 会以稳定不支持错误终止并登记该未完成索引版本的清理任务。自动回滚则使用部署前
+快照中的版本；对没有知识库环境变量的旧镜像，快照兼容默认仍为 `chunker-v1`。
+
+启用时会集中校验上传上限、chunk 大小/重叠比例/最小步长/单文档总量、batch、搜索 profile 总量、
+Worker poll、lease/heartbeat/retry、
 Embedding profile/revision route/有限超时、COSINE、Milvus URI/有限超时、数据库和应用账号；缺项返回稳定
 503，Worker 拒绝进入运行态。`KNOWLEDGE_MAX_FILE_SIZE` 上限为 50 MiB，Worker poll 上限为 60 秒，
 Worker 重试需满足 `0 < base <= max <= 3600 秒`，Embedding 超时上限为 120 秒，Milvus 超时上限为
-60 秒。应用账号不能是 `root`，collection 名由服务端
+60 秒。单次 Embedding batch 限制为 1 到 128；单文档 chunk 总量限制为 1 到 10000；搜索最多允许
+1 到 16 个 profile，默认 8，超过配置上限会在外部调用前以稳定 503 fail closed。搜索路由总超时按
+`ceil(max_profiles / 4) × (Embedding 超时 + 2 × Milvus 超时) + 5 秒` 计算，覆盖每个 profile 冷路径的
+Milvus client 构造与 search 两次有限超时以及全部并发批次。应用账号不能是
+`root`，collection 名由服务端
 前缀和允许维度生成，客户端不能指定。
 
 ## 本地真实 Milvus 2.6.21 验收
@@ -119,7 +134,9 @@ python -m unittest test.test_knowledge_milvus_integration
 `master` 发布流水线使用同一不可变 API 镜像启动 `fusion-api` 和 `fusion-knowledge-worker`，检查二者
 镜像引用、内容 ID、健康文件和数据库连接。Worker 与 API 共享原文件挂载并连接私有 Milvus 网络，
 不发布端口。第一次发布前在 dev Environment 配置 `KNOWLEDGE_BASE_ENABLED`、Embedding/Milvus
-Variables（包括完整的 `KNOWLEDGE_EMBEDDING_REVISION_ROUTES`）和 `MILVUS_PASSWORD` Secret；开关默认
+Variables（包括 `KNOWLEDGE_CHUNKER_VERSION=chunker-v2`、完整的
+`KNOWLEDGE_EMBEDDING_REVISION_ROUTES`、`KNOWLEDGE_SEARCH_MAX_PROFILES`、
+`KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT`）和 `MILVUS_PASSWORD` Secret；开关默认
 false。自动回滚快照会保留当时的完整 revision registry，使旧索引仍能路由到部署前的不可变 alias。
 
 `/health` 仍只代表 API 的数据库与 Redis 就绪，不把 Milvus 故障扩散成全部 CRUD 下线。Worker 健康和

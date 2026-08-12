@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.ai.embeddings.base import EmbeddingAdapter, EmbeddingError, EmbeddingProfile
 from app.ai.embeddings.litellm_embedding import LiteLLMEmbeddingAdapter
-from app.core.config import settings
+from app.core.config import KNOWLEDGE_SEARCH_PROFILE_CONCURRENCY, settings
 from app.db.knowledge_repository import (
     KnowledgeBaseLimitExceeded,
     KnowledgeBaseWriteConflict,
@@ -55,7 +55,6 @@ EmbeddingProfileKey = tuple[str, str, int, str, str, str]
 VectorHitKey = tuple[str, str, str, str]
 FILENAME_MAX_CHARACTERS = 255
 FILENAME_MAX_UTF8_BYTES = 500
-SEARCH_PROFILE_CONCURRENCY = 4
 
 
 class KnowledgeService:
@@ -570,7 +569,13 @@ class KnowledgeService:
         documents_by_profile: dict[EmbeddingProfileKey, list[KnowledgeDocument]],
         limit: int,
     ) -> list[tuple[EmbeddingProfileKey, list[KnowledgeVectorHit]]]:
-        semaphore = asyncio.Semaphore(SEARCH_PROFILE_CONCURRENCY)
+        if len(documents_by_profile) > settings.KNOWLEDGE_SEARCH_MAX_PROFILES:
+            raise ApiException(
+                ErrorCode.KNOWLEDGE_CONFIG_INVALID,
+                "知识库搜索所需 Embedding profile 数量超过配置上限",
+                503,
+            )
+        semaphore = asyncio.Semaphore(KNOWLEDGE_SEARCH_PROFILE_CONCURRENCY)
         tasks = [
             asyncio.create_task(
                 self._search_profile_bounded(
