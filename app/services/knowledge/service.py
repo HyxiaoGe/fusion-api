@@ -21,7 +21,11 @@ from app.db.knowledge_repository import (
     KnowledgeRepository,
 )
 from app.db.models import KnowledgeBase, KnowledgeDocument, KnowledgeIndexTask, KnowledgeIndexVersion
-from app.db.storage_cleanup_repository import StorageCleanupBusy, StorageCleanupRepository
+from app.db.storage_cleanup_repository import (
+    StorageCleanupBusy,
+    StorageCleanupRepository,
+    StorageUploadFenceConflict,
+)
 from app.schemas.knowledge import (
     KNOWLEDGE_BASE_NORMALIZED_NAME_MAX_LENGTH,
     KnowledgeBaseCreate,
@@ -284,7 +288,14 @@ class KnowledgeService:
                     version,
                     task,
                     max_documents=settings.KNOWLEDGE_MAX_DOCUMENTS_PER_BASE,
+                    upload_registration=cleanup_registration,
                 )
+            except StorageUploadFenceConflict as exc:
+                raise ApiException(
+                    ErrorCode.KNOWLEDGE_STORAGE_BUSY,
+                    "对象上传期间存储清理 fence 已失效，请稍后重试",
+                    503,
+                ) from exc
             except KnowledgeBaseWriteConflict as exc:
                 cleanup_succeeded = False
                 if exc.cleanup_storage:
@@ -315,14 +326,9 @@ class KnowledgeService:
                     "相同内容的活动文档已存在于该知识库",
                     409,
                 ) from exc
-            committed = StorageCleanupRepository(self.db).mark_document_committed(cleanup_registration)
-            if committed:
-                upload_lifecycle.mark_request_resolved()
-                await upload_lifecycle.wait_finished()
-            else:
-                # 文档事务虽已返回，但 intent 未能确认引用时交给 fresh-session finalizer
-                # 再次精确复核，避免请求 session 的异常状态泄漏到后台。
-                upload_lifecycle.detach_request()
+            # 文档、索引任务、intent 删除与 cleanup 完成已在同一 PG 事务提交。
+            upload_lifecycle.mark_request_resolved()
+            await upload_lifecycle.wait_finished()
             return KnowledgeDocumentUploadResult(
                 document=self._document_view(saved_document),
                 task=self._task_view(saved_task),
@@ -475,18 +481,14 @@ class KnowledgeService:
             raise ApiException.not_found("知识库不存在或无权访问")
         if any(row.status != "active" for row in bases):
             raise ApiException(ErrorCode.KNOWLEDGE_BASE_NOT_READY, "知识库尚不可检索", 409)
-        documents = self.repo.get_ready_documents(user_id, payload.knowledge_base_ids)
-        bases_with_ready_documents = {document.knowledge_base_id for document in documents}
+        ready_documents = self.repo.get_ready_documents(user_id, payload.knowledge_base_ids)
+        bases_with_ready_documents = {row.document.knowledge_base_id for row in ready_documents}
         if bases_with_ready_documents != set(payload.knowledge_base_ids):
             raise ApiException(ErrorCode.KNOWLEDGE_BASE_NOT_READY, "至少一个知识库尚无就绪文档", 409)
         documents_by_profile: dict[EmbeddingProfileKey, list[KnowledgeDocument]] = defaultdict(list)
-        for document in documents:
-            active_version = next(
-                (version for version in document.index_versions if version.id == document.active_index_version),
-                None,
-            )
-            if active_version is None:
-                raise ApiException(ErrorCode.KNOWLEDGE_BASE_NOT_READY, "知识库索引版本记录不完整", 503)
+        for ready_document in ready_documents:
+            document = ready_document.document
+            active_version = ready_document.active_version
             key = (
                 active_version.embedding_provider,
                 active_version.embedding_model,
@@ -666,16 +668,7 @@ class KnowledgeService:
     def _ensure_requested_bases_still_ready(self, user_id: str, knowledge_base_ids: list[str]) -> None:
         self.db.expire_all()
         ready_documents = self.repo.get_ready_documents(user_id, knowledge_base_ids)
-        ready_base_ids = {
-            document.knowledge_base_id
-            for document in ready_documents
-            if any(
-                version.id == document.active_index_version
-                and version.status == "active"
-                and version.deleted_at is None
-                for version in document.index_versions
-            )
-        }
+        ready_base_ids = {row.document.knowledge_base_id for row in ready_documents}
         if ready_base_ids != set(knowledge_base_ids):
             raise ApiException(ErrorCode.KNOWLEDGE_BASE_NOT_READY, "至少一个知识库已不再就绪", 409)
 

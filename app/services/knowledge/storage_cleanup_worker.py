@@ -60,6 +60,8 @@ class KnowledgeStorageCleanupWorker:
                 )
             else:
                 if not deleted:
+                    if repo.complete_absent_if_definitive(task, claimed.lease_token):
+                        return True
                     retry_delay = min(
                         settings.KNOWLEDGE_WORKER_RETRY_BASE_SECONDS * (2 ** max(claimed.task.attempt_count - 1, 0)),
                         settings.KNOWLEDGE_WORKER_RETRY_MAX_SECONDS,

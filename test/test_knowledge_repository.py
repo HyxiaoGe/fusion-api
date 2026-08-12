@@ -2,7 +2,7 @@ import unittest
 from datetime import timedelta
 from unittest.mock import patch
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
@@ -13,7 +13,16 @@ from app.db.knowledge_repository import (
     KnowledgeBaseWriteConflict,
     KnowledgeRepository,
 )
-from app.db.models import KnowledgeBase, KnowledgeDocument, KnowledgeIndexTask, KnowledgeIndexVersion, User
+from app.db.models import (
+    KnowledgeBase,
+    KnowledgeDocument,
+    KnowledgeIndexTask,
+    KnowledgeIndexVersion,
+    KnowledgeStorageCleanupTask,
+    KnowledgeStorageUploadIntent,
+    User,
+)
+from app.db.storage_cleanup_repository import StorageCleanupRepository, StorageUploadFenceConflict
 from app.utils.time import utc_now
 
 
@@ -134,6 +143,59 @@ class KnowledgeRepositoryTests(unittest.TestCase):
 
         self.assertIsNone(repo.get_knowledge_base("kb-1", "user-2"))
 
+    def test_ready_documents_load_active_versions_in_one_query_and_preserve_scope(self):
+        repo = KnowledgeRepository(self.db)
+        repo.create_knowledge_base(self._base())
+        expected_versions = {}
+        for index in range(6):
+            document, version, task = self._document_bundle(
+                document_id=f"doc-{index}",
+                checksum=f"{index:064x}",
+            )
+            repo.create_document_with_task(document, version, task)
+            document.status = "ready"
+            document.active_index_version = version.id
+            version.status = "active"
+            expected_versions[document.id] = version.id
+
+        inactive_document, inactive_version, inactive_task = self._document_bundle(
+            document_id="doc-inactive-version",
+            checksum="f" * 64,
+        )
+        repo.create_document_with_task(inactive_document, inactive_version, inactive_task)
+        inactive_document.status = "ready"
+        inactive_document.active_index_version = inactive_version.id
+        inactive_version.status = "superseded"
+
+        deleted_version_document, deleted_version, deleted_version_task = self._document_bundle(
+            document_id="doc-deleted-version",
+            checksum="e" * 64,
+        )
+        repo.create_document_with_task(deleted_version_document, deleted_version, deleted_version_task)
+        deleted_version_document.status = "ready"
+        deleted_version_document.active_index_version = deleted_version.id
+        deleted_version.status = "active"
+        deleted_version.deleted_at = utc_now()
+        self.db.commit()
+        self.db.expire_all()
+
+        statements = []
+
+        def count_selects(_connection, _cursor, statement, _parameters, _context, _executemany):
+            if statement.lstrip().upper().startswith("SELECT"):
+                statements.append(statement)
+
+        event.listen(self.engine, "before_cursor_execute", count_selects)
+        try:
+            rows = repo.get_ready_documents("user-1", ["kb-1"])
+            loaded_versions = {row.document.id: row.active_version.id for row in rows}
+        finally:
+            event.remove(self.engine, "before_cursor_execute", count_selects)
+
+        self.assertEqual(loaded_versions, expected_versions)
+        self.assertEqual(len(statements), 1)
+        self.assertEqual(repo.get_ready_documents("user-2", ["kb-1"]), [])
+
     def test_soft_deleted_document_releases_checksum_for_new_upload(self):
         repo = KnowledgeRepository(self.db)
         repo.create_knowledge_base(self._base())
@@ -251,6 +313,98 @@ class KnowledgeRepositoryTests(unittest.TestCase):
             repo.create_document_with_task(document, version, task)
 
         self.assertEqual(repo.count_documents(stale_base.id), 0)
+
+    def test_document_write_atomically_consumes_succeeded_upload_fence(self):
+        repo = KnowledgeRepository(self.db)
+        repo.create_knowledge_base(self._base())
+        document, version, task = self._document_bundle(storage_key="knowledge/atomic-fence")
+        cleanup_repo = StorageCleanupRepository(self.db)
+        registration = cleanup_repo.register_upload_intent(
+            storage_backend="local",
+            storage_key=document.storage_key,
+            hold_seconds=60,
+            max_attempts=3,
+        )
+        self.assertTrue(
+            cleanup_repo.record_upload_outcome(
+                registration,
+                outcome="succeeded",
+                hold_seconds=60,
+            )
+        )
+
+        committed_during_flush = []
+
+        def capture(_connection, _cursor, statement, _parameters, _context, _executemany):
+            if statement.upper().startswith("INSERT INTO KNOWLEDGE_DOCUMENTS"):
+                committed_during_flush.append(self.db.in_transaction())
+
+        event.listen(self.engine, "before_cursor_execute", capture)
+        try:
+            saved, _, _ = repo.create_document_with_task(
+                document,
+                version,
+                task,
+                upload_registration=registration,
+            )
+        finally:
+            event.remove(self.engine, "before_cursor_execute", capture)
+
+        self.assertEqual(saved.id, document.id)
+        cleanup_task = self.db.get(KnowledgeStorageCleanupTask, registration.task_id)
+        self.assertEqual(cleanup_task.status, "completed")
+        self.assertEqual(self.db.query(KnowledgeStorageUploadIntent).count(), 0)
+        self.assertEqual(committed_during_flush, [True])
+
+    def test_document_write_rejects_non_succeeded_upload_fence(self):
+        repo = KnowledgeRepository(self.db)
+        repo.create_knowledge_base(self._base())
+        document, version, task = self._document_bundle(storage_key="knowledge/uncertain-fence")
+        registration = StorageCleanupRepository(self.db).register_upload_intent(
+            storage_backend="local",
+            storage_key=document.storage_key,
+            hold_seconds=60,
+            max_attempts=3,
+        )
+
+        with self.assertRaises(StorageUploadFenceConflict):
+            repo.create_document_with_task(
+                document,
+                version,
+                task,
+                upload_registration=registration,
+            )
+
+        self.assertEqual(repo.count_documents("kb-1"), 0)
+
+    def test_document_write_rejects_upload_fence_for_another_storage_generation(self):
+        repo = KnowledgeRepository(self.db)
+        repo.create_knowledge_base(self._base())
+        document, version, task = self._document_bundle(storage_key="knowledge/document-generation")
+        cleanup_repo = StorageCleanupRepository(self.db)
+        registration = cleanup_repo.register_upload_intent(
+            storage_backend="local",
+            storage_key="knowledge/another-generation",
+            hold_seconds=60,
+            max_attempts=3,
+        )
+        self.assertTrue(
+            cleanup_repo.record_upload_outcome(
+                registration,
+                outcome="succeeded",
+                hold_seconds=60,
+            )
+        )
+
+        with self.assertRaises(StorageUploadFenceConflict):
+            repo.create_document_with_task(
+                document,
+                version,
+                task,
+                upload_registration=registration,
+            )
+
+        self.assertEqual(repo.count_documents("kb-1"), 0)
 
     def test_expired_exhausted_candidates_use_postgres_skip_locked(self):
         repo = KnowledgeRepository(self.db)

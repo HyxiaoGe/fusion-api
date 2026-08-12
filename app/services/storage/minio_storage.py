@@ -8,7 +8,11 @@ from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
 from app.core.logger import app_logger as logger
-from app.services.storage.base import StorageBackend
+from app.services.storage.base import (
+    DefinitiveStorageUploadError,
+    StorageBackend,
+    is_definitive_upload_rejection,
+)
 
 
 class MinIOStorageBackend(StorageBackend):
@@ -57,20 +61,26 @@ class MinIOStorageBackend(StorageBackend):
 
     async def upload(self, key: str, data: bytes, content_type: str) -> str:
         """上传文件到 MinIO"""
-        await asyncio.to_thread(
-            self.s3_client.put_object,
-            Bucket=self.bucket,
-            Key=key,
-            Body=io.BytesIO(data),
-            ContentLength=len(data),
-            ContentType=content_type,
-        )
+        try:
+            await asyncio.to_thread(
+                self.s3_client.put_object,
+                Bucket=self.bucket,
+                Key=key,
+                Body=io.BytesIO(data),
+                ContentLength=len(data),
+                ContentType=content_type,
+            )
+        except ClientError as exc:
+            if is_definitive_upload_rejection(exc):
+                raise DefinitiveStorageUploadError("MinIO 明确拒绝上传") from exc
+            raise
         logger.debug(f"MinIO 上传成功: {key} ({len(data)} bytes)")
         return key
 
     async def download(self, key: str) -> bytes:
         """从 MinIO 下载文件"""
         try:
+
             def download() -> bytes:
                 response = self.s3_client.get_object(Bucket=self.bucket, Key=key)
                 return response["Body"].read()

@@ -5,7 +5,7 @@ import io
 import threading
 import unittest
 import weakref
-from datetime import UTC
+from datetime import UTC, timedelta
 from unittest.mock import MagicMock, patch
 
 from fastapi import UploadFile
@@ -28,6 +28,7 @@ from app.schemas.response import ApiException
 from app.services.knowledge.service import KnowledgeService
 from app.services.knowledge.storage_cleanup_worker import KnowledgeStorageCleanupWorker
 from app.services.knowledge.storage_upload_guard import (
+    StorageUploadFenceLost,
     active_storage_upload_lifecycle_count,
     drain_storage_upload_lifecycles,
     start_guarded_storage_upload,
@@ -282,7 +283,8 @@ class KnowledgeStorageUploadGuardTests(unittest.IsolatedAsyncioTestCase):
                     task = db.query(KnowledgeStorageCleanupTask).one()
                     self.assertIn(task.status, {"retry", "failed"})
                     self.assertEqual(task.error_code, "KNOWLEDGE_STORAGE_DELETE_UNCERTAIN")
-                    self.assertEqual(db.query(KnowledgeStorageUploadIntent).count(), 0)
+                    intent = db.query(KnowledgeStorageUploadIntent).one()
+                    self.assertEqual(intent.outcome, "uploading")
 
                 lifecycle_sessions.available = True
                 storage.upload_release.set()
@@ -294,12 +296,15 @@ class KnowledgeStorageUploadGuardTests(unittest.IsolatedAsyncioTestCase):
         finally:
             service_db.close()
 
-        # fresh-session finalizer 将失去 fence 的代际重新置为待清理；迟到 PUT 出现后删除。
+        # fresh-session finalizer 保留不确定 outcome 并将代际置为待清理；迟到 PUT
+        # 出现后仍能删除，不能因第一次 absent 丢失持久证据。
         self.assertTrue(storage.object_exists)
         with self.Session() as db:
             task = db.query(KnowledgeStorageCleanupTask).one()
             self.assertEqual(task.status, "pending")
             self.assertEqual(db.query(KnowledgeDocument).count(), 0)
+            intent = db.query(KnowledgeStorageUploadIntent).one()
+            self.assertEqual(intent.outcome, "uploading")
             task.available_at = utc_now()
             db.commit()
         with patch(
@@ -310,6 +315,43 @@ class KnowledgeStorageUploadGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(storage.object_exists)
         with self.Session() as db:
             self.assertEqual(db.query(KnowledgeStorageCleanupTask).one().status, "completed")
+
+    async def test_renewal_cannot_revive_fence_after_cleanup_has_taken_over(self):
+        with self.Session() as db:
+            registration = StorageCleanupRepository(db).register_upload_intent(
+                storage_backend="local",
+                storage_key="knowledge/guard/taken-over",
+                hold_seconds=1,
+                max_attempts=3,
+                now=utc_now(),
+            )
+            intent = db.get(KnowledgeStorageUploadIntent, registration.intent_id)
+            intent.expires_at = utc_now() - timedelta(seconds=1)
+            task = db.get(KnowledgeStorageCleanupTask, registration.task_id)
+            task.available_at = utc_now() - timedelta(seconds=1)
+            db.commit()
+        with self.Session() as db:
+            claimed = StorageCleanupRepository(db).claim_task(worker_id="cleanup", lease_seconds=30)
+        self.assertIsNotNone(claimed)
+
+        lifecycle = start_guarded_storage_upload(
+            registration=registration,
+            session_factory=self.Session,
+            storage=_ImmediateStorage(),
+            storage_key="knowledge/guard/taken-over",
+            content=b"content",
+            mimetype="text/plain",
+            hold_seconds=1,
+        )
+        with self.assertRaises(StorageUploadFenceLost):
+            await lifecycle.wait_upload()
+        lifecycle.detach_request()
+        await lifecycle.wait_finished()
+
+        with self.Session() as db:
+            task = db.get(KnowledgeStorageCleanupTask, registration.task_id)
+            self.assertEqual(task.status, "running")
+            self.assertEqual(task.attempt_count, 1)
 
     @staticmethod
     def _as_utc(value):

@@ -736,7 +736,38 @@ jobs:
               echo "知识库禁止使用 Milvus root 账号"
               exit 1
             fi
-            validated_revision_routes="$(python3 - <<'PY'
+          fi
+          # BEGIN CURRENT_KNOWLEDGE_REVISION_ROUTES
+          read_current_knowledge_revision_routes() {
+            snapshot_path="$1"
+            case "${snapshot_path}" in
+              "${RUNNER_TEMP}"/fusion-knowledge-rollback-*.env) ;;
+              *) echo "知识库回滚配置未落在 RUNNER_TEMP 的受管路径中" >&2; return 1 ;;
+            esac
+            if [ ! -f "${snapshot_path}" ] || [ -L "${snapshot_path}" ]; then
+              echo "知识库回滚配置快照缺失或不是受管普通文件" >&2
+              return 1
+            fi
+            snapshot_mode="$(python3 -c 'import os, stat, sys; print(format(stat.S_IMODE(os.stat(sys.argv[1], follow_symlinks=False).st_mode), "o"), end="")' "${snapshot_path}")" || return 1
+            if [ "${snapshot_mode}" != "600" ]; then
+              echo "知识库回滚配置快照权限无效" >&2
+              return 1
+            fi
+            (
+              unset KNOWLEDGE_EMBEDDING_REVISION_ROUTES
+              source "${snapshot_path}"
+              if [ -n "${KNOWLEDGE_EMBEDDING_REVISION_ROUTES:-}" ]; then
+                printf '%s' "${KNOWLEDGE_EMBEDDING_REVISION_ROUTES}"
+              else
+                printf '%s' '{}'
+              fi
+            )
+          }
+          rollback_knowledge_config_file="${RUNNER_TEMP}/fusion-knowledge-rollback-${GITHUB_RUN_ID}-${GITHUB_JOB}-${GITHUB_RUN_ATTEMPT}.env"
+          current_knowledge_revision_routes="$(read_current_knowledge_revision_routes "${rollback_knowledge_config_file}")" || exit 1
+          export CURRENT_KNOWLEDGE_EMBEDDING_REVISION_ROUTES="${current_knowledge_revision_routes}"
+          # END CURRENT_KNOWLEDGE_REVISION_ROUTES
+          validated_revision_routes="$(python3 - <<'PY'
           import json
           import math
           import os
@@ -751,53 +782,72 @@ jobs:
                   raise SystemExit("knowledge deployment bounds invalid")
               return value
 
-          try:
-              max_file_size = int(os.environ["KNOWLEDGE_MAX_FILE_SIZE"])
-              chunk_size = int(os.environ["KNOWLEDGE_CHUNK_SIZE"])
-              chunk_overlap = int(os.environ["KNOWLEDGE_CHUNK_OVERLAP"])
-          except (KeyError, ValueError):
-              raise SystemExit("knowledge deployment bounds invalid")
-          embedding_timeout = finite_number("KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS")
-          worker_poll = finite_number("KNOWLEDGE_WORKER_POLL_SECONDS")
-          milvus_timeout = finite_number("MILVUS_TIMEOUT_SECONDS")
-          if not (
-              1 <= max_file_size <= 50 * 1024 * 1024
-              and 100 <= chunk_size <= 16_000
-              and 0 <= chunk_overlap
-              and chunk_overlap * 2 <= chunk_size
-              and chunk_size - chunk_overlap >= 100
-              and 1 <= embedding_timeout <= 120
-              and 0 < worker_poll <= 60
-              and 1 <= milvus_timeout <= 60
-          ):
-              raise SystemExit("knowledge deployment bounds invalid")
-          try:
-              routes = json.loads(os.environ["KNOWLEDGE_EMBEDDING_REVISION_ROUTES"])
-          except (KeyError, json.JSONDecodeError):
-              raise SystemExit("knowledge embedding revision routes invalid")
-          route_key = f'{os.environ["KNOWLEDGE_EMBEDDING_MODEL"]}@{os.environ["KNOWLEDGE_EMBEDDING_REVISION"]}'
-          route = routes.get(route_key) if isinstance(routes, dict) else None
-          if not isinstance(routes, dict) or not routes:
-              raise SystemExit("knowledge embedding revision routes invalid")
-          for key, alias in routes.items():
-              if not isinstance(key, str) or not isinstance(alias, str):
-                  raise SystemExit("knowledge embedding revision routes invalid")
-              model, separator, revision = key.rpartition("@")
-              if (
-                  not separator
-                  or re.fullmatch(r"[A-Za-z0-9_.:/-]{1,200}", model) is None
-                  or re.fullmatch(r"[A-Za-z0-9_.:/-]{1,120}", revision) is None
-                  or re.fullmatch(r"[A-Za-z0-9_.:/-]{1,200}", alias) is None
-                  or alias.startswith("litellm_proxy/")
+          def revision_routes(name, *, allow_empty, error):
+              try:
+                  routes = json.loads(os.environ[name])
+              except (KeyError, json.JSONDecodeError):
+                  raise SystemExit(error)
+              if not isinstance(routes, dict) or (not allow_empty and not routes):
+                  raise SystemExit(error)
+              for key, alias in routes.items():
+                  if not isinstance(key, str) or not isinstance(alias, str):
+                      raise SystemExit(error)
+                  model, separator, revision = key.rpartition("@")
+                  if (
+                      not separator
+                      or re.fullmatch(r"[A-Za-z0-9_.:/-]{1,200}", model) is None
+                      or re.fullmatch(r"[A-Za-z0-9_.:/-]{1,120}", revision) is None
+                      or re.fullmatch(r"[A-Za-z0-9_.:/-]{1,200}", alias) is None
+                      or alias.startswith("litellm_proxy/")
+                  ):
+                      raise SystemExit(error)
+              return routes
+
+          enabled = os.environ.get("KNOWLEDGE_BASE_ENABLED") == "true"
+          routes = revision_routes(
+              "KNOWLEDGE_EMBEDDING_REVISION_ROUTES",
+              allow_empty=not enabled,
+              error="knowledge embedding revision routes invalid",
+          )
+          current_routes = revision_routes(
+              "CURRENT_KNOWLEDGE_EMBEDDING_REVISION_ROUTES",
+              allow_empty=True,
+              error="current knowledge embedding revision routes invalid",
+          )
+          if any(routes.get(key) != alias for key, alias in current_routes.items()):
+              raise SystemExit("knowledge embedding revision routes history changed")
+
+          if enabled:
+              try:
+                  max_file_size = int(os.environ["KNOWLEDGE_MAX_FILE_SIZE"])
+                  chunk_size = int(os.environ["KNOWLEDGE_CHUNK_SIZE"])
+                  chunk_overlap = int(os.environ["KNOWLEDGE_CHUNK_OVERLAP"])
+                  worker_retry_base = int(os.environ["KNOWLEDGE_WORKER_RETRY_BASE_SECONDS"])
+                  worker_retry_max = int(os.environ["KNOWLEDGE_WORKER_RETRY_MAX_SECONDS"])
+              except (KeyError, ValueError):
+                  raise SystemExit("knowledge deployment bounds invalid")
+              embedding_timeout = finite_number("KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS")
+              worker_poll = finite_number("KNOWLEDGE_WORKER_POLL_SECONDS")
+              milvus_timeout = finite_number("MILVUS_TIMEOUT_SECONDS")
+              if not (
+                  1 <= max_file_size <= 50 * 1024 * 1024
+                  and 100 <= chunk_size <= 16_000
+                  and 0 <= chunk_overlap
+                  and chunk_overlap * 2 <= chunk_size
+                  and chunk_size - chunk_overlap >= 100
+                  and 1 <= embedding_timeout <= 120
+                  and 0 < worker_poll <= 60
+                  and 0 < worker_retry_base <= worker_retry_max <= 3600
+                  and 1 <= milvus_timeout <= 60
               ):
-                  raise SystemExit("knowledge embedding revision routes invalid")
-          if not isinstance(route, str):
-              raise SystemExit("knowledge embedding revision route missing")
+                  raise SystemExit("knowledge deployment bounds invalid")
+              route_key = f'{os.environ["KNOWLEDGE_EMBEDDING_MODEL"]}@{os.environ["KNOWLEDGE_EMBEDDING_REVISION"]}'
+              if not isinstance(routes.get(route_key), str):
+                  raise SystemExit("knowledge embedding revision route missing")
           print(json.dumps(routes, separators=(",", ":")), end="")
           PY
-            )" || exit 1
-            export KNOWLEDGE_EMBEDDING_REVISION_ROUTES="${validated_revision_routes}"
-          fi
+          )" || exit 1
+          export KNOWLEDGE_EMBEDDING_REVISION_ROUTES="${validated_revision_routes}"
           append_csv_value() {
             current="$1"
             required="$2"

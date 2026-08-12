@@ -24,6 +24,8 @@ def enabled_settings(**overrides):
         "KNOWLEDGE_CHUNK_OVERLAP": 200,
         "KNOWLEDGE_WORKER_LEASE_SECONDS": 180,
         "KNOWLEDGE_WORKER_HEARTBEAT_SECONDS": 30,
+        "KNOWLEDGE_WORKER_RETRY_BASE_SECONDS": 5,
+        "KNOWLEDGE_WORKER_RETRY_MAX_SECONDS": 300,
         "MILVUS_URI": "http://milvus:19530",
         "MILVUS_USERNAME": "fusion_knowledge",
         "MILVUS_PASSWORD": "secret",
@@ -67,6 +69,8 @@ class KnowledgeConfigTests(unittest.TestCase):
             ("KNOWLEDGE_MAX_FILE_SIZE", 50 * 1024 * 1024 + 1, "MAX_FILE_SIZE"),
             ("KNOWLEDGE_WORKER_POLL_SECONDS", 0, "POLL_SECONDS"),
             ("KNOWLEDGE_WORKER_POLL_SECONDS", 61, "POLL_SECONDS"),
+            ("KNOWLEDGE_WORKER_RETRY_BASE_SECONDS", 0, "RETRY_BASE_SECONDS"),
+            ("KNOWLEDGE_WORKER_RETRY_MAX_SECONDS", 3601, "RETRY_MAX_SECONDS"),
             ("KNOWLEDGE_CHUNK_OVERLAP", 601, "CHUNK_OVERLAP"),
         )
         for name, value, message in invalid_cases:
@@ -79,6 +83,18 @@ class KnowledgeConfigTests(unittest.TestCase):
                 KNOWLEDGE_CHUNK_SIZE=150, KNOWLEDGE_CHUNK_OVERLAP=60
             ).validate_knowledge_base_configuration()
         self.assertIn("最小步长", str(raised.exception))
+
+        with self.assertRaises(ValueError) as raised:
+            enabled_settings(
+                KNOWLEDGE_WORKER_RETRY_BASE_SECONDS=301,
+                KNOWLEDGE_WORKER_RETRY_MAX_SECONDS=300,
+            ).validate_knowledge_base_configuration()
+        self.assertIn("base <= max", str(raised.exception))
+
+        enabled_settings(
+            KNOWLEDGE_WORKER_RETRY_BASE_SECONDS=3600,
+            KNOWLEDGE_WORKER_RETRY_MAX_SECONDS=3600,
+        ).validate_knowledge_base_configuration()
 
     def test_embedding_timeout_and_revision_registry_fail_closed(self):
         invalid_cases = (

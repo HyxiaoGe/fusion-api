@@ -3,6 +3,25 @@
 from abc import ABC, abstractmethod
 
 
+class DefinitiveStorageUploadError(RuntimeError):
+    """对象存储已明确拒绝 PUT，远端不会在稍后生成对象。"""
+
+
+def is_definitive_upload_rejection(exc: Exception) -> bool:
+    """只把有明确 4xx 响应的 PUT 失败视为未写入；超时和限流仍属不确定。"""
+    status = getattr(exc, "status", None)
+    response = getattr(exc, "response", None)
+    if status is None and isinstance(response, dict):
+        metadata = response.get("ResponseMetadata")
+        if isinstance(metadata, dict):
+            status = metadata.get("HTTPStatusCode")
+    try:
+        status_code = int(status)
+    except (TypeError, ValueError):
+        return False
+    return 400 <= status_code < 500 and status_code not in {408, 425, 429}
+
+
 class StorageBackend(ABC):
     """文件存储后端抽象基类，定义统一的存储接口"""
 

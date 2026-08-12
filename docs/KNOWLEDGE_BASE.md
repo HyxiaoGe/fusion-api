@@ -55,6 +55,8 @@ KNOWLEDGE_EMBEDDING_REVISION_ROUTES={"embedding-v1@embedding-r1":"embedding-v1-r
 KNOWLEDGE_EMBEDDING_DIMENSION=1024
 KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS=1024
 KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS=30
+KNOWLEDGE_WORKER_RETRY_BASE_SECONDS=5
+KNOWLEDGE_WORKER_RETRY_MAX_SECONDS=300
 MILVUS_URI=http://fusion-knowledge-milvus:19530
 MILVUS_USERNAME=fusion_knowledge
 MILVUS_PASSWORD=使用密钥系统注入
@@ -67,11 +69,14 @@ MILVUS_COLLECTION_PREFIX=fusion_knowledge_chunks
 Embedding 请求会按每个索引版本的持久化键解析 registry 后再调用 Proxy，因此 revision 不只是展示标签。
 当前 `model@revision` 必须存在；历史索引版本仍可能用于检索、重试或清理时，对应 route 禁止删除或改指向。
 需要轮换模型时添加新 route，并同时更新当前 model/revision 后通过 rebuild 生成新索引版本。
+发布 preflight 会把候选 registry 与部署前从 API/Worker 捕获的 registry 对账，任何历史键删除或值改写都会
+fail closed；pre-#41 镜像按空 registry 兼容，自动回滚仍恢复部署前完整快照。
 
-启用时会集中校验上传上限、chunk 大小/重叠比例/最小步长、batch、Worker poll、lease/heartbeat、
+启用时会集中校验上传上限、chunk 大小/重叠比例/最小步长、batch、Worker poll、lease/heartbeat/retry、
 Embedding profile/revision route/有限超时、COSINE、Milvus URI/有限超时、数据库和应用账号；缺项返回稳定
 503，Worker 拒绝进入运行态。`KNOWLEDGE_MAX_FILE_SIZE` 上限为 50 MiB，Worker poll 上限为 60 秒，
-Embedding 超时上限为 120 秒，Milvus 超时上限为 60 秒。应用账号不能是 `root`，collection 名由服务端
+Worker 重试需满足 `0 < base <= max <= 3600 秒`，Embedding 超时上限为 120 秒，Milvus 超时上限为
+60 秒。应用账号不能是 `root`，collection 名由服务端
 前缀和允许维度生成，客户端不能指定。
 
 ## 本地真实 Milvus 2.6.21 验收

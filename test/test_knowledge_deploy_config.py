@@ -38,17 +38,21 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         marker = "validated_revision_routes=\"$(python3 - <<'PY'\n"
         script = self.workflow.split(marker, 1)[1].split("\n          PY\n", 1)[0]
         environment = {
+            "KNOWLEDGE_BASE_ENABLED": "true",
             "KNOWLEDGE_MAX_FILE_SIZE": "10485760",
             "KNOWLEDGE_CHUNK_SIZE": "1200",
             "KNOWLEDGE_CHUNK_OVERLAP": "200",
             "KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS": "30",
             "KNOWLEDGE_WORKER_POLL_SECONDS": "2",
+            "KNOWLEDGE_WORKER_RETRY_BASE_SECONDS": "5",
+            "KNOWLEDGE_WORKER_RETRY_MAX_SECONDS": "300",
             "MILVUS_TIMEOUT_SECONDS": "10",
             "KNOWLEDGE_EMBEDDING_MODEL": "embedding-v1",
             "KNOWLEDGE_EMBEDDING_REVISION": "embedding-r1",
             "KNOWLEDGE_EMBEDDING_REVISION_ROUTES": json.dumps(
                 {"embedding-v1@embedding-r1": "embedding-v1-r1-immutable"}
             ),
+            "CURRENT_KNOWLEDGE_EMBEDDING_REVISION_ROUTES": "{}",
         }
         environment.update(overrides)
         return subprocess.run(
@@ -80,6 +84,36 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
             env=environment,
         )
 
+    def _run_current_revision_routes_from_snapshot(self, contents: str) -> subprocess.CompletedProcess[str]:
+        lines = self.workflow.splitlines()
+        start = next(
+            index for index, line in enumerate(lines) if line.strip() == "# BEGIN CURRENT_KNOWLEDGE_REVISION_ROUTES"
+        )
+        end = next(
+            index
+            for index in range(start + 1, len(lines))
+            if lines[index].strip() == "# END CURRENT_KNOWLEDGE_REVISION_ROUTES"
+        )
+        script = textwrap.dedent("\n".join(lines[start + 1 : end]))
+        script += "\nprintf '%s' \"${CURRENT_KNOWLEDGE_EMBEDDING_REVISION_ROUTES}\"\n"
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {
+                **os.environ,
+                "RUNNER_TEMP": directory,
+                "GITHUB_RUN_ID": "42",
+                "GITHUB_JOB": "deploy",
+                "GITHUB_RUN_ATTEMPT": "1",
+            }
+            snapshot = Path(directory) / "fusion-knowledge-rollback-42-deploy-1.env"
+            snapshot.write_text(contents, encoding="utf-8")
+            snapshot.chmod(0o600)
+            return subprocess.run(
+                ["bash", "-c", script],
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+
     def test_real_acceptance_stack_pins_private_authenticated_milvus(self):
         self.assertIn("milvusdb/milvus:v2.6.21", self.milvus_compose)
         self.assertIn('COMMON_SECURITY_AUTHORIZATIONENABLED: "true"', self.milvus_compose)
@@ -110,6 +144,7 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
             "DEPLOY_MILVUS_TIMEOUT_SECONDS: ${{ vars.MILVUS_TIMEOUT_SECONDS || '10' }}",
             "knowledge deployment bounds invalid",
             "knowledge embedding revision route missing",
+            "knowledge embedding revision routes history changed",
         )
         for marker in required:
             self.assertIn(marker, self.workflow)
@@ -154,6 +189,7 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         self.assertNotIn("KNOWLEDGE_", github_output)
         self.assertNotIn("MILVUS_", github_output)
         self.assertIn('source "${ROLLBACK_KNOWLEDGE_CONFIG_FILE}"', rollback)
+        self.assertNotIn("knowledge embedding revision routes history changed", rollback)
         self.assertNotIn("DEPLOY_MILVUS_PASSWORD", rollback)
         self.assertNotIn("DEPLOY_KNOWLEDGE_EMBEDDING_MODEL", rollback)
         self.assertIn('rm -f -- "${rollback_knowledge_config_file}"', cleanup)
@@ -217,10 +253,66 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         self.assertIn("export MILVUS_PASSWORD=", contents)
         self.assertIn("fusion_knowledge_milvus", contents)
 
+    def test_current_registry_bash_read_supports_pre41_and_enabled_snapshots(self):
+        _, old_contents, _, _ = self._run_rollback_snapshot(
+            [
+                {
+                    "Config": {"Env": ["PATH=/usr/local/bin"]},
+                    "NetworkSettings": {"Networks": {"postgres_default": {}}},
+                }
+            ]
+        )
+        configured_routes = json.dumps(
+            {
+                "embedding-v0@embedding-r0": "embedding-v0-r0-immutable",
+                "embedding-v1@embedding-r1": "embedding-v1-r1-immutable",
+            }
+        )
+        knowledge_environment = [
+            "KNOWLEDGE_BASE_ENABLED=true",
+            "KNOWLEDGE_EMBEDDING_MODEL=embedding-v1",
+            "KNOWLEDGE_EMBEDDING_REVISION=embedding-r1",
+            f"KNOWLEDGE_EMBEDDING_REVISION_ROUTES={configured_routes}",
+            "MILVUS_URI=http://standalone:19530",
+            "MILVUS_USERNAME=fusion_app",
+            "MILVUS_PASSWORD=不能输出的旧密码",
+            "MILVUS_DATABASE=fusion_knowledge",
+        ]
+        container = {
+            "Config": {"Env": knowledge_environment},
+            "NetworkSettings": {"Networks": {"fusion_knowledge_milvus": {}}},
+        }
+        _, configured_contents, _, _ = self._run_rollback_snapshot([container, container])
+
+        old = self._run_current_revision_routes_from_snapshot(old_contents)
+        configured = self._run_current_revision_routes_from_snapshot(configured_contents)
+
+        self.assertEqual(old.returncode, 0, old.stderr)
+        self.assertEqual(old.stdout, "{}")
+        self.assertEqual(old.stderr, "")
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        self.assertEqual(json.loads(configured.stdout), json.loads(configured_routes))
+        self.assertNotIn("不能输出的旧密码", configured.stdout + configured.stderr)
+        pre41_candidate = self._run_candidate_knowledge_validation(
+            CURRENT_KNOWLEDGE_EMBEDDING_REVISION_ROUTES=old.stdout,
+        )
+        history_deletion = self._run_candidate_knowledge_validation(
+            CURRENT_KNOWLEDGE_EMBEDDING_REVISION_ROUTES=configured.stdout,
+        )
+        self.assertEqual(pre41_candidate.returncode, 0, pre41_candidate.stderr)
+        self.assertNotEqual(history_deletion.returncode, 0)
+        self.assertIn("knowledge embedding revision routes history changed", history_deletion.stderr)
+
     def test_candidate_deploy_validation_rejects_bounds_and_missing_revision_route(self):
         valid = self._run_candidate_knowledge_validation()
         invalid_size = self._run_candidate_knowledge_validation(KNOWLEDGE_MAX_FILE_SIZE="0")
         invalid_poll = self._run_candidate_knowledge_validation(KNOWLEDGE_WORKER_POLL_SECONDS="61")
+        invalid_retry_base = self._run_candidate_knowledge_validation(KNOWLEDGE_WORKER_RETRY_BASE_SECONDS="0")
+        invalid_retry_order = self._run_candidate_knowledge_validation(
+            KNOWLEDGE_WORKER_RETRY_BASE_SECONDS="301",
+            KNOWLEDGE_WORKER_RETRY_MAX_SECONDS="300",
+        )
+        invalid_retry_max = self._run_candidate_knowledge_validation(KNOWLEDGE_WORKER_RETRY_MAX_SECONDS="3601")
         invalid_milvus_timeout = self._run_candidate_knowledge_validation(MILVUS_TIMEOUT_SECONDS="61")
         missing_route = self._run_candidate_knowledge_validation(KNOWLEDGE_EMBEDDING_REVISION_ROUTES="{}")
         missing_current_route = self._run_candidate_knowledge_validation(
@@ -229,13 +321,58 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
 
         self.assertEqual(valid.returncode, 0)
         self.assertEqual(valid.stdout, '{"embedding-v1@embedding-r1":"embedding-v1-r1-immutable"}')
-        for completed in (invalid_size, invalid_poll, invalid_milvus_timeout):
+        for completed in (
+            invalid_size,
+            invalid_poll,
+            invalid_retry_base,
+            invalid_retry_order,
+            invalid_retry_max,
+            invalid_milvus_timeout,
+        ):
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("knowledge deployment bounds invalid", completed.stderr)
         self.assertNotEqual(missing_route.returncode, 0)
         self.assertIn("knowledge embedding revision routes invalid", missing_route.stderr)
         self.assertNotEqual(missing_current_route.returncode, 0)
         self.assertIn("knowledge embedding revision route missing", missing_current_route.stderr)
+
+    def test_candidate_revision_registry_is_append_only_against_current_deployment(self):
+        historical = {"embedding-v0@embedding-r0": "embedding-v0-r0-immutable"}
+        appended = {
+            **historical,
+            "embedding-v1@embedding-r1": "embedding-v1-r1-immutable",
+        }
+        pre41 = self._run_candidate_knowledge_validation(
+            CURRENT_KNOWLEDGE_EMBEDDING_REVISION_ROUTES="{}",
+        )
+        append_only = self._run_candidate_knowledge_validation(
+            CURRENT_KNOWLEDGE_EMBEDDING_REVISION_ROUTES=json.dumps(historical),
+            KNOWLEDGE_EMBEDDING_REVISION_ROUTES=json.dumps(appended),
+        )
+        deleted = self._run_candidate_knowledge_validation(
+            CURRENT_KNOWLEDGE_EMBEDDING_REVISION_ROUTES=json.dumps(historical),
+        )
+        rewritten = self._run_candidate_knowledge_validation(
+            CURRENT_KNOWLEDGE_EMBEDDING_REVISION_ROUTES=json.dumps(historical),
+            KNOWLEDGE_EMBEDDING_REVISION_ROUTES=json.dumps(
+                {
+                    "embedding-v0@embedding-r0": "embedding-v0-r0-rewritten",
+                    "embedding-v1@embedding-r1": "embedding-v1-r1-immutable",
+                }
+            ),
+        )
+        disabled_deletion = self._run_candidate_knowledge_validation(
+            KNOWLEDGE_BASE_ENABLED="false",
+            CURRENT_KNOWLEDGE_EMBEDDING_REVISION_ROUTES=json.dumps(historical),
+            KNOWLEDGE_EMBEDDING_REVISION_ROUTES="{}",
+        )
+
+        self.assertEqual(pre41.returncode, 0, pre41.stderr)
+        self.assertEqual(append_only.returncode, 0, append_only.stderr)
+        self.assertEqual(json.loads(append_only.stdout), appended)
+        for completed in (deleted, rewritten, disabled_deletion):
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("knowledge embedding revision routes history changed", completed.stderr)
 
     def test_revision_routes_bash_assignment_preserves_json_and_defaults_empty_value(self):
         configured_json = '{"embedding-v1@embedding-r1":"embedding-v1-r1-immutable"}'

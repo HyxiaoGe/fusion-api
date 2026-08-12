@@ -34,6 +34,10 @@ class StorageCleanupBusy(RuntimeError):
     """旧清理 Worker 已取得租约，新的同 key 上传必须等待其收敛。"""
 
 
+class StorageUploadFenceConflict(RuntimeError):
+    """文档提交时上传 intent 已失效、未成功或清理任务已取得所有权。"""
+
+
 class StorageCleanupRepository:
     """对象清理补偿的 intent guard、租约和有界重试状态机。"""
 
@@ -97,19 +101,114 @@ class StorageCleanupRepository:
             id=str(uuid.uuid4()),
             cleanup_task_id=task.id,
             expires_at=guard_until,
+            outcome="uploading",
         )
         self.db.add(intent)
         self.db.commit()
         return RegisteredStorageUploadIntent(task_id=task.id, intent_id=intent.id)
 
-    def mark_document_committed(self, registration: RegisteredStorageUploadIntent) -> bool:
+    def record_upload_outcome(
+        self,
+        registration: RegisteredStorageUploadIntent,
+        *,
+        outcome: str,
+        hold_seconds: float,
+    ) -> bool:
+        """在持久 fence 内记录 SDK 的确定结果，并续租到请求事务完成。"""
+        if outcome not in {"succeeded", "failed", "uncertain"}:
+            raise ValueError("上传结果只能是 succeeded、failed 或 uncertain")
         task = self._lock_task(registration.task_id)
-        if task is None or not self._has_document_reference(task):
+        if task is None or task.status in {"running", "completed"} or task.attempt_count != 0:
             self.db.rollback()
             return False
-        self._delete_intent(registration.intent_id, task.id)
+        intent = self._lock_intent(registration)
+        if intent is None or intent.outcome not in {"uploading", "uncertain"}:
+            self.db.rollback()
+            return False
+        now = utc_now()
+        guard_until = now + timedelta(seconds=max(1.0, hold_seconds))
+        intent.outcome = outcome
+        intent.outcome_at = now
+        intent.expires_at = guard_until
+        task.available_at = max(self._as_utc(task.available_at), self._as_utc(guard_until))
+        task.updated_at = now
+        self.db.commit()
+        return True
+
+    def release_detached_upload(self, registration: RegisteredStorageUploadIntent) -> None:
+        """取消请求的单调收敛：completed 不回退，不确定结果保留供 Worker 复核。"""
+        task = self._lock_task(registration.task_id)
+        if task is None:
+            self.db.rollback()
+            return
+        if task.status == "completed":
+            self.db.commit()
+            return
+        intent = self._lock_intent(registration)
+        now = utc_now()
+        if self._has_document_reference(task):
+            self._complete_locked(task, now)
+            return
+        if intent is not None and intent.outcome == "failed":
+            self._complete_locked(task, now)
+            return
+        if intent is not None and intent.outcome == "succeeded":
+            self._delete_intent(registration.intent_id, task.id)
+        elif intent is not None:
+            # unknown/uncertain 不能因一次 absent 就完成；保留过期 outcome，Worker
+            # 可在对象迟到后删除，或由后续明确结果推进为 failed。
+            intent.expires_at = now
+        if task.status != "running":
+            task.status = "pending"
+            task.available_at = now
+            self._clear_lease(task)
+            task.completed_at = None
+            task.updated_at = now
+        self.db.commit()
+
+    def complete_absent_if_definitive(
+        self,
+        task: KnowledgeStorageCleanupTask,
+        lease_token: str,
+    ) -> bool:
+        """只有 PUT 明确失败时，对象 absent 才是确定终态。"""
+        if not self._lease_token_matches(task, lease_token):
+            self.db.rollback()
+            return False
+        outcomes = self._upload_outcomes(task.id)
+        if not outcomes or any(outcome != "failed" for outcome in outcomes):
+            return False
         self._complete_locked(task, utc_now())
         return True
+
+    def lock_succeeded_upload_for_document(
+        self,
+        registration: RegisteredStorageUploadIntent,
+    ) -> KnowledgeStorageCleanupTask:
+        """在调用方文档事务内取得 task/intent fence；本方法不提交。"""
+        task = self._lock_task(registration.task_id)
+        intent = self._lock_intent(registration)
+        now = utc_now()
+        if (
+            task is None
+            or task.status in {"running", "completed"}
+            or task.attempt_count != 0
+            or intent is None
+            or intent.outcome != "succeeded"
+            or self._as_utc(intent.expires_at) <= self._as_utc(now)
+        ):
+            self.db.rollback()
+            raise StorageUploadFenceConflict("对象上传 fence 已失效")
+        return task
+
+    def complete_document_write_locked(
+        self,
+        registration: RegisteredStorageUploadIntent,
+        task: KnowledgeStorageCleanupTask,
+    ) -> None:
+        """与文档 INSERT 处于同一事务，原子移除 intent 并完成 cleanup task。"""
+        self._delete_intent(registration.intent_id, task.id)
+        self._set_completed(task, utc_now())
 
     def resolve_known_conflict(
         self,
@@ -120,6 +219,9 @@ class StorageCleanupRepository:
         task = self._lock_task(registration.task_id)
         if task is None:
             self.db.rollback()
+            return
+        if task.status == "completed":
+            self.db.commit()
             return
         now = utc_now()
         self._delete_intent(registration.intent_id, task.id)
@@ -190,7 +292,6 @@ class StorageCleanupRepository:
         if task is None:
             self.db.commit()
             return None
-        self._delete_expired_intents(task.id, now)
         lease_token = secrets.token_urlsafe(32)
         task.status = "running"
         task.attempt_count += 1
@@ -211,7 +312,6 @@ class StorageCleanupRepository:
         if not self._lease_matches(task, lease_token, now):
             self.db.rollback()
             return "lease_lost", None
-        self._delete_expired_intents(task.id, now)
         active_intents = self._active_intents(task.id, now)
         if active_intents:
             task.status = "pending"
@@ -227,7 +327,7 @@ class StorageCleanupRepository:
         return "delete", task
 
     def complete_delete(self, task: KnowledgeStorageCleanupTask, lease_token: str) -> bool:
-        if not self._lease_matches(task, lease_token, utc_now()):
+        if not self._lease_token_matches(task, lease_token):
             self.db.rollback()
             return False
         self._complete_locked(task, utc_now())
@@ -242,7 +342,7 @@ class StorageCleanupRepository:
         error_summary: str,
         retry_delay_seconds: int,
     ) -> bool:
-        if not self._lease_matches(task, lease_token, utc_now()):
+        if not self._lease_token_matches(task, lease_token):
             self.db.rollback()
             return False
         now = utc_now()
@@ -316,12 +416,31 @@ class StorageCleanupRepository:
             self._clear_lease(task)
 
     def _lock_task(self, task_id: str) -> KnowledgeStorageCleanupTask | None:
+        return self._task_by_id_query(task_id).first()
+
+    def _task_by_id_query(self, task_id: str):
         return (
             self.db.query(KnowledgeStorageCleanupTask)
             .filter(KnowledgeStorageCleanupTask.id == task_id)
             .populate_existing()
             .with_for_update()
-            .first()
+        )
+
+    def _lock_intent(
+        self,
+        registration: RegisteredStorageUploadIntent,
+    ) -> KnowledgeStorageUploadIntent | None:
+        return self._intent_query(registration).first()
+
+    def _intent_query(self, registration: RegisteredStorageUploadIntent):
+        return (
+            self.db.query(KnowledgeStorageUploadIntent)
+            .filter(
+                KnowledgeStorageUploadIntent.id == registration.intent_id,
+                KnowledgeStorageUploadIntent.cleanup_task_id == registration.task_id,
+            )
+            .populate_existing()
+            .with_for_update()
         )
 
     def _has_document_reference(self, task: KnowledgeStorageCleanupTask) -> bool:
@@ -347,6 +466,14 @@ class StorageCleanupRepository:
             .all()
         )
 
+    def _upload_outcomes(self, task_id: str) -> list[str]:
+        return [
+            str(outcome)
+            for (outcome,) in self.db.query(KnowledgeStorageUploadIntent.outcome)
+            .filter(KnowledgeStorageUploadIntent.cleanup_task_id == task_id)
+            .all()
+        ]
+
     def _delete_expired_intents(self, task_id: str, now: datetime) -> None:
         self.db.query(KnowledgeStorageUploadIntent).filter(
             KnowledgeStorageUploadIntent.cleanup_task_id == task_id,
@@ -363,13 +490,16 @@ class StorageCleanupRepository:
         self.db.query(KnowledgeStorageUploadIntent).filter(
             KnowledgeStorageUploadIntent.cleanup_task_id == task.id
         ).delete(synchronize_session=False)
+        self._set_completed(task, now)
+        self.db.commit()
+
+    def _set_completed(self, task: KnowledgeStorageCleanupTask, now: datetime) -> None:
         task.status = "completed"
         task.completed_at = now
         task.updated_at = now
         task.error_code = None
         task.error_summary = None
         self._clear_lease(task)
-        self.db.commit()
 
     def _reconcile_failed_tasks(
         self,
@@ -420,6 +550,12 @@ class StorageCleanupRepository:
         if not secrets.compare_digest(task.lease_token_hash, cls._hash_token(lease_token)):
             return False
         return task.lease_expires_at is not None and cls._as_utc(task.lease_expires_at) >= cls._as_utc(now)
+
+    @classmethod
+    def _lease_token_matches(cls, task: KnowledgeStorageCleanupTask | None, lease_token: str) -> bool:
+        if task is None or task.status != "running" or not task.lease_token_hash:
+            return False
+        return secrets.compare_digest(task.lease_token_hash, cls._hash_token(lease_token))
 
     @staticmethod
     def _hash_token(token: str) -> str:

@@ -5,11 +5,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).parent.parent
-MIGRATION_PATH = ROOT / "alembic" / "versions" / "5e7a9c2d4b10_add_knowledge_storage_cleanup.py"
+CLEANUP_MIGRATION_PATH = ROOT / "alembic" / "versions" / "5e7a9c2d4b10_add_knowledge_storage_cleanup.py"
+OUTCOME_MIGRATION_PATH = ROOT / "alembic" / "versions" / "6f8b1d3c5a20_add_knowledge_upload_outcome.py"
 
 
-def load_migration():
-    spec = importlib.util.spec_from_file_location("knowledge_storage_cleanup_migration", MIGRATION_PATH)
+def load_migration(path=CLEANUP_MIGRATION_PATH, name="knowledge_storage_cleanup_migration"):
+    spec = importlib.util.spec_from_file_location(name, path)
     migration = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(migration)
     return migration
@@ -34,6 +35,19 @@ class KnowledgeStorageCleanupMigrationTests(unittest.TestCase):
             ["knowledge_storage_upload_intents", "knowledge_storage_cleanup_tasks"],
         )
 
+    def test_upload_outcome_migration_is_expand_only_and_matches_state_machine(self):
+        migration = load_migration(OUTCOME_MIGRATION_PATH, "knowledge_upload_outcome_migration")
+        with patch.object(migration, "op") as operation:
+            migration.upgrade()
+
+        columns = [call.args[1] for call in operation.add_column.call_args_list]
+        self.assertEqual([column.name for column in columns], ["outcome", "outcome_at"])
+        self.assertEqual(columns[0].server_default.arg, "uploading")
+        constraint = operation.create_check_constraint.call_args.args[2]
+        self.assertIn("'uncertain'", constraint)
+        self.assertEqual(migration.down_revision, "5e7a9c2d4b10")
+        self.assertFalse(operation.drop_table.called)
+
     def test_revision_chain_has_single_cleanup_head(self):
         revisions: dict[str, str | None] = {}
         for path in (ROOT / "alembic" / "versions").glob("*.py"):
@@ -46,9 +60,9 @@ class KnowledgeStorageCleanupMigrationTests(unittest.TestCase):
                 revisions[assignments["revision"]] = assignments["down_revision"]
         heads = set(revisions) - {parent for parent in revisions.values() if parent is not None}
 
-        self.assertEqual(heads, {"5e7a9c2d4b10"})
+        self.assertEqual(heads, {"6f8b1d3c5a20"})
         visited: set[str] = set()
-        current: str | None = "5e7a9c2d4b10"
+        current: str | None = "6f8b1d3c5a20"
         while current is not None:
             self.assertNotIn(current, visited)
             visited.add(current)

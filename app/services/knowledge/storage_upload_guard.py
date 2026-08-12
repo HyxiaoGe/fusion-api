@@ -12,6 +12,7 @@ from app.db.storage_cleanup_repository import (
     RegisteredStorageUploadIntent,
     StorageCleanupRepository,
 )
+from app.services.storage.base import DefinitiveStorageUploadError
 from app.utils.time import utc_now
 
 logger = logging.getLogger(__name__)
@@ -96,13 +97,22 @@ class GuardedStorageUpload:
                     self._upload_result.cancel()
                 raise
             except Exception as exc:
+                outcome = "failed" if isinstance(exc, DefinitiveStorageUploadError) else "uncertain"
+                try:
+                    await asyncio.to_thread(self._record_upload_outcome, outcome)
+                except Exception:
+                    logger.exception(
+                        "知识库上传失败结果持久化失败，保留原始 intent 等待接管: task_id=%s intent_id=%s",
+                        self.registration.task_id,
+                        self.registration.intent_id,
+                    )
                 if not self._upload_result.done():
                     self._upload_result.set_exception(exc)
             else:
                 # SDK 返回时用新事务重新取得持久 fence。数据库失联期间 intent 可能
                 # 已过期且 cleanup Worker 已接管；此时绝不能继续提交文档记录。
                 try:
-                    fence_renewed = await asyncio.to_thread(self._renew_once)
+                    fence_renewed = await asyncio.to_thread(self._record_upload_outcome, "succeeded")
                 except Exception:
                     logger.exception(
                         "知识库上传返回后无法确认持久 fence: task_id=%s intent_id=%s",
@@ -168,7 +178,7 @@ class GuardedStorageUpload:
                 .with_for_update()
                 .first()
             )
-            if task is None:
+            if task is None or task.status in {"running", "completed"} or task.attempt_count != 0:
                 db.rollback()
                 return False
             intent = (
@@ -181,7 +191,7 @@ class GuardedStorageUpload:
                 .with_for_update()
                 .first()
             )
-            if intent is None:
+            if intent is None or intent.outcome not in {"uploading", "succeeded", "uncertain"}:
                 db.rollback()
                 return False
             now = utc_now()
@@ -195,17 +205,20 @@ class GuardedStorageUpload:
             db.commit()
             return True
 
+    def _record_upload_outcome(self, outcome: str) -> bool:
+        with self.session_factory() as db:
+            return StorageCleanupRepository(db).record_upload_outcome(
+                self.registration,
+                outcome=outcome,
+                hold_seconds=self.hold_seconds,
+            )
+
     def _finalize_detached_upload(self) -> None:
         """用新 session 精确复核代际 key，不复用已关闭的请求 session。"""
         try:
             with self.session_factory() as db:
                 repo = StorageCleanupRepository(db)
-                if repo.mark_document_committed(self.registration):
-                    return
-                repo.resolve_known_conflict(
-                    self.registration,
-                    cleanup_succeeded=False,
-                )
+                repo.release_detached_upload(self.registration)
         except Exception:
             # finalizer 失败时保留持久记录。停止续租后 intent 会到期，由 cleanup Worker
             # 再次按精确 backend + generation key 检查引用并删除孤立对象。

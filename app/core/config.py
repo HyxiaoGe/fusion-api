@@ -242,6 +242,11 @@ class Settings(BaseSettings):
             errors.append("KNOWLEDGE_WORKER_HEARTBEAT_SECONDS 必须小于 lease 的一半")
         if self.KNOWLEDGE_WORKER_MAX_ATTEMPTS <= 0:
             errors.append("KNOWLEDGE_WORKER_MAX_ATTEMPTS 必须大于 0")
+        if not (0 < self.KNOWLEDGE_WORKER_RETRY_BASE_SECONDS <= self.KNOWLEDGE_WORKER_RETRY_MAX_SECONDS <= 3600):
+            errors.append(
+                "KNOWLEDGE_WORKER_RETRY_BASE_SECONDS 与 KNOWLEDGE_WORKER_RETRY_MAX_SECONDS "
+                "必须满足 0 < base <= max <= 3600 秒"
+            )
         allowed_mime_types = set(self.RESOLVED_KNOWLEDGE_ALLOWED_MIME_TYPES)
         supported_mime_types = {
             "text/plain",

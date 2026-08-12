@@ -140,6 +140,18 @@ class KnowledgeStorageCleanupTests(unittest.IsolatedAsyncioTestCase):
                     max_attempts=3,
                 )
 
+    def test_document_fence_locks_cleanup_task_then_upload_intent_on_postgres(self):
+        registration = self._register(key="knowledge/document-fence", hold_seconds=60)
+        with self.Session() as db:
+            repo = StorageCleanupRepository(db)
+            task_sql = str(repo._task_by_id_query(registration.task_id).statement.compile(dialect=postgresql.dialect()))
+            intent_sql = str(repo._intent_query(registration).statement.compile(dialect=postgresql.dialect()))
+
+        self.assertIn("FOR UPDATE", task_sql)
+        self.assertIn("knowledge_storage_cleanup_tasks", task_sql)
+        self.assertIn("FOR UPDATE", intent_sql)
+        self.assertIn("knowledge_storage_upload_intents", intent_sql)
+
     def test_terminal_task_is_reused_for_later_same_key_intent(self):
         first = self._register(key="knowledge/reused", hold_seconds=1)
         self._activate(first, cleanup_succeeded=True)
@@ -155,6 +167,67 @@ class KnowledgeStorageCleanupTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(task.status, "pending")
             self.assertEqual(task.attempt_count, 0)
             self.assertEqual(db.query(KnowledgeStorageUploadIntent).filter_by(cleanup_task_id=task.id).count(), 1)
+
+    def test_finalizer_never_reopens_completed_cleanup_task(self):
+        registration = self._register(key="knowledge/completed-finalizer", hold_seconds=60)
+        self._activate(registration, cleanup_succeeded=True)
+
+        with self.Session() as db:
+            repo = StorageCleanupRepository(db)
+            repo.release_detached_upload(registration)
+            task = db.get(KnowledgeStorageCleanupTask, registration.task_id)
+            self.assertEqual(task.status, "completed")
+            self.assertIsNotNone(task.completed_at)
+            self.assertEqual(db.query(KnowledgeStorageUploadIntent).count(), 0)
+
+    async def test_definitive_put_failure_absent_completes_without_polling(self):
+        registration = self._register(key="knowledge/definitive-failure", hold_seconds=60)
+        with self.Session() as db:
+            repo = StorageCleanupRepository(db)
+            self.assertTrue(
+                repo.record_upload_outcome(
+                    registration,
+                    outcome="failed",
+                    hold_seconds=60,
+                )
+            )
+            repo.release_detached_upload(registration)
+
+        with self.Session() as db:
+            task = db.get(KnowledgeStorageCleanupTask, registration.task_id)
+            self.assertEqual(task.status, "completed")
+            self.assertEqual(db.query(KnowledgeStorageUploadIntent).count(), 0)
+
+    async def test_uncertain_put_failure_absent_keeps_persistent_recheck(self):
+        registration = self._register(key="knowledge/uncertain-failure", hold_seconds=1)
+        with self.Session() as db:
+            repo = StorageCleanupRepository(db)
+            self.assertTrue(
+                repo.record_upload_outcome(
+                    registration,
+                    outcome="uncertain",
+                    hold_seconds=1,
+                )
+            )
+            repo.release_detached_upload(registration)
+
+        storage = MagicMock()
+        storage.exists = AsyncMock(return_value=False)
+        storage.delete = AsyncMock(return_value=False)
+        worker = KnowledgeStorageCleanupWorker(self.Session, worker_id="uncertain-worker")
+        with patch(
+            "app.services.knowledge.storage_cleanup_worker.get_storage_for_backend",
+            return_value=storage,
+        ):
+            self.assertTrue(await worker.run_once())
+
+        with self.Session() as db:
+            task = db.get(KnowledgeStorageCleanupTask, registration.task_id)
+            self.assertIn(task.status, {"retry", "failed"})
+            self.assertEqual(task.error_code, "KNOWLEDGE_STORAGE_DELETE_UNCERTAIN")
+            intent = db.get(KnowledgeStorageUploadIntent, registration.intent_id)
+            self.assertIsNotNone(intent)
+            self.assertEqual(intent.outcome, "uncertain")
 
     async def test_document_reference_completes_without_deleting_object(self):
         registration = self._register(key="knowledge/referenced", hold_seconds=1)
@@ -356,7 +429,7 @@ class KnowledgeStorageCleanupTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(task.max_attempts, 2)
             self.assertEqual(task.available_at, retry_at)
 
-    def test_external_call_past_last_lease_is_reclaimed_and_eventually_completes(self):
+    def test_confirmed_delete_completes_after_wall_clock_lease_expiry_while_lock_is_held(self):
         registration = self._register(key="knowledge/slow-external-call", hold_seconds=1, max_attempts=1)
         self._activate(registration)
         claim_at = utc_now() + timedelta(seconds=2)
@@ -365,51 +438,19 @@ class KnowledgeStorageCleanupTests(unittest.IsolatedAsyncioTestCase):
             first = repo.claim_task(worker_id="worker-1", lease_seconds=10, now=claim_at)
         self.assertIsNotNone(first)
 
-        # 模拟不可取消的外部删除超过 lease 后才返回：旧 token 不能完成任务。
-        with self.Session() as db:
-            task = db.get(KnowledgeStorageCleanupTask, registration.task_id)
-            task.lease_expires_at = utc_now() - timedelta(seconds=1)
-            db.commit()
-            self.assertFalse(StorageCleanupRepository(db).complete_delete(task, first.lease_token))
-
-        reconcile_at = utc_now()
+        # prepare_delete 的事务仍持有 task 行锁，外部删除已经确认成功。即使墙钟越过
+        # lease，只要 token 未被替换，该持锁事务必须可以完成。
         with self.Session() as db:
             repo = StorageCleanupRepository(db)
-            self.assertIsNone(
-                repo.claim_task(
-                    worker_id="worker-2",
-                    lease_seconds=10,
-                    retry_base_seconds=1,
-                    retry_max_seconds=1,
-                    now=reconcile_at,
-                )
-            )
-            task = db.get(KnowledgeStorageCleanupTask, registration.task_id)
-            self.assertEqual(task.status, "retry")
-            self.assertEqual(task.attempt_count, 1)
-            self.assertEqual(task.max_attempts, 2)
-            retry_at = task.available_at
-
-        with self.Session() as db:
-            repo = StorageCleanupRepository(db)
-            reclaimed = repo.claim_task(
-                worker_id="worker-2",
-                lease_seconds=10,
-                retry_base_seconds=1,
-                retry_max_seconds=1,
-                now=retry_at,
-            )
-            self.assertIsNotNone(reclaimed)
-            self.assertEqual(reclaimed.task.attempt_count, 2)
-            decision, task = repo.prepare_delete(reclaimed.task.id, reclaimed.lease_token)
+            decision, task = repo.prepare_delete(first.task.id, first.lease_token)
             self.assertEqual(decision, "delete")
-            self.assertTrue(repo.complete_delete(task, reclaimed.lease_token))
+            task.lease_expires_at = utc_now() - timedelta(seconds=1)
+            self.assertTrue(repo.complete_delete(task, first.lease_token))
 
         with self.Session() as db:
             completed = db.get(KnowledgeStorageCleanupTask, registration.task_id)
             self.assertEqual(completed.status, "completed")
-            self.assertEqual(completed.attempt_count, 2)
-            self.assertEqual(completed.max_attempts, 2)
+            self.assertEqual(completed.attempt_count, 1)
 
     async def test_api_rejects_upload_while_same_key_cleanup_is_running(self):
         content = b"knowledge content"

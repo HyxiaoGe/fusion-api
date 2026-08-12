@@ -18,6 +18,11 @@ from app.db.models import (
     KnowledgeIndexVersion,
     User,
 )
+from app.db.storage_cleanup_repository import (
+    RegisteredStorageUploadIntent,
+    StorageCleanupRepository,
+    StorageUploadFenceConflict,
+)
 from app.utils.time import utc_now
 
 
@@ -25,6 +30,12 @@ from app.utils.time import utc_now
 class ClaimedKnowledgeTask:
     task: KnowledgeIndexTask
     lease_token: str
+
+
+@dataclass(frozen=True)
+class ReadyKnowledgeDocument:
+    document: KnowledgeDocument
+    active_version: KnowledgeIndexVersion
 
 
 class KnowledgeBaseWriteConflict(RuntimeError):
@@ -200,6 +211,7 @@ class KnowledgeRepository:
         task: KnowledgeIndexTask,
         *,
         max_documents: int | None = None,
+        upload_registration: RegisteredStorageUploadIntent | None = None,
     ) -> tuple[KnowledgeDocument, KnowledgeIndexVersion, KnowledgeIndexTask]:
         knowledge_base = (
             self.db.query(KnowledgeBase)
@@ -214,6 +226,17 @@ class KnowledgeRepository:
         if knowledge_base is None or knowledge_base.status != "active":
             self.db.rollback()
             raise KnowledgeBaseWriteConflict("知识库已进入删除流程", cleanup_storage=True)
+        cleanup_repo = StorageCleanupRepository(self.db)
+        cleanup_task = (
+            cleanup_repo.lock_succeeded_upload_for_document(upload_registration)
+            if upload_registration is not None
+            else None
+        )
+        if cleanup_task is not None and (
+            cleanup_task.storage_backend != document.storage_backend or cleanup_task.storage_key != document.storage_key
+        ):
+            self.db.rollback()
+            raise StorageUploadFenceConflict("对象上传 fence 与文档存储代际不一致")
         if max_documents is not None:
             active_count = (
                 self.db.query(KnowledgeDocument)
@@ -234,6 +257,9 @@ class KnowledgeRepository:
                 )
         self.db.add_all([document, version, task])
         try:
+            self.db.flush()
+            if upload_registration is not None and cleanup_task is not None:
+                cleanup_repo.complete_document_write_locked(upload_registration, cleanup_task)
             self.db.commit()
             self.db.refresh(document)
             self.db.refresh(version)
@@ -295,12 +321,21 @@ class KnowledgeRepository:
             .all()
         )
 
-    def get_ready_documents(self, user_id: str, knowledge_base_ids: Sequence[str]) -> list[KnowledgeDocument]:
+    def get_ready_documents(self, user_id: str, knowledge_base_ids: Sequence[str]) -> list[ReadyKnowledgeDocument]:
         if not knowledge_base_ids:
             return []
-        return (
-            self.db.query(KnowledgeDocument)
+        rows = (
+            self.db.query(KnowledgeDocument, KnowledgeIndexVersion)
             .join(KnowledgeBase, KnowledgeBase.id == KnowledgeDocument.knowledge_base_id)
+            .join(
+                KnowledgeIndexVersion,
+                and_(
+                    KnowledgeIndexVersion.id == KnowledgeDocument.active_index_version,
+                    KnowledgeIndexVersion.document_id == KnowledgeDocument.id,
+                    KnowledgeIndexVersion.knowledge_base_id == KnowledgeDocument.knowledge_base_id,
+                    KnowledgeIndexVersion.user_id == KnowledgeDocument.user_id,
+                ),
+            )
             .filter(
                 KnowledgeDocument.user_id == user_id,
                 KnowledgeDocument.knowledge_base_id.in_(knowledge_base_ids),
@@ -308,9 +343,14 @@ class KnowledgeRepository:
                 KnowledgeDocument.active_index_version.isnot(None),
                 KnowledgeBase.user_id == user_id,
                 KnowledgeBase.status == "active",
+                KnowledgeIndexVersion.user_id == user_id,
+                KnowledgeIndexVersion.status == "active",
+                KnowledgeIndexVersion.deleted_at.is_(None),
             )
+            .order_by(KnowledgeDocument.id.asc())
             .all()
         )
+        return [ReadyKnowledgeDocument(document=document, active_version=version) for document, version in rows]
 
     def revalidate_retrieval_documents(
         self,

@@ -3,12 +3,36 @@ import types
 import unittest
 from unittest.mock import patch
 
+from app.services.storage.base import DefinitiveStorageUploadError
 from app.services.storage.oss_storage import OSSStorageBackend
 
 UPLOAD_KEY = "files/v1/users/user-1/conversations/conv-1/files/file-1/original"
 
 
 class OSSStorageBackendTests(unittest.IsolatedAsyncioTestCase):
+    async def test_upload_maps_only_definitive_client_rejection(self):
+        class UploadError(RuntimeError):
+            def __init__(self, status):
+                super().__init__(f"status={status}")
+                self.status = status
+
+        backend = object.__new__(OSSStorageBackend)
+        backend._bucket = type(
+            "FakeBucket",
+            (),
+            {"put_object": lambda _self, *_args, **_kwargs: (_ for _ in ()).throw(UploadError(403))},
+        )()
+        with self.assertRaises(DefinitiveStorageUploadError):
+            await backend.upload("document", b"content", "text/plain")
+
+        backend._bucket = type(
+            "FakeBucket",
+            (),
+            {"put_object": lambda _self, *_args, **_kwargs: (_ for _ in ()).throw(UploadError(503))},
+        )()
+        with self.assertRaises(UploadError):
+            await backend.upload("document", b"content", "text/plain")
+
     async def test_get_upload_url_signs_put_with_content_type_header(self):
         calls = {}
 

@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import UploadFile
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from starlette.datastructures import Headers
@@ -369,6 +369,30 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.code, "KNOWLEDGE_BASE_NOT_READY")
         self.assertEqual(raised.exception.status_code, 409)
+
+    async def test_final_ready_check_uses_one_query_after_expiring_session_state(self):
+        knowledge_base_ids = []
+        for index in range(6):
+            knowledge_base, _document = await self._create_ready_document(
+                base_name=f"批量检查手册 {index}",
+                content=f"ready document {index}".encode(),
+                embedding_model=f"embed-{index}",
+            )
+            knowledge_base_ids.append(knowledge_base.id)
+
+        statements = []
+
+        def count_selects(_connection, _cursor, statement, _parameters, _context, _executemany):
+            if statement.lstrip().upper().startswith("SELECT"):
+                statements.append(statement)
+
+        event.listen(self.engine, "before_cursor_execute", count_selects)
+        try:
+            self.service._ensure_requested_bases_still_ready("user-1", knowledge_base_ids)
+        finally:
+            event.remove(self.engine, "before_cursor_execute", count_selects)
+
+        self.assertEqual(len(statements), 1)
 
     async def test_single_profile_retrieval_preserves_similarity_order(self):
         knowledge_base, document = await self._create_ready_document(

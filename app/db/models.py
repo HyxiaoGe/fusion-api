@@ -473,7 +473,7 @@ class KnowledgeStorageCleanupTask(Base):
 
 
 class KnowledgeStorageUploadIntent(Base):
-    """短期保护正在上传或等待数据库提交的对象，避免补偿 Worker 提前删除。"""
+    """保护上传与文档事务，并持久记录远端 PUT 结果。"""
 
     __tablename__ = "knowledge_storage_upload_intents"
 
@@ -485,9 +485,17 @@ class KnowledgeStorageUploadIntent(Base):
         index=True,
     )
     expires_at = Column(DateTime(timezone=True), nullable=False)
+    outcome = Column(String(20), nullable=False, default="uploading", server_default="uploading")
+    outcome_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utc_now, server_default=func.now(), nullable=False)
 
-    __table_args__ = (Index("ix_knowledge_storage_upload_intents_guard", "cleanup_task_id", "expires_at"),)
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IN ('uploading', 'succeeded', 'failed', 'uncertain')",
+            name="ck_knowledge_storage_upload_intents_outcome",
+        ),
+        Index("ix_knowledge_storage_upload_intents_guard", "cleanup_task_id", "expires_at"),
+    )
 
 
 class Message(Base):
