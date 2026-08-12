@@ -285,6 +285,106 @@ jobs:
             fi
           fi
 
+          rollback_knowledge_config_file="${RUNNER_TEMP}/fusion-knowledge-rollback-${GITHUB_RUN_ID}-${GITHUB_JOB}-${GITHUB_RUN_ATTEMPT}.env"
+          case "${rollback_knowledge_config_file}" in
+            "${RUNNER_TEMP}"/fusion-knowledge-rollback-*.env) ;;
+            *) echo "知识库回滚配置未落在 RUNNER_TEMP 的受管路径中"; exit 1 ;;
+          esac
+          export ROLLBACK_KNOWLEDGE_CONFIG_FILE="${rollback_knowledge_config_file}"
+          rollback_containers=(fusion-api)
+          if [ "${knowledge_worker_existed}" = "true" ]; then
+            rollback_containers+=(fusion-knowledge-worker)
+          fi
+          umask 077
+          docker inspect "${rollback_containers[@]}" | python3 -c '
+          import json
+          import os
+          import shlex
+          import sys
+
+          defaults = {
+              "KNOWLEDGE_BASE_ENABLED": "false",
+              "KNOWLEDGE_MAX_BASES_PER_USER": "50",
+              "KNOWLEDGE_MAX_DOCUMENTS_PER_BASE": "100",
+              "KNOWLEDGE_MAX_FILE_SIZE": str(10 * 1024 * 1024),
+              "KNOWLEDGE_ALLOWED_MIME_TYPES": "text/plain,text/markdown,text/csv,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+              "KNOWLEDGE_PARSER_VERSION": "parser-v1",
+              "KNOWLEDGE_CHUNKER_VERSION": "chunker-v1",
+              "KNOWLEDGE_CHUNK_SIZE": "1200",
+              "KNOWLEDGE_CHUNK_OVERLAP": "200",
+              "KNOWLEDGE_PARSE_TIMEOUT_SECONDS": "60",
+              "KNOWLEDGE_EMBEDDING_PROVIDER": "litellm",
+              "KNOWLEDGE_EMBEDDING_MODEL": "",
+              "KNOWLEDGE_EMBEDDING_REVISION": "",
+              "KNOWLEDGE_EMBEDDING_DIMENSION": "1024",
+              "KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS": "1024",
+              "KNOWLEDGE_EMBEDDING_BATCH_SIZE": "32",
+              "KNOWLEDGE_DISTANCE_METRIC": "COSINE",
+              "KNOWLEDGE_WORKER_POLL_SECONDS": "2",
+              "KNOWLEDGE_WORKER_LEASE_SECONDS": "180",
+              "KNOWLEDGE_WORKER_HEARTBEAT_SECONDS": "30",
+              "KNOWLEDGE_WORKER_MAX_ATTEMPTS": "5",
+              "KNOWLEDGE_WORKER_RETRY_BASE_SECONDS": "5",
+              "KNOWLEDGE_WORKER_RETRY_MAX_SECONDS": "300",
+              "KNOWLEDGE_WORKER_HEALTH_FILE": "/tmp/fusion-knowledge-worker-health.json",
+              "MILVUS_URI": "",
+              "MILVUS_USERNAME": "",
+              "MILVUS_PASSWORD": "",
+              "MILVUS_DATABASE": "",
+              "MILVUS_COLLECTION_PREFIX": "fusion_knowledge_chunks",
+              "MILVUS_TIMEOUT_SECONDS": "10",
+              "MILVUS_DOCKER_NETWORK": "fusion_knowledge_milvus",
+          }
+          known_networks = {"postgres_default", "middleware_default", "fusion-prompthub", "fusion-flyai"}
+
+          def read_config(container):
+              captured = {}
+              for entry in container.get("Config", {}).get("Env") or []:
+                  name, separator, value = entry.partition("=")
+                  if not separator or name not in defaults:
+                      continue
+                  if name in captured:
+                      raise SystemExit("duplicate knowledge container environment")
+                  captured[name] = value
+              if "MILVUS_DOCKER_NETWORK" not in captured:
+                  networks = set((container.get("NetworkSettings", {}).get("Networks") or {}).keys())
+                  candidates = networks - known_networks
+                  if len(candidates) > 1:
+                      raise SystemExit("ambiguous knowledge Milvus network")
+                  if candidates:
+                      captured["MILVUS_DOCKER_NETWORK"] = candidates.pop()
+              return {name: captured.get(name, default) for name, default in defaults.items()}
+
+          containers = json.load(sys.stdin)
+          if not containers:
+              raise SystemExit("missing rollback container configuration")
+          configs = [read_config(container) for container in containers]
+          if any(config != configs[0] for config in configs[1:]):
+              raise SystemExit("knowledge API and Worker configuration mismatch")
+          config = configs[0]
+          enabled = config["KNOWLEDGE_BASE_ENABLED"].strip().lower()
+          if enabled not in {"true", "false"}:
+              raise SystemExit("invalid knowledge feature flag")
+          config["KNOWLEDGE_BASE_ENABLED"] = enabled
+          if enabled == "true" and any(
+              not config[name]
+              for name in (
+                  "KNOWLEDGE_EMBEDDING_MODEL",
+                  "KNOWLEDGE_EMBEDDING_REVISION",
+                  "MILVUS_URI",
+                  "MILVUS_USERNAME",
+                  "MILVUS_PASSWORD",
+                  "MILVUS_DATABASE",
+              )
+          ):
+              raise SystemExit("incomplete enabled knowledge configuration")
+          path = os.environ["ROLLBACK_KNOWLEDGE_CONFIG_FILE"]
+          flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+          with os.fdopen(os.open(path, flags, 0o600), "w", encoding="utf-8") as stream:
+              for name, value in config.items():
+                  stream.write(f"export {name}={shlex.quote(value)}\n")
+          '
+
           capture_container_bool_env() {
             key="$1"
             docker inspect fusion-api --format '{{json .Config.Env}}' | python3 -c '
@@ -308,10 +408,6 @@ jobs:
           }
           rollback_model_admission_worker_enabled="$(capture_container_bool_env LITELLM_MODEL_ADMISSION_WORKER_ENABLED)" || {
             echo "无法读取部署前的模型准入 Worker 开关"
-            exit 1
-          }
-          rollback_knowledge_base_enabled="$(capture_container_bool_env KNOWLEDGE_BASE_ENABLED)" || {
-            echo "无法读取部署前的知识库开关"
             exit 1
           }
           case "${rollback_model_management_enabled}:${rollback_model_admission_worker_enabled}" in
@@ -414,7 +510,6 @@ jobs:
             printf '%s\n' "knowledge_worker_existed=${knowledge_worker_existed}"
             printf '%s\n' "knowledge_worker_image_ref=${knowledge_worker_image_ref}"
             printf '%s\n' "knowledge_worker_image_id=${knowledge_worker_image_id}"
-            printf '%s\n' "knowledge_base_enabled=${rollback_knowledge_base_enabled}"
             printf '%s\n' "model_management_enabled=${rollback_model_management_enabled}"
             printf '%s\n' "model_admission_worker_enabled=${rollback_model_admission_worker_enabled}"
             printf '%s\n' "model_management_current_target=${model_management_current_target}"
@@ -566,22 +661,35 @@ jobs:
           export LITELLM_GOVERNANCE_MAX_AGE_SECONDS="${DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS:-86400}"
           export LITELLM_MODEL_ADMISSION_WORKER_TOKEN="${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN:-}"
           export KNOWLEDGE_BASE_ENABLED="$(printf '%s' "${DEPLOY_KNOWLEDGE_BASE_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')"
+          export KNOWLEDGE_MAX_BASES_PER_USER="${KNOWLEDGE_MAX_BASES_PER_USER:-50}"
+          export KNOWLEDGE_MAX_DOCUMENTS_PER_BASE="${KNOWLEDGE_MAX_DOCUMENTS_PER_BASE:-100}"
+          export KNOWLEDGE_MAX_FILE_SIZE="${KNOWLEDGE_MAX_FILE_SIZE:-10485760}"
+          export KNOWLEDGE_ALLOWED_MIME_TYPES="${KNOWLEDGE_ALLOWED_MIME_TYPES:-text/plain,text/markdown,text/csv,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document}"
+          export KNOWLEDGE_PARSER_VERSION="${KNOWLEDGE_PARSER_VERSION:-parser-v1}"
+          export KNOWLEDGE_CHUNKER_VERSION="${KNOWLEDGE_CHUNKER_VERSION:-chunker-v1}"
           export KNOWLEDGE_EMBEDDING_MODEL="${DEPLOY_KNOWLEDGE_EMBEDDING_MODEL:-}"
           export KNOWLEDGE_EMBEDDING_REVISION="${DEPLOY_KNOWLEDGE_EMBEDDING_REVISION:-}"
+          export KNOWLEDGE_EMBEDDING_PROVIDER="${KNOWLEDGE_EMBEDDING_PROVIDER:-litellm}"
           export KNOWLEDGE_EMBEDDING_DIMENSION="${DEPLOY_KNOWLEDGE_EMBEDDING_DIMENSION:-1024}"
           export KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS="${DEPLOY_KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS:-1024}"
           export KNOWLEDGE_CHUNK_SIZE="${DEPLOY_KNOWLEDGE_CHUNK_SIZE:-1200}"
           export KNOWLEDGE_CHUNK_OVERLAP="${DEPLOY_KNOWLEDGE_CHUNK_OVERLAP:-200}"
           export KNOWLEDGE_PARSE_TIMEOUT_SECONDS="${DEPLOY_KNOWLEDGE_PARSE_TIMEOUT_SECONDS:-60}"
           export KNOWLEDGE_EMBEDDING_BATCH_SIZE="${DEPLOY_KNOWLEDGE_EMBEDDING_BATCH_SIZE:-32}"
+          export KNOWLEDGE_DISTANCE_METRIC="${KNOWLEDGE_DISTANCE_METRIC:-COSINE}"
+          export KNOWLEDGE_WORKER_POLL_SECONDS="${KNOWLEDGE_WORKER_POLL_SECONDS:-2}"
           export KNOWLEDGE_WORKER_LEASE_SECONDS="${DEPLOY_KNOWLEDGE_WORKER_LEASE_SECONDS:-180}"
           export KNOWLEDGE_WORKER_HEARTBEAT_SECONDS="${DEPLOY_KNOWLEDGE_WORKER_HEARTBEAT_SECONDS:-30}"
           export KNOWLEDGE_WORKER_MAX_ATTEMPTS="${DEPLOY_KNOWLEDGE_WORKER_MAX_ATTEMPTS:-5}"
+          export KNOWLEDGE_WORKER_RETRY_BASE_SECONDS="${KNOWLEDGE_WORKER_RETRY_BASE_SECONDS:-5}"
+          export KNOWLEDGE_WORKER_RETRY_MAX_SECONDS="${KNOWLEDGE_WORKER_RETRY_MAX_SECONDS:-300}"
+          export KNOWLEDGE_WORKER_HEALTH_FILE="${KNOWLEDGE_WORKER_HEALTH_FILE:-/tmp/fusion-knowledge-worker-health.json}"
           export MILVUS_URI="${DEPLOY_MILVUS_URI:-}"
           export MILVUS_USERNAME="${DEPLOY_MILVUS_USERNAME:-}"
           export MILVUS_PASSWORD="${DEPLOY_MILVUS_PASSWORD:-}"
           export MILVUS_DATABASE="${DEPLOY_MILVUS_DATABASE:-}"
           export MILVUS_COLLECTION_PREFIX="${DEPLOY_MILVUS_COLLECTION_PREFIX:-fusion_knowledge_chunks}"
+          export MILVUS_TIMEOUT_SECONDS="${MILVUS_TIMEOUT_SECONDS:-10}"
           export MILVUS_DOCKER_NETWORK="${DEPLOY_MILVUS_DOCKER_NETWORK:-fusion_knowledge_milvus}"
           case "${LITELLM_GOVERNANCE_MAX_AGE_SECONDS}" in
             ''|*[!0-9]*|0) echo "治理快照最大年龄必须是正整数"; exit 1 ;;
@@ -784,6 +892,13 @@ jobs:
                 - FLYAI_TRAVEL_TOOL_TIMEOUT_SECONDS=20
                 - FLYAI_TRAVEL_MAX_TOOL_CALLS_PER_RUN=4
                 - KNOWLEDGE_BASE_ENABLED=${KNOWLEDGE_BASE_ENABLED}
+                - KNOWLEDGE_MAX_BASES_PER_USER=${KNOWLEDGE_MAX_BASES_PER_USER}
+                - KNOWLEDGE_MAX_DOCUMENTS_PER_BASE=${KNOWLEDGE_MAX_DOCUMENTS_PER_BASE}
+                - KNOWLEDGE_MAX_FILE_SIZE=${KNOWLEDGE_MAX_FILE_SIZE}
+                - KNOWLEDGE_ALLOWED_MIME_TYPES=${KNOWLEDGE_ALLOWED_MIME_TYPES}
+                - KNOWLEDGE_PARSER_VERSION=${KNOWLEDGE_PARSER_VERSION}
+                - KNOWLEDGE_CHUNKER_VERSION=${KNOWLEDGE_CHUNKER_VERSION}
+                - KNOWLEDGE_EMBEDDING_PROVIDER=${KNOWLEDGE_EMBEDDING_PROVIDER}
                 - KNOWLEDGE_EMBEDDING_MODEL=${KNOWLEDGE_EMBEDDING_MODEL}
                 - KNOWLEDGE_EMBEDDING_REVISION=${KNOWLEDGE_EMBEDDING_REVISION}
                 - KNOWLEDGE_EMBEDDING_DIMENSION=${KNOWLEDGE_EMBEDDING_DIMENSION}
@@ -792,14 +907,21 @@ jobs:
                 - KNOWLEDGE_CHUNK_OVERLAP=${KNOWLEDGE_CHUNK_OVERLAP}
                 - KNOWLEDGE_PARSE_TIMEOUT_SECONDS=${KNOWLEDGE_PARSE_TIMEOUT_SECONDS}
                 - KNOWLEDGE_EMBEDDING_BATCH_SIZE=${KNOWLEDGE_EMBEDDING_BATCH_SIZE}
+                - KNOWLEDGE_DISTANCE_METRIC=${KNOWLEDGE_DISTANCE_METRIC}
+                - KNOWLEDGE_WORKER_POLL_SECONDS=${KNOWLEDGE_WORKER_POLL_SECONDS}
                 - KNOWLEDGE_WORKER_LEASE_SECONDS=${KNOWLEDGE_WORKER_LEASE_SECONDS}
                 - KNOWLEDGE_WORKER_HEARTBEAT_SECONDS=${KNOWLEDGE_WORKER_HEARTBEAT_SECONDS}
                 - KNOWLEDGE_WORKER_MAX_ATTEMPTS=${KNOWLEDGE_WORKER_MAX_ATTEMPTS}
+                - KNOWLEDGE_WORKER_RETRY_BASE_SECONDS=${KNOWLEDGE_WORKER_RETRY_BASE_SECONDS}
+                - KNOWLEDGE_WORKER_RETRY_MAX_SECONDS=${KNOWLEDGE_WORKER_RETRY_MAX_SECONDS}
+                - KNOWLEDGE_WORKER_HEALTH_FILE=${KNOWLEDGE_WORKER_HEALTH_FILE}
                 - MILVUS_URI=${MILVUS_URI}
                 - MILVUS_USERNAME=${MILVUS_USERNAME}
                 - MILVUS_PASSWORD=${MILVUS_PASSWORD}
                 - MILVUS_DATABASE=${MILVUS_DATABASE}
                 - MILVUS_COLLECTION_PREFIX=${MILVUS_COLLECTION_PREFIX}
+                - MILVUS_TIMEOUT_SECONDS=${MILVUS_TIMEOUT_SECONDS}
+                - MILVUS_DOCKER_NETWORK=${MILVUS_DOCKER_NETWORK}
                 - ENABLE_DOCS=false
               deploy:
                 resources:
@@ -839,6 +961,13 @@ jobs:
                 - LITELLM_PROXY_URL=${LITELLM_PROXY_URL:-http://litellm-proxy:4000}
                 - LITELLM_API_KEY=${LITELLM_API_KEY:-}
                 - KNOWLEDGE_BASE_ENABLED=${KNOWLEDGE_BASE_ENABLED}
+                - KNOWLEDGE_MAX_BASES_PER_USER=${KNOWLEDGE_MAX_BASES_PER_USER}
+                - KNOWLEDGE_MAX_DOCUMENTS_PER_BASE=${KNOWLEDGE_MAX_DOCUMENTS_PER_BASE}
+                - KNOWLEDGE_MAX_FILE_SIZE=${KNOWLEDGE_MAX_FILE_SIZE}
+                - KNOWLEDGE_ALLOWED_MIME_TYPES=${KNOWLEDGE_ALLOWED_MIME_TYPES}
+                - KNOWLEDGE_PARSER_VERSION=${KNOWLEDGE_PARSER_VERSION}
+                - KNOWLEDGE_CHUNKER_VERSION=${KNOWLEDGE_CHUNKER_VERSION}
+                - KNOWLEDGE_EMBEDDING_PROVIDER=${KNOWLEDGE_EMBEDDING_PROVIDER}
                 - KNOWLEDGE_EMBEDDING_MODEL=${KNOWLEDGE_EMBEDDING_MODEL}
                 - KNOWLEDGE_EMBEDDING_REVISION=${KNOWLEDGE_EMBEDDING_REVISION}
                 - KNOWLEDGE_EMBEDDING_DIMENSION=${KNOWLEDGE_EMBEDDING_DIMENSION}
@@ -847,14 +976,21 @@ jobs:
                 - KNOWLEDGE_CHUNK_OVERLAP=${KNOWLEDGE_CHUNK_OVERLAP}
                 - KNOWLEDGE_PARSE_TIMEOUT_SECONDS=${KNOWLEDGE_PARSE_TIMEOUT_SECONDS}
                 - KNOWLEDGE_EMBEDDING_BATCH_SIZE=${KNOWLEDGE_EMBEDDING_BATCH_SIZE}
+                - KNOWLEDGE_DISTANCE_METRIC=${KNOWLEDGE_DISTANCE_METRIC}
+                - KNOWLEDGE_WORKER_POLL_SECONDS=${KNOWLEDGE_WORKER_POLL_SECONDS}
                 - KNOWLEDGE_WORKER_LEASE_SECONDS=${KNOWLEDGE_WORKER_LEASE_SECONDS}
                 - KNOWLEDGE_WORKER_HEARTBEAT_SECONDS=${KNOWLEDGE_WORKER_HEARTBEAT_SECONDS}
                 - KNOWLEDGE_WORKER_MAX_ATTEMPTS=${KNOWLEDGE_WORKER_MAX_ATTEMPTS}
+                - KNOWLEDGE_WORKER_RETRY_BASE_SECONDS=${KNOWLEDGE_WORKER_RETRY_BASE_SECONDS}
+                - KNOWLEDGE_WORKER_RETRY_MAX_SECONDS=${KNOWLEDGE_WORKER_RETRY_MAX_SECONDS}
+                - KNOWLEDGE_WORKER_HEALTH_FILE=${KNOWLEDGE_WORKER_HEALTH_FILE}
                 - MILVUS_URI=${MILVUS_URI}
                 - MILVUS_USERNAME=${MILVUS_USERNAME}
                 - MILVUS_PASSWORD=${MILVUS_PASSWORD}
                 - MILVUS_DATABASE=${MILVUS_DATABASE}
                 - MILVUS_COLLECTION_PREFIX=${MILVUS_COLLECTION_PREFIX}
+                - MILVUS_TIMEOUT_SECONDS=${MILVUS_TIMEOUT_SECONDS}
+                - MILVUS_DOCKER_NETWORK=${MILVUS_DOCKER_NETWORK}
               healthcheck:
                 test: ["CMD", "python", "-m", "scripts.run_knowledge_worker", "--healthcheck", "--health-max-age-seconds", "120"]
                 interval: 30s
@@ -1531,7 +1667,6 @@ jobs:
           ROLLBACK_KNOWLEDGE_WORKER_EXISTED: ${{ steps.capture_rollback_target.outputs.knowledge_worker_existed }}
           ROLLBACK_KNOWLEDGE_WORKER_IMAGE_REF: ${{ steps.capture_rollback_target.outputs.knowledge_worker_image_ref }}
           ROLLBACK_KNOWLEDGE_WORKER_IMAGE_ID: ${{ steps.capture_rollback_target.outputs.knowledge_worker_image_id }}
-          ROLLBACK_KNOWLEDGE_BASE_ENABLED: ${{ steps.capture_rollback_target.outputs.knowledge_base_enabled }}
           ROLLBACK_MODEL_MANAGEMENT_CURRENT_TARGET: ${{ steps.capture_rollback_target.outputs.model_management_current_target }}
           ROLLBACK_MODEL_MANAGEMENT_TIMER_ENABLED: ${{ steps.capture_rollback_target.outputs.model_management_timer_enabled }}
           ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE: ${{ steps.capture_rollback_target.outputs.model_management_timer_active }}
@@ -1569,23 +1704,6 @@ jobs:
           ROLLBACK_LITELLM_MODEL_ADMISSION_WORKER_ENABLED: ${{ steps.capture_rollback_target.outputs.model_admission_worker_enabled }}
           DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS: ${{ vars.LITELLM_GOVERNANCE_MAX_AGE_SECONDS || '86400' }}
           DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN: ${{ secrets.LITELLM_MODEL_ADMISSION_WORKER_TOKEN }}
-          DEPLOY_KNOWLEDGE_EMBEDDING_MODEL: ${{ vars.KNOWLEDGE_EMBEDDING_MODEL }}
-          DEPLOY_KNOWLEDGE_EMBEDDING_REVISION: ${{ vars.KNOWLEDGE_EMBEDDING_REVISION }}
-          DEPLOY_KNOWLEDGE_EMBEDDING_DIMENSION: ${{ vars.KNOWLEDGE_EMBEDDING_DIMENSION || '1024' }}
-          DEPLOY_KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS: ${{ vars.KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS || '1024' }}
-          DEPLOY_KNOWLEDGE_CHUNK_SIZE: ${{ vars.KNOWLEDGE_CHUNK_SIZE || '1200' }}
-          DEPLOY_KNOWLEDGE_CHUNK_OVERLAP: ${{ vars.KNOWLEDGE_CHUNK_OVERLAP || '200' }}
-          DEPLOY_KNOWLEDGE_PARSE_TIMEOUT_SECONDS: ${{ vars.KNOWLEDGE_PARSE_TIMEOUT_SECONDS || '60' }}
-          DEPLOY_KNOWLEDGE_EMBEDDING_BATCH_SIZE: ${{ vars.KNOWLEDGE_EMBEDDING_BATCH_SIZE || '32' }}
-          DEPLOY_KNOWLEDGE_WORKER_LEASE_SECONDS: ${{ vars.KNOWLEDGE_WORKER_LEASE_SECONDS || '180' }}
-          DEPLOY_KNOWLEDGE_WORKER_HEARTBEAT_SECONDS: ${{ vars.KNOWLEDGE_WORKER_HEARTBEAT_SECONDS || '30' }}
-          DEPLOY_KNOWLEDGE_WORKER_MAX_ATTEMPTS: ${{ vars.KNOWLEDGE_WORKER_MAX_ATTEMPTS || '5' }}
-          DEPLOY_MILVUS_URI: ${{ vars.MILVUS_URI }}
-          DEPLOY_MILVUS_USERNAME: ${{ vars.MILVUS_USERNAME }}
-          DEPLOY_MILVUS_PASSWORD: ${{ secrets.MILVUS_PASSWORD }}
-          DEPLOY_MILVUS_DATABASE: ${{ vars.MILVUS_DATABASE }}
-          DEPLOY_MILVUS_COLLECTION_PREFIX: ${{ vars.MILVUS_COLLECTION_PREFIX || 'fusion_knowledge_chunks' }}
-          DEPLOY_MILVUS_DOCKER_NETWORK: ${{ vars.MILVUS_DOCKER_NETWORK || 'fusion_knowledge_milvus' }}
         run: |
           systemctl --user stop fusion-litellm-model-management.timer >/dev/null 2>&1 || true
           systemctl --user stop fusion-litellm-governance.timer >/dev/null 2>&1 || true
@@ -1613,6 +1731,20 @@ jobs:
           set -a
           source .env
           set +a
+          export ROLLBACK_KNOWLEDGE_CONFIG_FILE="${RUNNER_TEMP}/fusion-knowledge-rollback-${GITHUB_RUN_ID}-${GITHUB_JOB}-${GITHUB_RUN_ATTEMPT}.env"
+          case "${ROLLBACK_KNOWLEDGE_CONFIG_FILE}" in
+            "${RUNNER_TEMP}"/fusion-knowledge-rollback-*.env) ;;
+            *) echo "知识库回滚配置未落在 RUNNER_TEMP 的受管路径中"; exit 1 ;;
+          esac
+          if [ ! -f "${ROLLBACK_KNOWLEDGE_CONFIG_FILE}" ] || [ -L "${ROLLBACK_KNOWLEDGE_CONFIG_FILE}" ]; then
+            echo "知识库回滚配置快照缺失或不是受管普通文件"
+            exit 1
+          fi
+          if [ "$(stat -c '%a' "${ROLLBACK_KNOWLEDGE_CONFIG_FILE}")" != "600" ]; then
+            echo "知识库回滚配置快照权限无效"
+            exit 1
+          fi
+          source "${ROLLBACK_KNOWLEDGE_CONFIG_FILE}"
           export CONTEXT7_API_KEY=""
           export PROMPTHUB_API_KEY="${DEPLOY_PROMPTHUB_API_KEY:-}"
           export PROMPTHUB_SYNC_MODE="${DEPLOY_PROMPTHUB_SYNC_MODE:-disabled}"
@@ -1636,24 +1768,6 @@ jobs:
           export LITELLM_MODEL_ADMISSION_WORKER_ENABLED="$(printf '%s' "${ROLLBACK_LITELLM_MODEL_ADMISSION_WORKER_ENABLED}" | tr '[:upper:]' '[:lower:]')"
           export LITELLM_GOVERNANCE_MAX_AGE_SECONDS="${DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS:-86400}"
           export LITELLM_MODEL_ADMISSION_WORKER_TOKEN="${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN:-}"
-          export KNOWLEDGE_BASE_ENABLED="$(printf '%s' "${ROLLBACK_KNOWLEDGE_BASE_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')"
-          export KNOWLEDGE_EMBEDDING_MODEL="${DEPLOY_KNOWLEDGE_EMBEDDING_MODEL:-}"
-          export KNOWLEDGE_EMBEDDING_REVISION="${DEPLOY_KNOWLEDGE_EMBEDDING_REVISION:-}"
-          export KNOWLEDGE_EMBEDDING_DIMENSION="${DEPLOY_KNOWLEDGE_EMBEDDING_DIMENSION:-1024}"
-          export KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS="${DEPLOY_KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS:-1024}"
-          export KNOWLEDGE_CHUNK_SIZE="${DEPLOY_KNOWLEDGE_CHUNK_SIZE:-1200}"
-          export KNOWLEDGE_CHUNK_OVERLAP="${DEPLOY_KNOWLEDGE_CHUNK_OVERLAP:-200}"
-          export KNOWLEDGE_PARSE_TIMEOUT_SECONDS="${DEPLOY_KNOWLEDGE_PARSE_TIMEOUT_SECONDS:-60}"
-          export KNOWLEDGE_EMBEDDING_BATCH_SIZE="${DEPLOY_KNOWLEDGE_EMBEDDING_BATCH_SIZE:-32}"
-          export KNOWLEDGE_WORKER_LEASE_SECONDS="${DEPLOY_KNOWLEDGE_WORKER_LEASE_SECONDS:-180}"
-          export KNOWLEDGE_WORKER_HEARTBEAT_SECONDS="${DEPLOY_KNOWLEDGE_WORKER_HEARTBEAT_SECONDS:-30}"
-          export KNOWLEDGE_WORKER_MAX_ATTEMPTS="${DEPLOY_KNOWLEDGE_WORKER_MAX_ATTEMPTS:-5}"
-          export MILVUS_URI="${DEPLOY_MILVUS_URI:-}"
-          export MILVUS_USERNAME="${DEPLOY_MILVUS_USERNAME:-}"
-          export MILVUS_PASSWORD="${DEPLOY_MILVUS_PASSWORD:-}"
-          export MILVUS_DATABASE="${DEPLOY_MILVUS_DATABASE:-}"
-          export MILVUS_COLLECTION_PREFIX="${DEPLOY_MILVUS_COLLECTION_PREFIX:-fusion_knowledge_chunks}"
-          export MILVUS_DOCKER_NETWORK="${DEPLOY_MILVUS_DOCKER_NETWORK:-fusion_knowledge_milvus}"
           case "${LITELLM_GOVERNANCE_MAX_AGE_SECONDS}" in
             ''|*[!0-9]*|0) echo "治理快照最大年龄必须是正整数"; exit 1 ;;
           esac
@@ -1664,6 +1778,28 @@ jobs:
           if [ "${LITELLM_MODEL_ADMISSION_WORKER_ENABLED}" = "true" ] && [ -z "${LITELLM_MODEL_ADMISSION_WORKER_TOKEN}" ]; then
             echo "模型准入 Worker 已启用，但回滚发布密钥未配置"
             exit 1
+          fi
+          case "${KNOWLEDGE_BASE_ENABLED}" in
+            true|false) ;;
+            *) echo "回滚知识库开关必须为 true 或 false"; exit 1 ;;
+          esac
+          case "${MILVUS_DOCKER_NETWORK}" in
+            ''|*[!a-zA-Z0-9_.-]*) echo "回滚 Milvus Docker 网络格式无效"; exit 1 ;;
+          esac
+          if [ "${KNOWLEDGE_BASE_ENABLED}" = "true" ]; then
+            if [ -z "${KNOWLEDGE_EMBEDDING_MODEL}" ] \
+              || [ -z "${KNOWLEDGE_EMBEDDING_REVISION}" ] \
+              || [ -z "${MILVUS_URI}" ] \
+              || [ -z "${MILVUS_USERNAME}" ] \
+              || [ -z "${MILVUS_PASSWORD}" ] \
+              || [ -z "${MILVUS_DATABASE}" ]; then
+              echo "回滚知识库配置快照不完整"
+              exit 1
+            fi
+            if [ "$(printf '%s' "${MILVUS_USERNAME}" | tr '[:upper:]' '[:lower:]')" = "root" ]; then
+              echo "回滚知识库禁止使用 Milvus root 账号"
+              exit 1
+            fi
           fi
           append_csv_value() {
             current="$1"
@@ -2084,6 +2220,12 @@ jobs:
       - name: Cleanup Docker credential directory
         if: always()
         run: |
+          rollback_knowledge_config_file="${RUNNER_TEMP}/fusion-knowledge-rollback-${GITHUB_RUN_ID}-${GITHUB_JOB}-${GITHUB_RUN_ATTEMPT}.env"
+          case "${rollback_knowledge_config_file}" in
+            "${RUNNER_TEMP}"/fusion-knowledge-rollback-*.env) ;;
+            *) echo "知识库回滚配置未落在 RUNNER_TEMP 的受管路径中，拒绝删除"; exit 1 ;;
+          esac
+          rm -f -- "${rollback_knowledge_config_file}"
           expected="${RUNNER_TEMP}/.docker-${GITHUB_RUN_ID}-${GITHUB_JOB}"
           if [ -z "${DOCKER_CONFIG:-}" ] || [ "${DOCKER_CONFIG}" != "${expected}" ]; then
             echo "DOCKER_CONFIG 与当前 job 的隔离目录不一致，拒绝删除: ${DOCKER_CONFIG:-<empty>}"

@@ -32,8 +32,15 @@ from app.schemas.knowledge import (
     KnowledgeTaskView,
 )
 from app.schemas.response import ApiException, ErrorCode
-from app.services.knowledge.milvus import KnowledgeVectorError, MilvusKnowledgeStore
+from app.services.knowledge.milvus import (
+    KnowledgeVectorError,
+    KnowledgeVectorHit,
+    MilvusKnowledgeStore,
+)
 from app.services.storage import get_storage
+
+EmbeddingProfileKey = tuple[str, str, int, str, str, str]
+VectorHitKey = tuple[str, str, str, str]
 
 
 class KnowledgeService:
@@ -223,6 +230,12 @@ class KnowledgeService:
         except KnowledgeBaseWriteConflict as exc:
             if exc.cleanup_storage:
                 await self._delete_uploaded_object(storage_key)
+            if exc.duplicate:
+                raise ApiException(
+                    ErrorCode.KNOWLEDGE_DOCUMENT_DUPLICATE,
+                    str(exc),
+                    409,
+                ) from exc
             raise ApiException.conflict(str(exc)) from exc
         except IntegrityError as exc:
             raise ApiException(
@@ -380,7 +393,7 @@ class KnowledgeService:
         bases_with_ready_documents = {document.knowledge_base_id for document in documents}
         if bases_with_ready_documents != set(payload.knowledge_base_ids):
             raise ApiException(ErrorCode.KNOWLEDGE_BASE_NOT_READY, "至少一个知识库尚无就绪文档", 409)
-        documents_by_profile: dict[tuple[str, str, int, str, str, str], list[KnowledgeDocument]] = defaultdict(list)
+        documents_by_profile: dict[EmbeddingProfileKey, list[KnowledgeDocument]] = defaultdict(list)
         for document in documents:
             active_version = next(
                 (version for version in document.index_versions if version.id == document.active_index_version),
@@ -397,10 +410,10 @@ class KnowledgeService:
                 active_version.embedding_revision,
             )
             documents_by_profile[key].append(document)
-        hits = []
+        profile_hit_groups: list[tuple[EmbeddingProfileKey, list[KnowledgeVectorHit]]] = []
         overfetch = min(payload.top_k * 3, 100)
         try:
-            for key, profile_documents in documents_by_profile.items():
+            for key, profile_documents in sorted(documents_by_profile.items()):
                 profile = EmbeddingProfile(*key)
                 query_vector = (await self.embedding.embed([payload.query], profile))[0]
                 profile_hits = await self.vector_store.search(
@@ -411,11 +424,13 @@ class KnowledgeService:
                     index_versions=sorted({str(document.active_index_version) for document in profile_documents}),
                     limit=overfetch,
                 )
-                hits.extend(profile_hits)
+                profile_hit_groups.append((key, profile_hits))
         except EmbeddingError as exc:
             raise ApiException(exc.code, exc.summary, 503 if exc.retryable else 409) from exc
         except KnowledgeVectorError as exc:
             raise ApiException(exc.code, exc.summary, 503 if exc.retryable else 409) from exc
+        multiple_profiles = len(profile_hit_groups) > 1
+        hits = self._rank_fuse_profile_hits(profile_hit_groups) if multiple_profiles else profile_hit_groups[0][1]
         revalidated_documents = self.repo.revalidate_retrieval_documents(
             user_id=user_id,
             knowledge_base_ids=payload.knowledge_base_ids,
@@ -461,8 +476,42 @@ class KnowledgeService:
                     },
                 )
             )
-        validated.sort(key=lambda item: item.similarity, reverse=True)
+        if not multiple_profiles:
+            validated.sort(key=lambda item: item.similarity, reverse=True)
         return KnowledgeRetrievalResult(hits=validated[: payload.top_k], query=payload.query, top_k=payload.top_k)
+
+    @staticmethod
+    def _rank_fuse_profile_hits(
+        profile_hit_groups: list[tuple[EmbeddingProfileKey, list[KnowledgeVectorHit]]],
+    ) -> list[KnowledgeVectorHit]:
+        """用确定性 RRF 合并不同 Embedding profile，避免跨模型比较原始 cosine。"""
+        fusion_scores: dict[VectorHitKey, float] = defaultdict(float)
+        representatives: dict[VectorHitKey, KnowledgeVectorHit] = {}
+        profile_tiebreakers: dict[VectorHitKey, EmbeddingProfileKey] = {}
+        for profile_key, profile_hits in sorted(profile_hit_groups):
+            ranked_hits = sorted(
+                profile_hits,
+                key=lambda hit: (-hit.similarity, hit.chunk_id, hit.document_id, hit.index_version),
+            )
+            seen_hit_keys: set[VectorHitKey] = set()
+            for rank, hit in enumerate(ranked_hits, start=1):
+                hit_key = (hit.knowledge_base_id, hit.document_id, hit.index_version, hit.chunk_id)
+                if hit_key in seen_hit_keys:
+                    continue
+                seen_hit_keys.add(hit_key)
+                fusion_scores[hit_key] += 1.0 / (60 + rank)
+                representatives.setdefault(hit_key, hit)
+                profile_tiebreakers[hit_key] = min(profile_tiebreakers.get(hit_key, profile_key), profile_key)
+        return sorted(
+            representatives.values(),
+            key=lambda hit: (
+                -fusion_scores[(hit.knowledge_base_id, hit.document_id, hit.index_version, hit.chunk_id)],
+                profile_tiebreakers[(hit.knowledge_base_id, hit.document_id, hit.index_version, hit.chunk_id)],
+                hit.chunk_id,
+                hit.document_id,
+                hit.index_version,
+            ),
+        )
 
     def _require_base(self, user_id: str, knowledge_base_id: str, *, lock: bool = False) -> KnowledgeBase:
         row = self.repo.get_knowledge_base(knowledge_base_id, user_id, lock=lock)

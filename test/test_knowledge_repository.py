@@ -6,7 +6,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
-from app.db.knowledge_repository import KnowledgeBaseLimitExceeded, KnowledgeRepository
+from app.db.knowledge_repository import (
+    KnowledgeBaseLimitExceeded,
+    KnowledgeBaseWriteConflict,
+    KnowledgeRepository,
+)
 from app.db.models import KnowledgeBase, KnowledgeDocument, KnowledgeIndexTask, KnowledgeIndexVersion, User
 from app.utils.time import utc_now
 
@@ -45,8 +49,15 @@ class KnowledgeRepositoryTests(unittest.TestCase):
             distance_metric="COSINE",
         )
 
-    def _document_bundle(self, *, document_id="doc-1", checksum="a" * 64):
-        version_id = f"version-{document_id}"
+    def _document_bundle(
+        self,
+        *,
+        document_id="doc-1",
+        checksum="a" * 64,
+        storage_key=None,
+        version_id=None,
+    ):
+        version_id = version_id or f"version-{document_id}"
         document = KnowledgeDocument(
             id=document_id,
             knowledge_base_id="kb-1",
@@ -57,7 +68,7 @@ class KnowledgeRepositoryTests(unittest.TestCase):
             checksum_sha256=checksum,
             dedupe_key=checksum,
             storage_backend="local",
-            storage_key=f"knowledge/{document_id}",
+            storage_key=storage_key or f"knowledge/{document_id}",
             status="queued",
             parser_version="parser-v1",
             chunker_version="chunker-v1",
@@ -145,6 +156,81 @@ class KnowledgeRepositoryTests(unittest.TestCase):
         )
 
         self.assertEqual(saved.checksum_sha256, "a" * 64)
+
+    def test_soft_delete_tombstones_fit_database_columns(self):
+        repo = KnowledgeRepository(self.db)
+        knowledge_base = repo.create_knowledge_base(self._base(normalized="名" * 200))
+        document, version, task = self._document_bundle(
+            document_id="doc-" + "x" * 120,
+            version_id="version-tombstone",
+        )
+        repo.create_document_with_task(document, version, task)
+        document_delete_task = repo.enqueue_document_delete(document, max_attempts=3)
+        document_claim = repo.claim_task(worker_id="worker-1", lease_seconds=60)
+
+        self.assertEqual(document_claim.task.id, document_delete_task.id)
+        self.assertTrue(
+            repo.mark_document_deleted(
+                document.id,
+                task_id=document_delete_task.id,
+                lease_token=document_claim.lease_token,
+            )
+        )
+        self.assertTrue(repo.complete_task(document_delete_task.id, document_claim.lease_token))
+        self.db.refresh(document)
+        self.assertIn("#deleted#", document.dedupe_key)
+        self.assertLessEqual(len(document.dedupe_key), 120)
+
+        base_delete_task = repo.enqueue_knowledge_base_delete(knowledge_base, max_attempts=3)
+        base_claim = repo.claim_task(worker_id="worker-1", lease_seconds=60)
+        self.assertEqual(base_claim.task.id, base_delete_task.id)
+        self.assertTrue(
+            repo.mark_knowledge_base_deleted(
+                knowledge_base.id,
+                task_id=base_delete_task.id,
+                lease_token=base_claim.lease_token,
+            )
+        )
+        self.db.refresh(knowledge_base)
+        self.assertIn("#deleted#", knowledge_base.name_normalized)
+        self.assertLessEqual(len(knowledge_base.name_normalized), 200)
+
+    def test_document_limit_cleans_only_unreferenced_content_addressed_object(self):
+        repo = KnowledgeRepository(self.db)
+        repo.create_knowledge_base(self._base())
+        shared_key = "knowledge/v1/users/user-1/bases/kb-1/objects/" + "a" * 64
+        document, version, task = self._document_bundle(storage_key=shared_key)
+        repo.create_document_with_task(document, version, task, max_documents=1)
+
+        shared_document, shared_version, shared_task = self._document_bundle(
+            document_id="doc-shared",
+            checksum="a" * 64,
+            storage_key=shared_key,
+        )
+        with self.assertRaises(KnowledgeBaseWriteConflict) as shared_conflict:
+            repo.create_document_with_task(
+                shared_document,
+                shared_version,
+                shared_task,
+                max_documents=1,
+            )
+        self.assertFalse(shared_conflict.exception.cleanup_storage)
+        self.assertTrue(shared_conflict.exception.duplicate)
+
+        unreferenced_document, unreferenced_version, unreferenced_task = self._document_bundle(
+            document_id="doc-unreferenced",
+            checksum="b" * 64,
+            storage_key="knowledge/v1/users/user-1/bases/kb-1/objects/" + "b" * 64,
+        )
+        with self.assertRaises(KnowledgeBaseWriteConflict) as unreferenced_conflict:
+            repo.create_document_with_task(
+                unreferenced_document,
+                unreferenced_version,
+                unreferenced_task,
+                max_documents=1,
+            )
+        self.assertTrue(unreferenced_conflict.exception.cleanup_storage)
+        self.assertFalse(unreferenced_conflict.exception.duplicate)
 
     def test_expired_lease_is_reclaimed_and_old_token_is_fenced(self):
         repo = KnowledgeRepository(self.db)

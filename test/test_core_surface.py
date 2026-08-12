@@ -453,6 +453,29 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(captured["timeout"], self.main.settings.FILE_UPLOAD_TIMEOUT_SECONDS)
 
+    def test_timeout_middleware_uses_configured_budget_for_knowledge_upload(self):
+        middleware = self.main.TimeoutMiddleware(lambda scope, receive, send: None, timeout_seconds=10)
+        upload_request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/knowledge-bases/kb-1/documents",
+                "headers": [],
+            }
+        )
+        search_request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/knowledge-bases/search",
+                "headers": [],
+            }
+        )
+
+        with patch.object(self.main.settings, "FILE_UPLOAD_TIMEOUT_SECONDS", 137):
+            self.assertEqual(middleware._resolve_timeout_seconds(upload_request), 137)
+            self.assertEqual(middleware._resolve_timeout_seconds(search_request), 10)
+
     def test_timeout_middleware_uses_coordinated_budget_for_mcp_admin_operation(self):
         middleware = self.main.TimeoutMiddleware(lambda scope, receive, send: None, timeout_seconds=10)
         captured = {}

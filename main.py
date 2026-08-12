@@ -54,6 +54,14 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
     def _resolve_timeout_seconds(self, request: Request) -> int:
         key = (request.method.upper(), request.scope.get("path", ""))
         path = key[1]
+        path_segments = path.strip("/").split("/")
+        if (
+            key[0] == "POST"
+            and len(path_segments) == 4
+            and path_segments[:2] == ["api", "knowledge-bases"]
+            and path_segments[3] == "documents"
+        ):
+            return settings.FILE_UPLOAD_TIMEOUT_SECONDS
         if path.startswith("/api/admin/mcp/servers/") and path.endswith(("/test", "/tools/refresh")):
             return settings.MCP_ADMIN_OPERATION_TIMEOUT_SECONDS
         return self.route_timeouts.get(key, self.timeout_seconds)

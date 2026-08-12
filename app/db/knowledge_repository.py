@@ -30,8 +30,9 @@ class ClaimedKnowledgeTask:
 class KnowledgeBaseWriteConflict(RuntimeError):
     """文档提交前知识库已进入不可写状态。"""
 
-    def __init__(self, message: str, *, cleanup_storage: bool):
+    def __init__(self, message: str, *, cleanup_storage: bool, duplicate: bool = False):
         self.cleanup_storage = cleanup_storage
+        self.duplicate = duplicate
         super().__init__(message)
 
 
@@ -179,6 +180,20 @@ class KnowledgeRepository:
             .count()
         )
 
+    def _has_content_addressed_object_reference(self, document: KnowledgeDocument) -> bool:
+        return (
+            self.db.query(KnowledgeDocument.id)
+            .filter(
+                KnowledgeDocument.knowledge_base_id == document.knowledge_base_id,
+                KnowledgeDocument.status != "deleted",
+                KnowledgeDocument.checksum_sha256 == document.checksum_sha256,
+                KnowledgeDocument.storage_backend == document.storage_backend,
+                KnowledgeDocument.storage_key == document.storage_key,
+            )
+            .first()
+            is not None
+        )
+
     def create_document_with_task(
         self,
         document: KnowledgeDocument,
@@ -209,8 +224,13 @@ class KnowledgeRepository:
                 .count()
             )
             if active_count >= max_documents:
+                duplicate = self._has_content_addressed_object_reference(document)
                 self.db.rollback()
-                raise KnowledgeBaseWriteConflict("已达到每个知识库的文档数量上限", cleanup_storage=False)
+                raise KnowledgeBaseWriteConflict(
+                    "相同内容的活动文档已存在于该知识库" if duplicate else "已达到每个知识库的文档数量上限",
+                    cleanup_storage=not duplicate,
+                    duplicate=duplicate,
+                )
         self.db.add_all([document, version, task])
         try:
             self.db.commit()
@@ -356,9 +376,9 @@ class KnowledgeRepository:
         if not self._lease_matches(task, lease_token, utc_now()):
             self.db.rollback()
             return False
-        self.db.query(KnowledgeChunkManifest).filter(
-            KnowledgeChunkManifest.index_version == version.id
-        ).delete(synchronize_session=False)
+        self.db.query(KnowledgeChunkManifest).filter(KnowledgeChunkManifest.index_version == version.id).delete(
+            synchronize_session=False
+        )
         self.db.add_all(
             [
                 KnowledgeChunkManifest(
@@ -851,9 +871,9 @@ class KnowledgeRepository:
             return False
         version.status = "deleted"
         version.deleted_at = utc_now()
-        self.db.query(KnowledgeChunkManifest).filter(
-            KnowledgeChunkManifest.index_version == version_id
-        ).delete(synchronize_session=False)
+        self.db.query(KnowledgeChunkManifest).filter(KnowledgeChunkManifest.index_version == version_id).delete(
+            synchronize_session=False
+        )
         self.db.commit()
         return True
 
@@ -875,7 +895,11 @@ class KnowledgeRepository:
             return False
         now = utc_now()
         document.status = "deleted"
-        document.dedupe_key = f"{document.checksum_sha256}#deleted#{document.id}"
+        document.dedupe_key = self._soft_delete_tombstone(
+            document.checksum_sha256,
+            document.id,
+            max_length=120,
+        )
         document.deleted_at = now
         document.updated_at = now
         document.active_index_version = None
@@ -887,9 +911,9 @@ class KnowledgeRepository:
             {"status": "deleted", "deleted_at": now},
             synchronize_session=False,
         )
-        self.db.query(KnowledgeChunkManifest).filter(
-            KnowledgeChunkManifest.document_id == document.id
-        ).delete(synchronize_session=False)
+        self.db.query(KnowledgeChunkManifest).filter(KnowledgeChunkManifest.document_id == document.id).delete(
+            synchronize_session=False
+        )
         self.db.commit()
         return True
 
@@ -909,7 +933,11 @@ class KnowledgeRepository:
             return False
         now = utc_now()
         row.status = "deleted"
-        row.name_normalized = f"{row.name_normalized}#deleted#{row.id}"
+        row.name_normalized = self._soft_delete_tombstone(
+            row.name_normalized,
+            row.id,
+            max_length=200,
+        )
         row.deleted_at = now
         row.updated_at = now
         self.db.query(KnowledgeDocument).filter(KnowledgeDocument.knowledge_base_id == row.id).update(
@@ -929,9 +957,9 @@ class KnowledgeRepository:
             {"status": "deleted", "deleted_at": now},
             synchronize_session=False,
         )
-        self.db.query(KnowledgeChunkManifest).filter(
-            KnowledgeChunkManifest.knowledge_base_id == row.id
-        ).delete(synchronize_session=False)
+        self.db.query(KnowledgeChunkManifest).filter(KnowledgeChunkManifest.knowledge_base_id == row.id).delete(
+            synchronize_session=False
+        )
         self.db.query(KnowledgeIndexTask).filter(
             KnowledgeIndexTask.knowledge_base_id == row.id,
             KnowledgeIndexTask.status.in_(("pending", "retry")),
@@ -955,6 +983,12 @@ class KnowledgeRepository:
             {"status": "cancelled", "completed_at": now, "updated_at": now},
             synchronize_session=False,
         )
+
+    @staticmethod
+    def _soft_delete_tombstone(value: str, row_id: str, *, max_length: int) -> str:
+        suffix = f"#deleted#{hashlib.sha256(row_id.encode('utf-8')).hexdigest()}"
+        prefix_length = max(0, max_length - len(suffix))
+        return f"{value[:prefix_length]}{suffix}"[-max_length:]
 
     def _fail_exhausted_expired_tasks(self, now: datetime, *, external_write_grace_seconds: int) -> None:
         rows: Iterable[KnowledgeIndexTask] = (

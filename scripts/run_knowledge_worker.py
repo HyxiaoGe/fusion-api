@@ -12,7 +12,7 @@ import tempfile
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
+from typing import Awaitable, Callable
 
 from sqlalchemy import text
 
@@ -21,6 +21,8 @@ from app.core.logger import app_logger as logger
 from app.db.database import SessionLocal
 from app.services.knowledge.worker import KnowledgeWorker
 from app.services.storage import init_storage
+
+_DEPENDENCY_HEALTH_FAILURE_THRESHOLD = 3
 
 
 def _health_path() -> Path:
@@ -68,13 +70,40 @@ async def _refresh_health(
     *,
     worker_id: str,
     processed: Callable[[], int],
+    vector_health: Callable[[], Awaitable[None]],
+    interval_seconds: float | None = None,
 ) -> None:
-    interval = max(1, min(settings.KNOWLEDGE_WORKER_HEARTBEAT_SECONDS, 30))
+    interval = (
+        max(1, min(settings.KNOWLEDGE_WORKER_HEARTBEAT_SECONDS, 30)) if interval_seconds is None else interval_seconds
+    )
+    consecutive_failures = 0
+    dependency_unhealthy = False
     while not stop_event.is_set():
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=interval)
         except TimeoutError:
-            _write_health(status="running", worker_id=worker_id, processed=processed())
+            try:
+                await vector_health()
+            except Exception:
+                consecutive_failures += 1
+                became_unhealthy = consecutive_failures >= _DEPENDENCY_HEALTH_FAILURE_THRESHOLD
+                if became_unhealthy and not dependency_unhealthy:
+                    logger.warning(
+                        "知识库 Worker 持续无法连接 Milvus，连续失败次数=%d",
+                        consecutive_failures,
+                    )
+                dependency_unhealthy = became_unhealthy
+            else:
+                if dependency_unhealthy:
+                    logger.info("知识库 Worker 已恢复 Milvus 连接")
+                consecutive_failures = 0
+                dependency_unhealthy = False
+            _write_health(
+                status="unhealthy" if dependency_unhealthy else "running",
+                worker_id=worker_id,
+                processed=processed(),
+                error_code="KNOWLEDGE_VECTOR_UNAVAILABLE" if dependency_unhealthy else None,
+            )
 
 
 async def run_worker(*, once: bool) -> int:
@@ -110,21 +139,25 @@ async def run_worker(*, once: bool) -> int:
     processed = 0
     _write_health(status="running", worker_id=worker.worker_id, processed=processed)
     health_refresh = asyncio.create_task(
-        _refresh_health(stop_event, worker_id=worker.worker_id, processed=lambda: processed)
+        _refresh_health(
+            stop_event,
+            worker_id=worker.worker_id,
+            processed=lambda: processed,
+            vector_health=worker.vector_store.health,
+        )
     )
     try:
         while not stop_event.is_set():
             handled = await worker.run_once()
             if handled:
                 processed += 1
-                _write_health(status="running", worker_id=worker.worker_id, processed=processed)
             if once:
                 break
             if not handled:
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=settings.KNOWLEDGE_WORKER_POLL_SECONDS)
                 except TimeoutError:
-                    _write_health(status="running", worker_id=worker.worker_id, processed=processed)
+                    pass
         return 0
     finally:
         stop_event.set()
@@ -132,6 +165,7 @@ async def run_worker(*, once: bool) -> int:
         with suppress(asyncio.CancelledError):
             await health_refresh
         _write_health(status="stopped", worker_id=worker.worker_id, processed=processed)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="运行 Fusion 知识库 Worker")

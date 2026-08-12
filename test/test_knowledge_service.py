@@ -1,3 +1,4 @@
+import hashlib
 import io
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -8,7 +9,8 @@ from sqlalchemy.orm import sessionmaker
 from starlette.datastructures import Headers
 
 from app.db.database import Base
-from app.db.models import User
+from app.db.knowledge_repository import KnowledgeBaseWriteConflict
+from app.db.models import KnowledgeChunkManifest, User
 from app.schemas.knowledge import KnowledgeBaseCreate, KnowledgeRetrievalRequest
 from app.schemas.response import ApiException
 from app.services.knowledge.milvus import KnowledgeVectorHit
@@ -79,6 +81,63 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
             KnowledgeBaseCreate(name="  产品 手册  ", description="说明", business_type="product"),
         )
 
+    async def _create_ready_document(self, *, base_name: str, content: bytes, embedding_model: str):
+        knowledge_base = self.service.create_knowledge_base(
+            "user-1",
+            KnowledgeBaseCreate(name=base_name, description="说明", business_type="product"),
+        )
+        upload = UploadFile(
+            filename=f"{base_name}.txt",
+            file=io.BytesIO(content),
+            headers=Headers({"content-type": "text/plain"}),
+        )
+        created = await self.service.upload_document("user-1", knowledge_base.id, upload)
+        document = self.service.repo.get_document(created.document.id, "user-1")
+        document.status = "ready"
+        document.active_index_version = document.desired_index_version
+        version = next(item for item in document.index_versions if item.id == document.active_index_version)
+        version.status = "active"
+        version.embedding_model = embedding_model
+        version.embedding_revision = f"{embedding_model}-r1"
+        version.collection_name = f"knowledge_{embedding_model}_d2"
+        self.db.commit()
+        return knowledge_base, document
+
+    def _add_chunk(self, document, *, chunk_id: str, ordinal: int, text: str):
+        self.db.add(
+            KnowledgeChunkManifest(
+                chunk_id=chunk_id,
+                knowledge_base_id=document.knowledge_base_id,
+                document_id=document.id,
+                user_id=document.user_id,
+                index_version=document.active_index_version,
+                ordinal=ordinal,
+                text=text,
+                text_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                filename=document.original_filename,
+                char_start=ordinal * 10,
+                char_end=ordinal * 10 + len(text),
+                page=None,
+                section=None,
+            )
+        )
+
+    @staticmethod
+    def _vector_hit(document, *, chunk_id: str, similarity: float) -> KnowledgeVectorHit:
+        return KnowledgeVectorHit(
+            chunk_id=chunk_id,
+            document_id=document.id,
+            knowledge_base_id=document.knowledge_base_id,
+            index_version=document.active_index_version,
+            text="Milvus 中的正文不应直接返回",
+            similarity=similarity,
+            filename=document.original_filename,
+            char_start=0,
+            char_end=1,
+            page=None,
+            section=None,
+        )
+
     def test_crud_is_user_scoped_and_name_is_normalized(self):
         created = self._create_base()
 
@@ -144,6 +203,28 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
         self.storage.upload.assert_awaited_once()
         self.storage.delete.assert_not_awaited()
 
+    async def test_quota_recheck_duplicate_preserves_stable_error(self):
+        knowledge_base = self._create_base()
+        upload = UploadFile(
+            filename="manual.txt",
+            file=io.BytesIO(b"knowledge content"),
+            headers=Headers({"content-type": "text/plain"}),
+        )
+        self.service.repo.create_document_with_task = MagicMock(
+            side_effect=KnowledgeBaseWriteConflict(
+                "相同内容的活动文档已存在于该知识库",
+                cleanup_storage=False,
+                duplicate=True,
+            )
+        )
+
+        with self.assertRaises(ApiException) as duplicate:
+            await self.service.upload_document("user-1", knowledge_base.id, upload)
+
+        self.assertEqual(duplicate.exception.code, "KNOWLEDGE_DOCUMENT_DUPLICATE")
+        self.assertEqual(duplicate.exception.status_code, 409)
+        self.storage.delete.assert_not_awaited()
+
     async def test_retrieval_fails_closed_if_any_base_is_not_owned(self):
         owned = self._create_base()
         payload = KnowledgeRetrievalRequest(
@@ -201,6 +282,78 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result.hits, [])
+
+    async def test_single_profile_retrieval_preserves_similarity_order(self):
+        knowledge_base, document = await self._create_ready_document(
+            base_name="单模型手册",
+            content=b"single profile",
+            embedding_model="embed-a",
+        )
+        self._add_chunk(document, chunk_id="low-score", ordinal=0, text="低相似度")
+        self._add_chunk(document, chunk_id="high-score", ordinal=1, text="高相似度")
+        self.db.commit()
+        self.vector_store.search.return_value = [
+            self._vector_hit(document, chunk_id="low-score", similarity=0.2),
+            self._vector_hit(document, chunk_id="high-score", similarity=0.9),
+        ]
+
+        result = await self.service.retrieve(
+            "user-1",
+            KnowledgeRetrievalRequest(
+                knowledge_base_ids=[knowledge_base.id],
+                query="配置",
+                top_k=2,
+            ),
+        )
+
+        self.assertEqual([hit.chunk_id for hit in result.hits], ["high-score", "low-score"])
+        self.assertEqual([hit.similarity for hit in result.hits], [0.9, 0.2])
+
+    async def test_multi_profile_retrieval_uses_deterministic_rank_fusion(self):
+        base_a, document_a = await self._create_ready_document(
+            base_name="模型 A 手册",
+            content=b"profile a",
+            embedding_model="embed-a",
+        )
+        base_z, document_z = await self._create_ready_document(
+            base_name="模型 Z 手册",
+            content=b"profile z",
+            embedding_model="embed-z",
+        )
+        for document, chunks in (
+            (document_a, (("a-rank-1", "A 第一名"), ("a-rank-2", "A 第二名"))),
+            (document_z, (("z-rank-1", "Z 第一名"), ("z-rank-2", "Z 第二名"))),
+        ):
+            for ordinal, (chunk_id, text) in enumerate(chunks):
+                self._add_chunk(document, chunk_id=chunk_id, ordinal=ordinal, text=text)
+        self.db.commit()
+
+        async def search_by_profile(**kwargs):
+            if kwargs["profile"].model == "embed-a":
+                return [
+                    self._vector_hit(document_a, chunk_id="a-rank-2", similarity=0.19),
+                    self._vector_hit(document_a, chunk_id="a-rank-1", similarity=0.2),
+                ]
+            return [
+                self._vector_hit(document_z, chunk_id="z-rank-2", similarity=0.98),
+                self._vector_hit(document_z, chunk_id="z-rank-1", similarity=0.99),
+            ]
+
+        self.vector_store.search.side_effect = search_by_profile
+        result = await self.service.retrieve(
+            "user-1",
+            KnowledgeRetrievalRequest(
+                knowledge_base_ids=[base_z.id, base_a.id],
+                query="配置",
+                top_k=4,
+            ),
+        )
+
+        self.assertEqual(
+            [hit.chunk_id for hit in result.hits],
+            ["a-rank-1", "z-rank-1", "a-rank-2", "z-rank-2"],
+        )
+        self.assertEqual([hit.similarity for hit in result.hits], [0.2, 0.99, 0.19, 0.98])
 
 
 if __name__ == "__main__":
