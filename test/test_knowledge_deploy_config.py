@@ -34,6 +34,30 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
             syntax = subprocess.run(["bash", "-n", str(path)], text=True, capture_output=True, check=True)
         return completed, contents, mode, syntax
 
+    def _run_candidate_knowledge_validation(self, **overrides):
+        marker = "validated_revision_routes=\"$(python3 - <<'PY'\n"
+        script = self.workflow.split(marker, 1)[1].split("\n          PY\n", 1)[0]
+        environment = {
+            "KNOWLEDGE_MAX_FILE_SIZE": "10485760",
+            "KNOWLEDGE_CHUNK_SIZE": "1200",
+            "KNOWLEDGE_CHUNK_OVERLAP": "200",
+            "KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS": "30",
+            "KNOWLEDGE_WORKER_POLL_SECONDS": "2",
+            "MILVUS_TIMEOUT_SECONDS": "10",
+            "KNOWLEDGE_EMBEDDING_MODEL": "embedding-v1",
+            "KNOWLEDGE_EMBEDDING_REVISION": "embedding-r1",
+            "KNOWLEDGE_EMBEDDING_REVISION_ROUTES": json.dumps(
+                {"embedding-v1@embedding-r1": "embedding-v1-r1-immutable"}
+            ),
+        }
+        environment.update(overrides)
+        return subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(script)],
+            text=True,
+            capture_output=True,
+            env={**os.environ, **environment},
+        )
+
     def test_real_acceptance_stack_pins_private_authenticated_milvus(self):
         self.assertIn("milvusdb/milvus:v2.6.21", self.milvus_compose)
         self.assertIn('COMMON_SECURITY_AUTHORIZATIONENABLED: "true"', self.milvus_compose)
@@ -57,6 +81,13 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
             "--health-max-age-seconds 120",
             "DEPLOY_MILVUS_PASSWORD: ${{ secrets.MILVUS_PASSWORD }}",
             "DEPLOY_KNOWLEDGE_BASE_ENABLED: ${{ vars.KNOWLEDGE_BASE_ENABLED || 'false' }}",
+            "DEPLOY_KNOWLEDGE_EMBEDDING_REVISION_ROUTES: ${{ vars.KNOWLEDGE_EMBEDDING_REVISION_ROUTES }}",
+            "DEPLOY_KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS: ${{ vars.KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS || '30' }}",
+            "DEPLOY_KNOWLEDGE_MAX_FILE_SIZE: ${{ vars.KNOWLEDGE_MAX_FILE_SIZE || '10485760' }}",
+            "DEPLOY_KNOWLEDGE_WORKER_POLL_SECONDS: ${{ vars.KNOWLEDGE_WORKER_POLL_SECONDS || '2' }}",
+            "DEPLOY_MILVUS_TIMEOUT_SECONDS: ${{ vars.MILVUS_TIMEOUT_SECONDS || '10' }}",
+            "knowledge deployment bounds invalid",
+            "knowledge embedding revision route missing",
         )
         for marker in required:
             self.assertIn(marker, self.workflow)
@@ -78,6 +109,8 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         self.assertIn('"MILVUS_PASSWORD"', capture)
         for name in (
             "KNOWLEDGE_MAX_BASES_PER_USER",
+            "KNOWLEDGE_EMBEDDING_REVISION_ROUTES",
+            "KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS",
             "KNOWLEDGE_WORKER_RETRY_MAX_SECONDS",
             "KNOWLEDGE_WORKER_HEALTH_FILE",
             "MILVUS_TIMEOUT_SECONDS",
@@ -152,6 +185,26 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         self.assertIn("export KNOWLEDGE_BASE_ENABLED=true", contents)
         self.assertIn("export MILVUS_PASSWORD=", contents)
         self.assertIn("fusion_knowledge_milvus", contents)
+
+    def test_candidate_deploy_validation_rejects_bounds_and_missing_revision_route(self):
+        valid = self._run_candidate_knowledge_validation()
+        invalid_size = self._run_candidate_knowledge_validation(KNOWLEDGE_MAX_FILE_SIZE="0")
+        invalid_poll = self._run_candidate_knowledge_validation(KNOWLEDGE_WORKER_POLL_SECONDS="61")
+        invalid_milvus_timeout = self._run_candidate_knowledge_validation(MILVUS_TIMEOUT_SECONDS="61")
+        missing_route = self._run_candidate_knowledge_validation(KNOWLEDGE_EMBEDDING_REVISION_ROUTES="{}")
+        missing_current_route = self._run_candidate_knowledge_validation(
+            KNOWLEDGE_EMBEDDING_REVISION_ROUTES=json.dumps({"embedding-v0@embedding-r0": "embedding-v0-r0-immutable"})
+        )
+
+        self.assertEqual(valid.returncode, 0)
+        self.assertEqual(valid.stdout, '{"embedding-v1@embedding-r1":"embedding-v1-r1-immutable"}')
+        for completed in (invalid_size, invalid_poll, invalid_milvus_timeout):
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("knowledge deployment bounds invalid", completed.stderr)
+        self.assertNotEqual(missing_route.returncode, 0)
+        self.assertIn("knowledge embedding revision routes invalid", missing_route.stderr)
+        self.assertNotEqual(missing_current_route.returncode, 0)
+        self.assertIn("knowledge embedding revision route missing", missing_current_route.stderr)
 
 
 if __name__ == "__main__":

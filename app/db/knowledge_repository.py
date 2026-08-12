@@ -208,6 +208,7 @@ class KnowledgeRepository:
                 KnowledgeBase.id == document.knowledge_base_id,
                 KnowledgeBase.user_id == document.user_id,
             )
+            .populate_existing()
             .with_for_update()
             .first()
         )
@@ -990,17 +991,30 @@ class KnowledgeRepository:
         prefix_length = max(0, max_length - len(suffix))
         return f"{value[:prefix_length]}{suffix}"[-max_length:]
 
-    def _fail_exhausted_expired_tasks(self, now: datetime, *, external_write_grace_seconds: int) -> None:
-        rows: Iterable[KnowledgeIndexTask] = (
+    def _expired_exhausted_tasks_query(self, now: datetime):
+        query = (
             self.db.query(KnowledgeIndexTask)
             .filter(
                 KnowledgeIndexTask.status == "running",
                 KnowledgeIndexTask.lease_expires_at < now,
                 KnowledgeIndexTask.attempt_count >= KnowledgeIndexTask.max_attempts,
             )
-            .all()
+            .populate_existing()
         )
+        if self.db.get_bind().dialect.name == "postgresql":
+            return query.with_for_update(skip_locked=True)
+        return query.with_for_update()
+
+    def _fail_exhausted_expired_tasks(self, now: datetime, *, external_write_grace_seconds: int) -> None:
+        rows: Iterable[KnowledgeIndexTask] = self._expired_exhausted_tasks_query(now).all()
         for task in rows:
+            if (
+                task.status != "running"
+                or task.attempt_count < task.max_attempts
+                or task.lease_expires_at is None
+                or self._as_utc(task.lease_expires_at) >= self._as_utc(now)
+            ):
+                continue
             task.status = "failed"
             task.error_code = "KNOWLEDGE_TASK_RETRY_EXHAUSTED"
             task.error_summary = "任务租约过期且已达到最大尝试次数"

@@ -44,10 +44,12 @@ v1 支持 UTF-8 TXT、Markdown、CSV、带文字层的 PDF 和 DOCX，不支持 
 ```dotenv
 KNOWLEDGE_BASE_ENABLED=true
 KNOWLEDGE_EMBEDDING_PROVIDER=litellm
-KNOWLEDGE_EMBEDDING_MODEL=受治理的-embedding-alias
-KNOWLEDGE_EMBEDDING_REVISION=该-alias-不可变的发布版本
+KNOWLEDGE_EMBEDDING_MODEL=embedding-v1
+KNOWLEDGE_EMBEDDING_REVISION=embedding-r1
+KNOWLEDGE_EMBEDDING_REVISION_ROUTES={"embedding-v1@embedding-r1":"embedding-v1-r1-immutable"}
 KNOWLEDGE_EMBEDDING_DIMENSION=1024
 KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS=1024
+KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS=30
 MILVUS_URI=http://fusion-knowledge-milvus:19530
 MILVUS_USERNAME=fusion_knowledge
 MILVUS_PASSWORD=使用密钥系统注入
@@ -55,8 +57,16 @@ MILVUS_DATABASE=fusion_knowledge
 MILVUS_COLLECTION_PREFIX=fusion_knowledge_chunks
 ```
 
-启用时会集中校验 chunk、batch、lease/heartbeat、Embedding profile、COSINE、Milvus URI、数据库和
-应用账号；缺项返回稳定 503，Worker 拒绝进入运行态。应用账号不能是 `root`，collection 名由服务端
+`KNOWLEDGE_EMBEDDING_REVISION_ROUTES` 是 append-only JSON registry：键是持久化到知识库和索引版本的
+`model@revision`，值是 LiteLLM Proxy 中绑定具体供应商模型版本、禁止原地改指向的不可变 alias。
+Embedding 请求会按每个索引版本的持久化键解析 registry 后再调用 Proxy，因此 revision 不只是展示标签。
+当前 `model@revision` 必须存在；历史索引版本仍可能用于检索、重试或清理时，对应 route 禁止删除或改指向。
+需要轮换模型时添加新 route，并同时更新当前 model/revision 后通过 rebuild 生成新索引版本。
+
+启用时会集中校验上传上限、chunk 大小/重叠比例/最小步长、batch、Worker poll、lease/heartbeat、
+Embedding profile/revision route/有限超时、COSINE、Milvus URI/有限超时、数据库和应用账号；缺项返回稳定
+503，Worker 拒绝进入运行态。`KNOWLEDGE_MAX_FILE_SIZE` 上限为 50 MiB，Worker poll 上限为 60 秒，
+Embedding 超时上限为 120 秒，Milvus 超时上限为 60 秒。应用账号不能是 `root`，collection 名由服务端
 前缀和允许维度生成，客户端不能指定。
 
 ## 本地真实 Milvus 2.6.21 验收
@@ -99,7 +109,8 @@ python -m unittest test.test_knowledge_milvus_integration
 `master` 发布流水线使用同一不可变 API 镜像启动 `fusion-api` 和 `fusion-knowledge-worker`，检查二者
 镜像引用、内容 ID、健康文件和数据库连接。Worker 与 API 共享原文件挂载并连接私有 Milvus 网络，
 不发布端口。第一次发布前在 dev Environment 配置 `KNOWLEDGE_BASE_ENABLED`、Embedding/Milvus
-Variables 和 `MILVUS_PASSWORD` Secret；开关默认 false。
+Variables（包括完整的 `KNOWLEDGE_EMBEDDING_REVISION_ROUTES`）和 `MILVUS_PASSWORD` Secret；开关默认
+false。自动回滚快照会保留当时的完整 revision registry，使旧索引仍能路由到部署前的不可变 alias。
 
 `/health` 仍只代表 API 的数据库与 Redis 就绪，不把 Milvus 故障扩散成全部 CRUD 下线。Worker 健康和
 知识库检索会独立暴露 Milvus/配置问题。日志不得记录文档正文、向量、密码或 lease token；排障使用

@@ -214,6 +214,23 @@ class KnowledgeBasesApiTests(unittest.TestCase):
         self.assertEqual(response.json()["code"], "INVALID_PARAM")
         self.assertIsNone(response.json()["data"])
 
+    def test_expanded_normalized_name_is_rejected_for_create_and_patch(self):
+        expanding_name = "ﬃ" * 120
+
+        created = self.client.post(
+            "/api/knowledge-bases/",
+            json={"name": expanding_name, "description": "", "business_type": "product"},
+        )
+        updated = self.client.patch(
+            "/api/knowledge-bases/kb-1",
+            json={"name": expanding_name},
+        )
+
+        self.assertEqual(created.status_code, 422)
+        self.assertEqual(updated.status_code, 422)
+        self.assertEqual(created.json()["code"], "INVALID_PARAM")
+        self.assertEqual(updated.json()["code"], "INVALID_PARAM")
+
 
 if __name__ == "__main__":
     unittest.main()

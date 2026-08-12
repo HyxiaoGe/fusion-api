@@ -23,7 +23,7 @@ class DeterministicKnowledgeChunker:
     VERSION = "chunker-v1"
 
     def __init__(self, *, chunk_size: int, overlap: int):
-        if chunk_size < 100 or overlap < 0 or overlap >= chunk_size:
+        if chunk_size < 100 or overlap < 0 or overlap * 2 > chunk_size or chunk_size - overlap < 100:
             raise ValueError("知识库切片参数无效")
         self.chunk_size = chunk_size
         self.overlap = overlap

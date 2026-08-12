@@ -1,3 +1,4 @@
+import json
 import os
 import re
 from typing import List, Optional
@@ -96,9 +97,11 @@ class Settings(BaseSettings):
     KNOWLEDGE_EMBEDDING_PROVIDER: str = os.getenv("KNOWLEDGE_EMBEDDING_PROVIDER", "litellm")
     KNOWLEDGE_EMBEDDING_MODEL: str = os.getenv("KNOWLEDGE_EMBEDDING_MODEL", "")
     KNOWLEDGE_EMBEDDING_REVISION: str = os.getenv("KNOWLEDGE_EMBEDDING_REVISION", "")
+    KNOWLEDGE_EMBEDDING_REVISION_ROUTES: str = os.getenv("KNOWLEDGE_EMBEDDING_REVISION_ROUTES", "{}")
     KNOWLEDGE_EMBEDDING_DIMENSION: int = int(os.getenv("KNOWLEDGE_EMBEDDING_DIMENSION", "1024"))
     KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS: str = os.getenv("KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS", "1024")
     KNOWLEDGE_EMBEDDING_BATCH_SIZE: int = int(os.getenv("KNOWLEDGE_EMBEDDING_BATCH_SIZE", "32"))
+    KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS: float = float(os.getenv("KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS", "30"))
     KNOWLEDGE_DISTANCE_METRIC: str = os.getenv("KNOWLEDGE_DISTANCE_METRIC", "COSINE").upper()
     KNOWLEDGE_WORKER_POLL_SECONDS: float = float(os.getenv("KNOWLEDGE_WORKER_POLL_SECONDS", "2"))
     KNOWLEDGE_WORKER_LEASE_SECONDS: int = int(os.getenv("KNOWLEDGE_WORKER_LEASE_SECONDS", "180"))
@@ -131,6 +134,45 @@ class Settings(BaseSettings):
             )
         )
 
+    @property
+    def RESOLVED_KNOWLEDGE_EMBEDDING_REVISION_ROUTES(self) -> dict[str, str]:
+        try:
+            raw_routes = json.loads(self.KNOWLEDGE_EMBEDDING_REVISION_ROUTES)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("KNOWLEDGE_EMBEDDING_REVISION_ROUTES 必须是 JSON 对象") from exc
+        if not isinstance(raw_routes, dict):
+            raise ValueError("KNOWLEDGE_EMBEDDING_REVISION_ROUTES 必须是 JSON 对象")
+        if not raw_routes:
+            raise ValueError("KNOWLEDGE_EMBEDDING_REVISION_ROUTES 不能为空")
+        routes: dict[str, str] = {}
+        for raw_key, raw_alias in raw_routes.items():
+            if not isinstance(raw_key, str) or not isinstance(raw_alias, str):
+                raise ValueError("KNOWLEDGE_EMBEDDING_REVISION_ROUTES 的键和值必须是字符串")
+            key = raw_key.strip()
+            alias = raw_alias.strip()
+            model, separator, revision = key.rpartition("@")
+            if (
+                raw_key != key
+                or raw_alias != alias
+                or not separator
+                or re.fullmatch(r"[A-Za-z0-9_.:/-]{1,200}", model) is None
+                or re.fullmatch(r"[A-Za-z0-9_.:/-]{1,120}", revision) is None
+                or re.fullmatch(r"[A-Za-z0-9_.:/-]{1,200}", alias) is None
+                or alias.startswith("litellm_proxy/")
+            ):
+                raise ValueError("KNOWLEDGE_EMBEDDING_REVISION_ROUTES 包含无效的 model@revision 或 alias")
+            routes[key] = alias
+        return routes
+
+    def resolve_knowledge_embedding_route(self, model: str, revision: str | None) -> str:
+        """把持久化 model+revision 解析为不可变 LiteLLM Proxy alias。"""
+        if not model.strip() or not revision or not revision.strip():
+            raise ValueError("Embedding profile 缺少 model 或 revision")
+        route = self.RESOLVED_KNOWLEDGE_EMBEDDING_REVISION_ROUTES.get(f"{model}@{revision}")
+        if route is None:
+            raise ValueError("KNOWLEDGE_EMBEDDING_REVISION_ROUTES 缺少持久化 model@revision")
+        return route
+
     def validate_knowledge_base_configuration(self) -> None:
         """知识库启用时执行集中、可复用的 fail-closed 配置校验。"""
         if not self.KNOWLEDGE_BASE_ENABLED:
@@ -151,8 +193,19 @@ class Settings(BaseSettings):
             errors.append("KNOWLEDGE_EMBEDDING_MODEL 不能为空")
         if not self.KNOWLEDGE_EMBEDDING_REVISION.strip():
             errors.append("KNOWLEDGE_EMBEDDING_REVISION 不能为空")
+        if self.KNOWLEDGE_EMBEDDING_MODEL != self.KNOWLEDGE_EMBEDDING_MODEL.strip():
+            errors.append("KNOWLEDGE_EMBEDDING_MODEL 前后不能包含空白")
+        if self.KNOWLEDGE_EMBEDDING_REVISION != self.KNOWLEDGE_EMBEDDING_REVISION.strip():
+            errors.append("KNOWLEDGE_EMBEDDING_REVISION 前后不能包含空白")
         if self.KNOWLEDGE_EMBEDDING_MODEL.startswith("litellm_proxy/"):
             errors.append("KNOWLEDGE_EMBEDDING_MODEL 必须填写 Proxy 中的原始 alias")
+        try:
+            self.resolve_knowledge_embedding_route(
+                self.KNOWLEDGE_EMBEDDING_MODEL.strip(),
+                self.KNOWLEDGE_EMBEDDING_REVISION.strip(),
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
         litellm_proxy_url = urlparse(self.LITELLM_PROXY_URL)
         if litellm_proxy_url.scheme not in {"http", "https"} or not litellm_proxy_url.netloc:
             errors.append("LITELLM_PROXY_URL 必须是完整的 http(s) 地址")
@@ -164,12 +217,22 @@ class Settings(BaseSettings):
             errors.append("KNOWLEDGE_DISTANCE_METRIC 必须为 COSINE")
         if not 100 <= self.KNOWLEDGE_CHUNK_SIZE <= 16_000:
             errors.append("KNOWLEDGE_CHUNK_SIZE 必须在 100 到 16000 之间")
-        if self.KNOWLEDGE_CHUNK_OVERLAP < 0 or self.KNOWLEDGE_CHUNK_OVERLAP >= self.KNOWLEDGE_CHUNK_SIZE:
-            errors.append("KNOWLEDGE_CHUNK_OVERLAP 必须大于等于 0 且小于 chunk size")
+        if (
+            self.KNOWLEDGE_CHUNK_OVERLAP < 0
+            or self.KNOWLEDGE_CHUNK_OVERLAP * 2 > self.KNOWLEDGE_CHUNK_SIZE
+            or self.KNOWLEDGE_CHUNK_SIZE - self.KNOWLEDGE_CHUNK_OVERLAP < 100
+        ):
+            errors.append("KNOWLEDGE_CHUNK_OVERLAP 不得超过 chunk size 的一半，且切片最小步长为 100")
+        if not 1 <= self.KNOWLEDGE_MAX_FILE_SIZE <= 50 * 1024 * 1024:
+            errors.append("KNOWLEDGE_MAX_FILE_SIZE 必须在 1 到 52428800 字节之间")
         if not 1 <= self.KNOWLEDGE_PARSE_TIMEOUT_SECONDS <= 300:
             errors.append("KNOWLEDGE_PARSE_TIMEOUT_SECONDS 必须在 1 到 300 之间")
         if self.KNOWLEDGE_EMBEDDING_BATCH_SIZE <= 0:
             errors.append("KNOWLEDGE_EMBEDDING_BATCH_SIZE 必须大于 0")
+        if not 1 <= self.KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS <= 120:
+            errors.append("KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS 必须在 1 到 120 秒之间")
+        if not 0 < self.KNOWLEDGE_WORKER_POLL_SECONDS <= 60:
+            errors.append("KNOWLEDGE_WORKER_POLL_SECONDS 必须大于 0 且不超过 60 秒")
         if self.KNOWLEDGE_WORKER_LEASE_SECONDS <= 0:
             errors.append("KNOWLEDGE_WORKER_LEASE_SECONDS 必须大于 0")
         if (
@@ -196,6 +259,8 @@ class Settings(BaseSettings):
             errors.append("Milvus 应用账号和数据库配置不完整")
         if self.MILVUS_USERNAME.strip().casefold() == "root":
             errors.append("知识库禁止使用 Milvus root 账号")
+        if not 1 <= self.MILVUS_TIMEOUT_SECONDS <= 60:
+            errors.append("MILVUS_TIMEOUT_SECONDS 必须在 1 到 60 秒之间")
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,39}", self.MILVUS_COLLECTION_PREFIX):
             errors.append("MILVUS_COLLECTION_PREFIX 必须是长度不超过 40 的受控标识")
         if errors:

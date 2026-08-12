@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import unicodedata
 import uuid
 from collections import defaultdict
+from pathlib import PurePath
 
 from fastapi import UploadFile
 from sqlalchemy.exc import IntegrityError
@@ -19,6 +21,7 @@ from app.db.knowledge_repository import (
 )
 from app.db.models import KnowledgeBase, KnowledgeDocument, KnowledgeIndexTask, KnowledgeIndexVersion
 from app.schemas.knowledge import (
+    KNOWLEDGE_BASE_NORMALIZED_NAME_MAX_LENGTH,
     KnowledgeBaseCreate,
     KnowledgeBasePage,
     KnowledgeBaseUpdate,
@@ -30,6 +33,7 @@ from app.schemas.knowledge import (
     KnowledgeRetrievalRequest,
     KnowledgeRetrievalResult,
     KnowledgeTaskView,
+    normalize_knowledge_base_name,
 )
 from app.schemas.response import ApiException, ErrorCode
 from app.services.knowledge.milvus import (
@@ -37,10 +41,13 @@ from app.services.knowledge.milvus import (
     KnowledgeVectorHit,
     MilvusKnowledgeStore,
 )
+from app.services.knowledge.parser import KnowledgeDocumentParser
 from app.services.storage import get_storage
 
 EmbeddingProfileKey = tuple[str, str, int, str, str, str]
 VectorHitKey = tuple[str, str, str, str]
+FILENAME_MAX_CHARACTERS = 255
+FILENAME_MAX_UTF8_BYTES = 500
 
 
 class KnowledgeService:
@@ -149,9 +156,10 @@ class KnowledgeService:
             raise ApiException.conflict("删除中的知识库不能上传文档")
         if self.repo.count_documents(knowledge_base_id) >= settings.KNOWLEDGE_MAX_DOCUMENTS_PER_BASE:
             raise ApiException.bad_request("已达到每个知识库的文档数量上限")
-        filename = self._safe_filename(upload.filename or "document")
-        mimetype = upload.content_type or "application/octet-stream"
-        if mimetype not in settings.RESOLVED_KNOWLEDGE_ALLOWED_MIME_TYPES:
+        mimetype = self._normalize_mimetype(upload.content_type)
+        filename = self._safe_filename(upload.filename or "document", mimetype)
+        allowed_mime_types = {value.strip().lower() for value in settings.RESOLVED_KNOWLEDGE_ALLOWED_MIME_TYPES}
+        if mimetype not in allowed_mime_types:
             raise ApiException(
                 ErrorCode.KNOWLEDGE_DOCUMENT_UNSUPPORTED,
                 "当前知识库版本不支持该文档格式",
@@ -410,21 +418,14 @@ class KnowledgeService:
                 active_version.embedding_revision,
             )
             documents_by_profile[key].append(document)
-        profile_hit_groups: list[tuple[EmbeddingProfileKey, list[KnowledgeVectorHit]]] = []
         overfetch = min(payload.top_k * 3, 100)
         try:
-            for key, profile_documents in sorted(documents_by_profile.items()):
-                profile = EmbeddingProfile(*key)
-                query_vector = (await self.embedding.embed([payload.query], profile))[0]
-                profile_hits = await self.vector_store.search(
-                    profile=profile,
-                    query_vector=query_vector,
-                    user_id=user_id,
-                    knowledge_base_ids=sorted({document.knowledge_base_id for document in profile_documents}),
-                    index_versions=sorted({str(document.active_index_version) for document in profile_documents}),
-                    limit=overfetch,
-                )
-                profile_hit_groups.append((key, profile_hits))
+            profile_hit_groups = await self._search_profiles(
+                user_id=user_id,
+                query=payload.query,
+                documents_by_profile=documents_by_profile,
+                limit=overfetch,
+            )
         except EmbeddingError as exc:
             raise ApiException(exc.code, exc.summary, 503 if exc.retryable else 409) from exc
         except KnowledgeVectorError as exc:
@@ -478,7 +479,57 @@ class KnowledgeService:
             )
         if not multiple_profiles:
             validated.sort(key=lambda item: item.similarity, reverse=True)
+        self._ensure_requested_bases_still_ready(user_id, payload.knowledge_base_ids)
         return KnowledgeRetrievalResult(hits=validated[: payload.top_k], query=payload.query, top_k=payload.top_k)
+
+    async def _search_profiles(
+        self,
+        *,
+        user_id: str,
+        query: str,
+        documents_by_profile: dict[EmbeddingProfileKey, list[KnowledgeDocument]],
+        limit: int,
+    ) -> list[tuple[EmbeddingProfileKey, list[KnowledgeVectorHit]]]:
+        tasks = [
+            asyncio.create_task(
+                self._search_profile(
+                    user_id=user_id,
+                    query=query,
+                    profile_key=profile_key,
+                    documents=documents,
+                    limit=limit,
+                )
+            )
+            for profile_key, documents in sorted(documents_by_profile.items())
+        ]
+        try:
+            return list(await asyncio.gather(*tasks))
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+    async def _search_profile(
+        self,
+        *,
+        user_id: str,
+        query: str,
+        profile_key: EmbeddingProfileKey,
+        documents: list[KnowledgeDocument],
+        limit: int,
+    ) -> tuple[EmbeddingProfileKey, list[KnowledgeVectorHit]]:
+        profile = EmbeddingProfile(*profile_key)
+        query_vector = (await self.embedding.embed([query], profile))[0]
+        hits = await self.vector_store.search(
+            profile=profile,
+            query_vector=query_vector,
+            user_id=user_id,
+            knowledge_base_ids=sorted({document.knowledge_base_id for document in documents}),
+            index_versions=sorted({str(document.active_index_version) for document in documents}),
+            limit=limit,
+        )
+        return profile_key, hits
 
     @staticmethod
     def _rank_fuse_profile_hits(
@@ -512,6 +563,22 @@ class KnowledgeService:
                 hit.index_version,
             ),
         )
+
+    def _ensure_requested_bases_still_ready(self, user_id: str, knowledge_base_ids: list[str]) -> None:
+        self.db.expire_all()
+        ready_documents = self.repo.get_ready_documents(user_id, knowledge_base_ids)
+        ready_base_ids = {
+            document.knowledge_base_id
+            for document in ready_documents
+            if any(
+                version.id == document.active_index_version
+                and version.status == "active"
+                and version.deleted_at is None
+                for version in document.index_versions
+            )
+        }
+        if ready_base_ids != set(knowledge_base_ids):
+            raise ApiException(ErrorCode.KNOWLEDGE_BASE_NOT_READY, "至少一个知识库已不再就绪", 409)
 
     def _require_base(self, user_id: str, knowledge_base_id: str, *, lock: bool = False) -> KnowledgeBase:
         row = self.repo.get_knowledge_base(knowledge_base_id, user_id, lock=lock)
@@ -610,17 +677,44 @@ class KnowledgeService:
 
     @staticmethod
     def normalize_name(name: str) -> str:
-        normalized = unicodedata.normalize("NFKC", name)
-        return " ".join(normalized.split()).casefold()
+        normalized = normalize_knowledge_base_name(name)
+        if len(normalized) > KNOWLEDGE_BASE_NORMALIZED_NAME_MAX_LENGTH:
+            raise ApiException.bad_request("知识库名称规范化后不能超过 200 个字符")
+        return normalized
 
     @staticmethod
-    def _safe_filename(filename: str) -> str:
-        normalized = unicodedata.normalize("NFKC", filename)
-        safe = "".join(character for character in normalized if character.isalnum() or character in "._- ")
-        candidate = safe.strip() or "document"
-        while len(candidate.encode("utf-8")) > 500:
-            candidate = candidate[:-1]
-        return candidate[:255]
+    def _normalize_mimetype(content_type: str | None) -> str:
+        normalized = (content_type or "").split(";", 1)[0].strip().lower()
+        return normalized or "application/octet-stream"
+
+    @staticmethod
+    def _safe_filename(filename: str, mimetype: str) -> str:
+        normalized_path = unicodedata.normalize("NFKC", filename).replace("\\", "/")
+        basename = PurePath(normalized_path).name
+        original_suffix = PurePath(basename).suffix
+        allowed_suffixes = KnowledgeDocumentParser.MIME_SUFFIXES.get(mimetype, set())
+        suffix = original_suffix.lower() if original_suffix.lower() in allowed_suffixes else ""
+        stem_source = basename[: -len(original_suffix)] if suffix else basename
+        stem = "".join(character for character in stem_source if character.isalnum() or character in "._- ")
+        stem = stem.strip() or "document"
+        stem = KnowledgeService._truncate_filename_stem(
+            stem,
+            max_characters=FILENAME_MAX_CHARACTERS - len(suffix),
+            max_utf8_bytes=FILENAME_MAX_UTF8_BYTES - len(suffix.encode("utf-8")),
+        )
+        return f"{stem}{suffix}"
+
+    @staticmethod
+    def _truncate_filename_stem(stem: str, *, max_characters: int, max_utf8_bytes: int) -> str:
+        characters: list[str] = []
+        utf8_bytes = 0
+        for character in stem:
+            character_bytes = len(character.encode("utf-8"))
+            if len(characters) >= max_characters or utf8_bytes + character_bytes > max_utf8_bytes:
+                break
+            characters.append(character)
+            utf8_bytes += character_bytes
+        return "".join(characters) or "document"
 
     @staticmethod
     def _base_profile(row: KnowledgeBase) -> EmbeddingProfile:

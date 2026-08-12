@@ -1,7 +1,9 @@
 import unittest
 from datetime import timedelta
+from unittest.mock import patch
 
 from sqlalchemy import create_engine
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
@@ -231,6 +233,37 @@ class KnowledgeRepositoryTests(unittest.TestCase):
             )
         self.assertTrue(unreferenced_conflict.exception.cleanup_storage)
         self.assertFalse(unreferenced_conflict.exception.duplicate)
+
+    def test_create_document_refreshes_locked_base_from_database(self):
+        repo = KnowledgeRepository(self.db)
+        stale_base = repo.create_knowledge_base(self._base())
+        self.assertEqual(stale_base.status, "active")
+        with self.Session() as concurrent_db:
+            concurrent_db.query(KnowledgeBase).filter_by(id=stale_base.id).update(
+                {"status": "deleting"},
+                synchronize_session=False,
+            )
+            concurrent_db.commit()
+        self.assertEqual(stale_base.status, "active")
+        document, version, task = self._document_bundle()
+
+        with self.assertRaises(KnowledgeBaseWriteConflict):
+            repo.create_document_with_task(document, version, task)
+
+        self.assertEqual(repo.count_documents(stale_base.id), 0)
+
+    def test_expired_exhausted_candidates_use_postgres_skip_locked(self):
+        repo = KnowledgeRepository(self.db)
+        now = utc_now()
+
+        with patch.object(self.engine.dialect, "name", "postgresql"):
+            statement = repo._expired_exhausted_tasks_query(now).statement
+
+        sql = str(statement.compile(dialect=postgresql.dialect())).upper()
+        self.assertIn("FOR UPDATE SKIP LOCKED", sql)
+        self.assertIn("KNOWLEDGE_INDEX_TASKS.STATUS =", sql)
+        self.assertIn("KNOWLEDGE_INDEX_TASKS.LEASE_EXPIRES_AT <", sql)
+        self.assertIn("KNOWLEDGE_INDEX_TASKS.ATTEMPT_COUNT >= KNOWLEDGE_INDEX_TASKS.MAX_ATTEMPTS", sql)
 
     def test_expired_lease_is_reclaimed_and_old_token_is_fenced(self):
         repo = KnowledgeRepository(self.db)

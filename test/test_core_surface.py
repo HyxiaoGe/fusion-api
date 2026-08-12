@@ -453,7 +453,7 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(captured["timeout"], self.main.settings.FILE_UPLOAD_TIMEOUT_SECONDS)
 
-    def test_timeout_middleware_uses_configured_budget_for_knowledge_upload(self):
+    def test_timeout_middleware_uses_configured_budgets_for_knowledge_routes(self):
         middleware = self.main.TimeoutMiddleware(lambda scope, receive, send: None, timeout_seconds=10)
         upload_request = Request(
             {
@@ -471,10 +471,23 @@ class ChatCoreSurfaceTests(unittest.TestCase):
                 "headers": [],
             }
         )
+        retry_request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/knowledge-bases/kb-1/documents/doc-1/retry",
+                "headers": [],
+            }
+        )
 
-        with patch.object(self.main.settings, "FILE_UPLOAD_TIMEOUT_SECONDS", 137):
+        with (
+            patch.object(self.main.settings, "FILE_UPLOAD_TIMEOUT_SECONDS", 137),
+            patch.object(self.main.settings, "KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS", 41),
+            patch.object(self.main.settings, "MILVUS_TIMEOUT_SECONDS", 7.5),
+        ):
             self.assertEqual(middleware._resolve_timeout_seconds(upload_request), 137)
-            self.assertEqual(middleware._resolve_timeout_seconds(search_request), 10)
+            self.assertEqual(middleware._resolve_timeout_seconds(search_request), 53.5)
+            self.assertEqual(middleware._resolve_timeout_seconds(retry_request), 10)
 
     def test_timeout_middleware_uses_coordinated_budget_for_mcp_admin_operation(self):
         middleware = self.main.TimeoutMiddleware(lambda scope, receive, send: None, timeout_seconds=10)

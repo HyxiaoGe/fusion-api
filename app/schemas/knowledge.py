@@ -1,3 +1,4 @@
+import unicodedata
 from datetime import datetime
 from typing import Literal
 
@@ -15,6 +16,18 @@ KnowledgeDocumentStatus = Literal[
     "deleting",
     "deleted",
 ]
+KNOWLEDGE_BASE_NORMALIZED_NAME_MAX_LENGTH = 200
+
+
+def normalize_knowledge_base_name(name: str) -> str:
+    normalized = unicodedata.normalize("NFKC", name)
+    return " ".join(normalized.split()).casefold()
+
+
+def validate_normalized_name_length(name: str) -> str:
+    if len(normalize_knowledge_base_name(name)) > KNOWLEDGE_BASE_NORMALIZED_NAME_MAX_LENGTH:
+        raise ValueError("知识库名称规范化后不能超过 200 个字符")
+    return name
 
 
 class KnowledgeBaseCreate(BaseModel):
@@ -26,6 +39,8 @@ class KnowledgeBaseCreate(BaseModel):
     @classmethod
     def strip_text(cls, value: str) -> str:
         return value.strip() if isinstance(value, str) else value
+
+    _validate_normalized_name_length = field_validator("name")(validate_normalized_name_length)
 
 
 class KnowledgeBaseUpdate(BaseModel):
@@ -46,6 +61,8 @@ class KnowledgeBaseUpdate(BaseModel):
         if value is None:
             raise ValueError("字段不能为 null")
         return value
+
+    _validate_normalized_name_length = field_validator("name")(validate_normalized_name_length)
 
 
 class KnowledgeDocumentStats(BaseModel):

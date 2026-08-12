@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 from typing import Any
 
@@ -16,11 +17,23 @@ class LiteLLMEmbeddingAdapter(EmbeddingAdapter):
         if not texts:
             return []
         try:
-            response = await litellm.aembedding(
-                model=f"litellm_proxy/{profile.model}",
-                input=texts,
-                api_base=settings.LITELLM_PROXY_URL,
-                api_key=settings.LITELLM_API_KEY,
+            route = settings.resolve_knowledge_embedding_route(profile.model, profile.revision)
+        except ValueError as exc:
+            raise EmbeddingError(
+                "KNOWLEDGE_CONFIG_INVALID",
+                "Embedding revision 路由配置无效",
+                retryable=False,
+            ) from exc
+        try:
+            response = await asyncio.wait_for(
+                litellm.aembedding(
+                    model=f"litellm_proxy/{route}",
+                    input=texts,
+                    api_base=settings.LITELLM_PROXY_URL,
+                    api_key=settings.LITELLM_API_KEY,
+                    timeout=settings.KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS,
+                ),
+                timeout=settings.KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS,
             )
         except Exception as exc:
             raise EmbeddingError(

@@ -1,5 +1,7 @@
+import asyncio
 import hashlib
 import io
+import json
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,9 +13,9 @@ from starlette.datastructures import Headers
 from app.db.database import Base
 from app.db.knowledge_repository import KnowledgeBaseWriteConflict
 from app.db.models import KnowledgeChunkManifest, User
-from app.schemas.knowledge import KnowledgeBaseCreate, KnowledgeRetrievalRequest
+from app.schemas.knowledge import KnowledgeBaseCreate, KnowledgeBaseUpdate, KnowledgeRetrievalRequest
 from app.schemas.response import ApiException
-from app.services.knowledge.milvus import KnowledgeVectorHit
+from app.services.knowledge.milvus import KnowledgeVectorError, KnowledgeVectorHit
 from app.services.knowledge.service import KnowledgeService
 
 
@@ -48,6 +50,10 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
             patch("app.services.knowledge.service.settings.KNOWLEDGE_EMBEDDING_PROVIDER", "litellm"),
             patch("app.services.knowledge.service.settings.KNOWLEDGE_EMBEDDING_MODEL", "embed-v1"),
             patch("app.services.knowledge.service.settings.KNOWLEDGE_EMBEDDING_REVISION", "embed-r1"),
+            patch(
+                "app.services.knowledge.service.settings.KNOWLEDGE_EMBEDDING_REVISION_ROUTES",
+                json.dumps({"embed-v1@embed-r1": "embed-v1-r1-immutable"}),
+            ),
             patch("app.services.knowledge.service.settings.LITELLM_PROXY_URL", "http://litellm-proxy:4000"),
             patch("app.services.knowledge.service.settings.LITELLM_API_KEY", "proxy-key"),
             patch("app.services.knowledge.service.settings.KNOWLEDGE_EMBEDDING_DIMENSION", 2),
@@ -153,6 +159,29 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(duplicate.exception.status_code, 409)
 
+    def test_expanded_normalized_name_is_rejected_before_database_write(self):
+        expanding_name = "ﬃ" * 120
+        create_payload = KnowledgeBaseCreate.model_construct(
+            name=expanding_name,
+            description="",
+            business_type="product",
+        )
+
+        with self.assertRaises(ApiException) as create_error:
+            self.service.create_knowledge_base("user-1", create_payload)
+
+        self.assertEqual(create_error.exception.code, "INVALID_PARAM")
+        self.assertEqual(create_error.exception.status_code, 400)
+        knowledge_base = self._create_base()
+        update_payload = KnowledgeBaseUpdate.model_construct(name=expanding_name)
+
+        with self.assertRaises(ApiException) as update_error:
+            self.service.update_knowledge_base("user-1", knowledge_base.id, update_payload)
+
+        self.assertEqual(update_error.exception.code, "INVALID_PARAM")
+        self.assertEqual(update_error.exception.status_code, 400)
+        self.assertEqual(self.service.get_knowledge_base("user-1", knowledge_base.id).name, "产品 手册")
+
     def test_repeated_delete_requeues_after_terminal_failure(self):
         created = self._create_base()
         first = self.service.delete_knowledge_base("user-1", created.id)
@@ -187,6 +216,36 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.service.upload_document("user-1", knowledge_base.id, upload_file())
         self.assertEqual(duplicate.exception.code, "KNOWLEDGE_DOCUMENT_DUPLICATE")
         self.assertEqual(duplicate.exception.status_code, 409)
+
+    async def test_upload_normalizes_mime_before_allowlist_and_persistence(self):
+        knowledge_base = self._create_base()
+        upload = UploadFile(
+            filename="manual.TXT",
+            file=io.BytesIO(b"knowledge content"),
+            headers=Headers({"content-type": " Text/Plain ; Charset=UTF-8 "}),
+        )
+
+        result = await self.service.upload_document("user-1", knowledge_base.id, upload)
+
+        document = self.service.repo.get_document(result.document.id, "user-1")
+        self.assertEqual(document.mimetype, "text/plain")
+        self.assertEqual(document.original_filename, "manual.txt")
+        self.assertEqual(self.storage.upload.await_args.args[2], "text/plain")
+
+    def test_safe_filename_preserves_supported_suffix_with_character_and_byte_limits(self):
+        ascii_name = self.service._safe_filename(f"nested/{'a' * 400}.PDF", "application/pdf")
+        unicode_name = self.service._safe_filename(
+            f"nested\\{'资料' * 200}.DOCX", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+        sanitized_name = self.service._safe_filename("nested/💩.PDF", "application/pdf")
+
+        for filename, suffix in ((ascii_name, ".pdf"), (unicode_name, ".docx"), (sanitized_name, ".pdf")):
+            self.assertTrue(filename.endswith(suffix))
+            self.assertLessEqual(len(filename), 255)
+            self.assertLessEqual(len(filename.encode("utf-8")), 500)
+            self.assertNotIn("/", filename)
+            self.assertNotIn("\\", filename)
+        self.assertEqual(sanitized_name, "document.pdf")
 
     async def test_uncertain_database_failure_never_deletes_content_addressed_object(self):
         knowledge_base = self._create_base()
@@ -239,7 +298,7 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 404)
         self.vector_store.search.assert_not_awaited()
 
-    async def test_retrieval_revalidates_postgres_after_milvus_search(self):
+    async def test_retrieval_fails_if_base_loses_ready_document_after_milvus_search(self):
         knowledge_base = self._create_base()
         upload = UploadFile(
             filename="manual.txt",
@@ -272,16 +331,18 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
             ]
 
         self.vector_store.search.side_effect = delete_during_vector_search
-        result = await self.service.retrieve(
-            "user-1",
-            KnowledgeRetrievalRequest(
-                knowledge_base_ids=[knowledge_base.id],
-                query="配置",
-                top_k=5,
-            ),
-        )
+        with self.assertRaises(ApiException) as raised:
+            await self.service.retrieve(
+                "user-1",
+                KnowledgeRetrievalRequest(
+                    knowledge_base_ids=[knowledge_base.id],
+                    query="配置",
+                    top_k=5,
+                ),
+            )
 
-        self.assertEqual(result.hits, [])
+        self.assertEqual(raised.exception.code, "KNOWLEDGE_BASE_NOT_READY")
+        self.assertEqual(raised.exception.status_code, 409)
 
     async def test_single_profile_retrieval_preserves_similarity_order(self):
         knowledge_base, document = await self._create_ready_document(
@@ -354,6 +415,116 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
             ["a-rank-1", "z-rank-1", "a-rank-2", "z-rank-2"],
         )
         self.assertEqual([hit.similarity for hit in result.hits], [0.2, 0.99, 0.19, 0.98])
+
+    async def test_multi_profile_embedding_and_vector_queries_run_concurrently(self):
+        base_a, _document_a = await self._create_ready_document(
+            base_name="并发模型 A",
+            content=b"concurrent profile a",
+            embedding_model="embed-a",
+        )
+        base_z, _document_z = await self._create_ready_document(
+            base_name="并发模型 Z",
+            content=b"concurrent profile z",
+            embedding_model="embed-z",
+        )
+        embedding_started: set[str] = set()
+        embedding_release = asyncio.Event()
+        vector_started: set[str] = set()
+        vector_release = asyncio.Event()
+
+        async def concurrent_embed(_texts, profile):
+            embedding_started.add(profile.model)
+            if len(embedding_started) == 2:
+                embedding_release.set()
+            await asyncio.wait_for(embedding_release.wait(), timeout=0.5)
+            return [[1.0, 0.5]]
+
+        async def concurrent_search(**kwargs):
+            vector_started.add(kwargs["profile"].model)
+            if len(vector_started) == 2:
+                vector_release.set()
+            await asyncio.wait_for(vector_release.wait(), timeout=0.5)
+            return []
+
+        self.embedding.embed.side_effect = concurrent_embed
+        self.vector_store.search.side_effect = concurrent_search
+
+        result = await self.service.retrieve(
+            "user-1",
+            KnowledgeRetrievalRequest(
+                knowledge_base_ids=[base_z.id, base_a.id],
+                query="配置",
+                top_k=2,
+            ),
+        )
+
+        self.assertEqual(result.hits, [])
+        self.assertEqual(embedding_started, {"embed-a", "embed-z"})
+        self.assertEqual(vector_started, {"embed-a", "embed-z"})
+
+    async def test_multi_profile_dependency_failure_does_not_return_partial_hits(self):
+        base_a, document_a = await self._create_ready_document(
+            base_name="失败模型 A",
+            content=b"failure profile a",
+            embedding_model="embed-a",
+        )
+        base_z, _document_z = await self._create_ready_document(
+            base_name="失败模型 Z",
+            content=b"failure profile z",
+            embedding_model="embed-z",
+        )
+        self._add_chunk(document_a, chunk_id="partial-hit", ordinal=0, text="不得部分返回")
+        self.db.commit()
+
+        async def search_with_failure(**kwargs):
+            if kwargs["profile"].model == "embed-z":
+                raise KnowledgeVectorError("KNOWLEDGE_VECTOR_UNAVAILABLE", "向量检索失败", retryable=True)
+            return [self._vector_hit(document_a, chunk_id="partial-hit", similarity=0.9)]
+
+        self.vector_store.search.side_effect = search_with_failure
+
+        with self.assertRaises(ApiException) as raised:
+            await self.service.retrieve(
+                "user-1",
+                KnowledgeRetrievalRequest(
+                    knowledge_base_ids=[base_a.id, base_z.id],
+                    query="配置",
+                    top_k=2,
+                ),
+            )
+
+        self.assertEqual(raised.exception.code, "KNOWLEDGE_VECTOR_UNAVAILABLE")
+        self.assertEqual(raised.exception.status_code, 503)
+
+    async def test_retrieval_fails_if_active_version_changes_after_milvus_search(self):
+        knowledge_base, document = await self._create_ready_document(
+            base_name="版本切换手册",
+            content=b"active version",
+            embedding_model="embed-a",
+        )
+        self._add_chunk(document, chunk_id="stale-version", ordinal=0, text="旧版本内容")
+        self.db.commit()
+        active_version = next(item for item in document.index_versions if item.id == document.active_index_version)
+
+        async def supersede_during_search(**_kwargs):
+            active_version.status = "superseded"
+            self.db.commit()
+            return [self._vector_hit(document, chunk_id="stale-version", similarity=0.99)]
+
+        self.vector_store.search.side_effect = supersede_during_search
+
+        with self.assertRaises(ApiException) as raised:
+            await self.service.retrieve(
+                "user-1",
+                KnowledgeRetrievalRequest(
+                    knowledge_base_ids=[knowledge_base.id],
+                    query="配置",
+                    top_k=1,
+                ),
+            )
+
+        self.assertEqual(raised.exception.code, "KNOWLEDGE_BASE_NOT_READY")
+        self.assertEqual(raised.exception.status_code, 409)
 
 
 if __name__ == "__main__":

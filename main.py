@@ -51,9 +51,11 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
         if route_timeouts:
             self.route_timeouts.update(route_timeouts)
 
-    def _resolve_timeout_seconds(self, request: Request) -> int:
+    def _resolve_timeout_seconds(self, request: Request) -> float:
         key = (request.method.upper(), request.scope.get("path", ""))
         path = key[1]
+        if key == ("POST", "/api/knowledge-bases/search"):
+            return settings.KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS + settings.MILVUS_TIMEOUT_SECONDS + 5
         path_segments = path.strip("/").split("/")
         if (
             key[0] == "POST"
