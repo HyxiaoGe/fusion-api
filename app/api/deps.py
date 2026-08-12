@@ -23,6 +23,7 @@ from app.db.repositories import UserRepository
 from app.services.admin_audit_service import AdminAuditService
 from app.services.chat_service import ChatService
 from app.services.file_service import FileService
+from app.services.knowledge.service import KnowledgeService
 from app.services.mcp.runtime import get_mcp_client_manager
 from app.services.mcp.server_service import McpServerService
 from app.services.model_management_service import ModelManagementConfig, ModelManagementService
@@ -35,6 +36,10 @@ def get_chat_service(db: Session = Depends(get_db)) -> ChatService:
 
 def get_file_service(db: Session = Depends(get_db)) -> FileService:
     return FileService(db)
+
+
+def get_knowledge_service(db: Session = Depends(get_db)) -> KnowledgeService:
+    return KnowledgeService(db)
 
 
 def get_network_diagnostics_service(db: Session = Depends(get_db)) -> NetworkDiagnosticsService:

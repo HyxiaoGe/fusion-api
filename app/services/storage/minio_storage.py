@@ -1,5 +1,6 @@
 """MinIO/S3 兼容对象存储后端实现"""
 
+import asyncio
 import io
 
 import boto3
@@ -48,15 +49,16 @@ class MinIOStorageBackend(StorageBackend):
     async def ensure_bucket(self) -> None:
         """确保存储桶存在，不存在则创建"""
         try:
-            self.s3_client.head_bucket(Bucket=self.bucket)
+            await asyncio.to_thread(self.s3_client.head_bucket, Bucket=self.bucket)
             logger.info(f"MinIO bucket 已存在: {self.bucket}")
         except ClientError:
-            self.s3_client.create_bucket(Bucket=self.bucket)
+            await asyncio.to_thread(self.s3_client.create_bucket, Bucket=self.bucket)
             logger.info(f"MinIO bucket 已创建: {self.bucket}")
 
     async def upload(self, key: str, data: bytes, content_type: str) -> str:
         """上传文件到 MinIO"""
-        self.s3_client.put_object(
+        await asyncio.to_thread(
+            self.s3_client.put_object,
             Bucket=self.bucket,
             Key=key,
             Body=io.BytesIO(data),
@@ -69,9 +71,11 @@ class MinIOStorageBackend(StorageBackend):
     async def download(self, key: str) -> bytes:
         """从 MinIO 下载文件"""
         try:
-            response = self.s3_client.get_object(Bucket=self.bucket, Key=key)
-            data = response["Body"].read()
-            return data
+            def download() -> bytes:
+                response = self.s3_client.get_object(Bucket=self.bucket, Key=key)
+                return response["Body"].read()
+
+            return await asyncio.to_thread(download)
         except ClientError as e:
             if e.response["Error"]["Code"] == "NoSuchKey":
                 raise FileNotFoundError(f"文件不存在: {key}")
@@ -80,7 +84,7 @@ class MinIOStorageBackend(StorageBackend):
     async def get_size(self, key: str) -> int:
         """通过 HEAD 获取 MinIO 对象大小"""
         try:
-            response = self.s3_client.head_object(Bucket=self.bucket, Key=key)
+            response = await asyncio.to_thread(self.s3_client.head_object, Bucket=self.bucket, Key=key)
             return int(response["ContentLength"])
         except ClientError as e:
             if e.response["Error"]["Code"] == "NoSuchKey":
@@ -89,7 +93,8 @@ class MinIOStorageBackend(StorageBackend):
 
     async def get_url(self, key: str, expires: int = 3600) -> str:
         """生成 MinIO presigned URL"""
-        url = self.s3_client.generate_presigned_url(
+        url = await asyncio.to_thread(
+            self.s3_client.generate_presigned_url,
             "get_object",
             Params={"Bucket": self.bucket, "Key": key},
             ExpiresIn=expires,
@@ -99,15 +104,23 @@ class MinIOStorageBackend(StorageBackend):
     async def delete(self, key: str) -> bool:
         """删除 MinIO 中的文件"""
         try:
-            self.s3_client.delete_object(Bucket=self.bucket, Key=key)
+            await asyncio.to_thread(self.s3_client.delete_object, Bucket=self.bucket, Key=key)
             return True
-        except ClientError:
-            return False
+        except ClientError as exc:
+            if self._is_not_found(exc):
+                return False
+            raise
 
     async def exists(self, key: str) -> bool:
         """判断 MinIO 中文件是否存在"""
         try:
-            self.s3_client.head_object(Bucket=self.bucket, Key=key)
+            await asyncio.to_thread(self.s3_client.head_object, Bucket=self.bucket, Key=key)
             return True
-        except ClientError:
-            return False
+        except ClientError as exc:
+            if self._is_not_found(exc):
+                return False
+            raise
+
+    @staticmethod
+    def _is_not_found(exc: ClientError) -> bool:
+        return str(exc.response.get("Error", {}).get("Code", "")) in {"404", "NoSuchKey", "NotFound"}

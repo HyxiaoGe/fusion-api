@@ -42,3 +42,5 @@ boto3>=1.34.0
 oss2>=2.18.0
 Pillow>=10.0.0
 pillow-heif>=0.15.0
+# Milvus 2.6.x 服务端对应的官方推荐 Python SDK；精确固定以保证镜像可复现。
+pymilvus==2.6.12

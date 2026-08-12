@@ -4,13 +4,25 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.ai import litellm_cleanup, litellm_health
-from app.api import admin, admin_audit, admin_mcp, admin_model_management, auth, chat, files, models, prompts
+from app.api import (
+    admin,
+    admin_audit,
+    admin_mcp,
+    admin_model_management,
+    auth,
+    chat,
+    files,
+    knowledge_bases,
+    models,
+    prompts,
+)
 from app.core.config import settings
 from app.core.logger import app_logger
 from app.core.redis import close_redis, get_redis_pool, init_redis
@@ -194,6 +206,22 @@ async def api_exception_handler(request: Request, exc: ApiException):
     )
 
 
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
+    first = exc.errors()[0] if exc.errors() else {}
+    location = ".".join(str(part) for part in first.get("loc", ()) if part != "body")
+    message = str(first.get("msg", "请求参数校验失败"))
+    return JSONResponse(
+        status_code=422,
+        content={
+            "code": "INVALID_PARAM",
+            "message": f"{location}: {message}" if location else message,
+            "data": None,
+            "request_id": getattr(request.state, "request_id", generate_request_id()),
+        },
+    )
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     code_map = {
@@ -246,6 +274,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 # 注册路由
 app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 app.include_router(files.router, prefix="/api/files", tags=["files"])
+app.include_router(knowledge_bases.router, prefix="/api/knowledge-bases", tags=["knowledge-bases"])
 app.include_router(models.router, prefix="/api/models", tags=["models"])
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(prompts.router, prefix="/api/prompts", tags=["prompts"])

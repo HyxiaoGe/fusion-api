@@ -67,6 +67,7 @@ class User(Base):
     social_accounts = relationship("SocialAccount", back_populates="user", cascade="all, delete-orphan")
     conversations = relationship("Conversation", back_populates="user", cascade="all, delete-orphan")
     files = relationship("File", back_populates="user", cascade="all, delete-orphan")
+    knowledge_bases = relationship("KnowledgeBase", back_populates="user", cascade="all, delete-orphan")
 
 
 class SocialAccount(Base):
@@ -152,6 +153,283 @@ class ConversationFile(Base):
     # 关系
     conversation = relationship("Conversation", back_populates="files")
     file = relationship("File")
+
+
+class KnowledgeBase(Base):
+    """用户私有知识库；PostgreSQL 是生命周期和配置的事实来源。"""
+
+    __tablename__ = "knowledge_bases"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String(120), nullable=False)
+    name_normalized = Column(String(200), nullable=False)
+    description = Column(Text, nullable=False, default="", server_default="")
+    business_type = Column(String(60), nullable=False, default="general", server_default="general")
+    status = Column(String(20), nullable=False, default="active", server_default="active")
+    embedding_provider = Column(String(60), nullable=False)
+    embedding_model = Column(String(200), nullable=False)
+    embedding_revision = Column(String(120), nullable=False)
+    embedding_dimension = Column(Integer, nullable=False)
+    distance_metric = Column(String(20), nullable=False, default="COSINE", server_default="COSINE")
+    created_at = Column(DateTime(timezone=True), default=utc_now, server_default=func.now(), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=utc_now,
+        server_default=func.now(),
+        onupdate=utc_now,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+
+    user = relationship("User", back_populates="knowledge_bases")
+    documents = relationship("KnowledgeDocument", back_populates="knowledge_base", cascade="all, delete-orphan")
+    tasks = relationship("KnowledgeIndexTask", back_populates="knowledge_base", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "name_normalized", name="uq_knowledge_bases_user_name"),
+        CheckConstraint("embedding_dimension > 1", name="ck_knowledge_bases_embedding_dimension"),
+        CheckConstraint(
+            "status IN ('active', 'deleting', 'deleted')",
+            name="ck_knowledge_bases_status",
+        ),
+        CheckConstraint("distance_metric IN ('COSINE')", name="ck_knowledge_bases_distance_metric"),
+        Index("ix_knowledge_bases_user_updated_id", "user_id", "updated_at", "id"),
+    )
+
+
+class KnowledgeDocument(Base):
+    """知识库原始文档和当前可检索索引版本。"""
+
+    __tablename__ = "knowledge_documents"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    knowledge_base_id = Column(
+        String,
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    original_filename = Column(String(255), nullable=False)
+    mimetype = Column(String(120), nullable=False)
+    size = Column(Integer, nullable=False)
+    checksum_sha256 = Column(String(64), nullable=False)
+    dedupe_key = Column(String(120), nullable=False)
+    storage_backend = Column(String(20), nullable=False)
+    storage_key = Column(String(600), nullable=False)
+    status = Column(String(20), nullable=False, default="queued", server_default="queued")
+    parser_version = Column(String(40), nullable=False)
+    chunker_version = Column(String(40), nullable=False)
+    embedding_provider = Column(String(60), nullable=False)
+    embedding_model = Column(String(200), nullable=False)
+    embedding_revision = Column(String(120), nullable=False)
+    embedding_dimension = Column(Integer, nullable=False)
+    distance_metric = Column(String(20), nullable=False, default="COSINE", server_default="COSINE")
+    desired_index_version = Column(String(36), nullable=False)
+    active_index_version = Column(String(36), nullable=True)
+    chunk_count = Column(Integer, nullable=False, default=0, server_default="0")
+    error_code = Column(String(120), nullable=True)
+    error_summary = Column(String(500), nullable=True)
+    attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(DateTime(timezone=True), default=utc_now, server_default=func.now(), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=utc_now,
+        server_default=func.now(),
+        onupdate=utc_now,
+        nullable=False,
+    )
+    ready_at = Column(DateTime(timezone=True), nullable=True)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+
+    knowledge_base = relationship("KnowledgeBase", back_populates="documents")
+    tasks = relationship("KnowledgeIndexTask", back_populates="document")
+    index_versions = relationship(
+        "KnowledgeIndexVersion",
+        back_populates="document",
+        cascade="all, delete-orphan",
+        foreign_keys="KnowledgeIndexVersion.document_id",
+    )
+
+    __table_args__ = (
+        UniqueConstraint("knowledge_base_id", "dedupe_key", name="uq_knowledge_documents_base_dedupe"),
+        CheckConstraint("size >= 0", name="ck_knowledge_documents_size"),
+        CheckConstraint("embedding_dimension > 1", name="ck_knowledge_documents_embedding_dimension"),
+        CheckConstraint("chunk_count >= 0", name="ck_knowledge_documents_chunk_count"),
+        CheckConstraint("attempt_count >= 0", name="ck_knowledge_documents_attempt_count"),
+        CheckConstraint(
+            "status IN ('queued', 'parsing', 'chunking', 'embedding', 'writing', "
+            "'ready', 'failed', 'deleting', 'deleted')",
+            name="ck_knowledge_documents_status",
+        ),
+        CheckConstraint("distance_metric IN ('COSINE')", name="ck_knowledge_documents_distance_metric"),
+        Index("ix_knowledge_documents_base_updated_id", "knowledge_base_id", "updated_at", "id"),
+        Index("ix_knowledge_documents_user_status", "user_id", "status"),
+    )
+
+
+class KnowledgeIndexVersion(Base):
+    """一次不可变索引构建的 PostgreSQL 版本记录。"""
+
+    __tablename__ = "knowledge_index_versions"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    knowledge_base_id = Column(
+        String,
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    document_id = Column(
+        String,
+        ForeignKey("knowledge_documents.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    status = Column(String(20), nullable=False, default="building", server_default="building")
+    parser_version = Column(String(40), nullable=False)
+    chunker_version = Column(String(40), nullable=False)
+    chunk_size = Column(Integer, nullable=False)
+    chunk_overlap = Column(Integer, nullable=False)
+    embedding_provider = Column(String(60), nullable=False)
+    embedding_model = Column(String(200), nullable=False)
+    embedding_revision = Column(String(120), nullable=False)
+    embedding_dimension = Column(Integer, nullable=False)
+    distance_metric = Column(String(20), nullable=False, default="COSINE", server_default="COSINE")
+    collection_name = Column(String(200), nullable=False)
+    chunk_count = Column(Integer, nullable=False, default=0, server_default="0")
+    error_code = Column(String(120), nullable=True)
+    error_summary = Column(String(500), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, server_default=func.now(), nullable=False)
+    activated_at = Column(DateTime(timezone=True), nullable=True)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+
+    document = relationship(
+        "KnowledgeDocument",
+        back_populates="index_versions",
+        foreign_keys=[document_id],
+    )
+
+    __table_args__ = (
+        CheckConstraint("embedding_dimension > 1", name="ck_knowledge_index_versions_embedding_dimension"),
+        CheckConstraint("chunk_size >= 100", name="ck_knowledge_index_versions_chunk_size"),
+        CheckConstraint(
+            "chunk_overlap >= 0 AND chunk_overlap < chunk_size",
+            name="ck_knowledge_index_versions_chunk_overlap",
+        ),
+        CheckConstraint("chunk_count >= 0", name="ck_knowledge_index_versions_chunk_count"),
+        CheckConstraint(
+            "status IN ('building', 'active', 'superseded', 'deleting', 'deleted', 'failed')",
+            name="ck_knowledge_index_versions_status",
+        ),
+        CheckConstraint("distance_metric IN ('COSINE')", name="ck_knowledge_index_versions_distance_metric"),
+        Index("ix_knowledge_index_versions_document_created", "document_id", "created_at", "id"),
+        Index("ix_knowledge_index_versions_base_status", "knowledge_base_id", "status"),
+    )
+
+
+class KnowledgeChunkManifest(Base):
+    """PostgreSQL 保存的不可变切片正文，检索时作为最终授权数据源。"""
+
+    __tablename__ = "knowledge_chunk_manifests"
+
+    chunk_id = Column(String(64), primary_key=True)
+    knowledge_base_id = Column(String, ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=False)
+    document_id = Column(String, ForeignKey("knowledge_documents.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    index_version = Column(
+        String(36),
+        ForeignKey("knowledge_index_versions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    ordinal = Column(Integer, nullable=False)
+    text = Column(Text, nullable=False)
+    text_sha256 = Column(String(64), nullable=False)
+    filename = Column(String(255), nullable=False)
+    char_start = Column(Integer, nullable=False)
+    char_end = Column(Integer, nullable=False)
+    page = Column(Integer, nullable=True)
+    section = Column(String(120), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("index_version", "ordinal", name="uq_knowledge_chunk_manifests_version_ordinal"),
+        CheckConstraint("ordinal >= 0", name="ck_knowledge_chunk_manifests_ordinal"),
+        CheckConstraint("char_start >= 0 AND char_end >= char_start", name="ck_knowledge_chunk_manifests_offsets"),
+        Index("ix_knowledge_chunk_manifests_auth", "user_id", "knowledge_base_id", "document_id", "index_version"),
+    )
+
+
+class KnowledgeIndexTask(Base):
+    """可租约恢复的知识库持久任务。"""
+
+    __tablename__ = "knowledge_index_tasks"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    knowledge_base_id = Column(
+        String,
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    document_id = Column(
+        String,
+        ForeignKey("knowledge_documents.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    task_type = Column(String(30), nullable=False)
+    index_version = Column(
+        String(36),
+        ForeignKey("knowledge_index_versions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    status = Column(String(20), nullable=False, default="pending", server_default="pending")
+    phase = Column(String(20), nullable=False, default="queued", server_default="queued")
+    attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
+    max_attempts = Column(Integer, nullable=False, default=5, server_default="5")
+    available_at = Column(DateTime(timezone=True), default=utc_now, server_default=func.now(), nullable=False)
+    lease_owner = Column(String(120), nullable=True)
+    lease_token_hash = Column(String(64), nullable=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True)
+    heartbeat_at = Column(DateTime(timezone=True), nullable=True)
+    error_code = Column(String(120), nullable=True)
+    error_summary = Column(String(500), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, server_default=func.now(), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=utc_now,
+        server_default=func.now(),
+        onupdate=utc_now,
+        nullable=False,
+    )
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    knowledge_base = relationship("KnowledgeBase", back_populates="tasks")
+    document = relationship("KnowledgeDocument", back_populates="tasks")
+
+    __table_args__ = (
+        CheckConstraint("attempt_count >= 0", name="ck_knowledge_index_tasks_attempt_count"),
+        CheckConstraint("max_attempts > 0", name="ck_knowledge_index_tasks_max_attempts"),
+        CheckConstraint(
+            "task_type IN ('index_document', 'delete_document', 'delete_knowledge_base', 'delete_index_version')",
+            name="ck_knowledge_index_tasks_type",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'running', 'retry', 'completed', 'failed', 'cancelled')",
+            name="ck_knowledge_index_tasks_status",
+        ),
+        CheckConstraint(
+            "phase IN ('queued', 'parsing', 'chunking', 'embedding', 'writing', 'deleting', 'completed')",
+            name="ck_knowledge_index_tasks_phase",
+        ),
+        Index("ix_knowledge_index_tasks_claim", "status", "available_at", "created_at", "id"),
+        Index("ix_knowledge_index_tasks_base_status", "knowledge_base_id", "status"),
+    )
 
 
 class Message(Base):

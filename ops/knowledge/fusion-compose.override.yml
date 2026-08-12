@@ -1,0 +1,64 @@
+services:
+  app:
+    environment:
+      - KNOWLEDGE_BASE_ENABLED=${KNOWLEDGE_BASE_ENABLED:-false}
+      - KNOWLEDGE_EMBEDDING_MODEL=${KNOWLEDGE_EMBEDDING_MODEL:-}
+      - KNOWLEDGE_EMBEDDING_REVISION=${KNOWLEDGE_EMBEDDING_REVISION:-}
+      - KNOWLEDGE_EMBEDDING_DIMENSION=${KNOWLEDGE_EMBEDDING_DIMENSION:-1024}
+      - MILVUS_URI=${MILVUS_URI:-}
+      - MILVUS_USERNAME=${MILVUS_USERNAME:-}
+      - MILVUS_PASSWORD=${MILVUS_PASSWORD:-}
+      - MILVUS_DATABASE=${MILVUS_DATABASE:-fusion_knowledge}
+    networks:
+      - default
+      - middleware
+      - litellm_net
+      - flyai
+      - fusion-knowledge-milvus
+
+  knowledge-worker:
+    build: .
+    command: ["python", "-m", "scripts.run_knowledge_worker"]
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - ./logs/knowledge-worker:/app/logs
+      - ./storage/files:/app/storage/files
+    environment:
+      - KNOWLEDGE_BASE_ENABLED=${KNOWLEDGE_BASE_ENABLED:-false}
+      - LITELLM_PROXY_URL=${LITELLM_PROXY_URL:-http://litellm-proxy:4000}
+      - LITELLM_API_KEY=${LITELLM_API_KEY:-}
+      - KNOWLEDGE_EMBEDDING_MODEL=${KNOWLEDGE_EMBEDDING_MODEL:-}
+      - KNOWLEDGE_EMBEDDING_REVISION=${KNOWLEDGE_EMBEDDING_REVISION:-}
+      - KNOWLEDGE_EMBEDDING_DIMENSION=${KNOWLEDGE_EMBEDDING_DIMENSION:-1024}
+      - MILVUS_URI=${MILVUS_URI:-}
+      - MILVUS_USERNAME=${MILVUS_USERNAME:-}
+      - MILVUS_PASSWORD=${MILVUS_PASSWORD:-}
+      - MILVUS_DATABASE=${MILVUS_DATABASE:-fusion_knowledge}
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-m",
+          "scripts.run_knowledge_worker",
+          "--healthcheck",
+          "--health-max-age-seconds",
+          "120",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 4
+      start_period: 30s
+    networks:
+      - default
+      - middleware
+      - litellm_net
+      - fusion-knowledge-milvus
+
+networks:
+  fusion-knowledge-milvus:
+    external: true
+    name: fusion_knowledge_milvus

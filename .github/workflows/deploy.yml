@@ -268,6 +268,22 @@ jobs:
             echo "fusion-flyai-adapter 内容 ID 格式无效: ${adapter_image_id}"
             exit 1
           fi
+          knowledge_worker_existed="false"
+          knowledge_worker_image_ref=""
+          knowledge_worker_image_id=""
+          if docker container inspect fusion-knowledge-worker >/dev/null 2>&1; then
+            knowledge_worker_existed="true"
+            knowledge_worker_image_ref="$(docker inspect fusion-knowledge-worker --format '{{.Config.Image}}')"
+            knowledge_worker_image_id="$(docker inspect fusion-knowledge-worker --format '{{.Image}}')"
+            if [ "${knowledge_worker_image_ref}" != "${api_image_ref}" ]; then
+              echo "fusion-knowledge-worker 与 fusion-api 未运行同一镜像: api=${api_image_ref} worker=${knowledge_worker_image_ref}"
+              exit 1
+            fi
+            if [ "${knowledge_worker_image_id}" != "${api_image_id}" ]; then
+              echo "fusion-knowledge-worker 与 fusion-api 内容 ID 不一致"
+              exit 1
+            fi
+          fi
 
           capture_container_bool_env() {
             key="$1"
@@ -292,6 +308,10 @@ jobs:
           }
           rollback_model_admission_worker_enabled="$(capture_container_bool_env LITELLM_MODEL_ADMISSION_WORKER_ENABLED)" || {
             echo "无法读取部署前的模型准入 Worker 开关"
+            exit 1
+          }
+          rollback_knowledge_base_enabled="$(capture_container_bool_env KNOWLEDGE_BASE_ENABLED)" || {
+            echo "无法读取部署前的知识库开关"
             exit 1
           }
           case "${rollback_model_management_enabled}:${rollback_model_admission_worker_enabled}" in
@@ -391,6 +411,10 @@ jobs:
             printf '%s\n' "api_image_id=${api_image_id}"
             printf '%s\n' "adapter_image_ref=${adapter_image_ref}"
             printf '%s\n' "adapter_image_id=${adapter_image_id}"
+            printf '%s\n' "knowledge_worker_existed=${knowledge_worker_existed}"
+            printf '%s\n' "knowledge_worker_image_ref=${knowledge_worker_image_ref}"
+            printf '%s\n' "knowledge_worker_image_id=${knowledge_worker_image_id}"
+            printf '%s\n' "knowledge_base_enabled=${rollback_knowledge_base_enabled}"
             printf '%s\n' "model_management_enabled=${rollback_model_management_enabled}"
             printf '%s\n' "model_admission_worker_enabled=${rollback_model_admission_worker_enabled}"
             printf '%s\n' "model_management_current_target=${model_management_current_target}"
@@ -494,6 +518,24 @@ jobs:
           DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED: ${{ vars.LITELLM_MODEL_ADMISSION_WORKER_ENABLED || 'false' }}
           DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS: ${{ vars.LITELLM_GOVERNANCE_MAX_AGE_SECONDS || '86400' }}
           DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN: ${{ secrets.LITELLM_MODEL_ADMISSION_WORKER_TOKEN }}
+          DEPLOY_KNOWLEDGE_BASE_ENABLED: ${{ vars.KNOWLEDGE_BASE_ENABLED || 'false' }}
+          DEPLOY_KNOWLEDGE_EMBEDDING_MODEL: ${{ vars.KNOWLEDGE_EMBEDDING_MODEL }}
+          DEPLOY_KNOWLEDGE_EMBEDDING_REVISION: ${{ vars.KNOWLEDGE_EMBEDDING_REVISION }}
+          DEPLOY_KNOWLEDGE_EMBEDDING_DIMENSION: ${{ vars.KNOWLEDGE_EMBEDDING_DIMENSION || '1024' }}
+          DEPLOY_KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS: ${{ vars.KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS || '1024' }}
+          DEPLOY_KNOWLEDGE_CHUNK_SIZE: ${{ vars.KNOWLEDGE_CHUNK_SIZE || '1200' }}
+          DEPLOY_KNOWLEDGE_CHUNK_OVERLAP: ${{ vars.KNOWLEDGE_CHUNK_OVERLAP || '200' }}
+          DEPLOY_KNOWLEDGE_PARSE_TIMEOUT_SECONDS: ${{ vars.KNOWLEDGE_PARSE_TIMEOUT_SECONDS || '60' }}
+          DEPLOY_KNOWLEDGE_EMBEDDING_BATCH_SIZE: ${{ vars.KNOWLEDGE_EMBEDDING_BATCH_SIZE || '32' }}
+          DEPLOY_KNOWLEDGE_WORKER_LEASE_SECONDS: ${{ vars.KNOWLEDGE_WORKER_LEASE_SECONDS || '180' }}
+          DEPLOY_KNOWLEDGE_WORKER_HEARTBEAT_SECONDS: ${{ vars.KNOWLEDGE_WORKER_HEARTBEAT_SECONDS || '30' }}
+          DEPLOY_KNOWLEDGE_WORKER_MAX_ATTEMPTS: ${{ vars.KNOWLEDGE_WORKER_MAX_ATTEMPTS || '5' }}
+          DEPLOY_MILVUS_URI: ${{ vars.MILVUS_URI }}
+          DEPLOY_MILVUS_USERNAME: ${{ vars.MILVUS_USERNAME }}
+          DEPLOY_MILVUS_PASSWORD: ${{ secrets.MILVUS_PASSWORD }}
+          DEPLOY_MILVUS_DATABASE: ${{ vars.MILVUS_DATABASE }}
+          DEPLOY_MILVUS_COLLECTION_PREFIX: ${{ vars.MILVUS_COLLECTION_PREFIX || 'fusion_knowledge_chunks' }}
+          DEPLOY_MILVUS_DOCKER_NETWORK: ${{ vars.MILVUS_DOCKER_NETWORK || 'fusion_knowledge_milvus' }}
         run: |
           cd ~/project/fusion
           set -o pipefail
@@ -523,6 +565,24 @@ jobs:
           export LITELLM_MODEL_ADMISSION_WORKER_ENABLED="$(printf '%s' "${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')"
           export LITELLM_GOVERNANCE_MAX_AGE_SECONDS="${DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS:-86400}"
           export LITELLM_MODEL_ADMISSION_WORKER_TOKEN="${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN:-}"
+          export KNOWLEDGE_BASE_ENABLED="$(printf '%s' "${DEPLOY_KNOWLEDGE_BASE_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')"
+          export KNOWLEDGE_EMBEDDING_MODEL="${DEPLOY_KNOWLEDGE_EMBEDDING_MODEL:-}"
+          export KNOWLEDGE_EMBEDDING_REVISION="${DEPLOY_KNOWLEDGE_EMBEDDING_REVISION:-}"
+          export KNOWLEDGE_EMBEDDING_DIMENSION="${DEPLOY_KNOWLEDGE_EMBEDDING_DIMENSION:-1024}"
+          export KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS="${DEPLOY_KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS:-1024}"
+          export KNOWLEDGE_CHUNK_SIZE="${DEPLOY_KNOWLEDGE_CHUNK_SIZE:-1200}"
+          export KNOWLEDGE_CHUNK_OVERLAP="${DEPLOY_KNOWLEDGE_CHUNK_OVERLAP:-200}"
+          export KNOWLEDGE_PARSE_TIMEOUT_SECONDS="${DEPLOY_KNOWLEDGE_PARSE_TIMEOUT_SECONDS:-60}"
+          export KNOWLEDGE_EMBEDDING_BATCH_SIZE="${DEPLOY_KNOWLEDGE_EMBEDDING_BATCH_SIZE:-32}"
+          export KNOWLEDGE_WORKER_LEASE_SECONDS="${DEPLOY_KNOWLEDGE_WORKER_LEASE_SECONDS:-180}"
+          export KNOWLEDGE_WORKER_HEARTBEAT_SECONDS="${DEPLOY_KNOWLEDGE_WORKER_HEARTBEAT_SECONDS:-30}"
+          export KNOWLEDGE_WORKER_MAX_ATTEMPTS="${DEPLOY_KNOWLEDGE_WORKER_MAX_ATTEMPTS:-5}"
+          export MILVUS_URI="${DEPLOY_MILVUS_URI:-}"
+          export MILVUS_USERNAME="${DEPLOY_MILVUS_USERNAME:-}"
+          export MILVUS_PASSWORD="${DEPLOY_MILVUS_PASSWORD:-}"
+          export MILVUS_DATABASE="${DEPLOY_MILVUS_DATABASE:-}"
+          export MILVUS_COLLECTION_PREFIX="${DEPLOY_MILVUS_COLLECTION_PREFIX:-fusion_knowledge_chunks}"
+          export MILVUS_DOCKER_NETWORK="${DEPLOY_MILVUS_DOCKER_NETWORK:-fusion_knowledge_milvus}"
           case "${LITELLM_GOVERNANCE_MAX_AGE_SECONDS}" in
             ''|*[!0-9]*|0) echo "治理快照最大年龄必须是正整数"; exit 1 ;;
           esac
@@ -533,6 +593,28 @@ jobs:
           if [ "${LITELLM_MODEL_ADMISSION_WORKER_ENABLED}" = "true" ] && [ -z "${LITELLM_MODEL_ADMISSION_WORKER_TOKEN}" ]; then
             echo "模型准入 Worker 已启用，但发布密钥未配置"
             exit 1
+          fi
+          case "${KNOWLEDGE_BASE_ENABLED}" in
+            true|false) ;;
+            *) echo "KNOWLEDGE_BASE_ENABLED 必须为 true 或 false"; exit 1 ;;
+          esac
+          case "${MILVUS_DOCKER_NETWORK}" in
+            ''|*[!a-zA-Z0-9_.-]*) echo "MILVUS_DOCKER_NETWORK 格式无效"; exit 1 ;;
+          esac
+          if [ "${KNOWLEDGE_BASE_ENABLED}" = "true" ]; then
+            if [ -z "${KNOWLEDGE_EMBEDDING_MODEL}" ] \
+              || [ -z "${KNOWLEDGE_EMBEDDING_REVISION}" ] \
+              || [ -z "${MILVUS_URI}" ] \
+              || [ -z "${MILVUS_USERNAME}" ] \
+              || [ -z "${MILVUS_PASSWORD}" ] \
+              || [ -z "${MILVUS_DATABASE}" ]; then
+              echo "知识库已启用，但 Embedding 或 Milvus 应用账号配置不完整"
+              exit 1
+            fi
+            if [ "$(printf '%s' "${MILVUS_USERNAME}" | tr '[:upper:]' '[:lower:]')" = "root" ]; then
+              echo "知识库禁止使用 Milvus root 账号"
+              exit 1
+            fi
           fi
           append_csv_value() {
             current="$1"
@@ -563,6 +645,12 @@ jobs:
             echo "docker pull 失败（网络抖动），第 $n 次，10s 后重试..."
             sleep 10
           done
+          if docker run --rm --entrypoint /bin/sh "${DEPLOY_API_IMAGE}" -c 'test -f /app/scripts/run_knowledge_worker.py'; then
+            knowledge_worker_supported="true"
+          else
+            knowledge_worker_supported="false"
+          fi
+          printf '%s\n' "knowledge_worker_supported=${knowledge_worker_supported}" >> "${GITHUB_OUTPUT}"
           n=0
           until docker pull "${DEPLOY_ADAPTER_IMAGE}"; do
             n=$((n+1))
@@ -581,7 +669,10 @@ jobs:
           fi
           export LITELLM_GOVERNANCE_ROOT_HOST="${expected_governance_root}"
           test -d "${LITELLM_GOVERNANCE_ROOT_HOST}"
+          docker network inspect "${MILVUS_DOCKER_NETWORK}" >/dev/null 2>&1 \
+            || docker network create "${MILVUS_DOCKER_NETWORK}" >/dev/null
           mkdir -p ./fusion-api/storage/files
+          mkdir -p ./fusion-api/logs/knowledge-worker
           if docker container inspect fusion-api >/dev/null 2>&1; then
             if docker inspect fusion-api --format '{{range .Mounts}}{{println .Destination}}{{end}}' | grep -qx '/app/storage/files'; then
               echo "file storage already mounted; skip container file migration"
@@ -692,6 +783,23 @@ jobs:
                 - FLYAI_ADAPTER_TOKEN=${FLYAI_ADAPTER_TOKEN}
                 - FLYAI_TRAVEL_TOOL_TIMEOUT_SECONDS=20
                 - FLYAI_TRAVEL_MAX_TOOL_CALLS_PER_RUN=4
+                - KNOWLEDGE_BASE_ENABLED=${KNOWLEDGE_BASE_ENABLED}
+                - KNOWLEDGE_EMBEDDING_MODEL=${KNOWLEDGE_EMBEDDING_MODEL}
+                - KNOWLEDGE_EMBEDDING_REVISION=${KNOWLEDGE_EMBEDDING_REVISION}
+                - KNOWLEDGE_EMBEDDING_DIMENSION=${KNOWLEDGE_EMBEDDING_DIMENSION}
+                - KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS=${KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS}
+                - KNOWLEDGE_CHUNK_SIZE=${KNOWLEDGE_CHUNK_SIZE}
+                - KNOWLEDGE_CHUNK_OVERLAP=${KNOWLEDGE_CHUNK_OVERLAP}
+                - KNOWLEDGE_PARSE_TIMEOUT_SECONDS=${KNOWLEDGE_PARSE_TIMEOUT_SECONDS}
+                - KNOWLEDGE_EMBEDDING_BATCH_SIZE=${KNOWLEDGE_EMBEDDING_BATCH_SIZE}
+                - KNOWLEDGE_WORKER_LEASE_SECONDS=${KNOWLEDGE_WORKER_LEASE_SECONDS}
+                - KNOWLEDGE_WORKER_HEARTBEAT_SECONDS=${KNOWLEDGE_WORKER_HEARTBEAT_SECONDS}
+                - KNOWLEDGE_WORKER_MAX_ATTEMPTS=${KNOWLEDGE_WORKER_MAX_ATTEMPTS}
+                - MILVUS_URI=${MILVUS_URI}
+                - MILVUS_USERNAME=${MILVUS_USERNAME}
+                - MILVUS_PASSWORD=${MILVUS_PASSWORD}
+                - MILVUS_DATABASE=${MILVUS_DATABASE}
+                - MILVUS_COLLECTION_PREFIX=${MILVUS_COLLECTION_PREFIX}
                 - ENABLE_DOCS=false
               deploy:
                 resources:
@@ -703,6 +811,65 @@ jobs:
                 - middleware_default
                 - fusion-prompthub
                 - fusion-flyai
+                - fusion-knowledge-milvus
+
+            knowledge-worker:
+              profiles: ["knowledge-worker"]
+              image: ${DEPLOY_API_IMAGE}
+              container_name: fusion-knowledge-worker
+              command: ["python", "-m", "scripts.run_knowledge_worker"]
+              restart: always
+              volumes:
+                - ./fusion-api/logs/knowledge-worker:/app/logs
+                - ./fusion-api/storage/files:/app/storage/files
+              environment:
+                - DATABASE_URL=${DATABASE_URL}
+                - STORAGE_BACKEND=${STORAGE_BACKEND:-local}
+                - FILE_STORAGE_PATH=/app/storage/files
+                - MINIO_ENDPOINT=${MINIO_ENDPOINT:-}
+                - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-}
+                - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-}
+                - MINIO_BUCKET=${MINIO_BUCKET:-fusion-files}
+                - MINIO_USE_SSL=${MINIO_USE_SSL:-false}
+                - OSS_ENDPOINT=${OSS_ENDPOINT:-}
+                - OSS_ACCESS_KEY_ID=${OSS_ACCESS_KEY_ID:-}
+                - OSS_ACCESS_KEY_SECRET=${OSS_ACCESS_KEY_SECRET:-}
+                - OSS_BUCKET=${OSS_BUCKET:-}
+                - OSS_USE_SSL=${OSS_USE_SSL:-true}
+                - LITELLM_PROXY_URL=${LITELLM_PROXY_URL:-http://litellm-proxy:4000}
+                - LITELLM_API_KEY=${LITELLM_API_KEY:-}
+                - KNOWLEDGE_BASE_ENABLED=${KNOWLEDGE_BASE_ENABLED}
+                - KNOWLEDGE_EMBEDDING_MODEL=${KNOWLEDGE_EMBEDDING_MODEL}
+                - KNOWLEDGE_EMBEDDING_REVISION=${KNOWLEDGE_EMBEDDING_REVISION}
+                - KNOWLEDGE_EMBEDDING_DIMENSION=${KNOWLEDGE_EMBEDDING_DIMENSION}
+                - KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS=${KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS}
+                - KNOWLEDGE_CHUNK_SIZE=${KNOWLEDGE_CHUNK_SIZE}
+                - KNOWLEDGE_CHUNK_OVERLAP=${KNOWLEDGE_CHUNK_OVERLAP}
+                - KNOWLEDGE_PARSE_TIMEOUT_SECONDS=${KNOWLEDGE_PARSE_TIMEOUT_SECONDS}
+                - KNOWLEDGE_EMBEDDING_BATCH_SIZE=${KNOWLEDGE_EMBEDDING_BATCH_SIZE}
+                - KNOWLEDGE_WORKER_LEASE_SECONDS=${KNOWLEDGE_WORKER_LEASE_SECONDS}
+                - KNOWLEDGE_WORKER_HEARTBEAT_SECONDS=${KNOWLEDGE_WORKER_HEARTBEAT_SECONDS}
+                - KNOWLEDGE_WORKER_MAX_ATTEMPTS=${KNOWLEDGE_WORKER_MAX_ATTEMPTS}
+                - MILVUS_URI=${MILVUS_URI}
+                - MILVUS_USERNAME=${MILVUS_USERNAME}
+                - MILVUS_PASSWORD=${MILVUS_PASSWORD}
+                - MILVUS_DATABASE=${MILVUS_DATABASE}
+                - MILVUS_COLLECTION_PREFIX=${MILVUS_COLLECTION_PREFIX}
+              healthcheck:
+                test: ["CMD", "python", "-m", "scripts.run_knowledge_worker", "--healthcheck", "--health-max-age-seconds", "120"]
+                interval: 30s
+                timeout: 10s
+                retries: 4
+                start_period: 30s
+              deploy:
+                resources:
+                  limits:
+                    cpus: "1"
+                    memory: 1g
+              networks:
+                - postgres_default
+                - middleware_default
+                - fusion-knowledge-milvus
 
           networks:
             postgres_default:
@@ -714,13 +881,23 @@ jobs:
             fusion-flyai:
               name: fusion-flyai
               driver: bridge
+            fusion-knowledge-milvus:
+              external: true
+              name: ${MILVUS_DOCKER_NETWORK}
           EOF
           docker network inspect fusion-prompthub >/dev/null 2>&1 \
             || docker network create fusion-prompthub >/dev/null
-          docker compose -f docker-compose.fusion-api-ghcr.yml up -d
+          if [ "${knowledge_worker_supported}" = "true" ]; then
+            docker compose -f docker-compose.fusion-api-ghcr.yml --profile knowledge-worker up -d
+          else
+            docker compose -f docker-compose.fusion-api-ghcr.yml up -d
+            docker rm -f fusion-knowledge-worker >/dev/null 2>&1 || true
+          fi
 
       - name: Verify deployed image identity
         id: verify_image_identity
+        env:
+          KNOWLEDGE_WORKER_SUPPORTED: ${{ steps.deploy_candidate.outputs.knowledge_worker_supported }}
         run: |
           expected_api_image="${IMAGE_NAME}:${DEPLOY_TARGET_SHA}"
           actual_api_image="$(docker inspect fusion-api --format '{{.Config.Image}}')"
@@ -747,11 +924,24 @@ jobs:
             echo "fusion-flyai-adapter 内容 ID 不匹配: expected=${expected_adapter_id} actual=${actual_adapter_id}"
             exit 1
           fi
+          if [ "${KNOWLEDGE_WORKER_SUPPORTED}" = "true" ]; then
+            actual_worker_image="$(docker inspect fusion-knowledge-worker --format '{{.Config.Image}}')"
+            actual_worker_id="$(docker inspect fusion-knowledge-worker --format '{{.Image}}')"
+            if [ "${actual_worker_image}" != "${expected_api_image}" ] \
+              || [ "${actual_worker_id}" != "${expected_api_id}" ]; then
+              echo "fusion-knowledge-worker 未运行候选 API 镜像"
+              exit 1
+            fi
+          elif docker container inspect fusion-knowledge-worker >/dev/null 2>&1; then
+            echo "回滚目标不支持知识库 Worker，但旧容器仍存在"
+            exit 1
+          fi
 
       - name: Verify health
         id: verify_health
         env:
           ROLLBACK_REQUESTED: ${{ needs.prepare.outputs.rollback_requested }}
+          KNOWLEDGE_WORKER_SUPPORTED: ${{ steps.deploy_candidate.outputs.knowledge_worker_supported }}
         run: |
           healthy=0
           for attempt in $(seq 1 30); do
@@ -781,6 +971,23 @@ jobs:
             exit 1
           fi
 
+          if [ "${KNOWLEDGE_WORKER_SUPPORTED}" = "true" ]; then
+            worker_healthy=0
+            for attempt in $(seq 1 30); do
+              if [ "$(docker inspect fusion-knowledge-worker --format '{{.State.Health.Status}}' 2>/dev/null || true)" = "healthy" ]; then
+                worker_healthy=1
+                break
+              fi
+              sleep 2
+            done
+            if [ "${worker_healthy}" != "1" ]; then
+              docker logs --tail=120 fusion-knowledge-worker || true
+              exit 1
+            fi
+            docker exec fusion-knowledge-worker python -m scripts.run_knowledge_worker \
+              --healthcheck --health-max-age-seconds 120
+          fi
+
           docker exec -i fusion-api python - <<'PY'
           from app.core.config import settings
 
@@ -801,6 +1008,21 @@ jobs:
           if "CONTEXT7_API_KEY" not in settings.RESOLVED_MCP_ALLOWED_CREDENTIAL_REFS:
               raise SystemExit("Context7 MCP credential policy is missing")
           print("Context7 MCP policy configuration ok")
+          PY
+
+          docker exec -i fusion-api python - <<'PY'
+          from app.core.config import settings
+
+          knowledge_enabled = getattr(settings, "KNOWLEDGE_BASE_ENABLED", None)
+          if knowledge_enabled is None:
+              print("旧版回滚目标不含知识库配置，跳过该项兼容性探针")
+          elif knowledge_enabled:
+              settings.validate_knowledge_base_configuration()
+              if settings.MILVUS_USERNAME.casefold() == "root":
+                  raise SystemExit("knowledge Milvus account cannot be root")
+              print("knowledge base configuration ok")
+          else:
+              print("knowledge base feature disabled")
           PY
 
           docker inspect fusion-api --format '{{range .Mounts}}{{println .Destination}}{{end}}' | grep -qx '/app/storage/files'
@@ -1306,6 +1528,10 @@ jobs:
           ROLLBACK_API_IMAGE_ID: ${{ steps.capture_rollback_target.outputs.api_image_id }}
           ROLLBACK_ADAPTER_IMAGE_REF: ${{ steps.capture_rollback_target.outputs.adapter_image_ref }}
           ROLLBACK_ADAPTER_IMAGE_ID: ${{ steps.capture_rollback_target.outputs.adapter_image_id }}
+          ROLLBACK_KNOWLEDGE_WORKER_EXISTED: ${{ steps.capture_rollback_target.outputs.knowledge_worker_existed }}
+          ROLLBACK_KNOWLEDGE_WORKER_IMAGE_REF: ${{ steps.capture_rollback_target.outputs.knowledge_worker_image_ref }}
+          ROLLBACK_KNOWLEDGE_WORKER_IMAGE_ID: ${{ steps.capture_rollback_target.outputs.knowledge_worker_image_id }}
+          ROLLBACK_KNOWLEDGE_BASE_ENABLED: ${{ steps.capture_rollback_target.outputs.knowledge_base_enabled }}
           ROLLBACK_MODEL_MANAGEMENT_CURRENT_TARGET: ${{ steps.capture_rollback_target.outputs.model_management_current_target }}
           ROLLBACK_MODEL_MANAGEMENT_TIMER_ENABLED: ${{ steps.capture_rollback_target.outputs.model_management_timer_enabled }}
           ROLLBACK_MODEL_MANAGEMENT_TIMER_ACTIVE: ${{ steps.capture_rollback_target.outputs.model_management_timer_active }}
@@ -1343,6 +1569,23 @@ jobs:
           ROLLBACK_LITELLM_MODEL_ADMISSION_WORKER_ENABLED: ${{ steps.capture_rollback_target.outputs.model_admission_worker_enabled }}
           DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS: ${{ vars.LITELLM_GOVERNANCE_MAX_AGE_SECONDS || '86400' }}
           DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN: ${{ secrets.LITELLM_MODEL_ADMISSION_WORKER_TOKEN }}
+          DEPLOY_KNOWLEDGE_EMBEDDING_MODEL: ${{ vars.KNOWLEDGE_EMBEDDING_MODEL }}
+          DEPLOY_KNOWLEDGE_EMBEDDING_REVISION: ${{ vars.KNOWLEDGE_EMBEDDING_REVISION }}
+          DEPLOY_KNOWLEDGE_EMBEDDING_DIMENSION: ${{ vars.KNOWLEDGE_EMBEDDING_DIMENSION || '1024' }}
+          DEPLOY_KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS: ${{ vars.KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS || '1024' }}
+          DEPLOY_KNOWLEDGE_CHUNK_SIZE: ${{ vars.KNOWLEDGE_CHUNK_SIZE || '1200' }}
+          DEPLOY_KNOWLEDGE_CHUNK_OVERLAP: ${{ vars.KNOWLEDGE_CHUNK_OVERLAP || '200' }}
+          DEPLOY_KNOWLEDGE_PARSE_TIMEOUT_SECONDS: ${{ vars.KNOWLEDGE_PARSE_TIMEOUT_SECONDS || '60' }}
+          DEPLOY_KNOWLEDGE_EMBEDDING_BATCH_SIZE: ${{ vars.KNOWLEDGE_EMBEDDING_BATCH_SIZE || '32' }}
+          DEPLOY_KNOWLEDGE_WORKER_LEASE_SECONDS: ${{ vars.KNOWLEDGE_WORKER_LEASE_SECONDS || '180' }}
+          DEPLOY_KNOWLEDGE_WORKER_HEARTBEAT_SECONDS: ${{ vars.KNOWLEDGE_WORKER_HEARTBEAT_SECONDS || '30' }}
+          DEPLOY_KNOWLEDGE_WORKER_MAX_ATTEMPTS: ${{ vars.KNOWLEDGE_WORKER_MAX_ATTEMPTS || '5' }}
+          DEPLOY_MILVUS_URI: ${{ vars.MILVUS_URI }}
+          DEPLOY_MILVUS_USERNAME: ${{ vars.MILVUS_USERNAME }}
+          DEPLOY_MILVUS_PASSWORD: ${{ secrets.MILVUS_PASSWORD }}
+          DEPLOY_MILVUS_DATABASE: ${{ vars.MILVUS_DATABASE }}
+          DEPLOY_MILVUS_COLLECTION_PREFIX: ${{ vars.MILVUS_COLLECTION_PREFIX || 'fusion_knowledge_chunks' }}
+          DEPLOY_MILVUS_DOCKER_NETWORK: ${{ vars.MILVUS_DOCKER_NETWORK || 'fusion_knowledge_milvus' }}
         run: |
           systemctl --user stop fusion-litellm-model-management.timer >/dev/null 2>&1 || true
           systemctl --user stop fusion-litellm-governance.timer >/dev/null 2>&1 || true
@@ -1393,6 +1636,24 @@ jobs:
           export LITELLM_MODEL_ADMISSION_WORKER_ENABLED="$(printf '%s' "${ROLLBACK_LITELLM_MODEL_ADMISSION_WORKER_ENABLED}" | tr '[:upper:]' '[:lower:]')"
           export LITELLM_GOVERNANCE_MAX_AGE_SECONDS="${DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS:-86400}"
           export LITELLM_MODEL_ADMISSION_WORKER_TOKEN="${DEPLOY_LITELLM_MODEL_ADMISSION_WORKER_TOKEN:-}"
+          export KNOWLEDGE_BASE_ENABLED="$(printf '%s' "${ROLLBACK_KNOWLEDGE_BASE_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')"
+          export KNOWLEDGE_EMBEDDING_MODEL="${DEPLOY_KNOWLEDGE_EMBEDDING_MODEL:-}"
+          export KNOWLEDGE_EMBEDDING_REVISION="${DEPLOY_KNOWLEDGE_EMBEDDING_REVISION:-}"
+          export KNOWLEDGE_EMBEDDING_DIMENSION="${DEPLOY_KNOWLEDGE_EMBEDDING_DIMENSION:-1024}"
+          export KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS="${DEPLOY_KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS:-1024}"
+          export KNOWLEDGE_CHUNK_SIZE="${DEPLOY_KNOWLEDGE_CHUNK_SIZE:-1200}"
+          export KNOWLEDGE_CHUNK_OVERLAP="${DEPLOY_KNOWLEDGE_CHUNK_OVERLAP:-200}"
+          export KNOWLEDGE_PARSE_TIMEOUT_SECONDS="${DEPLOY_KNOWLEDGE_PARSE_TIMEOUT_SECONDS:-60}"
+          export KNOWLEDGE_EMBEDDING_BATCH_SIZE="${DEPLOY_KNOWLEDGE_EMBEDDING_BATCH_SIZE:-32}"
+          export KNOWLEDGE_WORKER_LEASE_SECONDS="${DEPLOY_KNOWLEDGE_WORKER_LEASE_SECONDS:-180}"
+          export KNOWLEDGE_WORKER_HEARTBEAT_SECONDS="${DEPLOY_KNOWLEDGE_WORKER_HEARTBEAT_SECONDS:-30}"
+          export KNOWLEDGE_WORKER_MAX_ATTEMPTS="${DEPLOY_KNOWLEDGE_WORKER_MAX_ATTEMPTS:-5}"
+          export MILVUS_URI="${DEPLOY_MILVUS_URI:-}"
+          export MILVUS_USERNAME="${DEPLOY_MILVUS_USERNAME:-}"
+          export MILVUS_PASSWORD="${DEPLOY_MILVUS_PASSWORD:-}"
+          export MILVUS_DATABASE="${DEPLOY_MILVUS_DATABASE:-}"
+          export MILVUS_COLLECTION_PREFIX="${DEPLOY_MILVUS_COLLECTION_PREFIX:-fusion_knowledge_chunks}"
+          export MILVUS_DOCKER_NETWORK="${DEPLOY_MILVUS_DOCKER_NETWORK:-fusion_knowledge_milvus}"
           case "${LITELLM_GOVERNANCE_MAX_AGE_SECONDS}" in
             ''|*[!0-9]*|0) echo "治理快照最大年龄必须是正整数"; exit 1 ;;
           esac
@@ -1456,15 +1717,38 @@ jobs:
           current_api_id="$(docker inspect fusion-api --format '{{.Image}}' 2>/dev/null || true)"
           current_adapter_ref="$(docker inspect fusion-flyai-adapter --format '{{.Config.Image}}' 2>/dev/null || true)"
           current_adapter_id="$(docker inspect fusion-flyai-adapter --format '{{.Image}}' 2>/dev/null || true)"
+          current_worker_ref="$(docker inspect fusion-knowledge-worker --format '{{.Config.Image}}' 2>/dev/null || true)"
+          current_worker_id="$(docker inspect fusion-knowledge-worker --format '{{.Image}}' 2>/dev/null || true)"
+          worker_requires_restore="false"
+          case "${ROLLBACK_KNOWLEDGE_WORKER_EXISTED}" in
+            true)
+              if [ "${current_worker_ref}" != "${ROLLBACK_KNOWLEDGE_WORKER_IMAGE_REF}" ] \
+                || [ "${current_worker_id}" != "${ROLLBACK_KNOWLEDGE_WORKER_IMAGE_ID}" ]; then
+                worker_requires_restore="true"
+              fi
+              ;;
+            false)
+              if [ -n "${current_worker_ref}" ] || [ -n "${current_worker_id}" ]; then
+                worker_requires_restore="true"
+              fi
+              ;;
+            *) echo "知识库 Worker 回滚状态无效"; exit 1 ;;
+          esac
           if [ "${current_api_ref}" != "${ROLLBACK_API_IMAGE_REF}" ] \
             || [ "${current_api_id}" != "${ROLLBACK_API_IMAGE_ID}" ] \
             || [ "${current_adapter_ref}" != "${ROLLBACK_ADAPTER_IMAGE_REF}" ] \
-            || [ "${current_adapter_id}" != "${ROLLBACK_ADAPTER_IMAGE_ID}" ]; then
+            || [ "${current_adapter_id}" != "${ROLLBACK_ADAPTER_IMAGE_ID}" ] \
+            || [ "${worker_requires_restore}" = "true" ]; then
             if [ ! -f docker-compose.fusion-api-ghcr.yml ]; then
               echo "候选部署未生成 compose 文件且容器身份已变化，无法安全回滚"
               exit 1
             fi
-            docker compose -f docker-compose.fusion-api-ghcr.yml up -d
+            if [ "${ROLLBACK_KNOWLEDGE_WORKER_EXISTED}" = "true" ]; then
+              docker compose -f docker-compose.fusion-api-ghcr.yml --profile knowledge-worker up -d
+            else
+              docker compose -f docker-compose.fusion-api-ghcr.yml up -d
+              docker rm -f fusion-knowledge-worker >/dev/null 2>&1 || true
+            fi
           else
             echo "候选失败发生在容器变更前，原部署无需重建"
           fi
@@ -1481,6 +1765,18 @@ jobs:
           if [ "${restored_adapter_ref}" != "${ROLLBACK_ADAPTER_IMAGE_REF}" ] \
             || [ "${restored_adapter_id}" != "${ROLLBACK_ADAPTER_IMAGE_ID}" ]; then
             echo "fusion-flyai-adapter 回滚身份校验失败"
+            exit 1
+          fi
+          if [ "${ROLLBACK_KNOWLEDGE_WORKER_EXISTED}" = "true" ]; then
+            restored_worker_ref="$(docker inspect fusion-knowledge-worker --format '{{.Config.Image}}')"
+            restored_worker_id="$(docker inspect fusion-knowledge-worker --format '{{.Image}}')"
+            if [ "${restored_worker_ref}" != "${ROLLBACK_KNOWLEDGE_WORKER_IMAGE_REF}" ] \
+              || [ "${restored_worker_id}" != "${ROLLBACK_KNOWLEDGE_WORKER_IMAGE_ID}" ]; then
+              echo "fusion-knowledge-worker 回滚身份校验失败"
+              exit 1
+            fi
+          elif docker container inspect fusion-knowledge-worker >/dev/null 2>&1; then
+            echo "fusion-knowledge-worker 回滚清理失败"
             exit 1
           fi
 
@@ -1510,6 +1806,20 @@ jobs:
           if [ "${adapter_healthy}" != "1" ]; then
             docker logs --tail=120 fusion-flyai-adapter || true
             exit 1
+          fi
+          if [ "${ROLLBACK_KNOWLEDGE_WORKER_EXISTED}" = "true" ]; then
+            worker_healthy=0
+            for attempt in $(seq 1 30); do
+              if [ "$(docker inspect fusion-knowledge-worker --format '{{.State.Health.Status}}' 2>/dev/null || true)" = "healthy" ]; then
+                worker_healthy=1
+                break
+              fi
+              sleep 2
+            done
+            if [ "${worker_healthy}" != "1" ]; then
+              docker logs --tail=120 fusion-knowledge-worker || true
+              exit 1
+            fi
           fi
 
           rollback_api_prefix="${IMAGE_NAME}:"
