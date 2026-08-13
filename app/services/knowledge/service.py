@@ -111,11 +111,13 @@ class KnowledgeService:
             distance_metric=profile.distance_metric,
         )
         try:
+            created = self.repo.create_knowledge_base(
+                row,
+                max_bases=settings.KNOWLEDGE_MAX_BASES_PER_USER,
+            )
             return self._base_view(
-                self.repo.create_knowledge_base(
-                    row,
-                    max_bases=settings.KNOWLEDGE_MAX_BASES_PER_USER,
-                )
+                created,
+                document_stats={"total": 0, "ready": 0, "processing": 0, "failed": 0},
             )
         except KnowledgeBaseLimitExceeded as exc:
             raise ApiException.bad_request("已达到每用户知识库数量上限") from exc
@@ -776,14 +778,19 @@ class KnowledgeService:
             query = query.filter(KnowledgeIndexTask.document_id == document_id)
         return query.order_by(KnowledgeIndexTask.created_at.desc()).first()
 
-    def _base_view(self, row: KnowledgeBase) -> KnowledgeBaseView:
+    def _base_view(
+        self,
+        row: KnowledgeBase,
+        *,
+        document_stats: dict[str, int] | None = None,
+    ) -> KnowledgeBaseView:
         return KnowledgeBaseView(
             id=row.id,
             name=row.name,
             description=row.description,
             business_type=row.business_type,
             status=row.status,
-            document_stats=self.repo.document_stats(row.id),
+            document_stats=document_stats if document_stats is not None else self.repo.document_stats(row.id),
             embedding_provider=row.embedding_provider,
             embedding_model=row.embedding_model,
             embedding_revision=row.embedding_revision,

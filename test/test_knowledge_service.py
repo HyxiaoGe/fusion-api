@@ -13,7 +13,13 @@ from starlette.datastructures import Headers
 
 from app.db.database import Base
 from app.db.knowledge_repository import KnowledgeBaseWriteConflict
-from app.db.models import KnowledgeChunkManifest, KnowledgeStorageCleanupTask, KnowledgeStorageUploadIntent, User
+from app.db.models import (
+    KnowledgeBase,
+    KnowledgeChunkManifest,
+    KnowledgeStorageCleanupTask,
+    KnowledgeStorageUploadIntent,
+    User,
+)
 from app.schemas.knowledge import KnowledgeBaseCreate, KnowledgeBaseUpdate, KnowledgeRetrievalRequest
 from app.schemas.response import ApiException
 from app.services.knowledge.milvus import KnowledgeVectorError, KnowledgeVectorHit
@@ -170,6 +176,41 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(duplicate.exception.status_code, 409)
 
+    def test_create_returns_without_any_post_commit_query(self):
+        committed = False
+
+        def mark_committed(_session):
+            nonlocal committed
+            committed = True
+
+        def reject_post_commit_sql(*_args):
+            if committed:
+                raise AssertionError("创建事务提交后禁止继续查询")
+
+        with sessionmaker(bind=self.engine, expire_on_commit=True)() as create_db:
+            create_service = KnowledgeService(
+                create_db,
+                storage=self.storage,
+                embedding=self.embedding,
+                vector_store=self.vector_store,
+            )
+            event.listen(create_db, "after_commit", mark_committed)
+            event.listen(self.engine, "before_cursor_execute", reject_post_commit_sql)
+            try:
+                created = create_service.create_knowledge_base(
+                    "user-1",
+                    KnowledgeBaseCreate(name="产品手册", description="说明", business_type="product"),
+                )
+            finally:
+                event.remove(self.engine, "before_cursor_execute", reject_post_commit_sql)
+                event.remove(create_db, "after_commit", mark_committed)
+
+        self.assertEqual(created.document_stats.total, 0)
+        with sessionmaker(bind=self.engine, expire_on_commit=False)() as verification_db:
+            self.assertEqual(verification_db.query(KnowledgeStorageCleanupTask).count(), 0)
+            self.assertEqual(verification_db.query(User).filter_by(id="user-1").count(), 1)
+            self.assertEqual(verification_db.query(KnowledgeBase).count(), 1)
+
     def test_expanded_normalized_name_is_rejected_before_database_write(self):
         expanding_name = "ﬃ" * 120
         create_payload = KnowledgeBaseCreate.model_construct(
@@ -201,12 +242,20 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
             task_type="delete_knowledge_base",
         )
         task.status = "failed"
+        task.cleanup_profile_cursor = "profile-cursor"
+        task.cleanup_cursor = "document-cursor"
+        task.cleanup_vectors_completed = True
+        task.attempt_count = task.max_attempts
         self.db.commit()
 
         second = self.service.delete_knowledge_base("user-1", created.id)
 
-        self.assertNotEqual(first.id, second.id)
+        self.assertEqual(first.id, second.id)
         self.assertEqual(second.status, "pending")
+        self.assertEqual(second.attempt_count, 0)
+        self.assertEqual(task.cleanup_profile_cursor, "profile-cursor")
+        self.assertEqual(task.cleanup_cursor, "document-cursor")
+        self.assertTrue(task.cleanup_vectors_completed)
 
     def test_document_mutations_lock_base_before_document(self):
         for operation in (self.service.delete_document, self.service.retry_document):

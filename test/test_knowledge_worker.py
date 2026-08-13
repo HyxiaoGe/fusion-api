@@ -112,6 +112,7 @@ class KnowledgeWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.vector_store.ensure_collection = AsyncMock(return_value="knowledge_v1_d2")
         self.vector_store.upsert_prepared = AsyncMock()
         self.vector_store.delete_index_version = AsyncMock()
+        self.vector_store.delete_knowledge_base = AsyncMock()
 
     def tearDown(self):
         self.engine.dispose()
@@ -475,6 +476,119 @@ class KnowledgeWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.vector_store.ensure_collection.assert_awaited_once()
         self.assertEqual(self.vector_store.upsert_prepared.await_count, 1)
         self.vector_store.delete_index_version.assert_not_awaited()
+
+    async def test_knowledge_base_delete_persists_profile_and_storage_batch_progress(self):
+        with self.Session() as db:
+            knowledge_base = db.get(KnowledgeBase, "kb-1")
+            knowledge_base.status = "deleting"
+            task = db.get(KnowledgeIndexTask, "task-1")
+            task.task_type = "delete_knowledge_base"
+            task.document_id = None
+            task.index_version = None
+            for index in range(1, 6):
+                if index == 1:
+                    document = db.get(KnowledgeDocument, "doc-1")
+                    version = db.get(KnowledgeIndexVersion, "version-1")
+                else:
+                    document = KnowledgeDocument(
+                        id=f"doc-{index}",
+                        knowledge_base_id="kb-1",
+                        user_id="user-1",
+                        original_filename=f"manual-{index}.txt",
+                        mimetype="text/plain",
+                        size=12,
+                        checksum_sha256=f"{index:064x}",
+                        dedupe_key=f"{index:064x}",
+                        storage_backend="local",
+                        storage_key=f"knowledge/doc-{index}",
+                        status="deleting",
+                        parser_version="parser-v1",
+                        chunker_version="chunker-v2",
+                        embedding_provider="litellm",
+                        embedding_model="embed-v1",
+                        embedding_revision="embed-r1",
+                        embedding_dimension=2,
+                        distance_metric="COSINE",
+                        desired_index_version=f"version-{index}",
+                        active_index_version=f"version-{index}",
+                    )
+                    version = KnowledgeIndexVersion(
+                        id=f"version-{index}",
+                        knowledge_base_id="kb-1",
+                        document_id=document.id,
+                        user_id="user-1",
+                        status="active",
+                        parser_version="parser-v1",
+                        chunker_version="chunker-v2",
+                        chunk_size=1200,
+                        chunk_overlap=200,
+                        embedding_provider="litellm",
+                        embedding_model="embed-v1",
+                        embedding_revision="embed-r1",
+                        embedding_dimension=2,
+                        distance_metric="COSINE",
+                        collection_name="knowledge_v1_d2",
+                    )
+                    db.add_all([document, version])
+                document.status = "deleting"
+                document.active_index_version = version.id
+                if index in {3, 4}:
+                    version.embedding_revision = "embed-r2"
+                    version.collection_name = "knowledge_r2_d2"
+                elif index == 5:
+                    version.embedding_revision = "embed-r3"
+                    version.collection_name = "knowledge_r3_d2"
+            db.commit()
+
+        worker = KnowledgeWorker(
+            self.Session,
+            worker_id="worker-delete-base",
+            embedding=self.embedding,
+            vector_store=self.vector_store,
+        )
+        with (
+            patch("app.services.knowledge.worker.get_storage_for_backend", return_value=self.storage),
+            patch("app.services.knowledge.worker.KNOWLEDGE_BASE_DELETE_PROFILE_BATCH_SIZE", 2),
+            patch("app.services.knowledge.worker.KNOWLEDGE_BASE_DELETE_BATCH_SIZE", 2),
+            patch("app.services.knowledge.worker.settings.FILE_UPLOAD_TIMEOUT_SECONDS", 5),
+        ):
+            self.assertTrue(await worker.run_once())
+            with self.Session() as db:
+                task = db.get(KnowledgeIndexTask, "task-1")
+                self.assertEqual(task.status, "pending")
+                self.assertEqual(task.attempt_count, 0)
+                self.assertFalse(task.cleanup_vectors_completed)
+                self.assertIsNotNone(task.cleanup_profile_cursor)
+                self.assertEqual(task.cleanup_cursor, None)
+            self.assertEqual(self.vector_store.delete_knowledge_base.await_count, 2)
+            self.storage.delete.assert_not_awaited()
+
+            self.assertTrue(await worker.run_once())
+            self.assertEqual(self.vector_store.delete_knowledge_base.await_count, 3)
+            self.assertEqual(self.storage.delete.await_count, 2)
+            with self.Session() as db:
+                task = db.get(KnowledgeIndexTask, "task-1")
+                self.assertEqual(task.status, "pending")
+                self.assertEqual(task.attempt_count, 0)
+                self.assertTrue(task.cleanup_vectors_completed)
+                self.assertEqual(task.cleanup_cursor, "doc-2")
+
+            self.assertTrue(await worker.run_once())
+            self.assertEqual(self.vector_store.delete_knowledge_base.await_count, 3)
+            self.assertEqual(self.storage.delete.await_count, 4)
+
+            self.assertTrue(await worker.run_once())
+
+        self.assertEqual(self.vector_store.delete_knowledge_base.await_count, 3)
+        self.assertEqual(self.storage.delete.await_count, 5)
+        with self.Session() as db:
+            task = db.get(KnowledgeIndexTask, "task-1")
+            self.assertEqual(task.status, "completed")
+            self.assertEqual(db.get(KnowledgeBase, "kb-1").status, "deleted")
+            self.assertEqual(
+                {row.status for row in db.query(KnowledgeDocument).filter_by(knowledge_base_id="kb-1")},
+                {"deleted"},
+            )
 
 
 if __name__ == "__main__":

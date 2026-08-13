@@ -401,6 +401,9 @@ class KnowledgeIndexTask(Base):
     heartbeat_at = Column(DateTime(timezone=True), nullable=True)
     error_code = Column(String(120), nullable=True)
     error_summary = Column(String(500), nullable=True)
+    cleanup_profile_cursor = Column(String(36), nullable=True)
+    cleanup_cursor = Column(String(36), nullable=True)
+    cleanup_vectors_completed = Column(Boolean, nullable=False, default=False, server_default="false")
     created_at = Column(DateTime(timezone=True), default=utc_now, server_default=func.now(), nullable=False)
     updated_at = Column(
         DateTime(timezone=True),

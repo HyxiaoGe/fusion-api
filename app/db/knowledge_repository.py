@@ -38,6 +38,26 @@ class ReadyKnowledgeDocument:
     active_version: KnowledgeIndexVersion
 
 
+@dataclass(frozen=True)
+class KnowledgeCleanupVectorProfile:
+    cursor: str
+    embedding_provider: str
+    embedding_model: str
+    embedding_dimension: int
+    distance_metric: str
+    collection_name: str
+    embedding_revision: str
+    milvus_uri: str | None
+    milvus_database: str | None
+
+
+@dataclass(frozen=True)
+class KnowledgeCleanupStorageObject:
+    document_id: str
+    storage_backend: str
+    storage_key: str
+
+
 class KnowledgeBaseWriteConflict(RuntimeError):
     """文档提交前知识库已进入不可写状态。"""
 
@@ -71,13 +91,18 @@ class KnowledgeRepository:
                 self.db.rollback()
                 raise KnowledgeBaseLimitExceeded
         self.db.add(knowledge_base)
+        expire_on_commit = self.db.expire_on_commit
         try:
-            self.db.commit()
+            self.db.expire_on_commit = False
+            self.db.flush()
             self.db.refresh(knowledge_base)
+            self.db.commit()
             return knowledge_base
         except Exception:
             self.db.rollback()
             raise
+        finally:
+            self.db.expire_on_commit = expire_on_commit
 
     def list_knowledge_bases(
         self,
@@ -549,15 +574,41 @@ class KnowledgeRepository:
             {"status": "cancelled", "completed_at": utc_now(), "updated_at": utc_now()},
             synchronize_session=False,
         )
-        task = KnowledgeIndexTask(
-            knowledge_base_id=knowledge_base.id,
-            user_id=knowledge_base.user_id,
-            task_type="delete_knowledge_base",
-            status="pending",
-            phase="queued",
-            max_attempts=max_attempts,
+        task = (
+            self.db.query(KnowledgeIndexTask)
+            .filter(
+                KnowledgeIndexTask.knowledge_base_id == knowledge_base.id,
+                KnowledgeIndexTask.task_type == "delete_knowledge_base",
+                KnowledgeIndexTask.status == "failed",
+            )
+            .order_by(KnowledgeIndexTask.created_at.desc())
+            .with_for_update()
+            .first()
         )
-        self.db.add(task)
+        if task is None:
+            task = KnowledgeIndexTask(
+                knowledge_base_id=knowledge_base.id,
+                user_id=knowledge_base.user_id,
+                task_type="delete_knowledge_base",
+                status="pending",
+                phase="queued",
+                max_attempts=max_attempts,
+            )
+            self.db.add(task)
+        else:
+            task.status = "pending"
+            task.phase = "deleting"
+            task.attempt_count = 0
+            task.max_attempts = max_attempts
+            task.available_at = utc_now()
+            task.lease_owner = None
+            task.lease_token_hash = None
+            task.lease_expires_at = None
+            task.heartbeat_at = None
+            task.error_code = None
+            task.error_summary = None
+            task.completed_at = None
+            task.updated_at = utc_now()
         try:
             self.db.commit()
             self.db.refresh(task)
@@ -1116,8 +1167,159 @@ class KnowledgeRepository:
         self.db.commit()
         return True
 
-    def documents_for_cleanup(self, knowledge_base_id: str) -> list[KnowledgeDocument]:
-        return self.db.query(KnowledgeDocument).filter(KnowledgeDocument.knowledge_base_id == knowledge_base_id).all()
+    def knowledge_base_cleanup_profiles(
+        self,
+        *,
+        task_id: str,
+        lease_token: str,
+        limit: int,
+    ) -> tuple[bool, bool, list[KnowledgeCleanupVectorProfile]] | None:
+        task = self._lock_task(task_id)
+        if (
+            not self._lease_matches(task, lease_token, utc_now())
+            or task is None
+            or task.task_type != "delete_knowledge_base"
+        ):
+            self.db.rollback()
+            return None
+        if task.cleanup_vectors_completed:
+            self.db.rollback()
+            return True, False, []
+        profile_cursor = func.min(KnowledgeIndexVersion.id).label("profile_cursor")
+        profile_columns = (
+            KnowledgeIndexVersion.embedding_provider,
+            KnowledgeIndexVersion.embedding_model,
+            KnowledgeIndexVersion.embedding_dimension,
+            KnowledgeIndexVersion.distance_metric,
+            KnowledgeIndexVersion.collection_name,
+            KnowledgeIndexVersion.embedding_revision,
+            KnowledgeIndexVersion.milvus_uri,
+            KnowledgeIndexVersion.milvus_database,
+        )
+        query = (
+            self.db.query(
+                profile_cursor,
+                KnowledgeIndexVersion.embedding_provider,
+                KnowledgeIndexVersion.embedding_model,
+                KnowledgeIndexVersion.embedding_dimension,
+                KnowledgeIndexVersion.distance_metric,
+                KnowledgeIndexVersion.collection_name,
+                KnowledgeIndexVersion.embedding_revision,
+                KnowledgeIndexVersion.milvus_uri,
+                KnowledgeIndexVersion.milvus_database,
+            )
+            .filter(
+                KnowledgeIndexVersion.knowledge_base_id == task.knowledge_base_id,
+                KnowledgeIndexVersion.status != "deleted",
+            )
+            .group_by(*profile_columns)
+        )
+        if task.cleanup_profile_cursor is not None:
+            query = query.having(profile_cursor > task.cleanup_profile_cursor)
+        rows = query.order_by(profile_cursor.asc()).limit(limit + 1).all()
+        self.db.rollback()
+        return False, len(rows) > limit, [KnowledgeCleanupVectorProfile(*tuple(row)) for row in rows[:limit]]
+
+    def checkpoint_knowledge_base_profile_cleanup(
+        self,
+        *,
+        task_id: str,
+        lease_token: str,
+        cursor: str,
+    ) -> bool:
+        task = self._lock_task(task_id)
+        if (
+            not self._lease_matches(task, lease_token, utc_now())
+            or task is None
+            or task.task_type != "delete_knowledge_base"
+            or task.cleanup_vectors_completed
+            or (task.cleanup_profile_cursor is not None and cursor <= task.cleanup_profile_cursor)
+        ):
+            self.db.rollback()
+            return False
+        task.cleanup_profile_cursor = cursor
+        self._requeue_cleanup_checkpoint(task)
+        self.db.commit()
+        return True
+
+    def mark_knowledge_base_vectors_cleaned(self, *, task_id: str, lease_token: str) -> bool:
+        task = self._lock_task(task_id)
+        if (
+            not self._lease_matches(task, lease_token, utc_now())
+            or task is None
+            or task.task_type != "delete_knowledge_base"
+        ):
+            self.db.rollback()
+            return False
+        task.cleanup_vectors_completed = True
+        task.cleanup_profile_cursor = None
+        task.updated_at = utc_now()
+        self.db.commit()
+        return True
+
+    def knowledge_base_cleanup_batch(
+        self,
+        *,
+        task_id: str,
+        lease_token: str,
+        limit: int,
+    ) -> list[KnowledgeCleanupStorageObject] | None:
+        task = self._lock_task(task_id)
+        if (
+            not self._lease_matches(task, lease_token, utc_now())
+            or task is None
+            or task.task_type != "delete_knowledge_base"
+            or not task.cleanup_vectors_completed
+        ):
+            self.db.rollback()
+            return None
+        query = self.db.query(
+            KnowledgeDocument.id,
+            KnowledgeDocument.storage_backend,
+            KnowledgeDocument.storage_key,
+        ).filter(
+            KnowledgeDocument.knowledge_base_id == task.knowledge_base_id,
+            KnowledgeDocument.status != "deleted",
+        )
+        if task.cleanup_cursor is not None:
+            query = query.filter(KnowledgeDocument.id > task.cleanup_cursor)
+        rows = query.order_by(KnowledgeDocument.id.asc()).limit(limit).all()
+        self.db.rollback()
+        return [KnowledgeCleanupStorageObject(*tuple(row)) for row in rows]
+
+    def checkpoint_knowledge_base_cleanup(
+        self,
+        *,
+        task_id: str,
+        lease_token: str,
+        cursor: str,
+    ) -> bool:
+        task = self._lock_task(task_id)
+        if (
+            not self._lease_matches(task, lease_token, utc_now())
+            or task is None
+            or task.task_type != "delete_knowledge_base"
+            or (task.cleanup_cursor is not None and cursor <= task.cleanup_cursor)
+        ):
+            self.db.rollback()
+            return False
+        task.cleanup_cursor = cursor
+        self._requeue_cleanup_checkpoint(task)
+        self.db.commit()
+        return True
+
+    @staticmethod
+    def _requeue_cleanup_checkpoint(task: KnowledgeIndexTask) -> None:
+        now = utc_now()
+        task.status = "pending"
+        task.phase = "deleting"
+        task.attempt_count = 0
+        task.available_at = now
+        task.updated_at = now
+        task.lease_owner = None
+        task.lease_token_hash = None
+        task.lease_expires_at = None
+        task.heartbeat_at = None
 
     def _cancel_non_delete_document_tasks(self, document_id: str) -> None:
         now = utc_now()

@@ -15,7 +15,12 @@ from sqlalchemy.orm import Session
 from app.ai.embeddings.base import EmbeddingAdapter, EmbeddingError, EmbeddingProfile
 from app.ai.embeddings.litellm_embedding import LiteLLMEmbeddingAdapter
 from app.core.config import settings
-from app.db.knowledge_repository import ClaimedKnowledgeTask, KnowledgeRepository
+from app.db.knowledge_repository import (
+    ClaimedKnowledgeTask,
+    KnowledgeCleanupStorageObject,
+    KnowledgeCleanupVectorProfile,
+    KnowledgeRepository,
+)
 from app.db.models import KnowledgeDocument, KnowledgeIndexVersion
 from app.services.knowledge.chunker import (
     DeterministicKnowledgeChunker,
@@ -32,6 +37,9 @@ from app.services.knowledge.parser import KnowledgeDocumentParser, KnowledgePars
 from app.services.storage import get_storage_for_backend
 
 logger = logging.getLogger(__name__)
+KNOWLEDGE_BASE_DELETE_BATCH_SIZE = 50
+KNOWLEDGE_BASE_DELETE_PROFILE_BATCH_SIZE = 4
+KNOWLEDGE_BASE_DELETE_STORAGE_CONCURRENCY = 4
 
 
 class KnowledgeWorkerError(RuntimeError):
@@ -184,7 +192,7 @@ class KnowledgeWorker:
         elif context.task_type == "delete_document":
             await self._delete_document(context, lease_token)
         elif context.task_type == "delete_knowledge_base":
-            await self._delete_knowledge_base(context, lease_token)
+            return await self._delete_knowledge_base(context, lease_token)
         elif context.task_type == "delete_index_version":
             await self._delete_index_version(context, lease_token)
         else:
@@ -382,15 +390,69 @@ class KnowledgeWorker:
         if not deleted:
             raise KnowledgeWorkerError("KNOWLEDGE_TASK_LEASE_LOST", "知识库任务租约已失效", retryable=True)
 
-    async def _delete_knowledge_base(self, context: TaskContext, lease_token: str) -> None:
+    async def _delete_knowledge_base(self, context: TaskContext, lease_token: str) -> bool:
         self._phase(context.task_id, lease_token, "deleting")
         with self.session_factory() as db:
-            documents = KnowledgeRepository(db).documents_for_cleanup(context.knowledge_base_id)
-            detached = [(document, list(document.index_versions)) for document in documents]
-        for document, versions in detached:
-            for version in versions:
-                await self.vector_store.delete_index_version(self._version_profile(version), version.id)
-            await self._delete_storage_object(document)
+            cleanup_profiles = KnowledgeRepository(db).knowledge_base_cleanup_profiles(
+                task_id=context.task_id,
+                lease_token=lease_token,
+                limit=KNOWLEDGE_BASE_DELETE_PROFILE_BATCH_SIZE,
+            )
+        if cleanup_profiles is None:
+            raise KnowledgeWorkerError("KNOWLEDGE_TASK_LEASE_LOST", "知识库任务租约已失效", retryable=True)
+        vectors_completed, has_more_profiles, profiles = cleanup_profiles
+        if not vectors_completed:
+            for profile in profiles:
+                await self.vector_store.delete_knowledge_base(
+                    self._version_profile(profile),
+                    context.knowledge_base_id,
+                )
+            if has_more_profiles:
+                with self.session_factory() as db:
+                    checkpointed = KnowledgeRepository(db).checkpoint_knowledge_base_profile_cleanup(
+                        task_id=context.task_id,
+                        lease_token=lease_token,
+                        cursor=profiles[-1].cursor,
+                    )
+                if not checkpointed:
+                    raise KnowledgeWorkerError(
+                        "KNOWLEDGE_TASK_LEASE_LOST",
+                        "知识库任务租约已失效",
+                        retryable=True,
+                    )
+                return True
+            with self.session_factory() as db:
+                if not KnowledgeRepository(db).mark_knowledge_base_vectors_cleaned(
+                    task_id=context.task_id,
+                    lease_token=lease_token,
+                ):
+                    raise KnowledgeWorkerError(
+                        "KNOWLEDGE_TASK_LEASE_LOST",
+                        "知识库任务租约已失效",
+                        retryable=True,
+                    )
+        with self.session_factory() as db:
+            batch = KnowledgeRepository(db).knowledge_base_cleanup_batch(
+                task_id=context.task_id,
+                lease_token=lease_token,
+                limit=KNOWLEDGE_BASE_DELETE_BATCH_SIZE,
+            )
+        if batch is None:
+            raise KnowledgeWorkerError("KNOWLEDGE_TASK_LEASE_LOST", "知识库任务租约已失效", retryable=True)
+        await asyncio.wait_for(
+            self._delete_storage_batch(batch),
+            timeout=settings.FILE_UPLOAD_TIMEOUT_SECONDS,
+        )
+        if len(batch) == KNOWLEDGE_BASE_DELETE_BATCH_SIZE:
+            with self.session_factory() as db:
+                checkpointed = KnowledgeRepository(db).checkpoint_knowledge_base_cleanup(
+                    task_id=context.task_id,
+                    lease_token=lease_token,
+                    cursor=batch[-1].document_id,
+                )
+            if not checkpointed:
+                raise KnowledgeWorkerError("KNOWLEDGE_TASK_LEASE_LOST", "知识库任务租约已失效", retryable=True)
+            return True
         with self.session_factory() as db:
             deleted = KnowledgeRepository(db).mark_knowledge_base_deleted(
                 context.knowledge_base_id,
@@ -399,6 +461,16 @@ class KnowledgeWorker:
             )
         if not deleted:
             raise KnowledgeWorkerError("KNOWLEDGE_TASK_LEASE_LOST", "知识库任务租约已失效", retryable=True)
+        return False
+
+    async def _delete_storage_batch(self, batch: list[KnowledgeCleanupStorageObject]) -> None:
+        semaphore = asyncio.Semaphore(KNOWLEDGE_BASE_DELETE_STORAGE_CONCURRENCY)
+
+        async def delete_one(storage_object: KnowledgeCleanupStorageObject) -> None:
+            async with semaphore:
+                await self._delete_storage_object(storage_object)
+
+        await asyncio.gather(*(delete_one(storage_object) for storage_object in batch))
 
     async def _delete_index_version(self, context: TaskContext, lease_token: str) -> None:
         self._phase(context.task_id, lease_token, "deleting")
@@ -430,7 +502,10 @@ class KnowledgeWorker:
         if not deleted:
             raise KnowledgeWorkerError("KNOWLEDGE_TASK_LEASE_LOST", "知识库任务租约已失效", retryable=True)
 
-    async def _delete_storage_object(self, document: KnowledgeDocument) -> None:
+    async def _delete_storage_object(
+        self,
+        document: KnowledgeDocument | KnowledgeCleanupStorageObject,
+    ) -> None:
         storage = get_storage_for_backend(document.storage_backend)
         if not await storage.exists(document.storage_key):
             return
@@ -495,7 +570,9 @@ class KnowledgeWorker:
         return max(1, int(settings.MILVUS_TIMEOUT_SECONDS * 4 + 5))
 
     @staticmethod
-    def _version_profile(version: KnowledgeIndexVersion) -> EmbeddingProfile:
+    def _version_profile(
+        version: KnowledgeIndexVersion | KnowledgeCleanupVectorProfile,
+    ) -> EmbeddingProfile:
         return EmbeddingProfile(
             version.embedding_provider,
             version.embedding_model,
