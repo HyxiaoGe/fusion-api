@@ -43,16 +43,19 @@ def bootstrap() -> None:
         assigned_roles = [assigned_roles]
     if role not in assigned_roles:
         admin.grant_role(user_name=app_username, role_name=role)
-    try:
-        admin.grant_privilege_v2(
-            role_name=role,
-            privilege="DatabaseReadWrite",
-            collection_name="*",
-            db_name=database,
-        )
-    except Exception as exc:
-        if not _already_exists(exc):
-            raise
+    # Milvus 的数据库级与 collection 级权限不会相互继承：前者负责发现、
+    # 创建 collection，后者负责建索引和读写其中的数据，两者缺一不可。
+    for privilege in ("DatabaseReadWrite", "CollectionReadWrite"):
+        try:
+            admin.grant_privilege_v2(
+                role_name=role,
+                privilege=privilege,
+                collection_name="*",
+                db_name=database,
+            )
+        except Exception as exc:
+            if not _already_exists(exc):
+                raise
 
     application = MilvusClient(
         uri=uri,

@@ -124,6 +124,11 @@ export MILVUS_DATABASE=fusion_knowledge
 python -m scripts.bootstrap_knowledge_milvus
 ```
 
+bootstrap 会在专用数据库内同时授予应用角色 `DatabaseReadWrite` 和
+`CollectionReadWrite`。Milvus 的数据库级与 collection 级权限不级联：前者用于发现、
+创建 collection，后者用于创建索引以及执行查询、搜索、写入和删除。已有环境升级后也应
+用 root 重新幂等执行一次 bootstrap；root 凭据不得写入应用或 Worker 配置。
+
 启动 API 与独立 Worker 的组合覆盖：
 
 ```bash
