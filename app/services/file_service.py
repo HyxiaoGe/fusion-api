@@ -527,9 +527,12 @@ class FileService:
         except StorageUploadFenceLost as exc:
             lifecycle.detach_request()
             raise FileStorageUnavailableError("对象上传期间持久清理 fence 已失效") from exc
-        except BaseException:
+        except asyncio.CancelledError:
             lifecycle.detach_request()
             raise
+        except Exception as exc:
+            lifecycle.detach_request()
+            raise FileStorageUnavailableError("对象存储暂时不可用，请稍后重试") from exc
         return lifecycle
 
     async def _commit_new_file_with_upload_fences(

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
 from app.ai.embeddings.base import EmbeddingProfile
-from app.core.config import settings
+from app.core.config import KNOWLEDGE_MILVUS_FILTER_TERM_BATCH_SIZE, settings
 from app.services.knowledge.chunker import KnowledgeChunk
 
 
@@ -180,33 +181,48 @@ class MilvusKnowledgeStore:
         if not knowledge_base_ids or not index_versions:
             return []
         collection = self._profile_collection(profile)
-        filter_expression = self.build_search_filter(user_id, knowledge_base_ids, index_versions)
-        result = await self._call(
-            lambda client: client.search(
-                collection_name=collection,
-                data=[query_vector],
-                anns_field="vector",
-                filter=filter_expression,
-                limit=limit,
-                output_fields=[
-                    "document_id",
-                    "knowledge_base_id",
-                    "index_version",
-                    "text",
-                    "filename",
-                    "char_start",
-                    "char_end",
-                    "page",
-                    "section",
-                ],
-                search_params={"metric_type": profile.distance_metric},
-                consistency_level="Strong",
-                timeout=settings.MILVUS_TIMEOUT_SECONDS,
-            ),
-            profile=profile,
-        )
-        rows = result[0] if result else []
-        return [self._hit_from_result(row) for row in rows]
+        unique_versions = sorted(set(index_versions))
+
+        def search_batches(client: Any) -> list[Any]:
+            rows: list[Any] = []
+            for offset in range(0, len(unique_versions), KNOWLEDGE_MILVUS_FILTER_TERM_BATCH_SIZE):
+                version_batch = unique_versions[offset : offset + KNOWLEDGE_MILVUS_FILTER_TERM_BATCH_SIZE]
+                result = client.search(
+                    collection_name=collection,
+                    data=[query_vector],
+                    anns_field="vector",
+                    filter=self.build_search_filter(user_id, knowledge_base_ids, version_batch),
+                    limit=limit,
+                    output_fields=[
+                        "document_id",
+                        "knowledge_base_id",
+                        "index_version",
+                        "text",
+                        "filename",
+                        "char_start",
+                        "char_end",
+                        "page",
+                        "section",
+                    ],
+                    search_params={"metric_type": profile.distance_metric},
+                    consistency_level="Strong",
+                    timeout=settings.MILVUS_TIMEOUT_SECONDS,
+                )
+                rows.extend(result[0] if result else [])
+            return rows
+
+        rows = await self._call(search_batches, profile=profile)
+        hits_by_key: dict[tuple[str, str, str, str], KnowledgeVectorHit] = {}
+        for row in rows:
+            hit = self._hit_from_result(row)
+            key = (hit.knowledge_base_id, hit.document_id, hit.index_version, hit.chunk_id)
+            previous = hits_by_key.get(key)
+            if previous is None or hit.similarity > previous.similarity:
+                hits_by_key[key] = hit
+        return sorted(
+            hits_by_key.values(),
+            key=lambda hit: (-hit.similarity, hit.chunk_id, hit.document_id, hit.index_version),
+        )[:limit]
 
     async def delete_document(self, profile: EmbeddingProfile, document_id: str) -> None:
         await self._delete(profile, f"document_id == {self._quote(document_id)}")
@@ -321,22 +337,60 @@ class MilvusKnowledgeStore:
 
     @staticmethod
     def _hit_from_result(row: Any) -> KnowledgeVectorHit:
-        entity = row.get("entity", {}) if isinstance(row, dict) else getattr(row, "entity", {})
-        read = entity.get if isinstance(entity, dict) else lambda name, default=None: getattr(entity, name, default)
-        row_get = row.get if isinstance(row, dict) else lambda name, default=None: getattr(row, name, default)
-        return KnowledgeVectorHit(
-            chunk_id=str(row_get("id", row_get("chunk_id", ""))),
-            document_id=str(read("document_id", "")),
-            knowledge_base_id=str(read("knowledge_base_id", "")),
-            index_version=str(read("index_version", "")),
-            text=str(read("text", "")),
-            similarity=float(row_get("distance", 0.0)),
-            filename=str(read("filename", "")),
-            char_start=int(read("char_start", 0)),
-            char_end=int(read("char_end", 0)),
-            page=(int(read("page", 0)) or None),
-            section=str(read("section", "")) or None,
-        )
+        try:
+            entity = row.get("entity", {}) if isinstance(row, dict) else getattr(row, "entity", {})
+            read = entity.get if isinstance(entity, dict) else lambda name, default=None: getattr(entity, name, default)
+            row_get = row.get if isinstance(row, dict) else lambda name, default=None: getattr(row, name, default)
+            chunk_id = row_get("id", row_get("chunk_id", ""))
+            document_id = read("document_id", "")
+            knowledge_base_id = read("knowledge_base_id", "")
+            index_version = read("index_version", "")
+            similarity_value = row_get("distance", 0.0)
+            char_start_value = read("char_start", 0)
+            char_end_value = read("char_end", 0)
+            page_value = read("page", 0)
+            if (
+                any(
+                    not isinstance(value, str) or not value
+                    for value in (chunk_id, document_id, knowledge_base_id, index_version)
+                )
+                or isinstance(similarity_value, bool)
+                or isinstance(char_start_value, bool)
+                or isinstance(char_end_value, bool)
+                or isinstance(page_value, bool)
+            ):
+                raise ValueError("invalid Milvus hit field types")
+            similarity = float(similarity_value)
+            char_start = int(char_start_value)
+            char_end = int(char_end_value)
+            page_number = int(page_value)
+            hit = KnowledgeVectorHit(
+                chunk_id=chunk_id,
+                document_id=document_id,
+                knowledge_base_id=knowledge_base_id,
+                index_version=index_version,
+                text=str(read("text", "")),
+                similarity=similarity,
+                filename=str(read("filename", "")),
+                char_start=char_start,
+                char_end=char_end,
+                page=page_number or None,
+                section=str(read("section", "")) or None,
+            )
+            if (
+                not math.isfinite(hit.similarity)
+                or hit.char_start < 0
+                or hit.char_end < hit.char_start
+                or page_number < 0
+            ):
+                raise ValueError("invalid Milvus hit fields")
+            return hit
+        except (AttributeError, KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise KnowledgeVectorError(
+                "KNOWLEDGE_VECTOR_RESPONSE_INVALID",
+                "Milvus 检索响应不符合知识库契约",
+                retryable=True,
+            ) from exc
 
     @classmethod
     def _validate_collection(cls, description: dict[str, Any], expected_dimension: int) -> None:

@@ -26,10 +26,15 @@ from app.api import (
     models,
     prompts,
 )
-from app.core.config import KNOWLEDGE_SEARCH_PROFILE_CONCURRENCY, settings
+from app.core.config import (
+    KNOWLEDGE_MILVUS_FILTER_TERM_BATCH_SIZE,
+    KNOWLEDGE_SEARCH_PROFILE_CONCURRENCY,
+    settings,
+)
 from app.core.logger import app_logger
 from app.core.redis import close_redis, get_redis_pool, init_redis
 from app.db.database import SessionLocal
+from app.schemas.knowledge import KNOWLEDGE_SEARCH_MAX_BASES_PER_REQUEST
 from app.schemas.response import ApiException, generate_request_id
 from app.services.knowledge.storage_upload_guard import shutdown_storage_upload_lifecycles
 from app.services.mcp.runtime import get_mcp_client_manager
@@ -146,8 +151,14 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
         path = key[1]
         if key == ("POST", "/api/knowledge-bases/search"):
             profile_batches = math.ceil(settings.KNOWLEDGE_SEARCH_MAX_PROFILES / KNOWLEDGE_SEARCH_PROFILE_CONCURRENCY)
+            max_index_versions = settings.KNOWLEDGE_MAX_DOCUMENTS_PER_BASE * KNOWLEDGE_SEARCH_MAX_BASES_PER_REQUEST
+            version_batches = math.ceil(max_index_versions / KNOWLEDGE_MILVUS_FILTER_TERM_BATCH_SIZE)
             return (
-                profile_batches * (settings.KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS + 2 * settings.MILVUS_TIMEOUT_SECONDS)
+                profile_batches
+                * (
+                    settings.KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS
+                    + (version_batches + 1) * settings.MILVUS_TIMEOUT_SECONDS
+                )
                 + 5
             )
         path_segments = path.strip("/").split("/")

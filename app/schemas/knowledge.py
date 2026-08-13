@@ -17,6 +17,7 @@ KnowledgeDocumentStatus = Literal[
     "deleted",
 ]
 KNOWLEDGE_BASE_NORMALIZED_NAME_MAX_LENGTH = 200
+KNOWLEDGE_SEARCH_MAX_BASES_PER_REQUEST = 5
 
 
 def normalize_knowledge_base_name(name: str) -> str:
@@ -180,7 +181,10 @@ class KnowledgeTaskEnvelope(BaseModel):
 
 
 class KnowledgeRetrievalRequest(BaseModel):
-    knowledge_base_ids: list[str] = Field(min_length=1, max_length=5)
+    knowledge_base_ids: list[str] = Field(
+        min_length=1,
+        max_length=KNOWLEDGE_SEARCH_MAX_BASES_PER_REQUEST,
+    )
     query: str = Field(min_length=1, max_length=4000)
     top_k: int = Field(default=8, ge=1, le=50)
 

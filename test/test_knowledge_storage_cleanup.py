@@ -395,7 +395,10 @@ class KnowledgeStorageCleanupTests(unittest.IsolatedAsyncioTestCase):
         first = self._register(key="knowledge/reused", hold_seconds=1)
         self._activate(first, cleanup_succeeded=True)
         with self.Session() as db:
-            self.assertEqual(db.get(KnowledgeStorageCleanupTask, first.task_id).status, "completed")
+            task = db.get(KnowledgeStorageCleanupTask, first.task_id)
+            self.assertEqual(task.status, "completed")
+            task.delete_started_at = utc_now()
+            db.commit()
 
         second = self._register(key="knowledge/reused", hold_seconds=60)
 
@@ -405,6 +408,7 @@ class KnowledgeStorageCleanupTests(unittest.IsolatedAsyncioTestCase):
             task = db.get(KnowledgeStorageCleanupTask, first.task_id)
             self.assertEqual(task.status, "pending")
             self.assertEqual(task.attempt_count, 0)
+            self.assertIsNone(task.delete_started_at)
             self.assertEqual(db.query(KnowledgeStorageUploadIntent).filter_by(cleanup_task_id=task.id).count(), 1)
 
     def test_finalizer_never_reopens_completed_cleanup_task(self):

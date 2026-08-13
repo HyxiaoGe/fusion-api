@@ -76,6 +76,20 @@ class MilvusKnowledgeStoreTests(unittest.TestCase):
         self.assertIn('knowledge_base_id in ["kb-1", "kb-2"]', expression)
         self.assertIn('index_version in ["version-1", "version-2"]', expression)
 
+    def test_malformed_search_hit_is_wrapped_as_retryable_vector_error(self):
+        invalid_hits = (
+            {"id": "chunk-1", "distance": "not-a-number", "entity": {}},
+            self._hit_row(char_start=-1),
+            self._hit_row(char_start=5, char_end=4),
+            self._hit_row(page=-1),
+        )
+
+        for row in invalid_hits:
+            with self.subTest(row=row), self.assertRaises(KnowledgeVectorError) as raised:
+                MilvusKnowledgeStore._hit_from_result(row)
+            self.assertEqual(raised.exception.code, "KNOWLEDGE_VECTOR_RESPONSE_INVALID")
+            self.assertTrue(raised.exception.retryable)
+
     def test_root_credentials_are_rejected(self):
         with (
             patch("app.services.knowledge.milvus.settings.MILVUS_URI", "http://milvus:19530"),
@@ -165,6 +179,24 @@ class MilvusKnowledgeStoreTests(unittest.TestCase):
                 MilvusKnowledgeStore._validate_vector_indexes(invalid, "COSINE")
             self.assertEqual(raised.exception.code, "KNOWLEDGE_VECTOR_SCHEMA_MISMATCH")
 
+    @staticmethod
+    def _hit_row(*, similarity=0.8, char_start=0, char_end=7, page=0, suffix="1"):
+        return {
+            "id": f"chunk-{suffix}",
+            "distance": similarity,
+            "entity": {
+                "document_id": f"doc-{suffix}",
+                "knowledge_base_id": "kb-1",
+                "index_version": f"version-{suffix}",
+                "text": f"chunk text {suffix}",
+                "filename": "manual.txt",
+                "char_start": char_start,
+                "char_end": char_end,
+                "page": page,
+                "section": "intro",
+            },
+        }
+
 
 class MilvusKnowledgeStoreBatchTests(unittest.IsolatedAsyncioTestCase):
     class FakeClient:
@@ -240,6 +272,45 @@ class MilvusKnowledgeStoreBatchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.code, "KNOWLEDGE_VECTOR_CONFIG_INVALID")
         self.assertFalse(raised.exception.retryable)
+
+    async def test_search_batches_version_terms_and_merges_global_ranking(self):
+        class SearchClient:
+            def __init__(self):
+                self.filters = []
+                self.similarities = iter((0.3, 0.9, 0.6))
+
+            def search(self, *, filter, **_kwargs):
+                self.filters.append(filter)
+                suffix = str(len(self.filters))
+                return [
+                    [
+                        MilvusKnowledgeStoreTests._hit_row(
+                            similarity=next(self.similarities),
+                            suffix=suffix,
+                        )
+                    ]
+                ]
+
+            def close(self):
+                return None
+
+        client = SearchClient()
+        store = MilvusKnowledgeStore(client_factory=lambda: client)
+        profile = EmbeddingProfile("litellm", "embed-v1", 2, "COSINE", "knowledge_v1_d2", "r1")
+
+        with patch("app.services.knowledge.milvus.KNOWLEDGE_MILVUS_FILTER_TERM_BATCH_SIZE", 2):
+            hits = await store.search(
+                profile=profile,
+                query_vector=[1.0, 0.5],
+                user_id="user-1",
+                knowledge_base_ids=["kb-1"],
+                index_versions=[f"version-{index}" for index in range(5)],
+                limit=2,
+            )
+
+        self.assertEqual(len(client.filters), 3)
+        self.assertEqual([expression.count("version-") for expression in client.filters], [2, 2, 1])
+        self.assertEqual([hit.similarity for hit in hits], [0.9, 0.6])
 
     @staticmethod
     def _record(index: int) -> KnowledgeVectorRecord:

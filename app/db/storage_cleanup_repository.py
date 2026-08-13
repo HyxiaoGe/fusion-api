@@ -107,6 +107,9 @@ class StorageCleanupRepository:
         task.heartbeat_at = None
         task.error_code = None
         task.error_summary = None
+        # 同一对象 key 的 cleanup task 会跨上传代际复用；旧代删除回执绝不能让
+        # 新代 uncertain/absent 被误判为已执行过 DELETE。
+        task.delete_started_at = None
         task.completed_at = None
         task.updated_at = registered_at
         intent = KnowledgeStorageUploadIntent(

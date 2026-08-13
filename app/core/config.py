@@ -8,6 +8,7 @@ from pydantic import Field
 from pydantic_settings import BaseSettings
 
 KNOWLEDGE_SEARCH_PROFILE_CONCURRENCY = 4
+KNOWLEDGE_MILVUS_FILTER_TERM_BATCH_SIZE = 512
 
 
 class Settings(BaseSettings):

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from app.core.config import settings
-from app.services.file_service import FileService
+from app.services.file_service import FileService, FileStorageUnavailableError
 from app.services.storage.local_storage import LocalStorageBackend
 
 ORIGINAL_KEY = "files/v1/users/user-1/conversations/conv-1/files/file-1/original"
@@ -629,6 +629,22 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
             patch("app.services.file_service.StorageCleanupRepository", return_value=repo),
             patch("app.services.file_service.start_guarded_storage_upload", return_value=lifecycle),
             self.assertRaises(asyncio.CancelledError),
+        ):
+            await self.service._guarded_file_upload("files/object", b"payload", "text/plain")
+
+        lifecycle.detach_request.assert_called_once_with()
+
+    async def test_guarded_legacy_upload_maps_storage_failure_to_unavailable(self):
+        registration = SimpleNamespace(task_id="cleanup-task", intent_id="upload-intent")
+        lifecycle = MagicMock()
+        lifecycle.wait_upload = AsyncMock(side_effect=TimeoutError("put timeout"))
+        repo = MagicMock()
+        repo.register_upload_intent.return_value = registration
+
+        with (
+            patch("app.services.file_service.StorageCleanupRepository", return_value=repo),
+            patch("app.services.file_service.start_guarded_storage_upload", return_value=lifecycle),
+            self.assertRaisesRegex(FileStorageUnavailableError, "对象存储暂时不可用"),
         ):
             await self.service._guarded_file_upload("files/object", b"payload", "text/plain")
 
