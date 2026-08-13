@@ -83,6 +83,43 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
             env={**os.environ, **environment},
         )
 
+    def _run_candidate_image_knowledge_validation(
+        self,
+        *,
+        rollback_requested: bool,
+        validator_available: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        marker = "\"${DEPLOY_API_IMAGE}\" - <<'PY'\n"
+        script = self.workflow.split(marker, 1)[1].split("\n          PY\n", 1)[0]
+        prelude = """
+        import sys
+        import types
+
+        app = types.ModuleType("app")
+        app.__path__ = []
+        core = types.ModuleType("app.core")
+        core.__path__ = []
+        config = types.ModuleType("app.core.config")
+        settings = types.SimpleNamespace()
+        if {validator_available!r}:
+            settings.validate_knowledge_base_configuration = lambda: None
+        config.settings = settings
+        sys.modules.update({{
+            "app": app,
+            "app.core": core,
+            "app.core.config": config,
+        }})
+        """.format(validator_available=validator_available)
+        return subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(prelude) + textwrap.dedent(script)],
+            text=True,
+            capture_output=True,
+            env={
+                **os.environ,
+                "FUSION_ROLLBACK_REQUESTED": "true" if rollback_requested else "false",
+            },
+        )
+
     def _run_revision_routes_assignment(self, value: str | None) -> subprocess.CompletedProcess[str]:
         lines = self.workflow.splitlines()
         start = next(
@@ -425,7 +462,9 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
 
         self.assertLess(validation, api_replacement)
         validation_block = self.workflow[validation - 4000 : validation + 200]
-        self.assertIn("settings.validate_knowledge_base_configuration()", validation_block)
+        self.assertIn('validator = getattr(settings, "validate_knowledge_base_configuration", None)', validation_block)
+        self.assertIn("validator()", validation_block)
+        self.assertIn('-e "FUSION_ROLLBACK_REQUESTED=${ROLLBACK_REQUESTED}"', validation_block)
         for name in (
             "KNOWLEDGE_PARSE_TIMEOUT_SECONDS",
             "KNOWLEDGE_WORKER_LEASE_SECONDS",
@@ -433,6 +472,30 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
             "KNOWLEDGE_WORKER_MAX_ATTEMPTS",
         ):
             self.assertIn(f'-e "{name}"', validation_block)
+
+    def test_candidate_image_validation_is_strict_for_release_and_compatible_for_legacy_rollback(self):
+        current_release = self._run_candidate_image_knowledge_validation(
+            rollback_requested=False,
+            validator_available=True,
+        )
+        invalid_release = self._run_candidate_image_knowledge_validation(
+            rollback_requested=False,
+            validator_available=False,
+        )
+        legacy_rollback = self._run_candidate_image_knowledge_validation(
+            rollback_requested=True,
+            validator_available=False,
+        )
+
+        self.assertEqual(current_release.returncode, 0, current_release.stderr)
+        self.assertIn("candidate knowledge settings ok", current_release.stdout)
+        self.assertNotEqual(invalid_release.returncode, 0)
+        self.assertIn("candidate knowledge settings validator missing", invalid_release.stderr)
+        self.assertEqual(legacy_rollback.returncode, 0, legacy_rollback.stderr)
+        self.assertIn(
+            "candidate knowledge settings skipped for legacy rollback image",
+            legacy_rollback.stdout,
+        )
 
     def test_compose_injects_search_and_document_resource_limits_into_api_and_worker(self):
         for name in (

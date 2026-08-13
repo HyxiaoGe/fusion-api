@@ -594,6 +594,7 @@ jobs:
       - name: Pull and restart fusion-api
         id: deploy_candidate
         env:
+          ROLLBACK_REQUESTED: ${{ needs.prepare.outputs.rollback_requested }}
           DEPLOY_PROMPTHUB_API_KEY: ${{ secrets.PROMPTHUB_API_KEY }}
           DEPLOY_PROMPTHUB_SYNC_MODE: ${{ vars.PROMPTHUB_SYNC_MODE || 'disabled' }}
           DEPLOY_MCP_ALLOWED_HOSTS: ${{ vars.MCP_ALLOWED_HOSTS }}
@@ -935,11 +936,20 @@ jobs:
               -e "MILVUS_DATABASE" \
               -e "MILVUS_COLLECTION_PREFIX" \
               -e "MILVUS_TIMEOUT_SECONDS" \
+              -e "FUSION_ROLLBACK_REQUESTED=${ROLLBACK_REQUESTED}" \
               "${DEPLOY_API_IMAGE}" - <<'PY'
+          import os
+
           from app.core.config import settings
 
-          settings.validate_knowledge_base_configuration()
-          print("candidate knowledge settings ok")
+          validator = getattr(settings, "validate_knowledge_base_configuration", None)
+          if validator is None:
+              if os.environ.get("FUSION_ROLLBACK_REQUESTED") != "true":
+                  raise SystemExit("candidate knowledge settings validator missing")
+              print("candidate knowledge settings skipped for legacy rollback image")
+          else:
+              validator()
+              print("candidate knowledge settings ok")
           PY
           fi
           if docker run --rm --entrypoint /bin/sh "${DEPLOY_API_IMAGE}" -c 'test -f /app/scripts/run_knowledge_worker.py'; then
