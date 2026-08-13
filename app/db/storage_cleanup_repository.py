@@ -154,6 +154,7 @@ class StorageCleanupRepository:
             self.db.rollback()
             return
         if self._task_state(task) == "completed":
+            self._delete_intent(registration.intent_id, task.id)
             self.db.commit()
             return
         intent = self._lock_intent(registration)
@@ -193,17 +194,38 @@ class StorageCleanupRepository:
         self._complete_locked(task, utc_now())
         return True
 
-    def mark_delete_started(self, task: KnowledgeStorageCleanupTask, lease_token: str) -> bool:
-        """在对象删除 RPC 前持久化可恢复阶段，并释放行锁。"""
+    def mark_delete_started(
+        self,
+        task: KnowledgeStorageCleanupTask,
+        lease_token: str,
+        *,
+        lease_seconds: int,
+    ) -> KnowledgeStorageCleanupTask | None:
+        """持久化删除回执后重新锁行，并在真实 RPC 返回前持续持有。"""
         locked = self._lock_task(task.id)
         if not self._lease_token_matches(locked, lease_token):
             self.db.rollback()
-            return False
+            return None
         now = utc_now()
         locked.delete_started_at = now
+        locked.lease_expires_at = now + timedelta(seconds=max(1, lease_seconds))
+        locked.heartbeat_at = now
         locked.updated_at = now
         self.db.commit()
-        return True
+
+        # delete_started_at 必须先独立持久化，才能在 RPC 成功后进程崩溃时凭 absent
+        # 安全收敛。随后重新取得同一行的排他锁；一旦旧 token 已被重领替换，绝不
+        # 再发送 DELETE。持锁跨越真实 RPC 可阻止过期租约被重领和同 key 重新上传。
+        locked = self._lock_task(task.id)
+        if not self._lease_token_matches(locked, lease_token):
+            self.db.rollback()
+            return None
+        now = utc_now()
+        locked.lease_expires_at = now + timedelta(seconds=max(1, lease_seconds))
+        locked.heartbeat_at = now
+        locked.updated_at = now
+        self.db.flush()
+        return locked
 
     def lock_succeeded_upload_for_document(
         self,
@@ -246,8 +268,7 @@ class StorageCleanupRepository:
     ) -> None:
         """在引用 INSERT/UPDATE 的同一事务内完成全部 cleanup fence。"""
         now = utc_now()
-        for registration, task in locked_uploads:
-            self._delete_intent(registration.intent_id, task.id)
+        for _registration, task in locked_uploads:
             self._set_completed(task, now)
 
     def complete_document_write_locked(
@@ -265,6 +286,7 @@ class StorageCleanupRepository:
             self.db.rollback()
             return False
         if self._task_state(task) == "completed":
+            self._delete_intent(registration.intent_id, task.id)
             self.db.commit()
             return True
         self._lock_intent(registration)
@@ -285,6 +307,7 @@ class StorageCleanupRepository:
             self.db.rollback()
             return
         if self._task_state(task) == "completed":
+            self._delete_intent(registration.intent_id, task.id)
             self.db.commit()
             return
         now = utc_now()
@@ -581,13 +604,15 @@ class StorageCleanupRepository:
         ).delete(synchronize_session=False)
 
     def _complete_locked(self, task: KnowledgeStorageCleanupTask, now: datetime) -> None:
-        self.db.query(KnowledgeStorageUploadIntent).filter(
-            KnowledgeStorageUploadIntent.cleanup_task_id == task.id
-        ).delete(synchronize_session=False)
         self._set_completed(task, now)
         self.db.commit()
 
     def _set_completed(self, task: KnowledgeStorageCleanupTask, now: datetime) -> None:
+        # 一个内容寻址 task 可被并发请求共享。任一受保护引用或删除完成后，该 task
+        # 已进入不可逆终态，必须清除全部 intent，避免败方 detach 永久遗留记录。
+        self.db.query(KnowledgeStorageUploadIntent).filter(
+            KnowledgeStorageUploadIntent.cleanup_task_id == task.id
+        ).delete(synchronize_session=False)
         self._set_task_state(task, "completed")
         task.completed_at = now
         task.updated_at = now

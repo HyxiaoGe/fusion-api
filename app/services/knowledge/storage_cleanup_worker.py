@@ -44,8 +44,14 @@ class KnowledgeStorageCleanupWorker:
                 else:
                     # 删除阶段先持久化再发 RPC；即使 RPC 成功后的 completed 提交失败，
                     # 重领任务也能用 delete_started_at + absent 安全收敛。
-                    if not repo.mark_delete_started(task, claimed.lease_token):
+                    locked_task = repo.mark_delete_started(
+                        task,
+                        claimed.lease_token,
+                        lease_seconds=settings.KNOWLEDGE_WORKER_LEASE_SECONDS,
+                    )
+                    if locked_task is None:
                         return True
+                    task = locked_task
                     if await storage.delete(storage_key):
                         deleted = True
                     elif not await storage.exists(storage_key):

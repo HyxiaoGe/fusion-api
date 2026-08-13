@@ -251,6 +251,23 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(duplicate.exception.code, "KNOWLEDGE_DOCUMENT_DUPLICATE")
         self.assertEqual(duplicate.exception.status_code, 409)
 
+    async def test_successful_upload_does_not_wait_for_lifecycle_shutdown(self):
+        knowledge_base = self._create_base()
+        upload = UploadFile(
+            filename="manual.txt",
+            file=io.BytesIO(b"knowledge content"),
+            headers=Headers({"content-type": "text/plain"}),
+        )
+
+        with patch(
+            "app.services.knowledge.storage_upload_guard.GuardedStorageUpload.wait_finished",
+            new=AsyncMock(side_effect=AssertionError("提交后不应等待 renewal 退出")),
+        ) as wait_finished:
+            result = await self.service.upload_document("user-1", knowledge_base.id, upload)
+
+        self.assertEqual(result.document.status, "queued")
+        wait_finished.assert_not_awaited()
+
     async def test_upload_normalizes_mime_before_allowlist_and_persistence(self):
         knowledge_base = self._create_base()
         upload = UploadFile(

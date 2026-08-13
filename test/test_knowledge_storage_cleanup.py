@@ -191,12 +191,42 @@ class KnowledgeStorageCleanupTests(unittest.IsolatedAsyncioTestCase):
             )
 
         lifecycle.mark_request_resolved.assert_called_once_with()
-        lifecycle.wait_finished.assert_awaited_once_with()
+        lifecycle.wait_finished.assert_not_awaited()
         with self.Session() as db:
             self.assertIsNotNone(db.get(File, "file-atomic"))
             self.assertIsNotNone(db.get(ConversationFile, ("conv-1", "file-atomic")))
             task = db.get(KnowledgeStorageCleanupTask, registration.task_id)
             self.assertEqual(task.status, "completed")
+            self.assertEqual(task.file_status, "completed")
+            self.assertEqual(
+                db.query(KnowledgeStorageUploadIntent).filter_by(cleanup_task_id=task.id).count(),
+                0,
+            )
+
+    def test_completing_shared_file_task_clears_every_upload_intent(self):
+        key = "files/v1/users/user-1/conversations/conv-1/files/file-shared/original"
+        first = self._register_file(key=key)
+        second = self._register_file(key=key)
+        self.assertEqual(first.task_id, second.task_id)
+
+        for registration in (first, second):
+            with self.Session() as db:
+                self.assertTrue(
+                    StorageCleanupRepository(db).record_upload_outcome(
+                        registration,
+                        outcome="succeeded",
+                        hold_seconds=60,
+                    )
+                )
+
+        with self.Session() as db:
+            repo = StorageCleanupRepository(db)
+            locked = repo.lock_succeeded_uploads_for_reference([first])
+            repo.complete_reference_writes_locked(locked)
+            db.commit()
+
+        with self.Session() as db:
+            task = db.get(KnowledgeStorageCleanupTask, first.task_id)
             self.assertEqual(task.file_status, "completed")
             self.assertEqual(
                 db.query(KnowledgeStorageUploadIntent).filter_by(cleanup_task_id=task.id).count(),
@@ -605,12 +635,34 @@ class KnowledgeStorageCleanupTests(unittest.IsolatedAsyncioTestCase):
         storage.exists = AsyncMock(return_value=True)
         storage.delete = AsyncMock(side_effect=blocked_delete)
         worker = KnowledgeStorageCleanupWorker(self.Session, worker_id="cleanup-1")
-        with patch(
-            "app.services.knowledge.storage_cleanup_worker.get_storage_for_backend",
-            return_value=storage,
+        original_mark_delete_started = StorageCleanupRepository.mark_delete_started
+        delete_transaction_states: list[bool] = []
+
+        def mark_delete_started_and_capture(repo, task, lease_token, *, lease_seconds):
+            locked = original_mark_delete_started(
+                repo,
+                task,
+                lease_token,
+                lease_seconds=lease_seconds,
+            )
+            delete_transaction_states.append(repo.db.in_transaction())
+            return locked
+
+        with (
+            patch(
+                "app.services.knowledge.storage_cleanup_worker.get_storage_for_backend",
+                return_value=storage,
+            ),
+            patch.object(
+                StorageCleanupRepository,
+                "mark_delete_started",
+                autospec=True,
+                side_effect=mark_delete_started_and_capture,
+            ),
         ):
             cleanup = asyncio.create_task(worker.run_once())
             await delete_started.wait()
+            self.assertEqual(delete_transaction_states, [True])
             with self.Session() as db:
                 with self.assertRaises(StorageCleanupBusy):
                     StorageCleanupRepository(db).register_upload_intent(

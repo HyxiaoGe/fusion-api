@@ -70,13 +70,27 @@ class KnowledgeStorageCleanupMigrationTests(unittest.TestCase):
             "knowledge_storage_cleanup_tasks",
             ["file_status", "available_at", "created_at", "id"],
         )
-        backfill_sql = str(operation.execute.call_args.args[0])
+        executed_sql = [str(call.args[0]) for call in operation.execute.call_args_list]
+        backfill_sql = next(sql for sql in executed_sql if "FROM files AS file" in sql)
         self.assertIn("FROM files AS file", backfill_sql)
         self.assertIn("file.storage_key = cleanup.storage_key", backfill_sql)
         self.assertIn("file.thumbnail_key = cleanup.storage_key", backfill_sql)
         self.assertIn("status = 'completed'", backfill_sql)
+        trigger_function_sql = next(sql for sql in executed_sql if "CREATE OR REPLACE FUNCTION" in sql)
+        self.assertIn("fusion_classify_file_cleanup_scope", trigger_function_sql)
+        self.assertIn("DELETE FROM knowledge_storage_upload_intents", trigger_function_sql)
+        self.assertIn("cleanup.storage_key = NEW.thumbnail_key", trigger_function_sql)
+        trigger_sql = next(sql for sql in executed_sql if "CREATE TRIGGER" in sql)
+        self.assertIn("AFTER INSERT OR UPDATE", trigger_sql)
+        self.assertIn("ON files", trigger_sql)
         self.assertEqual(migration.down_revision, "8a3d5f7b9c10")
         self.assertFalse(operation.drop_column.called)
+
+        with patch.object(migration, "op") as operation:
+            migration.downgrade()
+        downgrade_sql = [str(call.args[0]) for call in operation.execute.call_args_list]
+        self.assertTrue(any("DROP TRIGGER" in sql for sql in downgrade_sql))
+        self.assertTrue(any("DROP FUNCTION" in sql for sql in downgrade_sql))
 
     def test_revision_chain_has_single_cleanup_head(self):
         revisions: dict[str, str | None] = {}

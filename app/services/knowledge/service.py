@@ -319,7 +319,6 @@ class KnowledgeService:
                     cleanup_succeeded=cleanup_succeeded,
                 )
                 upload_lifecycle.mark_request_resolved()
-                await upload_lifecycle.wait_finished()
                 if exc.duplicate:
                     raise ApiException(
                         ErrorCode.KNOWLEDGE_DOCUMENT_DUPLICATE,
@@ -334,15 +333,15 @@ class KnowledgeService:
                     cleanup_succeeded=cleanup_succeeded,
                 )
                 upload_lifecycle.mark_request_resolved()
-                await upload_lifecycle.wait_finished()
                 raise ApiException(
                     ErrorCode.KNOWLEDGE_DOCUMENT_DUPLICATE,
                     "相同内容的活动文档已存在于该知识库",
                     409,
                 ) from exc
             # 文档、索引任务、intent 删除与 cleanup 完成已在同一 PG 事务提交。
+            # lifecycle 由模块级 registry 强引用并在后台停止续租；提交成功后不能
+            # 再等待可能阻塞于数据库的 renewal，否则客户端会收到错误的 408。
             upload_lifecycle.mark_request_resolved()
-            await upload_lifecycle.wait_finished()
             return KnowledgeDocumentUploadResult(
                 document=self._document_view(saved_document),
                 task=self._task_view(saved_task),

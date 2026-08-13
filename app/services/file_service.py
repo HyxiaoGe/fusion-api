@@ -554,7 +554,7 @@ class FileService:
         except Exception:
             self.db.rollback()
             raise
-        await self._complete_file_upload_lifecycles(lifecycles)
+        self._resolve_file_upload_lifecycles(lifecycles)
 
     async def _commit_file_update_with_upload_fences(
         self,
@@ -578,14 +578,13 @@ class FileService:
         except Exception:
             self.db.rollback()
             raise
-        await self._complete_file_upload_lifecycles(lifecycles)
+        self._resolve_file_upload_lifecycles(lifecycles)
 
     @staticmethod
-    async def _complete_file_upload_lifecycles(lifecycles: list[GuardedStorageUpload]) -> None:
+    def _resolve_file_upload_lifecycles(lifecycles: list[GuardedStorageUpload]) -> None:
+        """提交后只发终态信号；后台 registry 负责收尾，响应不等待 renewal。"""
         for lifecycle in lifecycles:
             lifecycle.mark_request_resolved()
-        for lifecycle in lifecycles:
-            await lifecycle.wait_finished()
 
     @staticmethod
     def _detach_file_upload_lifecycles(lifecycles: list[GuardedStorageUpload]) -> None:
