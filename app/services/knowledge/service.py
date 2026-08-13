@@ -565,7 +565,45 @@ class KnowledgeService:
         if not multiple_profiles:
             validated.sort(key=lambda item: item.similarity, reverse=True)
         self._ensure_requested_bases_still_ready(user_id, payload.knowledge_base_ids)
-        return KnowledgeRetrievalResult(hits=validated[: payload.top_k], query=payload.query, top_k=payload.top_k)
+        # 知识库仍有其他 ready 文档并不能证明每个已物化 hit 仍有效；在返回前按
+        # chunk/document/active version 再做一次精确授权，封住并发删除和版本切换。
+        self.db.expire_all()
+        final_chunks = {
+            chunk.chunk_id: chunk
+            for chunk in self.repo.get_authorized_chunks(
+                user_id=user_id,
+                knowledge_base_ids=payload.knowledge_base_ids,
+                chunk_ids=[hit.chunk_id for hit in validated],
+            )
+        }
+        final_hits = []
+        for hit in validated:
+            chunk = final_chunks.get(hit.chunk_id)
+            if (
+                chunk is None
+                or chunk.document_id != hit.document_id
+                or chunk.knowledge_base_id != hit.knowledge_base_id
+                or chunk.index_version != hit.index_version
+            ):
+                continue
+            final_hits.append(
+                KnowledgeRetrievalHit(
+                    chunk_id=hit.chunk_id,
+                    document_id=hit.document_id,
+                    knowledge_base_id=hit.knowledge_base_id,
+                    index_version=hit.index_version,
+                    text=chunk.text,
+                    similarity=hit.similarity,
+                    filename=chunk.filename,
+                    source={
+                        "char_start": chunk.char_start,
+                        "char_end": chunk.char_end,
+                        "page": chunk.page,
+                        "section": chunk.section,
+                    },
+                )
+            )
+        return KnowledgeRetrievalResult(hits=final_hits[: payload.top_k], query=payload.query, top_k=payload.top_k)
 
     async def _search_profiles(
         self,

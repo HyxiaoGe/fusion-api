@@ -4,8 +4,10 @@ import asyncio
 import hashlib
 import logging
 import uuid
+from collections.abc import Iterator
 from contextlib import suppress
 from dataclasses import dataclass
+from itertools import islice
 from typing import Callable
 
 from sqlalchemy.orm import Session
@@ -95,12 +97,21 @@ class KnowledgeWorker:
             work = asyncio.create_task(self._execute(context, claimed.lease_token))
             heartbeat = asyncio.create_task(self._heartbeat(context.task_id, claimed.lease_token))
             done, _pending = await asyncio.wait((work, heartbeat), return_when=asyncio.FIRST_COMPLETED)
-            if heartbeat in done:
-                heartbeat.result()
+            if heartbeat in done and work not in done:
+                try:
+                    heartbeat.result()
+                except Exception:
+                    # Milvus SDK 在线程中不可取消。heartbeat 先失败时仍必须等待真实
+                    # 外部调用返回，之后才能释放任务进入 retry/cleanup。
+                    await asyncio.shield(work)
+                    raise
             completed_in_work = await work
             if not completed_in_work:
                 self._complete(context.task_id, claimed.lease_token)
         except asyncio.CancelledError:
+            if work is not None and not work.done():
+                with suppress(asyncio.CancelledError, Exception):
+                    await asyncio.shield(work)
             raise
         except Exception as exc:
             error = self._classify_error(exc)
@@ -128,12 +139,10 @@ class KnowledgeWorker:
             )
         finally:
             if work is not None and not work.done():
-                work.cancel()
-                with suppress(asyncio.CancelledError):
-                    await work
+                await asyncio.shield(work)
             if heartbeat is not None:
                 heartbeat.cancel()
-                with suppress(asyncio.CancelledError):
+                with suppress(asyncio.CancelledError, Exception):
                     await heartbeat
         return True
 
@@ -142,7 +151,7 @@ class KnowledgeWorker:
             return KnowledgeRepository(db).claim_task(
                 worker_id=self.worker_id,
                 lease_seconds=settings.KNOWLEDGE_WORKER_LEASE_SECONDS,
-                external_write_grace_seconds=max(1, int(settings.MILVUS_TIMEOUT_SECONDS * 2)),
+                external_write_grace_seconds=self._external_write_grace_seconds(),
             )
 
     def _load_context(self, claimed: ClaimedKnowledgeTask) -> TaskContext:
@@ -232,13 +241,25 @@ class KnowledgeWorker:
             chunk_size=version.chunk_size,
             overlap=version.chunk_overlap,
         )
-        chunks = await asyncio.to_thread(
-            version_chunker.chunk,
-            sections,
-            document_id=document.id,
-            index_version=context.index_version,
-            max_chunks=settings.KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT,
-        )
+        legacy_stream = version.chunker_version == LegacyKnowledgeChunkerV1.VERSION
+        chunk_iterator = None
+        chunks = None
+        if legacy_stream:
+            # v1 曾允许 overlap=chunk_size-1。旧任务必须保留原边界/ID，但不能把
+            # 可能远超当前新文档上限的切片一次性留在内存中。
+            chunk_iterator = version_chunker.iter_chunks(
+                sections,
+                document_id=document.id,
+                index_version=context.index_version,
+            )
+        else:
+            chunks = await asyncio.to_thread(
+                version_chunker.chunk,
+                sections,
+                document_id=document.id,
+                index_version=context.index_version,
+                max_chunks=settings.KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT,
+            )
         self._phase(context.task_id, lease_token, "embedding")
         profile = self._version_profile(version)
         write_state = self._index_write_state(context, lease_token)
@@ -248,20 +269,51 @@ class KnowledgeWorker:
         if write_state != "allowed":
             raise KnowledgeWorkerError("KNOWLEDGE_TASK_LEASE_LOST", "知识库任务租约已失效", retryable=True)
         with self.session_factory() as db:
-            if not KnowledgeRepository(db).replace_chunk_manifest(
-                task_id=context.task_id,
-                lease_token=lease_token,
-                version=version,
-                filename=document.original_filename,
-                chunks=chunks,
-                batch_size=settings.KNOWLEDGE_EMBEDDING_BATCH_SIZE,
-            ):
+            repo = KnowledgeRepository(db)
+            manifest_ready = (
+                repo.reset_chunk_manifest(
+                    task_id=context.task_id,
+                    lease_token=lease_token,
+                    index_version=version.id,
+                )
+                if legacy_stream
+                else repo.replace_chunk_manifest(
+                    task_id=context.task_id,
+                    lease_token=lease_token,
+                    version=version,
+                    filename=document.original_filename,
+                    chunks=chunks,
+                    batch_size=settings.KNOWLEDGE_EMBEDDING_BATCH_SIZE,
+                )
+            )
+            if not manifest_ready:
                 raise KnowledgeWorkerError("KNOWLEDGE_TASK_LEASE_LOST", "知识库任务租约已失效", retryable=True)
         collection = await self.vector_store.ensure_collection(profile)
         writing_phase_started = False
         batch_size = settings.KNOWLEDGE_EMBEDDING_BATCH_SIZE
-        for offset in range(0, len(chunks), batch_size):
-            batch = chunks[offset : offset + batch_size]
+        chunk_count = 0
+        while True:
+            if chunk_iterator is not None:
+                batch = await asyncio.to_thread(self._take_chunk_batch, chunk_iterator, batch_size)
+                if not batch:
+                    break
+                with self.session_factory() as db:
+                    if not KnowledgeRepository(db).append_chunk_manifest(
+                        task_id=context.task_id,
+                        lease_token=lease_token,
+                        version=version,
+                        filename=document.original_filename,
+                        chunks=batch,
+                    ):
+                        raise KnowledgeWorkerError(
+                            "KNOWLEDGE_TASK_LEASE_LOST",
+                            "知识库任务租约已失效",
+                            retryable=True,
+                        )
+            else:
+                if chunks is None or chunk_count >= len(chunks):
+                    break
+                batch = chunks[chunk_count : chunk_count + batch_size]
             vectors = await self.embedding.embed([chunk.text for chunk in batch], profile)
             records = [
                 KnowledgeVectorRecord(
@@ -285,6 +337,7 @@ class KnowledgeWorker:
             if write_state != "allowed":
                 raise KnowledgeWorkerError("KNOWLEDGE_TASK_LEASE_LOST", "知识库任务租约已失效", retryable=True)
             await self.vector_store.upsert_prepared(profile, collection, records)
+            chunk_count += len(batch)
             del batch, vectors, records
         with self.session_factory() as db:
             finalized = KnowledgeRepository(db).finalize_document_index(
@@ -292,7 +345,7 @@ class KnowledgeWorker:
                 lease_token=lease_token,
                 document_id=document.id,
                 index_version=context.index_version,
-                chunk_count=len(chunks),
+                chunk_count=chunk_count,
                 cleanup_max_attempts=settings.KNOWLEDGE_WORKER_MAX_ATTEMPTS,
             )
         if finalized == "activated":
@@ -302,6 +355,10 @@ class KnowledgeWorker:
             return False
         # lease 被新 Worker 接管时，旧 Worker 不能删除同一 version 的幂等 upsert。
         raise KnowledgeWorkerError("KNOWLEDGE_TASK_LEASE_LOST", "知识库任务租约已失效", retryable=True)
+
+    @staticmethod
+    def _take_chunk_batch(iterator: Iterator, batch_size: int) -> list:
+        return list(islice(iterator, batch_size))
 
     async def _delete_document(self, context: TaskContext, lease_token: str) -> None:
         self._phase(context.task_id, lease_token, "deleting")
@@ -429,8 +486,13 @@ class KnowledgeWorker:
                 error_summary=error.summary,
                 retryable=error.retryable,
                 retry_delay_seconds=retry_delay_seconds,
-                external_write_grace_seconds=max(1, int(settings.MILVUS_TIMEOUT_SECONDS * 2)),
+                external_write_grace_seconds=self._external_write_grace_seconds(),
             )
+
+    @staticmethod
+    def _external_write_grace_seconds() -> int:
+        # 单批写入最多包含建连+upsert、建连+Strong readback 两段超时。
+        return max(1, int(settings.MILVUS_TIMEOUT_SECONDS * 4 + 5))
 
     @staticmethod
     def _version_profile(version: KnowledgeIndexVersion) -> EmbeddingProfile:

@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import json
 import os
 import sys
 import unittest
@@ -541,6 +542,83 @@ class ChatCoreSurfaceTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(captured["timeout"], 10)
+
+    def test_upload_body_limit_rejects_content_length_before_multipart_parser(self):
+        downstream_called = False
+        receive_called = False
+        sent = []
+
+        async def downstream(_scope, _receive, _send):
+            nonlocal downstream_called
+            downstream_called = True
+
+        async def receive():
+            nonlocal receive_called
+            receive_called = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        middleware = self.main.UploadBodyLimitMiddleware(downstream)
+        limit = self.main.settings.KNOWLEDGE_MAX_FILE_SIZE + self.main.MULTIPART_OVERHEAD_BYTES
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/knowledge-bases/kb-1/documents",
+            "headers": [(b"content-length", str(limit + 1).encode())],
+        }
+
+        asyncio.run(middleware(scope, receive, send))
+
+        self.assertFalse(downstream_called)
+        self.assertFalse(receive_called)
+        self.assertEqual(sent[0]["status"], 413)
+        payload = json.loads(sent[1]["body"])
+        self.assertEqual(payload["code"], "FILE_TOO_LARGE")
+
+    def test_upload_body_limit_bounds_chunked_request_without_content_length(self):
+        sent = []
+        chunks = iter(
+            [
+                {"type": "http.request", "body": b"12345", "more_body": True},
+                {"type": "http.request", "body": b"6789", "more_body": False},
+            ]
+        )
+
+        async def downstream(scope, receive, send):
+            try:
+                while True:
+                    message = await receive()
+                    if not message.get("more_body"):
+                        break
+            except self.main.RequestBodyTooLarge as exc:
+                # 模拟 Starlette 关闭临时文件后生成的内部 400；外层必须改写为 413。
+                await Response(exc.message, status_code=400)(scope, receive, send)
+                return
+            await Response("unexpected")(scope, receive, send)
+
+        async def receive():
+            return next(chunks)
+
+        async def send(message):
+            sent.append(message)
+
+        middleware = self.main.UploadBodyLimitMiddleware(downstream)
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/knowledge-bases/kb-1/documents",
+            "headers": [],
+        }
+        with (
+            patch.object(self.main.settings, "KNOWLEDGE_MAX_FILE_SIZE", 4),
+            patch.object(self.main, "MULTIPART_OVERHEAD_BYTES", 4),
+        ):
+            asyncio.run(middleware(scope, receive, send))
+
+        self.assertEqual(sent[0]["status"], 413)
+        self.assertEqual(json.loads(sent[1]["body"])["code"], "FILE_TOO_LARGE")
 
     def test_file_status_returns_not_found_when_service_has_no_record(self):
         self._enable_authenticated_overrides()

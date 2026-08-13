@@ -34,6 +34,10 @@ heartbeat、过期回收和终态 fencing 防止旧 Worker 写入新状态。Red
 当前激活版本和 chunk manifest，最终正文与来源也以 PostgreSQL 为准；任一指定知识库不可用时整体失败，
 不返回部分结果。
 
+上传请求在 Starlette 解析 multipart 和创建临时文件前先检查总请求体上限；没有 `Content-Length` 的
+分块请求也会按流量累计并在越界时返回 413 `FILE_TOO_LARGE`。文件内容仍由服务层按精确文件上限复核，
+multipart 固有开销不计入文件大小。
+
 原始对象 key 使用 `.../objects/{checksum}/{document_id}`：checksum 用于内容归组，document_id 隔离每次
 上传代际。对象上传前先写入带过期保护的持久 cleanup intent；文档和索引任务提交成功后清除 intent，
 配额/唯一冲突的同步删除失败或数据库结果不确定时由独立 Worker 通过租约、引用复查和退避重试收敛。
@@ -83,7 +87,9 @@ fail closed；pre-#41 镜像按空 registry 兼容，自动回滚仍恢复部署
 当前边界偏好与最小推进算法的不可变标识是 `chunker-v2`。候选部署始终从 Environment Variable 注入
 该版本，不继承服务器旧 `.env` 中的 `chunker-v1`；配置为其他值时 preflight fail closed。历史 active
 `chunker-v1` 索引仍可检索；升级时尚未领取或正在重试的 building v1 任务由 Worker 内保留的 v1 执行器
-按原始边界与确定性 ID 继续处理，新写入只使用 v2。自动回滚使用部署前快照中的版本；对没有知识库
+按原始边界与确定性 ID 继续处理。为兼容历史上允许的极端 overlap，这类 v1 任务以受控 Embedding batch
+流式解析、写 manifest 和写向量，不受 v2 的单文档 chunk 总量限制，也不会一次把全部切片保留在内存；
+新写入只使用 v2。自动回滚使用部署前快照中的版本；对没有知识库
 环境变量的旧镜像，快照兼容默认仍为 `chunker-v1`。
 
 启用时会集中校验上传上限、chunk 大小/重叠比例/最小步长/单文档总量、batch、搜索 profile 总量、
@@ -147,6 +153,10 @@ false。自动回滚快照会保留当时的完整 revision registry，使旧索
 `/health` 仍只代表 API 的数据库与 Redis 就绪，不把 Milvus 故障扩散成全部 CRUD 下线。Worker 健康和
 知识库检索会独立暴露 Milvus/配置问题。日志不得记录文档正文、向量、密码或 lease token；排障使用
 knowledge_base_id、document_id、task_id、index_version、phase 和稳定 error_code。
+
+持久存储清理不仅服务知识库上传，也保护既有 `/api/files/upload` 的晚到对象写入。因此即使
+`KNOWLEDGE_BASE_ENABLED=false`，Worker 仍以 cleanup-only 模式处理对象清理任务；该模式不初始化
+Embedding 或 Milvus，健康状态继续显示知识库功能已禁用。
 
 删除失败不会先删除 PostgreSQL 事实记录；任务会重试并保留可见错误。Embedding profile 或维度变更
 必须通过 retry/重建生成新版本，不能原地改 collection schema。镜像回滚不执行 Alembic downgrade；

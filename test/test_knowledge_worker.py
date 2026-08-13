@@ -1,4 +1,6 @@
+import asyncio
 import unittest
+from threading import Event
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from sqlalchemy import create_engine
@@ -184,6 +186,79 @@ class KnowledgeWorkerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(document.status, "ready")
             self.assertEqual(document.active_index_version, version.id)
             self.assertEqual(version.status, "active")
+
+    async def test_legacy_extreme_overlap_streams_in_batches_beyond_new_document_limit(self):
+        self._set_document_content(b"x" * 106, chunk_size=100, chunk_overlap=99)
+        with self.Session() as db:
+            document = db.query(KnowledgeDocument).filter_by(id="doc-1").one()
+            version = db.query(KnowledgeIndexVersion).filter_by(id="version-1").one()
+            document.chunker_version = "chunker-v1"
+            version.chunker_version = "chunker-v1"
+            db.commit()
+        worker = KnowledgeWorker(
+            self.Session,
+            worker_id="worker-legacy-stream",
+            embedding=self.embedding,
+            vector_store=self.vector_store,
+        )
+
+        with (
+            patch("app.services.knowledge.worker.get_storage_for_backend", return_value=self.storage),
+            patch("app.services.knowledge.worker.settings.KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT", 5),
+            patch("app.services.knowledge.worker.settings.KNOWLEDGE_EMBEDDING_BATCH_SIZE", 2),
+        ):
+            await worker.run_once()
+
+        self.assertEqual(self.embedding.embed.await_count, 4)
+        self.assertEqual(self.vector_store.upsert_prepared.await_count, 4)
+        with self.Session() as db:
+            self.assertEqual(db.query(KnowledgeChunkManifest).count(), 7)
+            document = db.query(KnowledgeDocument).filter_by(id="doc-1").one()
+            self.assertEqual(document.chunk_count, 7)
+            self.assertEqual(document.status, "ready")
+
+    async def test_heartbeat_failure_waits_for_uncancellable_external_work_before_retry(self):
+        external_started = Event()
+        external_release = Event()
+        external_finished = Event()
+        failure_observations = []
+        worker = KnowledgeWorker(
+            self.Session,
+            worker_id="worker-heartbeat-fence",
+            embedding=self.embedding,
+            vector_store=self.vector_store,
+        )
+
+        async def blocking_external_work(_context, _lease_token):
+            def run():
+                external_started.set()
+                external_release.wait(timeout=2)
+                external_finished.set()
+
+            await asyncio.to_thread(run)
+            raise KnowledgeVectorError("KNOWLEDGE_VECTOR_UNAVAILABLE", "Milvus 暂时不可用", retryable=True)
+
+        async def failed_heartbeat(_task_id, _lease_token):
+            await asyncio.to_thread(external_started.wait, 1)
+            raise ConnectionError("heartbeat database unavailable")
+
+        def observe_failure(*_args, **_kwargs):
+            failure_observations.append(external_finished.is_set())
+
+        with (
+            patch.object(worker, "_execute", side_effect=blocking_external_work),
+            patch.object(worker, "_heartbeat", side_effect=failed_heartbeat),
+            patch.object(worker, "_fail", side_effect=observe_failure),
+        ):
+            run = asyncio.create_task(worker.run_once())
+            await asyncio.to_thread(external_started.wait, 1)
+            await asyncio.sleep(0.05)
+            self.assertFalse(run.done())
+            self.assertEqual(failure_observations, [])
+            external_release.set()
+            await run
+
+        self.assertEqual(failure_observations, [True])
 
     async def test_non_retryable_embedding_contract_failure_is_visible(self):
         self.embedding.embed.side_effect = EmbeddingError(

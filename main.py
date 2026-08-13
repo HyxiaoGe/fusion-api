@@ -8,8 +8,10 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.formparsers import MultiPartException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.ai import litellm_cleanup, litellm_health
 from app.api import (
@@ -39,6 +41,92 @@ from app.services.suggested_question_worker import (
 )
 
 ASIA_SHANGHAI = timezone(timedelta(hours=8))
+MULTIPART_OVERHEAD_BYTES = 1024 * 1024
+
+
+class RequestBodyTooLarge(MultiPartException):
+    """multipart 解析前请求体已超过有界限制。"""
+
+
+class UploadBodyLimitMiddleware:
+    """在 Starlette multipart 解析和临时文件写入前限制上传请求体。"""
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    @staticmethod
+    def _body_limit(scope: Scope) -> int | None:
+        if scope.get("type") != "http" or str(scope.get("method", "")).upper() != "POST":
+            return None
+        path = str(scope.get("path", ""))
+        if path == "/api/files/upload":
+            return settings.MAX_FILE_SIZE * 5 + MULTIPART_OVERHEAD_BYTES
+        segments = path.strip("/").split("/")
+        if len(segments) == 4 and segments[:2] == ["api", "knowledge-bases"] and segments[3] == "documents":
+            return settings.KNOWLEDGE_MAX_FILE_SIZE + MULTIPART_OVERHEAD_BYTES
+        return None
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        limit = self._body_limit(scope)
+        if limit is None:
+            await self.app(scope, receive, send)
+            return
+        headers = {key.lower(): value for key, value in scope.get("headers", [])}
+        try:
+            content_length = int(headers.get(b"content-length", b"0"))
+        except ValueError:
+            content_length = 0
+        if content_length > limit:
+            await self._reject(scope, receive, send)
+            return
+
+        received = 0
+        response_started = False
+        body_too_large = False
+
+        async def limited_receive() -> Message:
+            nonlocal body_too_large, received
+            message = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body", b""))
+                if received > limit:
+                    body_too_large = True
+                    raise RequestBodyTooLarge("上传请求体超过文件大小上限")
+            return message
+
+        async def tracked_send(message: Message) -> None:
+            nonlocal response_started
+            # Starlette 会先关闭 multipart 临时文件，再把 MultiPartException
+            # 转为 400。超限标记由本中间件持有，因此丢弃该内部响应并统一返回 413。
+            if body_too_large:
+                return
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracked_send)
+        except RequestBodyTooLarge:
+            pass
+        if body_too_large and not response_started:
+            await self._reject(scope, receive, send)
+
+    @staticmethod
+    async def _reject(scope: Scope, receive: Receive, send: Send) -> None:
+        state = scope.get("state") or {}
+        request_id = state.get("request_id") if isinstance(state, dict) else getattr(state, "request_id", None)
+        request_id = request_id or generate_request_id()
+        response = JSONResponse(
+            status_code=413,
+            content={
+                "code": "FILE_TOO_LARGE",
+                "message": "上传请求体超过文件大小上限",
+                "data": None,
+                "request_id": request_id,
+            },
+            headers={"X-Request-ID": request_id},
+        )
+        await response(scope, receive, send)
 
 
 # 超时中间件
@@ -156,6 +244,9 @@ app.add_middleware(SessionMiddleware, secret_key=settings.SECRET_KEY)
 
 # 添加超时中间件
 app.add_middleware(TimeoutMiddleware, timeout_seconds=10)
+
+# 在 multipart 解析/临时文件写入前拒绝超限请求
+app.add_middleware(UploadBodyLimitMiddleware)
 
 # 配置CORS
 app.add_middleware(

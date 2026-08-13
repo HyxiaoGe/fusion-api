@@ -2,7 +2,7 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from scripts.run_knowledge_worker import _refresh_health, _run_cleanup_loop, _run_once_work
+from scripts.run_knowledge_worker import _refresh_health, _run_cleanup_loop, _run_once_work, run_worker
 
 
 class KnowledgeWorkerRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -87,6 +87,24 @@ class KnowledgeWorkerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             [None, None, "KNOWLEDGE_VECTOR_UNAVAILABLE", None],
         )
         self.assertTrue(all(call.kwargs["processed"] == 7 for call in write_health.call_args_list))
+
+    async def test_disabled_feature_still_processes_storage_cleanup_queue(self):
+        cleanup_worker = MagicMock()
+        cleanup_worker.run_once = AsyncMock(return_value=True)
+
+        with (
+            patch("scripts.run_knowledge_worker.settings.KNOWLEDGE_BASE_ENABLED", False),
+            patch("scripts.run_knowledge_worker.init_storage", new=AsyncMock()) as init_storage,
+            patch("scripts.run_knowledge_worker.KnowledgeStorageCleanupWorker", return_value=cleanup_worker),
+            patch("scripts.run_knowledge_worker._write_health") as write_health,
+        ):
+            result = await run_worker(once=True)
+
+        self.assertEqual(result, 0)
+        init_storage.assert_awaited_once_with()
+        cleanup_worker.run_once.assert_awaited_once_with()
+        self.assertEqual(write_health.call_args_list[-1].kwargs["status"], "disabled")
+        self.assertEqual(write_health.call_args_list[-1].kwargs["processed"], 1)
 
 
 if __name__ == "__main__":

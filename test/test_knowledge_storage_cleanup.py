@@ -15,6 +15,7 @@ from starlette.datastructures import Headers
 
 from app.db.database import Base
 from app.db.models import (
+    File,
     KnowledgeBase,
     KnowledgeDocument,
     KnowledgeStorageCleanupTask,
@@ -138,11 +139,29 @@ class KnowledgeStorageCleanupTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(claimed)
         self.assertEqual(clock.call_count, 2)
-        self.assertEqual(claimed.task.heartbeat_at, lock_acquired_at.replace(tzinfo=None))
+        self.assertEqual(claimed.task.heartbeat_at, lock_acquired_at)
         self.assertEqual(
             claimed.task.lease_expires_at,
-            (lock_acquired_at + timedelta(seconds=10)).replace(tzinfo=None),
+            lock_acquired_at + timedelta(seconds=10),
         )
+
+    def test_cleanup_claim_returns_committed_token_without_post_commit_refresh(self):
+        registration = self._register(key="knowledge/no-refresh", hold_seconds=1)
+        self._activate(registration)
+        with self.Session() as db:
+            repo = StorageCleanupRepository(db)
+            with patch.object(db, "refresh", side_effect=RuntimeError("post-commit read failed")) as refresh:
+                claimed = repo.claim_task(
+                    worker_id="cleanup-no-refresh",
+                    lease_seconds=30,
+                    now=utc_now() + timedelta(seconds=2),
+                )
+
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.task.status, "running")
+        self.assertEqual(claimed.task.lease_owner, "cleanup-no-refresh")
+        self.assertTrue(claimed.lease_token)
+        refresh.assert_not_called()
 
     def test_running_task_rejects_same_key_registration_without_revoking_lease(self):
         registration = self._register(key="knowledge/running", hold_seconds=1)
@@ -228,6 +247,36 @@ class KnowledgeStorageCleanupTests(unittest.IsolatedAsyncioTestCase):
             task = db.get(KnowledgeStorageCleanupTask, registration.task_id)
             self.assertEqual(task.status, "completed")
             self.assertIsNotNone(task.completed_at)
+            self.assertEqual(db.query(KnowledgeStorageUploadIntent).count(), 0)
+
+    def test_legacy_file_reference_protects_committed_upload_from_cleanup(self):
+        key = "files/v1/users/user-1/conversations/conv-1/files/file-1/processed.jpg"
+        registration = self._register(key=key, hold_seconds=60)
+        with self.Session() as db:
+            repo = StorageCleanupRepository(db)
+            self.assertTrue(repo.record_upload_outcome(registration, outcome="succeeded", hold_seconds=60))
+            db.add(
+                File(
+                    id="file-1",
+                    user_id="user-1",
+                    filename="file-1_photo.jpg",
+                    original_filename="photo.jpg",
+                    mimetype="image/jpeg",
+                    size=123,
+                    path=key,
+                    status="processed",
+                    storage_key=key,
+                    storage_backend="local",
+                )
+            )
+            db.commit()
+
+        with self.Session() as db:
+            self.assertTrue(StorageCleanupRepository(db).complete_referenced_upload(registration))
+
+        with self.Session() as db:
+            task = db.get(KnowledgeStorageCleanupTask, registration.task_id)
+            self.assertEqual(task.status, "completed")
             self.assertEqual(db.query(KnowledgeStorageUploadIntent).count(), 0)
 
     async def test_definitive_put_failure_absent_completes_without_polling(self):

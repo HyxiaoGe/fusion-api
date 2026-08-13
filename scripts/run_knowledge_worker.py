@@ -148,8 +148,18 @@ async def _run_cleanup_loop(
 async def run_worker(*, once: bool) -> int:
     if not settings.KNOWLEDGE_BASE_ENABLED:
         worker_id = f"{socket.gethostname()}-{os.getpid()}"
-        _write_health(status="disabled", worker_id=worker_id, processed=0)
+        # 旧 /api/files/upload 也复用持久对象 cleanup fence；即使知识库
+        # 功能关闭，仍必须运行不依赖 Milvus 的存储清理队列。
+        await init_storage()
+        cleanup_worker = KnowledgeStorageCleanupWorker(
+            SessionLocal,
+            worker_id=f"{worker_id}-storage-cleanup",
+        )
+        processed = 0
+        _write_health(status="disabled", worker_id=worker_id, processed=processed)
         if once:
+            processed += int(await cleanup_worker.run_once())
+            _write_health(status="disabled", worker_id=worker_id, processed=processed)
             return 0
         stop_event = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -158,9 +168,20 @@ async def run_worker(*, once: bool) -> int:
                 loop.add_signal_handler(sig, stop_event.set)
         while not stop_event.is_set():
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=60)
+                handled = await cleanup_worker.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("知识库关闭时存储清理循环异常")
+                handled = False
+            if handled:
+                processed += 1
+                _write_health(status="disabled", worker_id=worker_id, processed=processed)
+                continue
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=settings.KNOWLEDGE_WORKER_POLL_SECONDS)
             except TimeoutError:
-                _write_health(status="disabled", worker_id=worker_id, processed=0)
+                _write_health(status="disabled", worker_id=worker_id, processed=processed)
         return 0
     try:
         settings.validate_knowledge_base_configuration()

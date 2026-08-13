@@ -11,6 +11,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from app.db.models import (
+    File,
     KnowledgeDocument,
     KnowledgeStorageCleanupTask,
     KnowledgeStorageUploadIntent,
@@ -149,7 +150,7 @@ class StorageCleanupRepository:
             return
         intent = self._lock_intent(registration)
         now = utc_now()
-        if self._has_document_reference(task):
+        if self._has_storage_reference(task):
             self._complete_locked(task, now)
             return
         if intent is not None and intent.outcome == "failed":
@@ -225,6 +226,22 @@ class StorageCleanupRepository:
         self._delete_intent(registration.intent_id, task.id)
         self._set_completed(task, utc_now())
 
+    def complete_referenced_upload(self, registration: RegisteredStorageUploadIntent) -> bool:
+        """旧文件 API 已提交 File 引用后完成持久 cleanup fence。"""
+        task = self._lock_task(registration.task_id)
+        if task is None:
+            self.db.rollback()
+            return False
+        if task.status == "completed":
+            self.db.commit()
+            return True
+        self._lock_intent(registration)
+        if not self._has_storage_reference(task):
+            self.db.rollback()
+            return False
+        self._complete_locked(task, utc_now())
+        return True
+
     def resolve_known_conflict(
         self,
         registration: RegisteredStorageUploadIntent,
@@ -241,7 +258,7 @@ class StorageCleanupRepository:
         now = utc_now()
         self._delete_intent(registration.intent_id, task.id)
         self._delete_expired_intents(task.id, now)
-        if self._has_document_reference(task):
+        if self._has_storage_reference(task):
             self._complete_locked(task, now)
             return
         remaining = self._active_intents(task.id, now)
@@ -319,8 +336,12 @@ class StorageCleanupRepository:
         task.error_code = None
         task.error_summary = None
         task.updated_at = lease_started_at
-        self.db.commit()
-        self.db.refresh(task)
+        expire_on_commit = self.db.expire_on_commit
+        try:
+            self.db.expire_on_commit = False
+            self.db.commit()
+        finally:
+            self.db.expire_on_commit = expire_on_commit
         return ClaimedStorageCleanupTask(task=task, lease_token=lease_token)
 
     def prepare_delete(self, task_id: str, lease_token: str) -> tuple[str, KnowledgeStorageCleanupTask | None]:
@@ -338,7 +359,7 @@ class StorageCleanupRepository:
             task.updated_at = now
             self.db.commit()
             return "guarded", None
-        if self._has_document_reference(task):
+        if self._has_storage_reference(task):
             self._complete_locked(task, now)
             return "referenced", None
         return "delete", task
@@ -462,13 +483,24 @@ class StorageCleanupRepository:
             .with_for_update()
         )
 
-    def _has_document_reference(self, task: KnowledgeStorageCleanupTask) -> bool:
-        return (
+    def _has_storage_reference(self, task: KnowledgeStorageCleanupTask) -> bool:
+        knowledge_reference = (
             self.db.query(KnowledgeDocument.id)
             .filter(
                 KnowledgeDocument.storage_backend == task.storage_backend,
                 KnowledgeDocument.storage_key == task.storage_key,
                 KnowledgeDocument.status != "deleted",
+            )
+            .first()
+            is not None
+        )
+        if knowledge_reference:
+            return True
+        return (
+            self.db.query(File.id)
+            .filter(
+                File.storage_backend == task.storage_backend,
+                or_(File.storage_key == task.storage_key, File.thumbnail_key == task.storage_key),
             )
             .first()
             is not None

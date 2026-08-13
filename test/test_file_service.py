@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from datetime import datetime
@@ -574,12 +575,19 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        result = await self.service.complete_direct_upload("file-1", "user-1")
+        lifecycle = MagicMock()
+        lifecycle.registration.task_id = "cleanup-task"
+        with (
+            patch.object(self.service, "_guarded_file_upload", AsyncMock(side_effect=[lifecycle, lifecycle])),
+            patch.object(self.service, "_complete_file_upload_lifecycles", AsyncMock()) as complete_lifecycles,
+        ):
+            result = await self.service.complete_direct_upload("file-1", "user-1")
 
         self.service.storage.exists.assert_awaited_once_with(ORIGINAL_KEY)
         self.service.storage.get_size.assert_awaited_once_with(ORIGINAL_KEY)
         self.service.storage.download.assert_awaited_once_with(ORIGINAL_KEY)
         self.service.image_processor.process.assert_awaited_once_with(b"original-image", "image/png")
+        complete_lifecycles.assert_awaited_once_with([lifecycle, lifecycle])
         self.service.file_repo.update_file.assert_called_once_with(
             file_id="file-1",
             updates={
@@ -605,6 +613,85 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertTrue(result["thumbnail_url"].startswith(f"https://oss.example.com/{THUMBNAIL_KEY}"))
+
+    async def test_guarded_legacy_upload_detaches_when_request_is_cancelled(self):
+        registration = SimpleNamespace(task_id="cleanup-task", intent_id="upload-intent")
+        lifecycle = MagicMock()
+        lifecycle.wait_upload = AsyncMock(side_effect=asyncio.CancelledError)
+        repo = MagicMock()
+        repo.register_upload_intent.return_value = registration
+
+        with (
+            patch("app.services.file_service.StorageCleanupRepository", return_value=repo),
+            patch("app.services.file_service.start_guarded_storage_upload", return_value=lifecycle),
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await self.service._guarded_file_upload("files/object", b"payload", "text/plain")
+
+        lifecycle.detach_request.assert_called_once_with()
+
+    async def test_image_partial_upload_detaches_first_object_when_second_is_cancelled(self):
+        self.service.image_processor.process = AsyncMock(
+            return_value={
+                "processed": b"processed-image",
+                "thumbnail": b"thumbnail-image",
+                "mime_type": "image/jpeg",
+                "width": 640,
+                "height": 480,
+            }
+        )
+        first_lifecycle = MagicMock()
+
+        with (
+            patch.object(
+                self.service,
+                "_guarded_file_upload",
+                AsyncMock(side_effect=[first_lifecycle, asyncio.CancelledError]),
+            ),
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await self.service._process_and_store_image(
+                b"original",
+                "image/png",
+                "user-1",
+                "conv-1",
+                "file-1",
+            )
+
+        first_lifecycle.detach_request.assert_called_once_with()
+
+    async def test_image_url_failure_detaches_both_uploaded_objects(self):
+        self.service.image_processor.process = AsyncMock(
+            return_value={
+                "processed": b"processed-image",
+                "thumbnail": b"thumbnail-image",
+                "mime_type": "image/jpeg",
+                "width": 640,
+                "height": 480,
+            }
+        )
+        first_lifecycle = MagicMock()
+        second_lifecycle = MagicMock()
+        self.service.storage.get_url = AsyncMock(side_effect=RuntimeError("presign unavailable"))
+
+        with (
+            patch.object(
+                self.service,
+                "_guarded_file_upload",
+                AsyncMock(side_effect=[first_lifecycle, second_lifecycle]),
+            ),
+            self.assertRaisesRegex(RuntimeError, "presign unavailable"),
+        ):
+            await self.service._process_and_store_image(
+                b"original",
+                "image/png",
+                "user-1",
+                "conv-1",
+                "file-1",
+            )
+
+        first_lifecycle.detach_request.assert_called_once_with()
+        second_lifecycle.detach_request.assert_called_once_with()
 
     def test_conversation_id_from_key_requires_current_storage_schema(self):
         self.assertEqual(FileService._conversation_id_from_key(ORIGINAL_KEY), "conv-1")

@@ -427,33 +427,82 @@ class KnowledgeRepository:
             self.db.query(KnowledgeChunkManifest).filter(KnowledgeChunkManifest.index_version == version.id).delete(
                 synchronize_session=False
             )
-            manifest_table = KnowledgeChunkManifest.__table__
             for offset in range(0, len(chunks), batch_size):
                 batch = chunks[offset : offset + batch_size]
-                rows = [
-                    {
-                        "chunk_id": chunk.chunk_id,
-                        "knowledge_base_id": version.knowledge_base_id,
-                        "document_id": version.document_id,
-                        "user_id": version.user_id,
-                        "index_version": version.id,
-                        "ordinal": chunk.ordinal,
-                        "text": chunk.text,
-                        "text_sha256": hashlib.sha256(chunk.text.encode("utf-8")).hexdigest(),
-                        "filename": filename,
-                        "char_start": chunk.char_start,
-                        "char_end": chunk.char_end,
-                        "page": chunk.page,
-                        "section": chunk.section,
-                    }
-                    for chunk in batch
-                ]
-                self.db.execute(insert(manifest_table), rows)
+                self.db.execute(
+                    insert(KnowledgeChunkManifest.__table__),
+                    self._chunk_manifest_rows(version=version, filename=filename, chunks=batch),
+                )
             self.db.commit()
             return True
         except Exception:
             self.db.rollback()
             raise
+
+    def reset_chunk_manifest(self, *, task_id: str, lease_token: str, index_version: str) -> bool:
+        """v1 流式重试前清空未激活版本的部分 manifest。"""
+        task = self._lock_task(task_id)
+        if not self._lease_matches(task, lease_token, utc_now()) or task.index_version != index_version:
+            self.db.rollback()
+            return False
+        self.db.query(KnowledgeChunkManifest).filter(KnowledgeChunkManifest.index_version == index_version).delete(
+            synchronize_session=False
+        )
+        self.db.commit()
+        return True
+
+    def append_chunk_manifest(
+        self,
+        *,
+        task_id: str,
+        lease_token: str,
+        version: KnowledgeIndexVersion,
+        filename: str,
+        chunks: Sequence[object],
+    ) -> bool:
+        """在租约保护下追加一个有界 v1 manifest 批次。"""
+        if not chunks:
+            return True
+        task = self._lock_task(task_id)
+        if (
+            not self._lease_matches(task, lease_token, utc_now())
+            or task.index_version != version.id
+            or task.task_type != "index_document"
+        ):
+            self.db.rollback()
+            return False
+        self.db.execute(
+            insert(KnowledgeChunkManifest.__table__),
+            self._chunk_manifest_rows(version=version, filename=filename, chunks=chunks),
+        )
+        self.db.commit()
+        return True
+
+    @staticmethod
+    def _chunk_manifest_rows(
+        *,
+        version: KnowledgeIndexVersion,
+        filename: str,
+        chunks: Sequence[object],
+    ) -> list[dict[str, object]]:
+        return [
+            {
+                "chunk_id": chunk.chunk_id,
+                "knowledge_base_id": version.knowledge_base_id,
+                "document_id": version.document_id,
+                "user_id": version.user_id,
+                "index_version": version.id,
+                "ordinal": chunk.ordinal,
+                "text": chunk.text,
+                "text_sha256": hashlib.sha256(chunk.text.encode("utf-8")).hexdigest(),
+                "filename": filename,
+                "char_start": chunk.char_start,
+                "char_end": chunk.char_end,
+                "page": chunk.page,
+                "section": chunk.section,
+            }
+            for chunk in chunks
+        ]
 
     def enqueue_document_delete(self, document: KnowledgeDocument, *, max_attempts: int) -> KnowledgeIndexTask:
         document.status = "deleting"
@@ -681,8 +730,12 @@ class KnowledgeRepository:
         task.error_code = None
         task.error_summary = None
         task.updated_at = lease_started_at
-        self.db.commit()
-        self.db.refresh(task)
+        expire_on_commit = self.db.expire_on_commit
+        try:
+            self.db.expire_on_commit = False
+            self.db.commit()
+        finally:
+            self.db.expire_on_commit = expire_on_commit
         return ClaimedKnowledgeTask(task=task, lease_token=lease_token)
 
     def index_task_write_state(
@@ -742,18 +795,19 @@ class KnowledgeRepository:
             self.db.rollback()
             return False
         task.phase = phase
-        task.updated_at = utc_now()
+        now = utc_now()
+        task.updated_at = now
         if task.document_id:
-            document = self.db.query(KnowledgeDocument).filter(KnowledgeDocument.id == task.document_id).first()
-            if (
-                document is not None
-                and task.task_type == "index_document"
-                and document.desired_index_version == task.index_version
-                and document.status not in {"deleting", "deleted"}
-                and document.active_index_version is None
-            ):
-                document.status = phase
-                document.updated_at = utc_now()
+            if task.task_type == "index_document":
+                self.db.query(KnowledgeDocument).filter(
+                    KnowledgeDocument.id == task.document_id,
+                    KnowledgeDocument.desired_index_version == task.index_version,
+                    KnowledgeDocument.status.notin_(("deleting", "deleted")),
+                    KnowledgeDocument.active_index_version.is_(None),
+                ).update(
+                    {"status": phase, "updated_at": now},
+                    synchronize_session=False,
+                )
         self.db.commit()
         return True
 
@@ -802,24 +856,37 @@ class KnowledgeRepository:
         task.lease_expires_at = None
         task.heartbeat_at = None
         if task.document_id and task.task_type == "index_document":
-            document = self.db.query(KnowledgeDocument).filter(KnowledgeDocument.id == task.document_id).first()
-            if (
-                document is not None
-                and document.desired_index_version == task.index_version
-                and document.status not in {"deleting", "deleted"}
-                and document.active_index_version is None
-            ):
-                document.status = "queued" if will_retry else "failed"
-                document.error_code = task.error_code
-                document.error_summary = task.error_summary
-                document.attempt_count = task.attempt_count
-                document.updated_at = now
-                if not will_retry and task.index_version:
-                    version = self.get_index_version(task.index_version)
-                    if version is not None and version.status == "building":
-                        version.status = "failed"
-                        version.error_code = task.error_code
-                        version.error_summary = task.error_summary
+            document_updated = (
+                self.db.query(KnowledgeDocument)
+                .filter(
+                    KnowledgeDocument.id == task.document_id,
+                    KnowledgeDocument.desired_index_version == task.index_version,
+                    KnowledgeDocument.status.notin_(("deleting", "deleted")),
+                    KnowledgeDocument.active_index_version.is_(None),
+                )
+                .update(
+                    {
+                        "status": "queued" if will_retry else "failed",
+                        "error_code": task.error_code,
+                        "error_summary": task.error_summary,
+                        "attempt_count": task.attempt_count,
+                        "updated_at": now,
+                    },
+                    synchronize_session=False,
+                )
+            )
+            if document_updated and not will_retry and task.index_version:
+                self.db.query(KnowledgeIndexVersion).filter(
+                    KnowledgeIndexVersion.id == task.index_version,
+                    KnowledgeIndexVersion.status == "building",
+                ).update(
+                    {
+                        "status": "failed",
+                        "error_code": task.error_code,
+                        "error_summary": task.error_summary,
+                    },
+                    synchronize_session=False,
+                )
             if not will_retry:
                 self._schedule_final_index_cleanup(
                     task,
@@ -1190,24 +1257,37 @@ class KnowledgeRepository:
             task.lease_expires_at = None
             task.heartbeat_at = None
             if task.document_id and task.task_type == "index_document":
-                document = self.db.query(KnowledgeDocument).filter(KnowledgeDocument.id == task.document_id).first()
-                if (
-                    document is not None
-                    and document.desired_index_version == task.index_version
-                    and document.status not in {"deleting", "deleted"}
-                    and document.active_index_version is None
-                ):
-                    document.status = "failed"
-                    document.error_code = task.error_code
-                    document.error_summary = task.error_summary
-                    document.attempt_count = task.attempt_count
-                    document.updated_at = now
-                    if task.index_version:
-                        version = self.get_index_version(task.index_version)
-                        if version is not None and version.status == "building":
-                            version.status = "failed"
-                            version.error_code = task.error_code
-                            version.error_summary = task.error_summary
+                document_updated = (
+                    self.db.query(KnowledgeDocument)
+                    .filter(
+                        KnowledgeDocument.id == task.document_id,
+                        KnowledgeDocument.desired_index_version == task.index_version,
+                        KnowledgeDocument.status.notin_(("deleting", "deleted")),
+                        KnowledgeDocument.active_index_version.is_(None),
+                    )
+                    .update(
+                        {
+                            "status": "failed",
+                            "error_code": task.error_code,
+                            "error_summary": task.error_summary,
+                            "attempt_count": task.attempt_count,
+                            "updated_at": now,
+                        },
+                        synchronize_session=False,
+                    )
+                )
+                if document_updated and task.index_version:
+                    self.db.query(KnowledgeIndexVersion).filter(
+                        KnowledgeIndexVersion.id == task.index_version,
+                        KnowledgeIndexVersion.status == "building",
+                    ).update(
+                        {
+                            "status": "failed",
+                            "error_code": task.error_code,
+                            "error_summary": task.error_summary,
+                        },
+                        synchronize_session=False,
+                    )
                 self._schedule_final_index_cleanup(
                     task,
                     now,

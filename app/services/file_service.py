@@ -2,20 +2,27 @@ import asyncio
 import json
 import os
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import aiofiles
 from fastapi import UploadFile
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import settings
 from app.core.file_token import generate_file_token
 from app.core.logger import app_logger as logger
 from app.db.repositories import ConversationRepository, FileRepository
+from app.db.storage_cleanup_repository import StorageCleanupBusy, StorageCleanupRepository
 from app.processor.file_processor import FileProcessor
 from app.processor.image_processor import ImageProcessor
 from app.schemas.chat import Conversation
+from app.services.knowledge.storage_upload_guard import (
+    GuardedStorageUpload,
+    StorageUploadFenceLost,
+    start_guarded_storage_upload,
+)
 from app.services.storage import get_storage, get_storage_for_backend
 from app.services.storage.base import StorageBackend
 
@@ -52,7 +59,7 @@ def is_image_mime(mime_type: str) -> bool:
 class FileService:
     """文件服务，负责文件上传、存储和管理"""
 
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, *, session_factory: Callable[[], Session] | None = None):
         self.db = db
         self.file_repo = FileRepository(db)
         self.base_path = settings.FILE_STORAGE_PATH
@@ -63,6 +70,12 @@ class FileService:
         self.image_processor = ImageProcessor()
         # 获取存储后端
         self.storage: StorageBackend = get_storage()
+        self.session_factory = session_factory or sessionmaker(
+            bind=db.get_bind(),
+            autoflush=False,
+            expire_on_commit=False,
+        )
+        self.storage_upload_hold_seconds = max(1, settings.FILE_UPLOAD_TIMEOUT_SECONDS) + 30
 
     @staticmethod
     def _storage_for_file(file_obj: Any) -> StorageBackend:
@@ -168,6 +181,7 @@ class FileService:
             file_id = str(uuid.uuid4())
             safe_filename = self._safe_filename(file.filename)
 
+            upload_lifecycles: list[GuardedStorageUpload] = []
             try:
                 content = await file.read()
                 if len(content) > settings.MAX_FILE_SIZE:
@@ -185,6 +199,7 @@ class FileService:
                 if is_image_mime(mime_type):
                     # 图片走预处理管线
                     result = await self._process_and_store_image(content, mime_type, user_id, conversation_id, file_id)
+                    upload_lifecycles.extend(result.pop("upload_lifecycles"))
                     storage_key = result["storage_key"]
                     thumbnail_key = result["thumbnail_key"]
                     thumbnail_url = result["thumbnail_url"]
@@ -198,7 +213,7 @@ class FileService:
                     file_path_local = os.path.join(conversation_dir, f"{file_id}_{safe_filename}")
                     storage_key = self._original_storage_key(user_id, conversation_id, file_id)
 
-                    await self.storage.upload(storage_key, content, mime_type)
+                    upload_lifecycles.append(await self._guarded_file_upload(storage_key, content, mime_type))
 
                     # 兼容本地模式：同时写一份到本地（供 file_processor 读取）
                     if settings.STORAGE_BACKEND == "local":
@@ -231,6 +246,7 @@ class FileService:
 
                 self.file_repo.create_file(file_record)
                 self.file_repo.link_file_to_conversation(conversation_id, file_id)
+                await self._complete_file_upload_lifecycles(upload_lifecycles)
 
                 result_item = {"file_id": file_id, "thumbnail_url": thumbnail_url}
                 results.append(result_item)
@@ -241,7 +257,11 @@ class FileService:
 
                 logger.info(f"文件上传成功: {file_id}, 原始文件名: {file.filename}, 类型: {file.content_type}")
 
+            except asyncio.CancelledError:
+                self._detach_file_upload_lifecycles(upload_lifecycles)
+                raise
             except Exception as e:
+                self._detach_file_upload_lifecycles(upload_lifecycles)
                 logger.error(f"文件上传失败: {e}, 文件名: {file.filename}")
                 raise
 
@@ -323,20 +343,31 @@ class FileService:
         content = await self.storage.download(original_key)
 
         if is_image_mime(file.mimetype):
-            result = await self._process_and_store_image(content, file.mimetype, user_id, conversation_id, file_id)
-            updates = {
-                "status": "processed",
-                "mimetype": result["mime_type"],
-                "storage_key": result["storage_key"],
-                "thumbnail_key": result["thumbnail_key"],
-                "width": result["width"],
-                "height": result["height"],
-                "size": actual_size,
-                "processing_result": None,
-            }
-            self.file_repo.update_file(file_id=file_id, updates=updates)
-            file = UpdatedFileView(file, updates)
-            return await self._build_upload_result_from_file(file, thumbnail_url=result["thumbnail_url"])
+            upload_lifecycles: list[GuardedStorageUpload] = []
+            try:
+                result = await self._process_and_store_image(content, file.mimetype, user_id, conversation_id, file_id)
+                upload_lifecycles.extend(result.pop("upload_lifecycles"))
+                updates = {
+                    "status": "processed",
+                    "mimetype": result["mime_type"],
+                    "storage_key": result["storage_key"],
+                    "thumbnail_key": result["thumbnail_key"],
+                    "width": result["width"],
+                    "height": result["height"],
+                    "size": actual_size,
+                    "processing_result": None,
+                }
+                if not self.file_repo.update_file(file_id=file_id, updates=updates):
+                    raise RuntimeError("图片文件记录更新失败")
+                await self._complete_file_upload_lifecycles(upload_lifecycles)
+                file = UpdatedFileView(file, updates)
+                return await self._build_upload_result_from_file(file, thumbnail_url=result["thumbnail_url"])
+            except asyncio.CancelledError:
+                self._detach_file_upload_lifecycles(upload_lifecycles)
+                raise
+            except Exception:
+                self._detach_file_upload_lifecycles(upload_lifecycles)
+                raise
 
         file_path = await self._write_direct_upload_temp_file(
             conversation_id=conversation_id,
@@ -431,13 +462,23 @@ class FileService:
         storage_key = f"{storage_root}/processed{ext}"
         thumbnail_key = f"{storage_root}/thumbnail{ext}"
 
-        # 上传到存储后端
-        await self.storage.upload(storage_key, processed["processed"], processed["mime_type"])
-        await self.storage.upload(thumbnail_key, processed["thumbnail"], processed["mime_type"])
+        # 每个不可取消 PUT 都有独立持久 fence。第二个上传失败或请求
+        # 超时时，第一个对象也会由 detached finalizer/cleanup Worker 收敛。
+        upload_lifecycles: list[GuardedStorageUpload] = []
+        try:
+            upload_lifecycles.append(
+                await self._guarded_file_upload(storage_key, processed["processed"], processed["mime_type"])
+            )
+            upload_lifecycles.append(
+                await self._guarded_file_upload(thumbnail_key, processed["thumbnail"], processed["mime_type"])
+            )
 
-        # 获取缩略图访问 URL（本地存储模式追加签名 token）
-        thumbnail_url = await self.storage.get_url(thumbnail_key, expires=settings.MINIO_PRESIGN_EXPIRES)
-        thumbnail_url = self._sign_local_url(thumbnail_url, file_id, settings.MINIO_PRESIGN_EXPIRES)
+            # 获取缩略图访问 URL（本地存储模式追加签名 token）
+            thumbnail_url = await self.storage.get_url(thumbnail_key, expires=settings.MINIO_PRESIGN_EXPIRES)
+            thumbnail_url = self._sign_local_url(thumbnail_url, file_id, settings.MINIO_PRESIGN_EXPIRES)
+        except BaseException:
+            self._detach_file_upload_lifecycles(upload_lifecycles)
+            raise
 
         return {
             "storage_key": storage_key,
@@ -446,7 +487,64 @@ class FileService:
             "mime_type": processed["mime_type"],
             "width": processed["width"],
             "height": processed["height"],
+            "upload_lifecycles": upload_lifecycles,
         }
+
+    async def _guarded_file_upload(self, storage_key: str, content: bytes, mimetype: str) -> GuardedStorageUpload:
+        try:
+            registration = StorageCleanupRepository(self.db).register_upload_intent(
+                storage_backend=settings.STORAGE_BACKEND,
+                storage_key=storage_key,
+                hold_seconds=self.storage_upload_hold_seconds,
+                max_attempts=max(1, settings.KNOWLEDGE_WORKER_MAX_ATTEMPTS),
+            )
+        except StorageCleanupBusy as exc:
+            raise RuntimeError("对象存储清理正在进行，请稍后重试") from exc
+        lifecycle = start_guarded_storage_upload(
+            registration=registration,
+            session_factory=self.session_factory,
+            storage=self.storage,
+            storage_key=storage_key,
+            content=content,
+            mimetype=mimetype,
+            hold_seconds=self.storage_upload_hold_seconds,
+        )
+        try:
+            await lifecycle.wait_upload()
+        except StorageUploadFenceLost as exc:
+            lifecycle.detach_request()
+            raise RuntimeError("对象上传期间持久清理 fence 已失效") from exc
+        except BaseException:
+            lifecycle.detach_request()
+            raise
+        return lifecycle
+
+    async def _complete_file_upload_lifecycles(self, lifecycles: list[GuardedStorageUpload]) -> None:
+        for lifecycle in lifecycles:
+            lifecycle.mark_request_resolved()
+        for lifecycle in lifecycles:
+            try:
+                with self.session_factory() as db:
+                    completed = StorageCleanupRepository(db).complete_referenced_upload(lifecycle.registration)
+                if not completed:
+                    logger.warning(
+                        "文件对象已提交但 cleanup fence 尚未收敛: task_id=%s",
+                        lifecycle.registration.task_id,
+                    )
+            except Exception:
+                # File 引用已提交，持久 Worker 会在 intent 过期后检测引用并完成，
+                # 不得因补偿记账短暂失败删除已被引用的对象。
+                logger.exception(
+                    "文件对象 cleanup fence 完成失败，等待持久 Worker: task_id=%s",
+                    lifecycle.registration.task_id,
+                )
+        for lifecycle in lifecycles:
+            await lifecycle.wait_finished()
+
+    @staticmethod
+    def _detach_file_upload_lifecycles(lifecycles: list[GuardedStorageUpload]) -> None:
+        for lifecycle in lifecycles:
+            lifecycle.detach_request()
 
     async def get_file_url(self, file_id: str, user_id: str, variant: str = "thumbnail") -> Optional[str]:
         """获取文件访问 URL（MinIO 返回 presigned URL，本地存储返回带签名的代理 URL）"""

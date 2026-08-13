@@ -35,6 +35,13 @@ class KnowledgeEmbeddingValidationTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, "KNOWLEDGE_EMBEDDING_INVALID")
             self.assertFalse(raised.exception.retryable)
 
+    def test_integer_too_large_for_float_is_stable_non_retryable_error(self):
+        with self.assertRaises(EmbeddingError) as raised:
+            LiteLLMEmbeddingAdapter.validate_vectors([[10**400, 1]], expected_count=1, dimension=2)
+
+        self.assertEqual(raised.exception.code, "KNOWLEDGE_EMBEDDING_INVALID")
+        self.assertFalse(raised.exception.retryable)
+
 
 class KnowledgeEmbeddingAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_non_array_response_data_is_rejected_as_non_retryable_contract_error(self):

@@ -92,6 +92,17 @@ class DeterministicKnowledgeChunkerTests(unittest.TestCase):
             all(current.char_start - previous.char_start <= 50 for previous, current in zip(first, first[1:]))
         )
 
+    def test_legacy_v1_can_stream_past_current_new_document_limit(self):
+        chunker = LegacyKnowledgeChunkerV1(chunk_size=100, overlap=99)
+
+        streamed = chunker.iter_chunks(
+            [ParsedSection("x" * 106, page=None, section="legacy")],
+            document_id="doc-v1-stream",
+            index_version="version-v1-stream",
+        )
+
+        self.assertEqual([chunk.ordinal for chunk in streamed], list(range(7)))
+
 
 if __name__ == "__main__":
     unittest.main()

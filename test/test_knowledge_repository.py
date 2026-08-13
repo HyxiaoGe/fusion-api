@@ -600,11 +600,52 @@ class KnowledgeRepositoryTests(unittest.TestCase):
 
         self.assertIsNotNone(claimed)
         self.assertEqual(clock.call_count, 2)
-        self.assertEqual(claimed.task.heartbeat_at, lock_acquired_at.replace(tzinfo=None))
+        self.assertEqual(claimed.task.heartbeat_at, lock_acquired_at)
         self.assertEqual(
             claimed.task.lease_expires_at,
-            (lock_acquired_at + timedelta(seconds=10)).replace(tzinfo=None),
+            lock_acquired_at + timedelta(seconds=10),
         )
+
+    def test_claim_returns_committed_token_without_post_commit_refresh(self):
+        repo = KnowledgeRepository(self.db)
+        repo.create_knowledge_base(self._base())
+        document, _version, task = self._document_bundle()
+        repo.create_document_with_task(document, _version, task)
+
+        with patch.object(self.db, "refresh", side_effect=RuntimeError("post-commit read failed")) as refresh:
+            claimed = repo.claim_task(worker_id="worker-no-refresh", lease_seconds=60)
+
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.task.status, "running")
+        self.assertEqual(claimed.task.lease_owner, "worker-no-refresh")
+        self.assertTrue(claimed.lease_token)
+        refresh.assert_not_called()
+
+    def test_index_status_updates_cannot_overwrite_deleting_document(self):
+        repo = KnowledgeRepository(self.db)
+        repo.create_knowledge_base(self._base())
+        document, version, task = self._document_bundle()
+        repo.create_document_with_task(document, version, task)
+        claimed = repo.claim_task(worker_id="worker-delete-race", lease_seconds=60)
+        document.status = "deleting"
+        self.db.commit()
+
+        self.assertTrue(repo.update_task_phase(task.id, claimed.lease_token, "writing"))
+        self.db.refresh(document)
+        self.assertEqual(document.status, "deleting")
+
+        self.assertTrue(
+            repo.fail_task(
+                task.id,
+                claimed.lease_token,
+                error_code="KNOWLEDGE_VECTOR_UNAVAILABLE",
+                error_summary="Milvus 暂时不可用",
+                retryable=True,
+                retry_delay_seconds=1,
+            )
+        )
+        self.db.refresh(document)
+        self.assertEqual(document.status, "deleting")
 
     def test_renew_lease_reads_clock_only_after_task_lock(self):
         repo = KnowledgeRepository(self.db)

@@ -683,6 +683,53 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "KNOWLEDGE_BASE_NOT_READY")
         self.assertEqual(raised.exception.status_code, 409)
 
+    async def test_retrieval_revalidates_each_hit_after_base_ready_check(self):
+        knowledge_base, hit_document = await self._create_ready_document(
+            base_name="并发删除手册",
+            content=b"hit document",
+            embedding_model="embed-a",
+        )
+        second_upload = UploadFile(
+            filename="other.txt",
+            file=io.BytesIO(b"other ready document"),
+            headers=Headers({"content-type": "text/plain"}),
+        )
+        created = await self.service.upload_document("user-1", knowledge_base.id, second_upload)
+        other_document = self.service.repo.get_document(created.document.id, "user-1")
+        other_document.status = "ready"
+        other_document.active_index_version = other_document.desired_index_version
+        other_version = next(
+            item for item in other_document.index_versions if item.id == other_document.active_index_version
+        )
+        other_version.status = "active"
+        self._add_chunk(hit_document, chunk_id="deleted-hit", ordinal=0, text="不得返回的旧正文")
+        self.db.commit()
+        self.vector_store.search.return_value = [
+            self._vector_hit(hit_document, chunk_id="deleted-hit", similarity=0.99)
+        ]
+        original_ready_check = self.service._ensure_requested_bases_still_ready
+
+        def delete_hit_after_base_check(user_id, knowledge_base_ids):
+            original_ready_check(user_id, knowledge_base_ids)
+            hit_document.status = "deleting"
+            self.db.commit()
+
+        with patch.object(
+            self.service,
+            "_ensure_requested_bases_still_ready",
+            side_effect=delete_hit_after_base_check,
+        ):
+            result = await self.service.retrieve(
+                "user-1",
+                KnowledgeRetrievalRequest(
+                    knowledge_base_ids=[knowledge_base.id],
+                    query="删除竞态",
+                    top_k=1,
+                ),
+            )
+
+        self.assertEqual(result.hits, [])
+
 
 if __name__ == "__main__":
     unittest.main()

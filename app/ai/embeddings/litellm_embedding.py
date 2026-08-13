@@ -109,7 +109,7 @@ class LiteLLMEmbeddingAdapter(EmbeddingAdapter):
                 )
             try:
                 numeric = [float(value) for value in vector]
-            except (TypeError, ValueError) as exc:
+            except (OverflowError, TypeError, ValueError) as exc:
                 raise EmbeddingError(
                     "KNOWLEDGE_EMBEDDING_INVALID",
                     "Embedding 返回了非数值向量",
