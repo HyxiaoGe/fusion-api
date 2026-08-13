@@ -65,7 +65,7 @@ class MilvusKnowledgeStore:
     _INT64_FIELDS = {"chunk_ordinal", "char_start", "char_end", "page"}
 
     def __init__(self, client_factory: Callable[[], Any] | None = None):
-        self._client_factory = client_factory or self._build_client
+        self._client_factory = client_factory
 
     @classmethod
     def collection_name(cls, dimension: int) -> str:
@@ -109,7 +109,7 @@ class MilvusKnowledgeStore:
                 return
             self._create_collection(client, collection, profile.dimension, profile.distance_metric)
 
-        await self._call(ensure)
+        await self._call(ensure, profile=profile)
         return collection
 
     async def upsert(self, profile: EmbeddingProfile, records: Sequence[KnowledgeVectorRecord]) -> None:
@@ -133,10 +133,11 @@ class MilvusKnowledgeStore:
             )
         batch_size = settings.KNOWLEDGE_EMBEDDING_BATCH_SIZE
         for offset in range(0, len(records), batch_size):
-            await self._upsert_batch(collection, records[offset : offset + batch_size])
+            await self._upsert_batch(profile, collection, records[offset : offset + batch_size])
 
     async def _upsert_batch(
         self,
+        profile: EmbeddingProfile,
         collection: str,
         records: Sequence[KnowledgeVectorRecord],
     ) -> None:
@@ -146,7 +147,8 @@ class MilvusKnowledgeStore:
                 collection_name=collection,
                 data=data,
                 timeout=settings.MILVUS_TIMEOUT_SECONDS,
-            )
+            ),
+            profile=profile,
         )
         if isinstance(result, dict):
             upserted = result.get("upsert_count")
@@ -157,7 +159,7 @@ class MilvusKnowledgeStore:
                     retryable=True,
                 )
         expected_ids = {record.chunk.chunk_id for record in records}
-        actual_ids = await self._readback_chunk_ids(collection, sorted(expected_ids))
+        actual_ids = await self._readback_chunk_ids(profile, collection, sorted(expected_ids))
         if not expected_ids.issubset(actual_ids):
             raise KnowledgeVectorError(
                 "KNOWLEDGE_VECTOR_WRITE_INCOMPLETE",
@@ -200,7 +202,8 @@ class MilvusKnowledgeStore:
                 search_params={"metric_type": profile.distance_metric},
                 consistency_level="Strong",
                 timeout=settings.MILVUS_TIMEOUT_SECONDS,
-            )
+            ),
+            profile=profile,
         )
         rows = result[0] if result else []
         return [self._hit_from_result(row) for row in rows]
@@ -226,9 +229,14 @@ class MilvusKnowledgeStore:
                 timeout=settings.MILVUS_TIMEOUT_SECONDS,
             )
 
-        await self._call(delete)
+        await self._call(delete, profile=profile)
 
-    async def _readback_chunk_ids(self, collection: str, chunk_ids: Sequence[str]) -> set[str]:
+    async def _readback_chunk_ids(
+        self,
+        profile: EmbeddingProfile,
+        collection: str,
+        chunk_ids: Sequence[str],
+    ) -> set[str]:
         actual_ids: set[str] = set()
         batch_size = settings.KNOWLEDGE_EMBEDDING_BATCH_SIZE
         for offset in range(0, len(chunk_ids), batch_size):
@@ -240,15 +248,16 @@ class MilvusKnowledgeStore:
                     output_fields=["chunk_id"],
                     consistency_level="Strong",
                     timeout=settings.MILVUS_TIMEOUT_SECONDS,
-                )
+                ),
+                profile=profile,
             )
             actual_ids.update(str(row.get("chunk_id", row.get("id", ""))) for row in rows)
         return actual_ids
 
-    async def _call(self, operation: Callable[[Any], Any]) -> Any:
+    async def _call(self, operation: Callable[[Any], Any], *, profile: EmbeddingProfile | None = None) -> Any:
         def run() -> Any:
             try:
-                client = self._client_factory()
+                client = self._client_factory() if self._client_factory is not None else self._build_client(profile)
                 return operation(client)
             except KnowledgeVectorError:
                 raise
@@ -427,8 +436,12 @@ class MilvusKnowledgeStore:
         )
 
     @staticmethod
-    def _build_client() -> Any:
-        if not all((settings.MILVUS_URI, settings.MILVUS_USERNAME, settings.MILVUS_PASSWORD, settings.MILVUS_DATABASE)):
+    def _build_client(profile: EmbeddingProfile | None = None) -> Any:
+        milvus_uri = profile.milvus_uri if profile is not None and profile.milvus_uri else settings.MILVUS_URI
+        milvus_database = (
+            profile.milvus_database if profile is not None and profile.milvus_database else settings.MILVUS_DATABASE
+        )
+        if not all((milvus_uri, settings.MILVUS_USERNAME, settings.MILVUS_PASSWORD, milvus_database)):
             raise KnowledgeVectorError(
                 "KNOWLEDGE_VECTOR_CONFIG_INVALID",
                 "Milvus 应用账号配置不完整",
@@ -443,9 +456,9 @@ class MilvusKnowledgeStore:
         from pymilvus import MilvusClient
 
         return MilvusClient(
-            uri=settings.MILVUS_URI,
+            uri=milvus_uri,
             user=settings.MILVUS_USERNAME,
             password=settings.MILVUS_PASSWORD,
-            db_name=settings.MILVUS_DATABASE,
+            db_name=milvus_database,
             timeout=settings.MILVUS_TIMEOUT_SECONDS,
         )

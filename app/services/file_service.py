@@ -14,7 +14,11 @@ from app.core.config import settings
 from app.core.file_token import generate_file_token
 from app.core.logger import app_logger as logger
 from app.db.repositories import ConversationRepository, FileRepository
-from app.db.storage_cleanup_repository import StorageCleanupBusy, StorageCleanupRepository
+from app.db.storage_cleanup_repository import (
+    StorageCleanupBusy,
+    StorageCleanupRepository,
+    StorageUploadFenceConflict,
+)
 from app.processor.file_processor import FileProcessor
 from app.processor.image_processor import ImageProcessor
 from app.schemas.chat import Conversation
@@ -54,6 +58,10 @@ class UpdatedFileView:
 def is_image_mime(mime_type: str) -> bool:
     """判断 MIME 类型是否为图片"""
     return mime_type in IMAGE_MIME_TYPES or mime_type.startswith("image/")
+
+
+class FileStorageUnavailableError(RuntimeError):
+    """文件上传的持久存储 fence 暂时被 cleanup Worker 占用。"""
 
 
 class FileService:
@@ -244,9 +252,11 @@ class FileService:
                     "height": height,
                 }
 
-                self.file_repo.create_file(file_record)
-                self.file_repo.link_file_to_conversation(conversation_id, file_id)
-                await self._complete_file_upload_lifecycles(upload_lifecycles)
+                await self._commit_new_file_with_upload_fences(
+                    file_record=file_record,
+                    conversation_id=conversation_id,
+                    lifecycles=upload_lifecycles,
+                )
 
                 result_item = {"file_id": file_id, "thumbnail_url": thumbnail_url}
                 results.append(result_item)
@@ -357,9 +367,11 @@ class FileService:
                     "size": actual_size,
                     "processing_result": None,
                 }
-                if not self.file_repo.update_file(file_id=file_id, updates=updates):
-                    raise RuntimeError("图片文件记录更新失败")
-                await self._complete_file_upload_lifecycles(upload_lifecycles)
+                await self._commit_file_update_with_upload_fences(
+                    file_id=file_id,
+                    updates=updates,
+                    lifecycles=upload_lifecycles,
+                )
                 file = UpdatedFileView(file, updates)
                 return await self._build_upload_result_from_file(file, thumbnail_url=result["thumbnail_url"])
             except asyncio.CancelledError:
@@ -497,9 +509,10 @@ class FileService:
                 storage_key=storage_key,
                 hold_seconds=self.storage_upload_hold_seconds,
                 max_attempts=max(1, settings.KNOWLEDGE_WORKER_MAX_ATTEMPTS),
+                cleanup_scope="file",
             )
         except StorageCleanupBusy as exc:
-            raise RuntimeError("对象存储清理正在进行，请稍后重试") from exc
+            raise FileStorageUnavailableError("对象存储清理正在进行，请稍后重试") from exc
         lifecycle = start_guarded_storage_upload(
             registration=registration,
             session_factory=self.session_factory,
@@ -513,31 +526,64 @@ class FileService:
             await lifecycle.wait_upload()
         except StorageUploadFenceLost as exc:
             lifecycle.detach_request()
-            raise RuntimeError("对象上传期间持久清理 fence 已失效") from exc
+            raise FileStorageUnavailableError("对象上传期间持久清理 fence 已失效") from exc
         except BaseException:
             lifecycle.detach_request()
             raise
         return lifecycle
 
-    async def _complete_file_upload_lifecycles(self, lifecycles: list[GuardedStorageUpload]) -> None:
+    async def _commit_new_file_with_upload_fences(
+        self,
+        *,
+        file_record: dict[str, Any],
+        conversation_id: str,
+        lifecycles: list[GuardedStorageUpload],
+    ) -> None:
+        cleanup_repo = StorageCleanupRepository(self.db)
+        try:
+            locked = cleanup_repo.lock_succeeded_uploads_for_reference(
+                [lifecycle.registration for lifecycle in lifecycles]
+            )
+            self.file_repo.stage_file(file_record)
+            self.file_repo.stage_conversation_link(conversation_id, str(file_record["id"]))
+            cleanup_repo.complete_reference_writes_locked(locked)
+            self.db.commit()
+        except StorageUploadFenceConflict as exc:
+            self.db.rollback()
+            raise FileStorageUnavailableError("对象上传期间持久清理 fence 已失效") from exc
+        except Exception:
+            self.db.rollback()
+            raise
+        await self._complete_file_upload_lifecycles(lifecycles)
+
+    async def _commit_file_update_with_upload_fences(
+        self,
+        *,
+        file_id: str,
+        updates: dict[str, Any],
+        lifecycles: list[GuardedStorageUpload],
+    ) -> None:
+        cleanup_repo = StorageCleanupRepository(self.db)
+        try:
+            locked = cleanup_repo.lock_succeeded_uploads_for_reference(
+                [lifecycle.registration for lifecycle in lifecycles]
+            )
+            if not self.file_repo.stage_update_file(file_id, updates):
+                raise RuntimeError("图片文件记录更新失败")
+            cleanup_repo.complete_reference_writes_locked(locked)
+            self.db.commit()
+        except StorageUploadFenceConflict as exc:
+            self.db.rollback()
+            raise FileStorageUnavailableError("对象上传期间持久清理 fence 已失效") from exc
+        except Exception:
+            self.db.rollback()
+            raise
+        await self._complete_file_upload_lifecycles(lifecycles)
+
+    @staticmethod
+    async def _complete_file_upload_lifecycles(lifecycles: list[GuardedStorageUpload]) -> None:
         for lifecycle in lifecycles:
             lifecycle.mark_request_resolved()
-        for lifecycle in lifecycles:
-            try:
-                with self.session_factory() as db:
-                    completed = StorageCleanupRepository(db).complete_referenced_upload(lifecycle.registration)
-                if not completed:
-                    logger.warning(
-                        "文件对象已提交但 cleanup fence 尚未收敛: task_id=%s",
-                        lifecycle.registration.task_id,
-                    )
-            except Exception:
-                # File 引用已提交，持久 Worker 会在 intent 过期后检测引用并完成，
-                # 不得因补偿记账短暂失败删除已被引用的对象。
-                logger.exception(
-                    "文件对象 cleanup fence 完成失败，等待持久 Worker: task_id=%s",
-                    lifecycle.registration.task_id,
-                )
         for lifecycle in lifecycles:
             await lifecycle.wait_finished()
 

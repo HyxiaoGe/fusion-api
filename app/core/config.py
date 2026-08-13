@@ -179,6 +179,7 @@ class Settings(BaseSettings):
 
     def validate_knowledge_base_configuration(self) -> None:
         """知识库启用时执行集中、可复用的 fail-closed 配置校验。"""
+        self.validate_knowledge_storage_cleanup_configuration()
         if not self.KNOWLEDGE_BASE_ENABLED:
             return
         errors: list[str] = []
@@ -243,22 +244,11 @@ class Settings(BaseSettings):
             errors.append("KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT 必须在 1 到 10000 之间")
         if not 1 <= self.KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS <= 120:
             errors.append("KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS 必须在 1 到 120 秒之间")
-        if not 0 < self.KNOWLEDGE_WORKER_POLL_SECONDS <= 60:
-            errors.append("KNOWLEDGE_WORKER_POLL_SECONDS 必须大于 0 且不超过 60 秒")
-        if self.KNOWLEDGE_WORKER_LEASE_SECONDS <= 0:
-            errors.append("KNOWLEDGE_WORKER_LEASE_SECONDS 必须大于 0")
         if (
             self.KNOWLEDGE_WORKER_HEARTBEAT_SECONDS <= 0
             or self.KNOWLEDGE_WORKER_HEARTBEAT_SECONDS * 2 >= self.KNOWLEDGE_WORKER_LEASE_SECONDS
         ):
             errors.append("KNOWLEDGE_WORKER_HEARTBEAT_SECONDS 必须小于 lease 的一半")
-        if self.KNOWLEDGE_WORKER_MAX_ATTEMPTS <= 0:
-            errors.append("KNOWLEDGE_WORKER_MAX_ATTEMPTS 必须大于 0")
-        if not (0 < self.KNOWLEDGE_WORKER_RETRY_BASE_SECONDS <= self.KNOWLEDGE_WORKER_RETRY_MAX_SECONDS <= 3600):
-            errors.append(
-                "KNOWLEDGE_WORKER_RETRY_BASE_SECONDS 与 KNOWLEDGE_WORKER_RETRY_MAX_SECONDS "
-                "必须满足 0 < base <= max <= 3600 秒"
-            )
         allowed_mime_types = set(self.RESOLVED_KNOWLEDGE_ALLOWED_MIME_TYPES)
         supported_mime_types = {
             "text/plain",
@@ -272,14 +262,35 @@ class Settings(BaseSettings):
         milvus_uri = urlparse(self.MILVUS_URI)
         if milvus_uri.scheme not in {"http", "https"} or not milvus_uri.netloc:
             errors.append("MILVUS_URI 必须是完整的 http(s) 地址")
+        if len(self.MILVUS_URI) > 500 or "\x00" in self.MILVUS_URI:
+            errors.append("MILVUS_URI 长度或字符无效")
         if not self.MILVUS_USERNAME.strip() or not self.MILVUS_PASSWORD or not self.MILVUS_DATABASE.strip():
             errors.append("Milvus 应用账号和数据库配置不完整")
+        if len(self.MILVUS_DATABASE) > 120 or "\x00" in self.MILVUS_DATABASE:
+            errors.append("MILVUS_DATABASE 长度或字符无效")
         if self.MILVUS_USERNAME.strip().casefold() == "root":
             errors.append("知识库禁止使用 Milvus root 账号")
         if not 1 <= self.MILVUS_TIMEOUT_SECONDS <= 60:
             errors.append("MILVUS_TIMEOUT_SECONDS 必须在 1 到 60 秒之间")
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,39}", self.MILVUS_COLLECTION_PREFIX):
             errors.append("MILVUS_COLLECTION_PREFIX 必须是长度不超过 40 的受控标识")
+        if errors:
+            raise ValueError("；".join(errors))
+
+    def validate_knowledge_storage_cleanup_configuration(self) -> None:
+        """校验知识库关闭时仍被既有文件上传使用的 cleanup Worker 参数。"""
+        errors: list[str] = []
+        if not 0 < self.KNOWLEDGE_WORKER_POLL_SECONDS <= 60:
+            errors.append("KNOWLEDGE_WORKER_POLL_SECONDS 必须大于 0 且不超过 60 秒")
+        if self.KNOWLEDGE_WORKER_LEASE_SECONDS <= 0:
+            errors.append("KNOWLEDGE_WORKER_LEASE_SECONDS 必须大于 0")
+        if self.KNOWLEDGE_WORKER_MAX_ATTEMPTS <= 0:
+            errors.append("KNOWLEDGE_WORKER_MAX_ATTEMPTS 必须大于 0")
+        if not (0 < self.KNOWLEDGE_WORKER_RETRY_BASE_SECONDS <= self.KNOWLEDGE_WORKER_RETRY_MAX_SECONDS <= 3600):
+            errors.append(
+                "KNOWLEDGE_WORKER_RETRY_BASE_SECONDS 与 KNOWLEDGE_WORKER_RETRY_MAX_SECONDS "
+                "必须满足 0 < base <= max <= 3600 秒"
+            )
         if errors:
             raise ValueError("；".join(errors))
 

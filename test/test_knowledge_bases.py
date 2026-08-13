@@ -3,6 +3,7 @@ import os
 import sys
 import unittest
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
 
@@ -271,6 +272,25 @@ class KnowledgeBasesApiTests(unittest.TestCase):
             self.assertIsNone(response.json()["data"])
 
         self.assertEqual(self.service.calls, [])
+
+    def test_knowledge_path_ids_reject_encoded_nul_before_service_call(self):
+        self.service.get_knowledge_base = MagicMock(side_effect=AssertionError("service must not run"))
+        self.service.get_document = MagicMock(side_effect=AssertionError("service must not run"))
+        self.service.get_task = MagicMock(side_effect=AssertionError("service must not run"))
+
+        for path in (
+            "/api/knowledge-bases/kb%00invalid",
+            "/api/knowledge-bases/kb-1/documents/doc%00invalid",
+            "/api/knowledge-bases/tasks/task%00invalid",
+        ):
+            response = self.client.get(path)
+
+            self.assertEqual(response.status_code, 422, path)
+            self.assertEqual(response.json()["code"], "INVALID_PARAM", path)
+            self.assertIsNone(response.json()["data"], path)
+        self.service.get_knowledge_base.assert_not_called()
+        self.service.get_document.assert_not_called()
+        self.service.get_task.assert_not_called()
 
     def test_knowledge_text_normalization_contract_is_preserved(self):
         created = self.client.post(

@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, File, Query, Request, UploadFile
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, File, Path, Query, Request, UploadFile
 
 from app.api.deps import get_current_user, get_knowledge_service
 from app.db.models import User
@@ -18,6 +20,11 @@ from app.schemas.response import ApiResponse, success
 from app.services.knowledge.service import KnowledgeService
 
 router = APIRouter()
+
+KnowledgeResourceId = Annotated[
+    str,
+    Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"),
+]
 
 ERROR_RESPONSES = {
     400: {"model": ApiResponse[None], "description": "参数或文档格式无效"},
@@ -63,7 +70,7 @@ def list_knowledge_bases(
     responses=ERROR_RESPONSES,
 )
 def get_knowledge_base(
-    knowledge_base_id: str,
+    knowledge_base_id: KnowledgeResourceId,
     request: Request,
     current_user: User = Depends(get_current_user),
     service: KnowledgeService = Depends(get_knowledge_service),
@@ -78,7 +85,7 @@ def get_knowledge_base(
     responses=ERROR_RESPONSES,
 )
 def update_knowledge_base(
-    knowledge_base_id: str,
+    knowledge_base_id: KnowledgeResourceId,
     payload: KnowledgeBaseUpdate,
     request: Request,
     current_user: User = Depends(get_current_user),
@@ -95,7 +102,7 @@ def update_knowledge_base(
     responses=ERROR_RESPONSES,
 )
 def delete_knowledge_base(
-    knowledge_base_id: str,
+    knowledge_base_id: KnowledgeResourceId,
     request: Request,
     current_user: User = Depends(get_current_user),
     service: KnowledgeService = Depends(get_knowledge_service),
@@ -111,7 +118,7 @@ def delete_knowledge_base(
     responses=ERROR_RESPONSES,
 )
 async def upload_knowledge_document(
-    knowledge_base_id: str,
+    knowledge_base_id: KnowledgeResourceId,
     request: Request,
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
@@ -127,7 +134,7 @@ async def upload_knowledge_document(
     responses=ERROR_RESPONSES,
 )
 def list_knowledge_documents(
-    knowledge_base_id: str,
+    knowledge_base_id: KnowledgeResourceId,
     request: Request,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
@@ -149,8 +156,8 @@ def list_knowledge_documents(
     responses=ERROR_RESPONSES,
 )
 def get_knowledge_document(
-    knowledge_base_id: str,
-    document_id: str,
+    knowledge_base_id: KnowledgeResourceId,
+    document_id: KnowledgeResourceId,
     request: Request,
     current_user: User = Depends(get_current_user),
     service: KnowledgeService = Depends(get_knowledge_service),
@@ -166,8 +173,8 @@ def get_knowledge_document(
     responses=ERROR_RESPONSES,
 )
 def delete_knowledge_document(
-    knowledge_base_id: str,
-    document_id: str,
+    knowledge_base_id: KnowledgeResourceId,
+    document_id: KnowledgeResourceId,
     request: Request,
     current_user: User = Depends(get_current_user),
     service: KnowledgeService = Depends(get_knowledge_service),
@@ -183,8 +190,8 @@ def delete_knowledge_document(
     responses=ERROR_RESPONSES,
 )
 def retry_knowledge_document(
-    knowledge_base_id: str,
-    document_id: str,
+    knowledge_base_id: KnowledgeResourceId,
+    document_id: KnowledgeResourceId,
     request: Request,
     current_user: User = Depends(get_current_user),
     service: KnowledgeService = Depends(get_knowledge_service),
@@ -200,8 +207,8 @@ def retry_knowledge_document(
     responses=ERROR_RESPONSES,
 )
 def rebuild_knowledge_document(
-    knowledge_base_id: str,
-    document_id: str,
+    knowledge_base_id: KnowledgeResourceId,
+    document_id: KnowledgeResourceId,
     request: Request,
     current_user: User = Depends(get_current_user),
     service: KnowledgeService = Depends(get_knowledge_service),
@@ -231,7 +238,7 @@ async def search_knowledge_bases(
     responses=ERROR_RESPONSES,
 )
 def get_knowledge_task(
-    task_id: str,
+    task_id: KnowledgeResourceId,
     request: Request,
     current_user: User = Depends(get_current_user),
     service: KnowledgeService = Depends(get_knowledge_service),

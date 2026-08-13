@@ -178,7 +178,7 @@ class GuardedStorageUpload:
                 .with_for_update()
                 .first()
             )
-            if task is None or task.status in {"running", "completed"} or task.attempt_count != 0:
+            if task is None or (task.file_status or task.status) in {"running", "completed"} or task.attempt_count != 0:
                 db.rollback()
                 return False
             intent = (

@@ -299,6 +299,8 @@ class KnowledgeIndexVersion(Base):
     embedding_dimension = Column(Integer, nullable=False)
     distance_metric = Column(String(20), nullable=False, default="COSINE", server_default="COSINE")
     collection_name = Column(String(200), nullable=False)
+    milvus_uri = Column(String(500), nullable=True)
+    milvus_database = Column(String(120), nullable=True)
     chunk_count = Column(Integer, nullable=False, default=0, server_default="0")
     error_code = Column(String(120), nullable=True)
     error_summary = Column(String(500), nullable=True)
@@ -441,6 +443,9 @@ class KnowledgeStorageCleanupTask(Base):
     storage_backend = Column(String(20), nullable=False)
     storage_key = Column(String(600), nullable=False)
     status = Column(String(20), nullable=False, default="pending", server_default="pending")
+    # File 上传使用独立逻辑状态，物理 status 固定 completed，使旧版 Worker
+    # 无法领取新任务；知识库任务继续使用既有 status，保证滚动升级兼容。
+    file_status = Column(String(20), nullable=True)
     attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
     max_attempts = Column(Integer, nullable=False, default=5, server_default="5")
     available_at = Column(DateTime(timezone=True), default=utc_now, server_default=func.now(), nullable=False)
@@ -469,7 +474,12 @@ class KnowledgeStorageCleanupTask(Base):
             "status IN ('pending', 'running', 'retry', 'completed', 'failed')",
             name="ck_knowledge_storage_cleanup_status",
         ),
+        CheckConstraint(
+            "file_status IS NULL OR file_status IN ('pending', 'running', 'retry', 'completed', 'failed')",
+            name="ck_knowledge_storage_cleanup_file_status",
+        ),
         Index("ix_knowledge_storage_cleanup_claim", "status", "available_at", "created_at", "id"),
+        Index("ix_knowledge_storage_cleanup_file_claim", "file_status", "available_at", "created_at", "id"),
     )
 
 

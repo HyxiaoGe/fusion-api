@@ -106,6 +106,17 @@ class KnowledgeWorkerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(write_health.call_args_list[-1].kwargs["status"], "disabled")
         self.assertEqual(write_health.call_args_list[-1].kwargs["processed"], 1)
 
+    async def test_disabled_feature_rejects_invalid_cleanup_worker_configuration(self):
+        with (
+            patch("scripts.run_knowledge_worker.settings.KNOWLEDGE_BASE_ENABLED", False),
+            patch("scripts.run_knowledge_worker.settings.KNOWLEDGE_WORKER_POLL_SECONDS", 0),
+            patch("scripts.run_knowledge_worker.init_storage", new=AsyncMock()) as init_storage,
+        ):
+            result = await run_worker(once=True)
+
+        self.assertEqual(result, 2)
+        init_storage.assert_not_awaited()
+
 
 if __name__ == "__main__":
     unittest.main()

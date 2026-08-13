@@ -315,6 +315,29 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         self.assertIsNone(body["data"])
         service.upload_files.assert_awaited_once()
 
+    def test_file_upload_storage_fence_conflict_returns_retryable_service_error(self):
+        from app.services.file_service import FileStorageUnavailableError
+
+        self._enable_authenticated_overrides()
+        service = self._mock_file_service(
+            upload_files=AsyncMock(side_effect=FileStorageUnavailableError("对象存储清理正在进行，请稍后重试"))
+        )
+
+        response = self.client.post(
+            "/api/files/upload",
+            data={
+                "provider": "openai",
+                "model": "gpt-4.1",
+                "conversation_id": "conv-1",
+            },
+            files=[("files", ("note.txt", b"hello", "text/plain"))],
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["code"], "FILE_STORAGE_UNAVAILABLE")
+        self.assertIsNone(response.json()["data"])
+        service.upload_files.assert_awaited_once()
+
     def test_file_direct_upload_init_routes_to_file_service(self):
         self._enable_authenticated_overrides()
         service = self._mock_file_service(
@@ -400,6 +423,23 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         self.assertEqual(body["code"], "SUCCESS")
         self.assertEqual(body["data"]["file"]["file_id"], "file-1")
         self.assertEqual(body["data"]["file"]["status"], "processed")
+        service.complete_direct_upload.assert_awaited_once_with("file-1", "user-123")
+
+    def test_file_direct_upload_complete_storage_fence_conflict_returns_503(self):
+        from app.services.file_service import FileStorageUnavailableError
+
+        self._enable_authenticated_overrides()
+        service = self._mock_file_service(
+            complete_direct_upload=AsyncMock(
+                side_effect=FileStorageUnavailableError("对象上传期间持久清理 fence 已失效")
+            )
+        )
+
+        response = self.client.post("/api/files/upload/complete", json={"file_id": "file-1"})
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["code"], "FILE_STORAGE_UNAVAILABLE")
+        self.assertIsNone(response.json()["data"])
         service.complete_direct_upload.assert_awaited_once_with("file-1", "user-123")
 
     def test_timeout_middleware_uses_longer_budget_for_file_upload(self):

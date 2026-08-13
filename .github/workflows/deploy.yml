@@ -746,8 +746,9 @@ jobs:
             fi
           fi
           # BEGIN CURRENT_KNOWLEDGE_REVISION_ROUTES
-          read_current_knowledge_revision_routes() {
+          read_current_knowledge_snapshot_value() {
             snapshot_path="$1"
+            value_name="$2"
             case "${snapshot_path}" in
               "${RUNNER_TEMP}"/fusion-knowledge-rollback-*.env) ;;
               *) echo "知识库回滚配置未落在 RUNNER_TEMP 的受管路径中" >&2; return 1 ;;
@@ -762,18 +763,29 @@ jobs:
               return 1
             fi
             (
-              unset KNOWLEDGE_EMBEDDING_REVISION_ROUTES
+              unset KNOWLEDGE_BASE_ENABLED KNOWLEDGE_EMBEDDING_REVISION_ROUTES MILVUS_URI MILVUS_DATABASE
               source "${snapshot_path}"
-              if [ -n "${KNOWLEDGE_EMBEDDING_REVISION_ROUTES:-}" ]; then
-                printf '%s' "${KNOWLEDGE_EMBEDDING_REVISION_ROUTES}"
-              else
-                printf '%s' '{}'
-              fi
+              case "${value_name}" in
+                revision_routes)
+                  if [ -n "${KNOWLEDGE_EMBEDDING_REVISION_ROUTES:-}" ]; then
+                    printf '%s' "${KNOWLEDGE_EMBEDDING_REVISION_ROUTES}"
+                  else
+                    printf '%s' '{}'
+                  fi
+                  ;;
+                enabled) printf '%s' "${KNOWLEDGE_BASE_ENABLED:-false}" ;;
+                milvus_uri) printf '%s' "${MILVUS_URI:-}" ;;
+                milvus_database) printf '%s' "${MILVUS_DATABASE:-}" ;;
+                *) return 1 ;;
+              esac
             )
           }
           rollback_knowledge_config_file="${RUNNER_TEMP}/fusion-knowledge-rollback-${GITHUB_RUN_ID}-${GITHUB_JOB}-${GITHUB_RUN_ATTEMPT}.env"
-          current_knowledge_revision_routes="$(read_current_knowledge_revision_routes "${rollback_knowledge_config_file}")" || exit 1
+          current_knowledge_revision_routes="$(read_current_knowledge_snapshot_value "${rollback_knowledge_config_file}" revision_routes)" || exit 1
           export CURRENT_KNOWLEDGE_EMBEDDING_REVISION_ROUTES="${current_knowledge_revision_routes}"
+          export CURRENT_KNOWLEDGE_BASE_ENABLED="$(read_current_knowledge_snapshot_value "${rollback_knowledge_config_file}" enabled)" || exit 1
+          export CURRENT_MILVUS_URI="$(read_current_knowledge_snapshot_value "${rollback_knowledge_config_file}" milvus_uri)" || exit 1
+          export CURRENT_MILVUS_DATABASE="$(read_current_knowledge_snapshot_value "${rollback_knowledge_config_file}" milvus_database)" || exit 1
           # END CURRENT_KNOWLEDGE_REVISION_ROUTES
           validated_revision_routes="$(python3 - <<'PY'
           import json
@@ -825,6 +837,30 @@ jobs:
           if any(routes.get(key) != alias for key, alias in current_routes.items()):
               raise SystemExit("knowledge embedding revision routes history changed")
 
+          try:
+              worker_lease = int(os.environ["KNOWLEDGE_WORKER_LEASE_SECONDS"])
+              worker_max_attempts = int(os.environ["KNOWLEDGE_WORKER_MAX_ATTEMPTS"])
+              worker_retry_base = int(os.environ["KNOWLEDGE_WORKER_RETRY_BASE_SECONDS"])
+              worker_retry_max = int(os.environ["KNOWLEDGE_WORKER_RETRY_MAX_SECONDS"])
+          except (KeyError, ValueError):
+              raise SystemExit("knowledge cleanup worker bounds invalid")
+          worker_poll = finite_number("KNOWLEDGE_WORKER_POLL_SECONDS")
+          if not (
+              0 < worker_poll <= 60
+              and worker_lease > 0
+              and worker_max_attempts > 0
+              and 0 < worker_retry_base <= worker_retry_max <= 3600
+          ):
+              raise SystemExit("knowledge cleanup worker bounds invalid")
+
+          current_milvus_uri = os.environ.get("CURRENT_MILVUS_URI", "")
+          current_milvus_database = os.environ.get("CURRENT_MILVUS_DATABASE", "")
+          if (current_milvus_uri or current_milvus_database) and (
+              current_milvus_uri != os.environ.get("MILVUS_URI", "")
+              or current_milvus_database != os.environ.get("MILVUS_DATABASE", "")
+          ):
+              raise SystemExit("knowledge milvus storage route changed")
+
           if enabled:
               if os.environ.get("KNOWLEDGE_CHUNKER_VERSION") != "chunker-v2":
                   raise SystemExit("knowledge chunker version invalid")
@@ -844,15 +880,10 @@ jobs:
                   }
                   embedding_batch_size = int(os.environ["KNOWLEDGE_EMBEDDING_BATCH_SIZE"])
                   search_max_profiles = int(os.environ["KNOWLEDGE_SEARCH_MAX_PROFILES"])
-                  worker_lease = int(os.environ["KNOWLEDGE_WORKER_LEASE_SECONDS"])
                   worker_heartbeat = int(os.environ["KNOWLEDGE_WORKER_HEARTBEAT_SECONDS"])
-                  worker_max_attempts = int(os.environ["KNOWLEDGE_WORKER_MAX_ATTEMPTS"])
-                  worker_retry_base = int(os.environ["KNOWLEDGE_WORKER_RETRY_BASE_SECONDS"])
-                  worker_retry_max = int(os.environ["KNOWLEDGE_WORKER_RETRY_MAX_SECONDS"])
               except (KeyError, ValueError):
                   raise SystemExit("knowledge deployment bounds invalid")
               embedding_timeout = finite_number("KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS")
-              worker_poll = finite_number("KNOWLEDGE_WORKER_POLL_SECONDS")
               milvus_timeout = finite_number("MILVUS_TIMEOUT_SECONDS")
               if not (
                   1 <= max_bases_per_user <= 1_000

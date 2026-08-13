@@ -579,7 +579,11 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
         lifecycle.registration.task_id = "cleanup-task"
         with (
             patch.object(self.service, "_guarded_file_upload", AsyncMock(side_effect=[lifecycle, lifecycle])),
-            patch.object(self.service, "_complete_file_upload_lifecycles", AsyncMock()) as complete_lifecycles,
+            patch.object(
+                self.service,
+                "_commit_file_update_with_upload_fences",
+                AsyncMock(),
+            ) as commit_file_update,
         ):
             result = await self.service.complete_direct_upload("file-1", "user-1")
 
@@ -587,8 +591,7 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
         self.service.storage.get_size.assert_awaited_once_with(ORIGINAL_KEY)
         self.service.storage.download.assert_awaited_once_with(ORIGINAL_KEY)
         self.service.image_processor.process.assert_awaited_once_with(b"original-image", "image/png")
-        complete_lifecycles.assert_awaited_once_with([lifecycle, lifecycle])
-        self.service.file_repo.update_file.assert_called_once_with(
+        commit_file_update.assert_awaited_once_with(
             file_id="file-1",
             updates={
                 "status": "processed",
@@ -600,6 +603,7 @@ class FileServiceTests(unittest.IsolatedAsyncioTestCase):
                 "size": 321,
                 "processing_result": None,
             },
+            lifecycles=[lifecycle, lifecycle],
         )
         self.assertEqual(
             result,

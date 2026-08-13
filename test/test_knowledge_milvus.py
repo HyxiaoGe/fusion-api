@@ -1,5 +1,7 @@
 import copy
+import sys
 import unittest
+from types import ModuleType
 from unittest.mock import AsyncMock, patch
 
 from app.ai.embeddings.base import EmbeddingProfile
@@ -85,6 +87,35 @@ class MilvusKnowledgeStoreTests(unittest.TestCase):
             MilvusKnowledgeStore._build_client()
 
         self.assertEqual(raised.exception.code, "KNOWLEDGE_VECTOR_CONFIG_INVALID")
+
+    def test_persisted_profile_route_selects_historical_milvus_database(self):
+        profile = EmbeddingProfile(
+            "litellm",
+            "embed-v1",
+            1024,
+            "COSINE",
+            "knowledge_v1_d1024",
+            "r1",
+            "http://historical-milvus:19530",
+            "historical_knowledge",
+        )
+        pymilvus = ModuleType("pymilvus")
+        with (
+            patch("app.services.knowledge.milvus.settings.MILVUS_USERNAME", "fusion_app"),
+            patch("app.services.knowledge.milvus.settings.MILVUS_PASSWORD", "secret"),
+            patch("app.services.knowledge.milvus.settings.MILVUS_TIMEOUT_SECONDS", 17),
+            patch.dict(sys.modules, {"pymilvus": pymilvus}),
+            patch.object(pymilvus, "MilvusClient", create=True) as client,
+        ):
+            MilvusKnowledgeStore._build_client(profile)
+
+        client.assert_called_once_with(
+            uri="http://historical-milvus:19530",
+            user="fusion_app",
+            password="secret",
+            db_name="historical_knowledge",
+            timeout=17,
+        )
 
     def test_existing_collection_schema_mismatch_fails_closed(self):
         with self.assertRaises(KnowledgeVectorError) as raised:

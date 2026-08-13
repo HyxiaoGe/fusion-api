@@ -76,6 +76,9 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
                 {"embedding-v1@embedding-r1": "embedding-v1-r1-immutable"}
             ),
             "CURRENT_KNOWLEDGE_EMBEDDING_REVISION_ROUTES": "{}",
+            "CURRENT_KNOWLEDGE_BASE_ENABLED": "false",
+            "CURRENT_MILVUS_URI": "",
+            "CURRENT_MILVUS_DATABASE": "",
         }
         environment.update(overrides)
         return subprocess.run(
@@ -238,6 +241,8 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
             "knowledge chunker version invalid",
             "knowledge embedding revision route missing",
             "knowledge embedding revision routes history changed",
+            "knowledge cleanup worker bounds invalid",
+            "knowledge milvus storage route changed",
             "candidate knowledge settings ok",
         )
         for marker in required:
@@ -450,18 +455,22 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
             invalid_chunks,
             invalid_batch,
             invalid_profiles,
-            invalid_poll,
             invalid_parse_timeout,
-            invalid_lease,
             invalid_heartbeat,
-            invalid_attempts,
-            invalid_retry_base,
-            invalid_retry_order,
-            invalid_retry_max,
             invalid_milvus_timeout,
         ):
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("knowledge deployment bounds invalid", completed.stderr)
+        for completed in (
+            invalid_poll,
+            invalid_lease,
+            invalid_attempts,
+            invalid_retry_base,
+            invalid_retry_order,
+            invalid_retry_max,
+        ):
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("knowledge cleanup worker bounds invalid", completed.stderr)
         self.assertNotEqual(missing_route.returncode, 0)
         self.assertIn("knowledge embedding revision routes invalid", missing_route.stderr)
         self.assertNotEqual(missing_current_route.returncode, 0)
@@ -561,6 +570,38 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         for completed in (deleted, rewritten, disabled_deletion):
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("knowledge embedding revision routes history changed", completed.stderr)
+
+    def test_candidate_milvus_route_is_immutable_after_first_configured_deployment(self):
+        same_route = self._run_candidate_knowledge_validation(
+            CURRENT_KNOWLEDGE_BASE_ENABLED="false",
+            CURRENT_MILVUS_URI="http://milvus:19530",
+            CURRENT_MILVUS_DATABASE="fusion_knowledge",
+        )
+        changed_uri = self._run_candidate_knowledge_validation(
+            CURRENT_KNOWLEDGE_BASE_ENABLED="true",
+            CURRENT_MILVUS_URI="http://old-milvus:19530",
+            CURRENT_MILVUS_DATABASE="fusion_knowledge",
+        )
+        changed_database_while_disabled = self._run_candidate_knowledge_validation(
+            CURRENT_KNOWLEDGE_BASE_ENABLED="false",
+            CURRENT_MILVUS_URI="http://milvus:19530",
+            CURRENT_MILVUS_DATABASE="historical_knowledge",
+        )
+
+        self.assertEqual(same_route.returncode, 0, same_route.stderr)
+        for completed in (changed_uri, changed_database_while_disabled):
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("knowledge milvus storage route changed", completed.stderr)
+
+    def test_disabled_candidate_still_rejects_invalid_cleanup_worker_bounds(self):
+        completed = self._run_candidate_knowledge_validation(
+            KNOWLEDGE_BASE_ENABLED="false",
+            KNOWLEDGE_WORKER_POLL_SECONDS="0",
+            KNOWLEDGE_EMBEDDING_REVISION_ROUTES="{}",
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("knowledge cleanup worker bounds invalid", completed.stderr)
 
     def test_revision_routes_bash_assignment_preserves_json_and_defaults_empty_value(self):
         configured_json = '{"embedding-v1@embedding-r1":"embedding-v1-r1-immutable"}'

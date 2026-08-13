@@ -52,8 +52,11 @@ class StorageCleanupRepository:
         storage_key: str,
         hold_seconds: int,
         max_attempts: int,
+        cleanup_scope: str = "knowledge",
         now: datetime | None = None,
     ) -> RegisteredStorageUploadIntent:
+        if cleanup_scope not in {"knowledge", "file"}:
+            raise ValueError("对象清理 scope 无效")
         requested_now = now
         registration_started_at = requested_now or utc_now()
         guard_until = registration_started_at + timedelta(seconds=max(1, hold_seconds))
@@ -69,6 +72,8 @@ class StorageCleanupRepository:
                 storage_key=storage_key,
                 max_attempts=max_attempts,
                 available_at=guard_until,
+                status="completed" if cleanup_scope == "file" else "pending",
+                file_status="pending" if cleanup_scope == "file" else None,
             )
             self.db.add(task)
             try:
@@ -83,13 +88,16 @@ class StorageCleanupRepository:
                     raise StorageCleanupBusy("同一对象的清理任务正在运行") from exc
                 if task is None:
                     raise
-        if task.status == "running":
+        if (task.file_status is not None) != (cleanup_scope == "file"):
+            self.db.rollback()
+            raise StorageCleanupBusy("同一对象的清理 scope 不一致")
+        if self._task_state(task) == "running":
             self.db.rollback()
             raise StorageCleanupBusy("同一对象的清理任务正在运行")
         registered_at = requested_now or utc_now()
         guard_until = registered_at + timedelta(seconds=max(1, hold_seconds))
         self._delete_expired_intents(task.id, registered_at)
-        task.status = "pending"
+        self._set_task_state(task, "pending")
         task.attempt_count = 0
         task.max_attempts = max_attempts
         task.available_at = max(self._as_utc(task.available_at), self._as_utc(guard_until))
@@ -122,7 +130,7 @@ class StorageCleanupRepository:
         if outcome not in {"succeeded", "failed", "uncertain"}:
             raise ValueError("上传结果只能是 succeeded、failed 或 uncertain")
         task = self._lock_task(registration.task_id)
-        if task is None or task.status in {"running", "completed"} or task.attempt_count != 0:
+        if task is None or self._task_state(task) in {"running", "completed"} or task.attempt_count != 0:
             self.db.rollback()
             return False
         intent = self._lock_intent(registration)
@@ -145,7 +153,7 @@ class StorageCleanupRepository:
         if task is None:
             self.db.rollback()
             return
-        if task.status == "completed":
+        if self._task_state(task) == "completed":
             self.db.commit()
             return
         intent = self._lock_intent(registration)
@@ -162,8 +170,8 @@ class StorageCleanupRepository:
             # unknown/uncertain 不能因一次 absent 就完成；保留过期 outcome，Worker
             # 可在对象迟到后删除，或由后续明确结果推进为 failed。
             intent.expires_at = now
-        if task.status != "running":
-            task.status = "pending"
+        if self._task_state(task) != "running":
+            self._set_task_state(task, "pending")
             task.available_at = now
             self._clear_lease(task)
             task.completed_at = None
@@ -202,20 +210,45 @@ class StorageCleanupRepository:
         registration: RegisteredStorageUploadIntent,
     ) -> KnowledgeStorageCleanupTask:
         """在调用方文档事务内取得 task/intent fence；本方法不提交。"""
-        task = self._lock_task(registration.task_id)
-        intent = self._lock_intent(registration)
+        return self.lock_succeeded_uploads_for_reference([registration])[0][1]
+
+    def lock_succeeded_uploads_for_reference(
+        self,
+        registrations: list[RegisteredStorageUploadIntent],
+    ) -> list[tuple[RegisteredStorageUploadIntent, KnowledgeStorageCleanupTask]]:
+        """按稳定顺序锁定一个引用事务需要的全部成功上传 fence。"""
+        locked: list[tuple[RegisteredStorageUploadIntent, KnowledgeStorageCleanupTask]] = []
+        seen: set[str] = set()
+        for registration in sorted(registrations, key=lambda item: (item.task_id, item.intent_id)):
+            if registration.task_id in seen:
+                self.db.rollback()
+                raise StorageUploadFenceConflict("同一引用事务不能重复使用 cleanup task")
+            seen.add(registration.task_id)
+            task = self._lock_task(registration.task_id)
+            intent = self._lock_intent(registration)
+            now = utc_now()
+            if (
+                task is None
+                or self._task_state(task) in {"running", "completed"}
+                or task.attempt_count != 0
+                or intent is None
+                or intent.outcome != "succeeded"
+                or self._as_utc(intent.expires_at) <= self._as_utc(now)
+            ):
+                self.db.rollback()
+                raise StorageUploadFenceConflict("对象上传 fence 已失效")
+            locked.append((registration, task))
+        return locked
+
+    def complete_reference_writes_locked(
+        self,
+        locked_uploads: list[tuple[RegisteredStorageUploadIntent, KnowledgeStorageCleanupTask]],
+    ) -> None:
+        """在引用 INSERT/UPDATE 的同一事务内完成全部 cleanup fence。"""
         now = utc_now()
-        if (
-            task is None
-            or task.status in {"running", "completed"}
-            or task.attempt_count != 0
-            or intent is None
-            or intent.outcome != "succeeded"
-            or self._as_utc(intent.expires_at) <= self._as_utc(now)
-        ):
-            self.db.rollback()
-            raise StorageUploadFenceConflict("对象上传 fence 已失效")
-        return task
+        for registration, task in locked_uploads:
+            self._delete_intent(registration.intent_id, task.id)
+            self._set_completed(task, now)
 
     def complete_document_write_locked(
         self,
@@ -223,8 +256,7 @@ class StorageCleanupRepository:
         task: KnowledgeStorageCleanupTask,
     ) -> None:
         """与文档 INSERT 处于同一事务，原子移除 intent 并完成 cleanup task。"""
-        self._delete_intent(registration.intent_id, task.id)
-        self._set_completed(task, utc_now())
+        self.complete_reference_writes_locked([(registration, task)])
 
     def complete_referenced_upload(self, registration: RegisteredStorageUploadIntent) -> bool:
         """旧文件 API 已提交 File 引用后完成持久 cleanup fence。"""
@@ -232,7 +264,7 @@ class StorageCleanupRepository:
         if task is None:
             self.db.rollback()
             return False
-        if task.status == "completed":
+        if self._task_state(task) == "completed":
             self.db.commit()
             return True
         self._lock_intent(registration)
@@ -252,7 +284,7 @@ class StorageCleanupRepository:
         if task is None:
             self.db.rollback()
             return
-        if task.status == "completed":
+        if self._task_state(task) == "completed":
             self.db.commit()
             return
         now = utc_now()
@@ -265,7 +297,7 @@ class StorageCleanupRepository:
         if cleanup_succeeded and not remaining:
             self._complete_locked(task, now)
             return
-        task.status = "pending"
+        self._set_task_state(task, "pending")
         task.available_at = min((self._as_utc(row.expires_at) for row in remaining), default=self._as_utc(now))
         self._clear_lease(task)
         task.completed_at = None
@@ -299,7 +331,15 @@ class StorageCleanupRepository:
                 KnowledgeStorageCleanupTask.available_at <= now,
             ),
             and_(
+                KnowledgeStorageCleanupTask.file_status.in_(("pending", "retry")),
+                KnowledgeStorageCleanupTask.available_at <= now,
+            ),
+            and_(
                 KnowledgeStorageCleanupTask.status == "running",
+                KnowledgeStorageCleanupTask.lease_expires_at < now,
+            ),
+            and_(
+                KnowledgeStorageCleanupTask.file_status == "running",
                 KnowledgeStorageCleanupTask.lease_expires_at < now,
             ),
         )
@@ -327,7 +367,7 @@ class StorageCleanupRepository:
             return None
         lease_started_at = requested_now or utc_now()
         lease_token = secrets.token_urlsafe(32)
-        task.status = "running"
+        self._set_task_state(task, "running")
         task.attempt_count += 1
         task.lease_owner = worker_id
         task.lease_token_hash = self._hash_token(lease_token)
@@ -352,7 +392,7 @@ class StorageCleanupRepository:
             return "lease_lost", None
         active_intents = self._active_intents(task.id, now)
         if active_intents:
-            task.status = "pending"
+            self._set_task_state(task, "pending")
             task.available_at = min(self._as_utc(row.expires_at) for row in active_intents)
             task.attempt_count = max(0, task.attempt_count - 1)
             self._clear_lease(task)
@@ -387,7 +427,7 @@ class StorageCleanupRepository:
             return False
         now = utc_now()
         will_retry = task.attempt_count < task.max_attempts
-        task.status = "retry" if will_retry else "failed"
+        self._set_task_state(task, "retry" if will_retry else "failed")
         task.available_at = now + timedelta(seconds=retry_delay_seconds) if will_retry else now
         task.error_code = error_code[:120]
         task.error_summary = error_summary[:500]
@@ -420,7 +460,10 @@ class StorageCleanupRepository:
         query = (
             self.db.query(KnowledgeStorageCleanupTask)
             .filter(
-                KnowledgeStorageCleanupTask.status == "running",
+                or_(
+                    KnowledgeStorageCleanupTask.status == "running",
+                    KnowledgeStorageCleanupTask.file_status == "running",
+                ),
                 KnowledgeStorageCleanupTask.lease_expires_at < now,
                 KnowledgeStorageCleanupTask.attempt_count >= KnowledgeStorageCleanupTask.max_attempts,
             )
@@ -441,13 +484,13 @@ class StorageCleanupRepository:
     def _fail_exhausted_expired_tasks(self, now: datetime) -> None:
         for task in self._expired_exhausted_tasks_query(now).all():
             if (
-                task.status != "running"
+                self._task_state(task) != "running"
                 or task.lease_expires_at is None
                 or self._as_utc(task.lease_expires_at) >= self._as_utc(now)
                 or task.attempt_count < task.max_attempts
             ):
                 continue
-            task.status = "failed"
+            self._set_task_state(task, "failed")
             task.available_at = now
             task.error_code = "KNOWLEDGE_STORAGE_CLEANUP_INTERRUPTED"
             task.error_summary = "孤立对象清理 Worker 在最后一次尝试中断"
@@ -545,7 +588,7 @@ class StorageCleanupRepository:
         self.db.commit()
 
     def _set_completed(self, task: KnowledgeStorageCleanupTask, now: datetime) -> None:
-        task.status = "completed"
+        self._set_task_state(task, "completed")
         task.completed_at = now
         task.updated_at = now
         task.error_code = None
@@ -561,7 +604,12 @@ class StorageCleanupRepository:
     ) -> None:
         query = (
             self.db.query(KnowledgeStorageCleanupTask)
-            .filter(KnowledgeStorageCleanupTask.status == "failed")
+            .filter(
+                or_(
+                    KnowledgeStorageCleanupTask.status == "failed",
+                    KnowledgeStorageCleanupTask.file_status == "failed",
+                )
+            )
             .order_by(KnowledgeStorageCleanupTask.updated_at.asc(), KnowledgeStorageCleanupTask.id.asc())
             .limit(100)
         )
@@ -575,12 +623,26 @@ class StorageCleanupRepository:
                 max(1, retry_base_seconds) * (2 ** min(max(task.attempt_count - 1, 0), 8)),
                 max(1, retry_max_seconds),
             )
-            task.status = "retry"
+            self._set_task_state(task, "retry")
             task.max_attempts = max(task.max_attempts, task.attempt_count + 1)
             task.available_at = now + timedelta(seconds=delay)
             task.completed_at = None
             task.updated_at = now
             self._clear_lease(task)
+
+    @staticmethod
+    def _task_state(task: KnowledgeStorageCleanupTask) -> str:
+        return str(task.file_status or task.status)
+
+    @staticmethod
+    def _set_task_state(task: KnowledgeStorageCleanupTask, state: str) -> None:
+        if task.file_status is None:
+            task.status = state
+            return
+        # 物理 status 永远保持旧 Worker 不会领取的 completed；新 Worker 只按
+        # file_status 驱动状态机，从而允许安全回滚到不理解 File 引用的镜像。
+        task.status = "completed"
+        task.file_status = state
 
     @staticmethod
     def _clear_lease(task: KnowledgeStorageCleanupTask) -> None:
@@ -596,7 +658,7 @@ class StorageCleanupRepository:
         lease_token: str,
         now: datetime,
     ) -> bool:
-        if task is None or task.status != "running" or not task.lease_token_hash:
+        if task is None or cls._task_state(task) != "running" or not task.lease_token_hash:
             return False
         if not secrets.compare_digest(task.lease_token_hash, cls._hash_token(lease_token)):
             return False
@@ -604,7 +666,7 @@ class StorageCleanupRepository:
 
     @classmethod
     def _lease_token_matches(cls, task: KnowledgeStorageCleanupTask | None, lease_token: str) -> bool:
-        if task is None or task.status != "running" or not task.lease_token_hash:
+        if task is None or cls._task_state(task) != "running" or not task.lease_token_hash:
             return False
         return secrets.compare_digest(task.lease_token_hash, cls._hash_token(lease_token))
 

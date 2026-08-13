@@ -7,6 +7,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).parent.parent
 CLEANUP_MIGRATION_PATH = ROOT / "alembic" / "versions" / "5e7a9c2d4b10_add_knowledge_storage_cleanup.py"
 OUTCOME_MIGRATION_PATH = ROOT / "alembic" / "versions" / "6f8b1d3c5a20_add_knowledge_upload_outcome.py"
+FILE_SCOPE_MIGRATION_PATH = ROOT / "alembic" / "versions" / "9c4e7a2b6d11_add_file_cleanup_scope_and_vector_route.py"
 
 
 def load_migration(path=CLEANUP_MIGRATION_PATH, name="knowledge_storage_cleanup_migration"):
@@ -48,6 +49,35 @@ class KnowledgeStorageCleanupMigrationTests(unittest.TestCase):
         self.assertEqual(migration.down_revision, "5e7a9c2d4b10")
         self.assertFalse(operation.drop_table.called)
 
+    def test_file_cleanup_scope_and_vector_route_migration_is_expand_only(self):
+        migration = load_migration(FILE_SCOPE_MIGRATION_PATH, "knowledge_file_cleanup_scope_migration")
+        with patch.object(migration, "op") as operation:
+            migration.upgrade()
+
+        added = [(call.args[0], call.args[1]) for call in operation.add_column.call_args_list]
+        self.assertEqual(
+            [(table, column.name, column.nullable) for table, column in added],
+            [
+                ("knowledge_storage_cleanup_tasks", "file_status", True),
+                ("knowledge_index_versions", "milvus_uri", True),
+                ("knowledge_index_versions", "milvus_database", True),
+            ],
+        )
+        constraint = operation.create_check_constraint.call_args.args[2]
+        self.assertIn("file_status IS NULL", constraint)
+        operation.create_index.assert_called_once_with(
+            "ix_knowledge_storage_cleanup_file_claim",
+            "knowledge_storage_cleanup_tasks",
+            ["file_status", "available_at", "created_at", "id"],
+        )
+        backfill_sql = str(operation.execute.call_args.args[0])
+        self.assertIn("FROM files AS file", backfill_sql)
+        self.assertIn("file.storage_key = cleanup.storage_key", backfill_sql)
+        self.assertIn("file.thumbnail_key = cleanup.storage_key", backfill_sql)
+        self.assertIn("status = 'completed'", backfill_sql)
+        self.assertEqual(migration.down_revision, "8a3d5f7b9c10")
+        self.assertFalse(operation.drop_column.called)
+
     def test_revision_chain_has_single_cleanup_head(self):
         revisions: dict[str, str | None] = {}
         for path in (ROOT / "alembic" / "versions").glob("*.py"):
@@ -60,9 +90,9 @@ class KnowledgeStorageCleanupMigrationTests(unittest.TestCase):
                 revisions[assignments["revision"]] = assignments["down_revision"]
         heads = set(revisions) - {parent for parent in revisions.values() if parent is not None}
 
-        self.assertEqual(heads, {"8a3d5f7b9c10"})
+        self.assertEqual(heads, {"9c4e7a2b6d11"})
         visited: set[str] = set()
-        current: str | None = "8a3d5f7b9c10"
+        current: str | None = "9c4e7a2b6d11"
         while current is not None:
             self.assertNotIn(current, visited)
             visited.add(current)

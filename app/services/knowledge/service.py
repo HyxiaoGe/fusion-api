@@ -6,6 +6,7 @@ import unicodedata
 import uuid
 from collections import defaultdict
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import PurePath
 
 from fastapi import UploadFile
@@ -51,10 +52,16 @@ from app.services.knowledge.parser import KnowledgeDocumentParser
 from app.services.knowledge.storage_upload_guard import StorageUploadFenceLost, start_guarded_storage_upload
 from app.services.storage import get_storage
 
-EmbeddingProfileKey = tuple[str, str, int, str, str, str]
+EmbeddingProfileKey = tuple[str, str, int, str, str, str, str, str]
 VectorHitKey = tuple[str, str, str, str]
 FILENAME_MAX_CHARACTERS = 255
 FILENAME_MAX_UTF8_BYTES = 500
+
+
+@dataclass(frozen=True)
+class RetrievalDocumentRef:
+    knowledge_base_id: str
+    active_index_version: str
 
 
 class KnowledgeService:
@@ -278,6 +285,8 @@ class KnowledgeService:
                 embedding_dimension=profile.dimension,
                 distance_metric=profile.distance_metric,
                 collection_name=self.vector_store.collection_name(profile.dimension),
+                milvus_uri=settings.MILVUS_URI,
+                milvus_database=settings.MILVUS_DATABASE,
             )
             task = KnowledgeIndexTask(
                 knowledge_base_id=knowledge_base_id,
@@ -379,7 +388,7 @@ class KnowledgeService:
 
     def delete_document(self, user_id: str, knowledge_base_id: str, document_id: str) -> KnowledgeTaskView:
         self._require_enabled()
-        self._require_base(user_id, knowledge_base_id)
+        self._require_base(user_id, knowledge_base_id, lock=True)
         document = self._require_document(user_id, knowledge_base_id, document_id, lock=True)
         if document.status == "deleting":
             task = self._latest_task(document_id=document_id, task_type="delete_document")
@@ -390,7 +399,7 @@ class KnowledgeService:
 
     def retry_document(self, user_id: str, knowledge_base_id: str, document_id: str) -> KnowledgeTaskView:
         self._require_enabled()
-        knowledge_base = self._require_base(user_id, knowledge_base_id)
+        knowledge_base = self._require_base(user_id, knowledge_base_id, lock=True)
         document = self._require_document(user_id, knowledge_base_id, document_id, lock=True)
         if knowledge_base.status != "active" or document.status != "failed":
             raise ApiException(
@@ -416,6 +425,8 @@ class KnowledgeService:
             embedding_dimension=profile.dimension,
             distance_metric=profile.distance_metric,
             collection_name=self.vector_store.collection_name(profile.dimension),
+            milvus_uri=settings.MILVUS_URI,
+            milvus_database=settings.MILVUS_DATABASE,
         )
         task = KnowledgeIndexTask(
             knowledge_base_id=knowledge_base_id,
@@ -461,6 +472,8 @@ class KnowledgeService:
             embedding_dimension=profile.dimension,
             distance_metric=profile.distance_metric,
             collection_name=self.vector_store.collection_name(profile.dimension),
+            milvus_uri=settings.MILVUS_URI,
+            milvus_database=settings.MILVUS_DATABASE,
         )
         task = KnowledgeIndexTask(
             knowledge_base_id=knowledge_base_id,
@@ -490,7 +503,7 @@ class KnowledgeService:
         bases_with_ready_documents = {row.document.knowledge_base_id for row in ready_documents}
         if bases_with_ready_documents != set(payload.knowledge_base_ids):
             raise ApiException(ErrorCode.KNOWLEDGE_BASE_NOT_READY, "至少一个知识库尚无就绪文档", 409)
-        documents_by_profile: dict[EmbeddingProfileKey, list[KnowledgeDocument]] = defaultdict(list)
+        documents_by_profile: dict[EmbeddingProfileKey, list[RetrievalDocumentRef]] = defaultdict(list)
         for ready_document in ready_documents:
             document = ready_document.document
             active_version = ready_document.active_version
@@ -501,8 +514,18 @@ class KnowledgeService:
                 active_version.distance_metric,
                 active_version.collection_name,
                 active_version.embedding_revision,
+                active_version.milvus_uri or settings.MILVUS_URI,
+                active_version.milvus_database or settings.MILVUS_DATABASE,
             )
-            documents_by_profile[key].append(document)
+            documents_by_profile[key].append(
+                RetrievalDocumentRef(
+                    knowledge_base_id=document.knowledge_base_id,
+                    active_index_version=str(document.active_index_version),
+                )
+            )
+        # 只读 ORM 数据已复制为不可变快照；外部 Embedding/Milvus 最长等待数十秒，
+        # 先结束事务把连接归还池，完成后再由同一 Session 开启新事务做精确授权。
+        self.db.rollback()
         overfetch = min(payload.top_k * 3, 100)
         try:
             profile_hit_groups = await self._search_profiles(
@@ -610,7 +633,7 @@ class KnowledgeService:
         *,
         user_id: str,
         query: str,
-        documents_by_profile: dict[EmbeddingProfileKey, list[KnowledgeDocument]],
+        documents_by_profile: dict[EmbeddingProfileKey, list[RetrievalDocumentRef]],
         limit: int,
     ) -> list[tuple[EmbeddingProfileKey, list[KnowledgeVectorHit]]]:
         if len(documents_by_profile) > settings.KNOWLEDGE_SEARCH_MAX_PROFILES:
@@ -648,7 +671,7 @@ class KnowledgeService:
         user_id: str,
         query: str,
         profile_key: EmbeddingProfileKey,
-        documents: list[KnowledgeDocument],
+        documents: list[RetrievalDocumentRef],
         limit: int,
     ) -> tuple[EmbeddingProfileKey, list[KnowledgeVectorHit]]:
         async with semaphore:
@@ -666,7 +689,7 @@ class KnowledgeService:
         user_id: str,
         query: str,
         profile_key: EmbeddingProfileKey,
-        documents: list[KnowledgeDocument],
+        documents: list[RetrievalDocumentRef],
         limit: int,
     ) -> tuple[EmbeddingProfileKey, list[KnowledgeVectorHit]]:
         profile = EmbeddingProfile(*profile_key)

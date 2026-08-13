@@ -503,6 +503,8 @@ class KnowledgeWorker:
             version.distance_metric,
             version.collection_name,
             version.embedding_revision,
+            version.milvus_uri or settings.MILVUS_URI,
+            version.milvus_database or settings.MILVUS_DATABASE,
         )
 
     @staticmethod

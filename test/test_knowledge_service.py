@@ -208,6 +208,29 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(first.id, second.id)
         self.assertEqual(second.status, "pending")
 
+    def test_document_mutations_lock_base_before_document(self):
+        for operation in (self.service.delete_document, self.service.retry_document):
+            order: list[str] = []
+
+            def require_base(*_args, **_kwargs):
+                order.append("base")
+                return MagicMock()
+
+            def require_document(*_args, **_kwargs):
+                order.append("document")
+                raise RuntimeError("stop after locks")
+
+            with (
+                patch.object(self.service, "_require_base", side_effect=require_base) as base_lock,
+                patch.object(self.service, "_require_document", side_effect=require_document) as document_lock,
+                self.assertRaisesRegex(RuntimeError, "stop after locks"),
+            ):
+                operation("user-1", "kb-1", "doc-1")
+
+            self.assertEqual(order, ["base", "document"])
+            base_lock.assert_called_once_with("user-1", "kb-1", lock=True)
+            document_lock.assert_called_once_with("user-1", "kb-1", "doc-1", lock=True)
+
     async def test_upload_persists_task_and_duplicate_returns_stable_conflict(self):
         knowledge_base = self._create_base()
 
@@ -441,6 +464,61 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([hit.chunk_id for hit in result.hits], ["high-score", "low-score"])
         self.assertEqual([hit.similarity for hit in result.hits], [0.9, 0.2])
+
+    async def test_retrieval_releases_database_transaction_before_external_calls(self):
+        knowledge_base, _document = await self._create_ready_document(
+            base_name="连接释放手册",
+            content=b"release transaction",
+            embedding_model="embed-a",
+        )
+
+        async def embed_without_open_transaction(_texts, _profile):
+            self.assertFalse(self.db.in_transaction())
+            return [[1.0, 0.5]]
+
+        self.embedding.embed.side_effect = embed_without_open_transaction
+
+        result = await self.service.retrieve(
+            "user-1",
+            KnowledgeRetrievalRequest(
+                knowledge_base_ids=[knowledge_base.id],
+                query="配置",
+                top_k=1,
+            ),
+        )
+
+        self.assertEqual(result.hits, [])
+        self.embedding.embed.assert_awaited_once()
+
+    async def test_retrieval_uses_persisted_historical_milvus_route(self):
+        knowledge_base, document = await self._create_ready_document(
+            base_name="历史向量路由手册",
+            content=b"historical vector route",
+            embedding_model="embed-a",
+        )
+        version = next(item for item in document.index_versions if item.id == document.active_index_version)
+        version.milvus_uri = "http://historical-milvus:19530"
+        version.milvus_database = "historical_knowledge"
+        self.db.commit()
+
+        async def assert_historical_route(**kwargs):
+            self.assertEqual(kwargs["profile"].milvus_uri, "http://historical-milvus:19530")
+            self.assertEqual(kwargs["profile"].milvus_database, "historical_knowledge")
+            return []
+
+        self.vector_store.search.side_effect = assert_historical_route
+
+        result = await self.service.retrieve(
+            "user-1",
+            KnowledgeRetrievalRequest(
+                knowledge_base_ids=[knowledge_base.id],
+                query="历史路由",
+                top_k=1,
+            ),
+        )
+
+        self.assertEqual(result.hits, [])
+        self.vector_store.search.assert_awaited_once()
 
     async def test_active_legacy_v1_index_remains_retrievable(self):
         knowledge_base, document = await self._create_ready_document(

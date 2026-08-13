@@ -130,6 +130,18 @@ class KnowledgeWorkerTests(unittest.IsolatedAsyncioTestCase):
             version.chunk_overlap = chunk_overlap
             db.commit()
 
+    def test_version_profile_preserves_historical_milvus_route(self):
+        with self.Session() as db:
+            version = db.get(KnowledgeIndexVersion, "version-1")
+            version.milvus_uri = "http://historical-milvus:19530"
+            version.milvus_database = "historical_knowledge"
+            db.commit()
+
+            profile = KnowledgeWorker._version_profile(version)
+
+        self.assertEqual(profile.milvus_uri, "http://historical-milvus:19530")
+        self.assertEqual(profile.milvus_database, "historical_knowledge")
+
     async def test_index_task_completes_and_activates_version(self):
         worker = KnowledgeWorker(
             self.Session,

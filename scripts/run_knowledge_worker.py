@@ -146,6 +146,11 @@ async def _run_cleanup_loop(
 
 
 async def run_worker(*, once: bool) -> int:
+    try:
+        settings.validate_knowledge_storage_cleanup_configuration()
+    except ValueError as exc:
+        logger.error("存储清理 Worker 配置无效: %s", exc)
+        return 2
     if not settings.KNOWLEDGE_BASE_ENABLED:
         worker_id = f"{socket.gethostname()}-{os.getpid()}"
         # 旧 /api/files/upload 也复用持久对象 cleanup fence；即使知识库

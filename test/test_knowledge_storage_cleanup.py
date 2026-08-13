@@ -3,6 +3,7 @@ import hashlib
 import io
 import unittest
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import UploadFile
@@ -15,6 +16,8 @@ from starlette.datastructures import Headers
 
 from app.db.database import Base
 from app.db.models import (
+    Conversation,
+    ConversationFile,
     File,
     KnowledgeBase,
     KnowledgeDocument,
@@ -24,6 +27,7 @@ from app.db.models import (
 )
 from app.db.storage_cleanup_repository import StorageCleanupBusy, StorageCleanupRepository
 from app.schemas.response import ApiException
+from app.services.file_service import FileService, FileStorageUnavailableError
 from app.services.knowledge.service import KnowledgeService
 from app.services.knowledge.storage_cleanup_worker import KnowledgeStorageCleanupWorker
 from app.utils.time import utc_now
@@ -40,6 +44,14 @@ class KnowledgeStorageCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
         with self.Session() as db:
             db.add(User(id="user-1", username="cleanup-user", email="cleanup@example.com"))
+            db.add(
+                Conversation(
+                    id="conv-1",
+                    user_id="user-1",
+                    title="Cleanup",
+                    model_id="gpt-4.1",
+                )
+            )
             db.add(
                 KnowledgeBase(
                     id="kb-1",
@@ -77,6 +89,46 @@ class KnowledgeStorageCleanupTests(unittest.IsolatedAsyncioTestCase):
                 cleanup_succeeded=cleanup_succeeded,
             )
 
+    def _register_file(self, *, key: str, hold_seconds: int = 60):
+        with self.Session() as db:
+            return StorageCleanupRepository(db).register_upload_intent(
+                storage_backend="local",
+                storage_key=key,
+                hold_seconds=hold_seconds,
+                max_attempts=3,
+                cleanup_scope="file",
+            )
+
+    @staticmethod
+    def _file_record(*, file_id: str, key: str) -> dict:
+        return {
+            "id": file_id,
+            "user_id": "user-1",
+            "filename": f"{file_id}_note.txt",
+            "original_filename": "note.txt",
+            "mimetype": "text/plain",
+            "size": 5,
+            "path": key,
+            "status": "parsing",
+            "storage_key": key,
+            "thumbnail_key": None,
+            "storage_backend": "local",
+            "width": None,
+            "height": None,
+        }
+
+    def _file_service(self, db):
+        with patch("app.services.file_service.get_storage", return_value=MagicMock()):
+            return FileService(db, session_factory=self.Session)
+
+    @staticmethod
+    def _lifecycle(registration):
+        return SimpleNamespace(
+            registration=registration,
+            mark_request_resolved=MagicMock(),
+            wait_finished=AsyncMock(),
+        )
+
     def test_intent_guard_is_not_claimed_before_expiry(self):
         now = utc_now()
         with self.Session() as db:
@@ -94,6 +146,94 @@ class KnowledgeStorageCleanupTests(unittest.IsolatedAsyncioTestCase):
                 now=now + timedelta(seconds=59),
             )
         self.assertIsNone(claimed)
+
+    def test_file_cleanup_scope_is_invisible_to_rollback_worker_but_claimable_by_new_worker(self):
+        registration = self._register_file(key="files/v1/rollback-safe", hold_seconds=60)
+        self._activate(registration)
+
+        with self.Session() as db:
+            old_worker_candidate = (
+                db.query(KnowledgeStorageCleanupTask)
+                .filter(KnowledgeStorageCleanupTask.status.in_(("pending", "retry", "running", "failed")))
+                .first()
+            )
+            self.assertIsNone(old_worker_candidate)
+
+            claimed = StorageCleanupRepository(db).claim_task(
+                worker_id="new-worker",
+                lease_seconds=30,
+                now=utc_now() + timedelta(seconds=1),
+            )
+
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.task.status, "completed")
+        self.assertEqual(claimed.task.file_status, "running")
+
+    async def test_file_reference_and_cleanup_fence_commit_atomically(self):
+        key = "files/v1/users/user-1/conversations/conv-1/files/file-atomic/original"
+        registration = self._register_file(key=key)
+        with self.Session() as db:
+            self.assertTrue(
+                StorageCleanupRepository(db).record_upload_outcome(
+                    registration,
+                    outcome="succeeded",
+                    hold_seconds=60,
+                )
+            )
+
+        lifecycle = self._lifecycle(registration)
+        with self.Session() as db:
+            service = self._file_service(db)
+            await service._commit_new_file_with_upload_fences(
+                file_record=self._file_record(file_id="file-atomic", key=key),
+                conversation_id="conv-1",
+                lifecycles=[lifecycle],
+            )
+
+        lifecycle.mark_request_resolved.assert_called_once_with()
+        lifecycle.wait_finished.assert_awaited_once_with()
+        with self.Session() as db:
+            self.assertIsNotNone(db.get(File, "file-atomic"))
+            self.assertIsNotNone(db.get(ConversationFile, ("conv-1", "file-atomic")))
+            task = db.get(KnowledgeStorageCleanupTask, registration.task_id)
+            self.assertEqual(task.status, "completed")
+            self.assertEqual(task.file_status, "completed")
+            self.assertEqual(
+                db.query(KnowledgeStorageUploadIntent).filter_by(cleanup_task_id=task.id).count(),
+                0,
+            )
+
+    async def test_lost_file_upload_fence_cannot_commit_partial_file_reference(self):
+        key = "files/v1/users/user-1/conversations/conv-1/files/file-lost/original"
+        registration = self._register_file(key=key)
+        with self.Session() as db:
+            repo = StorageCleanupRepository(db)
+            self.assertTrue(repo.record_upload_outcome(registration, outcome="succeeded", hold_seconds=60))
+            task = db.get(KnowledgeStorageCleanupTask, registration.task_id)
+            task.attempt_count = 1
+            db.commit()
+
+        lifecycle = self._lifecycle(registration)
+        with self.Session() as db:
+            service = self._file_service(db)
+            with self.assertRaises(FileStorageUnavailableError):
+                await service._commit_new_file_with_upload_fences(
+                    file_record=self._file_record(file_id="file-lost", key=key),
+                    conversation_id="conv-1",
+                    lifecycles=[lifecycle],
+                )
+
+        lifecycle.mark_request_resolved.assert_not_called()
+        lifecycle.wait_finished.assert_not_awaited()
+        with self.Session() as db:
+            self.assertIsNone(db.get(File, "file-lost"))
+            self.assertIsNone(db.get(ConversationFile, ("conv-1", "file-lost")))
+            task = db.get(KnowledgeStorageCleanupTask, registration.task_id)
+            self.assertEqual(task.file_status, "pending")
+            self.assertEqual(
+                db.query(KnowledgeStorageUploadIntent).filter_by(cleanup_task_id=task.id).count(),
+                1,
+            )
 
     def test_register_upload_intent_guard_uses_fresh_clock_after_object_lock(self):
         registration_started_at = utc_now()

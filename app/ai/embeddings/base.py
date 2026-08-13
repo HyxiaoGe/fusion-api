@@ -20,6 +20,8 @@ class EmbeddingProfile:
     distance_metric: str = "COSINE"
     collection_name: str | None = None
     revision: str | None = None
+    milvus_uri: str | None = None
+    milvus_database: str | None = None
 
 
 class EmbeddingAdapter(ABC):

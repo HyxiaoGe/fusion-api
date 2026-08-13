@@ -66,6 +66,21 @@ class KnowledgeConfigTests(unittest.TestCase):
 
         configured.validate_knowledge_base_configuration()
 
+    def test_disabled_feature_still_rejects_invalid_cleanup_worker_bounds(self):
+        configured = enabled_settings(
+            KNOWLEDGE_BASE_ENABLED=False,
+            KNOWLEDGE_WORKER_POLL_SECONDS=0,
+            MILVUS_URI="",
+            MILVUS_USERNAME="",
+            MILVUS_PASSWORD="",
+            MILVUS_DATABASE="",
+        )
+
+        with self.assertRaises(ValueError) as raised:
+            configured.validate_knowledge_base_configuration()
+
+        self.assertIn("POLL_SECONDS", str(raised.exception))
+
     def test_resource_and_chunk_progress_bounds_fail_closed(self):
         invalid_cases = (
             ("KNOWLEDGE_MAX_BASES_PER_USER", 0, "MAX_BASES_PER_USER"),
