@@ -748,6 +748,83 @@ class KnowledgeRepositoryTests(unittest.TestCase):
         self.assertEqual(cleanup_task.attempt_count, 4)
         self.assertEqual(cleanup_task.max_attempts, 5)
 
+    def test_terminal_versions_do_not_starve_failed_cleanup_reconciliation_limit(self):
+        repo = KnowledgeRepository(self.db)
+        repo.create_knowledge_base(self._base())
+        document, live_version, index_task = self._document_bundle(version_id="z-live-version")
+        repo.create_document_with_task(document, live_version, index_task)
+        now = utc_now() + timedelta(seconds=1)
+        index_task.status = "cancelled"
+        index_task.completed_at = now
+        live_version.status = "deleting"
+        live_cleanup = KnowledgeIndexTask(
+            id="z-live-cleanup",
+            knowledge_base_id=document.knowledge_base_id,
+            document_id=document.id,
+            user_id=document.user_id,
+            task_type="delete_index_version",
+            index_version=live_version.id,
+            status="failed",
+            phase="deleting",
+            attempt_count=3,
+            max_attempts=3,
+            available_at=now,
+            completed_at=now,
+        )
+        self.db.add(live_cleanup)
+        for index in range(100):
+            version_id = f"a-terminal-version-{index:03d}"
+            self.db.add(
+                KnowledgeIndexVersion(
+                    id=version_id,
+                    knowledge_base_id=document.knowledge_base_id,
+                    document_id=document.id,
+                    user_id=document.user_id,
+                    status="deleted",
+                    parser_version="parser-v1",
+                    chunker_version="chunker-v2",
+                    chunk_size=1200,
+                    chunk_overlap=200,
+                    embedding_provider="litellm",
+                    embedding_model="embed-v1",
+                    embedding_revision="embed-r1",
+                    embedding_dimension=2,
+                    distance_metric="COSINE",
+                    collection_name="knowledge_v1_d2",
+                    deleted_at=now,
+                )
+            )
+            self.db.add(
+                KnowledgeIndexTask(
+                    id=f"a-terminal-cleanup-{index:03d}",
+                    knowledge_base_id=document.knowledge_base_id,
+                    document_id=document.id,
+                    user_id=document.user_id,
+                    task_type="delete_index_version",
+                    index_version=version_id,
+                    status="failed",
+                    phase="deleting",
+                    attempt_count=3,
+                    max_attempts=3,
+                    available_at=now,
+                    completed_at=now,
+                )
+            )
+        self.db.commit()
+
+        self.assertIsNone(
+            repo.claim_task(
+                worker_id="worker-1",
+                lease_seconds=60,
+                external_write_grace_seconds=10,
+                now=now,
+            )
+        )
+
+        self.db.refresh(live_cleanup)
+        self.assertEqual(live_cleanup.status, "retry")
+        self.assertEqual(live_cleanup.max_attempts, 4)
+
     def test_document_delete_waits_for_running_index_task(self):
         repo = KnowledgeRepository(self.db)
         repo.create_knowledge_base(self._base())

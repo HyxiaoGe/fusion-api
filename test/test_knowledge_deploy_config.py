@@ -40,16 +40,33 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         environment = {
             "KNOWLEDGE_BASE_ENABLED": "true",
             "KNOWLEDGE_MAX_FILE_SIZE": "10485760",
+            "KNOWLEDGE_ALLOWED_MIME_TYPES": "text/plain,text/markdown,text/csv,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "KNOWLEDGE_PARSER_VERSION": "parser-v1",
             "KNOWLEDGE_CHUNKER_VERSION": "chunker-v2",
             "KNOWLEDGE_CHUNK_SIZE": "1200",
             "KNOWLEDGE_CHUNK_OVERLAP": "200",
             "KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT": "10000",
+            "KNOWLEDGE_PARSE_TIMEOUT_SECONDS": "60",
+            "KNOWLEDGE_EMBEDDING_PROVIDER": "litellm",
             "KNOWLEDGE_EMBEDDING_BATCH_SIZE": "32",
             "KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS": "30",
+            "KNOWLEDGE_EMBEDDING_DIMENSION": "1024",
+            "KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS": "1024",
             "KNOWLEDGE_SEARCH_MAX_PROFILES": "8",
+            "KNOWLEDGE_DISTANCE_METRIC": "COSINE",
             "KNOWLEDGE_WORKER_POLL_SECONDS": "2",
+            "KNOWLEDGE_WORKER_LEASE_SECONDS": "180",
+            "KNOWLEDGE_WORKER_HEARTBEAT_SECONDS": "30",
+            "KNOWLEDGE_WORKER_MAX_ATTEMPTS": "5",
             "KNOWLEDGE_WORKER_RETRY_BASE_SECONDS": "5",
             "KNOWLEDGE_WORKER_RETRY_MAX_SECONDS": "300",
+            "LITELLM_PROXY_URL": "http://litellm-proxy:4000",
+            "LITELLM_API_KEY": "test-proxy-key",
+            "MILVUS_URI": "http://milvus:19530",
+            "MILVUS_USERNAME": "fusion_app",
+            "MILVUS_PASSWORD": "test-milvus-password",
+            "MILVUS_DATABASE": "fusion_knowledge",
+            "MILVUS_COLLECTION_PREFIX": "fusion_knowledge_chunks",
             "MILVUS_TIMEOUT_SECONDS": "10",
             "KNOWLEDGE_EMBEDDING_MODEL": "embedding-v1",
             "KNOWLEDGE_EMBEDDING_REVISION": "embedding-r1",
@@ -182,6 +199,7 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
             "knowledge chunker version invalid",
             "knowledge embedding revision route missing",
             "knowledge embedding revision routes history changed",
+            "candidate knowledge settings ok",
         )
         for marker in required:
             self.assertIn(marker, self.workflow)
@@ -356,6 +374,13 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         invalid_batch = self._run_candidate_knowledge_validation(KNOWLEDGE_EMBEDDING_BATCH_SIZE="129")
         invalid_profiles = self._run_candidate_knowledge_validation(KNOWLEDGE_SEARCH_MAX_PROFILES="17")
         invalid_poll = self._run_candidate_knowledge_validation(KNOWLEDGE_WORKER_POLL_SECONDS="61")
+        invalid_parse_timeout = self._run_candidate_knowledge_validation(KNOWLEDGE_PARSE_TIMEOUT_SECONDS="301")
+        invalid_lease = self._run_candidate_knowledge_validation(KNOWLEDGE_WORKER_LEASE_SECONDS="0")
+        invalid_heartbeat = self._run_candidate_knowledge_validation(
+            KNOWLEDGE_WORKER_LEASE_SECONDS="180",
+            KNOWLEDGE_WORKER_HEARTBEAT_SECONDS="100",
+        )
+        invalid_attempts = self._run_candidate_knowledge_validation(KNOWLEDGE_WORKER_MAX_ATTEMPTS="0")
         invalid_retry_base = self._run_candidate_knowledge_validation(KNOWLEDGE_WORKER_RETRY_BASE_SECONDS="0")
         invalid_retry_order = self._run_candidate_knowledge_validation(
             KNOWLEDGE_WORKER_RETRY_BASE_SECONDS="301",
@@ -378,6 +403,10 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
             invalid_batch,
             invalid_profiles,
             invalid_poll,
+            invalid_parse_timeout,
+            invalid_lease,
+            invalid_heartbeat,
+            invalid_attempts,
             invalid_retry_base,
             invalid_retry_order,
             invalid_retry_max,
@@ -389,6 +418,21 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         self.assertIn("knowledge embedding revision routes invalid", missing_route.stderr)
         self.assertNotEqual(missing_current_route.returncode, 0)
         self.assertIn("knowledge embedding revision route missing", missing_current_route.stderr)
+
+    def test_candidate_image_runs_central_knowledge_validation_before_compose_replacement(self):
+        validation = self.workflow.index("candidate knowledge settings ok")
+        api_replacement = self.workflow.index("docker compose -f docker-compose.fusion-api-ghcr.yml")
+
+        self.assertLess(validation, api_replacement)
+        validation_block = self.workflow[validation - 4000 : validation + 200]
+        self.assertIn("settings.validate_knowledge_base_configuration()", validation_block)
+        for name in (
+            "KNOWLEDGE_PARSE_TIMEOUT_SECONDS",
+            "KNOWLEDGE_WORKER_LEASE_SECONDS",
+            "KNOWLEDGE_WORKER_HEARTBEAT_SECONDS",
+            "KNOWLEDGE_WORKER_MAX_ATTEMPTS",
+        ):
+            self.assertIn(f'-e "{name}"', validation_block)
 
     def test_compose_injects_search_and_document_resource_limits_into_api_and_worker(self):
         for name in (

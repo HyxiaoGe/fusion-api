@@ -832,8 +832,12 @@ jobs:
                   chunk_size = int(os.environ["KNOWLEDGE_CHUNK_SIZE"])
                   chunk_overlap = int(os.environ["KNOWLEDGE_CHUNK_OVERLAP"])
                   max_chunks_per_document = int(os.environ["KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT"])
+                  parse_timeout = int(os.environ["KNOWLEDGE_PARSE_TIMEOUT_SECONDS"])
                   embedding_batch_size = int(os.environ["KNOWLEDGE_EMBEDDING_BATCH_SIZE"])
                   search_max_profiles = int(os.environ["KNOWLEDGE_SEARCH_MAX_PROFILES"])
+                  worker_lease = int(os.environ["KNOWLEDGE_WORKER_LEASE_SECONDS"])
+                  worker_heartbeat = int(os.environ["KNOWLEDGE_WORKER_HEARTBEAT_SECONDS"])
+                  worker_max_attempts = int(os.environ["KNOWLEDGE_WORKER_MAX_ATTEMPTS"])
                   worker_retry_base = int(os.environ["KNOWLEDGE_WORKER_RETRY_BASE_SECONDS"])
                   worker_retry_max = int(os.environ["KNOWLEDGE_WORKER_RETRY_MAX_SECONDS"])
               except (KeyError, ValueError):
@@ -848,10 +852,14 @@ jobs:
                   and chunk_overlap * 2 <= chunk_size
                   and chunk_size - chunk_overlap >= 100
                   and 1 <= max_chunks_per_document <= 10_000
+                  and 1 <= parse_timeout <= 300
                   and 1 <= embedding_batch_size <= 128
                   and 1 <= embedding_timeout <= 120
                   and 1 <= search_max_profiles <= 16
                   and 0 < worker_poll <= 60
+                  and worker_lease > 0
+                  and 0 < worker_heartbeat * 2 < worker_lease
+                  and worker_max_attempts > 0
                   and 0 < worker_retry_base <= worker_retry_max <= 3600
                   and 1 <= milvus_timeout <= 60
               ):
@@ -892,6 +900,48 @@ jobs:
             echo "docker pull 失败（网络抖动），第 $n 次，10s 后重试..."
             sleep 10
           done
+          if [ "${KNOWLEDGE_BASE_ENABLED}" = "true" ]; then
+            docker run --rm -i --entrypoint python --env-file .env \
+              -e "KNOWLEDGE_BASE_ENABLED" \
+              -e "KNOWLEDGE_MAX_FILE_SIZE" \
+              -e "KNOWLEDGE_ALLOWED_MIME_TYPES" \
+              -e "KNOWLEDGE_PARSER_VERSION" \
+              -e "KNOWLEDGE_CHUNKER_VERSION" \
+              -e "KNOWLEDGE_CHUNK_SIZE" \
+              -e "KNOWLEDGE_CHUNK_OVERLAP" \
+              -e "KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT" \
+              -e "KNOWLEDGE_PARSE_TIMEOUT_SECONDS" \
+              -e "KNOWLEDGE_EMBEDDING_PROVIDER" \
+              -e "KNOWLEDGE_EMBEDDING_MODEL" \
+              -e "KNOWLEDGE_EMBEDDING_REVISION" \
+              -e "KNOWLEDGE_EMBEDDING_REVISION_ROUTES" \
+              -e "KNOWLEDGE_EMBEDDING_DIMENSION" \
+              -e "KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS" \
+              -e "KNOWLEDGE_EMBEDDING_BATCH_SIZE" \
+              -e "KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS" \
+              -e "KNOWLEDGE_SEARCH_MAX_PROFILES" \
+              -e "KNOWLEDGE_DISTANCE_METRIC" \
+              -e "KNOWLEDGE_WORKER_POLL_SECONDS" \
+              -e "KNOWLEDGE_WORKER_LEASE_SECONDS" \
+              -e "KNOWLEDGE_WORKER_HEARTBEAT_SECONDS" \
+              -e "KNOWLEDGE_WORKER_MAX_ATTEMPTS" \
+              -e "KNOWLEDGE_WORKER_RETRY_BASE_SECONDS" \
+              -e "KNOWLEDGE_WORKER_RETRY_MAX_SECONDS" \
+              -e "LITELLM_PROXY_URL" \
+              -e "LITELLM_API_KEY" \
+              -e "MILVUS_URI" \
+              -e "MILVUS_USERNAME" \
+              -e "MILVUS_PASSWORD" \
+              -e "MILVUS_DATABASE" \
+              -e "MILVUS_COLLECTION_PREFIX" \
+              -e "MILVUS_TIMEOUT_SECONDS" \
+              "${DEPLOY_API_IMAGE}" - <<'PY'
+          from app.core.config import settings
+
+          settings.validate_knowledge_base_configuration()
+          print("candidate knowledge settings ok")
+          PY
+          fi
           if docker run --rm --entrypoint /bin/sh "${DEPLOY_API_IMAGE}" -c 'test -f /app/scripts/run_knowledge_worker.py'; then
             knowledge_worker_supported="true"
           else

@@ -28,6 +28,13 @@ class KnowledgeEmbeddingValidationTests(unittest.TestCase):
                 LiteLLMEmbeddingAdapter.validate_vectors([vector], expected_count=1, dimension=2)
             self.assertEqual(raised.exception.code, "KNOWLEDGE_EMBEDDING_INVALID")
 
+    def test_boolean_and_non_numeric_components_are_rejected(self):
+        for vector in ([True, False], ["1.0", 0.5]):
+            with self.subTest(vector=vector), self.assertRaises(EmbeddingError) as raised:
+                LiteLLMEmbeddingAdapter.validate_vectors([vector], expected_count=1, dimension=2)
+            self.assertEqual(raised.exception.code, "KNOWLEDGE_EMBEDDING_INVALID")
+            self.assertFalse(raised.exception.retryable)
+
 
 class KnowledgeEmbeddingAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_embedding_uses_registered_alias_through_litellm_proxy(self):

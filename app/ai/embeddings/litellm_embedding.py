@@ -101,6 +101,12 @@ class LiteLLMEmbeddingAdapter(EmbeddingAdapter):
                     "Embedding 返回维度与知识库配置不一致",
                     retryable=False,
                 )
+            if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in vector):
+                raise EmbeddingError(
+                    "KNOWLEDGE_EMBEDDING_INVALID",
+                    "Embedding 返回了非数值向量",
+                    retryable=False,
+                )
             try:
                 numeric = [float(value) for value in vector]
             except (TypeError, ValueError) as exc:

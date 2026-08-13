@@ -1081,10 +1081,15 @@ class KnowledgeRepository:
     def _failed_index_cleanup_tasks_query(self):
         query = (
             self.db.query(KnowledgeIndexTask)
+            .join(
+                KnowledgeIndexVersion,
+                KnowledgeIndexVersion.id == KnowledgeIndexTask.index_version,
+            )
             .filter(
                 KnowledgeIndexTask.task_type == "delete_index_version",
                 KnowledgeIndexTask.status == "failed",
                 KnowledgeIndexTask.index_version.is_not(None),
+                KnowledgeIndexVersion.status == "deleting",
             )
             .order_by(
                 KnowledgeIndexTask.index_version.asc(),
