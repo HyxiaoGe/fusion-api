@@ -570,6 +570,65 @@ class KnowledgeRepositoryTests(unittest.TestCase):
         self.assertFalse(repo.complete_task(task.id, first.lease_token))
         self.assertTrue(repo.complete_task(task.id, second.lease_token))
 
+    def test_claim_lease_uses_fresh_clock_after_task_lock(self):
+        repo = KnowledgeRepository(self.db)
+        repo.create_knowledge_base(self._base())
+        document, version, task = self._document_bundle()
+        repo.create_document_with_task(document, version, task)
+        query_started_at = utc_now() + timedelta(seconds=1)
+        lock_acquired_at = query_started_at + timedelta(seconds=9)
+
+        with patch(
+            "app.db.knowledge_repository.utc_now",
+            side_effect=(query_started_at, lock_acquired_at),
+        ) as clock:
+            claimed = repo.claim_task(worker_id="worker-1", lease_seconds=10)
+
+        self.assertIsNotNone(claimed)
+        self.assertEqual(clock.call_count, 2)
+        self.assertEqual(claimed.task.heartbeat_at, lock_acquired_at.replace(tzinfo=None))
+        self.assertEqual(
+            claimed.task.lease_expires_at,
+            (lock_acquired_at + timedelta(seconds=10)).replace(tzinfo=None),
+        )
+
+    def test_renew_lease_reads_clock_only_after_task_lock(self):
+        repo = KnowledgeRepository(self.db)
+        repo.create_knowledge_base(self._base())
+        document, version, task = self._document_bundle()
+        repo.create_document_with_task(document, version, task)
+        claimed = repo.claim_task(
+            worker_id="worker-1",
+            lease_seconds=60,
+            now=utc_now() + timedelta(seconds=1),
+        )
+        renewed_at = utc_now() + timedelta(seconds=10)
+        task_locked = False
+        original_lock_task = repo._lock_task
+
+        def lock_task(task_id):
+            nonlocal task_locked
+            row = original_lock_task(task_id)
+            task_locked = True
+            return row
+
+        def locked_clock():
+            self.assertTrue(task_locked)
+            return renewed_at
+
+        with (
+            patch.object(repo, "_lock_task", side_effect=lock_task),
+            patch("app.db.knowledge_repository.utc_now", side_effect=locked_clock),
+        ):
+            self.assertTrue(repo.renew_lease(task.id, claimed.lease_token, lease_seconds=30))
+
+        self.db.refresh(task)
+        self.assertEqual(task.heartbeat_at, renewed_at.replace(tzinfo=None))
+        self.assertEqual(
+            task.lease_expires_at,
+            (renewed_at + timedelta(seconds=30)).replace(tzinfo=None),
+        )
+
     def test_expired_index_task_waits_for_external_write_grace_before_reclaim(self):
         repo = KnowledgeRepository(self.db)
         repo.create_knowledge_base(self._base())

@@ -234,6 +234,12 @@ class KnowledgeService:
                     "对象上传期间存储清理 fence 已失效，请稍后重试",
                     503,
                 ) from exc
+            except Exception as exc:
+                raise ApiException(
+                    ErrorCode.KNOWLEDGE_STORAGE_UNAVAILABLE,
+                    "对象存储暂时不可用，请稍后重试",
+                    503,
+                ) from exc
             profile = self._base_profile(knowledge_base)
             document = KnowledgeDocument(
                 id=document_id,

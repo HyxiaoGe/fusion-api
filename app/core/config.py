@@ -219,6 +219,10 @@ class Settings(BaseSettings):
             errors.append("KNOWLEDGE_EMBEDDING_DIMENSION 必须进入允许维度列表")
         if self.KNOWLEDGE_DISTANCE_METRIC != "COSINE":
             errors.append("KNOWLEDGE_DISTANCE_METRIC 必须为 COSINE")
+        if not 1 <= self.KNOWLEDGE_MAX_BASES_PER_USER <= 1_000:
+            errors.append("KNOWLEDGE_MAX_BASES_PER_USER 必须在 1 到 1000 之间")
+        if not 1 <= self.KNOWLEDGE_MAX_DOCUMENTS_PER_BASE <= 10_000:
+            errors.append("KNOWLEDGE_MAX_DOCUMENTS_PER_BASE 必须在 1 到 10000 之间")
         if not 100 <= self.KNOWLEDGE_CHUNK_SIZE <= 16_000:
             errors.append("KNOWLEDGE_CHUNK_SIZE 必须在 100 到 16000 之间")
         if (

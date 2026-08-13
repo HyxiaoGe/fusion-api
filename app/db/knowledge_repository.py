@@ -578,7 +578,8 @@ class KnowledgeRepository:
         external_write_grace_seconds: int = 0,
         now: datetime | None = None,
     ) -> ClaimedKnowledgeTask | None:
-        now = now or utc_now()
+        requested_now = now
+        now = requested_now or utc_now()
         self._reconcile_failed_index_cleanup_tasks(
             now,
             base_delay_seconds=external_write_grace_seconds,
@@ -665,17 +666,18 @@ class KnowledgeRepository:
         if task is None:
             self.db.commit()
             return None
+        lease_started_at = requested_now or utc_now()
         lease_token = secrets.token_urlsafe(32)
         task.status = "running"
         task.phase = "queued"
         task.attempt_count += 1
         task.lease_owner = worker_id
         task.lease_token_hash = self._hash_token(lease_token)
-        task.lease_expires_at = now + timedelta(seconds=lease_seconds)
-        task.heartbeat_at = now
+        task.lease_expires_at = lease_started_at + timedelta(seconds=lease_seconds)
+        task.heartbeat_at = lease_started_at
         task.error_code = None
         task.error_summary = None
-        task.updated_at = now
+        task.updated_at = lease_started_at
         self.db.commit()
         self.db.refresh(task)
         return ClaimedKnowledgeTask(task=task, lease_token=lease_token)
@@ -720,8 +722,8 @@ class KnowledgeRepository:
         lease_seconds: int,
         now: datetime | None = None,
     ) -> bool:
-        now = now or utc_now()
         task = self._lock_task(task_id)
+        now = now or utc_now()
         if not self._lease_matches(task, lease_token, now):
             self.db.rollback()
             return False

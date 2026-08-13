@@ -53,8 +53,9 @@ class StorageCleanupRepository:
         max_attempts: int,
         now: datetime | None = None,
     ) -> RegisteredStorageUploadIntent:
-        now = now or utc_now()
-        guard_until = now + timedelta(seconds=max(1, hold_seconds))
+        requested_now = now
+        registration_started_at = requested_now or utc_now()
+        guard_until = registration_started_at + timedelta(seconds=max(1, hold_seconds))
         try:
             task = self._lock_task_for_object(storage_backend, storage_key)
         except OperationalError as exc:
@@ -84,7 +85,9 @@ class StorageCleanupRepository:
         if task.status == "running":
             self.db.rollback()
             raise StorageCleanupBusy("同一对象的清理任务正在运行")
-        self._delete_expired_intents(task.id, now)
+        registered_at = requested_now or utc_now()
+        guard_until = registered_at + timedelta(seconds=max(1, hold_seconds))
+        self._delete_expired_intents(task.id, registered_at)
         task.status = "pending"
         task.attempt_count = 0
         task.max_attempts = max_attempts
@@ -96,7 +99,7 @@ class StorageCleanupRepository:
         task.error_code = None
         task.error_summary = None
         task.completed_at = None
-        task.updated_at = now
+        task.updated_at = registered_at
         intent = KnowledgeStorageUploadIntent(
             id=str(uuid.uuid4()),
             cleanup_task_id=task.id,
@@ -249,7 +252,8 @@ class StorageCleanupRepository:
         retry_max_seconds: int = 300,
         now: datetime | None = None,
     ) -> ClaimedStorageCleanupTask | None:
-        now = now or utc_now()
+        requested_now = now
+        now = requested_now or utc_now()
         self._fail_exhausted_expired_tasks(now)
         self._reconcile_failed_tasks(
             now,
@@ -292,23 +296,24 @@ class StorageCleanupRepository:
         if task is None:
             self.db.commit()
             return None
+        lease_started_at = requested_now or utc_now()
         lease_token = secrets.token_urlsafe(32)
         task.status = "running"
         task.attempt_count += 1
         task.lease_owner = worker_id
         task.lease_token_hash = self._hash_token(lease_token)
-        task.lease_expires_at = now + timedelta(seconds=lease_seconds)
-        task.heartbeat_at = now
+        task.lease_expires_at = lease_started_at + timedelta(seconds=lease_seconds)
+        task.heartbeat_at = lease_started_at
         task.error_code = None
         task.error_summary = None
-        task.updated_at = now
+        task.updated_at = lease_started_at
         self.db.commit()
         self.db.refresh(task)
         return ClaimedStorageCleanupTask(task=task, lease_token=lease_token)
 
     def prepare_delete(self, task_id: str, lease_token: str) -> tuple[str, KnowledgeStorageCleanupTask | None]:
-        now = utc_now()
         task = self._lock_task(task_id)
+        now = utc_now()
         if not self._lease_matches(task, lease_token, now):
             self.db.rollback()
             return "lease_lost", None

@@ -68,6 +68,10 @@ class KnowledgeConfigTests(unittest.TestCase):
 
     def test_resource_and_chunk_progress_bounds_fail_closed(self):
         invalid_cases = (
+            ("KNOWLEDGE_MAX_BASES_PER_USER", 0, "MAX_BASES_PER_USER"),
+            ("KNOWLEDGE_MAX_BASES_PER_USER", 1_001, "MAX_BASES_PER_USER"),
+            ("KNOWLEDGE_MAX_DOCUMENTS_PER_BASE", 0, "MAX_DOCUMENTS_PER_BASE"),
+            ("KNOWLEDGE_MAX_DOCUMENTS_PER_BASE", 10_001, "MAX_DOCUMENTS_PER_BASE"),
             ("KNOWLEDGE_MAX_FILE_SIZE", 0, "MAX_FILE_SIZE"),
             ("KNOWLEDGE_MAX_FILE_SIZE", 50 * 1024 * 1024 + 1, "MAX_FILE_SIZE"),
             ("KNOWLEDGE_WORKER_POLL_SECONDS", 0, "POLL_SECONDS"),
@@ -101,6 +105,8 @@ class KnowledgeConfigTests(unittest.TestCase):
         self.assertIn("base <= max", str(raised.exception))
 
         enabled_settings(
+            KNOWLEDGE_MAX_BASES_PER_USER=1_000,
+            KNOWLEDGE_MAX_DOCUMENTS_PER_BASE=10_000,
             KNOWLEDGE_WORKER_RETRY_BASE_SECONDS=3600,
             KNOWLEDGE_WORKER_RETRY_MAX_SECONDS=3600,
             KNOWLEDGE_EMBEDDING_BATCH_SIZE=128,

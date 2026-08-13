@@ -94,6 +94,56 @@ class KnowledgeStorageCleanupTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertIsNone(claimed)
 
+    def test_register_upload_intent_guard_uses_fresh_clock_after_object_lock(self):
+        registration_started_at = utc_now()
+        object_locked_at = registration_started_at + timedelta(seconds=9)
+        with (
+            self.Session() as db,
+            patch(
+                "app.db.storage_cleanup_repository.utc_now",
+                side_effect=(registration_started_at, object_locked_at),
+            ) as clock,
+        ):
+            registration = StorageCleanupRepository(db).register_upload_intent(
+                storage_backend="local",
+                storage_key="knowledge/fresh-intent",
+                hold_seconds=10,
+                max_attempts=3,
+            )
+
+        self.assertEqual(clock.call_count, 2)
+        with self.Session() as db:
+            task = db.get(KnowledgeStorageCleanupTask, registration.task_id)
+            intent = db.get(KnowledgeStorageUploadIntent, registration.intent_id)
+            expected_expiry = (object_locked_at + timedelta(seconds=10)).replace(tzinfo=None)
+            self.assertEqual(task.available_at, expected_expiry)
+            self.assertEqual(intent.expires_at, expected_expiry)
+
+    def test_cleanup_claim_lease_uses_fresh_clock_after_task_lock(self):
+        registration = self._register(key="knowledge/fresh-lease", hold_seconds=1)
+        self._activate(registration)
+        query_started_at = utc_now() + timedelta(seconds=2)
+        lock_acquired_at = query_started_at + timedelta(seconds=9)
+        with (
+            self.Session() as db,
+            patch(
+                "app.db.storage_cleanup_repository.utc_now",
+                side_effect=(query_started_at, lock_acquired_at),
+            ) as clock,
+        ):
+            claimed = StorageCleanupRepository(db).claim_task(
+                worker_id="worker-1",
+                lease_seconds=10,
+            )
+
+        self.assertIsNotNone(claimed)
+        self.assertEqual(clock.call_count, 2)
+        self.assertEqual(claimed.task.heartbeat_at, lock_acquired_at.replace(tzinfo=None))
+        self.assertEqual(
+            claimed.task.lease_expires_at,
+            (lock_acquired_at + timedelta(seconds=10)).replace(tzinfo=None),
+        )
+
     def test_running_task_rejects_same_key_registration_without_revoking_lease(self):
         registration = self._register(key="knowledge/running", hold_seconds=1)
         self._activate(registration)

@@ -829,6 +829,8 @@ jobs:
               if os.environ.get("KNOWLEDGE_CHUNKER_VERSION") != "chunker-v2":
                   raise SystemExit("knowledge chunker version invalid")
               try:
+                  max_bases_per_user = int(os.environ["KNOWLEDGE_MAX_BASES_PER_USER"])
+                  max_documents_per_base = int(os.environ["KNOWLEDGE_MAX_DOCUMENTS_PER_BASE"])
                   max_file_size = int(os.environ["KNOWLEDGE_MAX_FILE_SIZE"])
                   chunk_size = int(os.environ["KNOWLEDGE_CHUNK_SIZE"])
                   chunk_overlap = int(os.environ["KNOWLEDGE_CHUNK_OVERLAP"])
@@ -847,7 +849,9 @@ jobs:
               worker_poll = finite_number("KNOWLEDGE_WORKER_POLL_SECONDS")
               milvus_timeout = finite_number("MILVUS_TIMEOUT_SECONDS")
               if not (
-                  1 <= max_file_size <= 50 * 1024 * 1024
+                  1 <= max_bases_per_user <= 1_000
+                  and 1 <= max_documents_per_base <= 10_000
+                  and 1 <= max_file_size <= 50 * 1024 * 1024
                   and 100 <= chunk_size <= 16_000
                   and 0 <= chunk_overlap
                   and chunk_overlap * 2 <= chunk_size
@@ -904,6 +908,8 @@ jobs:
           if [ "${KNOWLEDGE_BASE_ENABLED}" = "true" ]; then
             docker run --rm -i --entrypoint python --env-file .env \
               -e "KNOWLEDGE_BASE_ENABLED" \
+              -e "KNOWLEDGE_MAX_BASES_PER_USER" \
+              -e "KNOWLEDGE_MAX_DOCUMENTS_PER_BASE" \
               -e "KNOWLEDGE_MAX_FILE_SIZE" \
               -e "KNOWLEDGE_ALLOWED_MIME_TYPES" \
               -e "KNOWLEDGE_PARSER_VERSION" \

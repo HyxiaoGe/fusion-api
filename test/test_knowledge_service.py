@@ -13,7 +13,7 @@ from starlette.datastructures import Headers
 
 from app.db.database import Base
 from app.db.knowledge_repository import KnowledgeBaseWriteConflict
-from app.db.models import KnowledgeChunkManifest, User
+from app.db.models import KnowledgeChunkManifest, KnowledgeStorageCleanupTask, KnowledgeStorageUploadIntent, User
 from app.schemas.knowledge import KnowledgeBaseCreate, KnowledgeBaseUpdate, KnowledgeRetrievalRequest
 from app.schemas.response import ApiException
 from app.services.knowledge.milvus import KnowledgeVectorError, KnowledgeVectorHit
@@ -242,6 +242,26 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(document.mimetype, "text/plain")
         self.assertEqual(document.original_filename, "manual.txt")
         self.assertEqual(self.storage.upload.await_args.args[2], "text/plain")
+
+    async def test_transient_storage_upload_failure_returns_stable_503_and_keeps_cleanup(self):
+        knowledge_base = self._create_base()
+        self.storage.upload.side_effect = TimeoutError("temporary storage timeout")
+        upload = UploadFile(
+            filename="manual.txt",
+            file=io.BytesIO(b"knowledge content"),
+            headers=Headers({"content-type": "text/plain"}),
+        )
+
+        with self.assertRaises(ApiException) as raised:
+            await self.service.upload_document("user-1", knowledge_base.id, upload)
+
+        self.assertEqual(raised.exception.code, "KNOWLEDGE_STORAGE_UNAVAILABLE")
+        self.assertEqual(raised.exception.status_code, 503)
+        await drain_storage_upload_lifecycles()
+        cleanup_task = self.db.query(KnowledgeStorageCleanupTask).one()
+        upload_intent = self.db.query(KnowledgeStorageUploadIntent).one()
+        self.assertEqual(cleanup_task.status, "pending")
+        self.assertEqual(upload_intent.outcome, "uncertain")
 
     async def test_upload_rejects_missing_or_mismatched_suffix_before_storage(self):
         knowledge_base = self._create_base()

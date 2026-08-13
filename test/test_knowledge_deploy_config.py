@@ -39,6 +39,8 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         script = self.workflow.split(marker, 1)[1].split("\n          PY\n", 1)[0]
         environment = {
             "KNOWLEDGE_BASE_ENABLED": "true",
+            "KNOWLEDGE_MAX_BASES_PER_USER": "50",
+            "KNOWLEDGE_MAX_DOCUMENTS_PER_BASE": "100",
             "KNOWLEDGE_MAX_FILE_SIZE": "10485760",
             "KNOWLEDGE_ALLOWED_MIME_TYPES": "text/plain,text/markdown,text/csv,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "KNOWLEDGE_PARSER_VERSION": "parser-v1",
@@ -405,6 +407,8 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
 
     def test_candidate_deploy_validation_rejects_bounds_and_missing_revision_route(self):
         valid = self._run_candidate_knowledge_validation()
+        invalid_bases = self._run_candidate_knowledge_validation(KNOWLEDGE_MAX_BASES_PER_USER="1001")
+        invalid_documents = self._run_candidate_knowledge_validation(KNOWLEDGE_MAX_DOCUMENTS_PER_BASE="0")
         invalid_size = self._run_candidate_knowledge_validation(KNOWLEDGE_MAX_FILE_SIZE="0")
         legacy_chunker = self._run_candidate_knowledge_validation(KNOWLEDGE_CHUNKER_VERSION="chunker-v1")
         invalid_chunks = self._run_candidate_knowledge_validation(KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT="10001")
@@ -435,6 +439,8 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         self.assertNotEqual(legacy_chunker.returncode, 0)
         self.assertIn("knowledge chunker version invalid", legacy_chunker.stderr)
         for completed in (
+            invalid_bases,
+            invalid_documents,
             invalid_size,
             invalid_chunks,
             invalid_batch,
@@ -466,6 +472,8 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         self.assertIn("validator()", validation_block)
         self.assertIn('-e "FUSION_ROLLBACK_REQUESTED=${ROLLBACK_REQUESTED}"', validation_block)
         for name in (
+            "KNOWLEDGE_MAX_BASES_PER_USER",
+            "KNOWLEDGE_MAX_DOCUMENTS_PER_BASE",
             "KNOWLEDGE_PARSE_TIMEOUT_SECONDS",
             "KNOWLEDGE_WORKER_LEASE_SECONDS",
             "KNOWLEDGE_WORKER_HEARTBEAT_SECONDS",

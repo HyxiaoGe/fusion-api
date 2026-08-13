@@ -38,6 +38,8 @@ heartbeat、过期回收和终态 fencing 防止旧 Worker 写入新状态。Red
 上传代际。对象上传前先写入带过期保护的持久 cleanup intent；文档和索引任务提交成功后清除 intent，
 配额/唯一冲突的同步删除失败或数据库结果不确定时由独立 Worker 通过租约、引用复查和退避重试收敛。
 代际隔离保证旧清理请求即使晚到，也不会删除并发或后续上传的对象。
+对象存储暂时断连、超时或限流时，上传接口返回稳定 503 `KNOWLEDGE_STORAGE_UNAVAILABLE`，同时保留
+cleanup intent 继续处理不确定的远端写入结果。
 
 v1 支持 UTF-8 TXT、Markdown、CSV、带文字层的 PDF 和 DOCX，不支持 OCR、扫描 PDF、旧版 DOC、
 网页抓取、音视频、图片理解、rerank 或聊天知识库选择器。
@@ -87,7 +89,8 @@ Worker poll、lease/heartbeat/retry、
 Embedding profile/revision route/有限超时、COSINE、Milvus URI/有限超时、数据库和应用账号；缺项返回稳定
 503，Worker 拒绝进入运行态。`KNOWLEDGE_MAX_FILE_SIZE` 上限为 50 MiB，Worker poll 上限为 60 秒，
 Worker 重试需满足 `0 < base <= max <= 3600 秒`，Embedding 超时上限为 120 秒，Milvus 超时上限为
-60 秒。单次 Embedding batch 限制为 1 到 128；单文档 chunk 总量限制为 1 到 10000；搜索最多允许
+60 秒。每用户知识库数量限制为 1 到 1000，每知识库文档数量限制为 1 到 10000；单次 Embedding batch
+限制为 1 到 128；单文档 chunk 总量限制为 1 到 10000；搜索最多允许
 1 到 16 个 profile，默认 8，超过配置上限会在外部调用前以稳定 503 fail closed。搜索路由总超时按
 `ceil(max_profiles / 4) × (Embedding 超时 + 2 × Milvus 超时) + 5 秒` 计算，覆盖每个 profile 冷路径的
 Milvus client 构造与 search 两次有限超时以及全部并发批次。应用账号不能是
