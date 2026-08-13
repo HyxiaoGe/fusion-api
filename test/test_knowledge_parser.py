@@ -1,9 +1,10 @@
 import io
+import signal
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from app.services.knowledge.parser import KnowledgeDocumentParser, KnowledgeParseError
+from app.services.knowledge.parser import KnowledgeDocumentParser, KnowledgeParseError, parse_document_isolated
 
 
 class KnowledgeDocumentParserTests(unittest.TestCase):
@@ -69,6 +70,55 @@ class KnowledgeDocumentParserTests(unittest.TestCase):
             self.parser.parse(b"%PDF-fake", mimetype="text/plain", filename="manual.pdf")
 
         self.assertEqual(raised.exception.code, "KNOWLEDGE_DOCUMENT_TYPE_MISMATCH")
+
+    def test_isolated_parser_maps_child_crash_to_non_retryable_document_error(self):
+        context = MagicMock()
+        parent = MagicMock()
+        child = MagicMock()
+        process = MagicMock(exitcode=-signal.SIGKILL)
+        parent.poll.return_value = True
+        parent.recv.side_effect = EOFError
+        process.is_alive.return_value = False
+        context.Pipe.return_value = (parent, child)
+        context.Process.return_value = process
+
+        with (
+            patch("app.services.knowledge.parser.multiprocessing.get_context", return_value=context),
+            self.assertRaises(KnowledgeParseError) as raised,
+        ):
+            parse_document_isolated(
+                b"%PDF-fake",
+                mimetype="application/pdf",
+                filename="manual.pdf",
+                timeout_seconds=60,
+            )
+
+        self.assertEqual(raised.exception.code, "KNOWLEDGE_DOCUMENT_INVALID")
+        process.join.assert_called()
+
+    def test_isolated_parser_maps_cpu_limit_exit_to_parse_timeout(self):
+        context = MagicMock()
+        parent = MagicMock()
+        child = MagicMock()
+        process = MagicMock(exitcode=-signal.SIGXCPU)
+        parent.poll.return_value = True
+        parent.recv.side_effect = EOFError
+        process.is_alive.return_value = False
+        context.Pipe.return_value = (parent, child)
+        context.Process.return_value = process
+
+        with (
+            patch("app.services.knowledge.parser.multiprocessing.get_context", return_value=context),
+            self.assertRaises(KnowledgeParseError) as raised,
+        ):
+            parse_document_isolated(
+                b"PK-fake",
+                mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                filename="manual.docx",
+                timeout_seconds=60,
+            )
+
+        self.assertEqual(raised.exception.code, "KNOWLEDGE_DOCUMENT_PARSE_TIMEOUT")
 
 
 if __name__ == "__main__":

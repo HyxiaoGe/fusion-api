@@ -49,6 +49,20 @@ class MilvusKnowledgeStore:
     """受控 collection 的 Milvus v2 适配器。"""
 
     SCHEMA_VERSION = "v1"
+    _INT64_TYPE = 5
+    _VARCHAR_TYPE = 21
+    _FLOAT_VECTOR_TYPE = 101
+    _VARCHAR_FIELDS = {
+        "chunk_id": 64,
+        "user_id": 64,
+        "knowledge_base_id": 64,
+        "document_id": 64,
+        "index_version": 64,
+        "text": 65535,
+        "filename": 512,
+        "section": 120,
+    }
+    _INT64_FIELDS = {"chunk_ordinal", "char_start", "char_end", "page"}
 
     def __init__(self, client_factory: Callable[[], Any] | None = None):
         self._client_factory = client_factory or self._build_client
@@ -74,7 +88,24 @@ class MilvusKnowledgeStore:
 
         def ensure(client: Any) -> None:
             if client.has_collection(collection_name=collection, timeout=settings.MILVUS_TIMEOUT_SECONDS):
-                self._validate_collection(client.describe_collection(collection_name=collection), profile.dimension)
+                description = client.describe_collection(
+                    collection_name=collection,
+                    timeout=settings.MILVUS_TIMEOUT_SECONDS,
+                )
+                self._validate_collection(description, profile.dimension)
+                index_names = client.list_indexes(
+                    collection_name=collection,
+                    timeout=settings.MILVUS_TIMEOUT_SECONDS,
+                )
+                index_descriptions = [
+                    client.describe_index(
+                        collection_name=collection,
+                        index_name=index_name,
+                        timeout=settings.MILVUS_TIMEOUT_SECONDS,
+                    )
+                    for index_name in index_names
+                ]
+                self._validate_vector_indexes(index_descriptions, profile.distance_metric)
                 return
             self._create_collection(client, collection, profile.dimension, profile.distance_metric)
 
@@ -298,29 +329,72 @@ class MilvusKnowledgeStore:
             section=str(read("section", "")) or None,
         )
 
-    @staticmethod
-    def _validate_collection(description: dict[str, Any], expected_dimension: int) -> None:
-        fields = {field.get("name"): field for field in description.get("fields", [])}
-        required = {
-            "chunk_id",
-            "user_id",
-            "knowledge_base_id",
-            "document_id",
-            "index_version",
-            "chunk_ordinal",
-            "text",
-            "filename",
-            "char_start",
-            "char_end",
-            "page",
-            "section",
-            "vector",
-        }
-        vector_dimension = int((fields.get("vector") or {}).get("params", {}).get("dim", 0))
-        if not required.issubset(fields) or vector_dimension != expected_dimension:
+    @classmethod
+    def _validate_collection(cls, description: dict[str, Any], expected_dimension: int) -> None:
+        try:
+            raw_fields = description.get("fields", [])
+            fields = {field.get("name"): field for field in raw_fields}
+            expected_names = set(cls._VARCHAR_FIELDS) | cls._INT64_FIELDS | {"vector"}
+            if (
+                description.get("auto_id") is not False
+                or description.get("enable_dynamic_field") is not False
+                or len(raw_fields) != len(expected_names)
+                or set(fields) != expected_names
+            ):
+                raise ValueError("collection options or fields mismatch")
+
+            for name, max_length in cls._VARCHAR_FIELDS.items():
+                field = fields[name]
+                if (
+                    int(field.get("type", 0)) != cls._VARCHAR_TYPE
+                    or int((field.get("params") or {}).get("max_length", 0)) != max_length
+                    or field.get("is_primary", False) is not (name == "chunk_id")
+                ):
+                    raise ValueError(f"varchar field mismatch: {name}")
+
+            for name in cls._INT64_FIELDS:
+                field = fields[name]
+                if int(field.get("type", 0)) != cls._INT64_TYPE or field.get("is_primary", False) is not False:
+                    raise ValueError(f"int64 field mismatch: {name}")
+
+            vector = fields["vector"]
+            if (
+                int(vector.get("type", 0)) != cls._FLOAT_VECTOR_TYPE
+                or int((vector.get("params") or {}).get("dim", 0)) != expected_dimension
+                or vector.get("is_primary", False) is not False
+            ):
+                raise ValueError("vector field mismatch")
+        except (AttributeError, TypeError, ValueError, KeyError) as exc:
             raise KnowledgeVectorError(
                 "KNOWLEDGE_VECTOR_SCHEMA_MISMATCH",
                 "Milvus collection schema 与知识库配置不一致",
+                retryable=False,
+            ) from exc
+
+    @staticmethod
+    def _validate_vector_indexes(descriptions: Sequence[dict[str, Any]], expected_metric: str) -> None:
+        try:
+            vector_indexes = [description for description in descriptions if description.get("field_name") == "vector"]
+        except (AttributeError, TypeError) as exc:
+            raise KnowledgeVectorError(
+                "KNOWLEDGE_VECTOR_SCHEMA_MISMATCH",
+                "Milvus collection 向量索引与知识库配置不一致",
+                retryable=False,
+            ) from exc
+        if len(vector_indexes) != 1:
+            raise KnowledgeVectorError(
+                "KNOWLEDGE_VECTOR_SCHEMA_MISMATCH",
+                "Milvus collection 向量索引与知识库配置不一致",
+                retryable=False,
+            )
+        index = vector_indexes[0]
+        if (
+            str(index.get("index_type", "")).upper() != "AUTOINDEX"
+            or str(index.get("metric_type", "")).upper() != expected_metric.upper()
+        ):
+            raise KnowledgeVectorError(
+                "KNOWLEDGE_VECTOR_SCHEMA_MISMATCH",
+                "Milvus collection 向量索引与知识库配置不一致",
                 retryable=False,
             )
 

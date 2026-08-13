@@ -68,18 +68,32 @@ class LiteLLMEmbeddingAdapter(EmbeddingAdapter):
                 retryable=False,
             )
         ordered = [item for _index, item in indexed_items]
-        vectors = [list(self._read(item, "embedding", [])) for item in ordered]
-        self.validate_vectors(vectors, expected_count=len(texts), dimension=profile.dimension)
-        return vectors
+        vectors = []
+        for item in ordered:
+            raw_vector = self._read(item, "embedding", None)
+            if not isinstance(raw_vector, (list, tuple)):
+                raise EmbeddingError(
+                    "KNOWLEDGE_EMBEDDING_INVALID",
+                    "Embedding 返回了非数组向量",
+                    retryable=False,
+                )
+            vectors.append(list(raw_vector))
+        return self.validate_vectors(vectors, expected_count=len(texts), dimension=profile.dimension)
 
     @staticmethod
-    def validate_vectors(vectors: list[list[float]], *, expected_count: int, dimension: int) -> None:
+    def validate_vectors(
+        vectors: list[list[float]],
+        *,
+        expected_count: int,
+        dimension: int,
+    ) -> list[list[float]]:
         if len(vectors) != expected_count:
             raise EmbeddingError(
                 "KNOWLEDGE_EMBEDDING_COUNT_MISMATCH",
                 "Embedding 返回数量与请求不一致",
                 retryable=False,
             )
+        normalized_vectors = []
         for vector in vectors:
             if len(vector) != dimension:
                 raise EmbeddingError(
@@ -101,6 +115,8 @@ class LiteLLMEmbeddingAdapter(EmbeddingAdapter):
                     "Embedding 返回了空、零或非有限向量",
                     retryable=False,
                 )
+            normalized_vectors.append(numeric)
+        return normalized_vectors
 
     @staticmethod
     def _response_items(response: Any) -> list[Any]:

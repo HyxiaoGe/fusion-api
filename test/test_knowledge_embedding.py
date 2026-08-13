@@ -120,6 +120,30 @@ class KnowledgeEmbeddingAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "KNOWLEDGE_EMBEDDING_COUNT_MISMATCH")
         self.assertFalse(raised.exception.retryable)
 
+    async def test_non_array_embedding_is_rejected_as_stable_contract_error(self):
+        profile = EmbeddingProfile("litellm", "embedding-v1", 2, revision="embedding-r1")
+        for invalid_vector in (None, 7):
+            response = {"data": [{"index": 0, "embedding": invalid_vector}]}
+            with (
+                self.subTest(invalid_vector=invalid_vector),
+                patch("app.ai.embeddings.litellm_embedding.settings.LITELLM_PROXY_URL", "http://proxy:4000"),
+                patch("app.ai.embeddings.litellm_embedding.settings.LITELLM_API_KEY", "proxy-key"),
+                patch("app.ai.embeddings.litellm_embedding.settings.KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS", 15),
+                patch(
+                    "app.ai.embeddings.litellm_embedding.settings.KNOWLEDGE_EMBEDDING_REVISION_ROUTES",
+                    json.dumps({"embedding-v1@embedding-r1": "embedding-v1-r1-immutable"}),
+                ),
+                patch(
+                    "app.ai.embeddings.litellm_embedding.litellm.aembedding",
+                    new=AsyncMock(return_value=response),
+                ),
+                self.assertRaises(EmbeddingError) as raised,
+            ):
+                await LiteLLMEmbeddingAdapter().embed(["正文"], profile)
+
+            self.assertEqual(raised.exception.code, "KNOWLEDGE_EMBEDDING_INVALID")
+            self.assertFalse(raised.exception.retryable)
+
 
 if __name__ == "__main__":
     unittest.main()

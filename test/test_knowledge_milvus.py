@@ -1,3 +1,4 @@
+import copy
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -11,6 +12,45 @@ from app.services.knowledge.milvus import (
 
 
 class MilvusKnowledgeStoreTests(unittest.TestCase):
+    @staticmethod
+    def _valid_collection_description(dimension=1024):
+        varchar_lengths = {
+            "chunk_id": 64,
+            "user_id": 64,
+            "knowledge_base_id": 64,
+            "document_id": 64,
+            "index_version": 64,
+            "text": 65535,
+            "filename": 512,
+            "section": 120,
+        }
+        fields = [
+            {
+                "name": name,
+                "type": 21,
+                "params": {"max_length": length},
+                "is_primary": name == "chunk_id",
+            }
+            for name, length in varchar_lengths.items()
+        ]
+        fields.extend(
+            {"name": name, "type": 5, "params": {}, "is_primary": False}
+            for name in ("chunk_ordinal", "char_start", "char_end", "page")
+        )
+        fields.append(
+            {
+                "name": "vector",
+                "type": 101,
+                "params": {"dim": dimension},
+                "is_primary": False,
+            }
+        )
+        return {
+            "auto_id": False,
+            "enable_dynamic_field": False,
+            "fields": fields,
+        }
+
     def test_collection_name_is_dimension_bucketed_and_controlled(self):
         with (
             patch("app.services.knowledge.milvus.settings.MILVUS_COLLECTION_PREFIX", "fusion-knowledge"),
@@ -51,6 +91,49 @@ class MilvusKnowledgeStoreTests(unittest.TestCase):
             MilvusKnowledgeStore._validate_collection({"fields": []}, 1024)
         self.assertEqual(raised.exception.code, "KNOWLEDGE_VECTOR_SCHEMA_MISMATCH")
 
+    def test_existing_collection_full_schema_contract_is_accepted(self):
+        MilvusKnowledgeStore._validate_collection(self._valid_collection_description(), 1024)
+
+    def test_existing_collection_field_contract_mismatches_fail_closed(self):
+        cases = {}
+
+        wrong_text_type = self._valid_collection_description()
+        next(field for field in wrong_text_type["fields"] if field["name"] == "text")["type"] = 5
+        cases["wrong text type"] = wrong_text_type
+
+        short_filename = self._valid_collection_description()
+        next(field for field in short_filename["fields"] if field["name"] == "filename")["params"] = {"max_length": 64}
+        cases["short filename"] = short_filename
+
+        wrong_primary = self._valid_collection_description()
+        next(field for field in wrong_primary["fields"] if field["name"] == "chunk_id")["is_primary"] = False
+        cases["wrong primary"] = wrong_primary
+
+        dynamic_schema = self._valid_collection_description()
+        dynamic_schema["enable_dynamic_field"] = True
+        cases["dynamic fields enabled"] = dynamic_schema
+
+        for name, description in cases.items():
+            with self.subTest(name=name), self.assertRaises(KnowledgeVectorError) as raised:
+                MilvusKnowledgeStore._validate_collection(copy.deepcopy(description), 1024)
+            self.assertEqual(raised.exception.code, "KNOWLEDGE_VECTOR_SCHEMA_MISMATCH")
+
+    def test_existing_collection_vector_index_contract_is_validated(self):
+        MilvusKnowledgeStore._validate_vector_indexes(
+            [{"field_name": "vector", "index_type": "AUTOINDEX", "metric_type": "COSINE"}],
+            "COSINE",
+        )
+
+        for invalid in (
+            [],
+            [{"field_name": "vector", "index_type": "AUTOINDEX", "metric_type": "L2"}],
+            [{"field_name": "text", "index_type": "AUTOINDEX", "metric_type": "COSINE"}],
+            [{"field_name": "vector", "index_type": "HNSW", "metric_type": "COSINE"}],
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(KnowledgeVectorError) as raised:
+                MilvusKnowledgeStore._validate_vector_indexes(invalid, "COSINE")
+            self.assertEqual(raised.exception.code, "KNOWLEDGE_VECTOR_SCHEMA_MISMATCH")
+
 
 class MilvusKnowledgeStoreBatchTests(unittest.IsolatedAsyncioTestCase):
     class FakeClient:
@@ -82,6 +165,40 @@ class MilvusKnowledgeStoreBatchTests(unittest.IsolatedAsyncioTestCase):
         store.ensure_collection.assert_awaited_once_with(profile)
         self.assertEqual(client.upsert_sizes, [2, 2, 1])
         self.assertEqual(client.readback_sizes, [2, 2, 1])
+
+    async def test_existing_collection_schema_and_vector_index_are_both_validated(self):
+        class ExistingCollectionClient:
+            def __init__(self):
+                self.closed = False
+
+            def has_collection(self, **_kwargs):
+                return True
+
+            def describe_collection(self, **_kwargs):
+                return MilvusKnowledgeStoreTests._valid_collection_description(dimension=2)
+
+            def list_indexes(self, **_kwargs):
+                return ["vector"]
+
+            def describe_index(self, **_kwargs):
+                return {
+                    "field_name": "vector",
+                    "index_name": "vector",
+                    "index_type": "AUTOINDEX",
+                    "metric_type": "COSINE",
+                }
+
+            def close(self):
+                self.closed = True
+
+        client = ExistingCollectionClient()
+        store = MilvusKnowledgeStore(client_factory=lambda: client)
+        profile = EmbeddingProfile("litellm", "embed-v1", 2, "COSINE", "knowledge_v1_d2", "r1")
+
+        collection = await store.ensure_collection(profile)
+
+        self.assertEqual(collection, "knowledge_v1_d2")
+        self.assertTrue(client.closed)
 
     async def test_prepared_upsert_rejects_collection_from_another_profile(self):
         store = MilvusKnowledgeStore(client_factory=self.FakeClient)

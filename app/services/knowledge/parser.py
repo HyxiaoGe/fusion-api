@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import multiprocessing
+import signal
 import unicodedata
 import zipfile
 from contextlib import suppress
@@ -64,7 +65,13 @@ def parse_document_isolated(
             process.terminate()
             process.join(timeout=5)
             raise KnowledgeParseError("KNOWLEDGE_DOCUMENT_PARSE_TIMEOUT", "文档解析超过时间上限")
-        status, payload = parent.recv()
+        try:
+            status, payload = parent.recv()
+        except (EOFError, OSError) as exc:
+            process.join(timeout=5)
+            if process.exitcode == -signal.SIGXCPU:
+                raise KnowledgeParseError("KNOWLEDGE_DOCUMENT_PARSE_TIMEOUT", "文档解析超过 CPU 时间上限") from exc
+            raise KnowledgeParseError("KNOWLEDGE_DOCUMENT_INVALID", "文档解析子进程异常退出") from exc
         process.join(timeout=5)
         if status == "ok":
             return payload
