@@ -143,6 +143,14 @@ class KnowledgeWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(profile.milvus_uri, "http://historical-milvus:19530")
         self.assertEqual(profile.milvus_database, "historical_knowledge")
 
+    def test_storage_delete_batch_timeout_scales_with_waves_and_two_calls(self):
+        with (
+            patch("app.services.knowledge.worker.KNOWLEDGE_BASE_DELETE_STORAGE_CONCURRENCY", 4),
+            patch("app.services.knowledge.worker.settings.FILE_UPLOAD_TIMEOUT_SECONDS", 60),
+        ):
+            self.assertEqual(KnowledgeWorker._delete_storage_batch_timeout_seconds(1), 126)
+            self.assertEqual(KnowledgeWorker._delete_storage_batch_timeout_seconds(50), 1578)
+
     async def test_index_task_completes_and_activates_version(self):
         worker = KnowledgeWorker(
             self.Session,

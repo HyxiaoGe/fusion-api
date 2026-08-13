@@ -356,6 +356,46 @@ class KnowledgeRepositoryTests(unittest.TestCase):
         self.assertEqual(saved_task.id, task.id)
         self.assertEqual(self.db.query(KnowledgeDocument).filter_by(id=document.id).count(), 1)
 
+    def test_retry_document_returns_without_any_post_commit_query(self):
+        repo = KnowledgeRepository(self.db)
+        repo.create_knowledge_base(self._base())
+        document, version, task = self._document_bundle()
+        repo.create_document_with_task(document, version, task)
+        document.status = "failed"
+        version.status = "failed"
+        self.db.commit()
+        _unused, retry_version, retry_task = self._document_bundle(
+            document_id=document.id,
+            version_id="version-retry",
+        )
+        retry_task.id = "task-retry"
+        committed = False
+
+        def mark_committed(_session):
+            nonlocal committed
+            committed = True
+
+        def reject_post_commit_sql(*_args):
+            if committed:
+                raise AssertionError("重试事务提交后禁止继续查询")
+
+        self.db.expire_on_commit = True
+        event.listen(self.db, "after_commit", mark_committed)
+        event.listen(self.engine, "before_cursor_execute", reject_post_commit_sql)
+        try:
+            saved_task = repo.retry_document(document, retry_version, retry_task)
+            self.assertEqual(saved_task.id, "task-retry")
+            self.assertEqual(saved_task.status, "pending")
+        finally:
+            event.remove(self.engine, "before_cursor_execute", reject_post_commit_sql)
+            event.remove(self.db, "after_commit", mark_committed)
+            self.db.expire_on_commit = False
+
+        with self.Session() as verification_db:
+            persisted = verification_db.get(KnowledgeIndexTask, "task-retry")
+            self.assertIsNotNone(persisted)
+            self.assertEqual(persisted.status, "pending")
+
     def test_soft_delete_tombstones_fit_database_columns(self):
         repo = KnowledgeRepository(self.db)
         knowledge_base = repo.create_knowledge_base(self._base(normalized="名" * 200))

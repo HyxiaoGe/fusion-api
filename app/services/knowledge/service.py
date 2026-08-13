@@ -157,8 +157,12 @@ class KnowledgeService:
             raise ApiException.bad_request("知识库更新字段不能为 null")
         if "name" in updates:
             updates["name_normalized"] = self.normalize_name(str(updates["name"]))
+        document_stats = self.repo.document_stats(row.id)
         try:
-            return self._base_view(self.repo.update_knowledge_base(row, **updates))
+            return self._base_view(
+                self.repo.update_knowledge_base(row, **updates),
+                document_stats=document_stats,
+            )
         except IntegrityError as exc:
             raise ApiException.conflict("同一用户下知识库名称不能重复") from exc
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import uuid
 from collections.abc import Iterator
 from contextlib import suppress
@@ -441,7 +442,7 @@ class KnowledgeWorker:
             raise KnowledgeWorkerError("KNOWLEDGE_TASK_LEASE_LOST", "知识库任务租约已失效", retryable=True)
         await asyncio.wait_for(
             self._delete_storage_batch(batch),
-            timeout=settings.FILE_UPLOAD_TIMEOUT_SECONDS,
+            timeout=self._delete_storage_batch_timeout_seconds(len(batch)),
         )
         if len(batch) == KNOWLEDGE_BASE_DELETE_BATCH_SIZE:
             with self.session_factory() as db:
@@ -507,10 +508,23 @@ class KnowledgeWorker:
         document: KnowledgeDocument | KnowledgeCleanupStorageObject,
     ) -> None:
         storage = get_storage_for_backend(document.storage_backend)
-        if not await storage.exists(document.storage_key):
+        if not await asyncio.wait_for(
+            storage.exists(document.storage_key),
+            timeout=settings.FILE_UPLOAD_TIMEOUT_SECONDS,
+        ):
             return
-        if not await storage.delete(document.storage_key):
+        if not await asyncio.wait_for(
+            storage.delete(document.storage_key),
+            timeout=settings.FILE_UPLOAD_TIMEOUT_SECONDS,
+        ):
             raise KnowledgeWorkerError("KNOWLEDGE_STORAGE_DELETE_FAILED", "原始文档删除失败", retryable=True)
+
+    @staticmethod
+    def _delete_storage_batch_timeout_seconds(batch_size: int) -> float:
+        waves = math.ceil(batch_size / KNOWLEDGE_BASE_DELETE_STORAGE_CONCURRENCY)
+        # 每个对象最多串行 exists + delete 两次外部调用。每波预留一秒调度
+        # 余量，批次再预留五秒，避免所有单次调用均成功却被较小总预算取消。
+        return waves * (2 * settings.FILE_UPLOAD_TIMEOUT_SECONDS + 1) + 5
 
     async def _heartbeat(self, task_id: str, lease_token: str) -> None:
         while True:

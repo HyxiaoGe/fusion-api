@@ -166,13 +166,8 @@ class KnowledgeRepository:
         for key, value in updates.items():
             setattr(row, key, value)
         row.updated_at = utc_now()
-        try:
-            self.db.commit()
-            self.db.refresh(row)
-            return row
-        except Exception:
-            self.db.rollback()
-            raise
+        self._commit_loaded()
+        return row
 
     def document_stats(self, knowledge_base_id: str) -> dict[str, int]:
         rows = (
@@ -543,13 +538,8 @@ class KnowledgeRepository:
         )
         self._cancel_non_delete_document_tasks(document.id)
         self.db.add(task)
-        try:
-            self.db.commit()
-            self.db.refresh(task)
-            return task
-        except Exception:
-            self.db.rollback()
-            raise
+        self._commit_loaded()
+        return task
 
     def enqueue_knowledge_base_delete(
         self,
@@ -609,13 +599,8 @@ class KnowledgeRepository:
             task.error_summary = None
             task.completed_at = None
             task.updated_at = utc_now()
-        try:
-            self.db.commit()
-            self.db.refresh(task)
-            return task
-        except Exception:
-            self.db.rollback()
-            raise
+        self._commit_loaded()
+        return task
 
     def retry_document(
         self,
@@ -665,13 +650,21 @@ class KnowledgeRepository:
         document.error_summary = None
         document.updated_at = utc_now()
         self.db.add_all([row for row in (version, task, cleanup_task) if row is not None])
+        self._commit_loaded()
+        return task
+
+    def _commit_loaded(self) -> None:
+        """提交已加载对象，禁止成功 COMMIT 后再发 SQL。"""
+        expire_on_commit = self.db.expire_on_commit
         try:
+            self.db.flush()
+            self.db.expire_on_commit = False
             self.db.commit()
-            self.db.refresh(task)
-            return task
         except Exception:
             self.db.rollback()
             raise
+        finally:
+            self.db.expire_on_commit = expire_on_commit
 
     def claim_task(
         self,
