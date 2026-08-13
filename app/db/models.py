@@ -448,6 +448,7 @@ class KnowledgeStorageCleanupTask(Base):
     lease_token_hash = Column(String(64), nullable=True)
     lease_expires_at = Column(DateTime(timezone=True), nullable=True)
     heartbeat_at = Column(DateTime(timezone=True), nullable=True)
+    delete_started_at = Column(DateTime(timezone=True), nullable=True)
     error_code = Column(String(120), nullable=True)
     error_summary = Column(String(500), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utc_now, server_default=func.now(), nullable=False)

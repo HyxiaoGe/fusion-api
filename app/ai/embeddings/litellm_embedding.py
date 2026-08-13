@@ -127,7 +127,13 @@ class LiteLLMEmbeddingAdapter(EmbeddingAdapter):
     @staticmethod
     def _response_items(response: Any) -> list[Any]:
         data = response.get("data") if isinstance(response, dict) else getattr(response, "data", None)
-        return list(data) if data is not None else []
+        if not isinstance(data, (list, tuple)):
+            raise EmbeddingError(
+                "KNOWLEDGE_EMBEDDING_INVALID",
+                "Embedding 响应 data 不是数组",
+                retryable=False,
+            )
+        return list(data)
 
     @staticmethod
     def _read(item: Any, field: str, default: Any) -> Any:

@@ -15,7 +15,12 @@ from app.ai.embeddings.litellm_embedding import LiteLLMEmbeddingAdapter
 from app.core.config import settings
 from app.db.knowledge_repository import ClaimedKnowledgeTask, KnowledgeRepository
 from app.db.models import KnowledgeDocument, KnowledgeIndexVersion
-from app.services.knowledge.chunker import DeterministicKnowledgeChunker, KnowledgeChunkLimitExceeded
+from app.services.knowledge.chunker import (
+    DeterministicKnowledgeChunker,
+    KnowledgeChunkLimitExceeded,
+    LegacyKnowledgeChunkerV1,
+    knowledge_chunker_for_version,
+)
 from app.services.knowledge.milvus import (
     KnowledgeVectorError,
     KnowledgeVectorRecord,
@@ -64,10 +69,6 @@ class KnowledgeWorker:
         self.session_factory = session_factory
         self.worker_id = worker_id or f"knowledge-worker-{uuid.uuid4()}"
         self.parser = parser or KnowledgeDocumentParser()
-        self.chunker = DeterministicKnowledgeChunker(
-            chunk_size=settings.KNOWLEDGE_CHUNK_SIZE,
-            overlap=settings.KNOWLEDGE_CHUNK_OVERLAP,
-        )
         self.embedding = embedding or LiteLLMEmbeddingAdapter()
         self.vector_store = vector_store or MilvusKnowledgeStore()
 
@@ -186,10 +187,10 @@ class KnowledgeWorker:
         version = context.version
         if document is None or version is None or context.index_version is None:
             raise KnowledgeWorkerError("KNOWLEDGE_TASK_RESOURCE_MISSING", "索引任务资源不存在", retryable=False)
-        if (
-            version.parser_version != self.parser.VERSION
-            or version.chunker_version != DeterministicKnowledgeChunker.VERSION
-        ):
+        if version.parser_version != self.parser.VERSION or version.chunker_version not in {
+            LegacyKnowledgeChunkerV1.VERSION,
+            DeterministicKnowledgeChunker.VERSION,
+        }:
             raise KnowledgeWorkerError(
                 "KNOWLEDGE_INDEX_VERSION_UNSUPPORTED",
                 "Worker 不支持该解析或切片版本",
@@ -226,7 +227,8 @@ class KnowledgeWorker:
                 filename=document.original_filename,
             )
         self._phase(context.task_id, lease_token, "chunking")
-        version_chunker = DeterministicKnowledgeChunker(
+        version_chunker = knowledge_chunker_for_version(
+            version.chunker_version,
             chunk_size=version.chunk_size,
             overlap=version.chunk_overlap,
         )

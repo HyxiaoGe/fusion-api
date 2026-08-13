@@ -35,10 +35,23 @@ class KnowledgeStorageCleanupWorker:
             decision, task = repo.prepare_delete(claimed.task.id, claimed.lease_token)
             if decision != "delete" or task is None:
                 return True
+            storage_backend = task.storage_backend
+            storage_key = task.storage_key
             try:
-                # MinIO/OSS 的 SDK 删除在线程中不可取消。事务行锁必须覆盖到真实返回，
-                # 不能因 asyncio 超时提前释放同 key fencing。
-                deleted = await self._delete_idempotently(task.storage_backend, task.storage_key)
+                storage = get_storage_for_backend(storage_backend)
+                if not await storage.exists(storage_key):
+                    deleted = False
+                else:
+                    # 删除阶段先持久化再发 RPC；即使 RPC 成功后的 completed 提交失败，
+                    # 重领任务也能用 delete_started_at + absent 安全收敛。
+                    if not repo.mark_delete_started(task, claimed.lease_token):
+                        return True
+                    if await storage.delete(storage_key):
+                        deleted = True
+                    elif not await storage.exists(storage_key):
+                        deleted = True
+                    else:
+                        raise RuntimeError("storage object still exists after delete")
             except Exception as exc:
                 retry_delay = min(
                     settings.KNOWLEDGE_WORKER_RETRY_BASE_SECONDS * (2 ** max(claimed.task.attempt_count - 1, 0)),
@@ -53,9 +66,9 @@ class KnowledgeStorageCleanupWorker:
                 )
                 logger.warning(
                     "知识库孤立对象清理失败: task_id=%s backend=%s attempt=%s error_type=%s",
-                    task.id,
-                    task.storage_backend,
-                    task.attempt_count,
+                    claimed.task.id,
+                    storage_backend,
+                    claimed.task.attempt_count,
                     type(exc).__name__,
                 )
             else:
@@ -76,14 +89,3 @@ class KnowledgeStorageCleanupWorker:
                     return True
                 repo.complete_delete(task, claimed.lease_token)
         return True
-
-    @staticmethod
-    async def _delete_idempotently(storage_backend: str, storage_key: str) -> bool:
-        storage = get_storage_for_backend(storage_backend)
-        if not await storage.exists(storage_key):
-            return False
-        if await storage.delete(storage_key):
-            return True
-        if not await storage.exists(storage_key):
-            return True
-        raise RuntimeError("storage object still exists after delete")

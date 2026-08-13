@@ -152,7 +152,7 @@ class KnowledgeWorkerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(version.status, "active")
             self.assertGreater(document.chunk_count, 0)
 
-    async def test_legacy_building_v1_fails_closed_and_schedules_cleanup(self):
+    async def test_legacy_building_v1_is_processed_by_compatible_chunker(self):
         with self.Session() as db:
             document = db.query(KnowledgeDocument).filter_by(id="doc-1").one()
             version = db.query(KnowledgeIndexVersion).filter_by(id="version-1").one()
@@ -170,20 +170,18 @@ class KnowledgeWorkerTests(unittest.IsolatedAsyncioTestCase):
             handled = await worker.run_once()
 
         self.assertTrue(handled)
-        self.storage.download.assert_not_awaited()
-        self.embedding.embed.assert_not_awaited()
-        self.vector_store.ensure_collection.assert_not_awaited()
-        self.vector_store.upsert_prepared.assert_not_awaited()
+        self.storage.download.assert_awaited_once()
+        self.embedding.embed.assert_awaited()
+        self.vector_store.ensure_collection.assert_awaited_once()
+        self.vector_store.upsert_prepared.assert_awaited()
         with self.Session() as db:
             original = db.query(KnowledgeIndexTask).filter_by(id="task-1").one()
-            cleanup = db.query(KnowledgeIndexTask).filter_by(task_type="delete_index_version").one()
             document = db.query(KnowledgeDocument).filter_by(id="doc-1").one()
             version = db.query(KnowledgeIndexVersion).filter_by(id="version-1").one()
-            self.assertEqual(original.status, "failed")
-            self.assertEqual(original.error_code, "KNOWLEDGE_INDEX_VERSION_UNSUPPORTED")
-            self.assertEqual(document.status, "failed")
-            self.assertEqual(version.status, "deleting")
-            self.assertIn(cleanup.status, {"pending", "retry"})
+            self.assertEqual(original.status, "completed")
+            self.assertEqual(document.status, "ready")
+            self.assertEqual(document.active_index_version, version.id)
+            self.assertEqual(version.status, "active")
 
     async def test_non_retryable_embedding_contract_failure_is_visible(self):
         self.embedding.embed.side_effect = EmbeddingError(

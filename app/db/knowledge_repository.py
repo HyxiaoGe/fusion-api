@@ -256,18 +256,21 @@ class KnowledgeRepository:
                     duplicate=duplicate,
                 )
         self.db.add_all([document, version, task])
+        expire_on_commit = self.db.expire_on_commit
         try:
             self.db.flush()
             if upload_registration is not None and cleanup_task is not None:
                 cleanup_repo.complete_document_write_locked(upload_registration, cleanup_task)
+            # 三个新对象的字段在 flush 后已完整；本次提交禁止自动 expire，避免 commit
+            # 已成功后 refresh/属性惰性加载故障被误报为上传失败，同时保持对象仍在 Session。
+            self.db.expire_on_commit = False
             self.db.commit()
-            self.db.refresh(document)
-            self.db.refresh(version)
-            self.db.refresh(task)
             return document, version, task
         except Exception:
             self.db.rollback()
             raise
+        finally:
+            self.db.expire_on_commit = expire_on_commit
 
     def list_documents(
         self,

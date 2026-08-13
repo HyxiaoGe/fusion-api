@@ -179,9 +179,21 @@ class StorageCleanupRepository:
             self.db.rollback()
             return False
         outcomes = self._upload_outcomes(task.id)
-        if not outcomes or any(outcome != "failed" for outcome in outcomes):
+        if task.delete_started_at is None and (not outcomes or any(outcome != "failed" for outcome in outcomes)):
             return False
         self._complete_locked(task, utc_now())
+        return True
+
+    def mark_delete_started(self, task: KnowledgeStorageCleanupTask, lease_token: str) -> bool:
+        """在对象删除 RPC 前持久化可恢复阶段，并释放行锁。"""
+        locked = self._lock_task(task.id)
+        if not self._lease_token_matches(locked, lease_token):
+            self.db.rollback()
+            return False
+        now = utc_now()
+        locked.delete_started_at = now
+        locked.updated_at = now
+        self.db.commit()
         return True
 
     def lock_succeeded_upload_for_document(
@@ -332,6 +344,7 @@ class StorageCleanupRepository:
         return "delete", task
 
     def complete_delete(self, task: KnowledgeStorageCleanupTask, lease_token: str) -> bool:
+        task = self._lock_task(task.id)
         if not self._lease_token_matches(task, lease_token):
             self.db.rollback()
             return False
@@ -347,6 +360,7 @@ class StorageCleanupRepository:
         error_summary: str,
         retry_delay_seconds: int,
     ) -> bool:
+        task = self._lock_task(task.id)
         if not self._lease_token_matches(task, lease_token):
             self.db.rollback()
             return False

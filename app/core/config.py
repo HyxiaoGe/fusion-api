@@ -215,7 +215,7 @@ class Settings(BaseSettings):
             errors.append("LITELLM_PROXY_URL 必须是完整的 http(s) 地址")
         if not self.LITELLM_API_KEY:
             errors.append("LITELLM_API_KEY 不能为空")
-        if self.KNOWLEDGE_EMBEDDING_DIMENSION <= 0 or self.KNOWLEDGE_EMBEDDING_DIMENSION not in allowed_dimensions:
+        if self.KNOWLEDGE_EMBEDDING_DIMENSION <= 1 or self.KNOWLEDGE_EMBEDDING_DIMENSION not in allowed_dimensions:
             errors.append("KNOWLEDGE_EMBEDDING_DIMENSION 必须进入允许维度列表")
         if self.KNOWLEDGE_DISTANCE_METRIC != "COSINE":
             errors.append("KNOWLEDGE_DISTANCE_METRIC 必须为 COSINE")

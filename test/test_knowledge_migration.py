@@ -5,11 +5,9 @@ from unittest.mock import patch
 
 import sqlalchemy as sa
 
-MIGRATION_PATH = (
-    Path(__file__).parent.parent
-    / "alembic"
-    / "versions"
-    / "1f4b7c9d2e60_add_knowledge_base_v1.py"
+MIGRATION_PATH = Path(__file__).parent.parent / "alembic" / "versions" / "1f4b7c9d2e60_add_knowledge_base_v1.py"
+DELETE_RECEIPT_MIGRATION_PATH = (
+    Path(__file__).parent.parent / "alembic" / "versions" / "8a3d5f7b9c10_add_storage_delete_started_at.py"
 )
 
 
@@ -20,7 +18,27 @@ def load_migration():
     return migration
 
 
+def load_delete_receipt_migration():
+    spec = importlib.util.spec_from_file_location("knowledge_delete_receipt_migration", DELETE_RECEIPT_MIGRATION_PATH)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    return migration
+
+
 class KnowledgeMigrationTests(unittest.TestCase):
+    def test_delete_receipt_migration_is_expand_only(self):
+        migration = load_delete_receipt_migration()
+
+        with patch.object(migration, "op") as operation:
+            migration.upgrade()
+
+        operation.add_column.assert_called_once()
+        table_name, column = operation.add_column.call_args.args
+        self.assertEqual(table_name, "knowledge_storage_cleanup_tasks")
+        self.assertEqual(column.name, "delete_started_at")
+        self.assertFalse(operation.drop_column.called)
+        self.assertEqual(migration.down_revision, "6f8b1d3c5a20")
+
     def test_upgrade_is_expand_only_and_creates_versioned_task_schema(self):
         migration = load_migration()
 

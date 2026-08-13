@@ -37,6 +37,29 @@ class KnowledgeEmbeddingValidationTests(unittest.TestCase):
 
 
 class KnowledgeEmbeddingAdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_non_array_response_data_is_rejected_as_non_retryable_contract_error(self):
+        profile = EmbeddingProfile("litellm", "embedding-v1", 2, revision="embedding-r1")
+        for invalid_data in (7, True, {"index": 0}):
+            with (
+                self.subTest(invalid_data=invalid_data),
+                patch("app.ai.embeddings.litellm_embedding.settings.LITELLM_PROXY_URL", "http://proxy:4000"),
+                patch("app.ai.embeddings.litellm_embedding.settings.LITELLM_API_KEY", "proxy-key"),
+                patch("app.ai.embeddings.litellm_embedding.settings.KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS", 15),
+                patch(
+                    "app.ai.embeddings.litellm_embedding.settings.KNOWLEDGE_EMBEDDING_REVISION_ROUTES",
+                    json.dumps({"embedding-v1@embedding-r1": "embedding-v1-r1-immutable"}),
+                ),
+                patch(
+                    "app.ai.embeddings.litellm_embedding.litellm.aembedding",
+                    new=AsyncMock(return_value={"data": invalid_data}),
+                ),
+                self.assertRaises(EmbeddingError) as raised,
+            ):
+                await LiteLLMEmbeddingAdapter().embed(["正文"], profile)
+
+            self.assertEqual(raised.exception.code, "KNOWLEDGE_EMBEDDING_INVALID")
+            self.assertFalse(raised.exception.retryable)
+
     async def test_embedding_uses_registered_alias_through_litellm_proxy(self):
         response = {"data": [{"index": 0, "embedding": [1.0, 0.5]}]}
         profile = EmbeddingProfile("litellm", "embedding-v1", 2, "COSINE", revision="embedding-r1")

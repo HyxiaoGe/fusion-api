@@ -4,6 +4,8 @@ from unittest.mock import patch
 from app.services.knowledge.chunker import (
     DeterministicKnowledgeChunker,
     KnowledgeChunkLimitExceeded,
+    LegacyKnowledgeChunkerV1,
+    knowledge_chunker_for_version,
 )
 from app.services.knowledge.parser import ParsedSection
 
@@ -64,6 +66,28 @@ class DeterministicKnowledgeChunkerTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.max_chunks, 5)
+
+    def test_legacy_v1_keeps_original_boundaries_for_inflight_versions(self):
+        chunker = knowledge_chunker_for_version("chunker-v1", chunk_size=200, overlap=20)
+        self.assertIsInstance(chunker, LegacyKnowledgeChunkerV1)
+        text = "第一句。" * 80
+
+        first = chunker.chunk(
+            [ParsedSection(text, page=1, section="legacy")],
+            document_id="doc-v1",
+            index_version="version-v1",
+            max_chunks=100,
+        )
+        second = chunker.chunk(
+            [ParsedSection(text, page=1, section="legacy")],
+            document_id="doc-v1",
+            index_version="version-v1",
+            max_chunks=100,
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(chunker.VERSION, "chunker-v1")
+        self.assertGreater(len(first), 1)
 
 
 if __name__ == "__main__":

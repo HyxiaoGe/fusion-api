@@ -60,9 +60,9 @@ class KnowledgeStorageCleanupMigrationTests(unittest.TestCase):
                 revisions[assignments["revision"]] = assignments["down_revision"]
         heads = set(revisions) - {parent for parent in revisions.values() if parent is not None}
 
-        self.assertEqual(heads, {"6f8b1d3c5a20"})
+        self.assertEqual(heads, {"8a3d5f7b9c10"})
         visited: set[str] = set()
-        current: str | None = "6f8b1d3c5a20"
+        current: str | None = "8a3d5f7b9c10"
         while current is not None:
             self.assertNotIn(current, visited)
             visited.add(current)

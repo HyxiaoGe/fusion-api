@@ -409,6 +409,10 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         valid = self._run_candidate_knowledge_validation()
         invalid_bases = self._run_candidate_knowledge_validation(KNOWLEDGE_MAX_BASES_PER_USER="1001")
         invalid_documents = self._run_candidate_knowledge_validation(KNOWLEDGE_MAX_DOCUMENTS_PER_BASE="0")
+        invalid_dimension = self._run_candidate_knowledge_validation(
+            KNOWLEDGE_EMBEDDING_DIMENSION="1",
+            KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS="1",
+        )
         invalid_size = self._run_candidate_knowledge_validation(KNOWLEDGE_MAX_FILE_SIZE="0")
         legacy_chunker = self._run_candidate_knowledge_validation(KNOWLEDGE_CHUNKER_VERSION="chunker-v1")
         invalid_chunks = self._run_candidate_knowledge_validation(KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT="10001")
@@ -441,6 +445,7 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         for completed in (
             invalid_bases,
             invalid_documents,
+            invalid_dimension,
             invalid_size,
             invalid_chunks,
             invalid_batch,

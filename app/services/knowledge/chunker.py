@@ -104,3 +104,67 @@ class DeterministicKnowledgeChunker:
         content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         raw = f"{document_id}:{index_version}:{ordinal}:{content_hash}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+class LegacyKnowledgeChunkerV1(DeterministicKnowledgeChunker):
+    """升级期间继续处理已持久化的 v1 在途索引版本。"""
+
+    VERSION = "chunker-v1"
+
+    def __init__(self, *, chunk_size: int, overlap: int):
+        super().__init__(chunk_size=chunk_size, overlap=overlap)
+
+    def chunk(
+        self,
+        sections: list[ParsedSection],
+        *,
+        document_id: str,
+        index_version: str,
+        max_chunks: int | None = None,
+    ) -> list[KnowledgeChunk]:
+        if max_chunks is not None and max_chunks < 1:
+            raise ValueError("文档切片数量上限必须大于零")
+        chunks: list[KnowledgeChunk] = []
+        global_offset = 0
+        for section in sections:
+            start = 0
+            while start < len(section.text):
+                hard_end = min(start + self.chunk_size, len(section.text))
+                end = self._prefer_boundary(section.text, start, hard_end)
+                text = section.text[start:end].strip()
+                if text:
+                    if max_chunks is not None and len(chunks) >= max_chunks:
+                        raise KnowledgeChunkLimitExceeded(max_chunks)
+                    ordinal = len(chunks)
+                    chunk_id = self._chunk_id(document_id, index_version, ordinal, text)
+                    left_trim = len(section.text[start:end]) - len(section.text[start:end].lstrip())
+                    right_trimmed_length = len(section.text[start:end].rstrip())
+                    chunks.append(
+                        KnowledgeChunk(
+                            chunk_id=chunk_id,
+                            ordinal=ordinal,
+                            text=text,
+                            char_start=global_offset + start + left_trim,
+                            char_end=global_offset + start + right_trimmed_length,
+                            page=section.page,
+                            section=section.section,
+                        )
+                    )
+                if end >= len(section.text):
+                    break
+                start = max(start + 1, end - self.overlap)
+            global_offset += len(section.text) + 2
+        if not chunks:
+            raise ValueError("文档未产生可索引切片")
+        return chunks
+
+
+def knowledge_chunker_for_version(version: str, *, chunk_size: int, overlap: int):
+    chunker_types = {
+        LegacyKnowledgeChunkerV1.VERSION: LegacyKnowledgeChunkerV1,
+        DeterministicKnowledgeChunker.VERSION: DeterministicKnowledgeChunker,
+    }
+    chunker_type = chunker_types.get(version)
+    if chunker_type is None:
+        raise ValueError("Worker 不支持该切片版本")
+    return chunker_type(chunk_size=chunk_size, overlap=overlap)

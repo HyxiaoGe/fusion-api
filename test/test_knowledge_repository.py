@@ -342,6 +342,20 @@ class KnowledgeRepositoryTests(unittest.TestCase):
 
         self.assertEqual(saved.checksum_sha256, "a" * 64)
 
+    def test_document_transaction_does_not_refresh_after_commit(self):
+        repo = KnowledgeRepository(self.db)
+        repo.create_knowledge_base(self._base())
+        document, version, task = self._document_bundle()
+
+        with patch.object(self.db, "refresh", side_effect=RuntimeError("post-commit refresh failed")) as refresh:
+            saved_document, saved_version, saved_task = repo.create_document_with_task(document, version, task)
+
+        refresh.assert_not_called()
+        self.assertEqual(saved_document.id, document.id)
+        self.assertEqual(saved_version.id, version.id)
+        self.assertEqual(saved_task.id, task.id)
+        self.assertEqual(self.db.query(KnowledgeDocument).filter_by(id=document.id).count(), 1)
+
     def test_soft_delete_tombstones_fit_database_columns(self):
         repo = KnowledgeRepository(self.db)
         knowledge_base = repo.create_knowledge_base(self._base(normalized="名" * 200))

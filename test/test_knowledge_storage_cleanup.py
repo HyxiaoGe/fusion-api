@@ -359,6 +359,48 @@ class KnowledgeStorageCleanupTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(task.attempt_count, 2)
         self.assertEqual(storage.delete.await_count, 2)
 
+    async def test_delete_receipt_recovers_when_completed_commit_fails(self):
+        registration = self._register(key="knowledge/delete-receipt", hold_seconds=1)
+        self._activate(registration)
+        storage = MagicMock()
+        storage.exists = AsyncMock(side_effect=[True, False])
+        storage.delete = AsyncMock(return_value=True)
+        first_worker = KnowledgeStorageCleanupWorker(self.Session, worker_id="cleanup-first")
+
+        with (
+            patch(
+                "app.services.knowledge.storage_cleanup_worker.get_storage_for_backend",
+                return_value=storage,
+            ),
+            patch.object(
+                StorageCleanupRepository,
+                "complete_delete",
+                side_effect=RuntimeError("completed commit failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "completed commit failed"),
+        ):
+            await first_worker.run_once()
+
+        with self.Session() as db:
+            task = db.get(KnowledgeStorageCleanupTask, registration.task_id)
+            self.assertEqual(task.status, "running")
+            self.assertIsNotNone(task.delete_started_at)
+            task.lease_expires_at = utc_now() - timedelta(seconds=1)
+            db.commit()
+
+        second_worker = KnowledgeStorageCleanupWorker(self.Session, worker_id="cleanup-second")
+        with patch(
+            "app.services.knowledge.storage_cleanup_worker.get_storage_for_backend",
+            return_value=storage,
+        ):
+            self.assertTrue(await second_worker.run_once())
+
+        with self.Session() as db:
+            task = db.get(KnowledgeStorageCleanupTask, registration.task_id)
+            self.assertEqual(task.status, "completed")
+            self.assertIsNotNone(task.delete_started_at)
+        storage.delete.assert_awaited_once_with("knowledge/delete-receipt")
+
     async def test_blocked_delete_keeps_same_key_upload_fenced_until_sdk_returns(self):
         registration = self._register(key="knowledge/blocked", hold_seconds=1)
         self._activate(registration)

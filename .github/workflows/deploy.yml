@@ -836,6 +836,12 @@ jobs:
                   chunk_overlap = int(os.environ["KNOWLEDGE_CHUNK_OVERLAP"])
                   max_chunks_per_document = int(os.environ["KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT"])
                   parse_timeout = int(os.environ["KNOWLEDGE_PARSE_TIMEOUT_SECONDS"])
+                  embedding_dimension = int(os.environ["KNOWLEDGE_EMBEDDING_DIMENSION"])
+                  embedding_allowed_dimensions = {
+                      int(value.strip())
+                      for value in os.environ["KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS"].split(",")
+                      if value.strip()
+                  }
                   embedding_batch_size = int(os.environ["KNOWLEDGE_EMBEDDING_BATCH_SIZE"])
                   search_max_profiles = int(os.environ["KNOWLEDGE_SEARCH_MAX_PROFILES"])
                   worker_lease = int(os.environ["KNOWLEDGE_WORKER_LEASE_SECONDS"])
@@ -858,6 +864,8 @@ jobs:
                   and chunk_size - chunk_overlap >= 100
                   and 1 <= max_chunks_per_document <= 10_000
                   and 1 <= parse_timeout <= 300
+                  and embedding_dimension > 1
+                  and embedding_dimension in embedding_allowed_dimensions
                   and 1 <= embedding_batch_size <= 128
                   and 1 <= embedding_timeout <= 120
                   and 1 <= search_max_profiles <= 16

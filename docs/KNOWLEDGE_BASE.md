@@ -40,6 +40,8 @@ heartbeat、过期回收和终态 fencing 防止旧 Worker 写入新状态。Red
 代际隔离保证旧清理请求即使晚到，也不会删除并发或后续上传的对象。
 对象存储暂时断连、超时或限流时，上传接口返回稳定 503 `KNOWLEDGE_STORAGE_UNAVAILABLE`，同时保留
 cleanup intent 继续处理不确定的远端写入结果。
+Cleanup Worker 在发送对象删除前持久化 `delete_started_at`；即使对象已删除后 PostgreSQL 终态提交失败，
+过期租约重领也能在确认对象 absent 后完成任务，不会永久停留在不确定重试循环。
 
 v1 支持 UTF-8 TXT、Markdown、CSV、带文字层的 PDF 和 DOCX，不支持 OCR、扫描 PDF、旧版 DOC、
 网页抓取、音视频、图片理解、rerank 或聊天知识库选择器。
@@ -80,9 +82,9 @@ fail closed；pre-#41 镜像按空 registry 兼容，自动回滚仍恢复部署
 
 当前边界偏好与最小推进算法的不可变标识是 `chunker-v2`。候选部署始终从 Environment Variable 注入
 该版本，不继承服务器旧 `.env` 中的 `chunker-v1`；配置为其他值时 preflight fail closed。历史 active
-`chunker-v1` 索引仍可检索，因为检索读取其已落库的 manifest 与向量；历史 building v1 任务不能按 v2
-算法原地续跑，Worker 会以稳定不支持错误终止并登记该未完成索引版本的清理任务。自动回滚则使用部署前
-快照中的版本；对没有知识库环境变量的旧镜像，快照兼容默认仍为 `chunker-v1`。
+`chunker-v1` 索引仍可检索；升级时尚未领取或正在重试的 building v1 任务由 Worker 内保留的 v1 执行器
+按原始边界与确定性 ID 继续处理，新写入只使用 v2。自动回滚使用部署前快照中的版本；对没有知识库
+环境变量的旧镜像，快照兼容默认仍为 `chunker-v1`。
 
 启用时会集中校验上传上限、chunk 大小/重叠比例/最小步长/单文档总量、batch、搜索 profile 总量、
 Worker poll、lease/heartbeat/retry、
