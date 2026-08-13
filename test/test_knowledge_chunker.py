@@ -68,7 +68,7 @@ class DeterministicKnowledgeChunkerTests(unittest.TestCase):
         self.assertEqual(raised.exception.max_chunks, 5)
 
     def test_legacy_v1_keeps_original_boundaries_for_inflight_versions(self):
-        chunker = knowledge_chunker_for_version("chunker-v1", chunk_size=200, overlap=20)
+        chunker = knowledge_chunker_for_version("chunker-v1", chunk_size=200, overlap=150)
         self.assertIsInstance(chunker, LegacyKnowledgeChunkerV1)
         text = "第一句。" * 80
 
@@ -88,6 +88,9 @@ class DeterministicKnowledgeChunkerTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(chunker.VERSION, "chunker-v1")
         self.assertGreater(len(first), 1)
+        self.assertTrue(
+            all(current.char_start - previous.char_start <= 50 for previous, current in zip(first, first[1:]))
+        )
 
 
 if __name__ == "__main__":

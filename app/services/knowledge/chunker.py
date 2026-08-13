@@ -112,7 +112,10 @@ class LegacyKnowledgeChunkerV1(DeterministicKnowledgeChunker):
     VERSION = "chunker-v1"
 
     def __init__(self, *, chunk_size: int, overlap: int):
-        super().__init__(chunk_size=chunk_size, overlap=overlap)
+        if chunk_size < 100 or overlap < 0 or overlap >= chunk_size:
+            raise ValueError("知识库 v1 切片参数无效")
+        self.chunk_size = chunk_size
+        self.overlap = overlap
 
     def chunk(
         self,

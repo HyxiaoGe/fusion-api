@@ -158,6 +158,8 @@ class KnowledgeWorkerTests(unittest.IsolatedAsyncioTestCase):
             version = db.query(KnowledgeIndexVersion).filter_by(id="version-1").one()
             document.chunker_version = "chunker-v1"
             version.chunker_version = "chunker-v1"
+            version.chunk_size = 200
+            version.chunk_overlap = 150
             db.commit()
         worker = KnowledgeWorker(
             self.Session,
