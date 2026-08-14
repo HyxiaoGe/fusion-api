@@ -233,6 +233,7 @@ class MilvusKnowledgeStoreBatchTests(unittest.IsolatedAsyncioTestCase):
         class ExistingCollectionClient:
             def __init__(self):
                 self.closed = False
+                self.loaded = []
 
             def has_collection(self, **_kwargs):
                 return True
@@ -251,6 +252,9 @@ class MilvusKnowledgeStoreBatchTests(unittest.IsolatedAsyncioTestCase):
                     "metric_type": "COSINE",
                 }
 
+            def load_collection(self, **kwargs):
+                self.loaded.append(kwargs)
+
             def close(self):
                 self.closed = True
 
@@ -261,6 +265,8 @@ class MilvusKnowledgeStoreBatchTests(unittest.IsolatedAsyncioTestCase):
         collection = await store.ensure_collection(profile)
 
         self.assertEqual(collection, "knowledge_v1_d2")
+        self.assertEqual(client.loaded[0]["collection_name"], "knowledge_v1_d2")
+        self.assertEqual(client.loaded[0]["replica_number"], 1)
         self.assertTrue(client.closed)
 
     async def test_prepared_upsert_rejects_collection_from_another_profile(self):
@@ -278,6 +284,10 @@ class MilvusKnowledgeStoreBatchTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.filters = []
                 self.similarities = iter((0.3, 0.9, 0.6))
+                self.loaded = []
+
+            def load_collection(self, **kwargs):
+                self.loaded.append(kwargs)
 
             def search(self, *, filter, **_kwargs):
                 self.filters.append(filter)
@@ -309,8 +319,35 @@ class MilvusKnowledgeStoreBatchTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(len(client.filters), 3)
+        self.assertEqual(client.loaded[0]["collection_name"], "knowledge_v1_d2")
         self.assertEqual([expression.count("version-") for expression in client.filters], [2, 2, 1])
         self.assertEqual([hit.similarity for hit in hits], [0.9, 0.6])
+
+    async def test_delete_loads_existing_collection_before_filter_delete(self):
+        class DeleteClient:
+            def __init__(self):
+                self.events = []
+
+            def has_collection(self, **_kwargs):
+                return True
+
+            def load_collection(self, **kwargs):
+                self.events.append(("load", kwargs))
+
+            def delete(self, **kwargs):
+                self.events.append(("delete", kwargs))
+
+            def close(self):
+                return None
+
+        client = DeleteClient()
+        store = MilvusKnowledgeStore(client_factory=lambda: client)
+        profile = EmbeddingProfile("litellm", "embed-v1", 2, "COSINE", "knowledge_v1_d2", "r1")
+
+        await store.delete_index_version(profile, "version-1")
+
+        self.assertEqual([name for name, _kwargs in client.events], ["load", "delete"])
+        self.assertEqual(client.events[1][1]["filter"], 'index_version == "version-1"')
 
     @staticmethod
     def _record(index: int) -> KnowledgeVectorRecord:

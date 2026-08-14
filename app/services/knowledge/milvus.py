@@ -107,8 +107,9 @@ class MilvusKnowledgeStore:
                     for index_name in index_names
                 ]
                 self._validate_vector_indexes(index_descriptions, profile.distance_metric)
-                return
-            self._create_collection(client, collection, profile.dimension, profile.distance_metric)
+            else:
+                self._create_collection(client, collection, profile.dimension, profile.distance_metric)
+            self._load_collection(client, collection)
 
         await self._call(ensure, profile=profile)
         return collection
@@ -184,6 +185,7 @@ class MilvusKnowledgeStore:
         unique_versions = sorted(set(index_versions))
 
         def search_batches(client: Any) -> list[Any]:
+            self._load_collection(client, collection)
             rows: list[Any] = []
             for offset in range(0, len(unique_versions), KNOWLEDGE_MILVUS_FILTER_TERM_BATCH_SIZE):
                 version_batch = unique_versions[offset : offset + KNOWLEDGE_MILVUS_FILTER_TERM_BATCH_SIZE]
@@ -239,6 +241,7 @@ class MilvusKnowledgeStore:
         def delete(client: Any) -> None:
             if not client.has_collection(collection_name=collection, timeout=settings.MILVUS_TIMEOUT_SECONDS):
                 return
+            self._load_collection(client, collection)
             client.delete(
                 collection_name=collection,
                 filter=filter_expression,
@@ -246,6 +249,15 @@ class MilvusKnowledgeStore:
             )
 
         await self._call(delete, profile=profile)
+
+    @staticmethod
+    def _load_collection(client: Any, collection: str) -> None:
+        """显式加载 collection，覆盖 Standalone 重启或释放后的冷状态。"""
+        client.load_collection(
+            collection_name=collection,
+            replica_number=1,
+            timeout=settings.MILVUS_TIMEOUT_SECONDS,
+        )
 
     async def _readback_chunk_ids(
         self,

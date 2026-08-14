@@ -100,8 +100,9 @@ Worker 重试需满足 `0 < base <= max <= 3600 秒`，Embedding 超时上限为
 60 秒。每用户知识库数量限制为 1 到 1000，每知识库文档数量限制为 1 到 10000；单次 Embedding batch
 限制为 1 到 128；单文档 chunk 总量限制为 1 到 10000；搜索最多允许
 1 到 16 个 profile，默认 8，超过配置上限会在外部调用前以稳定 503 fail closed。搜索路由总超时按
-`ceil(max_profiles / 4) × (Embedding 超时 + 2 × Milvus 超时) + 5 秒` 计算，覆盖每个 profile 冷路径的
-Milvus client 构造与 search 两次有限超时以及全部并发批次。应用账号不能是
+`ceil(max_profiles / 4) × (Embedding 超时 + (版本过滤批次数 + 2) × Milvus 超时) + 5 秒` 计算，
+覆盖每个 profile 冷路径的 Milvus client 构造、collection 显式加载、全部版本过滤 search 批次和
+全部 profile 并发批次。应用账号不能是
 `root`，collection 名由服务端
 前缀和允许维度生成，客户端不能指定。
 

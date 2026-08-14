@@ -529,7 +529,7 @@ class ChatCoreSurfaceTests(unittest.TestCase):
             patch.object(self.main.settings, "KNOWLEDGE_MAX_DOCUMENTS_PER_BASE", 600),
         ):
             self.assertEqual(middleware._resolve_timeout_seconds(upload_request), 137)
-            self.assertEqual(middleware._resolve_timeout_seconds(search_request), 285.5)
+            self.assertEqual(middleware._resolve_timeout_seconds(search_request), 308)
             self.assertEqual(middleware._resolve_timeout_seconds(retry_request), 10)
 
     def test_timeout_middleware_uses_coordinated_budget_for_mcp_admin_operation(self):

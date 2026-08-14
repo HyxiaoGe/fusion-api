@@ -157,7 +157,7 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
                 profile_batches
                 * (
                     settings.KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS
-                    + (version_batches + 1) * settings.MILVUS_TIMEOUT_SECONDS
+                    + (version_batches + 2) * settings.MILVUS_TIMEOUT_SECONDS
                 )
                 + 5
             )
