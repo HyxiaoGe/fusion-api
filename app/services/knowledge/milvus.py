@@ -98,6 +98,12 @@ class MilvusKnowledgeStore:
                     collection_name=collection,
                     timeout=settings.MILVUS_TIMEOUT_SECONDS,
                 )
+                if not index_names:
+                    self._create_vector_index(client, collection, profile.distance_metric)
+                    index_names = client.list_indexes(
+                        collection_name=collection,
+                        timeout=settings.MILVUS_TIMEOUT_SECONDS,
+                    )
                 index_descriptions = [
                     client.describe_index(
                         collection_name=collection,
@@ -491,8 +497,7 @@ class MilvusKnowledgeStore:
         schema.add_field(field_name="page", datatype=DataType.INT64)
         schema.add_field(field_name="section", datatype=DataType.VARCHAR, max_length=120)
         schema.add_field(field_name="vector", datatype=DataType.FLOAT_VECTOR, dim=dimension)
-        indexes = client.prepare_index_params()
-        indexes.add_index(field_name="vector", index_type="AUTOINDEX", metric_type=metric)
+        indexes = MilvusKnowledgeStore._vector_index_params(client, metric)
         client.create_collection(
             collection_name=name,
             schema=schema,
@@ -500,6 +505,20 @@ class MilvusKnowledgeStore:
             consistency_level="Strong",
             timeout=settings.MILVUS_TIMEOUT_SECONDS,
         )
+
+    @staticmethod
+    def _create_vector_index(client: Any, collection: str, metric: str) -> None:
+        client.create_index(
+            collection_name=collection,
+            index_params=MilvusKnowledgeStore._vector_index_params(client, metric),
+            timeout=settings.MILVUS_TIMEOUT_SECONDS,
+        )
+
+    @staticmethod
+    def _vector_index_params(client: Any, metric: str) -> Any:
+        indexes = client.prepare_index_params()
+        indexes.add_index(field_name="vector", index_type="AUTOINDEX", metric_type=metric)
+        return indexes
 
     @staticmethod
     def _build_client(profile: EmbeddingProfile | None = None) -> Any:

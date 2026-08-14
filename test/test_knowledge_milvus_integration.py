@@ -56,6 +56,7 @@ class KnowledgeMilvusIntegrationTests(unittest.IsolatedAsyncioTestCase):
             filename="integration.txt",
         )
 
+        body_error = None
         try:
             await store.upsert(profile, [record])
             hits = await store.search(
@@ -82,8 +83,16 @@ class KnowledgeMilvusIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     limit=5,
                 )
                 self.assertEqual(denied, [])
-        finally:
+        except Exception as exc:
+            body_error = exc
+
+        try:
             await store.delete_index_version(profile, index_version)
+        except Exception:
+            if body_error is None:
+                raise
+        if body_error is not None:
+            raise body_error
 
         cleaned = await store.search(
             profile=profile,

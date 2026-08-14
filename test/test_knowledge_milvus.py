@@ -279,6 +279,62 @@ class MilvusKnowledgeStoreBatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "KNOWLEDGE_VECTOR_CONFIG_INVALID")
         self.assertFalse(raised.exception.retryable)
 
+    async def test_exact_schema_without_index_is_repaired_before_loading(self):
+        class IndexParams:
+            def __init__(self):
+                self.added = []
+
+            def add_index(self, **kwargs):
+                self.added.append(kwargs)
+
+        class MissingIndexClient:
+            def __init__(self):
+                self.index_created = False
+                self.params = IndexParams()
+                self.loaded = False
+
+            def has_collection(self, **_kwargs):
+                return True
+
+            def describe_collection(self, **_kwargs):
+                return MilvusKnowledgeStoreTests._valid_collection_description(dimension=2)
+
+            def list_indexes(self, **_kwargs):
+                return ["vector"] if self.index_created else []
+
+            def prepare_index_params(self):
+                return self.params
+
+            def create_index(self, **_kwargs):
+                self.index_created = True
+
+            def describe_index(self, **_kwargs):
+                return {
+                    "field_name": "vector",
+                    "index_name": "vector",
+                    "index_type": "AUTOINDEX",
+                    "metric_type": "COSINE",
+                }
+
+            def load_collection(self, **_kwargs):
+                self.loaded = True
+
+            def close(self):
+                return None
+
+        client = MissingIndexClient()
+        store = MilvusKnowledgeStore(client_factory=lambda: client)
+        profile = EmbeddingProfile("litellm", "embed-v1", 2, "COSINE", "knowledge_v1_d2", "r1")
+
+        await store.ensure_collection(profile)
+
+        self.assertTrue(client.index_created)
+        self.assertTrue(client.loaded)
+        self.assertEqual(
+            client.params.added,
+            [{"field_name": "vector", "index_type": "AUTOINDEX", "metric_type": "COSINE"}],
+        )
+
     async def test_search_batches_version_terms_and_merges_global_ranking(self):
         class SearchClient:
             def __init__(self):
