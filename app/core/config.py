@@ -1,8 +1,14 @@
+import json
 import os
+import re
 from typing import List, Optional
+from urllib.parse import urlparse
 
 from pydantic import Field
 from pydantic_settings import BaseSettings
+
+KNOWLEDGE_SEARCH_PROFILE_CONCURRENCY = 4
+KNOWLEDGE_MILVUS_FILTER_TERM_BATCH_SIZE = 512
 
 
 class Settings(BaseSettings):
@@ -23,6 +29,8 @@ class Settings(BaseSettings):
     )
     LITELLM_MODEL_ADMISSION_WORKER_TOKEN: str = os.getenv("LITELLM_MODEL_ADMISSION_WORKER_TOKEN", "")
     LITELLM_MODEL_ADMISSION_LEASE_SECONDS: int = int(os.getenv("LITELLM_MODEL_ADMISSION_LEASE_SECONDS", "600"))
+    LITELLM_PROXY_URL: str = os.getenv("LITELLM_PROXY_URL", "http://litellm-proxy:4000")
+    LITELLM_API_KEY: str = os.getenv("LITELLM_API_KEY", "")
 
     # 数据库配置
     DATABASE_URL: str = os.getenv("DATABASE_URL")
@@ -66,6 +74,226 @@ class Settings(BaseSettings):
     OSS_ACCESS_KEY_SECRET: str = os.getenv("OSS_ACCESS_KEY_SECRET", "")
     OSS_BUCKET: str = os.getenv("OSS_BUCKET", "")
     OSS_USE_SSL: bool = os.getenv("OSS_USE_SSL", "true").lower() == "true"
+
+    # 知识库 v1：API、独立 Worker、Embedding 与 Milvus 均通过配置显式启用。
+    KNOWLEDGE_BASE_ENABLED: bool = os.getenv("KNOWLEDGE_BASE_ENABLED", "false").lower() == "true"
+    KNOWLEDGE_MAX_BASES_PER_USER: int = int(os.getenv("KNOWLEDGE_MAX_BASES_PER_USER", "50"))
+    KNOWLEDGE_MAX_DOCUMENTS_PER_BASE: int = int(os.getenv("KNOWLEDGE_MAX_DOCUMENTS_PER_BASE", "100"))
+    KNOWLEDGE_MAX_FILE_SIZE: int = int(os.getenv("KNOWLEDGE_MAX_FILE_SIZE", str(10 * 1024 * 1024)))
+    KNOWLEDGE_ALLOWED_MIME_TYPES: str = os.getenv(
+        "KNOWLEDGE_ALLOWED_MIME_TYPES",
+        ",".join(
+            (
+                "text/plain",
+                "text/markdown",
+                "text/csv",
+                "application/pdf",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        ),
+    )
+    KNOWLEDGE_PARSER_VERSION: str = os.getenv("KNOWLEDGE_PARSER_VERSION", "parser-v1")
+    KNOWLEDGE_CHUNKER_VERSION: str = os.getenv("KNOWLEDGE_CHUNKER_VERSION", "chunker-v2")
+    KNOWLEDGE_CHUNK_SIZE: int = int(os.getenv("KNOWLEDGE_CHUNK_SIZE", "1200"))
+    KNOWLEDGE_CHUNK_OVERLAP: int = int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "200"))
+    KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT: int = int(os.getenv("KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT", "10000"))
+    KNOWLEDGE_PARSE_TIMEOUT_SECONDS: int = int(os.getenv("KNOWLEDGE_PARSE_TIMEOUT_SECONDS", "60"))
+    KNOWLEDGE_EMBEDDING_PROVIDER: str = os.getenv("KNOWLEDGE_EMBEDDING_PROVIDER", "litellm")
+    KNOWLEDGE_EMBEDDING_MODEL: str = os.getenv("KNOWLEDGE_EMBEDDING_MODEL", "")
+    KNOWLEDGE_EMBEDDING_REVISION: str = os.getenv("KNOWLEDGE_EMBEDDING_REVISION", "")
+    KNOWLEDGE_EMBEDDING_REVISION_ROUTES: str = os.getenv("KNOWLEDGE_EMBEDDING_REVISION_ROUTES", "{}")
+    KNOWLEDGE_EMBEDDING_DIMENSION: int = int(os.getenv("KNOWLEDGE_EMBEDDING_DIMENSION", "1024"))
+    KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS: str = os.getenv("KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS", "1024")
+    KNOWLEDGE_EMBEDDING_BATCH_SIZE: int = int(os.getenv("KNOWLEDGE_EMBEDDING_BATCH_SIZE", "32"))
+    KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS: float = float(os.getenv("KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS", "30"))
+    KNOWLEDGE_SEARCH_MAX_PROFILES: int = int(os.getenv("KNOWLEDGE_SEARCH_MAX_PROFILES", "8"))
+    KNOWLEDGE_DISTANCE_METRIC: str = os.getenv("KNOWLEDGE_DISTANCE_METRIC", "COSINE").upper()
+    KNOWLEDGE_WORKER_POLL_SECONDS: float = float(os.getenv("KNOWLEDGE_WORKER_POLL_SECONDS", "2"))
+    KNOWLEDGE_WORKER_LEASE_SECONDS: int = int(os.getenv("KNOWLEDGE_WORKER_LEASE_SECONDS", "180"))
+    KNOWLEDGE_WORKER_HEARTBEAT_SECONDS: int = int(os.getenv("KNOWLEDGE_WORKER_HEARTBEAT_SECONDS", "30"))
+    KNOWLEDGE_WORKER_MAX_ATTEMPTS: int = int(os.getenv("KNOWLEDGE_WORKER_MAX_ATTEMPTS", "5"))
+    KNOWLEDGE_WORKER_RETRY_BASE_SECONDS: int = int(os.getenv("KNOWLEDGE_WORKER_RETRY_BASE_SECONDS", "5"))
+    KNOWLEDGE_WORKER_RETRY_MAX_SECONDS: int = int(os.getenv("KNOWLEDGE_WORKER_RETRY_MAX_SECONDS", "300"))
+    KNOWLEDGE_WORKER_HEALTH_FILE: str = os.getenv(
+        "KNOWLEDGE_WORKER_HEALTH_FILE",
+        "/tmp/fusion-knowledge-worker-health.json",
+    )
+    MILVUS_URI: str = os.getenv("MILVUS_URI", "")
+    MILVUS_USERNAME: str = os.getenv("MILVUS_USERNAME", "")
+    MILVUS_PASSWORD: str = os.getenv("MILVUS_PASSWORD", "")
+    MILVUS_DATABASE: str = os.getenv("MILVUS_DATABASE", "")
+    MILVUS_COLLECTION_PREFIX: str = os.getenv("MILVUS_COLLECTION_PREFIX", "fusion_knowledge_chunks")
+    MILVUS_TIMEOUT_SECONDS: float = float(os.getenv("MILVUS_TIMEOUT_SECONDS", "10"))
+
+    @property
+    def RESOLVED_KNOWLEDGE_ALLOWED_MIME_TYPES(self) -> List[str]:
+        return list(
+            dict.fromkeys(value.strip() for value in self.KNOWLEDGE_ALLOWED_MIME_TYPES.split(",") if value.strip())
+        )
+
+    @property
+    def RESOLVED_KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS(self) -> List[int]:
+        return list(
+            dict.fromkeys(
+                int(value.strip()) for value in self.KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS.split(",") if value.strip()
+            )
+        )
+
+    @property
+    def RESOLVED_KNOWLEDGE_EMBEDDING_REVISION_ROUTES(self) -> dict[str, str]:
+        try:
+            raw_routes = json.loads(self.KNOWLEDGE_EMBEDDING_REVISION_ROUTES)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("KNOWLEDGE_EMBEDDING_REVISION_ROUTES 必须是 JSON 对象") from exc
+        if not isinstance(raw_routes, dict):
+            raise ValueError("KNOWLEDGE_EMBEDDING_REVISION_ROUTES 必须是 JSON 对象")
+        if not raw_routes:
+            raise ValueError("KNOWLEDGE_EMBEDDING_REVISION_ROUTES 不能为空")
+        routes: dict[str, str] = {}
+        for raw_key, raw_alias in raw_routes.items():
+            if not isinstance(raw_key, str) or not isinstance(raw_alias, str):
+                raise ValueError("KNOWLEDGE_EMBEDDING_REVISION_ROUTES 的键和值必须是字符串")
+            key = raw_key.strip()
+            alias = raw_alias.strip()
+            model, separator, revision = key.rpartition("@")
+            if (
+                raw_key != key
+                or raw_alias != alias
+                or not separator
+                or re.fullmatch(r"[A-Za-z0-9_.:/-]{1,200}", model) is None
+                or re.fullmatch(r"[A-Za-z0-9_.:/-]{1,120}", revision) is None
+                or re.fullmatch(r"[A-Za-z0-9_.:/-]{1,200}", alias) is None
+                or alias.startswith("litellm_proxy/")
+            ):
+                raise ValueError("KNOWLEDGE_EMBEDDING_REVISION_ROUTES 包含无效的 model@revision 或 alias")
+            routes[key] = alias
+        return routes
+
+    def resolve_knowledge_embedding_route(self, model: str, revision: str | None) -> str:
+        """把持久化 model+revision 解析为不可变 LiteLLM Proxy alias。"""
+        if not model.strip() or not revision or not revision.strip():
+            raise ValueError("Embedding profile 缺少 model 或 revision")
+        route = self.RESOLVED_KNOWLEDGE_EMBEDDING_REVISION_ROUTES.get(f"{model}@{revision}")
+        if route is None:
+            raise ValueError("KNOWLEDGE_EMBEDDING_REVISION_ROUTES 缺少持久化 model@revision")
+        return route
+
+    def validate_knowledge_base_configuration(self) -> None:
+        """知识库启用时执行集中、可复用的 fail-closed 配置校验。"""
+        self.validate_knowledge_storage_cleanup_configuration()
+        if not self.KNOWLEDGE_BASE_ENABLED:
+            return
+        errors: list[str] = []
+        try:
+            allowed_dimensions = self.RESOLVED_KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS
+        except ValueError:
+            allowed_dimensions = []
+            errors.append("KNOWLEDGE_EMBEDDING_ALLOWED_DIMENSIONS 必须是整数列表")
+        if self.KNOWLEDGE_EMBEDDING_PROVIDER != "litellm":
+            errors.append("KNOWLEDGE_EMBEDDING_PROVIDER 必须为 litellm")
+        if self.KNOWLEDGE_PARSER_VERSION != "parser-v1":
+            errors.append("KNOWLEDGE_PARSER_VERSION 必须与当前解析器实现一致")
+        if self.KNOWLEDGE_CHUNKER_VERSION != "chunker-v2":
+            errors.append("KNOWLEDGE_CHUNKER_VERSION 必须与当前切片器实现一致")
+        if not self.KNOWLEDGE_EMBEDDING_MODEL.strip():
+            errors.append("KNOWLEDGE_EMBEDDING_MODEL 不能为空")
+        if not self.KNOWLEDGE_EMBEDDING_REVISION.strip():
+            errors.append("KNOWLEDGE_EMBEDDING_REVISION 不能为空")
+        if self.KNOWLEDGE_EMBEDDING_MODEL != self.KNOWLEDGE_EMBEDDING_MODEL.strip():
+            errors.append("KNOWLEDGE_EMBEDDING_MODEL 前后不能包含空白")
+        if self.KNOWLEDGE_EMBEDDING_REVISION != self.KNOWLEDGE_EMBEDDING_REVISION.strip():
+            errors.append("KNOWLEDGE_EMBEDDING_REVISION 前后不能包含空白")
+        if self.KNOWLEDGE_EMBEDDING_MODEL.startswith("litellm_proxy/"):
+            errors.append("KNOWLEDGE_EMBEDDING_MODEL 必须填写 Proxy 中的原始 alias")
+        try:
+            self.resolve_knowledge_embedding_route(
+                self.KNOWLEDGE_EMBEDDING_MODEL.strip(),
+                self.KNOWLEDGE_EMBEDDING_REVISION.strip(),
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
+        litellm_proxy_url = urlparse(self.LITELLM_PROXY_URL)
+        if litellm_proxy_url.scheme not in {"http", "https"} or not litellm_proxy_url.netloc:
+            errors.append("LITELLM_PROXY_URL 必须是完整的 http(s) 地址")
+        if not self.LITELLM_API_KEY:
+            errors.append("LITELLM_API_KEY 不能为空")
+        if self.KNOWLEDGE_EMBEDDING_DIMENSION <= 1 or self.KNOWLEDGE_EMBEDDING_DIMENSION not in allowed_dimensions:
+            errors.append("KNOWLEDGE_EMBEDDING_DIMENSION 必须进入允许维度列表")
+        if self.KNOWLEDGE_DISTANCE_METRIC != "COSINE":
+            errors.append("KNOWLEDGE_DISTANCE_METRIC 必须为 COSINE")
+        if not 1 <= self.KNOWLEDGE_MAX_BASES_PER_USER <= 1_000:
+            errors.append("KNOWLEDGE_MAX_BASES_PER_USER 必须在 1 到 1000 之间")
+        if not 1 <= self.KNOWLEDGE_MAX_DOCUMENTS_PER_BASE <= 10_000:
+            errors.append("KNOWLEDGE_MAX_DOCUMENTS_PER_BASE 必须在 1 到 10000 之间")
+        if not 100 <= self.KNOWLEDGE_CHUNK_SIZE <= 16_000:
+            errors.append("KNOWLEDGE_CHUNK_SIZE 必须在 100 到 16000 之间")
+        if (
+            self.KNOWLEDGE_CHUNK_OVERLAP < 0
+            or self.KNOWLEDGE_CHUNK_OVERLAP * 2 > self.KNOWLEDGE_CHUNK_SIZE
+            or self.KNOWLEDGE_CHUNK_SIZE - self.KNOWLEDGE_CHUNK_OVERLAP < 100
+        ):
+            errors.append("KNOWLEDGE_CHUNK_OVERLAP 不得超过 chunk size 的一半，且切片最小步长为 100")
+        if not 1 <= self.KNOWLEDGE_MAX_FILE_SIZE <= 50 * 1024 * 1024:
+            errors.append("KNOWLEDGE_MAX_FILE_SIZE 必须在 1 到 52428800 字节之间")
+        if not 1 <= self.KNOWLEDGE_PARSE_TIMEOUT_SECONDS <= 300:
+            errors.append("KNOWLEDGE_PARSE_TIMEOUT_SECONDS 必须在 1 到 300 之间")
+        if not 1 <= self.KNOWLEDGE_EMBEDDING_BATCH_SIZE <= 128:
+            errors.append("KNOWLEDGE_EMBEDDING_BATCH_SIZE 必须在 1 到 128 之间")
+        if not 1 <= self.KNOWLEDGE_SEARCH_MAX_PROFILES <= 16:
+            errors.append("KNOWLEDGE_SEARCH_MAX_PROFILES 必须在 1 到 16 之间")
+        if not 1 <= self.KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT <= 10_000:
+            errors.append("KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT 必须在 1 到 10000 之间")
+        if not 1 <= self.KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS <= 120:
+            errors.append("KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS 必须在 1 到 120 秒之间")
+        if (
+            self.KNOWLEDGE_WORKER_HEARTBEAT_SECONDS <= 0
+            or self.KNOWLEDGE_WORKER_HEARTBEAT_SECONDS * 2 >= self.KNOWLEDGE_WORKER_LEASE_SECONDS
+        ):
+            errors.append("KNOWLEDGE_WORKER_HEARTBEAT_SECONDS 必须小于 lease 的一半")
+        allowed_mime_types = set(self.RESOLVED_KNOWLEDGE_ALLOWED_MIME_TYPES)
+        supported_mime_types = {
+            "text/plain",
+            "text/markdown",
+            "text/csv",
+            "application/pdf",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        }
+        if not allowed_mime_types or not allowed_mime_types.issubset(supported_mime_types):
+            errors.append("KNOWLEDGE_ALLOWED_MIME_TYPES 包含 v1 解析器不支持的类型")
+        milvus_uri = urlparse(self.MILVUS_URI)
+        if milvus_uri.scheme not in {"http", "https"} or not milvus_uri.netloc:
+            errors.append("MILVUS_URI 必须是完整的 http(s) 地址")
+        if len(self.MILVUS_URI) > 500 or "\x00" in self.MILVUS_URI:
+            errors.append("MILVUS_URI 长度或字符无效")
+        if not self.MILVUS_USERNAME.strip() or not self.MILVUS_PASSWORD or not self.MILVUS_DATABASE.strip():
+            errors.append("Milvus 应用账号和数据库配置不完整")
+        if len(self.MILVUS_DATABASE) > 120 or "\x00" in self.MILVUS_DATABASE:
+            errors.append("MILVUS_DATABASE 长度或字符无效")
+        if self.MILVUS_USERNAME.strip().casefold() == "root":
+            errors.append("知识库禁止使用 Milvus root 账号")
+        if not 1 <= self.MILVUS_TIMEOUT_SECONDS <= 60:
+            errors.append("MILVUS_TIMEOUT_SECONDS 必须在 1 到 60 秒之间")
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,39}", self.MILVUS_COLLECTION_PREFIX):
+            errors.append("MILVUS_COLLECTION_PREFIX 必须是长度不超过 40 的受控标识")
+        if errors:
+            raise ValueError("；".join(errors))
+
+    def validate_knowledge_storage_cleanup_configuration(self) -> None:
+        """校验知识库关闭时仍被既有文件上传使用的 cleanup Worker 参数。"""
+        errors: list[str] = []
+        if not 0 < self.KNOWLEDGE_WORKER_POLL_SECONDS <= 60:
+            errors.append("KNOWLEDGE_WORKER_POLL_SECONDS 必须大于 0 且不超过 60 秒")
+        if self.KNOWLEDGE_WORKER_LEASE_SECONDS <= 0:
+            errors.append("KNOWLEDGE_WORKER_LEASE_SECONDS 必须大于 0")
+        if self.KNOWLEDGE_WORKER_MAX_ATTEMPTS <= 0:
+            errors.append("KNOWLEDGE_WORKER_MAX_ATTEMPTS 必须大于 0")
+        if not (0 < self.KNOWLEDGE_WORKER_RETRY_BASE_SECONDS <= self.KNOWLEDGE_WORKER_RETRY_MAX_SECONDS <= 3600):
+            errors.append(
+                "KNOWLEDGE_WORKER_RETRY_BASE_SECONDS 与 KNOWLEDGE_WORKER_RETRY_MAX_SECONDS "
+                "必须满足 0 < base <= max <= 3600 秒"
+            )
+        if errors:
+            raise ValueError("；".join(errors))
 
     # Github OAuth
     GITHUB_CLIENT_ID: Optional[str] = None

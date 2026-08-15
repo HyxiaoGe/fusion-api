@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import json
 import os
 import sys
 import unittest
@@ -314,6 +315,29 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         self.assertIsNone(body["data"])
         service.upload_files.assert_awaited_once()
 
+    def test_file_upload_storage_fence_conflict_returns_retryable_service_error(self):
+        from app.services.file_service import FileStorageUnavailableError
+
+        self._enable_authenticated_overrides()
+        service = self._mock_file_service(
+            upload_files=AsyncMock(side_effect=FileStorageUnavailableError("对象存储清理正在进行，请稍后重试"))
+        )
+
+        response = self.client.post(
+            "/api/files/upload",
+            data={
+                "provider": "openai",
+                "model": "gpt-4.1",
+                "conversation_id": "conv-1",
+            },
+            files=[("files", ("note.txt", b"hello", "text/plain"))],
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["code"], "FILE_STORAGE_UNAVAILABLE")
+        self.assertIsNone(response.json()["data"])
+        service.upload_files.assert_awaited_once()
+
     def test_file_direct_upload_init_routes_to_file_service(self):
         self._enable_authenticated_overrides()
         service = self._mock_file_service(
@@ -401,6 +425,23 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         self.assertEqual(body["data"]["file"]["status"], "processed")
         service.complete_direct_upload.assert_awaited_once_with("file-1", "user-123")
 
+    def test_file_direct_upload_complete_storage_fence_conflict_returns_503(self):
+        from app.services.file_service import FileStorageUnavailableError
+
+        self._enable_authenticated_overrides()
+        service = self._mock_file_service(
+            complete_direct_upload=AsyncMock(
+                side_effect=FileStorageUnavailableError("对象上传期间持久清理 fence 已失效")
+            )
+        )
+
+        response = self.client.post("/api/files/upload/complete", json={"file_id": "file-1"})
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["code"], "FILE_STORAGE_UNAVAILABLE")
+        self.assertIsNone(response.json()["data"])
+        service.complete_direct_upload.assert_awaited_once_with("file-1", "user-123")
+
     def test_timeout_middleware_uses_longer_budget_for_file_upload(self):
         middleware = self.main.TimeoutMiddleware(lambda scope, receive, send: None, timeout_seconds=10)
         captured = {}
@@ -453,6 +494,44 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(captured["timeout"], self.main.settings.FILE_UPLOAD_TIMEOUT_SECONDS)
 
+    def test_timeout_middleware_uses_configured_budgets_for_knowledge_routes(self):
+        middleware = self.main.TimeoutMiddleware(lambda scope, receive, send: None, timeout_seconds=10)
+        upload_request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/knowledge-bases/kb-1/documents",
+                "headers": [],
+            }
+        )
+        search_request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/knowledge-bases/search",
+                "headers": [],
+            }
+        )
+        retry_request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/knowledge-bases/kb-1/documents/doc-1/retry",
+                "headers": [],
+            }
+        )
+
+        with (
+            patch.object(self.main.settings, "FILE_UPLOAD_TIMEOUT_SECONDS", 137),
+            patch.object(self.main.settings, "KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS", 41),
+            patch.object(self.main.settings, "MILVUS_TIMEOUT_SECONDS", 7.5),
+            patch.object(self.main.settings, "KNOWLEDGE_SEARCH_MAX_PROFILES", 9),
+            patch.object(self.main.settings, "KNOWLEDGE_MAX_DOCUMENTS_PER_BASE", 600),
+        ):
+            self.assertEqual(middleware._resolve_timeout_seconds(upload_request), 137)
+            self.assertEqual(middleware._resolve_timeout_seconds(search_request), 308)
+            self.assertEqual(middleware._resolve_timeout_seconds(retry_request), 10)
+
     def test_timeout_middleware_uses_coordinated_budget_for_mcp_admin_operation(self):
         middleware = self.main.TimeoutMiddleware(lambda scope, receive, send: None, timeout_seconds=10)
         captured = {}
@@ -504,6 +583,83 @@ class ChatCoreSurfaceTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(captured["timeout"], 10)
+
+    def test_upload_body_limit_rejects_content_length_before_multipart_parser(self):
+        downstream_called = False
+        receive_called = False
+        sent = []
+
+        async def downstream(_scope, _receive, _send):
+            nonlocal downstream_called
+            downstream_called = True
+
+        async def receive():
+            nonlocal receive_called
+            receive_called = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        middleware = self.main.UploadBodyLimitMiddleware(downstream)
+        limit = self.main.settings.KNOWLEDGE_MAX_FILE_SIZE + self.main.MULTIPART_OVERHEAD_BYTES
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/knowledge-bases/kb-1/documents",
+            "headers": [(b"content-length", str(limit + 1).encode())],
+        }
+
+        asyncio.run(middleware(scope, receive, send))
+
+        self.assertFalse(downstream_called)
+        self.assertFalse(receive_called)
+        self.assertEqual(sent[0]["status"], 413)
+        payload = json.loads(sent[1]["body"])
+        self.assertEqual(payload["code"], "FILE_TOO_LARGE")
+
+    def test_upload_body_limit_bounds_chunked_request_without_content_length(self):
+        sent = []
+        chunks = iter(
+            [
+                {"type": "http.request", "body": b"12345", "more_body": True},
+                {"type": "http.request", "body": b"6789", "more_body": False},
+            ]
+        )
+
+        async def downstream(scope, receive, send):
+            try:
+                while True:
+                    message = await receive()
+                    if not message.get("more_body"):
+                        break
+            except self.main.RequestBodyTooLarge as exc:
+                # 模拟 Starlette 关闭临时文件后生成的内部 400；外层必须改写为 413。
+                await Response(exc.message, status_code=400)(scope, receive, send)
+                return
+            await Response("unexpected")(scope, receive, send)
+
+        async def receive():
+            return next(chunks)
+
+        async def send(message):
+            sent.append(message)
+
+        middleware = self.main.UploadBodyLimitMiddleware(downstream)
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/knowledge-bases/kb-1/documents",
+            "headers": [],
+        }
+        with (
+            patch.object(self.main.settings, "KNOWLEDGE_MAX_FILE_SIZE", 4),
+            patch.object(self.main, "MULTIPART_OVERHEAD_BYTES", 4),
+        ):
+            asyncio.run(middleware(scope, receive, send))
+
+        self.assertEqual(sent[0]["status"], 413)
+        self.assertEqual(json.loads(sent[1]["body"])["code"], "FILE_TOO_LARGE")
 
     def test_file_status_returns_not_found_when_service_has_no_record(self):
         self._enable_authenticated_overrides()

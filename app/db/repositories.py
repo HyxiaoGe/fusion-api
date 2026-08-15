@@ -481,24 +481,7 @@ class FileRepository:
     def create_file(self, file_data: Dict[str, Any]) -> File:
         """创建新文件记录"""
         try:
-            db_file = File(
-                id=file_data.get("id", str(uuid.uuid4())),
-                user_id=file_data["user_id"],
-                filename=file_data["filename"],
-                original_filename=file_data["original_filename"],
-                mimetype=file_data["mimetype"],
-                size=file_data["size"],
-                path=file_data["path"],
-                status=file_data.get("status", "pending"),
-                processing_result=file_data.get("processing_result"),
-                parsed_content=file_data.get("parsed_content"),
-                storage_key=file_data.get("storage_key"),
-                thumbnail_key=file_data.get("thumbnail_key"),
-                storage_backend=file_data.get("storage_backend", "local"),
-                width=file_data.get("width"),
-                height=file_data.get("height"),
-            )
-            self.db.add(db_file)
+            db_file = self.stage_file(file_data)
             self.db.commit()
             self.db.refresh(db_file)
             return db_file
@@ -506,6 +489,44 @@ class FileRepository:
             self.db.rollback()
             logger.error(f"创建文件记录失败: {e}")
             raise
+
+    def stage_file(self, file_data: Dict[str, Any]) -> File:
+        """把 File 加入当前事务，不单独提交。"""
+        db_file = File(
+            id=file_data.get("id", str(uuid.uuid4())),
+            user_id=file_data["user_id"],
+            filename=file_data["filename"],
+            original_filename=file_data["original_filename"],
+            mimetype=file_data["mimetype"],
+            size=file_data["size"],
+            path=file_data["path"],
+            status=file_data.get("status", "pending"),
+            processing_result=file_data.get("processing_result"),
+            parsed_content=file_data.get("parsed_content"),
+            storage_key=file_data.get("storage_key"),
+            thumbnail_key=file_data.get("thumbnail_key"),
+            storage_backend=file_data.get("storage_backend", "local"),
+            width=file_data.get("width"),
+            height=file_data.get("height"),
+        )
+        self.db.add(db_file)
+        self.db.flush()
+        return db_file
+
+    def stage_conversation_link(self, conversation_id: str, file_id: str) -> None:
+        """把 ConversationFile 加入当前事务，不单独提交。"""
+        existing = (
+            self.db.query(ConversationFile)
+            .filter(ConversationFile.conversation_id == conversation_id, ConversationFile.file_id == file_id)
+            .first()
+        )
+        if existing is None:
+            self.db.add(ConversationFile(conversation_id=conversation_id, file_id=file_id))
+            self.db.flush()
+
+    def stage_update_file(self, file_id: str, updates: Dict[str, Any]) -> bool:
+        """在当前事务更新 File，不单独提交。"""
+        return self.db.query(File).filter(File.id == file_id).update(updates, synchronize_session=False) > 0
 
     def link_file_to_conversation(self, conversation_id: str, file_id: str) -> bool:
         """关联文件到对话"""

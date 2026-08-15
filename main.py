@@ -1,21 +1,42 @@
 import asyncio
+import math
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.formparsers import MultiPartException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.ai import litellm_cleanup, litellm_health
-from app.api import admin, admin_audit, admin_mcp, admin_model_management, auth, chat, files, models, prompts
-from app.core.config import settings
+from app.api import (
+    admin,
+    admin_audit,
+    admin_mcp,
+    admin_model_management,
+    auth,
+    chat,
+    files,
+    knowledge_bases,
+    models,
+    prompts,
+)
+from app.core.config import (
+    KNOWLEDGE_MILVUS_FILTER_TERM_BATCH_SIZE,
+    KNOWLEDGE_SEARCH_PROFILE_CONCURRENCY,
+    settings,
+)
 from app.core.logger import app_logger
 from app.core.redis import close_redis, get_redis_pool, init_redis
 from app.db.database import SessionLocal
+from app.schemas.knowledge import KNOWLEDGE_SEARCH_MAX_BASES_PER_REQUEST
 from app.schemas.response import ApiException, generate_request_id
+from app.services.knowledge.storage_upload_guard import shutdown_storage_upload_lifecycles
 from app.services.mcp.runtime import get_mcp_client_manager
 from app.services.scheduler_service import start_scheduler, stop_scheduler
 from app.services.storage import init_storage
@@ -25,6 +46,92 @@ from app.services.suggested_question_worker import (
 )
 
 ASIA_SHANGHAI = timezone(timedelta(hours=8))
+MULTIPART_OVERHEAD_BYTES = 1024 * 1024
+
+
+class RequestBodyTooLarge(MultiPartException):
+    """multipart 解析前请求体已超过有界限制。"""
+
+
+class UploadBodyLimitMiddleware:
+    """在 Starlette multipart 解析和临时文件写入前限制上传请求体。"""
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    @staticmethod
+    def _body_limit(scope: Scope) -> int | None:
+        if scope.get("type") != "http" or str(scope.get("method", "")).upper() != "POST":
+            return None
+        path = str(scope.get("path", ""))
+        if path == "/api/files/upload":
+            return settings.MAX_FILE_SIZE * 5 + MULTIPART_OVERHEAD_BYTES
+        segments = path.strip("/").split("/")
+        if len(segments) == 4 and segments[:2] == ["api", "knowledge-bases"] and segments[3] == "documents":
+            return settings.KNOWLEDGE_MAX_FILE_SIZE + MULTIPART_OVERHEAD_BYTES
+        return None
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        limit = self._body_limit(scope)
+        if limit is None:
+            await self.app(scope, receive, send)
+            return
+        headers = {key.lower(): value for key, value in scope.get("headers", [])}
+        try:
+            content_length = int(headers.get(b"content-length", b"0"))
+        except ValueError:
+            content_length = 0
+        if content_length > limit:
+            await self._reject(scope, receive, send)
+            return
+
+        received = 0
+        response_started = False
+        body_too_large = False
+
+        async def limited_receive() -> Message:
+            nonlocal body_too_large, received
+            message = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body", b""))
+                if received > limit:
+                    body_too_large = True
+                    raise RequestBodyTooLarge("上传请求体超过文件大小上限")
+            return message
+
+        async def tracked_send(message: Message) -> None:
+            nonlocal response_started
+            # Starlette 会先关闭 multipart 临时文件，再把 MultiPartException
+            # 转为 400。超限标记由本中间件持有，因此丢弃该内部响应并统一返回 413。
+            if body_too_large:
+                return
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracked_send)
+        except RequestBodyTooLarge:
+            pass
+        if body_too_large and not response_started:
+            await self._reject(scope, receive, send)
+
+    @staticmethod
+    async def _reject(scope: Scope, receive: Receive, send: Send) -> None:
+        state = scope.get("state") or {}
+        request_id = state.get("request_id") if isinstance(state, dict) else getattr(state, "request_id", None)
+        request_id = request_id or generate_request_id()
+        response = JSONResponse(
+            status_code=413,
+            content={
+                "code": "FILE_TOO_LARGE",
+                "message": "上传请求体超过文件大小上限",
+                "data": None,
+                "request_id": request_id,
+            },
+            headers={"X-Request-ID": request_id},
+        )
+        await response(scope, receive, send)
 
 
 # 超时中间件
@@ -39,9 +146,29 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
         if route_timeouts:
             self.route_timeouts.update(route_timeouts)
 
-    def _resolve_timeout_seconds(self, request: Request) -> int:
+    def _resolve_timeout_seconds(self, request: Request) -> float:
         key = (request.method.upper(), request.scope.get("path", ""))
         path = key[1]
+        if key == ("POST", "/api/knowledge-bases/search"):
+            profile_batches = math.ceil(settings.KNOWLEDGE_SEARCH_MAX_PROFILES / KNOWLEDGE_SEARCH_PROFILE_CONCURRENCY)
+            max_index_versions = settings.KNOWLEDGE_MAX_DOCUMENTS_PER_BASE * KNOWLEDGE_SEARCH_MAX_BASES_PER_REQUEST
+            version_batches = math.ceil(max_index_versions / KNOWLEDGE_MILVUS_FILTER_TERM_BATCH_SIZE)
+            return (
+                profile_batches
+                * (
+                    settings.KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS
+                    + (version_batches + 2) * settings.MILVUS_TIMEOUT_SECONDS
+                )
+                + 5
+            )
+        path_segments = path.strip("/").split("/")
+        if (
+            key[0] == "POST"
+            and len(path_segments) == 4
+            and path_segments[:2] == ["api", "knowledge-bases"]
+            and path_segments[3] == "documents"
+        ):
+            return settings.FILE_UPLOAD_TIMEOUT_SECONDS
         if path.startswith("/api/admin/mcp/servers/") and path.endswith(("/test", "/tools/refresh")):
             return settings.MCP_ADMIN_OPERATION_TIMEOUT_SECONDS
         return self.route_timeouts.get(key, self.timeout_seconds)
@@ -81,6 +208,9 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # 对象存储 SDK 在线程中不可取消。先等待上传 lifecycle 完成真实 RPC、intent
+    # finalizer 和续租收敛，再关闭其余外部客户端；硬终止则由持久 cleanup 接管。
+    await shutdown_storage_upload_lifecycles()
     await stop_suggested_question_workers()
     await litellm_health.stop()
     await litellm_cleanup.close_async_clients()
@@ -125,6 +255,9 @@ app.add_middleware(SessionMiddleware, secret_key=settings.SECRET_KEY)
 
 # 添加超时中间件
 app.add_middleware(TimeoutMiddleware, timeout_seconds=10)
+
+# 在 multipart 解析/临时文件写入前拒绝超限请求
+app.add_middleware(UploadBodyLimitMiddleware)
 
 # 配置CORS
 app.add_middleware(
@@ -194,6 +327,22 @@ async def api_exception_handler(request: Request, exc: ApiException):
     )
 
 
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
+    first = exc.errors()[0] if exc.errors() else {}
+    location = ".".join(str(part) for part in first.get("loc", ()) if part != "body")
+    message = str(first.get("msg", "请求参数校验失败"))
+    return JSONResponse(
+        status_code=422,
+        content={
+            "code": "INVALID_PARAM",
+            "message": f"{location}: {message}" if location else message,
+            "data": None,
+            "request_id": getattr(request.state, "request_id", generate_request_id()),
+        },
+    )
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     code_map = {
@@ -246,6 +395,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 # 注册路由
 app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 app.include_router(files.router, prefix="/api/files", tags=["files"])
+app.include_router(knowledge_bases.router, prefix="/api/knowledge-bases", tags=["knowledge-bases"])
 app.include_router(models.router, prefix="/api/models", tags=["models"])
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(prompts.router, prefix="/api/prompts", tags=["prompts"])

@@ -4,7 +4,11 @@ import asyncio
 import io
 
 from app.core.logger import app_logger as logger
-from app.services.storage.base import StorageBackend
+from app.services.storage.base import (
+    DefinitiveStorageUploadError,
+    StorageBackend,
+    is_definitive_upload_rejection,
+)
 
 
 class OSSStorageBackend(StorageBackend):
@@ -49,12 +53,17 @@ class OSSStorageBackend(StorageBackend):
     async def upload(self, key: str, data: bytes, content_type: str) -> str:
         """上传文件到 OSS"""
         headers = {"Content-Type": content_type}
-        await asyncio.to_thread(
-            self._bucket.put_object,
-            key,
-            io.BytesIO(data),
-            headers=headers,
-        )
+        try:
+            await asyncio.to_thread(
+                self._bucket.put_object,
+                key,
+                io.BytesIO(data),
+                headers=headers,
+            )
+        except Exception as exc:
+            if is_definitive_upload_rejection(exc):
+                raise DefinitiveStorageUploadError("OSS 明确拒绝上传") from exc
+            raise
         logger.debug("OSS 上传成功: %s (%s bytes)", key, len(data))
         return key
 

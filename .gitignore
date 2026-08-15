@@ -12,6 +12,9 @@ logs
 __pycache__
 
 docs
+!docs/
+docs/*
+!docs/KNOWLEDGE_BASE.md
 
 .cursor
 

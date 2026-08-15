@@ -13,7 +13,7 @@ from app.db.models import User
 from app.db.repositories import UserRepository
 from app.schemas.files import DirectUploadCompleteRequest, DirectUploadInitRequest
 from app.schemas.response import ApiException, success
-from app.services.file_service import FileService
+from app.services.file_service import FileService, FileStorageUnavailableError
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -58,7 +58,10 @@ async def upload_files(
     file_service: FileService = Depends(get_file_service),
 ):
     """上传文件到指定对话"""
-    results = await file_service.upload_files(files, current_user.id, conversation_id, provider, model)
+    try:
+        results = await file_service.upload_files(files, current_user.id, conversation_id, provider, model)
+    except FileStorageUnavailableError as exc:
+        raise ApiException("FILE_STORAGE_UNAVAILABLE", str(exc), 503) from exc
     return success(data={"files": results}, message="上传成功", request_id=request.state.request_id)
 
 
@@ -100,6 +103,8 @@ async def complete_direct_upload(
         file = await file_service.complete_direct_upload(payload.file_id, current_user.id)
     except FileNotFoundError:
         raise ApiException.not_found("文件不存在或无权访问")
+    except FileStorageUnavailableError as exc:
+        raise ApiException("FILE_STORAGE_UNAVAILABLE", str(exc), 503) from exc
     except ValueError as e:
         raise ApiException.bad_request(str(e))
 
