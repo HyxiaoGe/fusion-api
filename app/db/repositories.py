@@ -5,12 +5,13 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.db.models import (
     AgentProgressSnapshot,
     AgentSession,
     ConversationFile,
+    ConversationKnowledgeBase,
     File,
     message_order_sequence,
 )
@@ -177,6 +178,7 @@ class ConversationRepository:
         try:
             db_conversation = (
                 self.db.query(ConversationModel)
+                .options(selectinload(ConversationModel.knowledge_base_selections))
                 .filter(ConversationModel.id == conversation_id, ConversationModel.user_id == user_id)
                 .first()
             )
@@ -189,11 +191,44 @@ class ConversationRepository:
             logger.error(f"获取对话失败: {e}")
             return None
 
+    def lock_owned_model(self, conversation_id: str, user_id: str) -> ConversationModel | None:
+        """锁定当前用户的会话行，供同事务内替换关联集合。"""
+
+        return (
+            self.db.query(ConversationModel)
+            .filter(ConversationModel.id == conversation_id, ConversationModel.user_id == user_id)
+            .with_for_update()
+            .first()
+        )
+
+    def replace_knowledge_base_selection(
+        self,
+        conversation: ConversationModel,
+        knowledge_base_ids: list[str],
+    ) -> None:
+        """在调用方事务内原子替换会话知识库选择。"""
+
+        self.db.query(ConversationKnowledgeBase).filter(
+            ConversationKnowledgeBase.conversation_id == conversation.id
+        ).delete(synchronize_session=False)
+        for position, knowledge_base_id in enumerate(knowledge_base_ids):
+            self.db.add(
+                ConversationKnowledgeBase(
+                    conversation_id=conversation.id,
+                    knowledge_base_id=knowledge_base_id,
+                    position=position,
+                )
+            )
+        conversation.updated_at = utc_now()
+        self.db.flush()
+        self.db.expire(conversation, ["knowledge_base_selections"])
+
     def get_all(self, user_id: str) -> List[Conversation]:
         """获取指定用户的所有对话"""
         try:
             db_conversations = (
                 self.db.query(ConversationModel)
+                .options(selectinload(ConversationModel.knowledge_base_selections))
                 .filter(ConversationModel.user_id == user_id)
                 .order_by(ConversationModel.updated_at.desc())
                 .all()
@@ -208,7 +243,11 @@ class ConversationRepository:
         """分页获取对话列表（不包含消息内容）"""
         try:
             offset = (page - 1) * page_size
-            query = self.db.query(ConversationModel).filter(ConversationModel.user_id == user_id)
+            query = (
+                self.db.query(ConversationModel)
+                .options(selectinload(ConversationModel.knowledge_base_selections))
+                .filter(ConversationModel.user_id == user_id)
+            )
             total = query.count()
 
             db_conversations = query.order_by(ConversationModel.updated_at.desc()).offset(offset).limit(page_size).all()
@@ -221,6 +260,7 @@ class ConversationRepository:
                     model_id=db_conv.model_id,
                     title=db_conv.title,
                     messages=[],
+                    knowledge_base_ids=self._knowledge_base_ids(db_conv),
                     created_at=db_conv.created_at,
                     updated_at=db_conv.updated_at,
                 )
@@ -242,6 +282,7 @@ class ConversationRepository:
         try:
             db_conversations = (
                 self.db.query(ConversationModel)
+                .options(selectinload(ConversationModel.knowledge_base_selections))
                 .filter(
                     ConversationModel.user_id == user_id,
                     ConversationModel.id.in_(conversation_ids),
@@ -255,6 +296,7 @@ class ConversationRepository:
                     model_id=db_conv.model_id,
                     title=db_conv.title,
                     messages=[],
+                    knowledge_base_ids=self._knowledge_base_ids(db_conv),
                     created_at=db_conv.created_at,
                     updated_at=db_conv.updated_at,
                 )
@@ -272,6 +314,7 @@ class ConversationRepository:
             pattern = f"%{query.strip()}%"
             db_conversations = (
                 self.db.query(ConversationModel)
+                .options(selectinload(ConversationModel.knowledge_base_selections))
                 .filter(
                     ConversationModel.user_id == user_id,
                     ConversationModel.title.ilike(pattern),
@@ -287,6 +330,7 @@ class ConversationRepository:
                     model_id=db_conv.model_id,
                     title=db_conv.title,
                     messages=[],
+                    knowledge_base_ids=self._knowledge_base_ids(db_conv),
                     created_at=db_conv.created_at,
                     updated_at=db_conv.updated_at,
                 )
@@ -424,9 +468,15 @@ class ConversationRepository:
             model_id=db_conversation.model_id,
             title=db_conversation.title,
             messages=messages,
+            knowledge_base_ids=self._knowledge_base_ids(db_conversation),
             created_at=db_conversation.created_at,
             updated_at=db_conversation.updated_at,
         )
+
+    @staticmethod
+    def _knowledge_base_ids(db_conversation: ConversationModel) -> list[str]:
+        selections = list(getattr(db_conversation, "knowledge_base_selections", []) or [])
+        return [row.knowledge_base_id for row in sorted(selections, key=lambda row: row.position)]
 
     def _latest_agent_runs_for_messages(
         self,

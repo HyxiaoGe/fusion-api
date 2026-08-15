@@ -212,14 +212,15 @@ def build_agent_loop_call_config(
 ) -> AgentLoopCallConfig:
     options = options or {}
     capabilities = capabilities or {}
+    knowledge_grounded = options.get("knowledge_grounded") is True
 
     use_reasoning = options.get("use_reasoning")
     supports_thinking = bool(capabilities.get("deepThinking", False))
     should_use_reasoning = use_reasoning is True or (use_reasoning is None and supports_thinking)
 
-    tools_disabled = options.get("disable_tools") is True
+    tools_disabled = options.get("disable_tools") is True or knowledge_grounded
     task_policy = resolve_agent_task_policy(options=options, capabilities=capabilities)
-    requested_plan_mode = task_policy.plan_mode
+    requested_plan_mode = "off" if knowledge_grounded else task_policy.plan_mode
     supports_function_calling = supports_search_tools(capabilities) and not tools_disabled
     supports_control_tools = bool(capabilities.get("functionCalling", False)) and not tools_disabled
     plan_mode: PlanMode = requested_plan_mode if supports_control_tools else "off"
@@ -292,7 +293,7 @@ def build_agent_loop_call_config(
         control_tool_names=control_tool_names,
         task_mode=task_policy.task_mode,
         network_profile=task_policy.network_profile,
-        evidence_policy=task_policy.evidence_policy,
+        evidence_policy="knowledge_grounded_v1" if knowledge_grounded else task_policy.evidence_policy,
         required_initial_tool_counts=dict(plan_tool_policy.required_initial_tool_counts),
         plan_tool_policy_reason=plan_tool_policy.reason,
     )
@@ -358,12 +359,15 @@ async def prepare_agent_loop_messages(
             inject_file_content_fn=inject_file_content_fn,
         )
 
-        messages, initial_content_blocks = await _prepare_url_context(
-            messages=messages,
-            original_message=original_message,
-            call_config=call_config,
-            preprocess_url_in_message_fn=preprocess_url_in_message_fn,
-        )
+        if call_config.evidence_policy == "knowledge_grounded_v1":
+            initial_content_blocks = []
+        else:
+            messages, initial_content_blocks = await _prepare_url_context(
+                messages=messages,
+                original_message=original_message,
+                call_config=call_config,
+                preprocess_url_in_message_fn=preprocess_url_in_message_fn,
+            )
     else:
         initial_content_blocks = []
         has_image_attachment = False

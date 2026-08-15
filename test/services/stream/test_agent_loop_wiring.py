@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 
 from app.services.stream.agent_loop_policy import AgentLoopLimits
@@ -123,45 +124,46 @@ class AgentLoopWiringTests(unittest.TestCase):
             preprocess_user_input=False,
         )
 
+        dependencies = AgentLoopWiringDependencies(
+            build_call_config_fn=build_call_config_fn,
+            build_execution_fn=build_execution_fn,
+            session_cache="session-cache",
+            redis_writer_factory=redis_writer_factory,
+            start_step_fn=_unused_async,
+            complete_step_fn=_unused_async,
+            run_round_fn=_unused_async,
+            handle_tool_calls_round_fn=_unused_async,
+            run_limit_summary_step_fn=_unused_async,
+            llm_call_fn=_unused_async,
+            stream_round_fn=_unused_async,
+            execute_tools_fn=_unused_async,
+            persist_message_fn=_unused_sync,
+            log_round_summary_fn=lambda **_kwargs: None,
+            clock=lambda: 100.0,
+            append_chunk_fn=append_chunk_fn,
+            start_agent_run_fn=start_agent_run_fn,
+            prepare_messages_fn=prepare_messages_fn,
+            run_agent_loop_fn=run_agent_loop_fn,
+            finalize_completed_run_fn=finalize_completed_run_fn,
+            finalize_superseded_run_fn=finalize_superseded_run_fn,
+            finalize_cancelled_run_fn=finalize_cancelled_run_fn,
+            finalize_failed_run_fn=finalize_failed_run_fn,
+            write_fallback_run_error_fn=write_fallback_run_error_fn,
+            complete_agent_run_fn=complete_agent_run_fn,
+            interrupt_agent_run_fn=interrupt_agent_run_fn,
+            fail_agent_run_fn=fail_agent_run_fn,
+            finalize_stream_fn=finalize_stream_fn,
+            write_fallback_error_status_fn=write_fallback_error_status_fn,
+            info_fn=info_fn,
+            error_fn=error_fn,
+            warning_fn=warning_fn,
+            load_dynamic_tools_fn=load_dynamic_tools_fn,
+        )
         lifecycle_call = build_agent_loop_lifecycle_call(
             run_input=run_input,
             db="db-wiring",
             limits=limits,
-            dependencies=AgentLoopWiringDependencies(
-                build_call_config_fn=build_call_config_fn,
-                build_execution_fn=build_execution_fn,
-                session_cache="session-cache",
-                redis_writer_factory=redis_writer_factory,
-                start_step_fn=_unused_async,
-                complete_step_fn=_unused_async,
-                run_round_fn=_unused_async,
-                handle_tool_calls_round_fn=_unused_async,
-                run_limit_summary_step_fn=_unused_async,
-                llm_call_fn=_unused_async,
-                stream_round_fn=_unused_async,
-                execute_tools_fn=_unused_async,
-                persist_message_fn=_unused_sync,
-                log_round_summary_fn=lambda **_kwargs: None,
-                clock=lambda: 100.0,
-                append_chunk_fn=append_chunk_fn,
-                start_agent_run_fn=start_agent_run_fn,
-                prepare_messages_fn=prepare_messages_fn,
-                run_agent_loop_fn=run_agent_loop_fn,
-                finalize_completed_run_fn=finalize_completed_run_fn,
-                finalize_superseded_run_fn=finalize_superseded_run_fn,
-                finalize_cancelled_run_fn=finalize_cancelled_run_fn,
-                finalize_failed_run_fn=finalize_failed_run_fn,
-                write_fallback_run_error_fn=write_fallback_run_error_fn,
-                complete_agent_run_fn=complete_agent_run_fn,
-                interrupt_agent_run_fn=interrupt_agent_run_fn,
-                fail_agent_run_fn=fail_agent_run_fn,
-                finalize_stream_fn=finalize_stream_fn,
-                write_fallback_error_status_fn=write_fallback_error_status_fn,
-                info_fn=info_fn,
-                error_fn=error_fn,
-                warning_fn=warning_fn,
-                load_dynamic_tools_fn=load_dynamic_tools_fn,
-            ),
+            dependencies=dependencies,
         )
 
         self.assertEqual(
@@ -228,6 +230,22 @@ class AgentLoopWiringTests(unittest.TestCase):
         self.assertIs(lifecycle_call.dependencies.info_fn, info_fn)
         self.assertIs(lifecycle_call.dependencies.error_fn, error_fn)
         self.assertIs(lifecycle_call.dependencies.warning_fn, warning_fn)
+
+        captured.pop("dynamic_tools_db")
+        strict_call = build_agent_loop_lifecycle_call(
+            run_input=replace(
+                run_input,
+                options={"knowledge_grounded": True},
+                capabilities={"functionCalling": True, "agentTools": True},
+                knowledge_base_ids=["kb-1"],
+            ),
+            db="db-wiring",
+            limits=limits,
+            dependencies=dependencies,
+        )
+        self.assertNotIn("dynamic_tools_db", captured)
+        self.assertEqual(captured["call_config_kwargs"]["additional_tools"], [])
+        self.assertEqual(strict_call.request.knowledge_base_ids, ["kb-1"])
 
     def test_run_input_and_dependencies_expose_builder_helpers(self):
         call_config = SimpleNamespace(

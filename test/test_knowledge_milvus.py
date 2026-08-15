@@ -115,6 +115,8 @@ class MilvusKnowledgeStoreTests(unittest.TestCase):
         )
         pymilvus = ModuleType("pymilvus")
         with (
+            patch("app.services.knowledge.milvus.settings.MILVUS_URI", "http://current-milvus:19530"),
+            patch("app.services.knowledge.milvus.settings.MILVUS_CONNECT_URI", "http://127.0.0.1:19530"),
             patch("app.services.knowledge.milvus.settings.MILVUS_USERNAME", "fusion_app"),
             patch("app.services.knowledge.milvus.settings.MILVUS_PASSWORD", "secret"),
             patch("app.services.knowledge.milvus.settings.MILVUS_TIMEOUT_SECONDS", 17),
@@ -128,6 +130,37 @@ class MilvusKnowledgeStoreTests(unittest.TestCase):
             user="fusion_app",
             password="secret",
             db_name="historical_knowledge",
+            timeout=17,
+        )
+
+    def test_runtime_connect_uri_routes_current_canonical_cluster(self):
+        profile = EmbeddingProfile(
+            "litellm",
+            "embed-v1",
+            1024,
+            "COSINE",
+            "knowledge_v1_d1024",
+            "r1",
+            "http://windows-milvus:19530",
+            "fusion_knowledge",
+        )
+        pymilvus = ModuleType("pymilvus")
+        with (
+            patch("app.services.knowledge.milvus.settings.MILVUS_URI", "http://windows-milvus:19530"),
+            patch("app.services.knowledge.milvus.settings.MILVUS_CONNECT_URI", "http://127.0.0.1:19530"),
+            patch("app.services.knowledge.milvus.settings.MILVUS_USERNAME", "fusion_app"),
+            patch("app.services.knowledge.milvus.settings.MILVUS_PASSWORD", "secret"),
+            patch("app.services.knowledge.milvus.settings.MILVUS_TIMEOUT_SECONDS", 17),
+            patch.dict(sys.modules, {"pymilvus": pymilvus}),
+            patch.object(pymilvus, "MilvusClient", create=True) as client,
+        ):
+            MilvusKnowledgeStore._build_client(profile)
+
+        client.assert_called_once_with(
+            uri="http://127.0.0.1:19530",
+            user="fusion_app",
+            password="secret",
+            db_name="fusion_knowledge",
             timeout=17,
         )
 

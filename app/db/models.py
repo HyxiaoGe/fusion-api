@@ -109,6 +109,12 @@ class Conversation(Base):
         order_by="(Message.sequence.asc().nullsfirst(), Message.created_at.asc(), Message.id.asc())",
     )
     files = relationship("ConversationFile", back_populates="conversation", cascade="all, delete-orphan")
+    knowledge_base_selections = relationship(
+        "ConversationKnowledgeBase",
+        back_populates="conversation",
+        cascade="all, delete-orphan",
+        order_by="ConversationKnowledgeBase.position",
+    )
 
     __table_args__ = (
         Index("ix_conversations_updated_id", "updated_at", "id"),
@@ -155,6 +161,34 @@ class ConversationFile(Base):
     file = relationship("File")
 
 
+class ConversationKnowledgeBase(Base):
+    """会话当前启用的知识库集合；position 保留用户选择顺序。"""
+
+    __tablename__ = "conversation_knowledge_bases"
+
+    conversation_id = Column(
+        String,
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    knowledge_base_id = Column(
+        String,
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    position = Column(Integer, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utc_now, server_default=func.now(), nullable=False)
+
+    conversation = relationship("Conversation", back_populates="knowledge_base_selections")
+    knowledge_base = relationship("KnowledgeBase", back_populates="conversation_selections")
+
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "position", name="uq_conversation_knowledge_bases_position"),
+        CheckConstraint("position >= 0 AND position < 5", name="ck_conversation_knowledge_bases_position"),
+        Index("ix_conversation_knowledge_bases_knowledge_base_id", "knowledge_base_id"),
+    )
+
+
 class KnowledgeBase(Base):
     """用户私有知识库；PostgreSQL 是生命周期和配置的事实来源。"""
 
@@ -185,6 +219,11 @@ class KnowledgeBase(Base):
     user = relationship("User", back_populates="knowledge_bases")
     documents = relationship("KnowledgeDocument", back_populates="knowledge_base", cascade="all, delete-orphan")
     tasks = relationship("KnowledgeIndexTask", back_populates="knowledge_base", cascade="all, delete-orphan")
+    conversation_selections = relationship(
+        "ConversationKnowledgeBase",
+        back_populates="knowledge_base",
+        cascade="all, delete-orphan",
+    )
 
     __table_args__ = (
         UniqueConstraint("user_id", "name_normalized", name="uq_knowledge_bases_user_name"),

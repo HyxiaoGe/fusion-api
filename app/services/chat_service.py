@@ -20,6 +20,7 @@ from app.schemas.chat import (
     ClientPartialContentBlock,
     Conversation,
     FileBlock,
+    KnowledgeEvidenceBlock,
     Message,
     TextBlock,
     Usage,
@@ -44,6 +45,13 @@ from app.services.chat.message_builder import (
 from app.services.chat.model_call_language_policy import finalize_model_call_language_policy
 from app.services.conversation_service import ConversationService
 from app.services.file_service import FileService, is_image_mime
+from app.services.knowledge.chat_grounding import (
+    KNOWLEDGE_UNVERIFIABLE_ANSWER_TEXT,
+    inject_knowledge_grounding_messages,
+    prepare_knowledge_grounding,
+    validate_grounded_answer,
+    validate_knowledge_query,
+)
 from app.services.storage import get_storage_for_backend
 from app.services.stream import StreamHandler, stream_redis_as_sse
 from app.services.stream.agent_loop_request_prep import (
@@ -248,11 +256,13 @@ class ChatService:
         stream: bool = True,
         options: Optional[Dict[str, Any]] = None,
         file_ids: Optional[List[str]] = None,
+        knowledge_base_ids: Optional[List[str]] = None,
         trace_id: Optional[str] = None,
     ) -> Union[StreamingResponse, ChatResponse]:
         """处理用户消息，路由到流式或非流式响应"""
-        if options is None:
-            options = {}
+        options = dict(options or {})
+        # strict grounding 只能由已验证的知识库选择开启，不能信任客户端内部开关。
+        options.pop("knowledge_grounded", None)
 
         existing_conversation = None
         if conversation_id:
@@ -271,7 +281,9 @@ class ChatService:
         if control is not None and getattr(control, "routable", True) is False:
             raise ApiException.service_unavailable("当前模型暂不可调用", code=ErrorCode.MODEL_UNAVAILABLE)
         existing_messages = getattr(existing_conversation, "messages", None)
-        is_upload_placeholder = existing_conversation is not None and isinstance(existing_messages, list) and not existing_messages
+        is_upload_placeholder = (
+            existing_conversation is not None and isinstance(existing_messages, list) and not existing_messages
+        )
         if (
             (existing_conversation is None or is_upload_placeholder)
             and control is not None
@@ -280,14 +292,42 @@ class ChatService:
             raise ApiException.service_unavailable("当前模型不可用于新会话", code=ErrorCode.MODEL_UNAVAILABLE)
         model_id = effective_model_id
 
+        effective_knowledge_base_ids = list(
+            knowledge_base_ids
+            if knowledge_base_ids is not None
+            else (getattr(existing_conversation, "knowledge_base_ids", None) or [])
+        )
+        if effective_knowledge_base_ids:
+            validate_knowledge_query(message)
         # 解析模型调用参数（薄代理 LiteLLM，不再走本地 DB）
         litellm_model, provider, litellm_kwargs = llm_manager.resolve_model(model_id)
 
         # 模型能力来自 LiteLLM metadata（vision / functionCalling 影响消息构造和工具开关）
         capabilities = _get_model_capabilities(model_id)
         has_vision = capabilities.get("vision", False)
-        task_policy = resolve_agent_task_policy(options=options, capabilities=capabilities)
+        requested_task_policy = resolve_agent_task_policy(
+            options=options,
+            capabilities=capabilities,
+            enforce_capabilities=False,
+        )
+        if effective_knowledge_base_ids and requested_task_policy.task_mode == "deep_research":
+            raise ApiException.bad_request("知识库问答不能与深度研究模式同时使用")
+        task_policy = (
+            resolve_agent_task_policy(options=options, capabilities=capabilities)
+            if requested_task_policy.task_mode == "deep_research"
+            else requested_task_policy
+        )
         options = task_policy.apply_to_options(options)
+        if effective_knowledge_base_ids and file_ids:
+            raise ApiException.bad_request("知识库问答暂不支持同时附加文件")
+        if effective_knowledge_base_ids:
+            options = {
+                **options,
+                "knowledge_grounded": True,
+                "disable_tools": True,
+                "plan_mode": "off",
+                "evidence_policy": "knowledge_grounded_v1",
+            }
         if task_policy.task_mode == "deep_research" and not stream:
             raise ApiException.bad_request("深度研究模式仅支持流式对话")
 
@@ -298,6 +338,31 @@ class ChatService:
             conversation, is_new_conversation = self._get_or_create_conversation(
                 conversation_id, user_id, model_id, message
             )
+
+        # 新建会话、选择替换与就绪校验必须先于消息序号预留和消息写入，并共享同一事务。
+        if is_new_conversation:
+            self.conversation_service.save_conversation(conversation)
+        if knowledge_base_ids is not None:
+            try:
+                self.conversation_service.replace_knowledge_base_selection(
+                    conversation_id=conversation.id,
+                    user_id=user_id,
+                    knowledge_base_ids=effective_knowledge_base_ids,
+                )
+            except Exception:
+                self.db.rollback()
+                raise
+            conversation.knowledge_base_ids = effective_knowledge_base_ids
+        elif effective_knowledge_base_ids:
+            try:
+                self.conversation_service.validate_knowledge_base_selection(
+                    conversation_id=conversation.id,
+                    user_id=user_id,
+                    knowledge_base_ids=effective_knowledge_base_ids,
+                )
+            except Exception:
+                self.db.rollback()
+                raise
 
         # 构造用户消息 content blocks
         validated_files = self._validate_message_files(file_ids or [], user_id, conversation.id)
@@ -315,9 +380,6 @@ class ChatService:
         )
         assistant_message_id = assistant_message_id or str(uuid_mod.uuid4())
 
-        # 持久化会话（包括前端传了 ID 但数据库不存在的情况）
-        if is_new_conversation:
-            self.conversation_service.save_conversation(conversation)
         self.conversation_service.create_message(user_message, conversation.id)
 
         if stream:
@@ -373,14 +435,15 @@ class ChatService:
                     litellm_kwargs=litellm_kwargs,
                     provider=provider,
                     raw_messages=conversation.messages,
-                    has_vision=has_vision,
-                    file_ids=file_ids,
+                    has_vision=has_vision and not effective_knowledge_base_ids,
+                    file_ids=None if effective_knowledge_base_ids else file_ids,
                     original_message=message,
                     assistant_message_id=assistant_message_id,
                     assistant_message_sequence=assistant_sequence,
                     task_id=task_id,
                     options=options,
                     capabilities=capabilities,
+                    knowledge_base_ids=effective_knowledge_base_ids,
                     trace_id=trace_id,
                 )
             )
@@ -409,13 +472,13 @@ class ChatService:
             user_system_prompt = user_record.system_prompt if user_record else None
             lm_messages = await build_llm_messages(
                 conversation.messages,
-                has_vision=has_vision,
+                has_vision=has_vision and not effective_knowledge_base_ids,
                 file_repo=self.file_repo,
                 user_system_prompt=user_system_prompt,
                 user_id=user_id,
                 conversation_id=conversation.id,
             )
-            if file_ids:
+            if file_ids and not effective_knowledge_base_ids:
                 image_ids = [fid for fid in file_ids if is_image_file(fid, self.file_repo)]
                 non_image_ids = [fid for fid in file_ids if fid not in image_ids]
                 if image_ids and not has_vision:
@@ -424,6 +487,25 @@ class ChatService:
                     file_contents = self.file_repo.get_parsed_file_content(non_image_ids)
                     if file_contents:
                         lm_messages = inject_file_content(lm_messages, message, file_contents)
+            initial_content_blocks: list[Any] = []
+            if effective_knowledge_base_ids:
+                grounding = await prepare_knowledge_grounding(
+                    db=self.db,
+                    user_id=user_id,
+                    query=message,
+                    knowledge_base_ids=effective_knowledge_base_ids,
+                )
+                initial_content_blocks.append(grounding.evidence_block)
+                if grounding.no_evidence:
+                    return self._persist_non_stream_grounding_answer(
+                        conversation_id=conversation.id,
+                        model_id=model_id,
+                        assistant_message_id=assistant_message_id,
+                        assistant_message_sequence=assistant_sequence,
+                        evidence_block=grounding.evidence_block,
+                        answer=grounding.deterministic_answer or "未在所选知识库中找到足够依据",
+                    )
+                lm_messages = inject_knowledge_grounding_messages(lm_messages, grounding)
             lm_messages = inject_no_tool_network_boundary(lm_messages, call_kwargs={})
             return await self._handle_non_stream(
                 litellm_model,
@@ -434,6 +516,7 @@ class ChatService:
                 options,
                 assistant_message_id,
                 assistant_sequence,
+                initial_content_blocks=initial_content_blocks,
             )
 
     async def continue_agent_run(
@@ -466,6 +549,11 @@ class ChatService:
             previous_run_id=previous_run_id,
             default_limits=_agent_loop_limits(),
         )
+        if any(
+            (block.get("type") if isinstance(block, dict) else getattr(block, "type", None)) == "knowledge_evidence"
+            for block in continuation.initial_content_blocks
+        ):
+            raise ApiException.bad_request("知识库回答暂不支持继续生成，请重新提问")
         stored_task_policy = getattr(continuation, "task_policy", None)
         continuation_options = (
             stored_task_policy.apply_to_options()
@@ -510,6 +598,7 @@ class ChatService:
                 task_id=task_id,
                 options=continuation_policy.apply_to_options(),
                 capabilities=capabilities,
+                knowledge_base_ids=[],
                 trace_id=trace_id,
                 initial_content_blocks=continuation.initial_content_blocks,
                 extra_system_prompts=[get_continuation_system_prompt()],
@@ -598,6 +687,7 @@ class ChatService:
         options: dict,
         assistant_message_id: str | None = None,
         assistant_message_sequence: int | None = None,
+        initial_content_blocks: list[Any] | None = None,
     ) -> ChatResponse:
         """处理非流式响应（LiteLLM Proxy 自己管 health / 重试）。"""
         controlled_call_kwargs = dict(litellm_kwargs)
@@ -625,6 +715,12 @@ class ChatService:
         )
 
         content_text = response.choices[0].message.content or ""
+        evidence_block = next(
+            (block for block in initial_content_blocks or [] if isinstance(block, KnowledgeEvidenceBlock)),
+            None,
+        )
+        if evidence_block is not None and not validate_grounded_answer(content_text, evidence_block):
+            content_text = KNOWLEDGE_UNVERIFIABLE_ANSWER_TEXT
         input_tokens = 0
         output_tokens = 0
         if response.usage:
@@ -642,7 +738,7 @@ class ChatService:
         assistant_message_kwargs: dict[str, Any] = {
             "sequence": assistant_message_sequence,
             "role": "assistant",
-            "content": [TextBlock(type="text", text=content_text)],
+            "content": [*(initial_content_blocks or []), TextBlock(type="text", text=content_text)],
             "model_id": model_id,
             "usage": usage_data,
         }
@@ -656,6 +752,30 @@ class ChatService:
             conversation_id=conversation_id,
             message=assistant_message,
         )
+
+    def _persist_non_stream_grounding_answer(
+        self,
+        *,
+        conversation_id: str,
+        model_id: str,
+        assistant_message_id: str,
+        assistant_message_sequence: int,
+        evidence_block: KnowledgeEvidenceBlock,
+        answer: str,
+    ) -> ChatResponse:
+        """无检索命中时仍按普通 assistant 消息完成，确保刷新可恢复。"""
+
+        assistant_message = Message(
+            id=assistant_message_id,
+            sequence=assistant_message_sequence,
+            role="assistant",
+            content=[evidence_block, TextBlock(type="text", text=answer)],
+            model_id=model_id,
+            usage=Usage(input_tokens=0, output_tokens=0),
+        )
+        self.conversation_service.create_message(assistant_message, conversation_id)
+        self.db.commit()
+        return ChatResponse(conversation_id=conversation_id, message=assistant_message)
 
     # 辅助功能（标题、推荐问题）固定使用的轻量快速模型，不跟随对话模型，
     # 避免对话用的是慢/贵的 thinking 模型时拖累这些"锦上添花"的小活。
@@ -829,6 +949,7 @@ class ChatService:
                 "id": conv.id,
                 "title": conv.title,
                 "model_id": conv.model_id,
+                "knowledge_base_ids": conv.knowledge_base_ids,
                 "created_at": conv.created_at,
                 "updated_at": conv.updated_at,
             }
@@ -844,6 +965,7 @@ class ChatService:
                 "id": conv.id,
                 "title": conv.title,
                 "model_id": conv.model_id,
+                "knowledge_base_ids": conv.knowledge_base_ids,
                 "created_at": conv.created_at,
                 "updated_at": conv.updated_at,
             }

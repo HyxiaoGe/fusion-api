@@ -6,7 +6,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.schemas.chat import ContextStatus, ProductResultBlock
+from app.schemas.chat import ContextStatus, KnowledgeEvidenceBlock, ProductResultBlock
 
 
 class AgentEventBase(BaseModel):
@@ -128,7 +128,7 @@ class AgentPlanItem(BaseModel):
 class AgentEvidenceItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str
-    kind: Literal["web", "file", "tool", "model"]
+    kind: Literal["web", "file", "tool", "model", "knowledge"]
     status: Literal["candidate", "selected", "read_success", "read_degraded", "read_failed", "used", "discarded"]
     title: str
     url: str | None = None
@@ -198,7 +198,7 @@ class ContentBlockUpserted(AgentEventBase):
 
     type: Literal["content_block_upserted"]
     protocol_version: Literal[2]
-    content_block: ProductResultBlock
+    content_block: ProductResultBlock | KnowledgeEvidenceBlock
 
 
 class ContentBlockDiscarded(AgentEventBase):

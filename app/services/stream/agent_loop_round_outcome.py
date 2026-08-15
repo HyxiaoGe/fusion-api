@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.schemas.chat import ThinkingBlock
+from app.schemas.chat import KnowledgeEvidenceBlock, ThinkingBlock
 from app.services.final_answer_evidence import build_used_final_answer_evidence
+from app.services.knowledge.chat_grounding import (
+    KNOWLEDGE_UNVERIFIABLE_ANSWER_TEXT,
+    validate_grounded_answer,
+)
 from app.services.mcp.amap_product_tools import AMAP_PRODUCT_TOOL_NAMES
 from app.services.mcp.flyai_travel_tools import FLYAI_TRAVEL_TOOL_NAMES
 from app.services.stream.agent_loop_outcome import AgentLoopExit, AgentLoopOutcome
@@ -388,6 +392,9 @@ async def _complete_text_round(request: AgentRoundOutcomeRequest) -> None:
 async def _commit_deferred_answer(
     request: AgentRoundOutcomeRequest,
 ) -> AgentRoundOutcomeRequest:
+    if request.runtime.evidence_policy == "knowledge_grounded_v1":
+        return await _commit_deferred_knowledge_answer(request)
+
     clarification = build_tool_repair_clarification(request.state.pending_tool_repairs)
     if clarification:
         grounded_answer = build_grounded_product_answer(request.state.content_blocks)
@@ -405,6 +412,29 @@ async def _commit_deferred_answer(
         return _with_replaced_answer(request, answer)
 
     return await _commit_deferred_product_answer(request)
+
+
+async def _commit_deferred_knowledge_answer(
+    request: AgentRoundOutcomeRequest,
+) -> AgentRoundOutcomeRequest:
+    """知识库回答只有通过显式引用校验后才写入用户可见流。"""
+
+    evidence_block = next(
+        (block for block in reversed(request.state.content_blocks) if isinstance(block, KnowledgeEvidenceBlock)),
+        None,
+    )
+    candidate = request.round_result.content_buf.strip()
+    if evidence_block is not None and validate_grounded_answer(candidate, evidence_block):
+        answer = candidate
+    else:
+        request.runtime.warning_fn(
+            "知识库回答缺少有效引用，使用确定性兜底: "
+            f"conv_id={request.runtime.conversation_id} run_id={request.runtime.run_id} "
+            f"step={request.step_number}"
+        )
+        answer = KNOWLEDGE_UNVERIFIABLE_ANSWER_TEXT
+    await _append_committed_answer(request, answer)
+    return _with_replaced_answer(request, answer)
 
 
 async def _commit_deferred_product_answer(

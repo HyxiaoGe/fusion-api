@@ -358,9 +358,10 @@ def assign_missing_source_reference_metadata(content_blocks: list[Any]) -> None:
         for ref in _value(block, "source_refs") or []:
             canonical_url = canonicalize_evidence_url(str(_value(ref, "url") or ""))
             citation_index = _value(ref, "citation_index")
+            if isinstance(citation_index, int) and not isinstance(citation_index, bool) and citation_index > 0:
+                max_index = max(max_index, citation_index)
             if canonical_url and isinstance(citation_index, int) and citation_index > 0:
                 registry.setdefault(canonical_url, citation_index)
-                max_index = max(max_index, citation_index)
 
     for block in content_blocks:
         for ref in _value(block, "source_refs") or []:

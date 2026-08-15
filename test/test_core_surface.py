@@ -201,6 +201,7 @@ class ChatCoreSurfaceTests(unittest.TestCase):
             stream=False,
             options={"temperature": 0.3},
             file_ids=["file-1"],
+            knowledge_base_ids=None,
             trace_id=ANY,
         )
 
@@ -234,6 +235,16 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         service.process_message.assert_awaited_once()
         self.assertIsNone(service.process_message.await_args.kwargs["user_message_id"])
         self.assertIsNone(service.process_message.await_args.kwargs["assistant_message_id"])
+
+    def test_chat_capabilities_advertise_strict_knowledge_protocol(self):
+        self._enable_authenticated_overrides()
+
+        response = self.client.get("/api/chat/capabilities")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["data"]["knowledge_grounding_v1"])
+        self.assertEqual(body["data"]["knowledge_grounding_max_bases"], 5)
 
     def test_get_conversations_uses_authenticated_user_id(self):
         self._enable_authenticated_overrides()

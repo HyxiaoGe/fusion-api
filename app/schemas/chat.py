@@ -130,6 +130,66 @@ class UrlBlock(BaseModel):
     reason: Optional[str] = None
 
 
+class KnowledgeSourceReference(BaseModel):
+    """知识库命中的持久化来源定位；不复制分块正文。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["knowledge"] = "knowledge"
+    evidence_id: str = Field(min_length=1, max_length=160)
+    citation_index: int = Field(ge=1)
+    knowledge_base_id: str = Field(min_length=1, max_length=160)
+    knowledge_base_name: str = Field(min_length=1, max_length=200)
+    document_id: str = Field(min_length=1, max_length=160)
+    index_version: str = Field(min_length=1, max_length=160)
+    chunk_id: str = Field(min_length=1, max_length=160)
+    ordinal: int = Field(ge=0)
+    filename: str = Field(min_length=1, max_length=255)
+    page: Optional[int] = Field(default=None, ge=1)
+    section: Optional[str] = Field(default=None, max_length=120)
+    char_start: int = Field(ge=0)
+    char_end: int = Field(ge=0)
+    status: Literal["success", "unavailable"] = "success"
+
+    @model_validator(mode="after")
+    def validate_offsets(self) -> "KnowledgeSourceReference":
+        if self.char_end < self.char_start:
+            raise ValueError("char_end 不能小于 char_start")
+        return self
+
+
+class KnowledgeEvidenceBlock(BaseModel):
+    """单轮知识库检索证据摘要，可刷新恢复且不永久保存原始分块正文。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["knowledge_evidence"]
+    id: str = Field(default_factory=lambda: f"blk_{uuid4().hex[:12]}", max_length=160)
+    schema_version: Literal[1] = 1
+    query: str = Field(min_length=1, max_length=4000)
+    status: Literal["success", "empty"]
+    source_count: int = Field(ge=0, le=8)
+    knowledge_base_ids: List[str] = Field(min_length=1, max_length=5)
+    source_refs: List[KnowledgeSourceReference] = Field(default_factory=list, max_length=8)
+
+    @model_validator(mode="after")
+    def validate_sources(self) -> "KnowledgeEvidenceBlock":
+        if len(set(self.knowledge_base_ids)) != len(self.knowledge_base_ids):
+            raise ValueError("knowledge_base_ids 不能重复")
+        if any("\x00" in value for value in self.knowledge_base_ids):
+            raise ValueError("knowledge_base_ids 不能包含 NUL 字符")
+        if self.source_count != len(self.source_refs):
+            raise ValueError("source_count 必须等于 source_refs 数量")
+        if self.status == "success" and not self.source_refs:
+            raise ValueError("success 状态必须包含来源")
+        if self.status == "empty" and self.source_refs:
+            raise ValueError("empty 状态不能包含来源")
+        citation_indexes = [item.citation_index for item in self.source_refs]
+        if len(citation_indexes) != len(set(citation_indexes)):
+            raise ValueError("citation_index 不能重复")
+        return self
+
+
 class UnsupportedContentBlock(BaseModel):
     """无法由当前版本解释的安全占位块，不携带原始 payload 或工具信息。"""
 
@@ -748,6 +808,7 @@ ContentBlock = Union[
     FileBlock,
     SearchBlock,
     UrlBlock,
+    KnowledgeEvidenceBlock,
     UnsupportedContentBlock,
     PlaceResultsBlock,
     RouteResultsBlock,
@@ -866,7 +927,8 @@ class Conversation(BaseModel):
     user_id: str
     model_id: str
     title: str
-    messages: List[Message] = []
+    messages: List[Message] = Field(default_factory=list)
+    knowledge_base_ids: List[str] = Field(default_factory=list, max_length=5)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -888,6 +950,19 @@ class ChatRequest(BaseModel):
     stream: bool = True  # 默认开启流式
     options: Optional[Dict[str, Any]] = None  # 扩展选项，如 use_reasoning
     file_ids: Optional[List[str]] = None  # 附带的文件 ID 列表
+    # None 保留已有会话选择（新会话视为空）；空数组清空；非空数组替换。
+    knowledge_base_ids: Optional[List[str]] = Field(default=None, max_length=5)
+
+    @field_validator("knowledge_base_ids")
+    @classmethod
+    def validate_knowledge_base_ids(cls, values: Optional[List[str]]) -> Optional[List[str]]:
+        if values is None:
+            return None
+        if any("\x00" in value for value in values):
+            raise ValueError("knowledge_base_ids 不能包含 NUL 字符")
+        if len(set(values)) != len(values):
+            raise ValueError("knowledge_base_ids 不能重复")
+        return values
 
     @field_validator("user_message_id", "assistant_message_id")
     @classmethod
@@ -1033,6 +1108,7 @@ class ConversationSummary(BaseModel):
     id: str
     model_id: str
     title: str
+    knowledge_base_ids: List[str] = Field(default_factory=list, max_length=5)
     created_at: datetime
     updated_at: datetime
 

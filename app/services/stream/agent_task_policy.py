@@ -10,7 +10,7 @@ from app.services.agent.plan_coordinator import PlanMode, normalize_plan_mode
 
 TaskMode = Literal["standard", "deep_research"]
 NetworkProfile = Literal["standard", "deep_research"]
-EvidencePolicy = Literal["standard", "deep_research_v1"]
+EvidencePolicy = Literal["standard", "deep_research_v1", "knowledge_grounded_v1"]
 
 DEEP_RESEARCH_NETWORK_PROFILE: NetworkProfile = "deep_research"
 DEEP_RESEARCH_EVIDENCE_POLICY: EvidencePolicy = "deep_research_v1"
