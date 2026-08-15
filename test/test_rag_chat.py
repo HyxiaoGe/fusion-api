@@ -23,6 +23,9 @@ from app.schemas.chat import (
     KnowledgeEvidenceBlock,
     KnowledgeSourceReference,
 )
+from app.schemas.chat import (
+    Conversation as ConversationSchema,
+)
 from app.schemas.content_block_registry import deserialize_content_blocks
 from app.schemas.knowledge import KnowledgeRetrievalHit, KnowledgeRetrievalResult
 from app.schemas.response import ApiException
@@ -70,7 +73,7 @@ class ConversationKnowledgeSelectionTests(unittest.TestCase):
     def setUp(self):
         self.engine = create_engine("sqlite:///:memory:")
         Base.metadata.create_all(self.engine)
-        self.db = sessionmaker(bind=self.engine, expire_on_commit=False)()
+        self.db = sessionmaker(bind=self.engine, expire_on_commit=False, autoflush=False)()
         self.db.add_all(
             [
                 User(id="user-1", username="user-one"),
@@ -187,6 +190,27 @@ class ConversationKnowledgeSelectionTests(unittest.TestCase):
         )
         self.db.commit()
         self.assertEqual(self.service.get_conversation("conv-1", "user-1").knowledge_base_ids, [])
+
+    def test_new_conversation_is_flushed_before_replacing_knowledge_selection(self):
+        conversation = ConversationSchema(
+            id="conv-new",
+            user_id="user-1",
+            title="新知识问答",
+            model_id="deepseek-chat",
+            messages=[],
+        )
+
+        self.service.save_conversation(conversation)
+        self.service.replace_knowledge_base_selection(
+            conversation_id=conversation.id,
+            user_id="user-1",
+            knowledge_base_ids=["kb-ready"],
+        )
+        self.db.commit()
+
+        restored = self.service.get_conversation(conversation.id, "user-1")
+        self.assertIsNotNone(restored)
+        self.assertEqual(restored.knowledge_base_ids, ["kb-ready"])
 
     def test_metadata_projects_selection_with_one_batched_relation_query(self):
         self.service.replace_knowledge_base_selection(
