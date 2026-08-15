@@ -219,6 +219,186 @@ class KnowledgeRepositoryTests(unittest.TestCase):
         self.assertEqual(len(statements), 1)
         self.assertEqual(repo.get_ready_documents("user-2", ["kb-1"]), [])
 
+    def test_active_chunk_page_is_ordered_paginated_and_fully_scoped(self):
+        repo = KnowledgeRepository(self.db)
+        repo.create_knowledge_base(self._base())
+        self.db.add(self._base(base_id="kb-other", normalized="other"))
+        document, active_version, task = self._document_bundle()
+        repo.create_document_with_task(document, active_version, task)
+        document.status = "ready"
+        document.active_index_version = active_version.id
+        active_version.status = "active"
+        active_version.chunk_count = 3
+        for chunk in self._chunks(3, prefix="active"):
+            self.db.add(
+                KnowledgeChunkManifest(
+                    chunk_id=chunk.chunk_id,
+                    knowledge_base_id=document.knowledge_base_id,
+                    document_id=document.id,
+                    user_id=document.user_id,
+                    index_version=active_version.id,
+                    ordinal=chunk.ordinal,
+                    text=chunk.text,
+                    text_sha256=hashlib.sha256(chunk.text.encode()).hexdigest(),
+                    filename=document.original_filename,
+                    char_start=chunk.char_start,
+                    char_end=chunk.char_end,
+                    page=chunk.page,
+                    section=chunk.section,
+                )
+            )
+        self.db.add_all(
+            [
+                KnowledgeChunkManifest(
+                    chunk_id="f" * 64,
+                    knowledge_base_id=document.knowledge_base_id,
+                    document_id=document.id,
+                    user_id="user-2",
+                    index_version=active_version.id,
+                    ordinal=98,
+                    text="其他用户正文",
+                    text_sha256="f" * 64,
+                    filename=document.original_filename,
+                    char_start=0,
+                    char_end=6,
+                ),
+                KnowledgeChunkManifest(
+                    chunk_id="e" * 64,
+                    knowledge_base_id="kb-other",
+                    document_id=document.id,
+                    user_id=document.user_id,
+                    index_version=active_version.id,
+                    ordinal=99,
+                    text="其他知识库正文",
+                    text_sha256="e" * 64,
+                    filename=document.original_filename,
+                    char_start=0,
+                    char_end=7,
+                ),
+            ]
+        )
+        building_version = KnowledgeIndexVersion(
+            id="version-building",
+            knowledge_base_id=document.knowledge_base_id,
+            document_id=document.id,
+            user_id=document.user_id,
+            status="building",
+            parser_version="parser-v1",
+            chunker_version="chunker-v2",
+            chunk_size=1600,
+            chunk_overlap=200,
+            embedding_provider="litellm",
+            embedding_model="embed-v1",
+            embedding_revision="embed-r1",
+            embedding_dimension=2,
+            distance_metric="COSINE",
+            collection_name="knowledge_v1_d2",
+        )
+        self.db.add(building_version)
+        self.db.flush()
+        self.db.add(
+            KnowledgeChunkManifest(
+                chunk_id="d" * 64,
+                knowledge_base_id=document.knowledge_base_id,
+                document_id=document.id,
+                user_id=document.user_id,
+                index_version=building_version.id,
+                ordinal=0,
+                text="尚未激活的正文",
+                text_sha256="d" * 64,
+                filename=document.original_filename,
+                char_start=0,
+                char_end=7,
+            )
+        )
+        self.db.commit()
+
+        statements = []
+
+        def capture_select(_connection, _cursor, statement, _parameters, _context, _executemany):
+            if statement.lstrip().upper().startswith("SELECT"):
+                statements.append(statement)
+
+        event.listen(self.engine, "before_cursor_execute", capture_select)
+        try:
+            first = repo.list_active_document_chunks(
+                user_id="user-1",
+                knowledge_base_id="kb-1",
+                document_id="doc-1",
+                page=1,
+                page_size=2,
+            )
+        finally:
+            event.remove(self.engine, "before_cursor_execute", capture_select)
+        second = repo.list_active_document_chunks(
+            user_id="user-1",
+            knowledge_base_id="kb-1",
+            document_id="doc-1",
+            page=2,
+            page_size=2,
+        )
+        out_of_range = repo.list_active_document_chunks(
+            user_id="user-1",
+            knowledge_base_id="kb-1",
+            document_id="doc-1",
+            page=3,
+            page_size=2,
+        )
+
+        self.assertIsNotNone(first)
+        self.assertEqual(len(statements), 1)
+        self.assertIn("OVER", statements[0].upper())
+        self.assertEqual(first.active_version.id, active_version.id)
+        self.assertEqual(first.total, 3)
+        self.assertEqual([chunk.ordinal for chunk in first.chunks], [0, 1])
+        self.assertEqual([chunk.ordinal for chunk in second.chunks], [2])
+        self.assertEqual(out_of_range.active_version.id, active_version.id)
+        self.assertEqual(out_of_range.total, 3)
+        self.assertEqual(out_of_range.chunks, [])
+        self.assertIsNone(
+            repo.list_active_document_chunks(
+                user_id="user-2",
+                knowledge_base_id="kb-1",
+                document_id="doc-1",
+                page=1,
+                page_size=20,
+            )
+        )
+
+    def test_active_chunk_page_returns_metadata_for_empty_page_and_rejects_non_ready_state(self):
+        repo = KnowledgeRepository(self.db)
+        repo.create_knowledge_base(self._base())
+        document, version, task = self._document_bundle()
+        repo.create_document_with_task(document, version, task)
+        document.status = "ready"
+        document.active_index_version = version.id
+        version.status = "active"
+        self.db.commit()
+
+        empty = repo.list_active_document_chunks(
+            user_id="user-1",
+            knowledge_base_id="kb-1",
+            document_id="doc-1",
+            page=3,
+            page_size=20,
+        )
+        self.assertIsNotNone(empty)
+        self.assertEqual(empty.active_version.id, version.id)
+        self.assertEqual(empty.total, 0)
+        self.assertEqual(empty.chunks, [])
+
+        version.status = "superseded"
+        self.db.commit()
+        self.assertIsNone(
+            repo.list_active_document_chunks(
+                user_id="user-1",
+                knowledge_base_id="kb-1",
+                document_id="doc-1",
+                page=1,
+                page_size=20,
+            )
+        )
+
     def test_replace_chunk_manifest_uses_bounded_core_batches(self):
         repo = KnowledgeRepository(self.db)
         repo.create_knowledge_base(self._base())

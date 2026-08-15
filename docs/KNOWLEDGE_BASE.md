@@ -23,6 +23,7 @@ heartbeat、过期回收和终态 fencing 防止旧 Worker 写入新状态。Red
 - `GET/PATCH/DELETE /{knowledge_base_id}`：详情、更新、异步删除。
 - `POST/GET /{knowledge_base_id}/documents`：上传、分页列出文档。
 - `GET/DELETE /{knowledge_base_id}/documents/{document_id}`：详情、异步删除。
+- `GET /{knowledge_base_id}/documents/{document_id}/chunks`：分页预览当前 ready 文档的 active 分块。
 - `POST /{knowledge_base_id}/documents/{document_id}/retry`：仅重试终态失败文档。
 - `POST /{knowledge_base_id}/documents/{document_id}/rebuild`：用当前不可变 Embedding revision 重建。
 - `GET /tasks/{task_id}`：本人异步任务状态与稳定错误码。
@@ -33,6 +34,11 @@ heartbeat、过期回收和终态 fencing 防止旧 Worker 写入新状态。Red
 和非本人资源统一返回 404。搜索会在返回前用 PostgreSQL 重新验证 owner、知识库、文档 ready 状态、
 当前激活版本和 chunk manifest，最终正文与来源也以 PostgreSQL 为准；任一指定知识库不可用时整体失败，
 不返回部分结果。
+
+分块预览只读取 PostgreSQL 中当前 `active_index_version` 对应的 manifest，不接受客户端指定历史版本，
+也不会访问 Milvus。非本人或跨知识库文档统一返回 404；知识库、文档或索引版本不再处于
+active/ready 状态时返回 409 `KNOWLEDGE_DOCUMENT_NOT_READY`。重建期间继续展示旧 active 版本，
+新 building 版本只有原子激活后才可见。分页参数 `page` 默认 1，`page_size` 默认 20 且范围为 1 至 50。
 
 上传请求在 Starlette 解析 multipart 和创建临时文件前先检查总请求体上限；没有 `Content-Length` 的
 分块请求也会按流量累计并在越界时返回 413 `FILE_TOO_LARGE`。文件内容仍由服务层按精确文件上限复核，

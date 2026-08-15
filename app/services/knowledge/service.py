@@ -21,7 +21,13 @@ from app.db.knowledge_repository import (
     KnowledgeBaseWriteConflict,
     KnowledgeRepository,
 )
-from app.db.models import KnowledgeBase, KnowledgeDocument, KnowledgeIndexTask, KnowledgeIndexVersion
+from app.db.models import (
+    KnowledgeBase,
+    KnowledgeChunkManifest,
+    KnowledgeDocument,
+    KnowledgeIndexTask,
+    KnowledgeIndexVersion,
+)
 from app.db.storage_cleanup_repository import (
     StorageCleanupBusy,
     StorageCleanupRepository,
@@ -33,6 +39,8 @@ from app.schemas.knowledge import (
     KnowledgeBasePage,
     KnowledgeBaseUpdate,
     KnowledgeBaseView,
+    KnowledgeChunkPage,
+    KnowledgeChunkView,
     KnowledgeDocumentPage,
     KnowledgeDocumentUploadResult,
     KnowledgeDocumentView,
@@ -404,6 +412,47 @@ class KnowledgeService:
         self._require_enabled()
         self._require_base(user_id, knowledge_base_id)
         return self._document_view(self._require_document(user_id, knowledge_base_id, document_id))
+
+    def list_document_chunks(
+        self,
+        user_id: str,
+        knowledge_base_id: str,
+        document_id: str,
+        *,
+        page: int,
+        page_size: int,
+    ) -> KnowledgeChunkPage:
+        self._require_enabled()
+        self._require_base(user_id, knowledge_base_id)
+        document = self._require_document(user_id, knowledge_base_id, document_id)
+        result = self.repo.list_active_document_chunks(
+            user_id=user_id,
+            knowledge_base_id=knowledge_base_id,
+            document_id=document_id,
+            page=page,
+            page_size=page_size,
+        )
+        if result is None:
+            raise ApiException(
+                ErrorCode.KNOWLEDGE_DOCUMENT_NOT_READY,
+                "文档尚无可预览的生效分块",
+                409,
+            )
+        total_pages = (result.total + page_size - 1) // page_size if result.total else 0
+        return KnowledgeChunkPage(
+            document_id=document.id,
+            active_index_version=result.active_version.id,
+            chunker_version=result.active_version.chunker_version,
+            chunk_size=result.active_version.chunk_size,
+            chunk_overlap=result.active_version.chunk_overlap,
+            items=[self._chunk_view(chunk) for chunk in result.chunks],
+            page=page,
+            page_size=page_size,
+            total=result.total,
+            total_pages=total_pages,
+            has_next=page < total_pages,
+            has_prev=page > 1,
+        )
 
     def delete_document(self, user_id: str, knowledge_base_id: str, document_id: str) -> KnowledgeTaskView:
         self._require_enabled()
@@ -817,6 +866,18 @@ class KnowledgeService:
             created_at=row.created_at,
             updated_at=row.updated_at,
             deleted_at=row.deleted_at,
+        )
+
+    @staticmethod
+    def _chunk_view(row: KnowledgeChunkManifest) -> KnowledgeChunkView:
+        return KnowledgeChunkView(
+            chunk_id=row.chunk_id,
+            ordinal=row.ordinal,
+            text=row.text,
+            char_start=row.char_start,
+            char_end=row.char_end,
+            page=row.page,
+            section=row.section,
         )
 
     @staticmethod

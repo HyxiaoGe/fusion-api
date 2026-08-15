@@ -64,6 +64,33 @@ class FakeKnowledgeService:
     def get_document(self, user_id, knowledge_base_id, document_id):
         return self._document(knowledge_base_id, document_id)
 
+    def list_document_chunks(self, user_id, knowledge_base_id, document_id, page, page_size):
+        self.calls.append(("list_chunks", user_id, knowledge_base_id, document_id, page, page_size))
+        return {
+            "document_id": document_id,
+            "active_index_version": "version-1",
+            "chunker_version": "chunker-v2",
+            "chunk_size": 1200,
+            "chunk_overlap": 200,
+            "items": [
+                {
+                    "chunk_id": "chunk-1",
+                    "ordinal": 0,
+                    "text": "正文",
+                    "char_start": 0,
+                    "char_end": 2,
+                    "page": None,
+                    "section": None,
+                }
+            ],
+            "page": page,
+            "page_size": page_size,
+            "total": 1,
+            "total_pages": 1,
+            "has_next": False,
+            "has_prev": page > 1,
+        }
+
     def delete_document(self, user_id, knowledge_base_id, document_id):
         return self._task("task-delete-document", "delete_document")
 
@@ -179,6 +206,18 @@ class KnowledgeBasesApiTests(unittest.TestCase):
         self.assertEqual(uploaded.status_code, 202)
         self.assertIn(("upload", "user-1", "kb-1", "manual.TXT"), self.service.calls)
 
+    def test_document_chunks_contract_and_pagination_validation(self):
+        response = self.client.get("/api/knowledge-bases/kb-1/documents/doc-1/chunks?page=1&page_size=20")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"]["active_index_version"], "version-1")
+        self.assertEqual(response.json()["data"]["items"][0]["text"], "正文")
+        self.assertIn(("list_chunks", "user-1", "kb-1", "doc-1", 1, 20), self.service.calls)
+
+        invalid = self.client.get("/api/knowledge-bases/kb-1/documents/doc-1/chunks?page=1&page_size=51")
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(invalid.json()["code"], "INVALID_PARAM")
+
     def test_search_route_is_not_shadowed_by_dynamic_detail_route(self):
         response = self.client.post(
             "/api/knowledge-bases/search",
@@ -197,6 +236,7 @@ class KnowledgeBasesApiTests(unittest.TestCase):
             "/api/knowledge-bases/{knowledge_base_id}",
             "/api/knowledge-bases/{knowledge_base_id}/documents",
             "/api/knowledge-bases/{knowledge_base_id}/documents/{document_id}",
+            "/api/knowledge-bases/{knowledge_base_id}/documents/{document_id}/chunks",
             "/api/knowledge-bases/{knowledge_base_id}/documents/{document_id}/retry",
             "/api/knowledge-bases/{knowledge_base_id}/documents/{document_id}/rebuild",
             "/api/knowledge-bases/tasks/{task_id}",

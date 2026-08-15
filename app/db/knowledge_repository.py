@@ -39,6 +39,13 @@ class ReadyKnowledgeDocument:
 
 
 @dataclass(frozen=True)
+class ActiveKnowledgeChunkPage:
+    chunks: list[KnowledgeChunkManifest]
+    active_version: KnowledgeIndexVersion
+    total: int
+
+
+@dataclass(frozen=True)
 class KnowledgeCleanupVectorProfile:
     cursor: str
     embedding_provider: str
@@ -433,6 +440,146 @@ class KnowledgeRepository:
                 KnowledgeBase.status == "active",
             )
             .all()
+        )
+
+    def list_active_document_chunks(
+        self,
+        *,
+        user_id: str,
+        knowledge_base_id: str,
+        document_id: str,
+        page: int,
+        page_size: int,
+    ) -> ActiveKnowledgeChunkPage | None:
+        rows = (
+            self._active_document_chunks_query(
+                user_id=user_id,
+                knowledge_base_id=knowledge_base_id,
+                document_id=document_id,
+            )
+            .add_columns(func.count(KnowledgeChunkManifest.chunk_id).over().label("total"))
+            .order_by(KnowledgeChunkManifest.ordinal.asc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
+        )
+        if rows:
+            return ActiveKnowledgeChunkPage(
+                chunks=[row[0] for row in rows],
+                active_version=rows[0][1],
+                total=int(rows[0][2]),
+            )
+        summary = self._active_document_chunk_summary(
+            user_id=user_id,
+            knowledge_base_id=knowledge_base_id,
+            document_id=document_id,
+        )
+        if summary is None:
+            return None
+        active_version, total = summary
+        return ActiveKnowledgeChunkPage(chunks=[], active_version=active_version, total=int(total))
+
+    def _active_document_chunks_query(
+        self,
+        *,
+        user_id: str,
+        knowledge_base_id: str,
+        document_id: str,
+    ):
+        return (
+            self.db.query(KnowledgeChunkManifest, KnowledgeIndexVersion)
+            .select_from(KnowledgeChunkManifest)
+            .join(
+                KnowledgeDocument,
+                and_(
+                    KnowledgeDocument.id == KnowledgeChunkManifest.document_id,
+                    KnowledgeDocument.knowledge_base_id == KnowledgeChunkManifest.knowledge_base_id,
+                    KnowledgeDocument.user_id == KnowledgeChunkManifest.user_id,
+                    KnowledgeDocument.active_index_version == KnowledgeChunkManifest.index_version,
+                ),
+            )
+            .join(
+                KnowledgeBase,
+                and_(
+                    KnowledgeBase.id == KnowledgeDocument.knowledge_base_id,
+                    KnowledgeBase.user_id == KnowledgeDocument.user_id,
+                ),
+            )
+            .join(
+                KnowledgeIndexVersion,
+                and_(
+                    KnowledgeIndexVersion.id == KnowledgeChunkManifest.index_version,
+                    KnowledgeIndexVersion.document_id == KnowledgeDocument.id,
+                    KnowledgeIndexVersion.knowledge_base_id == KnowledgeDocument.knowledge_base_id,
+                    KnowledgeIndexVersion.user_id == KnowledgeDocument.user_id,
+                ),
+            )
+            .filter(
+                KnowledgeBase.id == knowledge_base_id,
+                KnowledgeBase.user_id == user_id,
+                KnowledgeBase.status == "active",
+                KnowledgeDocument.id == document_id,
+                KnowledgeDocument.knowledge_base_id == knowledge_base_id,
+                KnowledgeDocument.user_id == user_id,
+                KnowledgeDocument.status == "ready",
+                KnowledgeIndexVersion.user_id == user_id,
+                KnowledgeIndexVersion.status == "active",
+                KnowledgeIndexVersion.deleted_at.is_(None),
+                KnowledgeChunkManifest.knowledge_base_id == knowledge_base_id,
+                KnowledgeChunkManifest.document_id == document_id,
+                KnowledgeChunkManifest.user_id == user_id,
+            )
+        )
+
+    def _active_document_chunk_summary(
+        self,
+        *,
+        user_id: str,
+        knowledge_base_id: str,
+        document_id: str,
+    ):
+        return (
+            self.db.query(KnowledgeIndexVersion, func.count(KnowledgeChunkManifest.chunk_id))
+            .select_from(KnowledgeIndexVersion)
+            .join(
+                KnowledgeDocument,
+                and_(
+                    KnowledgeDocument.active_index_version == KnowledgeIndexVersion.id,
+                    KnowledgeDocument.id == KnowledgeIndexVersion.document_id,
+                    KnowledgeDocument.knowledge_base_id == KnowledgeIndexVersion.knowledge_base_id,
+                    KnowledgeDocument.user_id == KnowledgeIndexVersion.user_id,
+                ),
+            )
+            .join(
+                KnowledgeBase,
+                and_(
+                    KnowledgeBase.id == KnowledgeDocument.knowledge_base_id,
+                    KnowledgeBase.user_id == KnowledgeDocument.user_id,
+                ),
+            )
+            .outerjoin(
+                KnowledgeChunkManifest,
+                and_(
+                    KnowledgeChunkManifest.index_version == KnowledgeIndexVersion.id,
+                    KnowledgeChunkManifest.document_id == KnowledgeDocument.id,
+                    KnowledgeChunkManifest.knowledge_base_id == KnowledgeBase.id,
+                    KnowledgeChunkManifest.user_id == user_id,
+                ),
+            )
+            .filter(
+                KnowledgeBase.id == knowledge_base_id,
+                KnowledgeBase.user_id == user_id,
+                KnowledgeBase.status == "active",
+                KnowledgeDocument.id == document_id,
+                KnowledgeDocument.knowledge_base_id == knowledge_base_id,
+                KnowledgeDocument.user_id == user_id,
+                KnowledgeDocument.status == "ready",
+                KnowledgeIndexVersion.user_id == user_id,
+                KnowledgeIndexVersion.status == "active",
+                KnowledgeIndexVersion.deleted_at.is_(None),
+            )
+            .group_by(KnowledgeIndexVersion)
+            .first()
         )
 
     def replace_chunk_manifest(
