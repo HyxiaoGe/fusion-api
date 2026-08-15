@@ -119,6 +119,9 @@ class ConversationRepository:
                 db_conversation.messages.append(db_message)
 
             self.db.add(db_conversation)
+            # 生产 Session 关闭了 autoflush；后续知识库选择会在同一事务内
+            # 通过 SELECT ... FOR UPDATE 锁定新会话，因此必须先物化该行。
+            self.db.flush()
             return self._convert_to_schema(db_conversation)
         except Exception as e:
             self.db.rollback()
