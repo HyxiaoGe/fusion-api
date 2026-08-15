@@ -1024,7 +1024,7 @@ jobs:
           docker network inspect "${MILVUS_DOCKER_NETWORK}" >/dev/null 2>&1 \
             || docker network create "${MILVUS_DOCKER_NETWORK}" >/dev/null
           mkdir -p ./fusion-api/storage/files
-          mkdir -p ./fusion-api/logs/knowledge-worker
+          mkdir -p ./knowledge-worker-logs
           if docker container inspect fusion-api >/dev/null 2>&1; then
             if docker inspect fusion-api --format '{{range .Mounts}}{{println .Destination}}{{end}}' | grep -qx '/app/storage/files'; then
               echo "file storage already mounted; skip container file migration"
@@ -1190,7 +1190,7 @@ jobs:
               command: ["python", "-m", "scripts.run_knowledge_worker"]
               restart: always
               volumes:
-                - ./fusion-api/logs/knowledge-worker:/app/logs
+                - ./knowledge-worker-logs:/app/logs
                 - ./fusion-api/storage/files:/app/storage/files
               environment:
                 - DATABASE_URL=${DATABASE_URL}
