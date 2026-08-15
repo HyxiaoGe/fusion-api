@@ -9,6 +9,7 @@ from app.schemas.knowledge import (
     KnowledgeBaseEnvelope,
     KnowledgeBasePage,
     KnowledgeBaseUpdate,
+    KnowledgeChunkPage,
     KnowledgeDocumentEnvelope,
     KnowledgeDocumentPage,
     KnowledgeDocumentUploadResult,
@@ -164,6 +165,30 @@ def get_knowledge_document(
 ):
     row = service.get_document(current_user.id, knowledge_base_id, document_id)
     return success(data={"document": row}, request_id=request.state.request_id)
+
+
+@router.get(
+    "/{knowledge_base_id}/documents/{document_id}/chunks",
+    response_model=ApiResponse[KnowledgeChunkPage],
+    responses=ERROR_RESPONSES,
+)
+def list_knowledge_document_chunks(
+    knowledge_base_id: KnowledgeResourceId,
+    document_id: KnowledgeResourceId,
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=50),
+    current_user: User = Depends(get_current_user),
+    service: KnowledgeService = Depends(get_knowledge_service),
+):
+    result = service.list_document_chunks(
+        current_user.id,
+        knowledge_base_id,
+        document_id,
+        page=page,
+        page_size=page_size,
+    )
+    return success(data=result, request_id=request.state.request_id)
 
 
 @router.delete(

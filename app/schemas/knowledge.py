@@ -150,6 +150,31 @@ class KnowledgeDocumentPage(BaseModel):
     has_prev: bool
 
 
+class KnowledgeChunkView(BaseModel):
+    chunk_id: str
+    ordinal: int
+    text: str
+    char_start: int
+    char_end: int
+    page: int | None
+    section: str | None
+
+
+class KnowledgeChunkPage(BaseModel):
+    document_id: str
+    active_index_version: str
+    chunker_version: str
+    chunk_size: int
+    chunk_overlap: int
+    items: list[KnowledgeChunkView]
+    page: int
+    page_size: int
+    total: int
+    total_pages: int
+    has_next: bool
+    has_prev: bool
+
+
 class KnowledgeTaskView(BaseModel):
     id: str
     task_type: str

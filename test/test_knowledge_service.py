@@ -473,6 +473,95 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 404)
         self.vector_store.search.assert_not_awaited()
 
+    async def test_document_chunk_preview_uses_only_ready_active_version(self):
+        knowledge_base, document = await self._create_ready_document(
+            base_name="分块预览手册",
+            content=b"active version",
+            embedding_model="embed-a",
+        )
+        self._add_chunk(document, chunk_id="active-1", ordinal=1, text="第二段")
+        self._add_chunk(document, chunk_id="active-0", ordinal=0, text="第一段")
+        self.db.commit()
+        active_version_id = document.active_index_version
+
+        self.service.rebuild_document("user-1", knowledge_base.id, document.id)
+        building_version = self.service.repo.get_index_version(document.desired_index_version)
+        self.db.add(
+            KnowledgeChunkManifest(
+                chunk_id="building-0",
+                knowledge_base_id=document.knowledge_base_id,
+                document_id=document.id,
+                user_id=document.user_id,
+                index_version=building_version.id,
+                ordinal=0,
+                text="构建中正文不得返回",
+                text_sha256=hashlib.sha256("构建中正文不得返回".encode()).hexdigest(),
+                filename=document.original_filename,
+                char_start=0,
+                char_end=9,
+                page=None,
+                section=None,
+            )
+        )
+        self.db.commit()
+
+        result = self.service.list_document_chunks(
+            "user-1",
+            knowledge_base.id,
+            document.id,
+            page=1,
+            page_size=1,
+        )
+
+        self.assertEqual(result.active_index_version, active_version_id)
+        self.assertEqual([chunk.text for chunk in result.items], ["第一段"])
+        self.assertEqual(result.total, 2)
+        self.assertTrue(result.has_next)
+
+    async def test_document_chunk_preview_preserves_404_scope_and_returns_stable_not_ready(self):
+        knowledge_base = self._create_base()
+        upload = UploadFile(
+            filename="manual.txt",
+            file=io.BytesIO(b"knowledge content"),
+            headers=Headers({"content-type": "text/plain"}),
+        )
+        created = await self.service.upload_document("user-1", knowledge_base.id, upload)
+
+        with self.assertRaises(ApiException) as not_ready:
+            self.service.list_document_chunks(
+                "user-1",
+                knowledge_base.id,
+                created.document.id,
+                page=1,
+                page_size=20,
+            )
+        self.assertEqual(not_ready.exception.code, "KNOWLEDGE_DOCUMENT_NOT_READY")
+        self.assertEqual(not_ready.exception.status_code, 409)
+
+        with self.assertRaises(ApiException) as other_user:
+            self.service.list_document_chunks(
+                "user-2",
+                knowledge_base.id,
+                created.document.id,
+                page=1,
+                page_size=20,
+            )
+        self.assertEqual(other_user.exception.status_code, 404)
+
+        other_base = self.service.create_knowledge_base(
+            "user-1",
+            KnowledgeBaseCreate(name="另一个知识库", description="", business_type="product"),
+        )
+        with self.assertRaises(ApiException) as cross_base:
+            self.service.list_document_chunks(
+                "user-1",
+                other_base.id,
+                created.document.id,
+                page=1,
+                page_size=20,
+            )
+        self.assertEqual(cross_base.exception.status_code, 404)
+
     async def test_retrieval_fails_if_base_loses_ready_document_after_milvus_search(self):
         knowledge_base = self._create_base()
         upload = UploadFile(
