@@ -1608,6 +1608,7 @@ jobs:
 
       - name: Install LiteLLM governance discovery
         env:
+          DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS: ${{ vars.LITELLM_GOVERNANCE_MAX_AGE_SECONDS || '86400' }}
           ROLLBACK_GOVERNANCE_TIMER_ACTIVE: ${{ steps.capture_rollback_target.outputs.governance_timer_active }}
         run: |
           set -euo pipefail
@@ -1705,15 +1706,37 @@ jobs:
             "${unit_dir}/fusion-litellm-governance.service" \
             "${unit_dir}/fusion-litellm-governance.timer"
           systemctl --user reset-failed fusion-litellm-governance.service >/dev/null 2>&1 || true
+          governance_smoke_failed="false"
           if ! systemctl --user start fusion-litellm-governance.service; then
-            journalctl --user -u fusion-litellm-governance.service -n 120 --no-pager || true
-            exit 1
+            governance_smoke_failed="true"
           fi
           governance_result="$(systemctl --user show fusion-litellm-governance.service --property=Result --value)"
           if [ "${governance_result}" != "success" ]; then
-            journalctl --user -u fusion-litellm-governance.service -n 120 --no-pager || true
-            echo "LiteLLM 治理 service smoke 未成功: ${governance_result}"
-            exit 1
+            governance_smoke_failed="true"
+          fi
+          if [ "${governance_smoke_failed}" = "true" ]; then
+            journalctl --user -u fusion-litellm-governance.service -n 40 --no-pager || true
+            PYTHONPATH="${GITHUB_WORKSPACE}" python3 - \
+              "${governance_output_dir}" \
+              "${DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS}" <<'PY'
+          import sys
+          from datetime import UTC, datetime
+          from pathlib import Path
+
+          from scripts.verify_litellm_governance_snapshot import load_verified_governance_snapshot
+
+          snapshot = load_verified_governance_snapshot(
+              governance_root=Path(sys.argv[1]),
+              max_age_seconds=int(sys.argv[2]),
+              now=datetime.now(UTC),
+              include_queue=False,
+          )
+          print(
+              "LiteLLM 治理降级快照通过信任链校验: "
+              f"run_id={snapshot.run_id} degraded_reason={snapshot.degraded_reason or 'none'}"
+          )
+          PY
+            echo "::warning::LiteLLM 治理实时刷新失败；继续使用已验证的最新成功快照"
           fi
           systemctl --user enable --now fusion-litellm-governance.timer
           systemctl --user is-active --quiet fusion-litellm-governance.timer

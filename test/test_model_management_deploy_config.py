@@ -20,8 +20,8 @@ class ModelManagementDeployConfigTests(unittest.TestCase):
         )
         self.assertIn('runtime_dir="/run/user/$(id -u)"', configure_step["run"])
         self.assertIn('test -S "${runtime_dir}/bus"', configure_step["run"])
-        self.assertIn('XDG_RUNTIME_DIR=${runtime_dir}', configure_step["run"])
-        self.assertIn('DBUS_SESSION_BUS_ADDRESS=unix:path=${runtime_dir}/bus', configure_step["run"])
+        self.assertIn("XDG_RUNTIME_DIR=${runtime_dir}", configure_step["run"])
+        self.assertIn("DBUS_SESSION_BUS_ADDRESS=unix:path=${runtime_dir}/bus", configure_step["run"])
         self.assertIn('>> "${GITHUB_ENV}"', configure_step["run"])
         self.assertIn("systemctl --user show-environment", configure_step["run"])
 
@@ -86,11 +86,7 @@ class ModelManagementDeployConfigTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
         document = yaml.safe_load(workflow)
         steps = document["jobs"]["deploy-dev"]["steps"]
-        rollback_step = next(
-            step
-            for step in steps
-            if step.get("name") == "Roll back failed deployment"
-        )
+        rollback_step = next(step for step in steps if step.get("name") == "Roll back failed deployment")
 
         self.assertIn(
             'model_management_current_target="$(readlink -f -- "${model_management_current_link}")"', workflow
@@ -217,6 +213,18 @@ class ModelManagementDeployConfigTests(unittest.TestCase):
         self.assertIn("systemctl --user start fusion-litellm-governance.service", install_script)
         self.assertIn(
             "systemctl --user show fusion-litellm-governance.service --property=Result --value",
+            install_script,
+        )
+        self.assertEqual(
+            install_step["env"]["DEPLOY_LITELLM_GOVERNANCE_MAX_AGE_SECONDS"],
+            "${{ vars.LITELLM_GOVERNANCE_MAX_AGE_SECONDS || '86400' }}",
+        )
+        self.assertIn("load_verified_governance_snapshot", install_script)
+        self.assertIn("governance_root=Path(sys.argv[1])", install_script)
+        self.assertIn("max_age_seconds=int(sys.argv[2])", install_script)
+        self.assertIn('"::warning::LiteLLM 治理实时刷新失败；继续使用已验证的最新成功快照"', install_script)
+        self.assertNotIn(
+            "journalctl --user -u fusion-litellm-governance.service -n 120 --no-pager || true\n            exit 1",
             install_script,
         )
         self.assertLess(
