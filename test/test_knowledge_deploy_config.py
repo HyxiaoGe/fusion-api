@@ -219,6 +219,11 @@ class KnowledgeDeployConfigTests(unittest.TestCase):
         self.assertIn("fusion-knowledge-milvus", worker)
         self.assertNotIn("ports:", worker)
 
+    def test_deploy_worker_log_directory_is_not_nested_under_container_owned_logs(self):
+        self.assertIn("mkdir -p ./knowledge-worker-logs", self.workflow)
+        self.assertIn("./knowledge-worker-logs:/app/logs", self.workflow)
+        self.assertNotIn("./fusion-api/logs/knowledge-worker", self.workflow)
+
     def test_deploy_tracks_worker_identity_health_and_rollback(self):
         required = (
             "fusion-knowledge-worker",
