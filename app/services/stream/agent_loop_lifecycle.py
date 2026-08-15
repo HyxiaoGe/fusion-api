@@ -8,7 +8,16 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.core.prompt_bundle import get_active_prompt_bundle_revision
+from app.schemas.chat import TextBlock
+from app.schemas.response import ApiException
 from app.services.agent_strategy_config import get_agent_strategy_config
+from app.services.knowledge.chat_grounding import (
+    KnowledgeGroundingStreamError,
+    inject_knowledge_grounding_messages,
+    max_explicit_citation_index,
+    prepare_knowledge_grounding,
+    to_stream_grounding_error,
+)
 from app.services.stream.agent_loop_execution import AgentLoopExecutionContext
 from app.services.stream.agent_loop_outcome import AgentLoopExit
 from app.services.stream.agent_loop_policy import AgentLoopLimits, map_run_terminal_state
@@ -32,6 +41,7 @@ class AgentLoopLifecycleRequest:
     initial_content_blocks: list[Any] = field(default_factory=list)
     extra_system_prompts: list[str] = field(default_factory=list)
     preprocess_user_input: bool = True
+    knowledge_base_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -88,9 +98,44 @@ async def _run_success_path(
     dependencies: AgentLoopLifecycleDependencies,
 ) -> None:
     await _start_run(request=request, execution=execution, dependencies=dependencies)
+    grounding = await _prepare_knowledge_grounding(request=request, execution=execution)
+    if grounding is not None:
+        execution.state.content_blocks.append(grounding.evidence_block)
+        await execution.emitter.content_block_upserted(
+            tool_call_id="knowledge_retrieval",
+            content_block=grounding.evidence_block,
+        )
+        if grounding.no_evidence:
+            answer = grounding.deterministic_answer or "未在所选知识库中找到足够依据"
+            block_id = f"blk_knowledge_empty_{execution.run_id[:12]}"
+            await execution.emitter.run_progress_updated(
+                phase="answering",
+                label="未找到足够依据",
+            )
+            await dependencies.append_chunk_fn(
+                execution.completion_context.conversation_id,
+                "answering",
+                answer,
+                block_id,
+                task_id=execution.completion_context.task_id,
+                run_id=execution.run_id,
+            )
+            execution.state.content_blocks.append(TextBlock(type="text", id=block_id, text=answer))
+            await _finalize_completed(
+                execution=execution,
+                dependencies=dependencies,
+                generate_suggestions=False,
+            )
+            return
     prepared_messages = await _prepare_messages(request=request, execution=execution, dependencies=dependencies)
     execution.state.content_blocks.extend(request.initial_content_blocks)
     execution.state.content_blocks.extend(prepared_messages.initial_content_blocks)
+    if grounding is not None:
+        prepared_messages.messages[:] = inject_knowledge_grounding_messages(prepared_messages.messages, grounding)
+        await execution.emitter.run_progress_updated(
+            phase="synthesizing",
+            label="正在基于知识库整理回答",
+        )
     configure_research_state(
         state=execution.state,
         call_config=request.call_config,
@@ -120,7 +165,11 @@ async def _run_success_path(
         )
         return
 
-    await _finalize_completed(execution=execution, dependencies=dependencies)
+    await _finalize_completed(
+        execution=execution,
+        dependencies=dependencies,
+        generate_suggestions=grounding is None,
+    )
 
 
 async def _start_run(
@@ -201,10 +250,38 @@ async def _prepare_messages(
     )
 
 
+async def _prepare_knowledge_grounding(
+    *,
+    request: AgentLoopLifecycleRequest,
+    execution: AgentLoopExecutionContext,
+) -> Any | None:
+    if not request.knowledge_base_ids:
+        return None
+    await execution.emitter.run_progress_updated(
+        phase="researching",
+        label="正在检索所选知识库",
+    )
+    try:
+        return await prepare_knowledge_grounding(
+            db=execution.completion_context.db,
+            user_id=execution.runtime.user_id,
+            query=request.original_message,
+            knowledge_base_ids=request.knowledge_base_ids,
+            citation_start=max_explicit_citation_index(request.initial_content_blocks) + 1,
+        )
+    except ApiException as error:
+        raise to_stream_grounding_error(error) from error
+    except KnowledgeGroundingStreamError:
+        raise
+    except Exception as error:
+        raise KnowledgeGroundingStreamError("knowledge_retrieval_unavailable") from error
+
+
 async def _finalize_completed(
     *,
     execution: AgentLoopExecutionContext,
     dependencies: AgentLoopLifecycleDependencies,
+    generate_suggestions: bool = True,
 ) -> None:
     terminal_state = map_run_terminal_state(
         unknown_terminated=execution.state.unknown_terminated,
@@ -216,9 +293,11 @@ async def _finalize_completed(
         persist_message_fn=dependencies.persist_message_fn,
         complete_agent_run_fn=dependencies.complete_agent_run_fn,
         finalize_stream_fn=dependencies.finalize_stream_fn,
-        claim_suggested_questions_fn=dependencies.claim_suggested_questions_fn,
-        generate_suggested_questions_fn=dependencies.generate_suggested_questions_fn,
-        fail_suggested_questions_fn=dependencies.fail_suggested_questions_fn,
+        claim_suggested_questions_fn=(dependencies.claim_suggested_questions_fn if generate_suggestions else None),
+        generate_suggested_questions_fn=(
+            dependencies.generate_suggested_questions_fn if generate_suggestions else None
+        ),
+        fail_suggested_questions_fn=(dependencies.fail_suggested_questions_fn if generate_suggestions else None),
         warning_fn=dependencies.warning_fn,
     )
 

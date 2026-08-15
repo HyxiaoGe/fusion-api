@@ -76,6 +76,7 @@ KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT=10000
 KNOWLEDGE_WORKER_RETRY_BASE_SECONDS=5
 KNOWLEDGE_WORKER_RETRY_MAX_SECONDS=300
 MILVUS_URI=http://fusion-knowledge-milvus:19530
+MILVUS_CONNECT_URI=
 MILVUS_USERNAME=fusion_knowledge
 MILVUS_PASSWORD=使用密钥系统注入
 MILVUS_DATABASE=fusion_knowledge
@@ -86,6 +87,10 @@ MILVUS_COLLECTION_PREFIX=fusion_knowledge_chunks
 `model@revision`，值是 LiteLLM Proxy 中绑定具体供应商模型版本、禁止原地改指向的不可变 alias。
 Embedding 请求会按每个索引版本的持久化键解析 registry 后再调用 Proxy，因此 revision 不只是展示标签。
 当前 `model@revision` 必须存在；历史索引版本仍可能用于检索、重试或清理时，对应 route 禁止删除或改指向。
+
+`MILVUS_URI` 是持久化到索引版本的数据所属集群规范地址。仅当当前进程需要通过代理或 SSH
+隧道访问同一集群时，才设置 `MILVUS_CONNECT_URI`；未设置时直接使用规范地址。运行时连接地址
+不会写入 PostgreSQL，也不会改变历史版本的集群归属。
 需要轮换模型时添加新 route，并同时更新当前 model/revision 后通过 rebuild 生成新索引版本。
 发布 preflight 会把候选 registry 与部署前从 API/Worker 捕获的 registry 对账，任何历史键删除或值改写都会
 fail closed；pre-#41 镜像按空 registry 兼容，自动回滚仍恢复部署前完整快照。

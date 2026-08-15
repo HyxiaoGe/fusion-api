@@ -166,6 +166,7 @@ class StreamHandler:
         initial_content_blocks: Optional[list] = None,
         extra_system_prompts: Optional[list[str]] = None,
         preprocess_user_input: bool = True,
+        knowledge_base_ids: Optional[list[str]] = None,
         limits: Optional[AgentLoopLimits] = None,
     ) -> None:
         """后台任务：调用 LLM，chunk 写入 Redis Stream，并由 agent loop 完成落库。"""
@@ -189,6 +190,7 @@ class StreamHandler:
             initial_content_blocks=initial_content_blocks,
             extra_system_prompts=extra_system_prompts,
             preprocess_user_input=preprocess_user_input,
+            knowledge_base_ids=knowledge_base_ids,
         )
 
         db = SessionLocal()

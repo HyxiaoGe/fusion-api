@@ -20,10 +20,14 @@ from app.ai.prompts.agent_loop import (
     get_limit_summary_prompt,
 )
 from app.core.logger import app_logger as logger
-from app.schemas.chat import ContextUsage, TextBlock, ThinkingBlock, Usage
+from app.schemas.chat import ContextUsage, KnowledgeEvidenceBlock, TextBlock, ThinkingBlock, Usage
 from app.services.chat.context_manager import ContextManagementError, ContextPlan, prepare_context
 from app.services.chat.model_call_language_policy import finalize_model_call_language_policy
 from app.services.final_answer_evidence import build_used_final_answer_evidence
+from app.services.knowledge.chat_grounding import (
+    KNOWLEDGE_UNVERIFIABLE_ANSWER_TEXT,
+    validate_grounded_answer,
+)
 from app.services.stream.context_status import build_context_usage, emit_context_status
 from app.services.stream.reasoning_policy import configure_reasoning_call_kwargs
 from app.services.stream.research_evidence import (
@@ -326,6 +330,7 @@ async def call_limit_summary_round(
         if (
             request.should_use_reasoning
             and _should_defer_summary_output(request)
+            and request.evidence_policy != "knowledge_grounded_v1"
             and _accepts_keyword(request.stream_round_fn, "allow_deferred_reasoning_output")
         ):
             stream_kwargs["allow_deferred_reasoning_output"] = True
@@ -787,6 +792,26 @@ async def run_limit_summary_step(
             text_block_id=text_block_id,
             step_id=summary_context.step_id,
         )
+    elif request.evidence_policy == "knowledge_grounded_v1":
+        evidence_block = next(
+            (block for block in reversed(request.content_blocks) if isinstance(block, KnowledgeEvidenceBlock)),
+            None,
+        )
+        candidate = round_result.content_buf.strip()
+        valid = evidence_block is not None and validate_grounded_answer(candidate, evidence_block)
+        answer = candidate if valid else KNOWLEDGE_UNVERIFIABLE_ANSWER_TEXT
+        incomplete = not valid
+        await append_chunk(
+            request.conversation_id,
+            "answering",
+            answer,
+            text_block_id,
+            task_id=request.task_id,
+            run_id=request.run_id,
+            step_id=summary_context.step_id,
+        )
+        request.content_blocks.append(TextBlock(type="text", id=text_block_id, text=answer))
+        await _emit_knowledge_summary_used_evidence(request=request, answer_text=answer)
     elif request.summary_finish_reason == "plan_synthesis":
         has_answer = bool(round_result.content_buf.strip())
         has_streamed_content = _streams_standard_plan_synthesis(request) and bool(round_result.content_buf.strip())
@@ -890,6 +915,29 @@ async def _complete_deep_research_summary(
         workset=workset,
     )
     return False
+
+
+async def _emit_knowledge_summary_used_evidence(
+    *,
+    request: LimitSummaryStepRequest,
+    answer_text: str,
+) -> None:
+    emit = getattr(request.emitter, "evidence_item_upserted", None)
+    if emit is None:
+        return
+    try:
+        evidence_items = build_used_final_answer_evidence(
+            content_blocks=request.content_blocks,
+            answer_text=answer_text,
+            evidence_policy="knowledge_grounded_v1",
+        )
+        for evidence in evidence_items:
+            await emit(tool_call_id=None, evidence=evidence)
+    except StreamWriteTerminalError:
+        raise
+    except Exception as error:  # noqa: BLE001 — used evidence 观测失败不能覆盖安全收尾
+        warning = request.warning_fn if request.warning_fn is not None else logger.warning
+        warning(f"知识库总结 used evidence 发送失败: error_type={type(error).__name__}")
 
 
 async def _emit_deep_summary_used_evidence(

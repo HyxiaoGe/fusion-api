@@ -567,6 +567,7 @@ class KnowledgeService:
             raise ApiException.not_found("知识库不存在或无权访问")
         if any(row.status != "active" for row in bases):
             raise ApiException(ErrorCode.KNOWLEDGE_BASE_NOT_READY, "知识库尚不可检索", 409)
+        knowledge_base_names = {row.id: row.name for row in bases}
         ready_documents = self.repo.get_ready_documents(user_id, payload.knowledge_base_ids)
         bases_with_ready_documents = {row.document.knowledge_base_id for row in ready_documents}
         if bases_with_ready_documents != set(payload.knowledge_base_ids):
@@ -641,7 +642,9 @@ class KnowledgeService:
                     chunk_id=hit.chunk_id,
                     document_id=hit.document_id,
                     knowledge_base_id=hit.knowledge_base_id,
+                    knowledge_base_name=knowledge_base_names[hit.knowledge_base_id],
                     index_version=hit.index_version,
+                    ordinal=chunk.ordinal,
                     text=chunk.text,
                     similarity=hit.similarity,
                     filename=document.original_filename,
@@ -682,7 +685,9 @@ class KnowledgeService:
                     chunk_id=hit.chunk_id,
                     document_id=hit.document_id,
                     knowledge_base_id=hit.knowledge_base_id,
+                    knowledge_base_name=hit.knowledge_base_name,
                     index_version=hit.index_version,
+                    ordinal=chunk.ordinal,
                     text=chunk.text,
                     similarity=hit.similarity,
                     filename=chunk.filename,

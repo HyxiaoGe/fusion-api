@@ -97,6 +97,119 @@ class ChatServiceTests(unittest.TestCase):
         service.model_control_repository.get.assert_called_once_with("saved/model")
         service._get_or_create_conversation.assert_not_called()
 
+    def test_knowledge_mode_rejects_final_deep_research_policy_before_writes(self):
+        service = ChatService(MagicMock())
+        service.conversation_service = MagicMock()
+        service.conversation_service.get_conversation.return_value = SimpleNamespace(
+            id="conv-knowledge",
+            model_id="saved/model",
+            messages=[SimpleNamespace(role="user")],
+            knowledge_base_ids=["kb-1"],
+        )
+        service.model_control_repository = MagicMock()
+        service.model_control_repository.get.return_value = None
+        final_policy = SimpleNamespace(
+            task_mode="deep_research",
+            apply_to_options=lambda options: {**options, "task_mode": "deep_research"},
+        )
+
+        with (
+            patch(
+                "app.services.chat_service.llm_manager.resolve_model",
+                return_value=("openai/saved-model", "openai", {}),
+            ),
+            patch(
+                "app.services.chat_service.litellm_catalog.get_capabilities",
+                return_value={"functionCalling": True, "searchCapable": True},
+            ),
+            patch("app.services.chat_service.resolve_agent_task_policy", return_value=final_policy),
+            self.assertRaises(ApiException) as raised,
+        ):
+            asyncio.run(
+                service.process_message(
+                    model_id="saved/model",
+                    message="研究一下",
+                    user_id="user-1",
+                    conversation_id="conv-knowledge",
+                    options={"legacy_mode": "research"},
+                )
+            )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(raised.exception.message, "知识库问答不能与深度研究模式同时使用")
+        service.conversation_service.create_message.assert_not_called()
+
+    def test_knowledge_mode_rejects_message_attachments_before_writes(self):
+        service = ChatService(MagicMock())
+        service.conversation_service = MagicMock()
+        service.conversation_service.get_conversation.return_value = SimpleNamespace(
+            id="conv-knowledge",
+            model_id="saved/model",
+            messages=[SimpleNamespace(role="user")],
+            knowledge_base_ids=["kb-1"],
+        )
+        service.model_control_repository = MagicMock()
+        service.model_control_repository.get.return_value = None
+
+        with (
+            patch(
+                "app.services.chat_service.llm_manager.resolve_model",
+                return_value=("openai/saved-model", "openai", {}),
+            ),
+            patch(
+                "app.services.chat_service.litellm_catalog.get_capabilities",
+                return_value={"functionCalling": True},
+            ),
+            self.assertRaises(ApiException) as raised,
+        ):
+            asyncio.run(
+                service.process_message(
+                    model_id="saved/model",
+                    message="结合附件回答",
+                    user_id="user-1",
+                    conversation_id="conv-knowledge",
+                    file_ids=["file-1"],
+                )
+            )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(raised.exception.message, "知识库问答暂不支持同时附加文件")
+        service.conversation_service.create_message.assert_not_called()
+
+    def test_knowledge_mode_rejects_invalid_query_before_writes(self):
+        for message in ("   ", "问题\x00注入", "问" * 4_001):
+            with self.subTest(message_length=len(message)):
+                service = ChatService(MagicMock())
+                service.conversation_service = MagicMock()
+                service.conversation_service.get_conversation.return_value = SimpleNamespace(
+                    id="conv-knowledge",
+                    model_id="saved/model",
+                    messages=[SimpleNamespace(role="user")],
+                    knowledge_base_ids=["kb-1"],
+                )
+                service.model_control_repository = MagicMock()
+                service.model_control_repository.get.return_value = None
+
+                with (
+                    patch(
+                        "app.services.chat_service.llm_manager.resolve_model",
+                        return_value=("openai/saved-model", "openai", {}),
+                    ) as resolve_model,
+                    self.assertRaises(ApiException) as raised,
+                ):
+                    asyncio.run(
+                        service.process_message(
+                            model_id="saved/model",
+                            message=message,
+                            user_id="user-1",
+                            conversation_id="conv-knowledge",
+                        )
+                    )
+
+                self.assertEqual(raised.exception.status_code, 400)
+                resolve_model.assert_not_called()
+                service.conversation_service.create_message.assert_not_called()
+
     def test_new_conversation_rejects_hidden_or_unregistered_model_before_generation(self):
         hidden = ChatService(MagicMock())
         hidden.model_control_repository = MagicMock()

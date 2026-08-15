@@ -539,7 +539,10 @@ class MilvusKnowledgeStore:
 
     @staticmethod
     def _build_client(profile: EmbeddingProfile | None = None) -> Any:
-        milvus_uri = profile.milvus_uri if profile is not None and profile.milvus_uri else settings.MILVUS_URI
+        canonical_uri = profile.milvus_uri if profile is not None and profile.milvus_uri else settings.MILVUS_URI
+        milvus_uri = canonical_uri
+        if settings.MILVUS_CONNECT_URI and canonical_uri == settings.MILVUS_URI:
+            milvus_uri = settings.MILVUS_CONNECT_URI
         milvus_database = (
             profile.milvus_database if profile is not None and profile.milvus_database else settings.MILVUS_DATABASE
         )

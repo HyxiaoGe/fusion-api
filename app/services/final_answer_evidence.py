@@ -41,7 +41,7 @@ def build_used_final_answer_evidence(
     evidence_policy: str = "standard",
     allowed_citation_indexes: set[int] | frozenset[int] | None = None,
 ) -> list[dict[str, Any]]:
-    """从最终回答文本里保守识别真正使用过的网页来源。"""
+    """从最终回答文本里保守识别真正使用过的网页或知识库来源。"""
     normalized_answer = (answer_text or "").strip()
     if not normalized_answer:
         return []
@@ -58,6 +58,9 @@ def build_used_final_answer_evidence(
             all_sources,
             allowed_citation_indexes=allowed,
         )
+        return [_to_evidence_item(source) for source in _dedupe_sources(used)]
+    if evidence_policy == "knowledge_grounded_v1":
+        used = _sources_from_citations(normalized_answer, search_sources, all_sources)
         return [_to_evidence_item(source) for source in _dedupe_sources(used)]
 
     used: list[_AnswerSource] = []
@@ -140,9 +143,13 @@ def _source_refs(block: Any) -> list[Any]:
 
 
 def _source_from_ref(ref: Any) -> _AnswerSource | None:
+    kind = _value(ref, "kind") or "search"
+    title = _value(ref, "title") or ""
+    if kind == "knowledge":
+        title = _value(ref, "filename") or _value(ref, "knowledge_base_name") or "知识库来源"
     return _source_from_values(
-        kind=_value(ref, "kind") or "search",
-        title=_value(ref, "title") or "",
+        kind=kind,
+        title=title,
         url=_value(ref, "url") or "",
         favicon=_value(ref, "favicon"),
         explicit_evidence_id=_value(ref, "evidence_id"),
@@ -162,13 +169,14 @@ def _source_from_values(
     raw_url = str(url or "").strip()
     canonical_url = canonicalize_evidence_url(raw_url)
     evidence_url = canonical_url or raw_url
-    if not evidence_url:
+    is_knowledge = kind == "knowledge"
+    if not evidence_url and not (is_knowledge and explicit_evidence_id):
         return None
 
     domain = _domain(evidence_url)
     return _AnswerSource(
         kind=kind,
-        title=str(title or "").strip() or domain or "网页来源",
+        title=str(title or "").strip() or domain or ("知识库来源" if is_knowledge else "网页来源"),
         url=raw_url,
         canonical_url=evidence_url,
         domain=domain,
@@ -247,7 +255,7 @@ def _dedupe_sources(sources: list[_AnswerSource]) -> list[_AnswerSource]:
     deduped: list[_AnswerSource] = []
     seen: set[str] = set()
     for source in sources:
-        key = source.canonical_url or source.url
+        key = source.canonical_url or source.url or source.evidence_id
         if not key or key in seen:
             continue
         deduped.append(source)
@@ -259,11 +267,11 @@ def _to_evidence_item(source: _AnswerSource) -> dict[str, Any]:
     evidence_url = source.canonical_url or source.url
     return {
         "id": source.evidence_id,
-        "kind": "web",
+        "kind": "knowledge" if source.kind == "knowledge" else "web",
         "status": "used",
         "title": source.title,
-        "url": evidence_url,
-        "domain": source.domain or _domain(evidence_url),
+        "url": evidence_url or None,
+        "domain": (source.domain or _domain(evidence_url)) if evidence_url else None,
         "claim": "最终回答引用了该来源。",
         "snippet": None,
         "used_by_final_answer": True,

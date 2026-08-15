@@ -77,11 +77,28 @@ async def send_message(
         stream=chat_request.stream,
         options=chat_request.options,
         file_ids=chat_request.file_ids,
+        knowledge_base_ids=chat_request.knowledge_base_ids,
         trace_id=request.state.request_id,
     )
     if isinstance(result, StreamingResponse):
         return result
     return success(data=result, request_id=request.state.request_id)
+
+
+@router.get("/capabilities")
+def get_chat_capabilities(
+    request: Request,
+    _current_user: User = Depends(get_current_user),
+):
+    """返回跨版本安全所需的聊天协议能力。"""
+
+    return success(
+        data={
+            "knowledge_grounding_v1": True,
+            "knowledge_grounding_max_bases": 5,
+        },
+        request_id=request.state.request_id,
+    )
 
 
 @router.get("/conversations")

@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from app.schemas.chat import KnowledgeEvidenceBlock
 from app.schemas.response import ApiException
 from app.services.chat_service import ChatService
 from app.services.stream_state_service import StreamInitResult
@@ -127,6 +128,56 @@ class ChatContinueTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertEqual(raised.exception.status_code, 409)
+
+    async def test_continue_agent_run_rejects_persisted_knowledge_evidence_before_stream_init(self):
+        service = ChatService(MagicMock())
+        service.conversation_service.get_conversation = MagicMock(
+            return_value=SimpleNamespace(
+                id="conv-1",
+                user_id="user-1",
+                model_id="deepseek-chat",
+                messages=[],
+            )
+        )
+        continuation_context = SimpleNamespace(
+            assistant_message=SimpleNamespace(sequence=42),
+            initial_content_blocks=[
+                KnowledgeEvidenceBlock(
+                    type="knowledge_evidence",
+                    query="问题",
+                    status="empty",
+                    source_count=0,
+                    knowledge_base_ids=["kb-1"],
+                    source_refs=[],
+                )
+            ],
+            limits=SimpleNamespace(max_steps=8, max_tool_calls=20, total_timeout_s=300),
+            plan_mode="off",
+        )
+
+        with (
+            patch(
+                "app.services.chat_service.llm_manager.resolve_model",
+                return_value=("deepseek/deepseek-chat", "deepseek", {}),
+            ),
+            patch(
+                "app.services.chat_service.litellm_catalog.get_capabilities",
+                return_value={"functionCalling": True},
+            ),
+            patch("app.services.chat_service.build_continuation_context", return_value=continuation_context),
+            patch("app.services.chat_service.get_stream_meta", new=AsyncMock(return_value=None)),
+            patch("app.services.chat_service.init_stream", new=AsyncMock()) as init_stream_mock,
+            self.assertRaises(ApiException) as raised,
+        ):
+            await service.continue_agent_run(
+                conversation_id="conv-1",
+                assistant_message_id="msg-1",
+                user_id="user-1",
+            )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(raised.exception.message, "知识库回答暂不支持继续生成，请重新提问")
+        init_stream_mock.assert_not_awaited()
 
     async def test_continue_agent_run_fails_before_starting_generation_when_stream_init_fails(self):
         service = ChatService(MagicMock())

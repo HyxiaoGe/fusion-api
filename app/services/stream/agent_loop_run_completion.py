@@ -26,6 +26,8 @@ AGENT_RUN_FAILED_ERROR_CODE = "agent_run_failed"
 _PUBLIC_ERROR_MESSAGES = {
     "context_budget_exceeded": "当前消息与必要上下文过长，请缩短本次输入或移除较大的文件后重试",
     "context_estimation_unavailable": "上下文预算暂时无法校验，请稍后重试",
+    "knowledge_selection_unavailable": "所选知识库当前不可用，请刷新后重新选择",
+    "knowledge_retrieval_unavailable": "知识库检索暂时不可用，请稍后重试",
 }
 
 

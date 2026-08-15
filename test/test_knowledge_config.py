@@ -42,6 +42,7 @@ def enabled_settings(**overrides):
 class KnowledgeConfigTests(unittest.TestCase):
     def test_valid_non_root_application_configuration_is_accepted(self):
         enabled_settings().validate_knowledge_base_configuration()
+        enabled_settings(MILVUS_CONNECT_URI="http://127.0.0.1:19530").validate_knowledge_base_configuration()
 
     def test_root_account_and_invalid_heartbeat_fail_closed(self):
         configured = enabled_settings(
@@ -156,6 +157,12 @@ class KnowledgeConfigTests(unittest.TestCase):
             with self.subTest(overrides=overrides), self.assertRaises(ValueError) as raised:
                 enabled_settings(**overrides).validate_knowledge_base_configuration()
             self.assertIn(message, str(raised.exception))
+
+    def test_milvus_runtime_connect_uri_must_be_a_complete_http_address(self):
+        with self.assertRaises(ValueError) as raised:
+            enabled_settings(MILVUS_CONNECT_URI="127.0.0.1:19530").validate_knowledge_base_configuration()
+
+        self.assertIn("MILVUS_CONNECT_URI", str(raised.exception))
 
     def test_historical_embedding_revision_resolves_to_persisted_immutable_alias(self):
         configured = enabled_settings(

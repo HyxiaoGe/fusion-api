@@ -233,7 +233,9 @@ class KnowledgeRetrievalHit(BaseModel):
     chunk_id: str
     document_id: str
     knowledge_base_id: str
+    knowledge_base_name: str
     index_version: str
+    ordinal: int
     text: str
     similarity: float
     filename: str

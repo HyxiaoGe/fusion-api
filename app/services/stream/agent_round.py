@@ -188,6 +188,7 @@ async def run_agent_round(
     emitter: Any | None = None,
     on_context_updated: Callable[[ContextUsage], None] | None = None,
     defer_output: bool = False,
+    allow_deferred_reasoning_output: bool = True,
 ) -> AgentRoundResult:
     finalized_messages = finalize_model_call_language_policy(messages)
     try:
@@ -253,7 +254,7 @@ async def run_agent_round(
             stream_round_fn=stream_round_fn,
             observation=observation,
             defer_output=defer_output,
-            allow_deferred_reasoning_output=defer_output,
+            allow_deferred_reasoning_output=defer_output and allow_deferred_reasoning_output,
         )
     except BaseException as exc:
         await observation.finish_error(exc)
@@ -287,6 +288,8 @@ async def run_agent_round(
         announced_tool_names=_announced_tool_names(call_kwargs),
         output_deferred=defer_output and _accepts_keyword(stream_round_fn, "defer_output"),
         allow_deferred_reasoning_output=(
-            defer_output and _accepts_keyword(stream_round_fn, "allow_deferred_reasoning_output")
+            defer_output
+            and allow_deferred_reasoning_output
+            and _accepts_keyword(stream_round_fn, "allow_deferred_reasoning_output")
         ),
     )

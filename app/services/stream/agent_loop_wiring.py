@@ -44,6 +44,7 @@ class AgentLoopRunInput:
     initial_content_blocks: list | None = None
     extra_system_prompts: list[str] | None = None
     preprocess_user_input: bool = True
+    knowledge_base_ids: list[str] | None = None
 
     def to_execution_request(
         self,
@@ -82,6 +83,7 @@ class AgentLoopRunInput:
             initial_content_blocks=self.initial_content_blocks or [],
             extra_system_prompts=self.extra_system_prompts or [],
             preprocess_user_input=self.preprocess_user_input,
+            knowledge_base_ids=self.knowledge_base_ids or [],
         )
 
 
@@ -187,6 +189,7 @@ def build_agent_loop_lifecycle_call(
     should_load_dynamic_tools = (
         supports_dynamic_agent_tools(capabilities)
         and options.get("disable_tools") is not True
+        and options.get("knowledge_grounded") is not True
         and dependencies.load_dynamic_tools_fn is not None
     )
     dynamic_tool_set = (

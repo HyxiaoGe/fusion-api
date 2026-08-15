@@ -119,6 +119,7 @@ class Settings(BaseSettings):
         "/tmp/fusion-knowledge-worker-health.json",
     )
     MILVUS_URI: str = os.getenv("MILVUS_URI", "")
+    MILVUS_CONNECT_URI: str = os.getenv("MILVUS_CONNECT_URI", "")
     MILVUS_USERNAME: str = os.getenv("MILVUS_USERNAME", "")
     MILVUS_PASSWORD: str = os.getenv("MILVUS_PASSWORD", "")
     MILVUS_DATABASE: str = os.getenv("MILVUS_DATABASE", "")
@@ -265,6 +266,12 @@ class Settings(BaseSettings):
             errors.append("MILVUS_URI 必须是完整的 http(s) 地址")
         if len(self.MILVUS_URI) > 500 or "\x00" in self.MILVUS_URI:
             errors.append("MILVUS_URI 长度或字符无效")
+        if self.MILVUS_CONNECT_URI:
+            milvus_connect_uri = urlparse(self.MILVUS_CONNECT_URI)
+            if milvus_connect_uri.scheme not in {"http", "https"} or not milvus_connect_uri.netloc:
+                errors.append("MILVUS_CONNECT_URI 必须是完整的 http(s) 地址")
+            if len(self.MILVUS_CONNECT_URI) > 500 or "\x00" in self.MILVUS_CONNECT_URI:
+                errors.append("MILVUS_CONNECT_URI 长度或字符无效")
         if not self.MILVUS_USERNAME.strip() or not self.MILVUS_PASSWORD or not self.MILVUS_DATABASE.strip():
             errors.append("Milvus 应用账号和数据库配置不完整")
         if len(self.MILVUS_DATABASE) > 120 or "\x00" in self.MILVUS_DATABASE:

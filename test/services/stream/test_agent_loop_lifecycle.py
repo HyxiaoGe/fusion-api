@@ -1,9 +1,18 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
-from app.schemas.chat import SearchBlock, SearchSourceSummary, SourceReference, TextBlock, UrlBlock
+from app.schemas.chat import (
+    KnowledgeEvidenceBlock,
+    KnowledgeSourceReference,
+    SearchBlock,
+    SearchSourceSummary,
+    SourceReference,
+    TextBlock,
+    UrlBlock,
+)
+from app.services.knowledge.chat_grounding import KnowledgeGroundingResult
 from app.services.stream.agent_loop_driver import AgentLoopExit, AgentLoopOutcome
 from app.services.stream.agent_loop_execution import (
     AgentLoopDependencies as ExecutionDependencies,
@@ -401,6 +410,139 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call_order[3][1], [{"role": "user", "content": "prepared"}])
         self.assertEqual(call_order[3][2], [initial_block])
         self.assertIs(call_order[4][1], execution.completion_context)
+
+    async def test_empty_knowledge_retrieval_completes_without_preparing_or_running_llm(self):
+        call_config = SimpleNamespace(
+            should_use_reasoning=False,
+            call_kwargs={},
+            announced_tools=[],
+            task_mode="standard",
+            network_profile="standard",
+            evidence_policy="knowledge_grounded_v1",
+            plan_mode="off",
+        )
+        execution = self._execution(call_config=call_config)
+        evidence = KnowledgeEvidenceBlock(
+            type="knowledge_evidence",
+            query="未知问题",
+            status="empty",
+            source_count=0,
+            knowledge_base_ids=["kb-1"],
+            source_refs=[],
+        )
+        grounding = KnowledgeGroundingResult(
+            evidence_block=evidence,
+            context_messages=[],
+            no_evidence=True,
+            deterministic_answer="未在所选知识库中找到足够依据",
+        )
+        prepare_messages = AsyncMock(side_effect=AssertionError("无命中不应准备 LLM 上下文"))
+        run_loop = AsyncMock(side_effect=AssertionError("无命中不应调用 LLM"))
+        finalized = []
+
+        async def finalize_completed_run_fn(**kwargs):
+            finalized.append(kwargs)
+
+        request = self._request(call_config=call_config)
+        request = AgentLoopLifecycleRequest(
+            raw_messages=request.raw_messages,
+            has_vision=False,
+            file_ids=None,
+            original_message="未知问题",
+            call_config=request.call_config,
+            limits=request.limits,
+            knowledge_base_ids=["kb-1"],
+        )
+        with patch(
+            "app.services.stream.agent_loop_lifecycle.prepare_knowledge_grounding",
+            new=AsyncMock(return_value=grounding),
+        ):
+            await run_agent_loop_lifecycle(
+                request=request,
+                execution=execution,
+                dependencies=self._dependencies(
+                    prepare_messages_fn=prepare_messages,
+                    run_agent_loop_fn=run_loop,
+                    finalize_completed_run_fn=finalize_completed_run_fn,
+                    claim_suggested_questions_fn=lambda **_kwargs: object(),
+                    generate_suggested_questions_fn=lambda **_kwargs: None,
+                ),
+            )
+
+        prepare_messages.assert_not_awaited()
+        run_loop.assert_not_awaited()
+        self.assertEqual([block.type for block in execution.state.content_blocks], ["knowledge_evidence", "text"])
+        self.assertIsNone(finalized[0]["claim_suggested_questions_fn"])
+        self.assertIsNone(finalized[0]["generate_suggested_questions_fn"])
+
+    async def test_successful_knowledge_run_also_disables_ungrounded_suggestions(self):
+        call_config = SimpleNamespace(
+            should_use_reasoning=False,
+            call_kwargs={},
+            announced_tools=[],
+            task_mode="standard",
+            network_profile="standard",
+            evidence_policy="knowledge_grounded_v1",
+            plan_mode="off",
+        )
+        execution = self._execution(call_config=call_config)
+        evidence = KnowledgeEvidenceBlock(
+            type="knowledge_evidence",
+            query="怎么发布",
+            status="success",
+            source_count=1,
+            knowledge_base_ids=["kb-1"],
+            source_refs=[
+                KnowledgeSourceReference(
+                    evidence_id="ev-knowledge-1",
+                    citation_index=1,
+                    knowledge_base_id="kb-1",
+                    knowledge_base_name="产品手册",
+                    document_id="doc-1",
+                    index_version="version-1",
+                    chunk_id="chunk-1",
+                    ordinal=1,
+                    filename="manual.md",
+                    char_start=0,
+                    char_end=10,
+                )
+            ],
+        )
+        grounding = KnowledgeGroundingResult(
+            evidence_block=evidence,
+            context_messages=[{"role": "user", "content": "不可信知识上下文"}],
+            no_evidence=False,
+        )
+        finalized = []
+
+        async def finalize_completed_run_fn(**kwargs):
+            finalized.append(kwargs)
+
+        request = AgentLoopLifecycleRequest(
+            raw_messages=[{"role": "user", "content": "怎么发布"}],
+            has_vision=False,
+            file_ids=None,
+            original_message="怎么发布",
+            call_config=call_config,
+            limits=self._limits(),
+            knowledge_base_ids=["kb-1"],
+        )
+        with patch(
+            "app.services.stream.agent_loop_lifecycle.prepare_knowledge_grounding",
+            new=AsyncMock(return_value=grounding),
+        ):
+            await run_agent_loop_lifecycle(
+                request=request,
+                execution=execution,
+                dependencies=self._dependencies(
+                    finalize_completed_run_fn=finalize_completed_run_fn,
+                    claim_suggested_questions_fn=lambda **_kwargs: object(),
+                    generate_suggested_questions_fn=lambda **_kwargs: None,
+                ),
+            )
+
+        self.assertIsNone(finalized[0]["claim_suggested_questions_fn"])
+        self.assertIsNone(finalized[0]["generate_suggested_questions_fn"])
 
     async def test_start_run_records_runtime_config_versions(self):
         configs = []
