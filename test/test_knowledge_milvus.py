@@ -335,6 +335,101 @@ class MilvusKnowledgeStoreBatchTests(unittest.IsolatedAsyncioTestCase):
             [{"field_name": "vector", "index_type": "AUTOINDEX", "metric_type": "COSINE"}],
         )
 
+    async def test_exact_schema_with_only_scalar_index_repairs_vector_index(self):
+        class IndexParams:
+            def __init__(self):
+                self.added = []
+
+            def add_index(self, **kwargs):
+                self.added.append(kwargs)
+
+        class ScalarIndexOnlyClient:
+            def __init__(self):
+                self.vector_index_created = False
+                self.params = IndexParams()
+                self.loaded = False
+
+            def has_collection(self, **_kwargs):
+                return True
+
+            def describe_collection(self, **_kwargs):
+                return MilvusKnowledgeStoreTests._valid_collection_description(dimension=2)
+
+            def list_indexes(self, **_kwargs):
+                names = ["user_id"]
+                if self.vector_index_created:
+                    names.append("vector")
+                return names
+
+            def describe_index(self, *, index_name, **_kwargs):
+                if index_name == "user_id":
+                    return {
+                        "field_name": "user_id",
+                        "index_name": "user_id",
+                        "index_type": "INVERTED",
+                    }
+                return {
+                    "field_name": "vector",
+                    "index_name": "vector",
+                    "index_type": "AUTOINDEX",
+                    "metric_type": "COSINE",
+                }
+
+            def prepare_index_params(self):
+                return self.params
+
+            def create_index(self, **_kwargs):
+                self.vector_index_created = True
+
+            def load_collection(self, **_kwargs):
+                self.loaded = True
+
+            def close(self):
+                return None
+
+        client = ScalarIndexOnlyClient()
+        store = MilvusKnowledgeStore(client_factory=lambda: client)
+        profile = EmbeddingProfile("litellm", "embed-v1", 2, "COSINE", "knowledge_v1_d2", "r1")
+
+        await store.ensure_collection(profile)
+
+        self.assertTrue(client.vector_index_created)
+        self.assertTrue(client.loaded)
+        self.assertEqual(
+            client.params.added,
+            [{"field_name": "vector", "index_type": "AUTOINDEX", "metric_type": "COSINE"}],
+        )
+
+    async def test_client_close_failure_does_not_override_successful_operation(self):
+        class CloseFailureClient:
+            def list_collections(self, **_kwargs):
+                return ["knowledge_v1_d2"]
+
+            def close(self):
+                raise RuntimeError("close failed")
+
+        store = MilvusKnowledgeStore(client_factory=CloseFailureClient)
+
+        await store.health()
+
+    async def test_client_close_failure_does_not_override_operation_failure(self):
+        operation_error = RuntimeError("operation failed")
+
+        class DoubleFailureClient:
+            def list_collections(self, **_kwargs):
+                raise operation_error
+
+            def close(self):
+                raise RuntimeError("close failed")
+
+        store = MilvusKnowledgeStore(client_factory=DoubleFailureClient)
+
+        with self.assertRaises(KnowledgeVectorError) as raised:
+            await store.health()
+
+        self.assertEqual(raised.exception.code, "KNOWLEDGE_VECTOR_UNAVAILABLE")
+        self.assertIs(raised.exception.__cause__, operation_error)
+
     async def test_search_batches_version_terms_and_merges_global_ranking(self):
         class SearchClient:
             def __init__(self):

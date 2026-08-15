@@ -32,6 +32,11 @@ from app.utils.time import utc_now
 class KnowledgeRepositoryTests(unittest.TestCase):
     def setUp(self):
         self.engine = create_engine("sqlite:///:memory:")
+        event.listen(
+            self.engine,
+            "connect",
+            lambda connection, _: connection.execute("PRAGMA foreign_keys=ON"),
+        )
         Base.metadata.create_all(self.engine)
         self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
         self.db = self.Session()
@@ -926,9 +931,11 @@ class KnowledgeRepositoryTests(unittest.TestCase):
             completed_at=now,
         )
         self.db.add(live_cleanup)
+        terminal_versions = []
+        terminal_tasks = []
         for index in range(100):
             version_id = f"a-terminal-version-{index:03d}"
-            self.db.add(
+            terminal_versions.append(
                 KnowledgeIndexVersion(
                     id=version_id,
                     knowledge_base_id=document.knowledge_base_id,
@@ -948,7 +955,7 @@ class KnowledgeRepositoryTests(unittest.TestCase):
                     deleted_at=now,
                 )
             )
-            self.db.add(
+            terminal_tasks.append(
                 KnowledgeIndexTask(
                     id=f"a-terminal-cleanup-{index:03d}",
                     knowledge_base_id=document.knowledge_base_id,
@@ -964,6 +971,9 @@ class KnowledgeRepositoryTests(unittest.TestCase):
                     completed_at=now,
                 )
             )
+        self.db.add_all(terminal_versions)
+        self.db.flush()
+        self.db.add_all(terminal_tasks)
         self.db.commit()
 
         self.assertIsNone(

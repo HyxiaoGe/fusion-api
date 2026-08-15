@@ -3,10 +3,12 @@ import hashlib
 import io
 import json
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import UploadFile
 from sqlalchemy import create_engine, event
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from starlette.datastructures import Headers
@@ -398,6 +400,42 @@ class KnowledgeServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.storage.upload.assert_awaited_once()
         self.storage.delete.assert_not_awaited()
+
+    async def test_non_duplicate_integrity_error_is_not_mislabeled_as_duplicate(self):
+        knowledge_base = self._create_base()
+        upload = UploadFile(
+            filename="manual.txt",
+            file=io.BytesIO(b"knowledge content"),
+            headers=Headers({"content-type": "text/plain"}),
+        )
+        original = RuntimeError("insert violates knowledge_index_tasks_index_version_fkey")
+        original.diag = SimpleNamespace(constraint_name="knowledge_index_tasks_index_version_fkey")
+        integrity_error = IntegrityError("INSERT", {}, original)
+        self.service.repo.create_document_with_task = MagicMock(side_effect=integrity_error)
+
+        with self.assertRaises(IntegrityError) as raised:
+            await self.service.upload_document("user-1", knowledge_base.id, upload)
+
+        self.assertIs(raised.exception, integrity_error)
+        self.storage.delete.assert_awaited_once()
+
+    async def test_dedupe_constraint_integrity_error_returns_stable_duplicate_conflict(self):
+        knowledge_base = self._create_base()
+        upload = UploadFile(
+            filename="manual.txt",
+            file=io.BytesIO(b"knowledge content"),
+            headers=Headers({"content-type": "text/plain"}),
+        )
+        original = RuntimeError("duplicate key")
+        original.diag = SimpleNamespace(constraint_name="uq_knowledge_documents_base_dedupe")
+        self.service.repo.create_document_with_task = MagicMock(side_effect=IntegrityError("INSERT", {}, original))
+
+        with self.assertRaises(ApiException) as duplicate:
+            await self.service.upload_document("user-1", knowledge_base.id, upload)
+
+        self.assertEqual(duplicate.exception.code, "KNOWLEDGE_DOCUMENT_DUPLICATE")
+        self.assertEqual(duplicate.exception.status_code, 409)
+        self.storage.delete.assert_awaited_once()
 
     async def test_quota_recheck_duplicate_preserves_stable_error(self):
         knowledge_base = self._create_base()

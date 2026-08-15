@@ -58,6 +58,18 @@ FILENAME_MAX_CHARACTERS = 255
 FILENAME_MAX_UTF8_BYTES = 500
 
 
+def _is_document_duplicate_conflict(error: IntegrityError) -> bool:
+    """只把文档内容去重约束映射为稳定的 409。"""
+    original = getattr(error, "orig", None)
+    diagnostic = getattr(original, "diag", None)
+    if getattr(diagnostic, "constraint_name", None) == "uq_knowledge_documents_base_dedupe":
+        return True
+    # SQLite 回归环境没有 PostgreSQL diag，只接受精确列组合。
+    return ("UNIQUE constraint failed: knowledge_documents.knowledge_base_id, knowledge_documents.dedupe_key") in str(
+        original or ""
+    )
+
+
 @dataclass(frozen=True)
 class RetrievalDocumentRef:
     knowledge_base_id: str
@@ -339,11 +351,13 @@ class KnowledgeService:
                     cleanup_succeeded=cleanup_succeeded,
                 )
                 upload_lifecycle.mark_request_resolved()
-                raise ApiException(
-                    ErrorCode.KNOWLEDGE_DOCUMENT_DUPLICATE,
-                    "相同内容的活动文档已存在于该知识库",
-                    409,
-                ) from exc
+                if _is_document_duplicate_conflict(exc):
+                    raise ApiException(
+                        ErrorCode.KNOWLEDGE_DOCUMENT_DUPLICATE,
+                        "相同内容的活动文档已存在于该知识库",
+                        409,
+                    ) from exc
+                raise
             # 文档、索引任务、intent 删除与 cleanup 完成已在同一 PG 事务提交。
             # lifecycle 由模块级 registry 强引用并在后台停止续租；提交成功后不能
             # 再等待可能阻塞于数据库的 renewal，否则客户端会收到错误的 408。

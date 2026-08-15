@@ -275,9 +275,17 @@ class KnowledgeRepository:
                     cleanup_storage=True,
                     duplicate=duplicate,
                 )
-        self.db.add_all([document, version, task])
         expire_on_commit = self.db.expire_on_commit
         try:
+            # KnowledgeIndexTask.index_version 只有标量外键，没有对应 ORM relationship；
+            # 若三个对象一次 flush，SQLAlchemy 无法据此建立版本先于任务的插入依赖，
+            # PostgreSQL 会先写任务并触发外键失败。显式分阶段 flush，同时仍由一个
+            # 事务保证任一后续步骤失败时整体回滚。
+            self.db.add(document)
+            self.db.flush()
+            self.db.add(version)
+            self.db.flush()
+            self.db.add(task)
             self.db.flush()
             if upload_registration is not None and cleanup_task is not None:
                 cleanup_repo.complete_document_write_locked(upload_registration, cleanup_task)
@@ -649,7 +657,13 @@ class KnowledgeRepository:
         document.error_code = None
         document.error_summary = None
         document.updated_at = utc_now()
-        self.db.add_all([row for row in (version, task, cleanup_task) if row is not None])
+        # 与首次上传相同，任务通过标量 index_version 外键引用新版本；必须先把
+        # 版本写入，再提交索引任务，避免真实 PostgreSQL 的即时外键校验失败。
+        self.db.add(version)
+        self.db.flush()
+        self.db.add(task)
+        if cleanup_task is not None:
+            self.db.add(cleanup_task)
         self._commit_loaded()
         return task
 

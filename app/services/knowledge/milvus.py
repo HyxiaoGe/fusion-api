@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import re
 from dataclasses import dataclass
@@ -10,6 +11,8 @@ from typing import Any, Callable, Sequence
 from app.ai.embeddings.base import EmbeddingProfile
 from app.core.config import KNOWLEDGE_MILVUS_FILTER_TERM_BATCH_SIZE, settings
 from app.services.knowledge.chunker import KnowledgeChunk
+
+logger = logging.getLogger(__name__)
 
 
 class KnowledgeVectorError(RuntimeError):
@@ -98,12 +101,6 @@ class MilvusKnowledgeStore:
                     collection_name=collection,
                     timeout=settings.MILVUS_TIMEOUT_SECONDS,
                 )
-                if not index_names:
-                    self._create_vector_index(client, collection, profile.distance_metric)
-                    index_names = client.list_indexes(
-                        collection_name=collection,
-                        timeout=settings.MILVUS_TIMEOUT_SECONDS,
-                    )
                 index_descriptions = [
                     client.describe_index(
                         collection_name=collection,
@@ -112,6 +109,23 @@ class MilvusKnowledgeStore:
                     )
                     for index_name in index_names
                 ]
+                if not any(
+                    isinstance(description, dict) and description.get("field_name") == "vector"
+                    for description in index_descriptions
+                ):
+                    self._create_vector_index(client, collection, profile.distance_metric)
+                    index_names = client.list_indexes(
+                        collection_name=collection,
+                        timeout=settings.MILVUS_TIMEOUT_SECONDS,
+                    )
+                    index_descriptions = [
+                        client.describe_index(
+                            collection_name=collection,
+                            index_name=index_name,
+                            timeout=settings.MILVUS_TIMEOUT_SECONDS,
+                        )
+                        for index_name in index_names
+                    ]
                 self._validate_vector_indexes(index_descriptions, profile.distance_metric)
             else:
                 self._create_collection(client, collection, profile.dimension, profile.distance_metric)
@@ -303,7 +317,10 @@ class MilvusKnowledgeStore:
                 ) from exc
             finally:
                 if "client" in locals() and hasattr(client, "close"):
-                    client.close()
+                    try:
+                        client.close()
+                    except Exception:
+                        logger.warning("Milvus 客户端关闭失败", exc_info=True)
 
         return await asyncio.to_thread(run)
 

@@ -883,7 +883,13 @@ class KnowledgeStorageCleanupTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             service_db.commit()
-            raise IntegrityError("insert", {}, RuntimeError("duplicate"))
+            raise IntegrityError(
+                "insert",
+                {},
+                RuntimeError(
+                    "UNIQUE constraint failed: knowledge_documents.knowledge_base_id, knowledge_documents.dedupe_key"
+                ),
+            )
 
         service.repo.create_document_with_task = MagicMock(side_effect=concurrent_commit)
         upload = UploadFile(
