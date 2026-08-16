@@ -97,6 +97,7 @@ class AgentEventEmitter:
                 type="run_started",
                 conversation_id=self._conv_id,
                 message_id=message_id,
+                task_id=self._task_id,
                 model=model,
                 tools=tools,
                 config=config,

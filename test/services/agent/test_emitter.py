@@ -24,6 +24,7 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args[3]["run_id"], "r1")
         self.assertEqual(args[3]["trace_id"], "r1")
         self.assertEqual(args[3]["message_id"], "m1")
+        self.assertEqual(args[3]["task_id"], "task-1")
 
     async def test_step_started_returns_step_id_and_persists_context(self):
         writer = AsyncMock()

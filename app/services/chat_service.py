@@ -458,6 +458,15 @@ class ChatService:
                     message_id=retry_user_message.id,
                     task_id=retry_generation_task_id,
                 )
+        elif not stream:
+            # 首次非流式生成也必须拥有 user 代际；若其间被重试接管，
+            # 迟到的原请求不得无条件创建 assistant。
+            retry_generation_task_id = str(uuid_mod.uuid4())
+            self.conversation_service.claim_unanswered_user_generation(
+                conversation_id=conversation.id,
+                message_id=user_message.id,
+                task_id=retry_generation_task_id,
+            )
 
         if stream:
             # 预分配 assistant 消息 ID 和 task ID
@@ -594,8 +603,8 @@ class ChatService:
                         replace_existing=retry_assistant_message is not None,
                         generation_task_id=retry_generation_task_id,
                         retry_user_message_id=(
-                            retry_user_message.id
-                            if retry_user_message is not None and retry_assistant_message is None
+                            user_message.id
+                            if retry_assistant_message is None and retry_generation_task_id is not None
                             else None
                         ),
                     )
@@ -614,8 +623,8 @@ class ChatService:
                 replace_existing=retry_assistant_message is not None,
                 generation_task_id=retry_generation_task_id,
                 retry_user_message_id=(
-                    retry_user_message.id
-                    if retry_user_message is not None and retry_assistant_message is None
+                    user_message.id
+                    if retry_assistant_message is None and retry_generation_task_id is not None
                     else None
                 ),
             )

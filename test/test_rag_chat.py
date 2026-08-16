@@ -8,14 +8,15 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
 from app.db.models import (
-    Conversation as ConversationModel,
-)
-from app.db.models import (
+    AgentSession,
     ConversationKnowledgeBase,
     KnowledgeBase,
     KnowledgeDocument,
     KnowledgeIndexVersion,
     User,
+)
+from app.db.models import (
+    Conversation as ConversationModel,
 )
 from app.db.models import (
     Message as MessageModel,
@@ -305,6 +306,44 @@ class ConversationKnowledgeSelectionTests(unittest.TestCase):
         restored = self.db.query(MessageModel).filter(MessageModel.id == "retry-assistant").one()
         self.assertEqual(restored.content, [{"type": "text", "id": "a1", "text": "较新的回答"}])
         self.assertEqual(restored.generation_task_id, "task-current")
+
+    def test_non_stream_retry_revokes_old_limit_reached_continuation(self):
+        assistant = MessageModel(
+            id="retry-assistant",
+            conversation_id="conv-1",
+            sequence=937,
+            role="assistant",
+            content=[{"type": "text", "id": "a1", "text": "旧回答"}],
+            generation_task_id="task-retry",
+        )
+        old_session = AgentSession(
+            id="run-old",
+            conversation_id="conv-1",
+            message_id="retry-assistant",
+            user_id="user-1",
+            model_id="deepseek-chat",
+            provider="test",
+            status="limit_reached",
+            limit_reason="max_steps",
+        )
+        self.db.add_all([assistant, old_session])
+        self.db.commit()
+
+        self.service.replace_assistant_message(
+            MessageSchema(
+                id="retry-assistant",
+                sequence=937,
+                role="assistant",
+                content=[{"type": "text", "id": "a2", "text": "重新生成的回答"}],
+            ),
+            "conv-1",
+            generation_task_id="task-retry",
+        )
+        self.db.commit()
+
+        self.db.refresh(old_session)
+        self.assertEqual(old_session.status, "interrupted")
+        self.assertIsNone(old_session.limit_reason)
 
     def test_non_stream_retry_cannot_replace_answer_after_newer_turn(self):
         assistant = MessageModel(

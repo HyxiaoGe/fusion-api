@@ -919,13 +919,23 @@ class ChatServiceTests(unittest.TestCase):
             {"metadata": {"tags": ["app:fusion", "phase:chat_non_stream"]}},
         )
         persisted_messages = [call.args[0] for call in service.conversation_service.create_message.call_args_list]
-        self.assertEqual([message.sequence for message in persisted_messages], [1, 2])
+        self.assertEqual([message.sequence for message in persisted_messages], [1])
         self.assertEqual(
             [message.id for message in persisted_messages],
-            [
-                "11111111-1111-4111-8111-111111111111",
-                "22222222-2222-4222-8222-222222222222",
-            ],
+            ["11111111-1111-4111-8111-111111111111"],
+        )
+        claimed_task_id = service.conversation_service.claim_unanswered_user_generation.call_args.kwargs["task_id"]
+        service.conversation_service.claim_unanswered_user_generation.assert_called_once_with(
+            conversation_id="conv-1",
+            message_id="11111111-1111-4111-8111-111111111111",
+            task_id=claimed_task_id,
+        )
+        created_assistant = service.conversation_service.create_retry_assistant_message.call_args
+        self.assertEqual(created_assistant.args[0].id, "22222222-2222-4222-8222-222222222222")
+        self.assertEqual(created_assistant.kwargs["retry_user_message_id"], persisted_messages[0].id)
+        self.assertEqual(
+            created_assistant.kwargs["generation_task_id"],
+            claimed_task_id,
         )
 
     def test_process_message_stream_passes_reserved_assistant_sequence_to_stream_paths(self):
@@ -1490,9 +1500,10 @@ class ChatServiceTests(unittest.TestCase):
         self.assertIn("【无联网工具边界规则】", sent_messages[2]["content"])
         self.assertEqual(sent_messages[3]["content"], "这张图里有什么？")
         generated_messages = [call.args[0] for call in service.conversation_service.create_message.call_args_list]
-        self.assertEqual(len(generated_messages), 2)
-        self.assertEqual([UUID(message.id).version for message in generated_messages], [4, 4])
-        self.assertNotEqual(generated_messages[0].id, generated_messages[1].id)
+        self.assertEqual(len(generated_messages), 1)
+        self.assertEqual(UUID(generated_messages[0].id).version, 4)
+        service.conversation_service.claim_unanswered_user_generation.assert_called_once()
+        service.conversation_service.create_retry_assistant_message.assert_called_once()
 
     def test_generate_suggested_questions_delegates_to_message_scoped_service(self):
         service = object.__new__(ChatService)

@@ -1045,6 +1045,7 @@ class AgentContextResultRequest(BaseModel):
 class StopStreamRequest(BaseModel):
     """停止流前由客户端提交的当前可见助手内容；空数组兼容旧客户端。"""
 
+    task_id: Optional[str] = Field(default=None, min_length=1, max_length=160)
     partial_content: List[ClientPartialContentBlock] = Field(default_factory=list)
 
 

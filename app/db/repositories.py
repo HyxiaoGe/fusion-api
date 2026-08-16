@@ -508,6 +508,18 @@ class ConversationRepository:
         db_message.suggested_questions_status = "idle"
         db_message.suggested_questions_auto_run_id = None
         db_message.created_at = message.created_at
+        self.db.query(AgentSession).filter(
+            AgentSession.conversation_id == conversation_id,
+            AgentSession.message_id == db_message.id,
+            AgentSession.status.in_(("running", "limit_reached", "incomplete")),
+        ).update(
+            {
+                AgentSession.status: "interrupted",
+                AgentSession.limit_reason: None,
+                AgentSession.error_message: "回答已重新生成",
+            },
+            synchronize_session=False,
+        )
         db_conversation.updated_at = utc_now()
         self.db.flush()
         self.db.refresh(db_message)

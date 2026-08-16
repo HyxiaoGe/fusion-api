@@ -78,7 +78,7 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
                 context = replace(_context(state), emitter=emitter)
                 common = {
                     "context": context,
-                    "persist_message_fn": lambda *_args: None,
+                    "persist_message_fn": lambda *_args: True,
                     "finalize_stream_fn": AsyncMock(),
                 }
 
@@ -362,6 +362,7 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
 
         def persist_message_fn(*args):
             calls.append(("persist", args))
+            return True
 
         async def complete_agent_run_fn(**kwargs):
             calls.append(("complete", kwargs))
@@ -385,6 +386,84 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[1][1]["finish_reason"], "stop")
         self.assertEqual(calls[2], ("finalize", ("conv-1",), {"success": True, "task_id": "task-1"}))
         self.assertTrue(state.terminal_emitted)
+
+    async def test_finalize_completed_superseded_write_interrupts_session_and_closes_owned_stream(self):
+        state = AgentLoopState()
+        state.content_blocks.append(TextBlock(type="text", id="txt-1", text="迟到回答"))
+        session_cache = AsyncMock()
+        emitter = AsyncMock()
+        finalize_stream_fn = AsyncMock(return_value=True)
+        complete_agent_run_fn = AsyncMock()
+
+        await finalize_completed_run(
+            context=replace(
+                _context(state),
+                emitter=emitter,
+                session_cache=session_cache,
+            ),
+            terminal_state=SimpleNamespace(session_status="completed", run_finish_reason="stop"),
+            persist_message_fn=lambda *_args: False,
+            complete_agent_run_fn=complete_agent_run_fn,
+            finalize_stream_fn=finalize_stream_fn,
+        )
+
+        complete_agent_run_fn.assert_not_awaited()
+        emitter.run_completed.assert_not_awaited()
+        session_cache.write_session_status.assert_awaited_once_with(
+            run_id="run-1",
+            status="interrupted",
+            total_steps=0,
+            total_tool_calls=0,
+            total_duration_ms=1234,
+        )
+        finalize_stream_fn.assert_awaited_once_with(
+            "conv-1",
+            success=False,
+            error_msg="被新请求取代",
+            task_id="task-1",
+            error_code="generation_superseded",
+        )
+
+    async def test_finalize_completed_persistence_failure_publishes_error_not_success(self):
+        state = AgentLoopState()
+        state.content_blocks.append(TextBlock(type="text", id="txt-1", text="未落库回答"))
+        session_cache = AsyncMock()
+        emitter = AsyncMock()
+        finalize_stream_fn = AsyncMock(return_value=True)
+        complete_agent_run_fn = AsyncMock()
+
+        await finalize_completed_run(
+            context=replace(
+                _context(state),
+                emitter=emitter,
+                session_cache=session_cache,
+            ),
+            terminal_state=SimpleNamespace(session_status="completed", run_finish_reason="stop"),
+            persist_message_fn=lambda *_args: None,
+            complete_agent_run_fn=complete_agent_run_fn,
+            finalize_stream_fn=finalize_stream_fn,
+        )
+
+        complete_agent_run_fn.assert_not_awaited()
+        emitter.run_completed.assert_not_awaited()
+        emitter.run_failed.assert_awaited_once_with(
+            error_code="assistant_persistence_failed",
+            message="回答保存失败，请稍后重试",
+        )
+        session_cache.write_session_status.assert_awaited_once_with(
+            run_id="run-1",
+            status="error",
+            total_steps=0,
+            total_tool_calls=0,
+            total_duration_ms=1234,
+        )
+        finalize_stream_fn.assert_awaited_once_with(
+            "conv-1",
+            success=False,
+            error_msg="回答保存失败，请稍后重试",
+            task_id="task-1",
+            error_code="assistant_persistence_failed",
+        )
 
     async def test_finalize_completed_claims_before_stream_finalization_and_generates_after(self):
         state = AgentLoopState()
@@ -415,7 +494,7 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
         await finalize_completed_run(
             context=replace(_context(state), emitter=emitter),
             terminal_state=SimpleNamespace(session_status="completed", run_finish_reason="stop"),
-            persist_message_fn=lambda *_args: calls.append(("persist", None)),
+            persist_message_fn=lambda *_args: calls.append(("persist", None)) or True,
             complete_agent_run_fn=complete_agent_run_fn,
             finalize_stream_fn=finalize_stream_fn,
             claim_suggested_questions_fn=claim_suggested_questions_fn,
@@ -452,7 +531,7 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
         await finalize_completed_run(
             context=replace(_context(state), emitter=emitter),
             terminal_state=SimpleNamespace(session_status="completed", run_finish_reason="stop"),
-            persist_message_fn=lambda *_args: None,
+            persist_message_fn=lambda *_args: True,
             complete_agent_run_fn=AsyncMock(),
             finalize_stream_fn=finalize_stream_fn,
             claim_suggested_questions_fn=claim_suggested_questions_fn,
@@ -478,7 +557,7 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
         await finalize_completed_run(
             context=_context(state),
             terminal_state=SimpleNamespace(session_status="completed", run_finish_reason="stop"),
-            persist_message_fn=lambda *_args: None,
+            persist_message_fn=lambda *_args: True,
             complete_agent_run_fn=AsyncMock(),
             finalize_stream_fn=finalize_stream_fn,
             claim_suggested_questions_fn=lambda **_kwargs: SimpleNamespace(revision=1),
@@ -502,7 +581,7 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
             await finalize_completed_run(
                 context=_context(state),
                 terminal_state=SimpleNamespace(session_status="completed", run_finish_reason="stop"),
-                persist_message_fn=lambda *_args: None,
+                persist_message_fn=lambda *_args: True,
                 complete_agent_run_fn=AsyncMock(),
                 finalize_stream_fn=finalize_stream_fn,
                 claim_suggested_questions_fn=lambda **_kwargs: claim,
@@ -550,7 +629,7 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
         await finalize_completed_run(
             context=replace(_context(state), emitter=emitter),
             terminal_state=SimpleNamespace(session_status="completed", run_finish_reason="stop"),
-            persist_message_fn=lambda *_args: None,
+            persist_message_fn=lambda *_args: True,
             complete_agent_run_fn=complete_agent_run_fn,
             finalize_stream_fn=finalize_stream_fn,
         )
@@ -612,7 +691,7 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
                         session_status="incomplete",
                         run_finish_reason="incomplete",
                     ),
-                    persist_message_fn=lambda *_args: None,
+                    persist_message_fn=lambda *_args: True,
                     complete_agent_run_fn=AsyncMock(),
                     finalize_stream_fn=AsyncMock(),
                 )
@@ -664,7 +743,7 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
                 session_status="completed",
                 run_finish_reason="stop",
             ),
-            persist_message_fn=lambda *_args: None,
+            persist_message_fn=lambda *_args: True,
             complete_agent_run_fn=AsyncMock(),
             finalize_stream_fn=AsyncMock(),
         )
@@ -718,7 +797,7 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
         await finalize_completed_run(
             context=replace(_context(state), emitter=emitter),
             terminal_state=SimpleNamespace(session_status="incomplete", run_finish_reason="incomplete"),
-            persist_message_fn=lambda *_args: None,
+            persist_message_fn=lambda *_args: True,
             complete_agent_run_fn=AsyncMock(),
             finalize_stream_fn=AsyncMock(),
         )
@@ -768,7 +847,7 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
         await finalize_completed_run(
             context=context,
             terminal_state=SimpleNamespace(session_status="completed", run_finish_reason="stop"),
-            persist_message_fn=lambda *_args: None,
+            persist_message_fn=lambda *_args: True,
             complete_agent_run_fn=complete_agent_run_fn,
             finalize_stream_fn=finalize_stream_fn,
         )

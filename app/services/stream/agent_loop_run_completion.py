@@ -23,6 +23,8 @@ FailSuggestedQuestionsFn = Callable[..., Any]
 
 AGENT_RUN_FAILED_MESSAGE = "生成服务暂时不可用，请稍后重试"
 AGENT_RUN_FAILED_ERROR_CODE = "agent_run_failed"
+ASSISTANT_PERSISTENCE_FAILED_MESSAGE = "回答保存失败，请稍后重试"
+ASSISTANT_PERSISTENCE_FAILED_ERROR_CODE = "assistant_persistence_failed"
 _PUBLIC_ERROR_MESSAGES = {
     "context_budget_exceeded": "当前消息与必要上下文过长，请缩短本次输入或移除较大的文件后重试",
     "context_estimation_unavailable": "上下文预算暂时无法校验，请稍后重试",
@@ -90,7 +92,48 @@ async def finalize_completed_run(
         persisted = persist_run_message(context=context, persist_message_fn=persist_message_fn, partial=False)
         if persisted is False:
             if warning_fn is not None:
-                warning_fn("assistant 终态写入已被更新任务接管，跳过旧任务收尾")
+                warning_fn("assistant 终态写入已被更新任务接管，终结旧任务")
+            superseded_stats = context.state.run_stats(context.run_id)
+            await context.session_cache.write_session_status(
+                run_id=superseded_stats.run_id,
+                status="interrupted",
+                total_steps=superseded_stats.total_steps,
+                total_tool_calls=superseded_stats.total_tool_calls,
+                total_duration_ms=context.duration_ms_factory(),
+            )
+            await finalize_stream_fn(
+                context.conversation_id,
+                success=False,
+                error_msg="被新请求取代",
+                task_id=context.task_id,
+                error_code="generation_superseded",
+            )
+            return
+        if persisted is not True:
+            if warning_fn is not None:
+                warning_fn("assistant 终态写入失败，不发布成功终态")
+            try:
+                await context.emitter.run_failed(
+                    error_code=ASSISTANT_PERSISTENCE_FAILED_ERROR_CODE,
+                    message=ASSISTANT_PERSISTENCE_FAILED_MESSAGE,
+                )
+            except StreamOwnershipLostError:
+                pass
+            failed_stats = context.state.run_stats(context.run_id)
+            await context.session_cache.write_session_status(
+                run_id=failed_stats.run_id,
+                status="error",
+                total_steps=failed_stats.total_steps,
+                total_tool_calls=failed_stats.total_tool_calls,
+                total_duration_ms=context.duration_ms_factory(),
+            )
+            await finalize_stream_fn(
+                context.conversation_id,
+                success=False,
+                error_msg=ASSISTANT_PERSISTENCE_FAILED_MESSAGE,
+                task_id=context.task_id,
+                error_code=ASSISTANT_PERSISTENCE_FAILED_ERROR_CODE,
+            )
             return
         await complete_agent_run_fn(
             emitter=context.emitter,

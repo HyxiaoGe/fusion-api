@@ -89,6 +89,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                     "usage": usage_data,
                 }
             )
+            return True
 
         async def _capture_finalize(conversation_id, success, error_msg="", task_id="", **kwargs):
             result.finalize_calls.append(

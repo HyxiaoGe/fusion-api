@@ -40,6 +40,7 @@ class AgentEventModelTests(unittest.TestCase):
             type="run_started",
             conversation_id="c1",
             message_id="msg-1",
+            task_id="task-1",
             model="gpt",
             tools=["web_search"],
             config={"max_steps": 8, "max_tool_calls": 20, "timeout_s": 300},
@@ -48,6 +49,7 @@ class AgentEventModelTests(unittest.TestCase):
         self.assertEqual(ev.type, "run_started")
         self.assertEqual(ev.tools, ["web_search"])
         self.assertEqual(ev.message_id, "msg-1")
+        self.assertEqual(ev.task_id, "task-1")
 
     def test_run_started_message_id_required(self):
         """RunStarted 缺 message_id 必须抛 ValidationError"""
@@ -55,6 +57,7 @@ class AgentEventModelTests(unittest.TestCase):
             RunStarted(
                 type="run_started",
                 conversation_id="c1",
+                task_id="task-1",
                 # message_id 漏了
                 model="gpt",
                 tools=[],

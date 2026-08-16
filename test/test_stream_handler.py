@@ -503,6 +503,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
             **_kwargs,
         ):
             order.append(("persist", msg_id, partial, len(content_blocks)))
+            return True
 
         async def _capture_execute(*_args, **kwargs):
             order.append(("execute", kwargs.get("message_id")))
@@ -802,6 +803,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                     "partial": partial,
                 }
             )
+            return True
 
         await self._invoke(
             stream_round_side_effect=[
@@ -958,6 +960,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         ):
             if not partial:
                 persist_calls.append(list(content_blocks))
+            return True
 
         await self._invoke(
             stream_round_side_effect=[
