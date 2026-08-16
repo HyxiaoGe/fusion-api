@@ -391,6 +391,178 @@ class ConversationRepository:
             logger.error(f"获取消息失败: {e}")
             return None
 
+    def list_messages_for_retry(self, conversation_id: str) -> list[MessageModel]:
+        """锁定会话消息，供调用方在同一事务内校验并复用最后一轮。"""
+
+        return (
+            self.db.query(MessageModel)
+            .filter(MessageModel.conversation_id == conversation_id)
+            .order_by(
+                MessageModel.sequence.asc().nullsfirst(),
+                MessageModel.created_at.asc(),
+                MessageModel.id.asc(),
+            )
+            .with_for_update()
+            .all()
+        )
+
+    def convert_message_model(self, db_message: MessageModel) -> Message:
+        """把已校验的消息行转换为业务 schema。"""
+
+        return self._convert_message_to_schema(db_message)
+
+    def convert_conversation_model(self, db_conversation: ConversationModel) -> Conversation:
+        """把已锁定并刷新的会话行转换为业务 schema。"""
+
+        return self._convert_to_schema(db_conversation)
+
+    def claim_assistant_message_generation(
+        self,
+        *,
+        conversation_id: str,
+        message_id: str,
+        task_id: str,
+    ) -> None:
+        """为新任务切换 assistant 写所有权，不提前破坏原回答。"""
+
+        db_message = (
+            self.db.query(MessageModel)
+            .filter(
+                MessageModel.id == message_id,
+                MessageModel.conversation_id == conversation_id,
+                MessageModel.role == "assistant",
+            )
+            .with_for_update()
+            .first()
+        )
+        if db_message is None:
+            raise ValueError("待重试的 assistant 消息不存在")
+        db_message.generation_task_id = task_id
+        self.db.flush()
+
+    def claim_unanswered_user_generation(
+        self,
+        *,
+        conversation_id: str,
+        message_id: str,
+        task_id: str,
+    ) -> None:
+        """为尚无回答的 user 消息切换生成所有权。"""
+
+        db_message = (
+            self.db.query(MessageModel)
+            .filter(
+                MessageModel.id == message_id,
+                MessageModel.conversation_id == conversation_id,
+                MessageModel.role == "user",
+            )
+            .with_for_update()
+            .first()
+        )
+        if db_message is None:
+            raise ValueError("待重试的 user 消息不存在")
+        db_message.generation_task_id = task_id
+        self.db.flush()
+
+    def replace_assistant_message(
+        self,
+        message: Message,
+        conversation_id: str,
+        *,
+        generation_task_id: str | None = None,
+    ) -> Message | None:
+        """用重试结果替换同一 assistant 消息，不追加第二条回答。"""
+
+        db_conversation = (
+            self.db.query(ConversationModel).filter(ConversationModel.id == conversation_id).with_for_update().first()
+        )
+        if db_conversation is None:
+            raise ValueError("待替换的会话不存在")
+        db_message = (
+            self.db.query(MessageModel)
+            .filter(
+                MessageModel.conversation_id == conversation_id,
+            )
+            .order_by(
+                MessageModel.sequence.desc().nullslast(),
+                MessageModel.created_at.desc(),
+                MessageModel.id.desc(),
+            )
+            .with_for_update()
+            .first()
+        )
+        if db_message is None or db_message.id != message.id or db_message.role != "assistant":
+            return None
+        if generation_task_id is not None and db_message.generation_task_id != generation_task_id:
+            return None
+        if message.sequence is not None:
+            if db_message.sequence is None:
+                db_message.sequence = message.sequence
+            elif db_message.sequence != message.sequence:
+                raise ValueError("assistant 消息顺序号与原轮次不一致")
+        db_message.content = [block.model_dump(mode="json") for block in message.content]
+        db_message.model_id = message.model_id
+        db_message.usage = message.usage.model_dump() if message.usage else None
+        db_message.suggested_questions = None
+        db_message.suggested_questions_revision = (db_message.suggested_questions_revision or 0) + 1
+        db_message.suggested_questions_status = "idle"
+        db_message.suggested_questions_auto_run_id = None
+        db_message.created_at = message.created_at
+        db_conversation.updated_at = utc_now()
+        self.db.flush()
+        self.db.refresh(db_message)
+        return self._convert_message_to_schema(db_message)
+
+    def create_retry_assistant_message(
+        self,
+        message: Message,
+        conversation_id: str,
+        *,
+        retry_user_message_id: str,
+        generation_task_id: str,
+    ) -> Message | None:
+        """仅当原 user 仍是最后一条且代际匹配时创建唯一回答。"""
+
+        db_conversation = (
+            self.db.query(ConversationModel).filter(ConversationModel.id == conversation_id).with_for_update().first()
+        )
+        if db_conversation is None:
+            raise ValueError("待补答的会话不存在")
+        latest = (
+            self.db.query(MessageModel)
+            .filter(MessageModel.conversation_id == conversation_id)
+            .order_by(
+                MessageModel.sequence.desc().nullslast(),
+                MessageModel.created_at.desc(),
+                MessageModel.id.desc(),
+            )
+            .with_for_update()
+            .first()
+        )
+        if (
+            latest is None
+            or latest.id != retry_user_message_id
+            or latest.role != "user"
+            or latest.generation_task_id != generation_task_id
+        ):
+            return None
+        db_message = MessageModel(
+            id=message.id,
+            conversation_id=conversation_id,
+            sequence=message.sequence,
+            role="assistant",
+            content=[block.model_dump(mode="json") for block in message.content],
+            model_id=message.model_id,
+            usage=message.usage.model_dump() if message.usage else None,
+            generation_task_id=generation_task_id,
+            created_at=message.created_at,
+        )
+        self.db.add(db_message)
+        db_conversation.updated_at = utc_now()
+        self.db.flush()
+        self.db.refresh(db_message)
+        return self._convert_message_to_schema(db_message)
+
     def update_message(self, message_id: str, update_data: Dict[str, Any]) -> Optional[Message]:
         """更新消息内容"""
         try:

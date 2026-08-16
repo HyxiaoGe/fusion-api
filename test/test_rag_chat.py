@@ -17,14 +17,21 @@ from app.db.models import (
     KnowledgeIndexVersion,
     User,
 )
+from app.db.models import (
+    Message as MessageModel,
+)
 from app.db.repositories import ConversationRepository
 from app.schemas.chat import (
     ChatRequest,
     KnowledgeEvidenceBlock,
     KnowledgeSourceReference,
+    TextBlock,
 )
 from app.schemas.chat import (
     Conversation as ConversationSchema,
+)
+from app.schemas.chat import (
+    Message as MessageSchema,
 )
 from app.schemas.content_block_registry import deserialize_content_blocks
 from app.schemas.knowledge import KnowledgeRetrievalHit, KnowledgeRetrievalResult
@@ -39,6 +46,7 @@ from app.services.knowledge.chat_grounding import (
     validate_grounded_answer,
 )
 from app.services.stream.agent_loop_request_prep import build_agent_loop_call_config
+from app.services.stream.persistence import persist_message
 
 
 class ChatRequestKnowledgeSelectionTests(unittest.TestCase):
@@ -169,6 +177,348 @@ class ConversationKnowledgeSelectionTests(unittest.TestCase):
         self.db.add_all([base, document])
         self.db.flush()
         self.db.add(version)
+
+    def test_message_retry_reuses_only_the_latest_complete_turn(self):
+        self.db.add_all(
+            [
+                MessageModel(
+                    id="retry-user",
+                    conversation_id="conv-1",
+                    sequence=901,
+                    role="user",
+                    content=[{"type": "text", "id": "q1", "text": "原始问题"}],
+                ),
+                MessageModel(
+                    id="retry-assistant",
+                    conversation_id="conv-1",
+                    sequence=902,
+                    role="assistant",
+                    content=[{"type": "text", "id": "a1", "text": "原始回答"}],
+                ),
+            ]
+        )
+        self.db.commit()
+
+        user_message, assistant_message = self.service.prepare_message_retry(
+            conversation_id="conv-1",
+            user_id="user-1",
+            user_message_id="retry-user",
+            assistant_message_id="retry-assistant",
+        )
+
+        self.assertEqual(user_message.id, "retry-user")
+        self.assertEqual(assistant_message.id, "retry-assistant")
+
+    def test_message_retry_rejects_historical_turn_with_later_messages(self):
+        self.db.add_all(
+            [
+                MessageModel(
+                    id="old-user",
+                    conversation_id="conv-1",
+                    sequence=911,
+                    role="user",
+                    content=[{"type": "text", "id": "q1", "text": "旧问题"}],
+                ),
+                MessageModel(
+                    id="old-assistant",
+                    conversation_id="conv-1",
+                    sequence=912,
+                    role="assistant",
+                    content=[{"type": "text", "id": "a1", "text": "旧回答"}],
+                ),
+                MessageModel(
+                    id="latest-user",
+                    conversation_id="conv-1",
+                    sequence=913,
+                    role="user",
+                    content=[{"type": "text", "id": "q2", "text": "新问题"}],
+                ),
+            ]
+        )
+        self.db.commit()
+
+        with self.assertRaises(ApiException) as raised:
+            self.service.prepare_message_retry(
+                conversation_id="conv-1",
+                user_id="user-1",
+                user_message_id="old-user",
+                assistant_message_id="old-assistant",
+            )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("最后一轮", raised.exception.message)
+
+    def test_claim_retry_assistant_preserves_old_answer_until_success(self):
+        assistant = MessageModel(
+            id="retry-assistant",
+            conversation_id="conv-1",
+            sequence=922,
+            role="assistant",
+            content=[{"type": "text", "id": "a1", "text": "原始回答"}],
+            usage={"input_tokens": 3, "output_tokens": 5},
+            suggested_questions=["旧推荐"],
+            suggested_questions_revision=4,
+            suggested_questions_status="ready",
+        )
+        self.db.add(assistant)
+        self.db.commit()
+
+        self.service.claim_assistant_message_generation(
+            conversation_id="conv-1",
+            message_id="retry-assistant",
+            task_id="task-retry",
+        )
+
+        self.db.refresh(assistant)
+        self.assertEqual(assistant.content, [{"type": "text", "id": "a1", "text": "原始回答"}])
+        self.assertEqual(assistant.usage, {"input_tokens": 3, "output_tokens": 5})
+        self.assertEqual(assistant.suggested_questions, ["旧推荐"])
+        self.assertEqual(assistant.suggested_questions_revision, 4)
+        self.assertEqual(assistant.suggested_questions_status, "ready")
+        self.assertEqual(assistant.generation_task_id, "task-retry")
+
+    def test_non_stream_retry_stale_generation_cannot_replace_newer_answer(self):
+        assistant = MessageModel(
+            id="retry-assistant",
+            conversation_id="conv-1",
+            sequence=932,
+            role="assistant",
+            content=[{"type": "text", "id": "a1", "text": "较新的回答"}],
+            generation_task_id="task-current",
+        )
+        self.db.add(assistant)
+        self.db.commit()
+
+        with self.assertRaises(ApiException) as raised:
+            self.service.replace_assistant_message(
+                MessageSchema(
+                    id="retry-assistant",
+                    sequence=932,
+                    role="assistant",
+                    content=[{"type": "text", "id": "a2", "text": "迟到回答"}],
+                ),
+                "conv-1",
+                generation_task_id="task-stale",
+            )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        restored = self.db.query(MessageModel).filter(MessageModel.id == "retry-assistant").one()
+        self.assertEqual(restored.content, [{"type": "text", "id": "a1", "text": "较新的回答"}])
+        self.assertEqual(restored.generation_task_id, "task-current")
+
+    def test_non_stream_retry_cannot_replace_answer_after_newer_turn(self):
+        assistant = MessageModel(
+            id="retry-assistant",
+            conversation_id="conv-1",
+            sequence=942,
+            role="assistant",
+            content=[{"type": "text", "id": "a1", "text": "原回答"}],
+            generation_task_id="task-retry",
+        )
+        newer_user = MessageModel(
+            id="newer-user",
+            conversation_id="conv-1",
+            sequence=943,
+            role="user",
+            content=[{"type": "text", "id": "q2", "text": "后续问题"}],
+        )
+        self.db.add_all([assistant, newer_user])
+        self.db.commit()
+
+        with self.assertRaises(ApiException) as raised:
+            self.service.replace_assistant_message(
+                MessageSchema(
+                    id="retry-assistant",
+                    sequence=942,
+                    role="assistant",
+                    content=[{"type": "text", "id": "a2", "text": "迟到的新回答"}],
+                ),
+                "conv-1",
+                generation_task_id="task-retry",
+            )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        restored = self.db.query(MessageModel).filter(MessageModel.id == "retry-assistant").one()
+        self.assertEqual(restored.content, [{"type": "text", "id": "a1", "text": "原回答"}])
+
+    def test_stream_retry_cannot_finalize_answer_after_newer_turn(self):
+        assistant = MessageModel(
+            id="retry-assistant",
+            conversation_id="conv-1",
+            sequence=952,
+            role="assistant",
+            content=[{"type": "text", "id": "a1", "text": "原回答"}],
+            generation_task_id="task-retry",
+        )
+        newer_user = MessageModel(
+            id="newer-user",
+            conversation_id="conv-1",
+            sequence=953,
+            role="user",
+            content=[{"type": "text", "id": "q2", "text": "后续问题"}],
+        )
+        self.db.add_all([assistant, newer_user])
+        self.db.commit()
+
+        persisted = persist_message(
+            self.db,
+            "retry-assistant",
+            "conv-1",
+            "new-model",
+            [TextBlock(type="text", id="a2", text="迟到的新回答")],
+            partial=False,
+            generation_task_id="task-retry",
+            replace_on_success=True,
+        )
+
+        self.assertFalse(persisted)
+        restored = self.db.query(MessageModel).filter(MessageModel.id == "retry-assistant").one()
+        self.assertEqual(restored.content, [{"type": "text", "id": "a1", "text": "原回答"}])
+
+    def test_message_write_lock_reloads_conversation_history(self):
+        initial = self.service.get_conversation("conv-1", "user-1")
+        self.assertEqual(initial.messages, [])
+        self.db.add(
+            MessageModel(
+                id="latest-user",
+                conversation_id="conv-1",
+                sequence=961,
+                role="user",
+                content=[{"type": "text", "id": "q1", "text": "锁后刷新"}],
+            )
+        )
+        self.db.commit()
+
+        refreshed = self.service.lock_conversation_for_message_write("conv-1", "user-1")
+
+        self.assertEqual([message.id for message in refreshed.messages], ["latest-user"])
+
+    def test_dual_unanswered_retry_creates_only_latest_generation_answer(self):
+        user_message = MessageModel(
+            id="unanswered-user",
+            conversation_id="conv-1",
+            sequence=971,
+            role="user",
+            content=[{"type": "text", "id": "q1", "text": "失败后重试"}],
+        )
+        self.db.add(user_message)
+        self.db.commit()
+        self.service.claim_unanswered_user_generation(
+            conversation_id="conv-1",
+            message_id="unanswered-user",
+            task_id="task-a",
+        )
+        self.db.commit()
+        self.service.claim_unanswered_user_generation(
+            conversation_id="conv-1",
+            message_id="unanswered-user",
+            task_id="task-b",
+        )
+        self.db.commit()
+
+        with self.assertRaises(ApiException) as stale:
+            self.service.create_retry_assistant_message(
+                MessageSchema(
+                    id="assistant-a",
+                    sequence=972,
+                    role="assistant",
+                    content=[{"type": "text", "id": "a1", "text": "迟到回答 A"}],
+                ),
+                "conv-1",
+                retry_user_message_id="unanswered-user",
+                generation_task_id="task-a",
+            )
+        self.assertEqual(stale.exception.status_code, 409)
+
+        created = self.service.create_retry_assistant_message(
+            MessageSchema(
+                id="assistant-b",
+                sequence=974,
+                role="assistant",
+                content=[{"type": "text", "id": "a2", "text": "有效回答 B"}],
+            ),
+            "conv-1",
+            retry_user_message_id="unanswered-user",
+            generation_task_id="task-b",
+        )
+        self.db.commit()
+
+        self.assertEqual(created.id, "assistant-b")
+        assistants = self.db.query(MessageModel).filter(MessageModel.role == "assistant").all()
+        self.assertEqual([message.id for message in assistants], ["assistant-b"])
+
+    def test_unanswered_retry_cannot_create_answer_after_newer_turn(self):
+        user_message = MessageModel(
+            id="unanswered-user",
+            conversation_id="conv-1",
+            sequence=981,
+            role="user",
+            content=[{"type": "text", "id": "q1", "text": "失败后重试"}],
+        )
+        self.db.add(user_message)
+        self.db.commit()
+        self.service.claim_unanswered_user_generation(
+            conversation_id="conv-1",
+            message_id="unanswered-user",
+            task_id="task-retry",
+        )
+        self.db.commit()
+        self.db.add(
+            MessageModel(
+                id="newer-user",
+                conversation_id="conv-1",
+                sequence=983,
+                role="user",
+                content=[{"type": "text", "id": "q2", "text": "新一轮问题"}],
+            )
+        )
+        self.db.commit()
+
+        with self.assertRaises(ApiException) as raised:
+            self.service.create_retry_assistant_message(
+                MessageSchema(
+                    id="retry-assistant",
+                    sequence=982,
+                    role="assistant",
+                    content=[{"type": "text", "id": "a1", "text": "迟到回答"}],
+                ),
+                "conv-1",
+                retry_user_message_id="unanswered-user",
+                generation_task_id="task-retry",
+            )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(self.db.query(MessageModel).filter(MessageModel.role == "assistant").count(), 0)
+
+    def test_stream_unanswered_retry_success_creates_assistant(self):
+        user_message = MessageModel(
+            id="unanswered-user",
+            conversation_id="conv-1",
+            sequence=991,
+            role="user",
+            content=[{"type": "text", "id": "q1", "text": "失败后重试"}],
+            generation_task_id="task-retry",
+        )
+        self.db.add(user_message)
+        self.db.commit()
+
+        persisted = persist_message(
+            self.db,
+            "retry-assistant",
+            "conv-1",
+            "new-model",
+            [TextBlock(type="text", id="a1", text="补答成功")],
+            partial=False,
+            sequence=992,
+            generation_task_id="task-retry",
+            defer_partial=True,
+            create_after_retry_user_id="unanswered-user",
+        )
+
+        self.assertTrue(persisted)
+        assistant = self.db.query(MessageModel).filter(MessageModel.id == "retry-assistant").one()
+        self.assertEqual(assistant.content, [{"type": "text", "id": "a1", "text": "补答成功"}])
+        self.assertEqual(assistant.generation_task_id, "task-retry")
 
     def test_replace_selection_persists_order_and_conversation_projection(self):
         self.service.replace_knowledge_base_selection(

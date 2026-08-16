@@ -53,14 +53,14 @@ def persist_run_message(
     persist_message_fn: PersistMessageFn,
     only_if_content: bool = False,
     partial: bool = False,
-) -> None:
+) -> bool | None:
     if only_if_content and not context.state.content_blocks and context.state.final_usage() is None:
-        return
+        return None
 
     persistence_kwargs = (
         {"sequence": context.assistant_message_sequence} if context.assistant_message_sequence is not None else {}
     )
-    persist_message_fn(
+    return persist_message_fn(
         context.db,
         context.assistant_message_id,
         context.conversation_id,
@@ -87,7 +87,11 @@ async def finalize_completed_run(
     suggestion_claim = None
     try:
         await _emit_terminal_plan(context, terminal_state.run_finish_reason)
-        persist_run_message(context=context, persist_message_fn=persist_message_fn, partial=False)
+        persisted = persist_run_message(context=context, persist_message_fn=persist_message_fn, partial=False)
+        if persisted is False:
+            if warning_fn is not None:
+                warning_fn("assistant 终态写入已被更新任务接管，跳过旧任务收尾")
+            return
         await complete_agent_run_fn(
             emitter=context.emitter,
             session_cache=context.session_cache,

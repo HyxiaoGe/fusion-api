@@ -124,6 +124,19 @@ def _continuation_original_user_text(
     return ""
 
 
+def _retry_user_payload(message: Message) -> tuple[str, list[str]]:
+    """从已持久化 user 消息恢复重试输入，禁止客户端改写历史问题。"""
+
+    text_parts: list[str] = []
+    file_ids: list[str] = []
+    for block in message.content:
+        if isinstance(block, TextBlock):
+            text_parts.append(block.text)
+        elif isinstance(block, FileBlock):
+            file_ids.append(block.file_id)
+    return "".join(text_parts), file_ids
+
+
 class ChatService:
     def __init__(self, db: Session):
         self.db = db
@@ -171,6 +184,9 @@ class ChatService:
             raise ApiException.not_found("无进行中的流")
         if not message_id or stream_meta.get("message_id") != message_id:
             raise ApiException.conflict("当前生成已被新请求取代")
+        if stream_meta.get("stream_mode") == "retry":
+            # retry 被中止时继续保留上一版完整回答，不能用半截新内容污染回滚基线。
+            return False
 
         from app.db.models import Message as MessageModel
 
@@ -253,6 +269,8 @@ class ChatService:
         conversation_id: Optional[str] = None,
         user_message_id: Optional[str] = None,
         assistant_message_id: Optional[str] = None,
+        retry_user_message_id: Optional[str] = None,
+        retry_assistant_message_id: Optional[str] = None,
         stream: bool = True,
         options: Optional[Dict[str, Any]] = None,
         file_ids: Optional[List[str]] = None,
@@ -269,6 +287,33 @@ class ChatService:
             candidate = self.conversation_service.get_conversation(conversation_id, user_id)
             if candidate is not None and isinstance(getattr(candidate, "model_id", None), str):
                 existing_conversation = candidate
+
+        retry_user_message: Message | None = None
+        retry_assistant_message: Message | None = None
+        if retry_assistant_message_id is not None and retry_user_message_id is None:
+            raise ApiException.bad_request("retry_assistant_message_id 必须与 retry_user_message_id 同时提供")
+        if retry_user_message_id is not None:
+            if existing_conversation is None or conversation_id is None:
+                raise ApiException.not_found("会话不存在或无权访问")
+            retry_user_message, retry_assistant_message = self.conversation_service.prepare_message_retry(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                user_message_id=retry_user_message_id,
+                assistant_message_id=retry_assistant_message_id,
+            )
+            stored_message, stored_file_ids = _retry_user_payload(retry_user_message)
+            if message != stored_message or list(file_ids or []) != stored_file_ids:
+                raise ApiException.conflict("重试内容与原用户消息不一致")
+            message = stored_message
+            file_ids = stored_file_ids
+            user_message_id = retry_user_message.id
+            # 历史消息只提供待校验的 file_id，重试仍必须重新验证所有权、会话关联与处理状态。
+            self._validate_message_files(file_ids, user_id, conversation_id)
+            if retry_assistant_message is not None:
+                assistant_message_id = retry_assistant_message.id
+                existing_conversation.messages = [
+                    item for item in existing_conversation.messages if item.id != retry_assistant_message.id
+                ]
 
         # 已有会话的模型绑定由服务端持久记录决定，忽略客户端覆盖；新会话才接受请求模型。
         effective_model_id = existing_conversation.model_id if existing_conversation is not None else model_id
@@ -364,27 +409,59 @@ class ChatService:
                 self.db.rollback()
                 raise
 
-        # 构造用户消息 content blocks
-        validated_files = self._validate_message_files(file_ids or [], user_id, conversation.id)
+        if existing_conversation is not None and retry_user_message is None:
+            refreshed_conversation = self.conversation_service.lock_conversation_for_message_write(
+                conversation.id,
+                user_id,
+            )
+            if isinstance(refreshed_conversation, Conversation):
+                conversation = refreshed_conversation
 
-        user_content = [TextBlock(type="text", text=message)]
-        for file_info in validated_files:
-            user_content.append(await self._build_file_block_from_record(file_info))
+        if retry_user_message is not None:
+            user_message = retry_user_message
+            if retry_assistant_message is not None and retry_assistant_message.sequence is not None:
+                assistant_sequence = retry_assistant_message.sequence
+            else:
+                _, assistant_sequence = self.conversation_service.reserve_message_sequence_pair()
+            assistant_message_id = assistant_message_id or str(uuid_mod.uuid4())
+        else:
+            # 普通发送仍构造并持久化一条全新的 user 消息。
+            validated_files = self._validate_message_files(file_ids or [], user_id, conversation.id)
+            user_content = [TextBlock(type="text", text=message)]
+            for file_info in validated_files:
+                user_content.append(await self._build_file_block_from_record(file_info))
 
-        user_sequence, assistant_sequence = self.conversation_service.reserve_message_sequence_pair()
-        user_message = Message(
-            id=user_message_id or str(uuid_mod.uuid4()),
-            role="user",
-            content=user_content,
-            sequence=user_sequence,
-        )
-        assistant_message_id = assistant_message_id or str(uuid_mod.uuid4())
+            user_sequence, assistant_sequence = self.conversation_service.reserve_message_sequence_pair()
+            user_message = Message(
+                id=user_message_id or str(uuid_mod.uuid4()),
+                role="user",
+                content=user_content,
+                sequence=user_sequence,
+            )
+            assistant_message_id = assistant_message_id or str(uuid_mod.uuid4())
+            self.conversation_service.create_message(user_message, conversation.id)
 
-        self.conversation_service.create_message(user_message, conversation.id)
+        retry_generation_task_id: str | None = None
+        if retry_user_message is not None:
+            retry_generation_task_id = str(uuid_mod.uuid4())
+            if retry_assistant_message is not None:
+                # 已有回答时在 assistant 行换代，后返回的旧调用不能覆盖新回答。
+                self.conversation_service.claim_assistant_message_generation(
+                    conversation_id=conversation.id,
+                    message_id=retry_assistant_message.id,
+                    task_id=retry_generation_task_id,
+                )
+            else:
+                # 尚无回答时把代际挂在原 user 行，完成阶段再 CAS 创建唯一 assistant。
+                self.conversation_service.claim_unanswered_user_generation(
+                    conversation_id=conversation.id,
+                    message_id=retry_user_message.id,
+                    task_id=retry_generation_task_id,
+                )
 
         if stream:
             # 预分配 assistant 消息 ID 和 task ID
-            task_id = str(uuid_mod.uuid4())
+            task_id = retry_generation_task_id or str(uuid_mod.uuid4())
 
             # 先初始化 Redis Stream（清除旧数据 + 写 start 标记），
             # 必须在 SSE 读取器启动之前完成，否则读取器会读到上一轮残留数据
@@ -395,6 +472,7 @@ class ChatService:
                     model_id,
                     assistant_message_id,
                     task_id,
+                    stream_mode="retry" if retry_user_message is not None else "initial",
                     message_sequence=assistant_sequence,
                 )
             except Exception:
@@ -422,7 +500,8 @@ class ChatService:
                         task_id,
                     )
                 raise
-            conversation.messages.append(user_message)
+            if retry_user_message is None:
+                conversation.messages.append(user_message)
 
             # 启动后台生成任务（独立于 HTTP 连接生命周期）
             # 图片 base64 编码等耗时操作在后台任务中完成，不阻塞 SSE 首字节
@@ -445,6 +524,13 @@ class ChatService:
                     capabilities=capabilities,
                     knowledge_base_ids=effective_knowledge_base_ids,
                     trace_id=trace_id,
+                    defer_partial_persistence=retry_user_message is not None,
+                    replace_on_success=retry_assistant_message is not None,
+                    create_after_retry_user_id=(
+                        retry_user_message.id
+                        if retry_user_message is not None and retry_assistant_message is None
+                        else None
+                    ),
                 )
             )
             register_task(conversation.id, task, task_id)
@@ -464,7 +550,8 @@ class ChatService:
             )
         else:
             self.db.commit()
-            conversation.messages.append(user_message)
+            if retry_user_message is None:
+                conversation.messages.append(user_message)
             # 非流式模式：同步构建消息（含图片 base64）
             from app.db.models import User as UserModel
 
@@ -504,6 +591,13 @@ class ChatService:
                         assistant_message_sequence=assistant_sequence,
                         evidence_block=grounding.evidence_block,
                         answer=grounding.deterministic_answer or "未在所选知识库中找到足够依据",
+                        replace_existing=retry_assistant_message is not None,
+                        generation_task_id=retry_generation_task_id,
+                        retry_user_message_id=(
+                            retry_user_message.id
+                            if retry_user_message is not None and retry_assistant_message is None
+                            else None
+                        ),
                     )
                 lm_messages = inject_knowledge_grounding_messages(lm_messages, grounding)
             lm_messages = inject_no_tool_network_boundary(lm_messages, call_kwargs={})
@@ -517,6 +611,13 @@ class ChatService:
                 assistant_message_id,
                 assistant_sequence,
                 initial_content_blocks=initial_content_blocks,
+                replace_existing=retry_assistant_message is not None,
+                generation_task_id=retry_generation_task_id,
+                retry_user_message_id=(
+                    retry_user_message.id
+                    if retry_user_message is not None and retry_assistant_message is None
+                    else None
+                ),
             )
 
     async def continue_agent_run(
@@ -570,16 +671,39 @@ class ChatService:
         )
 
         task_id = str(uuid_mod.uuid4())
-        init_result = await init_stream(
-            conversation_id,
-            str(user_id),
-            model_id,
-            assistant_message_id,
-            task_id,
-            stream_mode="continuation",
-            message_sequence=continuation.assistant_message.sequence,
+        self.conversation_service.claim_assistant_message_generation(
+            conversation_id=conversation_id,
+            message_id=assistant_message_id,
+            task_id=task_id,
         )
+        try:
+            init_result = await init_stream(
+                conversation_id,
+                str(user_id),
+                model_id,
+                assistant_message_id,
+                task_id,
+                stream_mode="continuation",
+                message_sequence=continuation.assistant_message.sequence,
+            )
+        except Exception:
+            self.db.rollback()
+            raise
+        if not init_result.ok:
+            self.db.rollback()
         _require_stream_initialized(init_result)
+        try:
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            await finalize_stream(
+                conversation_id,
+                success=False,
+                error_msg="消息持久化失败",
+                task_id=task_id,
+                error_code="generation_init_failed",
+            )
+            raise
 
         task = asyncio.create_task(
             self.stream_handler.generate_to_redis(
@@ -688,6 +812,9 @@ class ChatService:
         assistant_message_id: str | None = None,
         assistant_message_sequence: int | None = None,
         initial_content_blocks: list[Any] | None = None,
+        replace_existing: bool = False,
+        generation_task_id: str | None = None,
+        retry_user_message_id: str | None = None,
     ) -> ChatResponse:
         """处理非流式响应（LiteLLM Proxy 自己管 health / 重试）。"""
         controlled_call_kwargs = dict(litellm_kwargs)
@@ -745,7 +872,21 @@ class ChatService:
         if assistant_message_id is not None:
             assistant_message_kwargs["id"] = assistant_message_id
         assistant_message = Message(**assistant_message_kwargs)
-        self.conversation_service.create_message(assistant_message, conversation_id)
+        if replace_existing:
+            self.conversation_service.replace_assistant_message(
+                assistant_message,
+                conversation_id,
+                generation_task_id=generation_task_id,
+            )
+        elif retry_user_message_id is not None and generation_task_id is not None:
+            self.conversation_service.create_retry_assistant_message(
+                assistant_message,
+                conversation_id,
+                retry_user_message_id=retry_user_message_id,
+                generation_task_id=generation_task_id,
+            )
+        else:
+            self.conversation_service.create_message(assistant_message, conversation_id)
         self.db.commit()
 
         return ChatResponse(
@@ -762,6 +903,9 @@ class ChatService:
         assistant_message_sequence: int,
         evidence_block: KnowledgeEvidenceBlock,
         answer: str,
+        replace_existing: bool = False,
+        generation_task_id: str | None = None,
+        retry_user_message_id: str | None = None,
     ) -> ChatResponse:
         """无检索命中时仍按普通 assistant 消息完成，确保刷新可恢复。"""
 
@@ -773,7 +917,21 @@ class ChatService:
             model_id=model_id,
             usage=Usage(input_tokens=0, output_tokens=0),
         )
-        self.conversation_service.create_message(assistant_message, conversation_id)
+        if replace_existing:
+            self.conversation_service.replace_assistant_message(
+                assistant_message,
+                conversation_id,
+                generation_task_id=generation_task_id,
+            )
+        elif retry_user_message_id is not None and generation_task_id is not None:
+            self.conversation_service.create_retry_assistant_message(
+                assistant_message,
+                conversation_id,
+                retry_user_message_id=retry_user_message_id,
+                generation_task_id=generation_task_id,
+            )
+        else:
+            self.conversation_service.create_message(assistant_message, conversation_id)
         self.db.commit()
         return ChatResponse(conversation_id=conversation_id, message=assistant_message)
 

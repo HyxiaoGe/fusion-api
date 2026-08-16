@@ -947,6 +947,9 @@ class ChatRequest(BaseModel):
     conversation_id: Optional[str] = None
     user_message_id: Optional[str] = None
     assistant_message_id: Optional[str] = None
+    # 重试必须复用原轮次消息 ID，防止把同一用户问题再次追加到会话历史。
+    retry_user_message_id: Optional[str] = None
+    retry_assistant_message_id: Optional[str] = None
     stream: bool = True  # 默认开启流式
     options: Optional[Dict[str, Any]] = None  # 扩展选项，如 use_reasoning
     file_ids: Optional[List[str]] = None  # 附带的文件 ID 列表
@@ -964,7 +967,12 @@ class ChatRequest(BaseModel):
             raise ValueError("knowledge_base_ids 不能重复")
         return values
 
-    @field_validator("user_message_id", "assistant_message_id")
+    @field_validator(
+        "user_message_id",
+        "assistant_message_id",
+        "retry_user_message_id",
+        "retry_assistant_message_id",
+    )
     @classmethod
     def validate_message_uuid4(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
@@ -985,6 +993,19 @@ class ChatRequest(BaseModel):
             and self.user_message_id.lower() == self.assistant_message_id.lower()
         ):
             raise ValueError("user_message_id 与 assistant_message_id 必须不同")
+        if self.retry_user_message_id is not None:
+            if self.conversation_id is None:
+                raise ValueError("retry_user_message_id 必须与 conversation_id 同时提供")
+            if self.user_message_id is not None and self.user_message_id.lower() != self.retry_user_message_id.lower():
+                raise ValueError("user_message_id 与 retry_user_message_id 必须一致")
+        if self.retry_assistant_message_id is not None:
+            if self.retry_user_message_id is None:
+                raise ValueError("retry_assistant_message_id 必须与 retry_user_message_id 同时提供")
+            if (
+                self.assistant_message_id is not None
+                and self.assistant_message_id.lower() != self.retry_assistant_message_id.lower()
+            ):
+                raise ValueError("assistant_message_id 与 retry_assistant_message_id 必须一致")
         return self
 
 

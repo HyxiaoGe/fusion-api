@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
 from app.ai.prompts.agent_loop import VISIBLE_RESPONSE_LANGUAGE_PROMPT
-from app.schemas.chat import Conversation, Message, TextBlock
+from app.schemas.chat import Conversation, FileBlock, Message, TextBlock
 from app.schemas.response import ApiException
 from app.services.chat.context_manager import ContextPlan
 from app.services.chat_service import ChatService, _require_stream_initialized
@@ -641,7 +641,9 @@ class ChatServiceTests(unittest.TestCase):
         )
         query = db.query.return_value
         query.populate_existing.return_value = query
-        query.filter_by.return_value.first.return_value = existing
+        query.filter_by.return_value = query
+        query.with_for_update.return_value = query
+        query.first.return_value = existing
         query.filter.return_value.first.return_value = existing
         service = ChatService(db)
         service.conversation_service = MagicMock()
@@ -697,6 +699,26 @@ class ChatServiceTests(unittest.TestCase):
         )
 
         self.assertFalse(persisted)
+
+    def test_persist_stream_partial_before_stop_preserves_previous_answer_for_retry(self):
+        db = MagicMock()
+        service = ChatService(db)
+
+        persisted = service.persist_stream_partial_before_stop(
+            conversation_id="conv-1",
+            user_id="user-1",
+            message_id="assistant-1",
+            partial_content=[TextBlock(type="text", id="answer-1", text="半截新回答")],
+            stream_meta={
+                "status": "streaming",
+                "stream_mode": "retry",
+                "user_id": "user-1",
+                "message_id": "assistant-1",
+            },
+        )
+
+        self.assertFalse(persisted)
+        db.query.assert_not_called()
         db.query.assert_not_called()
         db.commit.assert_not_called()
 
@@ -978,6 +1000,263 @@ class ChatServiceTests(unittest.TestCase):
         )
         self.assertEqual(len(created_coroutines), 1)
 
+    def test_stream_retry_reuses_original_turn_without_persisting_duplicate_user(self):
+        db = MagicMock()
+        service = ChatService(db)
+        service.file_repo = MagicMock()
+        service.stream_handler = MagicMock()
+        service.stream_handler.generate_to_redis = AsyncMock()
+        service.conversation_service = MagicMock()
+        service._validate_message_files = MagicMock(return_value=[])
+        stored_user = Message(
+            id="11111111-1111-4111-8111-111111111111",
+            sequence=31,
+            role="user",
+            content=[
+                TextBlock(type="text", text="原始问题"),
+                FileBlock(
+                    type="file",
+                    file_id="file-1",
+                    filename="依据.txt",
+                    mime_type="text/plain",
+                ),
+            ],
+        )
+        stored_assistant = Message(
+            id="22222222-2222-4222-8222-222222222222",
+            sequence=32,
+            role="assistant",
+            content=[TextBlock(type="text", text="原始回答")],
+            model_id="saved/model",
+        )
+        conversation = Conversation(
+            id="conv-retry",
+            user_id="user-1",
+            title="原始问题",
+            model_id="saved/model",
+            messages=[stored_user, stored_assistant],
+        )
+        service.conversation_service.get_conversation.return_value = conversation
+        service.conversation_service.prepare_message_retry.return_value = (
+            stored_user,
+            stored_assistant,
+        )
+        created_coroutines = []
+
+        def close_created_coroutine(coroutine):
+            created_coroutines.append(coroutine)
+            coroutine.close()
+            return MagicMock()
+
+        with (
+            patch(
+                "app.services.chat_service.llm_manager.resolve_model",
+                return_value=("openai/saved-model", "openai", {}),
+            ),
+            patch(
+                "app.services.chat_service.litellm_catalog.get_capabilities",
+                return_value={"functionCalling": False, "agentTools": False, "vision": False},
+            ),
+            patch(
+                "app.services.chat_service.init_stream",
+                new=AsyncMock(return_value=StreamInitResult(ok=True)),
+            ) as init_stream_mock,
+            patch("app.services.chat_service.asyncio.create_task", side_effect=close_created_coroutine),
+            patch("app.services.chat_service.register_task"),
+        ):
+            asyncio.run(
+                service.process_message(
+                    model_id="saved/model",
+                    message="原始问题",
+                    user_id="user-1",
+                    conversation_id="conv-retry",
+                    user_message_id=stored_user.id,
+                    assistant_message_id=stored_assistant.id,
+                    retry_user_message_id=stored_user.id,
+                    retry_assistant_message_id=stored_assistant.id,
+                    stream=True,
+                    file_ids=["file-1"],
+                )
+            )
+
+        service.conversation_service.prepare_message_retry.assert_called_once_with(
+            conversation_id="conv-retry",
+            user_id="user-1",
+            user_message_id=stored_user.id,
+            assistant_message_id=stored_assistant.id,
+        )
+        service.conversation_service.create_message.assert_not_called()
+        service.conversation_service.reserve_message_sequence_pair.assert_not_called()
+        task_id = init_stream_mock.await_args.args[4]
+        service.conversation_service.claim_assistant_message_generation.assert_called_once_with(
+            conversation_id="conv-retry",
+            message_id=stored_assistant.id,
+            task_id=task_id,
+        )
+        service._validate_message_files.assert_called_once_with(["file-1"], "user-1", "conv-retry")
+        self.assertEqual(init_stream_mock.await_args.kwargs["message_sequence"], 32)
+        self.assertEqual(init_stream_mock.await_args.kwargs["stream_mode"], "retry")
+        raw_messages = service.stream_handler.generate_to_redis.call_args.kwargs["raw_messages"]
+        self.assertEqual([message.id for message in raw_messages], [stored_user.id])
+        self.assertEqual(
+            service.stream_handler.generate_to_redis.call_args.kwargs["original_message"],
+            "原始问题",
+        )
+        self.assertTrue(service.stream_handler.generate_to_redis.call_args.kwargs["defer_partial_persistence"])
+        self.assertTrue(service.stream_handler.generate_to_redis.call_args.kwargs["replace_on_success"])
+        self.assertEqual(len(created_coroutines), 1)
+
+    def test_stream_retry_unanswered_user_allocates_only_assistant_sequence(self):
+        db = MagicMock()
+        service = ChatService(db)
+        service.file_repo = MagicMock()
+        service.stream_handler = MagicMock()
+        service.stream_handler.generate_to_redis = AsyncMock()
+        service.conversation_service = MagicMock()
+        stored_user = Message(
+            id="11111111-1111-4111-8111-111111111111",
+            sequence=51,
+            role="user",
+            content=[TextBlock(type="text", text="失败后重试")],
+        )
+        conversation = Conversation(
+            id="conv-retry",
+            user_id="user-1",
+            title="失败后重试",
+            model_id="saved/model",
+            messages=[stored_user],
+        )
+        service.conversation_service.get_conversation.return_value = conversation
+        service.conversation_service.prepare_message_retry.return_value = (stored_user, None)
+        service.conversation_service.reserve_message_sequence_pair.return_value = (61, 62)
+        created_coroutines = []
+
+        def close_created_coroutine(coroutine):
+            created_coroutines.append(coroutine)
+            coroutine.close()
+            return MagicMock()
+
+        with (
+            patch(
+                "app.services.chat_service.llm_manager.resolve_model",
+                return_value=("openai/saved-model", "openai", {}),
+            ),
+            patch(
+                "app.services.chat_service.litellm_catalog.get_capabilities",
+                return_value={"functionCalling": False, "agentTools": False, "vision": False},
+            ),
+            patch(
+                "app.services.chat_service.init_stream",
+                new=AsyncMock(return_value=StreamInitResult(ok=True)),
+            ) as init_stream_mock,
+            patch("app.services.chat_service.asyncio.create_task", side_effect=close_created_coroutine),
+            patch("app.services.chat_service.register_task"),
+        ):
+            asyncio.run(
+                service.process_message(
+                    model_id="saved/model",
+                    message="失败后重试",
+                    user_id="user-1",
+                    conversation_id="conv-retry",
+                    user_message_id=stored_user.id,
+                    assistant_message_id="33333333-3333-4333-8333-333333333333",
+                    retry_user_message_id=stored_user.id,
+                    stream=True,
+                )
+            )
+
+        service.conversation_service.create_message.assert_not_called()
+        service.conversation_service.claim_assistant_message_generation.assert_not_called()
+        task_id = init_stream_mock.await_args.args[4]
+        service.conversation_service.claim_unanswered_user_generation.assert_called_once_with(
+            conversation_id="conv-retry",
+            message_id=stored_user.id,
+            task_id=task_id,
+        )
+        service.conversation_service.reserve_message_sequence_pair.assert_called_once_with()
+        self.assertEqual(init_stream_mock.await_args.kwargs["message_sequence"], 62)
+        self.assertEqual(init_stream_mock.await_args.kwargs["stream_mode"], "retry")
+        raw_messages = service.stream_handler.generate_to_redis.call_args.kwargs["raw_messages"]
+        self.assertEqual([message.id for message in raw_messages], [stored_user.id])
+        self.assertTrue(service.stream_handler.generate_to_redis.call_args.kwargs["defer_partial_persistence"])
+        self.assertFalse(service.stream_handler.generate_to_redis.call_args.kwargs["replace_on_success"])
+        self.assertEqual(
+            service.stream_handler.generate_to_redis.call_args.kwargs["create_after_retry_user_id"],
+            stored_user.id,
+        )
+        self.assertEqual(len(created_coroutines), 1)
+
+    def test_non_stream_retry_claims_generation_and_passes_fence_to_replace(self):
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = None
+        service = ChatService(db)
+        service.file_repo = MagicMock()
+        service.conversation_service = MagicMock()
+        service._validate_message_files = MagicMock(return_value=[])
+        service._handle_non_stream = AsyncMock(return_value=SimpleNamespace())
+        stored_user = Message(
+            id="11111111-1111-4111-8111-111111111111",
+            sequence=71,
+            role="user",
+            content=[TextBlock(type="text", text="原始问题")],
+        )
+        stored_assistant = Message(
+            id="22222222-2222-4222-8222-222222222222",
+            sequence=72,
+            role="assistant",
+            content=[TextBlock(type="text", text="原始回答")],
+            model_id="saved/model",
+        )
+        conversation = Conversation(
+            id="conv-retry",
+            user_id="user-1",
+            title="原始问题",
+            model_id="saved/model",
+            messages=[stored_user, stored_assistant],
+        )
+        service.conversation_service.get_conversation.return_value = conversation
+        service.conversation_service.prepare_message_retry.return_value = (
+            stored_user,
+            stored_assistant,
+        )
+
+        with (
+            patch(
+                "app.services.chat_service.llm_manager.resolve_model",
+                return_value=("openai/saved-model", "openai", {}),
+            ),
+            patch(
+                "app.services.chat_service.litellm_catalog.get_capabilities",
+                return_value={"functionCalling": False, "agentTools": False, "vision": False},
+            ),
+            patch(
+                "app.services.chat_service.build_llm_messages",
+                new=AsyncMock(return_value=[{"role": "user", "content": "原始问题"}]),
+            ),
+        ):
+            asyncio.run(
+                service.process_message(
+                    model_id="saved/model",
+                    message="原始问题",
+                    user_id="user-1",
+                    conversation_id="conv-retry",
+                    user_message_id=stored_user.id,
+                    assistant_message_id=stored_assistant.id,
+                    retry_user_message_id=stored_user.id,
+                    retry_assistant_message_id=stored_assistant.id,
+                    stream=False,
+                )
+            )
+
+        claimed_task_id = service.conversation_service.claim_assistant_message_generation.call_args.kwargs["task_id"]
+        service.conversation_service.claim_assistant_message_generation.assert_called_once_with(
+            conversation_id="conv-retry",
+            message_id=stored_assistant.id,
+            task_id=claimed_task_id,
+        )
+        self.assertEqual(service._handle_non_stream.await_args.kwargs["generation_task_id"], claimed_task_id)
+        self.assertTrue(service._handle_non_stream.await_args.kwargs["replace_existing"])
+
     def test_handle_non_stream_applies_controlled_max_tokens(self):
         service = object.__new__(ChatService)
         service.db = MagicMock()
@@ -1021,6 +1300,45 @@ class ChatServiceTests(unittest.TestCase):
         )
         self.assertEqual(prepare.await_args.kwargs["model_id"], "model-1")
         self.assertEqual(prepare.await_args.kwargs["litellm_model"], "litellm_proxy/model-1")
+
+    def test_handle_non_stream_unanswered_retry_uses_fenced_create(self):
+        service = object.__new__(ChatService)
+        service.db = MagicMock()
+        service.conversation_service = MagicMock()
+        mock_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="补答成功"))],
+            usage=None,
+        )
+
+        with (
+            patch("app.services.chat_service.litellm.acompletion", new=AsyncMock(return_value=mock_response)),
+            patch(
+                "app.services.chat_service.prepare_context",
+                new=AsyncMock(return_value=MagicMock(messages=[{"role": "user", "content": "问题"}])),
+            ),
+        ):
+            asyncio.run(
+                service._handle_non_stream(
+                    "litellm_proxy/model-1",
+                    "model-1",
+                    {},
+                    [{"role": "user", "content": "问题"}],
+                    "conv-1",
+                    {},
+                    assistant_message_id="assistant-1",
+                    assistant_message_sequence=102,
+                    generation_task_id="task-retry",
+                    retry_user_message_id="user-1",
+                )
+            )
+
+        created = service.conversation_service.create_retry_assistant_message.call_args
+        self.assertEqual(created.args[0].id, "assistant-1")
+        self.assertEqual(created.args[1], "conv-1")
+        self.assertEqual(created.kwargs["retry_user_message_id"], "user-1")
+        self.assertEqual(created.kwargs["generation_task_id"], "task-retry")
+        service.conversation_service.create_message.assert_not_called()
+        service.conversation_service.replace_assistant_message.assert_not_called()
 
     def test_handle_non_stream_persists_last_round_context_with_actual_prompt_tokens(self):
         service = object.__new__(ChatService)

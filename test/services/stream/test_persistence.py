@@ -17,6 +17,8 @@ from app.services.stream.persistence import persist_message
 def _populated_query(db):
     query = db.query.return_value
     query.populate_existing.return_value = query
+    query.filter_by.return_value = query
+    query.with_for_update.return_value = query
     return query
 
 
@@ -47,6 +49,115 @@ class MessagePersistenceAdvisoryLockTests(unittest.TestCase):
 
 
 class PersistMessageMonotonicTests(unittest.TestCase):
+    def test_retry_partial_keeps_previous_answer_until_success(self):
+        previous_content = [{"type": "text", "id": "answer-old", "text": "原回答"}]
+        existing = SimpleNamespace(
+            content=previous_content.copy(),
+            usage={"input_tokens": 10, "output_tokens": 20},
+            generation_task_id="task-retry",
+            model_id="old-model",
+            suggested_questions=["旧问题"],
+            suggested_questions_revision=3,
+            suggested_questions_status="ready",
+            suggested_questions_auto_run_id="run-old",
+        )
+        db = MagicMock()
+        _populated_query(db).filter_by.return_value.first.return_value = existing
+
+        persisted = persist_message(
+            db,
+            "msg-1",
+            "conv-1",
+            "new-model",
+            [TextBlock(type="text", id="answer-new", text="新回答片段")],
+            partial=True,
+            generation_task_id="task-retry",
+            defer_partial=True,
+            replace_on_success=True,
+        )
+
+        self.assertTrue(persisted)
+        self.assertEqual(existing.content, previous_content)
+        db.query.assert_not_called()
+        db.commit.assert_not_called()
+
+    def test_stale_generation_cannot_overwrite_current_retry(self):
+        previous_content = [{"type": "text", "id": "answer-old", "text": "原回答"}]
+        existing = SimpleNamespace(
+            content=previous_content.copy(),
+            usage=None,
+            generation_task_id="task-current",
+        )
+        db = MagicMock()
+        _populated_query(db).filter_by.return_value.first.return_value = existing
+
+        persisted = persist_message(
+            db,
+            "msg-1",
+            "conv-1",
+            "gpt-4",
+            [TextBlock(type="text", id="answer-stale", text="迟到回答")],
+            partial=False,
+            generation_task_id="task-stale",
+        )
+
+        self.assertFalse(persisted)
+        self.assertEqual(existing.content, previous_content)
+        db.query.return_value.with_for_update.assert_called_once_with()
+        db.commit.assert_not_called()
+        db.rollback.assert_called_once()
+
+    def test_retry_success_atomically_replaces_answer_and_invalidates_suggestions(self):
+        existing = SimpleNamespace(
+            id="msg-1",
+            role="assistant",
+            content=[{"type": "text", "id": "answer-old", "text": "原回答"}],
+            usage={"input_tokens": 10, "output_tokens": 20},
+            generation_task_id="task-retry",
+            model_id="old-model",
+            suggested_questions=["旧问题"],
+            suggested_questions_revision=3,
+            suggested_questions_status="ready",
+            suggested_questions_auto_run_id="run-old",
+        )
+        db = MagicMock()
+        conversation = SimpleNamespace(updated_at=None)
+        conversation_query = MagicMock()
+        conversation_query.populate_existing.return_value = conversation_query
+        conversation_query.filter_by.return_value = conversation_query
+        conversation_query.with_for_update.return_value = conversation_query
+        conversation_query.first.return_value = conversation
+        message_query = MagicMock()
+        message_query.populate_existing.return_value = message_query
+        message_query.filter_by.return_value = message_query
+        message_query.order_by.return_value = message_query
+        message_query.with_for_update.return_value = message_query
+        message_query.first.return_value = existing
+        db.query.side_effect = [conversation_query, message_query]
+        final = TextBlock(type="text", id="answer-new", text="新回答")
+
+        persisted = persist_message(
+            db,
+            "msg-1",
+            "conv-1",
+            "new-model",
+            [final],
+            partial=False,
+            generation_task_id="task-retry",
+            defer_partial=True,
+            replace_on_success=True,
+        )
+
+        self.assertTrue(persisted)
+        self.assertEqual(existing.content, [final.model_dump(mode="json")])
+        self.assertIsNone(existing.usage)
+        self.assertEqual(existing.model_id, "new-model")
+        self.assertIsNone(existing.suggested_questions)
+        self.assertEqual(existing.suggested_questions_revision, 4)
+        self.assertEqual(existing.suggested_questions_status, "idle")
+        self.assertIsNone(existing.suggested_questions_auto_run_id)
+        db.commit.assert_called_once()
+
     def test_rich_result_datetime_is_serialized_for_jsonb(self):
         existing = SimpleNamespace(content=[], usage=None)
         db = MagicMock()

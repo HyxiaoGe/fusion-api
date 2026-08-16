@@ -74,6 +74,8 @@ async def send_message(
         conversation_id=chat_request.conversation_id,
         user_message_id=chat_request.user_message_id,
         assistant_message_id=chat_request.assistant_message_id,
+        retry_user_message_id=chat_request.retry_user_message_id,
+        retry_assistant_message_id=chat_request.retry_assistant_message_id,
         stream=chat_request.stream,
         options=chat_request.options,
         file_ids=chat_request.file_ids,
@@ -96,6 +98,7 @@ def get_chat_capabilities(
         data={
             "knowledge_grounding_v1": True,
             "knowledge_grounding_max_bases": 5,
+            "message_retry_v1": True,
         },
         request_id=request.state.request_id,
     )

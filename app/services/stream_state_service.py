@@ -92,7 +92,7 @@ async def init_stream(
     message_id: str,
     task_id: str,
     *,
-    stream_mode: Literal["initial", "continuation"] = "initial",
+    stream_mode: Literal["initial", "retry", "continuation"] = "initial",
     message_sequence: int | None = None,
 ) -> StreamInitResult:
     """流开始时初始化 Redis Stream 和 Meta"""

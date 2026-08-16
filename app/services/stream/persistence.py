@@ -136,18 +136,77 @@ def persist_message(
     partial: bool = False,
     *,
     sequence: int | None = None,
-) -> None:
+    generation_task_id: str | None = None,
+    defer_partial: bool = False,
+    replace_on_success: bool = False,
+    create_after_retry_user_id: str | None = None,
+) -> bool | None:
     """
     将 assistant 消息写入 PostgreSQL。
     partial=True 时增量更新 content blocks（checkpoint）；若传入 usage，
     同步保存已产生的累计 Token 与最后上下文快照，供失败/中止后恢复。
     partial=False 时写入完整数据（最终落库）。
     """
+    if partial and defer_partial:
+        # retry 生成期间只通过 Redis 展示新内容；成功前 PostgreSQL 始终保留原回答。
+        return True
+
     try:
+        from app.db.models import Conversation as ConversationModel
         from app.db.models import Message as MessageModel
 
         acquire_message_persistence_lock(db, assistant_message_id)
-        existing = db.query(MessageModel).populate_existing().filter_by(id=assistant_message_id).first()
+        conversation = None
+        retry_create = create_after_retry_user_id is not None and not partial
+        if (replace_on_success or retry_create) and not partial:
+            conversation = (
+                db.query(ConversationModel).populate_existing().filter_by(id=conversation_id).with_for_update().first()
+            )
+            if conversation is None:
+                db.rollback()
+                return False
+            existing = (
+                db.query(MessageModel)
+                .populate_existing()
+                .filter_by(conversation_id=conversation_id)
+                .order_by(
+                    MessageModel.sequence.desc().nullslast(),
+                    MessageModel.created_at.desc(),
+                    MessageModel.id.desc(),
+                )
+                .with_for_update()
+                .first()
+            )
+            if replace_on_success:
+                if existing is None or existing.id != assistant_message_id or existing.role != "assistant":
+                    db.rollback()
+                    return False
+            elif (
+                existing is None
+                or existing.id != create_after_retry_user_id
+                or existing.role != "user"
+                or existing.generation_task_id != generation_task_id
+            ):
+                db.rollback()
+                return False
+            else:
+                existing = None
+        else:
+            existing = (
+                db.query(MessageModel).populate_existing().filter_by(id=assistant_message_id).with_for_update().first()
+            )
+        if existing is not None and generation_task_id is not None:
+            current_task_id = getattr(existing, "generation_task_id", None)
+            if current_task_id != generation_task_id:
+                logger.info(
+                    "拒绝迟到 assistant 写入: message_id=%s, task_id=%s, current_task_id=%s",
+                    assistant_message_id,
+                    generation_task_id,
+                    current_task_id,
+                )
+                db.rollback()
+                return False
+            existing.generation_task_id = generation_task_id
         # PostgreSQL JSONB 只能接收 JSON 原生值；富结果中的 aware datetime、URL 等
         # 必须先按 Pydantic JSON 模式序列化，不能把 Python 对象直接交给驱动。
         serialized_content = [block.model_dump(mode="json") for block in content_blocks]
@@ -164,6 +223,15 @@ def persist_message(
             )
             if usage_data:
                 existing.usage = usage_data.model_dump()
+            elif replace_on_success and not partial:
+                existing.usage = None
+            if replace_on_success and not partial:
+                existing.model_id = model_id
+                existing.suggested_questions = None
+                existing.suggested_questions_revision = (existing.suggested_questions_revision or 0) + 1
+                existing.suggested_questions_status = "idle"
+                existing.suggested_questions_auto_run_id = None
+                existing.created_at = utc_now()
         else:
             db_message = MessageModel(
                 id=assistant_message_id,
@@ -173,13 +241,18 @@ def persist_message(
                 content=serialized_content,
                 model_id=model_id,
                 usage=usage_data.model_dump() if usage_data else None,
+                generation_task_id=generation_task_id,
                 created_at=utc_now(),
             )
             db.add(db_message)
+        if (replace_on_success or retry_create) and conversation is not None:
+            conversation.updated_at = utc_now()
         db.commit()
+        return True
     except Exception as e:
         logger.error(f"写入 assistant 消息失败: {e}")
         db.rollback()
+        return None
 
 
 def extract_first_url(message: str) -> str | None:

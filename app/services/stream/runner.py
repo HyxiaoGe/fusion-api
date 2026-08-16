@@ -5,6 +5,8 @@ spec §4.1。本模块只负责 agent loop 的控制流编排，所有"做事"�
 """
 
 import time
+from dataclasses import replace
+from functools import partial
 from typing import Optional
 
 from app.core.logger import app_logger as logger
@@ -168,6 +170,9 @@ class StreamHandler:
         preprocess_user_input: bool = True,
         knowledge_base_ids: Optional[list[str]] = None,
         limits: Optional[AgentLoopLimits] = None,
+        defer_partial_persistence: bool = False,
+        replace_on_success: bool = False,
+        create_after_retry_user_id: str | None = None,
     ) -> None:
         """后台任务：调用 LLM，chunk 写入 Redis Stream，并由 agent loop 完成落库。"""
         run_input = AgentLoopRunInput(
@@ -195,11 +200,19 @@ class StreamHandler:
 
         db = SessionLocal()
         try:
+            dependencies = _agent_loop_wiring_dependencies()
+            run_persist_message = partial(
+                dependencies.persist_message_fn,
+                generation_task_id=task_id,
+                defer_partial=defer_partial_persistence,
+                replace_on_success=replace_on_success,
+                create_after_retry_user_id=create_after_retry_user_id,
+            )
             lifecycle_call = build_agent_loop_lifecycle_call(
                 run_input=run_input,
                 db=db,
                 limits=limits or _agent_loop_limits(),
-                dependencies=_agent_loop_wiring_dependencies(),
+                dependencies=replace(dependencies, persist_message_fn=run_persist_message),
             )
             await _run_agent_loop_lifecycle_call(lifecycle_call)
         finally:

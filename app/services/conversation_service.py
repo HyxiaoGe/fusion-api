@@ -81,6 +81,124 @@ class ConversationService:
         """创建新消息"""
         return self.repo.create_message(message, conversation_id)
 
+    def prepare_message_retry(
+        self,
+        *,
+        conversation_id: str,
+        user_id: str,
+        user_message_id: str,
+        assistant_message_id: str | None,
+    ) -> tuple[Message, Message | None]:
+        """锁定并校验可重试的最后一轮，返回原 user 与可复用 assistant。"""
+
+        conversation = self.repo.lock_owned_model(conversation_id, user_id)
+        if conversation is None:
+            raise ApiException.not_found("会话不存在或无权访问")
+        rows = self.repo.list_messages_for_retry(conversation_id)
+        target_index = next(
+            (index for index, row in enumerate(rows) if row.id == user_message_id),
+            None,
+        )
+        if target_index is None or rows[target_index].role != "user":
+            raise ApiException.not_found("待重试的用户消息不存在")
+
+        expected_assistant = rows[target_index + 1] if target_index + 1 < len(rows) else None
+        if expected_assistant is not None and expected_assistant.role != "assistant":
+            raise ApiException.conflict("只能重试会话中的最后一轮消息")
+        if assistant_message_id is None:
+            if expected_assistant is not None or target_index != len(rows) - 1:
+                raise ApiException.conflict("重试目标与会话最后一轮不一致")
+        else:
+            if expected_assistant is None or expected_assistant.id != assistant_message_id:
+                raise ApiException.conflict("重试目标与原回答不一致")
+            if target_index + 1 != len(rows) - 1:
+                raise ApiException.conflict("只能重试会话中的最后一轮消息")
+
+        user_message = self.repo.convert_message_model(rows[target_index])
+        assistant_message = (
+            self.repo.convert_message_model(expected_assistant) if expected_assistant is not None else None
+        )
+        return user_message, assistant_message
+
+    def lock_conversation_for_message_write(self, conversation_id: str, user_id: str) -> Conversation:
+        """串行化消息写入，并在锁内重载会话历史供后续模型调用。"""
+
+        conversation = self.repo.lock_owned_model(conversation_id, user_id)
+        if conversation is None:
+            raise ApiException.not_found("会话不存在或无权访问")
+        self.db.expire(conversation, ["messages", "knowledge_base_selections"])
+        return self.repo.convert_conversation_model(conversation)
+
+    def claim_assistant_message_generation(
+        self,
+        *,
+        conversation_id: str,
+        message_id: str,
+        task_id: str,
+    ) -> None:
+        """在当前事务内切换 assistant 写所有权，同时保留原回答。"""
+
+        self.repo.claim_assistant_message_generation(
+            conversation_id=conversation_id,
+            message_id=message_id,
+            task_id=task_id,
+        )
+
+    def claim_unanswered_user_generation(
+        self,
+        *,
+        conversation_id: str,
+        message_id: str,
+        task_id: str,
+    ) -> None:
+        """在当前事务内切换未回答 user 的生成所有权。"""
+
+        self.repo.claim_unanswered_user_generation(
+            conversation_id=conversation_id,
+            message_id=message_id,
+            task_id=task_id,
+        )
+
+    def replace_assistant_message(
+        self,
+        message: Message,
+        conversation_id: str,
+        *,
+        generation_task_id: str | None = None,
+    ) -> Message:
+        """用重试结果原位替换 assistant 消息。"""
+
+        replaced = self.repo.replace_assistant_message(
+            message,
+            conversation_id,
+            generation_task_id=generation_task_id,
+        )
+        if replaced is None:
+            self.db.rollback()
+            raise ApiException.conflict("回答已被更新请求取代")
+        return replaced
+
+    def create_retry_assistant_message(
+        self,
+        message: Message,
+        conversation_id: str,
+        *,
+        retry_user_message_id: str,
+        generation_task_id: str,
+    ) -> Message:
+        """为未回答 user 原子创建回答；被新请求取代时拒绝迟到写。"""
+
+        created = self.repo.create_retry_assistant_message(
+            message,
+            conversation_id,
+            retry_user_message_id=retry_user_message_id,
+            generation_task_id=generation_task_id,
+        )
+        if created is None:
+            self.db.rollback()
+            raise ApiException.conflict("回答已被更新请求取代")
+        return created
+
     def reserve_message_sequence_pair(self) -> tuple[int, int]:
         """为同一轮 user/assistant 消息预留稳定顺序号。"""
         return self.repo.reserve_message_sequence_pair()

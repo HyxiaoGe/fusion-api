@@ -576,6 +576,10 @@ class Message(Base):
     # 结构: {"input_tokens": 312, "output_tokens": 876}
     usage = Column(JSONB, nullable=True)
 
+    # 当前有权完成该消息轮次的 Redis 生成任务。
+    # assistant 重生成直接保护原回答；未回答 user 重试则保护后续唯一回答的创建。
+    generation_task_id = Column(String, nullable=True)
+
     # 仅 assistant 消息填充，持久化推荐问题（只保留最新一批）
     # 结构: ["问题1", "问题2", "问题3"]
     suggested_questions = Column(JSONB, nullable=True)
