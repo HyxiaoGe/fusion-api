@@ -184,11 +184,22 @@ class ChatService:
             raise ApiException.not_found("无进行中的流")
         if not message_id or stream_meta.get("message_id") != message_id:
             raise ApiException.conflict("当前生成已被新请求取代")
-        if stream_meta.get("stream_mode") == "retry":
-            # retry 被中止时继续保留上一版完整回答，不能用半截新内容污染回滚基线。
-            return False
 
         from app.db.models import Message as MessageModel
+
+        if stream_meta.get("stream_mode") == "retry":
+            # 只有「替换已有 assistant」的 retry 才需要保留上一版完整回答；
+            # 未回答 retry（尚无 assistant）必须落库 partial，否则刷新后整段回答消失。
+            existing = (
+                self.db.query(MessageModel)
+                .filter(
+                    MessageModel.id == message_id,
+                    MessageModel.conversation_id == conversation_id,
+                )
+                .first()
+            )
+            if existing is not None:
+                return False
 
         serialized_content = merge_partial_content_blocks([], partial_content)
         if not serialized_content:
@@ -223,6 +234,7 @@ class ChatService:
                         role="assistant",
                         content=serialized_content,
                         model_id=stream_meta.get("model") or conversation.model_id,
+                        generation_task_id=stream_meta.get("task_id"),
                     )
                 )
             self.db.commit()
@@ -458,9 +470,9 @@ class ChatService:
                     message_id=retry_user_message.id,
                     task_id=retry_generation_task_id,
                 )
-        elif not stream:
-            # 首次非流式生成也必须拥有 user 代际；若其间被重试接管，
-            # 迟到的原请求不得无条件创建 assistant。
+        else:
+            # 首次生成（无论流式或非流式）都必须拥有 user 代际；
+            # 若其间被另一标签重试接管，迟到的原请求不得无条件创建 assistant。
             retry_generation_task_id = str(uuid_mod.uuid4())
             self.conversation_service.claim_unanswered_user_generation(
                 conversation_id=conversation.id,
@@ -536,8 +548,8 @@ class ChatService:
                     defer_partial_persistence=retry_user_message is not None,
                     replace_on_success=retry_assistant_message is not None,
                     create_after_retry_user_id=(
-                        retry_user_message.id
-                        if retry_user_message is not None and retry_assistant_message is None
+                        user_message.id
+                        if retry_assistant_message is None and retry_generation_task_id is not None
                         else None
                     ),
                 )

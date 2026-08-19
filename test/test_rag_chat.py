@@ -559,6 +559,40 @@ class ConversationKnowledgeSelectionTests(unittest.TestCase):
         self.assertEqual(assistant.content, [{"type": "text", "id": "a1", "text": "补答成功"}])
         self.assertEqual(assistant.generation_task_id, "task-retry")
 
+    def test_partial_create_after_user_cas_blocks_superseded_stale_partial(self):
+        user_message = MessageModel(
+            id="unanswered-user",
+            conversation_id="conv-1",
+            sequence=1001,
+            role="user",
+            content=[{"type": "text", "id": "q1", "text": "失败后重试"}],
+            generation_task_id="task-stale",
+        )
+        self.db.add(user_message)
+        self.db.commit()
+        # 另一标签页重试接管，切换到新代际。
+        self.service.claim_unanswered_user_generation(
+            conversation_id="conv-1",
+            message_id="unanswered-user",
+            task_id="task-new",
+        )
+        self.db.commit()
+
+        persisted = persist_message(
+            self.db,
+            "retry-assistant",
+            "conv-1",
+            "new-model",
+            [TextBlock(type="text", id="a1", text="被取代的旧 partial")],
+            partial=True,
+            sequence=1002,
+            generation_task_id="task-stale",
+            create_after_retry_user_id="unanswered-user",
+        )
+
+        self.assertFalse(persisted)
+        self.assertEqual(self.db.query(MessageModel).filter(MessageModel.role == "assistant").count(), 0)
+
     def test_replace_selection_persists_order_and_conversation_projection(self):
         self.service.replace_knowledge_base_selection(
             conversation_id="conv-1",

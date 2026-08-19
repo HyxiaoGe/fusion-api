@@ -157,15 +157,24 @@ def persist_message(
 
         acquire_message_persistence_lock(db, assistant_message_id)
         conversation = None
-        retry_create = create_after_retry_user_id is not None and not partial
-        if (replace_on_success or retry_create) and not partial:
+        existing = (
+            db.query(MessageModel)
+            .populate_existing()
+            .filter_by(id=assistant_message_id)
+            .with_for_update()
+            .first()
+        )
+
+        if existing is None and create_after_retry_user_id is not None:
+            # 首次创建 assistant 前，校验目标 user 仍是最后一条且代际匹配，
+            # 阻止已被重试接管后的旧任务通过 partial 落库创建陈旧回答。
             conversation = (
                 db.query(ConversationModel).populate_existing().filter_by(id=conversation_id).with_for_update().first()
             )
             if conversation is None:
                 db.rollback()
                 return False
-            existing = (
+            latest = (
                 db.query(MessageModel)
                 .populate_existing()
                 .filter_by(conversation_id=conversation_id)
@@ -177,24 +186,40 @@ def persist_message(
                 .with_for_update()
                 .first()
             )
-            if replace_on_success:
-                if existing is None or existing.id != assistant_message_id or existing.role != "assistant":
-                    db.rollback()
-                    return False
-            elif (
-                existing is None
-                or existing.id != create_after_retry_user_id
-                or existing.role != "user"
-                or existing.generation_task_id != generation_task_id
+            if (
+                latest is None
+                or latest.id != create_after_retry_user_id
+                or latest.role != "user"
+                or latest.generation_task_id != generation_task_id
             ):
                 db.rollback()
                 return False
-            else:
-                existing = None
-        else:
-            existing = (
-                db.query(MessageModel).populate_existing().filter_by(id=assistant_message_id).with_for_update().first()
+
+        if replace_on_success and not partial:
+            if existing is None:
+                db.rollback()
+                return False
+            conversation = (
+                db.query(ConversationModel).populate_existing().filter_by(id=conversation_id).with_for_update().first()
             )
+            if conversation is None:
+                db.rollback()
+                return False
+            latest = (
+                db.query(MessageModel)
+                .populate_existing()
+                .filter_by(conversation_id=conversation_id)
+                .order_by(
+                    MessageModel.sequence.desc().nullslast(),
+                    MessageModel.created_at.desc(),
+                    MessageModel.id.desc(),
+                )
+                .with_for_update()
+                .first()
+            )
+            if latest is None or latest.id != assistant_message_id or latest.role != "assistant":
+                db.rollback()
+                return False
         if existing is not None and generation_task_id is not None:
             current_task_id = getattr(existing, "generation_task_id", None)
             if current_task_id != generation_task_id:
@@ -245,7 +270,7 @@ def persist_message(
                 created_at=utc_now(),
             )
             db.add(db_message)
-        if (replace_on_success or retry_create) and conversation is not None:
+        if conversation is not None:
             conversation.updated_at = utc_now()
         db.commit()
         return True

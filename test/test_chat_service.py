@@ -702,6 +702,7 @@ class ChatServiceTests(unittest.TestCase):
 
     def test_persist_stream_partial_before_stop_preserves_previous_answer_for_retry(self):
         db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = SimpleNamespace(id="assistant-1")
         service = ChatService(db)
 
         persisted = service.persist_stream_partial_before_stop(
@@ -718,9 +719,36 @@ class ChatServiceTests(unittest.TestCase):
         )
 
         self.assertFalse(persisted)
-        db.query.assert_not_called()
-        db.query.assert_not_called()
         db.commit.assert_not_called()
+
+    def test_persist_stream_partial_before_stop_creates_partial_for_unanswered_retry(self):
+        db = MagicMock()
+        _populated_query(db).filter.return_value.first.return_value = None
+        service = ChatService(db)
+        service.conversation_service = MagicMock()
+        service.conversation_service.get_conversation.return_value = SimpleNamespace(id="conv-1")
+        partial = [TextBlock(type="text", id="answer-1", text="补答 partial")]
+
+        persisted = service.persist_stream_partial_before_stop(
+            conversation_id="conv-1",
+            user_id="user-1",
+            message_id="assistant-new",
+            partial_content=partial,
+            stream_meta={
+                "status": "streaming",
+                "stream_mode": "retry",
+                "user_id": "user-1",
+                "message_id": "assistant-new",
+                "model": "gpt-4",
+                "task_id": "task-retry",
+            },
+        )
+
+        self.assertTrue(persisted)
+        created = db.add.call_args.args[0]
+        self.assertEqual(created.id, "assistant-new")
+        self.assertEqual(created.generation_task_id, "task-retry")
+        db.commit.assert_called_once()
 
     def test_persist_stream_partial_before_stop_creates_assistant_with_stream_model(self):
         db = MagicMock()
@@ -1193,6 +1221,68 @@ class ChatServiceTests(unittest.TestCase):
         self.assertEqual(
             service.stream_handler.generate_to_redis.call_args.kwargs["create_after_retry_user_id"],
             stored_user.id,
+        )
+        self.assertEqual(len(created_coroutines), 1)
+
+    def test_stream_first_message_claims_user_generation_and_passes_create_fence(self):
+        db = MagicMock()
+        service = ChatService(db)
+        service.file_repo = MagicMock()
+        service.stream_handler = MagicMock()
+        service.stream_handler.generate_to_redis = AsyncMock()
+        service.conversation_service = MagicMock()
+        conversation = Conversation(
+            id="conv-first",
+            user_id="user-1",
+            title="新问题",
+            model_id="saved/model",
+            messages=[],
+        )
+        service.conversation_service.get_conversation.return_value = conversation
+        service.conversation_service.reserve_message_sequence_pair.return_value = (71, 72)
+        created_coroutines = []
+
+        def close_created_coroutine(coroutine):
+            created_coroutines.append(coroutine)
+            coroutine.close()
+            return MagicMock()
+
+        with (
+            patch(
+                "app.services.chat_service.llm_manager.resolve_model",
+                return_value=("openai/saved-model", "openai", {}),
+            ),
+            patch(
+                "app.services.chat_service.litellm_catalog.get_capabilities",
+                return_value={"functionCalling": False, "agentTools": False, "vision": False},
+            ),
+            patch(
+                "app.services.chat_service.init_stream",
+                new=AsyncMock(return_value=StreamInitResult(ok=True)),
+            ) as init_stream_mock,
+            patch("app.services.chat_service.asyncio.create_task", side_effect=close_created_coroutine),
+            patch("app.services.chat_service.register_task"),
+        ):
+            asyncio.run(
+                service.process_message(
+                    model_id="saved/model",
+                    message="新问题",
+                    user_id="user-1",
+                    conversation_id="conv-first",
+                    stream=True,
+                )
+            )
+
+        user_message_id = service.conversation_service.create_message.call_args.args[0].id
+        task_id = init_stream_mock.await_args.args[4]
+        service.conversation_service.claim_unanswered_user_generation.assert_called_once_with(
+            conversation_id="conv-first",
+            message_id=user_message_id,
+            task_id=task_id,
+        )
+        self.assertEqual(
+            service.stream_handler.generate_to_redis.call_args.kwargs["create_after_retry_user_id"],
+            user_message_id,
         )
         self.assertEqual(len(created_coroutines), 1)
 

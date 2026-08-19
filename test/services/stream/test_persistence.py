@@ -122,18 +122,23 @@ class PersistMessageMonotonicTests(unittest.TestCase):
         )
         db = MagicMock()
         conversation = SimpleNamespace(updated_at=None)
+        assistant_query = MagicMock()
+        assistant_query.populate_existing.return_value = assistant_query
+        assistant_query.filter_by.return_value = assistant_query
+        assistant_query.with_for_update.return_value = assistant_query
+        assistant_query.first.return_value = existing
         conversation_query = MagicMock()
         conversation_query.populate_existing.return_value = conversation_query
         conversation_query.filter_by.return_value = conversation_query
         conversation_query.with_for_update.return_value = conversation_query
         conversation_query.first.return_value = conversation
-        message_query = MagicMock()
-        message_query.populate_existing.return_value = message_query
-        message_query.filter_by.return_value = message_query
-        message_query.order_by.return_value = message_query
-        message_query.with_for_update.return_value = message_query
-        message_query.first.return_value = existing
-        db.query.side_effect = [conversation_query, message_query]
+        latest_query = MagicMock()
+        latest_query.populate_existing.return_value = latest_query
+        latest_query.filter_by.return_value = latest_query
+        latest_query.order_by.return_value = latest_query
+        latest_query.with_for_update.return_value = latest_query
+        latest_query.first.return_value = existing
+        db.query.side_effect = [assistant_query, conversation_query, latest_query]
         final = TextBlock(type="text", id="answer-new", text="新回答")
 
         persisted = persist_message(

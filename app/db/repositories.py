@@ -396,6 +396,7 @@ class ConversationRepository:
 
         return (
             self.db.query(MessageModel)
+            .populate_existing()
             .filter(MessageModel.conversation_id == conversation_id)
             .order_by(
                 MessageModel.sequence.asc().nullsfirst(),
