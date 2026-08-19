@@ -167,6 +167,8 @@ class ChatCoreSurfaceTests(unittest.TestCase):
             "conversation_id": "conv-1",
             "user_message_id": "11111111-1111-4111-8111-111111111111",
             "assistant_message_id": "22222222-2222-4222-8222-222222222222",
+            "retry_user_message_id": "11111111-1111-4111-8111-111111111111",
+            "retry_assistant_message_id": "22222222-2222-4222-8222-222222222222",
             "stream": False,
             "options": {"temperature": 0.3},
             "file_ids": ["file-1"],
@@ -198,6 +200,8 @@ class ChatCoreSurfaceTests(unittest.TestCase):
             conversation_id="conv-1",
             user_message_id="11111111-1111-4111-8111-111111111111",
             assistant_message_id="22222222-2222-4222-8222-222222222222",
+            retry_user_message_id="11111111-1111-4111-8111-111111111111",
+            retry_assistant_message_id="22222222-2222-4222-8222-222222222222",
             stream=False,
             options={"temperature": 0.3},
             file_ids=["file-1"],
@@ -245,6 +249,7 @@ class ChatCoreSurfaceTests(unittest.TestCase):
         body = response.json()
         self.assertTrue(body["data"]["knowledge_grounding_v1"])
         self.assertEqual(body["data"]["knowledge_grounding_max_bases"], 5)
+        self.assertTrue(body["data"]["message_retry_v1"])
 
     def test_get_conversations_uses_authenticated_user_id(self):
         self._enable_authenticated_overrides()

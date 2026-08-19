@@ -219,6 +219,11 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
 
         # mock SessionLocal（generate_to_redis 内 db.add / db.query）
         self.mock_db = MagicMock()
+        persistence_query = self.mock_db.query.return_value
+        persistence_query.populate_existing.return_value = persistence_query
+        persistence_query.filter_by.return_value = persistence_query
+        persistence_query.with_for_update.return_value = persistence_query
+        persistence_query.first.return_value = None
         self.db_patchers = [
             patch("app.services.stream.runner.SessionLocal", return_value=self.mock_db),
             patch(
@@ -487,8 +492,18 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         tool_call = {"id": "tc1", "name": "web_search", "arguments": '{"query":"x"}'}
         order = []
 
-        def _capture_persist(db, msg_id, conv_id, model_id, content_blocks, usage_data=None, partial=False):
+        def _capture_persist(
+            db,
+            msg_id,
+            conv_id,
+            model_id,
+            content_blocks,
+            usage_data=None,
+            partial=False,
+            **_kwargs,
+        ):
             order.append(("persist", msg_id, partial, len(content_blocks)))
+            return True
 
         async def _capture_execute(*_args, **kwargs):
             order.append(("execute", kwargs.get("message_id")))
@@ -696,10 +711,12 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(execution.runtime.llm_call_fn, patched_llm_call)
         self.assertIs(execution.runtime.stream_round_fn, patched_stream_round)
         self.assertIs(execution.runtime.execute_tools_fn, patched_execute_tools)
-        self.assertIs(execution.runtime.persist_message_fn, patched_persist_message)
+        self.assertIs(execution.runtime.persist_message_fn.func, patched_persist_message)
+        self.assertEqual(execution.runtime.persist_message_fn.keywords["generation_task_id"], "task-1")
+        self.assertIsNone(execution.runtime.persist_message_fn.keywords["create_after_retry_user_id"])
         self.assertIs(dependencies.append_chunk_fn, patched_append_chunk)
         self.assertIs(dependencies.finalize_stream_fn, patched_finalize_stream)
-        self.assertIs(dependencies.persist_message_fn, patched_persist_message)
+        self.assertIs(dependencies.persist_message_fn.func, patched_persist_message)
 
     async def test_generate_to_redis_passes_continuation_inputs_and_limits_override(self):
         """continuation run 必须带旧内容、额外 system prompt，并使用恢复出的预算。"""
@@ -766,7 +783,16 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         """LLM stream 返回 cancelled 表示 lock owner 被替换，应按 superseded 收尾。"""
         persist_calls = []
 
-        def _capture_persist(db, message_id, conversation_id, model_id, content_blocks, usage_data=None, partial=False):
+        def _capture_persist(
+            db,
+            message_id,
+            conversation_id,
+            model_id,
+            content_blocks,
+            usage_data=None,
+            partial=False,
+            **_kwargs,
+        ):
             persist_calls.append(
                 {
                     "message_id": message_id,
@@ -777,6 +803,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                     "partial": partial,
                 }
             )
+            return True
 
         await self._invoke(
             stream_round_side_effect=[
@@ -921,9 +948,19 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         # 截获 persist_message 最终落库时传入的 content_blocks
         persist_calls = []
 
-        def _capture_persist(db, msg_id, conv_id, model_id, content_blocks, usage_data=None, partial=False):
+        def _capture_persist(
+            db,
+            msg_id,
+            conv_id,
+            model_id,
+            content_blocks,
+            usage_data=None,
+            partial=False,
+            **_kwargs,
+        ):
             if not partial:
                 persist_calls.append(list(content_blocks))
+            return True
 
         await self._invoke(
             stream_round_side_effect=[

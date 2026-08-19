@@ -36,6 +36,7 @@ class ChatContinueTests(unittest.IsolatedAsyncioTestCase):
             plan_mode="on",
         )
         service.stream_handler.generate_to_redis = AsyncMock()
+        service.conversation_service.claim_assistant_message_generation = MagicMock()
 
         with (
             patch(
@@ -75,6 +76,13 @@ class ChatContinueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(init_stream_mock.await_args.args[3], "msg-1")
         self.assertEqual(init_stream_mock.await_args.kwargs["stream_mode"], "continuation")
         self.assertEqual(init_stream_mock.await_args.kwargs["message_sequence"], 42)
+        task_id = init_stream_mock.await_args.args[4]
+        service.conversation_service.claim_assistant_message_generation.assert_called_once_with(
+            conversation_id="conv-1",
+            message_id="msg-1",
+            task_id=task_id,
+        )
+        db.commit.assert_called_once()
         self.assertEqual(
             service.stream_handler.generate_to_redis.call_args.kwargs["assistant_message_sequence"],
             42,
@@ -231,6 +239,7 @@ class ChatContinueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.status_code, 503)
         self.assertEqual(raised.exception.code, "STREAM_UNAVAILABLE")
+        service.db.rollback.assert_called_once()
         create_task_mock.assert_not_called()
         register_task_mock.assert_not_called()
 

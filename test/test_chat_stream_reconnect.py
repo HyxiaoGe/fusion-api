@@ -78,6 +78,38 @@ class ChatStreamReconnectTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(missing.data, {"status": "not_found"})
         self.assertEqual(hidden.data, {"status": "not_found"})
 
+    async def test_status_returns_owned_generation_task_id_for_safe_stop(self):
+        redis = SimpleNamespace(
+            ping=AsyncMock(return_value=True),
+            hgetall=AsyncMock(
+                return_value={
+                    "user_id": "user-1",
+                    "status": "streaming",
+                    "message_id": "msg-1",
+                    "task_id": "task-1",
+                    "stream_mode": "retry",
+                }
+            ),
+            xrevrange=AsyncMock(return_value=[("10-0", {})]),
+        )
+        with patch("app.api.chat.get_redis_pool", return_value=redis):
+            response = await get_stream_status_endpoint(
+                "conv-1",
+                request=self._request(),
+                current_user=SimpleNamespace(id="user-1"),
+            )
+
+        self.assertEqual(
+            response.data,
+            {
+                "status": "streaming",
+                "last_entry_id": "10-0",
+                "message_id": "msg-1",
+                "task_id": "task-1",
+                "stream_mode": "retry",
+            },
+        )
+
     async def test_reconnect_returns_recoverable_503_when_redis_pool_is_missing(self):
         with patch("app.api.chat.get_redis_pool", return_value=None):
             with self.assertRaises(ApiException) as raised:

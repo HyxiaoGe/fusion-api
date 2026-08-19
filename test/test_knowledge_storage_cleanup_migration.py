@@ -11,6 +11,7 @@ FILE_SCOPE_MIGRATION_PATH = ROOT / "alembic" / "versions" / "9c4e7a2b6d11_add_fi
 BASE_DELETE_PROGRESS_MIGRATION_PATH = (
     ROOT / "alembic" / "versions" / "b7d1e4f6a920_add_knowledge_base_delete_progress.py"
 )
+MESSAGE_GENERATION_MIGRATION_PATH = ROOT / "alembic" / "versions" / "d9f2a6c4e7b1_add_message_generation_fence.py"
 
 
 def load_migration(path=CLEANUP_MIGRATION_PATH, name="knowledge_storage_cleanup_migration"):
@@ -107,14 +108,27 @@ class KnowledgeStorageCleanupMigrationTests(unittest.TestCase):
                 revisions[assignments["revision"]] = assignments["down_revision"]
         heads = set(revisions) - {parent for parent in revisions.values() if parent is not None}
 
-        self.assertEqual(heads, {"c8e1f4a7b2d9"})
+        self.assertEqual(heads, {"d9f2a6c4e7b1"})
         visited: set[str] = set()
-        current: str | None = "c8e1f4a7b2d9"
+        current: str | None = "d9f2a6c4e7b1"
         while current is not None:
             self.assertNotIn(current, visited)
             visited.add(current)
             current = revisions[current]
         self.assertEqual(visited, set(revisions))
+
+    def test_message_generation_fence_migration_is_expand_only(self):
+        migration = load_migration(MESSAGE_GENERATION_MIGRATION_PATH, "message_generation_fence_migration")
+        with patch.object(migration, "op") as operation:
+            migration.upgrade()
+
+        operation.add_column.assert_called_once()
+        table_name, column = operation.add_column.call_args.args
+        self.assertEqual(table_name, "messages")
+        self.assertEqual(column.name, "generation_task_id")
+        self.assertTrue(column.nullable)
+        self.assertEqual(migration.down_revision, "c8e1f4a7b2d9")
+        self.assertFalse(operation.drop_table.called)
 
     def test_base_delete_progress_migration_is_expand_only(self):
         migration = load_migration(BASE_DELETE_PROGRESS_MIGRATION_PATH, "knowledge_base_delete_progress_migration")

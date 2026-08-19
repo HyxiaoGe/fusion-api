@@ -74,6 +74,8 @@ async def send_message(
         conversation_id=chat_request.conversation_id,
         user_message_id=chat_request.user_message_id,
         assistant_message_id=chat_request.assistant_message_id,
+        retry_user_message_id=chat_request.retry_user_message_id,
+        retry_assistant_message_id=chat_request.retry_assistant_message_id,
         stream=chat_request.stream,
         options=chat_request.options,
         file_ids=chat_request.file_ids,
@@ -96,6 +98,7 @@ def get_chat_capabilities(
         data={
             "knowledge_grounding_v1": True,
             "knowledge_grounding_max_bases": 5,
+            "message_retry_v1": True,
         },
         request_id=request.state.request_id,
     )
@@ -351,6 +354,7 @@ async def get_stream_status_endpoint(
                 "status": "streaming",
                 "last_entry_id": last_entry_id,
                 "message_id": meta.get("message_id"),
+                "task_id": meta.get("task_id"),
                 "stream_mode": stream_mode,
             },
             request_id=request.state.request_id,
@@ -404,7 +408,11 @@ async def stop_stream(
             raise ApiException.not_found("无进行中的流")
         if meta.get("user_id") != str(current_user.id):
             raise ApiException.not_found("无进行中的流")
-        expected_task_id = meta.get("task_id", "")
+        current_task_id = meta.get("task_id", "")
+        if stop_request.task_id is not None and stop_request.task_id != current_task_id:
+            return success(data={"cancelled": False}, request_id=request.state.request_id)
+        # 新客户端回传其实际观察到的代际；空值仅保留旧版兼容。
+        expected_task_id = stop_request.task_id or current_task_id
         claimed = await claim_stream_stop(conv_id, message_id, expected_task_id)
         if not claimed:
             return success(data={"cancelled": False}, request_id=request.state.request_id)

@@ -12,10 +12,13 @@ from app.services.stream.persistence import filter_authoritative_partial_content
 class StopStreamSchemaTests(unittest.TestCase):
     def test_partial_content_parses_content_blocks_and_defaults_empty(self):
         request = StopStreamRequest(
+            task_id="task-1",
             partial_content=[{"type": "text", "id": "answer-1", "text": "半截回答"}],
         )
 
+        self.assertEqual(request.task_id, "task-1")
         self.assertEqual(request.partial_content, [TextBlock(type="text", id="answer-1", text="半截回答")])
+        self.assertIsNone(StopStreamRequest().task_id)
         self.assertEqual(StopStreamRequest().partial_content, [])
 
     def test_partial_content_accepts_only_client_stream_blocks(self):
@@ -291,6 +294,37 @@ class StopStreamApiTests(unittest.IsolatedAsyncioTestCase):
         cancel_redis.assert_not_awaited()
         cancel_local.assert_not_called()
         release_guard.assert_not_awaited()
+
+    async def test_client_generation_mismatch_never_claims_or_cancels_new_stream(self):
+        chat_service = MagicMock()
+        meta = {
+            "status": "streaming",
+            "user_id": "user-1",
+            "message_id": "msg-1",
+            "task_id": "task-new",
+            "model": "gpt-4",
+        }
+        with (
+            patch("app.api.chat._read_stream_meta_strict", new=AsyncMock(return_value=(object(), meta))),
+            patch("app.api.chat.claim_stream_stop", new=AsyncMock()) as claim_stop,
+            patch("app.api.chat.release_stream_stop_guard", new=AsyncMock()) as release_guard,
+            patch("app.api.chat.cancel_task") as cancel_local,
+            patch("app.api.chat.cancel_stream", new=AsyncMock()) as cancel_redis,
+        ):
+            response = await stop_stream(
+                "conv-1",
+                request=self._request(),
+                stop_request=StopStreamRequest(task_id="task-old"),
+                message_id="msg-1",
+                chat_service=chat_service,
+                current_user=SimpleNamespace(id="user-1"),
+            )
+
+        self.assertEqual(response.data, {"cancelled": False})
+        claim_stop.assert_not_awaited()
+        release_guard.assert_not_awaited()
+        cancel_local.assert_not_called()
+        cancel_redis.assert_not_awaited()
 
     async def test_partial_db_failure_happens_after_freeze_and_still_releases_guard(self):
         calls = []

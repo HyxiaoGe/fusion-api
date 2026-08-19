@@ -68,7 +68,16 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 result.event_types.append(event["type"])
             return f"{len(result.append_calls)}-0"
 
-        def _capture_persist(db, msg_id, conv_id, model_id, content_blocks, usage_data=None, partial=False):
+        def _capture_persist(
+            db,
+            msg_id,
+            conv_id,
+            model_id,
+            content_blocks,
+            usage_data=None,
+            partial=False,
+            **_kwargs,
+        ):
             result.persist_calls.append(
                 {
                     "message_id": msg_id,
@@ -80,6 +89,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                     "usage": usage_data,
                 }
             )
+            return True
 
         async def _capture_finalize(conversation_id, success, error_msg="", task_id="", **kwargs):
             result.finalize_calls.append(
