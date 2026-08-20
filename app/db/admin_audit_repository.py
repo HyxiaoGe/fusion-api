@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import Integer, case, cast, func, or_
@@ -23,6 +23,7 @@ from app.db.models import (
     ToolCallLog,
     User,
 )
+from app.utils.time import as_utc
 
 
 def page_payload(items: list[Any], total: int, page: int, page_size: int) -> dict[str, Any]:
@@ -606,16 +607,10 @@ class AdminAuditRepository:
     @staticmethod
     def _latest_datetime(left: datetime | None, right: datetime | None) -> datetime | None:
         if left is None:
-            return right
+            return as_utc(right) if right is not None else None
         if right is None:
-            return left
-
-        def comparison_value(value: datetime) -> datetime:
-            if value.tzinfo is None or value.utcoffset() is None:
-                return value.replace(tzinfo=timezone.utc)
-            return value.astimezone(timezone.utc)
-
-        return left if comparison_value(left) >= comparison_value(right) else right
+            return as_utc(left)
+        return max(as_utc(left), as_utc(right))
 
     def list_audit_events(
         self,

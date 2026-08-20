@@ -750,7 +750,13 @@ class AgentSession(Base):
     limit_reason = Column(String(30), nullable=True)  # "max_steps" | "max_tool_calls" | "timeout"
     error_message = Column(Text, nullable=True)
 
-    created_at = Column(DateTime, default=get_china_time, index=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=utc_now,
+        server_default=func.now(),
+        nullable=False,
+        index=True,
+    )
 
     __table_args__ = (
         Index("ix_agent_sessions_conversation_message_created_at", "conversation_id", "message_id", "created_at"),

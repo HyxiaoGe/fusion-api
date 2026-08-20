@@ -34,11 +34,11 @@ class AdminAuditRepositoryTests(unittest.TestCase):
             tzinfo=timezone(timedelta(hours=8)),
         )
 
-        self.assertIs(
+        self.assertEqual(
             AdminAuditRepository._latest_datetime(naive_utc, aware_shanghai),
             aware_shanghai,
         )
-        self.assertIs(
+        self.assertEqual(
             AdminAuditRepository._latest_datetime(aware_shanghai, naive_utc),
             aware_shanghai,
         )
@@ -224,7 +224,7 @@ class AdminAuditRepositoryTests(unittest.TestCase):
         self.assertFalse(hasattr(users["user-1"], "system_prompt"))
 
     def test_model_operations_stats_batch_real_usage_agent_errors_and_latest_performance(self):
-        newer = datetime(2026, 7, 12, 12, 0, 0)
+        newer = datetime(2026, 7, 12, 12, 0, 0, tzinfo=timezone.utc)
         self.db.add(
             AgentSession(
                 id="run-error",
