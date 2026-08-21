@@ -44,7 +44,11 @@ class SessionCacheMessageIdTests(unittest.IsolatedAsyncioTestCase):
             session = MagicMock()
             mock_sl.return_value.__enter__.return_value = session
             existing = MagicMock()
-            existing.message_id = "old-assistant"
+            existing.conversation_id = "conv-2"
+            existing.user_id = "user-2"
+            existing.message_id = "assistant-1"
+            existing.turn_message_id = "user-1"
+            existing.previous_run_id = None
             session.get.return_value = existing
 
             await write_session_started(

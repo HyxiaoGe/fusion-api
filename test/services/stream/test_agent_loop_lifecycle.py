@@ -245,6 +245,7 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 assistant_message_id="msg-life",
                 turn_message_id="turn-life",
                 previous_run_id="run-previous",
+                run_attempt_kind="continue",
                 task_id="task-life",
                 call_config=call_config,
                 trace_id="run-life",
@@ -349,6 +350,7 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     kwargs["run_id"],
                     kwargs["turn_message_id"],
                     kwargs["previous_run_id"],
+                    kwargs["run_attempt_kind"],
                     kwargs["tools"],
                     kwargs["config"],
                 )
@@ -399,10 +401,10 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(call_order[0], ("append", "conv-life", "task-life", "preparing", "", ""))
         self.assertEqual(call_order[1][1], "run-life")
-        self.assertEqual(call_order[1][2:4], ("turn-life", "run-previous"))
-        self.assertEqual(call_order[1][4], ["web_search"])
+        self.assertEqual(call_order[1][2:5], ("turn-life", "run-previous", "continue"))
+        self.assertEqual(call_order[1][5], ["web_search"])
         self.assertEqual(
-            call_order[1][5],
+            call_order[1][6],
             {
                 "max_steps": 3,
                 "max_tool_calls": 5,

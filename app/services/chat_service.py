@@ -14,6 +14,7 @@ from app.ai.prompts import prompt_manager
 from app.core.config import settings
 from app.core.logger import app_logger as logger
 from app.db.model_catalog_control_repository import ModelCatalogControlRepository
+from app.db.models import AgentSession
 from app.db.repositories import ConversationRepository, FileRepository
 from app.schemas.chat import (
     ChatResponse,
@@ -30,6 +31,11 @@ from app.services.agent.context_broker import submit_context_result
 from app.services.agent.continuation import (
     build_continuation_context,
     get_continuation_system_prompt,
+)
+from app.services.agent.session_cache import (
+    InvalidPreviousRunError,
+    RunAttemptKind,
+    validate_previous_run_candidate,
 )
 from app.services.agent_strategy_config import get_agent_tools_disabled_aliases
 from app.services.chat.context_manager import (
@@ -317,6 +323,7 @@ class ChatService:
 
         retry_user_message: Message | None = None
         retry_assistant_message: Message | None = None
+        run_attempt_kind: RunAttemptKind = "initial"
         if retry_assistant_message_id is not None and retry_user_message_id is None:
             raise ApiException.bad_request("retry_assistant_message_id 必须与 retry_user_message_id 同时提供")
         if retry_user_message_id is not None:
@@ -341,6 +348,16 @@ class ChatService:
                 existing_conversation.messages = [
                     item for item in existing_conversation.messages if item.id != retry_assistant_message.id
                 ]
+            run_attempt_kind = "regenerate" if retry_assistant_message is not None else "retry"
+            if previous_run_id is not None:
+                self._validate_retry_previous_run(
+                    previous_run_id=previous_run_id,
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    turn_message_id=retry_user_message.id,
+                    attempt_kind=run_attempt_kind,
+                    assistant_message_id=assistant_message_id,
+                )
 
         # 已有会话的模型绑定由服务端持久记录决定，忽略客户端覆盖；新会话才接受请求模型。
         effective_model_id = existing_conversation.model_id if existing_conversation is not None else model_id
@@ -562,6 +579,7 @@ class ChatService:
                     trace_id=trace_id,
                     turn_message_id=user_message.id,
                     previous_run_id=previous_run_id,
+                    run_attempt_kind=run_attempt_kind,
                     defer_partial_persistence=retry_user_message is not None,
                     replace_on_success=retry_assistant_message is not None,
                     create_after_retry_user_id=(
@@ -767,6 +785,7 @@ class ChatService:
                 trace_id=trace_id,
                 turn_message_id=str(continuation_user_message.id),
                 previous_run_id=continuation.previous_session.id,
+                run_attempt_kind="continue",
                 initial_content_blocks=continuation.initial_content_blocks,
                 extra_system_prompts=[get_continuation_system_prompt()],
                 preprocess_user_input=False,
@@ -787,6 +806,29 @@ class ChatService:
                 "X-Accel-Buffering": "no",
             },
         )
+
+    def _validate_retry_previous_run(
+        self,
+        *,
+        previous_run_id: str,
+        conversation_id: str,
+        user_id: str,
+        turn_message_id: str,
+        attempt_kind: RunAttemptKind,
+        assistant_message_id: str | None,
+    ) -> AgentSession:
+        previous_run = self.db.get(AgentSession, previous_run_id)
+        try:
+            return validate_previous_run_candidate(
+                previous_run,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                turn_message_id=turn_message_id,
+                message_id=assistant_message_id,
+                run_attempt_kind=attempt_kind,
+            )
+        except InvalidPreviousRunError as error:
+            raise ApiException.not_found("待接续的 Agent 运行不存在或不可用") from error
 
     async def submit_agent_context_result(
         self,

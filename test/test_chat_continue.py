@@ -101,6 +101,10 @@ class ChatContinueTests(unittest.IsolatedAsyncioTestCase):
             "run-old",
         )
         self.assertEqual(
+            service.stream_handler.generate_to_redis.call_args.kwargs["run_attempt_kind"],
+            "continue",
+        )
+        self.assertEqual(
             service.stream_handler.generate_to_redis.call_args.kwargs["options"],
             {
                 "task_mode": "standard",

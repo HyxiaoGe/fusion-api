@@ -46,6 +46,7 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
                 model_id="gpt-4",
                 provider="openai",
                 turn_message_id="turn-1",
+                run_attempt_kind="initial",
             )
             session.add.assert_called_once()
             session.commit.assert_called_once()
@@ -77,6 +78,7 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
                 provider="openai",
                 message_id="msg-1",
                 turn_message_id="turn-1",
+                run_attempt_kind="initial",
                 run_config={"max_steps": 8, "max_tool_calls": 20, "timeout_s": 300},
             )
 
@@ -88,6 +90,11 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             session = MagicMock()
             mock_sl.return_value.__enter__.return_value = session
             existing = MagicMock()
+            existing.conversation_id = "c1"
+            existing.user_id = "u1"
+            existing.message_id = "msg-1"
+            existing.turn_message_id = "turn-1"
+            existing.previous_run_id = None
             session.get.return_value = existing
 
             await write_session_started(
@@ -98,6 +105,7 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
                 provider="openai",
                 message_id="msg-1",
                 turn_message_id="turn-1",
+                run_attempt_kind="initial",
                 run_config={"max_steps": 4, "max_tool_calls": 7, "timeout_s": 90},
             )
 
@@ -116,6 +124,9 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             existing.limit_reason = "max_steps"
             existing.error_message = "旧错误"
             existing.status = "completed"
+            existing.conversation_id = "c1"
+            existing.user_id = "u1"
+            existing.message_id = "assistant-stable"
             existing.turn_message_id = "turn-stable"
             existing.previous_run_id = "run-parent"
             existing.attempt_index = 3
@@ -123,19 +134,21 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
 
             await write_session_started(
                 run_id="r1",
-                conversation_id="c2",
-                user_id="u2",
+                conversation_id="c1",
+                user_id="u1",
                 model_id="gpt-5",
                 provider="anthropic",
-                turn_message_id="turn-new",
-                previous_run_id="run-new-parent",
+                message_id="assistant-stable",
+                turn_message_id="turn-stable",
+                previous_run_id="run-parent",
+                run_attempt_kind="regenerate",
             )
 
             # 不应 add 新行
             session.add.assert_not_called()
             # 应该更新已有行的元信息 + 重置 totals + 重置 status
-            self.assertEqual(existing.conversation_id, "c2")
-            self.assertEqual(existing.user_id, "u2")
+            self.assertEqual(existing.conversation_id, "c1")
+            self.assertEqual(existing.user_id, "u1")
             self.assertEqual(existing.model_id, "gpt-5")
             self.assertEqual(existing.provider, "anthropic")
             self.assertEqual(existing.status, "running")
@@ -148,6 +161,39 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(existing.previous_run_id, "run-parent")
             self.assertEqual(existing.attempt_index, 3)
             session.commit.assert_called_once()
+
+    async def test_write_session_started_rejects_cross_scope_same_run_reentry(self):
+        existing = SimpleNamespace(
+            id="run-shared",
+            conversation_id="other-conversation",
+            user_id="other-user",
+            message_id="assistant-other",
+            turn_message_id="turn-other",
+            previous_run_id=None,
+            attempt_index=1,
+            status="completed",
+        )
+        session = MagicMock()
+        session.get.return_value = existing
+        lock_result = MagicMock()
+        lock_result.scalar_one_or_none.return_value = "c1"
+        session.execute.return_value = lock_result
+
+        with patch("app.services.agent.session_cache.SessionLocal") as session_local:
+            session_local.return_value.__enter__.return_value = session
+            with self.assertRaises(ValueError):
+                await write_session_started(
+                    run_id="run-shared",
+                    conversation_id="c1",
+                    user_id="u1",
+                    model_id="gpt-4",
+                    provider="openai",
+                    message_id="assistant-1",
+                    turn_message_id="turn-1",
+                    run_attempt_kind="initial",
+                )
+
+        session.commit.assert_not_called()
 
     async def test_write_session_started_inserts_when_no_existing_row(self):
         """没有已有行：行为同 v1（add 新行）"""
@@ -164,6 +210,7 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
                 model_id="gpt-4",
                 provider="openai",
                 turn_message_id="turn-1",
+                run_attempt_kind="initial",
             )
 
             session.add.assert_called_once()
@@ -187,7 +234,15 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             session = MagicMock()
             mock_sl.return_value.__enter__.return_value = session
             session.get.return_value = None
-            session.execute.side_effect = [Result("c1"), Result(1), Result("run-old")]
+            previous = SimpleNamespace(
+                id="run-old",
+                conversation_id="c1",
+                user_id="u1",
+                turn_message_id="user-stable",
+                message_id="assistant-old",
+                status="error",
+            )
+            session.execute.side_effect = [Result("c1"), Result(1), Result(previous)]
 
             await write_session_started(
                 run_id="run-new",
@@ -197,6 +252,7 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
                 provider="openai",
                 message_id="assistant-new",
                 turn_message_id="user-stable",
+                run_attempt_kind="retry",
             )
 
         statements = [call.args[0] for call in session.execute.call_args_list]
@@ -222,7 +278,15 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
         sessions = []
         for max_attempt in (1, 2):
             session = MagicMock()
-            session.get.return_value = None
+            previous = SimpleNamespace(
+                id="run-old",
+                conversation_id="c1",
+                user_id="u1",
+                turn_message_id="user-stable",
+                message_id="assistant-old",
+                status="error",
+            )
+            session.get.side_effect = [None, previous]
             session.execute.side_effect = [Result("c1"), Result(max_attempt)]
             sessions.append(session)
         sessions[0].commit.side_effect = IntegrityError("insert", {}, conflict_orig)
@@ -241,6 +305,7 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
                 provider="openai",
                 turn_message_id="user-stable",
                 previous_run_id="run-old",
+                run_attempt_kind="retry",
             )
 
         self.assertEqual(session_local.call_count, 2)
@@ -263,7 +328,11 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
                 model_id="gpt-4",
                 provider="openai",
                 turn_message_id="turn-1",
+                run_attempt_kind="initial",
             )
+            with test_session_local() as db:
+                db.get(AgentSession, "run-1").status = "error"
+                db.commit()
             await write_session_started(
                 run_id="run-2",
                 conversation_id="c1",
@@ -272,6 +341,7 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
                 provider="openai",
                 turn_message_id="turn-1",
                 previous_run_id="run-1",
+                run_attempt_kind="retry",
             )
 
         with test_session_local() as db:
@@ -281,6 +351,124 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             ]
         self.assertEqual(sorted(attempts), [1, 2])
         engine.dispose()
+
+    async def test_write_session_started_rechecks_same_run_after_conversation_lock(self):
+        lock_acquired = False
+        existing = MagicMock()
+        existing.conversation_id = "c1"
+        existing.user_id = "u1"
+        existing.message_id = "assistant-1"
+        existing.turn_message_id = "turn-stable"
+        existing.previous_run_id = None
+        existing.attempt_index = 1
+        session = MagicMock()
+
+        def execute_lock(_statement):
+            nonlocal lock_acquired
+            lock_acquired = True
+            result = MagicMock()
+            result.scalar_one_or_none.return_value = "c1"
+            return result
+
+        def get_after_lock(_model, _run_id):
+            self.assertTrue(lock_acquired, "必须先拿 conversation lock，再读取同 run_id")
+            return existing
+
+        session.execute.side_effect = execute_lock
+        session.get.side_effect = get_after_lock
+        context = MagicMock()
+        context.__enter__.return_value = session
+
+        with patch("app.services.agent.session_cache.SessionLocal", return_value=context):
+            await write_session_started(
+                run_id="run-same",
+                conversation_id="c1",
+                user_id="u1",
+                model_id="gpt-4",
+                provider="openai",
+                message_id="assistant-1",
+                turn_message_id="turn-stable",
+                run_attempt_kind="initial",
+            )
+
+        session.add.assert_not_called()
+        self.assertEqual(existing.attempt_index, 1)
+        session.commit.assert_called_once()
+
+    async def test_write_session_started_rejects_invalid_previous_run_inside_lock(self):
+        previous = SimpleNamespace(
+            id="run-other",
+            conversation_id="other-conversation",
+            user_id="u1",
+            turn_message_id="turn-1",
+            message_id="assistant-old",
+            status="error",
+        )
+        session = MagicMock()
+        session.get.side_effect = [None, previous]
+        lock_result = MagicMock()
+        lock_result.scalar_one_or_none.return_value = "c1"
+        session.execute.return_value = lock_result
+
+        with patch("app.services.agent.session_cache.SessionLocal") as session_local:
+            session_local.return_value.__enter__.return_value = session
+            with self.assertRaises(ValueError):
+                await write_session_started(
+                    run_id="run-new",
+                    conversation_id="c1",
+                    user_id="u1",
+                    model_id="gpt-4",
+                    provider="openai",
+                    message_id="assistant-new",
+                    turn_message_id="turn-1",
+                    previous_run_id="run-other",
+                    run_attempt_kind="retry",
+                )
+
+        session.add.assert_not_called()
+        session.commit.assert_not_called()
+
+    async def test_write_session_started_accepts_legal_retry_regenerate_and_continue_lineage(self):
+        cases = (
+            ("retry", "error", "assistant-old", "assistant-new"),
+            ("regenerate", "completed", "assistant-same", "assistant-same"),
+            ("continue", "limit_reached", "assistant-same", "assistant-same"),
+        )
+        for attempt_kind, status, previous_message_id, message_id in cases:
+            with self.subTest(attempt_kind=attempt_kind):
+                previous = SimpleNamespace(
+                    id="run-old",
+                    conversation_id="c1",
+                    user_id="u1",
+                    turn_message_id="turn-1",
+                    message_id=previous_message_id,
+                    status=status,
+                )
+                session = MagicMock()
+                session.get.side_effect = [None, previous]
+                lock_result = MagicMock()
+                lock_result.scalar_one_or_none.return_value = "c1"
+                max_result = MagicMock()
+                max_result.scalar_one.return_value = 1
+                session.execute.side_effect = [lock_result, max_result]
+
+                with patch("app.services.agent.session_cache.SessionLocal") as session_local:
+                    session_local.return_value.__enter__.return_value = session
+                    await write_session_started(
+                        run_id=f"run-{attempt_kind}",
+                        conversation_id="c1",
+                        user_id="u1",
+                        model_id="gpt-4",
+                        provider="openai",
+                        message_id=message_id,
+                        turn_message_id="turn-1",
+                        previous_run_id="run-old",
+                        run_attempt_kind=attempt_kind,
+                    )
+
+                row = session.add.call_args.args[0]
+                self.assertEqual(row.previous_run_id, "run-old")
+                self.assertEqual(row.attempt_index, 2)
 
     async def test_write_step_started_inserts_running(self):
         with patch("app.services.agent.session_cache.SessionLocal") as mock_sl:

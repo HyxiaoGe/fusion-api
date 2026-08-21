@@ -52,6 +52,7 @@ class AgentLoopExecutionRequest:
     trace_id: str | None
     turn_message_id: str | None = None
     previous_run_id: str | None = None
+    run_attempt_kind: str = "initial"
     assistant_message_sequence: int | None = None
 
 
@@ -66,6 +67,7 @@ class AgentLoopExecutionContext:
     completion_context: AgentLoopRunCompletionContext
     turn_message_id: str | None
     previous_run_id: str | None
+    run_attempt_kind: str
 
 
 @dataclass(frozen=True)
@@ -222,4 +224,5 @@ def build_agent_loop_execution(
         completion_context=completion_context,
         turn_message_id=request.turn_message_id,
         previous_run_id=request.previous_run_id,
+        run_attempt_kind=request.run_attempt_kind,
     )

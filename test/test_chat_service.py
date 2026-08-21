@@ -30,6 +30,122 @@ class ChatServiceTests(unittest.TestCase):
     def tearDown(self):
         self.registered_model_patcher.stop()
 
+    def test_previous_run_validation_rejects_cross_scope_wrong_target_and_illegal_status(self):
+        service = ChatService(MagicMock())
+        base = {
+            "id": "run-old",
+            "conversation_id": "conv-1",
+            "user_id": "user-1",
+            "turn_message_id": "turn-1",
+            "message_id": "assistant-1",
+            "status": "completed",
+        }
+        cases = (
+            ("跨 conversation", {"conversation_id": "conv-other"}, "regenerate", "assistant-1"),
+            ("跨 user", {"user_id": "user-other"}, "regenerate", "assistant-1"),
+            ("跨 turn", {"turn_message_id": "turn-other"}, "regenerate", "assistant-1"),
+            ("错误 assistant", {"message_id": "assistant-other"}, "regenerate", "assistant-1"),
+            ("非法状态", {"status": "running"}, "regenerate", "assistant-1"),
+        )
+        for _label, overrides, attempt_kind, assistant_message_id in cases:
+            with self.subTest(case=_label):
+                service.db.get.return_value = SimpleNamespace(**{**base, **overrides})
+                with self.assertRaises(ApiException) as raised:
+                    service._validate_retry_previous_run(
+                        previous_run_id="run-old",
+                        conversation_id="conv-1",
+                        user_id="user-1",
+                        turn_message_id="turn-1",
+                        attempt_kind=attempt_kind,
+                        assistant_message_id=assistant_message_id,
+                    )
+                self.assertEqual(raised.exception.status_code, 404)
+
+    def test_previous_run_validation_accepts_legal_retry_and_regenerate(self):
+        service = ChatService(MagicMock())
+        cases = (
+            ("retry", "error", "assistant-old", "assistant-new"),
+            ("regenerate", "completed", "assistant-same", "assistant-same"),
+        )
+        for attempt_kind, status, previous_message_id, assistant_message_id in cases:
+            with self.subTest(attempt_kind=attempt_kind):
+                previous = SimpleNamespace(
+                    id="run-old",
+                    conversation_id="conv-1",
+                    user_id="user-1",
+                    turn_message_id="turn-1",
+                    message_id=previous_message_id,
+                    status=status,
+                )
+                service.db.get.return_value = previous
+                result = service._validate_retry_previous_run(
+                    previous_run_id="run-old",
+                    conversation_id="conv-1",
+                    user_id="user-1",
+                    turn_message_id="turn-1",
+                    attempt_kind=attempt_kind,
+                    assistant_message_id=assistant_message_id,
+                )
+                self.assertIs(result, previous)
+
+    def test_invalid_explicit_previous_run_fails_before_stream_initialization(self):
+        db = MagicMock()
+        service = ChatService(db)
+        service.file_repo = MagicMock()
+        service.stream_handler = MagicMock()
+        service.conversation_service = MagicMock()
+        service._validate_message_files = MagicMock(return_value=[])
+        stored_user = Message(
+            id="11111111-1111-4111-8111-111111111111",
+            sequence=31,
+            role="user",
+            content=[TextBlock(type="text", text="原始问题")],
+        )
+        stored_assistant = Message(
+            id="22222222-2222-4222-8222-222222222222",
+            sequence=32,
+            role="assistant",
+            content=[TextBlock(type="text", text="原始回答")],
+            model_id="saved/model",
+        )
+        conversation = Conversation(
+            id="conv-retry",
+            user_id="user-1",
+            title="原始问题",
+            model_id="saved/model",
+            messages=[stored_user, stored_assistant],
+        )
+        service.conversation_service.get_conversation.return_value = conversation
+        service.conversation_service.prepare_message_retry.return_value = (stored_user, stored_assistant)
+
+        with (
+            patch.object(
+                service,
+                "_validate_retry_previous_run",
+                side_effect=ApiException.not_found("待接续的 Agent 运行不存在或不可用"),
+                create=True,
+            ),
+            patch("app.services.chat_service.init_stream", new=AsyncMock()) as init_stream_mock,
+            self.assertRaises(ApiException) as raised,
+        ):
+            asyncio.run(
+                service.process_message(
+                    model_id="saved/model",
+                    message="原始问题",
+                    user_id="user-1",
+                    conversation_id="conv-retry",
+                    user_message_id=stored_user.id,
+                    assistant_message_id=stored_assistant.id,
+                    retry_user_message_id=stored_user.id,
+                    retry_assistant_message_id=stored_assistant.id,
+                    previous_run_id="run-other",
+                    stream=True,
+                )
+            )
+
+        self.assertEqual(raised.exception.status_code, 404)
+        init_stream_mock.assert_not_awaited()
+
     def test_deep_research_capability_gate_runs_before_conversation_or_message_persistence(self):
         service = ChatService(MagicMock())
         service._get_or_create_conversation = MagicMock()
@@ -1041,6 +1157,7 @@ class ChatServiceTests(unittest.TestCase):
             "33333333-3333-4333-8333-333333333333",
         )
         self.assertIsNone(service.stream_handler.generate_to_redis.call_args.kwargs["previous_run_id"])
+        self.assertEqual(service.stream_handler.generate_to_redis.call_args.kwargs["run_attempt_kind"], "initial")
         self.assertEqual(len(created_coroutines), 1)
 
     def test_stream_retry_reuses_original_turn_without_persisting_duplicate_user(self):
@@ -1083,6 +1200,14 @@ class ChatServiceTests(unittest.TestCase):
         service.conversation_service.prepare_message_retry.return_value = (
             stored_user,
             stored_assistant,
+        )
+        db.get.return_value = SimpleNamespace(
+            id="run-original",
+            conversation_id="conv-retry",
+            user_id="user-1",
+            turn_message_id=stored_user.id,
+            message_id=stored_assistant.id,
+            status="completed",
         )
         created_coroutines = []
 
@@ -1150,6 +1275,10 @@ class ChatServiceTests(unittest.TestCase):
         self.assertTrue(service.stream_handler.generate_to_redis.call_args.kwargs["replace_on_success"])
         self.assertEqual(service.stream_handler.generate_to_redis.call_args.kwargs["turn_message_id"], stored_user.id)
         self.assertEqual(service.stream_handler.generate_to_redis.call_args.kwargs["previous_run_id"], "run-original")
+        self.assertEqual(
+            service.stream_handler.generate_to_redis.call_args.kwargs["run_attempt_kind"],
+            "regenerate",
+        )
         self.assertEqual(len(created_coroutines), 1)
 
     def test_stream_retry_unanswered_user_allocates_only_assistant_sequence(self):
@@ -1175,6 +1304,14 @@ class ChatServiceTests(unittest.TestCase):
         service.conversation_service.get_conversation.return_value = conversation
         service.conversation_service.prepare_message_retry.return_value = (stored_user, None)
         service.conversation_service.reserve_message_sequence_pair.return_value = (61, 62)
+        db.get.return_value = SimpleNamespace(
+            id="run-failed-before-assistant",
+            conversation_id="conv-retry",
+            user_id="user-1",
+            turn_message_id=stored_user.id,
+            message_id=None,
+            status="error",
+        )
         created_coroutines = []
 
         def close_created_coroutine(coroutine):
@@ -1236,6 +1373,7 @@ class ChatServiceTests(unittest.TestCase):
             service.stream_handler.generate_to_redis.call_args.kwargs["previous_run_id"],
             "run-failed-before-assistant",
         )
+        self.assertEqual(service.stream_handler.generate_to_redis.call_args.kwargs["run_attempt_kind"], "retry")
         self.assertEqual(len(created_coroutines), 1)
 
     def test_stream_first_message_claims_user_generation_and_passes_create_fence(self):

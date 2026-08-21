@@ -61,6 +61,7 @@ class RunFinalizerTests(unittest.IsolatedAsyncioTestCase):
             message_id="msg-1",
             turn_message_id="turn-1",
             previous_run_id="run-previous",
+            run_attempt_kind="regenerate",
             tools=["web_search"],
             config={"max_steps": 8},
         )
@@ -77,6 +78,7 @@ class RunFinalizerTests(unittest.IsolatedAsyncioTestCase):
                     message_id="msg-1",
                     turn_message_id="turn-1",
                     previous_run_id="run-previous",
+                    run_attempt_kind="regenerate",
                     run_config={"max_steps": 8},
                 ),
                 call.run_started(
