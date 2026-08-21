@@ -28,6 +28,7 @@ from app.services.stream_state_service import StreamOwnershipLostError
 AsyncFn = Callable[..., Awaitable[Any]]
 PersistMessageFn = Callable[..., Any]
 LogFn = Callable[[str], None]
+TRAJECTORY_BARRIER_TIMEOUT_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -75,20 +76,101 @@ async def run_agent_loop_lifecycle(
     execution: AgentLoopExecutionContext,
     dependencies: AgentLoopLifecycleDependencies,
 ) -> None:
+    primary_error: BaseException | None = None
     try:
         await _run_success_path(request=request, execution=execution, dependencies=dependencies)
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as error:
+        primary_error = error
         await _finalize_cancelled(execution=execution, dependencies=dependencies)
         raise
-    except StreamOwnershipLostError:
+    except StreamOwnershipLostError as error:
+        primary_error = error
         # stop 接口或后续请求已经原子接管 Redis 终态时，后台任务可能先观察到
         # 写入权失效，再收到 asyncio cancellation。这属于正常中断，不应记为生成失败。
         await _finalize_cancelled(execution=execution, dependencies=dependencies)
     except Exception as error:
+        primary_error = error
         await _finalize_failed(error=error, execution=execution, dependencies=dependencies)
         raise
     finally:
-        await _write_fallback(execution=execution, dependencies=dependencies)
+        fallback_error: BaseException | None = None
+        try:
+            await _write_fallback(execution=execution, dependencies=dependencies)
+        except BaseException as error:
+            fallback_error = error
+            raise
+        finally:
+            cancelled_during_barrier = await commit_trajectory_barrier(
+                execution=execution,
+                warning_fn=dependencies.warning_fn,
+            )
+            if cancelled_during_barrier and primary_error is None and fallback_error is None:
+                raise asyncio.CancelledError
+
+
+async def commit_trajectory_barrier(
+    *,
+    execution: AgentLoopExecutionContext,
+    warning_fn: LogFn,
+) -> bool:
+    """幂等执行 emitter seal 与 Recorder finalize，并保留调用方取消语义。"""
+    state = execution.trajectory_barrier_state
+    if state.started:
+        return False
+    state.started = True
+
+    async def _commit() -> None:
+        last_sequence = await execution.emitter.seal_and_get_last_sequence()
+        await execution.trajectory_recorder.finalize(last_sequence)
+
+    barrier_task = asyncio.create_task(_commit())
+    cancelled, error, timed_out = await _wait_for_trajectory_barrier(barrier_task)
+    if timed_out:
+        barrier_task.add_done_callback(_consume_trajectory_barrier_result)
+        warning_fn(f"轨迹完整性提交屏障超时: run_id={execution.run_id}")
+    elif error is not None:
+        warning_fn(
+            "轨迹完整性提交屏障失败: "
+            f"run_id={execution.run_id}, error_type={type(error).__name__}"
+        )
+    return cancelled
+
+
+async def _wait_for_trajectory_barrier(
+    barrier_task: asyncio.Task[None],
+) -> tuple[bool, BaseException | None, bool]:
+    """在绝对 deadline 内等待；外层二次取消不取消底层 barrier。"""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + TRAJECTORY_BARRIER_TIMEOUT_SECONDS
+    cancelled = False
+    while not barrier_task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return cancelled, None, True
+        try:
+            done, _pending = await asyncio.wait({barrier_task}, timeout=remaining)
+        except asyncio.CancelledError:
+            cancelled = True
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                current_task.uncancel()
+            continue
+        if not done:
+            return cancelled, None, True
+
+    try:
+        barrier_task.result()
+    except BaseException as error:  # barrier 是辅助路径，任何异常都只降级并记录类型
+        return cancelled, error, False
+    return cancelled, None, False
+
+
+def _consume_trajectory_barrier_result(barrier_task: asyncio.Task[None]) -> None:
+    """消费外层超时后的迟到异常，避免 never-retrieved 告警。"""
+    try:
+        barrier_task.exception()
+    except asyncio.CancelledError:
+        pass
 
 
 async def _run_success_path(

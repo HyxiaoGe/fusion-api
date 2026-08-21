@@ -19,6 +19,7 @@ class RunFinalizerTests(unittest.IsolatedAsyncioTestCase):
             run_completed=AsyncMock(),
             run_interrupted=AsyncMock(),
             run_failed=AsyncMock(),
+            seal_and_get_last_sequence=AsyncMock(),
         )
         cache = SimpleNamespace(
             write_session_started=AsyncMock(),
@@ -119,6 +120,7 @@ class RunFinalizerTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ],
         )
+        emitter.seal_and_get_last_sequence.assert_not_awaited()
 
     async def test_interrupt_agent_run_closes_current_step_before_interrupted_status(self):
         emitter, cache, order = self._deps()

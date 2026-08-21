@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from app.services.agent.emitter import AgentEventEmitter
@@ -57,6 +57,13 @@ class AgentLoopExecutionRequest:
     assistant_message_sequence: int | None = None
 
 
+@dataclass
+class TrajectoryBarrierState:
+    """单次 run 的轨迹提交屏障幂等状态。"""
+
+    started: bool = False
+
+
 @dataclass(frozen=True)
 class AgentLoopExecutionContext:
     run_id: str
@@ -70,6 +77,7 @@ class AgentLoopExecutionContext:
     turn_message_id: str | None
     previous_run_id: str | None
     run_attempt_kind: str
+    trajectory_barrier_state: TrajectoryBarrierState = field(default_factory=TrajectoryBarrierState)
 
 
 @dataclass(frozen=True)
