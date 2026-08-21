@@ -376,11 +376,11 @@ def strip_pending_dsml_tool_protocol(text: str, *, final: bool = False) -> str:
     hidden_starts: list[int] = []
     dsml_marker_index = text.find(_DSML_TOOL_CALLS_OPEN)
     if dsml_marker_index >= 0:
-        hidden_starts.append(dsml_marker_index)
+        hidden_starts.append(0 if not text[:dsml_marker_index].strip() else dsml_marker_index)
     elif (dsml_pending_start := _pending_dsml_tool_protocol_start(text)) is not None:
         pending_candidate = text[dsml_pending_start:]
         if not final or pending_candidate.startswith(_DSML_DISTINCT_PREFIX):
-            hidden_starts.append(dsml_pending_start)
+            hidden_starts.append(0 if not text[:dsml_pending_start].strip() else dsml_pending_start)
 
     generic_candidate = _generic_tool_protocol_candidate(text)
     if generic_candidate is not None:
