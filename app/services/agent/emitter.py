@@ -12,6 +12,16 @@ from app.services.agent.sanitizer import cap_and_truncate, sanitize_arguments
 
 # Sentinel 用于 _envelope 区分"未传 step_id（用 current）"vs"显式传 None"
 _USE_CURRENT_STEP = object()
+_LLM_ERROR_SUMMARIES = {
+    "rate_limit": "模型服务请求过于频繁，请稍后重试。",
+    "timeout": "模型服务响应超时，请稍后重试。",
+    "provider_error": "模型服务暂时不可用，请稍后重试。",
+}
+_RETRIEVAL_ERROR_SUMMARIES = {
+    "timeout": "知识库检索超时，请稍后重试。",
+    "knowledge_retrieval_unavailable": "知识库检索暂时不可用，请稍后重试。",
+    "provider_error": "知识库检索暂时不可用，请稍后重试。",
+}
 
 
 class _RedisWriter(Protocol):
@@ -107,9 +117,18 @@ class AgentEventEmitter:
         )
 
     @staticmethod
-    def _truncate_summary(value: str | None, max_length: int = 120) -> str | None:
-        """限制可持久化的用户安全摘要长度。"""
-        return value[:max_length] if value is not None else None
+    def _controlled_error(error_code: str | None, summaries: dict[str, str]) -> tuple[str | None, str | None]:
+        """只将白名单错误码及其公开摘要发往用户事件。"""
+        if error_code not in summaries:
+            return None, None
+        return error_code, summaries[error_code]
+
+    @staticmethod
+    def _opaque_retrieval_summary(query_summary: str | None) -> str | None:
+        """隔离无法在 emitter 边界证明安全的检索原文。"""
+        if query_summary is None or not query_summary.strip():
+            return None
+        return "已发起知识库检索"
 
     async def run_started(self, *, message_id: str, model: str, tools: list[str], config: dict[str, Any]) -> None:
         await self._emit(
@@ -321,13 +340,14 @@ class AgentEventEmitter:
         message: str | None,
         parent_step_id: str | None = None,
     ) -> None:
+        safe_error_code, safe_message = self._controlled_error(error_code, _LLM_ERROR_SUMMARIES)
         await self._emit(
             ev.LLMRoundFailed(
                 type="llm_round_failed",
                 llm_round_id=llm_round_id,
                 status="failed",
-                error_code=error_code,
-                message=self._truncate_summary(message),
+                error_code=safe_error_code,
+                message=safe_message,
                 **self._envelope(parent_step_id=parent_step_id),
             )
         )
@@ -360,7 +380,7 @@ class AgentEventEmitter:
             ev.RetrievalStarted(
                 type="retrieval_started",
                 retrieval_id=retrieval_id,
-                query_summary=self._truncate_summary(query_summary),
+                query_summary=self._opaque_retrieval_summary(query_summary),
                 **self._envelope(parent_step_id=parent_step_id),
             )
         )
@@ -392,13 +412,14 @@ class AgentEventEmitter:
         message: str | None,
         parent_step_id: str | None = None,
     ) -> None:
+        safe_error_code, safe_message = self._controlled_error(error_code, _RETRIEVAL_ERROR_SUMMARIES)
         await self._emit(
             ev.RetrievalFailed(
                 type="retrieval_failed",
                 retrieval_id=retrieval_id,
                 status="failed",
-                error_code=error_code,
-                message=self._truncate_summary(message),
+                error_code=safe_error_code,
+                message=safe_message,
                 **self._envelope(parent_step_id=parent_step_id),
             )
         )

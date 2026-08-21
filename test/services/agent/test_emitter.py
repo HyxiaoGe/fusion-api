@@ -453,7 +453,7 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
         await open_emitter.step_started(step_number=1)
         self.assertEqual(await open_emitter.seal_and_get_last_sequence(), 0)
 
-    async def test_new_lifecycle_helpers_preserve_parent_and_bound_safe_summaries(self):
+    async def test_new_lifecycle_helpers_preserve_parent_and_emit_opaque_query_summary(self):
         writer = AsyncMock()
         em = AgentEventEmitter(run_id="r1", trace_id="r1", conversation_id="c1", task_id="task-1", redis_writer=writer)
         parent_step_id = await em.step_started(step_number=1)
@@ -461,16 +461,45 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
         await em.llm_round_started(
             llm_round_id="llm-1", round_index=1, model="deepseek/deepseek-chat", provider="deepseek", parent_step_id=parent_step_id
         )
-        await em.llm_round_failed(llm_round_id="llm-1", error_code="timeout", message="错" * 200, parent_step_id=parent_step_id)
-        await em.retrieval_started(retrieval_id="ret-1", query_summary="问" * 200, parent_step_id=parent_step_id)
+        await em.llm_round_failed(
+            llm_round_id="llm-1",
+            error_code="timeout",
+            message="上游错误 token=LEAK_TOKEN https://example.com/fail?secret=LEAK_SECRET",
+            parent_step_id=parent_step_id,
+        )
+        await em.retrieval_started(
+            retrieval_id="ret-1",
+            query_summary="私密短查询 LEAK_QUERY token=LEAK_TOKEN https://example.com/search?q=LEAK_QUERY#fragment",
+            parent_step_id=parent_step_id,
+        )
         await em.tool_attempt_started(
             tool_attempt_id="attempt-1", tool_call_id="tool-1", tool_name="web_search", attempt_index=1, parent_step_id=parent_step_id
         )
 
         payloads = [call.args[3] for call in writer.append_chunk.call_args_list[-4:]]
         self.assertEqual([payload["parent_step_id"] for payload in payloads], [parent_step_id] * 4)
-        self.assertEqual(payloads[1]["message"], "错" * 120)
-        self.assertEqual(payloads[2]["query_summary"], "问" * 120)
+        self.assertEqual(payloads[1]["message"], "模型服务响应超时，请稍后重试。")
+        self.assertEqual(payloads[2]["query_summary"], "已发起知识库检索")
+        serialized = str(payloads)
+        self.assertNotIn("LEAK_TOKEN", serialized)
+        self.assertNotIn("LEAK_SECRET", serialized)
+        self.assertNotIn("LEAK_QUERY", serialized)
+
+    async def test_lifecycle_errors_only_expose_known_controlled_error_code(self):
+        writer = AsyncMock()
+        em = AgentEventEmitter(run_id="r1", trace_id="r1", conversation_id="c1", task_id="task-1", redis_writer=writer)
+
+        await em.retrieval_failed(
+            retrieval_id="ret-1",
+            error_code="provider-private-token=LEAK_TOKEN",
+            message="provider response https://example.com/error?api_key=LEAK_KEY",
+        )
+
+        payload = writer.append_chunk.await_args.args[3]
+        self.assertIsNone(payload["error_code"])
+        self.assertIsNone(payload["message"])
+        self.assertNotIn("LEAK_TOKEN", str(payload))
+        self.assertNotIn("LEAK_KEY", str(payload))
 
     async def test_remaining_lifecycle_helpers_publish_their_protocol_payloads(self):
         writer = AsyncMock()
