@@ -271,6 +271,51 @@ class LitellmHealthSwitchTests(unittest.IsolatedAsyncioTestCase):
             await litellm_health._fetch_once()
         self.assertEqual(litellm_health.get_health("kimi-k2.7-code")["status"], "healthy")
 
+    async def test_record_success_newer_than_snapshot_is_preserved(self):
+        """P1：本地 record_success 比 Redis 快照新时，不被旧快照的 unhealthy 覆盖。"""
+        os.environ["LITELLM_HEALTH_ENABLED"] = "true"
+        fake = _FakeAsyncRedis()
+        # Redis 仍存上一轮 unhealthy@456 快照
+        fake._data[litellm_health._SNAPSHOT_KEY] = json.dumps(
+            {
+                "checked_at": 456.0,
+                "by_alias": {"kimi-k2.7-code": {"status": "unhealthy", "error": "服务商暂时不可用"}},
+            }
+        )
+        # 随后真实调用成功，本地写入 healthy@789
+        litellm_health.record_success("kimi-k2.7-code", checked_at=789.0)
+
+        with patch.object(litellm_health, "_get_sync_redis", return_value=_SyncFake(fake)):
+            health = litellm_health.get_health("kimi-k2.7-code")
+        self.assertEqual(
+            health,
+            {"status": "healthy", "error": None, "checked_at": 789.0},
+        )
+
+    async def test_snapshot_removes_aliases_absent_from_new_snapshot(self):
+        """更新快照里消失的 alias 应收敛为 unknown（除非本地有更新的 record_success）。"""
+        os.environ["LITELLM_HEALTH_ENABLED"] = "true"
+        fake = _FakeAsyncRedis()
+        fake._data[litellm_health._SNAPSHOT_KEY] = json.dumps(
+            {
+                "checked_at": 456.0,
+                "by_alias": {"kimi-k2.7-code": {"status": "unhealthy", "error": "服务商暂时不可用"}},
+            }
+        )
+        with patch.object(litellm_health, "_get_sync_redis", return_value=_SyncFake(fake)):
+            self.assertEqual(litellm_health.get_health("kimi-k2.7-code")["status"], "unhealthy")
+
+        # 新快照不再包含该 alias → 收敛为 unknown
+        fake._data[litellm_health._SNAPSHOT_KEY] = json.dumps(
+            {
+                "checked_at": 789.0,
+                "by_alias": {"qwen3.7-max": {"status": "healthy", "error": None}},
+            }
+        )
+        litellm_health._last_redis_sync_at = 0.0
+        with patch.object(litellm_health, "_get_sync_redis", return_value=_SyncFake(fake)):
+            self.assertEqual(litellm_health.get_health("kimi-k2.7-code")["status"], "unknown")
+
 
 if __name__ == "__main__":
     unittest.main()

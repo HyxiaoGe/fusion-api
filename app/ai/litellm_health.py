@@ -319,14 +319,24 @@ def _sync_from_redis() -> None:
     with _lock:
         merged: Dict[str, Dict[str, Any]] = {}
         for alias, entry in by_alias.items():
-            if isinstance(entry, dict):
+            if not isinstance(entry, dict):
+                continue
+            local = _by_alias.get(alias)
+            # 本地记录（如 record_success 的成功标记）比快照新 → 保留本地：快照仍存
+            # 上一轮 unhealthy 时，真实调用成功应立刻把模型拉回可用，而不是被旧快照
+            # 覆盖成 unhealthy 直到下一轮探测。
+            if local is not None and isinstance(local, dict) and (local.get("checked_at") or 0) > checked_at:
+                merged[alias] = dict(local)
+            else:
                 merged[alias] = {
                     "status": entry.get("status", "unknown"),
                     "error": entry.get("error"),
                     "checked_at": checked_at,
                 }
+        # 快照里没有的本地条目：仅当本地 checked_at 晚于快照（新鲜的 record_success）
+        # 时保留；否则丢弃，让已从快照消失的 alias 收敛为 unknown，避免残留旧值。
         for alias, entry in _by_alias.items():
-            if alias not in merged:
+            if alias not in merged and (entry.get("checked_at") or 0) > checked_at:
                 merged[alias] = dict(entry)
         _by_alias.clear()
         _by_alias.update(merged)
