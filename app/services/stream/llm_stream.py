@@ -131,6 +131,7 @@ class LLMStreamState:
     reasoning_probe_chunks: list[str] = field(default_factory=list)
     reasoning_snapshot_revision_logged: bool = False
     pending_reasoning_candidate_time: float | None = None
+    pending_content_candidate_time: float | None = None
 
 
 @dataclass(frozen=True)
@@ -626,6 +627,12 @@ def _final_reasoning_candidate(state: LLMStreamState) -> str:
     return sanitize_user_visible_reasoning(candidate, final=True)
 
 
+def _final_content_candidate(state: LLMStreamState) -> str:
+    candidate = strip_reasoning_tag_blocks(state.raw_content_buf)
+    candidate = strip_pending_dsml_tool_protocol(candidate, final=True)
+    return sanitize_internal_mcp_aliases(candidate, final=True)
+
+
 async def flush_pending_internal_mcp_aliases(*, request: LLMStreamRequest, state: LLMStreamState) -> None:
     if state.reasoning_transport_mode == "probing":
         _resolve_reasoning_probe(state, final=True)
@@ -640,12 +647,10 @@ async def flush_pending_internal_mcp_aliases(*, request: LLMStreamRequest, state
         reasoning_delta=_visible_delta(final_reasoning, state.reasoning_buf, channel="reasoning"),
         content_delta=_visible_delta(final_content, state.content_buf, channel="answering"),
         reasoning_candidate_time=state.pending_reasoning_candidate_time,
-        content_candidate_time=(
-            request.capture_output_candidate_time()
-            if request.capture_output_candidate_time is not None
-            else None
-        ),
+        content_candidate_time=state.pending_content_candidate_time,
     )
+    state.pending_reasoning_candidate_time = None
+    state.pending_content_candidate_time = None
 
 
 async def append_stream_delta(
@@ -737,7 +742,13 @@ async def process_stream_choice(*, request: LLMStreamRequest, state: LLMStreamSt
         request.on_output_candidate("tool_call", candidate_time)
     raw_reasoning_delta = extract_reasoning_delta(delta, request.should_use_reasoning)
     content_delta = extract_content_delta(delta, raw_reasoning_delta)
+    previous_content_candidate = _final_content_candidate(state)
     tag_reasoning_delta, content_delta = filter_reasoning_tag_content_delta(state, content_delta)
+    if (
+        state.pending_content_candidate_time is None
+        and _final_content_candidate(state) != previous_content_candidate
+    ):
+        state.pending_content_candidate_time = candidate_time
     previous_reasoning_candidate = _final_reasoning_candidate(state)
     reasoning_delta = filter_internal_mcp_reasoning_delta(
         state,
@@ -754,10 +765,12 @@ async def process_stream_choice(*, request: LLMStreamRequest, state: LLMStreamSt
         reasoning_delta=reasoning_delta,
         content_delta=content_delta,
         reasoning_candidate_time=state.pending_reasoning_candidate_time,
-        content_candidate_time=candidate_time,
+        content_candidate_time=state.pending_content_candidate_time,
     )
     if reasoning_delta:
         state.pending_reasoning_candidate_time = None
+    if content_delta:
+        state.pending_content_candidate_time = None
 
     usage_data = extract_usage(chunk)
     if usage_data:
