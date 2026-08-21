@@ -897,6 +897,7 @@ async def run_limit_summary_step(
     )
 
     next_usage = accumulate_summary_usage(request.accumulated_usage, round_result.usage_data)
+    primary_error: BaseException | None = None
     try:
         incomplete = await _commit_limit_summary_result(
             request=request,
@@ -905,8 +906,23 @@ async def run_limit_summary_step(
             thinking_block_id=thinking_block_id,
             text_block_id=text_block_id,
         )
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        await _finish_summary_round_lifecycle(round_result, model_output_visible=False)
+        try:
+            await _finish_summary_round_lifecycle(round_result, model_output_visible=False)
+        except BaseException as secondary_error:
+            if primary_error is None:
+                raise
+            try:
+                logger.warning(
+                    "deferred 总结生命周期收尾失败，保留主异常: "
+                    "error_type=%s error_code=deferred_terminal_failure",
+                    type(secondary_error).__name__,
+                )
+            except BaseException:
+                pass
     await complete_limit_summary_step(
         summary_context=summary_context,
         emitter=request.emitter,

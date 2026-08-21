@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from app.core.logger import app_logger as logger
 from app.schemas.chat import KnowledgeEvidenceBlock, ThinkingBlock
 from app.services.final_answer_evidence import build_used_final_answer_evidence
 from app.services.knowledge.chat_grounding import (
@@ -63,12 +64,28 @@ async def handle_agent_round_outcome(
     *,
     request: AgentRoundOutcomeRequest,
 ) -> AgentLoopOutcome | None:
+    primary_error: BaseException | None = None
     try:
         return await _handle_agent_round_outcome(request=request)
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
         lifecycle = request.round_result.llm_lifecycle
         if lifecycle is not None:
-            await lifecycle.finish_success(output_visible=False)
+            try:
+                await lifecycle.finish_success(output_visible=False)
+            except BaseException as secondary_error:
+                if primary_error is None:
+                    raise
+                try:
+                    logger.warning(
+                        "Agent deferred LLM 生命周期收尾失败，保留主异常: "
+                        "error_type=%s error_code=deferred_terminal_failure",
+                        type(secondary_error).__name__,
+                    )
+                except BaseException:
+                    pass
 
 
 async def _handle_agent_round_outcome(

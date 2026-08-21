@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -117,6 +118,97 @@ def _synthesis_state(*, run_id: str, step_id: str, **state_kwargs) -> AgentLoopS
 
 
 class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _deferred_lifecycle_request(lifecycle) -> AgentRoundOutcomeRequest:
+        return AgentRoundOutcomeRequest(
+            db="db",
+            messages=[{"role": "user", "content": "测试 deferred commit"}],
+            state=AgentLoopState(),
+            runtime=_runtime(),
+            step_number=1,
+            step_context=_step_context("step-deferred-terminal"),
+            round_result=AgentRoundResult(
+                reasoning_buf="",
+                content_buf="候选答案",
+                tool_calls=[],
+                finish_reason="stop",
+                accumulated_usage=Usage(input_tokens=1, output_tokens=1),
+                output_deferred=True,
+                llm_lifecycle=lifecycle,
+            ),
+        )
+
+    async def test_deferred_outcome_terminal_secondary_preserves_primary_base_exception(self):
+        error_factories = (
+            ("runtime", lambda role: RuntimeError(f"{role} secret")),
+            ("cancel", lambda role: asyncio.CancelledError(f"{role} secret")),
+        )
+
+        for primary_name, make_primary in error_factories:
+            for secondary_name, make_secondary in error_factories:
+                with self.subTest(primary=primary_name, secondary=secondary_name):
+                    primary = make_primary("primary")
+                    secondary = make_secondary("secondary")
+                    finish_success = AsyncMock(side_effect=secondary)
+                    lifecycle = SimpleNamespace(finish_success=finish_success)
+                    warning = Mock()
+                    cancelling_before = asyncio.current_task().cancelling()
+
+                    with (
+                        patch(
+                            "app.services.stream.agent_loop_round_outcome._handle_agent_round_outcome",
+                            new=AsyncMock(side_effect=primary),
+                        ),
+                        patch(
+                            "app.services.stream.agent_loop_round_outcome.logger",
+                            new=SimpleNamespace(warning=warning),
+                            create=True,
+                        ),
+                    ):
+                        with self.assertRaises(type(primary)) as raised:
+                            await handle_agent_round_outcome(
+                                request=self._deferred_lifecycle_request(lifecycle),
+                            )
+
+                    self.assertIs(raised.exception, primary)
+                    self.assertEqual(asyncio.current_task().cancelling(), cancelling_before)
+                    finish_success.assert_awaited_once_with(output_visible=False)
+                    warning.assert_called_once()
+                    logged = repr(warning.call_args)
+                    self.assertIn("error_code=deferred_terminal_failure", logged)
+                    self.assertIn(type(secondary).__name__, logged)
+                    self.assertNotIn(str(primary), logged)
+                    self.assertNotIn(str(secondary), logged)
+
+    async def test_deferred_outcome_terminal_failure_without_primary_remains_fail_closed(self):
+        for secondary in (RuntimeError("secondary secret"), asyncio.CancelledError("secondary secret")):
+            with self.subTest(secondary=type(secondary).__name__):
+                finish_success = AsyncMock(side_effect=secondary)
+                lifecycle = SimpleNamespace(finish_success=finish_success)
+                warning = Mock()
+                cancelling_before = asyncio.current_task().cancelling()
+
+                with (
+                    patch(
+                        "app.services.stream.agent_loop_round_outcome._handle_agent_round_outcome",
+                        new=AsyncMock(return_value=None),
+                    ),
+                    patch(
+                        "app.services.stream.agent_loop_round_outcome.logger",
+                        new=SimpleNamespace(warning=warning),
+                        create=True,
+                    ),
+                ):
+                    with self.assertRaises(type(secondary)) as raised:
+                        await handle_agent_round_outcome(
+                            request=self._deferred_lifecycle_request(lifecycle),
+                        )
+
+                self.assertIs(raised.exception, secondary)
+                self.assertEqual(asyncio.current_task().cancelling(), cancelling_before)
+                finish_success.assert_awaited_once_with(output_visible=False)
+                warning.assert_not_called()
+
     async def test_deep_synthesis_unannounced_tool_protocol_goes_directly_to_safe_summary(self):
         state = AgentLoopState(plan_coordinator=PlanCoordinator(run_id="run-synthesis", mode="on"))
         state.configure_research_mode(network_required=True)

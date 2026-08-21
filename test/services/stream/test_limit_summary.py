@@ -393,6 +393,157 @@ class LimitSummaryHelpersTests(unittest.TestCase):
 
 
 class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _deferred_commit_request() -> LimitSummaryStepRequest:
+        return LimitSummaryStepRequest(
+            conversation_id="conv-deferred-terminal",
+            task_id="task-deferred-terminal",
+            run_id="run-deferred-terminal",
+            step_number=1,
+            model_id="gpt-4",
+            provider="openai",
+            litellm_model="openai/gpt-4",
+            litellm_kwargs={},
+            messages=[{"role": "user", "content": "测试 deferred summary commit"}],
+            should_use_reasoning=False,
+            content_blocks=[],
+            call_kwargs={},
+            accumulated_usage=Usage(input_tokens=1, output_tokens=1),
+            emitter=AsyncMock(),
+            session_cache=object(),
+            total_timeout_s=300,
+            run_start=0.0,
+            start_step_fn=AsyncMock(),
+            complete_step_fn=AsyncMock(),
+            llm_call_fn=AsyncMock(),
+            stream_round_fn=AsyncMock(),
+            log_round_summary_fn=lambda **_kwargs: None,
+            clock=lambda: 1.0,
+            defer_output=True,
+        )
+
+    async def test_deferred_summary_commit_terminal_secondary_preserves_primary_base_exception(self):
+        error_factories = (
+            ("runtime", lambda role: RuntimeError(f"{role} secret")),
+            ("cancel", lambda role: asyncio.CancelledError(f"{role} secret")),
+        )
+
+        for primary_name, make_primary in error_factories:
+            for secondary_name, make_secondary in error_factories:
+                with self.subTest(primary=primary_name, secondary=secondary_name):
+                    primary = make_primary("primary")
+                    secondary = make_secondary("secondary")
+                    finish_success = AsyncMock(side_effect=secondary)
+                    lifecycle = SimpleNamespace(finish_success=finish_success)
+                    round_result = limit_summary_module.LimitSummaryRoundResult(
+                        reasoning_buf="",
+                        content_buf="候选总结",
+                        usage_data=Usage(input_tokens=1, output_tokens=1),
+                        context=ContextUsage(status="no_op"),
+                        llm_lifecycle=lifecycle,
+                    )
+                    complete_step = AsyncMock()
+                    cancelling_before = asyncio.current_task().cancelling()
+
+                    with (
+                        patch(
+                            "app.services.stream.limit_summary.append_limit_summary_prompt",
+                        ),
+                        patch(
+                            "app.services.stream.limit_summary.start_limit_summary_step",
+                            new=AsyncMock(
+                                return_value=AgentStepContext(
+                                    step_id="step-deferred-terminal",
+                                    step_number=1,
+                                    started_at=1.0,
+                                    thinking_block_id="thinking-deferred-terminal",
+                                    text_block_id="text-deferred-terminal",
+                                )
+                            ),
+                        ),
+                        patch(
+                            "app.services.stream.limit_summary.run_summary_round_with_timeout",
+                            new=AsyncMock(return_value=round_result),
+                        ),
+                        patch(
+                            "app.services.stream.limit_summary._commit_limit_summary_result",
+                            new=AsyncMock(side_effect=primary),
+                        ),
+                        patch(
+                            "app.services.stream.limit_summary.complete_limit_summary_step",
+                            new=complete_step,
+                        ),
+                        patch("app.services.stream.limit_summary.logger.warning") as warning,
+                    ):
+                        with self.assertRaises(type(primary)) as raised:
+                            await run_limit_summary_step(request=self._deferred_commit_request())
+
+                    self.assertIs(raised.exception, primary)
+                    self.assertEqual(asyncio.current_task().cancelling(), cancelling_before)
+                    finish_success.assert_awaited_once_with(output_visible=False)
+                    complete_step.assert_not_awaited()
+                    warning.assert_called_once()
+                    logged = repr(warning.call_args)
+                    self.assertIn("error_code=deferred_terminal_failure", logged)
+                    self.assertIn(type(secondary).__name__, logged)
+                    self.assertNotIn(str(primary), logged)
+                    self.assertNotIn(str(secondary), logged)
+
+    async def test_deferred_summary_commit_terminal_failure_without_primary_remains_fail_closed(self):
+        for secondary in (RuntimeError("secondary secret"), asyncio.CancelledError("secondary secret")):
+            with self.subTest(secondary=type(secondary).__name__):
+                finish_success = AsyncMock(side_effect=secondary)
+                lifecycle = SimpleNamespace(finish_success=finish_success)
+                round_result = limit_summary_module.LimitSummaryRoundResult(
+                    reasoning_buf="",
+                    content_buf="候选总结",
+                    usage_data=Usage(input_tokens=1, output_tokens=1),
+                    context=ContextUsage(status="no_op"),
+                    llm_lifecycle=lifecycle,
+                )
+                complete_step = AsyncMock()
+                warning = MagicMock()
+                cancelling_before = asyncio.current_task().cancelling()
+
+                with (
+                    patch(
+                        "app.services.stream.limit_summary.append_limit_summary_prompt",
+                    ),
+                    patch(
+                        "app.services.stream.limit_summary.start_limit_summary_step",
+                        new=AsyncMock(
+                            return_value=AgentStepContext(
+                                step_id="step-deferred-terminal",
+                                step_number=1,
+                                started_at=1.0,
+                                thinking_block_id="thinking-deferred-terminal",
+                                text_block_id="text-deferred-terminal",
+                            )
+                        ),
+                    ),
+                    patch(
+                        "app.services.stream.limit_summary.run_summary_round_with_timeout",
+                        new=AsyncMock(return_value=round_result),
+                    ),
+                    patch(
+                        "app.services.stream.limit_summary._commit_limit_summary_result",
+                        new=AsyncMock(return_value=False),
+                    ),
+                    patch(
+                        "app.services.stream.limit_summary.complete_limit_summary_step",
+                        new=complete_step,
+                    ),
+                    patch("app.services.stream.limit_summary.logger.warning", new=warning),
+                ):
+                    with self.assertRaises(type(secondary)) as raised:
+                        await run_limit_summary_step(request=self._deferred_commit_request())
+
+                self.assertIs(raised.exception, secondary)
+                self.assertEqual(asyncio.current_task().cancelling(), cancelling_before)
+                finish_success.assert_awaited_once_with(output_visible=False)
+                complete_step.assert_not_awaited()
+                warning.assert_not_called()
+
     def _plan_synthesis_request(
         self,
         *,
