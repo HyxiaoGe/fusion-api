@@ -343,6 +343,7 @@ class ConversationKnowledgeSelectionTests(unittest.TestCase):
 
         self.db.refresh(old_session)
         self.assertEqual(old_session.status, "interrupted")
+        self.assertIsNotNone(old_session.terminal_at)
         self.assertIsNone(old_session.limit_reason)
 
     def test_non_stream_retry_cannot_replace_answer_after_newer_turn(self):

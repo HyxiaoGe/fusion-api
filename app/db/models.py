@@ -755,6 +755,7 @@ class AgentSession(Base):
     status = Column(
         String(20), nullable=False
     )  # "running" | "completed" | "limit_reached" | "incomplete" | "error" | "interrupted"
+    terminal_at = Column(DateTime(timezone=True), nullable=True, index=True)
     limit_reason = Column(String(30), nullable=True)  # "max_steps" | "max_tool_calls" | "timeout"
     error_message = Column(Text, nullable=True)
 

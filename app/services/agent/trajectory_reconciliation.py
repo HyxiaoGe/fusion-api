@@ -5,15 +5,18 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.logger import app_logger
 from app.db.models import AgentEvent, AgentSession, RunTrajectoryMeta, TrajectoryLedgerSettings
 
 DEFAULT_RECONCILIATION_BATCH_SIZE = 100
+DEFAULT_RECONCILIATION_STALE_GRACE = timedelta(seconds=60)
 TERMINAL_OUTCOME_UNKNOWN_REASON = "terminal_outcome_unknown"
 
 _SAFE_DEGRADED_REASONS = frozenset(
@@ -102,7 +105,7 @@ def classify_missing_trajectory_meta(
     return TrajectoryStatusAssessment("degraded", "meta_missing")
 
 
-def build_reconciliation_candidate_query(*, batch_size: int):
+def build_reconciliation_candidate_query(*, batch_size: int, stale_before: datetime):
     """构造锁定 meta 候选的 PostgreSQL 兼容查询。"""
     if batch_size <= 0:
         raise ValueError("batch_size 必须大于 0")
@@ -110,10 +113,19 @@ def build_reconciliation_candidate_query(*, batch_size: int):
         select(RunTrajectoryMeta)
         .join(AgentSession, AgentSession.id == RunTrajectoryMeta.run_id)
         .where(AgentSession.status != "running")
+        .where(AgentSession.terminal_at.is_not(None))
+        .where(AgentSession.terminal_at <= stale_before)
         .where(
             or_(
-                RunTrajectoryMeta.trajectory_status == "recording",
-                RunTrajectoryMeta.terminal_intent_pending_at.is_not(None),
+                and_(
+                    RunTrajectoryMeta.trajectory_status == "recording",
+                    RunTrajectoryMeta.terminal_intent_pending_at.is_(None),
+                    RunTrajectoryMeta.updated_at <= stale_before,
+                ),
+                and_(
+                    RunTrajectoryMeta.terminal_intent_pending_at.is_not(None),
+                    RunTrajectoryMeta.terminal_intent_pending_at <= stale_before,
+                ),
             )
         )
         .order_by(RunTrajectoryMeta.updated_at, RunTrajectoryMeta.run_id)
@@ -126,11 +138,14 @@ def _build_missing_meta_query(
     *,
     batch_size: int,
     ledger_enabled_at: datetime | None,
+    stale_before: datetime,
 ):
     statement = (
         select(AgentSession)
         .outerjoin(RunTrajectoryMeta, RunTrajectoryMeta.run_id == AgentSession.id)
         .where(AgentSession.status != "running")
+        .where(AgentSession.terminal_at.is_not(None))
+        .where(AgentSession.terminal_at <= stale_before)
         .where(RunTrajectoryMeta.run_id.is_(None))
     )
     # 水位有效时只需持久收敛上线后的缺失；历史 run 由读取侧纯判定为 legacy，
@@ -209,6 +224,21 @@ def _watermark_from_session(session: Any) -> LedgerWatermarkResolution:
     return resolve_ledger_watermark(normalized)
 
 
+def _insert_missing_meta_do_nothing(session: Any, values: dict[str, Any]) -> bool:
+    """Recorder 与协调器竞态时只允许先到者创建 meta。"""
+    dialect_name = session.get_bind().dialect.name
+    if dialect_name == "postgresql":
+        statement = postgresql_insert(RunTrajectoryMeta).values(**values)
+    elif dialect_name == "sqlite":
+        statement = sqlite_insert(RunTrajectoryMeta).values(**values)
+    else:
+        raise RuntimeError(f"轨迹协调不支持数据库方言: {dialect_name}")
+    result = session.execute(
+        statement.on_conflict_do_nothing(index_elements=["run_id"])
+    )
+    return result.rowcount == 1
+
+
 def resolve_run_trajectory_status(session: Any, run_id: str) -> TrajectoryStatusAssessment:
     """读取侧完整性契约：pending complete 不得对外宣称 complete。"""
     meta = session.get(RunTrajectoryMeta, run_id)
@@ -235,11 +265,15 @@ def reconcile_trajectory_batch(
     session_factory: Callable[[], Any],
     now: datetime | None = None,
     batch_size: int = DEFAULT_RECONCILIATION_BATCH_SIZE,
+    stale_grace: timedelta = DEFAULT_RECONCILIATION_STALE_GRACE,
 ) -> TrajectoryReconciliationResult:
     """在一个短事务中幂等收敛一批终态 run。"""
     if batch_size <= 0:
         raise ValueError("batch_size 必须大于 0")
+    if stale_grace < timedelta(0):
+        raise ValueError("stale_grace 不能为负数")
     reconciled_at = _aware_utc(now or datetime.now(UTC))
+    stale_before = reconciled_at - stale_grace
     counters = {
         "pending_degraded": 0,
         "recording_completed": 0,
@@ -250,7 +284,10 @@ def reconcile_trajectory_batch(
     session = session_factory()
     try:
         meta_rows = session.execute(
-            build_reconciliation_candidate_query(batch_size=batch_size)
+            build_reconciliation_candidate_query(
+                batch_size=batch_size,
+                stale_before=stale_before,
+            )
         ).scalars().all()
         for meta in meta_rows:
             counters[_reconcile_meta(session, meta, now=reconciled_at)] += 1
@@ -262,6 +299,7 @@ def reconcile_trajectory_batch(
                 _build_missing_meta_query(
                     batch_size=remaining,
                     ledger_enabled_at=watermark.ledger_enabled_at,
+                    stale_before=stale_before,
                 )
             ).scalars().all()
             for run in missing_runs:
@@ -273,19 +311,21 @@ def reconcile_trajectory_batch(
                 if assessment.trajectory_status == "legacy":
                     counters["legacy_not_recorded"] += 1
                     continue
-                session.add(
-                    RunTrajectoryMeta(
-                        run_id=run.id,
-                        conversation_id=run.conversation_id,
-                        message_id=run.message_id,
-                        trajectory_status="degraded",
-                        event_count=0,
-                        finalized_at=None,
-                        degraded_reason=assessment.degraded_reason,
-                        updated_at=reconciled_at,
-                    )
+                inserted = _insert_missing_meta_do_nothing(
+                    session,
+                    {
+                        "run_id": run.id,
+                        "conversation_id": run.conversation_id,
+                        "message_id": run.message_id,
+                        "trajectory_status": "degraded",
+                        "event_count": 0,
+                        "finalized_at": None,
+                        "degraded_reason": assessment.degraded_reason,
+                        "updated_at": reconciled_at,
+                    },
                 )
-                counters["meta_missing_degraded"] += 1
+                if inserted:
+                    counters["meta_missing_degraded"] += 1
 
         session.commit()
     except BaseException:

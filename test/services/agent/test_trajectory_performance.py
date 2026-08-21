@@ -6,6 +6,7 @@ import unittest
 
 from app.services.agent.trajectory_recorder import TrajectoryRecorder
 from app.services.stream.tool_executor import AgentEventCompositeWriter
+from scripts.trajectory_p0_baseline import run_trajectory_stub_baseline
 
 
 def _event(run_id: str, sequence: int) -> dict:
@@ -49,6 +50,21 @@ class _ProgressSinkStub:
 
 
 class TrajectoryPerformanceGateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tracked_runner_reproduces_three_rounds_of_500_samples(self):
+        result = await run_trajectory_stub_baseline(rounds=3, samples_per_path=500)
+
+        self.assertEqual(result["rounds"], 3)
+        self.assertEqual(result["samples_per_path"], 500)
+        self.assertEqual(len(result["measurements"]), 3)
+        for measurement in result["measurements"]:
+            self.assertEqual(set(measurement), {"round", "baseline_stub", "trajectory_stub"})
+            for path in ("baseline_stub", "trajectory_stub"):
+                self.assertEqual(set(measurement[path]), {"p50_ms", "p95_ms", "p99_ms"})
+                self.assertLessEqual(measurement[path]["p50_ms"], measurement[path]["p95_ms"])
+                self.assertLessEqual(measurement[path]["p95_ms"], measurement[path]["p99_ms"])
+            self.assertLessEqual(measurement["trajectory_stub"]["p95_ms"], 5.0)
+            self.assertLessEqual(measurement["trajectory_stub"]["p99_ms"], 15.0)
+
     async def test_shared_admission_caps_simultaneous_workers_and_sessions_at_four(self):
         semaphore = threading.BoundedSemaphore(4)
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=12)

@@ -2,7 +2,7 @@
 
 ## 结论（2026-08-22，Asia/Shanghai）
 
-- 本机 Mock fast path 的绝对门限通过：三轮中最差 p95 `0.0725ms`、p99 `0.0841ms`，低于 p95 `5ms` / p99 `15ms`。
+- 本机 Mock fast path 的绝对门限通过：三轮中最差 p95 `0.0724ms`、p99 `0.0838ms`，低于 p95 `5ms` / p99 `15ms`。
 - 本机 Mock 相对门限**不作为通过项，且数值不满足 1.2 倍**：无 trajectory 的空操作基线只有约 `0.0003–0.0005ms`，低于可用于工程比较的计时粒度；加入真实 `TrajectoryRecorder` 调度后的 p95 约 `0.071ms`。因此本报告不宣称 §9.1 相对回归已经通过。
 - 真实 PostgreSQL `EXPLAIN/ANALYZE`、真实连接/锁等待、真实模型与客户端 SSE TTFT 均未验证，留给 Task 7 授权 dev 环境验收。P0 性能总门禁在这些证据补齐前保持未完成。
 
@@ -16,18 +16,26 @@
 - trajectory sink：真实 `TrajectoryRecorder` 的准入、executor、wait/shield 路径；事件落库函数替换为确定性空操作
 - 未使用 prompt、完整用户内容、凭证或真实模型请求
 
+可复现命令（固定运行 3 轮 × 每路径 500 样本，并输出全部三轮分位数）：
+
+```bash
+/Users/sean/code/fusion/fusion-api/.venv/bin/python scripts/trajectory_p0_baseline.py
+```
+
+同一 runner 也由 `test_tracked_runner_reproduces_three_rounds_of_500_samples` 实际执行并校验返回结构，不再依赖一次性的 `python -c` 命令。
+
 ## 本机样本（毫秒）
 
 | 轮次 | 路径 | p50 | p95 | p99 |
 |---:|---|---:|---:|---:|
 | 1 | Redis + progress stub | 0.0003 | 0.0004 | 0.0005 |
-| 1 | + TrajectoryRecorder fast path | 0.0626 | 0.0725 | 0.0841 |
-| 2 | Redis + progress stub | 0.0003 | 0.0003 | 0.0004 |
-| 2 | + TrajectoryRecorder fast path | 0.0612 | 0.0709 | 0.0761 |
+| 1 | + TrajectoryRecorder fast path | 0.0614 | 0.0713 | 0.0810 |
+| 2 | Redis + progress stub | 0.0003 | 0.0004 | 0.0004 |
+| 2 | + TrajectoryRecorder fast path | 0.0613 | 0.0711 | 0.0739 |
 | 3 | Redis + progress stub | 0.0003 | 0.0004 | 0.0004 |
-| 3 | + TrajectoryRecorder fast path | 0.0619 | 0.0715 | 0.0769 |
+| 3 | + TrajectoryRecorder fast path | 0.0621 | 0.0724 | 0.0838 |
 
-相对值被接近零的空操作基线主导：以第一轮为例，p95 约为 `181.25x`、p99 约为 `168.2x`，明确不满足 `1.2x`。这不应被解释成真实生产回归；也不能用它替代改造前后同数据库、同模型、同 SSE 客户端的对照数据。
+相对值被接近零的空操作基线主导：以第一轮为例，p95 约为 `178.25x`、p99 约为 `162x`，明确不满足 `1.2x`。这不应被解释成真实生产回归；也不能用它替代改造前后同数据库、同模型、同 SSE 客户端的对照数据。
 
 ## 已验证边界
 

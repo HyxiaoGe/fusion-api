@@ -2,6 +2,7 @@
 
 import os
 import unittest
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -60,6 +61,7 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row.attempt_index, 1)
             self.assertIsNone(row.previous_run_id)
             self.assertEqual(row.status, "running")
+            self.assertIsNone(row.terminal_at)
             self.assertEqual(row.total_steps, 0)
             self.assertEqual(row.total_tool_calls, 0)
 
@@ -124,6 +126,7 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             existing.limit_reason = "max_steps"
             existing.error_message = "旧错误"
             existing.status = "completed"
+            existing.terminal_at = datetime(2026, 8, 22, 1, 0, tzinfo=UTC)
             existing.conversation_id = "c1"
             existing.user_id = "u1"
             existing.message_id = "assistant-stable"
@@ -152,6 +155,7 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(existing.model_id, "gpt-5")
             self.assertEqual(existing.provider, "anthropic")
             self.assertEqual(existing.status, "running")
+            self.assertIsNone(existing.terminal_at)
             self.assertEqual(existing.total_steps, 0)
             self.assertEqual(existing.total_tool_calls, 0)
             self.assertIsNone(existing.total_duration_ms)
@@ -777,13 +781,16 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
                 await write_step_terminal(step_id="s1", status="completed")
 
     async def test_write_session_status_updates_terminal(self):
+        terminal_at = datetime(2026, 8, 22, 4, 0, tzinfo=UTC)
         with patch("app.services.agent.session_cache.SessionLocal") as mock_sl:
             session = MagicMock()
             mock_sl.return_value.__enter__.return_value = session
             row = MagicMock()
             session.get.return_value = row
-            await write_session_status(run_id="r1", status="interrupted", total_steps=2, total_tool_calls=3)
+            with patch("app.services.agent.session_cache.utc_now", return_value=terminal_at):
+                await write_session_status(run_id="r1", status="interrupted", total_steps=2, total_tool_calls=3)
             self.assertEqual(row.status, "interrupted")
+            self.assertEqual(row.terminal_at, terminal_at)
             self.assertEqual(row.total_steps, 2)
             self.assertEqual(row.total_tool_calls, 3)
 

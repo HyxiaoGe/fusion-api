@@ -1,15 +1,19 @@
+import asyncio
+import concurrent.futures
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
 from app.db.models import AgentEvent, AgentSession, RunTrajectoryMeta, TrajectoryLedgerSettings
 from app.services.agent.trajectory_reconciliation import (
+    DEFAULT_RECONCILIATION_STALE_GRACE,
     TERMINAL_OUTCOME_UNKNOWN_REASON,
     build_reconciliation_candidate_query,
     classify_missing_trajectory_meta,
@@ -17,16 +21,23 @@ from app.services.agent.trajectory_reconciliation import (
     resolve_ledger_watermark,
     resolve_run_trajectory_status,
 )
+from app.services.agent.trajectory_recorder import TrajectoryRecorder
+
+_DEFAULT_TERMINAL_AT = object()
 
 
 class TrajectoryReconciliationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         database_path = Path(self.temp_dir.name) / "trajectory-reconciliation.sqlite3"
-        self.engine = create_engine(f"sqlite:///{database_path}")
+        self.engine = create_engine(
+            f"sqlite:///{database_path}",
+            connect_args={"check_same_thread": False},
+        )
         Base.metadata.create_all(self.engine)
         self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
         self.now = datetime(2026, 8, 22, 4, 0, tzinfo=UTC)
+        self.stale_before = self.now - DEFAULT_RECONCILIATION_STALE_GRACE
 
     def tearDown(self) -> None:
         self.engine.dispose()
@@ -38,7 +49,10 @@ class TrajectoryReconciliationTests(unittest.TestCase):
         *,
         status: str = "completed",
         created_at: datetime | None = None,
+        terminal_at: datetime | None | object = _DEFAULT_TERMINAL_AT,
     ) -> None:
+        if terminal_at is _DEFAULT_TERMINAL_AT:
+            terminal_at = None if status == "running" else self.stale_before - timedelta(seconds=1)
         with self.Session() as db:
             db.add(
                 AgentSession(
@@ -50,6 +64,7 @@ class TrajectoryReconciliationTests(unittest.TestCase):
                     provider="provider-1",
                     status=status,
                     created_at=created_at or self.now,
+                    terminal_at=terminal_at,
                 )
             )
             db.commit()
@@ -65,6 +80,8 @@ class TrajectoryReconciliationTests(unittest.TestCase):
         intent_status: str | None = None,
         intent_reason: str | None = None,
         intent_version: int | None = None,
+        updated_at: datetime | None = None,
+        pending_at: datetime | None = None,
     ) -> None:
         with self.Session() as db:
             run = db.get(AgentSession, run_id)
@@ -81,8 +98,10 @@ class TrajectoryReconciliationTests(unittest.TestCase):
                     terminal_intent_status=intent_status if pending else None,
                     terminal_intent_reason=intent_reason if pending else None,
                     terminal_intent_version=intent_version if pending else None,
-                    terminal_intent_pending_at=self.now if pending else None,
-                    updated_at=self.now,
+                    terminal_intent_pending_at=(pending_at or self.stale_before - timedelta(seconds=1))
+                    if pending
+                    else None,
+                    updated_at=updated_at or self.stale_before - timedelta(seconds=1),
                 )
             )
             db.commit()
@@ -112,7 +131,10 @@ class TrajectoryReconciliationTests(unittest.TestCase):
 
     def test_postgresql_candidate_query_uses_stable_limit_and_skip_locked(self):
         compiled = str(
-            build_reconciliation_candidate_query(batch_size=37).compile(
+            build_reconciliation_candidate_query(
+                batch_size=37,
+                stale_before=self.stale_before,
+            ).compile(
                 dialect=postgresql.dialect(),
                 compile_kwargs={"literal_binds": True},
             )
@@ -121,6 +143,119 @@ class TrajectoryReconciliationTests(unittest.TestCase):
         self.assertIn("FOR UPDATE OF RUN_TRAJECTORY_META, AGENT_SESSIONS SKIP LOCKED", compiled)
         self.assertIn("LIMIT 37", compiled)
         self.assertIn("AGENT_SESSIONS.STATUS != 'RUNNING'", compiled)
+        self.assertIn("AGENT_SESSIONS.TERMINAL_AT <=", compiled)
+        self.assertIn("RUN_TRAJECTORY_META.UPDATED_AT <=", compiled)
+        self.assertIn("RUN_TRAJECTORY_META.TERMINAL_INTENT_PENDING_AT <=", compiled)
+
+    def test_fresh_terminal_rows_wait_for_grace_before_reconciliation(self):
+        self._add_run("fresh-recording", terminal_at=self.now)
+        self._add_meta(
+            "fresh-recording",
+            expected_last_sequence=0,
+            updated_at=self.now,
+        )
+        self._add_events("fresh-recording", [0])
+        self._add_run("fresh-complete-pending", terminal_at=self.now)
+        self._add_meta(
+            "fresh-complete-pending",
+            trajectory_status="complete",
+            expected_last_sequence=0,
+            pending=True,
+            intent_status="complete",
+            intent_version=1,
+            updated_at=self.now,
+            pending_at=self.now,
+        )
+        self._add_events("fresh-complete-pending", [0])
+        self._add_run("fresh-meta-missing", terminal_at=self.now)
+
+        fresh = reconcile_trajectory_batch(session_factory=self.Session, now=self.now)
+
+        self.assertEqual(fresh.processed, 0)
+        self.assertEqual(self._meta("fresh-recording").trajectory_status, "recording")
+        self.assertEqual(self._meta("fresh-complete-pending").trajectory_status, "complete")
+        self.assertIsNotNone(self._meta("fresh-complete-pending").terminal_intent_pending_at)
+        self.assertIsNone(self._meta("fresh-meta-missing"))
+
+        stale = reconcile_trajectory_batch(
+            session_factory=self.Session,
+            now=self.now + DEFAULT_RECONCILIATION_STALE_GRACE + timedelta(seconds=1),
+        )
+
+        self.assertEqual(stale.recording_completed, 1)
+        self.assertEqual(stale.pending_degraded, 1)
+        self.assertEqual(stale.meta_missing_degraded, 1)
+
+    def test_fresh_terminal_grace_allows_late_first_write_and_finalize_to_win(self):
+        self._add_run("late-recorder", terminal_at=self.now)
+        self._add_meta("late-recorder", updated_at=self.now)
+
+        result = reconcile_trajectory_batch(session_factory=self.Session, now=self.now)
+
+        self.assertEqual(result.processed, 0)
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        recorder = TrajectoryRecorder(
+            run_id="late-recorder",
+            conversation_id="conv-1",
+            message_id="msg-late-recorder",
+            session_factory=self.Session,
+            executor=executor,
+        )
+        event = {
+            "schema_version": 1,
+            "type": "step_started",
+            "run_id": "late-recorder",
+            "parent_run_id": None,
+            "step_id": "step-late",
+            "parent_step_id": None,
+            "tool_call_id": None,
+            "sequence": 0,
+            "trace_id": "trace-late",
+            "ts": self.now.timestamp(),
+            "step_number": 1,
+        }
+
+        async def finish_late_recorder() -> None:
+            await recorder.record_chunk("conv-1", "agent_event", event)
+            await recorder.finalize(0)
+
+        asyncio.run(finish_late_recorder())
+        executor.shutdown(wait=True)
+
+        meta = self._meta("late-recorder")
+        self.assertEqual(meta.trajectory_status, "complete")
+        self.assertIsNone(meta.terminal_intent_pending_at)
+
+    def test_conflicting_missing_meta_insert_never_overwrites_recorder_or_rolls_back_other_work(self):
+        self._add_run("recorder-won")
+        self._add_meta(
+            "recorder-won",
+            trajectory_status="complete",
+            expected_last_sequence=0,
+        )
+        self._add_run("other-pending")
+        self._add_meta(
+            "other-pending",
+            trajectory_status="complete",
+            expected_last_sequence=0,
+            pending=True,
+            intent_status="complete",
+            intent_version=1,
+        )
+
+        forced_stale_snapshot = select(AgentSession).where(AgentSession.id == "recorder-won")
+        with patch(
+            "app.services.agent.trajectory_reconciliation._build_missing_meta_query",
+            return_value=forced_stale_snapshot,
+        ):
+            result = reconcile_trajectory_batch(session_factory=self.Session, now=self.now)
+
+        self.assertEqual(result.pending_degraded, 1)
+        self.assertEqual(result.meta_missing_degraded, 0)
+        recorder_meta = self._meta("recorder-won")
+        self.assertEqual(recorder_meta.trajectory_status, "complete")
+        self.assertIsNone(recorder_meta.degraded_reason)
+        self.assertEqual(self._meta("other-pending").trajectory_status, "degraded")
 
     def test_any_pending_state_is_conservatively_degraded_and_clears_all_intent_fields(self):
         for index, status in enumerate(("recording", "complete", "degraded")):

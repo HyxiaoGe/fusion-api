@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from app.core.logger import app_logger as logger
 from app.db.database import SessionLocal
 from app.db.models import AgentSession, AgentStep, Conversation
+from app.utils.time import utc_now
 
 _ATTEMPT_ALLOCATION_RETRIES = 3
 _ATTEMPT_UNIQUE_INDEX = "uq_agent_sessions_turn_attempt"
@@ -152,6 +153,7 @@ def _allocate_new_session(
         attempt_index=attempt_index,
         run_config=run_config,
         status="running",
+        terminal_at=None,
         total_steps=0,
         total_tool_calls=0,
     )
@@ -279,6 +281,7 @@ def _reset_existing_session(
     existing.provider = provider
     existing.run_config = run_config
     existing.status = "running"
+    existing.terminal_at = None
     existing.limit_reason = None
     existing.error_message = None
     existing.total_duration_ms = None
@@ -392,6 +395,7 @@ async def write_session_status(
             logger.warning(f"write_session_status: agent_sessions row missing run_id={run_id}")
             return
         row.status = status
+        row.terminal_at = utc_now()
         row.total_steps = total_steps
         row.total_tool_calls = total_tool_calls
         row.limit_reason = limit_reason if status == "limit_reached" else None

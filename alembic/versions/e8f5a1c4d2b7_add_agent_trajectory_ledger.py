@@ -21,6 +21,7 @@ def upgrade() -> None:
     op.add_column("agent_sessions", sa.Column("turn_message_id", sa.String(), nullable=True))
     op.add_column("agent_sessions", sa.Column("previous_run_id", sa.String(), nullable=True))
     op.add_column("agent_sessions", sa.Column("attempt_index", sa.Integer(), nullable=True))
+    op.add_column("agent_sessions", sa.Column("terminal_at", sa.DateTime(timezone=True), nullable=True))
     op.create_foreign_key(
         "fk_agent_sessions_previous_run_id",
         "agent_sessions",
@@ -33,6 +34,11 @@ def upgrade() -> None:
         "UPDATE agent_sessions "
         "SET turn_message_id = message_id "
         "WHERE message_id IS NOT NULL"
+    )
+    op.execute(
+        "UPDATE agent_sessions "
+        "SET terminal_at = created_at "
+        "WHERE status <> 'running'"
     )
     op.execute(
         """
@@ -59,6 +65,7 @@ def upgrade() -> None:
         unique=True,
         postgresql_where=sa.text("turn_message_id IS NOT NULL AND attempt_index IS NOT NULL"),
     )
+    op.create_index("ix_agent_sessions_terminal_at", "agent_sessions", ["terminal_at"])
 
     op.create_table(
         "agent_events",
@@ -139,12 +146,14 @@ def downgrade() -> None:
     op.drop_table("trajectory_ledger_settings")
     op.drop_table("run_trajectory_meta")
     op.drop_table("agent_events")
+    op.drop_index("ix_agent_sessions_terminal_at", table_name="agent_sessions")
     op.drop_index("uq_agent_sessions_turn_attempt", table_name="agent_sessions")
     op.drop_constraint(
         "fk_agent_sessions_previous_run_id",
         "agent_sessions",
         type_="foreignkey",
     )
+    op.drop_column("agent_sessions", "terminal_at")
     op.drop_column("agent_sessions", "attempt_index")
     op.drop_column("agent_sessions", "previous_run_id")
     op.drop_column("agent_sessions", "turn_message_id")

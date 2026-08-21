@@ -42,8 +42,13 @@ class AgentTrajectoryMigrationTests(unittest.TestCase):
             for call in operation.add_column.call_args_list
             if call.args[0] == "agent_sessions"
         }
-        self.assertEqual(set(added_columns), {"turn_message_id", "previous_run_id", "attempt_index"})
+        self.assertEqual(
+            set(added_columns),
+            {"turn_message_id", "previous_run_id", "attempt_index", "terminal_at"},
+        )
         self.assertTrue(all(column.nullable for column in added_columns.values()))
+        self.assertIsInstance(added_columns["terminal_at"].type, sa.DateTime)
+        self.assertTrue(added_columns["terminal_at"].type.timezone)
         operation.create_foreign_key.assert_any_call(
             "fk_agent_sessions_previous_run_id",
             "agent_sessions",
@@ -68,7 +73,15 @@ class AgentTrajectoryMigrationTests(unittest.TestCase):
         self.assertIn("row_number() OVER", executed_sql)
         self.assertIn("PARTITION BY turn_message_id", executed_sql)
         self.assertIn("ORDER BY created_at, id", executed_sql)
+        self.assertIn("SET terminal_at = created_at", executed_sql)
+        self.assertIn("status <> 'running'", executed_sql)
         self.assertNotIn("SET previous_run_id", executed_sql)
+        terminal_index_call = next(
+            call
+            for call in operation.create_index.call_args_list
+            if call.args[0] == "ix_agent_sessions_terminal_at"
+        )
+        self.assertEqual(terminal_index_call.args[1:], ("agent_sessions", ["terminal_at"]))
 
     def test_upgrade_creates_ledger_tables_with_cascade_foreign_keys_and_environment_watermark(self):
         migration = load_migration()
@@ -142,7 +155,7 @@ class AgentTrajectoryMigrationTests(unittest.TestCase):
         )
         self.assertEqual(
             [call.args[1] for call in operation.drop_column.call_args_list],
-            ["attempt_index", "previous_run_id", "turn_message_id"],
+            ["terminal_at", "attempt_index", "previous_run_id", "turn_message_id"],
         )
 
 
@@ -174,6 +187,8 @@ class AgentTrajectoryModelContractTests(unittest.TestCase):
             "terminal_intent_pending_at IS NOT NULL",
         )
         self.assertFalse(TrajectoryLedgerSettings.__table__.c.ledger_enabled_at.nullable)
+        self.assertTrue(AgentSession.__table__.c.terminal_at.nullable)
+        self.assertTrue(AgentSession.__table__.c.terminal_at.type.timezone)
 
         attempt_index = next(index for index in AgentSession.__table__.indexes if index.name == "uq_agent_sessions_turn_attempt")
         compiled_where = str(attempt_index.dialect_options["postgresql"]["where"].compile(dialect=postgresql.dialect()))
