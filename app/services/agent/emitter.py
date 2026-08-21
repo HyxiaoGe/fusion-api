@@ -54,9 +54,10 @@ class AgentEventEmitter:
         self._current_step_id: str | None = None
         self._message_id: str | None = None
         self._lock = asyncio.Lock()
+        self._sealed = False
 
     async def _emit(self, event: ev.AgentEventBase, *, max_payload_bytes: int | None = None) -> None:
-        """在 lock 内原子分配 sequence + ts，再 dump + write，最后递增。
+        """在 lock 内校验后预留 sequence，再写入 Redis。
 
         依赖 Pydantic v2 默认行为：模型字段可赋值且不重新校验
         （未启用 frozen / validate_assignment）。extra="forbid" 只拒绝额外字段，
@@ -64,15 +65,29 @@ class AgentEventEmitter:
         validate_assignment，本方法的 mutation 会触发额外校验开销。
         """
         async with self._lock:
+            if self._sealed:
+                raise RuntimeError("agent_event emitter 已封口")
             event.sequence = self._sequence
             event.ts = time.time()
             payload = event.model_dump(mode="json")
             if max_payload_bytes is not None and len(event.model_dump_json().encode("utf-8")) > max_payload_bytes:
                 raise ValueError("agent_event 超过允许的体积上限")
-            await self._writer.append_chunk(self._conv_id, self._task_id, "agent_event", payload)
             self._sequence += 1
+            await self._writer.append_chunk(self._conv_id, self._task_id, "agent_event", payload)
 
-    def _envelope(self, *, tool_call_id: str | None = None, step_id: Any = _USE_CURRENT_STEP) -> dict[str, Any]:
+    async def seal_and_get_last_sequence(self) -> int:
+        """封口当前 emitter，并返回最后已预留的序号。"""
+        async with self._lock:
+            self._sealed = True
+            return self._sequence - 1
+
+    def _envelope(
+        self,
+        *,
+        tool_call_id: str | None = None,
+        step_id: Any = _USE_CURRENT_STEP,
+        parent_step_id: str | None = None,
+    ) -> dict[str, Any]:
         """构造 envelope 字段；sequence 与 ts 用占位值，由 _emit 在 lock 内回填。
 
         返回的 dict 不可直接发出 — sequence/ts 必须由 _emit 在 lock 内回填，
@@ -88,8 +103,13 @@ class AgentEventEmitter:
             step_id=self._current_step_id if step_id is _USE_CURRENT_STEP else step_id,
             tool_call_id=tool_call_id,
             parent_run_id=None,
-            parent_step_id=None,
+            parent_step_id=parent_step_id,
         )
+
+    @staticmethod
+    def _truncate_summary(value: str | None, max_length: int = 120) -> str | None:
+        """限制可持久化的用户安全摘要长度。"""
+        return value[:max_length] if value is not None else None
 
     async def run_started(self, *, message_id: str, model: str, tools: list[str], config: dict[str, Any]) -> None:
         await self._emit(
@@ -221,6 +241,222 @@ class AgentEventEmitter:
                 total_tool_calls=total_tool_calls,
                 finish_reason=finish_reason,
                 **self._envelope(step_id=None),
+            )
+        )
+
+    async def llm_round_started(
+        self,
+        *,
+        llm_round_id: str,
+        round_index: int,
+        model: str,
+        provider: str,
+        parent_step_id: str | None = None,
+    ) -> None:
+        await self._emit(
+            ev.LLMRoundStarted(
+                type="llm_round_started",
+                llm_round_id=llm_round_id,
+                round_index=round_index,
+                model=model,
+                provider=provider,
+                **self._envelope(parent_step_id=parent_step_id),
+            )
+        )
+
+    async def llm_round_first_output_delta(
+        self,
+        *,
+        llm_round_id: str,
+        delta_kind: str,
+        ttft_ms: int,
+        parent_step_id: str | None = None,
+    ) -> None:
+        await self._emit(
+            ev.LLMRoundFirstOutputDelta(
+                type="llm_round_first_output_delta",
+                llm_round_id=llm_round_id,
+                delta_kind=delta_kind,
+                ttft_ms=ttft_ms,
+                **self._envelope(parent_step_id=parent_step_id),
+            )
+        )
+
+    async def llm_round_completed(
+        self,
+        *,
+        llm_round_id: str,
+        finish_reason: str | None,
+        input_tokens: int,
+        output_tokens: int,
+        total_tokens: int,
+        cache_read_tokens: int | None,
+        cache_write_tokens: int | None,
+        ttft_ms: int | None,
+        duration_ms: int,
+        parent_step_id: str | None = None,
+    ) -> None:
+        await self._emit(
+            ev.LLMRoundCompleted(
+                type="llm_round_completed",
+                llm_round_id=llm_round_id,
+                status="success",
+                finish_reason=finish_reason,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
+                ttft_ms=ttft_ms,
+                duration_ms=duration_ms,
+                **self._envelope(parent_step_id=parent_step_id),
+            )
+        )
+
+    async def llm_round_failed(
+        self,
+        *,
+        llm_round_id: str,
+        error_code: str | None,
+        message: str | None,
+        parent_step_id: str | None = None,
+    ) -> None:
+        await self._emit(
+            ev.LLMRoundFailed(
+                type="llm_round_failed",
+                llm_round_id=llm_round_id,
+                status="failed",
+                error_code=error_code,
+                message=self._truncate_summary(message),
+                **self._envelope(parent_step_id=parent_step_id),
+            )
+        )
+
+    async def llm_round_cancelled(
+        self,
+        *,
+        llm_round_id: str,
+        reason: str,
+        parent_step_id: str | None = None,
+    ) -> None:
+        await self._emit(
+            ev.LLMRoundCancelled(
+                type="llm_round_cancelled",
+                llm_round_id=llm_round_id,
+                status="cancelled",
+                reason=reason,
+                **self._envelope(parent_step_id=parent_step_id),
+            )
+        )
+
+    async def retrieval_started(
+        self,
+        *,
+        retrieval_id: str,
+        query_summary: str | None,
+        parent_step_id: str | None = None,
+    ) -> None:
+        await self._emit(
+            ev.RetrievalStarted(
+                type="retrieval_started",
+                retrieval_id=retrieval_id,
+                query_summary=self._truncate_summary(query_summary),
+                **self._envelope(parent_step_id=parent_step_id),
+            )
+        )
+
+    async def retrieval_completed(
+        self,
+        *,
+        retrieval_id: str,
+        document_count: int,
+        duration_ms: int,
+        parent_step_id: str | None = None,
+    ) -> None:
+        await self._emit(
+            ev.RetrievalCompleted(
+                type="retrieval_completed",
+                retrieval_id=retrieval_id,
+                status="success",
+                document_count=document_count,
+                duration_ms=duration_ms,
+                **self._envelope(parent_step_id=parent_step_id),
+            )
+        )
+
+    async def retrieval_failed(
+        self,
+        *,
+        retrieval_id: str,
+        error_code: str | None,
+        message: str | None,
+        parent_step_id: str | None = None,
+    ) -> None:
+        await self._emit(
+            ev.RetrievalFailed(
+                type="retrieval_failed",
+                retrieval_id=retrieval_id,
+                status="failed",
+                error_code=error_code,
+                message=self._truncate_summary(message),
+                **self._envelope(parent_step_id=parent_step_id),
+            )
+        )
+
+    async def retrieval_cancelled(
+        self,
+        *,
+        retrieval_id: str,
+        reason: str,
+        parent_step_id: str | None = None,
+    ) -> None:
+        await self._emit(
+            ev.RetrievalCancelled(
+                type="retrieval_cancelled",
+                retrieval_id=retrieval_id,
+                status="cancelled",
+                reason=reason,
+                **self._envelope(parent_step_id=parent_step_id),
+            )
+        )
+
+    async def tool_attempt_started(
+        self,
+        *,
+        tool_attempt_id: str,
+        tool_call_id: str,
+        tool_name: str,
+        attempt_index: int,
+        parent_step_id: str | None = None,
+    ) -> None:
+        await self._emit(
+            ev.ToolAttemptStarted(
+                type="tool_attempt_started",
+                tool_attempt_id=tool_attempt_id,
+                tool_name=tool_name,
+                attempt_index=attempt_index,
+                **self._envelope(tool_call_id=tool_call_id, parent_step_id=parent_step_id),
+            )
+        )
+
+    async def tool_attempt_completed(
+        self,
+        *,
+        tool_attempt_id: str,
+        status: str,
+        error_code: str | None,
+        duration_ms: int,
+        tool_call_id: str | None = None,
+        parent_step_id: str | None = None,
+    ) -> None:
+        await self._emit(
+            ev.ToolAttemptCompleted(
+                type="tool_attempt_completed",
+                tool_attempt_id=tool_attempt_id,
+                status=status,
+                error_code=error_code,
+                duration_ms=duration_ms,
+                **self._envelope(tool_call_id=tool_call_id, parent_step_id=parent_step_id),
             )
         )
 

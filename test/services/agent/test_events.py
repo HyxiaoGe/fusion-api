@@ -2,15 +2,20 @@
 
 import unittest
 
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from app.services.agent.events import (
     AgentEventBase,
+    AnyAgentEvent,
     ContentBlockDiscarded,
     ContextRequired,
     ContextResult,
     EvidenceItemUpserted,
+    LLMRoundCompleted,
+    LLMRoundFirstOutputDelta,
+    LLMRoundStarted,
     PlanSnapshot,
+    RetrievalCompleted,
     RunCompleted,
     RunFailed,
     RunInterrupted,
@@ -20,6 +25,8 @@ from app.services.agent.events import (
     StepCompleted,
     StepStarted,
     SuggestedQuestionsPending,
+    ToolAttemptCompleted,
+    ToolAttemptStarted,
     ToolCallCompleted,
     ToolCallDelta,
     ToolCallStarted,
@@ -101,6 +108,62 @@ class AgentEventModelTests(unittest.TestCase):
         self.assertEqual(d["sequence"], 0)
         self.assertEqual(d["run_id"], "r1")
 
+    def test_existing_event_defaults_to_schema_version_1(self):
+        event = StepStarted(type="step_started", step_number=1, **self._common())
+
+        self.assertEqual(event.model_dump()["schema_version"], 1)
+
+    def test_new_lifecycle_events_are_discriminated_by_type(self):
+        payloads = [
+            {"type": "llm_round_started", "llm_round_id": "llm-1", "round_index": 1, "model": "deepseek/deepseek-chat", "provider": "deepseek"},
+            {"type": "llm_round_first_output_delta", "llm_round_id": "llm-1", "delta_kind": "content", "ttft_ms": 12},
+            {"type": "llm_round_completed", "llm_round_id": "llm-1", "status": "success", "finish_reason": "stop", "input_tokens": 1, "output_tokens": 2, "total_tokens": 3, "cache_read_tokens": None, "cache_write_tokens": None, "ttft_ms": 12, "duration_ms": 15},
+            {"type": "llm_round_failed", "llm_round_id": "llm-1", "status": "failed", "error_code": "timeout", "message": "已脱敏错误摘要"},
+            {"type": "llm_round_cancelled", "llm_round_id": "llm-1", "status": "cancelled", "reason": "user_cancelled"},
+            {"type": "retrieval_started", "retrieval_id": "ret-1", "query_summary": "查天气"},
+            {"type": "retrieval_completed", "retrieval_id": "ret-1", "status": "success", "document_count": 2, "duration_ms": 11},
+            {"type": "retrieval_failed", "retrieval_id": "ret-1", "status": "failed", "error_code": "timeout", "message": "已脱敏错误摘要"},
+            {"type": "retrieval_cancelled", "retrieval_id": "ret-1", "status": "cancelled", "reason": "shutdown"},
+            {"type": "tool_attempt_started", "tool_attempt_id": "attempt-1", "tool_call_id": "tool-1", "tool_name": "web_search", "attempt_index": 1},
+            {"type": "tool_attempt_completed", "tool_attempt_id": "attempt-1", "status": "timeout", "error_code": "timeout", "duration_ms": 12},
+        ]
+        adapter = TypeAdapter(AnyAgentEvent)
+
+        parsed = [adapter.validate_python({**self._common(), **payload}) for payload in payloads]
+
+        self.assertEqual([event.type for event in parsed], [payload["type"] for payload in payloads])
+        self.assertTrue(all(event.schema_version == 1 for event in parsed))
+
+    def test_new_lifecycle_events_reject_invalid_boundaries_and_statuses(self):
+        with self.assertRaises(ValidationError):
+            LLMRoundStarted(type="llm_round_started", llm_round_id="llm-1", round_index=0, model="m", provider="p", **self._common())
+        with self.assertRaises(ValidationError):
+            LLMRoundFirstOutputDelta(
+                type="llm_round_first_output_delta", llm_round_id="llm-1", delta_kind="content", ttft_ms=-1, **self._common()
+            )
+        with self.assertRaises(ValidationError):
+            LLMRoundCompleted(
+                type="llm_round_completed", llm_round_id="llm-1", status="success", finish_reason=None,
+                input_tokens=-1, output_tokens=0, total_tokens=0, cache_read_tokens=None,
+                cache_write_tokens=None, ttft_ms=None, duration_ms=0, **self._common()
+            )
+        with self.assertRaises(ValidationError):
+            RetrievalCompleted(
+                type="retrieval_completed", retrieval_id="ret-1", status="success", document_count=0,
+                duration_ms=-1, **self._common()
+            )
+        with self.assertRaises(ValidationError):
+            ToolAttemptStarted(
+                type="tool_attempt_started", tool_attempt_id="attempt-1", tool_call_id="tool-1",
+                tool_name="web_search", attempt_index=0,
+                **{key: value for key, value in self._common().items() if key != "tool_call_id"},
+            )
+        with self.assertRaises(ValidationError):
+            ToolAttemptCompleted(
+                type="tool_attempt_completed", tool_attempt_id="attempt-1", status="unknown",
+                error_code=None, duration_ms=0, **self._common()
+            )
+
     def test_content_block_discarded_requires_explicit_block_id(self):
         event = ContentBlockDiscarded(
             type="content_block_discarded",
@@ -170,6 +233,7 @@ class AgentEventModelTests(unittest.TestCase):
             event.model_dump(),
             {
                 **self._common(),
+                "schema_version": 1,
                 "parent_run_id": None,
                 "parent_step_id": None,
                 "type": "suggested_questions_pending",

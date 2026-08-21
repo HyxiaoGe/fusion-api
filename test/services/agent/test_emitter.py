@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 from pydantic import ValidationError
 
 from app.services.agent.emitter import AgentEventEmitter
+from app.services.agent.events import StepStarted
 
 
 class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
@@ -414,3 +415,88 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
         serialized = str([required, result])
         self.assertNotIn("latitude", serialized)
         self.assertNotIn("longitude", serialized)
+
+    async def test_cancelled_writer_reserves_sequence_before_await(self):
+        writer = AsyncMock()
+        writer.append_chunk.side_effect = [asyncio.CancelledError(), None]
+        em = AgentEventEmitter(run_id="r1", trace_id="r1", conversation_id="c1", task_id="task-1", redis_writer=writer)
+
+        with self.assertRaises(asyncio.CancelledError):
+            await em.step_started(step_number=1)
+        await em.step_started(step_number=2)
+
+        payloads = [call.args[3] for call in writer.append_chunk.call_args_list]
+        self.assertEqual([payload["sequence"] for payload in payloads], [0, 1])
+
+    async def test_payload_validation_failure_does_not_consume_sequence(self):
+        writer = AsyncMock()
+        em = AgentEventEmitter(run_id="r1", trace_id="r1", conversation_id="c1", task_id="task-1", redis_writer=writer)
+        oversized = StepStarted(type="step_started", step_number=1, **em._envelope())
+
+        with self.assertRaises(ValueError):
+            await em._emit(oversized, max_payload_bytes=1)
+        await em.step_started(step_number=1)
+
+        self.assertEqual(writer.append_chunk.await_args.args[3]["sequence"], 0)
+
+    async def test_seal_returns_last_reserved_sequence_and_rejects_later_emit(self):
+        writer = AsyncMock()
+        em = AgentEventEmitter(run_id="r1", trace_id="r1", conversation_id="c1", task_id="task-1", redis_writer=writer)
+
+        self.assertEqual(await em.seal_and_get_last_sequence(), -1)
+        with self.assertRaises(RuntimeError):
+            await em.run_completed(total_steps=0, total_tool_calls=0, finish_reason="stop")
+
+        open_emitter = AgentEventEmitter(
+            run_id="r2", trace_id="r2", conversation_id="c2", task_id="task-2", redis_writer=AsyncMock()
+        )
+        await open_emitter.step_started(step_number=1)
+        self.assertEqual(await open_emitter.seal_and_get_last_sequence(), 0)
+
+    async def test_new_lifecycle_helpers_preserve_parent_and_bound_safe_summaries(self):
+        writer = AsyncMock()
+        em = AgentEventEmitter(run_id="r1", trace_id="r1", conversation_id="c1", task_id="task-1", redis_writer=writer)
+        parent_step_id = await em.step_started(step_number=1)
+
+        await em.llm_round_started(
+            llm_round_id="llm-1", round_index=1, model="deepseek/deepseek-chat", provider="deepseek", parent_step_id=parent_step_id
+        )
+        await em.llm_round_failed(llm_round_id="llm-1", error_code="timeout", message="错" * 200, parent_step_id=parent_step_id)
+        await em.retrieval_started(retrieval_id="ret-1", query_summary="问" * 200, parent_step_id=parent_step_id)
+        await em.tool_attempt_started(
+            tool_attempt_id="attempt-1", tool_call_id="tool-1", tool_name="web_search", attempt_index=1, parent_step_id=parent_step_id
+        )
+
+        payloads = [call.args[3] for call in writer.append_chunk.call_args_list[-4:]]
+        self.assertEqual([payload["parent_step_id"] for payload in payloads], [parent_step_id] * 4)
+        self.assertEqual(payloads[1]["message"], "错" * 120)
+        self.assertEqual(payloads[2]["query_summary"], "问" * 120)
+
+    async def test_remaining_lifecycle_helpers_publish_their_protocol_payloads(self):
+        writer = AsyncMock()
+        em = AgentEventEmitter(run_id="r1", trace_id="r1", conversation_id="c1", task_id="task-1", redis_writer=writer)
+
+        await em.llm_round_first_output_delta(llm_round_id="llm-1", delta_kind="tool_call", ttft_ms=10)
+        await em.llm_round_completed(
+            llm_round_id="llm-1", finish_reason="stop", input_tokens=1, output_tokens=2, total_tokens=3,
+            cache_read_tokens=0, cache_write_tokens=None, ttft_ms=10, duration_ms=20,
+        )
+        await em.llm_round_cancelled(llm_round_id="llm-2", reason="superseded")
+        await em.retrieval_completed(retrieval_id="ret-1", document_count=2, duration_ms=20)
+        await em.retrieval_failed(retrieval_id="ret-2", error_code="timeout", message="已脱敏摘要")
+        await em.retrieval_cancelled(retrieval_id="ret-3", reason="shutdown")
+        await em.tool_attempt_completed(
+            tool_attempt_id="attempt-1", tool_call_id="tool-1", status="timeout", error_code="timeout", duration_ms=20
+        )
+
+        payloads = [call.args[3] for call in writer.append_chunk.call_args_list]
+        self.assertEqual(
+            [payload["type"] for payload in payloads],
+            [
+                "llm_round_first_output_delta", "llm_round_completed", "llm_round_cancelled",
+                "retrieval_completed", "retrieval_failed", "retrieval_cancelled", "tool_attempt_completed",
+            ],
+        )
+        self.assertEqual(payloads[0]["delta_kind"], "tool_call")
+        self.assertEqual(payloads[1]["total_tokens"], 3)
+        self.assertEqual(payloads[-1]["tool_call_id"], "tool-1")

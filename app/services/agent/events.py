@@ -13,6 +13,7 @@ class AgentEventBase(BaseModel):
     """所有 agent_event 的共享 envelope 字段."""
 
     model_config = ConfigDict(extra="forbid")
+    schema_version: Literal[1] = 1
     type: str
     run_id: str
     parent_run_id: str | None = None
@@ -92,6 +93,95 @@ class RunCompleted(AgentEventBase):
     # incomplete: LLM 返回 unknown finish_reason 退化时（雷点 3 修复路径），
     # 保留已 emit 的 reasoning/content 并报 incomplete，让前端区分于正常 stop。
     finish_reason: Literal["stop", "limit_reached", "incomplete"]
+
+
+class LLMRoundStarted(AgentEventBase):
+    type: Literal["llm_round_started"]
+    llm_round_id: str
+    round_index: int = Field(ge=1)
+    model: str
+    provider: str
+
+
+class LLMRoundFirstOutputDelta(AgentEventBase):
+    type: Literal["llm_round_first_output_delta"]
+    llm_round_id: str
+    delta_kind: Literal["reasoning", "content", "tool_call"]
+    ttft_ms: int = Field(ge=0)
+
+
+class LLMRoundCompleted(AgentEventBase):
+    type: Literal["llm_round_completed"]
+    llm_round_id: str
+    status: Literal["success"]
+    finish_reason: str | None
+    input_tokens: int = Field(ge=0)
+    output_tokens: int = Field(ge=0)
+    total_tokens: int = Field(ge=0)
+    cache_read_tokens: int | None = Field(default=None, ge=0)
+    cache_write_tokens: int | None = Field(default=None, ge=0)
+    ttft_ms: int | None = Field(default=None, ge=0)
+    duration_ms: int = Field(ge=0)
+
+
+class LLMRoundFailed(AgentEventBase):
+    type: Literal["llm_round_failed"]
+    llm_round_id: str
+    status: Literal["failed"]
+    error_code: str | None
+    message: str | None = Field(default=None, max_length=120)
+
+
+class LLMRoundCancelled(AgentEventBase):
+    type: Literal["llm_round_cancelled"]
+    llm_round_id: str
+    status: Literal["cancelled"]
+    reason: Literal["user_cancelled", "superseded", "shutdown"]
+
+
+class RetrievalStarted(AgentEventBase):
+    type: Literal["retrieval_started"]
+    retrieval_id: str
+    query_summary: str | None = Field(default=None, max_length=120)
+
+
+class RetrievalCompleted(AgentEventBase):
+    type: Literal["retrieval_completed"]
+    retrieval_id: str
+    status: Literal["success"]
+    document_count: int = Field(ge=0)
+    duration_ms: int = Field(ge=0)
+
+
+class RetrievalFailed(AgentEventBase):
+    type: Literal["retrieval_failed"]
+    retrieval_id: str
+    status: Literal["failed"]
+    error_code: str | None
+    message: str | None = Field(default=None, max_length=120)
+
+
+class RetrievalCancelled(AgentEventBase):
+    type: Literal["retrieval_cancelled"]
+    retrieval_id: str
+    status: Literal["cancelled"]
+    reason: Literal["user_cancelled", "superseded", "shutdown"]
+
+
+class ToolAttemptStarted(AgentEventBase):
+    type: Literal["tool_attempt_started"]
+    tool_attempt_id: str
+    tool_call_id: str
+    tool_name: str
+    attempt_index: int = Field(ge=1)
+
+
+class ToolAttemptCompleted(AgentEventBase):
+    type: Literal["tool_attempt_completed"]
+    tool_attempt_id: str
+    status: Literal["success", "failed", "cancelled", "timeout"]
+    error_code: str | None
+    duration_ms: int = Field(ge=0)
 
 
 class SuggestedQuestionsPending(AgentEventBase):
@@ -261,6 +351,17 @@ AnyAgentEvent = Annotated[
     | RunInterrupted
     | RunFailed
     | RunCompleted
+    | LLMRoundStarted
+    | LLMRoundFirstOutputDelta
+    | LLMRoundCompleted
+    | LLMRoundFailed
+    | LLMRoundCancelled
+    | RetrievalStarted
+    | RetrievalCompleted
+    | RetrievalFailed
+    | RetrievalCancelled
+    | ToolAttemptStarted
+    | ToolAttemptCompleted
     | SuggestedQuestionsPending
     | RunProgressUpdated
     | PlanSnapshot
