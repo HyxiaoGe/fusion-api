@@ -518,7 +518,7 @@ assessment/事件 latch、timeout、cancel、unknown：
 1. **内存降级 latch**：Recorder 进程内维护 per-run degraded 标记；首次落账失败/超时/准入失败/取消置位（§5.1），后续事件跳过落账（不重复报错），并在 DB 恢复后重试写 meta（幂等）。**迟到事务不得反转 latch**（§5.1、§5.2）。
 2. **stale/pending 协调任务**：以持久化的 `AgentSession.terminal_at` 作为业务终态年龄证据，并使用 60 秒 grace（`stale_before = now - 60s`）。候选 run 必须 `status != running AND terminal_at IS NOT NULL AND terminal_at <= stale_before`；此外：
    - 无 pending 的普通 stale `recording` 必须同时 `meta.updated_at <= stale_before`，再按 `expected_last_sequence +` §5.2 三断言判定 complete/degraded；
-   - `trajectory_status IN ('recording', 'complete', 'degraded') AND terminal_intent_pending_at IS NOT NULL` 的候选必须同时满足 `terminal_intent_pending_at <= stale_before AND meta.updated_at <= stale_before`。**任何到期遗留 pending 都表示 Recorder 未明确 ack，Task 6 必须保守收敛为 degraded**（已有 degraded 保持 degraded；未知 status/reason/version 也安全降级），并在同一原子更新中清除五个 intent 字段；
+   - 任意 `trajectory_status` 只要 `terminal_intent_pending_at IS NOT NULL`，都属于 pending 候选，并必须同时满足 `terminal_intent_pending_at <= stale_before AND meta.updated_at <= stale_before`。**任何到期遗留 pending 都表示 Recorder 未明确 ack，Task 6 必须保守收敛为 degraded**（已有 degraded 保持 degraded；未知 status/reason/version 也安全降级），并在同一原子更新中清除五个 intent 字段；
    - `terminal_intent_pending_at` 虽已过期、但 `updated_at` 仍新鲜时不得协调，给正常 finalize 的 B→C、C ack 或迟到纠偏保留完整 grace；若 C 未发生，则从最后一次持久写入再经过完整 grace 后才保守降级；
    - 新 run 缺 meta 也必须满足相同 `terminal_at <= stale_before` 才写 `degraded/meta_missing`。插入使用 PostgreSQL `ON CONFLICT (run_id) DO NOTHING`，仅 `rowcount=1` 计入处理数；若并发 Recorder 先创建 meta，协调器不得覆盖，且同批其他候选仍正常提交。
    扫描在 PostgreSQL 使用 `FOR UPDATE SKIP LOCKED` 分批执行；业务 `running` run 绝不处理。这样既保护正常 finalize/late first-write，也使进程崩溃遗留状态在 grace 后幂等收敛。
@@ -691,7 +691,7 @@ P0 验收不依赖 P2（MVP Adapter 联调属 P2 验收）。
 - **同步 DB 线程池**：fusion 为同步 SQLAlchemy + psycopg2（`connect_timeout` 限整数秒），超时隔离靠 `BoundedSemaphore` 准入 + `wait_for(asyncio.shield(...))` + 显式 `CancelledError` 分支；permit 泄漏由四规则 + 守恒测试兜底；若线程池方案实测不达 §9.1 阈值，记录决策切换 AsyncSession（§5.1 备选）。
 - **sequence 预留时机**：emitter 在第一次可取消 await 前预留并递增（§5.2）；取消/熔断导致的空洞只允许出现在 degraded run；complete 严格要求连续（§9.2）。
 - **同步 v1 延迟**：承认有界回归（不承诺零首屏影响）；若超 §9.1 阈值，P0 切换 §5.4 异步队列（切换条件已定义，实施成本可控）。
-- **协调 grace 的可见性窗口**：终态异常最多延后约「60 秒 grace + 一次 scheduler 周期」才收敛；这是保护正常 finalize B→C/C ack 与迟到首写的有意取舍。`terminal_at` 缺失时协调器不得猜测或破坏性更新，应保守跳过并通过日志/指标暴露，交由后续修复或人工处理。
+- **协调 grace 的可见性窗口**：终态异常最多延后约「60 秒 grace + 一次 scheduler 周期」才收敛；这是保护正常 finalize B→C/C ack 与迟到首写的有意取舍。`terminal_at` 缺失时协调器当前不得猜测或破坏性更新，只能保守跳过；为此类跳过补充不泄露敏感信息的聚合日志/指标属于后续运维项，缺少该观测能力是当前已知风险。
 - **TTL 推迟**：P0 只做级联删除；独立 TTL（含 `expired` 状态）留待后续，避免「complete 但事件为空」的假象。
 - **MVP 协议差异**（命名、sequence 0-based、span 含义）：由 P2 的 `FusionTrajectoryAdapter` 吸收，不反向污染 fusion API。
 - **仓库状态**：`.gitignore` 例外与文档跟踪按文首决定，在正式实施分支首个提交中一并处理；不在 detached HEAD 操作。
