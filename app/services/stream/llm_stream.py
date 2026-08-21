@@ -112,6 +112,8 @@ class LLMStreamRequest:
     allow_deferred_reasoning_output: bool = False
     partial_output: dict[str, str] | None = None
     on_visible_output: Callable[[str], Awaitable[None]] | None = None
+    on_output_candidate: Callable[[str, float | None], None] | None = None
+    capture_output_candidate_time: Callable[[], float | None] | None = None
 
 
 @dataclass
@@ -128,6 +130,7 @@ class LLMStreamState:
     reasoning_transport_mode: ReasoningTransportMode = "delta"
     reasoning_probe_chunks: list[str] = field(default_factory=list)
     reasoning_snapshot_revision_logged: bool = False
+    pending_reasoning_candidate_time: float | None = None
 
 
 @dataclass(frozen=True)
@@ -613,6 +616,16 @@ def filter_internal_mcp_reasoning_delta(
     return _visible_delta(visible_reasoning, state.reasoning_buf, channel="reasoning")
 
 
+def _final_reasoning_candidate(state: LLMStreamState) -> str:
+    raw_reasoning = (
+        "".join(state.reasoning_probe_chunks)
+        if state.reasoning_transport_mode == "probing"
+        else state.raw_reasoning_buf
+    )
+    candidate = strip_pending_dsml_tool_protocol(raw_reasoning, final=True)
+    return sanitize_user_visible_reasoning(candidate, final=True)
+
+
 async def flush_pending_internal_mcp_aliases(*, request: LLMStreamRequest, state: LLMStreamState) -> None:
     if state.reasoning_transport_mode == "probing":
         _resolve_reasoning_probe(state, final=True)
@@ -626,6 +639,12 @@ async def flush_pending_internal_mcp_aliases(*, request: LLMStreamRequest, state
         state=state,
         reasoning_delta=_visible_delta(final_reasoning, state.reasoning_buf, channel="reasoning"),
         content_delta=_visible_delta(final_content, state.content_buf, channel="answering"),
+        reasoning_candidate_time=state.pending_reasoning_candidate_time,
+        content_candidate_time=(
+            request.capture_output_candidate_time()
+            if request.capture_output_candidate_time is not None
+            else None
+        ),
     )
 
 
@@ -653,8 +672,12 @@ async def append_reasoning_and_content(
     state: LLMStreamState,
     reasoning_delta: str,
     content_delta: str,
+    reasoning_candidate_time: float | None = None,
+    content_candidate_time: float | None = None,
 ) -> None:
     if reasoning_delta:
+        if request.on_output_candidate is not None:
+            request.on_output_candidate("reasoning", reasoning_candidate_time)
         state.reasoning_buf += reasoning_delta
         deferred_reasoning_is_allowed = request.allow_deferred_reasoning_output
         if not request.defer_output or deferred_reasoning_is_allowed:
@@ -669,6 +692,8 @@ async def append_reasoning_and_content(
         if request.partial_output is not None:
             request.partial_output["reasoning_buf"] = state.reasoning_buf
     if content_delta:
+        if request.on_output_candidate is not None:
+            request.on_output_candidate("content", content_candidate_time)
         state.content_buf += content_delta
         if not request.defer_output:
             await append_stream_delta(
@@ -702,20 +727,37 @@ async def process_stream_choice(*, request: LLMStreamRequest, state: LLMStreamSt
     delta = choice.delta
     finish_reason = choice.finish_reason
 
+    candidate_time = (
+        request.capture_output_candidate_time()
+        if request.capture_output_candidate_time is not None
+        else None
+    )
     accumulate_tool_calls(state.tool_calls_acc, delta)
+    if getattr(delta, "tool_calls", None) and request.on_output_candidate is not None:
+        request.on_output_candidate("tool_call", candidate_time)
     raw_reasoning_delta = extract_reasoning_delta(delta, request.should_use_reasoning)
     content_delta = extract_content_delta(delta, raw_reasoning_delta)
     tag_reasoning_delta, content_delta = filter_reasoning_tag_content_delta(state, content_delta)
+    previous_reasoning_candidate = _final_reasoning_candidate(state)
     reasoning_delta = filter_internal_mcp_reasoning_delta(
         state,
         raw_reasoning_delta + (tag_reasoning_delta if request.should_use_reasoning else ""),
     )
+    if (
+        state.pending_reasoning_candidate_time is None
+        and _final_reasoning_candidate(state) != previous_reasoning_candidate
+    ):
+        state.pending_reasoning_candidate_time = candidate_time
     await append_reasoning_and_content(
         request=request,
         state=state,
         reasoning_delta=reasoning_delta,
         content_delta=content_delta,
+        reasoning_candidate_time=state.pending_reasoning_candidate_time,
+        content_candidate_time=candidate_time,
     )
+    if reasoning_delta:
+        state.pending_reasoning_candidate_time = None
 
     usage_data = extract_usage(chunk)
     if usage_data:
@@ -805,6 +847,8 @@ async def stream_round(
     allow_deferred_reasoning_output: bool = False,
     partial_output: dict[str, str] | None = None,
     on_visible_output: Callable[[str], Awaitable[None]] | None = None,
+    on_output_candidate: Callable[[str, float | None], None] | None = None,
+    capture_output_candidate_time: Callable[[], float | None] | None = None,
 ) -> tuple[str, str, list[dict], str, Optional[Usage]]:
     """
     通用 LLM 流式响应处理。
@@ -831,6 +875,8 @@ async def stream_round(
             allow_deferred_reasoning_output=allow_deferred_reasoning_output,
             partial_output=partial_output,
             on_visible_output=on_visible_output,
+            on_output_candidate=on_output_candidate,
+            capture_output_candidate_time=capture_output_candidate_time,
         ),
     )
     return StreamRoundTuple(

@@ -350,18 +350,22 @@ async def call_limit_summary_round(
             stream_kwargs["allow_deferred_reasoning_output"] = True
         if partial_output is not None and _accepts_keyword(request.stream_round_fn, "partial_output"):
             stream_kwargs["partial_output"] = partial_output
-        deferred_reasoning_is_visible = (
-            request.should_use_reasoning
-            and _should_defer_summary_output(request)
-            and request.evidence_policy != "knowledge_grounded_v1"
-        )
         visible_callback_supported = _accepts_keyword(request.stream_round_fn, "on_visible_output")
         if (
             lifecycle is not None
-            and (not _should_defer_summary_output(request) or deferred_reasoning_is_visible)
+            and not _should_defer_summary_output(request)
             and visible_callback_supported
         ):
             stream_kwargs["on_visible_output"] = lifecycle.publish_visible_output
+        candidate_callback = getattr(observation, "observe_output_candidate", None)
+        if callable(candidate_callback) and _accepts_keyword(request.stream_round_fn, "on_output_candidate"):
+            stream_kwargs["on_output_candidate"] = candidate_callback
+        capture_candidate_time = getattr(observation, "capture_output_candidate_time", None)
+        if callable(capture_candidate_time) and _accepts_keyword(
+            request.stream_round_fn,
+            "capture_output_candidate_time",
+        ):
+            stream_kwargs["capture_output_candidate_time"] = capture_candidate_time
         reasoning_buf, content_buf, tool_calls, finish_reason, usage_data = await request.stream_round_fn(
             response,
             request.conversation_id,
@@ -385,46 +389,63 @@ async def call_limit_summary_round(
             error=exc,
         )
         raise
-    freeze = getattr(observation, "freeze", None)
-    if callable(freeze):
-        freeze()
-    final_context = build_context_usage(context_plan, usage_data, round_index=request.step_number)
-    if request.on_context_updated is not None:
-        request.on_context_updated(final_context)
-    await emit_context_status(request.emitter, phase="final", context=final_context)
-    await observation.finish_success(usage=usage_data, finish_reason=finish_reason)
-    if lifecycle is not None:
-        lifecycle.record_result(usage=usage_data, finish_reason=finish_reason)
-        if finish_reason == "cancelled":
-            await lifecycle.finish_cancelled(reason="superseded")
-        elif not _should_defer_summary_output(request):
-            if tool_calls:
+    try:
+        freeze = getattr(observation, "freeze", None)
+        if callable(freeze):
+            freeze()
+        final_context = build_context_usage(context_plan, usage_data, round_index=request.step_number)
+        if request.on_context_updated is not None:
+            request.on_context_updated(final_context)
+        await emit_context_status(request.emitter, phase="final", context=final_context)
+        await observation.finish_success(usage=usage_data, finish_reason=finish_reason)
+        if lifecycle is not None:
+            lifecycle.record_result(usage=usage_data, finish_reason=finish_reason)
+            if finish_reason == "cancelled":
+                await lifecycle.finish_cancelled(reason="superseded")
+            elif _should_defer_summary_output(request) and tool_calls:
                 await lifecycle.publish_tool_output()
-            elif content_buf:
-                await lifecycle.publish_visible_output("content")
-            elif reasoning_buf:
-                await lifecycle.publish_visible_output("reasoning")
-            await lifecycle.finish_success(output_visible=False)
-    request.log_round_summary_fn(
-        conversation_id=request.conversation_id,
-        run_id=request.run_id,
-        step_number=request.step_number,
-        model_id=request.model_id,
-        provider=request.provider,
-        finish_reason=request.summary_finish_reason,
-        tool_calls_count=len(tool_calls),
-        reasoning_buf=reasoning_buf,
-        content_buf=content_buf,
-    )
-    return LimitSummaryRoundResult(
-        reasoning_buf=reasoning_buf,
-        content_buf=content_buf,
-        usage_data=usage_data,
-        context=final_context,
-        tool_calls=tuple(tool_calls),
-        finish_reason=finish_reason,
-        llm_lifecycle=(lifecycle if lifecycle is not None and not lifecycle.terminal_emitted else None),
-    )
+            elif not _should_defer_summary_output(request):
+                if tool_calls:
+                    await lifecycle.publish_tool_output()
+                elif content_buf:
+                    await lifecycle.publish_visible_output("content")
+                elif reasoning_buf:
+                    await lifecycle.publish_visible_output("reasoning")
+                await lifecycle.finish_success(output_visible=False)
+        request.log_round_summary_fn(
+            conversation_id=request.conversation_id,
+            run_id=request.run_id,
+            step_number=request.step_number,
+            model_id=request.model_id,
+            provider=request.provider,
+            finish_reason=request.summary_finish_reason,
+            tool_calls_count=len(tool_calls),
+            reasoning_buf=reasoning_buf,
+            content_buf=content_buf,
+        )
+        return LimitSummaryRoundResult(
+            reasoning_buf=reasoning_buf,
+            content_buf=content_buf,
+            usage_data=usage_data,
+            context=final_context,
+            tool_calls=tuple(tool_calls),
+            finish_reason=finish_reason,
+            llm_lifecycle=(lifecycle if lifecycle is not None and not lifecycle.terminal_emitted else None),
+        )
+    except asyncio.CancelledError as exc:
+        await _close_summary_round_after_primary_error(
+            observation=observation,
+            lifecycle=lifecycle,
+            error=exc,
+        )
+        raise
+    except BaseException as exc:
+        await _close_summary_round_after_primary_error(
+            observation=observation,
+            lifecycle=lifecycle,
+            error=exc,
+        )
+        raise
 
 
 def accumulate_summary_usage(accumulated_usage: Usage, usage_data: Usage | None) -> Usage:

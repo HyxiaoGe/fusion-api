@@ -102,7 +102,7 @@ class ToolAttemptLifecycle:
                 tool_name=self.tool_name,
                 attempt_index=self.attempt_index,
             )
-        except Exception as error:
+        except BaseException as error:
             raise ToolLifecycleControlPlaneError(error) from error
         started_at = time.monotonic()
         try:
@@ -167,7 +167,7 @@ class ToolAttemptLifecycle:
                 error_code=error_code,
                 duration_ms=max(0, int(round((time.monotonic() - started_at) * 1000))),
             )
-        except Exception as error:
+        except BaseException as error:
             raise ToolLifecycleControlPlaneError(error) from error
 
 

@@ -49,7 +49,7 @@ ResultSummaryBuilder = Callable[[ToolResult], dict]
 class ToolLifecycleControlPlaneError(RuntimeError):
     """让嵌套 attempt 的 emitter 故障穿透 handler 异常降级层。"""
 
-    def __init__(self, error: Exception):
+    def __init__(self, error: BaseException):
         self.error = error
         super().__init__(type(error).__name__)
 

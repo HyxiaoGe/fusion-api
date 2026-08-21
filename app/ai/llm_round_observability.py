@@ -213,6 +213,7 @@ class LLMRoundObservation:
         self.first_output_delta_at: float | None = None
         self.first_output_delta_kind: str | None = None
         self.first_output_delta_at_by_kind: dict[str, float] = {}
+        self._current_chunk_observed_at: float | None = None
         self.finished_at: float | None = None
         self._context_result = self._resolve_window()
         self._estimate_task: asyncio.Future[tuple[int | None, str]] | None = None
@@ -254,15 +255,29 @@ class LLMRoundObservation:
     def observe_chunk(self, chunk: Any) -> None:
         delta_kinds = _output_delta_kinds(chunk)
         if not delta_kinds:
+            self._current_chunk_observed_at = None
             return
         observed_at = self.clock()
-        if self.first_output_delta_at is None:
-            self.first_output_delta_at = observed_at
-            self.first_output_delta_kind = delta_kinds[0]
-        for delta_kind in delta_kinds:
-            self.first_output_delta_at_by_kind.setdefault(delta_kind, observed_at)
+        self._current_chunk_observed_at = observed_at
         if self.first_text_delta_at is None and {"reasoning", "content"}.intersection(delta_kinds):
             self.first_text_delta_at = observed_at
+
+    def capture_output_candidate_time(self) -> float | None:
+        """返回当前模型 chunk 的单调到达时刻，供过滤层跨 chunk 保留归因。"""
+        return self._current_chunk_observed_at
+
+    def observe_output_candidate(self, delta_kind: str, observed_at: float | None = None) -> None:
+        """记录过滤、重分类后的候选 kind，复用当前模型 chunk 的到达时刻。"""
+        if delta_kind not in {"reasoning", "content", "tool_call"}:
+            return
+        if observed_at is None:
+            observed_at = self._current_chunk_observed_at
+        if observed_at is None:
+            return
+        if self.first_output_delta_at is None:
+            self.first_output_delta_at = observed_at
+            self.first_output_delta_kind = delta_kind
+        self.first_output_delta_at_by_kind.setdefault(delta_kind, observed_at)
 
     def output_delta_ms(self, delta_kind: str) -> int | None:
         observed_at = self.first_output_delta_at_by_kind.get(delta_kind)

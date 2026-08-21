@@ -85,6 +85,7 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
 
         async def stream_round_fn(observed, *_args, **kwargs):
             async for _chunk in observed:
+                kwargs["on_output_candidate"]("content")
                 await kwargs["on_visible_output"]("content")
             return "", "答案", [], "stop", Usage(input_tokens=1, output_tokens=1)
 
@@ -242,13 +243,65 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIsNotNone(result.llm_lifecycle)
-        self.assertTrue(callable(stream_round_fn.await_args.kwargs["on_visible_output"]))
+        self.assertNotIn("on_visible_output", stream_round_fn.await_args.kwargs)
         emitter.llm_round_first_output_delta.assert_not_awaited()
         emitter.llm_round_completed.assert_not_awaited()
 
         await result.llm_lifecycle.finish_success(output_visible=False)
         emitter.llm_round_first_output_delta.assert_not_awaited()
         self.assertIsNone(emitter.llm_round_completed.await_args.kwargs["ttft_ms"])
+
+    async def test_post_stream_context_error_and_cancel_close_llm_round(self):
+        for primary in (RuntimeError("final context failed"), asyncio.CancelledError()):
+            with self.subTest(primary=type(primary).__name__):
+                emitter = AsyncMock()
+                observation = MagicMock(first_output_delta_kind=None, duration_ms=10)
+                observation.finish_success = AsyncMock()
+                observation.finish_error = AsyncMock()
+                observation.wrap_response.side_effect = lambda response: response
+                context_plan = MagicMock(messages=[], estimated_tokens_after=10)
+                context_plan.telemetry.return_value = {"context_management_status": "no_op"}
+
+                def build_context(_plan, usage=None, **_kwargs):
+                    if usage is None:
+                        return ContextUsage(status="no_op")
+                    raise primary
+
+                with (
+                    patch("app.services.stream.agent_round.prepare_context", new=AsyncMock(return_value=context_plan)),
+                    patch("app.services.stream.agent_round.create_llm_round_observation", return_value=observation),
+                    patch("app.services.stream.agent_round.build_context_usage", side_effect=build_context),
+                ):
+                    with self.assertRaises(type(primary)) as raised:
+                        await run_agent_round(
+                            conversation_id="conv-post",
+                            task_id="task-post",
+                            run_id="run-post",
+                            step_number=1,
+                            model_id="model",
+                            provider="provider",
+                            litellm_model="test/model",
+                            litellm_kwargs={},
+                            messages=[],
+                            should_use_reasoning=False,
+                            call_kwargs={},
+                            accumulated_usage=Usage(),
+                            step_context=AgentStepContext("step-post", 1, 0.0, "thinking", "text"),
+                            llm_call_fn=AsyncMock(return_value="response"),
+                            stream_round_fn=AsyncMock(
+                                return_value=("", "answer", [], "stop", Usage(input_tokens=1, output_tokens=1))
+                            ),
+                            log_round_summary_fn=lambda **_kwargs: None,
+                            emitter=emitter,
+                        )
+
+                self.assertIs(raised.exception, primary)
+                if isinstance(primary, asyncio.CancelledError):
+                    emitter.llm_round_cancelled.assert_awaited_once()
+                    emitter.llm_round_failed.assert_not_awaited()
+                else:
+                    emitter.llm_round_failed.assert_awaited_once()
+                    emitter.llm_round_cancelled.assert_not_awaited()
     async def test_run_agent_round_finalizes_language_contract_before_budget_and_model_call(self):
         step_context = AgentStepContext(
             step_id="step-language",

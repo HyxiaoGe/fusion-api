@@ -102,6 +102,8 @@ async def collect_agent_round_stream(
     defer_output: bool = False,
     allow_deferred_reasoning_output: bool = False,
     on_visible_output: Callable[[str], Awaitable[None]] | None = None,
+    on_output_candidate: Callable[..., None] | None = None,
+    capture_output_candidate_time: Callable[[], float | None] | None = None,
 ) -> StreamRoundResult:
     response = await llm_call_fn(
         litellm_model,
@@ -125,6 +127,13 @@ async def collect_agent_round_stream(
         stream_kwargs["allow_deferred_reasoning_output"] = True
     if on_visible_output is not None and _accepts_keyword(stream_round_fn, "on_visible_output"):
         stream_kwargs["on_visible_output"] = on_visible_output
+    if on_output_candidate is not None and _accepts_keyword(stream_round_fn, "on_output_candidate"):
+        stream_kwargs["on_output_candidate"] = on_output_candidate
+    if capture_output_candidate_time is not None and _accepts_keyword(
+        stream_round_fn,
+        "capture_output_candidate_time",
+    ):
+        stream_kwargs["capture_output_candidate_time"] = capture_output_candidate_time
     return await stream_round_fn(
         response,
         conversation_id,
@@ -291,12 +300,9 @@ async def run_agent_round(
             observation=observation,
             defer_output=defer_output,
             allow_deferred_reasoning_output=defer_output and allow_deferred_reasoning_output,
-            on_visible_output=(
-                lifecycle.publish_visible_output
-                if lifecycle is not None
-                and (not defer_output or allow_deferred_reasoning_output)
-                else None
-            ),
+            on_visible_output=(lifecycle.publish_visible_output if lifecycle is not None and not defer_output else None),
+            on_output_candidate=getattr(observation, "observe_output_candidate", None),
+            capture_output_candidate_time=getattr(observation, "capture_output_candidate_time", None),
         )
     except asyncio.CancelledError as exc:
         await _close_round_after_primary_error(observation=observation, lifecycle=lifecycle, error=exc)
@@ -304,51 +310,58 @@ async def run_agent_round(
     except BaseException as exc:
         await _close_round_after_primary_error(observation=observation, lifecycle=lifecycle, error=exc)
         raise
-    reasoning_buf, content_buf, tool_calls, finish_reason, usage_data = stream_result
-    _freeze_observation(observation)
-    final_context = build_context_usage(context_plan, usage_data, round_index=step_number)
-    if on_context_updated is not None:
-        on_context_updated(final_context)
-    await emit_context_status(emitter, phase="final", context=final_context)
-    await observation.finish_success(usage=usage_data, finish_reason=finish_reason)
-    if lifecycle is not None:
-        lifecycle.record_result(usage=usage_data, finish_reason=finish_reason)
-        if finish_reason == "cancelled":
-            await lifecycle.finish_cancelled(reason="superseded")
-        elif not defer_output or tool_calls:
-            if tool_calls:
-                await lifecycle.publish_tool_output()
-            elif content_buf:
-                await lifecycle.publish_visible_output("content")
-            elif reasoning_buf:
-                await lifecycle.publish_visible_output("reasoning")
-            await lifecycle.finish_success(output_visible=False)
-    if finish_reason != "cancelled":
-        litellm_health.record_success(model_id)
-    log_agent_round_summary(
-        conversation_id=conversation_id,
-        run_id=run_id,
-        step_number=step_number,
-        model_id=model_id,
-        provider=provider,
-        stream_result=stream_result,
-        log_round_summary_fn=log_round_summary_fn,
-    )
-    return AgentRoundResult(
-        reasoning_buf=reasoning_buf,
-        protocol_reasoning_buf=getattr(stream_result, "protocol_reasoning_buf", reasoning_buf),
-        protocol_content_buf=getattr(stream_result, "protocol_content_buf", content_buf),
-        content_buf=content_buf,
-        tool_calls=tool_calls,
-        finish_reason=finish_reason,
-        accumulated_usage=accumulate_usage(accumulated_usage, usage_data),
-        context=final_context,
-        announced_tool_names=_announced_tool_names(call_kwargs),
-        output_deferred=defer_output and _accepts_keyword(stream_round_fn, "defer_output"),
-        allow_deferred_reasoning_output=(
-            defer_output
-            and allow_deferred_reasoning_output
-            and _accepts_keyword(stream_round_fn, "allow_deferred_reasoning_output")
-        ),
-        llm_lifecycle=(lifecycle if lifecycle is not None and not lifecycle.terminal_emitted else None),
-    )
+    try:
+        reasoning_buf, content_buf, tool_calls, finish_reason, usage_data = stream_result
+        _freeze_observation(observation)
+        final_context = build_context_usage(context_plan, usage_data, round_index=step_number)
+        if on_context_updated is not None:
+            on_context_updated(final_context)
+        await emit_context_status(emitter, phase="final", context=final_context)
+        await observation.finish_success(usage=usage_data, finish_reason=finish_reason)
+        if lifecycle is not None:
+            lifecycle.record_result(usage=usage_data, finish_reason=finish_reason)
+            if finish_reason == "cancelled":
+                await lifecycle.finish_cancelled(reason="superseded")
+            elif not defer_output or tool_calls:
+                if tool_calls:
+                    await lifecycle.publish_tool_output()
+                elif content_buf:
+                    await lifecycle.publish_visible_output("content")
+                elif reasoning_buf:
+                    await lifecycle.publish_visible_output("reasoning")
+                await lifecycle.finish_success(output_visible=False)
+        if finish_reason != "cancelled":
+            litellm_health.record_success(model_id)
+        log_agent_round_summary(
+            conversation_id=conversation_id,
+            run_id=run_id,
+            step_number=step_number,
+            model_id=model_id,
+            provider=provider,
+            stream_result=stream_result,
+            log_round_summary_fn=log_round_summary_fn,
+        )
+        return AgentRoundResult(
+            reasoning_buf=reasoning_buf,
+            protocol_reasoning_buf=getattr(stream_result, "protocol_reasoning_buf", reasoning_buf),
+            protocol_content_buf=getattr(stream_result, "protocol_content_buf", content_buf),
+            content_buf=content_buf,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+            accumulated_usage=accumulate_usage(accumulated_usage, usage_data),
+            context=final_context,
+            announced_tool_names=_announced_tool_names(call_kwargs),
+            output_deferred=defer_output and _accepts_keyword(stream_round_fn, "defer_output"),
+            allow_deferred_reasoning_output=(
+                defer_output
+                and allow_deferred_reasoning_output
+                and _accepts_keyword(stream_round_fn, "allow_deferred_reasoning_output")
+            ),
+            llm_lifecycle=(lifecycle if lifecycle is not None and not lifecycle.terminal_emitted else None),
+        )
+    except asyncio.CancelledError as exc:
+        await _close_round_after_primary_error(observation=observation, lifecycle=lifecycle, error=exc)
+        raise
+    except BaseException as exc:
+        await _close_round_after_primary_error(observation=observation, lifecycle=lifecycle, error=exc)
+        raise

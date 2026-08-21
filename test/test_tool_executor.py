@@ -304,16 +304,30 @@ class DynamicToolExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(emitter.tool_attempt_completed.await_args.kwargs["error_code"])
 
         emitter.reset_mock()
-        emitter.tool_attempt_completed.side_effect = RuntimeError("terminal sink failed")
-        handler.execute.side_effect = asyncio.CancelledError
-        with self.assertRaises(asyncio.CancelledError):
+        primary_cancel = asyncio.CancelledError("primary")
+        secondary_cancel = asyncio.CancelledError("secondary")
+        emitter.tool_attempt_completed.side_effect = secondary_cancel
+        handler.execute.side_effect = primary_cancel
+        with self.assertRaises(asyncio.CancelledError) as raised:
             await tool_executor_module.execute_tool_handler(
                 request=request,
                 tool_call={"id": "call-cancel", "name": handler.tool_name},
                 handler=handler,
                 args={},
             )
+        self.assertIs(raised.exception, primary_cancel)
         self.assertEqual(emitter.tool_attempt_completed.await_args.kwargs["status"], "cancelled")
+
+        emitter.reset_mock()
+        handler.execute.side_effect = RuntimeError("primary handler failure")
+        emitter.tool_attempt_completed.side_effect = asyncio.CancelledError("secondary")
+        failed = await tool_executor_module.execute_tool_handler(
+            request=request,
+            tool_call={"id": "call-error-secondary-cancel", "name": handler.tool_name},
+            handler=handler,
+            args={},
+        )
+        self.assertEqual(failed.data["error_code"], "tool_execution_failed")
 
     async def test_attempt_emitter_failure_aborts_without_fabricating_logical_completion(self):
         emitter = AsyncMock()
@@ -340,6 +354,19 @@ class DynamicToolExecutionTests(unittest.IsolatedAsyncioTestCase):
             )
 
         handler.execute.assert_not_awaited()
+        emitter.tool_call_completed.assert_not_awaited()
+
+        emitter.reset_mock()
+        emitter.tool_attempt_started.side_effect = None
+        emitter.tool_attempt_completed.side_effect = asyncio.CancelledError("terminal cancelled")
+        with self.assertRaises(asyncio.CancelledError):
+            await tool_executor_module.execute_tool_handler(
+                request=request,
+                tool_call={"id": "call-terminal-cancel", "name": handler.tool_name},
+                handler=handler,
+                args={},
+            )
+
         emitter.tool_call_completed.assert_not_awaited()
 
         emitter.reset_mock()

@@ -684,6 +684,109 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         )
         return request, emitter, stream_kwargs, prepare_context_fn
 
+    async def test_deferred_real_tool_delta_emits_first_before_discard_completion(self):
+        from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata
+
+        workset, blocks = _deep_summary_evidence()
+        request, emitter, _stream_kwargs, prepare_context_fn = self._deep_request(
+            workset=workset,
+            content_blocks=list(blocks),
+            answer="unused",
+        )
+        events = []
+        emitter.llm_round_started.side_effect = lambda **_kwargs: events.append("started")
+        emitter.llm_round_first_output_delta.side_effect = lambda **_kwargs: events.append("first")
+        emitter.llm_round_completed.side_effect = lambda **_kwargs: events.append("completed")
+        now = [10.0]
+        observation = LLMRoundObservation(
+            metadata=RoundMetadata("conv", "run", 9, "step", "limit_summary", "model", "provider"),
+            litellm_model="test/model",
+            messages=[],
+            call_kwargs={},
+            clock=lambda: now[0],
+            token_estimator=lambda *_args, **_kwargs: 1,
+            context_window_resolver=lambda _model_id: (4096, "test", "known"),
+            run_context_in_thread=False,
+        )
+
+        async def response():
+            now[0] = 10.2
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content=None,
+                            reasoning_content=None,
+                            tool_calls=[
+                                SimpleNamespace(
+                                    index=0,
+                                    id="tool-1",
+                                    function=SimpleNamespace(name="web_search", arguments="{}"),
+                                )
+                            ],
+                        ),
+                        finish_reason="tool_calls",
+                    )
+                ],
+                usage=None,
+            )
+
+        request = replace(
+            request,
+            llm_call_fn=AsyncMock(return_value=response()),
+            stream_round_fn=partial(llm_stream_module.stream_round, model_id="model"),
+        )
+        with (
+            patch("app.services.stream.limit_summary.prepare_context", new=prepare_context_fn),
+            patch("app.services.stream.limit_summary._create_limit_summary_observation", return_value=observation),
+            patch("app.services.stream.llm_stream.check_lock_owner", new=AsyncMock(return_value=True)),
+        ):
+            result = await limit_summary_module.call_limit_summary_round(
+                request=request,
+                thinking_block_id="thinking",
+                text_block_id="text",
+                step_id="step",
+            )
+            await limit_summary_module._finish_summary_round_lifecycle(result, model_output_visible=False)
+
+        emitter.llm_round_first_output_delta.assert_awaited_once()
+        self.assertEqual(emitter.llm_round_first_output_delta.await_args.kwargs["delta_kind"], "tool_call")
+        self.assertEqual(emitter.llm_round_first_output_delta.await_args.kwargs["ttft_ms"], 200)
+        self.assertEqual(events, ["started", "first", "completed"])
+
+    async def test_post_stream_summary_context_error_and_cancel_close_round(self):
+        workset, blocks = _deep_summary_evidence()
+        for primary in (RuntimeError("final summary context failed"), asyncio.CancelledError()):
+            with self.subTest(primary=type(primary).__name__):
+                request, emitter, _stream_kwargs, prepare_context_fn = self._deep_request(
+                    workset=workset,
+                    content_blocks=list(blocks),
+                    answer="candidate",
+                )
+
+                def build_context(_plan, usage=None, **_kwargs):
+                    if usage is None:
+                        return ContextUsage(status="no_op")
+                    raise primary
+
+                with (
+                    patch("app.services.stream.limit_summary.prepare_context", new=prepare_context_fn),
+                    patch("app.services.stream.limit_summary.build_context_usage", side_effect=build_context),
+                ):
+                    with self.assertRaises(type(primary)) as raised:
+                        await limit_summary_module.call_limit_summary_round(
+                            request=request,
+                            thinking_block_id="thinking",
+                            text_block_id="text",
+                            step_id="step",
+                        )
+
+                self.assertIs(raised.exception, primary)
+                if isinstance(primary, asyncio.CancelledError):
+                    emitter.llm_round_cancelled.assert_awaited_once()
+                else:
+                    emitter.llm_round_failed.assert_awaited_once()
+
     async def test_streamed_plan_synthesis_with_late_tool_protocol_does_not_retry_or_bulk_append(self):
         events = []
         request, stream_kwargs, events, prepare_context_fn = self._plan_synthesis_request(
