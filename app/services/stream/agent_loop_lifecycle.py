@@ -83,8 +83,7 @@ async def run_agent_loop_lifecycle(
         primary_error = error
         await _finalize_cancelled(execution=execution, dependencies=dependencies)
         raise
-    except StreamOwnershipLostError as error:
-        primary_error = error
+    except StreamOwnershipLostError:
         # stop 接口或后续请求已经原子接管 Redis 终态时，后台任务可能先观察到
         # 写入权失效，再收到 asyncio cancellation。这属于正常中断，不应记为生成失败。
         await _finalize_cancelled(execution=execution, dependencies=dependencies)

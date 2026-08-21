@@ -645,6 +645,122 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         execution.emitter.seal_and_get_last_sequence.assert_awaited_once_with()
         execution.trajectory_recorder.finalize.assert_awaited_once_with(4)
 
+    async def _assert_ownership_lost_barrier_cancellation(self, *, cancel_count: int):
+        execution = self._execution()
+        barrier_entered = asyncio.Event()
+        release_barrier = asyncio.Event()
+        barrier_finished = asyncio.Event()
+
+        async def run_agent_loop_fn(**_kwargs):
+            raise StreamOwnershipLostError("external stop")
+
+        async def finalize(_expected_last_sequence):
+            barrier_entered.set()
+            await release_barrier.wait()
+            barrier_finished.set()
+
+        execution.emitter.seal_and_get_last_sequence = AsyncMock(return_value=8)
+        execution.trajectory_recorder.finalize = AsyncMock(side_effect=finalize)
+        task = asyncio.create_task(
+            run_agent_loop_lifecycle(
+                request=self._request(),
+                execution=execution,
+                dependencies=self._dependencies(run_agent_loop_fn=run_agent_loop_fn),
+            )
+        )
+        await asyncio.wait_for(barrier_entered.wait(), timeout=0.5)
+
+        for _ in range(cancel_count):
+            self.assertTrue(task.cancel())
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+
+        release_barrier.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=0.5)
+
+        self.assertTrue(task.cancelled())
+        self.assertEqual(task.cancelling(), 0)
+        self.assertTrue(barrier_finished.is_set())
+        execution.emitter.seal_and_get_last_sequence.assert_awaited_once_with()
+        execution.trajectory_recorder.finalize.assert_awaited_once_with(8)
+
+    async def test_ownership_lost_then_one_barrier_cancel_restores_cancelled_error(self):
+        await self._assert_ownership_lost_barrier_cancellation(cancel_count=1)
+
+    async def test_ownership_lost_then_two_barrier_cancels_restore_cancelled_error(self):
+        await self._assert_ownership_lost_barrier_cancellation(cancel_count=2)
+
+    async def test_business_error_stays_primary_when_cancel_arrives_during_barrier(self):
+        execution = self._execution()
+        primary_error = RuntimeError("primary failure")
+        barrier_entered = asyncio.Event()
+        release_barrier = asyncio.Event()
+
+        async def run_agent_loop_fn(**_kwargs):
+            raise primary_error
+
+        async def finalize(_expected_last_sequence):
+            barrier_entered.set()
+            await release_barrier.wait()
+
+        execution.emitter.seal_and_get_last_sequence = AsyncMock(return_value=9)
+        execution.trajectory_recorder.finalize = AsyncMock(side_effect=finalize)
+        task = asyncio.create_task(
+            run_agent_loop_lifecycle(
+                request=self._request(),
+                execution=execution,
+                dependencies=self._dependencies(run_agent_loop_fn=run_agent_loop_fn),
+            )
+        )
+        await asyncio.wait_for(barrier_entered.wait(), timeout=0.5)
+
+        self.assertTrue(task.cancel())
+        await asyncio.sleep(0)
+        release_barrier.set()
+        with self.assertRaises(RuntimeError) as raised:
+            await asyncio.wait_for(task, timeout=0.5)
+
+        self.assertIs(raised.exception, primary_error)
+        self.assertFalse(task.cancelled())
+        self.assertEqual(task.cancelling(), 0)
+
+    async def test_fallback_error_stays_primary_when_cancel_arrives_during_barrier(self):
+        execution = self._execution()
+        fallback_error = RuntimeError("fallback failure")
+        barrier_entered = asyncio.Event()
+        release_barrier = asyncio.Event()
+
+        async def write_fallback_run_error_fn(**_kwargs):
+            raise fallback_error
+
+        async def finalize(_expected_last_sequence):
+            barrier_entered.set()
+            await release_barrier.wait()
+
+        execution.emitter.seal_and_get_last_sequence = AsyncMock(return_value=10)
+        execution.trajectory_recorder.finalize = AsyncMock(side_effect=finalize)
+        task = asyncio.create_task(
+            run_agent_loop_lifecycle(
+                request=self._request(),
+                execution=execution,
+                dependencies=self._dependencies(
+                    write_fallback_run_error_fn=write_fallback_run_error_fn,
+                ),
+            )
+        )
+        await asyncio.wait_for(barrier_entered.wait(), timeout=0.5)
+
+        self.assertTrue(task.cancel())
+        await asyncio.sleep(0)
+        release_barrier.set()
+        with self.assertRaises(RuntimeError) as raised:
+            await asyncio.wait_for(task, timeout=0.5)
+
+        self.assertIs(raised.exception, fallback_error)
+        self.assertFalse(task.cancelled())
+        self.assertEqual(task.cancelling(), 0)
+
     async def test_repeated_barrier_entry_never_seals_or_finalizes_twice(self):
         execution = self._execution()
         execution.emitter.seal_and_get_last_sequence = AsyncMock(return_value=5)
