@@ -71,6 +71,8 @@ services:
       - MINIMAX_API_KEY=${MINIMAX_API_KEY:-}
       - LITELLM_PROXY_URL=${LITELLM_PROXY_URL:-http://litellm-proxy:4000}
       - LITELLM_API_KEY=${LITELLM_API_KEY:-}
+      # 全模型 /health 探测默认关闭（每模型真实 completion 产生费用），详见 docs/LITELLM_HEALTH.md
+      - LITELLM_HEALTH_ENABLED=${LITELLM_HEALTH_ENABLED:-false}
       - LITELLM_GOVERNANCE_ROOT=/var/lib/fusion/litellm-governance
       - LITELLM_GOVERNANCE_MAX_AGE_SECONDS=${LITELLM_GOVERNANCE_MAX_AGE_SECONDS:-86400}
       - LITELLM_MODEL_MANAGEMENT_ENABLED=${LITELLM_MODEL_MANAGEMENT_ENABLED:-false}
