@@ -34,6 +34,10 @@ _DEFAULT_SESSION_FACTORY: Callable[[], Any] | None = None
 _T = TypeVar("_T")
 
 
+class _TerminalOutcomeUnknownError(RuntimeError):
+    """终态 commit 与后续对账均失败，持久化结果不可判定。"""
+
+
 @dataclass(frozen=True)
 class _FinalizeHandshake:
     assessment_future: asyncio.Future[bool]
@@ -96,6 +100,8 @@ class TrajectoryRecorder:
         self._degraded_reason: str | None = None
         self._finalize_started = False
         self._latch_sealed = False
+        self._terminal_transition_finished = False
+        self._terminal_outcome_unknown = False
         self._active_records = 0
         self._record_drain_waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]] = []
 
@@ -146,11 +152,19 @@ class TrajectoryRecorder:
                 self._degraded_reason = reason
             return True
 
-    def _force_terminal_failure_latch(self) -> None:
-        """终态事务失败时保留内存证据；此时数据库仍是 recording。"""
+    def _force_terminal_failure_latch(self, reason: str = "write_failed") -> bool:
+        """终态完成线性化前保留失败证据，完成后拒绝制造 latch 冲突。"""
         with self._state_lock:
+            if self._terminal_transition_finished:
+                return False
             if self._degraded_reason is None:
-                self._degraded_reason = "write_failed"
+                self._degraded_reason = reason
+            return True
+
+    def _mark_terminal_outcome_unknown(self) -> None:
+        with self._state_lock:
+            self._terminal_outcome_unknown = True
+            self._terminal_transition_finished = True
 
     def _try_admit_record(self) -> bool:
         with self._state_lock:
@@ -290,11 +304,18 @@ class TrajectoryRecorder:
             self._mark_degraded("finalize_mismatch")
         handshake.acknowledgement.set()
         try:
-            await asyncio.shield(worker_future)
+            await asyncio.wait_for(
+                asyncio.shield(worker_future),
+                timeout=TRAJECTORY_WAIT_TIMEOUT_SECONDS,
+            )
         except asyncio.CancelledError:
-            self._mark_degraded("recorder_cancelled")
+            self._force_terminal_failure_latch("recorder_cancelled")
             self._consume_late(worker_future)
             raise
+        except asyncio.TimeoutError:
+            self._force_terminal_failure_latch("recorder_timeout")
+            self._consume_late(worker_future)
+            return
         except Exception as error:  # noqa: BLE001 — auxiliary sink 必须 fail-open
             self._log_failure("轨迹账本终态写入失败", error)
 
@@ -328,6 +349,21 @@ class TrajectoryRecorder:
                 assessment_complete=assessment_complete,
                 degraded_reason=latched_reason,
             )
+            while True:
+                with self._state_lock:
+                    final_latched_reason = self._degraded_reason
+                    if terminal_status != "complete" or final_latched_reason is None:
+                        self._terminal_transition_finished = True
+                        break
+                terminal_status = self._write_terminal_transaction(
+                    expected_last_sequence=handshake.expected_last_sequence,
+                    assessment_complete=False,
+                    degraded_reason=final_latched_reason,
+                    allow_complete_correction=True,
+                )
+        except _TerminalOutcomeUnknownError:
+            self._mark_terminal_outcome_unknown()
+            raise
         except BaseException:
             self._force_terminal_failure_latch()
             raise
@@ -452,10 +488,14 @@ class TrajectoryRecorder:
         expected_last_sequence: int,
         assessment_complete: bool,
         degraded_reason: str | None,
+        allow_complete_correction: bool = False,
     ) -> str:
-        """从 recording 单次转换终态；提交失败由 rollback 保持协调器可达。"""
+        """幂等转换终态；commit 结果不确定时用新 Session 对账。"""
         now = datetime.now(UTC)
         session = self._session_factory()
+        terminal_status: str
+        reason: str | None
+        operation_error: BaseException | None = None
         try:
             if assessment_complete and degraded_reason is None:
                 statement = (
@@ -472,12 +512,19 @@ class TrajectoryRecorder:
                     )
                 )
                 terminal_status = "complete"
+                reason = None
             else:
                 reason = degraded_reason or "finalize_mismatch"
+                eligible_status = (
+                    RunTrajectoryMeta.trajectory_status.in_(("recording", "complete"))
+                    if allow_complete_correction
+                    else RunTrajectoryMeta.trajectory_status == "recording"
+                )
                 statement = (
                     update(RunTrajectoryMeta)
                     .where(RunTrajectoryMeta.run_id == self.run_id)
-                    .where(RunTrajectoryMeta.trajectory_status == "recording")
+                    .where(eligible_status)
+                    .where(RunTrajectoryMeta.expected_last_sequence == expected_last_sequence)
                     .values(
                         trajectory_status="degraded",
                         expected_last_sequence=expected_last_sequence,
@@ -490,11 +537,66 @@ class TrajectoryRecorder:
             session.execute(statement)
             session.commit()
             return terminal_status
-        except BaseException:
-            session.rollback()
-            raise
+        except BaseException as error:
+            operation_error = error
+            try:
+                session.rollback()
+            except BaseException:
+                pass
         finally:
             session.close()
+
+        persisted = self._terminal_intent_is_persisted(
+            expected_last_sequence=expected_last_sequence,
+            terminal_status=terminal_status,
+            degraded_reason=reason,
+        )
+        if persisted is True:
+            return terminal_status
+        if persisted is None:
+            raise _TerminalOutcomeUnknownError("终态 commit 与对账结果均未知") from operation_error
+        if operation_error is None:  # pragma: no cover - try 分支已直接返回
+            raise RuntimeError("终态事务缺少执行结果")
+        raise operation_error
+
+    def _terminal_intent_is_persisted(
+        self,
+        *,
+        expected_last_sequence: int,
+        terminal_status: str,
+        degraded_reason: str | None,
+    ) -> bool | None:
+        """用独立短 Session 判定 commit 响应丢失后的真实持久化结果。"""
+        try:
+            session = self._session_factory()
+        except BaseException:
+            return None
+        try:
+            row = session.execute(
+                select(
+                    RunTrajectoryMeta.trajectory_status,
+                    RunTrajectoryMeta.expected_last_sequence,
+                    RunTrajectoryMeta.finalized_at,
+                    RunTrajectoryMeta.degraded_reason,
+                ).where(RunTrajectoryMeta.run_id == self.run_id)
+            ).one_or_none()
+        except BaseException:
+            return None
+        finally:
+            session.close()
+        if row is None or row.expected_last_sequence != expected_last_sequence:
+            return False
+        if terminal_status == "complete":
+            return (
+                row.trajectory_status == "complete"
+                and row.finalized_at is not None
+                and row.degraded_reason is None
+            )
+        return (
+            row.trajectory_status == "degraded"
+            and row.finalized_at is None
+            and row.degraded_reason == degraded_reason
+        )
 
     def _insert_meta_if_missing(self, session: Any, *, now: datetime) -> None:
         statement = self._insert_do_nothing(

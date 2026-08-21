@@ -495,6 +495,164 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
             [context for context in loop_errors if "never retrieved" in context.get("message", "").lower()]
         )
 
+    async def test_terminal_commit_response_loss_reconciles_complete_without_false_latch(self):
+        commit_persisted = threading.Event()
+        factory_calls = 0
+
+        class CommitThenLoseResponseSession(SqlAlchemySession):
+            def commit(self):
+                super().commit()
+                commit_persisted.set()
+                raise RuntimeError("终态 commit 响应丢失")
+
+        response_loss_factory = sessionmaker(
+            bind=self.engine,
+            class_=CommitThenLoseResponseSession,
+            expire_on_commit=False,
+        )
+
+        def session_factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            return response_loss_factory() if factory_calls == 3 else self.Session()
+
+        recorder = self._recorder(session_factory=session_factory)
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+
+        await recorder.finalize(0)
+
+        self.assertTrue(commit_persisted.is_set())
+        self.assertIsNone(recorder.degraded_reason)
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "complete")
+            self.assertEqual(meta.expected_last_sequence, 0)
+            self.assertIsNotNone(meta.finalized_at)
+            self.assertIsNone(meta.degraded_reason)
+
+    async def test_terminal_commit_and_reconciliation_failure_stays_unknown_without_false_latch(self):
+        commit_persisted = threading.Event()
+        reconciliation_attempted = threading.Event()
+        factory_calls = 0
+
+        class CommitThenLoseResponseSession(SqlAlchemySession):
+            def commit(self):
+                super().commit()
+                commit_persisted.set()
+                raise RuntimeError("终态 commit 响应丢失")
+
+        class FailingReconciliationSession(SqlAlchemySession):
+            def execute(self, *args, **kwargs):
+                reconciliation_attempted.set()
+                raise RuntimeError("终态对账查询失败")
+
+        response_loss_factory = sessionmaker(
+            bind=self.engine,
+            class_=CommitThenLoseResponseSession,
+            expire_on_commit=False,
+        )
+        failing_reconciliation_factory = sessionmaker(
+            bind=self.engine,
+            class_=FailingReconciliationSession,
+            expire_on_commit=False,
+        )
+
+        def session_factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            if factory_calls == 3:
+                return response_loss_factory()
+            if factory_calls == 4:
+                return failing_reconciliation_factory()
+            return self.Session()
+
+        recorder = self._recorder(session_factory=session_factory)
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+
+        await recorder.finalize(0)
+
+        self.assertTrue(commit_persisted.is_set())
+        self.assertTrue(reconciliation_attempted.is_set())
+        self.assertIsNone(recorder.degraded_reason)
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "complete")
+            self.assertEqual(meta.expected_last_sequence, 0)
+            self.assertIsNotNone(meta.finalized_at)
+            self.assertIsNone(meta.degraded_reason)
+
+    async def test_terminal_wait_timeout_returns_bounded_and_late_worker_converges_degraded(self):
+        terminal_commit_started = threading.Event()
+        release_terminal_commit = threading.Event()
+        terminal_worker_finished = threading.Event()
+        factory_calls = 0
+        worker_calls = 0
+        semaphore = threading.BoundedSemaphore(4)
+
+        class BlockingTerminalSession(SqlAlchemySession):
+            def commit(self):
+                terminal_commit_started.set()
+                release_terminal_commit.wait(timeout=2)
+                super().commit()
+
+        blocking_factory = sessionmaker(
+            bind=self.engine,
+            class_=BlockingTerminalSession,
+            expire_on_commit=False,
+        )
+
+        def session_factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            return blocking_factory() if factory_calls == 3 else self.Session()
+
+        def controlled_worker(operation):
+            nonlocal worker_calls
+            worker_calls += 1
+            call_index = worker_calls
+            try:
+                return operation()
+            finally:
+                if call_index == 2:
+                    terminal_worker_finished.set()
+
+        recorder = self._recorder(
+            session_factory=session_factory,
+            worker=controlled_worker,
+            semaphore=semaphore,
+        )
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+        finalize_task = asyncio.create_task(recorder.finalize(0))
+        self.assertTrue(await asyncio.to_thread(terminal_commit_started.wait, 1))
+
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(finalize_task),
+                timeout=TRAJECTORY_WAIT_TIMEOUT_SECONDS * 3,
+            )
+        except BaseException:
+            release_terminal_commit.set()
+            await finalize_task
+            raise
+
+        self.assertEqual(recorder.degraded_reason, "recorder_timeout")
+        self.assertFalse(terminal_worker_finished.is_set())
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "recording")
+            self.assertEqual(meta.expected_last_sequence, 0)
+            self.assertIsNone(meta.finalized_at)
+
+        release_terminal_commit.set()
+        self.assertTrue(await asyncio.to_thread(terminal_worker_finished.wait, 1))
+        await asyncio.sleep(0)
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "degraded")
+            self.assertEqual(meta.degraded_reason, "recorder_timeout")
+            self.assertIsNone(meta.finalized_at)
+        _assert_all_permits_available(self, semaphore)
+
     async def test_finalize_start_closes_record_admission_before_assessment(self):
         finalize_started = threading.Event()
         release_finalize = threading.Event()
