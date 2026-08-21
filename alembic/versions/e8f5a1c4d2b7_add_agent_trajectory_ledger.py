@@ -100,10 +100,20 @@ def upgrade() -> None:
         sa.Column("last_event_ts", sa.DateTime(timezone=True), nullable=True),
         sa.Column("finalized_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("degraded_reason", sa.Text(), nullable=True),
+        sa.Column("terminal_intent_status", sa.String(), nullable=True),
+        sa.Column("terminal_intent_reason", sa.Text(), nullable=True),
+        sa.Column("terminal_intent_version", sa.Integer(), nullable=True),
+        sa.Column("terminal_intent_pending_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.ForeignKeyConstraint(["conversation_id"], ["conversations.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["run_id"], ["agent_sessions.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("run_id"),
+    )
+    op.create_index(
+        "ix_run_trajectory_meta_terminal_intent_pending",
+        "run_trajectory_meta",
+        ["trajectory_status", "terminal_intent_pending_at"],
+        postgresql_where=sa.text("terminal_intent_pending_at IS NOT NULL"),
     )
 
     op.create_table(

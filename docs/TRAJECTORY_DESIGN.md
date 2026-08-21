@@ -1,6 +1,6 @@
 # Fusion Trajectory 集成设计（DSH 风格 Agent 执行轨迹）
 
-> 状态：设计稿 v0.11（终审通过；P0 实施预检补充稳定 turn 分组键）
+> 状态：设计稿 v0.12（P0 实施审查补充可崩溃恢复的终态 reconciliation intent）
 > 范围：fusion-api + fusion-ui 集成 Agent 执行轨迹展示；langchain-trajectory-mvp 降级为原型实验室与联调夹具。
 > 本文档是实施 P0 的正式依据；P0 已在独立实施分支开始，P1–P3 不在本轮范围内。
 >
@@ -324,8 +324,15 @@ CREATE TABLE run_trajectory_meta (
     last_event_ts           TIMESTAMPTZ,
     finalized_at            TIMESTAMPTZ,    -- 仅 complete 时有值
     degraded_reason         TEXT,           -- 仅 degraded 时有值
+    terminal_intent_status  TEXT,           -- pending 目标：'complete' | 'degraded'
+    terminal_intent_reason  TEXT,           -- pending degraded 的首次原因
+    terminal_intent_version INTEGER,        -- 当前协议为 1；四列清空表示已 ack
+    terminal_intent_pending_at TIMESTAMPTZ,  -- 非空表示终态仍待确认/协调
     updated_at              TIMESTAMPTZ NOT NULL
 );
+CREATE INDEX ix_run_trajectory_meta_terminal_intent_pending
+    ON run_trajectory_meta (trajectory_status, terminal_intent_pending_at)
+    WHERE terminal_intent_pending_at IS NOT NULL;
 
 CREATE TABLE trajectory_ledger_settings (
     singleton_key           TEXT PRIMARY KEY,          -- 固定为 'default'
@@ -339,11 +346,11 @@ CREATE TABLE trajectory_ledger_settings (
 | 状态 | 含义 | 进入条件 |
 |---|---|---|
 | `recording` | 账本写入中 | run 开始记录事件 |
-| `complete` | 账本完整 | **显式 seal + finalize 成功**：degraded latch 未置位 **且** 数据库校验 `COUNT = expected+1 ∧ MIN(sequence)=0 ∧ MAX(sequence)=expected`（§5.2），且 `finalized_at` 落库 |
+| `complete` | 账本完整 | **显式 seal + finalize 成功**：degraded latch 未置位 **且** 数据库校验 `COUNT = expected+1 ∧ MIN(sequence)=0 ∧ MAX(sequence)=expected`（§5.2），`finalized_at` 落库，且 `terminal_intent_pending_at IS NULL`；`complete + pending` 只是待协调的暂存终态，不得对外宣称完整 |
 | `degraded` | 观测缺失 | **latch 置位（含取消/迟到事务场景）** / 任意落账失败 / 超时熔断 / 准入满载 / stale 协调发现缺尾部事件 / 新 run 缺 meta（`meta_missing`） |
 | `legacy` | 账本建立前的历史 run | `run.created_at < ledger_enabled_at` 且无 meta（**仅此一种判据**，见 §5.3） |
 
-**只有显式 seal/finalize 成功才能进入 complete，且 latch 置位时 finalize 一律落 degraded**（§5.2）；stale recording 无持久化 `expected_last_sequence` 时只能保守标 `degraded`，不得猜测 complete。
+**只有显式 seal/finalize 成功且 terminal intent 已独立 ack 才能确认 complete，且 latch 置位时 finalize 一律落 degraded**（§5.2）；stale recording 无持久化 `expected_last_sequence` 时只能保守标 `degraded`，不得猜测 complete。`recording|complete + terminal_intent_pending_at` 都是 Task 6 必须扫描的未确认状态。
 
 ### 4.3 保留策略（P0 范围决策）
 
@@ -464,21 +471,33 @@ async def seal_and_get_last_sequence() -> int
   1. 所有同步辅助事件（含 `suggested_questions_pending`）发出完毕；
   2. `last_seq = await emitter.seal_and_get_last_sequence()`；
   3. `await trajectory_recorder.finalize(last_seq)`。
-- **finalize 的数据库校验（latch 优先，再验三断言）**：
+- **finalize 的数据库校验与 durable intent（latch 优先，再验三断言）**：
 
 ```text
-if recorder.degraded_latch(run_id):              # ← 第一步：latch 优先，终审定稿
-    trajectory_status = 'degraded'
-    degraded_reason = latch 原因（如 recorder_cancelled / recorder_timeout / admission_full / write_failed）
-    return  # 禁止进入 complete，即使 COUNT/MIN/MAX 重新满足
+独立事务 A（assessment 前必须明确 commit）：
+  UPSERT meta(recording)
+  SET expected_last_sequence = :expected,
+      terminal_intent_status = degraded（已有 latch）否则 complete,
+      terminal_intent_reason = 首次 latch 原因或 NULL,
+      terminal_intent_version = 1,
+      terminal_intent_pending_at = now
 
 SELECT COUNT(*), MIN(sequence), MAX(sequence) FROM agent_events WHERE run_id = :run_id
 断言：COUNT(*) = expected_last_sequence + 1
       MIN(sequence) = 0
       MAX(sequence) = expected_last_sequence
-通过 → trajectory_status = 'complete'，finalized_at = now
-不通过 → trajectory_status = 'degraded'，degraded_reason = 'finalize_mismatch'
+assessment/事件 latch、timeout、cancel、unknown：
+  用新的独立事务把 pending target 单调升级为 degraded（首次原因不可覆盖）
+
+风险终态事务 B（禁止清 intent）：
+  通过且无 latch → recording 条件更新为 complete，finalized_at = now
+  否则 → recording（或同 expected 的待纠正 complete）条件更新为 degraded
+
+只有 worker 明确确认事务 B 的真实结果并在线程锁内封住后到 latch 后：
+  独立幂等事务 C 清除四个 terminal_intent_* 字段（terminal ack）
 ```
+
+事务 A、B、C 必须分别使用独立短 Session。B 的 commit 响应丢失时只允许用新 Session 对账或有限幂等重试；**B 绝不得顺带清 intent**。C 失败、响应丢失或对账失败时保留 pending；宁可由 Task 6 保守降级，也不得把未确认的 `complete + pending` 当作权威 complete。终态结果仍 unknown 时不得封住 terminal timeout/cancel：后到原因可继续把 pending 单调升级为 degraded。
 
 > **迟到事务竞态**：最后一条事件（含终态辅助事件）落账超时后，迟到事务可能随后成功提交，使三断言重新满足——**只要 latch 曾置位（含取消），本次 run 只能落为 `degraded`**。需增加「最后一条事件迟到提交」与「取消后 sequence 不复用」的竞态测试（§9.2）。
 
@@ -490,7 +509,7 @@ SELECT COUNT(*), MIN(sequence), MAX(sequence) FROM agent_events WHERE run_id = :
 事件 INSERT 因 Postgres 不可用失败时，随后更新 meta 也可能失败——「失败必然可见」不能依赖同一次 DB 写。因此：
 
 1. **内存降级 latch**：Recorder 进程内维护 per-run degraded 标记；首次落账失败/超时/准入失败/取消置位（§5.1），后续事件跳过落账（不重复报错），并在 DB 恢复后重试写 meta（幂等）。**迟到事务不得反转 latch**（§5.1、§5.2）。
-2. **stale-recording 协调任务**：周期性扫描 `recording` 状态、但对应 run 已不在运行/已终态的 meta；按 run 实际终态收敛——latch 未置位且 `expected_last_sequence` 已持久化且数据库校验通过（§5.2 三断言）→ `complete`；否则 → `degraded`（含进程崩溃丢失内存队列的场景）。
+2. **stale/pending 协调任务**：周期性扫描 run 已不在运行/已终态且满足以下任一条件的 meta：普通 stale `recording`，或 `trajectory_status IN ('recording', 'complete') AND terminal_intent_pending_at IS NOT NULL`。无 pending 的普通 stale recording 仍按 `expected_last_sequence +` §5.2 三断言判定；**任何遗留 pending 都表示 Recorder 未明确 ack，Task 6 必须保守收敛为 degraded**（pending target/reason 用于幂等纠偏与审计；缺 reason 时使用终态结果未知的保守原因），再清除 intent。这样即使 B 实际 complete、响应丢失、对账失败后进程崩溃，也不会留下不可达的假 complete。
 3. **legacy 判定唯一判据**：
    - `run.created_at < ledger_enabled_at`（迁移持久化的各环境启用时间，§4.4）且无 meta → `legacy/not_recorded`（账本上线前，正常）；
    - `run.created_at >= ledger_enabled_at` 且无 meta → `degraded/meta_missing`（数据库故障被显式暴露，**不得伪装成历史运行**）。
@@ -596,6 +615,7 @@ P0 验收不依赖 P2（MVP Adapter 联调属 P2 验收）。
 - **seal + finalize 语义**：`seal_and_get_last_sequence()` 在同一把锁内封口并返回 `_sequence - 1`；finalize 在**所有同步辅助事件（含 `suggested_questions_pending`）之后**执行；`run_completed` 不触发 finalize；seal 后任何 emit 必须抛错。
 - **finalize 三断言 + latch 优先**：finalize 先查 degraded latch，置位（含取消 `recorder_cancelled`）则一律落 `degraded`（即使三断言满足）；未置位才验 `COUNT = expected+1 ∧ MIN(sequence)=0 ∧ MAX(sequence)=expected`（§5.2）——两条路径都有单测。
 - **迟到事务竞态**：「最后一条事件落账超时 → 迟到提交成功 → 三断言满足」仍必须 `degraded`（latch 权威性）有专门竞态测试。
+- **durable terminal intent**：assessment 前独立提交 `expected + pending(v1)`；风险终态事务不清 intent；正常 complete 仅在独立 ack 后清 intent。覆盖 terminal commit 响应丢失 + 首次/持续对账失败、unknown 后 cancel、ack 提交失败与进程崩溃前 DB 状态；断言 Task 6 可扫描 `recording|complete + pending`，permit 最终守恒。
 - **取消路径竞态**：worker 运行中 / 尚未启动时取消——permit 最终守恒（无泄漏）、迟到异常被消费、latch 保持 degraded、finalize 不得 complete、**sequence 不重复**（有专门竞态测试）。
 - **原子事务**：事件 INSERT 与 meta 计数同事务（§5.1）有故障注入测试——INSERT 成功后 commit 前失败，必须整体回滚，不得出现「有事件无计数」。
 - **超时熔断 + permit 生命周期**：`BoundedSemaphore(4)` 非阻塞准入——满载直接 fail-open（有测试：sem 满时新事件不排队、置 degraded）；`wait_for(250ms)` 在 DB 挂起时真正超时（非假超时）；**「任务尚未开始执行便超时」不得泄漏 permit**（有测试：连续 N 次超时后 semaphore 仍可继续 acquire，permit 数守恒）；`shield` 保证超时不取消底层任务；迟到任务异常被消费（无 never-retrieved 告警）；psycopg2 `connect_timeout` 整数秒限制已说明（500ms 不可配，主隔离靠 wait_for+闸门）。
@@ -618,7 +638,7 @@ P0 验收不依赖 P2（MVP Adapter 联调属 P2 验收）。
 
 | 阶段 | 交付物 | 退出标准 |
 |---|---|---|
-| P0 | 协议升级（schema_version + 新增生命周期事件含 `first_output_delta` 双分支语义、`retrieval_cancelled`、cache token 提取）；`agent_events` + `run_trajectory_meta`（FK、expected/finalized、latch 优先）；**AgentSession 迁移与回填（§4.4）**；`TrajectoryRecorder`（独立 Session + 原子事务 + **BoundedSemaphore 准入 + wait_for/shield/CancelledError/DB 超时熔断 + permit 生命周期四规则** + seal/finalize 三断言 + latch 优先）；emitter `seal_and_get_last_sequence`；`turn_message_id/previous_run_id/attempt_index`（稳定 turn 分组 + 两阶段兼容 + 并发分配）；落库 allowlist 脱敏；保留策略 = 级联删除（无独立 TTL） | §9 验收全绿（同步 v1 有界回归在阈值内；超阈值按 §5.4 切换）；不含 P2 依赖 |
+| P0 | 协议升级（schema_version + 新增生命周期事件含 `first_output_delta` 双分支语义、`retrieval_cancelled`、cache token 提取）；`agent_events` + `run_trajectory_meta`（FK、expected/finalized、latch 优先、**durable terminal intent + pending 扫描索引**）；**AgentSession 迁移与回填（§4.4）**；`TrajectoryRecorder`（独立 Session + 原子事务 + **BoundedSemaphore 准入 + wait_for/shield/CancelledError/DB 超时熔断 + permit 生命周期四规则** + seal/finalize 三断言 + latch 优先 + 独立 terminal ack）；emitter `seal_and_get_last_sequence`；`turn_message_id/previous_run_id/attempt_index`（稳定 turn 分组 + 两阶段兼容 + 并发分配）；落库 allowlist 脱敏；保留策略 = 级联删除（无独立 TTL） | §9 验收全绿（同步 v1 有界回归在阈值内；超阈值按 §5.4 切换）；不含 P2 依赖 |
 | P1 | `TrajectoryProjector`（orphan 收口 + `terminal_source` + 截断保护）；快照 API（用户/管理员端点分离、越权 404、`truncated` 语义）；**仅历史快照，不声称实时** | 真实数据可回放、可钻取、degraded/legacy/truncated 明示 |
 | P2 | MVP 侧 `FusionTrajectoryAdapter`（不污染 fusion 正式 API）；真实数据联调 | 协议与交互模型在 MVP 上钉死 |
 | P3 | fusion-ui 轨迹侧栏（账本 + 时间线 + 检查器 + 双向定位）+ 受控事件回调通道 + 运行中实时归并 | 与 DSH 轨迹对标的功能验收 |
@@ -630,6 +650,7 @@ P0 验收不依赖 P2（MVP Adapter 联调属 P2 验收）。
 - [ ] **超时熔断可执行 + permit 无泄漏**：`BoundedSemaphore(4)` 非阻塞准入（满载 fail-open、不排队）；`wait_for(asyncio.shield(future))`——超时不取消底层任务；submit 失败立即释放；worker `finally` 释放；迟到异常被消费；「任务未开始便超时」不泄漏 permit（permit 守恒测试）。
 - [ ] **`CancelledError` 分支**：捕获置 degraded（`recorder_cancelled`）→ 消费迟到 future → **re-raise**（不吞取消）；取消后已分配 sequence 不复用；「worker 运行中/未启动时取消」竞态测试覆盖 permit 守恒、latch 保持 degraded、finalize 不得 complete、sequence 不重复。
 - [ ] **finalize latch 优先**：latch 置位（含取消）→ 一律 degraded（即使三断言满足）；「最后一条事件迟到提交」竞态测试存在。
+- [ ] **durable terminal intent**：assessment 前独立提交 expected + pending；风险 terminal commit 不清 intent；明确终态后才独立 ack；commit/ack 结果未知或进程崩溃后，Task 6 可扫描 recording|complete pending 并保守收敛，unknown 不吞后到 timeout/cancel。
 - [ ] **sequence 在第一次可取消 await 前预留**：校验完成后、await writer 前递增；取消的 emit 消耗序号形成空洞（degraded）而非复用；complete 严格 `0..N-1` 连续、degraded 单调唯一允许空洞——两侧语义有测试。
 - [ ] `seal_and_get_last_sequence` 与 emit 互斥（同一把锁）；seal 后 emit 抛错有测试；取消路径 shield 有测试。
 - [ ] finalize 调用点在**所有同步辅助事件之后**；`run_completed` 不触发 finalize；finalize 三断言有单测。
@@ -641,7 +662,7 @@ P0 验收不依赖 P2（MVP Adapter 联调属 P2 验收）。
 - [ ] 落库 allowlist 是单点强制；新事件天然用户安全；管理员端点固定 `/api/admin/audit/.../trajectory` 接入访问审计；普通端点越权 404、不按角色切换内容。
 - [ ] `turn_message_id/previous_run_id/attempt_index` 四场景全覆盖 + 两阶段兼容（阶段 A 缺省时 FOR UPDATE 内解析 + 兼容指标；阶段 B 收紧）；部分唯一约束 + 并发分配有测试。
 - [ ] 迁移回填：历史 `turn_message_id = message_id`，row_number 按 `(turn_message_id, created_at, id)`、`message_id=NULL` 行处理、历史跨 assistant lineage 不伪造、`ledger_enabled_at` 由迁移持久化。
-- [ ] P0 无独立 TTL；级联删除无孤儿；`expected_last_sequence / finalized_at` 持久化完整。
+- [ ] P0 无独立 TTL；级联删除无孤儿；`expected_last_sequence / finalized_at / terminal_intent_*` 持久化完整。
 - [ ] `MAX_TRAJECTORY_EVENTS_PER_RUN` 截断保护：`truncated=true`，截断数据不生成看似完整的 span。
 - [ ] `schema_version` 缺失兼容；部署窗口无破坏。
 - [ ] 快照 API 的 O(n) 投影在长会话下可接受；有上限保护。

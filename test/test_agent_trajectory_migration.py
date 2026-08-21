@@ -91,6 +91,38 @@ class AgentTrajectoryMigrationTests(unittest.TestCase):
         settings_columns = {
             item.name: item for item in tables["trajectory_ledger_settings"] if isinstance(item, sa.Column)
         }
+        meta_columns = {
+            item.name: item for item in tables["run_trajectory_meta"] if isinstance(item, sa.Column)
+        }
+        self.assertEqual(
+            {
+                name
+                for name in meta_columns
+                if name.startswith("terminal_intent_")
+            },
+            {
+                "terminal_intent_status",
+                "terminal_intent_reason",
+                "terminal_intent_version",
+                "terminal_intent_pending_at",
+            },
+        )
+        self.assertTrue(all(meta_columns[name].nullable for name in meta_columns if name.startswith("terminal_intent_")))
+        self.assertIsInstance(meta_columns["terminal_intent_pending_at"].type, sa.DateTime)
+        self.assertTrue(meta_columns["terminal_intent_pending_at"].type.timezone)
+        pending_index_call = next(
+            call
+            for call in operation.create_index.call_args_list
+            if call.args[0] == "ix_run_trajectory_meta_terminal_intent_pending"
+        )
+        self.assertEqual(
+            pending_index_call.args[1:],
+            ("run_trajectory_meta", ["trajectory_status", "terminal_intent_pending_at"]),
+        )
+        self.assertEqual(
+            str(pending_index_call.kwargs["postgresql_where"]),
+            "terminal_intent_pending_at IS NOT NULL",
+        )
         self.assertIsInstance(settings_columns["ledger_enabled_at"].type, sa.DateTime)
         self.assertTrue(settings_columns["ledger_enabled_at"].type.timezone)
         executed_sql = "\n".join(str(call.args[0]) for call in operation.execute.call_args_list)
@@ -122,6 +154,23 @@ class AgentTrajectoryModelContractTests(unittest.TestCase):
             {"uq_agent_events_run_sequence"},
         )
         self.assertEqual(RunTrajectoryMeta.__table__.c.run_id.foreign_keys.pop().ondelete, "CASCADE")
+        self.assertTrue(RunTrajectoryMeta.__table__.c.terminal_intent_status.nullable)
+        self.assertTrue(RunTrajectoryMeta.__table__.c.terminal_intent_reason.nullable)
+        self.assertTrue(RunTrajectoryMeta.__table__.c.terminal_intent_version.nullable)
+        self.assertTrue(RunTrajectoryMeta.__table__.c.terminal_intent_pending_at.nullable)
+        pending_index = next(
+            index
+            for index in RunTrajectoryMeta.__table__.indexes
+            if index.name == "ix_run_trajectory_meta_terminal_intent_pending"
+        )
+        self.assertEqual(
+            [column.name for column in pending_index.columns],
+            ["trajectory_status", "terminal_intent_pending_at"],
+        )
+        self.assertEqual(
+            str(pending_index.dialect_options["postgresql"]["where"]),
+            "terminal_intent_pending_at IS NOT NULL",
+        )
         self.assertFalse(TrajectoryLedgerSettings.__table__.c.ledger_enabled_at.nullable)
 
         attempt_index = next(index for index in AgentSession.__table__.indexes if index.name == "uq_agent_sessions_turn_attempt")

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, TypeVar
 
-from sqlalchemy import create_engine, func, select, update
+from sqlalchemy import create_engine, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import sessionmaker
@@ -26,6 +26,7 @@ TRAJECTORY_STATEMENT_TIMEOUT_MS = 200
 TRAJECTORY_LOCK_TIMEOUT_MS = 100
 TRAJECTORY_CONNECT_TIMEOUT_SECONDS = 1
 TRAJECTORY_TERMINAL_RECONCILIATION_ATTEMPTS = 2
+TRAJECTORY_TERMINAL_INTENT_VERSION = 1
 
 _EXECUTOR = ThreadPoolExecutor(max_workers=TRAJECTORY_MAX_WORKERS, thread_name_prefix="trajectory-recorder")
 _ADMISSION_SEMAPHORE = threading.BoundedSemaphore(TRAJECTORY_MAX_WORKERS)
@@ -329,10 +330,15 @@ class TrajectoryRecorder:
             self._mark_degraded("finalize_mismatch")
         handshake.acknowledgement.set()
         try:
-            await asyncio.wait_for(
+            terminal_status = await asyncio.wait_for(
                 asyncio.shield(worker_future),
                 timeout=TRAJECTORY_WAIT_TIMEOUT_SECONDS,
             )
+            if terminal_status == "unknown":
+                self._force_terminal_failure_latch(
+                    "write_failed",
+                    expected_last_sequence=expected_last_sequence,
+                )
         except asyncio.CancelledError:
             self._force_terminal_failure_latch(
                 "recorder_cancelled",
@@ -359,7 +365,15 @@ class TrajectoryRecorder:
     def _finalize_with_handshake(self, handshake: _FinalizeHandshake) -> str:
         assessment_complete = False
         assessment_error: BaseException | None = None
+        intent_persisted = False
         try:
+            with self._state_lock:
+                initial_degraded_reason = self._degraded_reason
+            self._persist_terminal_intent_transaction(
+                expected_last_sequence=handshake.expected_last_sequence,
+                degraded_reason=initial_degraded_reason,
+            )
+            intent_persisted = True
             assessment_complete = self._assess_finalize_transaction(handshake.expected_last_sequence)
         except BaseException as error:
             assessment_error = error
@@ -374,7 +388,16 @@ class TrajectoryRecorder:
             self._mark_degraded("recorder_timeout")
 
         latched_reason = self._seal_latch_for_terminal_decision()
+        if not intent_persisted:
+            if assessment_error is None:  # pragma: no cover - 防御性保护
+                raise RuntimeError("终态 intent 未持久化")
+            raise assessment_error
         try:
+            if latched_reason is not None:
+                self._upgrade_terminal_intent_transaction(
+                    expected_last_sequence=handshake.expected_last_sequence,
+                    degraded_reason=latched_reason,
+                )
             try:
                 terminal_status = self._write_terminal_transaction(
                     expected_last_sequence=handshake.expected_last_sequence,
@@ -395,9 +418,12 @@ class TrajectoryRecorder:
                         if terminal_status == "degraded" and self._degraded_reason is None:
                             self._degraded_reason = self._terminal_failure_reason
                         self._terminal_failure_reason = None
-                        self._pending_terminal_reconciliation = None
                         self._terminal_transition_finished = True
                         break
+                self._upgrade_terminal_intent_transaction(
+                    expected_last_sequence=handshake.expected_last_sequence,
+                    degraded_reason=final_latched_reason,
+                )
                 try:
                     terminal_status = self._write_terminal_transaction(
                         expected_last_sequence=handshake.expected_last_sequence,
@@ -412,6 +438,22 @@ class TrajectoryRecorder:
                     )
                     if terminal_status == "unknown":
                         return terminal_status
+            terminal_reason = final_latched_reason if terminal_status == "degraded" else None
+            intent_acknowledged = self._ack_terminal_intent_transaction(
+                expected_last_sequence=handshake.expected_last_sequence,
+                terminal_status=terminal_status,
+                degraded_reason=terminal_reason,
+            )
+            with self._state_lock:
+                if intent_acknowledged:
+                    self._pending_terminal_reconciliation = None
+                else:
+                    self._pending_terminal_reconciliation = TrajectoryTerminalReconciliation(
+                        run_id=self.run_id,
+                        expected_last_sequence=handshake.expected_last_sequence,
+                        target_status=terminal_status,
+                        degraded_reason=terminal_reason,
+                    )
         except BaseException:
             self._force_terminal_failure_latch()
             raise
@@ -430,26 +472,38 @@ class TrajectoryRecorder:
             with self._state_lock:
                 degraded_reason = self._degraded_reason or self._terminal_failure_reason
             try:
+                if degraded_reason is not None:
+                    self._upgrade_terminal_intent_transaction(
+                        expected_last_sequence=expected_last_sequence,
+                        degraded_reason=degraded_reason,
+                    )
                 return self._write_terminal_transaction(
                     expected_last_sequence=expected_last_sequence,
                     assessment_complete=assessment_complete and degraded_reason is None,
                     degraded_reason=degraded_reason,
                     allow_complete_correction=degraded_reason is not None,
                 )
-            except _TerminalOutcomeUnknownError:
+            except (OSError, RuntimeError, _TerminalOutcomeUnknownError):
                 continue
 
         with self._state_lock:
             degraded_reason = self._degraded_reason or self._terminal_failure_reason
+            if degraded_reason is None:
+                self._terminal_failure_reason = "write_failed"
+                degraded_reason = self._terminal_failure_reason
             self._pending_terminal_reconciliation = TrajectoryTerminalReconciliation(
                 run_id=self.run_id,
                 expected_last_sequence=expected_last_sequence,
                 target_status="degraded" if degraded_reason is not None else "complete",
                 degraded_reason=degraded_reason,
             )
-            if self._degraded_reason is None:
-                self._terminal_failure_reason = None
-            self._terminal_transition_finished = True
+        try:
+            self._upgrade_terminal_intent_transaction(
+                expected_last_sequence=expected_last_sequence,
+                degraded_reason=degraded_reason,
+            )
+        except BaseException:
+            pass
         return "unknown"
 
     @staticmethod
@@ -527,12 +581,133 @@ class TrajectoryRecorder:
         finally:
             session.close()
 
-    def _assess_finalize_transaction(self, expected_last_sequence: int) -> bool:
-        """只持久化完整性评估输入，禁止在 ack 前写入任何终态。"""
+    def _persist_terminal_intent_transaction(
+        self,
+        *,
+        expected_last_sequence: int,
+        degraded_reason: str | None,
+    ) -> None:
+        """在 assessment 前用独立已确认事务持久化可恢复的终态意图。"""
         now = datetime.now(UTC)
         session = self._session_factory()
+        target_status = "degraded" if degraded_reason is not None else "complete"
+        operation_error: BaseException | None = None
         try:
             self._insert_meta_if_missing(session, now=now)
+            statement = (
+                update(RunTrajectoryMeta)
+                .where(RunTrajectoryMeta.run_id == self.run_id)
+                .where(RunTrajectoryMeta.trajectory_status.in_(("recording", "complete")))
+            )
+            if degraded_reason is None:
+                statement = statement.where(
+                    or_(
+                        RunTrajectoryMeta.terminal_intent_status.is_(None),
+                        RunTrajectoryMeta.terminal_intent_status == "complete",
+                    )
+                )
+                intent_reason = None
+            else:
+                intent_reason = func.coalesce(
+                    RunTrajectoryMeta.terminal_intent_reason,
+                    degraded_reason,
+                )
+            result = session.execute(
+                statement.values(
+                    expected_last_sequence=expected_last_sequence,
+                    terminal_intent_status=target_status,
+                    terminal_intent_reason=intent_reason,
+                    terminal_intent_version=TRAJECTORY_TERMINAL_INTENT_VERSION,
+                    terminal_intent_pending_at=func.coalesce(
+                        RunTrajectoryMeta.terminal_intent_pending_at,
+                        now,
+                    ),
+                    updated_at=now,
+                )
+            )
+            if result.rowcount != 1:
+                raise RuntimeError("终态 intent 不满足 recording/complete 持久化条件")
+            session.commit()
+            return
+        except BaseException as error:
+            operation_error = error
+            try:
+                session.rollback()
+            except BaseException:
+                pass
+        finally:
+            session.close()
+
+        persisted = self._terminal_intent_is_pending(
+            expected_last_sequence=expected_last_sequence,
+            target_status=target_status,
+            degraded_reason=degraded_reason,
+        )
+        if persisted is True:
+            return
+        if persisted is None:
+            raise _TerminalOutcomeUnknownError("终态 intent commit 与对账结果均未知") from operation_error
+        if operation_error is None:  # pragma: no cover - try 分支已直接返回
+            raise RuntimeError("终态 intent 事务缺少执行结果")
+        raise operation_error
+
+    def _upgrade_terminal_intent_transaction(
+        self,
+        *,
+        expected_last_sequence: int,
+        degraded_reason: str,
+    ) -> None:
+        """把 pending intent 单调升级为 degraded，首次原因不可被覆盖。"""
+        now = datetime.now(UTC)
+        session = self._session_factory()
+        operation_error: BaseException | None = None
+        try:
+            result = session.execute(
+                update(RunTrajectoryMeta)
+                .where(RunTrajectoryMeta.run_id == self.run_id)
+                .where(RunTrajectoryMeta.expected_last_sequence == expected_last_sequence)
+                .where(RunTrajectoryMeta.trajectory_status.in_(("recording", "complete")))
+                .where(RunTrajectoryMeta.terminal_intent_pending_at.is_not(None))
+                .where(RunTrajectoryMeta.terminal_intent_version == TRAJECTORY_TERMINAL_INTENT_VERSION)
+                .values(
+                    terminal_intent_status="degraded",
+                    terminal_intent_reason=func.coalesce(
+                        RunTrajectoryMeta.terminal_intent_reason,
+                        degraded_reason,
+                    ),
+                    updated_at=now,
+                )
+            )
+            if result.rowcount != 1:
+                raise RuntimeError("pending terminal intent 不可升级")
+            session.commit()
+            return
+        except BaseException as error:
+            operation_error = error
+            try:
+                session.rollback()
+            except BaseException:
+                pass
+        finally:
+            session.close()
+
+        persisted = self._terminal_intent_is_pending(
+            expected_last_sequence=expected_last_sequence,
+            target_status="degraded",
+            degraded_reason=degraded_reason,
+        )
+        if persisted is True:
+            return
+        if persisted is None:
+            raise _TerminalOutcomeUnknownError("终态 intent 升级与对账结果均未知") from operation_error
+        if operation_error is None:  # pragma: no cover - try 分支已直接返回
+            raise RuntimeError("终态 intent 升级缺少执行结果")
+        raise operation_error
+
+    def _assess_finalize_transaction(self, expected_last_sequence: int) -> bool:
+        """只读取 COUNT/MIN/MAX；pending intent 已由前置独立事务确认。"""
+        session = self._session_factory()
+        try:
             count, minimum, maximum = session.execute(
                 select(
                     func.count(AgentEvent.event_id),
@@ -545,15 +720,6 @@ class TrajectoryRecorder:
                 and count == expected_last_sequence + 1
                 and minimum == 0
                 and maximum == expected_last_sequence
-            )
-            session.execute(
-                update(RunTrajectoryMeta)
-                .where(RunTrajectoryMeta.run_id == self.run_id)
-                .where(RunTrajectoryMeta.trajectory_status == "recording")
-                .values(
-                    expected_last_sequence=expected_last_sequence,
-                    updated_at=now,
-                )
             )
             session.commit()
             return assessment_complete
@@ -584,6 +750,11 @@ class TrajectoryRecorder:
                     .where(RunTrajectoryMeta.run_id == self.run_id)
                     .where(RunTrajectoryMeta.trajectory_status == "recording")
                     .where(RunTrajectoryMeta.degraded_reason.is_(None))
+                    .where(RunTrajectoryMeta.expected_last_sequence == expected_last_sequence)
+                    .where(RunTrajectoryMeta.terminal_intent_status == "complete")
+                    .where(RunTrajectoryMeta.terminal_intent_reason.is_(None))
+                    .where(RunTrajectoryMeta.terminal_intent_version == TRAJECTORY_TERMINAL_INTENT_VERSION)
+                    .where(RunTrajectoryMeta.terminal_intent_pending_at.is_not(None))
                     .values(
                         trajectory_status="complete",
                         expected_last_sequence=expected_last_sequence,
@@ -606,6 +777,10 @@ class TrajectoryRecorder:
                     .where(RunTrajectoryMeta.run_id == self.run_id)
                     .where(eligible_status)
                     .where(RunTrajectoryMeta.expected_last_sequence == expected_last_sequence)
+                    .where(RunTrajectoryMeta.terminal_intent_status == "degraded")
+                    .where(RunTrajectoryMeta.terminal_intent_reason == reason)
+                    .where(RunTrajectoryMeta.terminal_intent_version == TRAJECTORY_TERMINAL_INTENT_VERSION)
+                    .where(RunTrajectoryMeta.terminal_intent_pending_at.is_not(None))
                     .values(
                         trajectory_status="degraded",
                         expected_last_sequence=expected_last_sequence,
@@ -615,7 +790,9 @@ class TrajectoryRecorder:
                     )
                 )
                 terminal_status = "degraded"
-            session.execute(statement)
+            result = session.execute(statement)
+            if result.rowcount != 1:
+                raise RuntimeError("终态转换条件不满足")
             session.commit()
             return terminal_status
         except BaseException as error:
@@ -659,6 +836,10 @@ class TrajectoryRecorder:
                     RunTrajectoryMeta.expected_last_sequence,
                     RunTrajectoryMeta.finalized_at,
                     RunTrajectoryMeta.degraded_reason,
+                    RunTrajectoryMeta.terminal_intent_status,
+                    RunTrajectoryMeta.terminal_intent_reason,
+                    RunTrajectoryMeta.terminal_intent_version,
+                    RunTrajectoryMeta.terminal_intent_pending_at,
                 ).where(RunTrajectoryMeta.run_id == self.run_id)
             ).one_or_none()
         except BaseException:
@@ -672,11 +853,166 @@ class TrajectoryRecorder:
                 row.trajectory_status == "complete"
                 and row.finalized_at is not None
                 and row.degraded_reason is None
+                and row.terminal_intent_status == "complete"
+                and row.terminal_intent_reason is None
+                and row.terminal_intent_version == TRAJECTORY_TERMINAL_INTENT_VERSION
+                and row.terminal_intent_pending_at is not None
             )
         return (
             row.trajectory_status == "degraded"
             and row.finalized_at is None
             and row.degraded_reason == degraded_reason
+            and row.terminal_intent_status == "degraded"
+            and row.terminal_intent_reason == degraded_reason
+            and row.terminal_intent_version == TRAJECTORY_TERMINAL_INTENT_VERSION
+            and row.terminal_intent_pending_at is not None
+        )
+
+    def _terminal_intent_is_pending(
+        self,
+        *,
+        expected_last_sequence: int,
+        target_status: str,
+        degraded_reason: str | None,
+    ) -> bool | None:
+        """对账 intent 的持久化真相；查询失败返回 unknown。"""
+        try:
+            session = self._session_factory()
+        except BaseException:
+            return None
+        try:
+            row = session.execute(
+                select(
+                    RunTrajectoryMeta.expected_last_sequence,
+                    RunTrajectoryMeta.terminal_intent_status,
+                    RunTrajectoryMeta.terminal_intent_reason,
+                    RunTrajectoryMeta.terminal_intent_version,
+                    RunTrajectoryMeta.terminal_intent_pending_at,
+                ).where(RunTrajectoryMeta.run_id == self.run_id)
+            ).one_or_none()
+        except BaseException:
+            return None
+        finally:
+            session.close()
+        return bool(
+            row is not None
+            and row.expected_last_sequence == expected_last_sequence
+            and row.terminal_intent_status == target_status
+            and row.terminal_intent_reason == degraded_reason
+            and row.terminal_intent_version == TRAJECTORY_TERMINAL_INTENT_VERSION
+            and row.terminal_intent_pending_at is not None
+        )
+
+    def _ack_terminal_intent_transaction(
+        self,
+        *,
+        expected_last_sequence: int,
+        terminal_status: str,
+        degraded_reason: str | None,
+    ) -> bool:
+        """终态明确后用独立幂等事务清除 pending；未知时保留给 stale 扫描。"""
+        now = datetime.now(UTC)
+        session = self._session_factory()
+        operation_error: BaseException | None = None
+        try:
+            statement = (
+                update(RunTrajectoryMeta)
+                .where(RunTrajectoryMeta.run_id == self.run_id)
+                .where(RunTrajectoryMeta.expected_last_sequence == expected_last_sequence)
+                .where(RunTrajectoryMeta.trajectory_status == terminal_status)
+                .where(RunTrajectoryMeta.terminal_intent_status == terminal_status)
+                .where(RunTrajectoryMeta.terminal_intent_version == TRAJECTORY_TERMINAL_INTENT_VERSION)
+                .where(RunTrajectoryMeta.terminal_intent_pending_at.is_not(None))
+            )
+            if terminal_status == "complete":
+                statement = statement.where(RunTrajectoryMeta.finalized_at.is_not(None)).where(
+                    RunTrajectoryMeta.degraded_reason.is_(None)
+                ).where(RunTrajectoryMeta.terminal_intent_reason.is_(None))
+            else:
+                statement = statement.where(RunTrajectoryMeta.finalized_at.is_(None)).where(
+                    RunTrajectoryMeta.degraded_reason == degraded_reason
+                ).where(RunTrajectoryMeta.terminal_intent_reason == degraded_reason)
+            result = session.execute(
+                statement.values(
+                    terminal_intent_status=None,
+                    terminal_intent_reason=None,
+                    terminal_intent_version=None,
+                    terminal_intent_pending_at=None,
+                    updated_at=now,
+                )
+            )
+            if result.rowcount != 1:
+                session.rollback()
+                return self._terminal_intent_is_cleared(
+                    expected_last_sequence=expected_last_sequence,
+                    terminal_status=terminal_status,
+                    degraded_reason=degraded_reason,
+                ) is True
+            session.commit()
+            return True
+        except BaseException as error:
+            operation_error = error
+            try:
+                session.rollback()
+            except BaseException:
+                pass
+        finally:
+            session.close()
+
+        cleared = self._terminal_intent_is_cleared(
+            expected_last_sequence=expected_last_sequence,
+            terminal_status=terminal_status,
+            degraded_reason=degraded_reason,
+        )
+        if cleared is True:
+            return True
+        if operation_error is not None:
+            self._log_failure("轨迹账本终态 intent ack 失败", operation_error)
+        return False
+
+    def _terminal_intent_is_cleared(
+        self,
+        *,
+        expected_last_sequence: int,
+        terminal_status: str,
+        degraded_reason: str | None,
+    ) -> bool | None:
+        try:
+            session = self._session_factory()
+        except BaseException:
+            return None
+        try:
+            row = session.execute(
+                select(
+                    RunTrajectoryMeta.trajectory_status,
+                    RunTrajectoryMeta.expected_last_sequence,
+                    RunTrajectoryMeta.finalized_at,
+                    RunTrajectoryMeta.degraded_reason,
+                    RunTrajectoryMeta.terminal_intent_status,
+                    RunTrajectoryMeta.terminal_intent_reason,
+                    RunTrajectoryMeta.terminal_intent_version,
+                    RunTrajectoryMeta.terminal_intent_pending_at,
+                ).where(RunTrajectoryMeta.run_id == self.run_id)
+            ).one_or_none()
+        except BaseException:
+            return None
+        finally:
+            session.close()
+        if row is None:
+            return False
+        terminal_matches = (
+            row.trajectory_status == terminal_status
+            and row.expected_last_sequence == expected_last_sequence
+            and row.degraded_reason == degraded_reason
+            and ((terminal_status == "complete" and row.finalized_at is not None) or
+                 (terminal_status == "degraded" and row.finalized_at is None))
+        )
+        return bool(
+            terminal_matches
+            and row.terminal_intent_status is None
+            and row.terminal_intent_reason is None
+            and row.terminal_intent_version is None
+            and row.terminal_intent_pending_at is None
         )
 
     def _insert_meta_if_missing(self, session: Any, *, now: datetime) -> None:

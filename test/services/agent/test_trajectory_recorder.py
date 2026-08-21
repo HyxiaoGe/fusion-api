@@ -4,6 +4,7 @@ import gc
 import tempfile
 import threading
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -181,6 +182,112 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(meta.expected_last_sequence, 1)
             self.assertIsNotNone(meta.finalized_at)
             self.assertIsNone(meta.degraded_reason)
+            self.assertIsNone(meta.terminal_intent_status)
+            self.assertIsNone(meta.terminal_intent_reason)
+            self.assertIsNone(meta.terminal_intent_version)
+            self.assertIsNone(meta.terminal_intent_pending_at)
+
+    async def test_terminal_ack_failure_leaves_complete_with_durable_pending_intent(self):
+        ack_attempted = threading.Event()
+        factory_calls = 0
+
+        class FailingAckSession(SqlAlchemySession):
+            def commit(self):
+                ack_attempted.set()
+                self.flush()
+                raise RuntimeError("intent ack 提交失败")
+
+        failing_ack_factory = sessionmaker(
+            bind=self.engine,
+            class_=FailingAckSession,
+            expire_on_commit=False,
+        )
+
+        def session_factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            return failing_ack_factory() if factory_calls == 5 else self.Session()
+
+        recorder = self._recorder(session_factory=session_factory)
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+
+        await recorder.finalize(0)
+
+        self.assertTrue(ack_attempted.is_set())
+        self.assertIsNone(recorder.degraded_reason)
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "complete")
+            self.assertIsNotNone(meta.finalized_at)
+            self.assertEqual(meta.terminal_intent_status, "complete")
+            self.assertIsNone(meta.terminal_intent_reason)
+            self.assertEqual(meta.terminal_intent_version, 1)
+            self.assertIsNotNone(meta.terminal_intent_pending_at)
+
+    async def test_finalize_persists_pending_intent_before_assessment_begins(self):
+        assessment_started = threading.Event()
+        release_assessment = threading.Event()
+        factory_calls = 0
+
+        class BlockingAssessmentSession(SqlAlchemySession):
+            def execute(self, *args, **kwargs):
+                assessment_started.set()
+                release_assessment.wait(timeout=2)
+                return super().execute(*args, **kwargs)
+
+        blocking_assessment_factory = sessionmaker(
+            bind=self.engine,
+            class_=BlockingAssessmentSession,
+            expire_on_commit=False,
+        )
+
+        def session_factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            return blocking_assessment_factory() if factory_calls == 3 else self.Session()
+
+        recorder = self._recorder(session_factory=session_factory)
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+        finalize_task = asyncio.create_task(recorder.finalize(0))
+        self.assertTrue(await asyncio.to_thread(assessment_started.wait, 1))
+
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "recording")
+            self.assertEqual(meta.expected_last_sequence, 0)
+            self.assertEqual(meta.terminal_intent_status, "complete")
+            self.assertIsNone(meta.terminal_intent_reason)
+            self.assertEqual(meta.terminal_intent_version, 1)
+            self.assertIsNotNone(meta.terminal_intent_pending_at)
+
+        release_assessment.set()
+        await finalize_task
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "complete")
+            self.assertIsNone(meta.terminal_intent_pending_at)
+
+    async def test_finalize_never_downgrades_existing_degraded_pending_intent(self):
+        recorder = self._recorder()
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            meta.expected_last_sequence = 0
+            meta.terminal_intent_status = "degraded"
+            meta.terminal_intent_reason = "recorder_cancelled"
+            meta.terminal_intent_version = 1
+            meta.terminal_intent_pending_at = datetime.now(UTC)
+            db.commit()
+
+        await recorder.finalize(0)
+
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "recording")
+            self.assertEqual(meta.terminal_intent_status, "degraded")
+            self.assertEqual(meta.terminal_intent_reason, "recorder_cancelled")
+            self.assertEqual(meta.terminal_intent_version, 1)
+            self.assertIsNotNone(meta.terminal_intent_pending_at)
 
     async def test_finalize_marks_gap_as_degraded(self):
         recorder = self._recorder()
@@ -335,6 +442,10 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(meta.trajectory_status, "degraded")
             self.assertEqual(meta.degraded_reason, "recorder_cancelled")
             self.assertIsNone(meta.finalized_at)
+            self.assertIsNone(meta.terminal_intent_status)
+            self.assertIsNone(meta.terminal_intent_reason)
+            self.assertIsNone(meta.terminal_intent_version)
+            self.assertIsNone(meta.terminal_intent_pending_at)
         _assert_all_permits_available(self, semaphore)
 
     async def test_finalize_cancel_after_ack_wins_before_terminal_decision(self):
@@ -458,7 +569,7 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
         def session_factory():
             nonlocal factory_calls
             factory_calls += 1
-            return failing_factory() if factory_calls == 3 else self.Session()
+            return failing_factory() if factory_calls == 5 else self.Session()
 
         def controlled_worker(operation):
             nonlocal worker_calls
@@ -487,6 +598,10 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(meta.trajectory_status, "recording")
             self.assertEqual(meta.expected_last_sequence, 0)
             self.assertIsNone(meta.finalized_at)
+            self.assertEqual(meta.terminal_intent_status, "degraded")
+            self.assertEqual(meta.terminal_intent_reason, "recorder_timeout")
+            self.assertEqual(meta.terminal_intent_version, 1)
+            self.assertIsNotNone(meta.terminal_intent_pending_at)
 
         del finalize_task
         gc.collect()
@@ -514,7 +629,7 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
         def session_factory():
             nonlocal factory_calls
             factory_calls += 1
-            return response_loss_factory() if factory_calls == 3 else self.Session()
+            return response_loss_factory() if factory_calls == 4 else self.Session()
 
         recorder = self._recorder(session_factory=session_factory)
         await recorder.record_chunk("conv-1", "agent_event", _event(0))
@@ -560,9 +675,9 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
         def session_factory():
             nonlocal factory_calls
             factory_calls += 1
-            if factory_calls == 3:
-                return response_loss_factory()
             if factory_calls == 4:
+                return response_loss_factory()
+            if factory_calls == 5:
                 return failing_reconciliation_factory()
             return self.Session()
 
@@ -604,7 +719,7 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
         def session_factory():
             nonlocal factory_calls
             factory_calls += 1
-            return blocking_factory() if factory_calls == 3 else self.Session()
+            return blocking_factory() if factory_calls == 4 else self.Session()
 
         def controlled_worker(operation):
             nonlocal worker_calls
@@ -642,6 +757,10 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(meta.trajectory_status, "recording")
             self.assertEqual(meta.expected_last_sequence, 0)
             self.assertIsNone(meta.finalized_at)
+            self.assertEqual(meta.terminal_intent_status, "complete")
+            self.assertIsNone(meta.terminal_intent_reason)
+            self.assertEqual(meta.terminal_intent_version, 1)
+            self.assertIsNotNone(meta.terminal_intent_pending_at)
 
         release_terminal_commit.set()
         self.assertTrue(await asyncio.to_thread(terminal_worker_finished.wait, 1))
@@ -688,9 +807,9 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
         def session_factory():
             nonlocal factory_calls
             factory_calls += 1
-            if factory_calls == 3:
-                return response_loss_factory()
             if factory_calls == 4:
+                return response_loss_factory()
+            if factory_calls == 5:
                 return first_failure_factory()
             return self.Session()
 
@@ -740,6 +859,7 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
         release_terminal_commit = threading.Event()
         terminal_worker_finished = threading.Event()
         first_reconciliation_failed = threading.Event()
+        release_first_reconciliation = threading.Event()
         factory_calls = 0
         worker_calls = 0
         semaphore = threading.BoundedSemaphore(4)
@@ -754,6 +874,7 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
         class FailFirstReconciliationSession(SqlAlchemySession):
             def execute(self, *args, **kwargs):
                 first_reconciliation_failed.set()
+                release_first_reconciliation.wait(timeout=2)
                 raise RuntimeError("首次终态对账失败")
 
         response_loss_factory = sessionmaker(
@@ -770,9 +891,9 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
         def session_factory():
             nonlocal factory_calls
             factory_calls += 1
-            if factory_calls == 3:
-                return response_loss_factory()
             if factory_calls == 4:
+                return response_loss_factory()
+            if factory_calls == 5:
                 return first_failure_factory()
             return self.Session()
 
@@ -794,6 +915,8 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
         await recorder.record_chunk("conv-1", "agent_event", _event(0))
         finalize_task = asyncio.create_task(recorder.finalize(0))
         self.assertTrue(await asyncio.to_thread(terminal_commit_started.wait, 1))
+        release_terminal_commit.set()
+        self.assertTrue(await asyncio.to_thread(first_reconciliation_failed.wait, 1))
 
         finalize_task.cancel()
         with self.assertRaises(asyncio.CancelledError):
@@ -803,7 +926,7 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(pending)
         self.assertEqual(pending.target_status, "degraded")
         self.assertEqual(pending.degraded_reason, "recorder_cancelled")
-        release_terminal_commit.set()
+        release_first_reconciliation.set()
         self.assertTrue(await asyncio.to_thread(terminal_worker_finished.wait, 1))
 
         self.assertTrue(first_reconciliation_failed.is_set())
@@ -813,6 +936,10 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(meta.trajectory_status, "degraded")
             self.assertEqual(meta.degraded_reason, "recorder_cancelled")
             self.assertIsNone(meta.finalized_at)
+            self.assertIsNone(meta.terminal_intent_status)
+            self.assertIsNone(meta.terminal_intent_reason)
+            self.assertIsNone(meta.terminal_intent_version)
+            self.assertIsNone(meta.terminal_intent_pending_at)
         self.assertIsNone(recorder.pending_terminal_reconciliation)
         _assert_all_permits_available(self, semaphore)
 
@@ -852,9 +979,9 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
         def session_factory():
             nonlocal factory_calls
             factory_calls += 1
-            if factory_calls == 3:
+            if factory_calls == 4:
                 return response_loss_factory()
-            if factory_calls >= 4:
+            if factory_calls >= 5:
                 return unavailable_factory()
             return self.Session()
 
@@ -885,7 +1012,7 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await asyncio.to_thread(terminal_worker_finished.wait, 1))
 
         self.assertGreaterEqual(reconciliation_attempts, 2)
-        self.assertIsNone(recorder.degraded_reason)
+        self.assertEqual(recorder.degraded_reason, "recorder_timeout")
         request = recorder.pending_terminal_reconciliation
         self.assertIsNotNone(request)
         self.assertEqual(request.run_id, "run-1")
@@ -894,7 +1021,13 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
         with self.Session() as db:
             meta = db.get(RunTrajectoryMeta, "run-1")
             self.assertEqual(meta.trajectory_status, "complete")
+            self.assertEqual(meta.expected_last_sequence, 0)
             self.assertIsNotNone(meta.finalized_at)
+            self.assertIsNone(meta.degraded_reason)
+            self.assertEqual(meta.terminal_intent_status, "complete")
+            self.assertIsNone(meta.terminal_intent_reason)
+            self.assertIsNotNone(meta.terminal_intent_pending_at)
+            self.assertEqual(meta.terminal_intent_version, 1)
         _assert_all_permits_available(self, semaphore)
 
     async def test_finalize_start_closes_record_admission_before_assessment(self):

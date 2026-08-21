@@ -850,12 +850,25 @@ class RunTrajectoryMeta(Base):
     last_event_ts = Column(DateTime(timezone=True), nullable=True)
     finalized_at = Column(DateTime(timezone=True), nullable=True)
     degraded_reason = Column(Text, nullable=True)
+    terminal_intent_status = Column(String, nullable=True)
+    terminal_intent_reason = Column(Text, nullable=True)
+    terminal_intent_version = Column(Integer, nullable=True)
+    terminal_intent_pending_at = Column(DateTime(timezone=True), nullable=True)
     updated_at = Column(
         DateTime(timezone=True),
         nullable=False,
         default=utc_now,
         server_default=func.now(),
         onupdate=utc_now,
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_run_trajectory_meta_terminal_intent_pending",
+            "trajectory_status",
+            "terminal_intent_pending_at",
+            postgresql_where=text("terminal_intent_pending_at IS NOT NULL"),
+        ),
     )
 
 
