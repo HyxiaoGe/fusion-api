@@ -24,6 +24,9 @@ from app.services.agent.trajectory_recorder import (
     create_trajectory_session_factory,
 )
 
+TERMINAL_INTENT_ID = "11111111-1111-4111-8111-111111111111"
+FOREIGN_TERMINAL_INTENT_ID = "22222222-2222-4222-8222-222222222222"
+
 
 def _event(sequence: int, event_type: str = "step_started", **fields):
     return {
@@ -182,6 +185,7 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(meta.expected_last_sequence, 1)
             self.assertIsNotNone(meta.finalized_at)
             self.assertIsNone(meta.degraded_reason)
+            self.assertIsNone(meta.terminal_intent_id)
             self.assertIsNone(meta.terminal_intent_status)
             self.assertIsNone(meta.terminal_intent_reason)
             self.assertIsNone(meta.terminal_intent_version)
@@ -220,6 +224,7 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(meta.trajectory_status, "complete")
             self.assertIsNotNone(meta.finalized_at)
             self.assertEqual(meta.terminal_intent_status, "complete")
+            self.assertIsNotNone(meta.terminal_intent_id)
             self.assertIsNone(meta.terminal_intent_reason)
             self.assertEqual(meta.terminal_intent_version, 1)
             self.assertIsNotNone(meta.terminal_intent_pending_at)
@@ -256,6 +261,7 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(meta.trajectory_status, "recording")
             self.assertEqual(meta.expected_last_sequence, 0)
             self.assertEqual(meta.terminal_intent_status, "complete")
+            self.assertIsNotNone(meta.terminal_intent_id)
             self.assertIsNone(meta.terminal_intent_reason)
             self.assertEqual(meta.terminal_intent_version, 1)
             self.assertIsNotNone(meta.terminal_intent_pending_at)
@@ -265,7 +271,251 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
         with self.Session() as db:
             meta = db.get(RunTrajectoryMeta, "run-1")
             self.assertEqual(meta.trajectory_status, "complete")
+            self.assertIsNone(meta.terminal_intent_id)
             self.assertIsNone(meta.terminal_intent_pending_at)
+
+    async def test_terminal_intent_commit_response_loss_recovers_only_the_same_intent(self):
+        intent_commit_lost = threading.Event()
+        factory_calls = 0
+
+        class IntentCommitResponseLossSession(SqlAlchemySession):
+            def commit(self):
+                super().commit()
+                intent_commit_lost.set()
+                raise OSError("intent commit 响应丢失")
+
+        response_loss_factory = sessionmaker(
+            bind=self.engine,
+            class_=IntentCommitResponseLossSession,
+            expire_on_commit=False,
+        )
+
+        def session_factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            return response_loss_factory() if factory_calls == 2 else self.Session()
+
+        recorder = self._recorder(session_factory=session_factory)
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+
+        with patch(
+            "app.services.agent.trajectory_recorder.uuid4",
+            return_value=TERMINAL_INTENT_ID,
+        ):
+            await recorder.finalize(0)
+
+        self.assertTrue(intent_commit_lost.is_set())
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "complete")
+            self.assertIsNone(meta.terminal_intent_id)
+            self.assertIsNone(meta.terminal_intent_status)
+            self.assertIsNone(meta.terminal_intent_reason)
+            self.assertIsNone(meta.terminal_intent_version)
+            self.assertIsNone(meta.terminal_intent_pending_at)
+
+    async def test_new_finalize_does_not_claim_or_clear_recording_with_foreign_pending_intent(self):
+        recorder = self._recorder()
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+        pending_at = datetime.now(UTC)
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            meta.expected_last_sequence = 0
+            meta.terminal_intent_id = FOREIGN_TERMINAL_INTENT_ID
+            meta.terminal_intent_status = "complete"
+            meta.terminal_intent_reason = None
+            meta.terminal_intent_version = 1
+            meta.terminal_intent_pending_at = pending_at
+            db.commit()
+
+        new_recorder = self._recorder()
+        await new_recorder.finalize(0)
+
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "recording")
+            self.assertEqual(meta.expected_last_sequence, 0)
+            self.assertEqual(meta.terminal_intent_id, FOREIGN_TERMINAL_INTENT_ID)
+            self.assertEqual(meta.terminal_intent_status, "complete")
+            self.assertIsNone(meta.terminal_intent_reason)
+            self.assertEqual(meta.terminal_intent_version, 1)
+            self.assertEqual(meta.terminal_intent_pending_at, pending_at.replace(tzinfo=None))
+
+    async def test_new_finalize_does_not_clear_complete_with_foreign_pending_intent(self):
+        recorder = self._recorder()
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+        finalized_at = datetime.now(UTC)
+        pending_at = datetime.now(UTC)
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            meta.trajectory_status = "complete"
+            meta.expected_last_sequence = 0
+            meta.finalized_at = finalized_at
+            meta.terminal_intent_id = FOREIGN_TERMINAL_INTENT_ID
+            meta.terminal_intent_status = "complete"
+            meta.terminal_intent_reason = None
+            meta.terminal_intent_version = 1
+            meta.terminal_intent_pending_at = pending_at
+            db.commit()
+
+        new_recorder = self._recorder()
+        await new_recorder.finalize(0)
+
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "complete")
+            self.assertEqual(meta.finalized_at, finalized_at.replace(tzinfo=None))
+            self.assertEqual(meta.terminal_intent_id, FOREIGN_TERMINAL_INTENT_ID)
+            self.assertEqual(meta.terminal_intent_status, "complete")
+            self.assertIsNone(meta.terminal_intent_reason)
+            self.assertEqual(meta.terminal_intent_version, 1)
+            self.assertEqual(meta.terminal_intent_pending_at, pending_at.replace(tzinfo=None))
+
+    async def test_new_finalize_does_not_clear_degraded_with_foreign_pending_intent(self):
+        recorder = self._recorder()
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+        pending_at = datetime.now(UTC)
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            meta.trajectory_status = "degraded"
+            meta.expected_last_sequence = 0
+            meta.finalized_at = None
+            meta.degraded_reason = "recorder_cancelled"
+            meta.terminal_intent_id = FOREIGN_TERMINAL_INTENT_ID
+            meta.terminal_intent_status = "degraded"
+            meta.terminal_intent_reason = "recorder_cancelled"
+            meta.terminal_intent_version = 1
+            meta.terminal_intent_pending_at = pending_at
+            db.commit()
+
+        new_recorder = self._recorder()
+        self.assertTrue(new_recorder._mark_degraded("recorder_cancelled"))
+        await new_recorder.finalize(0)
+
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "degraded")
+            self.assertIsNone(meta.finalized_at)
+            self.assertEqual(meta.degraded_reason, "recorder_cancelled")
+            self.assertEqual(meta.terminal_intent_id, FOREIGN_TERMINAL_INTENT_ID)
+            self.assertEqual(meta.terminal_intent_status, "degraded")
+            self.assertEqual(meta.terminal_intent_reason, "recorder_cancelled")
+            self.assertEqual(meta.terminal_intent_version, 1)
+            self.assertEqual(meta.terminal_intent_pending_at, pending_at.replace(tzinfo=None))
+
+    async def test_terminal_intent_a_precondition_failure_does_not_use_response_loss_readback(self):
+        recorder = self._recorder()
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            meta.terminal_intent_id = FOREIGN_TERMINAL_INTENT_ID
+            meta.terminal_intent_status = "degraded"
+            meta.terminal_intent_reason = "recorder_cancelled"
+            meta.terminal_intent_version = 1
+            meta.terminal_intent_pending_at = datetime.now(UTC)
+            db.commit()
+
+        factory_calls = 0
+
+        def session_factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            return self.Session()
+
+        new_recorder = self._recorder(session_factory=session_factory)
+        self.assertTrue(new_recorder._mark_degraded("recorder_cancelled"))
+        await new_recorder.finalize(0)
+
+        self.assertEqual(factory_calls, 1)
+
+    async def test_terminal_transition_with_wrong_intent_id_has_zero_effect(self):
+        recorder = self._recorder()
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+        pending_at = datetime.now(UTC)
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            meta.expected_last_sequence = 0
+            meta.terminal_intent_id = TERMINAL_INTENT_ID
+            meta.terminal_intent_status = "complete"
+            meta.terminal_intent_reason = None
+            meta.terminal_intent_version = 1
+            meta.terminal_intent_pending_at = pending_at
+            db.commit()
+
+        with self.assertRaises(RuntimeError):
+            recorder._write_terminal_transaction(
+                expected_last_sequence=0,
+                assessment_complete=True,
+                degraded_reason=None,
+                terminal_intent_id=FOREIGN_TERMINAL_INTENT_ID,
+            )
+
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "recording")
+            self.assertIsNone(meta.finalized_at)
+            self.assertEqual(meta.terminal_intent_id, TERMINAL_INTENT_ID)
+            self.assertEqual(meta.terminal_intent_pending_at, pending_at.replace(tzinfo=None))
+
+    async def test_terminal_ack_with_wrong_intent_id_has_zero_effect(self):
+        recorder = self._recorder()
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+        pending_at = datetime.now(UTC)
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            meta.trajectory_status = "complete"
+            meta.expected_last_sequence = 0
+            meta.finalized_at = datetime.now(UTC)
+            meta.terminal_intent_id = TERMINAL_INTENT_ID
+            meta.terminal_intent_status = "complete"
+            meta.terminal_intent_reason = None
+            meta.terminal_intent_version = 1
+            meta.terminal_intent_pending_at = pending_at
+            db.commit()
+
+        acknowledged = recorder._ack_terminal_intent_transaction(
+            expected_last_sequence=0,
+            terminal_status="complete",
+            degraded_reason=None,
+            terminal_intent_id=FOREIGN_TERMINAL_INTENT_ID,
+        )
+
+        self.assertFalse(acknowledged)
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.terminal_intent_id, TERMINAL_INTENT_ID)
+            self.assertEqual(meta.terminal_intent_status, "complete")
+            self.assertEqual(meta.terminal_intent_pending_at, pending_at.replace(tzinfo=None))
+
+    async def test_terminal_intent_upgrade_with_wrong_intent_id_has_zero_effect(self):
+        recorder = self._recorder()
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+        pending_at = datetime.now(UTC)
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            meta.expected_last_sequence = 0
+            meta.terminal_intent_id = TERMINAL_INTENT_ID
+            meta.terminal_intent_status = "complete"
+            meta.terminal_intent_reason = None
+            meta.terminal_intent_version = 1
+            meta.terminal_intent_pending_at = pending_at
+            db.commit()
+
+        with self.assertRaises(RuntimeError):
+            recorder._upgrade_terminal_intent_transaction(
+                expected_last_sequence=0,
+                degraded_reason="recorder_timeout",
+                terminal_intent_id=FOREIGN_TERMINAL_INTENT_ID,
+            )
+
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "recording")
+            self.assertIsNone(meta.degraded_reason)
+            self.assertEqual(meta.terminal_intent_id, TERMINAL_INTENT_ID)
+            self.assertEqual(meta.terminal_intent_status, "complete")
+            self.assertIsNone(meta.terminal_intent_reason)
+            self.assertEqual(meta.terminal_intent_pending_at, pending_at.replace(tzinfo=None))
 
     async def test_finalize_never_downgrades_existing_degraded_pending_intent(self):
         recorder = self._recorder()
@@ -273,6 +523,7 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
         with self.Session() as db:
             meta = db.get(RunTrajectoryMeta, "run-1")
             meta.expected_last_sequence = 0
+            meta.terminal_intent_id = FOREIGN_TERMINAL_INTENT_ID
             meta.terminal_intent_status = "degraded"
             meta.terminal_intent_reason = "recorder_cancelled"
             meta.terminal_intent_version = 1
@@ -284,6 +535,7 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
         with self.Session() as db:
             meta = db.get(RunTrajectoryMeta, "run-1")
             self.assertEqual(meta.trajectory_status, "recording")
+            self.assertEqual(meta.terminal_intent_id, FOREIGN_TERMINAL_INTENT_ID)
             self.assertEqual(meta.terminal_intent_status, "degraded")
             self.assertEqual(meta.terminal_intent_reason, "recorder_cancelled")
             self.assertEqual(meta.terminal_intent_version, 1)
@@ -1130,6 +1382,7 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
             assessment_future=loop.create_future(),
             acknowledgement=threading.Event(),
             expected_last_sequence=0,
+            terminal_intent_id=TERMINAL_INTENT_ID,
         )
 
         result = await asyncio.to_thread(recorder._finalize_with_handshake, handshake)

@@ -100,6 +100,7 @@ def upgrade() -> None:
         sa.Column("last_event_ts", sa.DateTime(timezone=True), nullable=True),
         sa.Column("finalized_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("degraded_reason", sa.Text(), nullable=True),
+        sa.Column("terminal_intent_id", sa.String(), nullable=True),
         sa.Column("terminal_intent_status", sa.String(), nullable=True),
         sa.Column("terminal_intent_reason", sa.Text(), nullable=True),
         sa.Column("terminal_intent_version", sa.Integer(), nullable=True),

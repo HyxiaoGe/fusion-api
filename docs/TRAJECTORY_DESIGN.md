@@ -1,6 +1,6 @@
 # Fusion Trajectory 集成设计（DSH 风格 Agent 执行轨迹）
 
-> 状态：设计稿 v0.12（P0 实施审查补充可崩溃恢复的终态 reconciliation intent）
+> 状态：设计稿 v0.13（P0 实施审查补充 terminal intent 所有权与全链路 CAS）
 > 范围：fusion-api + fusion-ui 集成 Agent 执行轨迹展示；langchain-trajectory-mvp 降级为原型实验室与联调夹具。
 > 本文档是实施 P0 的正式依据；P0 已在独立实施分支开始，P1–P3 不在本轮范围内。
 >
@@ -324,9 +324,10 @@ CREATE TABLE run_trajectory_meta (
     last_event_ts           TIMESTAMPTZ,
     finalized_at            TIMESTAMPTZ,    -- 仅 complete 时有值
     degraded_reason         TEXT,           -- 仅 degraded 时有值
+    terminal_intent_id      TEXT,           -- 每次 finalize 唯一所有权 token
     terminal_intent_status  TEXT,           -- pending 目标：'complete' | 'degraded'
     terminal_intent_reason  TEXT,           -- pending degraded 的首次原因
-    terminal_intent_version INTEGER,        -- 当前协议为 1；四列清空表示已 ack
+    terminal_intent_version INTEGER,        -- 当前协议为 1；五列清空表示已 ack
     terminal_intent_pending_at TIMESTAMPTZ,  -- 非空表示终态仍待确认/协调
     updated_at              TIMESTAMPTZ NOT NULL
 );
@@ -350,7 +351,7 @@ CREATE TABLE trajectory_ledger_settings (
 | `degraded` | 观测缺失 | **latch 置位（含取消/迟到事务场景）** / 任意落账失败 / 超时熔断 / 准入满载 / stale 协调发现缺尾部事件 / 新 run 缺 meta（`meta_missing`） |
 | `legacy` | 账本建立前的历史 run | `run.created_at < ledger_enabled_at` 且无 meta（**仅此一种判据**，见 §5.3） |
 
-**只有显式 seal/finalize 成功且 terminal intent 已独立 ack 才能确认 complete，且 latch 置位时 finalize 一律落 degraded**（§5.2）；stale recording 无持久化 `expected_last_sequence` 时只能保守标 `degraded`，不得猜测 complete。`recording|complete + terminal_intent_pending_at` 都是 Task 6 必须扫描的未确认状态。
+**只有显式 seal/finalize 成功且 terminal intent 已独立 ack 才能确认 complete，且 latch 置位时 finalize 一律落 degraded**（§5.2）；stale recording 无持久化 `expected_last_sequence` 时只能保守标 `degraded`，不得猜测 complete。`recording|complete|degraded + terminal_intent_pending_at` 都是 Task 6 必须扫描的未确认状态；任何新 Recorder 都不得冒领、覆盖或清除已有 pending。
 
 ### 4.3 保留策略（P0 范围决策）
 
@@ -476,7 +477,10 @@ async def seal_and_get_last_sequence() -> int
 ```text
 独立事务 A（assessment 前必须明确 commit）：
   UPSERT meta(recording)
+  为本次 finalize 生成唯一 :terminal_intent_id
+  仅 UPDATE trajectory_status = recording 且五个 intent 字段均为 NULL 的行
   SET expected_last_sequence = :expected,
+      terminal_intent_id = :terminal_intent_id,
       terminal_intent_status = degraded（已有 latch）否则 complete,
       terminal_intent_reason = 首次 latch 原因或 NULL,
       terminal_intent_version = 1,
@@ -487,17 +491,17 @@ SELECT COUNT(*), MIN(sequence), MAX(sequence) FROM agent_events WHERE run_id = :
       MIN(sequence) = 0
       MAX(sequence) = expected_last_sequence
 assessment/事件 latch、timeout、cancel、unknown：
-  用新的独立事务把 pending target 单调升级为 degraded（首次原因不可覆盖）
+  用新的独立事务按同一 terminal_intent_id CAS，把 pending target 单调升级为 degraded（首次原因不可覆盖）
 
 风险终态事务 B（禁止清 intent）：
-  通过且无 latch → recording 条件更新为 complete，finalized_at = now
-  否则 → recording（或同 expected 的待纠正 complete）条件更新为 degraded
+  通过且无 latch → 按同一 terminal_intent_id CAS，从 recording 更新为 complete，finalized_at = now
+  否则 → 按同一 terminal_intent_id CAS，将 recording（或同 expected 的待纠正 complete）更新为 degraded
 
 只有 worker 明确确认事务 B 的真实结果并在线程锁内封住后到 latch 后：
-  独立幂等事务 C 清除四个 terminal_intent_* 字段（terminal ack）
+  独立幂等事务 C 按同一 terminal_intent_id CAS，清除五个 terminal_intent_* 字段（terminal ack）
 ```
 
-事务 A、B、C 必须分别使用独立短 Session。B 的 commit 响应丢失时只允许用新 Session 对账或有限幂等重试；**B 绝不得顺带清 intent**。C 失败、响应丢失或对账失败时保留 pending；宁可由 Task 6 保守降级，也不得把未确认的 `complete + pending` 当作权威 complete。终态结果仍 unknown 时不得封住 terminal timeout/cancel：后到原因可继续把 pending 单调升级为 degraded。
+事务 A、B、C 必须分别使用独立短 Session。A 的 `rowcount=0` 是明确的所有权前置失败，**不得**走 response-loss readback；只有 commit/连接等导致结果不确定时，才允许用新 Session 按本次 `terminal_intent_id` 对账。B、C、degraded upgrade、pending DTO 与所有 readback 必须绑定同一 `terminal_intent_id`；错误 token 的写入必须零影响。B 的 commit 响应丢失时只允许用同 token 的新 Session 对账或有限幂等重试；**B 绝不得顺带清 intent**。C 失败、响应丢失或对账失败时保留 pending；宁可由 Task 6 保守降级，也不得把未确认的 `complete + pending` 当作权威 complete。终态结果仍 unknown 时不得封住 terminal timeout/cancel：后到原因可继续把本次 pending 单调升级为 degraded。历史 `recording|complete|degraded + pending` 只归 Task 6 协调，新 Recorder 不得接管。
 
 > **迟到事务竞态**：最后一条事件（含终态辅助事件）落账超时后，迟到事务可能随后成功提交，使三断言重新满足——**只要 latch 曾置位（含取消），本次 run 只能落为 `degraded`**。需增加「最后一条事件迟到提交」与「取消后 sequence 不复用」的竞态测试（§9.2）。
 
@@ -509,7 +513,7 @@ assessment/事件 latch、timeout、cancel、unknown：
 事件 INSERT 因 Postgres 不可用失败时，随后更新 meta 也可能失败——「失败必然可见」不能依赖同一次 DB 写。因此：
 
 1. **内存降级 latch**：Recorder 进程内维护 per-run degraded 标记；首次落账失败/超时/准入失败/取消置位（§5.1），后续事件跳过落账（不重复报错），并在 DB 恢复后重试写 meta（幂等）。**迟到事务不得反转 latch**（§5.1、§5.2）。
-2. **stale/pending 协调任务**：周期性扫描 run 已不在运行/已终态且满足以下任一条件的 meta：普通 stale `recording`，或 `trajectory_status IN ('recording', 'complete') AND terminal_intent_pending_at IS NOT NULL`。无 pending 的普通 stale recording 仍按 `expected_last_sequence +` §5.2 三断言判定；**任何遗留 pending 都表示 Recorder 未明确 ack，Task 6 必须保守收敛为 degraded**（pending target/reason 用于幂等纠偏与审计；缺 reason 时使用终态结果未知的保守原因），再清除 intent。这样即使 B 实际 complete、响应丢失、对账失败后进程崩溃，也不会留下不可达的假 complete。
+2. **stale/pending 协调任务**：周期性扫描 run 已不在运行/已终态且满足以下任一条件的 meta：普通 stale `recording`，或 `trajectory_status IN ('recording', 'complete', 'degraded') AND terminal_intent_pending_at IS NOT NULL`。无 pending 的普通 stale recording 仍按 `expected_last_sequence +` §5.2 三断言判定；**任何遗留 pending 都表示 Recorder 未明确 ack，Task 6 必须保守收敛为 degraded**（已有 degraded 保持 degraded；pending target/reason/id 用于幂等纠偏与审计；缺 reason 时使用终态结果未知的保守原因），再清除五个 intent 字段。这样即使 B 实际 complete、响应丢失、对账失败后进程崩溃，也不会留下不可达的假 complete。
 3. **legacy 判定唯一判据**：
    - `run.created_at < ledger_enabled_at`（迁移持久化的各环境启用时间，§4.4）且无 meta → `legacy/not_recorded`（账本上线前，正常）；
    - `run.created_at >= ledger_enabled_at` 且无 meta → `degraded/meta_missing`（数据库故障被显式暴露，**不得伪装成历史运行**）。
@@ -615,7 +619,7 @@ P0 验收不依赖 P2（MVP Adapter 联调属 P2 验收）。
 - **seal + finalize 语义**：`seal_and_get_last_sequence()` 在同一把锁内封口并返回 `_sequence - 1`；finalize 在**所有同步辅助事件（含 `suggested_questions_pending`）之后**执行；`run_completed` 不触发 finalize；seal 后任何 emit 必须抛错。
 - **finalize 三断言 + latch 优先**：finalize 先查 degraded latch，置位（含取消 `recorder_cancelled`）则一律落 `degraded`（即使三断言满足）；未置位才验 `COUNT = expected+1 ∧ MIN(sequence)=0 ∧ MAX(sequence)=expected`（§5.2）——两条路径都有单测。
 - **迟到事务竞态**：「最后一条事件落账超时 → 迟到提交成功 → 三断言满足」仍必须 `degraded`（latch 权威性）有专门竞态测试。
-- **durable terminal intent**：assessment 前独立提交 `expected + pending(v1)`；风险终态事务不清 intent；正常 complete 仅在独立 ack 后清 intent。覆盖 terminal commit 响应丢失 + 首次/持续对账失败、unknown 后 cancel、ack 提交失败与进程崩溃前 DB 状态；断言 Task 6 可扫描 `recording|complete + pending`，permit 最终守恒。
+- **durable terminal intent**：每次 finalize 生成唯一 `terminal_intent_id`；事务 A 只能从 `recording + no pending` 创建 `expected + pending(v1)`，明确前置失败不得 readback；风险终态事务不清 intent；B/C/升级/readback 全部按同 token CAS，正常 complete 仅在独立 ack 后清五字段。覆盖遗留 `recording|complete|degraded + pending` 不被新 Recorder 清理、A commit 响应丢失同 token 恢复、错误 token 零影响、terminal commit 响应丢失 + 首次/持续对账失败、unknown 后 cancel、ack 提交失败与进程崩溃前 DB 状态；断言 Task 6 可扫描 `recording|complete|degraded + pending`，permit 最终守恒。
 - **取消路径竞态**：worker 运行中 / 尚未启动时取消——permit 最终守恒（无泄漏）、迟到异常被消费、latch 保持 degraded、finalize 不得 complete、**sequence 不重复**（有专门竞态测试）。
 - **原子事务**：事件 INSERT 与 meta 计数同事务（§5.1）有故障注入测试——INSERT 成功后 commit 前失败，必须整体回滚，不得出现「有事件无计数」。
 - **超时熔断 + permit 生命周期**：`BoundedSemaphore(4)` 非阻塞准入——满载直接 fail-open（有测试：sem 满时新事件不排队、置 degraded）；`wait_for(250ms)` 在 DB 挂起时真正超时（非假超时）；**「任务尚未开始执行便超时」不得泄漏 permit**（有测试：连续 N 次超时后 semaphore 仍可继续 acquire，permit 数守恒）；`shield` 保证超时不取消底层任务；迟到任务异常被消费（无 never-retrieved 告警）；psycopg2 `connect_timeout` 整数秒限制已说明（500ms 不可配，主隔离靠 wait_for+闸门）。
@@ -650,7 +654,7 @@ P0 验收不依赖 P2（MVP Adapter 联调属 P2 验收）。
 - [ ] **超时熔断可执行 + permit 无泄漏**：`BoundedSemaphore(4)` 非阻塞准入（满载 fail-open、不排队）；`wait_for(asyncio.shield(future))`——超时不取消底层任务；submit 失败立即释放；worker `finally` 释放；迟到异常被消费；「任务未开始便超时」不泄漏 permit（permit 守恒测试）。
 - [ ] **`CancelledError` 分支**：捕获置 degraded（`recorder_cancelled`）→ 消费迟到 future → **re-raise**（不吞取消）；取消后已分配 sequence 不复用；「worker 运行中/未启动时取消」竞态测试覆盖 permit 守恒、latch 保持 degraded、finalize 不得 complete、sequence 不重复。
 - [ ] **finalize latch 优先**：latch 置位（含取消）→ 一律 degraded（即使三断言满足）；「最后一条事件迟到提交」竞态测试存在。
-- [ ] **durable terminal intent**：assessment 前独立提交 expected + pending；风险 terminal commit 不清 intent；明确终态后才独立 ack；commit/ack 结果未知或进程崩溃后，Task 6 可扫描 recording|complete pending 并保守收敛，unknown 不吞后到 timeout/cancel。
+- [ ] **durable terminal intent 所有权**：每次 finalize 唯一 token；A 仅从 recording + no pending 创建，rowcount=0 不 readback；B/C/升级/readback 同 token CAS；历史 recording|complete|degraded pending 不被新 Recorder 冒领。明确终态后才独立 ack；commit/ack 结果未知或进程崩溃后，Task 6 扫描三种状态的 pending 并保守收敛，unknown 不吞后到 timeout/cancel。
 - [ ] **sequence 在第一次可取消 await 前预留**：校验完成后、await writer 前递增；取消的 emit 消耗序号形成空洞（degraded）而非复用；complete 严格 `0..N-1` 连续、degraded 单调唯一允许空洞——两侧语义有测试。
 - [ ] `seal_and_get_last_sequence` 与 emit 互斥（同一把锁）；seal 后 emit 抛错有测试；取消路径 shield 有测试。
 - [ ] finalize 调用点在**所有同步辅助事件之后**；`run_completed` 不触发 finalize；finalize 三断言有单测。

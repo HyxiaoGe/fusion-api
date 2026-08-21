@@ -850,6 +850,7 @@ class RunTrajectoryMeta(Base):
     last_event_ts = Column(DateTime(timezone=True), nullable=True)
     finalized_at = Column(DateTime(timezone=True), nullable=True)
     degraded_reason = Column(Text, nullable=True)
+    terminal_intent_id = Column(String, nullable=True)
     terminal_intent_status = Column(String, nullable=True)
     terminal_intent_reason = Column(Text, nullable=True)
     terminal_intent_version = Column(Integer, nullable=True)

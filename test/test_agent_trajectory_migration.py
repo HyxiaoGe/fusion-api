@@ -101,6 +101,7 @@ class AgentTrajectoryMigrationTests(unittest.TestCase):
                 if name.startswith("terminal_intent_")
             },
             {
+                "terminal_intent_id",
                 "terminal_intent_status",
                 "terminal_intent_reason",
                 "terminal_intent_version",
@@ -154,6 +155,7 @@ class AgentTrajectoryModelContractTests(unittest.TestCase):
             {"uq_agent_events_run_sequence"},
         )
         self.assertEqual(RunTrajectoryMeta.__table__.c.run_id.foreign_keys.pop().ondelete, "CASCADE")
+        self.assertTrue(RunTrajectoryMeta.__table__.c.terminal_intent_id.nullable)
         self.assertTrue(RunTrajectoryMeta.__table__.c.terminal_intent_status.nullable)
         self.assertTrue(RunTrajectoryMeta.__table__.c.terminal_intent_reason.nullable)
         self.assertTrue(RunTrajectoryMeta.__table__.c.terminal_intent_version.nullable)

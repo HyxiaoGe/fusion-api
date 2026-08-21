@@ -9,8 +9,9 @@ from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, TypeVar
+from uuid import uuid4
 
-from sqlalchemy import create_engine, func, or_, select, update
+from sqlalchemy import create_engine, func, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import sessionmaker
@@ -40,12 +41,17 @@ class _TerminalOutcomeUnknownError(RuntimeError):
     """终态 commit 与后续对账均失败，持久化结果不可判定。"""
 
 
+class _TerminalIntentPreconditionError(RuntimeError):
+    """事务 A 未取得 recording + no-pending 的 intent 所有权。"""
+
+
 @dataclass(frozen=True)
 class TrajectoryTerminalReconciliation:
     """供后续 stale coordinator 消费的幂等终态请求。"""
 
     run_id: str
     expected_last_sequence: int
+    terminal_intent_id: str
     target_status: str
     degraded_reason: str | None
 
@@ -55,6 +61,7 @@ class _FinalizeHandshake:
     assessment_future: asyncio.Future[bool]
     acknowledgement: threading.Event
     expected_last_sequence: int
+    terminal_intent_id: str
 
 
 def create_trajectory_session_factory(database_url: str) -> Callable[[], Any]:
@@ -175,6 +182,7 @@ class TrajectoryRecorder:
         reason: str = "write_failed",
         *,
         expected_last_sequence: int | None = None,
+        terminal_intent_id: str | None = None,
     ) -> bool:
         """终态完成线性化前保留失败证据，完成后拒绝制造 latch 冲突。"""
         with self._state_lock:
@@ -182,11 +190,12 @@ class TrajectoryRecorder:
                 return False
             if self._degraded_reason is None and self._terminal_failure_reason is None:
                 self._terminal_failure_reason = reason
-            if expected_last_sequence is not None:
+            if expected_last_sequence is not None and terminal_intent_id is not None:
                 pending_reason = self._degraded_reason or self._terminal_failure_reason
                 self._pending_terminal_reconciliation = TrajectoryTerminalReconciliation(
                     run_id=self.run_id,
                     expected_last_sequence=expected_last_sequence,
+                    terminal_intent_id=terminal_intent_id,
                     target_status="degraded",
                     degraded_reason=pending_reason,
                 )
@@ -288,6 +297,7 @@ class TrajectoryRecorder:
             assessment_future=assessment_future,
             acknowledgement=threading.Event(),
             expected_last_sequence=expected_last_sequence,
+            terminal_intent_id=str(uuid4()),
         )
         try:
             worker_future = loop.run_in_executor(
@@ -338,11 +348,13 @@ class TrajectoryRecorder:
                 self._force_terminal_failure_latch(
                     "write_failed",
                     expected_last_sequence=expected_last_sequence,
+                    terminal_intent_id=handshake.terminal_intent_id,
                 )
         except asyncio.CancelledError:
             self._force_terminal_failure_latch(
                 "recorder_cancelled",
                 expected_last_sequence=expected_last_sequence,
+                terminal_intent_id=handshake.terminal_intent_id,
             )
             self._consume_late(worker_future)
             raise
@@ -350,6 +362,7 @@ class TrajectoryRecorder:
             self._force_terminal_failure_latch(
                 "recorder_timeout",
                 expected_last_sequence=expected_last_sequence,
+                terminal_intent_id=handshake.terminal_intent_id,
             )
             self._consume_late(worker_future)
             return
@@ -372,6 +385,7 @@ class TrajectoryRecorder:
             self._persist_terminal_intent_transaction(
                 expected_last_sequence=handshake.expected_last_sequence,
                 degraded_reason=initial_degraded_reason,
+                terminal_intent_id=handshake.terminal_intent_id,
             )
             intent_persisted = True
             assessment_complete = self._assess_finalize_transaction(handshake.expected_last_sequence)
@@ -397,17 +411,20 @@ class TrajectoryRecorder:
                 self._upgrade_terminal_intent_transaction(
                     expected_last_sequence=handshake.expected_last_sequence,
                     degraded_reason=latched_reason,
+                    terminal_intent_id=handshake.terminal_intent_id,
                 )
             try:
                 terminal_status = self._write_terminal_transaction(
                     expected_last_sequence=handshake.expected_last_sequence,
                     assessment_complete=assessment_complete,
                     degraded_reason=latched_reason,
+                    terminal_intent_id=handshake.terminal_intent_id,
                 )
             except _TerminalOutcomeUnknownError:
                 terminal_status = self._retry_unknown_terminal_transition(
                     expected_last_sequence=handshake.expected_last_sequence,
                     assessment_complete=assessment_complete,
+                    terminal_intent_id=handshake.terminal_intent_id,
                 )
             if terminal_status == "unknown":
                 return terminal_status
@@ -423,6 +440,7 @@ class TrajectoryRecorder:
                 self._upgrade_terminal_intent_transaction(
                     expected_last_sequence=handshake.expected_last_sequence,
                     degraded_reason=final_latched_reason,
+                    terminal_intent_id=handshake.terminal_intent_id,
                 )
                 try:
                     terminal_status = self._write_terminal_transaction(
@@ -430,11 +448,13 @@ class TrajectoryRecorder:
                         assessment_complete=False,
                         degraded_reason=final_latched_reason,
                         allow_complete_correction=True,
+                        terminal_intent_id=handshake.terminal_intent_id,
                     )
                 except _TerminalOutcomeUnknownError:
                     terminal_status = self._retry_unknown_terminal_transition(
                         expected_last_sequence=handshake.expected_last_sequence,
                         assessment_complete=False,
+                        terminal_intent_id=handshake.terminal_intent_id,
                     )
                     if terminal_status == "unknown":
                         return terminal_status
@@ -443,6 +463,7 @@ class TrajectoryRecorder:
                 expected_last_sequence=handshake.expected_last_sequence,
                 terminal_status=terminal_status,
                 degraded_reason=terminal_reason,
+                terminal_intent_id=handshake.terminal_intent_id,
             )
             with self._state_lock:
                 if intent_acknowledged:
@@ -451,11 +472,15 @@ class TrajectoryRecorder:
                     self._pending_terminal_reconciliation = TrajectoryTerminalReconciliation(
                         run_id=self.run_id,
                         expected_last_sequence=handshake.expected_last_sequence,
+                        terminal_intent_id=handshake.terminal_intent_id,
                         target_status=terminal_status,
                         degraded_reason=terminal_reason,
                     )
         except BaseException:
-            self._force_terminal_failure_latch()
+            self._force_terminal_failure_latch(
+                expected_last_sequence=handshake.expected_last_sequence,
+                terminal_intent_id=handshake.terminal_intent_id,
+            )
             raise
         if assessment_error is not None:
             raise assessment_error
@@ -466,6 +491,7 @@ class TrajectoryRecorder:
         *,
         expected_last_sequence: int,
         assessment_complete: bool,
+        terminal_intent_id: str,
     ) -> str:
         """有限次重试未知终态；耗尽后发布显式 reconciliation 请求。"""
         for _ in range(TRAJECTORY_TERMINAL_RECONCILIATION_ATTEMPTS):
@@ -476,12 +502,14 @@ class TrajectoryRecorder:
                     self._upgrade_terminal_intent_transaction(
                         expected_last_sequence=expected_last_sequence,
                         degraded_reason=degraded_reason,
+                        terminal_intent_id=terminal_intent_id,
                     )
                 return self._write_terminal_transaction(
                     expected_last_sequence=expected_last_sequence,
                     assessment_complete=assessment_complete and degraded_reason is None,
                     degraded_reason=degraded_reason,
                     allow_complete_correction=degraded_reason is not None,
+                    terminal_intent_id=terminal_intent_id,
                 )
             except (OSError, RuntimeError, _TerminalOutcomeUnknownError):
                 continue
@@ -494,6 +522,7 @@ class TrajectoryRecorder:
             self._pending_terminal_reconciliation = TrajectoryTerminalReconciliation(
                 run_id=self.run_id,
                 expected_last_sequence=expected_last_sequence,
+                terminal_intent_id=terminal_intent_id,
                 target_status="degraded" if degraded_reason is not None else "complete",
                 degraded_reason=degraded_reason,
             )
@@ -501,6 +530,7 @@ class TrajectoryRecorder:
             self._upgrade_terminal_intent_transaction(
                 expected_last_sequence=expected_last_sequence,
                 degraded_reason=degraded_reason,
+                terminal_intent_id=terminal_intent_id,
             )
         except BaseException:
             pass
@@ -586,8 +616,9 @@ class TrajectoryRecorder:
         *,
         expected_last_sequence: int,
         degraded_reason: str | None,
+        terminal_intent_id: str,
     ) -> None:
-        """在 assessment 前用独立已确认事务持久化可恢复的终态意图。"""
+        """事务 A 仅从 recording + no-pending 创建本次 finalize 的 intent。"""
         now = datetime.now(UTC)
         session = self._session_factory()
         target_status = "degraded" if degraded_reason is not None else "complete"
@@ -597,24 +628,21 @@ class TrajectoryRecorder:
             statement = (
                 update(RunTrajectoryMeta)
                 .where(RunTrajectoryMeta.run_id == self.run_id)
-                .where(RunTrajectoryMeta.trajectory_status.in_(("recording", "complete")))
+                .where(RunTrajectoryMeta.trajectory_status == "recording")
+                .where(RunTrajectoryMeta.terminal_intent_id.is_(None))
+                .where(RunTrajectoryMeta.terminal_intent_status.is_(None))
+                .where(RunTrajectoryMeta.terminal_intent_reason.is_(None))
+                .where(RunTrajectoryMeta.terminal_intent_version.is_(None))
+                .where(RunTrajectoryMeta.terminal_intent_pending_at.is_(None))
             )
             if degraded_reason is None:
-                statement = statement.where(
-                    or_(
-                        RunTrajectoryMeta.terminal_intent_status.is_(None),
-                        RunTrajectoryMeta.terminal_intent_status == "complete",
-                    )
-                )
                 intent_reason = None
             else:
-                intent_reason = func.coalesce(
-                    RunTrajectoryMeta.terminal_intent_reason,
-                    degraded_reason,
-                )
+                intent_reason = degraded_reason
             result = session.execute(
                 statement.values(
                     expected_last_sequence=expected_last_sequence,
+                    terminal_intent_id=terminal_intent_id,
                     terminal_intent_status=target_status,
                     terminal_intent_reason=intent_reason,
                     terminal_intent_version=TRAJECTORY_TERMINAL_INTENT_VERSION,
@@ -626,9 +654,17 @@ class TrajectoryRecorder:
                 )
             )
             if result.rowcount != 1:
-                raise RuntimeError("终态 intent 不满足 recording/complete 持久化条件")
+                try:
+                    session.rollback()
+                except BaseException:
+                    pass
+                raise _TerminalIntentPreconditionError(
+                    "终态 intent 不满足 recording + no-pending 所有权前置条件"
+                )
             session.commit()
             return
+        except _TerminalIntentPreconditionError:
+            raise
         except BaseException as error:
             operation_error = error
             try:
@@ -642,6 +678,7 @@ class TrajectoryRecorder:
             expected_last_sequence=expected_last_sequence,
             target_status=target_status,
             degraded_reason=degraded_reason,
+            terminal_intent_id=terminal_intent_id,
         )
         if persisted is True:
             return
@@ -656,6 +693,7 @@ class TrajectoryRecorder:
         *,
         expected_last_sequence: int,
         degraded_reason: str,
+        terminal_intent_id: str,
     ) -> None:
         """把 pending intent 单调升级为 degraded，首次原因不可被覆盖。"""
         now = datetime.now(UTC)
@@ -667,6 +705,7 @@ class TrajectoryRecorder:
                 .where(RunTrajectoryMeta.run_id == self.run_id)
                 .where(RunTrajectoryMeta.expected_last_sequence == expected_last_sequence)
                 .where(RunTrajectoryMeta.trajectory_status.in_(("recording", "complete")))
+                .where(RunTrajectoryMeta.terminal_intent_id == terminal_intent_id)
                 .where(RunTrajectoryMeta.terminal_intent_pending_at.is_not(None))
                 .where(RunTrajectoryMeta.terminal_intent_version == TRAJECTORY_TERMINAL_INTENT_VERSION)
                 .values(
@@ -695,6 +734,7 @@ class TrajectoryRecorder:
             expected_last_sequence=expected_last_sequence,
             target_status="degraded",
             degraded_reason=degraded_reason,
+            terminal_intent_id=terminal_intent_id,
         )
         if persisted is True:
             return
@@ -735,6 +775,7 @@ class TrajectoryRecorder:
         expected_last_sequence: int,
         assessment_complete: bool,
         degraded_reason: str | None,
+        terminal_intent_id: str,
         allow_complete_correction: bool = False,
     ) -> str:
         """幂等转换终态；commit 结果不确定时用新 Session 对账。"""
@@ -751,6 +792,7 @@ class TrajectoryRecorder:
                     .where(RunTrajectoryMeta.trajectory_status == "recording")
                     .where(RunTrajectoryMeta.degraded_reason.is_(None))
                     .where(RunTrajectoryMeta.expected_last_sequence == expected_last_sequence)
+                    .where(RunTrajectoryMeta.terminal_intent_id == terminal_intent_id)
                     .where(RunTrajectoryMeta.terminal_intent_status == "complete")
                     .where(RunTrajectoryMeta.terminal_intent_reason.is_(None))
                     .where(RunTrajectoryMeta.terminal_intent_version == TRAJECTORY_TERMINAL_INTENT_VERSION)
@@ -777,6 +819,7 @@ class TrajectoryRecorder:
                     .where(RunTrajectoryMeta.run_id == self.run_id)
                     .where(eligible_status)
                     .where(RunTrajectoryMeta.expected_last_sequence == expected_last_sequence)
+                    .where(RunTrajectoryMeta.terminal_intent_id == terminal_intent_id)
                     .where(RunTrajectoryMeta.terminal_intent_status == "degraded")
                     .where(RunTrajectoryMeta.terminal_intent_reason == reason)
                     .where(RunTrajectoryMeta.terminal_intent_version == TRAJECTORY_TERMINAL_INTENT_VERSION)
@@ -808,6 +851,7 @@ class TrajectoryRecorder:
             expected_last_sequence=expected_last_sequence,
             terminal_status=terminal_status,
             degraded_reason=reason,
+            terminal_intent_id=terminal_intent_id,
         )
         if persisted is True:
             return terminal_status
@@ -823,6 +867,7 @@ class TrajectoryRecorder:
         expected_last_sequence: int,
         terminal_status: str,
         degraded_reason: str | None,
+        terminal_intent_id: str,
     ) -> bool | None:
         """用独立短 Session 判定 commit 响应丢失后的真实持久化结果。"""
         try:
@@ -836,6 +881,7 @@ class TrajectoryRecorder:
                     RunTrajectoryMeta.expected_last_sequence,
                     RunTrajectoryMeta.finalized_at,
                     RunTrajectoryMeta.degraded_reason,
+                    RunTrajectoryMeta.terminal_intent_id,
                     RunTrajectoryMeta.terminal_intent_status,
                     RunTrajectoryMeta.terminal_intent_reason,
                     RunTrajectoryMeta.terminal_intent_version,
@@ -846,7 +892,11 @@ class TrajectoryRecorder:
             return None
         finally:
             session.close()
-        if row is None or row.expected_last_sequence != expected_last_sequence:
+        if (
+            row is None
+            or row.expected_last_sequence != expected_last_sequence
+            or row.terminal_intent_id != terminal_intent_id
+        ):
             return False
         if terminal_status == "complete":
             return (
@@ -874,6 +924,7 @@ class TrajectoryRecorder:
         expected_last_sequence: int,
         target_status: str,
         degraded_reason: str | None,
+        terminal_intent_id: str,
     ) -> bool | None:
         """对账 intent 的持久化真相；查询失败返回 unknown。"""
         try:
@@ -884,6 +935,7 @@ class TrajectoryRecorder:
             row = session.execute(
                 select(
                     RunTrajectoryMeta.expected_last_sequence,
+                    RunTrajectoryMeta.terminal_intent_id,
                     RunTrajectoryMeta.terminal_intent_status,
                     RunTrajectoryMeta.terminal_intent_reason,
                     RunTrajectoryMeta.terminal_intent_version,
@@ -897,6 +949,7 @@ class TrajectoryRecorder:
         return bool(
             row is not None
             and row.expected_last_sequence == expected_last_sequence
+            and row.terminal_intent_id == terminal_intent_id
             and row.terminal_intent_status == target_status
             and row.terminal_intent_reason == degraded_reason
             and row.terminal_intent_version == TRAJECTORY_TERMINAL_INTENT_VERSION
@@ -909,17 +962,20 @@ class TrajectoryRecorder:
         expected_last_sequence: int,
         terminal_status: str,
         degraded_reason: str | None,
+        terminal_intent_id: str,
     ) -> bool:
         """终态明确后用独立幂等事务清除 pending；未知时保留给 stale 扫描。"""
         now = datetime.now(UTC)
         session = self._session_factory()
         operation_error: BaseException | None = None
+        matched_intent = False
         try:
             statement = (
                 update(RunTrajectoryMeta)
                 .where(RunTrajectoryMeta.run_id == self.run_id)
                 .where(RunTrajectoryMeta.expected_last_sequence == expected_last_sequence)
                 .where(RunTrajectoryMeta.trajectory_status == terminal_status)
+                .where(RunTrajectoryMeta.terminal_intent_id == terminal_intent_id)
                 .where(RunTrajectoryMeta.terminal_intent_status == terminal_status)
                 .where(RunTrajectoryMeta.terminal_intent_version == TRAJECTORY_TERMINAL_INTENT_VERSION)
                 .where(RunTrajectoryMeta.terminal_intent_pending_at.is_not(None))
@@ -934,6 +990,7 @@ class TrajectoryRecorder:
                 ).where(RunTrajectoryMeta.terminal_intent_reason == degraded_reason)
             result = session.execute(
                 statement.values(
+                    terminal_intent_id=None,
                     terminal_intent_status=None,
                     terminal_intent_reason=None,
                     terminal_intent_version=None,
@@ -943,11 +1000,8 @@ class TrajectoryRecorder:
             )
             if result.rowcount != 1:
                 session.rollback()
-                return self._terminal_intent_is_cleared(
-                    expected_last_sequence=expected_last_sequence,
-                    terminal_status=terminal_status,
-                    degraded_reason=degraded_reason,
-                ) is True
+                return False
+            matched_intent = True
             session.commit()
             return True
         except BaseException as error:
@@ -959,10 +1013,13 @@ class TrajectoryRecorder:
         finally:
             session.close()
 
+        if not matched_intent:
+            return False
         cleared = self._terminal_intent_is_cleared(
             expected_last_sequence=expected_last_sequence,
             terminal_status=terminal_status,
             degraded_reason=degraded_reason,
+            terminal_intent_id=terminal_intent_id,
         )
         if cleared is True:
             return True
@@ -976,7 +1033,11 @@ class TrajectoryRecorder:
         expected_last_sequence: int,
         terminal_status: str,
         degraded_reason: str | None,
+        terminal_intent_id: str,
     ) -> bool | None:
+        """仅在 C 已按本次 token 命中但 commit 结果不确定后确认五字段已清空。"""
+        if not terminal_intent_id:
+            return False
         try:
             session = self._session_factory()
         except BaseException:
@@ -988,6 +1049,7 @@ class TrajectoryRecorder:
                     RunTrajectoryMeta.expected_last_sequence,
                     RunTrajectoryMeta.finalized_at,
                     RunTrajectoryMeta.degraded_reason,
+                    RunTrajectoryMeta.terminal_intent_id,
                     RunTrajectoryMeta.terminal_intent_status,
                     RunTrajectoryMeta.terminal_intent_reason,
                     RunTrajectoryMeta.terminal_intent_version,
@@ -1009,6 +1071,7 @@ class TrajectoryRecorder:
         )
         return bool(
             terminal_matches
+            and row.terminal_intent_id is None
             and row.terminal_intent_status is None
             and row.terminal_intent_reason is None
             and row.terminal_intent_version is None
