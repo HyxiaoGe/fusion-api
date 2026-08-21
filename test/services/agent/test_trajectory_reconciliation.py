@@ -77,6 +77,7 @@ class TrajectoryReconciliationTests(unittest.TestCase):
         expected_last_sequence: int | None = None,
         degraded_reason: str | None = None,
         pending: bool = False,
+        intent_id: str = "intent-1",
         intent_status: str | None = None,
         intent_reason: str | None = None,
         intent_version: int | None = None,
@@ -94,7 +95,7 @@ class TrajectoryReconciliationTests(unittest.TestCase):
                     expected_last_sequence=expected_last_sequence,
                     degraded_reason=degraded_reason,
                     finalized_at=self.now if trajectory_status == "complete" else None,
-                    terminal_intent_id="intent-1" if pending else None,
+                    terminal_intent_id=intent_id if pending else None,
                     terminal_intent_status=intent_status if pending else None,
                     terminal_intent_reason=intent_reason if pending else None,
                     terminal_intent_version=intent_version if pending else None,
@@ -144,8 +145,57 @@ class TrajectoryReconciliationTests(unittest.TestCase):
         self.assertIn("LIMIT 37", compiled)
         self.assertIn("AGENT_SESSIONS.STATUS != 'RUNNING'", compiled)
         self.assertIn("AGENT_SESSIONS.TERMINAL_AT <=", compiled)
-        self.assertIn("RUN_TRAJECTORY_META.UPDATED_AT <=", compiled)
+        self.assertEqual(compiled.count("RUN_TRAJECTORY_META.UPDATED_AT <="), 2)
         self.assertIn("RUN_TRAJECTORY_META.TERMINAL_INTENT_PENDING_AT <=", compiled)
+
+    def test_old_pending_with_fresh_update_waits_for_ack_or_a_full_new_grace(self):
+        for status in ("recording", "complete", "degraded"):
+            run_id = f"fresh-updated-{status}"
+            self._add_run(run_id)
+            self._add_meta(
+                run_id,
+                trajectory_status=status,
+                expected_last_sequence=0,
+                degraded_reason="write_failed" if status == "degraded" else None,
+                pending=True,
+                intent_id=f"intent-{status}",
+                intent_status="degraded" if status == "degraded" else "complete",
+                intent_reason="write_failed" if status == "degraded" else None,
+                intent_version=1,
+                pending_at=self.stale_before - timedelta(seconds=1),
+                updated_at=self.now,
+            )
+
+        fresh = reconcile_trajectory_batch(session_factory=self.Session, now=self.now)
+
+        self.assertEqual(fresh.processed, 0)
+        for status in ("recording", "complete", "degraded"):
+            self.assertIsNotNone(self._meta(f"fresh-updated-{status}").terminal_intent_pending_at)
+
+        complete_recorder = TrajectoryRecorder(
+            run_id="fresh-updated-complete",
+            conversation_id="conv-1",
+            message_id="msg-fresh-updated-complete",
+            session_factory=self.Session,
+        )
+        acknowledged = complete_recorder._ack_terminal_intent_transaction(
+            expected_last_sequence=0,
+            terminal_status="complete",
+            degraded_reason=None,
+            terminal_intent_id="intent-complete",
+        )
+        self.assertTrue(acknowledged)
+        self.assertIsNone(self._meta("fresh-updated-complete").terminal_intent_pending_at)
+
+        stale = reconcile_trajectory_batch(
+            session_factory=self.Session,
+            now=self.now + DEFAULT_RECONCILIATION_STALE_GRACE + timedelta(seconds=1),
+        )
+
+        self.assertEqual(stale.pending_degraded, 2)
+        self.assertEqual(self._meta("fresh-updated-complete").trajectory_status, "complete")
+        self.assertEqual(self._meta("fresh-updated-recording").trajectory_status, "degraded")
+        self.assertEqual(self._meta("fresh-updated-degraded").trajectory_status, "degraded")
 
     def test_fresh_terminal_rows_wait_for_grace_before_reconciliation(self):
         self._add_run("fresh-recording", terminal_at=self.now)

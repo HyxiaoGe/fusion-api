@@ -1,6 +1,6 @@
 # Fusion Trajectory 集成设计（DSH 风格 Agent 执行轨迹）
 
-> 状态：设计稿 v0.13（P0 实施审查补充 terminal intent 所有权与全链路 CAS）
+> 状态：设计稿 v0.14（P0 实施审查补充 `terminal_at` 终态年龄证据与协调 grace）
 > 范围：fusion-api + fusion-ui 集成 Agent 执行轨迹展示；langchain-trajectory-mvp 降级为原型实验室与联调夹具。
 > 本文档是实施 P0 的正式依据；P0 已在独立实施分支开始，P1–P3 不在本轮范围内。
 >
@@ -363,16 +363,19 @@ CREATE TABLE trajectory_ledger_settings (
 
 现有 `agent_sessions` 已有历史数据且 `message_id` 可空，按 Alembic expand/backfill/contract 顺序执行：
 
-1. **expand**：`ALTER TABLE agent_sessions ADD COLUMN turn_message_id TEXT NULL`、`ADD COLUMN previous_run_id TEXT NULL`、`ADD COLUMN attempt_index INTEGER NULL`（均可空，不动存量行）。
+1. **expand**：`ALTER TABLE agent_sessions ADD COLUMN turn_message_id TEXT NULL`、`ADD COLUMN previous_run_id TEXT NULL`、`ADD COLUMN attempt_index INTEGER NULL`、`ADD COLUMN terminal_at TIMESTAMPTZ NULL`（均可空，不动存量行）。
 2. **backfill**：
    - `turn_message_id = message_id`：历史行仅保留可证实的 assistant 锚点，不跨 assistant id 推断 user turn；
    - `attempt_index`：按 `(turn_message_id, created_at, id)` 用窗口函数 `row_number()` 回填，同一历史 assistant 锚点内的 run 得到稳定序号；
    - `message_id IS NULL` 的历史行：`turn_message_id / attempt_index` 保持 NULL（不参与 turn 归组，部分唯一索引不受影响）；
    - **历史 `previous_run_id` 保持 NULL，不伪造 lineage**（无法可靠推断，宁可缺失）。
+   - 历史非 `running` 行以 `created_at` 保守回填 `terminal_at`；历史 `running` 行保持 NULL，避免把仍在执行业务链路的 run 误当作可协调终态。
 3. **contract**：
    - 建部分唯一索引 `UNIQUE (turn_message_id, attempt_index) WHERE turn_message_id IS NOT NULL AND attempt_index IS NOT NULL`；
+   - 建普通索引 `ix_agent_sessions_terminal_at (terminal_at)`，供 stale/pending/meta-missing 协调任务按终态年龄筛选；
    - 新数据约束由应用层强制（新建 run 必须写 `attempt_index`；`previous_run_id` 由两阶段兼容控制），数据库层不强制 NOT NULL（避免迁移期间断约）。
 4. **`ledger_enabled_at` 不得是源码配置常量**：P0 新建单例表 `trajectory_ledger_settings` 持久化各环境的实际启用时间；legacy 判定只读取该不可变水位。不同环境（dev/prod）各自由迁移记录，运行时配置管理不得覆盖。
+5. **运行时 `terminal_at` 不变量**：新建 run 或重新进入 `running` 时必须清为 NULL；所有业务终态写入（completed / limit / error / interrupted 及兼容写入旁路）必须在同一事务写入 aware UTC。协调器不得用 `updated_at` 或 `created_at` 替代新 run 的业务终态时刻。
 
 ## 5. 采集层：TrajectoryRecorder（P0）
 
@@ -513,7 +516,12 @@ assessment/事件 latch、timeout、cancel、unknown：
 事件 INSERT 因 Postgres 不可用失败时，随后更新 meta 也可能失败——「失败必然可见」不能依赖同一次 DB 写。因此：
 
 1. **内存降级 latch**：Recorder 进程内维护 per-run degraded 标记；首次落账失败/超时/准入失败/取消置位（§5.1），后续事件跳过落账（不重复报错），并在 DB 恢复后重试写 meta（幂等）。**迟到事务不得反转 latch**（§5.1、§5.2）。
-2. **stale/pending 协调任务**：周期性扫描 run 已不在运行/已终态且满足以下任一条件的 meta：普通 stale `recording`，或 `trajectory_status IN ('recording', 'complete', 'degraded') AND terminal_intent_pending_at IS NOT NULL`。无 pending 的普通 stale recording 仍按 `expected_last_sequence +` §5.2 三断言判定；**任何遗留 pending 都表示 Recorder 未明确 ack，Task 6 必须保守收敛为 degraded**（已有 degraded 保持 degraded；pending target/reason/id 用于幂等纠偏与审计；缺 reason 时使用终态结果未知的保守原因），再清除五个 intent 字段。这样即使 B 实际 complete、响应丢失、对账失败后进程崩溃，也不会留下不可达的假 complete。
+2. **stale/pending 协调任务**：以持久化的 `AgentSession.terminal_at` 作为业务终态年龄证据，并使用 60 秒 grace（`stale_before = now - 60s`）。候选 run 必须 `status != running AND terminal_at IS NOT NULL AND terminal_at <= stale_before`；此外：
+   - 无 pending 的普通 stale `recording` 必须同时 `meta.updated_at <= stale_before`，再按 `expected_last_sequence +` §5.2 三断言判定 complete/degraded；
+   - `trajectory_status IN ('recording', 'complete', 'degraded') AND terminal_intent_pending_at IS NOT NULL` 的候选必须同时满足 `terminal_intent_pending_at <= stale_before AND meta.updated_at <= stale_before`。**任何到期遗留 pending 都表示 Recorder 未明确 ack，Task 6 必须保守收敛为 degraded**（已有 degraded 保持 degraded；未知 status/reason/version 也安全降级），并在同一原子更新中清除五个 intent 字段；
+   - `terminal_intent_pending_at` 虽已过期、但 `updated_at` 仍新鲜时不得协调，给正常 finalize 的 B→C、C ack 或迟到纠偏保留完整 grace；若 C 未发生，则从最后一次持久写入再经过完整 grace 后才保守降级；
+   - 新 run 缺 meta 也必须满足相同 `terminal_at <= stale_before` 才写 `degraded/meta_missing`。插入使用 PostgreSQL `ON CONFLICT (run_id) DO NOTHING`，仅 `rowcount=1` 计入处理数；若并发 Recorder 先创建 meta，协调器不得覆盖，且同批其他候选仍正常提交。
+   扫描在 PostgreSQL 使用 `FOR UPDATE SKIP LOCKED` 分批执行；业务 `running` run 绝不处理。这样既保护正常 finalize/late first-write，也使进程崩溃遗留状态在 grace 后幂等收敛。
 3. **legacy 判定唯一判据**：
    - `run.created_at < ledger_enabled_at`（迁移持久化的各环境启用时间，§4.4）且无 meta → `legacy/not_recorded`（账本上线前，正常）；
    - `run.created_at >= ledger_enabled_at` 且无 meta → `degraded/meta_missing`（数据库故障被显式暴露，**不得伪装成历史运行**）。
@@ -620,6 +628,7 @@ P0 验收不依赖 P2（MVP Adapter 联调属 P2 验收）。
 - **finalize 三断言 + latch 优先**：finalize 先查 degraded latch，置位（含取消 `recorder_cancelled`）则一律落 `degraded`（即使三断言满足）；未置位才验 `COUNT = expected+1 ∧ MIN(sequence)=0 ∧ MAX(sequence)=expected`（§5.2）——两条路径都有单测。
 - **迟到事务竞态**：「最后一条事件落账超时 → 迟到提交成功 → 三断言满足」仍必须 `degraded`（latch 权威性）有专门竞态测试。
 - **durable terminal intent**：每次 finalize 生成唯一 `terminal_intent_id`；事务 A 只能从 `recording + no pending` 创建 `expected + pending(v1)`，明确前置失败不得 readback；风险终态事务不清 intent；B/C/升级/readback 全部按同 token CAS，正常 complete 仅在独立 ack 后清五字段。覆盖遗留 `recording|complete|degraded + pending` 不被新 Recorder 清理、A commit 响应丢失同 token 恢复、错误 token 零影响、terminal commit 响应丢失 + 首次/持续对账失败、unknown 后 cancel、ack 提交失败与进程崩溃前 DB 状态；断言 Task 6 可扫描 `recording|complete|degraded + pending`，permit 最终守恒。
+- **协调 grace 与正常 ack 保护**：`terminal_at` 是唯一业务终态年龄证据；新建/重入 running 清 NULL，所有终态写 aware UTC。stale recording 需要 `terminal_at + meta.updated_at` 都过 60 秒 grace；pending 需要 `terminal_at + pending_at + meta.updated_at` 都过 grace。覆盖「pending_at 旧但 updated_at 新」的 recording/complete/degraded 不被协调、complete 可正常 C ack；若 C 未发生且 updated_at 再过完整 grace，pending 才保守 degraded 并原子清五字段。
 - **取消路径竞态**：worker 运行中 / 尚未启动时取消——permit 最终守恒（无泄漏）、迟到异常被消费、latch 保持 degraded、finalize 不得 complete、**sequence 不重复**（有专门竞态测试）。
 - **原子事务**：事件 INSERT 与 meta 计数同事务（§5.1）有故障注入测试——INSERT 成功后 commit 前失败，必须整体回滚，不得出现「有事件无计数」。
 - **超时熔断 + permit 生命周期**：`BoundedSemaphore(4)` 非阻塞准入——满载直接 fail-open（有测试：sem 满时新事件不排队、置 degraded）；`wait_for(250ms)` 在 DB 挂起时真正超时（非假超时）；**「任务尚未开始执行便超时」不得泄漏 permit**（有测试：连续 N 次超时后 semaphore 仍可继续 acquire，permit 数守恒）；`shield` 保证超时不取消底层任务；迟到任务异常被消费（无 never-retrieved 告警）；psycopg2 `connect_timeout` 整数秒限制已说明（500ms 不可配，主隔离靠 wait_for+闸门）。
@@ -627,6 +636,7 @@ P0 验收不依赖 P2（MVP Adapter 联调属 P2 验收）。
 - **完整性矩阵**：成功 / 失败 / 中断 / 继续执行（retry、regenerate）后的轨迹完整性——**seal/finalize 后无新事件；run 终态事件后允许同步辅助事件**。
 - **attempt_index 并发**：同 `turn_message_id` 并发 retry/continue 不产生相同 `attempt_index`（部分唯一约束 + conversation `SELECT FOR UPDATE` 原子分配）；迁移回填后历史行 `turn_message_id/attempt_index` 正确、`message_id=NULL` 行不受影响。
 - **legacy 判定**：`run.created_at < ledger_enabled_at`（迁移持久化值）→ `legacy`；`>= ledger_enabled_at` 且 meta 缺失 → `degraded/meta_missing`；两类有测试覆盖。
+- **meta_missing 并发安全**：新终态 run 缺 meta 仅在 `terminal_at` 过 grace 后候选；PostgreSQL `ON CONFLICT DO NOTHING` 不覆盖并发 Recorder 首写，仅实际插入行计数，并保证同批其他 stale/pending 候选提交。
 
 ### 9.3 协议与回归
 
@@ -642,7 +652,7 @@ P0 验收不依赖 P2（MVP Adapter 联调属 P2 验收）。
 
 | 阶段 | 交付物 | 退出标准 |
 |---|---|---|
-| P0 | 协议升级（schema_version + 新增生命周期事件含 `first_output_delta` 双分支语义、`retrieval_cancelled`、cache token 提取）；`agent_events` + `run_trajectory_meta`（FK、expected/finalized、latch 优先、**durable terminal intent + pending 扫描索引**）；**AgentSession 迁移与回填（§4.4）**；`TrajectoryRecorder`（独立 Session + 原子事务 + **BoundedSemaphore 准入 + wait_for/shield/CancelledError/DB 超时熔断 + permit 生命周期四规则** + seal/finalize 三断言 + latch 优先 + 独立 terminal ack）；emitter `seal_and_get_last_sequence`；`turn_message_id/previous_run_id/attempt_index`（稳定 turn 分组 + 两阶段兼容 + 并发分配）；落库 allowlist 脱敏；保留策略 = 级联删除（无独立 TTL） | §9 验收全绿（同步 v1 有界回归在阈值内；超阈值按 §5.4 切换）；不含 P2 依赖 |
+| P0 | 协议升级（schema_version + 新增生命周期事件含 `first_output_delta` 双分支语义、`retrieval_cancelled`、cache token 提取）；`agent_events` + `run_trajectory_meta`（FK、expected/finalized、latch 优先、**durable terminal intent + pending 扫描索引**）；**AgentSession 迁移与回填（§4.4，含 `terminal_at`、UTC 终态写入与 60 秒协调 grace）**；`TrajectoryRecorder`（独立 Session + 原子事务 + **BoundedSemaphore 准入 + wait_for/shield/CancelledError/DB 超时熔断 + permit 生命周期四规则** + seal/finalize 三断言 + latch 优先 + 独立 terminal ack）；emitter `seal_and_get_last_sequence`；`turn_message_id/previous_run_id/attempt_index`（稳定 turn 分组 + 两阶段兼容 + 并发分配）；落库 allowlist 脱敏；保留策略 = 级联删除（无独立 TTL） | §9 验收全绿（同步 v1 有界回归在阈值内；超阈值按 §5.4 切换）；不含 P2 依赖 |
 | P1 | `TrajectoryProjector`（orphan 收口 + `terminal_source` + 截断保护）；快照 API（用户/管理员端点分离、越权 404、`truncated` 语义）；**仅历史快照，不声称实时** | 真实数据可回放、可钻取、degraded/legacy/truncated 明示 |
 | P2 | MVP 侧 `FusionTrajectoryAdapter`（不污染 fusion 正式 API）；真实数据联调 | 协议与交互模型在 MVP 上钉死 |
 | P3 | fusion-ui 轨迹侧栏（账本 + 时间线 + 检查器 + 双向定位）+ 受控事件回调通道 + 运行中实时归并 | 与 DSH 轨迹对标的功能验收 |
@@ -655,11 +665,12 @@ P0 验收不依赖 P2（MVP Adapter 联调属 P2 验收）。
 - [ ] **`CancelledError` 分支**：捕获置 degraded（`recorder_cancelled`）→ 消费迟到 future → **re-raise**（不吞取消）；取消后已分配 sequence 不复用；「worker 运行中/未启动时取消」竞态测试覆盖 permit 守恒、latch 保持 degraded、finalize 不得 complete、sequence 不重复。
 - [ ] **finalize latch 优先**：latch 置位（含取消）→ 一律 degraded（即使三断言满足）；「最后一条事件迟到提交」竞态测试存在。
 - [ ] **durable terminal intent 所有权**：每次 finalize 唯一 token；A 仅从 recording + no pending 创建，rowcount=0 不 readback；B/C/升级/readback 同 token CAS；历史 recording|complete|degraded pending 不被新 Recorder 冒领。明确终态后才独立 ack；commit/ack 结果未知或进程崩溃后，Task 6 扫描三种状态的 pending 并保守收敛，unknown 不吞后到 timeout/cancel。
+- [ ] **协调 grace 与并发首写**：`AgentSession.terminal_at` 迁移回填、running 清 NULL、所有终态写 aware UTC；stale/pending/meta-missing 都要求 terminal_at 过 60 秒 grace，pending 额外要求 pending_at 与 updated_at 均过 cutoff，普通 recording 要求 updated_at 过 cutoff。新鲜 B→C/C ack 不被抢占；到期 pending 原子降级并清五字段；meta_missing 用 `ON CONFLICT DO NOTHING`，不覆盖并发 Recorder 首写。
 - [ ] **sequence 在第一次可取消 await 前预留**：校验完成后、await writer 前递增；取消的 emit 消耗序号形成空洞（degraded）而非复用；complete 严格 `0..N-1` 连续、degraded 单调唯一允许空洞——两侧语义有测试。
 - [ ] `seal_and_get_last_sequence` 与 emit 互斥（同一把锁）；seal 后 emit 抛错有测试；取消路径 shield 有测试。
 - [ ] finalize 调用点在**所有同步辅助事件之后**；`run_completed` 不触发 finalize；finalize 三断言有单测。
 - [ ] 事件 INSERT 与 meta 计数同事务；故障注入整体回滚有测试。
-- [ ] degraded 在 DB 不可用时仍可达（内存 latch + 协调任务）；legacy 唯一判据是迁移持久化的 `ledger_enabled_at`；新 run 缺 meta 必须 `degraded/meta_missing`。
+- [ ] degraded 在 DB 不可用时仍可达（内存 latch + 协调任务）；协调器使用 PostgreSQL `FOR UPDATE SKIP LOCKED` 幂等分批，业务 running 永不处理；legacy 唯一判据是迁移持久化的 `ledger_enabled_at`；新 run 缺 meta 仅在 terminal_at 过 grace 后写 `degraded/meta_missing`。
 - [ ] `first_output_delta` 只在真实 delta 时发送且 `ttft_ms` 非空；空流由 `completed.ttft_ms=null` 表达；**reasoning/content 分支可见 chunk 先于事件（顺序断言）**；**tool_call 分支不受该约束**。
 - [ ] `retrieval_cancelled` 覆盖；orphan 推导带 `terminal_source/inferred_reason`，成功 run 孤儿标 `unknown/incomplete`。
 - [ ] `app/ai` 无反向依赖 `app/services`；LLM round 事件由编排层发出。
@@ -680,6 +691,7 @@ P0 验收不依赖 P2（MVP Adapter 联调属 P2 验收）。
 - **同步 DB 线程池**：fusion 为同步 SQLAlchemy + psycopg2（`connect_timeout` 限整数秒），超时隔离靠 `BoundedSemaphore` 准入 + `wait_for(asyncio.shield(...))` + 显式 `CancelledError` 分支；permit 泄漏由四规则 + 守恒测试兜底；若线程池方案实测不达 §9.1 阈值，记录决策切换 AsyncSession（§5.1 备选）。
 - **sequence 预留时机**：emitter 在第一次可取消 await 前预留并递增（§5.2）；取消/熔断导致的空洞只允许出现在 degraded run；complete 严格要求连续（§9.2）。
 - **同步 v1 延迟**：承认有界回归（不承诺零首屏影响）；若超 §9.1 阈值，P0 切换 §5.4 异步队列（切换条件已定义，实施成本可控）。
+- **协调 grace 的可见性窗口**：终态异常最多延后约「60 秒 grace + 一次 scheduler 周期」才收敛；这是保护正常 finalize B→C/C ack 与迟到首写的有意取舍。`terminal_at` 缺失时协调器不得猜测或破坏性更新，应保守跳过并通过日志/指标暴露，交由后续修复或人工处理。
 - **TTL 推迟**：P0 只做级联删除；独立 TTL（含 `expired` 状态）留待后续，避免「complete 但事件为空」的假象。
 - **MVP 协议差异**（命名、sequence 0-based、span 含义）：由 P2 的 `FusionTrajectoryAdapter` 吸收，不反向污染 fusion API。
 - **仓库状态**：`.gitignore` 例外与文档跟踪按文首决定，在正式实施分支首个提交中一并处理；不在 detached HEAD 操作。

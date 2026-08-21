@@ -125,6 +125,7 @@ def build_reconciliation_candidate_query(*, batch_size: int, stale_before: datet
                 and_(
                     RunTrajectoryMeta.terminal_intent_pending_at.is_not(None),
                     RunTrajectoryMeta.terminal_intent_pending_at <= stale_before,
+                    RunTrajectoryMeta.updated_at <= stale_before,
                 ),
             )
         )
