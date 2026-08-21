@@ -1490,7 +1490,7 @@ class WebSearchRedirectPresentationTests(unittest.TestCase):
 
 
 class AgentEventCompositeWriterTests(unittest.IsolatedAsyncioTestCase):
-    async def test_writes_redis_before_recorder(self):
+    async def test_writes_redis_then_progress_then_trajectory(self):
         calls = []
 
         class RedisWriter:
@@ -1499,9 +1499,17 @@ class AgentEventCompositeWriterTests(unittest.IsolatedAsyncioTestCase):
 
         class Recorder:
             def record_chunk(self, conversation_id, chunk_type, payload):
-                calls.append(("recorder", conversation_id, chunk_type, payload))
+                calls.append(("progress", conversation_id, chunk_type, payload))
 
-        writer = AgentEventCompositeWriter(redis_writer=RedisWriter(), recorder=Recorder())
+        class TrajectoryRecorder:
+            async def record_chunk(self, conversation_id, chunk_type, payload):
+                calls.append(("trajectory", conversation_id, chunk_type, payload))
+
+        writer = AgentEventCompositeWriter(
+            redis_writer=RedisWriter(),
+            recorder=Recorder(),
+            trajectory_recorder=TrajectoryRecorder(),
+        )
 
         await writer.append_chunk("c1", "task-1", "agent_event", {"type": "run_progress_updated"})
 
@@ -1509,9 +1517,54 @@ class AgentEventCompositeWriterTests(unittest.IsolatedAsyncioTestCase):
             calls,
             [
                 ("redis", "c1", "task-1", "agent_event", {"type": "run_progress_updated"}),
-                ("recorder", "c1", "agent_event", {"type": "run_progress_updated"}),
+                ("progress", "c1", "agent_event", {"type": "run_progress_updated"}),
+                ("trajectory", "c1", "agent_event", {"type": "run_progress_updated"}),
             ],
         )
+
+    async def test_required_redis_failure_is_raised_unchanged_before_auxiliary_sinks(self):
+        failure = RuntimeError("redis failed")
+        progress = MagicMock()
+        trajectory = AsyncMock()
+        redis_writer = AsyncMock()
+        redis_writer.append_chunk.side_effect = failure
+        writer = AgentEventCompositeWriter(
+            redis_writer=redis_writer,
+            recorder=progress,
+            trajectory_recorder=trajectory,
+        )
+
+        with self.assertRaises(RuntimeError) as raised:
+            await writer.append_chunk("c1", "task-1", "agent_event", {"type": "plan_snapshot"})
+
+        self.assertIs(raised.exception, failure)
+        progress.record_chunk.assert_not_called()
+        trajectory.record_chunk.assert_not_awaited()
+
+    async def test_progress_failure_is_fail_open_and_does_not_skip_trajectory(self):
+        progress = MagicMock()
+        progress.record_chunk.side_effect = RuntimeError("progress failed")
+        trajectory = AsyncMock()
+        writer = AgentEventCompositeWriter(
+            redis_writer=AsyncMock(),
+            recorder=progress,
+            trajectory_recorder=trajectory,
+        )
+
+        await writer.append_chunk("c1", "task-1", "agent_event", {"type": "step_started"})
+
+        trajectory.record_chunk.assert_awaited_once()
+
+    async def test_trajectory_failure_is_fail_open(self):
+        trajectory = AsyncMock()
+        trajectory.record_chunk.side_effect = RuntimeError("trajectory failed")
+        writer = AgentEventCompositeWriter(
+            redis_writer=AsyncMock(),
+            recorder=MagicMock(),
+            trajectory_recorder=trajectory,
+        )
+
+        await writer.append_chunk("c1", "task-1", "agent_event", {"type": "step_started"})
 
 
 class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):

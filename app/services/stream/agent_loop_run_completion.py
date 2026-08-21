@@ -47,6 +47,7 @@ class AgentLoopRunCompletionContext:
     state: AgentLoopState
     duration_ms_factory: DurationMsFactory
     assistant_message_sequence: int | None = None
+    trajectory_recorder: Any | None = None
 
 
 def persist_run_message(

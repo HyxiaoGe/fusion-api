@@ -10,6 +10,7 @@ from typing import Any
 from app.services.agent.emitter import AgentEventEmitter
 from app.services.agent.plan_coordinator import PlanCoordinator
 from app.services.agent.progress_recorder import AgentProgressRecorder
+from app.services.agent.trajectory_recorder import TrajectoryRecorder
 from app.services.stream.agent_loop_policy import AgentLoopLimits
 from app.services.stream.agent_loop_request_prep import AgentLoopCallConfig
 from app.services.stream.agent_loop_run_completion import AgentLoopRunCompletionContext
@@ -65,6 +66,7 @@ class AgentLoopExecutionContext:
     emitter: AgentEventEmitter
     runtime: AgentLoopRuntime
     completion_context: AgentLoopRunCompletionContext
+    trajectory_recorder: TrajectoryRecorder
     turn_message_id: str | None
     previous_run_id: str | None
     run_attempt_kind: str
@@ -77,6 +79,7 @@ class AgentLoopExecutionParts:
     state: AgentLoopState
     network_budget: NetworkToolBudget
     emitter: AgentEventEmitter
+    trajectory_recorder: TrajectoryRecorder
 
 
 def _build_execution_parts(
@@ -92,9 +95,15 @@ def _build_execution_parts(
         message_id=request.assistant_message_id,
         user_id=request.user_id,
     )
+    trajectory_recorder = TrajectoryRecorder(
+        run_id=run_id,
+        conversation_id=request.conversation_id,
+        message_id=request.assistant_message_id,
+    )
     event_writer = AgentEventCompositeWriter(
         redis_writer=dependencies.redis_writer,
         recorder=progress_recorder,
+        trajectory_recorder=trajectory_recorder,
     )
     emitter = AgentEventEmitter(
         run_id=run_id,
@@ -122,6 +131,7 @@ def _build_execution_parts(
             ),
         ),
         emitter=emitter,
+        trajectory_recorder=trajectory_recorder,
     )
 
 
@@ -147,6 +157,7 @@ def _build_completion_context(
         session_cache=dependencies.session_cache,
         state=parts.state,
         duration_ms_factory=_run_duration_ms,
+        trajectory_recorder=parts.trajectory_recorder,
     )
 
 
@@ -222,6 +233,7 @@ def build_agent_loop_execution(
         emitter=parts.emitter,
         runtime=runtime,
         completion_context=completion_context,
+        trajectory_recorder=parts.trajectory_recorder,
         turn_message_id=request.turn_message_id,
         previous_run_id=request.previous_run_id,
         run_attempt_kind=request.run_attempt_kind,

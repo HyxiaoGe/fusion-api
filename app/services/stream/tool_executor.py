@@ -132,16 +132,33 @@ class AgentEventRedisWriter:
 
 
 class AgentEventCompositeWriter:
-    """agent_event 双写 adapter：先写 Redis，再旁路记录 progress snapshot。"""
+    """agent_event 多写 adapter：Redis 必需，两个旁路 sink 独立 fail-open。"""
 
-    def __init__(self, *, redis_writer: AgentEventRedisWriter, recorder=None) -> None:
+    def __init__(self, *, redis_writer: AgentEventRedisWriter, recorder=None, trajectory_recorder=None) -> None:
         self.redis_writer = redis_writer
         self.recorder = recorder
+        self.trajectory_recorder = trajectory_recorder
 
     async def append_chunk(self, conversation_id: str, task_id: str, chunk_type: str, payload: dict) -> None:
         await self.redis_writer.append_chunk(conversation_id, task_id, chunk_type, payload)
         if self.recorder is not None:
-            self.recorder.record_chunk(conversation_id, chunk_type, payload)
+            try:
+                self.recorder.record_chunk(conversation_id, chunk_type, payload)
+            except Exception as error:  # noqa: BLE001 — progress 是辅助 sink
+                logger.warning(
+                    "Agent progress 旁路记录失败: run_id=%s error_type=%s",
+                    payload.get("run_id"),
+                    type(error).__name__,
+                )
+        if self.trajectory_recorder is not None:
+            try:
+                await self.trajectory_recorder.record_chunk(conversation_id, chunk_type, payload)
+            except Exception as error:  # noqa: BLE001 — trajectory 是辅助 sink
+                logger.warning(
+                    "Trajectory 旁路记录失败: run_id=%s error_type=%s",
+                    payload.get("run_id"),
+                    type(error).__name__,
+                )
 
 
 async def _execute_handler(handler, args: dict, runtime_context: Any = None):

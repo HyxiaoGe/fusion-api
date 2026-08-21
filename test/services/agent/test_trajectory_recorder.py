@@ -1,0 +1,412 @@
+import asyncio
+import concurrent.futures
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session as SqlAlchemySession
+from sqlalchemy.orm import sessionmaker
+
+from app.db.database import Base
+from app.db.models import AgentEvent, AgentSession, RunTrajectoryMeta
+from app.services.agent.trajectory_recorder import (
+    TRAJECTORY_CONNECT_TIMEOUT_SECONDS,
+    TRAJECTORY_LOCK_TIMEOUT_MS,
+    TRAJECTORY_STATEMENT_TIMEOUT_MS,
+    TRAJECTORY_WAIT_TIMEOUT_SECONDS,
+    TrajectoryRecorder,
+    create_trajectory_session_factory,
+)
+
+
+def _event(sequence: int, event_type: str = "step_started", **fields):
+    return {
+        "schema_version": 1,
+        "type": event_type,
+        "run_id": "run-1",
+        "parent_run_id": None,
+        "step_id": "step-1",
+        "parent_step_id": None,
+        "tool_call_id": None,
+        "sequence": sequence,
+        "trace_id": "trace-1",
+        "ts": 1_700_000_000.0 + sequence,
+        **({"step_number": sequence + 1} if event_type == "step_started" else {}),
+        **fields,
+    }
+
+
+def _assert_all_permits_available(test_case: unittest.TestCase, semaphore: threading.BoundedSemaphore) -> None:
+    acquired = [semaphore.acquire(blocking=False) for _ in range(5)]
+    test_case.assertEqual(acquired, [True, True, True, True, False])
+    for _ in range(4):
+        semaphore.release()
+
+
+class ManualExecutor(concurrent.futures.Executor):
+    """仅由测试显式推进任务，覆盖 worker 尚未启动的取消/超时竞态。"""
+
+    def __init__(self) -> None:
+        self.submitted = threading.Event()
+        self._calls: list[tuple[concurrent.futures.Future, object, tuple]] = []
+
+    def submit(self, fn, /, *args, **kwargs):
+        if kwargs:
+            raise AssertionError("测试 executor 不接受 kwargs")
+        future = concurrent.futures.Future()
+        self._calls.append((future, fn, args))
+        self.submitted.set()
+        return future
+
+    def run_next(self) -> None:
+        future, fn, args = self._calls.pop(0)
+        if not future.set_running_or_notify_cancel():
+            return
+        try:
+            future.set_result(fn(*args))
+        except BaseException as error:
+            future.set_exception(error)
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._calls)
+
+
+class FailingSubmitExecutor(concurrent.futures.Executor):
+    def submit(self, fn, /, *args, **kwargs):
+        raise RuntimeError("executor 已关闭")
+
+
+class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        database_path = Path(self.temp_dir.name) / "trajectory.sqlite3"
+        self.engine = create_engine(
+            f"sqlite:///{database_path}",
+            connect_args={"check_same_thread": False},
+        )
+        Base.metadata.create_all(self.engine)
+        self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
+        with self.Session() as db:
+            db.add(
+                AgentSession(
+                    id="run-1",
+                    conversation_id="conv-1",
+                    message_id="msg-1",
+                    user_id="user-1",
+                    model_id="gpt-4",
+                    provider="openai",
+                    status="running",
+                )
+            )
+            db.commit()
+        self.executors: list[concurrent.futures.ThreadPoolExecutor] = []
+
+    def tearDown(self) -> None:
+        for executor in self.executors:
+            executor.shutdown(wait=True)
+        self.engine.dispose()
+        self.temp_dir.cleanup()
+
+    def _recorder(self, *, session_factory=None, worker=None) -> TrajectoryRecorder:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        self.executors.append(executor)
+        return TrajectoryRecorder(
+            run_id="run-1",
+            conversation_id="conv-1",
+            message_id="msg-1",
+            session_factory=session_factory or self.Session,
+            executor=executor,
+            semaphore=threading.BoundedSemaphore(4),
+            worker=worker,
+        )
+
+    async def test_uses_independent_short_sessions_and_counts_duplicate_sequence_once(self):
+        created_sessions: list[SqlAlchemySession] = []
+
+        def session_factory():
+            session = self.Session()
+            created_sessions.append(session)
+            return session
+
+        recorder = self._recorder(session_factory=session_factory)
+
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+
+        with self.Session() as db:
+            self.assertEqual(db.query(AgentEvent).filter_by(run_id="run-1").count(), 1)
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertIsNotNone(meta)
+            self.assertEqual(meta.event_count, 1)
+        self.assertEqual(len(created_sessions), 2)
+        self.assertTrue(all(session is not created_sessions[0] for session in created_sessions[1:]))
+        self.assertTrue(all(not session.is_active or session.in_transaction() is False for session in created_sessions))
+
+    async def test_commit_failure_after_insert_rolls_back_event_and_meta_together(self):
+        class FlushThenFailSession(SqlAlchemySession):
+            def commit(self):
+                self.flush()
+                raise RuntimeError("commit 前故障注入")
+
+        failing_factory = sessionmaker(
+            bind=self.engine,
+            class_=FlushThenFailSession,
+            expire_on_commit=False,
+        )
+        recorder = self._recorder(session_factory=failing_factory)
+
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+
+        with self.Session() as db:
+            self.assertEqual(db.query(AgentEvent).filter_by(run_id="run-1").count(), 0)
+            self.assertIsNone(db.get(RunTrajectoryMeta, "run-1"))
+        self.assertEqual(recorder.degraded_reason, "write_failed")
+
+    async def test_finalize_marks_complete_only_for_contiguous_sequence_range(self):
+        recorder = self._recorder()
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+        await recorder.record_chunk("conv-1", "agent_event", _event(1))
+
+        await recorder.finalize(1)
+
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "complete")
+            self.assertEqual(meta.expected_last_sequence, 1)
+            self.assertIsNotNone(meta.finalized_at)
+            self.assertIsNone(meta.degraded_reason)
+
+    async def test_finalize_marks_gap_as_degraded(self):
+        recorder = self._recorder()
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+        await recorder.record_chunk("conv-1", "agent_event", _event(2))
+
+        await recorder.finalize(2)
+
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "degraded")
+            self.assertEqual(meta.expected_last_sequence, 2)
+            self.assertIsNone(meta.finalized_at)
+            self.assertEqual(meta.degraded_reason, "finalize_mismatch")
+
+    async def test_finalize_checks_latch_before_matching_count_min_max(self):
+        recorder = self._recorder()
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+        await recorder.record_chunk("conv-1", "agent_event", _event(1, event_type="future_event"))
+
+        await recorder.finalize(0)
+
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.event_count, 1)
+            self.assertEqual(meta.trajectory_status, "degraded")
+            self.assertEqual(meta.degraded_reason, "unsupported_event_type")
+            self.assertIsNone(meta.finalized_at)
+
+    async def test_late_last_event_success_never_clears_latch_or_completes_run(self):
+        first_call = True
+        late_started = threading.Event()
+        allow_late_commit = threading.Event()
+        late_finished = threading.Event()
+
+        def controlled_worker(operation):
+            nonlocal first_call
+            if first_call:
+                first_call = False
+                operation()
+                return
+            late_started.set()
+            allow_late_commit.wait(timeout=2)
+            operation()
+            late_finished.set()
+
+        recorder = self._recorder(worker=controlled_worker)
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+
+        late_task = asyncio.create_task(recorder.record_chunk("conv-1", "agent_event", _event(1)))
+        self.assertTrue(await asyncio.to_thread(late_started.wait, 1))
+        await late_task
+        self.assertEqual(recorder.degraded_reason, "recorder_timeout")
+        allow_late_commit.set()
+        self.assertTrue(await asyncio.to_thread(late_finished.wait, 1))
+
+        await recorder.finalize(1)
+
+        with self.Session() as db:
+            self.assertEqual(db.query(AgentEvent).filter_by(run_id="run-1").count(), 2)
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "degraded")
+            self.assertEqual(meta.degraded_reason, "recorder_timeout")
+            self.assertIsNone(meta.finalized_at)
+
+
+class RecorderConcurrencyTests(unittest.IsolatedAsyncioTestCase):
+    def _recorder(self, *, executor, semaphore, worker=None) -> TrajectoryRecorder:
+        return TrajectoryRecorder(
+            run_id="run-1",
+            conversation_id="conv-1",
+            message_id="msg-1",
+            session_factory=Mock(side_effect=AssertionError("并发测试不得访问数据库")),
+            executor=executor,
+            semaphore=semaphore,
+            worker=worker or (lambda operation: operation()),
+        )
+
+    async def test_full_admission_fails_open_without_submitting(self):
+        semaphore = threading.BoundedSemaphore(4)
+        for _ in range(4):
+            self.assertTrue(semaphore.acquire(blocking=False))
+        executor = Mock()
+        recorder = self._recorder(executor=executor, semaphore=semaphore)
+
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+
+        executor.submit.assert_not_called()
+        self.assertEqual(recorder.degraded_reason, "admission_full")
+        for _ in range(4):
+            semaphore.release()
+
+    async def test_submit_failure_releases_callers_permit(self):
+        semaphore = threading.BoundedSemaphore(4)
+        recorder = self._recorder(executor=FailingSubmitExecutor(), semaphore=semaphore)
+
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+
+        self.assertEqual(recorder.degraded_reason, "write_failed")
+        _assert_all_permits_available(self, semaphore)
+
+    async def test_worker_success_and_failure_release_the_only_permit(self):
+        for error in (None, RuntimeError("worker failed")):
+            with self.subTest(error=error):
+                semaphore = threading.BoundedSemaphore(4)
+                executor = ManualExecutor()
+
+                def worker(_operation):
+                    if error is not None:
+                        raise error
+
+                recorder = self._recorder(executor=executor, semaphore=semaphore, worker=worker)
+                task = asyncio.create_task(recorder.record_chunk("conv-1", "agent_event", _event(0)))
+                self.assertTrue(await asyncio.to_thread(executor.submitted.wait, 1))
+                executor.run_next()
+                await task
+                _assert_all_permits_available(self, semaphore)
+
+    async def test_real_wait_for_timeout_shields_late_failure_and_preserves_first_latch(self):
+        semaphore = threading.BoundedSemaphore(4)
+        executor = ManualExecutor()
+
+        def worker(_operation):
+            raise RuntimeError("迟到异常")
+
+        recorder = self._recorder(executor=executor, semaphore=semaphore, worker=worker)
+
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+
+        self.assertEqual(recorder.degraded_reason, "recorder_timeout")
+        self.assertEqual(executor.pending_count, 1)
+        executor.run_next()
+        await asyncio.sleep(0)
+        _assert_all_permits_available(self, semaphore)
+
+        await recorder.record_chunk("conv-1", "agent_event", _event(1))
+        self.assertEqual(executor.pending_count, 0)
+        self.assertEqual(recorder.degraded_reason, "recorder_timeout")
+
+    async def test_cancel_before_worker_starts_relatches_reraises_and_eventually_releases(self):
+        semaphore = threading.BoundedSemaphore(4)
+        executor = ManualExecutor()
+        recorder = self._recorder(executor=executor, semaphore=semaphore)
+        task = asyncio.create_task(recorder.record_chunk("conv-1", "agent_event", _event(0)))
+        self.assertTrue(await asyncio.to_thread(executor.submitted.wait, 1))
+
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(recorder.degraded_reason, "recorder_cancelled")
+        executor.run_next()
+        await asyncio.sleep(0)
+        _assert_all_permits_available(self, semaphore)
+
+    async def test_cancel_running_worker_relatches_reraises_and_eventually_releases(self):
+        semaphore = threading.BoundedSemaphore(4)
+        started = threading.Event()
+        release_worker = threading.Event()
+        finished = threading.Event()
+
+        def worker(_operation):
+            started.set()
+            release_worker.wait(timeout=2)
+            finished.set()
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.addCleanup(executor.shutdown, wait=True)
+        recorder = self._recorder(executor=executor, semaphore=semaphore, worker=worker)
+        task = asyncio.create_task(recorder.record_chunk("conv-1", "agent_event", _event(0)))
+        self.assertTrue(await asyncio.to_thread(started.wait, 1))
+
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(recorder.degraded_reason, "recorder_cancelled")
+
+        release_worker.set()
+        self.assertTrue(await asyncio.to_thread(finished.wait, 1))
+        await asyncio.sleep(0)
+        _assert_all_permits_available(self, semaphore)
+
+    async def test_unknown_event_latches_and_never_reaches_worker(self):
+        semaphore = threading.BoundedSemaphore(4)
+        executor = Mock()
+        recorder = self._recorder(executor=executor, semaphore=semaphore)
+
+        await recorder.record_chunk("conv-1", "agent_event", _event(0, event_type="future_event"))
+
+        self.assertEqual(recorder.degraded_reason, "unsupported_event_type")
+        executor.submit.assert_not_called()
+        _assert_all_permits_available(self, semaphore)
+
+
+class RecorderConfigurationTests(unittest.TestCase):
+    def test_production_session_factory_configures_fixed_postgresql_timeouts(self):
+        engine = object()
+        factory = object()
+        with (
+            patch("app.services.agent.trajectory_recorder.create_engine", return_value=engine) as create_engine_mock,
+            patch("app.services.agent.trajectory_recorder.sessionmaker", return_value=factory) as sessionmaker_mock,
+        ):
+            result = create_trajectory_session_factory("postgresql://db.example/fusion")
+
+        self.assertIs(result, factory)
+        create_engine_mock.assert_called_once_with(
+            "postgresql://db.example/fusion",
+            connect_args={
+                "connect_timeout": TRAJECTORY_CONNECT_TIMEOUT_SECONDS,
+                "options": (
+                    f"-c statement_timeout={TRAJECTORY_STATEMENT_TIMEOUT_MS} "
+                    f"-c lock_timeout={TRAJECTORY_LOCK_TIMEOUT_MS}"
+                ),
+            },
+            pool_pre_ping=True,
+        )
+        sessionmaker_mock.assert_called_once_with(autocommit=False, autoflush=False, bind=engine)
+        self.assertEqual(TRAJECTORY_WAIT_TIMEOUT_SECONDS, 0.25)
+
+    def test_sqlite_session_factory_does_not_claim_postgresql_timeout_support(self):
+        with (
+            patch("app.services.agent.trajectory_recorder.create_engine", return_value=object()) as create_engine_mock,
+            patch("app.services.agent.trajectory_recorder.sessionmaker", return_value=object()),
+        ):
+            create_trajectory_session_factory("sqlite:///:memory:")
+
+        self.assertEqual(create_engine_mock.call_args.kwargs, {"pool_pre_ping": True})
+
+
+if __name__ == "__main__":
+    unittest.main()
