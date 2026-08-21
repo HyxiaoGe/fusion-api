@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import gc
 import tempfile
 import threading
 import unittest
@@ -18,6 +19,7 @@ from app.services.agent.trajectory_recorder import (
     TRAJECTORY_STATEMENT_TIMEOUT_MS,
     TRAJECTORY_WAIT_TIMEOUT_SECONDS,
     TrajectoryRecorder,
+    _FinalizeHandshake,
     create_trajectory_session_factory,
 )
 
@@ -111,7 +113,7 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.engine.dispose()
         self.temp_dir.cleanup()
 
-    def _recorder(self, *, session_factory=None, worker=None) -> TrajectoryRecorder:
+    def _recorder(self, *, session_factory=None, worker=None, semaphore=None) -> TrajectoryRecorder:
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
         self.executors.append(executor)
         return TrajectoryRecorder(
@@ -120,7 +122,7 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
             message_id="msg-1",
             session_factory=session_factory or self.Session,
             executor=executor,
-            semaphore=threading.BoundedSemaphore(4),
+            semaphore=semaphore or threading.BoundedSemaphore(4),
             worker=worker,
         )
 
@@ -194,6 +196,23 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(meta.finalized_at)
             self.assertEqual(meta.degraded_reason, "finalize_mismatch")
 
+    async def test_finalize_never_overwrites_persisted_degraded_with_complete(self):
+        recorder = self._recorder()
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            meta.trajectory_status = "degraded"
+            meta.degraded_reason = "prior_persistent_failure"
+            db.commit()
+
+        await recorder.finalize(0)
+
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "degraded")
+            self.assertEqual(meta.degraded_reason, "prior_persistent_failure")
+            self.assertIsNone(meta.finalized_at)
+
     async def test_finalize_checks_latch_before_matching_count_min_max(self):
         recorder = self._recorder()
         await recorder.record_chunk("conv-1", "agent_event", _event(0))
@@ -239,6 +258,211 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
 
         with self.Session() as db:
             self.assertEqual(db.query(AgentEvent).filter_by(run_id="run-1").count(), 2)
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "degraded")
+            self.assertEqual(meta.degraded_reason, "recorder_timeout")
+            self.assertIsNone(meta.finalized_at)
+
+    async def test_finalize_timeout_late_complete_is_corrected_to_degraded(self):
+        finalize_started = threading.Event()
+        release_finalize = threading.Event()
+        finalize_finished = threading.Event()
+        worker_calls = 0
+        semaphore = threading.BoundedSemaphore(4)
+
+        def controlled_worker(operation):
+            nonlocal worker_calls
+            worker_calls += 1
+            if worker_calls == 1:
+                return operation()
+            finalize_started.set()
+            release_finalize.wait(timeout=2)
+            try:
+                return operation()
+            finally:
+                finalize_finished.set()
+
+        recorder = self._recorder(worker=controlled_worker, semaphore=semaphore)
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+        finalize_task = asyncio.create_task(recorder.finalize(0))
+        self.assertTrue(await asyncio.to_thread(finalize_started.wait, 1))
+
+        await finalize_task
+        self.assertEqual(recorder.degraded_reason, "recorder_timeout")
+        release_finalize.set()
+        self.assertTrue(await asyncio.to_thread(finalize_finished.wait, 1))
+
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "degraded")
+            self.assertEqual(meta.degraded_reason, "recorder_timeout")
+            self.assertIsNone(meta.finalized_at)
+        _assert_all_permits_available(self, semaphore)
+
+    async def test_finalize_cancel_late_complete_is_corrected_and_cancel_reraised(self):
+        finalize_started = threading.Event()
+        release_finalize = threading.Event()
+        finalize_finished = threading.Event()
+        worker_calls = 0
+        semaphore = threading.BoundedSemaphore(4)
+
+        def controlled_worker(operation):
+            nonlocal worker_calls
+            worker_calls += 1
+            if worker_calls == 1:
+                return operation()
+            finalize_started.set()
+            release_finalize.wait(timeout=2)
+            try:
+                return operation()
+            finally:
+                finalize_finished.set()
+
+        recorder = self._recorder(worker=controlled_worker, semaphore=semaphore)
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+        finalize_task = asyncio.create_task(recorder.finalize(0))
+        self.assertTrue(await asyncio.to_thread(finalize_started.wait, 1))
+
+        finalize_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await finalize_task
+        self.assertEqual(recorder.degraded_reason, "recorder_cancelled")
+        release_finalize.set()
+        self.assertTrue(await asyncio.to_thread(finalize_finished.wait, 1))
+
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "degraded")
+            self.assertEqual(meta.degraded_reason, "recorder_cancelled")
+            self.assertIsNone(meta.finalized_at)
+        _assert_all_permits_available(self, semaphore)
+
+    async def test_finalize_concurrent_latch_after_initial_check_is_corrected_after_commit(self):
+        commit_ready = threading.Event()
+        release_commit = threading.Event()
+        finalize_finished = threading.Event()
+        factory_calls = 0
+        worker_calls = 0
+
+        class BlockingCommitSession(SqlAlchemySession):
+            def commit(self):
+                commit_ready.set()
+                release_commit.wait(timeout=2)
+                super().commit()
+
+        blocking_factory = sessionmaker(bind=self.engine, class_=BlockingCommitSession, expire_on_commit=False)
+
+        def session_factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            return self.Session() if factory_calls == 1 else blocking_factory()
+
+        def controlled_worker(operation):
+            nonlocal worker_calls
+            worker_calls += 1
+            try:
+                return operation()
+            finally:
+                if worker_calls == 2:
+                    finalize_finished.set()
+
+        recorder = self._recorder(session_factory=session_factory, worker=controlled_worker)
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+        finalize_task = asyncio.create_task(recorder.finalize(0))
+        self.assertTrue(await asyncio.to_thread(commit_ready.wait, 1))
+
+        await asyncio.to_thread(
+            lambda: asyncio.run(
+                recorder.record_chunk("conv-1", "agent_event", _event(1, event_type="future_event"))
+            )
+        )
+        self.assertEqual(recorder.degraded_reason, "unsupported_event_type")
+        release_commit.set()
+        await finalize_task
+        self.assertTrue(await asyncio.to_thread(finalize_finished.wait, 1))
+
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "degraded")
+            self.assertEqual(meta.degraded_reason, "unsupported_event_type")
+            self.assertIsNone(meta.finalized_at)
+
+    async def test_failed_late_correction_is_consumed_and_keeps_in_memory_latch(self):
+        finalize_started = threading.Event()
+        release_finalize = threading.Event()
+        finalize_finished = threading.Event()
+        correction_attempted = threading.Event()
+        factory_calls = 0
+        worker_calls = 0
+        loop_errors: list[dict] = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+        self.addCleanup(loop.set_exception_handler, previous_handler)
+
+        class FailingCorrectionSession(SqlAlchemySession):
+            def commit(self):
+                correction_attempted.set()
+                self.flush()
+                raise RuntimeError("纠偏提交失败")
+
+        failing_factory = sessionmaker(
+            bind=self.engine,
+            class_=FailingCorrectionSession,
+            expire_on_commit=False,
+        )
+
+        def session_factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            return failing_factory() if factory_calls == 3 else self.Session()
+
+        def controlled_worker(operation):
+            nonlocal worker_calls
+            worker_calls += 1
+            if worker_calls == 1:
+                return operation()
+            finalize_started.set()
+            release_finalize.wait(timeout=2)
+            try:
+                return operation()
+            finally:
+                finalize_finished.set()
+
+        recorder = self._recorder(session_factory=session_factory, worker=controlled_worker)
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+        finalize_task = asyncio.create_task(recorder.finalize(0))
+        self.assertTrue(await asyncio.to_thread(finalize_started.wait, 1))
+
+        await finalize_task
+        release_finalize.set()
+        self.assertTrue(await asyncio.to_thread(finalize_finished.wait, 1))
+        self.assertTrue(correction_attempted.is_set())
+        self.assertEqual(recorder.degraded_reason, "recorder_timeout")
+
+        del finalize_task
+        gc.collect()
+        await asyncio.sleep(0)
+        self.assertFalse(
+            [context for context in loop_errors if "never retrieved" in context.get("message", "").lower()]
+        )
+
+    async def test_finalize_worker_without_event_loop_acknowledgement_persists_timeout_degraded(self):
+        recorder = self._recorder()
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+        loop = asyncio.get_running_loop()
+        handshake = _FinalizeHandshake(
+            operation_future=loop.create_future(),
+            acknowledgement=threading.Event(),
+            expected_last_sequence=0,
+            initial_latched_reason=None,
+        )
+
+        result = await asyncio.to_thread(recorder._finalize_with_handshake, handshake)
+
+        self.assertEqual(result, "complete")
+        self.assertEqual(recorder.degraded_reason, "recorder_timeout")
+        with self.Session() as db:
             meta = db.get(RunTrajectoryMeta, "run-1")
             self.assertEqual(meta.trajectory_status, "degraded")
             self.assertEqual(meta.degraded_reason, "recorder_timeout")

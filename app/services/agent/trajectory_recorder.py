@@ -6,6 +6,7 @@ import asyncio
 import threading
 from collections.abc import Callable, Mapping
 from concurrent.futures import Executor, ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, TypeVar
 
@@ -31,6 +32,14 @@ _DEFAULT_FACTORY_LOCK = threading.Lock()
 _DEFAULT_SESSION_FACTORY: Callable[[], Any] | None = None
 
 _T = TypeVar("_T")
+
+
+@dataclass(frozen=True)
+class _FinalizeHandshake:
+    operation_future: asyncio.Future[str]
+    acknowledgement: threading.Event
+    expected_last_sequence: int
+    initial_latched_reason: str | None
 
 
 def create_trajectory_session_factory(database_url: str) -> Callable[[], Any]:
@@ -118,13 +127,7 @@ class TrajectoryRecorder:
 
     async def finalize(self, expected_last_sequence: int) -> None:
         """latch 优先持久化完整性，再在无 latch 时校验 COUNT/MIN/MAX。"""
-        latched_reason = self.degraded_reason
-        result = await self._run_isolated(
-            lambda: self._finalize_transaction(
-                expected_last_sequence=expected_last_sequence,
-                latched_reason=latched_reason,
-            )
-        )
+        result = await self._run_finalize_isolated(expected_last_sequence)
         if result == "finalize_mismatch":
             self._mark_degraded("finalize_mismatch")
 
@@ -165,11 +168,117 @@ class TrajectoryRecorder:
             self._log_failure("轨迹账本写入失败", error)
             return None
 
+    async def _run_finalize_isolated(self, expected_last_sequence: int) -> str | None:
+        if not self._semaphore.acquire(blocking=False):
+            self._mark_degraded("admission_full")
+            return None
+
+        loop = asyncio.get_running_loop()
+        operation_future: asyncio.Future[str] = loop.create_future()
+        handshake = _FinalizeHandshake(
+            operation_future=operation_future,
+            acknowledgement=threading.Event(),
+            expected_last_sequence=expected_last_sequence,
+            initial_latched_reason=self.degraded_reason,
+        )
+        try:
+            worker_future = loop.run_in_executor(
+                self._executor,
+                self._worker_entry,
+                lambda: self._finalize_with_handshake(handshake),
+            )
+        except Exception as error:  # noqa: BLE001 — auxiliary sink 必须 fail-open
+            self._semaphore.release()
+            operation_future.cancel()
+            self._mark_degraded("write_failed")
+            self._log_failure("提交 finalize worker 失败", error)
+            return None
+
+        try:
+            result = await asyncio.wait_for(
+                asyncio.shield(operation_future),
+                timeout=TRAJECTORY_WAIT_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            self._mark_degraded("recorder_cancelled")
+            handshake.acknowledgement.set()
+            self._consume_late(operation_future)
+            self._consume_late(worker_future)
+            raise
+        except asyncio.TimeoutError:
+            self._mark_degraded("recorder_timeout")
+            handshake.acknowledgement.set()
+            self._consume_late(operation_future)
+            self._consume_late(worker_future)
+            return None
+        except Exception as error:  # noqa: BLE001 — auxiliary sink 必须 fail-open
+            self._mark_degraded("write_failed")
+            handshake.acknowledgement.set()
+            self._consume_late(worker_future)
+            self._log_failure("轨迹账本 finalize 失败", error)
+            return None
+
+        handshake.acknowledgement.set()
+        self._consume_late(worker_future)
+        return result
+
     def _worker_entry(self, operation: Callable[[], _T]) -> _T:
         try:
             return self._worker(operation)
         finally:
             self._semaphore.release()
+
+    def _finalize_with_handshake(self, handshake: _FinalizeHandshake) -> str:
+        result: str | None = None
+        operation_error: BaseException | None = None
+        try:
+            result = self._finalize_transaction(
+                expected_last_sequence=handshake.expected_last_sequence,
+                latched_reason=handshake.initial_latched_reason,
+            )
+        except BaseException as error:
+            operation_error = error
+
+        self._publish_finalize_outcome(
+            handshake.operation_future,
+            result=result,
+            error=operation_error,
+        )
+        acknowledged = handshake.acknowledgement.wait(timeout=TRAJECTORY_WAIT_TIMEOUT_SECONDS)
+        if not acknowledged:
+            self._mark_degraded("recorder_timeout")
+
+        latched_reason = self.degraded_reason
+        if latched_reason is not None:
+            self._persist_degraded_transaction(
+                expected_last_sequence=handshake.expected_last_sequence,
+                degraded_reason=latched_reason,
+            )
+        if operation_error is not None:
+            raise operation_error
+        if result is None:  # pragma: no cover - 上述分支已覆盖全部结果
+            raise RuntimeError("finalize worker 未返回结果")
+        return result
+
+    @staticmethod
+    def _publish_finalize_outcome(
+        future: asyncio.Future[str],
+        *,
+        result: str | None,
+        error: BaseException | None,
+    ) -> None:
+        def _publish() -> None:
+            if future.done():
+                return
+            if error is not None:
+                future.set_exception(error)
+            elif result is not None:
+                future.set_result(result)
+
+        try:
+            future.get_loop().call_soon_threadsafe(_publish)
+        except RuntimeError:
+            return
 
     @staticmethod
     def _consume_late(future: asyncio.Future[Any]) -> None:
@@ -258,7 +367,7 @@ class TrajectoryRecorder:
                 degraded_reason = None if is_complete else "finalize_mismatch"
                 finalized_at = now if is_complete else None
 
-            session.execute(
+            meta_update = (
                 update(RunTrajectoryMeta)
                 .where(RunTrajectoryMeta.run_id == self.run_id)
                 .values(
@@ -269,8 +378,39 @@ class TrajectoryRecorder:
                     updated_at=now,
                 )
             )
+            if status == "complete":
+                meta_update = meta_update.where(RunTrajectoryMeta.trajectory_status != "degraded")
+            session.execute(meta_update)
             session.commit()
             return status if status == "complete" else str(degraded_reason)
+        except BaseException:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def _persist_degraded_transaction(
+        self,
+        *,
+        expected_last_sequence: int,
+        degraded_reason: str,
+    ) -> None:
+        now = datetime.now(UTC)
+        session = self._session_factory()
+        try:
+            self._insert_meta_if_missing(session, now=now)
+            session.execute(
+                update(RunTrajectoryMeta)
+                .where(RunTrajectoryMeta.run_id == self.run_id)
+                .values(
+                    trajectory_status="degraded",
+                    expected_last_sequence=expected_last_sequence,
+                    finalized_at=None,
+                    degraded_reason=degraded_reason,
+                    updated_at=now,
+                )
+            )
+            session.commit()
         except BaseException:
             session.rollback()
             raise
