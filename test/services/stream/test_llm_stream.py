@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -410,8 +411,9 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
                 async def response():
                     start = 110.0 + case_index
                     for offset, content, terminal in (
-                        (0.1, " \n", None),
-                        (0.2, protocol[:9], None),
+                        (0.1, "\n", None),
+                        (0.2, "\r\n", None),
+                        (0.3, protocol[:9], None),
                         (0.4, protocol[9:], "stop"),
                     ):
                         now[0] = start + offset
@@ -421,6 +423,7 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
                 with (
                     patch("app.services.stream.llm_stream.append_chunk", append_chunk),
                     patch("app.services.stream.llm_stream.check_lock_owner", new=AsyncMock(return_value=True)),
+                    patch("app.services.stream.llm_stream.logger.warning") as warning,
                 ):
                     result = await llm_stream_module.stream_round(
                         observation.wrap_response(response()),
@@ -439,16 +442,26 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
                 append_chunk.assert_not_awaited()
                 on_visible_output.assert_not_awaited()
                 self.assertIsNone(observation.output_delta_ms("content"))
+                self.assertFalse(
+                    any(
+                        "answering 内容过滤出现非单调输出" in str(call.args[0])
+                        for call in warning.call_args_list
+                    )
+                )
 
     async def test_normal_whitespace_content_stays_visible(self):
         from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata
 
         cases = (
-            ("whitespace_only", ((0.1, " \n", "stop"),), " \n"),
+            (
+                "whitespace_only",
+                ((0.1, "\n", None), (0.2, "\r\n", "stop")),
+                "\n\r\n",
+            ),
             (
                 "whitespace_then_body",
-                ((0.1, " \n", None), (0.4, "普通正文", "stop")),
-                " \n普通正文",
+                ((0.1, "\n", None), (0.2, "\r\n", None), (0.4, "普通正文", "stop")),
+                "\n\r\n普通正文",
             ),
         )
 
@@ -493,11 +506,136 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(result[1], expected)
                 self.assertEqual(
-                    "".join(call.args[2] for call in append_chunk.await_args_list),
-                    expected,
+                    [call.args[2] for call in append_chunk.await_args_list],
+                    [expected],
                 )
                 on_visible_output.assert_awaited_once_with("content")
                 self.assertEqual(observation.output_delta_ms("content"), 100)
+
+    async def test_whitespace_after_visible_body_is_not_delayed_until_finish(self):
+        append_chunk = AsyncMock()
+        append_counts_before_finish = []
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-visible-body",
+            task_id="task-visible-body",
+            should_use_reasoning=False,
+            thinking_block_id="thinking",
+            text_block_id="text",
+        )
+
+        async def response():
+            yield make_chunk(delta=SimpleNamespace(content="普通正文"))
+            yield make_chunk(delta=SimpleNamespace(content="\n"))
+            append_counts_before_finish.append(append_chunk.await_count)
+            yield make_chunk(delta=SimpleNamespace(content=None), finish_reason="stop")
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", new=AsyncMock(return_value=True)),
+        ):
+            result = await llm_stream_module.consume_stream_round(response(), request)
+
+        self.assertEqual(result.content_buf, "普通正文\n")
+        self.assertEqual(append_counts_before_finish, [2])
+        self.assertEqual(
+            [call.args[2] for call in append_chunk.await_args_list],
+            ["普通正文", "\n"],
+        )
+
+    async def test_final_flush_clears_pending_candidate_state_on_error_and_cancel(self):
+        cases = (
+            ("success", None),
+            ("error", RuntimeError("redis failed")),
+            ("cancel", asyncio.CancelledError()),
+        )
+
+        for name, error in cases:
+            with self.subTest(name=name):
+                state = llm_stream_module.LLMStreamState(
+                    raw_content_buf="\n",
+                    pending_reasoning_candidate_time=1.0,
+                    pending_content_candidate_time=2.0,
+                )
+                request = llm_stream_module.LLMStreamRequest(
+                    conversation_id="conv-flush-cleanup",
+                    task_id="task-flush-cleanup",
+                    should_use_reasoning=False,
+                    thinking_block_id="thinking",
+                    text_block_id="text",
+                )
+                append_chunk = AsyncMock(side_effect=error)
+
+                with patch("app.services.stream.llm_stream.append_chunk", append_chunk):
+                    if error is None:
+                        await llm_stream_module.flush_pending_internal_mcp_aliases(
+                            request=request,
+                            state=state,
+                        )
+                    else:
+                        with self.assertRaises(type(error)) as raised:
+                            await llm_stream_module.flush_pending_internal_mcp_aliases(
+                                request=request,
+                                state=state,
+                            )
+                        self.assertIs(raised.exception, error)
+
+                self.assertIsNone(state.pending_reasoning_candidate_time)
+                self.assertIsNone(state.pending_content_candidate_time)
+
+    async def test_leading_whitespace_is_not_published_when_stream_errors_or_is_cancelled(self):
+        from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata
+
+        cases = (
+            ("error", RuntimeError("stream failed")),
+            ("cancel", asyncio.CancelledError()),
+        )
+
+        for case_index, (name, error) in enumerate(cases, 1):
+            with self.subTest(name=name):
+                now = [130.0 + case_index]
+                observation = LLMRoundObservation(
+                    metadata=RoundMetadata("conv", "run", 1, "step", "agent", "model", "provider"),
+                    litellm_model="test/model",
+                    messages=[],
+                    call_kwargs={},
+                    clock=lambda: now[0],
+                    token_estimator=lambda *_args, **_kwargs: 1,
+                    context_window_resolver=lambda _model_id: (4096, "test", "known"),
+                    run_context_in_thread=False,
+                )
+                append_chunk = AsyncMock()
+                on_visible_output = AsyncMock()
+
+                async def response():
+                    start = 130.0 + case_index
+                    now[0] = start + 0.1
+                    yield make_chunk(delta=SimpleNamespace(content="\n"))
+                    now[0] = start + 0.2
+                    yield make_chunk(delta=SimpleNamespace(content="\r\n"))
+                    raise error
+
+                observation.start()
+                with (
+                    patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+                    patch("app.services.stream.llm_stream.check_lock_owner", new=AsyncMock(return_value=True)),
+                ):
+                    with self.assertRaises(type(error)) as raised:
+                        await llm_stream_module.stream_round(
+                            observation.wrap_response(response()),
+                            "conv",
+                            "task",
+                            False,
+                            "thinking",
+                            "text",
+                            on_visible_output=on_visible_output,
+                            on_output_candidate=observation.observe_output_candidate,
+                            capture_output_candidate_time=observation.capture_output_candidate_time,
+                        )
+
+                self.assertIs(raised.exception, error)
+                append_chunk.assert_not_awaited()
+                on_visible_output.assert_not_awaited()
+                self.assertIsNone(observation.output_delta_ms("content"))
 
     def test_extract_usage_supports_cache_tokens_and_rejects_invalid_values(self):
         usage = SimpleNamespace(

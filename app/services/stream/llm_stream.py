@@ -596,6 +596,8 @@ def filter_reasoning_tag_content_delta(state: LLMStreamState, content_delta: str
         tag_reasoning_delta = ""
     visible_content = strip_pending_dsml_tool_protocol(visible_content)
     visible_content = sanitize_internal_mcp_aliases(visible_content)
+    if not state.content_buf and not visible_content.strip():
+        visible_content = ""
     return (
         tag_reasoning_delta,
         _visible_delta(visible_content, state.content_buf, channel="answering"),
@@ -641,16 +643,18 @@ async def flush_pending_internal_mcp_aliases(*, request: LLMStreamRequest, state
     final_content = strip_reasoning_tag_blocks(state.raw_content_buf)
     final_content = strip_pending_dsml_tool_protocol(final_content, final=True)
     final_content = sanitize_internal_mcp_aliases(final_content, final=True)
-    await append_reasoning_and_content(
-        request=request,
-        state=state,
-        reasoning_delta=_visible_delta(final_reasoning, state.reasoning_buf, channel="reasoning"),
-        content_delta=_visible_delta(final_content, state.content_buf, channel="answering"),
-        reasoning_candidate_time=state.pending_reasoning_candidate_time,
-        content_candidate_time=state.pending_content_candidate_time,
-    )
-    state.pending_reasoning_candidate_time = None
-    state.pending_content_candidate_time = None
+    try:
+        await append_reasoning_and_content(
+            request=request,
+            state=state,
+            reasoning_delta=_visible_delta(final_reasoning, state.reasoning_buf, channel="reasoning"),
+            content_delta=_visible_delta(final_content, state.content_buf, channel="answering"),
+            reasoning_candidate_time=state.pending_reasoning_candidate_time,
+            content_candidate_time=state.pending_content_candidate_time,
+        )
+    finally:
+        state.pending_reasoning_candidate_time = None
+        state.pending_content_candidate_time = None
 
 
 async def append_stream_delta(
