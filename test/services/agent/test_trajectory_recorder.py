@@ -653,6 +653,250 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(meta.finalized_at)
         _assert_all_permits_available(self, semaphore)
 
+    async def test_terminal_timeout_response_loss_and_first_reconciliation_failure_converges_degraded(self):
+        terminal_commit_started = threading.Event()
+        release_terminal_commit = threading.Event()
+        terminal_worker_finished = threading.Event()
+        first_reconciliation_failed = threading.Event()
+        factory_calls = 0
+        worker_calls = 0
+        semaphore = threading.BoundedSemaphore(4)
+
+        class CommitThenLoseResponseSession(SqlAlchemySession):
+            def commit(self):
+                terminal_commit_started.set()
+                release_terminal_commit.wait(timeout=2)
+                super().commit()
+                raise RuntimeError("终态 commit 响应丢失")
+
+        class FailFirstReconciliationSession(SqlAlchemySession):
+            def execute(self, *args, **kwargs):
+                first_reconciliation_failed.set()
+                raise RuntimeError("首次终态对账失败")
+
+        response_loss_factory = sessionmaker(
+            bind=self.engine,
+            class_=CommitThenLoseResponseSession,
+            expire_on_commit=False,
+        )
+        first_failure_factory = sessionmaker(
+            bind=self.engine,
+            class_=FailFirstReconciliationSession,
+            expire_on_commit=False,
+        )
+
+        def session_factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            if factory_calls == 3:
+                return response_loss_factory()
+            if factory_calls == 4:
+                return first_failure_factory()
+            return self.Session()
+
+        def controlled_worker(operation):
+            nonlocal worker_calls
+            worker_calls += 1
+            call_index = worker_calls
+            try:
+                return operation()
+            finally:
+                if call_index == 2:
+                    terminal_worker_finished.set()
+
+        recorder = self._recorder(
+            session_factory=session_factory,
+            worker=controlled_worker,
+            semaphore=semaphore,
+        )
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+        finalize_task = asyncio.create_task(recorder.finalize(0))
+        self.assertTrue(await asyncio.to_thread(terminal_commit_started.wait, 1))
+
+        await asyncio.wait_for(
+            asyncio.shield(finalize_task),
+            timeout=TRAJECTORY_WAIT_TIMEOUT_SECONDS * 3,
+        )
+        self.assertEqual(recorder.degraded_reason, "recorder_timeout")
+        pending = recorder.pending_terminal_reconciliation
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending.target_status, "degraded")
+        self.assertEqual(pending.degraded_reason, "recorder_timeout")
+        release_terminal_commit.set()
+        self.assertTrue(await asyncio.to_thread(terminal_worker_finished.wait, 1))
+
+        self.assertTrue(first_reconciliation_failed.is_set())
+        self.assertEqual(recorder.degraded_reason, "recorder_timeout")
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "degraded")
+            self.assertEqual(meta.degraded_reason, "recorder_timeout")
+            self.assertIsNone(meta.finalized_at)
+        self.assertIsNone(recorder.pending_terminal_reconciliation)
+        _assert_all_permits_available(self, semaphore)
+
+    async def test_terminal_cancel_response_loss_and_first_reconciliation_failure_converges_degraded(self):
+        terminal_commit_started = threading.Event()
+        release_terminal_commit = threading.Event()
+        terminal_worker_finished = threading.Event()
+        first_reconciliation_failed = threading.Event()
+        factory_calls = 0
+        worker_calls = 0
+        semaphore = threading.BoundedSemaphore(4)
+
+        class CommitThenLoseResponseSession(SqlAlchemySession):
+            def commit(self):
+                terminal_commit_started.set()
+                release_terminal_commit.wait(timeout=2)
+                super().commit()
+                raise RuntimeError("终态 commit 响应丢失")
+
+        class FailFirstReconciliationSession(SqlAlchemySession):
+            def execute(self, *args, **kwargs):
+                first_reconciliation_failed.set()
+                raise RuntimeError("首次终态对账失败")
+
+        response_loss_factory = sessionmaker(
+            bind=self.engine,
+            class_=CommitThenLoseResponseSession,
+            expire_on_commit=False,
+        )
+        first_failure_factory = sessionmaker(
+            bind=self.engine,
+            class_=FailFirstReconciliationSession,
+            expire_on_commit=False,
+        )
+
+        def session_factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            if factory_calls == 3:
+                return response_loss_factory()
+            if factory_calls == 4:
+                return first_failure_factory()
+            return self.Session()
+
+        def controlled_worker(operation):
+            nonlocal worker_calls
+            worker_calls += 1
+            call_index = worker_calls
+            try:
+                return operation()
+            finally:
+                if call_index == 2:
+                    terminal_worker_finished.set()
+
+        recorder = self._recorder(
+            session_factory=session_factory,
+            worker=controlled_worker,
+            semaphore=semaphore,
+        )
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+        finalize_task = asyncio.create_task(recorder.finalize(0))
+        self.assertTrue(await asyncio.to_thread(terminal_commit_started.wait, 1))
+
+        finalize_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await finalize_task
+        self.assertEqual(recorder.degraded_reason, "recorder_cancelled")
+        pending = recorder.pending_terminal_reconciliation
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending.target_status, "degraded")
+        self.assertEqual(pending.degraded_reason, "recorder_cancelled")
+        release_terminal_commit.set()
+        self.assertTrue(await asyncio.to_thread(terminal_worker_finished.wait, 1))
+
+        self.assertTrue(first_reconciliation_failed.is_set())
+        self.assertEqual(recorder.degraded_reason, "recorder_cancelled")
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "degraded")
+            self.assertEqual(meta.degraded_reason, "recorder_cancelled")
+            self.assertIsNone(meta.finalized_at)
+        self.assertIsNone(recorder.pending_terminal_reconciliation)
+        _assert_all_permits_available(self, semaphore)
+
+    async def test_persistent_terminal_reconciliation_failure_exposes_request_without_latch_complete_conflict(self):
+        terminal_commit_started = threading.Event()
+        release_terminal_commit = threading.Event()
+        terminal_worker_finished = threading.Event()
+        reconciliation_attempts = 0
+        factory_calls = 0
+        worker_calls = 0
+        semaphore = threading.BoundedSemaphore(4)
+
+        class CommitThenLoseResponseSession(SqlAlchemySession):
+            def commit(self):
+                terminal_commit_started.set()
+                release_terminal_commit.wait(timeout=2)
+                super().commit()
+                raise RuntimeError("终态 commit 响应丢失")
+
+        class UnavailableReconciliationSession(SqlAlchemySession):
+            def execute(self, *args, **kwargs):
+                nonlocal reconciliation_attempts
+                reconciliation_attempts += 1
+                raise RuntimeError("终态数据库持续不可达")
+
+        response_loss_factory = sessionmaker(
+            bind=self.engine,
+            class_=CommitThenLoseResponseSession,
+            expire_on_commit=False,
+        )
+        unavailable_factory = sessionmaker(
+            bind=self.engine,
+            class_=UnavailableReconciliationSession,
+            expire_on_commit=False,
+        )
+
+        def session_factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            if factory_calls == 3:
+                return response_loss_factory()
+            if factory_calls >= 4:
+                return unavailable_factory()
+            return self.Session()
+
+        def controlled_worker(operation):
+            nonlocal worker_calls
+            worker_calls += 1
+            call_index = worker_calls
+            try:
+                return operation()
+            finally:
+                if call_index == 2:
+                    terminal_worker_finished.set()
+
+        recorder = self._recorder(
+            session_factory=session_factory,
+            worker=controlled_worker,
+            semaphore=semaphore,
+        )
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+        finalize_task = asyncio.create_task(recorder.finalize(0))
+        self.assertTrue(await asyncio.to_thread(terminal_commit_started.wait, 1))
+
+        await asyncio.wait_for(
+            asyncio.shield(finalize_task),
+            timeout=TRAJECTORY_WAIT_TIMEOUT_SECONDS * 3,
+        )
+        release_terminal_commit.set()
+        self.assertTrue(await asyncio.to_thread(terminal_worker_finished.wait, 1))
+
+        self.assertGreaterEqual(reconciliation_attempts, 2)
+        self.assertIsNone(recorder.degraded_reason)
+        request = recorder.pending_terminal_reconciliation
+        self.assertIsNotNone(request)
+        self.assertEqual(request.run_id, "run-1")
+        self.assertEqual(request.expected_last_sequence, 0)
+        self.assertEqual(request.degraded_reason, "recorder_timeout")
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertEqual(meta.trajectory_status, "complete")
+            self.assertIsNotNone(meta.finalized_at)
+        _assert_all_permits_available(self, semaphore)
+
     async def test_finalize_start_closes_record_admission_before_assessment(self):
         finalize_started = threading.Event()
         release_finalize = threading.Event()

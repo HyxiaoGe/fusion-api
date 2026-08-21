@@ -25,6 +25,7 @@ TRAJECTORY_WAIT_TIMEOUT_SECONDS = 0.25
 TRAJECTORY_STATEMENT_TIMEOUT_MS = 200
 TRAJECTORY_LOCK_TIMEOUT_MS = 100
 TRAJECTORY_CONNECT_TIMEOUT_SECONDS = 1
+TRAJECTORY_TERMINAL_RECONCILIATION_ATTEMPTS = 2
 
 _EXECUTOR = ThreadPoolExecutor(max_workers=TRAJECTORY_MAX_WORKERS, thread_name_prefix="trajectory-recorder")
 _ADMISSION_SEMAPHORE = threading.BoundedSemaphore(TRAJECTORY_MAX_WORKERS)
@@ -36,6 +37,16 @@ _T = TypeVar("_T")
 
 class _TerminalOutcomeUnknownError(RuntimeError):
     """终态 commit 与后续对账均失败，持久化结果不可判定。"""
+
+
+@dataclass(frozen=True)
+class TrajectoryTerminalReconciliation:
+    """供后续 stale coordinator 消费的幂等终态请求。"""
+
+    run_id: str
+    expected_last_sequence: int
+    target_status: str
+    degraded_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -101,14 +112,20 @@ class TrajectoryRecorder:
         self._finalize_started = False
         self._latch_sealed = False
         self._terminal_transition_finished = False
-        self._terminal_outcome_unknown = False
+        self._terminal_failure_reason: str | None = None
+        self._pending_terminal_reconciliation: TrajectoryTerminalReconciliation | None = None
         self._active_records = 0
         self._record_drain_waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]] = []
 
     @property
     def degraded_reason(self) -> str | None:
         with self._state_lock:
-            return self._degraded_reason
+            return self._degraded_reason or self._terminal_failure_reason
+
+    @property
+    def pending_terminal_reconciliation(self) -> TrajectoryTerminalReconciliation | None:
+        with self._state_lock:
+            return self._pending_terminal_reconciliation
 
     def degraded_latch(self, run_id: str | None = None) -> bool:
         return (run_id is None or run_id == self.run_id) and self.degraded_reason is not None
@@ -152,19 +169,27 @@ class TrajectoryRecorder:
                 self._degraded_reason = reason
             return True
 
-    def _force_terminal_failure_latch(self, reason: str = "write_failed") -> bool:
+    def _force_terminal_failure_latch(
+        self,
+        reason: str = "write_failed",
+        *,
+        expected_last_sequence: int | None = None,
+    ) -> bool:
         """终态完成线性化前保留失败证据，完成后拒绝制造 latch 冲突。"""
         with self._state_lock:
             if self._terminal_transition_finished:
                 return False
-            if self._degraded_reason is None:
-                self._degraded_reason = reason
+            if self._degraded_reason is None and self._terminal_failure_reason is None:
+                self._terminal_failure_reason = reason
+            if expected_last_sequence is not None:
+                pending_reason = self._degraded_reason or self._terminal_failure_reason
+                self._pending_terminal_reconciliation = TrajectoryTerminalReconciliation(
+                    run_id=self.run_id,
+                    expected_last_sequence=expected_last_sequence,
+                    target_status="degraded",
+                    degraded_reason=pending_reason,
+                )
             return True
-
-    def _mark_terminal_outcome_unknown(self) -> None:
-        with self._state_lock:
-            self._terminal_outcome_unknown = True
-            self._terminal_transition_finished = True
 
     def _try_admit_record(self) -> bool:
         with self._state_lock:
@@ -309,11 +334,17 @@ class TrajectoryRecorder:
                 timeout=TRAJECTORY_WAIT_TIMEOUT_SECONDS,
             )
         except asyncio.CancelledError:
-            self._force_terminal_failure_latch("recorder_cancelled")
+            self._force_terminal_failure_latch(
+                "recorder_cancelled",
+                expected_last_sequence=expected_last_sequence,
+            )
             self._consume_late(worker_future)
             raise
         except asyncio.TimeoutError:
-            self._force_terminal_failure_latch("recorder_timeout")
+            self._force_terminal_failure_latch(
+                "recorder_timeout",
+                expected_last_sequence=expected_last_sequence,
+            )
             self._consume_late(worker_future)
             return
         except Exception as error:  # noqa: BLE001 — auxiliary sink 必须 fail-open
@@ -344,32 +375,82 @@ class TrajectoryRecorder:
 
         latched_reason = self._seal_latch_for_terminal_decision()
         try:
-            terminal_status = self._write_terminal_transaction(
-                expected_last_sequence=handshake.expected_last_sequence,
-                assessment_complete=assessment_complete,
-                degraded_reason=latched_reason,
-            )
-            while True:
-                with self._state_lock:
-                    final_latched_reason = self._degraded_reason
-                    if terminal_status != "complete" or final_latched_reason is None:
-                        self._terminal_transition_finished = True
-                        break
+            try:
                 terminal_status = self._write_terminal_transaction(
                     expected_last_sequence=handshake.expected_last_sequence,
-                    assessment_complete=False,
-                    degraded_reason=final_latched_reason,
-                    allow_complete_correction=True,
+                    assessment_complete=assessment_complete,
+                    degraded_reason=latched_reason,
                 )
-        except _TerminalOutcomeUnknownError:
-            self._mark_terminal_outcome_unknown()
-            raise
+            except _TerminalOutcomeUnknownError:
+                terminal_status = self._retry_unknown_terminal_transition(
+                    expected_last_sequence=handshake.expected_last_sequence,
+                    assessment_complete=assessment_complete,
+                )
+            if terminal_status == "unknown":
+                return terminal_status
+            while True:
+                with self._state_lock:
+                    final_latched_reason = self._degraded_reason or self._terminal_failure_reason
+                    if terminal_status != "complete" or final_latched_reason is None:
+                        if terminal_status == "degraded" and self._degraded_reason is None:
+                            self._degraded_reason = self._terminal_failure_reason
+                        self._terminal_failure_reason = None
+                        self._pending_terminal_reconciliation = None
+                        self._terminal_transition_finished = True
+                        break
+                try:
+                    terminal_status = self._write_terminal_transaction(
+                        expected_last_sequence=handshake.expected_last_sequence,
+                        assessment_complete=False,
+                        degraded_reason=final_latched_reason,
+                        allow_complete_correction=True,
+                    )
+                except _TerminalOutcomeUnknownError:
+                    terminal_status = self._retry_unknown_terminal_transition(
+                        expected_last_sequence=handshake.expected_last_sequence,
+                        assessment_complete=False,
+                    )
+                    if terminal_status == "unknown":
+                        return terminal_status
         except BaseException:
             self._force_terminal_failure_latch()
             raise
         if assessment_error is not None:
             raise assessment_error
         return terminal_status
+
+    def _retry_unknown_terminal_transition(
+        self,
+        *,
+        expected_last_sequence: int,
+        assessment_complete: bool,
+    ) -> str:
+        """有限次重试未知终态；耗尽后发布显式 reconciliation 请求。"""
+        for _ in range(TRAJECTORY_TERMINAL_RECONCILIATION_ATTEMPTS):
+            with self._state_lock:
+                degraded_reason = self._degraded_reason or self._terminal_failure_reason
+            try:
+                return self._write_terminal_transaction(
+                    expected_last_sequence=expected_last_sequence,
+                    assessment_complete=assessment_complete and degraded_reason is None,
+                    degraded_reason=degraded_reason,
+                    allow_complete_correction=degraded_reason is not None,
+                )
+            except _TerminalOutcomeUnknownError:
+                continue
+
+        with self._state_lock:
+            degraded_reason = self._degraded_reason or self._terminal_failure_reason
+            self._pending_terminal_reconciliation = TrajectoryTerminalReconciliation(
+                run_id=self.run_id,
+                expected_last_sequence=expected_last_sequence,
+                target_status="degraded" if degraded_reason is not None else "complete",
+                degraded_reason=degraded_reason,
+            )
+            if self._degraded_reason is None:
+                self._terminal_failure_reason = None
+            self._terminal_transition_finished = True
+        return "unknown"
 
     @staticmethod
     def _publish_finalize_outcome(
