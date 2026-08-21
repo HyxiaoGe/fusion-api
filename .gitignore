@@ -15,6 +15,7 @@ docs
 !docs/
 docs/*
 !docs/KNOWLEDGE_BASE.md
+!docs/LITELLM_HEALTH.md
 
 .cursor
 

@@ -18,6 +18,9 @@ Fusion API 是 Fusion 的聊天核心后端，提供认证、模型管理、会�
 知识库 v1 的配置、状态机、非 root Milvus 初始化、独立 Worker、真实验收和故障恢复见
 [知识库运行手册](docs/KNOWLEDGE_BASE.md)。
 
+LiteLLM 全模型健康探测（`/health` 会产生真实 completion 费用）的开关、多实例协调
+与迁移/回滚见 [LiteLLM 健康探测成本治理](docs/LITELLM_HEALTH.md)。
+
 ### 实用功能
 - **自动生成标题**：基于对话内容智能生成对话标题
 - **推荐问题**：根据当前对话生成相关的推荐问题
