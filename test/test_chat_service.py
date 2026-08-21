@@ -1036,6 +1036,11 @@ class ChatServiceTests(unittest.TestCase):
             service.stream_handler.generate_to_redis.call_args.kwargs["assistant_message_sequence"],
             42,
         )
+        self.assertEqual(
+            service.stream_handler.generate_to_redis.call_args.kwargs["turn_message_id"],
+            "33333333-3333-4333-8333-333333333333",
+        )
+        self.assertIsNone(service.stream_handler.generate_to_redis.call_args.kwargs["previous_run_id"])
         self.assertEqual(len(created_coroutines), 1)
 
     def test_stream_retry_reuses_original_turn_without_persisting_duplicate_user(self):
@@ -1112,6 +1117,7 @@ class ChatServiceTests(unittest.TestCase):
                     assistant_message_id=stored_assistant.id,
                     retry_user_message_id=stored_user.id,
                     retry_assistant_message_id=stored_assistant.id,
+                    previous_run_id="run-original",
                     stream=True,
                     file_ids=["file-1"],
                 )
@@ -1142,6 +1148,8 @@ class ChatServiceTests(unittest.TestCase):
         )
         self.assertTrue(service.stream_handler.generate_to_redis.call_args.kwargs["defer_partial_persistence"])
         self.assertTrue(service.stream_handler.generate_to_redis.call_args.kwargs["replace_on_success"])
+        self.assertEqual(service.stream_handler.generate_to_redis.call_args.kwargs["turn_message_id"], stored_user.id)
+        self.assertEqual(service.stream_handler.generate_to_redis.call_args.kwargs["previous_run_id"], "run-original")
         self.assertEqual(len(created_coroutines), 1)
 
     def test_stream_retry_unanswered_user_allocates_only_assistant_sequence(self):
@@ -1199,6 +1207,7 @@ class ChatServiceTests(unittest.TestCase):
                     user_message_id=stored_user.id,
                     assistant_message_id="33333333-3333-4333-8333-333333333333",
                     retry_user_message_id=stored_user.id,
+                    previous_run_id="run-failed-before-assistant",
                     stream=True,
                 )
             )
@@ -1221,6 +1230,11 @@ class ChatServiceTests(unittest.TestCase):
         self.assertEqual(
             service.stream_handler.generate_to_redis.call_args.kwargs["create_after_retry_user_id"],
             stored_user.id,
+        )
+        self.assertEqual(service.stream_handler.generate_to_redis.call_args.kwargs["turn_message_id"], stored_user.id)
+        self.assertEqual(
+            service.stream_handler.generate_to_redis.call_args.kwargs["previous_run_id"],
+            "run-failed-before-assistant",
         )
         self.assertEqual(len(created_coroutines), 1)
 

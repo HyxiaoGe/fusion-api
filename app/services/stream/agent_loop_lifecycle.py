@@ -195,6 +195,8 @@ async def _start_run(
         model_id=context.model_id,
         provider=execution.runtime.provider,
         message_id=context.assistant_message_id,
+        turn_message_id=execution.turn_message_id,
+        previous_run_id=execution.previous_run_id,
         tools=request.call_config.announced_tools,
         config=_run_config(request.limits, request.call_config),
     )

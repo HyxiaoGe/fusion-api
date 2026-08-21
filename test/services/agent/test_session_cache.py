@@ -2,11 +2,19 @@
 
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+from sqlalchemy import create_engine
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import sessionmaker
 
 # 防御层：万一 unittest discover 没把 test/ 当 package，这里兜底
 os.environ.setdefault("DATABASE_URL", "sqlite:///./fusion-test.db")
 
+from app.db.database import Base  # noqa: E402
+from app.db.models import AgentSession, Conversation  # noqa: E402
 from app.services.agent.session_cache import (  # noqa: E402
     write_session_started,
     write_session_status,
@@ -17,13 +25,27 @@ from app.services.agent.session_cache import (  # noqa: E402
 
 
 class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _configure_new_run(session, *, conversation_id="c1", max_attempt=None):
+        lock_result = MagicMock()
+        lock_result.scalar_one_or_none.return_value = conversation_id
+        max_result = MagicMock()
+        max_result.scalar_one.return_value = max_attempt
+        session.execute.side_effect = [lock_result, max_result]
+
     async def test_write_session_started_inserts_row(self):
         with patch("app.services.agent.session_cache.SessionLocal") as mock_sl:
             session = MagicMock()
             mock_sl.return_value.__enter__.return_value = session
             session.get.return_value = None  # 明确无已有行
+            self._configure_new_run(session)
             await write_session_started(
-                run_id="r1", conversation_id="c1", user_id="u1", model_id="gpt-4", provider="openai"
+                run_id="r1",
+                conversation_id="c1",
+                user_id="u1",
+                model_id="gpt-4",
+                provider="openai",
+                turn_message_id="turn-1",
             )
             session.add.assert_called_once()
             session.commit.assert_called_once()
@@ -33,6 +55,9 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row.user_id, "u1")
             self.assertEqual(row.model_id, "gpt-4")
             self.assertEqual(row.provider, "openai")
+            self.assertEqual(row.turn_message_id, "turn-1")
+            self.assertEqual(row.attempt_index, 1)
+            self.assertIsNone(row.previous_run_id)
             self.assertEqual(row.status, "running")
             self.assertEqual(row.total_steps, 0)
             self.assertEqual(row.total_tool_calls, 0)
@@ -42,6 +67,7 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             session = MagicMock()
             mock_sl.return_value.__enter__.return_value = session
             session.get.return_value = None
+            self._configure_new_run(session)
 
             await write_session_started(
                 run_id="r1",
@@ -50,6 +76,7 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
                 model_id="gpt-4",
                 provider="openai",
                 message_id="msg-1",
+                turn_message_id="turn-1",
                 run_config={"max_steps": 8, "max_tool_calls": 20, "timeout_s": 300},
             )
 
@@ -70,6 +97,7 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
                 model_id="gpt-4",
                 provider="openai",
                 message_id="msg-1",
+                turn_message_id="turn-1",
                 run_config={"max_steps": 4, "max_tool_calls": 7, "timeout_s": 90},
             )
 
@@ -88,10 +116,19 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             existing.limit_reason = "max_steps"
             existing.error_message = "旧错误"
             existing.status = "completed"
+            existing.turn_message_id = "turn-stable"
+            existing.previous_run_id = "run-parent"
+            existing.attempt_index = 3
             session.get.return_value = existing
 
             await write_session_started(
-                run_id="r1", conversation_id="c2", user_id="u2", model_id="gpt-5", provider="anthropic"
+                run_id="r1",
+                conversation_id="c2",
+                user_id="u2",
+                model_id="gpt-5",
+                provider="anthropic",
+                turn_message_id="turn-new",
+                previous_run_id="run-new-parent",
             )
 
             # 不应 add 新行
@@ -107,6 +144,9 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(existing.total_duration_ms)
             self.assertIsNone(existing.limit_reason)
             self.assertIsNone(existing.error_message)
+            self.assertEqual(existing.turn_message_id, "turn-stable")
+            self.assertEqual(existing.previous_run_id, "run-parent")
+            self.assertEqual(existing.attempt_index, 3)
             session.commit.assert_called_once()
 
     async def test_write_session_started_inserts_when_no_existing_row(self):
@@ -115,9 +155,15 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             session = MagicMock()
             mock_sl.return_value.__enter__.return_value = session
             session.get.return_value = None  # 无已有行
+            self._configure_new_run(session)
 
             await write_session_started(
-                run_id="r1", conversation_id="c1", user_id="u1", model_id="gpt-4", provider="openai"
+                run_id="r1",
+                conversation_id="c1",
+                user_id="u1",
+                model_id="gpt-4",
+                provider="openai",
+                turn_message_id="turn-1",
             )
 
             session.add.assert_called_once()
@@ -125,6 +171,116 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row.id, "r1")
             self.assertEqual(row.status, "running")
             session.commit.assert_called_once()
+
+    async def test_write_session_started_locks_conversation_before_allocating_attempt(self):
+        class Result:
+            def __init__(self, value):
+                self.value = value
+
+            def scalar_one(self):
+                return self.value
+
+            def scalar_one_or_none(self):
+                return self.value
+
+        with patch("app.services.agent.session_cache.SessionLocal") as mock_sl:
+            session = MagicMock()
+            mock_sl.return_value.__enter__.return_value = session
+            session.get.return_value = None
+            session.execute.side_effect = [Result("c1"), Result(1), Result("run-old")]
+
+            await write_session_started(
+                run_id="run-new",
+                conversation_id="c1",
+                user_id="u1",
+                model_id="gpt-4",
+                provider="openai",
+                message_id="assistant-new",
+                turn_message_id="user-stable",
+            )
+
+        statements = [call.args[0] for call in session.execute.call_args_list]
+        lock_sql = str(statements[0].compile(dialect=postgresql.dialect()))
+        self.assertIn("FOR UPDATE", lock_sql)
+        row = session.add.call_args.args[0]
+        self.assertEqual(row.attempt_index, 2)
+        self.assertEqual(row.previous_run_id, "run-old")
+        self.assertEqual(row.message_id, "assistant-new")
+
+    async def test_write_session_started_retries_only_the_attempt_unique_conflict(self):
+        class Result:
+            def __init__(self, value):
+                self.value = value
+
+            def scalar_one(self):
+                return self.value
+
+            def scalar_one_or_none(self):
+                return self.value
+
+        conflict_orig = SimpleNamespace(diag=SimpleNamespace(constraint_name="uq_agent_sessions_turn_attempt"))
+        sessions = []
+        for max_attempt in (1, 2):
+            session = MagicMock()
+            session.get.return_value = None
+            session.execute.side_effect = [Result("c1"), Result(max_attempt)]
+            sessions.append(session)
+        sessions[0].commit.side_effect = IntegrityError("insert", {}, conflict_orig)
+        contexts = []
+        for session in sessions:
+            context = MagicMock()
+            context.__enter__.return_value = session
+            contexts.append(context)
+
+        with patch("app.services.agent.session_cache.SessionLocal", side_effect=contexts) as session_local:
+            await write_session_started(
+                run_id="run-new",
+                conversation_id="c1",
+                user_id="u1",
+                model_id="gpt-4",
+                provider="openai",
+                turn_message_id="user-stable",
+                previous_run_id="run-old",
+            )
+
+        self.assertEqual(session_local.call_count, 2)
+        sessions[0].rollback.assert_called_once()
+        self.assertEqual(sessions[1].add.call_args.args[0].attempt_index, 3)
+
+    async def test_independent_sessions_allocate_distinct_attempts_for_the_same_turn(self):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        test_session_local = sessionmaker(bind=engine)
+        with test_session_local() as db:
+            db.add(Conversation(id="c1", user_id="u1", title="测试", model_id="gpt-4"))
+            db.commit()
+
+        with patch("app.services.agent.session_cache.SessionLocal", test_session_local):
+            await write_session_started(
+                run_id="run-1",
+                conversation_id="c1",
+                user_id="u1",
+                model_id="gpt-4",
+                provider="openai",
+                turn_message_id="turn-1",
+            )
+            await write_session_started(
+                run_id="run-2",
+                conversation_id="c1",
+                user_id="u1",
+                model_id="gpt-4",
+                provider="openai",
+                turn_message_id="turn-1",
+                previous_run_id="run-1",
+            )
+
+        with test_session_local() as db:
+            attempts = [
+                row.attempt_index
+                for row in db.query(AgentSession).filter(AgentSession.turn_message_id == "turn-1").all()
+            ]
+        self.assertEqual(sorted(attempts), [1, 2])
+        engine.dispose()
 
     async def test_write_step_started_inserts_running(self):
         with patch("app.services.agent.session_cache.SessionLocal") as mock_sl:

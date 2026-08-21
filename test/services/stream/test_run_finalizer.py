@@ -59,6 +59,8 @@ class RunFinalizerTests(unittest.IsolatedAsyncioTestCase):
             model_id="gpt-4",
             provider="openai",
             message_id="msg-1",
+            turn_message_id="turn-1",
+            previous_run_id="run-previous",
             tools=["web_search"],
             config={"max_steps": 8},
         )
@@ -73,6 +75,8 @@ class RunFinalizerTests(unittest.IsolatedAsyncioTestCase):
                     model_id="gpt-4",
                     provider="openai",
                     message_id="msg-1",
+                    turn_message_id="turn-1",
+                    previous_run_id="run-previous",
                     run_config={"max_steps": 8},
                 ),
                 call.run_started(

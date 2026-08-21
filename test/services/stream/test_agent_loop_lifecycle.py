@@ -243,6 +243,8 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 litellm_kwargs={},
                 provider="openai",
                 assistant_message_id="msg-life",
+                turn_message_id="turn-life",
+                previous_run_id="run-previous",
                 task_id="task-life",
                 call_config=call_config,
                 trace_id="run-life",
@@ -341,7 +343,16 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
             call_order.append(("append", conversation_id, task_id, chunk_type, content, block_id))
 
         async def start_agent_run_fn(**kwargs):
-            call_order.append(("start", kwargs["run_id"], kwargs["tools"], kwargs["config"]))
+            call_order.append(
+                (
+                    "start",
+                    kwargs["run_id"],
+                    kwargs["turn_message_id"],
+                    kwargs["previous_run_id"],
+                    kwargs["tools"],
+                    kwargs["config"],
+                )
+            )
 
         async def prepare_messages_fn(**kwargs):
             call_order.append(
@@ -388,9 +399,10 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(call_order[0], ("append", "conv-life", "task-life", "preparing", "", ""))
         self.assertEqual(call_order[1][1], "run-life")
-        self.assertEqual(call_order[1][2], ["web_search"])
+        self.assertEqual(call_order[1][2:4], ("turn-life", "run-previous"))
+        self.assertEqual(call_order[1][4], ["web_search"])
         self.assertEqual(
-            call_order[1][3],
+            call_order[1][5],
             {
                 "max_steps": 3,
                 "max_tool_calls": 5,

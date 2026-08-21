@@ -100,28 +100,42 @@ def _continuation_original_user_text(
 ) -> str:
     """找出被续写回答对应的上一条用户原文；只读取 text block。"""
 
+    message = _find_continuation_user_message(messages, assistant_message_id=assistant_message_id)
+    return _user_message_text(message) if message is not None else ""
+
+
+def _find_continuation_user_message(
+    messages: list[Any],
+    *,
+    assistant_message_id: str,
+) -> Any | None:
+    """按持久化消息顺序定位被续写 assistant 的前序 user turn。"""
+
     assistant_index = next(
         (index for index, message in enumerate(messages) if str(getattr(message, "id", "")) == assistant_message_id),
         len(messages),
     )
     for message in reversed(messages[:assistant_index]):
-        if getattr(message, "role", None) != "user":
-            continue
-        content = getattr(message, "content", None)
-        if not isinstance(content, list):
-            return ""
-        text_parts: list[str] = []
-        for block in content:
-            if isinstance(block, dict):
-                block_type = block.get("type")
-                text = block.get("text")
-            else:
-                block_type = getattr(block, "type", None)
-                text = getattr(block, "text", None)
-            if block_type == "text" and isinstance(text, str) and text:
-                text_parts.append(text)
-        return "\n".join(text_parts)[:4_000]
-    return ""
+        if getattr(message, "role", None) == "user":
+            return message
+    return None
+
+
+def _user_message_text(message: Any) -> str:
+    content = getattr(message, "content", None)
+    if not isinstance(content, list):
+        return ""
+    text_parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict):
+            block_type = block.get("type")
+            text = block.get("text")
+        else:
+            block_type = getattr(block, "type", None)
+            text = getattr(block, "text", None)
+        if block_type == "text" and isinstance(text, str) and text:
+            text_parts.append(text)
+    return "\n".join(text_parts)[:4_000]
 
 
 def _retry_user_payload(message: Message) -> tuple[str, list[str]]:
@@ -283,6 +297,7 @@ class ChatService:
         assistant_message_id: Optional[str] = None,
         retry_user_message_id: Optional[str] = None,
         retry_assistant_message_id: Optional[str] = None,
+        previous_run_id: Optional[str] = None,
         stream: bool = True,
         options: Optional[Dict[str, Any]] = None,
         file_ids: Optional[List[str]] = None,
@@ -545,6 +560,8 @@ class ChatService:
                     capabilities=capabilities,
                     knowledge_base_ids=effective_knowledge_base_ids,
                     trace_id=trace_id,
+                    turn_message_id=user_message.id,
+                    previous_run_id=previous_run_id,
                     defer_partial_persistence=retry_user_message is not None,
                     replace_on_success=retry_assistant_message is not None,
                     create_after_retry_user_id=(
@@ -686,10 +703,13 @@ class ChatService:
             options=continuation_options,
             capabilities=capabilities,
         )
-        original_user_text = _continuation_original_user_text(
+        continuation_user_message = _find_continuation_user_message(
             conversation.messages,
             assistant_message_id=assistant_message_id,
         )
+        if continuation_user_message is None:
+            raise ApiException.bad_request("无法定位被续写回答对应的用户消息")
+        original_user_text = _user_message_text(continuation_user_message)
 
         task_id = str(uuid_mod.uuid4())
         self.conversation_service.claim_assistant_message_generation(
@@ -745,6 +765,8 @@ class ChatService:
                 capabilities=capabilities,
                 knowledge_base_ids=[],
                 trace_id=trace_id,
+                turn_message_id=str(continuation_user_message.id),
+                previous_run_id=continuation.previous_session.id,
                 initial_content_blocks=continuation.initial_content_blocks,
                 extra_system_prompts=[get_continuation_system_prompt()],
                 preprocess_user_input=False,

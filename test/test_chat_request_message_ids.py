@@ -1,11 +1,17 @@
+import asyncio
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from pydantic import ValidationError
+from starlette.responses import StreamingResponse
 
+from app.api.chat import send_message
 from app.schemas.chat import ChatRequest
 
 USER_MESSAGE_ID = "11111111-1111-4111-8111-111111111111"
 ASSISTANT_MESSAGE_ID = "22222222-2222-4222-8222-222222222222"
+PREVIOUS_RUN_ID = "run-previous"
 
 
 class ChatRequestMessageIdTests(unittest.TestCase):
@@ -27,6 +33,7 @@ class ChatRequestMessageIdTests(unittest.TestCase):
         self.assertIsNone(request.assistant_message_id)
         self.assertIsNone(request.retry_user_message_id)
         self.assertIsNone(request.retry_assistant_message_id)
+        self.assertIsNone(request.previous_run_id)
 
     def test_accepts_retry_ids_that_reuse_the_original_turn(self):
         request = ChatRequest(
@@ -37,10 +44,35 @@ class ChatRequestMessageIdTests(unittest.TestCase):
             assistant_message_id=ASSISTANT_MESSAGE_ID,
             retry_user_message_id=USER_MESSAGE_ID,
             retry_assistant_message_id=ASSISTANT_MESSAGE_ID,
+            previous_run_id=PREVIOUS_RUN_ID,
         )
 
         self.assertEqual(request.retry_user_message_id, USER_MESSAGE_ID)
         self.assertEqual(request.retry_assistant_message_id, ASSISTANT_MESSAGE_ID)
+        self.assertEqual(request.previous_run_id, PREVIOUS_RUN_ID)
+
+    def test_send_route_forwards_optional_previous_run_id(self):
+        response = StreamingResponse(iter(()))
+        chat_service = SimpleNamespace(process_message=AsyncMock(return_value=response))
+        chat_request = ChatRequest(
+            model_id="deepseek-chat",
+            message="重试",
+            conversation_id="conversation-1",
+            retry_user_message_id=USER_MESSAGE_ID,
+            previous_run_id=PREVIOUS_RUN_ID,
+        )
+
+        result = asyncio.run(
+            send_message(
+                chat_request=chat_request,
+                request=SimpleNamespace(state=SimpleNamespace(request_id="run-new")),
+                chat_service=chat_service,
+                current_user=SimpleNamespace(id="user-1"),
+            )
+        )
+
+        self.assertIs(result, response)
+        self.assertEqual(chat_service.process_message.await_args.kwargs["previous_run_id"], PREVIOUS_RUN_ID)
 
     def test_rejects_retry_without_conversation(self):
         with self.assertRaisesRegex(ValidationError, "conversation_id"):
@@ -57,6 +89,15 @@ class ChatRequestMessageIdTests(unittest.TestCase):
                 message="你好",
                 conversation_id="conversation-1",
                 retry_assistant_message_id=ASSISTANT_MESSAGE_ID,
+            )
+
+    def test_rejects_previous_run_without_retry_turn(self):
+        with self.assertRaisesRegex(ValidationError, "retry_user_message_id"):
+            ChatRequest(
+                model_id="deepseek-chat",
+                message="你好",
+                conversation_id="conversation-1",
+                previous_run_id=PREVIOUS_RUN_ID,
             )
 
     def test_rejects_retry_ids_that_do_not_match_request_message_ids(self):

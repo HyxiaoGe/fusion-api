@@ -63,14 +63,21 @@
 - Add: `alembic/versions/e8f5a1c4d2b7_add_agent_trajectory_ledger.py`
 - Modify: `app/services/agent/session_cache.py`
 - Modify: `app/schemas/chat.py`
+- Modify: `app/api/chat.py`
 - Modify: `app/services/stream/agent_loop_execution.py`
+- Modify: `app/services/stream/agent_loop_lifecycle.py`
 - Modify: `app/services/stream/agent_loop_wiring.py`
+- Modify: `app/services/stream/run_finalizer.py`
 - Modify: `app/services/stream/runner.py`
 - Modify: `app/services/chat_service.py`
 - Add: `test/test_agent_trajectory_migration.py`
 - Modify: `test/services/agent/test_session_cache.py`
 - Modify: `test/test_chat_request_message_ids.py`
+- Modify: `test/test_chat_service.py`
+- Modify: `test/test_chat_continue.py`
 - Modify: `test/services/agent/test_continuation.py`
+- Modify: `test/services/stream/test_agent_loop_lifecycle.py`
+- Modify: `test/services/stream/test_run_finalizer.py`
 
 **Steps**
 
@@ -86,8 +93,8 @@
 4. 将 `write_session_started()` 扩展为原子 attempt 分配入口，新增 `turn_message_id` 与 optional `previous_run_id`；initial 为 1，retry/regenerate/continue 递增；请求缺 previous 时只在同一加锁事务中按 turn 解析最新 run并记录兼容指标。
 5. 给 `ChatRequest` 增加 optional `previous_run_id`，并将现有稳定 `user_message_id` 作为 `turn_message_id` 沿 `chat.py → chat_service.py → runner.py → agent_loop_wiring.py → execution/lifecycle start` 透传；continue 从被续写 assistant 的前序 user message解析同一 turn，并复用现有 `previous_run_id`。不得让旧客户端因缺字段失败。
 6. 加并发测试：两个独立 Session 对同一 `turn_message_id` 分配 attempt，不产生重复；另加“首次生成失败后重试换 assistant id 仍属于同一 turn”的回归。若 SQLite 不能表达 `FOR UPDATE`，使用 SQL/调用契约测试并在 PostgreSQL migration test 中校验唯一约束。
-7. Run: `/Users/sean/code/fusion/fusion-api/.venv/bin/python -m pytest test/test_agent_trajectory_migration.py test/services/agent/test_session_cache.py test/test_chat_request_message_ids.py test/services/agent/test_continuation.py -q`
-8. Run: `/Users/sean/code/fusion/fusion-api/.venv/bin/python -m ruff check app/db/models.py app/services/agent/session_cache.py app/schemas/chat.py app/services/stream/agent_loop_execution.py app/services/stream/agent_loop_wiring.py app/services/stream/runner.py app/services/chat_service.py test/test_agent_trajectory_migration.py test/services/agent/test_session_cache.py test/test_chat_request_message_ids.py test/services/agent/test_continuation.py`
+7. Run: `/Users/sean/code/fusion/fusion-api/.venv/bin/python -m pytest test/test_agent_trajectory_migration.py test/services/agent/test_session_cache.py test/test_chat_request_message_ids.py test/test_chat_service.py test/test_chat_continue.py test/services/agent/test_continuation.py test/services/stream/test_agent_loop_lifecycle.py test/services/stream/test_run_finalizer.py -q`
+8. Run: `/Users/sean/code/fusion/fusion-api/.venv/bin/python -m ruff check app/db/models.py app/services/agent/session_cache.py app/schemas/chat.py app/api/chat.py app/services/stream/agent_loop_execution.py app/services/stream/agent_loop_lifecycle.py app/services/stream/agent_loop_wiring.py app/services/stream/run_finalizer.py app/services/stream/runner.py app/services/chat_service.py test/test_agent_trajectory_migration.py test/services/agent/test_session_cache.py test/test_chat_request_message_ids.py test/test_chat_service.py test/test_chat_continue.py test/services/agent/test_continuation.py test/services/stream/test_agent_loop_lifecycle.py test/services/stream/test_run_finalizer.py`
 9. Commit: `feat: 增加轨迹账本模型与运行尝试层级`
 
 ## Task 3：实现 TrajectoryRecorder、allowlist、latch 与完整性 barrier

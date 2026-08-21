@@ -31,6 +31,7 @@ class ChatContinueTests(unittest.IsolatedAsyncioTestCase):
         service.conversation_service.get_conversation = MagicMock(return_value=conversation)
         continuation_context = SimpleNamespace(
             assistant_message=SimpleNamespace(sequence=42),
+            previous_session=SimpleNamespace(id="run-old"),
             initial_content_blocks=[],
             limits=SimpleNamespace(max_steps=8, max_tool_calls=20, total_timeout_s=300),
             plan_mode="on",
@@ -92,6 +93,14 @@ class ChatContinueTests(unittest.IsolatedAsyncioTestCase):
             "深圳南山区明天天气如何？",
         )
         self.assertEqual(
+            service.stream_handler.generate_to_redis.call_args.kwargs["turn_message_id"],
+            "user-msg-1",
+        )
+        self.assertEqual(
+            service.stream_handler.generate_to_redis.call_args.kwargs["previous_run_id"],
+            "run-old",
+        )
+        self.assertEqual(
             service.stream_handler.generate_to_redis.call_args.kwargs["options"],
             {
                 "task_mode": "standard",
@@ -144,7 +153,10 @@ class ChatContinueTests(unittest.IsolatedAsyncioTestCase):
                 id="conv-1",
                 user_id="user-1",
                 model_id="deepseek-chat",
-                messages=[],
+                messages=[
+                    SimpleNamespace(id="user-msg-1", role="user", content=[]),
+                    SimpleNamespace(id="msg-1", role="assistant", content=[]),
+                ],
             )
         )
         continuation_context = SimpleNamespace(
@@ -194,7 +206,10 @@ class ChatContinueTests(unittest.IsolatedAsyncioTestCase):
                 id="conv-1",
                 user_id="user-1",
                 model_id="deepseek-chat",
-                messages=[],
+                messages=[
+                    SimpleNamespace(id="user-msg-1", role="user", content=[]),
+                    SimpleNamespace(id="msg-1", role="assistant", content=[]),
+                ],
             )
         )
         continuation_context = SimpleNamespace(

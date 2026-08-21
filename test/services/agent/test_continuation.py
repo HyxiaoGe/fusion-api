@@ -198,6 +198,8 @@ class AgentContinuationTests(unittest.TestCase):
                 id="run-old",
                 conversation_id="conv-1",
                 message_id="msg-1",
+                turn_message_id="user-msg-1",
+                attempt_index=1,
                 user_id="user-1",
                 model_id="deepseek-chat",
                 provider="deepseek",
@@ -208,6 +210,9 @@ class AgentContinuationTests(unittest.TestCase):
                 id="run-new",
                 conversation_id="conv-1",
                 message_id="msg-1",
+                turn_message_id="user-msg-1",
+                previous_run_id="run-old",
+                attempt_index=2,
                 user_id="user-1",
                 model_id="deepseek-chat",
                 provider="deepseek",
@@ -240,6 +245,8 @@ class AgentContinuationTests(unittest.TestCase):
                 id="run-old",
                 conversation_id="conv-1",
                 message_id="msg-1",
+                turn_message_id="user-msg-1",
+                attempt_index=1,
                 user_id="user-1",
                 model_id="deepseek-chat",
                 provider="deepseek",
@@ -250,6 +257,9 @@ class AgentContinuationTests(unittest.TestCase):
                 id="run-new",
                 conversation_id="conv-1",
                 message_id="msg-1",
+                turn_message_id="user-msg-1",
+                previous_run_id="run-old",
+                attempt_index=2,
                 user_id="user-1",
                 model_id="deepseek-chat",
                 provider="deepseek",
@@ -277,6 +287,9 @@ class AgentContinuationTests(unittest.TestCase):
             )
 
             self.assertEqual(result.id, "run-new")
+            self.assertEqual(result.turn_message_id, "user-msg-1")
+            self.assertEqual(result.previous_run_id, "run-old")
+            self.assertEqual(result.attempt_index, 2)
         finally:
             db.close()
             engine.dispose()

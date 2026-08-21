@@ -50,6 +50,8 @@ class AgentLoopExecutionRequest:
     task_id: str
     call_config: AgentLoopCallConfig
     trace_id: str | None
+    turn_message_id: str | None = None
+    previous_run_id: str | None = None
     assistant_message_sequence: int | None = None
 
 
@@ -62,6 +64,8 @@ class AgentLoopExecutionContext:
     emitter: AgentEventEmitter
     runtime: AgentLoopRuntime
     completion_context: AgentLoopRunCompletionContext
+    turn_message_id: str | None
+    previous_run_id: str | None
 
 
 @dataclass(frozen=True)
@@ -216,4 +220,6 @@ def build_agent_loop_execution(
         emitter=parts.emitter,
         runtime=runtime,
         completion_context=completion_context,
+        turn_message_id=request.turn_message_id,
+        previous_run_id=request.previous_run_id,
     )
