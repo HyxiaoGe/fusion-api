@@ -24,6 +24,7 @@ from app.services.stream.agent_loop_execution import (
 from app.services.stream.agent_loop_lifecycle import (
     AgentLoopLifecycleDependencies,
     AgentLoopLifecycleRequest,
+    _prepare_knowledge_grounding,
     commit_trajectory_barrier,
     configure_research_state,
     run_agent_loop_lifecycle,
@@ -43,6 +44,86 @@ def _unused_sync(*_args, **_kwargs):
 
 
 class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_knowledge_retrieval_emits_started_and_completed_around_real_call(self):
+        emitted = []
+
+        class CaptureWriter:
+            async def append_chunk(self, _conversation_id, _task_id, _chunk_type, payload):
+                emitted.append(payload)
+
+        execution = self._execution(redis_writer=CaptureWriter())
+        request = AgentLoopLifecycleRequest(
+            raw_messages=[],
+            has_vision=False,
+            file_ids=None,
+            original_message="不能写入轨迹的原始检索问题",
+            call_config=self._call_config(),
+            limits=self._limits(),
+            knowledge_base_ids=["kb-1"],
+        )
+        grounding = SimpleNamespace(evidence_block=SimpleNamespace(source_count=2))
+
+        with patch(
+            "app.services.stream.agent_loop_lifecycle.prepare_knowledge_grounding",
+            new=AsyncMock(return_value=grounding),
+        ):
+            result = await _prepare_knowledge_grounding(request=request, execution=execution)
+
+        self.assertIs(result, grounding)
+        retrieval_events = [event for event in emitted if event["type"].startswith("retrieval_")]
+        self.assertEqual(
+            [event["type"] for event in retrieval_events],
+            ["retrieval_started", "retrieval_completed"],
+        )
+        self.assertEqual(retrieval_events[0]["query_summary"], "已发起知识库检索")
+        self.assertEqual(retrieval_events[1]["document_count"], 2)
+        self.assertGreaterEqual(retrieval_events[1]["duration_ms"], 0)
+
+    async def test_knowledge_retrieval_error_and_cancel_close_the_span(self):
+        emitted = []
+
+        class CaptureWriter:
+            async def append_chunk(self, _conversation_id, _task_id, _chunk_type, payload):
+                emitted.append(payload)
+
+        execution = self._execution(redis_writer=CaptureWriter())
+        request = AgentLoopLifecycleRequest(
+            raw_messages=[],
+            has_vision=False,
+            file_ids=None,
+            original_message="敏感问题",
+            call_config=self._call_config(),
+            limits=self._limits(),
+            knowledge_base_ids=["kb-1"],
+        )
+
+        with patch(
+            "app.services.stream.agent_loop_lifecycle.prepare_knowledge_grounding",
+            new=AsyncMock(side_effect=RuntimeError("上游敏感报错")),
+        ):
+            with self.assertRaisesRegex(Exception, "knowledge_retrieval_unavailable"):
+                await _prepare_knowledge_grounding(request=request, execution=execution)
+
+        retrieval_events = [event for event in emitted if event["type"].startswith("retrieval_")]
+        self.assertEqual(
+            [event["type"] for event in retrieval_events],
+            ["retrieval_started", "retrieval_failed"],
+        )
+        self.assertNotIn("上游敏感报错", str(retrieval_events[-1]))
+
+        emitted.clear()
+        with patch(
+            "app.services.stream.agent_loop_lifecycle.prepare_knowledge_grounding",
+            new=AsyncMock(side_effect=asyncio.CancelledError),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await _prepare_knowledge_grounding(request=request, execution=execution)
+
+        retrieval_events = [event for event in emitted if event["type"].startswith("retrieval_")]
+        self.assertEqual(
+            [event["type"] for event in retrieval_events],
+            ["retrieval_started", "retrieval_cancelled"],
+        )
     def test_deep_research_with_files_still_requires_network_gate(self):
         execution = self._execution(
             call_config=SimpleNamespace(

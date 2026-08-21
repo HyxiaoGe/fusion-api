@@ -34,6 +34,50 @@ async def async_response(chunks):
 
 
 class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
+    def test_extract_usage_supports_cache_tokens_and_rejects_invalid_values(self):
+        usage = SimpleNamespace(
+            prompt_tokens=10,
+            completion_tokens=4,
+            cache_read_input_tokens=6,
+            cache_creation_input_tokens=2,
+        )
+
+        result = llm_stream_module.extract_usage(SimpleNamespace(usage=usage))
+
+        self.assertEqual(
+            result,
+            Usage(
+                input_tokens=10,
+                output_tokens=4,
+                cache_read_tokens=6,
+                cache_write_tokens=2,
+            ),
+        )
+
+        invalid = SimpleNamespace(
+            prompt_tokens=10,
+            completion_tokens=4,
+            cache_read_tokens=True,
+            cache_read_input_tokens=-1,
+            cache_write_tokens=float("inf"),
+        )
+        invalid_result = llm_stream_module.extract_usage(SimpleNamespace(usage=invalid))
+        self.assertIsNone(invalid_result.cache_read_tokens)
+        self.assertIsNone(invalid_result.cache_write_tokens)
+
+    def test_extract_usage_supports_nested_prompt_cache_details(self):
+        usage = {
+            "prompt_tokens": 12,
+            "completion_tokens": 5,
+            "prompt_tokens_details": {"cached_tokens": 7},
+            "cache_creation_input_tokens": 3,
+        }
+
+        result = llm_stream_module.extract_usage(SimpleNamespace(usage=usage))
+
+        self.assertEqual(result.cache_read_tokens, 7)
+        self.assertEqual(result.cache_write_tokens, 3)
+
     async def test_plan_mode_tool_round_buffers_content_without_answering_or_preview(self):
         events: list[str] = []
 

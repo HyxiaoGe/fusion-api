@@ -923,6 +923,7 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         append_chunk = AsyncMock()
         complete_step_fn = AsyncMock()
         warnings: list[str] = []
+        llm_lifecycle = AsyncMock()
 
         with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
             outcome = await handle_agent_round_outcome(
@@ -943,6 +944,7 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
                         finish_reason="stop",
                         accumulated_usage=Usage(input_tokens=2, output_tokens=20),
                         output_deferred=True,
+                        llm_lifecycle=llm_lifecycle,
                     ),
                 )
             )
@@ -956,6 +958,8 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(warnings, [])
         complete_step_fn.assert_awaited_once()
+        llm_lifecycle.publish_visible_output.assert_awaited_once_with("content")
+        llm_lifecycle.finish_success.assert_awaited_once_with(output_visible=False)
 
     async def test_plan_mode_deferred_web_research_answer_bypasses_product_validation(self):
         coordinator = PlanCoordinator(run_id="run-web-research-answer", mode="on")
@@ -1710,6 +1714,7 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         append_chunk = AsyncMock()
         step_context = _step_context("step-product")
         warnings: list[str] = []
+        llm_lifecycle = AsyncMock()
 
         with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
             outcome = await handle_agent_round_outcome(
@@ -1727,6 +1732,7 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
                         finish_reason="stop",
                         accumulated_usage=Usage(input_tokens=2, output_tokens=3),
                         output_deferred=True,
+                        llm_lifecycle=llm_lifecycle,
                     ),
                 )
             )
@@ -1743,6 +1749,8 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(warnings), 1)
         self.assertIn("reason_code=unsupported_claim", warnings[0])
         self.assertNotIn("停车", warnings[0])
+        llm_lifecycle.publish_visible_output.assert_not_awaited()
+        llm_lifecycle.finish_success.assert_awaited_once_with(output_visible=False)
         self.assertNotIn("排队", warnings[0])
         complete_step_fn.assert_awaited_once()
 

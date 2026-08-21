@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import time
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -345,20 +347,61 @@ async def _prepare_knowledge_grounding(
         phase="researching",
         label="正在检索所选知识库",
     )
+    retrieval_id = str(uuid.uuid4())
+    started_at = time.monotonic()
+    await execution.emitter.retrieval_started(
+        retrieval_id=retrieval_id,
+        query_summary=request.original_message,
+        parent_step_id=None,
+    )
     try:
-        return await prepare_knowledge_grounding(
+        grounding = await prepare_knowledge_grounding(
             db=execution.completion_context.db,
             user_id=execution.runtime.user_id,
             query=request.original_message,
             knowledge_base_ids=request.knowledge_base_ids,
             citation_start=max_explicit_citation_index(request.initial_content_blocks) + 1,
         )
+    except asyncio.CancelledError:
+        await execution.emitter.retrieval_cancelled(
+            retrieval_id=retrieval_id,
+            reason="shutdown",
+            parent_step_id=None,
+        )
+        raise
     except ApiException as error:
-        raise to_stream_grounding_error(error) from error
-    except KnowledgeGroundingStreamError:
+        mapped_error = to_stream_grounding_error(error)
+        await execution.emitter.retrieval_failed(
+            retrieval_id=retrieval_id,
+            error_code=mapped_error.error_code,
+            message=None,
+            parent_step_id=None,
+        )
+        raise mapped_error from error
+    except KnowledgeGroundingStreamError as error:
+        await execution.emitter.retrieval_failed(
+            retrieval_id=retrieval_id,
+            error_code=error.error_code,
+            message=None,
+            parent_step_id=None,
+        )
         raise
     except Exception as error:
-        raise KnowledgeGroundingStreamError("knowledge_retrieval_unavailable") from error
+        mapped_error = KnowledgeGroundingStreamError("knowledge_retrieval_unavailable")
+        await execution.emitter.retrieval_failed(
+            retrieval_id=retrieval_id,
+            error_code=mapped_error.error_code,
+            message=None,
+            parent_step_id=None,
+        )
+        raise mapped_error from error
+    await execution.emitter.retrieval_completed(
+        retrieval_id=retrieval_id,
+        document_count=grounding.evidence_block.source_count,
+        duration_ms=max(0, int(round((time.monotonic() - started_at) * 1000))),
+        parent_step_id=None,
+    )
+    return grounding
 
 
 async def _finalize_completed(

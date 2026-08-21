@@ -204,10 +204,10 @@ class LLMRoundObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(observation.last_payload["error_type"], "RuntimeError")
         self.assertEqual(observation.last_payload["outcome"], "error")
 
-    async def test_first_model_text_delta_skips_empty_usage_and_tool_only_chunks(self):
+    async def test_first_model_delta_records_tool_call_without_losing_later_text_timing(self):
         from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata
 
-        times = iter([10.0, 10.4, 11.0])
+        times = iter([10.0, 10.2, 10.4, 11.0])
         observation = LLMRoundObservation(
             metadata=RoundMetadata(
                 conversation_id="conv-1",
@@ -253,8 +253,44 @@ class LLMRoundObservabilityTests(unittest.IsolatedAsyncioTestCase):
         await observation.finish_success(usage=None, finish_reason="stop")
         await observation.wait_for_log()
 
+        self.assertEqual(observation.first_output_delta_kind, "tool_call")
+        self.assertEqual(observation.first_output_delta_ms, 200)
         self.assertEqual(observation.last_payload["first_model_text_delta_ms"], 400.0)
         self.assertEqual(observation.last_payload["total_duration_ms"], 1000.0)
+
+    async def test_empty_stream_keeps_first_output_measurement_unknown(self):
+        from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata
+
+        observation = LLMRoundObservation(
+            metadata=RoundMetadata(
+                conversation_id="conv-empty",
+                run_id="run-empty",
+                round_index=1,
+                step_id="step-empty",
+                round_kind="agent",
+                model_id="safe-model",
+                provider="test",
+            ),
+            litellm_model="test/safe-model",
+            messages=[],
+            call_kwargs={},
+            clock=iter([20.0, 20.5]).__next__,
+            token_estimator=lambda *_args, **_kwargs: 1,
+            context_window_resolver=lambda _model_id: (4096, "litellm_catalog", "known"),
+            run_context_in_thread=False,
+        )
+
+        async def response():
+            yield SimpleNamespace(choices=[], usage=None)
+
+        observation.start()
+        async for _chunk in observation.wrap_response(response()):
+            pass
+        await observation.finish_success(usage=None, finish_reason="stop")
+
+        self.assertIsNone(observation.first_output_delta_kind)
+        self.assertIsNone(observation.first_output_delta_ms)
+        self.assertEqual(observation.duration_ms, 500)
 
     async def test_fast_error_still_emits_completed_background_estimate(self):
         from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata

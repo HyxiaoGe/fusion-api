@@ -63,6 +63,18 @@ async def handle_agent_round_outcome(
     *,
     request: AgentRoundOutcomeRequest,
 ) -> AgentLoopOutcome | None:
+    try:
+        return await _handle_agent_round_outcome(request=request)
+    finally:
+        lifecycle = request.round_result.llm_lifecycle
+        if lifecycle is not None:
+            await lifecycle.finish_success(output_visible=False)
+
+
+async def _handle_agent_round_outcome(
+    *,
+    request: AgentRoundOutcomeRequest,
+) -> AgentLoopOutcome | None:
     if _requires_deep_synthesis_protocol_summary(request):
         return await _complete_deep_synthesis_protocol_round(request)
 
@@ -408,7 +420,7 @@ async def _commit_deferred_answer(
     if request.runtime.task_mode == "deep_research" or not _has_product_answer_context(request.state):
         answer = request.round_result.content_buf.strip()
         if answer:
-            await _append_committed_answer(request, answer)
+            await _append_committed_answer(request, answer, model_output_visible=True)
         return _with_replaced_answer(request, answer)
 
     return await _commit_deferred_product_answer(request)
@@ -426,6 +438,7 @@ async def _commit_deferred_knowledge_answer(
     candidate = request.round_result.content_buf.strip()
     if evidence_block is not None and validate_grounded_answer(candidate, evidence_block):
         answer = candidate
+        model_output_visible = True
     else:
         request.runtime.warning_fn(
             "知识库回答缺少有效引用，使用确定性兜底: "
@@ -433,7 +446,8 @@ async def _commit_deferred_knowledge_answer(
             f"step={request.step_number}"
         )
         answer = KNOWLEDGE_UNVERIFIABLE_ANSWER_TEXT
-    await _append_committed_answer(request, answer)
+        model_output_visible = False
+    await _append_committed_answer(request, answer, model_output_visible=model_output_visible)
     return _with_replaced_answer(request, answer)
 
 
@@ -451,6 +465,7 @@ async def _commit_deferred_product_answer(
     )
     if validation.is_valid:
         answer = candidate
+        model_output_visible = True
     else:
         repaired_answer, repair_reason_code = repair_unsupported_product_answer(
             candidate,
@@ -464,6 +479,7 @@ async def _commit_deferred_product_answer(
                 f"step={request.step_number} reason_code={validation.reason_code}"
             )
             answer = repaired_answer
+            model_output_visible = True
         else:
             request.runtime.warning_fn(
                 "产品结果模型回答校验未通过，使用确定性兜底: "
@@ -484,9 +500,14 @@ async def _commit_deferred_product_answer(
                 answer = build_product_tool_failure_answer(request.messages)
             if not answer:
                 answer = "已展示本次查询的结构化结果，请以卡片信息为准。"
+            model_output_visible = False
     answer = neutralize_product_provider_mentions(answer, request.state.content_blocks)
     if answer:
-        await _append_committed_answer(request, answer)
+        await _append_committed_answer(
+            request,
+            answer,
+            model_output_visible=model_output_visible,
+        )
     return _with_replaced_answer(request, answer)
 
 
@@ -501,6 +522,8 @@ def _has_product_answer_context(state: AgentLoopState) -> bool:
 async def _append_committed_answer(
     request: AgentRoundOutcomeRequest,
     answer: str,
+    *,
+    model_output_visible: bool = False,
 ) -> None:
     snapshot = request.state.plan_coordinator.begin_synthesis()
     emit_snapshot = getattr(request.runtime.emitter, "plan_snapshot", None)
@@ -515,6 +538,9 @@ async def _append_committed_answer(
         run_id=request.runtime.run_id,
         step_id=request.step_context.step_id,
     )
+    lifecycle = request.round_result.llm_lifecycle
+    if model_output_visible and lifecycle is not None:
+        await lifecycle.publish_visible_output("content")
 
 
 def _with_replaced_answer(
@@ -543,6 +569,7 @@ def _with_replaced_answer(
             announced_tool_names=request.round_result.announced_tool_names,
             output_deferred=False,
             allow_deferred_reasoning_output=request.round_result.allow_deferred_reasoning_output,
+            llm_lifecycle=request.round_result.llm_lifecycle,
         ),
     )
 

@@ -215,6 +215,131 @@ class DynamicToolExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "success")
         self.assertEqual(handler.execute.await_count, 2)
 
+    async def test_physical_attempt_lifecycle_wraps_each_backoff_invocation(self):
+        emitter = AsyncMock()
+        handler = SimpleNamespace(
+            tool_name="web_search",
+            execute=AsyncMock(
+                side_effect=[
+                    ToolResult(
+                        status="failed",
+                        data={"error_code": "search_unavailable", "retryable": True},
+                    ),
+                    ToolResult(status="success", data={"sources": []}),
+                ]
+            ),
+            _build_result_summary=MagicMock(return_value={}),
+        )
+        request = tool_executor_module.ToolExecutionBatchRequest(
+            conversation_id="conv-attempt",
+            user_id="user-attempt",
+            model_id="model-attempt",
+            provider="openai",
+            step_number=3,
+            emitter=emitter,
+        )
+
+        with patch("backoff._async.asyncio.sleep", new=AsyncMock()):
+            result = await tool_executor_module.execute_tool_handler(
+                request=request,
+                tool_call={"id": "call-attempt", "name": "web_search"},
+                handler=handler,
+                args={},
+            )
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual(
+            [call.kwargs["attempt_index"] for call in emitter.tool_attempt_started.await_args_list],
+            [1, 2],
+        )
+        self.assertEqual(
+            [call.kwargs["status"] for call in emitter.tool_attempt_completed.await_args_list],
+            ["failed", "success"],
+        )
+        self.assertEqual(
+            emitter.tool_attempt_started.await_args_list[0].kwargs["tool_call_id"],
+            "call-attempt",
+        )
+
+    async def test_single_physical_attempt_maps_timeout_and_cancellation(self):
+        emitter = AsyncMock()
+        handler = SimpleNamespace(
+            tool_name="side_effect_tool",
+            supports_automatic_retry=False,
+            execute=AsyncMock(),
+            _build_result_summary=MagicMock(return_value={}),
+        )
+        request = tool_executor_module.ToolExecutionBatchRequest(
+            conversation_id="conv-attempt",
+            user_id="user-attempt",
+            model_id="model-attempt",
+            provider="openai",
+            step_number=4,
+            emitter=emitter,
+        )
+
+        handler.execute.side_effect = asyncio.TimeoutError
+        result = await tool_executor_module.execute_tool_handler(
+            request=request,
+            tool_call={"id": "call-timeout", "name": handler.tool_name},
+            handler=handler,
+            args={},
+        )
+
+        self.assertEqual(result.data["error_code"], "tool_timeout")
+        self.assertEqual(emitter.tool_attempt_completed.await_args.kwargs["status"], "timeout")
+        self.assertEqual(emitter.tool_attempt_completed.await_args.kwargs["error_code"], "tool_timeout")
+
+        emitter.reset_mock()
+        handler.execute.side_effect = RuntimeError("上游敏感错误")
+        failed = await tool_executor_module.execute_tool_handler(
+            request=request,
+            tool_call={"id": "call-error", "name": handler.tool_name},
+            handler=handler,
+            args={},
+        )
+        self.assertEqual(failed.data["error_code"], "tool_execution_failed")
+        self.assertEqual(emitter.tool_attempt_completed.await_args.kwargs["status"], "failed")
+        self.assertIsNone(emitter.tool_attempt_completed.await_args.kwargs["error_code"])
+
+        emitter.reset_mock()
+        handler.execute.side_effect = asyncio.CancelledError
+        with self.assertRaises(asyncio.CancelledError):
+            await tool_executor_module.execute_tool_handler(
+                request=request,
+                tool_call={"id": "call-cancel", "name": handler.tool_name},
+                handler=handler,
+                args={},
+            )
+        self.assertEqual(emitter.tool_attempt_completed.await_args.kwargs["status"], "cancelled")
+
+    async def test_attempt_emitter_failure_aborts_without_fabricating_logical_completion(self):
+        emitter = AsyncMock()
+        emitter.tool_attempt_started.side_effect = RuntimeError("event stream unavailable")
+        handler = SimpleNamespace(
+            tool_name="web_search",
+            execute=AsyncMock(return_value=ToolResult(status="success")),
+            _build_result_summary=MagicMock(return_value={}),
+        )
+        request = tool_executor_module.ToolExecutionBatchRequest(
+            conversation_id="conv-attempt",
+            user_id="user-attempt",
+            model_id="model-attempt",
+            provider="openai",
+            emitter=emitter,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "event stream unavailable"):
+            await tool_executor_module.execute_tool_handler(
+                request=request,
+                tool_call={"id": "call-control-plane", "name": handler.tool_name},
+                handler=handler,
+                args={},
+            )
+
+        handler.execute.assert_not_awaited()
+        emitter.tool_call_completed.assert_not_awaited()
+
     async def test_invalid_argument_json_returns_repair_context_without_calling_remote_handler(self):
         handler = MagicMock()
         handler.tool_name = "mcp_docs_a1b2c3d4"
@@ -260,6 +385,8 @@ class DynamicToolExecutionTests(unittest.IsolatedAsyncioTestCase):
         emitter.tool_call_completed.assert_awaited_once()
         self.assertEqual(emitter.tool_call_completed.await_args.kwargs["status"], "degraded")
         self.assertIsNone(emitter.tool_call_completed.await_args.kwargs["error"])
+        emitter.tool_attempt_started.assert_not_awaited()
+        emitter.tool_attempt_completed.assert_not_awaited()
 
     async def test_repeated_invalid_argument_json_is_not_retryable_and_never_calls_handler(self):
         handler = MagicMock()

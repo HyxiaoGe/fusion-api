@@ -138,18 +138,28 @@ def calculate_budget_metrics(
     return round(prompt_tokens / context_window_tokens, 6), prompt_tokens > context_window_tokens
 
 
-def _has_text_delta(chunk: Any) -> bool:
+def _output_delta_kind(chunk: Any) -> str | None:
     choices = getattr(chunk, "choices", None) or []
     if not choices:
-        return False
+        return None
     delta = getattr(choices[0], "delta", None)
     if delta is None:
-        return False
+        return None
     reasoning = getattr(delta, "reasoning_content", None)
     model_extra = getattr(delta, "model_extra", None)
     if not reasoning and isinstance(model_extra, dict):
         reasoning = model_extra.get("reasoning_content")
-    return bool(reasoning or getattr(delta, "content", None))
+    if reasoning:
+        return "reasoning"
+    if getattr(delta, "content", None):
+        return "content"
+    if getattr(delta, "tool_calls", None):
+        return "tool_call"
+    return None
+
+
+def _has_text_delta(chunk: Any) -> bool:
+    return _output_delta_kind(chunk) in {"reasoning", "content"}
 
 
 class _ObservedAsyncIterator:
@@ -199,6 +209,9 @@ class LLMRoundObservation:
         }
         self.started_at: float | None = None
         self.first_text_delta_at: float | None = None
+        self.first_output_delta_at: float | None = None
+        self.first_output_delta_kind: str | None = None
+        self.finished_at: float | None = None
         self._context_result = self._resolve_window()
         self._estimate_task: asyncio.Future[tuple[int | None, str]] | None = None
         self._log_task: asyncio.Task[None] | None = None
@@ -237,8 +250,27 @@ class LLMRoundObservation:
         return _ObservedAsyncIterator(response, self)
 
     def observe_chunk(self, chunk: Any) -> None:
-        if self.first_text_delta_at is None and _has_text_delta(chunk):
-            self.first_text_delta_at = self.clock()
+        delta_kind = _output_delta_kind(chunk)
+        if delta_kind is None:
+            return
+        observed_at = self.clock()
+        if self.first_output_delta_at is None:
+            self.first_output_delta_at = observed_at
+            self.first_output_delta_kind = delta_kind
+        if self.first_text_delta_at is None and delta_kind in {"reasoning", "content"}:
+            self.first_text_delta_at = observed_at
+
+    @property
+    def first_output_delta_ms(self) -> int | None:
+        if self.started_at is None or self.first_output_delta_at is None:
+            return None
+        return max(0, int(round((self.first_output_delta_at - self.started_at) * 1000)))
+
+    @property
+    def duration_ms(self) -> int | None:
+        if self.started_at is None or self.finished_at is None:
+            return None
+        return max(0, int(round((self.finished_at - self.started_at) * 1000)))
 
     async def finish_success(self, *, usage: Usage | None, finish_reason: str) -> None:
         outcome = "cancelled" if finish_reason == "cancelled" else "success"
@@ -318,6 +350,7 @@ class LLMRoundObservation:
     ) -> None:
         try:
             finished_at = self.clock()
+            self.finished_at = finished_at
             self._log_task = asyncio.create_task(
                 self._finish_log(
                     finished_at=finished_at,

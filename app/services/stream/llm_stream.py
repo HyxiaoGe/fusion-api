@@ -9,6 +9,7 @@ spec §4.2。stream_round 把 litellm streaming response 消费成
 import asyncio
 import json
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -110,6 +111,7 @@ class LLMStreamRequest:
     defer_output: bool = False
     allow_deferred_reasoning_output: bool = False
     partial_output: dict[str, str] | None = None
+    on_visible_output: Callable[[str], Awaitable[None]] | None = None
 
 
 @dataclass
@@ -230,12 +232,44 @@ def _log_llm_retry(details: dict) -> None:
     )
 
 
+def _usage_value(usage, key: str):
+    if isinstance(usage, dict):
+        return usage.get(key)
+    return getattr(usage, key, None)
+
+
+def _non_negative_int(*values) -> int | None:
+    for value in values:
+        if value is None or isinstance(value, bool):
+            continue
+        if isinstance(value, float) and not value.is_integer():
+            continue
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if parsed >= 0:
+            return parsed
+    return None
+
+
 def extract_usage(chunk) -> Optional[Usage]:
-    if not hasattr(chunk, "usage") or not chunk.usage:
+    usage = getattr(chunk, "usage", None)
+    if not usage:
         return None
+    prompt_details = _usage_value(usage, "prompt_tokens_details")
     return Usage(
-        input_tokens=chunk.usage.prompt_tokens or 0,
-        output_tokens=chunk.usage.completion_tokens or 0,
+        input_tokens=_non_negative_int(_usage_value(usage, "prompt_tokens")) or 0,
+        output_tokens=_non_negative_int(_usage_value(usage, "completion_tokens")) or 0,
+        cache_read_tokens=_non_negative_int(
+            _usage_value(usage, "cache_read_tokens"),
+            _usage_value(usage, "cache_read_input_tokens"),
+            _usage_value(prompt_details, "cached_tokens"),
+        ),
+        cache_write_tokens=_non_negative_int(
+            _usage_value(usage, "cache_write_tokens"),
+            _usage_value(usage, "cache_creation_input_tokens"),
+        ),
     )
 
 
@@ -630,6 +664,8 @@ async def append_reasoning_and_content(
                 content=reasoning_delta,
                 block_id=request.thinking_block_id,
             )
+            if request.on_visible_output is not None:
+                await request.on_visible_output("reasoning")
         if request.partial_output is not None:
             request.partial_output["reasoning_buf"] = state.reasoning_buf
     if content_delta:
@@ -641,6 +677,8 @@ async def append_reasoning_and_content(
                 content=content_delta,
                 block_id=request.text_block_id,
             )
+            if request.on_visible_output is not None:
+                await request.on_visible_output("content")
         if request.partial_output is not None:
             request.partial_output["content_buf"] = state.content_buf
 
@@ -766,6 +804,7 @@ async def stream_round(
     defer_output: bool = False,
     allow_deferred_reasoning_output: bool = False,
     partial_output: dict[str, str] | None = None,
+    on_visible_output: Callable[[str], Awaitable[None]] | None = None,
 ) -> tuple[str, str, list[dict], str, Optional[Usage]]:
     """
     通用 LLM 流式响应处理。
@@ -791,6 +830,7 @@ async def stream_round(
             defer_output=defer_output,
             allow_deferred_reasoning_output=allow_deferred_reasoning_output,
             partial_output=partial_output,
+            on_visible_output=on_visible_output,
         ),
     )
     return StreamRoundTuple(

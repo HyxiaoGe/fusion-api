@@ -217,6 +217,15 @@ class LimitSummaryHelpersTests(unittest.TestCase):
 
         self.assertEqual(result, Usage(input_tokens=7, output_tokens=10))
 
+    def test_accumulate_summary_usage_preserves_optional_cache_tokens(self):
+        result = accumulate_summary_usage(
+            Usage(input_tokens=2, output_tokens=3, cache_read_tokens=4),
+            Usage(input_tokens=5, output_tokens=7, cache_read_tokens=6, cache_write_tokens=8),
+        )
+
+        self.assertEqual(result.cache_read_tokens, 10)
+        self.assertEqual(result.cache_write_tokens, 8)
+
     def test_accumulate_summary_usage_keeps_existing_usage_without_usage_data(self):
         accumulated_usage = Usage(input_tokens=2, output_tokens=3)
 
@@ -1632,11 +1641,16 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         messages = []
         observation = MagicMock()
         log_round_summary_fn = MagicMock()
+        emitter = AsyncMock()
+        call_order = []
+        emitter.llm_round_started.side_effect = lambda **_kwargs: call_order.append("started")
+        emitter.llm_round_cancelled.side_effect = lambda **_kwargs: call_order.append("cancelled")
         observation.finish_success = AsyncMock()
         observation.finish_error = AsyncMock()
         observation.wrap_response.side_effect = lambda response: response
 
         async def llm_call_fn(*_args, **_kwargs):
+            call_order.append("network")
             return "response"
 
         async def stream_round_fn(*_args, **_kwargs):
@@ -1665,7 +1679,7 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
             content_blocks=[],
             call_kwargs={},
             accumulated_usage=Usage(input_tokens=2, output_tokens=3),
-            emitter=object(),
+            emitter=emitter,
             session_cache=object(),
             total_timeout_s=300,
             run_start=100.0,
@@ -1709,14 +1723,19 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
             finish_reason="cancelled",
         )
         self.assertEqual(log_round_summary_fn.call_args.kwargs["finish_reason"], "no_progress_summary")
+        self.assertEqual(call_order, ["started", "network", "cancelled"])
+        emitter.llm_round_completed.assert_not_awaited()
 
     async def test_run_limit_summary_step_appends_prompt_and_records_success(self):
         messages = [{"role": "user", "content": "hi"}]
         content_blocks = []
         accumulated_usage = Usage(input_tokens=2, output_tokens=3)
-        emitter = object()
+        emitter = AsyncMock()
         session_cache = object()
         events = []
+        emitter.llm_round_started.side_effect = lambda **_kwargs: events.append(("llm_started",))
+        emitter.llm_round_first_output_delta.side_effect = lambda **_kwargs: events.append(("first",))
+        emitter.llm_round_completed.side_effect = lambda **_kwargs: events.append(("llm_completed",))
 
         async def start_step_fn(*, emitter, session_cache, run_id, step_number, clock, on_step_started):
             events.append(("start", emitter, session_cache, run_id, step_number, clock))
@@ -1773,7 +1792,18 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         def clock():
             return 120.0
 
-        with patch("app.services.stream.limit_summary.append_chunk", new=AsyncMock()) as append_chunk:
+        observation = MagicMock(first_output_delta_kind="content", first_output_delta_ms=50, duration_ms=80)
+        observation.finish_success = AsyncMock()
+        observation.finish_error = AsyncMock()
+        observation.wrap_response.side_effect = lambda response: response
+        append_chunk = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append(("answer_chunk",)))
+        with (
+            patch("app.services.stream.limit_summary.append_chunk", new=append_chunk),
+            patch(
+                "app.services.stream.limit_summary.create_llm_round_observation",
+                return_value=observation,
+            ),
+        ):
             outcome = await run_limit_summary_step(
                 request=LimitSummaryStepRequest(
                     conversation_id="conv-1",
@@ -1823,10 +1853,23 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(content_blocks[1].text, "总结正文")
         self.assertEqual(warnings, [])
 
-        self.assertEqual([event[0] for event in events], ["start", "llm", "stream", "log", "complete"])
-        self.assertEqual(events[1][4], {"temperature": 0.1})
         self.assertEqual(
-            events[2],
+            [event[0] for event in events],
+            [
+                "start",
+                "llm_started",
+                "llm",
+                "stream",
+                "log",
+                "answer_chunk",
+                "first",
+                "llm_completed",
+                "complete",
+            ],
+        )
+        self.assertEqual(events[2][4], {"temperature": 0.1})
+        self.assertEqual(
+            events[3],
             (
                 "stream",
                 "response",
@@ -1840,13 +1883,13 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
                 True,
             ),
         )
-        self.assertEqual(events[3][1]["finish_reason"], "limit_summary")
-        self.assertEqual(events[3][1]["tool_calls_count"], 0)
-        self.assertEqual(events[3][1]["reasoning_buf"], "推理")
-        self.assertEqual(events[3][1]["content_buf"], "总结正文")
-        self.assertEqual(events[4][1].step_id, "step-summary")
-        self.assertEqual(events[4][4], [])
-        self.assertEqual(events[4][5], 0)
+        self.assertEqual(events[4][1]["finish_reason"], "limit_summary")
+        self.assertEqual(events[4][1]["tool_calls_count"], 0)
+        self.assertEqual(events[4][1]["reasoning_buf"], "推理")
+        self.assertEqual(events[4][1]["content_buf"], "总结正文")
+        self.assertEqual(events[8][1].step_id, "step-summary")
+        self.assertEqual(events[8][4], [])
+        self.assertEqual(events[8][5], 0)
 
     async def test_run_limit_summary_step_swallows_timeout_and_completes_step(self):
         messages = [{"role": "user", "content": "hi"}]

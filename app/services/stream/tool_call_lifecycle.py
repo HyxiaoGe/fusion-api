@@ -46,6 +46,14 @@ ToolExecutorFn = Callable[[Any, dict], Awaitable[ToolResult]]
 ResultSummaryBuilder = Callable[[ToolResult], dict]
 
 
+class ToolLifecycleControlPlaneError(RuntimeError):
+    """让嵌套 attempt 的 emitter 故障穿透 handler 异常降级层。"""
+
+    def __init__(self, error: Exception):
+        self.error = error
+        super().__init__(type(error).__name__)
+
+
 @dataclass(frozen=True)
 class ToolLifecycleAttempt:
     result: ToolResult
@@ -151,6 +159,8 @@ async def run_tool_attempt(*, target: Any, args: dict, execute: ToolExecutorFn) 
     start_mono = time.monotonic()
     try:
         result = await execute(target, args)
+    except ToolLifecycleControlPlaneError as exc:
+        raise exc.error from None
     except asyncio.CancelledError as exc:
         return ToolLifecycleAttempt(
             result=_build_failed_result(exc),
