@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Literal, TypeAlias
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from app.core.logger import app_logger as logger
@@ -116,10 +116,16 @@ def _allocate_new_session(
     run_attempt_kind: RunAttemptKind,
     run_config: dict | None,
 ) -> AgentSession:
+    turn_scope = _turn_scope_condition(
+        turn_message_id=turn_message_id,
+        message_id=message_id,
+        run_attempt_kind=run_attempt_kind,
+    )
     max_attempt = session.execute(
         select(func.max(AgentSession.attempt_index)).where(
             AgentSession.conversation_id == conversation_id,
-            AgentSession.turn_message_id == turn_message_id,
+            AgentSession.user_id == user_id,
+            turn_scope,
         )
     ).scalar_one()
     attempt_index = int(max_attempt or 0) + 1
@@ -173,7 +179,12 @@ def _resolve_previous_run(
             select(AgentSession)
             .where(
                 AgentSession.conversation_id == conversation_id,
-                AgentSession.turn_message_id == turn_message_id,
+                AgentSession.user_id == user_id,
+                _turn_scope_condition(
+                    turn_message_id=turn_message_id,
+                    message_id=message_id,
+                    run_attempt_kind=run_attempt_kind,
+                ),
             )
             .order_by(
                 AgentSession.attempt_index.desc().nullslast(),
@@ -212,16 +223,39 @@ def validate_previous_run_candidate(
 ) -> AgentSession:
     if previous_run is None:
         raise InvalidPreviousRunError("previous run 不存在")
+    exact_turn_matches = str(previous_run.turn_message_id) == str(turn_message_id)
+    legacy_turn_matches = (
+        run_attempt_kind in {"regenerate", "continue"}
+        and message_id is not None
+        and str(previous_run.turn_message_id) == str(message_id)
+        and str(previous_run.message_id) == str(message_id)
+    )
     scope_matches = (
         str(previous_run.conversation_id) == str(conversation_id)
         and str(previous_run.user_id) == str(user_id)
-        and str(previous_run.turn_message_id) == str(turn_message_id)
+        and (exact_turn_matches or legacy_turn_matches)
     )
     status_allowed = previous_run.status in _ALLOWED_PREVIOUS_STATUSES[run_attempt_kind]
     assistant_matches = run_attempt_kind == "retry" or str(previous_run.message_id) == str(message_id)
     if not scope_matches or not status_allowed or not assistant_matches:
         raise InvalidPreviousRunError("previous run 不属于当前可接续范围")
     return previous_run
+
+
+def _turn_scope_condition(
+    *,
+    turn_message_id: str,
+    message_id: str | None,
+    run_attempt_kind: RunAttemptKind,
+):
+    exact_turn = AgentSession.turn_message_id == turn_message_id
+    if run_attempt_kind not in {"regenerate", "continue"} or message_id is None:
+        return exact_turn
+    legacy_turn = and_(
+        AgentSession.turn_message_id == message_id,
+        AgentSession.message_id == message_id,
+    )
+    return or_(exact_turn, legacy_turn)
 
 
 def _lock_conversation(session, conversation_id: str) -> None:

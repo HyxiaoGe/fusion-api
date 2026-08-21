@@ -470,6 +470,252 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(row.previous_run_id, "run-old")
                 self.assertEqual(row.attempt_index, 2)
 
+    async def test_write_session_started_accepts_legacy_regenerate_fallback_and_explicit_continue(self):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        test_session_local = sessionmaker(bind=engine)
+        with test_session_local() as db:
+            db.add(Conversation(id="c1", user_id="u1", title="测试", model_id="gpt-4"))
+            db.add_all(
+                [
+                    AgentSession(
+                        id="run-legacy-regenerate",
+                        conversation_id="c1",
+                        user_id="u1",
+                        model_id="gpt-4",
+                        provider="openai",
+                        message_id="assistant-regenerate",
+                        turn_message_id="assistant-regenerate",
+                        attempt_index=2,
+                        status="completed",
+                    ),
+                    AgentSession(
+                        id="run-legacy-continue",
+                        conversation_id="c1",
+                        user_id="u1",
+                        model_id="gpt-4",
+                        provider="openai",
+                        message_id="assistant-continue",
+                        turn_message_id="assistant-continue",
+                        attempt_index=3,
+                        status="limit_reached",
+                    ),
+                ]
+            )
+            db.commit()
+
+        with patch("app.services.agent.session_cache.SessionLocal", test_session_local):
+            await write_session_started(
+                run_id="run-new-regenerate",
+                conversation_id="c1",
+                user_id="u1",
+                model_id="gpt-4",
+                provider="openai",
+                message_id="assistant-regenerate",
+                turn_message_id="user-regenerate",
+                run_attempt_kind="regenerate",
+            )
+            await write_session_started(
+                run_id="run-new-continue",
+                conversation_id="c1",
+                user_id="u1",
+                model_id="gpt-4",
+                provider="openai",
+                message_id="assistant-continue",
+                turn_message_id="user-continue",
+                previous_run_id="run-legacy-continue",
+                run_attempt_kind="continue",
+            )
+
+        with test_session_local() as db:
+            regenerated = db.get(AgentSession, "run-new-regenerate")
+            continued = db.get(AgentSession, "run-new-continue")
+            self.assertEqual(regenerated.previous_run_id, "run-legacy-regenerate")
+            self.assertEqual(regenerated.attempt_index, 3)
+            self.assertEqual(continued.previous_run_id, "run-legacy-continue")
+            self.assertEqual(continued.attempt_index, 4)
+        engine.dispose()
+
+    async def test_write_session_started_rejects_forged_legacy_alias(self):
+        previous = SimpleNamespace(
+            id="run-forged",
+            conversation_id="c1",
+            user_id="u1",
+            turn_message_id="assistant-target",
+            message_id="assistant-other",
+            status="completed",
+        )
+        session = MagicMock()
+        session.get.side_effect = [None, previous]
+        lock_result = MagicMock()
+        lock_result.scalar_one_or_none.return_value = "c1"
+        max_result = MagicMock()
+        max_result.scalar_one.return_value = 1
+        session.execute.side_effect = [lock_result, max_result]
+
+        with patch("app.services.agent.session_cache.SessionLocal") as session_local:
+            session_local.return_value.__enter__.return_value = session
+            with self.assertRaises(ValueError):
+                await write_session_started(
+                    run_id="run-new",
+                    conversation_id="c1",
+                    user_id="u1",
+                    model_id="gpt-4",
+                    provider="openai",
+                    message_id="assistant-target",
+                    turn_message_id="user-target",
+                    previous_run_id="run-forged",
+                    run_attempt_kind="regenerate",
+                )
+
+        session.add.assert_not_called()
+
+    async def test_legacy_retry_without_assistant_anchor_does_not_guess_lineage(self):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        test_session_local = sessionmaker(bind=engine)
+        with test_session_local() as db:
+            db.add(Conversation(id="c1", user_id="u1", title="测试", model_id="gpt-4"))
+            db.add(
+                AgentSession(
+                    id="run-legacy",
+                    conversation_id="c1",
+                    user_id="u1",
+                    model_id="gpt-4",
+                    provider="openai",
+                    message_id="assistant-old",
+                    turn_message_id="assistant-old",
+                    attempt_index=1,
+                    status="error",
+                )
+            )
+            db.commit()
+
+        with patch("app.services.agent.session_cache.SessionLocal", test_session_local):
+            with self.assertRaises(ValueError):
+                await write_session_started(
+                    run_id="run-new",
+                    conversation_id="c1",
+                    user_id="u1",
+                    model_id="gpt-4",
+                    provider="openai",
+                    message_id="assistant-new",
+                    turn_message_id="user-1",
+                    run_attempt_kind="retry",
+                )
+
+        with test_session_local() as db:
+            self.assertIsNone(db.get(AgentSession, "run-new"))
+        engine.dispose()
+
+    async def test_legacy_and_new_turn_attempts_share_one_monotonic_index(self):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        test_session_local = sessionmaker(bind=engine)
+        with test_session_local() as db:
+            db.add(Conversation(id="c1", user_id="u1", title="测试", model_id="gpt-4"))
+            db.add(
+                AgentSession(
+                    id="run-legacy",
+                    conversation_id="c1",
+                    user_id="u1",
+                    model_id="gpt-4",
+                    provider="openai",
+                    message_id="assistant-1",
+                    turn_message_id="assistant-1",
+                    attempt_index=3,
+                    status="completed",
+                )
+            )
+            db.commit()
+
+        with patch("app.services.agent.session_cache.SessionLocal", test_session_local):
+            await write_session_started(
+                run_id="run-new-1",
+                conversation_id="c1",
+                user_id="u1",
+                model_id="gpt-4",
+                provider="openai",
+                message_id="assistant-1",
+                turn_message_id="user-1",
+                previous_run_id="run-legacy",
+                run_attempt_kind="regenerate",
+            )
+            with test_session_local() as db:
+                db.get(AgentSession, "run-new-1").status = "completed"
+                db.commit()
+            await write_session_started(
+                run_id="run-new-2",
+                conversation_id="c1",
+                user_id="u1",
+                model_id="gpt-4",
+                provider="openai",
+                message_id="assistant-1",
+                turn_message_id="user-1",
+                previous_run_id="run-new-1",
+                run_attempt_kind="regenerate",
+            )
+
+        with test_session_local() as db:
+            self.assertEqual(db.get(AgentSession, "run-new-1").attempt_index, 4)
+            self.assertEqual(db.get(AgentSession, "run-new-2").attempt_index, 5)
+        engine.dispose()
+
+    async def test_legacy_fallback_ignores_cross_user_candidate(self):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        test_session_local = sessionmaker(bind=engine)
+        with test_session_local() as db:
+            db.add(Conversation(id="c1", user_id="u1", title="测试", model_id="gpt-4"))
+            db.add_all(
+                [
+                    AgentSession(
+                        id="run-valid",
+                        conversation_id="c1",
+                        user_id="u1",
+                        model_id="gpt-4",
+                        provider="openai",
+                        message_id="assistant-1",
+                        turn_message_id="assistant-1",
+                        attempt_index=1,
+                        status="completed",
+                    ),
+                    AgentSession(
+                        id="run-cross-user",
+                        conversation_id="c1",
+                        user_id="u2",
+                        model_id="gpt-4",
+                        provider="openai",
+                        message_id="assistant-1",
+                        turn_message_id="assistant-1",
+                        attempt_index=2,
+                        status="completed",
+                    ),
+                ]
+            )
+            db.commit()
+
+        with (
+            patch("app.services.agent.session_cache.SessionLocal", test_session_local),
+            self.assertLogs("app", level="INFO"),
+        ):
+            await write_session_started(
+                run_id="run-new",
+                conversation_id="c1",
+                user_id="u1",
+                model_id="gpt-4",
+                provider="openai",
+                message_id="assistant-1",
+                turn_message_id="user-1",
+                run_attempt_kind="regenerate",
+            )
+
+        with test_session_local() as db:
+            created = db.get(AgentSession, "run-new")
+            self.assertEqual(created.previous_run_id, "run-valid")
+            self.assertEqual(created.attempt_index, 2)
+        engine.dispose()
+
     async def test_write_step_started_inserts_running(self):
         with patch("app.services.agent.session_cache.SessionLocal") as mock_sl:
             session = MagicMock()

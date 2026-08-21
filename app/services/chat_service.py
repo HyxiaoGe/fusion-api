@@ -690,19 +690,19 @@ class ChatService:
         if not conversation:
             raise ApiException.not_found("会话不存在或无权访问")
 
-        meta = await get_stream_meta(conversation_id)
-        if meta and meta.get("status") == "streaming":
-            raise ApiException.conflict("当前会话已有回答正在生成，请结束后再继续")
-
-        model_id = conversation.model_id
-        litellm_model, provider, litellm_kwargs = llm_manager.resolve_model(model_id)
-        capabilities = _get_model_capabilities(model_id)
-        has_vision = capabilities.get("vision", False)
+        continuation_user_message = _find_continuation_user_message(
+            conversation.messages,
+            assistant_message_id=assistant_message_id,
+        )
+        if continuation_user_message is None:
+            raise ApiException.not_found("待接续的 Agent 运行不存在或不可用")
 
         continuation = build_continuation_context(
             self.db,
             conversation_id=conversation_id,
+            user_id=user_id,
             message_id=assistant_message_id,
+            turn_message_id=str(continuation_user_message.id),
             previous_run_id=previous_run_id,
             default_limits=_agent_loop_limits(),
         )
@@ -711,6 +711,15 @@ class ChatService:
             for block in continuation.initial_content_blocks
         ):
             raise ApiException.bad_request("知识库回答暂不支持继续生成，请重新提问")
+
+        meta = await get_stream_meta(conversation_id)
+        if meta and meta.get("status") == "streaming":
+            raise ApiException.conflict("当前会话已有回答正在生成，请结束后再继续")
+
+        model_id = conversation.model_id
+        litellm_model, provider, litellm_kwargs = llm_manager.resolve_model(model_id)
+        capabilities = _get_model_capabilities(model_id)
+        has_vision = capabilities.get("vision", False)
         stored_task_policy = getattr(continuation, "task_policy", None)
         continuation_options = (
             stored_task_policy.apply_to_options()
@@ -721,12 +730,6 @@ class ChatService:
             options=continuation_options,
             capabilities=capabilities,
         )
-        continuation_user_message = _find_continuation_user_message(
-            conversation.messages,
-            assistant_message_id=assistant_message_id,
-        )
-        if continuation_user_message is None:
-            raise ApiException.bad_request("无法定位被续写回答对应的用户消息")
         original_user_text = _user_message_text(continuation_user_message)
 
         task_id = str(uuid_mod.uuid4())

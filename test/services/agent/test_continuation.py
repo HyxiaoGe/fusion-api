@@ -55,6 +55,106 @@ class FakeDb:
 
 
 class AgentContinuationTests(unittest.TestCase):
+    def test_build_continuation_context_rejects_invalid_run_scope_before_continue(self):
+        message = SimpleNamespace(
+            id="assistant-1",
+            conversation_id="conv-1",
+            role="assistant",
+            content=[],
+        )
+        base = {
+            "id": "run-old",
+            "conversation_id": "conv-1",
+            "user_id": "user-1",
+            "turn_message_id": "user-message-1",
+            "message_id": "assistant-1",
+            "status": "limit_reached",
+            "run_config": {},
+        }
+        cases = (
+            ("跨 user", {"user_id": "user-other"}),
+            ("跨 turn", {"turn_message_id": "user-message-other"}),
+            ("错误 assistant", {"message_id": "assistant-other"}),
+            ("非法状态", {"status": "completed"}),
+        )
+
+        for label, overrides in cases:
+            with self.subTest(case=label):
+                db = FakeDb(message=message, sessions=[SimpleNamespace(**{**base, **overrides})])
+                with self.assertRaises(ApiException) as raised:
+                    build_continuation_context(
+                        db,
+                        conversation_id="conv-1",
+                        user_id="user-1",
+                        message_id="assistant-1",
+                        turn_message_id="user-message-1",
+                        previous_run_id="run-old",
+                        default_limits=AgentLoopLimits(max_steps=8, max_tool_calls=20, total_timeout_s=300),
+                    )
+
+                self.assertEqual(raised.exception.status_code, 404)
+
+    def test_build_continuation_context_accepts_strict_legacy_turn_alias(self):
+        message = SimpleNamespace(
+            id="assistant-1",
+            conversation_id="conv-1",
+            role="assistant",
+            content=[],
+        )
+        legacy = SimpleNamespace(
+            id="run-legacy",
+            conversation_id="conv-1",
+            user_id="user-1",
+            turn_message_id="assistant-1",
+            message_id="assistant-1",
+            status="limit_reached",
+            run_config={},
+        )
+
+        for previous_run_id in (None, "run-legacy"):
+            with self.subTest(previous_run_id=previous_run_id):
+                context = build_continuation_context(
+                    FakeDb(message=message, sessions=[legacy]),
+                    conversation_id="conv-1",
+                    user_id="user-1",
+                    message_id="assistant-1",
+                    turn_message_id="user-message-1",
+                    previous_run_id=previous_run_id,
+                    default_limits=AgentLoopLimits(max_steps=8, max_tool_calls=20, total_timeout_s=300),
+                )
+
+                self.assertIs(context.previous_session, legacy)
+
+    def test_build_continuation_context_rejects_forged_legacy_turn_alias(self):
+        message = SimpleNamespace(
+            id="assistant-1",
+            conversation_id="conv-1",
+            role="assistant",
+            content=[],
+        )
+        forged = SimpleNamespace(
+            id="run-forged",
+            conversation_id="conv-1",
+            user_id="user-1",
+            turn_message_id="assistant-1",
+            message_id="assistant-other",
+            status="limit_reached",
+            run_config={},
+        )
+
+        with self.assertRaises(ApiException) as raised:
+            build_continuation_context(
+                FakeDb(message=message, sessions=[forged]),
+                conversation_id="conv-1",
+                user_id="user-1",
+                message_id="assistant-1",
+                turn_message_id="user-message-1",
+                previous_run_id="run-forged",
+                default_limits=AgentLoopLimits(max_steps=8, max_tool_calls=20, total_timeout_s=300),
+            )
+
+        self.assertEqual(raised.exception.status_code, 404)
+
     def test_deserialize_content_blocks_isolates_invalid_blocks(self):
         blocks = deserialize_content_blocks(
             [
@@ -79,13 +179,23 @@ class AgentContinuationTests(unittest.TestCase):
             role="assistant",
             content=[{"type": "route_results", "id": "route-future", "schema_version": 2}],
         )
-        previous_session = SimpleNamespace(id="run-old", status="limit_reached", run_config={})
+        previous_session = SimpleNamespace(
+            id="run-old",
+            conversation_id="conv-1",
+            user_id="user-1",
+            turn_message_id="user-msg-1",
+            message_id="msg-1",
+            status="limit_reached",
+            run_config={},
+        )
         db = FakeDb(message=message, sessions=[previous_session])
 
         context = build_continuation_context(
             db,
             conversation_id="conv-1",
+            user_id="user-1",
             message_id="msg-1",
+            turn_message_id="user-msg-1",
             previous_run_id="run-old",
             default_limits=AgentLoopLimits(max_steps=8, max_tool_calls=20, total_timeout_s=300),
         )
@@ -182,11 +292,13 @@ class AgentContinuationTests(unittest.TestCase):
             find_latest_limit_reached_session(
                 db,
                 conversation_id="conv-1",
+                user_id="user-1",
                 message_id="msg-1",
+                turn_message_id="user-msg-1",
                 previous_run_id=None,
             )
 
-        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(raised.exception.status_code, 404)
 
     def test_find_latest_limit_reached_session_rejects_when_latest_session_completed(self):
         engine = create_engine("sqlite:///:memory:")
@@ -226,11 +338,13 @@ class AgentContinuationTests(unittest.TestCase):
                 find_latest_limit_reached_session(
                     db,
                     conversation_id="conv-1",
+                    user_id="user-1",
                     message_id="msg-1",
+                    turn_message_id="user-msg-1",
                     previous_run_id=None,
                 )
 
-            self.assertEqual(raised.exception.status_code, 400)
+            self.assertEqual(raised.exception.status_code, 404)
         finally:
             db.close()
             engine.dispose()
@@ -282,7 +396,9 @@ class AgentContinuationTests(unittest.TestCase):
             result = find_latest_limit_reached_session(
                 db,
                 conversation_id="conv-1",
+                user_id="user-1",
                 message_id="msg-1",
+                turn_message_id="user-msg-1",
                 previous_run_id=None,
             )
 
@@ -303,6 +419,10 @@ class AgentContinuationTests(unittest.TestCase):
         )
         previous_session = SimpleNamespace(
             id="run-old",
+            conversation_id="conv-1",
+            user_id="user-1",
+            turn_message_id="user-msg-1",
+            message_id="msg-1",
             status="limit_reached",
             run_config={
                 "max_steps": 3,
@@ -316,7 +436,9 @@ class AgentContinuationTests(unittest.TestCase):
         context = build_continuation_context(
             db,
             conversation_id="conv-1",
+            user_id="user-1",
             message_id="msg-1",
+            turn_message_id="user-msg-1",
             previous_run_id="run-old",
             default_limits=AgentLoopLimits(max_steps=8, max_tool_calls=20, total_timeout_s=300),
         )

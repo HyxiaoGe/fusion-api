@@ -64,16 +64,17 @@ class ChatServiceTests(unittest.TestCase):
     def test_previous_run_validation_accepts_legal_retry_and_regenerate(self):
         service = ChatService(MagicMock())
         cases = (
-            ("retry", "error", "assistant-old", "assistant-new"),
-            ("regenerate", "completed", "assistant-same", "assistant-same"),
+            ("retry", "error", "turn-1", "assistant-old", "assistant-new"),
+            ("regenerate", "completed", "turn-1", "assistant-same", "assistant-same"),
+            ("regenerate", "completed", "assistant-same", "assistant-same", "assistant-same"),
         )
-        for attempt_kind, status, previous_message_id, assistant_message_id in cases:
-            with self.subTest(attempt_kind=attempt_kind):
+        for attempt_kind, status, previous_turn_id, previous_message_id, assistant_message_id in cases:
+            with self.subTest(attempt_kind=attempt_kind, previous_turn_id=previous_turn_id):
                 previous = SimpleNamespace(
                     id="run-old",
                     conversation_id="conv-1",
                     user_id="user-1",
-                    turn_message_id="turn-1",
+                    turn_message_id=previous_turn_id,
                     message_id=previous_message_id,
                     status=status,
                 )
