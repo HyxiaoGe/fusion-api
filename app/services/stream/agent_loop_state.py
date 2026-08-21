@@ -163,11 +163,20 @@ class AgentLoopState:
         return max(0.0, now - run_start - self.context_wait_seconds)
 
     def final_usage(self) -> Usage | None:
-        if self.accumulated_usage.input_tokens <= 0 and self.last_context is None:
+        usage = self.accumulated_usage
+        if (
+            usage.input_tokens <= 0
+            and usage.output_tokens <= 0
+            and usage.cache_read_tokens is None
+            and usage.cache_write_tokens is None
+            and self.last_context is None
+        ):
             return None
         return Usage(
-            input_tokens=self.accumulated_usage.input_tokens,
-            output_tokens=self.accumulated_usage.output_tokens,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cache_read_tokens=usage.cache_read_tokens,
+            cache_write_tokens=usage.cache_write_tokens,
             context=self.last_context,
         )
 

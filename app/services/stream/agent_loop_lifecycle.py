@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.core.logger import app_logger as logger
 from app.core.prompt_bundle import get_active_prompt_bundle_revision
 from app.schemas.chat import TextBlock
 from app.schemas.response import ApiException
@@ -363,7 +364,8 @@ async def _prepare_knowledge_grounding(
             citation_start=max_explicit_citation_index(request.initial_content_blocks) + 1,
         )
     except asyncio.CancelledError:
-        await execution.emitter.retrieval_cancelled(
+        await _emit_retrieval_terminal_preserving_primary(
+            execution.emitter.retrieval_cancelled,
             retrieval_id=retrieval_id,
             reason="shutdown",
             parent_step_id=None,
@@ -371,7 +373,8 @@ async def _prepare_knowledge_grounding(
         raise
     except ApiException as error:
         mapped_error = to_stream_grounding_error(error)
-        await execution.emitter.retrieval_failed(
+        await _emit_retrieval_terminal_preserving_primary(
+            execution.emitter.retrieval_failed,
             retrieval_id=retrieval_id,
             error_code=mapped_error.error_code,
             message=None,
@@ -379,7 +382,8 @@ async def _prepare_knowledge_grounding(
         )
         raise mapped_error from error
     except KnowledgeGroundingStreamError as error:
-        await execution.emitter.retrieval_failed(
+        await _emit_retrieval_terminal_preserving_primary(
+            execution.emitter.retrieval_failed,
             retrieval_id=retrieval_id,
             error_code=error.error_code,
             message=None,
@@ -388,7 +392,8 @@ async def _prepare_knowledge_grounding(
         raise
     except Exception as error:
         mapped_error = KnowledgeGroundingStreamError("knowledge_retrieval_unavailable")
-        await execution.emitter.retrieval_failed(
+        await _emit_retrieval_terminal_preserving_primary(
+            execution.emitter.retrieval_failed,
             retrieval_id=retrieval_id,
             error_code=mapped_error.error_code,
             message=None,
@@ -402,6 +407,16 @@ async def _prepare_knowledge_grounding(
         parent_step_id=None,
     )
     return grounding
+
+
+async def _emit_retrieval_terminal_preserving_primary(emit: AsyncFn, **kwargs: Any) -> None:
+    try:
+        await emit(**kwargs)
+    except BaseException as secondary:
+        logger.warning(
+            "知识检索生命周期收尾失败，保留主异常: error_type=%s",
+            type(secondary).__name__,
+        )
 
 
 async def _finalize_completed(

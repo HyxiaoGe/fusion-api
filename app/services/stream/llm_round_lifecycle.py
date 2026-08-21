@@ -17,9 +17,15 @@ def _measured_int(observation: Any, name: str) -> int | None:
     return None
 
 
-def _measured_kind(observation: Any) -> str | None:
-    value = getattr(observation, "first_output_delta_kind", None)
-    return value if value in {"reasoning", "content", "tool_call"} else None
+def _measured_delta_ms(observation: Any, delta_kind: str) -> int | None:
+    by_kind = getattr(observation, "output_delta_ms", None)
+    if callable(by_kind):
+        value = by_kind(delta_kind)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return max(0, value)
+    if getattr(observation, "first_output_delta_kind", None) == delta_kind:
+        return _measured_int(observation, "first_output_delta_ms")
+    return None
 
 
 def _llm_error_code(error: BaseException) -> str:
@@ -60,6 +66,7 @@ class LLMRoundLifecycle:
     usage: Usage | None = None
     finish_reason: str | None = None
     first_output_emitted: bool = False
+    published_delta_kind: str | None = None
     terminal_emitted: bool = False
 
     @classmethod
@@ -95,23 +102,25 @@ class LLMRoundLifecycle:
         self.usage = usage
         self.finish_reason = finish_reason
 
-    async def publish_visible_output(self, _visible_kind: str | None = None) -> None:
+    async def publish_visible_output(self, visible_kind: str | None = None) -> None:
         """在对应可见 chunk 已写 Redis 后发送首次输出事件。"""
 
         if self.first_output_emitted or self.terminal_emitted:
             return
-        delta_kind = _measured_kind(self.observation)
-        ttft_ms = _measured_int(self.observation, "first_output_delta_ms")
-        if delta_kind not in {"reasoning", "content"} or ttft_ms is None:
+        delta_kind = visible_kind
+        if delta_kind not in {"reasoning", "content"}:
+            return
+        ttft_ms = _measured_delta_ms(self.observation, delta_kind)
+        if ttft_ms is None:
             return
         await self._publish_first(delta_kind=delta_kind, ttft_ms=ttft_ms)
 
     async def publish_tool_output(self) -> None:
         if self.first_output_emitted or self.terminal_emitted:
             return
-        delta_kind = _measured_kind(self.observation)
-        ttft_ms = _measured_int(self.observation, "first_output_delta_ms")
-        if delta_kind != "tool_call" or ttft_ms is None:
+        delta_kind = "tool_call"
+        ttft_ms = _measured_delta_ms(self.observation, delta_kind)
+        if ttft_ms is None:
             return
         await self._publish_first(delta_kind=delta_kind, ttft_ms=ttft_ms)
 
@@ -123,13 +132,13 @@ class LLMRoundLifecycle:
             parent_step_id=self.parent_step_id,
         )
         self.first_output_emitted = True
+        self.published_delta_kind = delta_kind
 
     async def finish_success(self, *, output_visible: bool = False) -> None:
         if self.terminal_emitted:
             return
         if output_visible:
-            await self.publish_visible_output()
-        await self.publish_tool_output()
+            await self.publish_visible_output(getattr(self.observation, "first_output_delta_kind", None))
         usage = self.usage or Usage()
         await self.emitter.llm_round_completed(
             llm_round_id=self.llm_round_id,
@@ -140,7 +149,7 @@ class LLMRoundLifecycle:
             cache_read_tokens=usage.cache_read_tokens,
             cache_write_tokens=usage.cache_write_tokens,
             ttft_ms=(
-                _measured_int(self.observation, "first_output_delta_ms")
+                _measured_delta_ms(self.observation, self.published_delta_kind or "")
                 if self.first_output_emitted
                 else None
             ),

@@ -292,6 +292,7 @@ class DynamicToolExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         emitter.reset_mock()
         handler.execute.side_effect = RuntimeError("上游敏感错误")
+        emitter.tool_attempt_completed.side_effect = RuntimeError("terminal sink failed")
         failed = await tool_executor_module.execute_tool_handler(
             request=request,
             tool_call={"id": "call-error", "name": handler.tool_name},
@@ -303,6 +304,7 @@ class DynamicToolExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(emitter.tool_attempt_completed.await_args.kwargs["error_code"])
 
         emitter.reset_mock()
+        emitter.tool_attempt_completed.side_effect = RuntimeError("terminal sink failed")
         handler.execute.side_effect = asyncio.CancelledError
         with self.assertRaises(asyncio.CancelledError):
             await tool_executor_module.execute_tool_handler(
@@ -338,6 +340,19 @@ class DynamicToolExecutionTests(unittest.IsolatedAsyncioTestCase):
             )
 
         handler.execute.assert_not_awaited()
+        emitter.tool_call_completed.assert_not_awaited()
+
+        emitter.reset_mock()
+        emitter.tool_attempt_started.side_effect = None
+        emitter.tool_attempt_completed.side_effect = RuntimeError("terminal event stream unavailable")
+        with self.assertRaisesRegex(RuntimeError, "terminal event stream unavailable"):
+            await tool_executor_module.execute_tool_handler(
+                request=request,
+                tool_call={"id": "call-terminal-control-plane", "name": handler.tool_name},
+                handler=handler,
+                args={},
+            )
+
         emitter.tool_call_completed.assert_not_awaited()
 
     async def test_invalid_argument_json_returns_repair_context_without_calling_remote_handler(self):

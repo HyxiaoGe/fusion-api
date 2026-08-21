@@ -124,6 +124,33 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
             [event["type"] for event in retrieval_events],
             ["retrieval_started", "retrieval_cancelled"],
         )
+
+    async def test_retrieval_terminal_sink_failure_does_not_replace_primary_error_or_cancel(self):
+        execution = self._execution()
+        request = AgentLoopLifecycleRequest(
+            raw_messages=[],
+            has_vision=False,
+            file_ids=None,
+            original_message="敏感问题",
+            call_config=self._call_config(),
+            limits=self._limits(),
+            knowledge_base_ids=["kb-1"],
+        )
+        execution.emitter.retrieval_failed = AsyncMock(side_effect=RuntimeError("sink failed"))
+        with patch(
+            "app.services.stream.agent_loop_lifecycle.prepare_knowledge_grounding",
+            new=AsyncMock(side_effect=RuntimeError("upstream failed")),
+        ):
+            with self.assertRaisesRegex(Exception, "knowledge_retrieval_unavailable"):
+                await _prepare_knowledge_grounding(request=request, execution=execution)
+
+        execution.emitter.retrieval_cancelled = AsyncMock(side_effect=RuntimeError("sink failed"))
+        with patch(
+            "app.services.stream.agent_loop_lifecycle.prepare_knowledge_grounding",
+            new=AsyncMock(side_effect=asyncio.CancelledError),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await _prepare_knowledge_grounding(request=request, execution=execution)
     def test_deep_research_with_files_still_requires_network_gate(self):
         execution = self._execution(
             call_config=SimpleNamespace(

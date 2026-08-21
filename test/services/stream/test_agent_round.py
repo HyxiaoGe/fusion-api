@@ -36,6 +36,87 @@ class AgentRoundUsageTests(unittest.TestCase):
 
 
 class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
+    async def test_round_timing_excludes_started_and_context_sink_delay(self):
+        from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata
+
+        now = [0.0]
+        calls = []
+        emitter = AsyncMock()
+
+        async def started(**_kwargs):
+            calls.append("started")
+            now[0] += 5.0
+
+        async def context_status(**kwargs):
+            if kwargs["phase"] == "final":
+                now[0] += 7.0
+
+        emitter.llm_round_started.side_effect = started
+        emitter.context_status_updated.side_effect = context_status
+        context_plan = ContextPlan(
+            messages=[],
+            status="no_op",
+            context_window_tokens=1000,
+            context_window_source="test",
+            context_window_status="known",
+            estimated_tokens_after=10,
+        )
+        observation = LLMRoundObservation(
+            metadata=RoundMetadata("conv", "run", 1, "step", "agent", "model", "provider"),
+            litellm_model="test/model",
+            messages=[],
+            call_kwargs={},
+            clock=lambda: now[0],
+            token_estimator=lambda *_args, **_kwargs: 1,
+            context_window_resolver=lambda _model_id: (1000, "test", "known"),
+            run_context_in_thread=False,
+        )
+
+        async def response():
+            now[0] = 5.1
+            yield MagicMock(
+                choices=[MagicMock(delta=MagicMock(content="答案", reasoning_content=None, tool_calls=None))]
+            )
+            now[0] = 5.2
+
+        async def llm_call_fn(*_args, **_kwargs):
+            calls.append("network")
+            return response()
+
+        async def stream_round_fn(observed, *_args, **kwargs):
+            async for _chunk in observed:
+                await kwargs["on_visible_output"]("content")
+            return "", "答案", [], "stop", Usage(input_tokens=1, output_tokens=1)
+
+        with (
+            patch("app.services.stream.agent_round.prepare_context", new=AsyncMock(return_value=context_plan)),
+            patch("app.services.stream.agent_round.create_llm_round_observation", return_value=observation),
+        ):
+            await run_agent_round(
+                conversation_id="conv",
+                task_id="task",
+                run_id="run",
+                step_number=1,
+                model_id="model",
+                provider="provider",
+                litellm_model="test/model",
+                litellm_kwargs={},
+                messages=[],
+                should_use_reasoning=False,
+                call_kwargs={},
+                accumulated_usage=Usage(),
+                step_context=AgentStepContext("step", 1, 0.0, "thinking", "text"),
+                llm_call_fn=llm_call_fn,
+                stream_round_fn=stream_round_fn,
+                log_round_summary_fn=lambda **_kwargs: None,
+                emitter=emitter,
+            )
+
+        self.assertEqual(calls, ["started", "network"])
+        completed = emitter.llm_round_completed.await_args.kwargs
+        self.assertEqual(completed["ttft_ms"], 100)
+        self.assertEqual(completed["duration_ms"], 200)
+
     async def test_run_agent_round_emits_llm_lifecycle_in_order(self):
         calls: list[str] = []
         emitter = AsyncMock()
@@ -89,6 +170,7 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancelled_llm_call_emits_cancelled_and_reraises(self):
         emitter = AsyncMock()
+        emitter.llm_round_cancelled.side_effect = RuntimeError("terminal sink failed")
         observation = MagicMock()
         observation.finish_success = AsyncMock()
         observation.finish_error = AsyncMock()
@@ -133,6 +215,7 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
         context_plan = MagicMock(messages=[], estimated_tokens_after=10)
         context_plan.telemetry.return_value = {"context_management_status": "no_op"}
 
+        stream_round_fn = AsyncMock(return_value=("", "候选", [], "stop", Usage()))
         with (
             patch("app.services.stream.agent_round.prepare_context", new=AsyncMock(return_value=context_plan)),
             patch("app.services.stream.agent_round.create_llm_round_observation", return_value=observation),
@@ -152,13 +235,14 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
                 accumulated_usage=Usage(),
                 step_context=AgentStepContext("step-deferred", 2, 0.0, "thinking", "text"),
                 llm_call_fn=AsyncMock(return_value="response"),
-                stream_round_fn=AsyncMock(return_value=("", "候选", [], "stop", Usage())),
+                stream_round_fn=stream_round_fn,
                 log_round_summary_fn=lambda **_kwargs: None,
                 emitter=emitter,
                 defer_output=True,
             )
 
         self.assertIsNotNone(result.llm_lifecycle)
+        self.assertTrue(callable(stream_round_fn.await_args.kwargs["on_visible_output"]))
         emitter.llm_round_first_output_delta.assert_not_awaited()
         emitter.llm_round_completed.assert_not_awaited()
 
@@ -654,6 +738,7 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
         observation.finish_error = AsyncMock()
         error = RuntimeError("provider echoed private prompt")
         emitter = AsyncMock()
+        emitter.llm_round_failed.side_effect = RuntimeError("terminal sink failed")
 
         async def llm_call_fn(*_args, **_kwargs):
             raise error

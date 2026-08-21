@@ -5,7 +5,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from threading import BoundedSemaphore
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from app.schemas.chat import Message, TextBlock, Usage
 from app.services.chat.message_builder import build_llm_messages
@@ -257,6 +257,109 @@ class LLMRoundObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(observation.first_output_delta_ms, 200)
         self.assertEqual(observation.last_payload["first_model_text_delta_ms"], 400.0)
         self.assertEqual(observation.last_payload["total_duration_ms"], 1000.0)
+
+    async def test_each_output_kind_keeps_its_own_first_arrival_time(self):
+        from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata
+
+        times = iter([10.0, 10.1, 10.4, 10.7])
+        observation = LLMRoundObservation(
+            metadata=RoundMetadata("conv", "run", 1, "step", "agent", "model", "provider"),
+            litellm_model="test/model",
+            messages=[],
+            call_kwargs={},
+            clock=lambda: next(times),
+            token_estimator=lambda *_args, **_kwargs: 1,
+            context_window_resolver=lambda _model_id: (4096, "test", "known"),
+            run_context_in_thread=False,
+        )
+
+        observation.start()
+        observation.observe_chunk(
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(reasoning_content="隐藏推理", content=None, tool_calls=None))]
+            )
+        )
+        observation.observe_chunk(
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(reasoning_content=None, content="可见正文", tool_calls=None))]
+            )
+        )
+        observation.observe_chunk(
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(reasoning_content="同块推理", content=None, tool_calls=[object()]))]
+            )
+        )
+
+        self.assertEqual(observation.output_delta_ms("reasoning"), 100)
+        self.assertEqual(observation.output_delta_ms("content"), 400)
+        self.assertEqual(observation.output_delta_ms("tool_call"), 700)
+
+    async def test_lifecycle_uses_the_kind_that_became_visible(self):
+        from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata
+        from app.services.stream.llm_round_lifecycle import LLMRoundLifecycle
+
+        now = [20.0]
+        observation = LLMRoundObservation(
+            metadata=RoundMetadata("conv", "run", 1, "step", "agent", "model", "provider"),
+            litellm_model="test/model",
+            messages=[],
+            call_kwargs={},
+            clock=lambda: now[0],
+            token_estimator=lambda *_args, **_kwargs: 1,
+            context_window_resolver=lambda _model_id: (4096, "test", "known"),
+            run_context_in_thread=False,
+        )
+        observation.start()
+        now[0] = 20.1
+        observation.observe_chunk(
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(reasoning_content="隐藏", content=None, tool_calls=None))]
+            )
+        )
+        now[0] = 20.4
+        observation.observe_chunk(
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(reasoning_content=None, content="正文", tool_calls=None))]
+            )
+        )
+        emitter = AsyncMock()
+        lifecycle = LLMRoundLifecycle(emitter, observation, "round", "step")
+
+        await lifecycle.publish_visible_output("content")
+
+        self.assertEqual(emitter.llm_round_first_output_delta.await_args.kwargs["delta_kind"], "content")
+        self.assertEqual(emitter.llm_round_first_output_delta.await_args.kwargs["ttft_ms"], 400)
+
+        observation = LLMRoundObservation(
+            metadata=RoundMetadata("conv", "run", 2, "step", "agent", "model", "provider"),
+            litellm_model="test/model",
+            messages=[],
+            call_kwargs={},
+            clock=lambda: now[0],
+            token_estimator=lambda *_args, **_kwargs: 1,
+            context_window_resolver=lambda _model_id: (4096, "test", "known"),
+            run_context_in_thread=False,
+        )
+        observation.start()
+        now[0] = 20.6
+        observation.observe_chunk(
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(reasoning_content="隐藏", content="隐藏正文", tool_calls=None))]
+            )
+        )
+        now[0] = 20.9
+        observation.observe_chunk(
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(reasoning_content=None, content=None, tool_calls=[object()]))]
+            )
+        )
+        emitter = AsyncMock()
+        lifecycle = LLMRoundLifecycle(emitter, observation, "round-2", "step")
+
+        await lifecycle.publish_tool_output()
+
+        self.assertEqual(emitter.llm_round_first_output_delta.await_args.kwargs["delta_kind"], "tool_call")
+        self.assertEqual(emitter.llm_round_first_output_delta.await_args.kwargs["ttft_ms"], 500)
 
     async def test_empty_stream_keeps_first_output_measurement_unknown(self):
         from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata

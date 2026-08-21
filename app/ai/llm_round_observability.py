@@ -138,28 +138,29 @@ def calculate_budget_metrics(
     return round(prompt_tokens / context_window_tokens, 6), prompt_tokens > context_window_tokens
 
 
-def _output_delta_kind(chunk: Any) -> str | None:
+def _output_delta_kinds(chunk: Any) -> tuple[str, ...]:
     choices = getattr(chunk, "choices", None) or []
     if not choices:
-        return None
+        return ()
     delta = getattr(choices[0], "delta", None)
     if delta is None:
-        return None
+        return ()
     reasoning = getattr(delta, "reasoning_content", None)
     model_extra = getattr(delta, "model_extra", None)
     if not reasoning and isinstance(model_extra, dict):
         reasoning = model_extra.get("reasoning_content")
+    kinds = []
     if reasoning:
-        return "reasoning"
+        kinds.append("reasoning")
     if getattr(delta, "content", None):
-        return "content"
+        kinds.append("content")
     if getattr(delta, "tool_calls", None):
-        return "tool_call"
-    return None
+        kinds.append("tool_call")
+    return tuple(kinds)
 
 
 def _has_text_delta(chunk: Any) -> bool:
-    return _output_delta_kind(chunk) in {"reasoning", "content"}
+    return bool({"reasoning", "content"}.intersection(_output_delta_kinds(chunk)))
 
 
 class _ObservedAsyncIterator:
@@ -211,6 +212,7 @@ class LLMRoundObservation:
         self.first_text_delta_at: float | None = None
         self.first_output_delta_at: float | None = None
         self.first_output_delta_kind: str | None = None
+        self.first_output_delta_at_by_kind: dict[str, float] = {}
         self.finished_at: float | None = None
         self._context_result = self._resolve_window()
         self._estimate_task: asyncio.Future[tuple[int | None, str]] | None = None
@@ -250,15 +252,28 @@ class LLMRoundObservation:
         return _ObservedAsyncIterator(response, self)
 
     def observe_chunk(self, chunk: Any) -> None:
-        delta_kind = _output_delta_kind(chunk)
-        if delta_kind is None:
+        delta_kinds = _output_delta_kinds(chunk)
+        if not delta_kinds:
             return
         observed_at = self.clock()
         if self.first_output_delta_at is None:
             self.first_output_delta_at = observed_at
-            self.first_output_delta_kind = delta_kind
-        if self.first_text_delta_at is None and delta_kind in {"reasoning", "content"}:
+            self.first_output_delta_kind = delta_kinds[0]
+        for delta_kind in delta_kinds:
+            self.first_output_delta_at_by_kind.setdefault(delta_kind, observed_at)
+        if self.first_text_delta_at is None and {"reasoning", "content"}.intersection(delta_kinds):
             self.first_text_delta_at = observed_at
+
+    def output_delta_ms(self, delta_kind: str) -> int | None:
+        observed_at = self.first_output_delta_at_by_kind.get(delta_kind)
+        if self.started_at is None or observed_at is None:
+            return None
+        return max(0, int(round((observed_at - self.started_at) * 1000)))
+
+    def freeze(self) -> None:
+        """在流消费结束处冻结网络测量，后续 sink 延迟不得计入。"""
+        if self.finished_at is None:
+            self.finished_at = self.clock()
 
     @property
     def first_output_delta_ms(self) -> int | None:
@@ -349,8 +364,10 @@ class LLMRoundObservation:
         error_type: str | None,
     ) -> None:
         try:
-            finished_at = self.clock()
-            self.finished_at = finished_at
+            self.freeze()
+            finished_at = self.finished_at
+            if finished_at is None:
+                return
             self._log_task = asyncio.create_task(
                 self._finish_log(
                     finished_at=finished_at,

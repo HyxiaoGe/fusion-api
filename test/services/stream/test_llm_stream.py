@@ -1877,6 +1877,44 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
             {"metadata": {"tags": ["app:fusion", "phase:chat_stream"]}},
         )
 
+    async def test_visible_output_callback_runs_after_redis_append_for_each_kind(self):
+        events = []
+
+        async def append_chunk(*args, **_kwargs):
+            events.append(("append", args[1]))
+            return "entry-id"
+
+        async def on_visible_output(kind):
+            events.append(("first", kind))
+
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv",
+            task_id="task",
+            should_use_reasoning=True,
+            thinking_block_id="thinking",
+            text_block_id="text",
+            on_visible_output=on_visible_output,
+        )
+        state = llm_stream_module.LLMStreamState()
+
+        with patch("app.services.stream.llm_stream.append_chunk", new=append_chunk):
+            await llm_stream_module.append_reasoning_and_content(
+                request=request,
+                state=state,
+                reasoning_delta="推理",
+                content_delta="正文",
+            )
+
+        self.assertEqual(
+            events,
+            [
+                ("append", "reasoning"),
+                ("first", "reasoning"),
+                ("append", "answering"),
+                ("first", "content"),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,6 +10,7 @@ from typing import Any
 
 from app.ai import litellm_health
 from app.ai.llm_round_observability import create_llm_round_observation
+from app.core.logger import app_logger as logger
 from app.schemas.chat import ContextUsage, Usage
 from app.services.chat.context_manager import ContextManagementError, ContextPlan, prepare_context
 from app.services.chat.model_call_language_policy import finalize_model_call_language_policy
@@ -143,6 +144,32 @@ def _accepts_keyword(fn: Callable[..., Any], keyword: str) -> bool:
     return keyword in parameters or any(parameter.kind == Parameter.VAR_KEYWORD for parameter in parameters.values())
 
 
+def _freeze_observation(observation: Any) -> None:
+    freeze = getattr(observation, "freeze", None)
+    if callable(freeze):
+        freeze()
+
+
+async def _close_round_after_primary_error(
+    *, observation: Any, lifecycle: LLMRoundLifecycle | None, error: BaseException
+) -> None:
+    """terminal sink 是 secondary；不得替换网络异常或取消。"""
+    _freeze_observation(observation)
+    try:
+        await observation.finish_error(error)
+    except BaseException as secondary:
+        logger.warning("LLM 观测异常收尾失败，保留主异常: error_type=%s", type(secondary).__name__)
+    if lifecycle is None:
+        return
+    try:
+        if isinstance(error, asyncio.CancelledError):
+            await lifecycle.finish_cancelled(reason="shutdown")
+        else:
+            await lifecycle.finish_failed(error)
+    except BaseException as secondary:
+        logger.warning("LLM 生命周期异常收尾失败，保留主异常: error_type=%s", type(secondary).__name__)
+
+
 def log_agent_round_summary(
     *,
     conversation_id: str,
@@ -237,7 +264,6 @@ async def run_agent_round(
         call_kwargs=call_kwargs,
         assistant_message_id=assistant_message_id,
     )
-    observation.start()
     lifecycle = await LLMRoundLifecycle.start(
         emitter=emitter,
         observation=observation,
@@ -246,6 +272,7 @@ async def run_agent_round(
         provider=provider,
         parent_step_id=step_context.step_id,
     )
+    observation.start()
     try:
         stream_result = await collect_agent_round_stream(
             conversation_id=conversation_id,
@@ -266,21 +293,19 @@ async def run_agent_round(
             allow_deferred_reasoning_output=defer_output and allow_deferred_reasoning_output,
             on_visible_output=(
                 lifecycle.publish_visible_output
-                if lifecycle is not None and not defer_output
+                if lifecycle is not None
+                and (not defer_output or allow_deferred_reasoning_output)
                 else None
             ),
         )
     except asyncio.CancelledError as exc:
-        await observation.finish_error(exc)
-        if lifecycle is not None:
-            await lifecycle.finish_cancelled(reason="shutdown")
+        await _close_round_after_primary_error(observation=observation, lifecycle=lifecycle, error=exc)
         raise
     except BaseException as exc:
-        await observation.finish_error(exc)
-        if lifecycle is not None:
-            await lifecycle.finish_failed(exc)
+        await _close_round_after_primary_error(observation=observation, lifecycle=lifecycle, error=exc)
         raise
     reasoning_buf, content_buf, tool_calls, finish_reason, usage_data = stream_result
+    _freeze_observation(observation)
     final_context = build_context_usage(context_plan, usage_data, round_index=step_number)
     if on_context_updated is not None:
         on_context_updated(final_context)
@@ -291,7 +316,13 @@ async def run_agent_round(
         if finish_reason == "cancelled":
             await lifecycle.finish_cancelled(reason="superseded")
         elif not defer_output or tool_calls:
-            await lifecycle.finish_success(output_visible=bool(reasoning_buf or content_buf))
+            if tool_calls:
+                await lifecycle.publish_tool_output()
+            elif content_buf:
+                await lifecycle.publish_visible_output("content")
+            elif reasoning_buf:
+                await lifecycle.publish_visible_output("reasoning")
+            await lifecycle.finish_success(output_visible=False)
     if finish_reason != "cancelled":
         litellm_health.record_success(model_id)
     log_agent_round_summary(

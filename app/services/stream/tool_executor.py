@@ -108,7 +108,7 @@ class ToolAttemptLifecycle:
         try:
             result = await operation()
         except asyncio.CancelledError:
-            await self._complete(
+            await self._complete_preserving_primary(
                 tool_attempt_id=tool_attempt_id,
                 status="cancelled",
                 error_code=None,
@@ -116,7 +116,7 @@ class ToolAttemptLifecycle:
             )
             raise
         except BaseException:
-            await self._complete(
+            await self._complete_preserving_primary(
                 tool_attempt_id=tool_attempt_id,
                 status="failed",
                 error_code=None,
@@ -141,6 +141,15 @@ class ToolAttemptLifecycle:
             started_at=started_at,
         )
         return result
+
+    async def _complete_preserving_primary(self, **kwargs: Any) -> None:
+        try:
+            await self._complete(**kwargs)
+        except ToolLifecycleControlPlaneError as secondary:
+            logger.warning(
+                "工具 attempt 生命周期收尾失败，保留主异常: error_type=%s",
+                type(secondary.error).__name__,
+            )
 
     async def _complete(
         self,

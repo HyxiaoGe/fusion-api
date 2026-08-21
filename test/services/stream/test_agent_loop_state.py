@@ -115,8 +115,20 @@ class AgentLoopStateTests(unittest.TestCase):
 
         self.assertIsNone(state.final_usage())
 
+    def test_final_usage_keeps_cache_only_provider_usage(self):
+        state = AgentLoopState(accumulated_usage=Usage(cache_read_tokens=12))
+
+        self.assertEqual(state.final_usage(), Usage(cache_read_tokens=12))
+
     def test_final_usage_keeps_accumulated_tokens_and_last_round_context(self):
-        state = AgentLoopState(accumulated_usage=Usage(input_tokens=100, output_tokens=20))
+        state = AgentLoopState(
+            accumulated_usage=Usage(
+                input_tokens=100,
+                output_tokens=20,
+                cache_read_tokens=30,
+                cache_write_tokens=40,
+            )
+        )
         first = ContextUsage(status="no_op", window_tokens=1000, actual_prompt_tokens=40)
         last = ContextUsage(status="trimmed", window_tokens=1000, actual_prompt_tokens=70, removed_turns=1)
 
@@ -126,6 +138,8 @@ class AgentLoopStateTests(unittest.TestCase):
         final = state.final_usage()
         self.assertEqual(final.input_tokens, 100)
         self.assertEqual(final.output_tokens, 20)
+        self.assertEqual(final.cache_read_tokens, 30)
+        self.assertEqual(final.cache_write_tokens, 40)
         self.assertEqual(final.context, last)
 
 
