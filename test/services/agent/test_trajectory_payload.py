@@ -1,4 +1,4 @@
-import pytest
+import unittest
 
 from app.services.agent.trajectory_payload import (
     MAX_LEDGER_LIST_ITEMS,
@@ -317,8 +317,7 @@ EVENT_ALLOWED_FIELDS = {
 }
 
 
-@pytest.mark.parametrize("event_type", sorted(EVENT_FIELDS))
-def test_every_event_type_uses_an_explicit_top_level_allowlist(event_type):
+def _assert_event_type_uses_an_explicit_top_level_allowlist(event_type):
     payload = {
         **COMMON,
         "type": event_type,
@@ -336,7 +335,7 @@ def test_every_event_type_uses_an_explicit_top_level_allowlist(event_type):
     assert "unexpected" not in stored
 
 
-def test_nested_payloads_drop_full_inputs_outputs_and_strip_url_query():
+def _assert_nested_payloads_drop_full_inputs_outputs_and_strip_url_query():
     started = build_trajectory_payload({**COMMON, "type": "tool_call_started", **EVENT_FIELDS["tool_call_started"]})
     completed = build_trajectory_payload(
         {**COMMON, "type": "tool_call_completed", **EVENT_FIELDS["tool_call_completed"]}
@@ -366,7 +365,7 @@ def test_nested_payloads_drop_full_inputs_outputs_and_strip_url_query():
     }
 
 
-def test_evidence_url_drops_embedded_credentials_as_well_as_query_and_fragment():
+def _assert_evidence_url_drops_embedded_credentials_as_well_as_query_and_fragment():
     payload = {
         **COMMON,
         "type": "evidence_item_upserted",
@@ -382,7 +381,7 @@ def test_evidence_url_drops_embedded_credentials_as_well_as_query_and_fragment()
     assert stored["evidence"]["url"] == "https://example.com/report"
 
 
-def test_text_and_lists_are_bounded_and_secret_like_error_text_is_redacted():
+def _assert_text_and_lists_are_bounded_and_secret_like_error_text_is_redacted():
     long_text = "x" * (MAX_LEDGER_TEXT_LENGTH + 50)
     error = build_trajectory_payload(
         {
@@ -408,6 +407,21 @@ def test_text_and_lists_are_bounded_and_secret_like_error_text_is_redacted():
     assert all(len(item) <= MAX_LEDGER_TEXT_LENGTH for item in digest["key_findings"])
 
 
-def test_unknown_event_type_is_rejected_instead_of_storing_raw_payload():
-    with pytest.raises(UnsupportedTrajectoryEventError):
-        build_trajectory_payload({**COMMON, "type": "future_event", "secret": "raw"})
+class TrajectoryPayloadTests(unittest.TestCase):
+    def test_every_event_type_uses_an_explicit_top_level_allowlist(self):
+        for event_type in sorted(EVENT_FIELDS):
+            with self.subTest(event_type=event_type):
+                _assert_event_type_uses_an_explicit_top_level_allowlist(event_type)
+
+    def test_nested_payloads_drop_full_inputs_outputs_and_strip_url_query(self):
+        _assert_nested_payloads_drop_full_inputs_outputs_and_strip_url_query()
+
+    def test_evidence_url_drops_embedded_credentials_as_well_as_query_and_fragment(self):
+        _assert_evidence_url_drops_embedded_credentials_as_well_as_query_and_fragment()
+
+    def test_text_and_lists_are_bounded_and_secret_like_error_text_is_redacted(self):
+        _assert_text_and_lists_are_bounded_and_secret_like_error_text_is_redacted()
+
+    def test_unknown_event_type_is_rejected_instead_of_storing_raw_payload(self):
+        with self.assertRaises(UnsupportedTrajectoryEventError):
+            build_trajectory_payload({**COMMON, "type": "future_event", "secret": "raw"})
