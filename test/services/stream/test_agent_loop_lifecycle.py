@@ -1,8 +1,19 @@
 import asyncio
+import concurrent.futures
+import tempfile
+import threading
 import unittest
+from dataclasses import replace
+from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
+
+from app.db.database import Base
+from app.db.models import AgentEvent, AgentSession, RunTrajectoryMeta
 from app.schemas.chat import (
     KnowledgeEvidenceBlock,
     KnowledgeSourceReference,
@@ -12,6 +23,7 @@ from app.schemas.chat import (
     TextBlock,
     UrlBlock,
 )
+from app.services.agent.trajectory_recorder import TrajectoryRecorder
 from app.services.knowledge.chat_grounding import KnowledgeGroundingResult
 from app.services.stream.agent_loop_driver import AgentLoopExit, AgentLoopOutcome
 from app.services.stream.agent_loop_execution import (
@@ -31,8 +43,14 @@ from app.services.stream.agent_loop_lifecycle import (
 )
 from app.services.stream.agent_loop_policy import AgentLoopLimits
 from app.services.stream.agent_loop_request_prep import AgentLoopPreparedMessages
+from app.services.stream.agent_loop_run_completion import (
+    finalize_completed_run,
+    write_fallback_run_error,
+)
 from app.services.stream.research_evidence import validate_research_completion
-from app.services.stream_state_service import StreamOwnershipLostError
+from app.services.stream.run_finalizer import interrupt_agent_run
+from app.services.stream.tool_executor import AgentEventCompositeWriter
+from app.services.stream_state_service import StreamOwnershipLostError, StreamWriteTerminalError
 
 
 async def _unused_async(**_kwargs):
@@ -536,6 +554,399 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call_order[3][1], [{"role": "user", "content": "prepared"}])
         self.assertEqual(call_order[3][2], [initial_block])
         self.assertIs(call_order[4][1], execution.completion_context)
+
+    async def test_completed_persist_superseded_emits_terminal_and_skips_error_fallback(self):
+        events = []
+
+        class CaptureWriter:
+            async def append_chunk(self, _conversation_id, _task_id, _chunk_type, payload):
+                events.append(payload)
+
+        class SessionCache:
+            def __init__(self):
+                self.status = "running"
+
+            async def write_session_status(self, **kwargs):
+                self.status = kwargs["status"]
+
+        session_cache = SessionCache()
+        execution = self._execution(redis_writer=CaptureWriter())
+        execution = replace(
+            execution,
+            completion_context=replace(
+                execution.completion_context,
+                session_cache=session_cache,
+            ),
+        )
+        fallback_status = AsyncMock()
+        finalize_stream = AsyncMock()
+        complete_run = AsyncMock()
+        finalized = []
+
+        async def finalize(expected_last_sequence):
+            finalized.append(expected_last_sequence)
+            self.assertEqual([event["type"] for event in events], ["run_interrupted"])
+
+        execution.trajectory_recorder.finalize = AsyncMock(side_effect=finalize)
+        real_seal = execution.emitter.seal_and_get_last_sequence
+        execution.emitter.seal_and_get_last_sequence = AsyncMock(side_effect=real_seal)
+
+        await run_agent_loop_lifecycle(
+            request=self._request(),
+            execution=execution,
+            dependencies=self._dependencies(
+                finalize_completed_run_fn=finalize_completed_run,
+                write_fallback_run_error_fn=write_fallback_run_error,
+                persist_message_fn=lambda *_args: False,
+                complete_agent_run_fn=complete_run,
+                interrupt_agent_run_fn=interrupt_agent_run,
+                finalize_stream_fn=finalize_stream,
+                write_fallback_error_status_fn=fallback_status,
+            ),
+        )
+
+        self.assertEqual(session_cache.status, "interrupted")
+        self.assertTrue(execution.state.terminal_emitted)
+        self.assertEqual(finalized, [0])
+        self.assertEqual([event["type"] for event in events], ["run_interrupted"])
+        complete_run.assert_not_awaited()
+        fallback_status.assert_not_awaited()
+        execution.emitter.seal_and_get_last_sequence.assert_awaited_once_with()
+        execution.trajectory_recorder.finalize.assert_awaited_once_with(0)
+
+    async def test_completed_persist_superseded_terminal_failure_keeps_business_status_and_no_double_terminal(self):
+        for terminal_error in (
+            StreamWriteTerminalError("required writer failed"),
+            StreamOwnershipLostError("ownership lost"),
+        ):
+            with self.subTest(error_type=type(terminal_error).__name__):
+                events = []
+
+                class FailingTerminalWriter:
+                    async def append_chunk(self, _conversation_id, _task_id, _chunk_type, payload):
+                        if payload["type"] == "run_interrupted":
+                            raise terminal_error
+                        events.append(payload)
+
+                class SessionCache:
+                    def __init__(self):
+                        self.status = "running"
+
+                    async def write_session_status(self, **kwargs):
+                        self.status = kwargs["status"]
+
+                session_cache = SessionCache()
+                execution = self._execution(redis_writer=FailingTerminalWriter())
+                execution = replace(
+                    execution,
+                    completion_context=replace(
+                        execution.completion_context,
+                        session_cache=session_cache,
+                    ),
+                )
+                fallback_status = AsyncMock()
+                finalize_cancelled = AsyncMock()
+                finalize_failed = AsyncMock()
+                execution.trajectory_recorder.finalize = AsyncMock()
+                real_seal = execution.emitter.seal_and_get_last_sequence
+                execution.emitter.seal_and_get_last_sequence = AsyncMock(side_effect=real_seal)
+                dependencies = self._dependencies(
+                    finalize_completed_run_fn=finalize_completed_run,
+                    finalize_cancelled_run_fn=finalize_cancelled,
+                    finalize_failed_run_fn=finalize_failed,
+                    write_fallback_run_error_fn=write_fallback_run_error,
+                    persist_message_fn=lambda *_args: False,
+                    complete_agent_run_fn=AsyncMock(),
+                    interrupt_agent_run_fn=interrupt_agent_run,
+                    finalize_stream_fn=AsyncMock(),
+                    write_fallback_error_status_fn=fallback_status,
+                )
+
+                if isinstance(terminal_error, StreamOwnershipLostError):
+                    await run_agent_loop_lifecycle(
+                        request=self._request(),
+                        execution=execution,
+                        dependencies=dependencies,
+                    )
+                else:
+                    with self.assertRaises(StreamWriteTerminalError) as raised:
+                        await run_agent_loop_lifecycle(
+                            request=self._request(),
+                            execution=execution,
+                            dependencies=dependencies,
+                        )
+                    self.assertIs(raised.exception, terminal_error)
+
+                self.assertEqual(session_cache.status, "interrupted")
+                self.assertFalse(execution.state.terminal_emitted)
+                self.assertEqual(events, [])
+                fallback_status.assert_not_awaited()
+                finalize_cancelled.assert_not_awaited()
+                finalize_failed.assert_not_awaited()
+                execution.emitter.seal_and_get_last_sequence.assert_awaited_once_with()
+                execution.trajectory_recorder.finalize.assert_awaited_once_with(0)
+
+    async def test_completed_persist_superseded_cancel_during_terminal_has_no_second_terminal(self):
+        terminal_entered = asyncio.Event()
+        terminal_calls = 0
+
+        class BlockingTerminalWriter:
+            async def append_chunk(self, _conversation_id, _task_id, _chunk_type, payload):
+                nonlocal terminal_calls
+                if payload["type"] == "run_interrupted":
+                    terminal_calls += 1
+                    terminal_entered.set()
+                    await asyncio.Event().wait()
+
+        class SessionCache:
+            def __init__(self):
+                self.status = "running"
+
+            async def write_session_status(self, **kwargs):
+                self.status = kwargs["status"]
+
+        session_cache = SessionCache()
+        execution = self._execution(redis_writer=BlockingTerminalWriter())
+        execution = replace(
+            execution,
+            completion_context=replace(
+                execution.completion_context,
+                session_cache=session_cache,
+            ),
+        )
+        finalize_cancelled = AsyncMock()
+        fallback_status = AsyncMock()
+        execution.trajectory_recorder.finalize = AsyncMock()
+        real_seal = execution.emitter.seal_and_get_last_sequence
+        execution.emitter.seal_and_get_last_sequence = AsyncMock(side_effect=real_seal)
+        task = asyncio.create_task(
+            run_agent_loop_lifecycle(
+                request=self._request(),
+                execution=execution,
+                dependencies=self._dependencies(
+                    finalize_completed_run_fn=finalize_completed_run,
+                    finalize_cancelled_run_fn=finalize_cancelled,
+                    write_fallback_run_error_fn=write_fallback_run_error,
+                    persist_message_fn=lambda *_args: False,
+                    complete_agent_run_fn=AsyncMock(),
+                    interrupt_agent_run_fn=interrupt_agent_run,
+                    finalize_stream_fn=AsyncMock(),
+                    write_fallback_error_status_fn=fallback_status,
+                ),
+            )
+        )
+        await asyncio.wait_for(terminal_entered.wait(), timeout=0.5)
+
+        self.assertTrue(task.cancel())
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=0.5)
+
+        self.assertEqual(session_cache.status, "interrupted")
+        self.assertEqual(terminal_calls, 1)
+        self.assertFalse(execution.state.terminal_emitted)
+        fallback_status.assert_not_awaited()
+        finalize_cancelled.assert_not_awaited()
+        execution.emitter.seal_and_get_last_sequence.assert_awaited_once_with()
+        execution.trajectory_recorder.finalize.assert_awaited_once_with(0)
+
+    async def test_completed_persist_superseded_real_ledger_terminal_matrix(self):
+        scenarios = (
+            ("accepted", None, None, True, "complete"),
+            (
+                "redis_terminal",
+                StreamWriteTerminalError("required writer failed"),
+                None,
+                False,
+                "degraded",
+            ),
+            (
+                "ownership",
+                StreamOwnershipLostError("ownership lost"),
+                None,
+                False,
+                "degraded",
+            ),
+            ("trajectory_sink", None, "write_failed", True, "degraded"),
+        )
+
+        for scenario, writer_error, sink_reason, terminal_emitted, trajectory_status in scenarios:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temp_dir:
+                database_path = Path(temp_dir) / "trajectory.sqlite3"
+                engine = create_engine(
+                    f"sqlite:///{database_path}",
+                    connect_args={"check_same_thread": False},
+                )
+                session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+                Base.metadata.create_all(engine)
+                with session_factory() as db:
+                    db.add(
+                        AgentSession(
+                            id="run-life",
+                            conversation_id="conv-life",
+                            message_id="msg-life",
+                            user_id="user-life",
+                            model_id="gpt-4",
+                            provider="openai",
+                            status="running",
+                        )
+                    )
+                    db.commit()
+
+                sink_state = {"fail_next": False}
+
+                def recorder_session_factory():
+                    if sink_state["fail_next"]:
+                        sink_state["fail_next"] = False
+                        raise RuntimeError("trajectory terminal sink failed")
+                    return session_factory()
+
+                class RedisWriter:
+                    def __init__(self):
+                        self.events = []
+
+                    async def append_chunk(self, _conversation_id, _task_id, _chunk_type, payload):
+                        if payload["type"] == "run_interrupted":
+                            if writer_error is not None:
+                                raise writer_error
+                            if sink_reason is not None:
+                                sink_state["fail_next"] = True
+                        self.events.append(payload)
+
+                class SessionCache:
+                    async def write_session_status(self, **kwargs):
+                        with session_factory() as db:
+                            session = db.get(AgentSession, kwargs["run_id"])
+                            session.status = kwargs["status"]
+                            session.total_steps = kwargs["total_steps"]
+                            session.total_tool_calls = kwargs["total_tool_calls"]
+                            session.total_duration_ms = kwargs["total_duration_ms"]
+                            session.terminal_at = datetime.now(UTC)
+                            db.commit()
+
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+                try:
+                    recorder = TrajectoryRecorder(
+                        run_id="run-life",
+                        conversation_id="conv-life",
+                        message_id="msg-life",
+                        session_factory=recorder_session_factory,
+                        executor=executor,
+                        semaphore=threading.BoundedSemaphore(4),
+                    )
+                    redis_writer = RedisWriter()
+                    execution = self._execution(redis_writer=redis_writer)
+                    execution.emitter._writer = AgentEventCompositeWriter(
+                        redis_writer=redis_writer,
+                        trajectory_recorder=recorder,
+                    )
+                    execution = replace(
+                        execution,
+                        trajectory_recorder=recorder,
+                        completion_context=replace(
+                            execution.completion_context,
+                            session_cache=SessionCache(),
+                            trajectory_recorder=recorder,
+                        ),
+                    )
+                    real_seal = execution.emitter.seal_and_get_last_sequence
+                    execution.emitter.seal_and_get_last_sequence = AsyncMock(side_effect=real_seal)
+                    real_finalize = recorder.finalize
+                    recorder.finalize = AsyncMock(side_effect=real_finalize)
+                    await execution.emitter.run_started(
+                        message_id="msg-life",
+                        model="gpt-4",
+                        tools=[],
+                        config={},
+                    )
+                    fallback_status = AsyncMock()
+                    finalize_stream = AsyncMock()
+                    dependencies = self._dependencies(
+                        finalize_completed_run_fn=finalize_completed_run,
+                        finalize_cancelled_run_fn=AsyncMock(),
+                        finalize_failed_run_fn=AsyncMock(),
+                        write_fallback_run_error_fn=write_fallback_run_error,
+                        persist_message_fn=lambda *_args: False,
+                        complete_agent_run_fn=AsyncMock(),
+                        interrupt_agent_run_fn=interrupt_agent_run,
+                        finalize_stream_fn=finalize_stream,
+                        write_fallback_error_status_fn=fallback_status,
+                    )
+
+                    if isinstance(writer_error, StreamOwnershipLostError):
+                        await run_agent_loop_lifecycle(
+                            request=self._request(),
+                            execution=execution,
+                            dependencies=dependencies,
+                        )
+                    elif writer_error is not None:
+                        with self.assertRaises(type(writer_error)) as raised:
+                            await run_agent_loop_lifecycle(
+                                request=self._request(),
+                                execution=execution,
+                                dependencies=dependencies,
+                            )
+                        self.assertIs(raised.exception, writer_error)
+                    else:
+                        await run_agent_loop_lifecycle(
+                            request=self._request(),
+                            execution=execution,
+                            dependencies=dependencies,
+                        )
+
+                    with session_factory() as db:
+                        session = db.get(AgentSession, "run-life")
+                        ledger_events = list(
+                            db.scalars(
+                                select(AgentEvent)
+                                .where(AgentEvent.run_id == "run-life")
+                                .order_by(AgentEvent.sequence)
+                            )
+                        )
+                        event_types = [event.event_type for event in ledger_events]
+                        meta = db.get(RunTrajectoryMeta, "run-life")
+                        self.assertEqual(session.status, "interrupted")
+                        self.assertIsNotNone(session.terminal_at)
+                        self.assertEqual(meta.trajectory_status, trajectory_status)
+                        if trajectory_status == "degraded":
+                            self.assertEqual(
+                                meta.degraded_reason,
+                                sink_reason or "finalize_mismatch",
+                            )
+                            self.assertIsNone(meta.finalized_at)
+                        else:
+                            self.assertIsNone(meta.degraded_reason)
+                            self.assertIsNotNone(meta.finalized_at)
+
+                    expected_events = (
+                        ["run_started", "run_interrupted"]
+                        if scenario == "accepted"
+                        else ["run_started"]
+                    )
+                    self.assertEqual(event_types, expected_events)
+                    if scenario == "accepted":
+                        self.assertEqual(ledger_events[-1].payload["reason"], "superseded")
+                    required_event_types = [event["type"] for event in redis_writer.events]
+                    self.assertEqual(
+                        required_event_types,
+                        (
+                            ["run_started", "run_interrupted"]
+                            if writer_error is None
+                            else ["run_started"]
+                        ),
+                    )
+                    self.assertEqual(execution.state.terminal_emitted, terminal_emitted)
+                    fallback_status.assert_not_awaited()
+                    dependencies.finalize_cancelled_run_fn.assert_not_awaited()
+                    dependencies.finalize_failed_run_fn.assert_not_awaited()
+                    execution.emitter.seal_and_get_last_sequence.assert_awaited_once_with()
+                    recorder.finalize.assert_awaited_once_with(1)
+                    if terminal_emitted:
+                        finalize_stream.assert_awaited_once()
+                    else:
+                        finalize_stream.assert_not_awaited()
+                finally:
+                    executor.shutdown(wait=True)
+                    engine.dispose()
 
     async def test_terminal_matrix_commits_trajectory_barrier_once_after_fallback(self):
         scenarios = (

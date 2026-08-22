@@ -52,6 +52,7 @@ class AgentLoopState:
     limit_reason: AgentLoopLimitReason | None = None
     unknown_terminated: bool = False
     terminal_emitted: bool = False
+    superseded_terminal_decided: bool = False
     consecutive_no_progress_search_results: int = 0
     context_wait_seconds: float = 0.0
     runtime_contexts: dict[str, Any] = field(default_factory=dict)
@@ -185,6 +186,9 @@ class AgentLoopState:
 
     def mark_terminal_emitted(self) -> None:
         self.terminal_emitted = True
+
+    def mark_superseded_terminal_decided(self) -> None:
+        self.superseded_terminal_decided = True
 
     def run_stats(self, run_id: str) -> AgentRunStats:
         return AgentRunStats(

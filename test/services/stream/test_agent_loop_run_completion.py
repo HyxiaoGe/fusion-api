@@ -1,8 +1,10 @@
 import unittest
 from dataclasses import replace
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from app.db.models import AgentSession
 from app.schemas.chat import ContextUsage, TextBlock, Usage
 from app.services.agent.plan_coordinator import PlanCoordinator
 from app.services.stream.agent_loop_run_completion import (
@@ -16,6 +18,7 @@ from app.services.stream.agent_loop_run_completion import (
 from app.services.stream.agent_loop_state import AgentLoopState
 from app.services.stream.itinerary_observability import ItineraryToolObservation
 from app.services.stream.limit_summary import SUMMARY_PROTOCOL_FALLBACK_TEXT
+from app.services.stream.run_finalizer import interrupt_agent_run
 
 
 def _context(state: AgentLoopState | None = None) -> AgentLoopRunCompletionContext:
@@ -390,7 +393,25 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
     async def test_finalize_completed_superseded_write_interrupts_session_and_closes_owned_stream(self):
         state = AgentLoopState()
         state.content_blocks.append(TextBlock(type="text", id="txt-1", text="迟到回答"))
-        session_cache = AsyncMock()
+        session = AgentSession(
+            id="run-1",
+            conversation_id="conv-1",
+            message_id="msg-1",
+            user_id="user-1",
+            model_id="gpt-4",
+            provider="openai",
+            status="running",
+        )
+
+        class SessionCache:
+            async def write_session_status(self, **kwargs):
+                session.status = kwargs["status"]
+                session.total_steps = kwargs["total_steps"]
+                session.total_tool_calls = kwargs["total_tool_calls"]
+                session.total_duration_ms = kwargs["total_duration_ms"]
+                session.terminal_at = datetime.now(UTC)
+
+        session_cache = SessionCache()
         emitter = AsyncMock()
         finalize_stream_fn = AsyncMock(return_value=True)
         complete_agent_run_fn = AsyncMock()
@@ -404,18 +425,16 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
             terminal_state=SimpleNamespace(session_status="completed", run_finish_reason="stop"),
             persist_message_fn=lambda *_args: False,
             complete_agent_run_fn=complete_agent_run_fn,
+            interrupt_agent_run_fn=interrupt_agent_run,
             finalize_stream_fn=finalize_stream_fn,
         )
 
         complete_agent_run_fn.assert_not_awaited()
         emitter.run_completed.assert_not_awaited()
-        session_cache.write_session_status.assert_awaited_once_with(
-            run_id="run-1",
-            status="interrupted",
-            total_steps=0,
-            total_tool_calls=0,
-            total_duration_ms=1234,
-        )
+        emitter.run_interrupted.assert_awaited_once_with(reason="superseded")
+        self.assertEqual(session.status, "interrupted")
+        self.assertIsNotNone(session.terminal_at)
+        self.assertTrue(state.terminal_emitted)
         finalize_stream_fn.assert_awaited_once_with(
             "conv-1",
             success=False,
@@ -464,6 +483,29 @@ class AgentLoopRunCompletionTests(unittest.IsolatedAsyncioTestCase):
             task_id="task-1",
             error_code="assistant_persistence_failed",
         )
+
+    async def test_finalize_completed_superseded_retry_does_not_emit_second_terminal(self):
+        state = AgentLoopState()
+        emitter = AsyncMock()
+        interrupt_agent_run_fn = AsyncMock()
+        finalize_stream_fn = AsyncMock()
+        context = replace(_context(state), emitter=emitter)
+
+        for _ in range(2):
+            await finalize_completed_run(
+                context=context,
+                terminal_state=SimpleNamespace(session_status="completed", run_finish_reason="stop"),
+                persist_message_fn=lambda *_args: False,
+                complete_agent_run_fn=AsyncMock(),
+                interrupt_agent_run_fn=interrupt_agent_run_fn,
+                finalize_stream_fn=finalize_stream_fn,
+            )
+
+        interrupt_agent_run_fn.assert_awaited_once()
+        self.assertEqual(interrupt_agent_run_fn.await_args.kwargs["reason"], "superseded")
+        finalize_stream_fn.assert_awaited_once()
+        emitter.run_completed.assert_not_awaited()
+        self.assertTrue(state.terminal_emitted)
 
     async def test_finalize_completed_claims_before_stream_finalization_and_generates_after(self):
         state = AgentLoopState()

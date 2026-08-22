@@ -84,15 +84,18 @@ async def run_agent_loop_lifecycle(
         await _run_success_path(request=request, execution=execution, dependencies=dependencies)
     except asyncio.CancelledError as error:
         primary_error = error
-        await _finalize_cancelled(execution=execution, dependencies=dependencies)
+        if not execution.state.superseded_terminal_decided:
+            await _finalize_cancelled(execution=execution, dependencies=dependencies)
         raise
     except StreamOwnershipLostError:
         # stop 接口或后续请求已经原子接管 Redis 终态时，后台任务可能先观察到
         # 写入权失效，再收到 asyncio cancellation。这属于正常中断，不应记为生成失败。
-        await _finalize_cancelled(execution=execution, dependencies=dependencies)
+        if not execution.state.superseded_terminal_decided:
+            await _finalize_cancelled(execution=execution, dependencies=dependencies)
     except Exception as error:
         primary_error = error
-        await _finalize_failed(error=error, execution=execution, dependencies=dependencies)
+        if not execution.state.superseded_terminal_decided:
+            await _finalize_failed(error=error, execution=execution, dependencies=dependencies)
         raise
     finally:
         fallback_error: BaseException | None = None
@@ -435,6 +438,7 @@ async def _finalize_completed(
         persist_message_fn=dependencies.persist_message_fn,
         complete_agent_run_fn=dependencies.complete_agent_run_fn,
         finalize_stream_fn=dependencies.finalize_stream_fn,
+        interrupt_agent_run_fn=dependencies.interrupt_agent_run_fn,
         claim_suggested_questions_fn=(dependencies.claim_suggested_questions_fn if generate_suggestions else None),
         generate_suggested_questions_fn=(
             dependencies.generate_suggested_questions_fn if generate_suggestions else None
