@@ -97,6 +97,73 @@ class AdminAuditApiTests(unittest.TestCase):
         )
         self.db.commit()
 
+    def _add_trajectory_run(
+        self,
+        run_id: str,
+        *,
+        conversation_id: str = "conv-1",
+        user_id: str = "user-1",
+    ) -> None:
+        from app.db.models import AgentEvent, AgentSession, RunTrajectoryMeta, ToolCallLog
+
+        created = datetime(2026, 7, 11, 12, 0, 0)
+        self.db.add(
+            AgentSession(
+                id=run_id,
+                conversation_id=conversation_id,
+                message_id=f"msg-{run_id}",
+                user_id=user_id,
+                model_id="model-1",
+                provider="provider-1",
+                status="completed",
+                total_steps=2,
+                total_tool_calls=1,
+                total_duration_ms=123,
+                created_at=created,
+                terminal_at=created,
+            )
+        )
+        self.db.add(
+            RunTrajectoryMeta(
+                run_id=run_id,
+                conversation_id=conversation_id,
+                trajectory_status="complete",
+                event_count=1,
+                expected_last_sequence=0,
+            )
+        )
+        self.db.add(
+            AgentEvent(
+                conversation_id=conversation_id,
+                message_id=f"msg-{run_id}",
+                run_id=run_id,
+                sequence=0,
+                event_type="step_completed",
+                schema_version=1,
+                event_ts=created,
+                payload={"duration_ms": 10, "safe_summary": "event-0"},
+            )
+        )
+        self.db.add(
+            ToolCallLog(
+                id=f"tool-{run_id}",
+                conversation_id=conversation_id,
+                message_id=f"msg-{run_id}",
+                user_id=user_id,
+                tool_name="private_tool",
+                status="success",
+                model_id="model-1",
+                provider="provider-1",
+                input_params={"secret": "input-secret"},
+                output_data={"secret": "output-secret"},
+                error_message="error-secret",
+                trace_id=run_id,
+                step_number=1,
+                created_at=created,
+            )
+        )
+        self.db.commit()
+
     def test_rejects_non_auditor_and_sets_no_store_for_admin(self):
         self.current_user.is_superuser = False
         forbidden = self.client.get("/api/admin/audit/users")
@@ -1206,6 +1273,87 @@ class AdminAuditApiTests(unittest.TestCase):
         from app.db.models import PerformanceRun
 
         self.assertEqual(self.db.query(PerformanceRun).count(), 0)
+
+    def test_trajectory_diagnostics_are_audited_bounded_and_separate_from_normal_snapshot(self):
+        """若管理员接口绕过审计、泄漏原始工具字段或伪造 span 关联，本端到端契约必须失败。"""
+        from app.db.models import AdminAuditEvent, ToolCallLog
+
+        self._add_trajectory_run("run-audit")
+        self.db.add(
+            ToolCallLog(
+                id="tool-audit-web",
+                conversation_id="conv-1",
+                message_id="msg-run-audit",
+                user_id="user-1",
+                tool_name="web_search",
+                status="failed",
+                model_id="model-1",
+                provider="provider-1",
+                input_params={"query": "安全查询", "authorization": "input-secret"},
+                output_data={"result_count": 1, "private_payload": "output-secret"},
+                error_message="Bearer error-secret",
+                trace_id="run-audit",
+                step_number=2,
+                created_at=datetime(2026, 7, 11, 12, 1, 0),
+            )
+        )
+        self.db.commit()
+
+        self.current_user.is_superuser = False
+        forbidden = self.client.get("/api/admin/audit/conversations/conv-1/runs/run-audit/trajectory")
+        self.current_user.id = "user-1"
+        normal = self.client.get("/api/conversations/conv-1/runs/run-audit/trajectory")
+        self.current_user.id = "admin-1"
+        self.current_user.is_superuser = True
+        response = self.client.get(
+            "/api/admin/audit/conversations/conv-1/runs/run-audit/trajectory",
+            headers={"X-Admin-Audit-Reason": "support trajectory"},
+        )
+
+        self.assertEqual(forbidden.status_code, 403)
+        self.assertEqual(normal.status_code, 200)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["cache-control"], "private, no-store")
+        data = response.json()["data"]
+        self.assertEqual(data["snapshot"], normal.json()["data"])
+        self.assertNotEqual(set(data), set(normal.json()["data"]))
+        tool = next(item for item in data["tool_calls"] if item["id"] == "tool-audit-web")
+        self.assertEqual(tool["association"], "run")
+        self.assertNotIn("tool_call_id", tool)
+        self.assertEqual(tool["arguments"], {"query": "安全查询"})
+        self.assertEqual(tool["result_preview"], {"result_count": 1})
+        self.assertEqual(tool["error"], {"type": "execution_failed", "message": "执行失败"})
+        self.assertIn("error", tool["redacted_fields"])
+        self.assertEqual([item["id"] for item in data["tool_calls"]], ["tool-run-audit", "tool-audit-web"])
+        self.assertNotIn("input-secret", response.text)
+        self.assertNotIn("output-secret", response.text)
+        self.assertNotIn("error-secret", response.text)
+        event = self.db.query(AdminAuditEvent).filter(AdminAuditEvent.action == "admin.audit.trajectory.view").one()
+        self.assertEqual(event.resource_type, "conversation_run_trajectory")
+        self.assertEqual(event.resource_id, "run-audit")
+        self.assertEqual(event.target_user_id, "user-1")
+        self.assertEqual(event.reason, "support trajectory")
+        self.assertEqual(event.extra_metadata, {})
+
+    def test_trajectory_diagnostics_hide_cross_conversation_runs_and_fail_closed_when_audit_fails(self):
+        """若 run 归属仅靠管理员权限，或审计失败仍返回诊断，敏感轨迹会泄漏。"""
+        from unittest.mock import patch
+
+        self._add_trajectory_run("run-audit-own")
+        self._add_trajectory_run("run-audit-other", conversation_id="conv-2", user_id="user-2")
+
+        cross_run = self.client.get("/api/admin/audit/conversations/conv-1/runs/run-audit-other/trajectory")
+        with patch(
+            "app.db.admin_audit_repository.AdminAuditRepository.create_audit_event",
+            side_effect=RuntimeError("audit unavailable"),
+        ):
+            audit_failed = self.client.get("/api/admin/audit/conversations/conv-1/runs/run-audit-own/trajectory")
+
+        self.assertEqual(cross_run.status_code, 404)
+        self.assertEqual(audit_failed.status_code, 503)
+        self.assertNotIn("input-secret", audit_failed.text)
+        self.assertNotIn("output-secret", audit_failed.text)
+        self.assertNotIn("error-secret", audit_failed.text)
 
 
 if __name__ == "__main__":

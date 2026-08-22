@@ -7,7 +7,14 @@ from typing import TypeAlias
 from sqlalchemy import and_, select
 from sqlalchemy.orm import Session, load_only
 
-from app.db.models import AgentEvent, AgentSession, Conversation, RunTrajectoryMeta, TrajectoryLedgerSettings
+from app.db.models import (
+    AgentEvent,
+    AgentSession,
+    Conversation,
+    RunTrajectoryMeta,
+    ToolCallLog,
+    TrajectoryLedgerSettings,
+)
 from app.services.agent.trajectory_reconciliation import (
     LedgerWatermarkResolution,
     UserTrajectoryMetaRow,
@@ -102,6 +109,40 @@ class TrajectoryRepository:
         ).one_or_none()
         return None if row is None else (row[0], self._user_meta_from_columns(row[1:]))
 
+    def get_run_for_admin(self, conversation_id: str, run_id: str) -> RunWithMeta | None:
+        """管理员读取仍严格验证 run 属于指定会话，但不附加普通用户归属条件。"""
+        row = self._session.execute(
+            select(
+                AgentSession,
+                RunTrajectoryMeta.trajectory_status,
+                RunTrajectoryMeta.event_count,
+                RunTrajectoryMeta.expected_last_sequence,
+                RunTrajectoryMeta.degraded_reason,
+                RunTrajectoryMeta.terminal_intent_pending_at,
+            )
+            .options(
+                load_only(
+                    AgentSession.id,
+                    AgentSession.conversation_id,
+                    AgentSession.user_id,
+                    AgentSession.message_id,
+                    AgentSession.turn_message_id,
+                    AgentSession.attempt_index,
+                    AgentSession.status,
+                    AgentSession.total_steps,
+                    AgentSession.total_tool_calls,
+                    AgentSession.total_duration_ms,
+                    AgentSession.terminal_at,
+                    AgentSession.created_at,
+                ),
+            )
+            .join(Conversation, Conversation.id == AgentSession.conversation_id)
+            .outerjoin(RunTrajectoryMeta, RunTrajectoryMeta.run_id == AgentSession.id)
+            .where(Conversation.id == conversation_id)
+            .where(AgentSession.id == run_id)
+        ).one_or_none()
+        return None if row is None else (row[0], self._user_meta_from_columns(row[1:]))
+
     def list_events(self, conversation_id: str, run_id: str, limit: int) -> list[AgentEvent]:
         if limit <= 0:
             raise ValueError("limit 必须大于 0")
@@ -125,6 +166,36 @@ class TrajectoryRepository:
                 .where(AgentEvent.conversation_id == conversation_id)
                 .where(AgentEvent.run_id == run_id)
                 .order_by(AgentEvent.sequence.asc())
+                .limit(limit)
+            ).scalars()
+        )
+
+    def list_tool_diagnostics(self, run_id: str, limit: int = 5001) -> list[ToolCallLog]:
+        """返回仅可由 trace_id 可靠归属到 run 的工具日志。"""
+        if limit <= 0:
+            raise ValueError("limit 必须大于 0")
+        return list(
+            self._session.execute(
+                select(ToolCallLog)
+                .options(
+                    load_only(
+                        ToolCallLog.id,
+                        ToolCallLog.message_id,
+                        ToolCallLog.trace_id,
+                        ToolCallLog.step_number,
+                        ToolCallLog.tool_name,
+                        ToolCallLog.status,
+                        ToolCallLog.duration_ms,
+                        ToolCallLog.model_id,
+                        ToolCallLog.provider,
+                        ToolCallLog.input_params,
+                        ToolCallLog.output_data,
+                        ToolCallLog.error_message,
+                        ToolCallLog.created_at,
+                    )
+                )
+                .where(ToolCallLog.trace_id == run_id)
+                .order_by(ToolCallLog.step_number.asc(), ToolCallLog.created_at.asc(), ToolCallLog.id.asc())
                 .limit(limit)
             ).scalars()
         )

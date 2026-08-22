@@ -11,7 +11,15 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
-from app.db.models import AgentEvent, AgentSession, Conversation, RunTrajectoryMeta, TrajectoryLedgerSettings, User
+from app.db.models import (
+    AgentEvent,
+    AgentSession,
+    Conversation,
+    RunTrajectoryMeta,
+    ToolCallLog,
+    TrajectoryLedgerSettings,
+    User,
+)
 from app.db.trajectory_repository import TrajectoryRepository
 from app.services.trajectory_query_service import TrajectoryQueryService
 
@@ -255,3 +263,34 @@ class TrajectoryQueryServiceTests(unittest.TestCase):
             [(item.turn_message_id, item.attempt_index) for item in result.items],
             [("turn-b", 1), ("turn-a", 1), ("turn-a", 2)],
         )
+
+    def test_admin_snapshot_bounds_tool_diagnostics_and_marks_truncation(self):
+        """若管理员工具诊断无界读取，单次历史查看可被大量 ToolCallLog 放大。"""
+        self._run("run-admin")
+        self._meta("run-admin")
+        with self.Session() as db:
+            db.add_all(
+                [
+                    ToolCallLog(
+                        id=f"tool-admin-{index}",
+                        conversation_id="conv-1",
+                        message_id="msg-run-admin",
+                        user_id="user-1",
+                        tool_name="private_tool",
+                        status="success",
+                        model_id="model-1",
+                        provider="provider-1",
+                        trace_id="run-admin",
+                        step_number=index,
+                        created_at=self.now + timedelta(seconds=index),
+                    )
+                    for index in range(2)
+                ]
+            )
+            db.commit()
+
+        snapshot = self._service(max_events=1).get_admin_snapshot("conv-1", "run-admin")
+
+        assert snapshot is not None
+        self.assertTrue(snapshot.tool_calls_truncated)
+        self.assertEqual([item.id for item in snapshot.tool_calls], ["tool-admin-0"])

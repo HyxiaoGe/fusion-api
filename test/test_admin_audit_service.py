@@ -117,3 +117,26 @@ def test_model_detail_rejects_control_character_id_before_catalog_or_database_ac
         raise AssertionError("控制字符模型 ID 应被拒绝")
 
     repository.list_model_operation_stats.assert_not_called()
+
+
+def test_trajectory_view_audit_records_only_resource_identity_and_safe_reason():
+    """若轨迹诊断没有独立审计动作或复制诊断内容到元数据，管理员访问不可追溯且会泄漏。"""
+    repository = Mock()
+    repository.conversation_target_user_id.return_value = "user-1"
+    service = AdminAuditService(repository)
+
+    service.record_trajectory_view(
+        "conv-1",
+        "run-1",
+        admin=SimpleNamespace(id="admin-1", username="root", email="root@example.com"),
+        request_id="request-trajectory",
+        reason="support trajectory",
+    )
+
+    event = repository.create_audit_event.call_args.kwargs
+    assert event["action"] == "admin.audit.trajectory.view"
+    assert event["resource_type"] == "conversation_run_trajectory"
+    assert event["resource_id"] == "run-1"
+    assert event["target_user_id"] == "user-1"
+    assert event["reason"] == "support trajectory"
+    assert event["extra_metadata"] == {}

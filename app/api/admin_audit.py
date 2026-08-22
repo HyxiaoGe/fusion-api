@@ -7,11 +7,12 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, Header, Query, Request
 
-from app.api.deps import get_admin_audit_service, get_conversation_auditor
+from app.api.deps import get_admin_audit_service, get_conversation_auditor, get_trajectory_query_service
 from app.db.models import User
 from app.schemas.admin_audit import AdminPerformanceRunImport
-from app.schemas.response import success
+from app.schemas.response import ApiException, success
 from app.services.admin_audit_service import AdminAuditService
+from app.services.trajectory_query_service import TrajectoryQueryService
 
 router = APIRouter()
 
@@ -108,6 +109,28 @@ def get_conversation(
         data=service.get_conversation(conversation_id, admin=auditor, **_context(request, reason)),
         request_id=request.state.request_id,
     )
+
+
+@router.get("/conversations/{conversation_id}/runs/{run_id}/trajectory")
+def get_trajectory_diagnostics(
+    conversation_id: str,
+    run_id: str,
+    request: Request,
+    reason: str | None = Header(None, alias="X-Admin-Audit-Reason", max_length=300),
+    trajectory_service: TrajectoryQueryService = Depends(get_trajectory_query_service),
+    audit_service: AdminAuditService = Depends(get_admin_audit_service),
+    auditor: User = Depends(get_conversation_auditor),
+):
+    data = trajectory_service.get_admin_snapshot(conversation_id, run_id)
+    if data is None:
+        raise ApiException.not_found("会话或轨迹不存在")
+    audit_service.record_trajectory_view(
+        conversation_id,
+        run_id,
+        admin=auditor,
+        **_context(request, reason),
+    )
+    return success(data=data, request_id=request.state.request_id)
 
 
 def _conversation_page(

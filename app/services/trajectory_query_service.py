@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from app.db.models import AgentEvent, AgentSession
 from app.db.trajectory_repository import TrajectoryRepository
+from app.schemas.admin_trajectory import AdminTrajectorySnapshot, AdminTrajectoryToolCall
 from app.schemas.trajectory import (
     TrajectoryCompleteness,
     TrajectoryEventRecord,
@@ -11,6 +12,7 @@ from app.schemas.trajectory import (
     TrajectoryRunSummary,
     TrajectorySnapshot,
 )
+from app.services.admin_audit_service import AdminAuditService
 from app.services.agent.trajectory_projector import project_trajectory
 from app.services.agent.trajectory_reconciliation import resolve_user_trajectory_status_from_rows
 
@@ -50,6 +52,35 @@ class TrajectoryQueryService:
         row = self._repository.get_run(conversation_id, run_id, user_id)
         if row is None:
             return None
+        return self._snapshot_from_row(conversation_id, run_id, row)
+
+    def get_admin_snapshot(self, conversation_id: str, run_id: str) -> AdminTrajectorySnapshot | None:
+        """构造管理员诊断，但不承担权限判断或访问审计。"""
+        row = self._repository.get_run_for_admin(conversation_id, run_id)
+        if row is None:
+            return None
+        snapshot = self._snapshot_from_row(conversation_id, run_id, row)
+        tool_rows = self._repository.list_tool_diagnostics(run_id, self._max_events_per_run + 1)
+        tool_calls_truncated = len(tool_rows) > self._max_events_per_run
+        tools = [
+            AdminTrajectoryToolCall(
+                association="run",
+                **{key: value for key, value in AdminAuditService._tool_item(tool).items() if key != "trace_id"},
+            )
+            for tool in tool_rows[: self._max_events_per_run]
+        ]
+        return AdminTrajectorySnapshot(
+            snapshot=snapshot,
+            tool_calls=tools,
+            tool_calls_truncated=tool_calls_truncated,
+        )
+
+    def _snapshot_from_row(
+        self,
+        conversation_id: str,
+        run_id: str,
+        row: tuple[AgentSession, object | None],
+    ) -> TrajectorySnapshot:
         run, meta = row
         event_rows = self._repository.list_events(conversation_id, run_id, self._max_events_per_run + 1)
         truncated = len(event_rows) > self._max_events_per_run

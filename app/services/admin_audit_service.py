@@ -228,6 +228,27 @@ class AdminAuditService:
             raise ApiException.not_found("对话不存在")
         return target_user_id
 
+    def record_trajectory_view(
+        self,
+        conversation_id: str,
+        run_id: str,
+        *,
+        admin: User,
+        request_id: str,
+        reason: str | None,
+    ) -> None:
+        """在任何管理员轨迹诊断返回前持久化访问审计。"""
+        target_user_id = self._assert_conversation(conversation_id)
+        self._record(
+            admin=admin,
+            action="admin.audit.trajectory.view",
+            resource_type="conversation_run_trajectory",
+            resource_id=run_id,
+            target_user_id=target_user_id,
+            request_id=request_id,
+            reason=reason,
+        )
+
     @staticmethod
     def _error_projection(error_message: Any, status: Any = None) -> dict[str, str] | None:
         raw_error = error_message if isinstance(error_message, str) else ""

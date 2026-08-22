@@ -1,8 +1,8 @@
 # Fusion Trajectory 集成设计（DSH 风格 Agent 执行轨迹）
 
-> 状态：设计稿 v0.15（P0 已按 dev 同步基线切换有界异步接纳）
+> 状态：设计稿 v0.15（P0 已 dev 验收；P1 实施中）
 > 范围：fusion-api + fusion-ui 集成 Agent 执行轨迹展示；langchain-trajectory-mvp 降级为原型实验室与联调夹具。
-> 本文档是实施 P0 的正式依据；P0 已在独立实施分支开始，P1–P3 不在本轮范围内。
+> 本文档是 P0/P1 的实施依据；P1 当前仅实施历史快照读侧，P2–P3 尚未开始。
 >
 > **仓库处理决定**：正式实施分支通过 `.gitignore` 的 `!docs/TRAJECTORY_DESIGN.md` 例外跟踪本文档。
 
@@ -569,13 +569,21 @@ GET /api/conversations/{conversation_id}/runs
 GET /api/conversations/{conversation_id}/runs/{run_id}/trajectory
     → TrajectorySnapshot（事件 + 投影 + completeness + degraded_reason + truncated）
       —— 普通用户 DTO 与管理员诊断 DTO 分离（§7.3）
+
+GET /api/admin/audit/conversations/{conversation_id}/runs/{run_id}/trajectory
+    → AdminTrajectorySnapshot({snapshot: TrajectorySnapshot, tool_calls: [...]})
+      —— 仅审计员；成功审计写入后才返回诊断
 ```
+
+普通 `TrajectorySnapshot` 固定包含 `run`、`records`、`spans`、`completeness` 与 `truncated`，不因角色增加诊断字段。管理员 `AdminTrajectorySnapshot` 以该普通快照作为嵌套 `snapshot`，额外给出独立的 `tool_calls` 与 `tool_calls_truncated`；每项固定为 `{association: "run", id, message_id, step_number, tool_name, status, duration_ms, model_id, provider, arguments, result_preview, error, redacted_fields, created_at}`。
+
+两个读取上限默认值固定为：`MAX_TRAJECTORY_EVENTS_PER_RUN=5000`、`MAX_TRAJECTORY_RUNS_PER_CONVERSATION=500`。事件、run 列表和管理员 `ToolCallLog` 诊断均使用 `LIMIT max+1`；前两者设置 `truncated=true`，工具诊断设置 `tool_calls_truncated=true`。
 
 **截断保护**：
 
 - 定义 `MAX_TRAJECTORY_EVENTS_PER_RUN`（默认 5000，配置常量）；
 - 查询使用数据库 `LIMIT max+1` 探测超限；
-- 超限时响应携带 `truncated=true`，投影只基于已加载前缀；**禁止对截断数据生成看似完整的 span**（未配对的 started 一律按 §3.3 标注 inferred/unknown，且整体标记 truncated）；
+- 超限时响应携带 `truncated=true`，投影只基于已加载前缀；**禁止对截断数据生成看似完整的 span**（未配对的 started 一律标注 `terminal_source=inferred`、`status=unknown`、`inferred_reason=truncated_prefix`，且整体标记 truncated）；
 - 运行列表接口同样受 `MAX_TRAJECTORY_RUNS_PER_CONVERSATION` 保护（超限返回最近 N 条 + `truncated=true`）。
 
 **实时性边界**：P1 只提供历史快照，**不声称实时**；「打开面板拉快照」之外，运行中实时 SSE 归并属于 **P3**（复用现有聊天 SSE + 受控事件回调通道）。P1 文档与接口注释不得出现实时语义。
@@ -592,6 +600,8 @@ GET /api/conversations/{conversation_id}/runs/{run_id}/trajectory
 - **落库 allowlist**：`TrajectoryRecorder` 按事件类型定义允许入库的字段白名单（现有 `sanitize_arguments` 是工具名定向脱敏，不是通用事件脱敏器，不能直接当账本脱敏用）。
 - **管理员 DTO 的字段来源**：prompt、工具 schema、完整输入/输出**不在账本中**，v1 管理员 DTO 只能承诺从 `ToolCallLog / messages / 工具注册表` 可还原的字段；无法还原的字段**从 v1 承诺中删除**，不得声称账本可提供。
 - **DTO 分离**：普通用户 `TrajectorySnapshot` 与管理员诊断 DTO 分离（不同端点，§7.2）；**禁止依赖前端隐藏字段实现权限**。
+- **run 级关联限制**：`ToolCallLog` 只按 `trace_id=run_id` 查询并按 `step_number / created_at / id` 排序。它没有 ledger `tool_call_id` 外键，管理员工具项必须固定 `association="run"`，不得伪造 span 或 `tool_call_id` 精确关联。
+- **审计闭环**：管理员轨迹读取必须复用 `get_conversation_auditor` 与 `X-Admin-Audit-Reason`；在返回 `tool_calls` 前写入 `admin.audit.trajectory.view`，审计失败返回既有 503，不得 fail-open。
 - 命名：账本称「**脱敏事件账本**」，文档与 UI 不得声称是完整原始事件。
 
 ## 8. 前端（P3）
