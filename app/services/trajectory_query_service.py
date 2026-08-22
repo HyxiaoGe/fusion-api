@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 from app.db.models import AgentEvent, AgentSession
 from app.db.trajectory_repository import TrajectoryRepository
@@ -20,7 +21,6 @@ from app.services.agent.trajectory_reconciliation import (
     resolve_ledger_watermark,
     resolve_user_trajectory_status_from_rows,
 )
-from app.utils.time import as_utc
 
 
 class TrajectoryQueryService:
@@ -80,8 +80,17 @@ class TrajectoryQueryService:
         item = {key: value for key, value in AdminAuditService._tool_item(tool).items() if key != "trace_id"}
         created_at = item.get("created_at")
         if isinstance(created_at, datetime):
-            item["created_at"] = as_utc(created_at)
+            item["created_at"] = TrajectoryQueryService._tool_call_log_created_at_as_utc(created_at)
         return AdminTrajectoryToolCall(association="run", **item)
+
+    @staticmethod
+    def _tool_call_log_created_at_as_utc(value: datetime | None) -> datetime | None:
+        """按 ToolCallLog 的既有北京时间墙钟语义规范化，不能替代通用 as_utc。"""
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=ZoneInfo("Asia/Shanghai")).astimezone(UTC)
+        return value.astimezone(UTC)
 
     def _snapshot_from_row(
         self,

@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
@@ -359,7 +360,7 @@ class TrajectoryQueryServiceTests(unittest.TestCase):
         self.assertIn(2, parameters)
 
     def test_admin_snapshot_preserves_legacy_nullable_tool_time_with_utc_serialization_and_stable_order(self):
-        """若历史 ToolCallLog 的空或 naive 时间使 DTO 失败、依赖宿主机时区或排序漂移，诊断不可用。"""
+        """若历史 ToolCallLog 的北京墙钟 naive 时间被当 UTC 或排序漂移，诊断不可用。"""
         self._run("run-admin-legacy")
         self._meta("run-admin-legacy")
         naive_created = datetime(2026, 8, 22, 4, 0, 0)
@@ -433,9 +434,62 @@ class TrajectoryQueryServiceTests(unittest.TestCase):
             ["tool-sort-a", "tool-sort-b", "tool-sort-later", "tool-sort-null"],
         )
         created_at = {item.id: item.created_at for item in snapshot.tool_calls}
-        self.assertEqual(created_at["tool-sort-a"], naive_created.replace(tzinfo=UTC))
+        self.assertEqual(
+            created_at["tool-sort-a"],
+            naive_created.replace(tzinfo=ZoneInfo("Asia/Shanghai")).astimezone(UTC),
+        )
         self.assertIsNone(created_at["tool-sort-null"])
         encoded = snapshot.model_dump(mode="json")
         encoded_naive = next(item for item in encoded["tool_calls"] if item["id"] == "tool-sort-a")["created_at"]
         self.assertEqual(datetime.fromisoformat(encoded_naive.replace("Z", "+00:00")).tzinfo, UTC)
         self.assertIsNone(next(item for item in encoded["tool_calls"] if item["id"] == "tool-sort-null")["created_at"])
+
+    def test_admin_snapshot_interprets_sqlite_default_tool_time_as_beijing_wall_clock(self):
+        """若 SQLite 读回的 get_china_time() 墙钟被直接附 UTC，管理员诊断会整体快八小时。"""
+        self._run("run-admin-default-time")
+        self._meta("run-admin-default-time")
+        with self.Session() as db:
+            default_time = ToolCallLog(
+                id="tool-default-time",
+                conversation_id="conv-1",
+                message_id="msg-run-admin-default-time",
+                user_id="user-1",
+                tool_name="private_tool",
+                status="success",
+                model_id="model-1",
+                provider="provider-1",
+                trace_id="run-admin-default-time",
+                step_number=1,
+            )
+            db.add(default_time)
+            db.flush()
+            written_time = default_time.created_at
+            db.commit()
+
+        with self.Session() as db:
+            database_time = db.get(ToolCallLog, "tool-default-time").created_at
+
+        self.assertIsNotNone(written_time)
+        self.assertIsNotNone(database_time)
+        assert written_time is not None
+        assert database_time is not None
+        self.assertIsNone(database_time.tzinfo)
+        self.assertEqual(database_time, written_time.replace(tzinfo=None))
+
+        snapshot = self._service().get_admin_snapshot("conv-1", "run-admin-default-time")
+
+        assert snapshot is not None
+        returned_time = snapshot.tool_calls[0].created_at
+        expected_time = database_time.replace(tzinfo=ZoneInfo("Asia/Shanghai")).astimezone(UTC)
+        self.assertEqual(returned_time, expected_time)
+        self.assertEqual(returned_time, database_time.replace(tzinfo=UTC) - timedelta(hours=8))
+
+    def test_admin_tool_time_normalizer_keeps_aware_instant_and_null(self):
+        """若局部兼容器也重解释 aware 值或把 NULL 变成时间，会破坏已存数据语义。"""
+        aware_time = datetime(2026, 8, 22, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        self.assertEqual(
+            TrajectoryQueryService._tool_call_log_created_at_as_utc(aware_time),
+            aware_time.astimezone(UTC),
+        )
+        self.assertIsNone(TrajectoryQueryService._tool_call_log_created_at_as_utc(None))
