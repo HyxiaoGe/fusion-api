@@ -73,11 +73,7 @@ class TrajectoryPerformanceGateTests(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(measurement["trajectory_stub"]["p95_ms"], 5.0)
             self.assertLessEqual(measurement["trajectory_stub"]["p99_ms"], 15.0)
         self.assertEqual(
-            [
-                task
-                for task in asyncio.all_tasks() - tasks_before
-                if task.get_name().startswith("trajectory-recorder-")
-            ],
+            [task for task in asyncio.all_tasks() - tasks_before if task.get_name().startswith("trajectory-recorder-")],
             [],
         )
 
@@ -225,11 +221,7 @@ class TrajectoryPerformanceGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(p99, 15.0)
         self.assertEqual(finalized_sequences, [249])
         self.assertEqual(
-            [
-                task
-                for task in asyncio.all_tasks() - tasks_before
-                if task.get_name().startswith("trajectory-recorder-")
-            ],
+            [task for task in asyncio.all_tasks() - tasks_before if task.get_name().startswith("trajectory-recorder-")],
             [],
         )
         executor.shutdown(wait=True)
