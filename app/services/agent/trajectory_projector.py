@@ -361,7 +361,7 @@ def project_trajectory(
                 attempt.terminal_source = "recorded"
                 attempt.inferred_reason = None
             else:
-                fallback_span_candidates = step_or_run_candidates(record)
+                fallback_span_candidates = tool_step_or_run_candidates(record)
         append_record(record, span_id, fallback_span_candidates)
 
     for builder in builders.values():

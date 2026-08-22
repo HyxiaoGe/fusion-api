@@ -243,6 +243,71 @@ def test_missing_started_terminal_record_falls_back_to_existing_step_or_run(
     assert child_span_id not in {span.span_id for span in projection.spans}
 
 
+def test_missing_attempt_started_terminal_attaches_to_existing_tool_span():
+    projection = project_trajectory(
+        [
+            event(0, "run_started"),
+            event(1, "step_started", step_id="step-1"),
+            event(
+                2,
+                "tool_call_started",
+                step_id="step-1",
+                tool_call_id="tool-1",
+                payload={"tool_name": "web_search"},
+            ),
+            event(
+                3,
+                "tool_attempt_completed",
+                step_id="step-1",
+                tool_call_id="tool-1",
+                payload={"tool_attempt_id": "attempt-1", "status": "success", "duration_ms": 20},
+            ),
+        ],
+        run_status="running",
+        run_ended_at=None,
+        truncated=False,
+    )
+
+    tool = span_by_id(projection, "tool:tool-1")
+    assert record_by_sequence(projection, 3).span_id == "tool:tool-1"
+    assert tool.record_sequences == [2, 3]
+    assert len(tool.record_sequences) == len(set(tool.record_sequences))
+    assert "tool_attempt:attempt-1" not in {span.span_id for span in projection.spans}
+
+
+def test_missing_attempt_started_terminal_delays_binding_until_later_tool_span():
+    projection = project_trajectory(
+        [
+            event(0, "run_started"),
+            event(1, "step_started", step_id="step-1"),
+            event(
+                2,
+                "tool_attempt_completed",
+                step_id="step-1",
+                tool_call_id="tool-1",
+                payload={"tool_attempt_id": "attempt-1", "status": "success", "duration_ms": 20},
+            ),
+            event(
+                3,
+                "tool_call_started",
+                step_id="step-1",
+                tool_call_id="tool-1",
+                payload={"tool_name": "web_search"},
+            ),
+        ],
+        run_status="running",
+        run_ended_at=None,
+        truncated=False,
+    )
+
+    tool = span_by_id(projection, "tool:tool-1")
+    assert [record.sequence for record in projection.records] == [0, 1, 2, 3]
+    assert record_by_sequence(projection, 2).span_id == "tool:tool-1"
+    assert tool.record_sequences == [2, 3]
+    assert len(tool.record_sequences) == len(set(tool.record_sequences))
+    assert "tool_attempt:attempt-1" not in {span.span_id for span in projection.spans}
+
+
 @pytest.mark.parametrize(
     ("event_type", "step_id", "tool_call_id", "payload"),
     [
