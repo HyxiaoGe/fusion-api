@@ -4,6 +4,7 @@ import threading
 import time
 import unittest
 
+from app.services.agent.queued_trajectory_recorder import QueuedTrajectoryRecorder
 from app.services.agent.trajectory_recorder import TrajectoryRecorder
 from app.services.stream.tool_executor import AgentEventCompositeWriter
 from scripts.trajectory_p0_baseline import run_trajectory_stub_baseline
@@ -50,20 +51,35 @@ class _ProgressSinkStub:
 
 
 class TrajectoryPerformanceGateTests(unittest.IsolatedAsyncioTestCase):
-    async def test_tracked_runner_reproduces_three_rounds_of_500_samples(self):
-        result = await run_trajectory_stub_baseline(rounds=3, samples_per_path=500)
+    async def test_tracked_runner_finalizes_each_unique_run_without_leaking_tasks(self):
+        tasks_before = set(asyncio.all_tasks())
+        result = await run_trajectory_stub_baseline(rounds=3, samples_per_path=5)
+        await asyncio.sleep(0)
 
         self.assertEqual(result["rounds"], 3)
-        self.assertEqual(result["samples_per_path"], 500)
+        self.assertEqual(result["samples_per_path"], 5)
         self.assertEqual(len(result["measurements"]), 3)
+        self.assertEqual(len({item["run_id"] for item in result["measurements"]}), 3)
         for measurement in result["measurements"]:
-            self.assertEqual(set(measurement), {"round", "baseline_stub", "trajectory_stub"})
+            self.assertEqual(
+                set(measurement),
+                {"round", "run_id", "finalized_sequence", "baseline_stub", "trajectory_stub"},
+            )
+            self.assertEqual(measurement["finalized_sequence"], 4)
             for path in ("baseline_stub", "trajectory_stub"):
                 self.assertEqual(set(measurement[path]), {"p50_ms", "p95_ms", "p99_ms"})
                 self.assertLessEqual(measurement[path]["p50_ms"], measurement[path]["p95_ms"])
                 self.assertLessEqual(measurement[path]["p95_ms"], measurement[path]["p99_ms"])
             self.assertLessEqual(measurement["trajectory_stub"]["p95_ms"], 5.0)
             self.assertLessEqual(measurement["trajectory_stub"]["p99_ms"], 15.0)
+        self.assertEqual(
+            [
+                task
+                for task in asyncio.all_tasks() - tasks_before
+                if task.get_name().startswith("trajectory-recorder-")
+            ],
+            [],
+        )
 
     async def test_shared_admission_caps_simultaneous_workers_and_sessions_at_four(self):
         semaphore = threading.BoundedSemaphore(4)
@@ -122,24 +138,27 @@ class TrajectoryPerformanceGateTests(unittest.IsolatedAsyncioTestCase):
             semaphore.release()
         executor.shutdown(wait=True)
 
-    async def test_recorder_timeout_occurs_only_after_visible_redis_and_progress_sinks(self):
+    async def test_failed_queued_sink_does_not_change_visible_redis_and_progress_order(self):
         calls: list[str] = []
-        release = threading.Event()
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        recorder = TrajectoryRecorder(
-            run_id="run-timeout",
+        inner = TrajectoryRecorder(
+            run_id="run-failed",
             conversation_id="conv-1",
             message_id="msg-1",
             executor=executor,
             semaphore=threading.BoundedSemaphore(4),
         )
 
-        def slow_write(_payload):
+        def failed_write(_payload):
             calls.append("trajectory_started")
-            release.wait(timeout=2)
-            calls.append("trajectory_finished")
+            raise RuntimeError("stub 写入失败")
 
-        recorder._write_event = slow_write
+        async def capture_finalize(_expected_last_sequence: int) -> None:
+            calls.append("trajectory_finalized")
+
+        inner._write_event = failed_write
+        inner._run_finalize_isolated = capture_finalize
+        recorder = QueuedTrajectoryRecorder(inner)
         writer = AgentEventCompositeWriter(
             redis_writer=_RedisWriterStub(calls),
             recorder=_ProgressSinkStub(calls),
@@ -150,25 +169,34 @@ class TrajectoryPerformanceGateTests(unittest.IsolatedAsyncioTestCase):
             "conv-1",
             "task-1",
             "agent_event",
-            _event("run-timeout", 0),
+            _event("run-failed", 0),
         )
+        self.assertEqual(calls, ["redis", "progress"])
+        await recorder.finalize(0)
 
         self.assertEqual(calls[:3], ["redis", "progress", "trajectory_started"])
-        self.assertNotIn("trajectory_finished", calls)
-        self.assertEqual(recorder.degraded_reason, "recorder_timeout")
-        release.set()
+        self.assertEqual(calls[-1], "trajectory_finalized")
+        self.assertEqual(recorder.degraded_reason, "write_failed")
         executor.shutdown(wait=True)
 
-    async def test_local_stub_fast_path_meets_absolute_latency_gate(self):
+    async def test_production_queue_admission_meets_gate_with_twenty_ms_inner_write(self):
+        tasks_before = set(asyncio.all_tasks())
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-        recorder = TrajectoryRecorder(
-            run_id="run-fast",
+        inner = TrajectoryRecorder(
+            run_id="run-slow",
             conversation_id="conv-1",
             message_id="msg-1",
             executor=executor,
             semaphore=threading.BoundedSemaphore(4),
         )
-        recorder._write_event = lambda _payload: None
+        finalized_sequences: list[int] = []
+
+        async def capture_finalize(expected_last_sequence: int) -> None:
+            finalized_sequences.append(expected_last_sequence)
+
+        inner._write_event = lambda _payload: time.sleep(0.02)
+        inner._run_finalize_isolated = capture_finalize
+        recorder = QueuedTrajectoryRecorder(inner)
         writer = AgentEventCompositeWriter(
             redis_writer=_RedisWriterStub(),
             recorder=_ProgressSinkStub(),
@@ -182,9 +210,11 @@ class TrajectoryPerformanceGateTests(unittest.IsolatedAsyncioTestCase):
                 "conv-1",
                 "task-1",
                 "agent_event",
-                _event("run-fast", sequence),
+                _event("run-slow", sequence),
             )
             samples.append(time.perf_counter() - started)
+        await recorder.finalize(249)
+        await asyncio.sleep(0)
 
         p50 = _percentile_ms(samples, 0.50)
         p95 = _percentile_ms(samples, 0.95)
@@ -193,6 +223,15 @@ class TrajectoryPerformanceGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(p95, p99)
         self.assertLessEqual(p95, 5.0)
         self.assertLessEqual(p99, 15.0)
+        self.assertEqual(finalized_sequences, [249])
+        self.assertEqual(
+            [
+                task
+                for task in asyncio.all_tasks() - tasks_before
+                if task.get_name().startswith("trajectory-recorder-")
+            ],
+            [],
+        )
         executor.shutdown(wait=True)
 
 
