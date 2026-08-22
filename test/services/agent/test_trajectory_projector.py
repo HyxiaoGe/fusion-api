@@ -224,6 +224,40 @@ def test_terminal_runs_infer_orphan_closure(run_status, event_type, expected_sta
     assert step.ended_at == BASE_TIME + timedelta(milliseconds=120)
 
 
+def test_incomplete_terminal_run_infers_unknown_orphan_closure():
+    records = [
+        event(0, "run_started"),
+        event(1, "step_started", offset_ms=10, step_id="step-1"),
+    ]
+
+    projection = project_trajectory(
+        records,
+        run_status="incomplete",
+        run_ended_at=BASE_TIME + timedelta(milliseconds=120),
+        truncated=False,
+    )
+
+    step = span_by_id(projection, "step:step-1")
+    assert (step.status, step.terminal_source, step.inferred_reason) == (
+        "unknown",
+        "inferred",
+        "run_completed_without_close",
+    )
+    assert step.ended_at == BASE_TIME + timedelta(milliseconds=120)
+
+
+def test_recorded_run_terminal_preserves_zero_payload_duration():
+    projection = project_trajectory(
+        [event(0, "run_started"), event(1, "run_completed", offset_ms=10, payload={"duration_ms": 0})],
+        run_status="completed",
+        run_ended_at=BASE_TIME + timedelta(milliseconds=10),
+        truncated=False,
+    )
+
+    run = span_by_id(projection, "run:run-1")
+    assert (run.duration_ms, run.terminal_source) == (0, "recorded")
+
+
 def test_truncated_prefix_never_uses_full_run_terminal_to_close_open_spans():
     records = [event(0, "run_started"), event(1, "step_started", offset_ms=10, step_id="step-1")]
 

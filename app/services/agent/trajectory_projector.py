@@ -86,7 +86,7 @@ def _terminal_status(event_type: str, payload: dict[str, Any]) -> str:
 
 def _orphan_outcome(run_status: str) -> tuple[str, str] | None:
     normalized = run_status.lower()
-    if normalized in {"complete", "completed", "success"}:
+    if normalized in {"complete", "completed", "incomplete", "success"}:
         return "unknown", "run_completed_without_close"
     if normalized in {"failed", "error"}:
         return "failed", "run_failed_without_close"
@@ -183,7 +183,8 @@ def project_trajectory(
             span_id = run.span_id
             run.end_sequence = record.sequence
             run.ended_at = record.timestamp
-            run.duration_ms = _payload_int(payload, "duration_ms") or _duration_ms(run.started_at, record.timestamp)
+            duration = _payload_int(payload, "duration_ms")
+            run.duration_ms = duration if duration is not None else _duration_ms(run.started_at, record.timestamp)
             run.status = _terminal_status(event_type, payload)
             run.terminal_source = "recorded"
             run.inferred_reason = None
