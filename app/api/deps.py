@@ -20,6 +20,7 @@ from app.db.model_admission_operation_repository import ModelAdmissionOperationR
 from app.db.model_catalog_control_repository import ModelCatalogControlRepository
 from app.db.models import User as UserModel
 from app.db.repositories import UserRepository
+from app.db.trajectory_repository import TrajectoryRepository
 from app.services.admin_audit_service import AdminAuditService
 from app.services.chat_service import ChatService
 from app.services.file_service import FileService
@@ -28,6 +29,7 @@ from app.services.mcp.runtime import get_mcp_client_manager
 from app.services.mcp.server_service import McpServerService
 from app.services.model_management_service import ModelManagementConfig, ModelManagementService
 from app.services.network_diagnostics_service import NetworkDiagnosticsService
+from app.services.trajectory_query_service import TrajectoryQueryService
 
 
 def get_chat_service(db: Session = Depends(get_db)) -> ChatService:
@@ -44,6 +46,14 @@ def get_knowledge_service(db: Session = Depends(get_db)) -> KnowledgeService:
 
 def get_network_diagnostics_service(db: Session = Depends(get_db)) -> NetworkDiagnosticsService:
     return NetworkDiagnosticsService(db)
+
+
+def get_trajectory_query_service(db: Session = Depends(get_db)) -> TrajectoryQueryService:
+    return TrajectoryQueryService(
+        TrajectoryRepository(db),
+        max_events_per_run=settings.MAX_TRAJECTORY_EVENTS_PER_RUN,
+        max_runs_per_conversation=settings.MAX_TRAJECTORY_RUNS_PER_CONVERSATION,
+    )
 
 
 def get_user_repo(db: Session = Depends(get_db)) -> UserRepository:

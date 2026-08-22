@@ -70,3 +70,56 @@ class TrajectoryProjection(BaseModel):
 
     records: list[TrajectoryRecord] = Field(default_factory=list)
     spans: list[TrajectorySpan] = Field(default_factory=list)
+
+
+class TrajectoryRunSummary(BaseModel):
+    """AgentSession 权威摘要在普通读取端点中的稳定形状。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    message_id: str | None = None
+    turn_message_id: str | None = None
+    attempt_index: int | None = None
+    status: str
+    trajectory_status: str
+    total_steps: int
+    total_tool_calls: int
+    duration_ms: int | None = None
+    started_at: datetime
+    ended_at: datetime | None = None
+
+
+class TrajectoryRunListResponse(BaseModel):
+    """会话内有界的 run 尝试列表。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[TrajectoryRunSummary] = Field(default_factory=list)
+    truncated: bool = False
+
+
+class TrajectoryCompleteness(BaseModel):
+    """账本读取前缀与持久化完整性状态。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+    degraded_reason: str | None = None
+    event_count: int | None = None
+    expected_last_sequence: int | None = None
+    loaded_event_count: int
+    first_sequence: int | None = None
+    last_sequence: int | None = None
+
+
+class TrajectorySnapshot(BaseModel):
+    """普通用户可读取的脱敏账本快照。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run: TrajectoryRunSummary
+    records: list[TrajectoryRecord] = Field(default_factory=list)
+    spans: list[TrajectorySpan] = Field(default_factory=list)
+    completeness: TrajectoryCompleteness
+    truncated: bool = False

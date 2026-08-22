@@ -1,0 +1,187 @@
+"""普通用户轨迹 API 的鉴权、信封与脱敏边界。"""
+
+from __future__ import annotations
+
+import importlib
+import os
+import sys
+import unittest
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+os.environ["DATABASE_URL"] = "sqlite:///./fusion-test.db"
+os.environ["SERVER_HOST"] = "http://dev.example:8002"
+os.environ["FRONTEND_URL"] = "http://dev.example:3004"
+os.environ["AUTH_SERVICE_BASE_URL"] = "http://auth.example:8100"
+os.environ["AUTH_SERVICE_CLIENT_ID"] = "fusion-client"
+os.environ["AUTH_SERVICE_JWKS_URL"] = "http://auth.example:8100/.well-known/jwks.json"
+
+
+class TrajectoryApiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        sys.modules.pop("main", None)
+        cls.main = importlib.import_module("main")
+        cls.client = TestClient(cls.main.app)
+
+    def setUp(self) -> None:
+        from app.db.database import Base
+
+        self.engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(self.engine)
+        self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
+        self.db = self.Session()
+        self.now = datetime(2026, 8, 22, 4, 0, tzinfo=UTC)
+        self._seed()
+
+        from app.api.deps import get_current_user, get_db
+        from app.core.config import settings
+
+        self.current_user = SimpleNamespace(
+            id="user-1", username="alice", email="alice@example.com", is_superuser=False
+        )
+        self.main.app.dependency_overrides[get_current_user] = lambda: self.current_user
+        self.main.app.dependency_overrides[get_db] = lambda: self.db
+        self.previous_max_events = settings.MAX_TRAJECTORY_EVENTS_PER_RUN
+        self.previous_max_runs = settings.MAX_TRAJECTORY_RUNS_PER_CONVERSATION
+        settings.MAX_TRAJECTORY_EVENTS_PER_RUN = 2
+        settings.MAX_TRAJECTORY_RUNS_PER_CONVERSATION = 2
+
+    def tearDown(self) -> None:
+        from app.core.config import settings
+
+        settings.MAX_TRAJECTORY_EVENTS_PER_RUN = self.previous_max_events
+        settings.MAX_TRAJECTORY_RUNS_PER_CONVERSATION = self.previous_max_runs
+        self.main.app.dependency_overrides.clear()
+        self.db.close()
+        self.engine.dispose()
+
+    def _seed(self) -> None:
+        from app.db.models import Conversation, TrajectoryLedgerSettings, User
+
+        self.db.add_all(
+            [
+                User(id="user-1", username="alice", email="alice@example.com"),
+                User(id="user-2", username="bob", email="bob@example.com"),
+                Conversation(id="conv-1", user_id="user-1", title="我的会话", model_id="model-1"),
+                Conversation(id="conv-2", user_id="user-2", title="他人的会话", model_id="model-1"),
+                TrajectoryLedgerSettings(singleton_key="default", ledger_enabled_at=self.now - timedelta(days=1)),
+            ]
+        )
+        self.db.commit()
+
+    def _add_run(self, run_id: str, *, conversation_id: str = "conv-1", user_id: str = "user-1") -> None:
+        from app.db.models import AgentEvent, AgentSession, RunTrajectoryMeta, ToolCallLog
+
+        self.db.add(
+            AgentSession(
+                id=run_id,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                message_id=f"msg-{run_id}",
+                turn_message_id=f"turn-{run_id}",
+                attempt_index=1,
+                model_id="model-1",
+                provider="provider-1",
+                status="completed",
+                total_steps=2,
+                total_tool_calls=3,
+                total_duration_ms=123,
+                created_at=self.now,
+                terminal_at=self.now,
+            )
+        )
+        if conversation_id == "conv-1":
+            self.db.add(
+                RunTrajectoryMeta(
+                    run_id=run_id,
+                    conversation_id=conversation_id,
+                    trajectory_status="complete",
+                    event_count=3,
+                    expected_last_sequence=2,
+                )
+            )
+            self.db.add_all(
+                [
+                    AgentEvent(
+                        conversation_id=conversation_id,
+                        message_id=f"msg-{run_id}",
+                        run_id=run_id,
+                        sequence=sequence,
+                        event_type="step_completed",
+                        schema_version=1,
+                        event_ts=self.now + timedelta(seconds=sequence),
+                        payload={"duration_ms": 10, "safe_summary": f"event-{sequence}"},
+                    )
+                    for sequence in range(3)
+                ]
+            )
+            self.db.add(
+                ToolCallLog(
+                    id=f"tool-{run_id}",
+                    conversation_id=conversation_id,
+                    message_id=f"msg-{run_id}",
+                    user_id=user_id,
+                    tool_name="private_tool",
+                    status="success",
+                    model_id="model-1",
+                    provider="provider-1",
+                    input_params={"secret": "input-secret"},
+                    output_data={"secret": "output-secret"},
+                    error_message="error-secret",
+                    trace_id=run_id,
+                    created_at=self.now,
+                )
+            )
+        self.db.commit()
+
+    def test_run_list_and_snapshot_use_success_envelope_and_bounded_safe_payload(self):
+        """若 router 未挂 /api、未传播 request_id 或读取 ToolCallLog，本端到端契约必须失败。"""
+        self._add_run("run-1")
+
+        listing = self.client.get("/api/conversations/conv-1/runs")
+        snapshot = self.client.get("/api/conversations/conv-1/runs/run-1/trajectory")
+
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual(listing.json()["code"], "SUCCESS")
+        self.assertTrue(listing.json()["request_id"])
+        self.assertEqual(listing.json()["data"]["items"][0]["run_id"], "run-1")
+        self.assertEqual(snapshot.status_code, 200)
+        data = snapshot.json()["data"]
+        self.assertTrue(data["truncated"])
+        self.assertEqual([item["sequence"] for item in data["records"]], [0, 1])
+        self.assertEqual(data["run"]["total_steps"], 2)
+        self.assertEqual(data["completeness"]["loaded_event_count"], 2)
+        self.assertNotIn("input-secret", snapshot.text)
+        self.assertNotIn("output-secret", snapshot.text)
+        self.assertNotIn("error-secret", snapshot.text)
+        self.assertNotIn("input_params", snapshot.text)
+        self.assertNotIn("output_data", snapshot.text)
+        self.assertNotIn("terminal_intent", snapshot.text)
+
+    def test_unauthorized_conversation_and_cross_conversation_run_are_uniformly_not_found(self):
+        """若 handler 在 service 之外泄漏资源归属，404 契约会被破坏。"""
+        self._add_run("run-own")
+        self._add_run("run-other", conversation_id="conv-2", user_id="user-2")
+
+        foreign_conversation = self.client.get("/api/conversations/conv-2/runs")
+        cross_run = self.client.get("/api/conversations/conv-1/runs/run-other/trajectory")
+        missing_run = self.client.get("/api/conversations/conv-1/runs/no-such-run/trajectory")
+
+        for response in (foreign_conversation, cross_run, missing_run):
+            self.assertEqual(response.status_code, 404)
+            self.assertEqual(response.json()["code"], "NOT_FOUND")
+            self.assertEqual(response.json()["message"], "会话或轨迹不存在，或无权访问")
+
+
+if __name__ == "__main__":
+    unittest.main()
