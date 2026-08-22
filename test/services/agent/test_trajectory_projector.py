@@ -179,6 +179,90 @@ def test_projects_recorded_tool_and_step_summaries_without_started_events():
     assert step.started_at == BASE_TIME + timedelta(milliseconds=120)
 
 
+def test_tool_summary_before_step_summary_finally_binds_to_later_step_parent():
+    projection = project_trajectory(
+        [
+            event(0, "run_started"),
+            event(
+                1,
+                "tool_call_completed",
+                offset_ms=100,
+                step_id="step-1",
+                tool_call_id="tool-1",
+                payload={"tool_name": "web_search", "status": "success", "duration_ms": 20},
+            ),
+            event(2, "step_completed", offset_ms=150, step_id="step-1", payload={"duration_ms": 30}),
+            event(3, "run_completed", offset_ms=160),
+        ],
+        run_status="completed",
+        run_ended_at=BASE_TIME + timedelta(milliseconds=160),
+        truncated=False,
+    )
+
+    assert span_by_id(projection, "tool:tool-1").parent_span_id == "step:step-1"
+
+
+@pytest.mark.parametrize(
+    ("event_type", "payload", "child_span_id"),
+    [
+        ("llm_round_completed", {"llm_round_id": "llm-1", "status": "success", "duration_ms": 20}, "llm:llm-1"),
+        (
+            "retrieval_completed",
+            {"retrieval_id": "retrieval-1", "status": "success", "duration_ms": 20},
+            "retrieval:retrieval-1",
+        ),
+        (
+            "tool_attempt_completed",
+            {"tool_attempt_id": "attempt-1", "status": "success", "duration_ms": 20},
+            "tool_attempt:attempt-1",
+        ),
+    ],
+)
+@pytest.mark.parametrize("has_step", [True, False])
+def test_missing_started_terminal_record_falls_back_to_existing_step_or_run(
+    event_type, payload, child_span_id, has_step
+):
+    records = [event(0, "run_started")]
+    if has_step:
+        records.append(event(1, "step_started", step_id="step-1"))
+    records.append(
+        event(
+            len(records),
+            event_type,
+            step_id="step-1",
+            parent_step_id="step-1",
+            tool_call_id="tool-1" if event_type == "tool_attempt_completed" else None,
+            payload=payload,
+        )
+    )
+
+    projection = project_trajectory(records, run_status="running", run_ended_at=None, truncated=False)
+
+    terminal = record_by_sequence(projection, len(records) - 1)
+    assert terminal.span_id == ("step:step-1" if has_step else "run:run-1")
+    assert child_span_id not in {span.span_id for span in projection.spans}
+
+
+@pytest.mark.parametrize(
+    ("event_type", "step_id", "tool_call_id", "payload"),
+    [
+        ("step_completed", "step-1", None, {}),
+        ("tool_call_completed", "step-1", "tool-1", {"tool_name": "web_search", "status": "success"}),
+    ],
+)
+def test_terminal_without_duration_and_without_parent_span_falls_back_to_run(
+    event_type, step_id, tool_call_id, payload
+):
+    projection = project_trajectory(
+        [event(0, "run_started"), event(1, event_type, step_id=step_id, tool_call_id=tool_call_id, payload=payload)],
+        run_status="running",
+        run_ended_at=None,
+        truncated=False,
+    )
+
+    assert record_by_sequence(projection, 1).span_id == "run:run-1"
+
+
 def test_annotations_do_not_create_spans_and_attach_to_most_precise_parent():
     records = [
         event(0, "run_started"),
