@@ -395,7 +395,8 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 clock=lambda: 10.0,
             ),
         )
-        # lifecycle 测试不连接真实账本数据库；Task 4 只验证编排层 finalize 契约。
+        # lifecycle 测试不连接真实账本数据库；这里只验证编排层接纳与 finalize 契约。
+        execution.trajectory_recorder.record_chunk = AsyncMock()
         execution.trajectory_recorder.finalize = AsyncMock()
         return execution
 

@@ -1,6 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
+from app.services.agent.queued_trajectory_recorder import QueuedTrajectoryRecorder
 from app.services.agent.trajectory_recorder import TrajectoryRecorder
 from app.services.stream.agent_loop_execution import (
     AgentLoopDependencies,
@@ -143,7 +144,8 @@ class AgentLoopExecutionTests(unittest.TestCase):
         self.assertIsInstance(execution.emitter._writer, AgentEventCompositeWriter)
         self.assertEqual(execution.emitter._writer.recorder.run_id, "run-1")
         self.assertEqual(execution.emitter._writer.recorder.message_id, "msg-1")
-        self.assertIsInstance(execution.trajectory_recorder, TrajectoryRecorder)
+        self.assertIsInstance(execution.trajectory_recorder, QueuedTrajectoryRecorder)
+        self.assertIsInstance(execution.trajectory_recorder.inner, TrajectoryRecorder)
         self.assertIs(execution.emitter._writer.trajectory_recorder, execution.trajectory_recorder)
         self.assertIs(execution.completion_context.trajectory_recorder, execution.trajectory_recorder)
         self.assertEqual(execution.trajectory_recorder.run_id, "run-1")
