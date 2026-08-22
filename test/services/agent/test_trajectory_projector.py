@@ -1,9 +1,8 @@
 """轨迹账本读侧投影器的纯函数契约。"""
 
+import unittest
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
-
-import pytest
 
 from app.schemas.trajectory import TrajectoryEventRecord
 from app.services.agent.trajectory_projector import project_trajectory
@@ -45,7 +44,7 @@ def record_by_sequence(projection, sequence: int):
     return next(record for record in projection.records if record.sequence == sequence)
 
 
-def test_projects_paired_lifecycle_spans_with_hierarchy_timing_ttft_and_records():
+def _assert_projects_paired_lifecycle_spans_with_hierarchy_timing_ttft_and_records():
     records = [
         event(0, "run_started", payload={"model": "gpt-4"}),
         event(1, "step_started", offset_ms=10, step_id="step-1", payload={"step_number": 1}),
@@ -152,7 +151,7 @@ def test_projects_paired_lifecycle_spans_with_hierarchy_timing_ttft_and_records(
     assert record_by_sequence(projection, 9).span_id == "retrieval:retrieval-1"
 
 
-def test_projects_recorded_tool_and_step_summaries_without_started_events():
+def _assert_projects_recorded_tool_and_step_summaries_without_started_events():
     records = [
         event(0, "run_started"),
         event(
@@ -179,7 +178,7 @@ def test_projects_recorded_tool_and_step_summaries_without_started_events():
     assert step.started_at == BASE_TIME + timedelta(milliseconds=120)
 
 
-def test_tool_summary_before_step_summary_finally_binds_to_later_step_parent():
+def _assert_tool_summary_before_step_summary_finally_binds_to_later_step_parent():
     projection = project_trajectory(
         [
             event(0, "run_started"),
@@ -202,24 +201,7 @@ def test_tool_summary_before_step_summary_finally_binds_to_later_step_parent():
     assert span_by_id(projection, "tool:tool-1").parent_span_id == "step:step-1"
 
 
-@pytest.mark.parametrize(
-    ("event_type", "payload", "child_span_id"),
-    [
-        ("llm_round_completed", {"llm_round_id": "llm-1", "status": "success", "duration_ms": 20}, "llm:llm-1"),
-        (
-            "retrieval_completed",
-            {"retrieval_id": "retrieval-1", "status": "success", "duration_ms": 20},
-            "retrieval:retrieval-1",
-        ),
-        (
-            "tool_attempt_completed",
-            {"tool_attempt_id": "attempt-1", "status": "success", "duration_ms": 20},
-            "tool_attempt:attempt-1",
-        ),
-    ],
-)
-@pytest.mark.parametrize("has_step", [True, False])
-def test_missing_started_terminal_record_falls_back_to_existing_step_or_run(
+def _assert_missing_started_terminal_record_falls_back_to_existing_step_or_run(
     event_type, payload, child_span_id, has_step
 ):
     records = [event(0, "run_started")]
@@ -243,7 +225,7 @@ def test_missing_started_terminal_record_falls_back_to_existing_step_or_run(
     assert child_span_id not in {span.span_id for span in projection.spans}
 
 
-def test_missing_attempt_started_terminal_attaches_to_existing_tool_span():
+def _assert_missing_attempt_started_terminal_attaches_to_existing_tool_span():
     projection = project_trajectory(
         [
             event(0, "run_started"),
@@ -275,7 +257,7 @@ def test_missing_attempt_started_terminal_attaches_to_existing_tool_span():
     assert "tool_attempt:attempt-1" not in {span.span_id for span in projection.spans}
 
 
-def test_missing_attempt_started_terminal_delays_binding_until_later_tool_span():
+def _assert_missing_attempt_started_terminal_delays_binding_until_later_tool_span():
     projection = project_trajectory(
         [
             event(0, "run_started"),
@@ -308,14 +290,7 @@ def test_missing_attempt_started_terminal_delays_binding_until_later_tool_span()
     assert "tool_attempt:attempt-1" not in {span.span_id for span in projection.spans}
 
 
-@pytest.mark.parametrize(
-    ("event_type", "step_id", "tool_call_id", "payload"),
-    [
-        ("step_completed", "step-1", None, {}),
-        ("tool_call_completed", "step-1", "tool-1", {"tool_name": "web_search", "status": "success"}),
-    ],
-)
-def test_terminal_without_duration_and_without_parent_span_falls_back_to_run(
+def _assert_terminal_without_duration_and_without_parent_span_falls_back_to_run(
     event_type, step_id, tool_call_id, payload
 ):
     projection = project_trajectory(
@@ -328,7 +303,7 @@ def test_terminal_without_duration_and_without_parent_span_falls_back_to_run(
     assert record_by_sequence(projection, 1).span_id == "run:run-1"
 
 
-def test_annotations_do_not_create_spans_and_attach_to_most_precise_parent():
+def _assert_annotations_do_not_create_spans_and_attach_to_most_precise_parent():
     records = [
         event(0, "run_started"),
         event(1, "step_started", step_id="step-1"),
@@ -349,15 +324,7 @@ def test_annotations_do_not_create_spans_and_attach_to_most_precise_parent():
     assert span_by_id(projection, "step:step-1").record_sequences == [1, 3, 4, 5]
 
 
-@pytest.mark.parametrize(
-    ("run_status", "event_type", "expected_status", "reason"),
-    [
-        ("completed", "run_completed", "unknown", "run_completed_without_close"),
-        ("failed", "run_failed", "failed", "run_failed_without_close"),
-        ("interrupted", "run_interrupted", "cancelled", "run_interrupted_without_close"),
-    ],
-)
-def test_terminal_runs_infer_orphan_closure(run_status, event_type, expected_status, reason):
+def _assert_terminal_run_infers_orphan_closure(run_status, event_type, expected_status, reason):
     records = [
         event(0, "run_started"),
         event(1, "step_started", offset_ms=10, step_id="step-1"),
@@ -373,7 +340,7 @@ def test_terminal_runs_infer_orphan_closure(run_status, event_type, expected_sta
     assert step.ended_at == BASE_TIME + timedelta(milliseconds=120)
 
 
-def test_incomplete_terminal_run_infers_unknown_orphan_closure():
+def _assert_incomplete_terminal_run_infers_unknown_orphan_closure():
     records = [
         event(0, "run_started"),
         event(1, "step_started", offset_ms=10, step_id="step-1"),
@@ -395,7 +362,7 @@ def test_incomplete_terminal_run_infers_unknown_orphan_closure():
     assert step.ended_at == BASE_TIME + timedelta(milliseconds=120)
 
 
-def test_recorded_run_terminal_preserves_zero_payload_duration():
+def _assert_recorded_run_terminal_preserves_zero_payload_duration():
     projection = project_trajectory(
         [event(0, "run_started"), event(1, "run_completed", offset_ms=10, payload={"duration_ms": 0})],
         run_status="completed",
@@ -407,7 +374,7 @@ def test_recorded_run_terminal_preserves_zero_payload_duration():
     assert (run.duration_ms, run.terminal_source) == (0, "recorded")
 
 
-def test_truncated_prefix_never_uses_full_run_terminal_to_close_open_spans():
+def _assert_truncated_prefix_never_uses_full_run_terminal_to_close_open_spans():
     records = [event(0, "run_started"), event(1, "step_started", offset_ms=10, step_id="step-1")]
 
     projection = project_trajectory(
@@ -419,7 +386,7 @@ def test_truncated_prefix_never_uses_full_run_terminal_to_close_open_spans():
     assert step.ended_at == BASE_TIME + timedelta(milliseconds=10)
 
 
-def test_legacy_record_without_schema_version_projects_as_zero_without_mutation():
+def _assert_legacy_record_without_schema_version_projects_as_zero_without_mutation():
     records = [event(0, "run_started", schema_version=None, payload={"model": "gpt-4", "nested": {"value": 1}})]
     before = deepcopy([record.model_dump() for record in records])
 
@@ -429,7 +396,7 @@ def test_legacy_record_without_schema_version_projects_as_zero_without_mutation(
     assert [record.model_dump() for record in records] == before
 
 
-def test_running_open_span_keeps_running_status_without_terminal_source():
+def _assert_running_open_span_keeps_running_status_without_terminal_source():
     projection = project_trajectory(
         [event(0, "run_started"), event(1, "step_started", step_id="step-1")],
         run_status="running",
@@ -439,3 +406,86 @@ def test_running_open_span_keeps_running_status_without_terminal_source():
 
     step = span_by_id(projection, "step:step-1")
     assert (step.status, step.terminal_source, step.inferred_reason, step.ended_at) == ("running", None, None, None)
+
+
+class TrajectoryProjectorTests(unittest.TestCase):
+    def test_projects_paired_lifecycle_spans_with_hierarchy_timing_ttft_and_records(self):
+        _assert_projects_paired_lifecycle_spans_with_hierarchy_timing_ttft_and_records()
+
+    def test_projects_recorded_tool_and_step_summaries_without_started_events(self):
+        _assert_projects_recorded_tool_and_step_summaries_without_started_events()
+
+    def test_tool_summary_before_step_summary_finally_binds_to_later_step_parent(self):
+        _assert_tool_summary_before_step_summary_finally_binds_to_later_step_parent()
+
+    def test_missing_started_terminal_record_falls_back_to_existing_step_or_run(self):
+        cases = [
+            ("llm_round_completed", {"llm_round_id": "llm-1", "status": "success", "duration_ms": 20}, "llm:llm-1"),
+            (
+                "retrieval_completed",
+                {"retrieval_id": "retrieval-1", "status": "success", "duration_ms": 20},
+                "retrieval:retrieval-1",
+            ),
+            (
+                "tool_attempt_completed",
+                {"tool_attempt_id": "attempt-1", "status": "success", "duration_ms": 20},
+                "tool_attempt:attempt-1",
+            ),
+        ]
+        for has_step in (True, False):
+            for event_type, payload, child_span_id in cases:
+                with self.subTest(event_type=event_type, has_step=has_step):
+                    _assert_missing_started_terminal_record_falls_back_to_existing_step_or_run(
+                        event_type,
+                        payload,
+                        child_span_id,
+                        has_step,
+                    )
+
+    def test_missing_attempt_started_terminal_attaches_to_existing_tool_span(self):
+        _assert_missing_attempt_started_terminal_attaches_to_existing_tool_span()
+
+    def test_missing_attempt_started_terminal_delays_binding_until_later_tool_span(self):
+        _assert_missing_attempt_started_terminal_delays_binding_until_later_tool_span()
+
+    def test_terminal_without_duration_and_without_parent_span_falls_back_to_run(self):
+        cases = [
+            ("step_completed", "step-1", None, {}),
+            ("tool_call_completed", "step-1", "tool-1", {"tool_name": "web_search", "status": "success"}),
+        ]
+        for event_type, step_id, tool_call_id, payload in cases:
+            with self.subTest(event_type=event_type):
+                _assert_terminal_without_duration_and_without_parent_span_falls_back_to_run(
+                    event_type,
+                    step_id,
+                    tool_call_id,
+                    payload,
+                )
+
+    def test_annotations_do_not_create_spans_and_attach_to_most_precise_parent(self):
+        _assert_annotations_do_not_create_spans_and_attach_to_most_precise_parent()
+
+    def test_terminal_runs_infer_orphan_closure(self):
+        cases = [
+            ("completed", "run_completed", "unknown", "run_completed_without_close"),
+            ("failed", "run_failed", "failed", "run_failed_without_close"),
+            ("interrupted", "run_interrupted", "cancelled", "run_interrupted_without_close"),
+        ]
+        for run_status, event_type, expected_status, reason in cases:
+            with self.subTest(run_status=run_status):
+                _assert_terminal_run_infers_orphan_closure(run_status, event_type, expected_status, reason)
+
+    def test_incomplete_terminal_run_infers_unknown_orphan_closure(self):
+        _assert_incomplete_terminal_run_infers_unknown_orphan_closure()
+
+    def test_recorded_run_terminal_preserves_zero_payload_duration(self):
+        _assert_recorded_run_terminal_preserves_zero_payload_duration()
+
+    def test_truncated_prefix_never_uses_full_run_terminal_to_close_open_spans(self):
+        _assert_truncated_prefix_never_uses_full_run_terminal_to_close_open_spans()
+
+    def test_legacy_record_without_schema_version_projects_as_zero_without_mutation(self):
+        _assert_legacy_record_without_schema_version_projects_as_zero_without_mutation()
+
+    def test_running_open_span_keeps_running_status_without_terminal_source(self):
+        _assert_running_open_span_keeps_running_status_without_terminal_source()
