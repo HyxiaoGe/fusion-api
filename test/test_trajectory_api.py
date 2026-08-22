@@ -79,7 +79,15 @@ class TrajectoryApiTests(unittest.TestCase):
         )
         self.db.commit()
 
-    def _add_run(self, run_id: str, *, conversation_id: str = "conv-1", user_id: str = "user-1") -> None:
+    def _add_run(
+        self,
+        run_id: str,
+        *,
+        conversation_id: str = "conv-1",
+        user_id: str = "user-1",
+        trajectory_status: str = "complete",
+        terminal_intent_reason: str | None = None,
+    ) -> None:
         from app.db.models import AgentEvent, AgentSession, RunTrajectoryMeta, ToolCallLog
 
         self.db.add(
@@ -105,9 +113,11 @@ class TrajectoryApiTests(unittest.TestCase):
                 RunTrajectoryMeta(
                     run_id=run_id,
                     conversation_id=conversation_id,
-                    trajectory_status="complete",
+                    trajectory_status=trajectory_status,
                     event_count=3,
                     expected_last_sequence=2,
+                    terminal_intent_pending_at=self.now if terminal_intent_reason else None,
+                    terminal_intent_reason=terminal_intent_reason,
                 )
             )
             self.db.add_all(
@@ -181,6 +191,22 @@ class TrajectoryApiTests(unittest.TestCase):
             self.assertEqual(response.status_code, 404)
             self.assertEqual(response.json()["code"], "NOT_FOUND")
             self.assertEqual(response.json()["message"], "会话或轨迹不存在，或无权访问")
+
+    def test_pending_intent_reason_and_persisted_legacy_meta_do_not_leak_to_normal_response(self):
+        """若普通 DTO 读取 terminal intent 或信任已有 legacy meta，此回归必须失败。"""
+        self._add_run("run-pending", terminal_intent_reason="write_failed")
+        self._add_run("run-legacy-meta", trajectory_status="legacy")
+
+        pending = self.client.get("/api/conversations/conv-1/runs/run-pending/trajectory")
+        legacy_meta = self.client.get("/api/conversations/conv-1/runs/run-legacy-meta/trajectory")
+
+        self.assertEqual(pending.status_code, 200)
+        self.assertNotIn("write_failed", pending.text)
+        self.assertNotIn("terminal_intent_reason", pending.text)
+        self.assertEqual(pending.json()["data"]["completeness"]["degraded_reason"], "terminal_outcome_unknown")
+        self.assertEqual(legacy_meta.status_code, 200)
+        self.assertEqual(legacy_meta.json()["data"]["completeness"]["status"], "degraded")
+        self.assertEqual(legacy_meta.json()["data"]["completeness"]["degraded_reason"], "terminal_outcome_unknown")
 
 
 if __name__ == "__main__":

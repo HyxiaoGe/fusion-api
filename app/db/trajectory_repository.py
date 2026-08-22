@@ -4,13 +4,17 @@ from __future__ import annotations
 
 from typing import TypeAlias
 
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.orm import Session, load_only
 
 from app.db.models import AgentEvent, AgentSession, Conversation, RunTrajectoryMeta, TrajectoryLedgerSettings
-from app.services.agent.trajectory_reconciliation import LedgerWatermarkResolution, resolve_ledger_watermark
+from app.services.agent.trajectory_reconciliation import (
+    LedgerWatermarkResolution,
+    UserTrajectoryMetaRow,
+    resolve_ledger_watermark,
+)
 
-RunWithMeta: TypeAlias = tuple[AgentSession, RunTrajectoryMeta | None]
+RunWithMeta: TypeAlias = tuple[AgentSession, UserTrajectoryMetaRow | None]
 
 
 class TrajectoryRepository:
@@ -22,10 +26,17 @@ class TrajectoryRepository:
     def list_runs(self, conversation_id: str, user_id: str, limit: int) -> list[RunWithMeta] | None:
         if limit <= 0:
             raise ValueError("limit 必须大于 0")
-        if not self._conversation_is_owned(conversation_id, user_id):
-            return None
         rows = self._session.execute(
-            select(AgentSession, RunTrajectoryMeta)
+            select(
+                Conversation.id,
+                AgentSession,
+                RunTrajectoryMeta.trajectory_status,
+                RunTrajectoryMeta.event_count,
+                RunTrajectoryMeta.expected_last_sequence,
+                RunTrajectoryMeta.degraded_reason,
+                RunTrajectoryMeta.terminal_intent_pending_at,
+            )
+            .select_from(Conversation)
             .options(
                 load_only(
                     AgentSession.id,
@@ -41,27 +52,31 @@ class TrajectoryRepository:
                     AgentSession.terminal_at,
                     AgentSession.created_at,
                 ),
-                load_only(
-                    RunTrajectoryMeta.run_id,
-                    RunTrajectoryMeta.trajectory_status,
-                    RunTrajectoryMeta.event_count,
-                    RunTrajectoryMeta.expected_last_sequence,
-                    RunTrajectoryMeta.degraded_reason,
-                    RunTrajectoryMeta.terminal_intent_reason,
-                    RunTrajectoryMeta.terminal_intent_pending_at,
-                ),
+            )
+            .outerjoin(
+                AgentSession,
+                and_(AgentSession.conversation_id == Conversation.id, AgentSession.user_id == user_id),
             )
             .outerjoin(RunTrajectoryMeta, RunTrajectoryMeta.run_id == AgentSession.id)
-            .where(AgentSession.conversation_id == conversation_id)
-            .where(AgentSession.user_id == user_id)
+            .where(Conversation.id == conversation_id)
+            .where(Conversation.user_id == user_id)
             .order_by(AgentSession.created_at.desc(), AgentSession.id.desc())
             .limit(limit)
         ).all()
-        return [(row[0], row[1]) for row in rows]
+        if not rows:
+            return None
+        return [(row[1], self._user_meta_from_columns(row[2:])) for row in rows if row[1] is not None]
 
     def get_run(self, conversation_id: str, run_id: str, user_id: str) -> RunWithMeta | None:
         row = self._session.execute(
-            select(AgentSession, RunTrajectoryMeta)
+            select(
+                AgentSession,
+                RunTrajectoryMeta.trajectory_status,
+                RunTrajectoryMeta.event_count,
+                RunTrajectoryMeta.expected_last_sequence,
+                RunTrajectoryMeta.degraded_reason,
+                RunTrajectoryMeta.terminal_intent_pending_at,
+            )
             .options(
                 load_only(
                     AgentSession.id,
@@ -76,15 +91,6 @@ class TrajectoryRepository:
                     AgentSession.total_duration_ms,
                     AgentSession.terminal_at,
                     AgentSession.created_at,
-                ),
-                load_only(
-                    RunTrajectoryMeta.run_id,
-                    RunTrajectoryMeta.trajectory_status,
-                    RunTrajectoryMeta.event_count,
-                    RunTrajectoryMeta.expected_last_sequence,
-                    RunTrajectoryMeta.degraded_reason,
-                    RunTrajectoryMeta.terminal_intent_reason,
-                    RunTrajectoryMeta.terminal_intent_pending_at,
                 ),
             )
             .join(Conversation, Conversation.id == AgentSession.conversation_id)
@@ -94,7 +100,7 @@ class TrajectoryRepository:
             .where(AgentSession.id == run_id)
             .where(AgentSession.user_id == user_id)
         ).one_or_none()
-        return None if row is None else (row[0], row[1])
+        return None if row is None else (row[0], self._user_meta_from_columns(row[1:]))
 
     def list_events(self, conversation_id: str, run_id: str, limit: int) -> list[AgentEvent]:
         if limit <= 0:
@@ -132,10 +138,15 @@ class TrajectoryRepository:
         ).all()
         return resolve_ledger_watermark([(row.singleton_key, row.ledger_enabled_at) for row in rows])
 
-    def _conversation_is_owned(self, conversation_id: str, user_id: str) -> bool:
-        return (
-            self._session.execute(
-                select(Conversation.id).where(Conversation.id == conversation_id).where(Conversation.user_id == user_id)
-            ).scalar_one_or_none()
-            is not None
+    @staticmethod
+    def _user_meta_from_columns(values: tuple[object, ...]) -> UserTrajectoryMetaRow | None:
+        trajectory_status, event_count, expected_last_sequence, degraded_reason, pending_at = values
+        if trajectory_status is None:
+            return None
+        return UserTrajectoryMetaRow(
+            trajectory_status=str(trajectory_status),
+            event_count=int(event_count),
+            expected_last_sequence=expected_last_sequence if isinstance(expected_last_sequence, int) else None,
+            degraded_reason=degraded_reason if isinstance(degraded_reason, str) else None,
+            has_pending_terminal_intent=pending_at is not None,
         )

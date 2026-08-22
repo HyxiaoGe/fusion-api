@@ -12,7 +12,7 @@ from app.schemas.trajectory import (
     TrajectorySnapshot,
 )
 from app.services.agent.trajectory_projector import project_trajectory
-from app.services.agent.trajectory_reconciliation import resolve_trajectory_status_from_rows
+from app.services.agent.trajectory_reconciliation import resolve_user_trajectory_status_from_rows
 
 
 class TrajectoryQueryService:
@@ -39,7 +39,9 @@ class TrajectoryQueryService:
         bounded_rows = rows[: self._max_runs_per_conversation]
         watermark = self._repository.resolve_ledger_watermark()
         items = [
-            self._run_summary(run, resolve_trajectory_status_from_rows(run, meta, watermark).trajectory_status)
+            self._run_summary(
+                run, resolve_user_trajectory_status_from_rows(run.created_at, meta, watermark).trajectory_status
+            )
             for run, meta in bounded_rows
         ]
         return TrajectoryRunListResponse(items=self._grouping_order(items), truncated=truncated)
@@ -52,7 +54,11 @@ class TrajectoryQueryService:
         event_rows = self._repository.list_events(conversation_id, run_id, self._max_events_per_run + 1)
         truncated = len(event_rows) > self._max_events_per_run
         loaded_events = event_rows[: self._max_events_per_run]
-        assessment = resolve_trajectory_status_from_rows(run, meta, self._repository.resolve_ledger_watermark())
+        assessment = resolve_user_trajectory_status_from_rows(
+            run.created_at,
+            meta,
+            self._repository.resolve_ledger_watermark(),
+        )
         records = [self._event_record(event) for event in loaded_events]
         projection = project_trajectory(
             records,

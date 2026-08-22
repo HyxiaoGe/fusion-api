@@ -7,7 +7,7 @@ import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
@@ -80,7 +80,14 @@ class TrajectoryQueryServiceTests(unittest.TestCase):
             )
             db.commit()
 
-    def _meta(self, run_id: str, *, status: str = "complete", pending: bool = False) -> None:
+    def _meta(
+        self,
+        run_id: str,
+        *,
+        status: str = "complete",
+        pending: bool = False,
+        pending_reason: str | None = None,
+    ) -> None:
         with self.Session() as db:
             db.add(
                 RunTrajectoryMeta(
@@ -90,6 +97,7 @@ class TrajectoryQueryServiceTests(unittest.TestCase):
                     event_count=3,
                     expected_last_sequence=2,
                     terminal_intent_pending_at=self.now if pending else None,
+                    terminal_intent_reason=pending_reason,
                 )
             )
             db.commit()
@@ -190,3 +198,60 @@ class TrajectoryQueryServiceTests(unittest.TestCase):
             TrajectoryQueryService(TrajectoryRepository(db), max_events_per_run=0, max_runs_per_conversation=1)
         with self.assertRaisesRegex(ValueError, "必须大于 0"):
             TrajectoryQueryService(TrajectoryRepository(db), max_events_per_run=1, max_runs_per_conversation=0)
+
+    def test_pending_reason_and_persisted_legacy_meta_are_not_exposed_as_user_status(self):
+        """若普通 helper 读取 intent reason 或信任已有 legacy meta，安全状态会泄漏或失真。"""
+        self._run("run-pending")
+        self._meta("run-pending", pending=True, pending_reason="write_failed")
+        self._run("run-legacy-meta", created_at=self.now - timedelta(days=2), turn_message_id="turn-legacy")
+        self._meta("run-legacy-meta", status="legacy")
+
+        service = self._service()
+        pending = service.get_user_snapshot("conv-1", "run-pending", "user-1")
+        legacy_meta = service.get_user_snapshot("conv-1", "run-legacy-meta", "user-1")
+
+        assert pending is not None
+        assert legacy_meta is not None
+        self.assertEqual(
+            (pending.completeness.status, pending.completeness.degraded_reason),
+            ("degraded", "terminal_outcome_unknown"),
+        )
+        self.assertEqual(
+            (legacy_meta.completeness.status, legacy_meta.completeness.degraded_reason),
+            ("degraded", "terminal_outcome_unknown"),
+        )
+
+    def test_run_list_uses_owner_aware_outer_join_and_one_watermark_query(self):
+        """若正常非空列表额外预检会话，读侧查询数会从两次退化为三次。"""
+        self._run("run-count")
+        self._meta("run-count")
+        statements: list[str] = []
+
+        def capture(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:
+            if statement.lstrip().upper().startswith("SELECT"):
+                statements.append(statement)
+
+        event.listen(self.engine, "before_cursor_execute", capture)
+        try:
+            result = self._service().list_runs("conv-1", "user-1")
+        finally:
+            event.remove(self.engine, "before_cursor_execute", capture)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(len(statements), 2)
+
+    def test_run_list_keeps_all_latest_attempts_in_a_turn_and_sorts_them_ascending(self):
+        """若分组逻辑只覆盖一个 attempt 或按时间倒序输出，同一 turn 的重试顺序会错误。"""
+        self._run("run-turn-a-2", created_at=self.now - timedelta(minutes=1), turn_message_id="turn-a", attempt_index=2)
+        self._run("run-turn-a-1", created_at=self.now - timedelta(minutes=2), turn_message_id="turn-a", attempt_index=1)
+        self._run("run-turn-b-1", created_at=self.now, turn_message_id="turn-b", attempt_index=1)
+        for run_id in ("run-turn-a-2", "run-turn-a-1", "run-turn-b-1"):
+            self._meta(run_id)
+
+        result = self._service(max_runs=3).list_runs("conv-1", "user-1")
+
+        assert result is not None
+        self.assertEqual(
+            [(item.turn_message_id, item.attempt_index) for item in result.items],
+            [("turn-b", 1), ("turn-a", 1), ("turn-a", 2)],
+        )

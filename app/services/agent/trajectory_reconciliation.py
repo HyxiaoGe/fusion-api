@@ -47,6 +47,17 @@ class TrajectoryStatusAssessment:
 
 
 @dataclass(frozen=True)
+class UserTrajectoryMetaRow:
+    """普通读取侧所需的窄 meta 行，绝不携带 terminal intent 详情。"""
+
+    trajectory_status: str
+    event_count: int
+    expected_last_sequence: int | None
+    degraded_reason: str | None
+    has_pending_terminal_intent: bool
+
+
+@dataclass(frozen=True)
 class LedgerWatermarkResolution:
     ledger_enabled_at: datetime | None
     degraded_reason: str | None
@@ -276,6 +287,30 @@ def resolve_trajectory_status_from_rows(
         ledger_enabled_at=ledger_enabled_at,
         ledger_error=ledger_error,
     )
+
+
+def resolve_user_trajectory_status_from_rows(
+    run_created_at: datetime,
+    meta: UserTrajectoryMetaRow | None,
+    watermark: LedgerWatermarkResolution,
+) -> TrajectoryStatusAssessment:
+    """普通 P1 读取侧状态判定；pending 与未知 meta 均只返回安全通用原因。"""
+    if meta is None:
+        return classify_missing_trajectory_meta(
+            run_created_at=run_created_at,
+            ledger_enabled_at=watermark.ledger_enabled_at,
+            ledger_error=watermark.degraded_reason,
+        )
+    if meta.has_pending_terminal_intent:
+        return TrajectoryStatusAssessment("degraded", TERMINAL_OUTCOME_UNKNOWN_REASON)
+    if meta.trajectory_status == "degraded":
+        reason = (
+            meta.degraded_reason if meta.degraded_reason in _SAFE_DEGRADED_REASONS else TERMINAL_OUTCOME_UNKNOWN_REASON
+        )
+        return TrajectoryStatusAssessment("degraded", reason)
+    if meta.trajectory_status in {"recording", "complete"}:
+        return TrajectoryStatusAssessment(meta.trajectory_status, None)
+    return TrajectoryStatusAssessment("degraded", TERMINAL_OUTCOME_UNKNOWN_REASON)
 
 
 def reconcile_trajectory_batch(
