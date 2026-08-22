@@ -14,6 +14,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.logger import app_logger
 from app.db.models import AgentEvent, AgentSession, RunTrajectoryMeta, TrajectoryLedgerSettings
+from app.schemas.trajectory import UserTrajectoryMetaRow
 
 DEFAULT_RECONCILIATION_BATCH_SIZE = 100
 DEFAULT_RECONCILIATION_STALE_GRACE = timedelta(seconds=60)
@@ -234,9 +235,7 @@ def _insert_missing_meta_do_nothing(session: Any, values: dict[str, Any]) -> boo
         statement = sqlite_insert(RunTrajectoryMeta).values(**values)
     else:
         raise RuntimeError(f"轨迹协调不支持数据库方言: {dialect_name}")
-    result = session.execute(
-        statement.on_conflict_do_nothing(index_elements=["run_id"])
-    )
+    result = session.execute(statement.on_conflict_do_nothing(index_elements=["run_id"]))
     return result.rowcount == 1
 
 
@@ -244,21 +243,64 @@ def resolve_run_trajectory_status(session: Any, run_id: str) -> TrajectoryStatus
     """读取侧完整性契约：pending complete 不得对外宣称 complete。"""
     meta = session.get(RunTrajectoryMeta, run_id)
     if meta is not None:
+        return resolve_trajectory_status_from_rows(None, meta, None)
+    run = session.get(AgentSession, run_id)
+    watermark = _watermark_from_session(session)
+    if run is None or not isinstance(run.created_at, datetime):
+        return TrajectoryStatusAssessment("degraded", "meta_missing")
+    return resolve_trajectory_status_from_rows(run, meta, watermark)
+
+
+def resolve_trajectory_status_from_rows(
+    run: AgentSession | None,
+    meta: RunTrajectoryMeta | None,
+    watermark: LedgerWatermarkResolution | datetime | None,
+) -> TrajectoryStatusAssessment:
+    """由已批量读取的 run/meta/水位判定完整性，避免 P1 列表 N+1 查询。"""
+    if meta is not None:
         if meta.terminal_intent_pending_at is not None:
             return TrajectoryStatusAssessment("degraded", _safe_pending_reason(meta))
         if meta.trajectory_status in {"recording", "complete", "degraded", "legacy"}:
             return TrajectoryStatusAssessment(meta.trajectory_status, meta.degraded_reason)
         return TrajectoryStatusAssessment("degraded", TERMINAL_OUTCOME_UNKNOWN_REASON)
 
-    run = session.get(AgentSession, run_id)
-    watermark = _watermark_from_session(session)
     if run is None or not isinstance(run.created_at, datetime):
         return TrajectoryStatusAssessment("degraded", "meta_missing")
+    if isinstance(watermark, LedgerWatermarkResolution):
+        ledger_enabled_at = watermark.ledger_enabled_at
+        ledger_error = watermark.degraded_reason
+    else:
+        ledger_enabled_at = watermark
+        ledger_error = None if isinstance(watermark, datetime) else "ledger_settings_missing"
     return classify_missing_trajectory_meta(
         run_created_at=run.created_at,
-        ledger_enabled_at=watermark.ledger_enabled_at,
-        ledger_error=watermark.degraded_reason,
+        ledger_enabled_at=ledger_enabled_at,
+        ledger_error=ledger_error,
     )
+
+
+def resolve_user_trajectory_status_from_rows(
+    run_created_at: datetime,
+    meta: UserTrajectoryMetaRow | None,
+    watermark: LedgerWatermarkResolution,
+) -> TrajectoryStatusAssessment:
+    """普通 P1 读取侧状态判定；pending 与未知 meta 均只返回安全通用原因。"""
+    if meta is None:
+        return classify_missing_trajectory_meta(
+            run_created_at=run_created_at,
+            ledger_enabled_at=watermark.ledger_enabled_at,
+            ledger_error=watermark.degraded_reason,
+        )
+    if meta.has_pending_terminal_intent:
+        return TrajectoryStatusAssessment("degraded", TERMINAL_OUTCOME_UNKNOWN_REASON)
+    if meta.trajectory_status == "degraded":
+        reason = (
+            meta.degraded_reason if meta.degraded_reason in _SAFE_DEGRADED_REASONS else TERMINAL_OUTCOME_UNKNOWN_REASON
+        )
+        return TrajectoryStatusAssessment("degraded", reason)
+    if meta.trajectory_status in {"recording", "complete"}:
+        return TrajectoryStatusAssessment(meta.trajectory_status, None)
+    return TrajectoryStatusAssessment("degraded", TERMINAL_OUTCOME_UNKNOWN_REASON)
 
 
 def reconcile_trajectory_batch(
@@ -284,25 +326,33 @@ def reconcile_trajectory_batch(
     }
     session = session_factory()
     try:
-        meta_rows = session.execute(
-            build_reconciliation_candidate_query(
-                batch_size=batch_size,
-                stale_before=stale_before,
+        meta_rows = (
+            session.execute(
+                build_reconciliation_candidate_query(
+                    batch_size=batch_size,
+                    stale_before=stale_before,
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         for meta in meta_rows:
             counters[_reconcile_meta(session, meta, now=reconciled_at)] += 1
 
         remaining = batch_size - len(meta_rows)
         if remaining > 0:
             watermark = _watermark_from_session(session)
-            missing_runs = session.execute(
-                _build_missing_meta_query(
-                    batch_size=remaining,
-                    ledger_enabled_at=watermark.ledger_enabled_at,
-                    stale_before=stale_before,
+            missing_runs = (
+                session.execute(
+                    _build_missing_meta_query(
+                        batch_size=remaining,
+                        ledger_enabled_at=watermark.ledger_enabled_at,
+                        stale_before=stale_before,
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             for run in missing_runs:
                 assessment = classify_missing_trajectory_meta(
                     run_created_at=run.created_at,

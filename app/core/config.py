@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     REDIS_STREAM_TTL: int = 300  # 流状态缓存 TTL（秒）
 
+    # 轨迹历史读取上限：服务层额外查询一条以明确截断状态。
+    MAX_TRAJECTORY_EVENTS_PER_RUN: int = int(os.getenv("MAX_TRAJECTORY_EVENTS_PER_RUN", "5000"))
+    MAX_TRAJECTORY_RUNS_PER_CONVERSATION: int = int(os.getenv("MAX_TRAJECTORY_RUNS_PER_CONVERSATION", "500"))
+
     # 文件存储配置
     FILE_STORAGE_PATH: str = os.getenv("FILE_STORAGE_PATH", "./storage/files")
     FILE_STORAGE_KEY_PREFIX: str = os.getenv("FILE_STORAGE_KEY_PREFIX", "files/v1")

@@ -25,6 +25,7 @@ from app.api import (
     knowledge_bases,
     models,
     prompts,
+    trajectory,
 )
 from app.core.config import (
     KNOWLEDGE_MILVUS_FILTER_TERM_BATCH_SIZE,
@@ -399,6 +400,7 @@ app.include_router(knowledge_bases.router, prefix="/api/knowledge-bases", tags=[
 app.include_router(models.router, prefix="/api/models", tags=["models"])
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(prompts.router, prefix="/api/prompts", tags=["prompts"])
+app.include_router(trajectory.router, prefix="/api", tags=["trajectory"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 app.include_router(admin_audit.router, prefix="/api/admin/audit", tags=["admin-audit"])
 app.include_router(admin_mcp.router, prefix="/api/admin/mcp", tags=["admin-mcp"])
