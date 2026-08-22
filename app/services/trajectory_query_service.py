@@ -14,7 +14,10 @@ from app.schemas.trajectory import (
 )
 from app.services.admin_audit_service import AdminAuditService
 from app.services.agent.trajectory_projector import project_trajectory
-from app.services.agent.trajectory_reconciliation import resolve_user_trajectory_status_from_rows
+from app.services.agent.trajectory_reconciliation import (
+    resolve_ledger_watermark,
+    resolve_user_trajectory_status_from_rows,
+)
 
 
 class TrajectoryQueryService:
@@ -39,7 +42,7 @@ class TrajectoryQueryService:
             return None
         truncated = len(rows) > self._max_runs_per_conversation
         bounded_rows = rows[: self._max_runs_per_conversation]
-        watermark = self._repository.resolve_ledger_watermark()
+        watermark = self._ledger_watermark()
         items = [
             self._run_summary(
                 run, resolve_user_trajectory_status_from_rows(run.created_at, meta, watermark).trajectory_status
@@ -88,7 +91,7 @@ class TrajectoryQueryService:
         assessment = resolve_user_trajectory_status_from_rows(
             run.created_at,
             meta,
-            self._repository.resolve_ledger_watermark(),
+            self._ledger_watermark(),
         )
         records = [self._event_record(event) for event in loaded_events]
         projection = project_trajectory(
@@ -143,6 +146,9 @@ class TrajectoryQueryService:
             trace_id=event.trace_id,
             payload=dict(event.payload or {}),
         )
+
+    def _ledger_watermark(self):
+        return resolve_ledger_watermark(self._repository.list_ledger_watermark_rows())
 
     @staticmethod
     def _grouping_order(items: list[TrajectoryRunSummary]) -> list[TrajectoryRunSummary]:

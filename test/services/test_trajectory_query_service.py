@@ -248,6 +248,55 @@ class TrajectoryQueryServiceTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(len(statements), 2)
 
+    def test_run_list_applies_max_plus_one_limit_in_database_query(self):
+        """若删除 repository 的 SQL LIMIT，响应切片仍可假绿而此数据库边界测试必须失败。"""
+        self._run("run-list-limit-1", turn_message_id="turn-list-1")
+        self._run("run-list-limit-2", turn_message_id="turn-list-2")
+        self._run("run-list-limit-3", turn_message_id="turn-list-3")
+        for run_id in ("run-list-limit-1", "run-list-limit-2", "run-list-limit-3"):
+            self._meta(run_id)
+        statements: list[tuple[str, tuple[object, ...] | list[object]]] = []
+
+        def capture(_conn, _cursor, statement, parameters, _context, _executemany) -> None:
+            if "FROM conversations" in statement:
+                statements.append((statement, parameters))
+
+        event.listen(self.engine, "before_cursor_execute", capture)
+        try:
+            result = self._service(max_runs=2).list_runs("conv-1", "user-1")
+        finally:
+            event.remove(self.engine, "before_cursor_execute", capture)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(len(statements), 1)
+        statement, parameters = statements[0]
+        self.assertIn("LIMIT", statement.upper())
+        self.assertIn(3, parameters)
+
+    def test_snapshot_applies_max_plus_one_limit_in_database_query(self):
+        """若删除 event SQL LIMIT，快照仍可在 service 切片而掩盖无界读取。"""
+        self._run("run-event-limit")
+        self._meta("run-event-limit")
+        for sequence in range(3):
+            self._event("run-event-limit", sequence)
+        statements: list[tuple[str, tuple[object, ...] | list[object]]] = []
+
+        def capture(_conn, _cursor, statement, parameters, _context, _executemany) -> None:
+            if "FROM agent_events" in statement:
+                statements.append((statement, parameters))
+
+        event.listen(self.engine, "before_cursor_execute", capture)
+        try:
+            snapshot = self._service(max_events=2).get_user_snapshot("conv-1", "run-event-limit", "user-1")
+        finally:
+            event.remove(self.engine, "before_cursor_execute", capture)
+
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(len(statements), 1)
+        statement, parameters = statements[0]
+        self.assertIn("LIMIT", statement.upper())
+        self.assertIn(3, parameters)
+
     def test_run_list_keeps_all_latest_attempts_in_a_turn_and_sorts_them_ascending(self):
         """若分组逻辑只覆盖一个 attempt 或按时间倒序输出，同一 turn 的重试顺序会错误。"""
         self._run("run-turn-a-2", created_at=self.now - timedelta(minutes=1), turn_message_id="turn-a", attempt_index=2)

@@ -2,10 +2,22 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
+
+
+@dataclass(frozen=True)
+class UserTrajectoryMetaRow:
+    """普通读取所需的窄 meta 数据，不携带 terminal intent 详情。"""
+
+    trajectory_status: str
+    event_count: int
+    expected_last_sequence: int | None
+    degraded_reason: str | None
+    has_pending_terminal_intent: bool
 
 
 class TrajectoryEventRecord(BaseModel):

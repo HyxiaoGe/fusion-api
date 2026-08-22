@@ -14,6 +14,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.logger import app_logger
 from app.db.models import AgentEvent, AgentSession, RunTrajectoryMeta, TrajectoryLedgerSettings
+from app.schemas.trajectory import UserTrajectoryMetaRow
 
 DEFAULT_RECONCILIATION_BATCH_SIZE = 100
 DEFAULT_RECONCILIATION_STALE_GRACE = timedelta(seconds=60)
@@ -44,17 +45,6 @@ class TrajectoryStatusAssessment:
 
     trajectory_status: str
     degraded_reason: str | None
-
-
-@dataclass(frozen=True)
-class UserTrajectoryMetaRow:
-    """普通读取侧所需的窄 meta 行，绝不携带 terminal intent 详情。"""
-
-    trajectory_status: str
-    event_count: int
-    expected_last_sequence: int | None
-    degraded_reason: str | None
-    has_pending_terminal_intent: bool
 
 
 @dataclass(frozen=True)

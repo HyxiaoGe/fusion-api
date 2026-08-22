@@ -15,11 +15,7 @@ from app.db.models import (
     ToolCallLog,
     TrajectoryLedgerSettings,
 )
-from app.services.agent.trajectory_reconciliation import (
-    LedgerWatermarkResolution,
-    UserTrajectoryMetaRow,
-    resolve_ledger_watermark,
-)
+from app.schemas.trajectory import UserTrajectoryMetaRow
 
 RunWithMeta: TypeAlias = tuple[AgentSession, UserTrajectoryMetaRow | None]
 
@@ -200,14 +196,15 @@ class TrajectoryRepository:
             ).scalars()
         )
 
-    def resolve_ledger_watermark(self) -> LedgerWatermarkResolution:
+    def list_ledger_watermark_rows(self) -> list[tuple[object, object]]:
+        """返回原始水位行；状态规则由 service 层在中立数据上解释。"""
         rows = self._session.execute(
             select(
                 TrajectoryLedgerSettings.singleton_key,
                 TrajectoryLedgerSettings.ledger_enabled_at,
             )
         ).all()
-        return resolve_ledger_watermark([(row.singleton_key, row.ledger_enabled_at) for row in rows])
+        return [(row.singleton_key, row.ledger_enabled_at) for row in rows]
 
     @staticmethod
     def _user_meta_from_columns(values: tuple[object, ...]) -> UserTrajectoryMetaRow | None:
