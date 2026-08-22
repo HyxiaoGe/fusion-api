@@ -601,6 +601,7 @@ GET /api/admin/audit/conversations/{conversation_id}/runs/{run_id}/trajectory
 - **管理员 DTO 的字段来源**：prompt、工具 schema、完整输入/输出**不在账本中**，v1 管理员 DTO 只能承诺从 `ToolCallLog / messages / 工具注册表` 可还原的字段；无法还原的字段**从 v1 承诺中删除**，不得声称账本可提供。
 - **DTO 分离**：普通用户 `TrajectorySnapshot` 与管理员诊断 DTO 分离（不同端点，§7.2）；**禁止依赖前端隐藏字段实现权限**。
 - **run 级关联限制**：`ToolCallLog` 只按 `trace_id=run_id` 查询并按 `step_number / created_at / id` 排序。它没有 ledger `tool_call_id` 外键，管理员工具项必须固定 `association="run"`，不得伪造 span 或 `tool_call_id` 精确关联。
+- **历史兼容**：管理员工具项的 `created_at` 可为 null；非空历史无时区值按仓库 UTC 语义显式规范化。`step_number` 与 `created_at` 的 NULL 排在非空值之后，再用 `id` 稳定兜底，保证 SQLite/PostgreSQL 一致。
 - **审计闭环**：管理员轨迹读取必须复用 `get_conversation_auditor` 与 `X-Admin-Audit-Reason`；在返回 `tool_calls` 前写入 `admin.audit.trajectory.view`，审计失败返回既有 503，不得 fail-open。
 - 命名：账本称「**脱敏事件账本**」，文档与 UI 不得声称是完整原始事件。
 

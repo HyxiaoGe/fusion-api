@@ -314,7 +314,7 @@ class TrajectoryQueryServiceTests(unittest.TestCase):
         )
 
     def test_admin_snapshot_bounds_tool_diagnostics_and_marks_truncation(self):
-        """若管理员工具诊断无界读取，单次历史查看可被大量 ToolCallLog 放大。"""
+        """若删除 ToolCallLog SQL LIMIT，service 切片仍可能掩盖无界读取。"""
         self._run("run-admin")
         self._meta("run-admin")
         with self.Session() as db:
@@ -338,8 +338,104 @@ class TrajectoryQueryServiceTests(unittest.TestCase):
             )
             db.commit()
 
-        snapshot = self._service(max_events=1).get_admin_snapshot("conv-1", "run-admin")
+        statements: list[tuple[str, tuple[object, ...] | list[object]]] = []
+
+        def capture(_conn, _cursor, statement, parameters, _context, _executemany) -> None:
+            if "FROM tool_call_logs" in statement:
+                statements.append((statement, parameters))
+
+        event.listen(self.engine, "before_cursor_execute", capture)
+        try:
+            snapshot = self._service(max_events=1).get_admin_snapshot("conv-1", "run-admin")
+        finally:
+            event.remove(self.engine, "before_cursor_execute", capture)
 
         assert snapshot is not None
         self.assertTrue(snapshot.tool_calls_truncated)
         self.assertEqual([item.id for item in snapshot.tool_calls], ["tool-admin-0"])
+        self.assertEqual(len(statements), 1)
+        statement, parameters = statements[0]
+        self.assertIn("LIMIT", statement.upper())
+        self.assertIn(2, parameters)
+
+    def test_admin_snapshot_preserves_legacy_nullable_tool_time_with_utc_serialization_and_stable_order(self):
+        """若历史 ToolCallLog 的空或 naive 时间使 DTO 失败、依赖宿主机时区或排序漂移，诊断不可用。"""
+        self._run("run-admin-legacy")
+        self._meta("run-admin-legacy")
+        naive_created = datetime(2026, 8, 22, 4, 0, 0)
+        with self.Session() as db:
+            null_time = ToolCallLog(
+                id="tool-sort-null",
+                conversation_id="conv-1",
+                message_id="msg-run-admin-legacy",
+                user_id="user-1",
+                tool_name="private_tool",
+                status="success",
+                model_id="model-1",
+                provider="provider-1",
+                trace_id="run-admin-legacy",
+                step_number=None,
+                created_at=self.now,
+            )
+            db.add_all(
+                [
+                    ToolCallLog(
+                        id="tool-sort-b",
+                        conversation_id="conv-1",
+                        message_id="msg-run-admin-legacy",
+                        user_id="user-1",
+                        tool_name="private_tool",
+                        status="success",
+                        model_id="model-1",
+                        provider="provider-1",
+                        trace_id="run-admin-legacy",
+                        step_number=1,
+                        created_at=naive_created,
+                    ),
+                    ToolCallLog(
+                        id="tool-sort-a",
+                        conversation_id="conv-1",
+                        message_id="msg-run-admin-legacy",
+                        user_id="user-1",
+                        tool_name="private_tool",
+                        status="success",
+                        model_id="model-1",
+                        provider="provider-1",
+                        trace_id="run-admin-legacy",
+                        step_number=1,
+                        created_at=naive_created,
+                    ),
+                    ToolCallLog(
+                        id="tool-sort-later",
+                        conversation_id="conv-1",
+                        message_id="msg-run-admin-legacy",
+                        user_id="user-1",
+                        tool_name="private_tool",
+                        status="success",
+                        model_id="model-1",
+                        provider="provider-1",
+                        trace_id="run-admin-legacy",
+                        step_number=1,
+                        created_at=naive_created + timedelta(seconds=1),
+                    ),
+                    null_time,
+                ]
+            )
+            db.flush()
+            null_time.created_at = None
+            db.commit()
+
+        snapshot = self._service(max_events=8).get_admin_snapshot("conv-1", "run-admin-legacy")
+
+        assert snapshot is not None
+        self.assertEqual(
+            [item.id for item in snapshot.tool_calls],
+            ["tool-sort-a", "tool-sort-b", "tool-sort-later", "tool-sort-null"],
+        )
+        created_at = {item.id: item.created_at for item in snapshot.tool_calls}
+        self.assertEqual(created_at["tool-sort-a"], naive_created.replace(tzinfo=UTC))
+        self.assertIsNone(created_at["tool-sort-null"])
+        encoded = snapshot.model_dump(mode="json")
+        encoded_naive = next(item for item in encoded["tool_calls"] if item["id"] == "tool-sort-a")["created_at"]
+        self.assertEqual(datetime.fromisoformat(encoded_naive.replace("Z", "+00:00")).tzinfo, UTC)
+        self.assertIsNone(next(item for item in encoded["tool_calls"] if item["id"] == "tool-sort-null")["created_at"])

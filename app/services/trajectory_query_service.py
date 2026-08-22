@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from app.db.models import AgentEvent, AgentSession
 from app.db.trajectory_repository import TrajectoryRepository
 from app.schemas.admin_trajectory import AdminTrajectorySnapshot, AdminTrajectoryToolCall
@@ -18,6 +20,7 @@ from app.services.agent.trajectory_reconciliation import (
     resolve_ledger_watermark,
     resolve_user_trajectory_status_from_rows,
 )
+from app.utils.time import as_utc
 
 
 class TrajectoryQueryService:
@@ -65,18 +68,20 @@ class TrajectoryQueryService:
         snapshot = self._snapshot_from_row(conversation_id, run_id, row)
         tool_rows = self._repository.list_tool_diagnostics(run_id, self._max_events_per_run + 1)
         tool_calls_truncated = len(tool_rows) > self._max_events_per_run
-        tools = [
-            AdminTrajectoryToolCall(
-                association="run",
-                **{key: value for key, value in AdminAuditService._tool_item(tool).items() if key != "trace_id"},
-            )
-            for tool in tool_rows[: self._max_events_per_run]
-        ]
+        tools = [self._admin_tool_call(tool) for tool in tool_rows[: self._max_events_per_run]]
         return AdminTrajectorySnapshot(
             snapshot=snapshot,
             tool_calls=tools,
             tool_calls_truncated=tool_calls_truncated,
         )
+
+    @staticmethod
+    def _admin_tool_call(tool) -> AdminTrajectoryToolCall:
+        item = {key: value for key, value in AdminAuditService._tool_item(tool).items() if key != "trace_id"}
+        created_at = item.get("created_at")
+        if isinstance(created_at, datetime):
+            item["created_at"] = as_utc(created_at)
+        return AdminTrajectoryToolCall(association="run", **item)
 
     def _snapshot_from_row(
         self,

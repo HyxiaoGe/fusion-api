@@ -28,7 +28,7 @@ class AdminTrajectoryToolCall(BaseModel):
     result_preview: dict[str, Any] = Field(default_factory=dict)
     error: dict[str, str] | None = None
     redacted_fields: list[str] = Field(default_factory=list)
-    created_at: datetime
+    created_at: datetime | None = None
 
 
 class AdminTrajectorySnapshot(BaseModel):

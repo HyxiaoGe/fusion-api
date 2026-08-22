@@ -1339,7 +1339,27 @@ class AdminAuditApiTests(unittest.TestCase):
         """若 run 归属仅靠管理员权限，或审计失败仍返回诊断，敏感轨迹会泄漏。"""
         from unittest.mock import patch
 
+        from app.db.models import Conversation, Message, User
+
         self._add_trajectory_run("run-audit-own")
+        self.db.add_all(
+            [
+                User(id="user-2", username="bob", email="bob@example.com"),
+                Conversation(
+                    id="conv-2",
+                    user_id="user-2",
+                    title="他人的审计对话",
+                    model_id="model-1",
+                ),
+                Message(
+                    id="msg-run-audit-other",
+                    conversation_id="conv-2",
+                    role="assistant",
+                    content=[{"type": "text", "text": "other conversation"}],
+                ),
+            ]
+        )
+        self.db.commit()
         self._add_trajectory_run("run-audit-other", conversation_id="conv-2", user_id="user-2")
 
         cross_run = self.client.get("/api/admin/audit/conversations/conv-1/runs/run-audit-other/trajectory")

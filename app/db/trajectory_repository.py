@@ -191,7 +191,11 @@ class TrajectoryRepository:
                     )
                 )
                 .where(ToolCallLog.trace_id == run_id)
-                .order_by(ToolCallLog.step_number.asc(), ToolCallLog.created_at.asc(), ToolCallLog.id.asc())
+                .order_by(
+                    ToolCallLog.step_number.asc().nulls_last(),
+                    ToolCallLog.created_at.asc().nulls_last(),
+                    ToolCallLog.id.asc(),
+                )
                 .limit(limit)
             ).scalars()
         )
