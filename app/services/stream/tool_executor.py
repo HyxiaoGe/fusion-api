@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import json
 import re
+import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -24,6 +25,7 @@ from app.services.mcp.tool_contract import (
     validate_tool_argument_resource_limits,
 )
 from app.services.stream.tool_call_lifecycle import (
+    ToolLifecycleControlPlaneError,
     emit_tool_call_result,
     emit_tool_call_started,
     execute_tool_with_lifecycle,
@@ -81,6 +83,94 @@ class ToolExecutionIds:
     log_id: str
 
 
+@dataclass
+class ToolAttemptLifecycle:
+    """同一 logical tool call 下的物理 handler attempt 计数器。"""
+
+    emitter: AgentEventEmitter
+    tool_call_id: str
+    tool_name: str
+    attempt_index: int = 0
+
+    async def execute(self, operation):
+        self.attempt_index += 1
+        tool_attempt_id = str(uuid.uuid4())
+        try:
+            await self.emitter.tool_attempt_started(
+                tool_attempt_id=tool_attempt_id,
+                tool_call_id=self.tool_call_id,
+                tool_name=self.tool_name,
+                attempt_index=self.attempt_index,
+            )
+        except BaseException as error:
+            raise ToolLifecycleControlPlaneError(error) from error
+        started_at = time.monotonic()
+        try:
+            result = await operation()
+        except asyncio.CancelledError:
+            await self._complete_preserving_primary(
+                tool_attempt_id=tool_attempt_id,
+                status="cancelled",
+                error_code=None,
+                started_at=started_at,
+            )
+            raise
+        except BaseException:
+            await self._complete_preserving_primary(
+                tool_attempt_id=tool_attempt_id,
+                status="failed",
+                error_code=None,
+                started_at=started_at,
+            )
+            raise
+
+        data = result.data if isinstance(result.data, dict) else {}
+        if data.get("error_code") == "tool_timeout":
+            status = "timeout"
+            error_code = "tool_timeout"
+        elif result.status in {"success", "degraded"}:
+            status = "success"
+            error_code = None
+        else:
+            status = "failed"
+            error_code = None
+        await self._complete(
+            tool_attempt_id=tool_attempt_id,
+            status=status,
+            error_code=error_code,
+            started_at=started_at,
+        )
+        return result
+
+    async def _complete_preserving_primary(self, **kwargs: Any) -> None:
+        try:
+            await self._complete(**kwargs)
+        except ToolLifecycleControlPlaneError as secondary:
+            logger.warning(
+                "工具 attempt 生命周期收尾失败，保留主异常: error_type=%s",
+                type(secondary.error).__name__,
+            )
+
+    async def _complete(
+        self,
+        *,
+        tool_attempt_id: str,
+        status: str,
+        error_code: str | None,
+        started_at: float,
+    ) -> None:
+        try:
+            await self.emitter.tool_attempt_completed(
+                tool_attempt_id=tool_attempt_id,
+                tool_call_id=self.tool_call_id,
+                status=status,
+                error_code=error_code,
+                duration_ms=max(0, int(round((time.monotonic() - started_at) * 1000))),
+            )
+        except BaseException as error:
+            raise ToolLifecycleControlPlaneError(error) from error
+
+
 def _should_retry_tool_result(result) -> bool:
     """决定 ToolResult 是否应该再试一次（True = 重试，False = 接受当前结果）。"""
     if result.status in ("success", "degraded"):
@@ -132,16 +222,33 @@ class AgentEventRedisWriter:
 
 
 class AgentEventCompositeWriter:
-    """agent_event 双写 adapter：先写 Redis，再旁路记录 progress snapshot。"""
+    """agent_event 多写 adapter：Redis 必需，两个旁路 sink 独立 fail-open。"""
 
-    def __init__(self, *, redis_writer: AgentEventRedisWriter, recorder=None) -> None:
+    def __init__(self, *, redis_writer: AgentEventRedisWriter, recorder=None, trajectory_recorder=None) -> None:
         self.redis_writer = redis_writer
         self.recorder = recorder
+        self.trajectory_recorder = trajectory_recorder
 
     async def append_chunk(self, conversation_id: str, task_id: str, chunk_type: str, payload: dict) -> None:
         await self.redis_writer.append_chunk(conversation_id, task_id, chunk_type, payload)
         if self.recorder is not None:
-            self.recorder.record_chunk(conversation_id, chunk_type, payload)
+            try:
+                self.recorder.record_chunk(conversation_id, chunk_type, payload)
+            except Exception as error:  # noqa: BLE001 — progress 是辅助 sink
+                logger.warning(
+                    "Agent progress 旁路记录失败: run_id=%s error_type=%s",
+                    payload.get("run_id"),
+                    type(error).__name__,
+                )
+        if self.trajectory_recorder is not None:
+            try:
+                await self.trajectory_recorder.record_chunk(conversation_id, chunk_type, payload)
+            except Exception as error:  # noqa: BLE001 — trajectory 是辅助 sink
+                logger.warning(
+                    "Trajectory 旁路记录失败: run_id=%s error_type=%s",
+                    payload.get("run_id"),
+                    type(error).__name__,
+                )
 
 
 async def _execute_handler(handler, args: dict, runtime_context: Any = None):
@@ -158,7 +265,12 @@ async def _execute_handler(handler, args: dict, runtime_context: Any = None):
     interval=1,
     on_backoff=_log_tool_retry,
 )
-async def execute_tool_with_retry(handler, args: dict, runtime_context: Any = None):
+async def execute_tool_with_retry(
+    handler,
+    args: dict,
+    runtime_context: Any = None,
+    attempt_lifecycle: ToolAttemptLifecycle | None = None,
+):
     """带重试的工具执行（仅瞬时故障重试），返回 ToolResult。
 
     永久性错误（not_found / invalid / 401 / 403 / 404 / 400 / rate_limit）不重试。
@@ -167,31 +279,49 @@ async def execute_tool_with_retry(handler, args: dict, runtime_context: Any = No
     """
     from app.services.tool_handlers import ToolResult
 
-    try:
-        return await asyncio.wait_for(
-            _execute_handler(handler, args, runtime_context),
-            timeout=AGENT_TOOL_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        return ToolResult(
-            status="failed",
-            error_message="工具调用超时",
-            data={"error_code": "tool_timeout", "retryable": True},
-        )
+    async def execute_attempt():
+        try:
+            return await asyncio.wait_for(
+                _execute_handler(handler, args, runtime_context),
+                timeout=AGENT_TOOL_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            return ToolResult(
+                status="failed",
+                error_message="工具调用超时",
+                data={"error_code": "tool_timeout", "retryable": True},
+            )
+
+    if attempt_lifecycle is None:
+        return await execute_attempt()
+    return await attempt_lifecycle.execute(execute_attempt)
 
 
-async def execute_tool_once(handler, args: dict, runtime_context: Any = None):
+async def execute_tool_once(
+    handler,
+    args: dict,
+    runtime_context: Any = None,
+    attempt_lifecycle: ToolAttemptLifecycle | None = None,
+):
     """有副作用或不具备幂等保证的工具只执行一次，但仍保留统一超时。"""
     from app.services.tool_handlers import ToolResult
 
-    try:
-        return await asyncio.wait_for(_execute_handler(handler, args, runtime_context), timeout=AGENT_TOOL_TIMEOUT)
-    except asyncio.TimeoutError:
-        return ToolResult(
-            status="failed",
-            error_message="工具调用超时",
-            data={"error_code": "tool_timeout", "retryable": False},
-        )
+    async def execute_attempt():
+        try:
+            return await asyncio.wait_for(
+                _execute_handler(handler, args, runtime_context),
+                timeout=AGENT_TOOL_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            return ToolResult(
+                status="failed",
+                error_message="工具调用超时",
+                data={"error_code": "tool_timeout", "retryable": False},
+            )
+
+    if attempt_lifecycle is None:
+        return await execute_attempt()
+    return await attempt_lifecycle.execute(execute_attempt)
 
 
 def new_tool_execution_ids() -> ToolExecutionIds:
@@ -383,12 +513,22 @@ async def execute_tool_handler(*, request: ToolExecutionBatchRequest, tool_call:
     )
     if request.emitter is None:
         return await executor(handler, args, request.runtime_context)
+    attempt_lifecycle = ToolAttemptLifecycle(
+        emitter=request.emitter,
+        tool_call_id=tool_call["id"],
+        tool_name=handler.tool_name,
+    )
     return await execute_tool_with_lifecycle(
         tool_call_id=tool_call["id"],
         tool_name=handler.tool_name,
         args=_sanitize_event_arguments(handler, args),
         target=handler,
-        execute=lambda target, _event_arguments: executor(target, args, request.runtime_context),
+        execute=lambda target, _event_arguments: executor(
+            target,
+            args,
+            request.runtime_context,
+            attempt_lifecycle,
+        ),
         result_summary_builder=handler._build_result_summary,
         emitter=request.emitter,
         plan_item_id=tool_call.get("plan_item_id"),

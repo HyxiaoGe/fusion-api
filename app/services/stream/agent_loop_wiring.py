@@ -40,6 +40,9 @@ class AgentLoopRunInput:
     options: dict | None
     capabilities: dict | None
     trace_id: str | None
+    turn_message_id: str | None = None
+    previous_run_id: str | None = None
+    run_attempt_kind: str = "initial"
     assistant_message_sequence: int | None = None
     initial_content_blocks: list | None = None
     extra_system_prompts: list[str] | None = None
@@ -65,6 +68,9 @@ class AgentLoopRunInput:
             task_id=self.task_id,
             call_config=call_config,
             trace_id=self.trace_id,
+            turn_message_id=self.turn_message_id,
+            previous_run_id=self.previous_run_id,
+            run_attempt_kind=self.run_attempt_kind,
         )
 
     def to_lifecycle_request(

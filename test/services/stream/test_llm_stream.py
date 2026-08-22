@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -34,6 +35,652 @@ async def async_response(chunks):
 
 
 class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_filtered_candidates_keep_reclassified_and_late_visible_times(self):
+        from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata
+
+        now = [30.0]
+        observation = LLMRoundObservation(
+            metadata=RoundMetadata("conv", "run", 1, "step", "agent", "model", "provider"),
+            litellm_model="test/model",
+            messages=[],
+            call_kwargs={},
+            clock=lambda: now[0],
+            token_estimator=lambda *_args, **_kwargs: 1,
+            context_window_resolver=lambda _model_id: (4096, "test", "known"),
+            run_context_in_thread=False,
+        )
+
+        async def response():
+            now[0] = 30.1
+            yield make_chunk(delta=SimpleNamespace(content="<think>隐藏推理</think>"))
+            now[0] = 30.5
+            yield make_chunk(delta=SimpleNamespace(content="可见正文"), finish_reason="stop")
+
+        observation.start()
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", new=AsyncMock()),
+            patch("app.services.stream.llm_stream.check_lock_owner", new=AsyncMock(return_value=True)),
+        ):
+            result = await llm_stream_module.stream_round(
+                observation.wrap_response(response()),
+                "conv",
+                "task",
+                True,
+                "thinking",
+                "text",
+                reasoning_transport_mode="delta",
+                defer_output=True,
+                on_output_candidate=observation.observe_output_candidate,
+            )
+
+        self.assertEqual(result[:2], ("隐藏推理", "可见正文"))
+        self.assertEqual(observation.output_delta_ms("reasoning"), 100)
+        self.assertEqual(observation.output_delta_ms("content"), 500)
+        self.assertIsNone(observation.output_delta_ms("tool_call"))
+
+    async def test_malformed_dsml_does_not_create_visible_or_tool_candidate(self):
+        from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata
+
+        now = [40.0]
+        observation = LLMRoundObservation(
+            metadata=RoundMetadata("conv", "run", 1, "step", "agent", "model", "provider"),
+            litellm_model="test/model",
+            messages=[],
+            call_kwargs={},
+            clock=lambda: now[0],
+            token_estimator=lambda *_args, **_kwargs: 1,
+            context_window_resolver=lambda _model_id: (4096, "test", "known"),
+            run_context_in_thread=False,
+        )
+
+        async def response():
+            now[0] = 40.1
+            yield make_chunk(delta=SimpleNamespace(content="<｜｜DSML｜｜tool_calls>garbage"), finish_reason="stop")
+
+        observation.start()
+        with patch("app.services.stream.llm_stream.check_lock_owner", new=AsyncMock(return_value=True)):
+            result = await llm_stream_module.stream_round(
+                observation.wrap_response(response()),
+                "conv",
+                "task",
+                False,
+                "thinking",
+                "text",
+                defer_output=True,
+                on_output_candidate=observation.observe_output_candidate,
+            )
+
+        self.assertEqual(result[3], "tool_protocol_error")
+        self.assertIsNone(observation.output_delta_ms("content"))
+        self.assertIsNone(observation.output_delta_ms("tool_call"))
+
+    async def test_probing_flush_uses_earliest_contributing_chunk_time(self):
+        from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata
+
+        now = [50.0]
+        observation = LLMRoundObservation(
+            metadata=RoundMetadata("conv", "run", 1, "step", "agent", "model", "provider"),
+            litellm_model="test/model",
+            messages=[],
+            call_kwargs={},
+            clock=lambda: now[0],
+            token_estimator=lambda *_args, **_kwargs: 1,
+            context_window_resolver=lambda _model_id: (4096, "test", "known"),
+            run_context_in_thread=False,
+        )
+
+        async def response():
+            for observed_at, text, finish_reason in (
+                (50.1, "第一段缓冲推理", None),
+                (50.3, "第二段缓冲推理", None),
+                (50.5, "第三段缓冲推理", "stop"),
+            ):
+                now[0] = observed_at
+                yield make_chunk(
+                    delta=SimpleNamespace(content=None, reasoning_content=text),
+                    finish_reason=finish_reason,
+                )
+
+        observation.start()
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", new=AsyncMock()),
+            patch("app.services.stream.llm_stream.check_lock_owner", new=AsyncMock(return_value=True)),
+        ):
+            result = await llm_stream_module.stream_round(
+                observation.wrap_response(response()),
+                "conv",
+                "task",
+                True,
+                "thinking",
+                "text",
+                reasoning_transport_mode="probing",
+                on_output_candidate=observation.observe_output_candidate,
+                capture_output_candidate_time=observation.capture_output_candidate_time,
+            )
+
+        self.assertEqual(result[0], "第一段缓冲推理第二段缓冲推理第三段缓冲推理")
+        self.assertEqual(observation.output_delta_ms("reasoning"), 100)
+
+    async def test_discarded_probing_buffer_never_creates_candidate(self):
+        from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata
+
+        now = [60.0]
+        observation = LLMRoundObservation(
+            metadata=RoundMetadata("conv", "run", 1, "step", "agent", "model", "provider"),
+            litellm_model="test/model",
+            messages=[],
+            call_kwargs={},
+            clock=lambda: now[0],
+            token_estimator=lambda *_args, **_kwargs: 1,
+            context_window_resolver=lambda _model_id: (4096, "test", "known"),
+            run_context_in_thread=False,
+        )
+
+        async def response():
+            now[0] = 60.1
+            yield make_chunk(
+                delta=SimpleNamespace(content=None, reasoning_content="<｜｜DSML"),
+                finish_reason=None,
+            )
+            now[0] = 60.4
+            yield make_chunk(
+                delta=SimpleNamespace(content=None, reasoning_content="｜｜tool_calls>garbage"),
+                finish_reason="stop",
+            )
+
+        observation.start()
+        with patch("app.services.stream.llm_stream.check_lock_owner", new=AsyncMock(return_value=True)):
+            result = await llm_stream_module.stream_round(
+                observation.wrap_response(response()),
+                "conv",
+                "task",
+                True,
+                "thinking",
+                "text",
+                reasoning_transport_mode="probing",
+                defer_output=True,
+                on_output_candidate=observation.observe_output_candidate,
+                capture_output_candidate_time=observation.capture_output_candidate_time,
+            )
+
+        self.assertEqual(result[0], "")
+        self.assertIsNone(observation.output_delta_ms("reasoning"))
+
+    async def test_split_update_plan_uses_first_content_fragment_without_crossing_reasoning_kind(self):
+        from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata
+
+        now = [70.0]
+        observation = LLMRoundObservation(
+            metadata=RoundMetadata("conv", "run", 1, "step", "agent", "model", "provider"),
+            litellm_model="test/model",
+            messages=[],
+            call_kwargs={},
+            clock=lambda: now[0],
+            token_estimator=lambda *_args, **_kwargs: 1,
+            context_window_resolver=lambda _model_id: (4096, "test", "known"),
+            run_context_in_thread=False,
+        )
+
+        async def response():
+            for observed_at, text, finish_reason in (
+                (70.1, "<think>隐藏推理</think>", None),
+                (70.4, "up", None),
+                (70.5, "date_plan 已完成", "stop"),
+            ):
+                now[0] = observed_at
+                yield make_chunk(delta=SimpleNamespace(content=text), finish_reason=finish_reason)
+
+        observation.start()
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", new=AsyncMock()),
+            patch("app.services.stream.llm_stream.check_lock_owner", new=AsyncMock(return_value=True)),
+        ):
+            result = await llm_stream_module.stream_round(
+                observation.wrap_response(response()),
+                "conv",
+                "task",
+                True,
+                "thinking",
+                "text",
+                reasoning_transport_mode="delta",
+                defer_output=True,
+                on_output_candidate=observation.observe_output_candidate,
+                capture_output_candidate_time=observation.capture_output_candidate_time,
+            )
+
+        self.assertEqual(result[:2], ("隐藏推理", "更新计划已完成"))
+        self.assertEqual(observation.output_delta_ms("reasoning"), 100)
+        self.assertEqual(observation.output_delta_ms("content"), 400)
+
+    async def test_split_mcp_alias_uses_first_content_fragment_time(self):
+        from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata
+
+        now = [80.0]
+        observation = LLMRoundObservation(
+            metadata=RoundMetadata("conv", "run", 1, "step", "agent", "model", "provider"),
+            litellm_model="test/model",
+            messages=[],
+            call_kwargs={},
+            clock=lambda: now[0],
+            token_estimator=lambda *_args, **_kwargs: 1,
+            context_window_resolver=lambda _model_id: (4096, "test", "known"),
+            run_context_in_thread=False,
+        )
+
+        async def response():
+            now[0] = 80.1
+            yield make_chunk(delta=SimpleNamespace(content="mcp_"))
+            now[0] = 80.6
+            yield make_chunk(
+                delta=SimpleNamespace(content="a" * 43),
+                finish_reason="stop",
+            )
+
+        observation.start()
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", new=AsyncMock()),
+            patch("app.services.stream.llm_stream.check_lock_owner", new=AsyncMock(return_value=True)),
+        ):
+            result = await llm_stream_module.stream_round(
+                observation.wrap_response(response()),
+                "conv",
+                "task",
+                False,
+                "thinking",
+                "text",
+                defer_output=True,
+                on_output_candidate=observation.observe_output_candidate,
+                capture_output_candidate_time=observation.capture_output_candidate_time,
+            )
+
+        self.assertEqual(result[1], "外部工具")
+        self.assertEqual(observation.output_delta_ms("content"), 100)
+
+    async def test_finish_flush_uses_first_buffered_content_fragment_time(self):
+        from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata
+
+        now = [90.0]
+        observation = LLMRoundObservation(
+            metadata=RoundMetadata("conv", "run", 1, "step", "agent", "model", "provider"),
+            litellm_model="test/model",
+            messages=[],
+            call_kwargs={},
+            clock=lambda: now[0],
+            token_estimator=lambda *_args, **_kwargs: 1,
+            context_window_resolver=lambda _model_id: (4096, "test", "known"),
+            run_context_in_thread=False,
+        )
+
+        async def response():
+            now[0] = 90.1
+            yield make_chunk(delta=SimpleNamespace(content="upda"))
+            now[0] = 90.7
+            yield make_chunk(delta=SimpleNamespace(content=None), finish_reason="stop")
+
+        observation.start()
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", new=AsyncMock()),
+            patch("app.services.stream.llm_stream.check_lock_owner", new=AsyncMock(return_value=True)),
+        ):
+            result = await llm_stream_module.stream_round(
+                observation.wrap_response(response()),
+                "conv",
+                "task",
+                False,
+                "thinking",
+                "text",
+                defer_output=True,
+                on_output_candidate=observation.observe_output_candidate,
+                capture_output_candidate_time=observation.capture_output_candidate_time,
+            )
+
+        self.assertEqual(result[1], "更新计划")
+        self.assertEqual(observation.output_delta_ms("content"), 100)
+
+    async def test_fragmented_dsml_discard_does_not_create_content_candidate(self):
+        from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata
+
+        now = [100.0]
+        observation = LLMRoundObservation(
+            metadata=RoundMetadata("conv", "run", 1, "step", "agent", "model", "provider"),
+            litellm_model="test/model",
+            messages=[],
+            call_kwargs={},
+            clock=lambda: now[0],
+            token_estimator=lambda *_args, **_kwargs: 1,
+            context_window_resolver=lambda _model_id: (4096, "test", "known"),
+            run_context_in_thread=False,
+        )
+
+        async def response():
+            now[0] = 100.1
+            yield make_chunk(delta=SimpleNamespace(content="<｜｜DSML"))
+            now[0] = 100.4
+            yield make_chunk(
+                delta=SimpleNamespace(content="｜｜tool_calls>garbage"),
+                finish_reason="stop",
+            )
+
+        observation.start()
+        with patch("app.services.stream.llm_stream.check_lock_owner", new=AsyncMock(return_value=True)):
+            result = await llm_stream_module.stream_round(
+                observation.wrap_response(response()),
+                "conv",
+                "task",
+                False,
+                "thinking",
+                "text",
+                defer_output=True,
+                on_output_candidate=observation.observe_output_candidate,
+                capture_output_candidate_time=observation.capture_output_candidate_time,
+            )
+
+        self.assertEqual(result[1], "")
+        self.assertEqual(result[3], "tool_protocol_error")
+        self.assertIsNone(observation.output_delta_ms("content"))
+
+    async def test_leading_whitespace_dsml_only_never_becomes_visible_content(self):
+        from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata
+
+        valid_protocol = (
+            "<｜｜DSML｜｜tool_calls>"
+            '<｜｜DSML｜｜invoke name="web_search"></｜｜DSML｜｜invoke>'
+            "</｜｜DSML｜｜tool_calls>"
+        )
+        cases = (
+            ("valid", valid_protocol, "tool_calls"),
+            ("malformed", "<｜｜DSML｜｜tool_calls>garbage", "tool_protocol_error"),
+        )
+
+        for case_index, (name, protocol, finish_reason) in enumerate(cases, 1):
+            with self.subTest(name=name):
+                now = [110.0 + case_index]
+                observation = LLMRoundObservation(
+                    metadata=RoundMetadata("conv", "run", 1, "step", "agent", "model", "provider"),
+                    litellm_model="test/model",
+                    messages=[],
+                    call_kwargs={},
+                    clock=lambda: now[0],
+                    token_estimator=lambda *_args, **_kwargs: 1,
+                    context_window_resolver=lambda _model_id: (4096, "test", "known"),
+                    run_context_in_thread=False,
+                )
+                append_chunk = AsyncMock()
+                on_visible_output = AsyncMock()
+
+                async def response():
+                    start = 110.0 + case_index
+                    for offset, content, terminal in (
+                        (0.1, "\n", None),
+                        (0.2, "\r\n", None),
+                        (0.3, protocol[:9], None),
+                        (0.4, protocol[9:], "stop"),
+                    ):
+                        now[0] = start + offset
+                        yield make_chunk(delta=SimpleNamespace(content=content), finish_reason=terminal)
+
+                observation.start()
+                with (
+                    patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+                    patch("app.services.stream.llm_stream.check_lock_owner", new=AsyncMock(return_value=True)),
+                    patch("app.services.stream.llm_stream.logger.warning") as warning,
+                ):
+                    result = await llm_stream_module.stream_round(
+                        observation.wrap_response(response()),
+                        "conv",
+                        "task",
+                        False,
+                        "thinking",
+                        "text",
+                        on_visible_output=on_visible_output,
+                        on_output_candidate=observation.observe_output_candidate,
+                        capture_output_candidate_time=observation.capture_output_candidate_time,
+                    )
+
+                self.assertEqual(result[1], "")
+                self.assertEqual(result[3], finish_reason)
+                append_chunk.assert_not_awaited()
+                on_visible_output.assert_not_awaited()
+                self.assertIsNone(observation.output_delta_ms("content"))
+                self.assertFalse(
+                    any(
+                        "answering 内容过滤出现非单调输出" in str(call.args[0])
+                        for call in warning.call_args_list
+                    )
+                )
+
+    async def test_normal_whitespace_content_stays_visible(self):
+        from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata
+
+        cases = (
+            (
+                "whitespace_only",
+                ((0.1, "\n", None), (0.2, "\r\n", "stop")),
+                "\n\r\n",
+            ),
+            (
+                "whitespace_then_body",
+                ((0.1, "\n", None), (0.2, "\r\n", None), (0.4, "普通正文", "stop")),
+                "\n\r\n普通正文",
+            ),
+        )
+
+        for case_index, (name, chunks, expected) in enumerate(cases, 1):
+            with self.subTest(name=name):
+                now = [120.0 + case_index]
+                observation = LLMRoundObservation(
+                    metadata=RoundMetadata("conv", "run", 1, "step", "agent", "model", "provider"),
+                    litellm_model="test/model",
+                    messages=[],
+                    call_kwargs={},
+                    clock=lambda: now[0],
+                    token_estimator=lambda *_args, **_kwargs: 1,
+                    context_window_resolver=lambda _model_id: (4096, "test", "known"),
+                    run_context_in_thread=False,
+                )
+                append_chunk = AsyncMock()
+                on_visible_output = AsyncMock()
+
+                async def response():
+                    start = 120.0 + case_index
+                    for offset, content, finish_reason in chunks:
+                        now[0] = start + offset
+                        yield make_chunk(delta=SimpleNamespace(content=content), finish_reason=finish_reason)
+
+                observation.start()
+                with (
+                    patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+                    patch("app.services.stream.llm_stream.check_lock_owner", new=AsyncMock(return_value=True)),
+                ):
+                    result = await llm_stream_module.stream_round(
+                        observation.wrap_response(response()),
+                        "conv",
+                        "task",
+                        False,
+                        "thinking",
+                        "text",
+                        on_visible_output=on_visible_output,
+                        on_output_candidate=observation.observe_output_candidate,
+                        capture_output_candidate_time=observation.capture_output_candidate_time,
+                    )
+
+                self.assertEqual(result[1], expected)
+                self.assertEqual(
+                    [call.args[2] for call in append_chunk.await_args_list],
+                    [expected],
+                )
+                on_visible_output.assert_awaited_once_with("content")
+                self.assertEqual(observation.output_delta_ms("content"), 100)
+
+    async def test_whitespace_after_visible_body_is_not_delayed_until_finish(self):
+        append_chunk = AsyncMock()
+        append_counts_before_finish = []
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv-visible-body",
+            task_id="task-visible-body",
+            should_use_reasoning=False,
+            thinking_block_id="thinking",
+            text_block_id="text",
+        )
+
+        async def response():
+            yield make_chunk(delta=SimpleNamespace(content="普通正文"))
+            yield make_chunk(delta=SimpleNamespace(content="\n"))
+            append_counts_before_finish.append(append_chunk.await_count)
+            yield make_chunk(delta=SimpleNamespace(content=None), finish_reason="stop")
+
+        with (
+            patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+            patch("app.services.stream.llm_stream.check_lock_owner", new=AsyncMock(return_value=True)),
+        ):
+            result = await llm_stream_module.consume_stream_round(response(), request)
+
+        self.assertEqual(result.content_buf, "普通正文\n")
+        self.assertEqual(append_counts_before_finish, [2])
+        self.assertEqual(
+            [call.args[2] for call in append_chunk.await_args_list],
+            ["普通正文", "\n"],
+        )
+
+    async def test_final_flush_clears_pending_candidate_state_on_error_and_cancel(self):
+        cases = (
+            ("success", None),
+            ("error", RuntimeError("redis failed")),
+            ("cancel", asyncio.CancelledError()),
+        )
+
+        for name, error in cases:
+            with self.subTest(name=name):
+                state = llm_stream_module.LLMStreamState(
+                    raw_content_buf="\n",
+                    pending_reasoning_candidate_time=1.0,
+                    pending_content_candidate_time=2.0,
+                )
+                request = llm_stream_module.LLMStreamRequest(
+                    conversation_id="conv-flush-cleanup",
+                    task_id="task-flush-cleanup",
+                    should_use_reasoning=False,
+                    thinking_block_id="thinking",
+                    text_block_id="text",
+                )
+                append_chunk = AsyncMock(side_effect=error)
+
+                with patch("app.services.stream.llm_stream.append_chunk", append_chunk):
+                    if error is None:
+                        await llm_stream_module.flush_pending_internal_mcp_aliases(
+                            request=request,
+                            state=state,
+                        )
+                    else:
+                        with self.assertRaises(type(error)) as raised:
+                            await llm_stream_module.flush_pending_internal_mcp_aliases(
+                                request=request,
+                                state=state,
+                            )
+                        self.assertIs(raised.exception, error)
+
+                self.assertIsNone(state.pending_reasoning_candidate_time)
+                self.assertIsNone(state.pending_content_candidate_time)
+
+    async def test_leading_whitespace_is_not_published_when_stream_errors_or_is_cancelled(self):
+        from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata
+
+        cases = (
+            ("error", RuntimeError("stream failed")),
+            ("cancel", asyncio.CancelledError()),
+        )
+
+        for case_index, (name, error) in enumerate(cases, 1):
+            with self.subTest(name=name):
+                now = [130.0 + case_index]
+                observation = LLMRoundObservation(
+                    metadata=RoundMetadata("conv", "run", 1, "step", "agent", "model", "provider"),
+                    litellm_model="test/model",
+                    messages=[],
+                    call_kwargs={},
+                    clock=lambda: now[0],
+                    token_estimator=lambda *_args, **_kwargs: 1,
+                    context_window_resolver=lambda _model_id: (4096, "test", "known"),
+                    run_context_in_thread=False,
+                )
+                append_chunk = AsyncMock()
+                on_visible_output = AsyncMock()
+
+                async def response():
+                    start = 130.0 + case_index
+                    now[0] = start + 0.1
+                    yield make_chunk(delta=SimpleNamespace(content="\n"))
+                    now[0] = start + 0.2
+                    yield make_chunk(delta=SimpleNamespace(content="\r\n"))
+                    raise error
+
+                observation.start()
+                with (
+                    patch("app.services.stream.llm_stream.append_chunk", append_chunk),
+                    patch("app.services.stream.llm_stream.check_lock_owner", new=AsyncMock(return_value=True)),
+                ):
+                    with self.assertRaises(type(error)) as raised:
+                        await llm_stream_module.stream_round(
+                            observation.wrap_response(response()),
+                            "conv",
+                            "task",
+                            False,
+                            "thinking",
+                            "text",
+                            on_visible_output=on_visible_output,
+                            on_output_candidate=observation.observe_output_candidate,
+                            capture_output_candidate_time=observation.capture_output_candidate_time,
+                        )
+
+                self.assertIs(raised.exception, error)
+                append_chunk.assert_not_awaited()
+                on_visible_output.assert_not_awaited()
+                self.assertIsNone(observation.output_delta_ms("content"))
+
+    def test_extract_usage_supports_cache_tokens_and_rejects_invalid_values(self):
+        usage = SimpleNamespace(
+            prompt_tokens=10,
+            completion_tokens=4,
+            cache_read_input_tokens=6,
+            cache_creation_input_tokens=2,
+        )
+
+        result = llm_stream_module.extract_usage(SimpleNamespace(usage=usage))
+
+        self.assertEqual(
+            result,
+            Usage(
+                input_tokens=10,
+                output_tokens=4,
+                cache_read_tokens=6,
+                cache_write_tokens=2,
+            ),
+        )
+
+        invalid = SimpleNamespace(
+            prompt_tokens=10,
+            completion_tokens=4,
+            cache_read_tokens=True,
+            cache_read_input_tokens=-1,
+            cache_write_tokens=float("inf"),
+        )
+        invalid_result = llm_stream_module.extract_usage(SimpleNamespace(usage=invalid))
+        self.assertIsNone(invalid_result.cache_read_tokens)
+        self.assertIsNone(invalid_result.cache_write_tokens)
+
+    def test_extract_usage_supports_nested_prompt_cache_details(self):
+        usage = {
+            "prompt_tokens": 12,
+            "completion_tokens": 5,
+            "prompt_tokens_details": {"cached_tokens": 7},
+            "cache_creation_input_tokens": 3,
+        }
+
+        result = llm_stream_module.extract_usage(SimpleNamespace(usage=usage))
+
+        self.assertEqual(result.cache_read_tokens, 7)
+        self.assertEqual(result.cache_write_tokens, 3)
+
     async def test_plan_mode_tool_round_buffers_content_without_answering_or_preview(self):
         events: list[str] = []
 
@@ -1831,6 +2478,44 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             call.await_args.kwargs["extra_body"],
             {"metadata": {"tags": ["app:fusion", "phase:chat_stream"]}},
+        )
+
+    async def test_visible_output_callback_runs_after_redis_append_for_each_kind(self):
+        events = []
+
+        async def append_chunk(*args, **_kwargs):
+            events.append(("append", args[1]))
+            return "entry-id"
+
+        async def on_visible_output(kind):
+            events.append(("first", kind))
+
+        request = llm_stream_module.LLMStreamRequest(
+            conversation_id="conv",
+            task_id="task",
+            should_use_reasoning=True,
+            thinking_block_id="thinking",
+            text_block_id="text",
+            on_visible_output=on_visible_output,
+        )
+        state = llm_stream_module.LLMStreamState()
+
+        with patch("app.services.stream.llm_stream.append_chunk", new=append_chunk):
+            await llm_stream_module.append_reasoning_and_content(
+                request=request,
+                state=state,
+                reasoning_delta="推理",
+                content_delta="正文",
+            )
+
+        self.assertEqual(
+            events,
+            [
+                ("append", "reasoning"),
+                ("first", "reasoning"),
+                ("append", "answering"),
+                ("first", "content"),
+            ],
         )
 
 

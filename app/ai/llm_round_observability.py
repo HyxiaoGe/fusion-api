@@ -138,18 +138,29 @@ def calculate_budget_metrics(
     return round(prompt_tokens / context_window_tokens, 6), prompt_tokens > context_window_tokens
 
 
-def _has_text_delta(chunk: Any) -> bool:
+def _output_delta_kinds(chunk: Any) -> tuple[str, ...]:
     choices = getattr(chunk, "choices", None) or []
     if not choices:
-        return False
+        return ()
     delta = getattr(choices[0], "delta", None)
     if delta is None:
-        return False
+        return ()
     reasoning = getattr(delta, "reasoning_content", None)
     model_extra = getattr(delta, "model_extra", None)
     if not reasoning and isinstance(model_extra, dict):
         reasoning = model_extra.get("reasoning_content")
-    return bool(reasoning or getattr(delta, "content", None))
+    kinds = []
+    if reasoning:
+        kinds.append("reasoning")
+    if getattr(delta, "content", None):
+        kinds.append("content")
+    if getattr(delta, "tool_calls", None):
+        kinds.append("tool_call")
+    return tuple(kinds)
+
+
+def _has_text_delta(chunk: Any) -> bool:
+    return bool({"reasoning", "content"}.intersection(_output_delta_kinds(chunk)))
 
 
 class _ObservedAsyncIterator:
@@ -199,6 +210,11 @@ class LLMRoundObservation:
         }
         self.started_at: float | None = None
         self.first_text_delta_at: float | None = None
+        self.first_output_delta_at: float | None = None
+        self.first_output_delta_kind: str | None = None
+        self.first_output_delta_at_by_kind: dict[str, float] = {}
+        self._current_chunk_observed_at: float | None = None
+        self.finished_at: float | None = None
         self._context_result = self._resolve_window()
         self._estimate_task: asyncio.Future[tuple[int | None, str]] | None = None
         self._log_task: asyncio.Task[None] | None = None
@@ -237,8 +253,54 @@ class LLMRoundObservation:
         return _ObservedAsyncIterator(response, self)
 
     def observe_chunk(self, chunk: Any) -> None:
-        if self.first_text_delta_at is None and _has_text_delta(chunk):
-            self.first_text_delta_at = self.clock()
+        delta_kinds = _output_delta_kinds(chunk)
+        if not delta_kinds:
+            self._current_chunk_observed_at = None
+            return
+        observed_at = self.clock()
+        self._current_chunk_observed_at = observed_at
+        if self.first_text_delta_at is None and {"reasoning", "content"}.intersection(delta_kinds):
+            self.first_text_delta_at = observed_at
+
+    def capture_output_candidate_time(self) -> float | None:
+        """返回当前模型 chunk 的单调到达时刻，供过滤层跨 chunk 保留归因。"""
+        return self._current_chunk_observed_at
+
+    def observe_output_candidate(self, delta_kind: str, observed_at: float | None = None) -> None:
+        """记录过滤、重分类后的候选 kind，复用当前模型 chunk 的到达时刻。"""
+        if delta_kind not in {"reasoning", "content", "tool_call"}:
+            return
+        if observed_at is None:
+            observed_at = self._current_chunk_observed_at
+        if observed_at is None:
+            return
+        if self.first_output_delta_at is None:
+            self.first_output_delta_at = observed_at
+            self.first_output_delta_kind = delta_kind
+        self.first_output_delta_at_by_kind.setdefault(delta_kind, observed_at)
+
+    def output_delta_ms(self, delta_kind: str) -> int | None:
+        observed_at = self.first_output_delta_at_by_kind.get(delta_kind)
+        if self.started_at is None or observed_at is None:
+            return None
+        return max(0, int(round((observed_at - self.started_at) * 1000)))
+
+    def freeze(self) -> None:
+        """在流消费结束处冻结网络测量，后续 sink 延迟不得计入。"""
+        if self.finished_at is None:
+            self.finished_at = self.clock()
+
+    @property
+    def first_output_delta_ms(self) -> int | None:
+        if self.started_at is None or self.first_output_delta_at is None:
+            return None
+        return max(0, int(round((self.first_output_delta_at - self.started_at) * 1000)))
+
+    @property
+    def duration_ms(self) -> int | None:
+        if self.started_at is None or self.finished_at is None:
+            return None
+        return max(0, int(round((self.finished_at - self.started_at) * 1000)))
 
     async def finish_success(self, *, usage: Usage | None, finish_reason: str) -> None:
         outcome = "cancelled" if finish_reason == "cancelled" else "success"
@@ -317,7 +379,10 @@ class LLMRoundObservation:
         error_type: str | None,
     ) -> None:
         try:
-            finished_at = self.clock()
+            self.freeze()
+            finished_at = self.finished_at
+            if finished_at is None:
+                return
             self._log_task = asyncio.create_task(
                 self._finish_log(
                     finished_at=finished_at,

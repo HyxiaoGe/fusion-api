@@ -17,6 +17,11 @@ class SessionCacheMessageIdTests(unittest.IsolatedAsyncioTestCase):
             session = MagicMock()
             mock_sl.return_value.__enter__.return_value = session
             session.get.return_value = None
+            lock_result = MagicMock()
+            lock_result.scalar_one_or_none.return_value = "conv-1"
+            max_result = MagicMock()
+            max_result.scalar_one.return_value = None
+            session.execute.side_effect = [lock_result, max_result]
 
             await write_session_started(
                 run_id="run-1",
@@ -25,6 +30,7 @@ class SessionCacheMessageIdTests(unittest.IsolatedAsyncioTestCase):
                 model_id="gpt-4",
                 provider="openai",
                 message_id="assistant-1",
+                turn_message_id="user-1",
             )
 
             session.add.assert_called_once()
@@ -38,7 +44,11 @@ class SessionCacheMessageIdTests(unittest.IsolatedAsyncioTestCase):
             session = MagicMock()
             mock_sl.return_value.__enter__.return_value = session
             existing = MagicMock()
-            existing.message_id = "old-assistant"
+            existing.conversation_id = "conv-2"
+            existing.user_id = "user-2"
+            existing.message_id = "assistant-1"
+            existing.turn_message_id = "user-1"
+            existing.previous_run_id = None
             session.get.return_value = existing
 
             await write_session_started(
@@ -48,6 +58,7 @@ class SessionCacheMessageIdTests(unittest.IsolatedAsyncioTestCase):
                 model_id="gpt-5",
                 provider="anthropic",
                 message_id="assistant-1",
+                turn_message_id="user-1",
             )
 
             session.add.assert_not_called()

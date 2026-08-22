@@ -857,6 +857,8 @@ class Usage(BaseModel):
 
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_read_tokens: Optional[int] = Field(default=None, ge=0)
+    cache_write_tokens: Optional[int] = Field(default=None, ge=0)
     context: Optional[ContextUsage] = None
 
     @field_validator("context", mode="before")
@@ -950,6 +952,7 @@ class ChatRequest(BaseModel):
     # 重试必须复用原轮次消息 ID，防止把同一用户问题再次追加到会话历史。
     retry_user_message_id: Optional[str] = None
     retry_assistant_message_id: Optional[str] = None
+    previous_run_id: Optional[str] = None
     stream: bool = True  # 默认开启流式
     options: Optional[Dict[str, Any]] = None  # 扩展选项，如 use_reasoning
     file_ids: Optional[List[str]] = None  # 附带的文件 ID 列表
@@ -1006,6 +1009,8 @@ class ChatRequest(BaseModel):
                 and self.assistant_message_id.lower() != self.retry_assistant_message_id.lower()
             ):
                 raise ValueError("assistant_message_id 与 retry_assistant_message_id 必须一致")
+        if self.previous_run_id is not None and self.retry_user_message_id is None:
+            raise ValueError("previous_run_id 必须与 retry_user_message_id 同时提供")
         return self
 
 

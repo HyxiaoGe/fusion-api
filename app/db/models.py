@@ -16,6 +16,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    Uuid,
     func,
     text,
 )
@@ -735,6 +736,13 @@ class AgentSession(Base):
         index=True,
     )
     message_id = Column(String, nullable=True)
+    turn_message_id = Column(String, nullable=True)
+    previous_run_id = Column(
+        String,
+        ForeignKey("agent_sessions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    attempt_index = Column(Integer, nullable=True)
     user_id = Column(String, nullable=False, index=True)
     model_id = Column(String(100), nullable=False)
     provider = Column(String(50), nullable=False)
@@ -747,6 +755,7 @@ class AgentSession(Base):
     status = Column(
         String(20), nullable=False
     )  # "running" | "completed" | "limit_reached" | "incomplete" | "error" | "interrupted"
+    terminal_at = Column(DateTime(timezone=True), nullable=True, index=True)
     limit_reason = Column(String(30), nullable=True)  # "max_steps" | "max_tool_calls" | "timeout"
     error_message = Column(Text, nullable=True)
 
@@ -758,10 +767,124 @@ class AgentSession(Base):
         index=True,
     )
 
+    previous_run = relationship(
+        "AgentSession",
+        remote_side=[id],
+        foreign_keys=[previous_run_id],
+        back_populates="next_runs",
+    )
+    next_runs = relationship(
+        "AgentSession",
+        foreign_keys=[previous_run_id],
+        back_populates="previous_run",
+    )
+
     __table_args__ = (
+        Index(
+            "uq_agent_sessions_turn_attempt",
+            "turn_message_id",
+            "attempt_index",
+            unique=True,
+            postgresql_where=text("turn_message_id IS NOT NULL AND attempt_index IS NOT NULL"),
+        ),
         Index("ix_agent_sessions_conversation_message_created_at", "conversation_id", "message_id", "created_at"),
         Index("ix_agent_sessions_conversation_created_id", "conversation_id", "created_at", "id"),
         Index("ix_agent_sessions_user_created_id", "user_id", "created_at", "id"),
+    )
+
+
+class AgentEvent(Base):
+    """用户安全的 Agent 事件追加账本。"""
+
+    __tablename__ = "agent_events"
+
+    event_id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    conversation_id = Column(
+        String,
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    message_id = Column(String, nullable=True)
+    run_id = Column(
+        String,
+        ForeignKey("agent_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sequence = Column(Integer, nullable=False)
+    event_type = Column(String, nullable=False)
+    schema_version = Column(Integer, nullable=False, default=1, server_default="1")
+    step_id = Column(String, nullable=True)
+    tool_call_id = Column(String, nullable=True)
+    parent_step_id = Column(String, nullable=True)
+    trace_id = Column(String, nullable=True)
+    event_ts = Column(DateTime(timezone=True), nullable=False)
+    recorded_at = Column(DateTime(timezone=True), nullable=False, default=utc_now, server_default=func.now())
+    payload = Column(JSONB, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("run_id", "sequence", name="uq_agent_events_run_sequence"),
+        Index("ix_agent_events_conversation_ts", "conversation_id", "event_ts"),
+        Index("ix_agent_events_run", "run_id"),
+    )
+
+
+class RunTrajectoryMeta(Base):
+    """run 级轨迹完整性状态，与 AgentSession 业务终态分离。"""
+
+    __tablename__ = "run_trajectory_meta"
+
+    run_id = Column(
+        String,
+        ForeignKey("agent_sessions.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    conversation_id = Column(
+        String,
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    message_id = Column(String, nullable=True)
+    trajectory_status = Column(String, nullable=False)
+    event_count = Column(Integer, nullable=False, default=0, server_default="0")
+    expected_last_sequence = Column(Integer, nullable=True)
+    first_event_ts = Column(DateTime(timezone=True), nullable=True)
+    last_event_ts = Column(DateTime(timezone=True), nullable=True)
+    finalized_at = Column(DateTime(timezone=True), nullable=True)
+    degraded_reason = Column(Text, nullable=True)
+    terminal_intent_id = Column(String, nullable=True)
+    terminal_intent_status = Column(String, nullable=True)
+    terminal_intent_reason = Column(Text, nullable=True)
+    terminal_intent_version = Column(Integer, nullable=True)
+    terminal_intent_pending_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        server_default=func.now(),
+        onupdate=utc_now,
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_run_trajectory_meta_terminal_intent_pending",
+            "trajectory_status",
+            "terminal_intent_pending_at",
+            postgresql_where=text("terminal_intent_pending_at IS NOT NULL"),
+        ),
+    )
+
+
+class TrajectoryLedgerSettings(Base):
+    """轨迹账本的环境级不可变启用水位。"""
+
+    __tablename__ = "trajectory_ledger_settings"
+
+    singleton_key = Column(String, primary_key=True)
+    ledger_enabled_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("singleton_key = 'default'", name="ck_trajectory_ledger_settings_singleton_key"),
     )
 
 

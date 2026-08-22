@@ -215,6 +215,173 @@ class DynamicToolExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "success")
         self.assertEqual(handler.execute.await_count, 2)
 
+    async def test_physical_attempt_lifecycle_wraps_each_backoff_invocation(self):
+        emitter = AsyncMock()
+        handler = SimpleNamespace(
+            tool_name="web_search",
+            execute=AsyncMock(
+                side_effect=[
+                    ToolResult(
+                        status="failed",
+                        data={"error_code": "search_unavailable", "retryable": True},
+                    ),
+                    ToolResult(status="success", data={"sources": []}),
+                ]
+            ),
+            _build_result_summary=MagicMock(return_value={}),
+        )
+        request = tool_executor_module.ToolExecutionBatchRequest(
+            conversation_id="conv-attempt",
+            user_id="user-attempt",
+            model_id="model-attempt",
+            provider="openai",
+            step_number=3,
+            emitter=emitter,
+        )
+
+        with patch("backoff._async.asyncio.sleep", new=AsyncMock()):
+            result = await tool_executor_module.execute_tool_handler(
+                request=request,
+                tool_call={"id": "call-attempt", "name": "web_search"},
+                handler=handler,
+                args={},
+            )
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual(
+            [call.kwargs["attempt_index"] for call in emitter.tool_attempt_started.await_args_list],
+            [1, 2],
+        )
+        self.assertEqual(
+            [call.kwargs["status"] for call in emitter.tool_attempt_completed.await_args_list],
+            ["failed", "success"],
+        )
+        self.assertEqual(
+            emitter.tool_attempt_started.await_args_list[0].kwargs["tool_call_id"],
+            "call-attempt",
+        )
+
+    async def test_single_physical_attempt_maps_timeout_and_cancellation(self):
+        emitter = AsyncMock()
+        handler = SimpleNamespace(
+            tool_name="side_effect_tool",
+            supports_automatic_retry=False,
+            execute=AsyncMock(),
+            _build_result_summary=MagicMock(return_value={}),
+        )
+        request = tool_executor_module.ToolExecutionBatchRequest(
+            conversation_id="conv-attempt",
+            user_id="user-attempt",
+            model_id="model-attempt",
+            provider="openai",
+            step_number=4,
+            emitter=emitter,
+        )
+
+        handler.execute.side_effect = asyncio.TimeoutError
+        result = await tool_executor_module.execute_tool_handler(
+            request=request,
+            tool_call={"id": "call-timeout", "name": handler.tool_name},
+            handler=handler,
+            args={},
+        )
+
+        self.assertEqual(result.data["error_code"], "tool_timeout")
+        self.assertEqual(emitter.tool_attempt_completed.await_args.kwargs["status"], "timeout")
+        self.assertEqual(emitter.tool_attempt_completed.await_args.kwargs["error_code"], "tool_timeout")
+
+        emitter.reset_mock()
+        handler.execute.side_effect = RuntimeError("上游敏感错误")
+        emitter.tool_attempt_completed.side_effect = RuntimeError("terminal sink failed")
+        failed = await tool_executor_module.execute_tool_handler(
+            request=request,
+            tool_call={"id": "call-error", "name": handler.tool_name},
+            handler=handler,
+            args={},
+        )
+        self.assertEqual(failed.data["error_code"], "tool_execution_failed")
+        self.assertEqual(emitter.tool_attempt_completed.await_args.kwargs["status"], "failed")
+        self.assertIsNone(emitter.tool_attempt_completed.await_args.kwargs["error_code"])
+
+        emitter.reset_mock()
+        primary_cancel = asyncio.CancelledError("primary")
+        secondary_cancel = asyncio.CancelledError("secondary")
+        emitter.tool_attempt_completed.side_effect = secondary_cancel
+        handler.execute.side_effect = primary_cancel
+        with self.assertRaises(asyncio.CancelledError) as raised:
+            await tool_executor_module.execute_tool_handler(
+                request=request,
+                tool_call={"id": "call-cancel", "name": handler.tool_name},
+                handler=handler,
+                args={},
+            )
+        self.assertIs(raised.exception, primary_cancel)
+        self.assertEqual(emitter.tool_attempt_completed.await_args.kwargs["status"], "cancelled")
+
+        emitter.reset_mock()
+        handler.execute.side_effect = RuntimeError("primary handler failure")
+        emitter.tool_attempt_completed.side_effect = asyncio.CancelledError("secondary")
+        failed = await tool_executor_module.execute_tool_handler(
+            request=request,
+            tool_call={"id": "call-error-secondary-cancel", "name": handler.tool_name},
+            handler=handler,
+            args={},
+        )
+        self.assertEqual(failed.data["error_code"], "tool_execution_failed")
+
+    async def test_attempt_emitter_failure_aborts_without_fabricating_logical_completion(self):
+        emitter = AsyncMock()
+        emitter.tool_attempt_started.side_effect = RuntimeError("event stream unavailable")
+        handler = SimpleNamespace(
+            tool_name="web_search",
+            execute=AsyncMock(return_value=ToolResult(status="success")),
+            _build_result_summary=MagicMock(return_value={}),
+        )
+        request = tool_executor_module.ToolExecutionBatchRequest(
+            conversation_id="conv-attempt",
+            user_id="user-attempt",
+            model_id="model-attempt",
+            provider="openai",
+            emitter=emitter,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "event stream unavailable"):
+            await tool_executor_module.execute_tool_handler(
+                request=request,
+                tool_call={"id": "call-control-plane", "name": handler.tool_name},
+                handler=handler,
+                args={},
+            )
+
+        handler.execute.assert_not_awaited()
+        emitter.tool_call_completed.assert_not_awaited()
+
+        emitter.reset_mock()
+        emitter.tool_attempt_started.side_effect = None
+        emitter.tool_attempt_completed.side_effect = asyncio.CancelledError("terminal cancelled")
+        with self.assertRaises(asyncio.CancelledError):
+            await tool_executor_module.execute_tool_handler(
+                request=request,
+                tool_call={"id": "call-terminal-cancel", "name": handler.tool_name},
+                handler=handler,
+                args={},
+            )
+
+        emitter.tool_call_completed.assert_not_awaited()
+
+        emitter.reset_mock()
+        emitter.tool_attempt_started.side_effect = None
+        emitter.tool_attempt_completed.side_effect = RuntimeError("terminal event stream unavailable")
+        with self.assertRaisesRegex(RuntimeError, "terminal event stream unavailable"):
+            await tool_executor_module.execute_tool_handler(
+                request=request,
+                tool_call={"id": "call-terminal-control-plane", "name": handler.tool_name},
+                handler=handler,
+                args={},
+            )
+
+        emitter.tool_call_completed.assert_not_awaited()
+
     async def test_invalid_argument_json_returns_repair_context_without_calling_remote_handler(self):
         handler = MagicMock()
         handler.tool_name = "mcp_docs_a1b2c3d4"
@@ -260,6 +427,8 @@ class DynamicToolExecutionTests(unittest.IsolatedAsyncioTestCase):
         emitter.tool_call_completed.assert_awaited_once()
         self.assertEqual(emitter.tool_call_completed.await_args.kwargs["status"], "degraded")
         self.assertIsNone(emitter.tool_call_completed.await_args.kwargs["error"])
+        emitter.tool_attempt_started.assert_not_awaited()
+        emitter.tool_attempt_completed.assert_not_awaited()
 
     async def test_repeated_invalid_argument_json_is_not_retryable_and_never_calls_handler(self):
         handler = MagicMock()
@@ -1490,7 +1659,7 @@ class WebSearchRedirectPresentationTests(unittest.TestCase):
 
 
 class AgentEventCompositeWriterTests(unittest.IsolatedAsyncioTestCase):
-    async def test_writes_redis_before_recorder(self):
+    async def test_writes_redis_then_progress_then_trajectory(self):
         calls = []
 
         class RedisWriter:
@@ -1499,9 +1668,17 @@ class AgentEventCompositeWriterTests(unittest.IsolatedAsyncioTestCase):
 
         class Recorder:
             def record_chunk(self, conversation_id, chunk_type, payload):
-                calls.append(("recorder", conversation_id, chunk_type, payload))
+                calls.append(("progress", conversation_id, chunk_type, payload))
 
-        writer = AgentEventCompositeWriter(redis_writer=RedisWriter(), recorder=Recorder())
+        class TrajectoryRecorder:
+            async def record_chunk(self, conversation_id, chunk_type, payload):
+                calls.append(("trajectory", conversation_id, chunk_type, payload))
+
+        writer = AgentEventCompositeWriter(
+            redis_writer=RedisWriter(),
+            recorder=Recorder(),
+            trajectory_recorder=TrajectoryRecorder(),
+        )
 
         await writer.append_chunk("c1", "task-1", "agent_event", {"type": "run_progress_updated"})
 
@@ -1509,9 +1686,54 @@ class AgentEventCompositeWriterTests(unittest.IsolatedAsyncioTestCase):
             calls,
             [
                 ("redis", "c1", "task-1", "agent_event", {"type": "run_progress_updated"}),
-                ("recorder", "c1", "agent_event", {"type": "run_progress_updated"}),
+                ("progress", "c1", "agent_event", {"type": "run_progress_updated"}),
+                ("trajectory", "c1", "agent_event", {"type": "run_progress_updated"}),
             ],
         )
+
+    async def test_required_redis_failure_is_raised_unchanged_before_auxiliary_sinks(self):
+        failure = RuntimeError("redis failed")
+        progress = MagicMock()
+        trajectory = AsyncMock()
+        redis_writer = AsyncMock()
+        redis_writer.append_chunk.side_effect = failure
+        writer = AgentEventCompositeWriter(
+            redis_writer=redis_writer,
+            recorder=progress,
+            trajectory_recorder=trajectory,
+        )
+
+        with self.assertRaises(RuntimeError) as raised:
+            await writer.append_chunk("c1", "task-1", "agent_event", {"type": "plan_snapshot"})
+
+        self.assertIs(raised.exception, failure)
+        progress.record_chunk.assert_not_called()
+        trajectory.record_chunk.assert_not_awaited()
+
+    async def test_progress_failure_is_fail_open_and_does_not_skip_trajectory(self):
+        progress = MagicMock()
+        progress.record_chunk.side_effect = RuntimeError("progress failed")
+        trajectory = AsyncMock()
+        writer = AgentEventCompositeWriter(
+            redis_writer=AsyncMock(),
+            recorder=progress,
+            trajectory_recorder=trajectory,
+        )
+
+        await writer.append_chunk("c1", "task-1", "agent_event", {"type": "step_started"})
+
+        trajectory.record_chunk.assert_awaited_once()
+
+    async def test_trajectory_failure_is_fail_open(self):
+        trajectory = AsyncMock()
+        trajectory.record_chunk.side_effect = RuntimeError("trajectory failed")
+        writer = AgentEventCompositeWriter(
+            redis_writer=AsyncMock(),
+            recorder=MagicMock(),
+            trajectory_recorder=trajectory,
+        )
+
+        await writer.append_chunk("c1", "task-1", "agent_event", {"type": "step_started"})
 
 
 class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):

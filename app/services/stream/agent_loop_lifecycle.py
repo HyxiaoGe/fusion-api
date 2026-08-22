@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import time
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.core.logger import app_logger as logger
 from app.core.prompt_bundle import get_active_prompt_bundle_revision
 from app.schemas.chat import TextBlock
 from app.schemas.response import ApiException
@@ -28,6 +31,7 @@ from app.services.stream_state_service import StreamOwnershipLostError
 AsyncFn = Callable[..., Awaitable[Any]]
 PersistMessageFn = Callable[..., Any]
 LogFn = Callable[[str], None]
+TRAJECTORY_BARRIER_TIMEOUT_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -75,20 +79,103 @@ async def run_agent_loop_lifecycle(
     execution: AgentLoopExecutionContext,
     dependencies: AgentLoopLifecycleDependencies,
 ) -> None:
+    primary_error: BaseException | None = None
     try:
         await _run_success_path(request=request, execution=execution, dependencies=dependencies)
-    except asyncio.CancelledError:
-        await _finalize_cancelled(execution=execution, dependencies=dependencies)
+    except asyncio.CancelledError as error:
+        primary_error = error
+        if not execution.state.superseded_terminal_decided:
+            await _finalize_cancelled(execution=execution, dependencies=dependencies)
         raise
     except StreamOwnershipLostError:
         # stop 接口或后续请求已经原子接管 Redis 终态时，后台任务可能先观察到
         # 写入权失效，再收到 asyncio cancellation。这属于正常中断，不应记为生成失败。
-        await _finalize_cancelled(execution=execution, dependencies=dependencies)
+        if not execution.state.superseded_terminal_decided:
+            await _finalize_cancelled(execution=execution, dependencies=dependencies)
     except Exception as error:
-        await _finalize_failed(error=error, execution=execution, dependencies=dependencies)
+        primary_error = error
+        if not execution.state.superseded_terminal_decided:
+            await _finalize_failed(error=error, execution=execution, dependencies=dependencies)
         raise
     finally:
-        await _write_fallback(execution=execution, dependencies=dependencies)
+        fallback_error: BaseException | None = None
+        try:
+            await _write_fallback(execution=execution, dependencies=dependencies)
+        except BaseException as error:
+            fallback_error = error
+            raise
+        finally:
+            cancelled_during_barrier = await commit_trajectory_barrier(
+                execution=execution,
+                warning_fn=dependencies.warning_fn,
+            )
+            if cancelled_during_barrier and primary_error is None and fallback_error is None:
+                raise asyncio.CancelledError
+
+
+async def commit_trajectory_barrier(
+    *,
+    execution: AgentLoopExecutionContext,
+    warning_fn: LogFn,
+) -> bool:
+    """幂等执行 emitter seal 与 Recorder finalize，并保留调用方取消语义。"""
+    state = execution.trajectory_barrier_state
+    if state.started:
+        return False
+    state.started = True
+
+    async def _commit() -> None:
+        last_sequence = await execution.emitter.seal_and_get_last_sequence()
+        await execution.trajectory_recorder.finalize(last_sequence)
+
+    barrier_task = asyncio.create_task(_commit())
+    cancelled, error, timed_out = await _wait_for_trajectory_barrier(barrier_task)
+    if timed_out:
+        barrier_task.add_done_callback(_consume_trajectory_barrier_result)
+        warning_fn(f"轨迹完整性提交屏障超时: run_id={execution.run_id}")
+    elif error is not None:
+        warning_fn(
+            "轨迹完整性提交屏障失败: "
+            f"run_id={execution.run_id}, error_type={type(error).__name__}"
+        )
+    return cancelled
+
+
+async def _wait_for_trajectory_barrier(
+    barrier_task: asyncio.Task[None],
+) -> tuple[bool, BaseException | None, bool]:
+    """在绝对 deadline 内等待；外层二次取消不取消底层 barrier。"""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + TRAJECTORY_BARRIER_TIMEOUT_SECONDS
+    cancelled = False
+    while not barrier_task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return cancelled, None, True
+        try:
+            done, _pending = await asyncio.wait({barrier_task}, timeout=remaining)
+        except asyncio.CancelledError:
+            cancelled = True
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                current_task.uncancel()
+            continue
+        if not done:
+            return cancelled, None, True
+
+    try:
+        barrier_task.result()
+    except BaseException as error:  # barrier 是辅助路径，任何异常都只降级并记录类型
+        return cancelled, error, False
+    return cancelled, None, False
+
+
+def _consume_trajectory_barrier_result(barrier_task: asyncio.Task[None]) -> None:
+    """消费外层超时后的迟到异常，避免 never-retrieved 告警。"""
+    try:
+        barrier_task.exception()
+    except asyncio.CancelledError:
+        pass
 
 
 async def _run_success_path(
@@ -195,6 +282,9 @@ async def _start_run(
         model_id=context.model_id,
         provider=execution.runtime.provider,
         message_id=context.assistant_message_id,
+        turn_message_id=execution.turn_message_id,
+        previous_run_id=execution.previous_run_id,
+        run_attempt_kind=execution.run_attempt_kind,
         tools=request.call_config.announced_tools,
         config=_run_config(request.limits, request.call_config),
     )
@@ -261,20 +351,75 @@ async def _prepare_knowledge_grounding(
         phase="researching",
         label="正在检索所选知识库",
     )
+    retrieval_id = str(uuid.uuid4())
+    started_at = time.monotonic()
+    await execution.emitter.retrieval_started(
+        retrieval_id=retrieval_id,
+        query_summary=request.original_message,
+        parent_step_id=None,
+    )
     try:
-        return await prepare_knowledge_grounding(
+        grounding = await prepare_knowledge_grounding(
             db=execution.completion_context.db,
             user_id=execution.runtime.user_id,
             query=request.original_message,
             knowledge_base_ids=request.knowledge_base_ids,
             citation_start=max_explicit_citation_index(request.initial_content_blocks) + 1,
         )
+    except asyncio.CancelledError:
+        await _emit_retrieval_terminal_preserving_primary(
+            execution.emitter.retrieval_cancelled,
+            retrieval_id=retrieval_id,
+            reason="shutdown",
+            parent_step_id=None,
+        )
+        raise
     except ApiException as error:
-        raise to_stream_grounding_error(error) from error
-    except KnowledgeGroundingStreamError:
+        mapped_error = to_stream_grounding_error(error)
+        await _emit_retrieval_terminal_preserving_primary(
+            execution.emitter.retrieval_failed,
+            retrieval_id=retrieval_id,
+            error_code=mapped_error.error_code,
+            message=None,
+            parent_step_id=None,
+        )
+        raise mapped_error from error
+    except KnowledgeGroundingStreamError as error:
+        await _emit_retrieval_terminal_preserving_primary(
+            execution.emitter.retrieval_failed,
+            retrieval_id=retrieval_id,
+            error_code=error.error_code,
+            message=None,
+            parent_step_id=None,
+        )
         raise
     except Exception as error:
-        raise KnowledgeGroundingStreamError("knowledge_retrieval_unavailable") from error
+        mapped_error = KnowledgeGroundingStreamError("knowledge_retrieval_unavailable")
+        await _emit_retrieval_terminal_preserving_primary(
+            execution.emitter.retrieval_failed,
+            retrieval_id=retrieval_id,
+            error_code=mapped_error.error_code,
+            message=None,
+            parent_step_id=None,
+        )
+        raise mapped_error from error
+    await execution.emitter.retrieval_completed(
+        retrieval_id=retrieval_id,
+        document_count=grounding.evidence_block.source_count,
+        duration_ms=max(0, int(round((time.monotonic() - started_at) * 1000))),
+        parent_step_id=None,
+    )
+    return grounding
+
+
+async def _emit_retrieval_terminal_preserving_primary(emit: AsyncFn, **kwargs: Any) -> None:
+    try:
+        await emit(**kwargs)
+    except BaseException as secondary:
+        logger.warning(
+            "知识检索生命周期收尾失败，保留主异常: error_type=%s",
+            type(secondary).__name__,
+        )
 
 
 async def _finalize_completed(
@@ -293,6 +438,7 @@ async def _finalize_completed(
         persist_message_fn=dependencies.persist_message_fn,
         complete_agent_run_fn=dependencies.complete_agent_run_fn,
         finalize_stream_fn=dependencies.finalize_stream_fn,
+        interrupt_agent_run_fn=dependencies.interrupt_agent_run_fn,
         claim_suggested_questions_fn=(dependencies.claim_suggested_questions_fn if generate_suggestions else None),
         generate_suggested_questions_fn=(
             dependencies.generate_suggested_questions_fn if generate_suggestions else None

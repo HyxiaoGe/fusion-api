@@ -16,6 +16,7 @@ from app.schemas.chat import ContentBlock
 from app.schemas.content_block_registry import deserialize_content_blocks
 from app.schemas.response import ApiException
 from app.services.agent.plan_coordinator import PlanMode, normalize_plan_mode
+from app.services.agent.session_cache import InvalidPreviousRunError, validate_previous_run_candidate
 from app.services.stream.agent_loop_policy import AgentLoopLimits
 from app.services.stream.agent_task_policy import AgentTaskPolicy, restore_agent_task_policy
 
@@ -68,26 +69,39 @@ def find_latest_limit_reached_session(
     db: Session,
     *,
     conversation_id: str,
+    user_id: str,
     message_id: str,
+    turn_message_id: str,
     previous_run_id: str | None = None,
 ) -> AgentSession:
     query = db.query(AgentSession).filter(
         AgentSession.conversation_id == conversation_id,
+        AgentSession.user_id == user_id,
         AgentSession.message_id == message_id,
     )
     session = query.order_by(AgentSession.created_at.desc()).first()
-    if session is None or session.status != "limit_reached":
-        raise ApiException.bad_request("这条回答当前不能继续执行")
-    if previous_run_id and session.id != previous_run_id:
-        raise ApiException.bad_request("这条回答当前不能继续执行")
-    return session
+    try:
+        if previous_run_id and (session is None or session.id != previous_run_id):
+            raise InvalidPreviousRunError("previous run 不是当前 assistant 的最新运行")
+        return validate_previous_run_candidate(
+            session,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            turn_message_id=turn_message_id,
+            message_id=message_id,
+            run_attempt_kind="continue",
+        )
+    except InvalidPreviousRunError as error:
+        raise ApiException.not_found("待接续的 Agent 运行不存在或不可用") from error
 
 
 def build_continuation_context(
     db: Session,
     *,
     conversation_id: str,
+    user_id: str,
     message_id: str,
+    turn_message_id: str,
     previous_run_id: str | None,
     default_limits: AgentLoopLimits,
 ) -> AgentContinuationContext:
@@ -106,7 +120,9 @@ def build_continuation_context(
     previous_session = find_latest_limit_reached_session(
         db,
         conversation_id=conversation_id,
+        user_id=user_id,
         message_id=message_id,
+        turn_message_id=turn_message_id,
         previous_run_id=previous_run_id,
     )
 

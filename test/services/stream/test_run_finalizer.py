@@ -19,6 +19,7 @@ class RunFinalizerTests(unittest.IsolatedAsyncioTestCase):
             run_completed=AsyncMock(),
             run_interrupted=AsyncMock(),
             run_failed=AsyncMock(),
+            seal_and_get_last_sequence=AsyncMock(),
         )
         cache = SimpleNamespace(
             write_session_started=AsyncMock(),
@@ -59,6 +60,9 @@ class RunFinalizerTests(unittest.IsolatedAsyncioTestCase):
             model_id="gpt-4",
             provider="openai",
             message_id="msg-1",
+            turn_message_id="turn-1",
+            previous_run_id="run-previous",
+            run_attempt_kind="regenerate",
             tools=["web_search"],
             config={"max_steps": 8},
         )
@@ -73,6 +77,9 @@ class RunFinalizerTests(unittest.IsolatedAsyncioTestCase):
                     model_id="gpt-4",
                     provider="openai",
                     message_id="msg-1",
+                    turn_message_id="turn-1",
+                    previous_run_id="run-previous",
+                    run_attempt_kind="regenerate",
                     run_config={"max_steps": 8},
                 ),
                 call.run_started(
@@ -113,6 +120,7 @@ class RunFinalizerTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ],
         )
+        emitter.seal_and_get_last_sequence.assert_not_awaited()
 
     async def test_interrupt_agent_run_closes_current_step_before_interrupted_status(self):
         emitter, cache, order = self._deps()

@@ -52,6 +52,7 @@ class AgentLoopState:
     limit_reason: AgentLoopLimitReason | None = None
     unknown_terminated: bool = False
     terminal_emitted: bool = False
+    superseded_terminal_decided: bool = False
     consecutive_no_progress_search_results: int = 0
     context_wait_seconds: float = 0.0
     runtime_contexts: dict[str, Any] = field(default_factory=dict)
@@ -163,11 +164,20 @@ class AgentLoopState:
         return max(0.0, now - run_start - self.context_wait_seconds)
 
     def final_usage(self) -> Usage | None:
-        if self.accumulated_usage.input_tokens <= 0 and self.last_context is None:
+        usage = self.accumulated_usage
+        if (
+            usage.input_tokens <= 0
+            and usage.output_tokens <= 0
+            and usage.cache_read_tokens is None
+            and usage.cache_write_tokens is None
+            and self.last_context is None
+        ):
             return None
         return Usage(
-            input_tokens=self.accumulated_usage.input_tokens,
-            output_tokens=self.accumulated_usage.output_tokens,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cache_read_tokens=usage.cache_read_tokens,
+            cache_write_tokens=usage.cache_write_tokens,
             context=self.last_context,
         )
 
@@ -176,6 +186,9 @@ class AgentLoopState:
 
     def mark_terminal_emitted(self) -> None:
         self.terminal_emitted = True
+
+    def mark_superseded_terminal_decided(self) -> None:
+        self.superseded_terminal_decided = True
 
     def run_stats(self, run_id: str) -> AgentRunStats:
         return AgentRunStats(

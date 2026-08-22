@@ -29,6 +29,7 @@ from app.services.knowledge.chat_grounding import (
     validate_grounded_answer,
 )
 from app.services.stream.context_status import build_context_usage, emit_context_status
+from app.services.stream.llm_round_lifecycle import LLMRoundLifecycle, accumulate_token_usage
 from app.services.stream.reasoning_policy import configure_reasoning_call_kwargs
 from app.services.stream.research_evidence import (
     ResearchEvidenceWorkset,
@@ -63,6 +64,7 @@ class LimitSummaryRoundResult:
     context: ContextUsage | None = None
     tool_calls: tuple[dict, ...] = ()
     finish_reason: str = "stop"
+    llm_lifecycle: LLMRoundLifecycle | None = None
 
 
 @dataclass(frozen=True)
@@ -245,13 +247,14 @@ def _create_limit_summary_observation(
     context_plan: ContextPlan,
     step_id: str,
     call_kwargs: dict,
+    round_index: int | None = None,
     estimator_status: str | None = None,
 ) -> Any:
     round_kind = "plan_synthesis" if request.summary_finish_reason == "plan_synthesis" else "limit_summary"
     return create_llm_round_observation(
         conversation_id=request.conversation_id,
         run_id=request.run_id,
-        round_index=request.step_number,
+        round_index=round_index or request.step_number,
         step_id=step_id,
         round_kind=round_kind,
         model_id=request.model_id,
@@ -273,6 +276,7 @@ async def call_limit_summary_round(
     text_block_id: str,
     step_id: str,
     partial_output: dict[str, str] | None = None,
+    round_index: int | None = None,
 ) -> LimitSummaryRoundResult:
     final_call_kwargs = configure_reasoning_call_kwargs(
         build_limit_summary_call_kwargs(request.call_kwargs),
@@ -297,6 +301,7 @@ async def call_limit_summary_round(
             context_plan=error.plan,
             step_id=step_id,
             call_kwargs=final_call_kwargs,
+            round_index=round_index,
             estimator_status="context_manager_error",
         )
         observation.start()
@@ -312,6 +317,15 @@ async def call_limit_summary_round(
         context_plan=context_plan,
         step_id=step_id,
         call_kwargs=final_call_kwargs,
+        round_index=round_index,
+    )
+    lifecycle = await LLMRoundLifecycle.start(
+        emitter=request.emitter,
+        observation=observation,
+        round_index=round_index or request.step_number,
+        model=request.model_id,
+        provider=request.provider,
+        parent_step_id=step_id,
     )
     observation.start()
     try:
@@ -336,6 +350,22 @@ async def call_limit_summary_round(
             stream_kwargs["allow_deferred_reasoning_output"] = True
         if partial_output is not None and _accepts_keyword(request.stream_round_fn, "partial_output"):
             stream_kwargs["partial_output"] = partial_output
+        visible_callback_supported = _accepts_keyword(request.stream_round_fn, "on_visible_output")
+        if (
+            lifecycle is not None
+            and not _should_defer_summary_output(request)
+            and visible_callback_supported
+        ):
+            stream_kwargs["on_visible_output"] = lifecycle.publish_visible_output
+        candidate_callback = getattr(observation, "observe_output_candidate", None)
+        if callable(candidate_callback) and _accepts_keyword(request.stream_round_fn, "on_output_candidate"):
+            stream_kwargs["on_output_candidate"] = candidate_callback
+        capture_candidate_time = getattr(observation, "capture_output_candidate_time", None)
+        if callable(capture_candidate_time) and _accepts_keyword(
+            request.stream_round_fn,
+            "capture_output_candidate_time",
+        ):
+            stream_kwargs["capture_output_candidate_time"] = capture_candidate_time
         reasoning_buf, content_buf, tool_calls, finish_reason, usage_data = await request.stream_round_fn(
             response,
             request.conversation_id,
@@ -345,42 +375,102 @@ async def call_limit_summary_round(
             text_block_id,
             **stream_kwargs,
         )
-    except BaseException as exc:
-        await observation.finish_error(exc)
+    except asyncio.CancelledError as exc:
+        await _close_summary_round_after_primary_error(
+            observation=observation,
+            lifecycle=lifecycle,
+            error=exc,
+        )
         raise
-    final_context = build_context_usage(context_plan, usage_data, round_index=request.step_number)
-    if request.on_context_updated is not None:
-        request.on_context_updated(final_context)
-    await emit_context_status(request.emitter, phase="final", context=final_context)
-    await observation.finish_success(usage=usage_data, finish_reason=finish_reason)
-    request.log_round_summary_fn(
-        conversation_id=request.conversation_id,
-        run_id=request.run_id,
-        step_number=request.step_number,
-        model_id=request.model_id,
-        provider=request.provider,
-        finish_reason=request.summary_finish_reason,
-        tool_calls_count=len(tool_calls),
-        reasoning_buf=reasoning_buf,
-        content_buf=content_buf,
-    )
-    return LimitSummaryRoundResult(
-        reasoning_buf=reasoning_buf,
-        content_buf=content_buf,
-        usage_data=usage_data,
-        context=final_context,
-        tool_calls=tuple(tool_calls),
-        finish_reason=finish_reason,
-    )
+    except BaseException as exc:
+        await _close_summary_round_after_primary_error(
+            observation=observation,
+            lifecycle=lifecycle,
+            error=exc,
+        )
+        raise
+    try:
+        freeze = getattr(observation, "freeze", None)
+        if callable(freeze):
+            freeze()
+        final_context = build_context_usage(context_plan, usage_data, round_index=request.step_number)
+        if request.on_context_updated is not None:
+            request.on_context_updated(final_context)
+        await emit_context_status(request.emitter, phase="final", context=final_context)
+        await observation.finish_success(usage=usage_data, finish_reason=finish_reason)
+        if lifecycle is not None:
+            lifecycle.record_result(usage=usage_data, finish_reason=finish_reason)
+            if finish_reason == "cancelled":
+                await lifecycle.finish_cancelled(reason="superseded")
+            elif _should_defer_summary_output(request) and tool_calls:
+                await lifecycle.publish_tool_output()
+            elif not _should_defer_summary_output(request):
+                if tool_calls:
+                    await lifecycle.publish_tool_output()
+                elif content_buf:
+                    await lifecycle.publish_visible_output("content")
+                elif reasoning_buf:
+                    await lifecycle.publish_visible_output("reasoning")
+                await lifecycle.finish_success(output_visible=False)
+        request.log_round_summary_fn(
+            conversation_id=request.conversation_id,
+            run_id=request.run_id,
+            step_number=request.step_number,
+            model_id=request.model_id,
+            provider=request.provider,
+            finish_reason=request.summary_finish_reason,
+            tool_calls_count=len(tool_calls),
+            reasoning_buf=reasoning_buf,
+            content_buf=content_buf,
+        )
+        return LimitSummaryRoundResult(
+            reasoning_buf=reasoning_buf,
+            content_buf=content_buf,
+            usage_data=usage_data,
+            context=final_context,
+            tool_calls=tuple(tool_calls),
+            finish_reason=finish_reason,
+            llm_lifecycle=(lifecycle if lifecycle is not None and not lifecycle.terminal_emitted else None),
+        )
+    except asyncio.CancelledError as exc:
+        await _close_summary_round_after_primary_error(
+            observation=observation,
+            lifecycle=lifecycle,
+            error=exc,
+        )
+        raise
+    except BaseException as exc:
+        await _close_summary_round_after_primary_error(
+            observation=observation,
+            lifecycle=lifecycle,
+            error=exc,
+        )
+        raise
 
 
 def accumulate_summary_usage(accumulated_usage: Usage, usage_data: Usage | None) -> Usage:
-    if not usage_data:
-        return accumulated_usage
-    return Usage(
-        input_tokens=accumulated_usage.input_tokens + usage_data.input_tokens,
-        output_tokens=accumulated_usage.output_tokens + usage_data.output_tokens,
-    )
+    return accumulate_token_usage(accumulated_usage, usage_data)
+
+
+async def _close_summary_round_after_primary_error(
+    *, observation: Any, lifecycle: LLMRoundLifecycle | None, error: BaseException
+) -> None:
+    freeze = getattr(observation, "freeze", None)
+    if callable(freeze):
+        freeze()
+    try:
+        await observation.finish_error(error)
+    except BaseException as secondary:
+        logger.warning("总结 LLM 观测异常收尾失败，保留主异常: error_type=%s", type(secondary).__name__)
+    if lifecycle is None:
+        return
+    try:
+        if isinstance(error, asyncio.CancelledError):
+            await lifecycle.finish_cancelled(reason="shutdown")
+        else:
+            await lifecycle.finish_failed(error)
+    except BaseException as secondary:
+        logger.warning("总结 LLM 生命周期异常收尾失败，保留主异常: error_type=%s", type(secondary).__name__)
 
 
 def append_summary_content_blocks(
@@ -431,6 +521,7 @@ async def run_summary_round_with_timeout(
     remaining: float,
 ) -> LimitSummaryRoundResult:
     started_at = time.monotonic()
+    next_round_index = request.step_number
     first_partial: dict[str, str] = {}
     try:
         first_result = await asyncio.wait_for(
@@ -440,9 +531,11 @@ async def run_summary_round_with_timeout(
                 text_block_id=text_block_id,
                 step_id=summary_context.step_id,
                 partial_output=first_partial if _streams_standard_plan_synthesis(request) else None,
+                round_index=next_round_index,
             ),
             timeout=remaining,
         )
+        next_round_index += 1
     except asyncio.TimeoutError:
         warning = request.warning_fn if request.warning_fn is not None else logger.warning
         warning(f"触顶总结超出剩余预算: conv_id={request.conversation_id}, budget={remaining}s")
@@ -476,8 +569,10 @@ async def run_summary_round_with_timeout(
             context=first_result.context,
             tool_calls=(),
             finish_reason="protocol_fallback",
+            llm_lifecycle=first_result.llm_lifecycle,
         )
     else:
+        await _finish_summary_round_lifecycle(first_result, model_output_visible=False)
         warning = request.warning_fn if request.warning_fn is not None else logger.warning
         warning(
             "无工具收尾总结返回了工具协议，执行一次无工具重试: "
@@ -500,9 +595,11 @@ async def run_summary_round_with_timeout(
                     text_block_id=text_block_id,
                     step_id=summary_context.step_id,
                     partial_output=retry_partial if _streams_standard_plan_synthesis(request) else None,
+                    round_index=next_round_index,
                 ),
                 timeout=retry_remaining,
             )
+            next_round_index += 1
         except asyncio.TimeoutError:
             warning(
                 "无工具收尾重试超出剩余预算，使用安全失败文案: "
@@ -535,6 +632,7 @@ async def run_summary_round_with_timeout(
 
         usage_data = _combine_optional_usage(first_result.usage_data, retry_result.usage_data)
         if _is_summary_tool_protocol_violation(retry_result):
+            await _finish_summary_round_lifecycle(retry_result, model_output_visible=False)
             warning(
                 "无工具收尾重试仍返回工具协议，使用安全失败文案: "
                 f"conv_id={request.conversation_id}, run_id={request.run_id}, step={request.step_number}"
@@ -553,6 +651,7 @@ async def run_summary_round_with_timeout(
                 context=retry_result.context,
                 tool_calls=(),
                 finish_reason=retry_result.finish_reason,
+                llm_lifecycle=retry_result.llm_lifecycle,
             )
         else:
             result = LimitSummaryRoundResult(
@@ -562,6 +661,7 @@ async def run_summary_round_with_timeout(
                 context=retry_result.context,
                 tool_calls=(),
                 finish_reason=retry_result.finish_reason,
+                llm_lifecycle=retry_result.llm_lifecycle,
             )
 
     return await _repair_deep_research_summary_citations(
@@ -571,6 +671,7 @@ async def run_summary_round_with_timeout(
         text_block_id=text_block_id,
         result=result,
         remaining=remaining - (time.monotonic() - started_at),
+        round_index=next_round_index,
     )
 
 
@@ -582,6 +683,7 @@ async def _repair_deep_research_summary_citations(
     text_block_id: str,
     result: LimitSummaryRoundResult,
     remaining: float,
+    round_index: int,
 ) -> LimitSummaryRoundResult:
     """证据充足但最终引用缺失或越界时，允许一次无工具引用修正。"""
 
@@ -606,6 +708,7 @@ async def _repair_deep_research_summary_citations(
             "content": build_research_repair_prompt(validation.reason, workset),
         }
     )
+    await _finish_summary_round_lifecycle(result, model_output_visible=False)
     try:
         repaired = await asyncio.wait_for(
             call_limit_summary_round(
@@ -613,6 +716,7 @@ async def _repair_deep_research_summary_citations(
                 thinking_block_id=thinking_block_id,
                 text_block_id=text_block_id,
                 step_id=summary_context.step_id,
+                round_index=round_index,
             ),
             timeout=remaining,
         )
@@ -620,6 +724,7 @@ async def _repair_deep_research_summary_citations(
         warning(f"深度研究收尾引用修正超出剩余预算: conv_id={request.conversation_id}, budget={remaining}s")
         return result
     if _is_summary_tool_protocol_violation(repaired):
+        await _finish_summary_round_lifecycle(repaired, model_output_visible=False)
         warning(
             "深度研究收尾引用修正返回工具协议，保留原候选等待安全门禁: "
             f"conv_id={request.conversation_id}, run_id={request.run_id}, step={request.step_number}"
@@ -632,6 +737,7 @@ async def _repair_deep_research_summary_citations(
         context=repaired.context,
         tool_calls=(),
         finish_reason=repaired.finish_reason,
+        llm_lifecycle=repaired.llm_lifecycle,
     )
 
 
@@ -639,14 +745,27 @@ def _combine_optional_usage(*items: Usage | None) -> Usage | None:
     present = [item for item in items if item is not None]
     if not present:
         return None
-    return Usage(
-        input_tokens=sum(item.input_tokens for item in present),
-        output_tokens=sum(item.output_tokens for item in present),
-    )
+    combined = present[0]
+    for item in present[1:]:
+        combined = accumulate_token_usage(combined, item)
+    return combined
 
 
 def _is_summary_tool_protocol_violation(result: LimitSummaryRoundResult) -> bool:
     return bool(result.tool_calls) or result.finish_reason == "tool_protocol_error"
+
+
+async def _finish_summary_round_lifecycle(
+    result: LimitSummaryRoundResult,
+    *,
+    model_output_visible: bool,
+) -> None:
+    lifecycle = result.llm_lifecycle
+    if lifecycle is None:
+        return
+    if model_output_visible:
+        await lifecycle.publish_visible_output("content")
+    await lifecycle.finish_success(output_visible=False)
 
 
 def _build_summary_protocol_fallback(
@@ -661,6 +780,7 @@ def _build_summary_protocol_fallback(
         context=result.context,
         tool_calls=(),
         finish_reason="protocol_fallback",
+        llm_lifecycle=result.llm_lifecycle,
     )
 
 
@@ -709,6 +829,7 @@ def _build_streamed_retry_failure(
                 context=retry_result.context,
                 tool_calls=(),
                 finish_reason=retry_result.finish_reason,
+                llm_lifecycle=retry_result.llm_lifecycle,
             )
         return _build_summary_protocol_fallback(
             fallback_result,
@@ -730,6 +851,7 @@ def _build_streamed_retry_failure(
             context=(retry_result or first_result).context,
             tool_calls=(),
             finish_reason=finish_reason,
+            llm_lifecycle=None,
         )
     return LimitSummaryRoundResult(
         reasoning_buf=reasoning_buf,
@@ -738,6 +860,7 @@ def _build_streamed_retry_failure(
         context=(retry_result or first_result).context,
         tool_calls=(),
         finish_reason=finish_reason,
+        llm_lifecycle=None,
     )
 
 
@@ -773,6 +896,55 @@ async def run_limit_summary_step(
         remaining=remaining,
     )
 
+    next_usage = accumulate_summary_usage(request.accumulated_usage, round_result.usage_data)
+    primary_error: BaseException | None = None
+    try:
+        incomplete = await _commit_limit_summary_result(
+            request=request,
+            round_result=round_result,
+            summary_context=summary_context,
+            thinking_block_id=thinking_block_id,
+            text_block_id=text_block_id,
+        )
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        try:
+            await _finish_summary_round_lifecycle(round_result, model_output_visible=False)
+        except BaseException as secondary_error:
+            if primary_error is None:
+                raise
+            try:
+                logger.warning(
+                    "deferred 总结生命周期收尾失败，保留主异常: "
+                    "error_type=%s error_code=deferred_terminal_failure",
+                    type(secondary_error).__name__,
+                )
+            except BaseException:
+                pass
+    await complete_limit_summary_step(
+        summary_context=summary_context,
+        emitter=request.emitter,
+        session_cache=request.session_cache,
+        complete_step_fn=request.complete_step_fn,
+        clock=request.clock,
+    )
+    return LimitSummaryOutcome(
+        accumulated_usage=next_usage,
+        context=round_result.context,
+        incomplete=incomplete,
+    )
+
+
+async def _commit_limit_summary_result(
+    *,
+    request: LimitSummaryStepRequest,
+    round_result: LimitSummaryRoundResult,
+    summary_context: Any,
+    thinking_block_id: str,
+    text_block_id: str,
+) -> bool:
     if round_result.reasoning_buf:
         request.content_blocks.append(
             ThinkingBlock(
@@ -782,10 +954,8 @@ async def run_limit_summary_step(
             )
         )
 
-    next_usage = accumulate_summary_usage(request.accumulated_usage, round_result.usage_data)
-    incomplete = False
     if request.task_mode == "deep_research":
-        incomplete = await _complete_deep_research_summary(
+        return await _complete_deep_research_summary(
             request=request,
             round_result=round_result,
             thinking_block_id=thinking_block_id,
@@ -800,7 +970,6 @@ async def run_limit_summary_step(
         candidate = round_result.content_buf.strip()
         valid = evidence_block is not None and validate_grounded_answer(candidate, evidence_block)
         answer = candidate if valid else KNOWLEDGE_UNVERIFIABLE_ANSWER_TEXT
-        incomplete = not valid
         await append_chunk(
             request.conversation_id,
             "answering",
@@ -810,8 +979,11 @@ async def run_limit_summary_step(
             run_id=request.run_id,
             step_id=summary_context.step_id,
         )
+        if valid:
+            await _finish_summary_round_lifecycle(round_result, model_output_visible=True)
         request.content_blocks.append(TextBlock(type="text", id=text_block_id, text=answer))
         await _emit_knowledge_summary_used_evidence(request=request, answer_text=answer)
+        return not valid
     elif request.summary_finish_reason == "plan_synthesis":
         has_answer = bool(round_result.content_buf.strip())
         has_streamed_content = _streams_standard_plan_synthesis(request) and bool(round_result.content_buf.strip())
@@ -838,6 +1010,7 @@ async def run_limit_summary_step(
             )
         if answer:
             request.content_blocks.append(TextBlock(type="text", id=text_block_id, text=answer))
+        return incomplete
     else:
         answer = round_result.content_buf.strip()
         incomplete = round_result.finish_reason == "protocol_fallback" or not answer
@@ -853,6 +1026,8 @@ async def run_limit_summary_step(
                 run_id=request.run_id,
                 step_id=summary_context.step_id,
             )
+            if round_result.content_buf.strip():
+                await _finish_summary_round_lifecycle(round_result, model_output_visible=True)
         if round_result.content_buf.strip():
             append_summary_content_blocks(
                 content_blocks=request.content_blocks,
@@ -861,18 +1036,7 @@ async def run_limit_summary_step(
             )
         else:
             request.content_blocks.append(TextBlock(type="text", id=text_block_id, text=answer))
-    await complete_limit_summary_step(
-        summary_context=summary_context,
-        emitter=request.emitter,
-        session_cache=request.session_cache,
-        complete_step_fn=request.complete_step_fn,
-        clock=request.clock,
-    )
-    return LimitSummaryOutcome(
-        accumulated_usage=next_usage,
-        context=round_result.context,
-        incomplete=incomplete,
-    )
+        return incomplete
 
 
 async def _complete_deep_research_summary(
@@ -902,6 +1066,8 @@ async def _complete_deep_research_summary(
         run_id=request.run_id,
         step_id=step_id,
     )
+    if validation.is_valid:
+        await _finish_summary_round_lifecycle(round_result, model_output_visible=True)
     append_summary_content_blocks(
         content_blocks=request.content_blocks,
         content_buf=answer,

@@ -1,8 +1,19 @@
 import asyncio
+import concurrent.futures
+import tempfile
+import threading
 import unittest
+from dataclasses import replace
+from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
+
+from app.db.database import Base
+from app.db.models import AgentEvent, AgentSession, RunTrajectoryMeta
 from app.schemas.chat import (
     KnowledgeEvidenceBlock,
     KnowledgeSourceReference,
@@ -12,6 +23,7 @@ from app.schemas.chat import (
     TextBlock,
     UrlBlock,
 )
+from app.services.agent.trajectory_recorder import TrajectoryRecorder
 from app.services.knowledge.chat_grounding import KnowledgeGroundingResult
 from app.services.stream.agent_loop_driver import AgentLoopExit, AgentLoopOutcome
 from app.services.stream.agent_loop_execution import (
@@ -24,13 +36,21 @@ from app.services.stream.agent_loop_execution import (
 from app.services.stream.agent_loop_lifecycle import (
     AgentLoopLifecycleDependencies,
     AgentLoopLifecycleRequest,
+    _prepare_knowledge_grounding,
+    commit_trajectory_barrier,
     configure_research_state,
     run_agent_loop_lifecycle,
 )
 from app.services.stream.agent_loop_policy import AgentLoopLimits
 from app.services.stream.agent_loop_request_prep import AgentLoopPreparedMessages
+from app.services.stream.agent_loop_run_completion import (
+    finalize_completed_run,
+    write_fallback_run_error,
+)
 from app.services.stream.research_evidence import validate_research_completion
-from app.services.stream_state_service import StreamOwnershipLostError
+from app.services.stream.run_finalizer import interrupt_agent_run
+from app.services.stream.tool_executor import AgentEventCompositeWriter
+from app.services.stream_state_service import StreamOwnershipLostError, StreamWriteTerminalError
 
 
 async def _unused_async(**_kwargs):
@@ -42,6 +62,113 @@ def _unused_sync(*_args, **_kwargs):
 
 
 class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_knowledge_retrieval_emits_started_and_completed_around_real_call(self):
+        emitted = []
+
+        class CaptureWriter:
+            async def append_chunk(self, _conversation_id, _task_id, _chunk_type, payload):
+                emitted.append(payload)
+
+        execution = self._execution(redis_writer=CaptureWriter())
+        request = AgentLoopLifecycleRequest(
+            raw_messages=[],
+            has_vision=False,
+            file_ids=None,
+            original_message="不能写入轨迹的原始检索问题",
+            call_config=self._call_config(),
+            limits=self._limits(),
+            knowledge_base_ids=["kb-1"],
+        )
+        grounding = SimpleNamespace(evidence_block=SimpleNamespace(source_count=2))
+
+        with patch(
+            "app.services.stream.agent_loop_lifecycle.prepare_knowledge_grounding",
+            new=AsyncMock(return_value=grounding),
+        ):
+            result = await _prepare_knowledge_grounding(request=request, execution=execution)
+
+        self.assertIs(result, grounding)
+        retrieval_events = [event for event in emitted if event["type"].startswith("retrieval_")]
+        self.assertEqual(
+            [event["type"] for event in retrieval_events],
+            ["retrieval_started", "retrieval_completed"],
+        )
+        self.assertEqual(retrieval_events[0]["query_summary"], "已发起知识库检索")
+        self.assertEqual(retrieval_events[1]["document_count"], 2)
+        self.assertGreaterEqual(retrieval_events[1]["duration_ms"], 0)
+
+    async def test_knowledge_retrieval_error_and_cancel_close_the_span(self):
+        emitted = []
+
+        class CaptureWriter:
+            async def append_chunk(self, _conversation_id, _task_id, _chunk_type, payload):
+                emitted.append(payload)
+
+        execution = self._execution(redis_writer=CaptureWriter())
+        request = AgentLoopLifecycleRequest(
+            raw_messages=[],
+            has_vision=False,
+            file_ids=None,
+            original_message="敏感问题",
+            call_config=self._call_config(),
+            limits=self._limits(),
+            knowledge_base_ids=["kb-1"],
+        )
+
+        with patch(
+            "app.services.stream.agent_loop_lifecycle.prepare_knowledge_grounding",
+            new=AsyncMock(side_effect=RuntimeError("上游敏感报错")),
+        ):
+            with self.assertRaisesRegex(Exception, "knowledge_retrieval_unavailable"):
+                await _prepare_knowledge_grounding(request=request, execution=execution)
+
+        retrieval_events = [event for event in emitted if event["type"].startswith("retrieval_")]
+        self.assertEqual(
+            [event["type"] for event in retrieval_events],
+            ["retrieval_started", "retrieval_failed"],
+        )
+        self.assertNotIn("上游敏感报错", str(retrieval_events[-1]))
+
+        emitted.clear()
+        with patch(
+            "app.services.stream.agent_loop_lifecycle.prepare_knowledge_grounding",
+            new=AsyncMock(side_effect=asyncio.CancelledError),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await _prepare_knowledge_grounding(request=request, execution=execution)
+
+        retrieval_events = [event for event in emitted if event["type"].startswith("retrieval_")]
+        self.assertEqual(
+            [event["type"] for event in retrieval_events],
+            ["retrieval_started", "retrieval_cancelled"],
+        )
+
+    async def test_retrieval_terminal_sink_failure_does_not_replace_primary_error_or_cancel(self):
+        execution = self._execution()
+        request = AgentLoopLifecycleRequest(
+            raw_messages=[],
+            has_vision=False,
+            file_ids=None,
+            original_message="敏感问题",
+            call_config=self._call_config(),
+            limits=self._limits(),
+            knowledge_base_ids=["kb-1"],
+        )
+        execution.emitter.retrieval_failed = AsyncMock(side_effect=RuntimeError("sink failed"))
+        with patch(
+            "app.services.stream.agent_loop_lifecycle.prepare_knowledge_grounding",
+            new=AsyncMock(side_effect=RuntimeError("upstream failed")),
+        ):
+            with self.assertRaisesRegex(Exception, "knowledge_retrieval_unavailable"):
+                await _prepare_knowledge_grounding(request=request, execution=execution)
+
+        execution.emitter.retrieval_cancelled = AsyncMock(side_effect=RuntimeError("sink failed"))
+        with patch(
+            "app.services.stream.agent_loop_lifecycle.prepare_knowledge_grounding",
+            new=AsyncMock(side_effect=asyncio.CancelledError),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await _prepare_knowledge_grounding(request=request, execution=execution)
     def test_deep_research_with_files_still_requires_network_gate(self):
         execution = self._execution(
             call_config=SimpleNamespace(
@@ -233,7 +360,7 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
             async def append_chunk(self, *_args, **_kwargs):
                 return None
 
-        return build_agent_loop_execution(
+        execution = build_agent_loop_execution(
             request=AgentLoopExecutionRequest(
                 db="db",
                 conversation_id="conv-life",
@@ -243,6 +370,9 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 litellm_kwargs={},
                 provider="openai",
                 assistant_message_id="msg-life",
+                turn_message_id="turn-life",
+                previous_run_id="run-previous",
+                run_attempt_kind="continue",
                 task_id="task-life",
                 call_config=call_config,
                 trace_id="run-life",
@@ -265,6 +395,9 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 clock=lambda: 10.0,
             ),
         )
+        # lifecycle 测试不连接真实账本数据库；Task 4 只验证编排层 finalize 契约。
+        execution.trajectory_recorder.finalize = AsyncMock()
+        return execution
 
     def _request(self, *, call_config=None, limits=None):
         return AgentLoopLifecycleRequest(
@@ -341,7 +474,17 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
             call_order.append(("append", conversation_id, task_id, chunk_type, content, block_id))
 
         async def start_agent_run_fn(**kwargs):
-            call_order.append(("start", kwargs["run_id"], kwargs["tools"], kwargs["config"]))
+            call_order.append(
+                (
+                    "start",
+                    kwargs["run_id"],
+                    kwargs["turn_message_id"],
+                    kwargs["previous_run_id"],
+                    kwargs["run_attempt_kind"],
+                    kwargs["tools"],
+                    kwargs["config"],
+                )
+            )
 
         async def prepare_messages_fn(**kwargs):
             call_order.append(
@@ -388,9 +531,10 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(call_order[0], ("append", "conv-life", "task-life", "preparing", "", ""))
         self.assertEqual(call_order[1][1], "run-life")
-        self.assertEqual(call_order[1][2], ["web_search"])
+        self.assertEqual(call_order[1][2:5], ("turn-life", "run-previous", "continue"))
+        self.assertEqual(call_order[1][5], ["web_search"])
         self.assertEqual(
-            call_order[1][3],
+            call_order[1][6],
             {
                 "max_steps": 3,
                 "max_tool_calls": 5,
@@ -410,6 +554,782 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call_order[3][1], [{"role": "user", "content": "prepared"}])
         self.assertEqual(call_order[3][2], [initial_block])
         self.assertIs(call_order[4][1], execution.completion_context)
+
+    async def test_completed_persist_superseded_emits_terminal_and_skips_error_fallback(self):
+        events = []
+
+        class CaptureWriter:
+            async def append_chunk(self, _conversation_id, _task_id, _chunk_type, payload):
+                events.append(payload)
+
+        class SessionCache:
+            def __init__(self):
+                self.status = "running"
+
+            async def write_session_status(self, **kwargs):
+                self.status = kwargs["status"]
+
+        session_cache = SessionCache()
+        execution = self._execution(redis_writer=CaptureWriter())
+        execution = replace(
+            execution,
+            completion_context=replace(
+                execution.completion_context,
+                session_cache=session_cache,
+            ),
+        )
+        fallback_status = AsyncMock()
+        finalize_stream = AsyncMock()
+        complete_run = AsyncMock()
+        finalized = []
+
+        async def finalize(expected_last_sequence):
+            finalized.append(expected_last_sequence)
+            self.assertEqual([event["type"] for event in events], ["run_interrupted"])
+
+        execution.trajectory_recorder.finalize = AsyncMock(side_effect=finalize)
+        real_seal = execution.emitter.seal_and_get_last_sequence
+        execution.emitter.seal_and_get_last_sequence = AsyncMock(side_effect=real_seal)
+
+        await run_agent_loop_lifecycle(
+            request=self._request(),
+            execution=execution,
+            dependencies=self._dependencies(
+                finalize_completed_run_fn=finalize_completed_run,
+                write_fallback_run_error_fn=write_fallback_run_error,
+                persist_message_fn=lambda *_args: False,
+                complete_agent_run_fn=complete_run,
+                interrupt_agent_run_fn=interrupt_agent_run,
+                finalize_stream_fn=finalize_stream,
+                write_fallback_error_status_fn=fallback_status,
+            ),
+        )
+
+        self.assertEqual(session_cache.status, "interrupted")
+        self.assertTrue(execution.state.terminal_emitted)
+        self.assertEqual(finalized, [0])
+        self.assertEqual([event["type"] for event in events], ["run_interrupted"])
+        complete_run.assert_not_awaited()
+        fallback_status.assert_not_awaited()
+        execution.emitter.seal_and_get_last_sequence.assert_awaited_once_with()
+        execution.trajectory_recorder.finalize.assert_awaited_once_with(0)
+
+    async def test_completed_persist_superseded_terminal_failure_keeps_business_status_and_no_double_terminal(self):
+        for terminal_error in (
+            StreamWriteTerminalError("required writer failed"),
+            StreamOwnershipLostError("ownership lost"),
+        ):
+            with self.subTest(error_type=type(terminal_error).__name__):
+                events = []
+
+                class FailingTerminalWriter:
+                    async def append_chunk(self, _conversation_id, _task_id, _chunk_type, payload):
+                        if payload["type"] == "run_interrupted":
+                            raise terminal_error
+                        events.append(payload)
+
+                class SessionCache:
+                    def __init__(self):
+                        self.status = "running"
+
+                    async def write_session_status(self, **kwargs):
+                        self.status = kwargs["status"]
+
+                session_cache = SessionCache()
+                execution = self._execution(redis_writer=FailingTerminalWriter())
+                execution = replace(
+                    execution,
+                    completion_context=replace(
+                        execution.completion_context,
+                        session_cache=session_cache,
+                    ),
+                )
+                fallback_status = AsyncMock()
+                finalize_cancelled = AsyncMock()
+                finalize_failed = AsyncMock()
+                execution.trajectory_recorder.finalize = AsyncMock()
+                real_seal = execution.emitter.seal_and_get_last_sequence
+                execution.emitter.seal_and_get_last_sequence = AsyncMock(side_effect=real_seal)
+                dependencies = self._dependencies(
+                    finalize_completed_run_fn=finalize_completed_run,
+                    finalize_cancelled_run_fn=finalize_cancelled,
+                    finalize_failed_run_fn=finalize_failed,
+                    write_fallback_run_error_fn=write_fallback_run_error,
+                    persist_message_fn=lambda *_args: False,
+                    complete_agent_run_fn=AsyncMock(),
+                    interrupt_agent_run_fn=interrupt_agent_run,
+                    finalize_stream_fn=AsyncMock(),
+                    write_fallback_error_status_fn=fallback_status,
+                )
+
+                if isinstance(terminal_error, StreamOwnershipLostError):
+                    await run_agent_loop_lifecycle(
+                        request=self._request(),
+                        execution=execution,
+                        dependencies=dependencies,
+                    )
+                else:
+                    with self.assertRaises(StreamWriteTerminalError) as raised:
+                        await run_agent_loop_lifecycle(
+                            request=self._request(),
+                            execution=execution,
+                            dependencies=dependencies,
+                        )
+                    self.assertIs(raised.exception, terminal_error)
+
+                self.assertEqual(session_cache.status, "interrupted")
+                self.assertFalse(execution.state.terminal_emitted)
+                self.assertEqual(events, [])
+                fallback_status.assert_not_awaited()
+                finalize_cancelled.assert_not_awaited()
+                finalize_failed.assert_not_awaited()
+                execution.emitter.seal_and_get_last_sequence.assert_awaited_once_with()
+                execution.trajectory_recorder.finalize.assert_awaited_once_with(0)
+
+    async def test_completed_persist_superseded_cancel_during_terminal_has_no_second_terminal(self):
+        terminal_entered = asyncio.Event()
+        terminal_calls = 0
+
+        class BlockingTerminalWriter:
+            async def append_chunk(self, _conversation_id, _task_id, _chunk_type, payload):
+                nonlocal terminal_calls
+                if payload["type"] == "run_interrupted":
+                    terminal_calls += 1
+                    terminal_entered.set()
+                    await asyncio.Event().wait()
+
+        class SessionCache:
+            def __init__(self):
+                self.status = "running"
+
+            async def write_session_status(self, **kwargs):
+                self.status = kwargs["status"]
+
+        session_cache = SessionCache()
+        execution = self._execution(redis_writer=BlockingTerminalWriter())
+        execution = replace(
+            execution,
+            completion_context=replace(
+                execution.completion_context,
+                session_cache=session_cache,
+            ),
+        )
+        finalize_cancelled = AsyncMock()
+        fallback_status = AsyncMock()
+        execution.trajectory_recorder.finalize = AsyncMock()
+        real_seal = execution.emitter.seal_and_get_last_sequence
+        execution.emitter.seal_and_get_last_sequence = AsyncMock(side_effect=real_seal)
+        task = asyncio.create_task(
+            run_agent_loop_lifecycle(
+                request=self._request(),
+                execution=execution,
+                dependencies=self._dependencies(
+                    finalize_completed_run_fn=finalize_completed_run,
+                    finalize_cancelled_run_fn=finalize_cancelled,
+                    write_fallback_run_error_fn=write_fallback_run_error,
+                    persist_message_fn=lambda *_args: False,
+                    complete_agent_run_fn=AsyncMock(),
+                    interrupt_agent_run_fn=interrupt_agent_run,
+                    finalize_stream_fn=AsyncMock(),
+                    write_fallback_error_status_fn=fallback_status,
+                ),
+            )
+        )
+        await asyncio.wait_for(terminal_entered.wait(), timeout=0.5)
+
+        self.assertTrue(task.cancel())
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=0.5)
+
+        self.assertEqual(session_cache.status, "interrupted")
+        self.assertEqual(terminal_calls, 1)
+        self.assertFalse(execution.state.terminal_emitted)
+        fallback_status.assert_not_awaited()
+        finalize_cancelled.assert_not_awaited()
+        execution.emitter.seal_and_get_last_sequence.assert_awaited_once_with()
+        execution.trajectory_recorder.finalize.assert_awaited_once_with(0)
+
+    async def test_completed_persist_superseded_real_ledger_terminal_matrix(self):
+        scenarios = (
+            ("accepted", None, None, True, "complete"),
+            (
+                "redis_terminal",
+                StreamWriteTerminalError("required writer failed"),
+                None,
+                False,
+                "degraded",
+            ),
+            (
+                "ownership",
+                StreamOwnershipLostError("ownership lost"),
+                None,
+                False,
+                "degraded",
+            ),
+            ("trajectory_sink", None, "write_failed", True, "degraded"),
+        )
+
+        for scenario, writer_error, sink_reason, terminal_emitted, trajectory_status in scenarios:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temp_dir:
+                database_path = Path(temp_dir) / "trajectory.sqlite3"
+                engine = create_engine(
+                    f"sqlite:///{database_path}",
+                    connect_args={"check_same_thread": False},
+                )
+                session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+                Base.metadata.create_all(engine)
+                with session_factory() as db:
+                    db.add(
+                        AgentSession(
+                            id="run-life",
+                            conversation_id="conv-life",
+                            message_id="msg-life",
+                            user_id="user-life",
+                            model_id="gpt-4",
+                            provider="openai",
+                            status="running",
+                        )
+                    )
+                    db.commit()
+
+                sink_state = {"fail_next": False}
+
+                def recorder_session_factory():
+                    if sink_state["fail_next"]:
+                        sink_state["fail_next"] = False
+                        raise RuntimeError("trajectory terminal sink failed")
+                    return session_factory()
+
+                class RedisWriter:
+                    def __init__(self):
+                        self.events = []
+
+                    async def append_chunk(self, _conversation_id, _task_id, _chunk_type, payload):
+                        if payload["type"] == "run_interrupted":
+                            if writer_error is not None:
+                                raise writer_error
+                            if sink_reason is not None:
+                                sink_state["fail_next"] = True
+                        self.events.append(payload)
+
+                class SessionCache:
+                    async def write_session_status(self, **kwargs):
+                        with session_factory() as db:
+                            session = db.get(AgentSession, kwargs["run_id"])
+                            session.status = kwargs["status"]
+                            session.total_steps = kwargs["total_steps"]
+                            session.total_tool_calls = kwargs["total_tool_calls"]
+                            session.total_duration_ms = kwargs["total_duration_ms"]
+                            session.terminal_at = datetime.now(UTC)
+                            db.commit()
+
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+                try:
+                    recorder = TrajectoryRecorder(
+                        run_id="run-life",
+                        conversation_id="conv-life",
+                        message_id="msg-life",
+                        session_factory=recorder_session_factory,
+                        executor=executor,
+                        semaphore=threading.BoundedSemaphore(4),
+                    )
+                    redis_writer = RedisWriter()
+                    execution = self._execution(redis_writer=redis_writer)
+                    execution.emitter._writer = AgentEventCompositeWriter(
+                        redis_writer=redis_writer,
+                        trajectory_recorder=recorder,
+                    )
+                    execution = replace(
+                        execution,
+                        trajectory_recorder=recorder,
+                        completion_context=replace(
+                            execution.completion_context,
+                            session_cache=SessionCache(),
+                            trajectory_recorder=recorder,
+                        ),
+                    )
+                    real_seal = execution.emitter.seal_and_get_last_sequence
+                    execution.emitter.seal_and_get_last_sequence = AsyncMock(side_effect=real_seal)
+                    real_finalize = recorder.finalize
+                    recorder.finalize = AsyncMock(side_effect=real_finalize)
+                    await execution.emitter.run_started(
+                        message_id="msg-life",
+                        model="gpt-4",
+                        tools=[],
+                        config={},
+                    )
+                    fallback_status = AsyncMock()
+                    finalize_stream = AsyncMock()
+                    dependencies = self._dependencies(
+                        finalize_completed_run_fn=finalize_completed_run,
+                        finalize_cancelled_run_fn=AsyncMock(),
+                        finalize_failed_run_fn=AsyncMock(),
+                        write_fallback_run_error_fn=write_fallback_run_error,
+                        persist_message_fn=lambda *_args: False,
+                        complete_agent_run_fn=AsyncMock(),
+                        interrupt_agent_run_fn=interrupt_agent_run,
+                        finalize_stream_fn=finalize_stream,
+                        write_fallback_error_status_fn=fallback_status,
+                    )
+
+                    if isinstance(writer_error, StreamOwnershipLostError):
+                        await run_agent_loop_lifecycle(
+                            request=self._request(),
+                            execution=execution,
+                            dependencies=dependencies,
+                        )
+                    elif writer_error is not None:
+                        with self.assertRaises(type(writer_error)) as raised:
+                            await run_agent_loop_lifecycle(
+                                request=self._request(),
+                                execution=execution,
+                                dependencies=dependencies,
+                            )
+                        self.assertIs(raised.exception, writer_error)
+                    else:
+                        await run_agent_loop_lifecycle(
+                            request=self._request(),
+                            execution=execution,
+                            dependencies=dependencies,
+                        )
+
+                    with session_factory() as db:
+                        session = db.get(AgentSession, "run-life")
+                        ledger_events = list(
+                            db.scalars(
+                                select(AgentEvent)
+                                .where(AgentEvent.run_id == "run-life")
+                                .order_by(AgentEvent.sequence)
+                            )
+                        )
+                        event_types = [event.event_type for event in ledger_events]
+                        meta = db.get(RunTrajectoryMeta, "run-life")
+                        self.assertEqual(session.status, "interrupted")
+                        self.assertIsNotNone(session.terminal_at)
+                        self.assertEqual(meta.trajectory_status, trajectory_status)
+                        if trajectory_status == "degraded":
+                            self.assertEqual(
+                                meta.degraded_reason,
+                                sink_reason or "finalize_mismatch",
+                            )
+                            self.assertIsNone(meta.finalized_at)
+                        else:
+                            self.assertIsNone(meta.degraded_reason)
+                            self.assertIsNotNone(meta.finalized_at)
+
+                    expected_events = (
+                        ["run_started", "run_interrupted"]
+                        if scenario == "accepted"
+                        else ["run_started"]
+                    )
+                    self.assertEqual(event_types, expected_events)
+                    if scenario == "accepted":
+                        self.assertEqual(ledger_events[-1].payload["reason"], "superseded")
+                    required_event_types = [event["type"] for event in redis_writer.events]
+                    self.assertEqual(
+                        required_event_types,
+                        (
+                            ["run_started", "run_interrupted"]
+                            if writer_error is None
+                            else ["run_started"]
+                        ),
+                    )
+                    self.assertEqual(execution.state.terminal_emitted, terminal_emitted)
+                    fallback_status.assert_not_awaited()
+                    dependencies.finalize_cancelled_run_fn.assert_not_awaited()
+                    dependencies.finalize_failed_run_fn.assert_not_awaited()
+                    execution.emitter.seal_and_get_last_sequence.assert_awaited_once_with()
+                    recorder.finalize.assert_awaited_once_with(1)
+                    if terminal_emitted:
+                        finalize_stream.assert_awaited_once()
+                    else:
+                        finalize_stream.assert_not_awaited()
+                finally:
+                    executor.shutdown(wait=True)
+                    engine.dispose()
+
+    async def test_terminal_matrix_commits_trajectory_barrier_once_after_fallback(self):
+        scenarios = (
+            ("completed", AgentLoopOutcome(exit=AgentLoopExit.COMPLETED), None, None),
+            ("limit_reached", AgentLoopOutcome(exit=AgentLoopExit.COMPLETED), "max_steps", None),
+            ("superseded", AgentLoopOutcome(exit=AgentLoopExit.SUPERSEDED), None, None),
+            ("interrupted", None, None, StreamOwnershipLostError("external stop")),
+            ("failed", None, None, RuntimeError("LLM failed")),
+            ("user_cancelled", None, None, asyncio.CancelledError()),
+        )
+
+        for scenario, outcome, limit_reason, raised_error in scenarios:
+            with self.subTest(scenario=scenario):
+                execution = self._execution()
+                calls = []
+
+                async def run_agent_loop_fn(**_kwargs):
+                    if limit_reason is not None:
+                        execution.state.limit_reason = limit_reason
+                    if raised_error is not None:
+                        raise raised_error
+                    return outcome
+
+                async def write_fallback_run_error_fn(**_kwargs):
+                    calls.append("fallback")
+
+                async def seal_and_get_last_sequence():
+                    calls.append("seal")
+                    return 7
+
+                async def finalize(expected_last_sequence):
+                    calls.append(("finalize", expected_last_sequence))
+
+                execution.emitter.seal_and_get_last_sequence = AsyncMock(
+                    side_effect=seal_and_get_last_sequence
+                )
+                execution.trajectory_recorder.finalize = AsyncMock(side_effect=finalize)
+                dependencies = self._dependencies(
+                    run_agent_loop_fn=run_agent_loop_fn,
+                    write_fallback_run_error_fn=write_fallback_run_error_fn,
+                )
+
+                if isinstance(raised_error, asyncio.CancelledError):
+                    with self.assertRaises(asyncio.CancelledError):
+                        await run_agent_loop_lifecycle(
+                            request=self._request(),
+                            execution=execution,
+                            dependencies=dependencies,
+                        )
+                elif raised_error is not None and not isinstance(
+                    raised_error,
+                    StreamOwnershipLostError,
+                ):
+                    with self.assertRaises(type(raised_error)):
+                        await run_agent_loop_lifecycle(
+                            request=self._request(),
+                            execution=execution,
+                            dependencies=dependencies,
+                        )
+                else:
+                    await run_agent_loop_lifecycle(
+                        request=self._request(),
+                        execution=execution,
+                        dependencies=dependencies,
+                    )
+
+                self.assertEqual(calls[-3:], ["fallback", "seal", ("finalize", 7)])
+                execution.emitter.seal_and_get_last_sequence.assert_awaited_once_with()
+                execution.trajectory_recorder.finalize.assert_awaited_once_with(7)
+
+    async def test_suggested_questions_pending_is_emitted_before_fallback_and_seal(self):
+        execution = self._execution()
+        calls = []
+
+        async def finalize_completed_run_fn(**_kwargs):
+            calls.append("run_completed")
+            await execution.emitter.suggested_questions_pending(
+                message_id="msg-life",
+                revision=1,
+            )
+
+        async def pending_event(**_kwargs):
+            calls.append("suggested_questions_pending")
+
+        async def write_fallback_run_error_fn(**_kwargs):
+            calls.append("fallback")
+
+        async def seal_and_get_last_sequence():
+            calls.append("seal")
+            return 3
+
+        async def finalize(_expected_last_sequence):
+            calls.append("finalize")
+
+        execution.emitter.suggested_questions_pending = AsyncMock(side_effect=pending_event)
+        execution.emitter.seal_and_get_last_sequence = AsyncMock(
+            side_effect=seal_and_get_last_sequence
+        )
+        execution.trajectory_recorder.finalize = AsyncMock(side_effect=finalize)
+
+        await run_agent_loop_lifecycle(
+            request=self._request(),
+            execution=execution,
+            dependencies=self._dependencies(
+                finalize_completed_run_fn=finalize_completed_run_fn,
+                write_fallback_run_error_fn=write_fallback_run_error_fn,
+            ),
+        )
+
+        self.assertEqual(
+            calls,
+            [
+                "run_completed",
+                "suggested_questions_pending",
+                "fallback",
+                "seal",
+                "finalize",
+            ],
+        )
+
+    async def test_start_before_session_failure_still_seals_and_attempts_finalize(self):
+        execution = self._execution()
+        calls = []
+
+        async def append_chunk_fn(*_args, **_kwargs):
+            raise RuntimeError("start unavailable")
+
+        async def seal_and_get_last_sequence():
+            calls.append("seal")
+            return -1
+
+        async def finalize(expected_last_sequence):
+            calls.append(("finalize", expected_last_sequence))
+
+        execution.emitter.seal_and_get_last_sequence = AsyncMock(
+            side_effect=seal_and_get_last_sequence
+        )
+        execution.trajectory_recorder.finalize = AsyncMock(side_effect=finalize)
+
+        with self.assertRaisesRegex(RuntimeError, "start unavailable"):
+            await run_agent_loop_lifecycle(
+                request=self._request(),
+                execution=execution,
+                dependencies=self._dependencies(append_chunk_fn=append_chunk_fn),
+            )
+
+        self.assertEqual(calls, ["seal", ("finalize", -1)])
+
+    async def test_barrier_failure_preserves_original_business_exception(self):
+        execution = self._execution()
+        warnings = []
+        primary_error = RuntimeError("primary failure")
+
+        async def run_agent_loop_fn(**_kwargs):
+            raise primary_error
+
+        execution.emitter.seal_and_get_last_sequence = AsyncMock(return_value=2)
+        execution.trajectory_recorder.finalize = AsyncMock(
+            side_effect=ValueError("barrier failure")
+        )
+
+        with self.assertRaises(RuntimeError) as raised:
+            await run_agent_loop_lifecycle(
+                request=self._request(),
+                execution=execution,
+                dependencies=self._dependencies(
+                    run_agent_loop_fn=run_agent_loop_fn,
+                    warning_fn=warnings.append,
+                ),
+            )
+
+        self.assertIs(raised.exception, primary_error)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("轨迹完整性提交屏障失败", warnings[0])
+
+    async def test_shutdown_second_cancellation_cannot_interrupt_bounded_barrier(self):
+        execution = self._execution()
+        loop_entered = asyncio.Event()
+        barrier_entered = asyncio.Event()
+        release_barrier = asyncio.Event()
+        barrier_finished = asyncio.Event()
+
+        async def run_agent_loop_fn(**_kwargs):
+            loop_entered.set()
+            await asyncio.Event().wait()
+
+        async def finalize(_expected_last_sequence):
+            barrier_entered.set()
+            await release_barrier.wait()
+            barrier_finished.set()
+
+        execution.emitter.seal_and_get_last_sequence = AsyncMock(return_value=4)
+        execution.trajectory_recorder.finalize = AsyncMock(side_effect=finalize)
+
+        task = asyncio.create_task(
+            run_agent_loop_lifecycle(
+                request=self._request(),
+                execution=execution,
+                dependencies=self._dependencies(run_agent_loop_fn=run_agent_loop_fn),
+            )
+        )
+        await asyncio.wait_for(loop_entered.wait(), timeout=0.5)
+        task.cancel()
+        await asyncio.wait_for(barrier_entered.wait(), timeout=0.5)
+
+        task.cancel()
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+
+        release_barrier.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=0.5)
+
+        self.assertTrue(barrier_finished.is_set())
+        execution.emitter.seal_and_get_last_sequence.assert_awaited_once_with()
+        execution.trajectory_recorder.finalize.assert_awaited_once_with(4)
+
+    async def _assert_ownership_lost_barrier_cancellation(self, *, cancel_count: int):
+        execution = self._execution()
+        barrier_entered = asyncio.Event()
+        release_barrier = asyncio.Event()
+        barrier_finished = asyncio.Event()
+
+        async def run_agent_loop_fn(**_kwargs):
+            raise StreamOwnershipLostError("external stop")
+
+        async def finalize(_expected_last_sequence):
+            barrier_entered.set()
+            await release_barrier.wait()
+            barrier_finished.set()
+
+        execution.emitter.seal_and_get_last_sequence = AsyncMock(return_value=8)
+        execution.trajectory_recorder.finalize = AsyncMock(side_effect=finalize)
+        task = asyncio.create_task(
+            run_agent_loop_lifecycle(
+                request=self._request(),
+                execution=execution,
+                dependencies=self._dependencies(run_agent_loop_fn=run_agent_loop_fn),
+            )
+        )
+        await asyncio.wait_for(barrier_entered.wait(), timeout=0.5)
+
+        for _ in range(cancel_count):
+            self.assertTrue(task.cancel())
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+
+        release_barrier.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=0.5)
+
+        self.assertTrue(task.cancelled())
+        self.assertEqual(task.cancelling(), 0)
+        self.assertTrue(barrier_finished.is_set())
+        execution.emitter.seal_and_get_last_sequence.assert_awaited_once_with()
+        execution.trajectory_recorder.finalize.assert_awaited_once_with(8)
+
+    async def test_ownership_lost_then_one_barrier_cancel_restores_cancelled_error(self):
+        await self._assert_ownership_lost_barrier_cancellation(cancel_count=1)
+
+    async def test_ownership_lost_then_two_barrier_cancels_restore_cancelled_error(self):
+        await self._assert_ownership_lost_barrier_cancellation(cancel_count=2)
+
+    async def test_business_error_stays_primary_when_cancel_arrives_during_barrier(self):
+        execution = self._execution()
+        primary_error = RuntimeError("primary failure")
+        barrier_entered = asyncio.Event()
+        release_barrier = asyncio.Event()
+
+        async def run_agent_loop_fn(**_kwargs):
+            raise primary_error
+
+        async def finalize(_expected_last_sequence):
+            barrier_entered.set()
+            await release_barrier.wait()
+
+        execution.emitter.seal_and_get_last_sequence = AsyncMock(return_value=9)
+        execution.trajectory_recorder.finalize = AsyncMock(side_effect=finalize)
+        task = asyncio.create_task(
+            run_agent_loop_lifecycle(
+                request=self._request(),
+                execution=execution,
+                dependencies=self._dependencies(run_agent_loop_fn=run_agent_loop_fn),
+            )
+        )
+        await asyncio.wait_for(barrier_entered.wait(), timeout=0.5)
+
+        self.assertTrue(task.cancel())
+        await asyncio.sleep(0)
+        release_barrier.set()
+        with self.assertRaises(RuntimeError) as raised:
+            await asyncio.wait_for(task, timeout=0.5)
+
+        self.assertIs(raised.exception, primary_error)
+        self.assertFalse(task.cancelled())
+        self.assertEqual(task.cancelling(), 0)
+
+    async def test_fallback_error_stays_primary_when_cancel_arrives_during_barrier(self):
+        execution = self._execution()
+        fallback_error = RuntimeError("fallback failure")
+        barrier_entered = asyncio.Event()
+        release_barrier = asyncio.Event()
+
+        async def write_fallback_run_error_fn(**_kwargs):
+            raise fallback_error
+
+        async def finalize(_expected_last_sequence):
+            barrier_entered.set()
+            await release_barrier.wait()
+
+        execution.emitter.seal_and_get_last_sequence = AsyncMock(return_value=10)
+        execution.trajectory_recorder.finalize = AsyncMock(side_effect=finalize)
+        task = asyncio.create_task(
+            run_agent_loop_lifecycle(
+                request=self._request(),
+                execution=execution,
+                dependencies=self._dependencies(
+                    write_fallback_run_error_fn=write_fallback_run_error_fn,
+                ),
+            )
+        )
+        await asyncio.wait_for(barrier_entered.wait(), timeout=0.5)
+
+        self.assertTrue(task.cancel())
+        await asyncio.sleep(0)
+        release_barrier.set()
+        with self.assertRaises(RuntimeError) as raised:
+            await asyncio.wait_for(task, timeout=0.5)
+
+        self.assertIs(raised.exception, fallback_error)
+        self.assertFalse(task.cancelled())
+        self.assertEqual(task.cancelling(), 0)
+
+    async def test_repeated_barrier_entry_never_seals_or_finalizes_twice(self):
+        execution = self._execution()
+        execution.emitter.seal_and_get_last_sequence = AsyncMock(return_value=5)
+        execution.trajectory_recorder.finalize = AsyncMock()
+
+        await commit_trajectory_barrier(
+            execution=execution,
+            warning_fn=lambda _message: None,
+        )
+        await commit_trajectory_barrier(
+            execution=execution,
+            warning_fn=lambda _message: None,
+        )
+
+        execution.emitter.seal_and_get_last_sequence.assert_awaited_once_with()
+        execution.trajectory_recorder.finalize.assert_awaited_once_with(5)
+
+    async def test_barrier_timeout_is_bounded_and_does_not_cancel_late_finalize(self):
+        execution = self._execution()
+        barrier_entered = asyncio.Event()
+        release_barrier = asyncio.Event()
+        barrier_finished = asyncio.Event()
+        warnings = []
+
+        async def finalize(_expected_last_sequence):
+            barrier_entered.set()
+            await release_barrier.wait()
+            barrier_finished.set()
+
+        execution.emitter.seal_and_get_last_sequence = AsyncMock(return_value=6)
+        execution.trajectory_recorder.finalize = AsyncMock(side_effect=finalize)
+
+        with patch(
+            "app.services.stream.agent_loop_lifecycle.TRAJECTORY_BARRIER_TIMEOUT_SECONDS",
+            0.01,
+        ):
+            await run_agent_loop_lifecycle(
+                request=self._request(),
+                execution=execution,
+                dependencies=self._dependencies(warning_fn=warnings.append),
+            )
+
+        self.assertTrue(barrier_entered.is_set())
+        self.assertFalse(barrier_finished.is_set())
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("轨迹完整性提交屏障超时", warnings[0])
+
+        release_barrier.set()
+        await asyncio.wait_for(barrier_finished.wait(), timeout=0.5)
+        execution.trajectory_recorder.finalize.assert_awaited_once_with(6)
 
     async def test_empty_knowledge_retrieval_completes_without_preparing_or_running_llm(self):
         call_config = SimpleNamespace(

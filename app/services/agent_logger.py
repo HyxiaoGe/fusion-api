@@ -15,6 +15,7 @@ from typing import Optional
 from app.core.logger import app_logger as logger
 from app.db.database import SessionLocal
 from app.db.models import AgentSession, AgentStep, ToolCallLog
+from app.utils.time import utc_now
 
 
 async def log_tool_call(
@@ -126,6 +127,7 @@ async def log_agent_session(
             total_tool_calls=total_tool_calls,
             total_duration_ms=total_duration_ms,
             status=status,
+            terminal_at=None if status == "running" else utc_now(),
             limit_reason=limit_reason,
             error_message=error_message,
         )

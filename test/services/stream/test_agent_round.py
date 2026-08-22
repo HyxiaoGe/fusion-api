@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -24,8 +25,283 @@ class AgentRoundUsageTests(unittest.TestCase):
 
         self.assertIs(result, accumulated_usage)
 
+    def test_accumulate_usage_preserves_optional_cache_token_totals(self):
+        result = accumulate_usage(
+            Usage(input_tokens=2, output_tokens=3, cache_read_tokens=4),
+            Usage(input_tokens=5, output_tokens=7, cache_read_tokens=6, cache_write_tokens=8),
+        )
+
+        self.assertEqual(result.cache_read_tokens, 10)
+        self.assertEqual(result.cache_write_tokens, 8)
+
 
 class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
+    async def test_round_timing_excludes_started_and_context_sink_delay(self):
+        from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata
+
+        now = [0.0]
+        calls = []
+        emitter = AsyncMock()
+
+        async def started(**_kwargs):
+            calls.append("started")
+            now[0] += 5.0
+
+        async def context_status(**kwargs):
+            if kwargs["phase"] == "final":
+                now[0] += 7.0
+
+        emitter.llm_round_started.side_effect = started
+        emitter.context_status_updated.side_effect = context_status
+        context_plan = ContextPlan(
+            messages=[],
+            status="no_op",
+            context_window_tokens=1000,
+            context_window_source="test",
+            context_window_status="known",
+            estimated_tokens_after=10,
+        )
+        observation = LLMRoundObservation(
+            metadata=RoundMetadata("conv", "run", 1, "step", "agent", "model", "provider"),
+            litellm_model="test/model",
+            messages=[],
+            call_kwargs={},
+            clock=lambda: now[0],
+            token_estimator=lambda *_args, **_kwargs: 1,
+            context_window_resolver=lambda _model_id: (1000, "test", "known"),
+            run_context_in_thread=False,
+        )
+
+        async def response():
+            now[0] = 5.1
+            yield MagicMock(
+                choices=[MagicMock(delta=MagicMock(content="答案", reasoning_content=None, tool_calls=None))]
+            )
+            now[0] = 5.2
+
+        async def llm_call_fn(*_args, **_kwargs):
+            calls.append("network")
+            return response()
+
+        async def stream_round_fn(observed, *_args, **kwargs):
+            async for _chunk in observed:
+                kwargs["on_output_candidate"]("content")
+                await kwargs["on_visible_output"]("content")
+            return "", "答案", [], "stop", Usage(input_tokens=1, output_tokens=1)
+
+        with (
+            patch("app.services.stream.agent_round.prepare_context", new=AsyncMock(return_value=context_plan)),
+            patch("app.services.stream.agent_round.create_llm_round_observation", return_value=observation),
+        ):
+            await run_agent_round(
+                conversation_id="conv",
+                task_id="task",
+                run_id="run",
+                step_number=1,
+                model_id="model",
+                provider="provider",
+                litellm_model="test/model",
+                litellm_kwargs={},
+                messages=[],
+                should_use_reasoning=False,
+                call_kwargs={},
+                accumulated_usage=Usage(),
+                step_context=AgentStepContext("step", 1, 0.0, "thinking", "text"),
+                llm_call_fn=llm_call_fn,
+                stream_round_fn=stream_round_fn,
+                log_round_summary_fn=lambda **_kwargs: None,
+                emitter=emitter,
+            )
+
+        self.assertEqual(calls, ["started", "network"])
+        completed = emitter.llm_round_completed.await_args.kwargs
+        self.assertEqual(completed["ttft_ms"], 100)
+        self.assertEqual(completed["duration_ms"], 200)
+
+    async def test_run_agent_round_emits_llm_lifecycle_in_order(self):
+        calls: list[str] = []
+        emitter = AsyncMock()
+        emitter.llm_round_started.side_effect = lambda **_kwargs: calls.append("started")
+        emitter.llm_round_first_output_delta.side_effect = lambda **_kwargs: calls.append("first")
+        emitter.llm_round_completed.side_effect = lambda **_kwargs: calls.append("completed")
+        observation = MagicMock(first_output_delta_kind="content", first_output_delta_ms=125, duration_ms=400)
+        observation.finish_success = AsyncMock()
+        observation.finish_error = AsyncMock()
+        observation.wrap_response.side_effect = lambda response: response
+        context_plan = MagicMock(messages=[], estimated_tokens_after=10)
+        context_plan.telemetry.return_value = {"context_management_status": "no_op"}
+
+        async def llm_call_fn(*_args, **_kwargs):
+            calls.append("network")
+            return "response"
+
+        async def stream_round_fn(*_args, **kwargs):
+            await kwargs["on_visible_output"]("content")
+            return "", "回答", [], "stop", Usage(input_tokens=3, output_tokens=2)
+
+        with (
+            patch("app.services.stream.agent_round.prepare_context", new=AsyncMock(return_value=context_plan)),
+            patch("app.services.stream.agent_round.create_llm_round_observation", return_value=observation),
+        ):
+            result = await run_agent_round(
+                conversation_id="conv-life",
+                task_id="task-life",
+                run_id="run-life",
+                step_number=1,
+                model_id="gpt-4",
+                provider="openai",
+                litellm_model="openai/gpt-4",
+                litellm_kwargs={},
+                messages=[],
+                should_use_reasoning=False,
+                call_kwargs={},
+                accumulated_usage=Usage(),
+                step_context=AgentStepContext("step-life", 1, 0.0, "thinking", "text"),
+                llm_call_fn=llm_call_fn,
+                stream_round_fn=stream_round_fn,
+                log_round_summary_fn=lambda **_kwargs: None,
+                emitter=emitter,
+            )
+
+        self.assertEqual(calls, ["started", "network", "first", "completed"])
+        self.assertIsNone(result.llm_lifecycle)
+        completed = emitter.llm_round_completed.await_args.kwargs
+        self.assertEqual(completed["total_tokens"], 5)
+        self.assertEqual(completed["ttft_ms"], 125)
+
+    async def test_cancelled_llm_call_emits_cancelled_and_reraises(self):
+        emitter = AsyncMock()
+        emitter.llm_round_cancelled.side_effect = RuntimeError("terminal sink failed")
+        observation = MagicMock()
+        observation.finish_success = AsyncMock()
+        observation.finish_error = AsyncMock()
+        context_plan = MagicMock(messages=[], estimated_tokens_after=10)
+        context_plan.telemetry.return_value = {"context_management_status": "no_op"}
+
+        with (
+            patch("app.services.stream.agent_round.prepare_context", new=AsyncMock(return_value=context_plan)),
+            patch("app.services.stream.agent_round.create_llm_round_observation", return_value=observation),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await run_agent_round(
+                    conversation_id="conv-cancel",
+                    task_id="task-cancel",
+                    run_id="run-cancel",
+                    step_number=1,
+                    model_id="gpt-4",
+                    provider="openai",
+                    litellm_model="openai/gpt-4",
+                    litellm_kwargs={},
+                    messages=[],
+                    should_use_reasoning=False,
+                    call_kwargs={},
+                    accumulated_usage=Usage(),
+                    step_context=AgentStepContext("step-cancel", 1, 0.0, "thinking", "text"),
+                    llm_call_fn=AsyncMock(side_effect=asyncio.CancelledError),
+                    stream_round_fn=AsyncMock(),
+                    log_round_summary_fn=lambda **_kwargs: None,
+                    emitter=emitter,
+                )
+
+        emitter.llm_round_cancelled.assert_awaited_once()
+        self.assertEqual(emitter.llm_round_cancelled.await_args.kwargs["reason"], "shutdown")
+        emitter.llm_round_failed.assert_not_awaited()
+
+    async def test_deferred_agent_round_keeps_lifecycle_open_until_visibility_decision(self):
+        emitter = AsyncMock()
+        observation = MagicMock(first_output_delta_kind="content", first_output_delta_ms=80, duration_ms=200)
+        observation.finish_success = AsyncMock()
+        observation.finish_error = AsyncMock()
+        observation.wrap_response.side_effect = lambda response: response
+        context_plan = MagicMock(messages=[], estimated_tokens_after=10)
+        context_plan.telemetry.return_value = {"context_management_status": "no_op"}
+
+        stream_round_fn = AsyncMock(return_value=("", "候选", [], "stop", Usage()))
+        with (
+            patch("app.services.stream.agent_round.prepare_context", new=AsyncMock(return_value=context_plan)),
+            patch("app.services.stream.agent_round.create_llm_round_observation", return_value=observation),
+        ):
+            result = await run_agent_round(
+                conversation_id="conv-deferred",
+                task_id="task-deferred",
+                run_id="run-deferred",
+                step_number=2,
+                model_id="gpt-4",
+                provider="openai",
+                litellm_model="openai/gpt-4",
+                litellm_kwargs={},
+                messages=[],
+                should_use_reasoning=False,
+                call_kwargs={},
+                accumulated_usage=Usage(),
+                step_context=AgentStepContext("step-deferred", 2, 0.0, "thinking", "text"),
+                llm_call_fn=AsyncMock(return_value="response"),
+                stream_round_fn=stream_round_fn,
+                log_round_summary_fn=lambda **_kwargs: None,
+                emitter=emitter,
+                defer_output=True,
+            )
+
+        self.assertIsNotNone(result.llm_lifecycle)
+        self.assertNotIn("on_visible_output", stream_round_fn.await_args.kwargs)
+        emitter.llm_round_first_output_delta.assert_not_awaited()
+        emitter.llm_round_completed.assert_not_awaited()
+
+        await result.llm_lifecycle.finish_success(output_visible=False)
+        emitter.llm_round_first_output_delta.assert_not_awaited()
+        self.assertIsNone(emitter.llm_round_completed.await_args.kwargs["ttft_ms"])
+
+    async def test_post_stream_context_error_and_cancel_close_llm_round(self):
+        for primary in (RuntimeError("final context failed"), asyncio.CancelledError()):
+            with self.subTest(primary=type(primary).__name__):
+                emitter = AsyncMock()
+                observation = MagicMock(first_output_delta_kind=None, duration_ms=10)
+                observation.finish_success = AsyncMock()
+                observation.finish_error = AsyncMock()
+                observation.wrap_response.side_effect = lambda response: response
+                context_plan = MagicMock(messages=[], estimated_tokens_after=10)
+                context_plan.telemetry.return_value = {"context_management_status": "no_op"}
+
+                def build_context(_plan, usage=None, **_kwargs):
+                    if usage is None:
+                        return ContextUsage(status="no_op")
+                    raise primary
+
+                with (
+                    patch("app.services.stream.agent_round.prepare_context", new=AsyncMock(return_value=context_plan)),
+                    patch("app.services.stream.agent_round.create_llm_round_observation", return_value=observation),
+                    patch("app.services.stream.agent_round.build_context_usage", side_effect=build_context),
+                ):
+                    with self.assertRaises(type(primary)) as raised:
+                        await run_agent_round(
+                            conversation_id="conv-post",
+                            task_id="task-post",
+                            run_id="run-post",
+                            step_number=1,
+                            model_id="model",
+                            provider="provider",
+                            litellm_model="test/model",
+                            litellm_kwargs={},
+                            messages=[],
+                            should_use_reasoning=False,
+                            call_kwargs={},
+                            accumulated_usage=Usage(),
+                            step_context=AgentStepContext("step-post", 1, 0.0, "thinking", "text"),
+                            llm_call_fn=AsyncMock(return_value="response"),
+                            stream_round_fn=AsyncMock(
+                                return_value=("", "answer", [], "stop", Usage(input_tokens=1, output_tokens=1))
+                            ),
+                            log_round_summary_fn=lambda **_kwargs: None,
+                            emitter=emitter,
+                        )
+
+                self.assertIs(raised.exception, primary)
+                if isinstance(primary, asyncio.CancelledError):
+                    emitter.llm_round_cancelled.assert_awaited_once()
+                    emitter.llm_round_failed.assert_not_awaited()
+                else:
+                    emitter.llm_round_failed.assert_awaited_once()
+                    emitter.llm_round_cancelled.assert_not_awaited()
     async def test_run_agent_round_finalizes_language_contract_before_budget_and_model_call(self):
         step_context = AgentStepContext(
             step_id="step-language",
@@ -514,6 +790,8 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
         observation.finish_success = AsyncMock()
         observation.finish_error = AsyncMock()
         error = RuntimeError("provider echoed private prompt")
+        emitter = AsyncMock()
+        emitter.llm_round_failed.side_effect = RuntimeError("terminal sink failed")
 
         async def llm_call_fn(*_args, **_kwargs):
             raise error
@@ -540,10 +818,14 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
                     llm_call_fn=llm_call_fn,
                     stream_round_fn=AsyncMock(),
                     log_round_summary_fn=lambda **_kwargs: None,
+                    emitter=emitter,
                 )
 
         self.assertIs(raised.exception, error)
         observation.finish_error.assert_awaited_once_with(error)
+        emitter.llm_round_failed.assert_awaited_once()
+        self.assertEqual(emitter.llm_round_failed.await_args.kwargs["error_code"], "provider_error")
+        self.assertIsNone(emitter.llm_round_failed.await_args.kwargs["message"])
         record_success.assert_not_called()
 
     async def test_collect_agent_round_stream_calls_llm_then_streams_with_step_ids(self):
@@ -764,6 +1046,7 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
         async def stream_round_fn(*_args, **_kwargs):
             return "", "", [], "cancelled", None
 
+        emitter = AsyncMock()
         with patch("app.services.stream.agent_round.litellm_health.record_success") as record_success:
             result = await run_agent_round(
                 conversation_id="conv-1",
@@ -782,9 +1065,12 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
                 llm_call_fn=llm_call_fn,
                 stream_round_fn=stream_round_fn,
                 log_round_summary_fn=lambda **_kwargs: None,
+                emitter=emitter,
             )
 
         self.assertEqual(result.finish_reason, "cancelled")
+        emitter.llm_round_cancelled.assert_awaited_once()
+        self.assertEqual(emitter.llm_round_cancelled.await_args.kwargs["reason"], "superseded")
         record_success.assert_not_called()
 
     async def test_run_agent_round_keeps_accumulated_usage_without_usage_data(self):

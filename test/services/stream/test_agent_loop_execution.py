@@ -1,6 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
+from app.services.agent.trajectory_recorder import TrajectoryRecorder
 from app.services.stream.agent_loop_execution import (
     AgentLoopDependencies,
     AgentLoopExecutionParts,
@@ -142,6 +143,12 @@ class AgentLoopExecutionTests(unittest.TestCase):
         self.assertIsInstance(execution.emitter._writer, AgentEventCompositeWriter)
         self.assertEqual(execution.emitter._writer.recorder.run_id, "run-1")
         self.assertEqual(execution.emitter._writer.recorder.message_id, "msg-1")
+        self.assertIsInstance(execution.trajectory_recorder, TrajectoryRecorder)
+        self.assertIs(execution.emitter._writer.trajectory_recorder, execution.trajectory_recorder)
+        self.assertIs(execution.completion_context.trajectory_recorder, execution.trajectory_recorder)
+        self.assertEqual(execution.trajectory_recorder.run_id, "run-1")
+        self.assertEqual(execution.trajectory_recorder.conversation_id, "conv-1")
+        self.assertEqual(execution.trajectory_recorder.message_id, "msg-1")
 
     def test_build_execution_context_generates_run_id_when_trace_id_missing(self):
         call_config = SimpleNamespace(
@@ -226,6 +233,7 @@ class AgentLoopExecutionTests(unittest.TestCase):
             state=AgentLoopState(),
             network_budget=NetworkToolBudget(),
             emitter=object(),
+            trajectory_recorder=object(),
         )
 
         runtime = build_agent_loop_runtime(

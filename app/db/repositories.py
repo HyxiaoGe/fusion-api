@@ -516,6 +516,7 @@ class ConversationRepository:
         ).update(
             {
                 AgentSession.status: "interrupted",
+                AgentSession.terminal_at: utc_now(),
                 AgentSession.limit_reason: None,
                 AgentSession.error_message: "回答已重新生成",
             },

@@ -61,6 +61,9 @@ class AgentRunSessionCache(Protocol):
         model_id: str,
         provider: str,
         message_id: str,
+        turn_message_id: str,
+        previous_run_id: str | None,
+        run_attempt_kind: str,
         run_config: dict | None = None,
     ) -> None: ...
 
@@ -91,6 +94,9 @@ async def start_agent_run(
     model_id: str,
     provider: str,
     message_id: str,
+    turn_message_id: str,
+    previous_run_id: str | None,
+    run_attempt_kind: str,
     tools: list[str],
     config: dict[str, Any],
 ) -> None:
@@ -101,6 +107,9 @@ async def start_agent_run(
         model_id=model_id,
         provider=provider,
         message_id=message_id,
+        turn_message_id=turn_message_id,
+        previous_run_id=previous_run_id,
+        run_attempt_kind=run_attempt_kind,
         run_config=config,
     )
     await emitter.run_started(

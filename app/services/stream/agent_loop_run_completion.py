@@ -9,7 +9,7 @@ from typing import Any
 from app.services.stream.agent_loop_policy import AgentRunTerminalState
 from app.services.stream.agent_loop_state import AgentLoopState
 from app.services.stream.itinerary_observability import build_itinerary_run_payload, emit_itinerary_run_log
-from app.services.stream.run_finalizer import InterruptedStatusWriteError
+from app.services.stream.run_finalizer import InterruptedStatusWriteError, interrupt_agent_run
 from app.services.stream_state_service import StreamOwnershipLostError, StreamWriteTerminalError
 
 PersistMessageFn = Callable[..., Any]
@@ -47,6 +47,7 @@ class AgentLoopRunCompletionContext:
     state: AgentLoopState
     duration_ms_factory: DurationMsFactory
     assistant_message_sequence: int | None = None
+    trajectory_recorder: Any | None = None
 
 
 def persist_run_message(
@@ -81,6 +82,7 @@ async def finalize_completed_run(
     persist_message_fn: PersistMessageFn,
     complete_agent_run_fn: TerminalRunFn,
     finalize_stream_fn: FinalizeStreamFn,
+    interrupt_agent_run_fn: TerminalRunFn = interrupt_agent_run,
     claim_suggested_questions_fn: ClaimSuggestedQuestionsFn | None = None,
     generate_suggested_questions_fn: GenerateSuggestedQuestionsFn | None = None,
     fail_suggested_questions_fn: FailSuggestedQuestionsFn | None = None,
@@ -93,19 +95,11 @@ async def finalize_completed_run(
         if persisted is False:
             if warning_fn is not None:
                 warning_fn("assistant 终态写入已被更新任务接管，终结旧任务")
-            superseded_stats = context.state.run_stats(context.run_id)
-            await context.session_cache.write_session_status(
-                run_id=superseded_stats.run_id,
-                status="interrupted",
-                total_steps=superseded_stats.total_steps,
-                total_tool_calls=superseded_stats.total_tool_calls,
-                total_duration_ms=context.duration_ms_factory(),
-            )
-            await finalize_stream_fn(
-                context.conversation_id,
-                success=False,
+            await _finalize_superseded_terminal(
+                context=context,
                 error_msg="被新请求取代",
-                task_id=context.task_id,
+                interrupt_agent_run_fn=interrupt_agent_run_fn,
+                finalize_stream_fn=finalize_stream_fn,
                 error_code="generation_superseded",
             )
             return
@@ -206,20 +200,11 @@ async def finalize_superseded_run(
     try:
         await _emit_terminal_plan(context, "superseded")
         persist_run_message(context=context, persist_message_fn=persist_message_fn, partial=True)
-        await interrupt_agent_run_fn(
-            emitter=context.emitter,
-            session_cache=context.session_cache,
-            stats=context.state.run_stats(context.run_id),
-            duration_ms_factory=context.duration_ms_factory,
-            current_step_id=context.state.current_step_id,
-            reason="superseded",
-        )
-        context.state.mark_terminal_emitted()
-        await finalize_stream_fn(
-            context.conversation_id,
-            success=False,
+        await _finalize_superseded_terminal(
+            context=context,
             error_msg=error_msg or "被新请求取代",
-            task_id=context.task_id,
+            interrupt_agent_run_fn=interrupt_agent_run_fn,
+            finalize_stream_fn=finalize_stream_fn,
         )
     finally:
         _emit_itinerary_observation(
@@ -228,6 +213,37 @@ async def finalize_superseded_run(
             finish_reason="unknown",
             limit_reason=None,
         )
+
+
+async def _finalize_superseded_terminal(
+    *,
+    context: AgentLoopRunCompletionContext,
+    error_msg: str,
+    interrupt_agent_run_fn: TerminalRunFn,
+    finalize_stream_fn: FinalizeStreamFn,
+    error_code: str | None = None,
+) -> None:
+    """统一 superseded 业务终态；仅 required writer 接受事件后确认已发送。"""
+    if context.state.superseded_terminal_decided:
+        return
+    context.state.mark_superseded_terminal_decided()
+    await interrupt_agent_run_fn(
+        emitter=context.emitter,
+        session_cache=context.session_cache,
+        stats=context.state.run_stats(context.run_id),
+        duration_ms_factory=context.duration_ms_factory,
+        current_step_id=context.state.current_step_id,
+        reason="superseded",
+    )
+    context.state.mark_terminal_emitted()
+    finalize_kwargs = {
+        "success": False,
+        "error_msg": error_msg,
+        "task_id": context.task_id,
+    }
+    if error_code is not None:
+        finalize_kwargs["error_code"] = error_code
+    await finalize_stream_fn(context.conversation_id, **finalize_kwargs)
 
 
 async def finalize_cancelled_run(
@@ -394,7 +410,7 @@ async def write_fallback_run_error(
     write_fallback_error_status_fn: TerminalRunFn,
     warning_fn: WarningFn,
 ) -> None:
-    if context.state.terminal_emitted:
+    if context.state.terminal_emitted or context.state.superseded_terminal_decided:
         return
 
     try:

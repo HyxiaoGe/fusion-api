@@ -217,6 +217,15 @@ class LimitSummaryHelpersTests(unittest.TestCase):
 
         self.assertEqual(result, Usage(input_tokens=7, output_tokens=10))
 
+    def test_accumulate_summary_usage_preserves_optional_cache_tokens(self):
+        result = accumulate_summary_usage(
+            Usage(input_tokens=2, output_tokens=3, cache_read_tokens=4),
+            Usage(input_tokens=5, output_tokens=7, cache_read_tokens=6, cache_write_tokens=8),
+        )
+
+        self.assertEqual(result.cache_read_tokens, 10)
+        self.assertEqual(result.cache_write_tokens, 8)
+
     def test_accumulate_summary_usage_keeps_existing_usage_without_usage_data(self):
         accumulated_usage = Usage(input_tokens=2, output_tokens=3)
 
@@ -384,6 +393,157 @@ class LimitSummaryHelpersTests(unittest.TestCase):
 
 
 class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _deferred_commit_request() -> LimitSummaryStepRequest:
+        return LimitSummaryStepRequest(
+            conversation_id="conv-deferred-terminal",
+            task_id="task-deferred-terminal",
+            run_id="run-deferred-terminal",
+            step_number=1,
+            model_id="gpt-4",
+            provider="openai",
+            litellm_model="openai/gpt-4",
+            litellm_kwargs={},
+            messages=[{"role": "user", "content": "测试 deferred summary commit"}],
+            should_use_reasoning=False,
+            content_blocks=[],
+            call_kwargs={},
+            accumulated_usage=Usage(input_tokens=1, output_tokens=1),
+            emitter=AsyncMock(),
+            session_cache=object(),
+            total_timeout_s=300,
+            run_start=0.0,
+            start_step_fn=AsyncMock(),
+            complete_step_fn=AsyncMock(),
+            llm_call_fn=AsyncMock(),
+            stream_round_fn=AsyncMock(),
+            log_round_summary_fn=lambda **_kwargs: None,
+            clock=lambda: 1.0,
+            defer_output=True,
+        )
+
+    async def test_deferred_summary_commit_terminal_secondary_preserves_primary_base_exception(self):
+        error_factories = (
+            ("runtime", lambda role: RuntimeError(f"{role} secret")),
+            ("cancel", lambda role: asyncio.CancelledError(f"{role} secret")),
+        )
+
+        for primary_name, make_primary in error_factories:
+            for secondary_name, make_secondary in error_factories:
+                with self.subTest(primary=primary_name, secondary=secondary_name):
+                    primary = make_primary("primary")
+                    secondary = make_secondary("secondary")
+                    finish_success = AsyncMock(side_effect=secondary)
+                    lifecycle = SimpleNamespace(finish_success=finish_success)
+                    round_result = limit_summary_module.LimitSummaryRoundResult(
+                        reasoning_buf="",
+                        content_buf="候选总结",
+                        usage_data=Usage(input_tokens=1, output_tokens=1),
+                        context=ContextUsage(status="no_op"),
+                        llm_lifecycle=lifecycle,
+                    )
+                    complete_step = AsyncMock()
+                    cancelling_before = asyncio.current_task().cancelling()
+
+                    with (
+                        patch(
+                            "app.services.stream.limit_summary.append_limit_summary_prompt",
+                        ),
+                        patch(
+                            "app.services.stream.limit_summary.start_limit_summary_step",
+                            new=AsyncMock(
+                                return_value=AgentStepContext(
+                                    step_id="step-deferred-terminal",
+                                    step_number=1,
+                                    started_at=1.0,
+                                    thinking_block_id="thinking-deferred-terminal",
+                                    text_block_id="text-deferred-terminal",
+                                )
+                            ),
+                        ),
+                        patch(
+                            "app.services.stream.limit_summary.run_summary_round_with_timeout",
+                            new=AsyncMock(return_value=round_result),
+                        ),
+                        patch(
+                            "app.services.stream.limit_summary._commit_limit_summary_result",
+                            new=AsyncMock(side_effect=primary),
+                        ),
+                        patch(
+                            "app.services.stream.limit_summary.complete_limit_summary_step",
+                            new=complete_step,
+                        ),
+                        patch("app.services.stream.limit_summary.logger.warning") as warning,
+                    ):
+                        with self.assertRaises(type(primary)) as raised:
+                            await run_limit_summary_step(request=self._deferred_commit_request())
+
+                    self.assertIs(raised.exception, primary)
+                    self.assertEqual(asyncio.current_task().cancelling(), cancelling_before)
+                    finish_success.assert_awaited_once_with(output_visible=False)
+                    complete_step.assert_not_awaited()
+                    warning.assert_called_once()
+                    logged = repr(warning.call_args)
+                    self.assertIn("error_code=deferred_terminal_failure", logged)
+                    self.assertIn(type(secondary).__name__, logged)
+                    self.assertNotIn(str(primary), logged)
+                    self.assertNotIn(str(secondary), logged)
+
+    async def test_deferred_summary_commit_terminal_failure_without_primary_remains_fail_closed(self):
+        for secondary in (RuntimeError("secondary secret"), asyncio.CancelledError("secondary secret")):
+            with self.subTest(secondary=type(secondary).__name__):
+                finish_success = AsyncMock(side_effect=secondary)
+                lifecycle = SimpleNamespace(finish_success=finish_success)
+                round_result = limit_summary_module.LimitSummaryRoundResult(
+                    reasoning_buf="",
+                    content_buf="候选总结",
+                    usage_data=Usage(input_tokens=1, output_tokens=1),
+                    context=ContextUsage(status="no_op"),
+                    llm_lifecycle=lifecycle,
+                )
+                complete_step = AsyncMock()
+                warning = MagicMock()
+                cancelling_before = asyncio.current_task().cancelling()
+
+                with (
+                    patch(
+                        "app.services.stream.limit_summary.append_limit_summary_prompt",
+                    ),
+                    patch(
+                        "app.services.stream.limit_summary.start_limit_summary_step",
+                        new=AsyncMock(
+                            return_value=AgentStepContext(
+                                step_id="step-deferred-terminal",
+                                step_number=1,
+                                started_at=1.0,
+                                thinking_block_id="thinking-deferred-terminal",
+                                text_block_id="text-deferred-terminal",
+                            )
+                        ),
+                    ),
+                    patch(
+                        "app.services.stream.limit_summary.run_summary_round_with_timeout",
+                        new=AsyncMock(return_value=round_result),
+                    ),
+                    patch(
+                        "app.services.stream.limit_summary._commit_limit_summary_result",
+                        new=AsyncMock(return_value=False),
+                    ),
+                    patch(
+                        "app.services.stream.limit_summary.complete_limit_summary_step",
+                        new=complete_step,
+                    ),
+                    patch("app.services.stream.limit_summary.logger.warning", new=warning),
+                ):
+                    with self.assertRaises(type(secondary)) as raised:
+                        await run_limit_summary_step(request=self._deferred_commit_request())
+
+                self.assertIs(raised.exception, secondary)
+                self.assertEqual(asyncio.current_task().cancelling(), cancelling_before)
+                finish_success.assert_awaited_once_with(output_visible=False)
+                complete_step.assert_not_awaited()
+                warning.assert_not_called()
+
     def _plan_synthesis_request(
         self,
         *,
@@ -644,7 +804,7 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
             stream_kwargs.append(kwargs)
             return reasoning_buf, next(answers), [], "stop", Usage(input_tokens=2, output_tokens=3)
 
-        emitter = SimpleNamespace(evidence_item_upserted=AsyncMock())
+        emitter = AsyncMock()
         request = LimitSummaryStepRequest(
             conversation_id="conv-deep",
             task_id="task-deep",
@@ -674,6 +834,109 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
             research_workset=workset,
         )
         return request, emitter, stream_kwargs, prepare_context_fn
+
+    async def test_deferred_real_tool_delta_emits_first_before_discard_completion(self):
+        from app.ai.llm_round_observability import LLMRoundObservation, RoundMetadata
+
+        workset, blocks = _deep_summary_evidence()
+        request, emitter, _stream_kwargs, prepare_context_fn = self._deep_request(
+            workset=workset,
+            content_blocks=list(blocks),
+            answer="unused",
+        )
+        events = []
+        emitter.llm_round_started.side_effect = lambda **_kwargs: events.append("started")
+        emitter.llm_round_first_output_delta.side_effect = lambda **_kwargs: events.append("first")
+        emitter.llm_round_completed.side_effect = lambda **_kwargs: events.append("completed")
+        now = [10.0]
+        observation = LLMRoundObservation(
+            metadata=RoundMetadata("conv", "run", 9, "step", "limit_summary", "model", "provider"),
+            litellm_model="test/model",
+            messages=[],
+            call_kwargs={},
+            clock=lambda: now[0],
+            token_estimator=lambda *_args, **_kwargs: 1,
+            context_window_resolver=lambda _model_id: (4096, "test", "known"),
+            run_context_in_thread=False,
+        )
+
+        async def response():
+            now[0] = 10.2
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content=None,
+                            reasoning_content=None,
+                            tool_calls=[
+                                SimpleNamespace(
+                                    index=0,
+                                    id="tool-1",
+                                    function=SimpleNamespace(name="web_search", arguments="{}"),
+                                )
+                            ],
+                        ),
+                        finish_reason="tool_calls",
+                    )
+                ],
+                usage=None,
+            )
+
+        request = replace(
+            request,
+            llm_call_fn=AsyncMock(return_value=response()),
+            stream_round_fn=partial(llm_stream_module.stream_round, model_id="model"),
+        )
+        with (
+            patch("app.services.stream.limit_summary.prepare_context", new=prepare_context_fn),
+            patch("app.services.stream.limit_summary._create_limit_summary_observation", return_value=observation),
+            patch("app.services.stream.llm_stream.check_lock_owner", new=AsyncMock(return_value=True)),
+        ):
+            result = await limit_summary_module.call_limit_summary_round(
+                request=request,
+                thinking_block_id="thinking",
+                text_block_id="text",
+                step_id="step",
+            )
+            await limit_summary_module._finish_summary_round_lifecycle(result, model_output_visible=False)
+
+        emitter.llm_round_first_output_delta.assert_awaited_once()
+        self.assertEqual(emitter.llm_round_first_output_delta.await_args.kwargs["delta_kind"], "tool_call")
+        self.assertEqual(emitter.llm_round_first_output_delta.await_args.kwargs["ttft_ms"], 200)
+        self.assertEqual(events, ["started", "first", "completed"])
+
+    async def test_post_stream_summary_context_error_and_cancel_close_round(self):
+        workset, blocks = _deep_summary_evidence()
+        for primary in (RuntimeError("final summary context failed"), asyncio.CancelledError()):
+            with self.subTest(primary=type(primary).__name__):
+                request, emitter, _stream_kwargs, prepare_context_fn = self._deep_request(
+                    workset=workset,
+                    content_blocks=list(blocks),
+                    answer="candidate",
+                )
+
+                def build_context(_plan, usage=None, **_kwargs):
+                    if usage is None:
+                        return ContextUsage(status="no_op")
+                    raise primary
+
+                with (
+                    patch("app.services.stream.limit_summary.prepare_context", new=prepare_context_fn),
+                    patch("app.services.stream.limit_summary.build_context_usage", side_effect=build_context),
+                ):
+                    with self.assertRaises(type(primary)) as raised:
+                        await limit_summary_module.call_limit_summary_round(
+                            request=request,
+                            thinking_block_id="thinking",
+                            text_block_id="text",
+                            step_id="step",
+                        )
+
+                self.assertIs(raised.exception, primary)
+                if isinstance(primary, asyncio.CancelledError):
+                    emitter.llm_round_cancelled.assert_awaited_once()
+                else:
+                    emitter.llm_round_failed.assert_awaited_once()
 
     async def test_streamed_plan_synthesis_with_late_tool_protocol_does_not_retry_or_bulk_append(self):
         events = []
@@ -992,6 +1255,61 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.content_blocks[-1].text, DEEP_RESEARCH_INCOMPLETE_TEXT)
         emitter.evidence_item_upserted.assert_not_awaited()
 
+    async def test_deep_summary_closes_malformed_citation_repair_round(self):
+        workset, blocks = _deep_summary_evidence()
+        request, emitter, _stream_kwargs, prepare_context_fn = self._deep_request(
+            workset=workset,
+            content_blocks=list(blocks),
+            answer="未引用的候选",
+        )
+        request = replace(
+            request,
+            stream_round_fn=AsyncMock(
+                side_effect=[
+                    ("", "未引用的候选", [], "stop", Usage(input_tokens=1, output_tokens=1)),
+                    ("隐藏协议", "", [], "tool_protocol_error", Usage(input_tokens=1, output_tokens=1)),
+                ]
+            ),
+        )
+
+        with (
+            patch("app.services.stream.limit_summary.prepare_context", new=prepare_context_fn),
+            patch("app.services.stream.limit_summary.append_chunk", new=AsyncMock()),
+        ):
+            outcome = await run_limit_summary_step(request=request)
+
+        self.assertTrue(outcome.incomplete)
+        self.assertEqual(emitter.llm_round_completed.await_count, 2)
+        self.assertTrue(all(call.kwargs["ttft_ms"] is None for call in emitter.llm_round_completed.await_args_list))
+
+    async def test_malformed_summary_retry_exception_closes_both_rounds(self):
+        workset, blocks = _deep_summary_evidence()
+        request, emitter, _stream_kwargs, prepare_context_fn = self._deep_request(
+            workset=workset,
+            content_blocks=list(blocks),
+            answer="unused",
+        )
+        primary = RuntimeError("retry provider failed")
+        request = replace(
+            request,
+            task_mode="standard",
+            stream_round_fn=AsyncMock(
+                side_effect=[
+                    ("隐藏协议", "", [], "tool_protocol_error", Usage(input_tokens=1, output_tokens=1)),
+                    primary,
+                ]
+            ),
+        )
+
+        with patch("app.services.stream.limit_summary.prepare_context", new=prepare_context_fn):
+            with self.assertRaises(RuntimeError) as raised:
+                await run_limit_summary_step(request=request)
+
+        self.assertIs(raised.exception, primary)
+        self.assertEqual(emitter.llm_round_completed.await_count, 1)
+        self.assertIsNone(emitter.llm_round_completed.await_args.kwargs["ttft_ms"])
+        emitter.llm_round_failed.assert_awaited_once()
+
     async def test_no_progress_summary_removes_conflicting_tool_usage_contract_before_call(self):
         sent_messages = []
 
@@ -1159,6 +1477,7 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
     async def test_no_progress_summary_retries_once_when_model_returns_tool_protocol(self):
         content_blocks = []
         warnings = []
+        emitter = AsyncMock()
 
         async def start_step_fn(**_kwargs):
             return AgentStepContext(
@@ -1185,8 +1504,8 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
                 (
                     "内部工具规划",
                     "这段工具协议前缀不得展示",
-                    [{"id": "dsml-step-summary-1", "name": "web_search", "arguments": "{}"}],
-                    "tool_calls",
+                    [],
+                    "tool_protocol_error",
                     Usage(input_tokens=5, output_tokens=7),
                 ),
                 ("最终总结推理", "最终答复", [], "stop", Usage(input_tokens=3, output_tokens=4)),
@@ -1212,7 +1531,7 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
             content_blocks=content_blocks,
             call_kwargs={"tools": [{"function": {"name": "web_search"}}], "tool_choice": "auto"},
             accumulated_usage=Usage(input_tokens=2, output_tokens=3),
-            emitter=AsyncMock(),
+            emitter=emitter,
             session_cache=object(),
             total_timeout_s=300,
             run_start=100.0,
@@ -1254,6 +1573,8 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("工具协议前缀", content_blocks[1].text)
         self.assertTrue(any("工具协议" in warning for warning in warnings))
         self.assertTrue(any("不要输出任何工具调用" in str(message.get("content", "")) for message in request.messages))
+        self.assertEqual(emitter.llm_round_completed.await_count, 2)
+        self.assertIsNone(emitter.llm_round_completed.await_args_list[0].kwargs["ttft_ms"])
 
     async def test_k3_plan_synthesis_streams_normally_while_limit_summary_stays_deferred(self):
         async def prepare_context_fn(**kwargs):
@@ -1393,6 +1714,7 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_progress_summary_uses_safe_fallback_after_repeated_tool_protocol(self):
         content_blocks = []
+        emitter = AsyncMock()
 
         async def start_step_fn(**_kwargs):
             return AgentStepContext(
@@ -1417,8 +1739,8 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         tool_protocol_result = (
             "内部工具规划",
             "",
-            [{"id": "dsml-step-summary-1", "name": "web_search", "arguments": "{}"}],
-            "tool_calls",
+            [],
+            "tool_protocol_error",
             None,
         )
         request = LimitSummaryStepRequest(
@@ -1435,7 +1757,7 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
             content_blocks=content_blocks,
             call_kwargs={"tools": [{"function": {"name": "web_search"}}], "tool_choice": "auto"},
             accumulated_usage=Usage(input_tokens=0, output_tokens=0),
-            emitter=AsyncMock(),
+            emitter=emitter,
             session_cache=object(),
             total_timeout_s=300,
             run_start=100.0,
@@ -1461,6 +1783,8 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(content_blocks[0].thinking, "内部工具规划内部工具规划")
         self.assertIn("未能生成可靠的最终答复", content_blocks[1].text)
         self.assertNotIn("DSML", content_blocks[1].text)
+        self.assertEqual(emitter.llm_round_completed.await_count, 2)
+        self.assertTrue(all(call.kwargs["ttft_ms"] is None for call in emitter.llm_round_completed.await_args_list))
 
     async def test_limit_summary_replaces_previous_round_context_with_final_summary_round(self):
         emitter = AsyncMock()
@@ -1632,11 +1956,16 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         messages = []
         observation = MagicMock()
         log_round_summary_fn = MagicMock()
+        emitter = AsyncMock()
+        call_order = []
+        emitter.llm_round_started.side_effect = lambda **_kwargs: call_order.append("started")
+        emitter.llm_round_cancelled.side_effect = lambda **_kwargs: call_order.append("cancelled")
         observation.finish_success = AsyncMock()
         observation.finish_error = AsyncMock()
         observation.wrap_response.side_effect = lambda response: response
 
         async def llm_call_fn(*_args, **_kwargs):
+            call_order.append("network")
             return "response"
 
         async def stream_round_fn(*_args, **_kwargs):
@@ -1665,7 +1994,7 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
             content_blocks=[],
             call_kwargs={},
             accumulated_usage=Usage(input_tokens=2, output_tokens=3),
-            emitter=object(),
+            emitter=emitter,
             session_cache=object(),
             total_timeout_s=300,
             run_start=100.0,
@@ -1709,14 +2038,19 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
             finish_reason="cancelled",
         )
         self.assertEqual(log_round_summary_fn.call_args.kwargs["finish_reason"], "no_progress_summary")
+        self.assertEqual(call_order, ["started", "network", "cancelled"])
+        emitter.llm_round_completed.assert_not_awaited()
 
     async def test_run_limit_summary_step_appends_prompt_and_records_success(self):
         messages = [{"role": "user", "content": "hi"}]
         content_blocks = []
         accumulated_usage = Usage(input_tokens=2, output_tokens=3)
-        emitter = object()
+        emitter = AsyncMock()
         session_cache = object()
         events = []
+        emitter.llm_round_started.side_effect = lambda **_kwargs: events.append(("llm_started",))
+        emitter.llm_round_first_output_delta.side_effect = lambda **_kwargs: events.append(("first",))
+        emitter.llm_round_completed.side_effect = lambda **_kwargs: events.append(("llm_completed",))
 
         async def start_step_fn(*, emitter, session_cache, run_id, step_number, clock, on_step_started):
             events.append(("start", emitter, session_cache, run_id, step_number, clock))
@@ -1773,7 +2107,18 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         def clock():
             return 120.0
 
-        with patch("app.services.stream.limit_summary.append_chunk", new=AsyncMock()) as append_chunk:
+        observation = MagicMock(first_output_delta_kind="content", first_output_delta_ms=50, duration_ms=80)
+        observation.finish_success = AsyncMock()
+        observation.finish_error = AsyncMock()
+        observation.wrap_response.side_effect = lambda response: response
+        append_chunk = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append(("answer_chunk",)))
+        with (
+            patch("app.services.stream.limit_summary.append_chunk", new=append_chunk),
+            patch(
+                "app.services.stream.limit_summary.create_llm_round_observation",
+                return_value=observation,
+            ),
+        ):
             outcome = await run_limit_summary_step(
                 request=LimitSummaryStepRequest(
                     conversation_id="conv-1",
@@ -1823,10 +2168,23 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(content_blocks[1].text, "总结正文")
         self.assertEqual(warnings, [])
 
-        self.assertEqual([event[0] for event in events], ["start", "llm", "stream", "log", "complete"])
-        self.assertEqual(events[1][4], {"temperature": 0.1})
         self.assertEqual(
-            events[2],
+            [event[0] for event in events],
+            [
+                "start",
+                "llm_started",
+                "llm",
+                "stream",
+                "log",
+                "answer_chunk",
+                "first",
+                "llm_completed",
+                "complete",
+            ],
+        )
+        self.assertEqual(events[2][4], {"temperature": 0.1})
+        self.assertEqual(
+            events[3],
             (
                 "stream",
                 "response",
@@ -1840,13 +2198,13 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
                 True,
             ),
         )
-        self.assertEqual(events[3][1]["finish_reason"], "limit_summary")
-        self.assertEqual(events[3][1]["tool_calls_count"], 0)
-        self.assertEqual(events[3][1]["reasoning_buf"], "推理")
-        self.assertEqual(events[3][1]["content_buf"], "总结正文")
-        self.assertEqual(events[4][1].step_id, "step-summary")
-        self.assertEqual(events[4][4], [])
-        self.assertEqual(events[4][5], 0)
+        self.assertEqual(events[4][1]["finish_reason"], "limit_summary")
+        self.assertEqual(events[4][1]["tool_calls_count"], 0)
+        self.assertEqual(events[4][1]["reasoning_buf"], "推理")
+        self.assertEqual(events[4][1]["content_buf"], "总结正文")
+        self.assertEqual(events[8][1].step_id, "step-summary")
+        self.assertEqual(events[8][4], [])
+        self.assertEqual(events[8][5], 0)
 
     async def test_run_limit_summary_step_swallows_timeout_and_completes_step(self):
         messages = [{"role": "user", "content": "hi"}]
