@@ -12,9 +12,21 @@ MODEL_MANAGEMENT_SERVICE = ROOT / "ops/litellm/fusion-litellm-model-management.s
 MODEL_MANAGEMENT_TIMER = ROOT / "ops/litellm/fusion-litellm-model-management.timer"
 REQUIREMENTS = ROOT / "ops/litellm/requirements-governance.txt"
 GOVERNANCE_ENV = ROOT / "ops/litellm/litellm-governance.env.example"
+DEPLOY_WORKFLOW = ROOT / ".github/workflows/deploy.yml"
 
 
 class LiteLLMGovernanceUnitTests(unittest.TestCase):
+    def test_deploy_validates_governance_offline_without_running_provider_discovery(self):
+        content = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+        install_step = content.split("- name: Install LiteLLM governance discovery", 1)[1].split(
+            "- name: Install model management worker", 1
+        )[0]
+
+        self.assertIn("-m scripts.run_litellm_governance_unit", install_step)
+        self.assertIn("-- /usr/bin/true", install_step)
+        self.assertNotIn("systemctl --user start fusion-litellm-governance.service", install_step)
+        self.assertIn("systemctl --user enable --now fusion-litellm-governance.timer", install_step)
+
     def test_documented_module_entrypoints_start_from_repo_root(self):
         modules = (
             "scripts.run_litellm_governance_unit",
