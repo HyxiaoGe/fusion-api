@@ -10,6 +10,7 @@ from typing import Any
 from app.services.agent.emitter import AgentEventEmitter
 from app.services.agent.plan_coordinator import PlanCoordinator
 from app.services.agent.progress_recorder import AgentProgressRecorder
+from app.services.agent.queued_trajectory_recorder import QueuedTrajectoryRecorder
 from app.services.agent.trajectory_recorder import TrajectoryRecorder
 from app.services.stream.agent_loop_policy import AgentLoopLimits
 from app.services.stream.agent_loop_request_prep import AgentLoopCallConfig
@@ -73,7 +74,7 @@ class AgentLoopExecutionContext:
     emitter: AgentEventEmitter
     runtime: AgentLoopRuntime
     completion_context: AgentLoopRunCompletionContext
-    trajectory_recorder: TrajectoryRecorder
+    trajectory_recorder: QueuedTrajectoryRecorder
     turn_message_id: str | None
     previous_run_id: str | None
     run_attempt_kind: str
@@ -87,7 +88,7 @@ class AgentLoopExecutionParts:
     state: AgentLoopState
     network_budget: NetworkToolBudget
     emitter: AgentEventEmitter
-    trajectory_recorder: TrajectoryRecorder
+    trajectory_recorder: QueuedTrajectoryRecorder
 
 
 def _build_execution_parts(
@@ -103,11 +104,12 @@ def _build_execution_parts(
         message_id=request.assistant_message_id,
         user_id=request.user_id,
     )
-    trajectory_recorder = TrajectoryRecorder(
+    trajectory_core = TrajectoryRecorder(
         run_id=run_id,
         conversation_id=request.conversation_id,
         message_id=request.assistant_message_id,
     )
+    trajectory_recorder = QueuedTrajectoryRecorder(trajectory_core)
     event_writer = AgentEventCompositeWriter(
         redis_writer=dependencies.redis_writer,
         recorder=progress_recorder,
