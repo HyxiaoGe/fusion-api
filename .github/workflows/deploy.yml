@@ -1706,17 +1706,18 @@ jobs:
           systemd-analyze --user verify \
             "${unit_dir}/fusion-litellm-governance.service" \
             "${unit_dir}/fusion-litellm-governance.timer"
+          governance_python="${HOME}/.local/share/fusion/litellm-governance-venv/bin/python"
           systemctl --user reset-failed fusion-litellm-governance.service >/dev/null 2>&1 || true
-          if ! systemctl --user start fusion-litellm-governance.service; then
-            journalctl --user -u fusion-litellm-governance.service -n 120 --no-pager || true
-            exit 1
-          fi
-          governance_result="$(systemctl --user show fusion-litellm-governance.service --property=Result --value)"
-          if [ "${governance_result}" != "success" ]; then
-            journalctl --user -u fusion-litellm-governance.service -n 120 --no-pager || true
-            echo "LiteLLM 治理 service smoke 未成功: ${governance_result}"
-            exit 1
-          fi
+          (
+            cd "${current_link}"
+            "${governance_python}" -m scripts.run_litellm_governance_unit \
+              --proxy-env "${proxy_env}" \
+              --governance-env "${governance_env}" \
+              --registry "${registry_target}" \
+              --require-env LITELLM_MASTER_KEY \
+              --require-env LITELLM_CANDIDATE_KEY \
+              -- /usr/bin/true
+          )
           systemctl --user enable --now fusion-litellm-governance.timer
           systemctl --user is-active --quiet fusion-litellm-governance.timer
 

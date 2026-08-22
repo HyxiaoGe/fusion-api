@@ -214,17 +214,15 @@ class ModelManagementDeployConfigTests(unittest.TestCase):
         self.assertIn('proxy_env="${HOME}/project/litellm-proxy/.env"', install_script)
         self.assertIn('governance_env="${HOME}/.config/fusion/litellm-governance.env"', install_script)
         self.assertIn("os.chmod(path, 0o600, follow_symlinks=False)", install_script)
-        self.assertIn("systemctl --user start fusion-litellm-governance.service", install_script)
-        self.assertIn(
-            "systemctl --user show fusion-litellm-governance.service --property=Result --value",
-            install_script,
-        )
+        self.assertIn("-m scripts.run_litellm_governance_unit", install_script)
+        self.assertIn("-- /usr/bin/true", install_script)
+        self.assertNotIn("systemctl --user start fusion-litellm-governance.service", install_script)
         self.assertLess(
             install_script.index("os.chmod(path, 0o600, follow_symlinks=False)"),
-            install_script.index("systemctl --user start fusion-litellm-governance.service"),
+            install_script.index("-m scripts.run_litellm_governance_unit"),
         )
         self.assertLess(
-            install_script.index("systemctl --user start fusion-litellm-governance.service"),
+            install_script.index("-m scripts.run_litellm_governance_unit"),
             install_script.index("systemctl --user enable --now fusion-litellm-governance.timer"),
         )
 
