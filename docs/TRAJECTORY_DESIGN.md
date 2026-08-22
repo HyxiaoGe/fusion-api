@@ -443,7 +443,6 @@ async def _record(run_id: str, payload: dict) -> None:
 - 两条路径都收敛到 `degraded`，**不会错标 complete，也不会出现 sequence 重复**（唯一约束 `(run_id, sequence)` 兜底）。
 
 - 数据库侧配置可用的超时：`statement_timeout=200`（ms，整数，经连接 options 下发）、`lock_timeout=100`（ms，整数）、`connect_timeout=1`（s，psycopg2 最小粒度，仅作连接兜底，**非主隔离手段**）。
-- **备选方案（决策点）**：真正 `AsyncSession`（asyncpg/psycopg3 async 驱动）。若线程池方案实测不达 §9.1 阈值，P0 记录决策并切换；不默认采用（fusion 现有层为同步 Session，切换成本高）。
 - **首屏边界**：sink 顺序保持 Redis、progress 先于队列接纳（§2.1 硬约束 #7）；`first_output_delta` 的 reasoning/content 分支在可见 chunk 写 Redis 之后才接纳落账（§3.3）。同步核心的数据库等待只发生在单 run 消费者中。
 
 ### 5.2 账本完成边界：emitter seal + recorder finalize
