@@ -8,6 +8,7 @@ from starlette.responses import StreamingResponse
 
 from app.api.chat import send_message
 from app.schemas.chat import ChatRequest
+from app.schemas.response import ApiException
 
 USER_MESSAGE_ID = "11111111-1111-4111-8111-111111111111"
 ASSISTANT_MESSAGE_ID = "22222222-2222-4222-8222-222222222222"
@@ -73,6 +74,31 @@ class ChatRequestMessageIdTests(unittest.TestCase):
 
         self.assertIs(result, response)
         self.assertEqual(chat_service.process_message.await_args.kwargs["previous_run_id"], PREVIOUS_RUN_ID)
+
+    def test_send_route_preserves_stale_previous_run_conflict_contract(self):
+        conflict = ApiException.conflict("所选 Agent 运行已不是最新执行，请刷新轨迹后重试")
+        chat_service = SimpleNamespace(process_message=AsyncMock(side_effect=conflict))
+        chat_request = ChatRequest(
+            model_id="deepseek-chat",
+            message="重试",
+            conversation_id="conversation-1",
+            retry_user_message_id=USER_MESSAGE_ID,
+            previous_run_id=PREVIOUS_RUN_ID,
+        )
+
+        with self.assertRaises(ApiException) as raised:
+            asyncio.run(
+                send_message(
+                    chat_request=chat_request,
+                    request=SimpleNamespace(state=SimpleNamespace(request_id="run-new")),
+                    chat_service=chat_service,
+                    current_user=SimpleNamespace(id="user-1"),
+                )
+            )
+
+        self.assertIs(raised.exception, conflict)
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.code, "CONFLICT")
 
     def test_rejects_retry_without_conversation(self):
         with self.assertRaisesRegex(ValidationError, "conversation_id"):

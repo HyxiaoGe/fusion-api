@@ -79,6 +79,9 @@ class ChatServiceTests(unittest.TestCase):
                     status=status,
                 )
                 service.db.get.return_value = previous
+                latest_result = MagicMock()
+                latest_result.scalar_one_or_none.return_value = previous
+                service.db.execute.return_value = latest_result
                 result = service._validate_retry_previous_run(
                     previous_run_id="run-old",
                     conversation_id="conv-1",
@@ -88,6 +91,43 @@ class ChatServiceTests(unittest.TestCase):
                     assistant_message_id=assistant_message_id,
                 )
                 self.assertIs(result, previous)
+
+    def test_previous_run_validation_rejects_stale_attempt_with_stable_conflict(self):
+        service = ChatService(MagicMock())
+        previous = SimpleNamespace(
+            id="run-old",
+            conversation_id="conv-1",
+            user_id="user-1",
+            turn_message_id="turn-1",
+            message_id="assistant-1",
+            status="completed",
+        )
+        latest = SimpleNamespace(
+            id="run-latest",
+            conversation_id="conv-1",
+            user_id="user-1",
+            turn_message_id="turn-1",
+            message_id="assistant-1",
+            status="completed",
+        )
+        service.db.get.return_value = previous
+        latest_result = MagicMock()
+        latest_result.scalar_one_or_none.return_value = latest
+        service.db.execute.return_value = latest_result
+
+        with self.assertRaises(ApiException) as raised:
+            service._validate_retry_previous_run(
+                previous_run_id="run-old",
+                conversation_id="conv-1",
+                user_id="user-1",
+                turn_message_id="turn-1",
+                attempt_kind="regenerate",
+                assistant_message_id="assistant-1",
+            )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.code, "CONFLICT")
+        self.assertEqual(raised.exception.message, "所选 Agent 运行已不是最新执行，请刷新轨迹后重试")
 
     def test_invalid_explicit_previous_run_fails_before_stream_initialization(self):
         db = MagicMock()
@@ -1210,6 +1250,9 @@ class ChatServiceTests(unittest.TestCase):
             message_id=stored_assistant.id,
             status="completed",
         )
+        latest_result = MagicMock()
+        latest_result.scalar_one_or_none.return_value = db.get.return_value
+        db.execute.return_value = latest_result
         created_coroutines = []
 
         def close_created_coroutine(coroutine):
@@ -1313,6 +1356,9 @@ class ChatServiceTests(unittest.TestCase):
             message_id=None,
             status="error",
         )
+        latest_result = MagicMock()
+        latest_result.scalar_one_or_none.return_value = db.get.return_value
+        db.execute.return_value = latest_result
         created_coroutines = []
 
         def close_created_coroutine(coroutine):

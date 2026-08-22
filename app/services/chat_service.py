@@ -35,7 +35,8 @@ from app.services.agent.continuation import (
 from app.services.agent.session_cache import (
     InvalidPreviousRunError,
     RunAttemptKind,
-    validate_previous_run_candidate,
+    StalePreviousRunError,
+    validate_latest_previous_run_candidate,
 )
 from app.services.agent_strategy_config import get_agent_tools_disabled_aliases
 from app.services.chat.context_manager import (
@@ -820,9 +821,10 @@ class ChatService:
         attempt_kind: RunAttemptKind,
         assistant_message_id: str | None,
     ) -> AgentSession:
-        previous_run = self.db.get(AgentSession, previous_run_id)
+        previous_run = self.db.get(AgentSession, previous_run_id, populate_existing=True)
         try:
-            return validate_previous_run_candidate(
+            return validate_latest_previous_run_candidate(
+                self.db,
                 previous_run,
                 conversation_id=conversation_id,
                 user_id=user_id,
@@ -830,6 +832,8 @@ class ChatService:
                 message_id=assistant_message_id,
                 run_attempt_kind=attempt_kind,
             )
+        except StalePreviousRunError as error:
+            raise ApiException.conflict("所选 Agent 运行已不是最新执行，请刷新轨迹后重试") from error
         except InvalidPreviousRunError as error:
             raise ApiException.not_found("待接续的 Agent 运行不存在或不可用") from error
 

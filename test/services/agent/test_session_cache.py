@@ -291,7 +291,7 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
                 status="error",
             )
             session.get.side_effect = [None, previous]
-            session.execute.side_effect = [Result("c1"), Result(max_attempt)]
+            session.execute.side_effect = [Result("c1"), Result(max_attempt), Result(previous)]
             sessions.append(session)
         sessions[0].commit.side_effect = IntegrityError("insert", {}, conflict_orig)
         contexts = []
@@ -354,6 +354,58 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
                 for row in db.query(AgentSession).filter(AgentSession.turn_message_id == "turn-1").all()
             ]
         self.assertEqual(sorted(attempts), [1, 2])
+        engine.dispose()
+
+    async def test_explicit_retry_cannot_branch_from_stale_attempt_inside_allocation_lock(self):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        test_session_local = sessionmaker(bind=engine)
+        with test_session_local() as db:
+            db.add(Conversation(id="c1", user_id="u1", title="测试", model_id="gpt-4"))
+            db.add_all(
+                [
+                    AgentSession(
+                        id="run-old",
+                        conversation_id="c1",
+                        user_id="u1",
+                        model_id="gpt-4",
+                        provider="openai",
+                        message_id="assistant-1",
+                        turn_message_id="turn-1",
+                        attempt_index=1,
+                        status="error",
+                    ),
+                    AgentSession(
+                        id="run-latest",
+                        conversation_id="c1",
+                        user_id="u1",
+                        model_id="gpt-4",
+                        provider="openai",
+                        message_id="assistant-2",
+                        turn_message_id="turn-1",
+                        attempt_index=2,
+                        status="error",
+                    ),
+                ]
+            )
+            db.commit()
+
+        with patch("app.services.agent.session_cache.SessionLocal", test_session_local):
+            with self.assertRaisesRegex(ValueError, "最新"):
+                await write_session_started(
+                    run_id="run-branch",
+                    conversation_id="c1",
+                    user_id="u1",
+                    model_id="gpt-4",
+                    provider="openai",
+                    message_id="assistant-3",
+                    turn_message_id="turn-1",
+                    previous_run_id="run-old",
+                    run_attempt_kind="retry",
+                )
+
+        with test_session_local() as db:
+            self.assertIsNone(db.get(AgentSession, "run-branch"))
         engine.dispose()
 
     async def test_write_session_started_rechecks_same_run_after_conversation_lock(self):
@@ -454,7 +506,9 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
                 lock_result.scalar_one_or_none.return_value = "c1"
                 max_result = MagicMock()
                 max_result.scalar_one.return_value = 1
-                session.execute.side_effect = [lock_result, max_result]
+                latest_result = MagicMock()
+                latest_result.scalar_one_or_none.return_value = previous
+                session.execute.side_effect = [lock_result, max_result, latest_result]
 
                 with patch("app.services.agent.session_cache.SessionLocal") as session_local:
                     session_local.return_value.__enter__.return_value = session
