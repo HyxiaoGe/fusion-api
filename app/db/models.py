@@ -889,6 +889,7 @@ class TrajectoryLedgerSettings(Base):
 
     singleton_key = Column(String, primary_key=True)
     ledger_enabled_at = Column(DateTime(timezone=True), nullable=False)
+    trajectory_detail_enabled_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now, server_default=func.now())
 
     __table_args__ = (CheckConstraint("singleton_key = 'default'", name="ck_trajectory_ledger_settings_singleton_key"),)

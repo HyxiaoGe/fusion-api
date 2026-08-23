@@ -158,6 +158,7 @@ class AdminAuditApiTests(unittest.TestCase):
                 output_data={"secret": "output-secret"},
                 error_message="error-secret",
                 trace_id=run_id,
+                tool_call_id=f"call-{run_id}",
                 step_number=1,
                 created_at=created,
             )
@@ -1370,6 +1371,69 @@ class AdminAuditApiTests(unittest.TestCase):
             audit_failed = self.client.get("/api/admin/audit/conversations/conv-1/runs/run-audit-own/trajectory")
 
         self.assertEqual(cross_run.status_code, 404)
+        self.assertEqual(audit_failed.status_code, 503)
+        self.assertNotIn("input-secret", audit_failed.text)
+        self.assertNotIn("output-secret", audit_failed.text)
+        self.assertNotIn("error-secret", audit_failed.text)
+
+    def test_tool_node_detail_requires_reason_audits_access_and_fails_closed(self):
+        """若管理员详情允许无原因读取或审计失败仍返回，敏感诊断访问不可追溯。"""
+        from unittest.mock import patch
+
+        from app.db.models import AdminAuditEvent, Conversation, User
+
+        self._add_trajectory_run("run-node-detail")
+        self.db.add_all(
+            [
+                User(id="user-2", username="bob", email="bob@example.com"),
+                Conversation(id="conv-2", user_id="user-2", title="他人的对话", model_id="model-1"),
+            ]
+        )
+        self.db.commit()
+        self._add_trajectory_run("run-node-other", conversation_id="conv-2", user_id="user-2")
+
+        missing_reason = self.client.get(
+            "/api/admin/audit/conversations/conv-1/runs/run-node-detail/node-detail/tool/call-run-node-detail"
+        )
+        self.current_user.is_superuser = False
+        forbidden = self.client.get(
+            "/api/admin/audit/conversations/conv-1/runs/run-node-detail/node-detail/tool/call-run-node-detail",
+            headers={"X-Admin-Audit-Reason": "support node detail"},
+        )
+        self.current_user.is_superuser = True
+        cross_run = self.client.get(
+            "/api/admin/audit/conversations/conv-1/runs/run-node-other/node-detail/tool/call-run-node-other",
+            headers={"X-Admin-Audit-Reason": "support node detail"},
+        )
+        response = self.client.get(
+            "/api/admin/audit/conversations/conv-1/runs/run-node-detail/node-detail/tool/call-run-node-detail",
+            headers={"X-Admin-Audit-Reason": "support node detail"},
+        )
+
+        self.assertEqual(missing_reason.status_code, 422)
+        self.assertEqual(forbidden.status_code, 403)
+        self.assertEqual(cross_run.status_code, 404)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"]["status"], "available")
+        event = (
+            self.db.query(AdminAuditEvent)
+            .filter(AdminAuditEvent.action == "admin.audit.trajectory.node_detail.view")
+            .one()
+        )
+        self.assertEqual(event.resource_type, "conversation_run_tool_node_detail")
+        self.assertEqual(event.resource_id, "run-node-detail:call-run-node-detail")
+        self.assertEqual(event.target_user_id, "user-1")
+        self.assertEqual(event.reason, "support node detail")
+        self.assertEqual(event.extra_metadata, {})
+
+        with patch(
+            "app.db.admin_audit_repository.AdminAuditRepository.create_audit_event",
+            side_effect=RuntimeError("audit unavailable"),
+        ):
+            audit_failed = self.client.get(
+                "/api/admin/audit/conversations/conv-1/runs/run-node-detail/node-detail/tool/call-run-node-detail",
+                headers={"X-Admin-Audit-Reason": "support node detail"},
+            )
         self.assertEqual(audit_failed.status_code, 503)
         self.assertNotIn("input-secret", audit_failed.text)
         self.assertNotIn("output-secret", audit_failed.text)

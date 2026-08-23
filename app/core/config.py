@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     # 轨迹历史读取上限：服务层额外查询一条以明确截断状态。
     MAX_TRAJECTORY_EVENTS_PER_RUN: int = int(os.getenv("MAX_TRAJECTORY_EVENTS_PER_RUN", "5000"))
     MAX_TRAJECTORY_RUNS_PER_CONVERSATION: int = int(os.getenv("MAX_TRAJECTORY_RUNS_PER_CONVERSATION", "500"))
+    TRAJECTORY_DETAIL_SETTLE_GRACE_SECONDS: float = float(os.getenv("TRAJECTORY_DETAIL_SETTLE_GRACE_SECONDS", "5"))
 
     # 文件存储配置
     FILE_STORAGE_PATH: str = os.getenv("FILE_STORAGE_PATH", "./storage/files")

@@ -37,3 +37,18 @@ def get_run_trajectory(
     if result is None:
         raise ApiException.not_found(_NOT_FOUND_MESSAGE)
     return success(data=result, request_id=request.state.request_id)
+
+
+@router.get("/conversations/{conversation_id}/runs/{run_id}/node-detail/tool/{node_id}")
+def get_tool_node_detail(
+    conversation_id: str,
+    run_id: str,
+    node_id: str,
+    request: Request,
+    service: TrajectoryQueryService = Depends(get_trajectory_query_service),
+    current_user: User = Depends(get_current_user),
+):
+    result = service.get_user_tool_node_detail(conversation_id, run_id, node_id, current_user.id)
+    if result is None:
+        raise ApiException.not_found(_NOT_FOUND_MESSAGE)
+    return success(data=result, request_id=request.state.request_id)

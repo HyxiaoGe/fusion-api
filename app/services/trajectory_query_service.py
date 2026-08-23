@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from app.db.models import AgentEvent, AgentSession
 from app.db.trajectory_repository import TrajectoryRepository
 from app.schemas.admin_trajectory import AdminTrajectorySnapshot, AdminTrajectoryToolCall
 from app.schemas.trajectory import (
+    ToolNodeDetail,
     TrajectoryCompleteness,
     TrajectoryEventRecord,
+    TrajectoryNodeDetailResponse,
     TrajectoryRunListResponse,
     TrajectoryRunSummary,
     TrajectorySnapshot,
@@ -21,6 +24,7 @@ from app.services.agent.trajectory_reconciliation import (
     resolve_ledger_watermark,
     resolve_user_trajectory_status_from_rows,
 )
+from app.utils.time import as_utc, utc_now
 
 
 class TrajectoryQueryService:
@@ -32,12 +36,18 @@ class TrajectoryQueryService:
         *,
         max_events_per_run: int,
         max_runs_per_conversation: int,
+        detail_settle_grace_seconds: float = 5,
+        now_provider: Callable[[], datetime] = utc_now,
     ) -> None:
         if max_events_per_run <= 0 or max_runs_per_conversation <= 0:
             raise ValueError("轨迹查询上限必须大于 0")
+        if detail_settle_grace_seconds < 0:
+            raise ValueError("轨迹详情收敛宽限期不能为负数")
         self._repository = repository
         self._max_events_per_run = max_events_per_run
         self._max_runs_per_conversation = max_runs_per_conversation
+        self._detail_settle_grace = timedelta(seconds=detail_settle_grace_seconds)
+        self._now_provider = now_provider
 
     def list_runs(self, conversation_id: str, user_id: str) -> TrajectoryRunListResponse | None:
         rows = self._repository.list_runs(conversation_id, user_id, self._max_runs_per_conversation + 1)
@@ -73,6 +83,96 @@ class TrajectoryQueryService:
             snapshot=snapshot,
             tool_calls=tools,
             tool_calls_truncated=tool_calls_truncated,
+        )
+
+    def get_user_tool_node_detail(
+        self,
+        conversation_id: str,
+        run_id: str,
+        tool_call_id: str,
+        user_id: str,
+    ) -> TrajectoryNodeDetailResponse | None:
+        return self._get_tool_node_detail(conversation_id, run_id, tool_call_id, user_id=user_id)
+
+    def get_admin_tool_node_detail(
+        self,
+        conversation_id: str,
+        run_id: str,
+        tool_call_id: str,
+    ) -> TrajectoryNodeDetailResponse | None:
+        return self._get_tool_node_detail(conversation_id, run_id, tool_call_id, user_id=None)
+
+    def _get_tool_node_detail(
+        self,
+        conversation_id: str,
+        run_id: str,
+        tool_call_id: str,
+        *,
+        user_id: str | None,
+    ) -> TrajectoryNodeDetailResponse | None:
+        run = self._repository.get_detail_run(conversation_id, run_id, user_id)
+        if run is None:
+            return None
+        tool = self._repository.get_exact_tool_detail(
+            conversation_id=conversation_id,
+            user_id=run.user_id,
+            run_id=run_id,
+            tool_call_id=tool_call_id,
+        )
+        if tool is not None:
+            return self._available_tool_detail(tool_call_id, tool)
+
+        watermark = self._repository.get_detail_watermark()
+        if watermark is None or as_utc(run.created_at) < as_utc(watermark):
+            return self._unavailable_tool_detail("not_recorded", "detail_not_recorded")
+        if run.status == "running":
+            return self._unavailable_tool_detail("pending", "run_in_progress")
+        if run.terminal_at is not None:
+            age = as_utc(self._now_provider()) - as_utc(run.terminal_at)
+            if age <= self._detail_settle_grace:
+                return self._unavailable_tool_detail("pending", "detail_settling")
+        return self._unavailable_tool_detail("degraded", "tool_detail_missing")
+
+    @staticmethod
+    def _available_tool_detail(tool_call_id: str, tool) -> TrajectoryNodeDetailResponse:
+        safe_item = AdminAuditService._tool_item(tool)
+        payload = safe_item["arguments"] or None
+        result = safe_item["result_preview"] or None
+        sections = ["summary"]
+        if payload is not None:
+            sections.append("payload")
+        if result is not None:
+            sections.append("result")
+        if safe_item["duration_ms"] is not None:
+            sections.append("timing")
+        redacted_fields = [
+            field.replace("arguments", "payload", 1).replace("result_preview", "result", 1)
+            for field in safe_item["redacted_fields"]
+        ]
+        return TrajectoryNodeDetailResponse(
+            status="available",
+            available_sections=sections,
+            detail=ToolNodeDetail(
+                tool_call_id=tool_call_id,
+                tool_name=safe_item["tool_name"],
+                status=safe_item["status"],
+                duration_ms=safe_item["duration_ms"],
+                payload=payload,
+                result=result,
+                error=safe_item["error"],
+            ),
+            redacted_fields=redacted_fields,
+            reason=None,
+        )
+
+    @staticmethod
+    def _unavailable_tool_detail(status: str, reason: str) -> TrajectoryNodeDetailResponse:
+        return TrajectoryNodeDetailResponse(
+            status=status,
+            available_sections=[],
+            detail=None,
+            redacted_fields=[],
+            reason=reason,
         )
 
     @staticmethod

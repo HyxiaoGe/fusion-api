@@ -149,6 +149,7 @@ class TrajectoryApiTests(unittest.TestCase):
                     output_data={"secret": "output-secret"},
                     error_message="error-secret",
                     trace_id=run_id,
+                    tool_call_id=f"call-{run_id}",
                     created_at=self.now,
                 )
             )
@@ -207,6 +208,34 @@ class TrajectoryApiTests(unittest.TestCase):
         self.assertEqual(legacy_meta.status_code, 200)
         self.assertEqual(legacy_meta.json()["data"]["completeness"]["status"], "degraded")
         self.assertEqual(legacy_meta.json()["data"]["completeness"]["degraded_reason"], "terminal_outcome_unknown")
+
+    def test_tool_node_detail_endpoint_returns_safe_exact_detail_and_uniform_404(self):
+        """若普通端点未按会话、用户、run 与 tool_call_id 精确鉴权，详情会越权或误关联。"""
+        self._add_run("run-detail")
+        self._add_run("run-other", conversation_id="conv-2", user_id="user-2")
+
+        exact = self.client.get("/api/conversations/conv-1/runs/run-detail/node-detail/tool/call-run-detail")
+        wrong_node = self.client.get("/api/conversations/conv-1/runs/run-detail/node-detail/tool/tool-run-detail")
+        cross_run = self.client.get("/api/conversations/conv-1/runs/run-other/node-detail/tool/call-run-other")
+
+        self.assertEqual(exact.status_code, 200)
+        data = exact.json()["data"]
+        self.assertEqual(data["status"], "available")
+        self.assertEqual(data["node_type"], "tool")
+        self.assertEqual(data["detail"]["tool_call_id"], "call-run-detail")
+        self.assertIsNone(data["detail"]["payload"])
+        self.assertIsNone(data["detail"]["result"])
+        self.assertIn("payload.secret", data["redacted_fields"])
+        self.assertIn("result.secret", data["redacted_fields"])
+        self.assertNotIn("input-secret", exact.text)
+        self.assertNotIn("output-secret", exact.text)
+        self.assertNotIn("error-secret", exact.text)
+        for response in (cross_run,):
+            self.assertEqual(response.status_code, 404)
+            self.assertEqual(response.json()["message"], "会话或轨迹不存在，或无权访问")
+        self.assertEqual(wrong_node.status_code, 200)
+        self.assertEqual(wrong_node.json()["data"]["status"], "not_recorded")
+        self.assertIsNone(wrong_node.json()["data"]["detail"])
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -135,3 +135,30 @@ class TrajectorySnapshot(BaseModel):
     spans: list[TrajectorySpan] = Field(default_factory=list)
     completeness: TrajectoryCompleteness
     truncated: bool = False
+
+
+class ToolNodeDetail(BaseModel):
+    """普通用户可读取的 Tool 节点安全详情。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tool_call_id: str
+    tool_name: str
+    status: str
+    duration_ms: int | None = None
+    payload: dict[str, Any] | None = None
+    result: dict[str, Any] | None = None
+    error: dict[str, str] | None = None
+
+
+class TrajectoryNodeDetailResponse(BaseModel):
+    """P3 Tool Node Detail 的稳定响应信封。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["available", "pending", "not_recorded", "degraded"]
+    node_type: Literal["tool"] = "tool"
+    available_sections: list[Literal["summary", "payload", "result", "timing", "schema"]] = Field(default_factory=list)
+    detail: ToolNodeDetail | None = None
+    redacted_fields: list[str] = Field(default_factory=list)
+    reason: str | None = None

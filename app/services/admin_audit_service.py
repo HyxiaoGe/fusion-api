@@ -249,6 +249,28 @@ class AdminAuditService:
             reason=reason,
         )
 
+    def record_trajectory_node_detail_view(
+        self,
+        conversation_id: str,
+        run_id: str,
+        tool_call_id: str,
+        *,
+        admin: User,
+        request_id: str,
+        reason: str,
+    ) -> None:
+        """在任何管理员 Tool Node Detail 返回前持久化访问审计。"""
+        target_user_id = self._assert_conversation(conversation_id)
+        self._record(
+            admin=admin,
+            action="admin.audit.trajectory.node_detail.view",
+            resource_type="conversation_run_tool_node_detail",
+            resource_id=f"{run_id}:{tool_call_id}",
+            target_user_id=target_user_id,
+            request_id=request_id,
+            reason=reason,
+        )
+
     @staticmethod
     def _error_projection(error_message: Any, status: Any = None) -> dict[str, str] | None:
         raw_error = error_message if isinstance(error_message, str) else ""
@@ -690,15 +712,24 @@ class AdminAuditService:
         arguments, input_fields = sanitize_admin_value(argument_projection, max_string_chars=1000, max_list_items=30)
         result, output_fields = sanitize_admin_value(output_projection, max_string_chars=1000, max_list_items=30)
         error = cls._error_projection(tool.error_message, tool.status)
-        redacted = sorted(
-            [f"arguments.{field}" for field in input_fields] + [f"result_preview.{field}" for field in output_fields]
-        )
-        if raw_arguments and not argument_projection:
-            redacted.append("arguments")
-        if raw_output and not output_projection:
-            redacted.append("result_preview")
+        redacted = {
+            *[f"arguments.{field}" for field in input_fields],
+            *[f"result_preview.{field}" for field in output_fields],
+            *[f"arguments.{key}" for key in raw_arguments if key not in argument_projection],
+            *[f"result_preview.{key}" for key in raw_output if key not in output_projection],
+        }
+        raw_sources = raw_output.get("sources")
+        projected_sources = output_projection.get("sources")
+        if isinstance(raw_sources, list) and isinstance(projected_sources, list):
+            for index, source in enumerate(raw_sources[:20]):
+                if not isinstance(source, dict):
+                    continue
+                projected_source = projected_sources[index] if index < len(projected_sources) else {}
+                redacted.update(
+                    f"result_preview.sources.{index}.{key}" for key in source if key not in projected_source
+                )
         if tool.error_message:
-            redacted.append("error")
+            redacted.add("error")
         return {
             "id": tool.id,
             "message_id": tool.message_id,
@@ -712,7 +743,7 @@ class AdminAuditService:
             "arguments": arguments,
             "result_preview": result,
             "error": error,
-            "redacted_fields": redacted,
+            "redacted_fields": sorted(redacted),
             "created_at": tool.created_at,
         }
 

@@ -133,6 +133,30 @@ def get_trajectory_diagnostics(
     return success(data=data, request_id=request.state.request_id)
 
 
+@router.get("/conversations/{conversation_id}/runs/{run_id}/node-detail/tool/{node_id}")
+def get_tool_node_detail_diagnostics(
+    conversation_id: str,
+    run_id: str,
+    node_id: str,
+    request: Request,
+    reason: str = Header(..., alias="X-Admin-Audit-Reason", min_length=1, max_length=300),
+    trajectory_service: TrajectoryQueryService = Depends(get_trajectory_query_service),
+    audit_service: AdminAuditService = Depends(get_admin_audit_service),
+    auditor: User = Depends(get_conversation_auditor),
+):
+    data = trajectory_service.get_admin_tool_node_detail(conversation_id, run_id, node_id)
+    if data is None:
+        raise ApiException.not_found("会话或轨迹不存在")
+    audit_service.record_trajectory_node_detail_view(
+        conversation_id,
+        run_id,
+        node_id,
+        admin=auditor,
+        **_context(request, reason),
+    )
+    return success(data=data, request_id=request.state.request_id)
+
+
 def _conversation_page(
     method_name: str,
     conversation_id: str,

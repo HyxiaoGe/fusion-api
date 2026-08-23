@@ -139,6 +139,78 @@ class TrajectoryRepository:
         ).one_or_none()
         return None if row is None else (row[0], self._user_meta_from_columns(row[1:]))
 
+    def get_detail_run(
+        self,
+        conversation_id: str,
+        run_id: str,
+        user_id: str | None,
+    ) -> AgentSession | None:
+        """读取 Node Detail 所属 run；普通端点必须同时限定当前用户。"""
+        query = (
+            select(AgentSession)
+            .options(
+                load_only(
+                    AgentSession.id,
+                    AgentSession.conversation_id,
+                    AgentSession.user_id,
+                    AgentSession.status,
+                    AgentSession.terminal_at,
+                    AgentSession.created_at,
+                )
+            )
+            .join(Conversation, Conversation.id == AgentSession.conversation_id)
+            .where(Conversation.id == conversation_id)
+            .where(AgentSession.id == run_id)
+            .where(Conversation.user_id == AgentSession.user_id)
+        )
+        if user_id is not None:
+            query = query.where(Conversation.user_id == user_id).where(AgentSession.user_id == user_id)
+        return self._session.execute(query).scalar_one_or_none()
+
+    def get_exact_tool_detail(
+        self,
+        *,
+        conversation_id: str,
+        user_id: str,
+        run_id: str,
+        tool_call_id: str,
+    ) -> ToolCallLog | None:
+        """只按完整归属与精确关联键读取工具日志，不提供任何启发式 fallback。"""
+        return self._session.execute(
+            select(ToolCallLog)
+            .options(
+                load_only(
+                    ToolCallLog.id,
+                    ToolCallLog.conversation_id,
+                    ToolCallLog.message_id,
+                    ToolCallLog.user_id,
+                    ToolCallLog.tool_name,
+                    ToolCallLog.status,
+                    ToolCallLog.error_message,
+                    ToolCallLog.duration_ms,
+                    ToolCallLog.model_id,
+                    ToolCallLog.provider,
+                    ToolCallLog.input_params,
+                    ToolCallLog.output_data,
+                    ToolCallLog.trace_id,
+                    ToolCallLog.tool_call_id,
+                    ToolCallLog.step_number,
+                    ToolCallLog.created_at,
+                )
+            )
+            .where(ToolCallLog.conversation_id == conversation_id)
+            .where(ToolCallLog.user_id == user_id)
+            .where(ToolCallLog.trace_id == run_id)
+            .where(ToolCallLog.tool_call_id == tool_call_id)
+        ).scalar_one_or_none()
+
+    def get_detail_watermark(self):
+        return self._session.execute(
+            select(TrajectoryLedgerSettings.trajectory_detail_enabled_at).where(
+                TrajectoryLedgerSettings.singleton_key == "default"
+            )
+        ).scalar_one_or_none()
+
     def list_events(self, conversation_id: str, run_id: str, limit: int) -> list[AgentEvent]:
         if limit <= 0:
             raise ValueError("limit 必须大于 0")
