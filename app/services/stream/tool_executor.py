@@ -549,6 +549,7 @@ async def log_tool_execution(
     ids: ToolExecutionIds,
     result,
     args: dict,
+    tool_call_id: str | None,
 ) -> None:
     await handler.log(
         log_id=ids.log_id,
@@ -559,6 +560,7 @@ async def log_tool_execution(
         result=result,
         input_params=args,
         trace_id=request.trace_id,
+        tool_call_id=tool_call_id,
         step_number=request.step_number,
         message_id=request.message_id,
     )
@@ -695,11 +697,7 @@ async def execute_one_tool_call(request: ToolExecutionBatchRequest, tool_call: d
         tool_name=tool_call["name"],
         args=args,
         network_budget=request.network_budget,
-        plan_item_id=(
-            tool_call.get("plan_item_id")
-            if isinstance(tool_call.get("plan_item_id"), str)
-            else None
-        ),
+        plan_item_id=(tool_call.get("plan_item_id") if isinstance(tool_call.get("plan_item_id"), str) else None),
     )
     executable_args = strip_internal_tool_arguments(args)
     if budget_result is not None:
@@ -738,7 +736,14 @@ async def execute_one_tool_call(request: ToolExecutionBatchRequest, tool_call: d
     ):
         request.successful_tool_call_signatures.add(successful_signature)
 
-    await log_tool_execution(request=request, handler=handler, ids=ids, result=result, args=executable_args)
+    await log_tool_execution(
+        request=request,
+        handler=handler,
+        ids=ids,
+        result=result,
+        args=executable_args,
+        tool_call_id=tool_call["id"],
+    )
     record = build_tool_execution_record(tool_call=tool_call, result=result, handler=handler, ids=ids)
     await emit_progress_digest_events(request=request, record=record)
     return record
@@ -760,7 +765,14 @@ async def _complete_preflight_tool_result(
         args=args,
         result=result,
     )
-    await log_tool_execution(request=request, handler=handler, ids=ids, result=result, args=args)
+    await log_tool_execution(
+        request=request,
+        handler=handler,
+        ids=ids,
+        result=result,
+        args=args,
+        tool_call_id=tool_call["id"],
+    )
     record = build_tool_execution_record(
         tool_call=tool_call,
         result=result,

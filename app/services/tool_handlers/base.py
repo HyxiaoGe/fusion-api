@@ -113,6 +113,7 @@ class BaseToolHandler(ABC):
         result: ToolResult,
         input_params: dict,
         trace_id: str = None,
+        tool_call_id: str | None = None,
         step_number: int = None,
         message_id: str | None = None,
     ) -> None:
@@ -134,6 +135,7 @@ class BaseToolHandler(ABC):
                 output_data=_serialize_for_json(safe_output_data),
                 error_message=result.error_message,
                 trace_id=trace_id,
+                tool_call_id=tool_call_id,
                 step_number=step_number,
             )
         )
