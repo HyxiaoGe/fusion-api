@@ -22,8 +22,9 @@
 ConversationViewShell（同一份 messages + 脱敏事件账本）
   ├─ Chat Tab：用户提问 / 助手回答 / 轻量运行状态 / 「查看轨迹」
   ├─ Trajectory Tab：全高、按 turn 组织的会话级有界轨迹视图
-  │    ├─ 最近 N 个 Run 的骨架与摘要带
-  │    └─ 当前选中 Run 的 records / spans 水合、虚拟账本、瀑布图与检查器
+  │    ├─ 顶部 TrajectoryOverview：会话时间域、Run 占位与当前焦点的详细记录
+  │    ├─ 中部 TrajectoryTable：按 Turn 组织的虚拟化用户可读账本
+  │    └─ 右侧 TrajectoryNodeDetailPanel：选中节点的 Summary/Payload/Result/Timing
   └─ ChatInput：会话壳唯一实例，跨 Tab 始终挂载
 ```
 
@@ -548,7 +549,7 @@ dev 同步基线已经触发切换；`QueuedTrajectoryRecorder` 固定以下生�
   - **自带摘要**：`tool_call_completed / step_completed` 已携带 `duration_ms / status / result_summary`，可直接建 span，配对只用于补参数与流式 delta。
 - **Orphan 收口**：按 §3.3 规则推导关闭未配对 span；推导 span 必须携带 `terminal_source: recorded|inferred` 与 `inferred_reason`；**成功 run 中的孤儿标 `unknown/incomplete`，不得伪装成真实 cancelled**；TTFT 允许为 null（无任何 output delta 的轮次）。
 - annotation 事件不建 span，按类型挂到对应 span 的附加区段（plan/evidence/context）。
-- **P3 分层边界**：P1 已发布 `records + spans + completeness + truncated`，不新增第二套后端 cell 投影。P3 在浏览器端用 `TrajectoryCellProjection` 将会话 messages、P1 run/snapshot 与受控 SSE 增量投影为用户可读 cell；P1 spans 仍是历史瀑布图的权威投影。
+- **P3 分层边界**：P1 已发布 `records + spans + completeness + truncated`，不新增第二套后端 cell 投影。P3 在浏览器端以 target-specific 的 `TrajectoryCellProjection` 将会话 messages、P1 run summary/records/spans/completeness 与受控 SSE 增量投影为用户可读 cell；P1 spans 只是输入之一，不保留独立 Span 瀑布视图或重复 Span 列表。
 - 结果模型：`TrajectorySnapshot { run, records[], spans[], completeness, message 归组, attempt 归组, truncated }`。
 
 ### 6.2 与现有持久化模型的关系
