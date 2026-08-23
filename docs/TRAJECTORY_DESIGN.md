@@ -1,6 +1,6 @@
 # Fusion Trajectory 集成设计（DSH 风格 Agent 执行轨迹）
 
-> 状态：设计稿 v0.19（P0 已 dev 验收并采用 `QueuedTrajectoryRecorder`；P1 已由 PR #54 合并并部署验证；P2 独立联调夹具已完成既有真实 API 验证；P3 实施中）
+> 状态：设计稿 v0.21（P0 已 dev 验收并采用 `QueuedTrajectoryRecorder`；P1 已由 PR #54 合并并部署验证；P2 独立联调夹具已完成既有真实 API 验证；P3 实施中；v0.21 P3 决策已迁入本正式 `feat/trajectory-p3-contract-guard` 分支）
 > 范围：fusion-api + fusion-ui 集成 Agent 执行轨迹展示；`langchain-trajectory-mvp` 仅保留为历史联调夹具，不进入 Fusion P3 运行时或交付链路。
 > 本文档记录 P0–P3 的统一架构；P3 直接消费已发布 P1，不重新实施后端投影器或快照 API。
 >
@@ -605,6 +605,33 @@ GET /api/admin/audit/conversations/{conversation_id}/runs/{run_id}/trajectory
 - **审计闭环**：管理员轨迹读取必须复用 `get_conversation_auditor` 与 `X-Admin-Audit-Reason`；在返回 `tool_calls` 前写入 `admin.audit.trajectory.view`，审计失败返回既有 503，不得 fail-open。
 - 命名：账本称「**脱敏事件账本**」，文档与 UI 不得声称是完整原始事件。
 
+### 7.4 Trajectory Node Detail 契约（v0.21 定稿，P3 只承诺 Tool）
+
+> 本节与 §8 的 Network 式三区交互共享同一 Detail 契约，分别验收。硬约束：**只支持精确关联，不支持历史猜测；旧数据允许缺失，新数据缺失必须显式暴露。**
+> **P3 实现范围（v0.21，YAGNI）**：后端 `node-detail` 端点只承诺 `node_type=tool`；LLM/Message/Run/Step 的 Summary/Timing 由前端投影直接生成，不经 Node Detail API；统一 Envelope 为未来扩展保留其他 `node_type`。
+
+```typescript
+type TrajectoryNodeDetailResponse = {
+  status: "available" | "pending" | "not_recorded" | "degraded";
+  node_type: "tool" | "llm" | "message" | "run" | "step";
+  available_sections: Array<"summary" | "payload" | "result" | "timing" | "schema">;
+  detail: ToolNodeDetail | LlmNodeDetail | MessageNodeDetail | RunNodeDetail | StepNodeDetail | null;
+  redacted_fields: string[];
+  reason: string | null;
+};
+```
+
+- `status` 表示关联数据是否可信，`available_sections` 表示可展示的详情页签，二者不得混用；P3 后端只实现 Tool 分支，非 Tool 节点不因没有 Tool Payload 而标记 degraded。
+- 普通端点为 `GET /api/conversations/{conversation_id}/runs/{run_id}/node-detail/{node_type}/{node_id}`，Tool 的 `node_id` 为 `tool_call_id`；管理员端点位于 `/api/admin/audit/conversations/{conversation_id}/runs/{run_id}/node-detail/{node_type}/{node_id}`，要求访问原因和审计记录。
+- `trajectory_detail_enabled_at` 是独立于 `ledger_enabled_at` 的持久化水位。先迁移列/索引、部署写入链路、确认实例开始写 `tool_call_id`，再显式激活该水位；激活前数据统一为 `not_recorded`，不得在迁移开始时提前生效。
+- Tool 的服务端状态按以下确定性顺序判定：① 精确 `(run_id, tool_call_id)` 行存在为 `available`；② `run.created_at < trajectory_detail_enabled_at` 为 `not_recorded`；③ run 仍在运行或④ 已终态但仍在 `detail_settle_grace` 内为 `pending`；⑤ 其余终态且超宽限期仍无精确行才为 `degraded`。
+- `ToolCallLog` 是 fire-and-forget 写入，Run finalize 不等待它；`detail_settle_grace` 为数秒级有限值（例如 5s），宽限期后缺失收敛为 `degraded`，不得无限刷新，也不得改变 P0 ledger finalize barrier。
+- 新增 nullable `ToolCallLog.tool_call_id`，链路为 `tool_call["id"] → log_tool_execution → handler.log → log_tool_call → ToolCallLog.tool_call_id`；不得复用日志记录 ID。新写入必须同时具备 `trace_id` 与 `tool_call_id`，并建立部分唯一索引 `UNIQUE (trace_id, tool_call_id) WHERE trace_id IS NOT NULL AND tool_call_id IS NOT NULL`。
+- 查询只允许精确匹配 `conversation_id + user_id + run_id/trace_id + tool_call_id`，禁止按 step/name/time 做历史启发式 fallback。普通用户脱敏由服务端执行，并在 `redacted_fields` 明示。
+- `ToolCallLog` 每个逻辑 Tool Call 只保留最终一条；Attempt 只来自 `tool_attempt_started/completed`。Payload/Result 归属逻辑 Tool 节点，Attempt 仅展示状态、错误码和 Timing；单次成功 Attempt 默认折叠。
+- 历史 run 缺精确详情时展示基础账本与 Timing，并以 `not_recorded` 说明 Payload/Result 不可用，不标 degraded、不猜测关联；新 run 缺失必须显式 `pending` 或 `degraded`。
+- 本节不回填旧数据、不把 Payload/Result 复制进 `agent_events`、不实施 cursor 分页或 Schema UI。
+
 ## 8. 前端（P3）：Chat Tab + 会话级有界 Trajectory Tab
 
 ### 8.1 定位、范围与 DSH 对标
@@ -614,6 +641,7 @@ GET /api/admin/audit/conversations/{conversation_id}/runs/{run_id}/trajectory
 - 按 `turn_message_id` 分组、按 `attempt_index` 排序；P1 普通 run DTO 不含 `previous_run_id`，P3 首版不绘制精确 lineage edge。cursor 与精确 lineage 属于 P1.1 后续增强。
 - 对标 DSH 的部分：会话视图 Tab、turn 组织、用户可读账本、Chat → Trajectory one-shot inspect、长列表虚拟化。`plan/context` cell 与 Trajectory → Chat reveal 属于 Fusion 扩展。
 - 普通会话 Tab 只消费普通用户 `TrajectorySnapshot`；管理员诊断继续走独立 admin-audit 页面/端点，不在普通组件中按角色切换 DTO，也不把 run 级管理员工具记录伪装成精确 tool/span 关联。
+- v0.21 的视图布局为 Network 式三区：顶部 `TrajectoryOverview` 负责会话时间域与联动；中部 `TrajectoryTable` 是按 Turn 组织的虚拟化账本；右侧 `TrajectoryNodeDetailPanel` 展示选中节点。Overview、记录表与详情使用同一选中状态，避免再引入独立 Span 瀑布图加重复列表。
 
 ### 8.2 规范化事件、实时合并与终态对账
 
@@ -666,12 +694,14 @@ ConversationViewShell
 
 ### 8.5 组件、懒加载与虚拟化
 
-- `TrajectoryTabView`：全高编排、Run 选择、完整性粘性横幅、终态动作与错误/空态。
-- `TrajectoryLedger`：按 turn/run 组织用户可读 cell；固定折叠行高度，检查器独立渲染，避免动态展开破坏虚拟窗口。
-- `TrajectoryTimeline`：会话级 Run 摘要带 + 当前选中 Run 的 P1 span 瀑布图；Run 摘要带不把人类两次提问间的等待时间画入执行耗时。
-- `TrajectoryInspector`：只展示普通用户安全字段、耗时、TTFT、状态、父子关系与短错误；不倾倒事件 JSON、prompt、完整参数/结果或管理员 DTO。
+- `TrajectoryTabView`：全高编排 Network 式三区、Run 选择、完整性粘性横幅、终态动作与错误/空态。
+- `TrajectoryOverview`：记录级时间总览（Input/Model/Tools 轨道、投影模式切换、区间选择、缩放/平移、hover 精确时刻）。P3 只实现 `sequence`（等宽、查看执行顺序）与 `actual`（真实 start/end、查看时间分布）两种模式；`duration/time` 后置，不纳入本期验收。
+- Overview 的会话域由 Run summary 构成：当前聚焦 Run 展开 Input/Model/Tools 详细记录，未水合 Run 仅显示粗粒度占位区段；切换焦点时替换详细展开区段，不把 LRU 缓存详情永久拼入 Overview。跨未水合 Run 拖选时先聚焦并加载对应 Run，再展示详细匹配；不得假装已过滤全部记录，也不新增 Overview API。
+- `TrajectoryTable`：按 Turn 分隔的高密度虚拟化记录表（user/message/tool 等 cell，#N、类型标记、单行摘要、状态、耗时）。记录行点击高亮 Overview；Overview 区段点击定位记录表并打开右侧详情。
+- `TrajectoryNodeDetailPanel`：消费 §7.4 Tool Node Detail DTO，展示 Summary/Payload/Result/Timing；Payload/Result 按点击懒加载，诊断字段折叠展示。LLM/Message/Run/Step 的 Summary/Timing 由前端投影生成，不调用 Node Detail API。
+- 区间选择清除必须同时提供可见「清除范围」按钮、Escape 和触屏入口；右键清除只能作为快捷方式，不能是唯一入口。
 - 首载只拉 run list；只拉当前选中 Run snapshot；切换时按需加载并使用最多 8 个 Run 的 LRU 缓存。
-- `TrajectoryLedger` 使用固定行高窗口化，overscan 后 DOM 记录行始终 ≤200；支持 Home/End/方向键与 `aria-posinset/aria-setsize`。inspect 可先计算目标 index，再滚动到尚未挂载的虚拟行。
+- `TrajectoryTable` 使用固定行高窗口化，overscan 后 DOM 记录行始终 ≤200；支持 Home/End/方向键与 `aria-posinset/aria-setsize`。inspect 可先计算目标 index，再滚动到尚未挂载的虚拟行。
 - 5000 事件固定 fixture 的 CI 门禁：纯投影批次 ≤750ms、1000 条受控增量合并批次 ≤500ms、DOM 记录行 ≤200；同时验证首/中/尾定位和连续 SSE 合并。
 
 ### 8.6 InspectRequest 与 revealInChat
@@ -723,6 +753,7 @@ InspectRequest = {
 - Chat → Trajectory inspect 与 Trajectory → Chat message reveal 分别通过 e2e；Tab 切换不终止 SSE。
 - Agent run retry/continue 只在 Trajectory，消息级 retry 保留；请求目标与 `previous_run_id` 正确，新 attempt 自动选中。
 - 四组一致性闸门通过；真实 dev 新 Run 覆盖工具、知识库、失败/触顶或 continuation、刷新恢复与 console 0 error。
+- Network 联动验收：顶部区段点击定位记录表并打开右侧详情，记录行点击高亮 Overview；区间拖选仅显示/聚焦时间重叠记录；可访问清除范围可用；`sequence/actual` 可切换；未水合 Run 占位、焦点替换展开与跨 Run 拖选按 §8.5 收敛；Tool Node Detail 的 `available/pending/not_recorded/degraded` 四态与 settle grace 正确。
 
 ## 9. P0 验收标准
 
@@ -776,7 +807,20 @@ P0 验收不依赖 P2（MVP Adapter 联调属 P2 验收）。
 | P1 | **已完成（PR #54）**：`TrajectoryProjector`（orphan 收口 + `terminal_source` + 截断保护）；普通/管理员快照 API 分离；仅历史、有界、`truncated` 明示 | P3 直接消费，不重新实施 |
 | P1.1（后续可选） | Run/event cursor 分页与精确 `previous_run_id` lineage DTO | P3 首版不依赖；需要突破有界历史时再做 |
 | P2 | **已完成历史验证**：独立 MVP `FusionTrajectoryAdapter` 只读 P1 快照；不进入 Fusion P3 runtime，不复制其 SQLite/SSE/投影器 | 仅作为既有联调证据保留 |
-| P3 | fusion-ui 双 Tab；前端 `TrajectoryCellProjection`；会话级有界账本；按 Run 水合/LRU；虚拟化；P1+SSE 归并与终态对账；inspect/reveal；一致性闸门；替代旧“过程” | §8.9 全部通过；旧组件 cleanup 在真实 dev 回归后独立提交 |
+| P3 | fusion-ui 双 Tab；前端 `TrajectoryCellProjection`；Network 三区的 `TrajectoryOverview + TrajectoryTable + TrajectoryNodeDetailPanel`；Tool-only Node Detail 精确关联、四态与 settle grace；会话级有界账本；按 Run 水合/LRU；虚拟化；P1+SSE 归并与终态对账；inspect/reveal；一致性闸门；替代旧“过程” | §8.9 全部通过；旧组件 cleanup 在真实 dev 回归后独立提交 |
+
+**P3 实施顺序（v0.21 定稿，Node Detail 后端前置以先验证真实契约）**：
+
+1. 将 v0.21 文档迁入正式 P3 分支；
+2. `ToolCallLog.tool_call_id` 迁移与写入链路（§7.4）；
+3. Tool Node Detail 端点、脱敏、四态与 settle grace（§7.4）；
+4. 前端 Detail client/type（§7.4 Envelope）；
+5. `TrajectoryOverview` + `TrajectoryTable`（§8.5）；
+6. `TrajectoryNodeDetailPanel` 接真实 API；
+7. SSE 实时归并与尾部跟随（§8.2/§8.5）；
+8. 一致性闸门（§8.8）；
+9. dev 真实 Run 回归；
+10. 最后删除旧「过程」组件（三条件齐备）。
 
 ## 11. 对抗式审查清单（终审确认用）
 
