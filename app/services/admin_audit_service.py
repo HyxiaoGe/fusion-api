@@ -712,24 +712,15 @@ class AdminAuditService:
         arguments, input_fields = sanitize_admin_value(argument_projection, max_string_chars=1000, max_list_items=30)
         result, output_fields = sanitize_admin_value(output_projection, max_string_chars=1000, max_list_items=30)
         error = cls._error_projection(tool.error_message, tool.status)
-        redacted = {
-            *[f"arguments.{field}" for field in input_fields],
-            *[f"result_preview.{field}" for field in output_fields],
-            *[f"arguments.{key}" for key in raw_arguments if key not in argument_projection],
-            *[f"result_preview.{key}" for key in raw_output if key not in output_projection],
-        }
-        raw_sources = raw_output.get("sources")
-        projected_sources = output_projection.get("sources")
-        if isinstance(raw_sources, list) and isinstance(projected_sources, list):
-            for index, source in enumerate(raw_sources[:20]):
-                if not isinstance(source, dict):
-                    continue
-                projected_source = projected_sources[index] if index < len(projected_sources) else {}
-                redacted.update(
-                    f"result_preview.sources.{index}.{key}" for key in source if key not in projected_source
-                )
+        redacted = sorted(
+            [f"arguments.{field}" for field in input_fields] + [f"result_preview.{field}" for field in output_fields]
+        )
+        if raw_arguments and not argument_projection:
+            redacted.append("arguments")
+        if raw_output and not output_projection:
+            redacted.append("result_preview")
         if tool.error_message:
-            redacted.add("error")
+            redacted.append("error")
         return {
             "id": tool.id,
             "message_id": tool.message_id,
@@ -743,7 +734,7 @@ class AdminAuditService:
             "arguments": arguments,
             "result_preview": result,
             "error": error,
-            "redacted_fields": sorted(redacted),
+            "redacted_fields": redacted,
             "created_at": tool.created_at,
         }
 

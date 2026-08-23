@@ -144,6 +144,9 @@ def get_tool_node_detail_diagnostics(
     audit_service: AdminAuditService = Depends(get_admin_audit_service),
     auditor: User = Depends(get_conversation_auditor),
 ):
+    normalized_reason = reason.strip()
+    if not normalized_reason:
+        raise ApiException.bad_request("管理员审计原因不能为空")
     data = trajectory_service.get_admin_tool_node_detail(conversation_id, run_id, node_id)
     if data is None:
         raise ApiException.not_found("会话或轨迹不存在")
@@ -152,7 +155,7 @@ def get_tool_node_detail_diagnostics(
         run_id,
         node_id,
         admin=auditor,
-        **_context(request, reason),
+        **_context(request, normalized_reason),
     )
     return success(data=data, request_id=request.state.request_id)
 

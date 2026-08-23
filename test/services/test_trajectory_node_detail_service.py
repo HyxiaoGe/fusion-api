@@ -160,13 +160,14 @@ class TrajectoryNodeDetailServiceTests(unittest.TestCase):
         self.assertEqual(response.detail.payload, {"query": "安全查询"})
         self.assertEqual(response.detail.result["result_count"], 1)
         self.assertEqual(response.detail.error, {"type": "execution_failed", "message": "执行失败"})
-        self.assertIn("payload.authorization", response.redacted_fields)
-        self.assertIn("result.private_payload", response.redacted_fields)
-        self.assertIn("result.sources.0.raw_content", response.redacted_fields)
+        self.assertIn("payload", response.redacted_fields)
+        self.assertIn("result", response.redacted_fields)
         self.assertIn("error", response.redacted_fields)
         encoded = json.dumps(response.model_dump(mode="json"), ensure_ascii=False)
         for secret in ("input-secret", "output-secret", "source-secret", "error-secret"):
             self.assertNotIn(secret, encoded)
+        for hidden_key in ("authorization", "private_payload", "raw_content"):
+            self.assertNotIn(hidden_key, encoded)
         for internal_field in ("log-run-before-call-exact", "trace_id", "step_number", "model_id", "provider"):
             self.assertNotIn(internal_field, encoded)
         self.assertNotIn("schema", response.available_sections)
@@ -190,8 +191,10 @@ class TrajectoryNodeDetailServiceTests(unittest.TestCase):
         self.assertIsNone(response.detail.payload)
         self.assertIsNone(response.detail.result)
         self.assertEqual(response.available_sections, ["summary"])
-        self.assertIn("payload.account", response.redacted_fields)
-        self.assertIn("result.raw", response.redacted_fields)
+        self.assertIn("payload", response.redacted_fields)
+        self.assertIn("result", response.redacted_fields)
+        self.assertNotIn("account", response.model_dump_json())
+        self.assertNotIn("raw", response.model_dump_json())
         self.assertNotIn("input-secret", response.model_dump_json())
         self.assertNotIn("output-secret", response.model_dump_json())
 
@@ -223,12 +226,90 @@ class TrajectoryNodeDetailServiceTests(unittest.TestCase):
         self.assertEqual(response.detail.tool_name, "url_read")
         self.assertEqual(set(response.detail.payload or {}), {"url", "reason"})
         self.assertEqual(set(response.detail.result or {}), {"url", "title", "status", "content_length"})
-        self.assertIn("payload.authorization", response.redacted_fields)
+        self.assertIn("payload", response.redacted_fields)
         self.assertIn("payload.url.query.token", response.redacted_fields)
-        self.assertIn("result.content", response.redacted_fields)
+        self.assertIn("result", response.redacted_fields)
         self.assertIn("result.url.query.token", response.redacted_fields)
+        self.assertNotIn("authorization", response.model_dump_json())
+        self.assertNotIn('"content":', response.model_dump_json())
         self.assertNotIn("input-secret", response.model_dump_json())
         self.assertNotIn("output-secret", response.model_dump_json())
+
+    def test_mcp_and_amap_details_exclude_internal_binding_metadata(self):
+        """若普通详情沿用管理员宽投影，MCP 服务绑定与版本哈希会泄漏。"""
+        for index, tool_name in enumerate(("mcp_internal_alias", "local_place_search"), start=1):
+            run_id = f"run-internal-{index}"
+            call_id = f"call-internal-{index}"
+            self._run(run_id, terminal_at=self.now - timedelta(minutes=1))
+            self._tool(
+                run_id,
+                call_id,
+                tool_name=tool_name,
+                input_params={
+                    "mcp_server_id": "server-amap-secret",
+                    "remote_tool_name": "maps_text_search-secret",
+                    "provider": "amap-internal-provider",
+                    "config_version": 7,
+                    "definition_sha256": "a" * 64,
+                    "argument_count": 3,
+                    "internal_request_id": "request-secret",
+                },
+                output_data={
+                    "mcp_server_id": "server-amap-secret",
+                    "remote_tool_name": "maps_text_search-secret",
+                    "provider": "amap-internal-provider",
+                    "config_version": 7,
+                    "definition_sha256": "a" * 64,
+                    "status": "failed",
+                    "payload_bytes": 128,
+                    "error_code": "rate_limited",
+                    "subcall_attempt_count": 2,
+                    "remote_tools_attempted": ["maps_geo-secret"],
+                    "internal_response_id": "response-secret",
+                },
+                error_message="MCP upstream failed with server-secret",
+            )
+
+            response = self._service().get_user_tool_node_detail("conv-1", run_id, call_id, "user-1")
+
+            assert response is not None and response.detail is not None
+            self.assertEqual(response.detail.payload, {"argument_count": 3})
+            self.assertEqual(
+                response.detail.result,
+                {
+                    "status": "failed",
+                    "payload_bytes": 128,
+                    "error_code": "rate_limited",
+                    "subcall_attempt_count": 2,
+                },
+            )
+            self.assertEqual(response.detail.error, {"type": "execution_failed", "message": "执行失败"})
+            self.assertIn("payload", response.redacted_fields)
+            self.assertIn("result", response.redacted_fields)
+            self.assertIn("error", response.redacted_fields)
+            encoded = response.model_dump_json()
+            for hidden_key in (
+                "mcp_server_id",
+                "remote_tool_name",
+                "provider",
+                "config_version",
+                "definition_sha256",
+                "remote_tools_attempted",
+                "internal_request_id",
+                "internal_response_id",
+            ):
+                self.assertNotIn(hidden_key, encoded)
+            for hidden_value in (
+                "server-amap-secret",
+                "maps_text_search-secret",
+                "amap-internal-provider",
+                "request-secret",
+                "maps_geo-secret",
+                "response-secret",
+                "server-secret",
+                "a" * 64,
+            ):
+                self.assertNotIn(hidden_value, encoded)
 
     def test_missing_exact_log_converges_in_deterministic_four_state_order(self):
         """若状态顺序或 terminal_at 边界改变，旧数据会被伪装或新缺失会无限 pending。"""

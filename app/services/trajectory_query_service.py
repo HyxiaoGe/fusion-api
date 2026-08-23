@@ -18,13 +18,32 @@ from app.schemas.trajectory import (
     TrajectoryRunSummary,
     TrajectorySnapshot,
 )
+from app.services.admin_audit_sanitizer import sanitize_admin_value
 from app.services.admin_audit_service import AdminAuditService
 from app.services.agent.trajectory_projector import project_trajectory
 from app.services.agent.trajectory_reconciliation import (
     resolve_ledger_watermark,
     resolve_user_trajectory_status_from_rows,
 )
+from app.services.mcp.amap_product_tools import AMAP_PRODUCT_TOOL_NAMES
+from app.services.mcp.flyai_travel_tools import FLYAI_TRAVEL_TOOL_NAMES
 from app.utils.time import as_utc, utc_now
+
+_USER_WEB_SEARCH_ARGUMENT_FIELDS = ("query", "count", "domains", "recency_days", "intent")
+_USER_WEB_SEARCH_RESULT_FIELDS = (
+    "result_count",
+    "requested_count",
+    "actual_count",
+    "context_source_count",
+    "context_source_limit",
+    "fallback_used",
+    "budget_limited",
+)
+_USER_WEB_SEARCH_SOURCE_FIELDS = ("title", "url", "favicon", "status")
+_USER_URL_READ_ARGUMENT_FIELDS = ("url", "reason")
+_USER_URL_READ_RESULT_FIELDS = ("url", "safe_log_url", "title", "status", "content_length", "length", "reason")
+_USER_MCP_RESULT_FIELDS = ("status", "payload_bytes", "error_code", "subcall_attempt_count")
+_USER_FLYAI_RESULT_FIELDS = ("status", "result_count", "response_bytes", "error_code")
 
 
 class TrajectoryQueryService:
@@ -135,9 +154,9 @@ class TrajectoryQueryService:
 
     @staticmethod
     def _available_tool_detail(tool_call_id: str, tool) -> TrajectoryNodeDetailResponse:
-        safe_item = AdminAuditService._tool_item(tool)
-        payload = safe_item["arguments"] or None
-        result = safe_item["result_preview"] or None
+        safe_item = TrajectoryQueryService._user_tool_item(tool)
+        payload = safe_item["payload"] or None
+        result = safe_item["result"] or None
         sections = ["summary"]
         if payload is not None:
             sections.append("payload")
@@ -145,10 +164,6 @@ class TrajectoryQueryService:
             sections.append("result")
         if safe_item["duration_ms"] is not None:
             sections.append("timing")
-        redacted_fields = [
-            field.replace("arguments", "payload", 1).replace("result_preview", "result", 1)
-            for field in safe_item["redacted_fields"]
-        ]
         return TrajectoryNodeDetailResponse(
             status="available",
             available_sections=sections,
@@ -161,9 +176,79 @@ class TrajectoryQueryService:
                 result=result,
                 error=safe_item["error"],
             ),
-            redacted_fields=redacted_fields,
+            redacted_fields=safe_item["redacted_fields"],
             reason=None,
         )
+
+    @staticmethod
+    def _user_tool_item(tool) -> dict:
+        """普通用户 Tool Detail 的独立窄投影，不继承管理员内部诊断字段。"""
+        raw_payload = tool.input_params if isinstance(tool.input_params, dict) else {}
+        raw_result = tool.output_data if isinstance(tool.output_data, dict) else {}
+        payload_projection: dict = {}
+        result_projection: dict = {}
+        nested_result_cropped = False
+
+        if tool.tool_name == "web_search":
+            payload_projection = {
+                key: raw_payload[key] for key in _USER_WEB_SEARCH_ARGUMENT_FIELDS if key in raw_payload
+            }
+            result_projection = {key: raw_result[key] for key in _USER_WEB_SEARCH_RESULT_FIELDS if key in raw_result}
+            sources = raw_result.get("sources")
+            if isinstance(sources, list):
+                projected_sources = []
+                for source in sources[:20]:
+                    if not isinstance(source, dict):
+                        nested_result_cropped = True
+                        continue
+                    projected_source = {key: source[key] for key in _USER_WEB_SEARCH_SOURCE_FIELDS if key in source}
+                    projected_sources.append(projected_source)
+                    nested_result_cropped = nested_result_cropped or len(projected_source) != len(source)
+                result_projection["sources"] = projected_sources
+                nested_result_cropped = nested_result_cropped or len(sources) > 20
+        elif tool.tool_name == "url_read":
+            payload_projection = {key: raw_payload[key] for key in _USER_URL_READ_ARGUMENT_FIELDS if key in raw_payload}
+            result_projection = {key: raw_result[key] for key in _USER_URL_READ_RESULT_FIELDS if key in raw_result}
+        elif tool.tool_name.startswith("mcp_") or tool.tool_name in AMAP_PRODUCT_TOOL_NAMES:
+            payload_projection = (
+                {"argument_count": raw_payload["argument_count"]} if "argument_count" in raw_payload else {}
+            )
+            result_projection = {key: raw_result[key] for key in _USER_MCP_RESULT_FIELDS if key in raw_result}
+        elif tool.tool_name in FLYAI_TRAVEL_TOOL_NAMES:
+            payload_projection = (
+                {"argument_count": raw_payload["argument_count"]} if "argument_count" in raw_payload else {}
+            )
+            result_projection = {key: raw_result[key] for key in _USER_FLYAI_RESULT_FIELDS if key in raw_result}
+
+        payload, payload_fields = sanitize_admin_value(
+            payload_projection,
+            max_string_chars=1000,
+            max_list_items=30,
+        )
+        result, result_fields = sanitize_admin_value(
+            result_projection,
+            max_string_chars=1000,
+            max_list_items=30,
+        )
+        redacted_fields = {
+            *[f"payload.{field}" for field in payload_fields],
+            *[f"result.{field}" for field in result_fields],
+        }
+        if set(raw_payload) != set(payload_projection):
+            redacted_fields.add("payload")
+        if set(raw_result) != set(result_projection) or nested_result_cropped:
+            redacted_fields.add("result")
+        if tool.error_message:
+            redacted_fields.add("error")
+        return {
+            "tool_name": tool.tool_name,
+            "status": tool.status,
+            "duration_ms": tool.duration_ms,
+            "payload": payload,
+            "result": result,
+            "error": AdminAuditService._error_projection(tool.error_message, tool.status),
+            "redacted_fields": sorted(redacted_fields),
+        }
 
     @staticmethod
     def _unavailable_tool_detail(status: str, reason: str) -> TrajectoryNodeDetailResponse:

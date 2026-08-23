@@ -1395,6 +1395,10 @@ class AdminAuditApiTests(unittest.TestCase):
         missing_reason = self.client.get(
             "/api/admin/audit/conversations/conv-1/runs/run-node-detail/node-detail/tool/call-run-node-detail"
         )
+        blank_reason = self.client.get(
+            "/api/admin/audit/conversations/conv-1/runs/run-node-detail/node-detail/tool/call-run-node-detail",
+            headers={"X-Admin-Audit-Reason": "   "},
+        )
         self.current_user.is_superuser = False
         forbidden = self.client.get(
             "/api/admin/audit/conversations/conv-1/runs/run-node-detail/node-detail/tool/call-run-node-detail",
@@ -1407,10 +1411,11 @@ class AdminAuditApiTests(unittest.TestCase):
         )
         response = self.client.get(
             "/api/admin/audit/conversations/conv-1/runs/run-node-detail/node-detail/tool/call-run-node-detail",
-            headers={"X-Admin-Audit-Reason": "support node detail"},
+            headers={"X-Admin-Audit-Reason": "  support node detail  "},
         )
 
         self.assertEqual(missing_reason.status_code, 422)
+        self.assertEqual(blank_reason.status_code, 400)
         self.assertEqual(forbidden.status_code, 403)
         self.assertEqual(cross_run.status_code, 404)
         self.assertEqual(response.status_code, 200)
