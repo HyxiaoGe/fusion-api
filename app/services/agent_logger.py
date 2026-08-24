@@ -33,9 +33,18 @@ async def log_tool_call(
     metadata: Optional[dict] = None,
     log_id: Optional[str] = None,
     trace_id: Optional[str] = None,
+    tool_call_id: Optional[str] = None,
     step_number: Optional[int] = None,
 ) -> None:
     """异步记录工具调用日志，失败时静默处理不影响主流程"""
+    missing_linkage_fields = [
+        field_name for field_name, value in (("trace_id", trace_id), ("tool_call_id", tool_call_id)) if not value
+    ]
+    if missing_linkage_fields:
+        logger.warning(
+            "工具调用日志缺少精确关联字段: missing=%s，保持 fail-open",
+            ",".join(missing_linkage_fields),
+        )
     try:
         db = SessionLocal()
         log = ToolCallLog(
@@ -53,6 +62,7 @@ async def log_tool_call(
             output_data=output_data,
             extra_metadata=metadata,
             trace_id=trace_id,
+            tool_call_id=tool_call_id,
             step_number=step_number,
         )
         db.add(log)

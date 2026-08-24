@@ -712,6 +712,7 @@ class ToolCallLog(Base):
     extra_metadata = Column("metadata", JSONB, nullable=True)
 
     trace_id = Column(String, nullable=True, index=True)
+    tool_call_id = Column(String, nullable=True)
     step_number = Column(Integer, nullable=True)
 
     created_at = Column(DateTime, default=get_china_time, index=True)
@@ -720,6 +721,13 @@ class ToolCallLog(Base):
         Index("ix_tool_call_logs_conversation_created_id", "conversation_id", "created_at", "id"),
         Index("ix_tool_call_logs_user_created_id", "user_id", "created_at", "id"),
         Index("ix_tool_call_logs_trace_step_created_id", "trace_id", "step_number", "created_at", "id"),
+        Index(
+            "uq_tool_call_logs_trace_tool_call",
+            "trace_id",
+            "tool_call_id",
+            unique=True,
+            postgresql_where=text("trace_id IS NOT NULL AND tool_call_id IS NOT NULL"),
+        ),
     )
 
 
@@ -881,11 +889,10 @@ class TrajectoryLedgerSettings(Base):
 
     singleton_key = Column(String, primary_key=True)
     ledger_enabled_at = Column(DateTime(timezone=True), nullable=False)
+    trajectory_detail_enabled_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now, server_default=func.now())
 
-    __table_args__ = (
-        CheckConstraint("singleton_key = 'default'", name="ck_trajectory_ledger_settings_singleton_key"),
-    )
+    __table_args__ = (CheckConstraint("singleton_key = 'default'", name="ck_trajectory_ledger_settings_singleton_key"),)
 
 
 class AgentProgressSnapshot(Base):

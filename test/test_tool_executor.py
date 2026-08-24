@@ -422,6 +422,7 @@ class DynamicToolExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("有效 JSON 对象", record.format_llm_context())
         handler.execute.assert_not_awaited()
         handler.log.assert_awaited_once()
+        self.assertEqual(handler.log.await_args.kwargs["tool_call_id"], "call-invalid-json")
         self.assertEqual(handler.log.await_args.kwargs["input_params"], {})
         emitter.tool_call_started.assert_awaited_once()
         emitter.tool_call_completed.assert_awaited_once()
@@ -1820,6 +1821,7 @@ class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):
         handler.execute.assert_awaited_once_with({"query": "redis stream"})
         handler.log.assert_awaited_once()
         self.assertEqual(handler.log.await_args.kwargs["message_id"], "assistant-1")
+        self.assertEqual(handler.log.await_args.kwargs["tool_call_id"], "call-1")
         self.assertEqual(handler.log.await_args.kwargs["trace_id"], "trace-1")
         self.assertEqual(handler.log.await_args.kwargs["step_number"], 2)
         self.assertEqual(handler.log.await_args.kwargs["input_params"], {"query": "redis stream"})
@@ -1977,6 +1979,7 @@ class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):
             )
 
         handler.log.assert_awaited_once()
+        self.assertEqual(handler.log.await_args.kwargs["tool_call_id"], "call-1")
         self.assertEqual(handler.log.await_args.kwargs["message_id"], "assistant-1")
 
     async def test_execute_tools_parallel_with_emitter_keeps_events_log_and_record(self):
@@ -2020,8 +2023,37 @@ class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completed_kwargs["status"], "success")
         handler.log.assert_awaited_once()
         self.assertEqual(handler.log.await_args.kwargs["message_id"], "assistant-1")
+        self.assertEqual(handler.log.await_args.kwargs["tool_call_id"], "call-1")
         self.assertEqual(handler.log.await_args.kwargs["trace_id"], "trace-1")
         self.assertEqual(handler.log.await_args.kwargs["step_number"], 2)
+
+    async def test_execute_tools_parallel_retries_handler_but_writes_one_log_for_logical_call(self):
+        handler = AsyncMock()
+        handler.tool_name = "web_search"
+        handler.execute.side_effect = [
+            ToolResult(
+                status="failed",
+                data={"error_code": "search_unavailable", "retryable": True},
+            ),
+            ToolResult(status="success", data={"sources": []}),
+        ]
+
+        with patch("backoff._async.asyncio.sleep", new=AsyncMock()):
+            records = await execute_tools_parallel(
+                [{"id": "call-retry", "name": "web_search", "arguments": {"query": "redis"}}],
+                conversation_id="conv-1",
+                user_id="user-1",
+                model_id="gpt-4",
+                provider="openai",
+                tool_handlers={"web_search": handler},
+                trace_id="trace-1",
+            )
+
+        self.assertEqual(records[0].result.status, "success")
+        self.assertEqual(handler.execute.await_count, 2)
+        handler.log.assert_awaited_once()
+        self.assertEqual(handler.log.await_args.kwargs["tool_call_id"], "call-retry")
+        self.assertEqual(handler.log.await_args.kwargs["trace_id"], "trace-1")
 
     async def test_execute_tools_parallel_with_emitter_emits_tool_digest_and_evidence(self):
         handler = MagicMock()
@@ -2219,6 +2251,7 @@ class ToolExecutorMessageIdTests(unittest.IsolatedAsyncioTestCase):
         )
         handler.log.assert_awaited_once()
         self.assertEqual(handler.log.await_args.kwargs["message_id"], "assistant-1")
+        self.assertEqual(handler.log.await_args.kwargs["tool_call_id"], "call-5")
 
 
 if __name__ == "__main__":

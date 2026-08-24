@@ -53,6 +53,7 @@ def get_trajectory_query_service(db: Session = Depends(get_db)) -> TrajectoryQue
         TrajectoryRepository(db),
         max_events_per_run=settings.MAX_TRAJECTORY_EVENTS_PER_RUN,
         max_runs_per_conversation=settings.MAX_TRAJECTORY_RUNS_PER_CONVERSATION,
+        detail_settle_grace_seconds=settings.TRAJECTORY_DETAIL_SETTLE_GRACE_SECONDS,
     )
 
 

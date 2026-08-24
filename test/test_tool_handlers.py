@@ -868,6 +868,7 @@ class ToolHandlerLogTests(unittest.IsolatedAsyncioTestCase):
                 result=result,
                 input_params={"query": "redis"},
                 trace_id="trace-1",
+                tool_call_id="call-1",
                 step_number=1,
                 message_id="assistant-1",
             )
@@ -875,6 +876,7 @@ class ToolHandlerLogTests(unittest.IsolatedAsyncioTestCase):
 
         mock_log_tool_call.assert_awaited_once()
         assert mock_log_tool_call.await_args.kwargs["message_id"] == "assistant-1"
+        assert mock_log_tool_call.await_args.kwargs["tool_call_id"] == "call-1"
 
     async def test_url_read_log_sanitizes_input_url(self):
         from app.services.tool_handlers.base import ToolResult

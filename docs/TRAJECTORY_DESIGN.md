@@ -1,31 +1,31 @@
 # Fusion Trajectory 集成设计（DSH 风格 Agent 执行轨迹）
 
-> 状态：设计稿 v0.15（P0 已 dev 验收；P1 实施中）
-> 范围：fusion-api + fusion-ui 集成 Agent 执行轨迹展示；langchain-trajectory-mvp 降级为原型实验室与联调夹具。
-> 本文档是 P0/P1 的实施依据；P1 当前仅实施历史快照读侧，P2–P3 尚未开始。
+> 状态：设计稿 v0.21（P0 已 dev 验收并采用 `QueuedTrajectoryRecorder`；P1 已由 PR #54 合并并部署验证；P2 独立联调夹具已完成既有真实 API 验证；P3 实施中；v0.21 P3 决策已迁入本正式 `feat/trajectory-p3-contract-guard` 分支）
+> 范围：fusion-api + fusion-ui 集成 Agent 执行轨迹展示；`langchain-trajectory-mvp` 仅保留为历史联调夹具，不进入 Fusion P3 运行时或交付链路。
+> 本文档记录 P0–P3 的统一架构；P3 直接消费已发布 P1，不重新实施后端投影器或快照 API。
 >
 > **仓库处理决定**：正式实施分支通过 `.gitignore` 的 `!docs/TRAJECTORY_DESIGN.md` 例外跟踪本文档。
+> **P3 仓库落位**：本文档以 `fusion-api/origin/master` 的 v0.15 为底，仅合入 P3 决策，保留已经发布的 P0/P1 事实；前端在 `fusion-ui/origin/master` 的独立 P3 worktree 实施。
 
 ## 1. 背景与目标
 
 ### 1.1 背景
 
 - fusion 已有自实现 Agent 运行时（零 LangChain）：多轮对话、工具调用、计划协调、推理流、上下文管理，并已发出 21 种 `agent_event`（`run/step/tool` 三级层级、`sequence`、`trace_id`）。
-- 但这些事件经 `AgentEventCompositeWriter` 写入 Redis Stream，**带 TTL 即蒸发**（进行中 600s / 结束后 60s，见 `app/core/redis.py`），不可回放、不可查询、不可刷新恢复。
+- P0 之前这些事件只进入带 TTL 的 Redis Stream；P0 已将脱敏事件按 sequence 追加到 PostgreSQL，Redis/SSE 继续负责实时投递，P1 已提供有界历史查询和 span 投影。
 - 目标对标 DeepSeek Harness 的 Trajectory：在 fusion-ui 中提供独立的「Agent 执行轨迹」视图——按轮次组织的账本、Overview 时间线、逐条检查器，与聊天双向定位。
 - `langchain-trajectory-mvp` 已验证「追加账本 + SSE 补发 + 投影纪律 + 瀑布图 UI」三层能力；其数据源是演示链，不适合作为 fusion 的数据源。**MVP 转型为：① UI 原型实验室（快速试交互）；② P2 阶段的联调夹具。**
 
 ### 1.2 目标形态
 
 ```
-对话页（现有聊天原样保留）
-  ├─ 聊天流：plan 卡片 / 工具卡片 / 推理 / 回答（低噪声用户视图，AgentRunTimeline 不动）
-  └─ 轨迹侧栏（新增，独立调试视图，可折叠 Tab）
-       ├─ 轮次账本：conversation → message → run attempt → step → tool/llm round
-       │    #N 索引 / 类型标记 / 单行摘要 / 耗时 / 状态
-       ├─ Overview 时间线：真实耗时比例投影，拖选聚焦、缩放、hover 精确计时
-       ├─ 检查器：输入/输出/错误/工具 schema/证据/token（TTFT、cache、thinking）
-       └─ 聊天 ↔ 轨迹双向定位（hover 工具调用 → 轨迹节点，反之亦然）
+ConversationViewShell（同一份 messages + 脱敏事件账本）
+  ├─ Chat Tab：用户提问 / 助手回答 / 轻量运行状态 / 「查看轨迹」
+  ├─ Trajectory Tab：全高、按 turn 组织的会话级有界轨迹视图
+  │    ├─ 顶部 TrajectoryOverview：会话时间域、Run 占位与当前焦点的详细记录
+  │    ├─ 中部 TrajectoryTable：按 Turn 组织的虚拟化用户可读账本
+  │    └─ 右侧 TrajectoryNodeDetailPanel：选中节点的 Summary/Payload/Result/Timing
+  └─ ChatInput：会话壳唯一实例，跨 Tab 始终挂载
 ```
 
 ### 1.3 设计硬约束（评审结论，不可放宽）
@@ -79,7 +79,7 @@ TrajectoryProjector（查询时 O(n) 纯函数投影，不落冗余 span 数据�
         ↓
 Trajectory 快照 JSON（事件 + span/record 投影 + 完整性状态 + truncated，按用户/诊断分级）
         ↓
-fusion-ui 轨迹侧栏（运行中实时归并 = P3，复用现有聊天 SSE）
+fusion-ui Trajectory Tab（运行中实时归并 = P3，复用现有聊天 SSE）
 ```
 
 ### 2.3 数据关系（一个协议，三个消费者）
@@ -549,6 +549,7 @@ dev 同步基线已经触发切换；`QueuedTrajectoryRecorder` 固定以下生�
   - **自带摘要**：`tool_call_completed / step_completed` 已携带 `duration_ms / status / result_summary`，可直接建 span，配对只用于补参数与流式 delta。
 - **Orphan 收口**：按 §3.3 规则推导关闭未配对 span；推导 span 必须携带 `terminal_source: recorded|inferred` 与 `inferred_reason`；**成功 run 中的孤儿标 `unknown/incomplete`，不得伪装成真实 cancelled**；TTFT 允许为 null（无任何 output delta 的轮次）。
 - annotation 事件不建 span，按类型挂到对应 span 的附加区段（plan/evidence/context）。
+- **P3 分层边界**：P1 已发布 `records + spans + completeness + truncated`，不新增第二套后端 cell 投影。P3 在浏览器端以 target-specific 的 `TrajectoryCellProjection` 将会话 messages、P1 run summary/records/spans/completeness 与受控 SSE 增量投影为用户可读 cell；P1 spans 只是输入之一，不保留独立 Span 瀑布视图或重复 Span 列表。
 - 结果模型：`TrajectorySnapshot { run, records[], spans[], completeness, message 归组, attempt 归组, truncated }`。
 
 ### 6.2 与现有持久化模型的关系
@@ -605,18 +606,155 @@ GET /api/admin/audit/conversations/{conversation_id}/runs/{run_id}/trajectory
 - **审计闭环**：管理员轨迹读取必须复用 `get_conversation_auditor` 与 `X-Admin-Audit-Reason`；在返回 `tool_calls` 前写入 `admin.audit.trajectory.view`，审计失败返回既有 503，不得 fail-open。
 - 命名：账本称「**脱敏事件账本**」，文档与 UI 不得声称是完整原始事件。
 
-## 8. 前端（P3）
+### 7.4 Trajectory Node Detail 契约（v0.21 定稿，P3 只承诺 Tool）
 
-- **独立调试侧栏/Tab**，不扩充 `AgentRunTimeline`（它是普通用户的低噪声执行状态展示，成功路径主动压缩信息，职责不同）。
-- 组件拆分（移植自 MVP 原型，按 fusion-ui 的 Redux/设计规范重写状态接入）：
-  - `TrajectoryLedger`：轮次账本（#N / 类型标记 / 单行摘要 / 状态 / 耗时）
-  - `TrajectoryTimeline`：Overview 时间线（真实耗时比例、拖选聚焦、缩放、hover 计时；TTFT 分段）
-  - `TrajectoryInspector`：检查器（用户级字段 / 管理员诊断字段分级渲染）
-  - `TrajectorySidebar`：编排 + 聊天双向定位（hover 工具调用 ↔ 轨迹节点）
-- **受控事件回调通道（P3 交付，随侧栏一起验收）**：现有 `dispatchAgentEvent` 是 switch 无 default，未知事件被直接丢弃（`fusion-ui/src/lib/api/chat.ts`）。P3 增加受控通用回调（如 `onAgentEvent(type, payload)`）供轨迹侧栏实时消费；**只转发经过公共事件 union、`schema_version` 与 allowlist 校验的 DTO，不允许任意未知事件直通**；不改变现有已知事件的既有处理路径。
-  - P3 的实时归并语义：打开面板拉快照（P1 端点）+ 运行中消费现有聊天 SSE 增量归并；`truncated / degraded / legacy` 状态必须随视图明示。
-- 聊天 ↔ 轨迹双向定位是 DSH 体验的关键，P3 必须实现（`tool_call_id / step_id / message_id / llm_round_id` 足够做链接键）。
-- MVP 前端继续作为原型实验室：交互创新（Overview 拖选、搜索、折叠）先在 MVP 快速迭代，稳定后移植。
+> 本节与 §8 的 Network 式三区交互共享同一 Detail 契约，分别验收。硬约束：**只支持精确关联，不支持历史猜测；旧数据允许缺失，新数据缺失必须显式暴露。**
+> **P3 实现范围（v0.21，YAGNI）**：后端 `node-detail` 端点只承诺 `node_type=tool`；LLM/Message/Run/Step 的 Summary/Timing 由前端投影直接生成，不经 Node Detail API；统一 Envelope 为未来扩展保留其他 `node_type`。
+
+```typescript
+type TrajectoryNodeDetailResponse = {
+  status: "available" | "pending" | "not_recorded" | "degraded";
+  node_type: "tool" | "llm" | "message" | "run" | "step";
+  available_sections: Array<"summary" | "payload" | "result" | "timing" | "schema">;
+  detail: ToolNodeDetail | LlmNodeDetail | MessageNodeDetail | RunNodeDetail | StepNodeDetail | null;
+  redacted_fields: string[];
+  reason: string | null;
+};
+```
+
+- `status` 表示关联数据是否可信，`available_sections` 表示可展示的详情页签，二者不得混用；P3 后端只实现 Tool 分支，非 Tool 节点不因没有 Tool Payload 而标记 degraded。
+- 普通端点为 `GET /api/conversations/{conversation_id}/runs/{run_id}/node-detail/{node_type}/{node_id}`，Tool 的 `node_id` 为 `tool_call_id`；管理员端点位于 `/api/admin/audit/conversations/{conversation_id}/runs/{run_id}/node-detail/{node_type}/{node_id}`，要求访问原因和审计记录。
+- `trajectory_detail_enabled_at` 是独立于 `ledger_enabled_at` 的持久化水位。先迁移列/索引、部署写入链路、确认实例开始写 `tool_call_id`，再显式激活该水位；激活前数据统一为 `not_recorded`，不得在迁移开始时提前生效。
+- Tool 的服务端状态按以下确定性顺序判定：① 精确 `(run_id, tool_call_id)` 行存在为 `available`；② `run.created_at < trajectory_detail_enabled_at` 为 `not_recorded`；③ run 仍在运行或④ 已终态但仍在 `detail_settle_grace` 内为 `pending`；⑤ 其余终态且超宽限期仍无精确行才为 `degraded`。
+- `ToolCallLog` 是 fire-and-forget 写入，Run finalize 不等待它；`detail_settle_grace` 为数秒级有限值（例如 5s），宽限期后缺失收敛为 `degraded`，不得无限刷新，也不得改变 P0 ledger finalize barrier。
+- 新增 nullable `ToolCallLog.tool_call_id`，链路为 `tool_call["id"] → log_tool_execution → handler.log → log_tool_call → ToolCallLog.tool_call_id`；不得复用日志记录 ID。新写入必须同时具备 `trace_id` 与 `tool_call_id`，并建立部分唯一索引 `UNIQUE (trace_id, tool_call_id) WHERE trace_id IS NOT NULL AND tool_call_id IS NOT NULL`。
+- 查询只允许精确匹配 `conversation_id + user_id + run_id/trace_id + tool_call_id`，禁止按 step/name/time 做历史启发式 fallback。普通用户脱敏由服务端执行，并在 `redacted_fields` 明示。
+- `ToolCallLog` 每个逻辑 Tool Call 只保留最终一条；Attempt 只来自 `tool_attempt_started/completed`。Payload/Result 归属逻辑 Tool 节点，Attempt 仅展示状态、错误码和 Timing；单次成功 Attempt 默认折叠。
+- 历史 run 缺精确详情时展示基础账本与 Timing，并以 `not_recorded` 说明 Payload/Result 不可用，不标 degraded、不猜测关联；新 run 缺失必须显式 `pending` 或 `degraded`。
+- 本节不回填旧数据、不把 Payload/Result 复制进 `agent_events`、不实施 cursor 分页或 Schema UI。
+
+## 8. 前端（P3）：Chat Tab + 会话级有界 Trajectory Tab
+
+### 8.1 定位、范围与 DSH 对标
+
+- Trajectory 是会话级全高 Tab，不是常驻窄侧栏；Chat 与 Trajectory 共享 conversation 数据和同一个 Composer。
+- 首版是**会话级有界轨迹视图**：Run 列表只覆盖 P1 返回的最近 N 个 Run；单 Run 只覆盖 P1 返回的 sequence 前缀。任何 `truncated` 都必须由粘性横幅常驻明示，禁止“全部历史”“完整轨迹”等误导措辞。
+- 按 `turn_message_id` 分组、按 `attempt_index` 排序；P1 普通 run DTO 不含 `previous_run_id`，P3 首版不绘制精确 lineage edge。cursor 与精确 lineage 属于 P1.1 后续增强。
+- 对标 DSH 的部分：会话视图 Tab、turn 组织、用户可读账本、Chat → Trajectory one-shot inspect、长列表虚拟化。`plan/context` cell 与 Trajectory → Chat reveal 属于 Fusion 扩展。
+- 普通会话 Tab 只消费普通用户 `TrajectorySnapshot`；管理员诊断继续走独立 admin-audit 页面/端点，不在普通组件中按角色切换 DTO，也不把 run 级管理员工具记录伪装成精确 tool/span 关联。
+- v0.21 的视图布局为 Network 式三区：顶部 `TrajectoryOverview` 负责会话时间域与联动；中部 `TrajectoryTable` 是按 Turn 组织的虚拟化账本；右侧 `TrajectoryNodeDetailPanel` 展示选中节点。Overview、记录表与详情使用同一选中状态，避免再引入独立 Span 瀑布图加重复列表。
+
+### 8.2 规范化事件、实时合并与终态对账
+
+P1 record 与 SSE event 必须先经过独立 allowlist adapter，统一为：
+
+```text
+NormalizedTrajectoryEvent = {
+  runId, sequence, eventType, schemaVersion, timestamp,
+  stepId, toolCallId, parentStepId, traceId, payload
+}
+identity = (runId, sequence)
+```
+
+- `schema_version` 缺失按 legacy 版本兼容；未知 schema 或不在公共事件 union/字段 allowlist 中的对象不得进入 Redux。
+- `trajectorySlice` 以 conversation 为根，在 Tab 未挂载时也持续接收受控事件；初次发送、continuation、页面 reconnect 三条 `createAgentStreamEventHandlers` 装配路径必须全部接入。
+- merge 以 `(runId, sequence)` 幂等。snapshot 覆盖其 durable 前缀，保留 sequence 更大的 live tail；相同 identity 若出现 payload 冲突，以 durable snapshot 为准并显式标记 reconciliation conflict。
+- parser 内 `lastSequenceByRun` 只负责单次 SSE 读取防重，不能替代 trajectory slice 的跨快照/重连去重。
+- `run_completed / run_failed / run_interrupted / run_limit_reached` 到达后，将该 run 标为 `reconciling` 并重拉 P1 快照；只有 P1 `completeness/truncated` 能确认最终可信度。终态 refetch 前不得先宣称轨迹 complete。
+- 验收必须覆盖：先订阅后取快照的交叠、Tab 晚打开、重连重放、snapshot 落后 live、终态 refetch 与同 key 冲突。
+
+### 8.3 TrajectoryCellProjection 与 message join
+
+`TrajectoryCellProjection` 是无 fetch、无 Redux、可单测的纯函数，输入为 messages、P1 run summaries、已加载 snapshots 与 live tail，输出：
+
+```text
+TrajectoryCell =
+  UserCell | MessageCell | RunCell | PlanCell | ContextCell |
+  ToolCell | SubtoolCell | CompactedCell
+```
+
+- 新数据确定性 join：`turn_message_id → user message`，`message_id → assistant message`；message 正文只引用 messages，不复制进账本。
+- legacy 回填可能令 `turn_message_id` 等于 assistant id：先用 `message_id` 命中 assistant，再回看同一会话中相邻 user。仍无法归组的 run 进入“未关联运行”，不得猜测。
+- Run 未加载 snapshot 时只生成 Turn/Run 骨架；选中后按需水合详细 cell。禁止一次请求或一次渲染拼接所有 Run 的全部事件。
+- `legacy/degraded/truncated` 不参加完整字段 parity：可以用持久化 `message.agent_run` 的高置信度摘要生成带来源标记的 fallback，但不得伪造缺失事件、span 或消除完整性横幅。
+- 主状态来自 `AgentSession.status`（运行中/完成/失败/中断/回答不完整）；轨迹 badge 独立来自 `trajectory_status/truncated`（记录中/完整/降级/历史未记录/已截断），两者不得互相覆盖。
+
+### 8.4 会话壳与 Composer 单实例
+
+```text
+ConversationViewShell
+  ├─ ViewTabs(Chat | Trajectory)
+  ├─ ActiveViewBody
+  └─ ChatInput（唯一实例，始终挂载）
+```
+
+- Tab 只切换 body；Composer 不 remount，草稿、附件、知识库选择、模型与焦点状态保持。
+- 普通发送始终创建会话新 turn，与 `selectedRunId` 无关；从 Trajectory Tab 发送后保持当前 Tab，使用户可以直接观察新 run 实时进入账本。
+- stop/steering 只作用于当前 active stream/run，不作用于所选历史 run；无 active stream 时不展示运行控制。
+- 轨迹滚动区的底部边界由唯一 Composer 所在会话壳自然约束，不复制第二份 Composer 或固定双份 padding。
+
+### 8.5 组件、懒加载与虚拟化
+
+- `TrajectoryTabView`：全高编排 Network 式三区、Run 选择、完整性粘性横幅、终态动作与错误/空态。
+- `TrajectoryOverview`：记录级时间总览（Input/Model/Tools 轨道、投影模式切换、区间选择、缩放/平移、hover 精确时刻）。P3 只实现 `sequence`（等宽、查看执行顺序）与 `actual`（真实 start/end、查看时间分布）两种模式；`duration/time` 后置，不纳入本期验收。
+- Overview 的会话域由 Run summary 构成：当前聚焦 Run 展开 Input/Model/Tools 详细记录，未水合 Run 仅显示粗粒度占位区段；切换焦点时替换详细展开区段，不把 LRU 缓存详情永久拼入 Overview。跨未水合 Run 拖选时先聚焦并加载对应 Run，再展示详细匹配；不得假装已过滤全部记录，也不新增 Overview API。
+- `TrajectoryTable`：按 Turn 分隔的高密度虚拟化记录表（user/message/tool 等 cell，#N、类型标记、单行摘要、状态、耗时）。记录行点击高亮 Overview；Overview 区段点击定位记录表并打开右侧详情。
+- `TrajectoryNodeDetailPanel`：消费 §7.4 Tool Node Detail DTO，展示 Summary/Payload/Result/Timing；Payload/Result 按点击懒加载，诊断字段折叠展示。LLM/Message/Run/Step 的 Summary/Timing 由前端投影生成，不调用 Node Detail API。
+- 区间选择清除必须同时提供可见「清除范围」按钮、Escape 和触屏入口；右键清除只能作为快捷方式，不能是唯一入口。
+- 首载只拉 run list；只拉当前选中 Run snapshot；切换时按需加载并使用最多 8 个 Run 的 LRU 缓存。
+- `TrajectoryTable` 使用固定行高窗口化，overscan 后 DOM 记录行始终 ≤200；支持 Home/End/方向键与 `aria-posinset/aria-setsize`。inspect 可先计算目标 index，再滚动到尚未挂载的虚拟行。
+- 5000 事件固定 fixture 的 CI 门禁：纯投影批次 ≤750ms、1000 条受控增量合并批次 ≤500ms、DOM 记录行 ≤200；同时验证首/中/尾定位和连续 SSE 合并。
+
+### 8.6 InspectRequest 与 revealInChat
+
+- **Chat → Trajectory one-shot inspect**：
+
+```text
+InspectRequest = {
+  nonce, conversationId, messageId, runId?,
+  target?: { kind: message | tool, id }
+}
+```
+
+- 消费顺序固定：切 Tab → 确定 Run → 必要时加载 snapshot → `scrollToIndex` → 高亮 → 清除 request。持久 `selectedMessageId/selectedRunId/selectedSpanId` 与一次性 request 分开。
+- 聊天轻量状态行的 `messageId` 是稳定入口；只有仍存在稳定 `tool_call_id` 的用户内容卡片才允许发 tool target，不承诺聊天中存在 step/LLM 锚点。
+- target 因 `truncated/legacy/缺失` 不可见时定位到 Run 头并提示“该节点不在当前有界快照中”，不得无限等待。
+- **Trajectory → Chat** 使用独立 `revealInChat` Fusion 增强：保证切回 Chat 并定位 message；只有聊天中确有稳定 DOM target 时才做细定位，不称为“双向 one-shot”。
+- Tab 往返保持 selection、ledger/timeline scroll 和 inspector 状态。
+
+### 8.7 retry/continue 与聊天轻量状态行
+
+- 消息级“重新发送/重新生成”保留在 Chat，继续覆盖非 Agent、发送失败与普通消息；“唯一入口”只约束 Agent run 级 retry/continue。
+- Agent run 级 retry/continue 只出现在 Trajectory 终态横幅。按钮仅在所选 run 属于会话最后一轮、是该 assistant 的最新 attempt、当前无 active stream 且既有模型/知识库前置条件满足时可用；continue 额外要求 `status=limit_reached`。历史 attempt 只读。
+- run retry 请求必须显式发送 `previous_run_id=selectedRunId`；continue 继续显式发送 selected run id。新 stream 的 `run_started.run_id` 到达后自动选中真实新 run，不用 `attempt_index + 1` 猜测。
+- Chat 中 Agent 状态行固定为：状态点及名称、耗时、一个最高优先级异常、独立轨迹 badge、“查看轨迹”。禁止 plan、工具列表、Evidence、Step、Token、TTFT、run retry/continue 与可展开过程。
+
+### 8.8 一致性闸门与旧“过程”迁移
+
+一致性测试拆成四组，不能用一个“同源”断言混合不同语义：
+
+1. `event projection parity`：同一已知事件集的 plan/tool/evidence/run 规范化字段；主 cohort 仅 `complete && !truncated && supported schema`。
+2. `live ↔ durable reconciliation`：同一 complete、非 truncated run 在终态 refetch 后一致。
+3. `message join invariants`：user/message cell 与 messages 一致，未关联 run 不猜测。
+4. `action policy`：消息级 retry 与 Agent run retry/continue 的 eligibility、目标 message/run id 和 `previous_run_id` 分别测试。
+
+`legacy/degraded/truncated` 单独验收“状态不静默、已知摘要仍可见、未知不伪造”，不要求与完整 progress 摘要逐字段相等。
+
+迁移分两次交付：
+
+1. P3 产品 PR 移除 `AssistantResponseStack` 对 `AgentRunTimeline` 的内联挂载，保留 `AnswerEvidence`、`StructuredToolResults` 与消息级 `MessageActions`；旧过程实现暂时留在仓库，便于 dev 回归对照。
+2. 一致性测试通过、新能力可达、真实 dev run 回归通过后，再用独立 cleanup PR 物理删除零引用的 `AgentRunTimeline / ExecutionProcess / executionProcessModel`；`RunBanner/RunHeader/...` 按实际复用情况保留或删除。
+
+### 8.9 P3 退出标准
+
+- 会话壳双 Tab、唯一 Composer、Tab 往返状态保持；Trajectory Tab 全高且只声称有界视图。
+- 多 turn/run attempt 按 `turn_message_id + attempt_index` 组织；未加载 Run 骨架 → 选中水合；最多 8 个 snapshot 缓存。
+- P1 snapshot + SSE 合并、终态对账、reconciliation conflict、`degraded/legacy/truncated` 全部可见。
+- 5000 事件性能与虚拟化门禁通过；锚点可定位未挂载行，键盘/ARIA 有效。
+- Chat → Trajectory inspect 与 Trajectory → Chat message reveal 分别通过 e2e；Tab 切换不终止 SSE。
+- Agent run retry/continue 只在 Trajectory，消息级 retry 保留；请求目标与 `previous_run_id` 正确，新 attempt 自动选中。
+- 四组一致性闸门通过；真实 dev 新 Run 覆盖工具、知识库、失败/触顶或 continuation、刷新恢复与 console 0 error。
+- Network 联动验收：顶部区段点击定位记录表并打开右侧详情，记录行点击高亮 Overview；区间拖选仅显示/聚焦时间重叠记录；可访问清除范围可用；`sequence/actual` 可切换；未水合 Run 占位、焦点替换展开与跨 Run 拖选按 §8.5 收敛；Tool Node Detail 的 `available/pending/not_recorded/degraded` 四态与 settle grace 正确。
 
 ## 9. P0 验收标准
 
@@ -667,9 +805,23 @@ P0 验收不依赖 P2（MVP Adapter 联调属 P2 验收）。
 | 阶段 | 交付物 | 退出标准 |
 |---|---|---|
 | P0 | 协议升级（schema_version + 新增生命周期事件含 `first_output_delta` 双分支语义、`retrieval_cancelled`、cache token 提取）；`agent_events` + `run_trajectory_meta`（FK、expected/finalized、latch 优先、**durable terminal intent + pending 扫描索引**）；**AgentSession 迁移与回填（§4.4，含 `terminal_at`、UTC 终态写入与 60 秒协调 grace）**；`QueuedTrajectoryRecorder` **有界异步接纳已启用**（容量 1000、单 run 单消费者、10 秒 flush barrier）并包装 `TrajectoryRecorder` 同步核心（独立 Session + 原子事务 + **BoundedSemaphore 准入 + wait_for/shield/CancelledError/DB 超时熔断 + permit 生命周期四规则** + seal/finalize 三断言 + latch 优先 + 独立 terminal ack）；emitter `seal_and_get_last_sequence`；`turn_message_id/previous_run_id/attempt_index`（稳定 turn 分组 + 两阶段兼容 + 并发分配）；落库 allowlist 脱敏；保留策略 = 级联删除（无独立 TTL） | §9 验收全绿；不含 P2 依赖 |
-| P1 | `TrajectoryProjector`（orphan 收口 + `terminal_source` + 截断保护）；快照 API（用户/管理员端点分离、越权 404、`truncated` 语义）；**仅历史快照，不声称实时** | 真实数据可回放、可钻取、degraded/legacy/truncated 明示 |
-| P2 | MVP 侧 `FusionTrajectoryAdapter`（不污染 fusion 正式 API）；真实数据联调 | 协议与交互模型在 MVP 上钉死 |
-| P3 | fusion-ui 轨迹侧栏（账本 + 时间线 + 检查器 + 双向定位）+ 受控事件回调通道 + 运行中实时归并 | 与 DSH 轨迹对标的功能验收 |
+| P1 | **已完成（PR #54）**：`TrajectoryProjector`（orphan 收口 + `terminal_source` + 截断保护）；普通/管理员快照 API 分离；仅历史、有界、`truncated` 明示 | P3 直接消费，不重新实施 |
+| P1.1（后续可选） | Run/event cursor 分页与精确 `previous_run_id` lineage DTO | P3 首版不依赖；需要突破有界历史时再做 |
+| P2 | **已完成历史验证**：独立 MVP `FusionTrajectoryAdapter` 只读 P1 快照；不进入 Fusion P3 runtime，不复制其 SQLite/SSE/投影器 | 仅作为既有联调证据保留 |
+| P3 | fusion-ui 双 Tab；前端 `TrajectoryCellProjection`；Network 三区的 `TrajectoryOverview + TrajectoryTable + TrajectoryNodeDetailPanel`；Tool-only Node Detail 精确关联、四态与 settle grace；会话级有界账本；按 Run 水合/LRU；虚拟化；P1+SSE 归并与终态对账；inspect/reveal；一致性闸门；替代旧“过程” | §8.9 全部通过；旧组件 cleanup 在真实 dev 回归后独立提交 |
+
+**P3 实施顺序（v0.21 定稿，Node Detail 后端前置以先验证真实契约）**：
+
+1. 将 v0.21 文档迁入正式 P3 分支；
+2. `ToolCallLog.tool_call_id` 迁移与写入链路（§7.4）；
+3. Tool Node Detail 端点、脱敏、四态与 settle grace（§7.4）；
+4. 前端 Detail client/type（§7.4 Envelope）；
+5. `TrajectoryOverview` + `TrajectoryTable`（§8.5）；
+6. `TrajectoryNodeDetailPanel` 接真实 API；
+7. SSE 实时归并与尾部跟随（§8.2/§8.5）；
+8. 一致性闸门（§8.8）；
+9. dev 真实 Run 回归；
+10. 最后删除旧「过程」组件（三条件齐备）。
 
 ## 11. 对抗式审查清单（终审确认用）
 

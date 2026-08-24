@@ -31,6 +31,10 @@ class InvalidPreviousRunError(ValueError):
     """previous run 不属于当前用户 turn 或状态不允许接续。"""
 
 
+class StalePreviousRunError(InvalidPreviousRunError):
+    """previous run 合法但已不是当前 turn 的最新 attempt。"""
+
+
 async def write_session_started(
     *,
     run_id: str,
@@ -196,9 +200,49 @@ def _resolve_previous_run(
             .limit(1)
         ).scalar_one_or_none()
     else:
-        previous_run = session.get(AgentSession, previous_run_id) if previous_run_id is not None else None
+        previous_run = (
+            session.get(AgentSession, previous_run_id, populate_existing=True) if previous_run_id is not None else None
+        )
 
-    validate_previous_run_candidate(
+    if used_fallback:
+        validate_previous_run_candidate(
+            previous_run,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            turn_message_id=turn_message_id,
+            message_id=message_id,
+            run_attempt_kind=run_attempt_kind,
+        )
+    else:
+        validate_latest_previous_run_candidate(
+            session,
+            previous_run,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            turn_message_id=turn_message_id,
+            message_id=message_id,
+            run_attempt_kind=run_attempt_kind,
+        )
+    if used_fallback:
+        logger.info(
+            f"TRAJECTORY_PREVIOUS_RUN_FALLBACK turn_message_id={turn_message_id} previous_run_id={previous_run.id}"
+        )
+    return previous_run
+
+
+def validate_latest_previous_run_candidate(
+    session,
+    previous_run: AgentSession | None,
+    *,
+    conversation_id: str,
+    user_id: str,
+    turn_message_id: str,
+    message_id: str | None,
+    run_attempt_kind: RunAttemptKind,
+) -> AgentSession:
+    """在调用方已持有的 conversation 锁事务内校验 latest attempt。"""
+
+    validated = validate_previous_run_candidate(
         previous_run,
         conversation_id=conversation_id,
         user_id=user_id,
@@ -206,12 +250,28 @@ def _resolve_previous_run(
         message_id=message_id,
         run_attempt_kind=run_attempt_kind,
     )
-    if used_fallback:
-        logger.info(
-            "TRAJECTORY_PREVIOUS_RUN_FALLBACK "
-            f"turn_message_id={turn_message_id} previous_run_id={previous_run.id}"
+    latest = session.execute(
+        select(AgentSession)
+        .where(
+            AgentSession.conversation_id == conversation_id,
+            AgentSession.user_id == user_id,
+            _turn_scope_condition(
+                turn_message_id=turn_message_id,
+                message_id=message_id,
+                run_attempt_kind=run_attempt_kind,
+            ),
         )
-    return previous_run
+        .order_by(
+            AgentSession.attempt_index.desc().nullslast(),
+            AgentSession.created_at.desc(),
+            AgentSession.id.desc(),
+        )
+        .limit(1)
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
+    if latest is None or str(latest.id) != str(validated.id):
+        raise StalePreviousRunError("previous run 不是当前 turn 的最新 attempt")
+    return validated
 
 
 def validate_previous_run_candidate(

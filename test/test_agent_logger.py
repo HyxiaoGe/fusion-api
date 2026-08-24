@@ -33,6 +33,7 @@ class ToolCallLogModelTests(unittest.TestCase):
             "output_data",
             "metadata",
             "trace_id",
+            "tool_call_id",
             "step_number",
             "created_at",
         }
@@ -62,6 +63,8 @@ class LogToolCallTests(unittest.IsolatedAsyncioTestCase):
             input_params={"query": "test"},
             output_data={"result_count": 1, "sources": []},
             log_id="custom-log-id",
+            trace_id="trace-1",
+            tool_call_id="call-1",
         )
 
         mock_db.add.assert_called_once()
@@ -70,6 +73,39 @@ class LogToolCallTests(unittest.IsolatedAsyncioTestCase):
         # 验证使用了自定义 log_id
         added_obj = mock_db.add.call_args[0][0]
         self.assertEqual(added_obj.id, "custom-log-id")
+        self.assertEqual(added_obj.trace_id, "trace-1")
+        self.assertEqual(added_obj.tool_call_id, "call-1")
+
+    @patch("app.services.agent_logger.SessionLocal")
+    async def test_log_tool_call_warns_and_stays_fail_open_without_exact_linkage(self, mock_session_cls):
+        """缺少精确关联字段时仍写日志，不猜测关联也不阻断主链路。"""
+        mock_db = MagicMock()
+        mock_session_cls.return_value = mock_db
+
+        with self.assertLogs("app", level="WARNING") as captured:
+            await log_tool_call(
+                conversation_id="conv-1",
+                message_id="msg-1",
+                user_id="user-1",
+                tool_name="web_search",
+                status="success",
+                duration_ms=200,
+                model_id="gpt-4",
+                provider="openai",
+                trace_id=None,
+                tool_call_id=None,
+                step_number=7,
+            )
+
+        mock_db.add.assert_called_once()
+        mock_db.commit.assert_called_once()
+        added_obj = mock_db.add.call_args.args[0]
+        self.assertIsNone(added_obj.trace_id)
+        self.assertIsNone(added_obj.tool_call_id)
+        logs = "\n".join(captured.output)
+        self.assertIn("缺少精确关联字段", logs)
+        self.assertIn("trace_id", logs)
+        self.assertIn("tool_call_id", logs)
 
     @patch("app.services.agent_logger.SessionLocal")
     async def test_log_tool_call_handles_error_gracefully(self, mock_session_cls):
