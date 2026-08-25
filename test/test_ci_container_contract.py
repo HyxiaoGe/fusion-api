@@ -47,6 +47,8 @@ class CIContainerContractTest(unittest.TestCase):
         dependency_stage = dockerfile[: dockerfile.index("AS production")]
 
         self.assertGreaterEqual(dependency_stage.count("Acquire::Retries=5"), 2)
+        self.assertIn("for attempt in 1 2 3 4 5", dependency_stage)
+        self.assertIn('if [ "$attempt" -eq 5 ]', dependency_stage)
 
     def test_pr_and_release_workflows_run_equivalent_container_tests(self) -> None:
         release_workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")

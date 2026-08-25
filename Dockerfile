@@ -4,12 +4,19 @@ FROM python:3.12-slim AS dependencies
 
 WORKDIR /app
 
-RUN apt-get -o Acquire::Retries=5 update \
-    && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
-    build-essential \
-    gcc \
-    libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
+RUN set -u; \
+    for attempt in 1 2 3 4 5; do \
+        if apt-get -o Acquire::Retries=5 update \
+            && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+                build-essential \
+                gcc \
+                libpq-dev; then \
+            rm -rf /var/lib/apt/lists/*; \
+            exit 0; \
+        fi; \
+        if [ "$attempt" -eq 5 ]; then exit 1; fi; \
+        sleep $((attempt * 2)); \
+    done
 
 COPY requirements.txt ./
 RUN --mount=type=cache,target=/root/.cache/pip \
