@@ -42,6 +42,12 @@ class CIContainerContractTest(unittest.TestCase):
         self.assertNotIn("ruff", production)
         self.assertNotRegex(dockerfile, r"(?m)^\s*git\s*\\?\s*$")
 
+    def test_dockerfile_retries_transient_apt_download_failures(self) -> None:
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        dependency_stage = dockerfile[: dockerfile.index("AS production")]
+
+        self.assertGreaterEqual(dependency_stage.count("Acquire::Retries=5"), 2)
+
     def test_pr_and_release_workflows_run_equivalent_container_tests(self) -> None:
         release_workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
         pr_workflow = (ROOT / ".github/workflows/pr-ci.yml").read_text(encoding="utf-8")
@@ -72,9 +78,7 @@ class CIContainerContractTest(unittest.TestCase):
     def test_windows_release_build_disables_registry_incompatible_attestations(self) -> None:
         windows_build_script = (ROOT / ".github/scripts/windows-build-and-test.ps1").read_text(encoding="utf-8")
         build_commands = [
-            line.strip()
-            for line in windows_build_script.splitlines()
-            if line.strip().startswith("docker build ")
+            line.strip() for line in windows_build_script.splitlines() if line.strip().startswith("docker build ")
         ]
 
         self.assertEqual(3, len(build_commands))

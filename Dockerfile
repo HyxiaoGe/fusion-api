@@ -4,7 +4,8 @@ FROM python:3.12-slim AS dependencies
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get -o Acquire::Retries=5 update \
+    && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
     build-essential \
     gcc \
     libpq-dev \
