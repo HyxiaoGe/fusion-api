@@ -14,6 +14,7 @@ from sqlalchemy.orm import sessionmaker
 from app.db.database import Base
 from app.db.models import (
     AgentEvent,
+    AgentLlmRoundDetail,
     AgentSession,
     Conversation,
     RunTrajectoryMeta,
@@ -96,6 +97,7 @@ class TrajectoryQueryServiceTests(unittest.TestCase):
         status: str = "complete",
         pending: bool = False,
         pending_reason: str | None = None,
+        llm_detail_schema_version: int | None = None,
     ) -> None:
         with self.Session() as db:
             db.add(
@@ -107,6 +109,50 @@ class TrajectoryQueryServiceTests(unittest.TestCase):
                     expected_last_sequence=2,
                     terminal_intent_pending_at=self.now if pending else None,
                     terminal_intent_reason=pending_reason,
+                    llm_detail_schema_version=llm_detail_schema_version,
+                )
+            )
+            db.commit()
+
+    def _llm_event(self, run_id: str, sequence: int, event_type: str, llm_round_id: str) -> None:
+        with self.Session() as db:
+            db.add(
+                AgentEvent(
+                    conversation_id="conv-1",
+                    message_id=f"msg-{run_id}",
+                    run_id=run_id,
+                    sequence=sequence,
+                    event_type=event_type,
+                    schema_version=1,
+                    event_ts=self.now + timedelta(milliseconds=sequence),
+                    step_id="step-1",
+                    payload={
+                        "llm_round_id": llm_round_id,
+                        "round_index": sequence + 1,
+                        **(
+                            {"model": "deepseek-chat", "provider": "deepseek"}
+                            if event_type == "llm_round_started"
+                            else {"duration_ms": 120, "input_tokens": 10, "output_tokens": 20}
+                        ),
+                    },
+                )
+            )
+            db.commit()
+
+    def _llm_detail(self, run_id: str, llm_round_id: str, *, reasoning: str, output: str) -> None:
+        with self.Session() as db:
+            db.add(
+                AgentLlmRoundDetail(
+                    conversation_id="conv-1",
+                    run_id=run_id,
+                    message_id=f"msg-{run_id}",
+                    llm_round_id=llm_round_id,
+                    reasoning_text=reasoning,
+                    content_text=output,
+                    reasoning_preview=reasoning[:200] or None,
+                    output_preview=output[:200] or None,
+                    redacted_fields=[],
+                    truncated_fields=[],
                 )
             )
             db.commit()
@@ -149,6 +195,48 @@ class TrajectoryQueryServiceTests(unittest.TestCase):
         self.assertEqual(snapshot.completeness.expected_last_sequence, 2)
         self.assertEqual(snapshot.completeness.loaded_event_count, 2)
         self.assertEqual((snapshot.completeness.first_sequence, snapshot.completeness.last_sequence), (0, 1))
+
+    def test_snapshot_batches_llm_previews_and_run_list_counts_distinct_rounds(self):
+        self._run("run-llm")
+        self._meta("run-llm", llm_detail_schema_version=1)
+        self._llm_event("run-llm", 0, "llm_round_started", "round-1")
+        self._llm_event("run-llm", 1, "llm_round_completed", "round-1")
+        self._llm_event("run-llm", 2, "llm_round_started", "round-2")
+        self._llm_event("run-llm", 3, "llm_round_completed", "round-2")
+        self._llm_detail("run-llm", "round-1", reasoning="先分析", output="第一次回答")
+        self._llm_detail("run-llm", "round-2", reasoning="", output="第二次回答")
+
+        service = self._service(max_events=10)
+        snapshot = service.get_user_snapshot("conv-1", "run-llm", "user-1")
+        truncated_snapshot = self._service(max_events=1).get_user_snapshot(
+            "conv-1",
+            "run-llm",
+            "user-1",
+        )
+        run_list = service.list_runs("conv-1", "user-1")
+
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.run.llm_round_count, 2)
+        self.assertTrue(truncated_snapshot.truncated)
+        self.assertEqual(truncated_snapshot.run.llm_round_count, 2)
+        self.assertEqual(snapshot.run.llm_detail_schema_version, 1)
+        self.assertEqual(
+            [summary.model_dump() for summary in snapshot.llm_round_summaries],
+            [
+                {
+                    "llm_round_id": "round-1",
+                    "reasoning_preview": "先分析",
+                    "output_preview": "第一次回答",
+                },
+                {
+                    "llm_round_id": "round-2",
+                    "reasoning_preview": None,
+                    "output_preview": "第二次回答",
+                },
+            ],
+        )
+        self.assertEqual(run_list.items[0].llm_round_count, 2)
+        self.assertEqual(run_list.items[0].llm_detail_schema_version, 1)
 
     def test_snapshot_at_exact_event_cap_is_not_truncated_and_legacy_empty_is_explainable(self):
         """若 limit+1 边界错判，或 legacy 空账本误作不存在，本测试必须失败。"""
@@ -283,7 +371,7 @@ class TrajectoryQueryServiceTests(unittest.TestCase):
         statements: list[tuple[str, tuple[object, ...] | list[object]]] = []
 
         def capture(_conn, _cursor, statement, parameters, _context, _executemany) -> None:
-            if "FROM agent_events" in statement:
+            if "FROM agent_events" in statement and "ORDER BY agent_events.sequence" in statement:
                 statements.append((statement, parameters))
 
         event.listen(self.engine, "before_cursor_execute", capture)

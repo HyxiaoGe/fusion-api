@@ -18,6 +18,8 @@ class UserTrajectoryMetaRow:
     expected_last_sequence: int | None
     degraded_reason: str | None
     has_pending_terminal_intent: bool
+    llm_detail_schema_version: int | None
+    llm_round_count: int
 
 
 class TrajectoryEventRecord(BaseModel):
@@ -100,6 +102,8 @@ class TrajectoryRunSummary(BaseModel):
     duration_ms: int | None = None
     started_at: datetime
     ended_at: datetime | None = None
+    llm_detail_schema_version: int | None = None
+    llm_round_count: int = 0
 
 
 class TrajectoryRunListResponse(BaseModel):
@@ -125,6 +129,16 @@ class TrajectoryCompleteness(BaseModel):
     last_sequence: int | None = None
 
 
+class TrajectoryLlmRoundSummary(BaseModel):
+    """快照中用于高密度账本展示的有界 LLM 正文预览。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    llm_round_id: str
+    reasoning_preview: str | None = None
+    output_preview: str | None = None
+
+
 class TrajectorySnapshot(BaseModel):
     """普通用户可读取的脱敏账本快照。"""
 
@@ -135,6 +149,7 @@ class TrajectorySnapshot(BaseModel):
     spans: list[TrajectorySpan] = Field(default_factory=list)
     completeness: TrajectoryCompleteness
     truncated: bool = False
+    llm_round_summaries: list[TrajectoryLlmRoundSummary] = Field(default_factory=list)
 
 
 class ToolNodeDetail(BaseModel):
@@ -151,14 +166,27 @@ class ToolNodeDetail(BaseModel):
     error: dict[str, str] | None = None
 
 
+class LlmNodeDetail(BaseModel):
+    """普通用户可读取的单个 LLM Round 正文详情。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    llm_round_id: str
+    reasoning_text: str | None = None
+    output_text: str | None = None
+
+
 class TrajectoryNodeDetailResponse(BaseModel):
-    """P3 Tool Node Detail 的稳定响应信封。"""
+    """P3 Tool/LLM Node Detail 的统一稳定响应信封。"""
 
     model_config = ConfigDict(extra="forbid")
 
     status: Literal["available", "pending", "not_recorded", "degraded"]
-    node_type: Literal["tool"] = "tool"
-    available_sections: list[Literal["summary", "payload", "result", "timing", "schema"]] = Field(default_factory=list)
-    detail: ToolNodeDetail | None = None
+    node_type: Literal["tool", "llm"] = "tool"
+    available_sections: list[Literal["summary", "payload", "result", "timing", "schema", "thinking", "output"]] = Field(
+        default_factory=list
+    )
+    detail: ToolNodeDetail | LlmNodeDetail | None = None
     redacted_fields: list[str] = Field(default_factory=list)
+    truncated_fields: list[str] = Field(default_factory=list)
     reason: str | None = None

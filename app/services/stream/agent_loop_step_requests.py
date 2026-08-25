@@ -117,4 +117,5 @@ def build_limit_summary_step_request(
         evidence_policy=runtime.evidence_policy,
         research_workset=state.research_workset,
         defer_output=True,
+        llm_round_detail_scheduler=runtime.llm_round_detail_scheduler,
     )

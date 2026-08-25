@@ -37,6 +37,7 @@ from app.core.redis import close_redis, get_redis_pool, init_redis
 from app.db.database import SessionLocal
 from app.schemas.knowledge import KNOWLEDGE_SEARCH_MAX_BASES_PER_REQUEST
 from app.schemas.response import ApiException, generate_request_id
+from app.services.agent.llm_round_detail_recorder import stop_llm_round_detail_workers
 from app.services.knowledge.storage_upload_guard import shutdown_storage_upload_lifecycles
 from app.services.mcp.runtime import get_mcp_client_manager
 from app.services.scheduler_service import start_scheduler, stop_scheduler
@@ -212,6 +213,7 @@ async def lifespan(app: FastAPI):
     # 对象存储 SDK 在线程中不可取消。先等待上传 lifecycle 完成真实 RPC、intent
     # finalizer 和续租收敛，再关闭其余外部客户端；硬终止则由持久 cleanup 接管。
     await shutdown_storage_upload_lifecycles()
+    await stop_llm_round_detail_workers()
     await stop_suggested_question_workers()
     await litellm_health.stop()
     await litellm_cleanup.close_async_clients()

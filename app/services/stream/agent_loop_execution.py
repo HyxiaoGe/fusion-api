@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from inspect import Parameter, signature
 from typing import Any
 
 from app.services.agent.emitter import AgentEventEmitter
@@ -37,6 +38,7 @@ class AgentLoopDependencies:
     log_round_summary_fn: Callable[..., None]
     warning_fn: Callable[[str], None]
     clock: Callable[[], float]
+    llm_round_detail_scheduler: Callable[[Any], Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -178,6 +180,10 @@ def build_agent_loop_runtime(
     dependencies: AgentLoopDependencies,
     parts: AgentLoopExecutionParts,
 ) -> AgentLoopRuntime:
+    llm_round_detail_scheduler = _bind_llm_round_detail_scheduler(
+        dependencies.llm_round_detail_scheduler,
+        trajectory_recorder=parts.trajectory_recorder,
+    )
     return AgentLoopRuntime(
         conversation_id=request.conversation_id,
         task_id=request.task_id,
@@ -213,7 +219,33 @@ def build_agent_loop_runtime(
         control_tool_names=getattr(request.call_config, "control_tool_names", frozenset()),
         task_mode=getattr(request.call_config, "task_mode", "standard"),
         evidence_policy=getattr(request.call_config, "evidence_policy", "standard"),
+        llm_round_detail_scheduler=llm_round_detail_scheduler,
     )
+
+
+def _bind_llm_round_detail_scheduler(
+    scheduler: Callable[[Any], Any] | None,
+    *,
+    trajectory_recorder: QueuedTrajectoryRecorder,
+) -> Callable[[Any], Any] | None:
+    if scheduler is None or not _accepts_keyword(scheduler, "on_degraded"):
+        return scheduler
+
+    def schedule_with_degraded_latch(draft: Any) -> Any:
+        return scheduler(
+            draft,
+            on_degraded=trajectory_recorder.mark_auxiliary_degraded,
+        )
+
+    return schedule_with_degraded_latch
+
+
+def _accepts_keyword(fn: Callable[..., Any], keyword: str) -> bool:
+    try:
+        parameters = signature(fn).parameters
+    except (TypeError, ValueError):
+        return True
+    return keyword in parameters or any(parameter.kind == Parameter.VAR_KEYWORD for parameter in parameters.values())
 
 
 def build_agent_loop_execution(

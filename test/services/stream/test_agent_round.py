@@ -34,6 +34,14 @@ class AgentRoundUsageTests(unittest.TestCase):
         self.assertEqual(result.cache_read_tokens, 10)
         self.assertEqual(result.cache_write_tokens, 8)
 
+    def test_accumulate_usage_preserves_optional_reasoning_token_totals(self):
+        result = accumulate_usage(
+            Usage(input_tokens=2, output_tokens=3, reasoning_tokens=4),
+            Usage(input_tokens=5, output_tokens=7, reasoning_tokens=6),
+        )
+
+        self.assertEqual(result.reasoning_tokens, 10)
+
 
 class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
     async def test_round_timing_excludes_started_and_context_sink_delay(self):
@@ -207,6 +215,53 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(emitter.llm_round_cancelled.await_args.kwargs["reason"], "shutdown")
         emitter.llm_round_failed.assert_not_awaited()
 
+    async def test_stream_failure_persists_visible_partial_round_detail(self):
+        emitter = AsyncMock()
+        detail_scheduler = MagicMock()
+        observation = MagicMock()
+        observation.finish_success = AsyncMock()
+        observation.finish_error = AsyncMock()
+        observation.wrap_response.side_effect = lambda response: response
+        context_plan = MagicMock(messages=[], estimated_tokens_after=10)
+        context_plan.telemetry.return_value = {"context_management_status": "no_op"}
+
+        async def stream_round_fn(*_args, partial_output, **_kwargs):
+            partial_output["reasoning_buf"] = "部分推理"
+            partial_output["content_buf"] = "部分回答"
+            raise RuntimeError("stream failed")
+
+        with (
+            patch("app.services.stream.agent_round.prepare_context", new=AsyncMock(return_value=context_plan)),
+            patch("app.services.stream.agent_round.create_llm_round_observation", return_value=observation),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stream failed"):
+                await run_agent_round(
+                    conversation_id="conv-partial",
+                    task_id="task-partial",
+                    run_id="run-partial",
+                    step_number=1,
+                    model_id="deepseek-chat",
+                    provider="deepseek",
+                    litellm_model="deepseek/deepseek-chat",
+                    litellm_kwargs={},
+                    messages=[],
+                    should_use_reasoning=True,
+                    call_kwargs={},
+                    accumulated_usage=Usage(),
+                    step_context=AgentStepContext("step-partial", 1, 0.0, "thinking", "text"),
+                    llm_call_fn=AsyncMock(return_value="response"),
+                    stream_round_fn=stream_round_fn,
+                    log_round_summary_fn=lambda **_kwargs: None,
+                    emitter=emitter,
+                    llm_round_detail_scheduler=detail_scheduler,
+                )
+
+        emitter.llm_round_failed.assert_awaited_once()
+        detail_scheduler.assert_called_once()
+        draft = detail_scheduler.call_args.args[0]
+        self.assertEqual(draft.reasoning_text, "部分推理")
+        self.assertEqual(draft.content_text, "部分回答")
+
     async def test_deferred_agent_round_keeps_lifecycle_open_until_visibility_decision(self):
         emitter = AsyncMock()
         observation = MagicMock(first_output_delta_kind="content", first_output_delta_ms=80, duration_ms=200)
@@ -302,6 +357,7 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     emitter.llm_round_failed.assert_awaited_once()
                     emitter.llm_round_cancelled.assert_not_awaited()
+
     async def test_run_agent_round_finalizes_language_contract_before_budget_and_model_call(self):
         step_context = AgentStepContext(
             step_id="step-language",

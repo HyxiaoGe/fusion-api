@@ -10,9 +10,11 @@ from app.db.models import AgentEvent, AgentSession
 from app.db.trajectory_repository import TrajectoryRepository
 from app.schemas.admin_trajectory import AdminTrajectorySnapshot, AdminTrajectoryToolCall
 from app.schemas.trajectory import (
+    LlmNodeDetail,
     ToolNodeDetail,
     TrajectoryCompleteness,
     TrajectoryEventRecord,
+    TrajectoryLlmRoundSummary,
     TrajectoryNodeDetailResponse,
     TrajectoryRunListResponse,
     TrajectoryRunSummary,
@@ -77,7 +79,10 @@ class TrajectoryQueryService:
         watermark = self._ledger_watermark()
         items = [
             self._run_summary(
-                run, resolve_user_trajectory_status_from_rows(run.created_at, meta, watermark).trajectory_status
+                run,
+                resolve_user_trajectory_status_from_rows(run.created_at, meta, watermark).trajectory_status,
+                llm_detail_schema_version=meta.llm_detail_schema_version if meta is not None else None,
+                llm_round_count=meta.llm_round_count if meta is not None else 0,
             )
             for run, meta in bounded_rows
         ]
@@ -120,6 +125,89 @@ class TrajectoryQueryService:
         tool_call_id: str,
     ) -> TrajectoryNodeDetailResponse | None:
         return self._get_tool_node_detail(conversation_id, run_id, tool_call_id, user_id=None)
+
+    def get_user_llm_node_detail(
+        self,
+        conversation_id: str,
+        run_id: str,
+        llm_round_id: str,
+        user_id: str,
+    ) -> TrajectoryNodeDetailResponse | None:
+        return self._get_llm_node_detail(conversation_id, run_id, llm_round_id, user_id=user_id)
+
+    def get_admin_llm_node_detail(
+        self,
+        conversation_id: str,
+        run_id: str,
+        llm_round_id: str,
+    ) -> TrajectoryNodeDetailResponse | None:
+        return self._get_llm_node_detail(conversation_id, run_id, llm_round_id, user_id=None)
+
+    def _get_llm_node_detail(
+        self,
+        conversation_id: str,
+        run_id: str,
+        llm_round_id: str,
+        *,
+        user_id: str | None,
+    ) -> TrajectoryNodeDetailResponse | None:
+        run = self._repository.get_detail_run(conversation_id, run_id, user_id)
+        if run is None:
+            return None
+        lifecycle = self._repository.list_llm_round_lifecycle_events(
+            conversation_id=conversation_id,
+            run_id=run_id,
+            llm_round_id=llm_round_id,
+        )
+        if not lifecycle:
+            return None
+        if self._repository.get_llm_detail_schema_version(run_id) != 1:
+            return None
+
+        detail = self._repository.get_exact_llm_detail(
+            conversation_id=conversation_id,
+            run_id=run_id,
+            llm_round_id=llm_round_id,
+        )
+        if detail is not None:
+            sections = ["summary"]
+            if detail.reasoning_text is not None:
+                sections.append("thinking")
+            if detail.content_text is not None:
+                sections.append("output")
+            sections.append("timing")
+            return TrajectoryNodeDetailResponse(
+                status="available",
+                node_type="llm",
+                available_sections=sections,
+                detail=LlmNodeDetail(
+                    llm_round_id=llm_round_id,
+                    reasoning_text=detail.reasoning_text,
+                    output_text=detail.content_text,
+                ),
+                redacted_fields=list(detail.redacted_fields or []),
+                truncated_fields=list(detail.truncated_fields or []),
+            )
+
+        terminal = next(
+            (
+                event
+                for event in reversed(lifecycle)
+                if event.event_type in {"llm_round_completed", "llm_round_failed", "llm_round_cancelled"}
+            ),
+            None,
+        )
+        if terminal is None:
+            if run.status == "running":
+                return self._unavailable_llm_detail("pending", "llm_round_in_progress")
+            terminal_at = run.terminal_at
+        else:
+            terminal_at = terminal.event_ts
+        if terminal_at is not None:
+            age = as_utc(self._now_provider()) - as_utc(terminal_at)
+            if age <= self._detail_settle_grace:
+                return self._unavailable_llm_detail("pending", "llm_detail_settling")
+        return self._unavailable_llm_detail("degraded", "llm_detail_missing")
 
     def _get_tool_node_detail(
         self,
@@ -261,6 +349,18 @@ class TrajectoryQueryService:
         )
 
     @staticmethod
+    def _unavailable_llm_detail(status: str, reason: str) -> TrajectoryNodeDetailResponse:
+        return TrajectoryNodeDetailResponse(
+            status=status,
+            node_type="llm",
+            available_sections=[],
+            detail=None,
+            redacted_fields=[],
+            truncated_fields=[],
+            reason=reason,
+        )
+
+    @staticmethod
     def _admin_tool_call(tool) -> AdminTrajectoryToolCall:
         item = {key: value for key, value in AdminAuditService._tool_item(tool).items() if key != "trace_id"}
         created_at = item.get("created_at")
@@ -299,8 +399,23 @@ class TrajectoryQueryService:
             run_ended_at=run.terminal_at,
             truncated=truncated,
         )
+        llm_summaries = []
+        if meta is not None and meta.llm_detail_schema_version == 1:
+            llm_summaries = [
+                TrajectoryLlmRoundSummary(
+                    llm_round_id=detail.llm_round_id,
+                    reasoning_preview=detail.reasoning_preview,
+                    output_preview=detail.output_preview,
+                )
+                for detail in self._repository.list_llm_round_details(conversation_id, run_id)
+            ]
         return TrajectorySnapshot(
-            run=self._run_summary(run, assessment.trajectory_status),
+            run=self._run_summary(
+                run,
+                assessment.trajectory_status,
+                llm_detail_schema_version=meta.llm_detail_schema_version if meta is not None else None,
+                llm_round_count=meta.llm_round_count if meta is not None else 0,
+            ),
             records=projection.records,
             spans=projection.spans,
             completeness=TrajectoryCompleteness(
@@ -313,10 +428,17 @@ class TrajectoryQueryService:
                 last_sequence=loaded_events[-1].sequence if loaded_events else None,
             ),
             truncated=truncated,
+            llm_round_summaries=llm_summaries,
         )
 
     @staticmethod
-    def _run_summary(run: AgentSession, trajectory_status: str) -> TrajectoryRunSummary:
+    def _run_summary(
+        run: AgentSession,
+        trajectory_status: str,
+        *,
+        llm_detail_schema_version: int | None = None,
+        llm_round_count: int = 0,
+    ) -> TrajectoryRunSummary:
         return TrajectoryRunSummary(
             run_id=run.id,
             message_id=run.message_id,
@@ -329,6 +451,8 @@ class TrajectoryQueryService:
             duration_ms=run.total_duration_ms,
             started_at=run.created_at,
             ended_at=run.terminal_at,
+            llm_detail_schema_version=llm_detail_schema_version,
+            llm_round_count=llm_round_count,
         )
 
     @staticmethod

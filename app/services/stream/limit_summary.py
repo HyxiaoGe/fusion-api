@@ -101,6 +101,7 @@ class LimitSummaryStepRequest:
     evidence_policy: str = "standard"
     research_workset: ResearchEvidenceWorkset | None = None
     defer_output: bool = True
+    llm_round_detail_scheduler: Callable[[Any], Any] | None = None
 
 
 def _streams_standard_plan_synthesis(request: LimitSummaryStepRequest) -> bool:
@@ -326,8 +327,13 @@ async def call_limit_summary_round(
         model=request.model_id,
         provider=request.provider,
         parent_step_id=step_id,
+        conversation_id=request.conversation_id,
+        run_id=request.run_id,
+        message_id=request.assistant_message_id,
+        detail_scheduler=request.llm_round_detail_scheduler,
     )
     observation.start()
+    detail_partial_output = partial_output if partial_output is not None else {}
     try:
         response = await request.llm_call_fn(
             request.litellm_model,
@@ -348,14 +354,10 @@ async def call_limit_summary_round(
             and _accepts_keyword(request.stream_round_fn, "allow_deferred_reasoning_output")
         ):
             stream_kwargs["allow_deferred_reasoning_output"] = True
-        if partial_output is not None and _accepts_keyword(request.stream_round_fn, "partial_output"):
-            stream_kwargs["partial_output"] = partial_output
+        if _accepts_keyword(request.stream_round_fn, "partial_output"):
+            stream_kwargs["partial_output"] = detail_partial_output
         visible_callback_supported = _accepts_keyword(request.stream_round_fn, "on_visible_output")
-        if (
-            lifecycle is not None
-            and not _should_defer_summary_output(request)
-            and visible_callback_supported
-        ):
+        if lifecycle is not None and not _should_defer_summary_output(request) and visible_callback_supported:
             stream_kwargs["on_visible_output"] = lifecycle.publish_visible_output
         candidate_callback = getattr(observation, "observe_output_candidate", None)
         if callable(candidate_callback) and _accepts_keyword(request.stream_round_fn, "on_output_candidate"):
@@ -376,6 +378,11 @@ async def call_limit_summary_round(
             **stream_kwargs,
         )
     except asyncio.CancelledError as exc:
+        if lifecycle is not None:
+            lifecycle.record_detail(
+                reasoning_text=detail_partial_output.get("reasoning_buf", ""),
+                content_text=detail_partial_output.get("content_buf", ""),
+            )
         await _close_summary_round_after_primary_error(
             observation=observation,
             lifecycle=lifecycle,
@@ -383,6 +390,11 @@ async def call_limit_summary_round(
         )
         raise
     except BaseException as exc:
+        if lifecycle is not None:
+            lifecycle.record_detail(
+                reasoning_text=detail_partial_output.get("reasoning_buf", ""),
+                content_text=detail_partial_output.get("content_buf", ""),
+            )
         await _close_summary_round_after_primary_error(
             observation=observation,
             lifecycle=lifecycle,
@@ -399,6 +411,7 @@ async def call_limit_summary_round(
         await emit_context_status(request.emitter, phase="final", context=final_context)
         await observation.finish_success(usage=usage_data, finish_reason=finish_reason)
         if lifecycle is not None:
+            lifecycle.record_detail(reasoning_text=reasoning_buf, content_text=content_buf)
             lifecycle.record_result(usage=usage_data, finish_reason=finish_reason)
             if finish_reason == "cancelled":
                 await lifecycle.finish_cancelled(reason="superseded")
@@ -917,8 +930,7 @@ async def run_limit_summary_step(
                 raise
             try:
                 logger.warning(
-                    "deferred 总结生命周期收尾失败，保留主异常: "
-                    "error_type=%s error_code=deferred_terminal_failure",
+                    "deferred 总结生命周期收尾失败，保留主异常: error_type=%s error_code=deferred_terminal_failure",
                     type(secondary_error).__name__,
                 )
             except BaseException:

@@ -120,6 +120,7 @@ class LLMRoundCompleted(AgentEventBase):
     total_tokens: int = Field(ge=0)
     cache_read_tokens: int | None = Field(default=None, ge=0)
     cache_write_tokens: int | None = Field(default=None, ge=0)
+    reasoning_tokens: int | None = Field(default=None, ge=0)
     ttft_ms: int | None = Field(default=None, ge=0)
     duration_ms: int = Field(ge=0)
 

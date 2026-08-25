@@ -1,11 +1,11 @@
 # Fusion Trajectory 集成设计（DSH 风格 Agent 执行轨迹）
 
-> 状态：设计稿 v0.21（P0 已 dev 验收并采用 `QueuedTrajectoryRecorder`；P1 已由 PR #54 合并并部署验证；P2 独立联调夹具已完成既有真实 API 验证；P3 实施中；v0.21 P3 决策已迁入本正式 `feat/trajectory-p3-contract-guard` 分支）
+> 状态：设计稿 v0.22（P0 已 dev 验收并采用 `QueuedTrajectoryRecorder`；P1 已由 PR #54 合并并部署验证；P2 独立联调夹具已完成既有真实 API 验证；P3 初版已实现，v0.22 LLM Round Detail 增量进入实施）
 > 范围：fusion-api + fusion-ui 集成 Agent 执行轨迹展示；`langchain-trajectory-mvp` 仅保留为历史联调夹具，不进入 Fusion P3 运行时或交付链路。
 > 本文档记录 P0–P3 的统一架构；P3 直接消费已发布 P1，不重新实施后端投影器或快照 API。
 >
 > **仓库处理决定**：正式实施分支通过 `.gitignore` 的 `!docs/TRAJECTORY_DESIGN.md` 例外跟踪本文档。
-> **P3 仓库落位**：本文档以 `fusion-api/origin/master` 的 v0.15 为底，仅合入 P3 决策，保留已经发布的 P0/P1 事实；前端在 `fusion-ui/origin/master` 的独立 P3 worktree 实施。
+> **P3 仓库落位**：v0.22 已迁入正式 `feat/trajectory-p3-contract-guard` API worktree；前端继续在 `feat/trajectory-p3-ui` 独立 worktree 实施。禁止在旧 `feat/trajectory-ledger-p0` worktree 编写 P3 代码。
 
 ## 1. 背景与目标
 
@@ -606,23 +606,24 @@ GET /api/admin/audit/conversations/{conversation_id}/runs/{run_id}/trajectory
 - **审计闭环**：管理员轨迹读取必须复用 `get_conversation_auditor` 与 `X-Admin-Audit-Reason`；在返回 `tool_calls` 前写入 `admin.audit.trajectory.view`，审计失败返回既有 503，不得 fail-open。
 - 命名：账本称「**脱敏事件账本**」，文档与 UI 不得声称是完整原始事件。
 
-### 7.4 Trajectory Node Detail 契约（v0.21 定稿，P3 只承诺 Tool）
+### 7.4 Trajectory Node Detail 契约（v0.22 定稿，P3 实现 Tool + LLM）
 
 > 本节与 §8 的 Network 式三区交互共享同一 Detail 契约，分别验收。硬约束：**只支持精确关联，不支持历史猜测；旧数据允许缺失，新数据缺失必须显式暴露。**
-> **P3 实现范围（v0.21，YAGNI）**：后端 `node-detail` 端点只承诺 `node_type=tool`；LLM/Message/Run/Step 的 Summary/Timing 由前端投影直接生成，不经 Node Detail API；统一 Envelope 为未来扩展保留其他 `node_type`。
+> **P3 实现范围（v0.22）**：后端 `node-detail` 端点实现 `node_type=tool` 与 `node_type=llm`；Message/Run/Step 的 Summary/Timing 仍由前端投影直接生成，不经 Node Detail API；统一 Envelope 为未来扩展保留其他 `node_type`。
 
 ```typescript
 type TrajectoryNodeDetailResponse = {
   status: "available" | "pending" | "not_recorded" | "degraded";
   node_type: "tool" | "llm" | "message" | "run" | "step";
-  available_sections: Array<"summary" | "payload" | "result" | "timing" | "schema">;
+  available_sections: Array<"summary" | "payload" | "result" | "timing" | "schema" | "thinking" | "output">;
   detail: ToolNodeDetail | LlmNodeDetail | MessageNodeDetail | RunNodeDetail | StepNodeDetail | null;
   redacted_fields: string[];
+  truncated_fields: string[];
   reason: string | null;
 };
 ```
 
-- `status` 表示关联数据是否可信，`available_sections` 表示可展示的详情页签，二者不得混用；P3 后端只实现 Tool 分支，非 Tool 节点不因没有 Tool Payload 而标记 degraded。
+- `status` 表示关联数据是否可信，`available_sections` 表示可展示的详情页签，二者不得混用；Tool 没有 Payload 或 LLM 没有 Reasoning 都不等于 degraded。`truncated_fields` 是公共 Envelope 字段，与表示脱敏移除的 `redacted_fields` 分离。
 - 普通端点为 `GET /api/conversations/{conversation_id}/runs/{run_id}/node-detail/{node_type}/{node_id}`，Tool 的 `node_id` 为 `tool_call_id`；管理员端点位于 `/api/admin/audit/conversations/{conversation_id}/runs/{run_id}/node-detail/{node_type}/{node_id}`，要求访问原因和审计记录。
 - `trajectory_detail_enabled_at` 是独立于 `ledger_enabled_at` 的持久化水位。先迁移列/索引、部署写入链路、确认实例开始写 `tool_call_id`，再显式激活该水位；激活前数据统一为 `not_recorded`，不得在迁移开始时提前生效。
 - Tool 的服务端状态按以下确定性顺序判定：① 精确 `(run_id, tool_call_id)` 行存在为 `available`；② `run.created_at < trajectory_detail_enabled_at` 为 `not_recorded`；③ run 仍在运行或④ 已终态但仍在 `detail_settle_grace` 内为 `pending`；⑤ 其余终态且超宽限期仍无精确行才为 `degraded`。
@@ -632,6 +633,38 @@ type TrajectoryNodeDetailResponse = {
 - `ToolCallLog` 每个逻辑 Tool Call 只保留最终一条；Attempt 只来自 `tool_attempt_started/completed`。Payload/Result 归属逻辑 Tool 节点，Attempt 仅展示状态、错误码和 Timing；单次成功 Attempt 默认折叠。
 - 历史 run 缺精确详情时展示基础账本与 Timing，并以 `not_recorded` 说明 Payload/Result 不可用，不标 degraded、不猜测关联；新 run 缺失必须显式 `pending` 或 `degraded`。
 - 本节不回填旧数据、不把 Payload/Result 复制进 `agent_events`、不实施 cursor 分页或 Schema UI。
+
+#### 7.4.11 LLM Round Detail（v0.22）
+
+DSH 轨迹把每次模型请求投影为 `ASSISTANT · Request #N`，与 Tool Action/Observation 交替呈现。Fusion 已捕获模型显式返回的 `reasoning_content`，但 P0 账本只保留生命周期，聊天 `ThinkingBlock` 又没有 `llm_round_id`，因此 P3 通过独立详情表补齐精确关联。这里的 Reasoning 仅指供应商明确返回的用户可获取输出，不涉及隐藏思维链。
+
+```sql
+CREATE TABLE agent_llm_round_details (
+    id                UUID PRIMARY KEY,
+    conversation_id   TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    run_id            TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
+    message_id        TEXT REFERENCES messages(id) ON DELETE SET NULL,
+    llm_round_id      TEXT NOT NULL,
+    reasoning_text    TEXT,
+    content_text      TEXT,
+    reasoning_preview TEXT,
+    output_preview    TEXT,
+    redacted_fields   JSONB NOT NULL DEFAULT '[]',
+    truncated_fields  JSONB NOT NULL DEFAULT '[]',
+    recorded_at       TIMESTAMPTZ NOT NULL,
+    UNIQUE (run_id, llm_round_id)
+);
+```
+
+- `agent_events` 继续保存 model/provider、状态、finish reason、Token、TTFT 与 duration；详情表只保存净化正文和 preview，不重复维护生命周期字段。
+- `run_trajectory_meta.llm_detail_schema_version` 是每 Run 的能力声明：`NULL` 表示未启用，LLM 节点仍可展示生命周期 Summary/Timing，但不渲染 Thinking/Output，也没有旧数据专属文案；`1` 表示应具备新契约，终态超出 settle grace 仍缺详情时为 degraded。新 Recorder 创建 meta 时写入 `1`，冲突时不覆盖历史 `NULL`。
+- 写入管线固定为：流式层得到用户可见 `reasoning_buf` → `sanitize_user_visible_reasoning(..., final=True)` → 有界 `reasoning_text` → 同事务生成不超过 200 字符的 preview。`raw_reasoning_buf` 不进入数据库、API 或日志；`redacted_fields` 与 `truncated_fields` 分别表示脱敏移除和超长截断。
+- 每个 completed/failed/cancelled Round 在生命周期终态事件成功发出后调度一次详情写入，失败/取消也提交已产生的部分正文；`UNIQUE (run_id, llm_round_id)` + `ON CONFLICT DO NOTHING` 保证幂等。后台任务必须受控跟踪、可在 shutdown 观察，不进入 Agent 热路径或 P0 finalize barrier。
+- `TrajectorySnapshot` 增加有界 `llm_round_summaries[]`，只批量返回 `llm_round_id/reasoning_preview/output_preview`；完整正文走 `node-detail/llm/{llm_round_id}`。LLM Detail 状态为：详情存在 `available`；生命周期未结束或终态仍在 grace 内 `pending`；version=1 且终态超 grace 仍缺详情 `degraded`。version 为 `NULL` 时前端不请求正文详情。
+- 实时路径收到 `llm_round_completed/failed/cancelled` 后只请求对应节点详情；异步写入尚未可见时在既有有限 grace 内重试，available 后更新该 Cell 缓存，超期 degraded；不重拉整个快照，不把正文加入 SSE envelope。
+- Runs API 增加 `llm_round_count`。会话级 Request 编号按稳定 Run 顺序 `(started_at, run_id)` 计算：前序 Run 的 `llm_round_count` 之和加当前 `round_index`，无需加载所有 Run 事件，也不在写入热路径分配会话锁。
+- LLM Detail 页签固定为 Summary/Thinking/Output/Timing。首版只展示 Round 完成后的完整内容，不实现逐 Token Thinking。供应商若提供 `completion_tokens_details.reasoning_tokens`，以 `llm_round_completed.reasoning_tokens` 可选生命周期字段进入账本；未提供时为 null，不估算、不写入详情表。
+- Tool 与 LLM 状态必须区分：Tool 使用 `available/pending/not_recorded/degraded`；LLM 使用 capability absent（非响应 status）以及 `available/pending/degraded`，不得把 Tool 的旧水位语义套到 LLM。
 
 ## 8. 前端（P3）：Chat Tab + 会话级有界 Trajectory Tab
 
@@ -670,12 +703,13 @@ identity = (runId, sequence)
 ```text
 TrajectoryCell =
   UserCell | MessageCell | RunCell | PlanCell | ContextCell |
-  ToolCell | SubtoolCell | CompactedCell
+  LlmRoundCell | ToolCell | SubtoolCell | CompactedCell
 ```
 
 - 新数据确定性 join：`turn_message_id → user message`，`message_id → assistant message`；message 正文只引用 messages，不复制进账本。
 - legacy 回填可能令 `turn_message_id` 等于 assistant id：先用 `message_id` 命中 assistant，再回看同一会话中相邻 user。仍无法归组的 run 进入“未关联运行”，不得猜测。
 - Run 未加载 snapshot 时只生成 Turn/Run 骨架；选中后按需水合详细 cell。禁止一次请求或一次渲染拼接所有 Run 的全部事件。
+- `LlmRoundCell` 以 `llm_round_id` 去重，把 started/first-output/terminal 生命周期合并为一条 `assistant_request` 行；显示会话级 Request 编号、模型、状态、Reasoning/Output preview、Token、总耗时与 TTFT，并按 sequence 插入对应 Tool 之前。
 - `legacy/degraded/truncated` 不参加完整字段 parity：可以用持久化 `message.agent_run` 的高置信度摘要生成带来源标记的 fallback，但不得伪造缺失事件、span 或消除完整性横幅。
 - 主状态来自 `AgentSession.status`（运行中/完成/失败/中断/回答不完整）；轨迹 badge 独立来自 `trajectory_status/truncated`（记录中/完整/降级/历史未记录/已截断），两者不得互相覆盖。
 
@@ -699,7 +733,7 @@ ConversationViewShell
 - `TrajectoryOverview`：记录级时间总览（Input/Model/Tools 轨道、投影模式切换、区间选择、缩放/平移、hover 精确时刻）。P3 只实现 `sequence`（等宽、查看执行顺序）与 `actual`（真实 start/end、查看时间分布）两种模式；`duration/time` 后置，不纳入本期验收。
 - Overview 的会话域由 Run summary 构成：当前聚焦 Run 展开 Input/Model/Tools 详细记录，未水合 Run 仅显示粗粒度占位区段；切换焦点时替换详细展开区段，不把 LRU 缓存详情永久拼入 Overview。跨未水合 Run 拖选时先聚焦并加载对应 Run，再展示详细匹配；不得假装已过滤全部记录，也不新增 Overview API。
 - `TrajectoryTable`：按 Turn 分隔的高密度虚拟化记录表（user/message/tool 等 cell，#N、类型标记、单行摘要、状态、耗时）。记录行点击高亮 Overview；Overview 区段点击定位记录表并打开右侧详情。
-- `TrajectoryNodeDetailPanel`：消费 §7.4 Tool Node Detail DTO，展示 Summary/Payload/Result/Timing；Payload/Result 按点击懒加载，诊断字段折叠展示。LLM/Message/Run/Step 的 Summary/Timing 由前端投影生成，不调用 Node Detail API。
+- `TrajectoryNodeDetailPanel`：Tool 展示 Summary/Payload/Result/Timing；LLM 展示 Summary/Thinking/Output/Timing。Payload/Result/Thinking/Output 按点击懒加载，诊断字段折叠展示；Message/Run/Step 的 Summary/Timing 仍由前端投影生成。
 - 区间选择清除必须同时提供可见「清除范围」按钮、Escape 和触屏入口；右键清除只能作为快捷方式，不能是唯一入口。
 - 首载只拉 run list；只拉当前选中 Run snapshot；切换时按需加载并使用最多 8 个 Run 的 LRU 缓存。
 - `TrajectoryTable` 使用固定行高窗口化，overscan 后 DOM 记录行始终 ≤200；支持 Home/End/方向键与 `aria-posinset/aria-setsize`。inspect 可先计算目标 index，再滚动到尚未挂载的虚拟行。
@@ -797,6 +831,7 @@ P0 验收不依赖 P2（MVP Adapter 联调属 P2 验收）。
 - **发送顺序断言**：reasoning/content 分支——Redis Stream 中可见 chunk 条目先于 `first_output_delta` 条目（有测试）；tool_call 分支——不要求可见 chunk 前置（有测试覆盖该分支不违反约束）。
 - `retrieval_cancelled` 有真实/模拟取消路径覆盖。
 - cache token：`cache_read_tokens / cache_write_tokens` 提取逻辑有单测（供应商不返回时为 null，不报错）。
+- **LLM Round Detail**：聊天视图继续隐藏工具轮次中间 Reasoning，Trajectory 能按 `llm_round_id` 展示同一轮净化后 Reasoning；`raw_reasoning_buf` 不入库/API；completed 后单节点请求在 grace 内 `pending→available`，缺失时 `pending→degraded`；`llm_detail_schema_version=NULL` 不渲染正文区；跨 Run/retry/continue 的 Request 编号唯一稳定；刷新后可回放。
 - **Orphan 收口**：推导 span 带 `terminal_source/ inferred_reason`；成功 run 孤儿标 `unknown/incomplete`（不伪装 cancelled）有单测。
 - 回归：现有聊天流、进度快照、SSE、管理审计全量测试通过；`app/ai` 无新增对 `app/services` 的依赖（架构规则）。
 
@@ -808,20 +843,22 @@ P0 验收不依赖 P2（MVP Adapter 联调属 P2 验收）。
 | P1 | **已完成（PR #54）**：`TrajectoryProjector`（orphan 收口 + `terminal_source` + 截断保护）；普通/管理员快照 API 分离；仅历史、有界、`truncated` 明示 | P3 直接消费，不重新实施 |
 | P1.1（后续可选） | Run/event cursor 分页与精确 `previous_run_id` lineage DTO | P3 首版不依赖；需要突破有界历史时再做 |
 | P2 | **已完成历史验证**：独立 MVP `FusionTrajectoryAdapter` 只读 P1 快照；不进入 Fusion P3 runtime，不复制其 SQLite/SSE/投影器 | 仅作为既有联调证据保留 |
-| P3 | fusion-ui 双 Tab；前端 `TrajectoryCellProjection`；Network 三区的 `TrajectoryOverview + TrajectoryTable + TrajectoryNodeDetailPanel`；Tool-only Node Detail 精确关联、四态与 settle grace；会话级有界账本；按 Run 水合/LRU；虚拟化；P1+SSE 归并与终态对账；inspect/reveal；一致性闸门；替代旧“过程” | §8.9 全部通过；旧组件 cleanup 在真实 dev 回归后独立提交 |
+| P3 | fusion-ui 双 Tab；前端 `TrajectoryCellProjection`；Network 三区的 `TrajectoryOverview + TrajectoryTable + TrajectoryNodeDetailPanel`；Tool Detail 精确关联与四态；LLM Round Detail 独立正文存储、`LlmRoundCell`、Thinking/Output/Timing 与实时单节点 settle；会话级有界账本；按 Run 水合/LRU；虚拟化；P1+SSE 归并与终态对账；inspect/reveal；一致性闸门；替代旧“过程” | §8 验收通过；Tool 使用 available/pending/not_recorded/degraded，LLM 使用 capability absent/available/pending/degraded；旧组件 cleanup 在真实 dev 回归后独立提交 |
 
-**P3 实施顺序（v0.21 定稿，Node Detail 后端前置以先验证真实契约）**：
+**P3 v0.22 增量实施顺序（LLM Node Detail 后端前置）**：
 
-1. 将 v0.21 文档迁入正式 P3 分支；
-2. `ToolCallLog.tool_call_id` 迁移与写入链路（§7.4）；
-3. Tool Node Detail 端点、脱敏、四态与 settle grace（§7.4）；
-4. 前端 Detail client/type（§7.4 Envelope）；
-5. `TrajectoryOverview` + `TrajectoryTable`（§8.5）；
-6. `TrajectoryNodeDetailPanel` 接真实 API；
-7. SSE 实时归并与尾部跟随（§8.2/§8.5）；
-8. 一致性闸门（§8.8）；
-9. dev 真实 Run 回归；
-10. 最后删除旧「过程」组件（三条件齐备）。
+1. 将 v0.22 文档和实施计划迁入正式 P3 API 分支；
+2. 新增 `agent_llm_round_details` 与 `run_trajectory_meta.llm_detail_schema_version` 迁移；
+3. 实现 LLM Round Detail 净化、幂等后台写入与 shutdown 管理；
+4. 在 completed/failed/cancelled 生命周期收口后提交完整或部分正文；
+5. 快照增加 `llm_round_summaries`，Runs API 增加 `llm_round_count`；
+6. 实现普通/管理员 LLM Node Detail 端点和 settle status；
+7. 前端增加 LLM Detail 类型、client、缓存与 `LlmRoundCell`；
+8. DetailPanel 接入 Summary/Thinking/Output/Timing；
+9. completed 事件触发单节点详情补齐，不重拉快照；
+10. 运行后端目标测试、前端测试、类型检查与构建；
+11. 使用新真实多轮 Tool Run 验证聊天不变、Trajectory 可回放；
+12. 一致性闸门通过后，旧「过程」删除仍保持为最后一个独立迁移提交。
 
 ## 11. 对抗式审查清单（终审确认用）
 

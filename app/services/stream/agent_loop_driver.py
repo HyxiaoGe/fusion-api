@@ -350,6 +350,11 @@ async def _run_round(
         runtime.run_round_fn, "allow_deferred_reasoning_output"
     ):
         run_round_kwargs["allow_deferred_reasoning_output"] = False
+    if runtime.llm_round_detail_scheduler is not None and _accepts_keyword(
+        runtime.run_round_fn,
+        "llm_round_detail_scheduler",
+    ):
+        run_round_kwargs["llm_round_detail_scheduler"] = runtime.llm_round_detail_scheduler
     round_result = await runtime.run_round_fn(**run_round_kwargs)
     state.finish_reason = round_result.finish_reason
     state.update_usage(round_result.accumulated_usage)

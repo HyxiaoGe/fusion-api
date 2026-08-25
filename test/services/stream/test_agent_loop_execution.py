@@ -152,6 +152,48 @@ class AgentLoopExecutionTests(unittest.TestCase):
         self.assertEqual(execution.trajectory_recorder.conversation_id, "conv-1")
         self.assertEqual(execution.trajectory_recorder.message_id, "msg-1")
 
+    def test_llm_detail_write_failure_marks_current_trajectory_degraded(self):
+        callbacks = []
+
+        def detail_scheduler(_draft, *, on_degraded=None):
+            callbacks.append(on_degraded)
+            on_degraded("llm_detail_write_failed")
+
+        dependencies = self._dependencies(clock=lambda: 100.0)
+        dependencies = AgentLoopDependencies(
+            **{
+                **dependencies.__dict__,
+                "llm_round_detail_scheduler": detail_scheduler,
+            }
+        )
+        execution = build_agent_loop_execution(
+            request=AgentLoopExecutionRequest(
+                db="db",
+                conversation_id="conv-detail",
+                user_id="user-detail",
+                model_id="gpt-4",
+                litellm_model="openai/gpt-4",
+                litellm_kwargs={},
+                provider="openai",
+                assistant_message_id="msg-detail",
+                task_id="task-detail",
+                call_config=SimpleNamespace(should_use_reasoning=True, call_kwargs={}),
+                trace_id="run-detail",
+            ),
+            limits=AgentLoopLimits(max_steps=1, max_tool_calls=1, total_timeout_s=1),
+            dependencies=dependencies,
+        )
+
+        execution.runtime.llm_round_detail_scheduler("draft")
+
+        self.assertEqual(len(callbacks), 1)
+        self.assertTrue(callable(callbacks[0]))
+        self.assertTrue(execution.trajectory_recorder.degraded_latch())
+        self.assertEqual(
+            execution.trajectory_recorder.degraded_reason,
+            "llm_detail_write_failed",
+        )
+
     def test_build_execution_context_generates_run_id_when_trace_id_missing(self):
         call_config = SimpleNamespace(
             should_use_reasoning=False,

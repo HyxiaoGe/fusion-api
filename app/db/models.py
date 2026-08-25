@@ -864,6 +864,7 @@ class RunTrajectoryMeta(Base):
     terminal_intent_reason = Column(Text, nullable=True)
     terminal_intent_version = Column(Integer, nullable=True)
     terminal_intent_pending_at = Column(DateTime(timezone=True), nullable=True)
+    llm_detail_schema_version = Column(Integer, nullable=True)
     updated_at = Column(
         DateTime(timezone=True),
         nullable=False,
@@ -879,6 +880,38 @@ class RunTrajectoryMeta(Base):
             "terminal_intent_pending_at",
             postgresql_where=text("terminal_intent_pending_at IS NOT NULL"),
         ),
+    )
+
+
+class AgentLlmRoundDetail(Base):
+    """按 LLM round 精确关联的用户可见正文详情。"""
+
+    __tablename__ = "agent_llm_round_details"
+
+    id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    conversation_id = Column(
+        String,
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    run_id = Column(
+        String,
+        ForeignKey("agent_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    message_id = Column(String, ForeignKey("messages.id", ondelete="SET NULL"), nullable=True)
+    llm_round_id = Column(String, nullable=False)
+    reasoning_text = Column(Text, nullable=True)
+    content_text = Column(Text, nullable=True)
+    reasoning_preview = Column(Text, nullable=True)
+    output_preview = Column(Text, nullable=True)
+    redacted_fields = Column(JSONB, nullable=False, default=list, server_default=JSON_EMPTY_SERVER_DEFAULT)
+    truncated_fields = Column(JSONB, nullable=False, default=list, server_default=JSON_EMPTY_SERVER_DEFAULT)
+    recorded_at = Column(DateTime(timezone=True), nullable=False, default=utc_now, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("run_id", "llm_round_id", name="uq_agent_llm_round_details_run_round"),
+        Index("ix_agent_llm_round_details_conversation_run", "conversation_id", "run_id"),
     )
 
 

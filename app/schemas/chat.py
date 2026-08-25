@@ -859,6 +859,7 @@ class Usage(BaseModel):
     output_tokens: int = 0
     cache_read_tokens: Optional[int] = Field(default=None, ge=0)
     cache_write_tokens: Optional[int] = Field(default=None, ge=0)
+    reasoning_tokens: Optional[int] = Field(default=None, ge=0)
     context: Optional[ContextUsage] = None
 
     @field_validator("context", mode="before")

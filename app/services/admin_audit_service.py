@@ -253,19 +253,20 @@ class AdminAuditService:
         self,
         conversation_id: str,
         run_id: str,
-        tool_call_id: str,
+        node_id: str,
         *,
         admin: User,
         request_id: str,
         reason: str,
+        node_type: str = "tool",
     ) -> None:
-        """在任何管理员 Tool Node Detail 返回前持久化访问审计。"""
+        """在任何管理员 Node Detail 返回前持久化访问审计。"""
         target_user_id = self._assert_conversation(conversation_id)
         self._record(
             admin=admin,
             action="admin.audit.trajectory.node_detail.view",
-            resource_type="conversation_run_tool_node_detail",
-            resource_id=f"{run_id}:{tool_call_id}",
+            resource_type=f"conversation_run_{node_type}_node_detail",
+            resource_id=f"{run_id}:{node_id}",
             target_user_id=target_user_id,
             request_id=request_id,
             reason=reason,

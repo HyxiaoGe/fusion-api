@@ -262,6 +262,7 @@ def extract_usage(chunk) -> Optional[Usage]:
     if not usage:
         return None
     prompt_details = _usage_value(usage, "prompt_tokens_details")
+    completion_details = _usage_value(usage, "completion_tokens_details")
     return Usage(
         input_tokens=_non_negative_int(_usage_value(usage, "prompt_tokens")) or 0,
         output_tokens=_non_negative_int(_usage_value(usage, "completion_tokens")) or 0,
@@ -273,6 +274,10 @@ def extract_usage(chunk) -> Optional[Usage]:
         cache_write_tokens=_non_negative_int(
             _usage_value(usage, "cache_write_tokens"),
             _usage_value(usage, "cache_creation_input_tokens"),
+        ),
+        reasoning_tokens=_non_negative_int(
+            _usage_value(usage, "reasoning_tokens"),
+            _usage_value(completion_details, "reasoning_tokens"),
         ),
     )
 
@@ -737,9 +742,7 @@ async def process_stream_choice(*, request: LLMStreamRequest, state: LLMStreamSt
     finish_reason = choice.finish_reason
 
     candidate_time = (
-        request.capture_output_candidate_time()
-        if request.capture_output_candidate_time is not None
-        else None
+        request.capture_output_candidate_time() if request.capture_output_candidate_time is not None else None
     )
     accumulate_tool_calls(state.tool_calls_acc, delta)
     if getattr(delta, "tool_calls", None) and request.on_output_candidate is not None:
@@ -748,10 +751,7 @@ async def process_stream_choice(*, request: LLMStreamRequest, state: LLMStreamSt
     content_delta = extract_content_delta(delta, raw_reasoning_delta)
     previous_content_candidate = _final_content_candidate(state)
     tag_reasoning_delta, content_delta = filter_reasoning_tag_content_delta(state, content_delta)
-    if (
-        state.pending_content_candidate_time is None
-        and _final_content_candidate(state) != previous_content_candidate
-    ):
+    if state.pending_content_candidate_time is None and _final_content_candidate(state) != previous_content_candidate:
         state.pending_content_candidate_time = candidate_time
     previous_reasoning_candidate = _final_reasoning_candidate(state)
     reasoning_delta = filter_internal_mcp_reasoning_delta(
