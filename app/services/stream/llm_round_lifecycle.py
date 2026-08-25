@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from app.core.logger import app_logger as logger
 from app.schemas.chat import Usage
+from app.services.agent.llm_round_detail_recorder import LlmRoundDetailDraft
 
 
 def _measured_int(observation: Any, name: str) -> int | None:
@@ -52,6 +55,7 @@ def accumulate_token_usage(current: Usage, addition: Usage | None) -> Usage:
         output_tokens=current.output_tokens + addition.output_tokens,
         cache_read_tokens=_optional_sum(current.cache_read_tokens, addition.cache_read_tokens),
         cache_write_tokens=_optional_sum(current.cache_write_tokens, addition.cache_write_tokens),
+        reasoning_tokens=_optional_sum(current.reasoning_tokens, addition.reasoning_tokens),
     )
 
 
@@ -68,6 +72,13 @@ class LLMRoundLifecycle:
     first_output_emitted: bool = False
     published_delta_kind: str | None = None
     terminal_emitted: bool = False
+    conversation_id: str | None = None
+    run_id: str | None = None
+    message_id: str | None = None
+    detail_scheduler: Callable[[LlmRoundDetailDraft], Any] | None = None
+    reasoning_text: str = ""
+    content_text: str = ""
+    detail_scheduled: bool = False
 
     @classmethod
     async def start(
@@ -79,6 +90,10 @@ class LLMRoundLifecycle:
         model: str,
         provider: str,
         parent_step_id: str,
+        conversation_id: str | None = None,
+        run_id: str | None = None,
+        message_id: str | None = None,
+        detail_scheduler: Callable[[LlmRoundDetailDraft], Any] | None = None,
     ) -> LLMRoundLifecycle | None:
         emit = getattr(emitter, "llm_round_started", None)
         if not callable(emit):
@@ -88,6 +103,10 @@ class LLMRoundLifecycle:
             observation=observation,
             llm_round_id=str(uuid.uuid4()),
             parent_step_id=parent_step_id,
+            conversation_id=conversation_id,
+            run_id=run_id,
+            message_id=message_id,
+            detail_scheduler=detail_scheduler,
         )
         await emit(
             llm_round_id=lifecycle.llm_round_id,
@@ -101,6 +120,12 @@ class LLMRoundLifecycle:
     def record_result(self, *, usage: Usage | None, finish_reason: str | None) -> None:
         self.usage = usage
         self.finish_reason = finish_reason
+
+    def record_detail(self, *, reasoning_text: str, content_text: str) -> None:
+        """保存该 logical round 已对用户可见的正文，等待终态后异步落库。"""
+
+        self.reasoning_text = reasoning_text
+        self.content_text = content_text
 
     async def publish_visible_output(self, visible_kind: str | None = None) -> None:
         """在对应可见 chunk 已写 Redis 后发送首次输出事件。"""
@@ -148,6 +173,7 @@ class LLMRoundLifecycle:
             total_tokens=usage.input_tokens + usage.output_tokens,
             cache_read_tokens=usage.cache_read_tokens,
             cache_write_tokens=usage.cache_write_tokens,
+            reasoning_tokens=usage.reasoning_tokens,
             ttft_ms=(
                 _measured_delta_ms(self.observation, self.published_delta_kind or "")
                 if self.first_output_emitted
@@ -157,6 +183,7 @@ class LLMRoundLifecycle:
             parent_step_id=self.parent_step_id,
         )
         self.terminal_emitted = True
+        self._schedule_detail()
 
     async def finish_failed(self, error: BaseException) -> None:
         if self.terminal_emitted:
@@ -168,6 +195,7 @@ class LLMRoundLifecycle:
             parent_step_id=self.parent_step_id,
         )
         self.terminal_emitted = True
+        self._schedule_detail()
 
     async def finish_cancelled(self, *, reason: str) -> None:
         if self.terminal_emitted:
@@ -178,3 +206,29 @@ class LLMRoundLifecycle:
             parent_step_id=self.parent_step_id,
         )
         self.terminal_emitted = True
+        self._schedule_detail()
+
+    def _schedule_detail(self) -> None:
+        if self.detail_scheduled or self.detail_scheduler is None:
+            return
+        if self.conversation_id is None or self.run_id is None:
+            return
+        self.detail_scheduled = True
+        try:
+            self.detail_scheduler(
+                LlmRoundDetailDraft(
+                    conversation_id=self.conversation_id,
+                    run_id=self.run_id,
+                    message_id=self.message_id,
+                    llm_round_id=self.llm_round_id,
+                    reasoning_text=self.reasoning_text,
+                    content_text=self.content_text,
+                )
+            )
+        except BaseException as error:  # noqa: BLE001 — 详情是辅助投影，不得替换生命周期终态
+            logger.warning(
+                "调度 LLM round 详情失败: run_id=%s llm_round_id=%s error_type=%s",
+                self.run_id,
+                self.llm_round_id,
+                type(error).__name__,
+            )

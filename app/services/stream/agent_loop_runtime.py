@@ -45,3 +45,4 @@ class AgentLoopRuntime:
     control_tool_names: frozenset[str] = frozenset()
     task_mode: str = "standard"
     evidence_policy: str = "standard"
+    llm_round_detail_scheduler: Callable[[Any], Any] | None = None

@@ -238,6 +238,65 @@ class TrajectoryApiTests(unittest.TestCase):
         self.assertEqual(wrong_node.json()["data"]["status"], "not_recorded")
         self.assertIsNone(wrong_node.json()["data"]["detail"])
 
+    def test_llm_node_detail_endpoint_returns_exact_visible_text_and_uniform_404(self):
+        from app.db.models import AgentEvent, AgentLlmRoundDetail, RunTrajectoryMeta
+
+        self._add_run("run-llm-detail")
+        meta = self.db.get(RunTrajectoryMeta, "run-llm-detail")
+        meta.llm_detail_schema_version = 1
+        self.db.add_all(
+            [
+                AgentEvent(
+                    conversation_id="conv-1",
+                    message_id="msg-run-llm-detail",
+                    run_id="run-llm-detail",
+                    sequence=3,
+                    event_type="llm_round_started",
+                    schema_version=1,
+                    event_ts=self.now,
+                    step_id="step-1",
+                    payload={"llm_round_id": "round-exact", "round_index": 1},
+                ),
+                AgentEvent(
+                    conversation_id="conv-1",
+                    message_id="msg-run-llm-detail",
+                    run_id="run-llm-detail",
+                    sequence=4,
+                    event_type="llm_round_completed",
+                    schema_version=1,
+                    event_ts=self.now,
+                    step_id="step-1",
+                    payload={"llm_round_id": "round-exact", "duration_ms": 100},
+                ),
+                AgentLlmRoundDetail(
+                    conversation_id="conv-1",
+                    run_id="run-llm-detail",
+                    message_id="msg-run-llm-detail",
+                    llm_round_id="round-exact",
+                    reasoning_text="模型显式推理",
+                    content_text="模型输出",
+                    reasoning_preview="模型显式推理",
+                    output_preview="模型输出",
+                    redacted_fields=[],
+                    truncated_fields=[],
+                ),
+            ]
+        )
+        self.db.commit()
+
+        exact = self.client.get("/api/conversations/conv-1/runs/run-llm-detail/node-detail/llm/round-exact")
+        wrong_node = self.client.get("/api/conversations/conv-1/runs/run-llm-detail/node-detail/llm/round-other")
+        cross_user = self.client.get("/api/conversations/conv-2/runs/run-llm-detail/node-detail/llm/round-exact")
+
+        self.assertEqual(exact.status_code, 200)
+        data = exact.json()["data"]
+        self.assertEqual(data["node_type"], "llm")
+        self.assertEqual(data["detail"]["reasoning_text"], "模型显式推理")
+        self.assertEqual(data["detail"]["output_text"], "模型输出")
+        for response in (wrong_node, cross_user):
+            self.assertEqual(response.status_code, 404)
+            self.assertEqual(response.json()["message"], "会话或轨迹不存在，或无权访问")
+
 
 if __name__ == "__main__":
     unittest.main()

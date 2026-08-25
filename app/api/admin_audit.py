@@ -160,6 +160,34 @@ def get_tool_node_detail_diagnostics(
     return success(data=data, request_id=request.state.request_id)
 
 
+@router.get("/conversations/{conversation_id}/runs/{run_id}/node-detail/llm/{node_id}")
+def get_llm_node_detail_diagnostics(
+    conversation_id: str,
+    run_id: str,
+    node_id: str,
+    request: Request,
+    reason: str = Header(..., alias="X-Admin-Audit-Reason", min_length=1, max_length=300),
+    trajectory_service: TrajectoryQueryService = Depends(get_trajectory_query_service),
+    audit_service: AdminAuditService = Depends(get_admin_audit_service),
+    auditor: User = Depends(get_conversation_auditor),
+):
+    normalized_reason = reason.strip()
+    if not normalized_reason:
+        raise ApiException.bad_request("管理员审计原因不能为空")
+    data = trajectory_service.get_admin_llm_node_detail(conversation_id, run_id, node_id)
+    if data is None:
+        raise ApiException.not_found("会话或轨迹不存在")
+    audit_service.record_trajectory_node_detail_view(
+        conversation_id,
+        run_id,
+        node_id,
+        admin=auditor,
+        **_context(request, normalized_reason),
+        node_type="llm",
+    )
+    return success(data=data, request_id=request.state.request_id)
+
+
 def _conversation_page(
     method_name: str,
     conversation_id: str,

@@ -71,8 +71,7 @@ def create_trajectory_session_factory(database_url: str) -> Callable[[], Any]:
         engine_kwargs["connect_args"] = {
             "connect_timeout": TRAJECTORY_CONNECT_TIMEOUT_SECONDS,
             "options": (
-                f"-c statement_timeout={TRAJECTORY_STATEMENT_TIMEOUT_MS} "
-                f"-c lock_timeout={TRAJECTORY_LOCK_TIMEOUT_MS}"
+                f"-c statement_timeout={TRAJECTORY_STATEMENT_TIMEOUT_MS} -c lock_timeout={TRAJECTORY_LOCK_TIMEOUT_MS}"
             ),
         }
     engine = create_engine(database_url, **engine_kwargs)
@@ -237,9 +236,7 @@ class TrajectoryRecorder:
         except asyncio.CancelledError:
             self._mark_degraded("recorder_cancelled")
             with self._state_lock:
-                self._record_drain_waiters = [
-                    item for item in self._record_drain_waiters if item[1] is not waiter
-                ]
+                self._record_drain_waiters = [item for item in self._record_drain_waiters if item[1] is not waiter]
             waiter.cancel()
             raise
         return True
@@ -658,9 +655,7 @@ class TrajectoryRecorder:
                     session.rollback()
                 except BaseException:
                     pass
-                raise _TerminalIntentPreconditionError(
-                    "终态 intent 不满足 recording + no-pending 所有权前置条件"
-                )
+                raise _TerminalIntentPreconditionError("终态 intent 不满足 recording + no-pending 所有权前置条件")
             session.commit()
             return
         except _TerminalIntentPreconditionError:
@@ -981,13 +976,17 @@ class TrajectoryRecorder:
                 .where(RunTrajectoryMeta.terminal_intent_pending_at.is_not(None))
             )
             if terminal_status == "complete":
-                statement = statement.where(RunTrajectoryMeta.finalized_at.is_not(None)).where(
-                    RunTrajectoryMeta.degraded_reason.is_(None)
-                ).where(RunTrajectoryMeta.terminal_intent_reason.is_(None))
+                statement = (
+                    statement.where(RunTrajectoryMeta.finalized_at.is_not(None))
+                    .where(RunTrajectoryMeta.degraded_reason.is_(None))
+                    .where(RunTrajectoryMeta.terminal_intent_reason.is_(None))
+                )
             else:
-                statement = statement.where(RunTrajectoryMeta.finalized_at.is_(None)).where(
-                    RunTrajectoryMeta.degraded_reason == degraded_reason
-                ).where(RunTrajectoryMeta.terminal_intent_reason == degraded_reason)
+                statement = (
+                    statement.where(RunTrajectoryMeta.finalized_at.is_(None))
+                    .where(RunTrajectoryMeta.degraded_reason == degraded_reason)
+                    .where(RunTrajectoryMeta.terminal_intent_reason == degraded_reason)
+                )
             result = session.execute(
                 statement.values(
                     terminal_intent_id=None,
@@ -1066,8 +1065,10 @@ class TrajectoryRecorder:
             row.trajectory_status == terminal_status
             and row.expected_last_sequence == expected_last_sequence
             and row.degraded_reason == degraded_reason
-            and ((terminal_status == "complete" and row.finalized_at is not None) or
-                 (terminal_status == "degraded" and row.finalized_at is None))
+            and (
+                (terminal_status == "complete" and row.finalized_at is not None)
+                or (terminal_status == "degraded" and row.finalized_at is None)
+            )
         )
         return bool(
             terminal_matches
@@ -1088,6 +1089,7 @@ class TrajectoryRecorder:
                 "message_id": self.message_id,
                 "trajectory_status": "recording",
                 "event_count": 0,
+                "llm_detail_schema_version": 1,
                 "updated_at": now,
             },
             conflict_columns=("run_id",),

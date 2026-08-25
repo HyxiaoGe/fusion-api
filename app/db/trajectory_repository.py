@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from typing import TypeAlias
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session, load_only
 
 from app.db.models import (
     AgentEvent,
+    AgentLlmRoundDetail,
     AgentSession,
     Conversation,
     RunTrajectoryMeta,
@@ -18,6 +19,16 @@ from app.db.models import (
 from app.schemas.trajectory import UserTrajectoryMetaRow
 
 RunWithMeta: TypeAlias = tuple[AgentSession, UserTrajectoryMetaRow | None]
+
+
+def _llm_round_count_subquery():
+    return (
+        select(func.count(func.distinct(AgentEvent.payload["llm_round_id"].as_string())))
+        .where(AgentEvent.run_id == AgentSession.id)
+        .where(AgentEvent.event_type == "llm_round_started")
+        .correlate(AgentSession)
+        .scalar_subquery()
+    )
 
 
 class TrajectoryRepository:
@@ -38,6 +49,8 @@ class TrajectoryRepository:
                 RunTrajectoryMeta.expected_last_sequence,
                 RunTrajectoryMeta.degraded_reason,
                 RunTrajectoryMeta.terminal_intent_pending_at,
+                RunTrajectoryMeta.llm_detail_schema_version,
+                _llm_round_count_subquery(),
             )
             .select_from(Conversation)
             .options(
@@ -79,6 +92,8 @@ class TrajectoryRepository:
                 RunTrajectoryMeta.expected_last_sequence,
                 RunTrajectoryMeta.degraded_reason,
                 RunTrajectoryMeta.terminal_intent_pending_at,
+                RunTrajectoryMeta.llm_detail_schema_version,
+                _llm_round_count_subquery(),
             )
             .options(
                 load_only(
@@ -115,6 +130,8 @@ class TrajectoryRepository:
                 RunTrajectoryMeta.expected_last_sequence,
                 RunTrajectoryMeta.degraded_reason,
                 RunTrajectoryMeta.terminal_intent_pending_at,
+                RunTrajectoryMeta.llm_detail_schema_version,
+                _llm_round_count_subquery(),
             )
             .options(
                 load_only(
@@ -211,6 +228,80 @@ class TrajectoryRepository:
             )
         ).scalar_one_or_none()
 
+    def get_llm_detail_schema_version(self, run_id: str) -> int | None:
+        return self._session.execute(
+            select(RunTrajectoryMeta.llm_detail_schema_version).where(RunTrajectoryMeta.run_id == run_id)
+        ).scalar_one_or_none()
+
+    def get_exact_llm_detail(
+        self,
+        *,
+        conversation_id: str,
+        run_id: str,
+        llm_round_id: str,
+    ) -> AgentLlmRoundDetail | None:
+        return self._session.execute(
+            select(AgentLlmRoundDetail)
+            .options(
+                load_only(
+                    AgentLlmRoundDetail.llm_round_id,
+                    AgentLlmRoundDetail.reasoning_text,
+                    AgentLlmRoundDetail.content_text,
+                    AgentLlmRoundDetail.redacted_fields,
+                    AgentLlmRoundDetail.truncated_fields,
+                )
+            )
+            .where(AgentLlmRoundDetail.conversation_id == conversation_id)
+            .where(AgentLlmRoundDetail.run_id == run_id)
+            .where(AgentLlmRoundDetail.llm_round_id == llm_round_id)
+        ).scalar_one_or_none()
+
+    def list_llm_round_details(self, conversation_id: str, run_id: str) -> list[AgentLlmRoundDetail]:
+        return list(
+            self._session.execute(
+                select(AgentLlmRoundDetail)
+                .options(
+                    load_only(
+                        AgentLlmRoundDetail.llm_round_id,
+                        AgentLlmRoundDetail.reasoning_preview,
+                        AgentLlmRoundDetail.output_preview,
+                        AgentLlmRoundDetail.recorded_at,
+                    )
+                )
+                .where(AgentLlmRoundDetail.conversation_id == conversation_id)
+                .where(AgentLlmRoundDetail.run_id == run_id)
+                .order_by(AgentLlmRoundDetail.recorded_at.asc(), AgentLlmRoundDetail.llm_round_id.asc())
+            ).scalars()
+        )
+
+    def list_llm_round_lifecycle_events(
+        self,
+        *,
+        conversation_id: str,
+        run_id: str,
+        llm_round_id: str,
+    ) -> list[AgentEvent]:
+        return list(
+            self._session.execute(
+                select(AgentEvent)
+                .options(load_only(AgentEvent.event_type, AgentEvent.event_ts, AgentEvent.sequence, AgentEvent.payload))
+                .where(AgentEvent.conversation_id == conversation_id)
+                .where(AgentEvent.run_id == run_id)
+                .where(
+                    AgentEvent.event_type.in_(
+                        (
+                            "llm_round_started",
+                            "llm_round_completed",
+                            "llm_round_failed",
+                            "llm_round_cancelled",
+                        )
+                    )
+                )
+                .where(AgentEvent.payload["llm_round_id"].as_string() == llm_round_id)
+                .order_by(AgentEvent.sequence.asc())
+            ).scalars()
+        )
+
     def list_events(self, conversation_id: str, run_id: str, limit: int) -> list[AgentEvent]:
         if limit <= 0:
             raise ValueError("limit 必须大于 0")
@@ -284,7 +375,15 @@ class TrajectoryRepository:
 
     @staticmethod
     def _user_meta_from_columns(values: tuple[object, ...]) -> UserTrajectoryMetaRow | None:
-        trajectory_status, event_count, expected_last_sequence, degraded_reason, pending_at = values
+        (
+            trajectory_status,
+            event_count,
+            expected_last_sequence,
+            degraded_reason,
+            pending_at,
+            llm_version,
+            llm_round_count,
+        ) = values
         if trajectory_status is None:
             return None
         return UserTrajectoryMetaRow(
@@ -293,4 +392,6 @@ class TrajectoryRepository:
             expected_last_sequence=expected_last_sequence if isinstance(expected_last_sequence, int) else None,
             degraded_reason=degraded_reason if isinstance(degraded_reason, str) else None,
             has_pending_terminal_intent=pending_at is not None,
+            llm_detail_schema_version=llm_version if isinstance(llm_version, int) else None,
+            llm_round_count=int(llm_round_count or 0),
         )

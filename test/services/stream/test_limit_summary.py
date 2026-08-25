@@ -422,6 +422,45 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
             defer_output=True,
         )
 
+    async def test_summary_stream_failure_persists_visible_partial_round_detail(self):
+        detail_scheduler = MagicMock()
+        emitter = AsyncMock()
+        observation = MagicMock()
+        observation.wrap_response.side_effect = lambda response: response
+        observation.finish_error = AsyncMock()
+        context_plan = MagicMock(messages=[], estimated_tokens_after=10)
+        context_plan.telemetry.return_value = {"context_management_status": "no_op"}
+
+        async def stream_round_fn(*_args, partial_output, **_kwargs):
+            partial_output["reasoning_buf"] = "总结部分推理"
+            partial_output["content_buf"] = "总结部分回答"
+            raise RuntimeError("summary stream failed")
+
+        request = replace(
+            self._deferred_commit_request(),
+            emitter=emitter,
+            llm_call_fn=AsyncMock(return_value="response"),
+            stream_round_fn=stream_round_fn,
+            llm_round_detail_scheduler=detail_scheduler,
+        )
+        with (
+            patch("app.services.stream.limit_summary.prepare_context", new=AsyncMock(return_value=context_plan)),
+            patch("app.services.stream.limit_summary.create_llm_round_observation", return_value=observation),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "summary stream failed"):
+                await limit_summary_module.call_limit_summary_round(
+                    request=request,
+                    thinking_block_id="thinking",
+                    text_block_id="text",
+                    step_id="step-summary",
+                )
+
+        emitter.llm_round_failed.assert_awaited_once()
+        detail_scheduler.assert_called_once()
+        draft = detail_scheduler.call_args.args[0]
+        self.assertEqual(draft.reasoning_text, "总结部分推理")
+        self.assertEqual(draft.content_text, "总结部分回答")
+
     async def test_deferred_summary_commit_terminal_secondary_preserves_primary_base_exception(self):
         error_factories = (
             ("runtime", lambda role: RuntimeError(f"{role} secret")),

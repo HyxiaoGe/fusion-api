@@ -443,10 +443,7 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
                 on_visible_output.assert_not_awaited()
                 self.assertIsNone(observation.output_delta_ms("content"))
                 self.assertFalse(
-                    any(
-                        "answering 内容过滤出现非单调输出" in str(call.args[0])
-                        for call in warning.call_args_list
-                    )
+                    any("answering 内容过滤出现非单调输出" in str(call.args[0]) for call in warning.call_args_list)
                 )
 
     async def test_normal_whitespace_content_stays_visible(self):
@@ -680,6 +677,18 @@ class LLMStreamTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.cache_read_tokens, 7)
         self.assertEqual(result.cache_write_tokens, 3)
+
+    def test_extract_usage_supports_nested_completion_reasoning_tokens(self):
+        usage = SimpleNamespace(
+            prompt_tokens=10,
+            completion_tokens=20,
+            prompt_tokens_details=None,
+            completion_tokens_details=SimpleNamespace(reasoning_tokens=8),
+        )
+
+        result = llm_stream_module.extract_usage(SimpleNamespace(usage=usage))
+
+        self.assertEqual(result.reasoning_tokens, 8)
 
     async def test_plan_mode_tool_round_buffers_content_without_answering_or_preview(self):
         events: list[str] = []

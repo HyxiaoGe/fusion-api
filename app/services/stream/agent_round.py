@@ -12,6 +12,7 @@ from app.ai import litellm_health
 from app.ai.llm_round_observability import create_llm_round_observation
 from app.core.logger import app_logger as logger
 from app.schemas.chat import ContextUsage, Usage
+from app.services.agent.llm_round_detail_recorder import LlmRoundDetailDraft
 from app.services.chat.context_manager import ContextManagementError, ContextPlan, prepare_context
 from app.services.chat.model_call_language_policy import finalize_model_call_language_policy
 from app.services.stream.context_status import build_context_usage, emit_context_status
@@ -104,6 +105,7 @@ async def collect_agent_round_stream(
     on_visible_output: Callable[[str], Awaitable[None]] | None = None,
     on_output_candidate: Callable[..., None] | None = None,
     capture_output_candidate_time: Callable[[], float | None] | None = None,
+    partial_output: dict[str, str] | None = None,
 ) -> StreamRoundResult:
     response = await llm_call_fn(
         litellm_model,
@@ -134,6 +136,8 @@ async def collect_agent_round_stream(
         "capture_output_candidate_time",
     ):
         stream_kwargs["capture_output_candidate_time"] = capture_output_candidate_time
+    if partial_output is not None and _accepts_keyword(stream_round_fn, "partial_output"):
+        stream_kwargs["partial_output"] = partial_output
     return await stream_round_fn(
         response,
         conversation_id,
@@ -226,6 +230,7 @@ async def run_agent_round(
     on_context_updated: Callable[[ContextUsage], None] | None = None,
     defer_output: bool = False,
     allow_deferred_reasoning_output: bool = True,
+    llm_round_detail_scheduler: Callable[[LlmRoundDetailDraft], Any] | None = None,
 ) -> AgentRoundResult:
     finalized_messages = finalize_model_call_language_policy(messages)
     try:
@@ -280,8 +285,13 @@ async def run_agent_round(
         model=model_id,
         provider=provider,
         parent_step_id=step_context.step_id,
+        conversation_id=conversation_id,
+        run_id=run_id,
+        message_id=assistant_message_id,
+        detail_scheduler=llm_round_detail_scheduler,
     )
     observation.start()
+    partial_output: dict[str, str] = {}
     try:
         stream_result = await collect_agent_round_stream(
             conversation_id=conversation_id,
@@ -300,14 +310,27 @@ async def run_agent_round(
             observation=observation,
             defer_output=defer_output,
             allow_deferred_reasoning_output=defer_output and allow_deferred_reasoning_output,
-            on_visible_output=(lifecycle.publish_visible_output if lifecycle is not None and not defer_output else None),
+            on_visible_output=(
+                lifecycle.publish_visible_output if lifecycle is not None and not defer_output else None
+            ),
             on_output_candidate=getattr(observation, "observe_output_candidate", None),
             capture_output_candidate_time=getattr(observation, "capture_output_candidate_time", None),
+            partial_output=partial_output,
         )
     except asyncio.CancelledError as exc:
+        if lifecycle is not None:
+            lifecycle.record_detail(
+                reasoning_text=partial_output.get("reasoning_buf", ""),
+                content_text=partial_output.get("content_buf", ""),
+            )
         await _close_round_after_primary_error(observation=observation, lifecycle=lifecycle, error=exc)
         raise
     except BaseException as exc:
+        if lifecycle is not None:
+            lifecycle.record_detail(
+                reasoning_text=partial_output.get("reasoning_buf", ""),
+                content_text=partial_output.get("content_buf", ""),
+            )
         await _close_round_after_primary_error(observation=observation, lifecycle=lifecycle, error=exc)
         raise
     try:
@@ -319,6 +342,7 @@ async def run_agent_round(
         await emit_context_status(emitter, phase="final", context=final_context)
         await observation.finish_success(usage=usage_data, finish_reason=finish_reason)
         if lifecycle is not None:
+            lifecycle.record_detail(reasoning_text=reasoning_buf, content_text=content_buf)
             lifecycle.record_result(usage=usage_data, finish_reason=finish_reason)
             if finish_reason == "cancelled":
                 await lifecycle.finish_cancelled(reason="superseded")

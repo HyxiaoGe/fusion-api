@@ -65,6 +65,11 @@ class QueuedTrajectoryRecorder:
     def degraded_latch(self, run_id: str | None = None) -> bool:
         return self._inner.degraded_latch(run_id)
 
+    def mark_auxiliary_degraded(self, reason: str) -> bool:
+        """让同一 run 的其他辅助写入显式降低轨迹完整性。"""
+
+        return self._inner._mark_degraded(reason)
+
     async def record_chunk(
         self,
         conversation_id: str,

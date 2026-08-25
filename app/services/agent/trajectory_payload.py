@@ -48,6 +48,7 @@ _EVENT_FIELDS: dict[str, frozenset[str]] = {
             "total_tokens",
             "cache_read_tokens",
             "cache_write_tokens",
+            "reasoning_tokens",
             "ttft_ms",
             "duration_ms",
         }
@@ -72,12 +73,8 @@ _EVENT_FIELDS: dict[str, frozenset[str]] = {
             "max_tool_calls",
         }
     ),
-    "plan_snapshot": frozenset(
-        {"protocol_version", "plan_id", "mode", "source", "revision", "reason", "items"}
-    ),
-    "plan_step_updated": frozenset(
-        {"protocol_version", "plan_id", "mode", "source", "revision", "reason", "item"}
-    ),
+    "plan_snapshot": frozenset({"protocol_version", "plan_id", "mode", "source", "revision", "reason", "items"}),
+    "plan_step_updated": frozenset({"protocol_version", "plan_id", "mode", "source", "revision", "reason", "item"}),
     "tool_result_digest": frozenset(
         {
             "protocol_version",

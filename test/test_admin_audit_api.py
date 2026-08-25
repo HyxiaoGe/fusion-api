@@ -1444,6 +1444,72 @@ class AdminAuditApiTests(unittest.TestCase):
         self.assertNotIn("output-secret", audit_failed.text)
         self.assertNotIn("error-secret", audit_failed.text)
 
+    def test_llm_node_detail_requires_reason_and_records_llm_audit_resource(self):
+        from app.db.models import AdminAuditEvent, AgentEvent, AgentLlmRoundDetail, RunTrajectoryMeta
+
+        self._add_trajectory_run("run-llm-node")
+        meta = self.db.get(RunTrajectoryMeta, "run-llm-node")
+        meta.llm_detail_schema_version = 1
+        created = datetime(2026, 7, 11, 12, 0, 1)
+        self.db.add_all(
+            [
+                AgentEvent(
+                    conversation_id="conv-1",
+                    message_id="msg-run-llm-node",
+                    run_id="run-llm-node",
+                    sequence=1,
+                    event_type="llm_round_started",
+                    schema_version=1,
+                    event_ts=created,
+                    step_id="step-1",
+                    payload={"llm_round_id": "round-1", "round_index": 1},
+                ),
+                AgentEvent(
+                    conversation_id="conv-1",
+                    message_id="msg-run-llm-node",
+                    run_id="run-llm-node",
+                    sequence=2,
+                    event_type="llm_round_completed",
+                    schema_version=1,
+                    event_ts=created,
+                    step_id="step-1",
+                    payload={"llm_round_id": "round-1", "duration_ms": 100},
+                ),
+                AgentLlmRoundDetail(
+                    conversation_id="conv-1",
+                    run_id="run-llm-node",
+                    message_id="msg-run-llm-node",
+                    llm_round_id="round-1",
+                    reasoning_text="显式推理",
+                    content_text="输出",
+                    reasoning_preview="显式推理",
+                    output_preview="输出",
+                    redacted_fields=[],
+                    truncated_fields=[],
+                ),
+            ]
+        )
+        self.db.commit()
+
+        missing_reason = self.client.get(
+            "/api/admin/audit/conversations/conv-1/runs/run-llm-node/node-detail/llm/round-1"
+        )
+        response = self.client.get(
+            "/api/admin/audit/conversations/conv-1/runs/run-llm-node/node-detail/llm/round-1",
+            headers={"X-Admin-Audit-Reason": "review model reasoning"},
+        )
+
+        self.assertEqual(missing_reason.status_code, 422)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"]["node_type"], "llm")
+        event = (
+            self.db.query(AdminAuditEvent)
+            .filter(AdminAuditEvent.resource_type == "conversation_run_llm_node_detail")
+            .one()
+        )
+        self.assertEqual(event.resource_id, "run-llm-node:round-1")
+        self.assertEqual(event.reason, "review model reasoning")
+
 
 if __name__ == "__main__":
     unittest.main()

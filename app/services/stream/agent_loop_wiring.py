@@ -131,6 +131,7 @@ class AgentLoopWiringDependencies:
     generate_suggested_questions_fn: Callable[..., Any] | None = None
     fail_suggested_questions_fn: Callable[..., Any] | None = None
     load_dynamic_tools_fn: Callable[..., Any] | None = None
+    llm_round_detail_scheduler: Callable[[Any], Any] | None = None
 
     def to_execution_dependencies(self) -> AgentLoopDependencies:
         return AgentLoopDependencies(
@@ -148,6 +149,7 @@ class AgentLoopWiringDependencies:
             log_round_summary_fn=self.log_round_summary_fn,
             warning_fn=self.warning_fn,
             clock=self.clock,
+            llm_round_detail_scheduler=self.llm_round_detail_scheduler,
         )
 
     def to_lifecycle_dependencies(self) -> AgentLoopLifecycleDependencies:

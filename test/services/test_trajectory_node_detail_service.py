@@ -13,7 +13,16 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.config import settings
 from app.db.database import Base
-from app.db.models import AgentSession, Conversation, ToolCallLog, TrajectoryLedgerSettings, User
+from app.db.models import (
+    AgentEvent,
+    AgentLlmRoundDetail,
+    AgentSession,
+    Conversation,
+    RunTrajectoryMeta,
+    ToolCallLog,
+    TrajectoryLedgerSettings,
+    User,
+)
 from app.db.trajectory_repository import TrajectoryRepository
 from app.services.trajectory_query_service import TrajectoryQueryService
 
@@ -126,6 +135,123 @@ class TrajectoryNodeDetailServiceTests(unittest.TestCase):
                 )
             )
             db.commit()
+
+    def _llm_round(
+        self,
+        run_id: str,
+        llm_round_id: str,
+        *,
+        terminal_at: datetime | None,
+        detail: tuple[str, str] | None = None,
+        schema_version: int | None = 1,
+    ) -> None:
+        with self.Session() as db:
+            db.add(
+                RunTrajectoryMeta(
+                    run_id=run_id,
+                    conversation_id="conv-1",
+                    message_id=f"msg-{run_id}",
+                    trajectory_status="complete" if terminal_at is not None else "recording",
+                    event_count=2 if terminal_at is not None else 1,
+                    llm_detail_schema_version=schema_version,
+                )
+            )
+            db.add(
+                AgentEvent(
+                    conversation_id="conv-1",
+                    message_id=f"msg-{run_id}",
+                    run_id=run_id,
+                    sequence=0,
+                    event_type="llm_round_started",
+                    schema_version=1,
+                    event_ts=self.now - timedelta(seconds=10),
+                    step_id="step-1",
+                    payload={"llm_round_id": llm_round_id, "round_index": 1},
+                )
+            )
+            if terminal_at is not None:
+                db.add(
+                    AgentEvent(
+                        conversation_id="conv-1",
+                        message_id=f"msg-{run_id}",
+                        run_id=run_id,
+                        sequence=1,
+                        event_type="llm_round_completed",
+                        schema_version=1,
+                        event_ts=terminal_at,
+                        step_id="step-1",
+                        payload={"llm_round_id": llm_round_id, "duration_ms": 100},
+                    )
+                )
+            if detail is not None:
+                reasoning, output = detail
+                db.add(
+                    AgentLlmRoundDetail(
+                        conversation_id="conv-1",
+                        run_id=run_id,
+                        message_id=f"msg-{run_id}",
+                        llm_round_id=llm_round_id,
+                        reasoning_text=reasoning or None,
+                        content_text=output or None,
+                        reasoning_preview=reasoning[:200] or None,
+                        output_preview=output[:200] or None,
+                        redacted_fields=["reasoning_text"] if reasoning else [],
+                        truncated_fields=["content_text"] if output else [],
+                    )
+                )
+            db.commit()
+
+    def test_llm_detail_uses_exact_round_identity_and_exposes_thinking_output_sections(self):
+        self._run("run-llm", terminal_at=self.now - timedelta(seconds=20))
+        self._llm_round(
+            "run-llm",
+            "round-exact",
+            terminal_at=self.now - timedelta(seconds=10),
+            detail=("显式推理", "最终输出"),
+        )
+
+        response = self._service().get_user_llm_node_detail("conv-1", "run-llm", "round-exact", "user-1")
+        missing = self._service().get_user_llm_node_detail("conv-1", "run-llm", "round-other", "user-1")
+
+        self.assertIsNotNone(response)
+        self.assertIsNone(missing)
+        self.assertEqual(response.status, "available")
+        self.assertEqual(response.node_type, "llm")
+        self.assertEqual(response.available_sections, ["summary", "thinking", "output", "timing"])
+        self.assertEqual(response.detail.reasoning_text, "显式推理")
+        self.assertEqual(response.detail.output_text, "最终输出")
+        self.assertEqual(response.redacted_fields, ["reasoning_text"])
+        self.assertEqual(response.truncated_fields, ["content_text"])
+
+    def test_llm_detail_status_uses_schema_version_and_round_terminal_grace(self):
+        self._run("run-old", terminal_at=self.now - timedelta(minutes=1))
+        self._llm_round(
+            "run-old",
+            "round-old",
+            terminal_at=self.now - timedelta(minutes=1),
+            schema_version=None,
+        )
+        self._run("run-live", status="running")
+        self._llm_round("run-live", "round-live", terminal_at=None)
+        self._run("run-settling", terminal_at=self.now)
+        self._llm_round("run-settling", "round-settling", terminal_at=self.now - timedelta(seconds=5))
+        self._run("run-degraded", terminal_at=self.now)
+        self._llm_round(
+            "run-degraded",
+            "round-degraded",
+            terminal_at=self.now - timedelta(seconds=5, microseconds=1),
+        )
+
+        service = self._service()
+        old = service.get_user_llm_node_detail("conv-1", "run-old", "round-old", "user-1")
+        live = service.get_user_llm_node_detail("conv-1", "run-live", "round-live", "user-1")
+        settling = service.get_user_llm_node_detail("conv-1", "run-settling", "round-settling", "user-1")
+        degraded = service.get_user_llm_node_detail("conv-1", "run-degraded", "round-degraded", "user-1")
+
+        self.assertIsNone(old)
+        self.assertEqual((live.status, live.reason), ("pending", "llm_round_in_progress"))
+        self.assertEqual((settling.status, settling.reason), ("pending", "llm_detail_settling"))
+        self.assertEqual((degraded.status, degraded.reason), ("degraded", "llm_detail_missing"))
 
     def test_available_precedes_watermark_and_uses_safe_allowlist_projection(self):
         """若先判水位或回传原始工具日志，水位前的精确日志会丢失并泄漏凭据。"""

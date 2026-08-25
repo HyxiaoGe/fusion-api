@@ -148,9 +148,33 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
             meta = db.get(RunTrajectoryMeta, "run-1")
             self.assertIsNotNone(meta)
             self.assertEqual(meta.event_count, 1)
+            self.assertEqual(meta.llm_detail_schema_version, 1)
         self.assertEqual(len(created_sessions), 2)
         self.assertTrue(all(session is not created_sessions[0] for session in created_sessions[1:]))
         self.assertTrue(all(not session.is_active or session.in_transaction() is False for session in created_sessions))
+
+    async def test_existing_meta_without_llm_detail_capability_is_not_silently_upgraded(self):
+        with self.Session() as db:
+            db.add(
+                RunTrajectoryMeta(
+                    run_id="run-1",
+                    conversation_id="conv-1",
+                    message_id="msg-1",
+                    trajectory_status="recording",
+                    event_count=0,
+                    llm_detail_schema_version=None,
+                )
+            )
+            db.commit()
+
+        recorder = self._recorder()
+        await recorder.record_chunk("conv-1", "agent_event", _event(0))
+
+        with self.Session() as db:
+            meta = db.get(RunTrajectoryMeta, "run-1")
+            self.assertIsNotNone(meta)
+            self.assertIsNone(meta.llm_detail_schema_version)
+            self.assertEqual(meta.event_count, 1)
 
     async def test_commit_failure_after_insert_rolls_back_event_and_meta_together(self):
         class FlushThenFailSession(SqlAlchemySession):
@@ -778,9 +802,7 @@ class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await asyncio.to_thread(commit_ready.wait, 1))
 
         await asyncio.to_thread(
-            lambda: asyncio.run(
-                recorder.record_chunk("conv-1", "agent_event", _event(1, event_type="future_event"))
-            )
+            lambda: asyncio.run(recorder.record_chunk("conv-1", "agent_event", _event(1, event_type="future_event")))
         )
         self.assertIsNone(recorder.degraded_reason)
         release_commit.set()
