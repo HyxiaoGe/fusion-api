@@ -221,6 +221,29 @@ class TrajectoryRepository:
             .where(ToolCallLog.tool_call_id == tool_call_id)
         ).scalar_one_or_none()
 
+    def get_system_prompt_snapshot(self, conversation_id: str, run_id: str, user_id: str) -> object | None:
+        """独立详情读取只取快照子键，不加载运行配置的其他字段。"""
+        return self._session.execute(
+            select(AgentSession.run_config["system_prompt_snapshot"])
+            .join(Conversation, Conversation.id == AgentSession.conversation_id)
+            .where(Conversation.id == conversation_id)
+            .where(Conversation.user_id == user_id)
+            .where(AgentSession.id == run_id)
+            .where(AgentSession.user_id == user_id)
+        ).scalar_one_or_none()
+
+    def get_system_prompt_prepared_event(self, conversation_id: str, run_id: str) -> AgentEvent | None:
+        """每个 Run 只有一次组装；读取对应终态元数据，不加载完整事件列。"""
+        return self._session.execute(
+            select(AgentEvent)
+            .options(load_only(AgentEvent.payload))
+            .where(AgentEvent.conversation_id == conversation_id)
+            .where(AgentEvent.run_id == run_id)
+            .where(AgentEvent.event_type == "system_prompt_prepared")
+            .order_by(AgentEvent.sequence.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+
     def get_detail_watermark(self):
         return self._session.execute(
             select(TrajectoryLedgerSettings.trajectory_detail_enabled_at).where(

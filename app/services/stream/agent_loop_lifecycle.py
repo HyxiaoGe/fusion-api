@@ -14,6 +14,7 @@ from app.core.logger import app_logger as logger
 from app.core.prompt_bundle import get_active_prompt_bundle_revision
 from app.schemas.chat import TextBlock
 from app.schemas.response import ApiException
+from app.services.agent.session_cache import write_system_prompt_snapshot
 from app.services.agent_strategy_config import get_agent_strategy_config
 from app.services.knowledge.chat_grounding import (
     KnowledgeGroundingStreamError,
@@ -72,6 +73,7 @@ class AgentLoopLifecycleDependencies:
     claim_suggested_questions_fn: Callable[..., Any] | None = None
     generate_suggested_questions_fn: Callable[..., Any] | None = None
     fail_suggested_questions_fn: Callable[..., Any] | None = None
+    write_system_prompt_snapshot_fn: AsyncFn = write_system_prompt_snapshot
 
 
 async def run_agent_loop_lifecycle(
@@ -346,6 +348,21 @@ async def _prepare_messages(
         raise
     metadata = getattr(prepared, "prompt_assembly", None)
     if metadata is not None:
+        metadata = dict(metadata)
+        snapshot = getattr(prepared, "prompt_snapshot", None)
+        if snapshot is not None:
+            try:
+                await dependencies.write_system_prompt_snapshot_fn(
+                    run_id=execution.run_id,
+                    conversation_id=execution.completion_context.conversation_id,
+                    user_id=execution.runtime.user_id,
+                    snapshot=snapshot,
+                )
+                metadata["detail_status"] = "available"
+            except Exception as error:
+                # 辅助正文失败不终止生成，也不将异常中的提示词写入日志。
+                metadata["detail_status"] = "degraded"
+                dependencies.warning_fn(f"系统提示词正文保存失败: error_type={type(error).__name__}")
         await execution.emitter.system_prompt_prepared(**metadata)
     return prepared
 

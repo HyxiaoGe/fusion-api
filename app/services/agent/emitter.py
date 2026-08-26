@@ -648,6 +648,7 @@ class AgentEventEmitter:
         duration_ms: int,
         fingerprint: str | None = None,
         char_count: int | None = None,
+        detail_status: str | None = None,
         error_code: str | None = None,
         message: str | None = None,
     ) -> None:
@@ -665,6 +666,7 @@ class AgentEventEmitter:
                 section_ids=section_ids,
                 fingerprint=fingerprint,
                 char_count=char_count,
+                detail_status=detail_status,
                 duration_ms=duration_ms,
                 error_code=safe_error,
                 message="系统提示词组装失败，请稍后重试。" if safe_error else None,

@@ -10,6 +10,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 # 防御层：万一 unittest discover 没把 test/ 当 package，这里兜底
 os.environ.setdefault("DATABASE_URL", "sqlite:///./fusion-test.db")
@@ -26,6 +27,91 @@ from app.services.agent.session_cache import (  # noqa: E402
 
 
 class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_prompt_snapshot_is_durable_scoped_and_not_overwritten_on_run_reentry(self):
+        from app.db.trajectory_repository import TrajectoryRepository
+        from app.services.agent import session_cache
+        from app.services.trajectory_query_service import TrajectoryQueryService
+
+        engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+        Base.metadata.create_all(engine)
+        factory = sessionmaker(bind=engine, expire_on_commit=False)
+        snapshot = {
+            "schema_version": 1,
+            "template_version": "test.1",
+            "fingerprint": "a45b3127dea09221b17f29ba070f505393118249e0bfdb59899439b3f78677cd",
+            "char_count": 7,
+            "sections": [{"section_id": "identity", "content": "原文\n保持换行"}],
+        }
+        try:
+            with factory() as db:
+                db.add(Conversation(id="c1", user_id="u1", title="测试", model_id="m1"))
+                db.add(
+                    AgentSession(
+                        id="r1",
+                        conversation_id="c1",
+                        user_id="u1",
+                        message_id="m1",
+                        turn_message_id="t1",
+                        model_id="m1",
+                        provider="p1",
+                        status="running",
+                        run_config={"max_steps": 3},
+                    )
+                )
+                db.commit()
+            with patch("app.services.agent.session_cache.SessionLocal", factory):
+                for conversation_id, user_id in [("wrong", "u1"), ("c1", "wrong")]:
+                    with self.assertRaises(ValueError):
+                        await session_cache.write_system_prompt_snapshot(
+                            run_id="r1",
+                            conversation_id=conversation_id,
+                            user_id=user_id,
+                            snapshot=snapshot,
+                        )
+                await session_cache.write_system_prompt_snapshot(
+                    run_id="r1",
+                    conversation_id="c1",
+                    user_id="u1",
+                    snapshot=snapshot,
+                )
+                await session_cache.write_system_prompt_snapshot(
+                    run_id="r1",
+                    conversation_id="c1",
+                    user_id="u1",
+                    snapshot=snapshot,
+                )
+                with self.assertRaises(ValueError):
+                    await session_cache.write_system_prompt_snapshot(
+                        run_id="r1",
+                        conversation_id="c1",
+                        user_id="u1",
+                        snapshot={"sections": []},
+                    )
+                await write_session_status(run_id="r1", status="completed", total_steps=1, total_tool_calls=0)
+                await write_session_started(
+                    run_id="r1",
+                    conversation_id="c1",
+                    user_id="u1",
+                    model_id="m1",
+                    provider="p1",
+                    message_id="m1",
+                    turn_message_id="t1",
+                    run_config={"max_steps": 8},
+                )
+            with factory() as db:
+                saved = db.get(AgentSession, "r1").run_config
+                self.assertEqual(saved["system_prompt_snapshot"], snapshot)
+                self.assertEqual(saved["max_steps"], 8)
+                service = TrajectoryQueryService(
+                    TrajectoryRepository(db), max_events_per_run=10, max_runs_per_conversation=10
+                )
+                detail = service.get_user_system_prompt_node_detail("c1", "r1", "u1")
+                self.assertEqual(detail.status, "available")
+                self.assertEqual(detail.detail.sections[0].content, "原文\n保持换行")
+                self.assertEqual(detail.detail.fingerprint, snapshot["fingerprint"])
+        finally:
+            engine.dispose()
+
     @staticmethod
     def _configure_new_run(session, *, conversation_id="c1", max_attempt=None):
         lock_result = MagicMock()

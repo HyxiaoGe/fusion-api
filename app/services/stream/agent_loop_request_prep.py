@@ -130,6 +130,7 @@ class AgentLoopPreparedMessages:
     initial_content_blocks: list[Any] = field(default_factory=list)
     final_tool_names: list[str] = field(default_factory=list)
     prompt_assembly: dict[str, Any] | None = None
+    prompt_snapshot: dict[str, Any] | None = None
 
 
 def announced_tool_names_from_call_kwargs(call_kwargs: dict) -> list[str]:
@@ -399,6 +400,16 @@ async def prepare_agent_loop_messages(
         messages=messages,
         initial_content_blocks=initial_content_blocks,
         prompt_assembly=assembly.metadata,
+        prompt_snapshot={
+            "schema_version": 1,
+            "template_version": assembly.metadata["template_version"],
+            "fingerprint": assembly.metadata["fingerprint"],
+            "char_count": assembly.metadata["char_count"],
+            "sections": [
+                {"section_id": section_id, "content": message["content"]}
+                for section_id, message in zip(assembly.metadata["section_ids"], assembly.messages, strict=True)
+            ],
+        },
         final_tool_names=[
             name
             for name in announced_tool_names_from_call_kwargs(call_config.call_kwargs)

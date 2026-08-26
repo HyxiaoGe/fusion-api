@@ -88,6 +88,17 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(AGENT_PLAN_CONTROL_ON_PROMPT, contents)
         self.assertEqual(prepared.prompt_assembly["status"], "ready")
         self.assertTrue(all(set(message) == {"role", "content"} for message in prepared.messages))
+        snapshot = prepared.prompt_snapshot
+        self.assertEqual(snapshot["fingerprint"], prepared.prompt_assembly["fingerprint"])
+        self.assertEqual(
+            [section["content"] for section in snapshot["sections"]],
+            contents[: len(prepared.prompt_assembly["section_ids"])],
+        )
+        self.assertIn(
+            "请解释", next(s["content"] for s in snapshot["sections"] if s["section_id"] == "user_preferences")
+        )
+        prepared.messages[0]["content"] = "运行中追加或改写的内容"
+        self.assertNotEqual(snapshot["sections"][0]["content"], "运行中追加或改写的内容")
 
     async def test_assembly_sections_follow_actual_capabilities_and_modes(self):
         from app.services.stream.agent_loop_request_prep import AgentLoopCallConfig
@@ -131,6 +142,8 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(prepared.prompt_assembly["section_ids"], expected)
                 self.assertEqual(len(prepared.messages), len(expected))
+                self.assertEqual([s["section_id"] for s in prepared.prompt_snapshot["sections"]], expected)
+                self.assertTrue(all(s["content"] for s in prepared.prompt_snapshot["sections"]))
 
     async def test_io_failure_is_not_an_assembly_failure(self):
         from unittest.mock import patch

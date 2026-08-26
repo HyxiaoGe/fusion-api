@@ -704,7 +704,7 @@ class ConversationRepository:
             latest_by_message_id[message_id] = AgentRunSummary(
                 run_id=row.id,
                 status=row.status,
-                config=row.run_config or {},
+                config={key: value for key, value in (row.run_config or {}).items() if key != "system_prompt_snapshot"},
                 total_steps=row.total_steps or 0,
                 total_tool_calls=row.total_tool_calls or 0,
                 limit_reason=row.limit_reason if row.status == "limit_reached" else None,

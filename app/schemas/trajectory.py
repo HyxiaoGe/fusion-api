@@ -176,17 +176,43 @@ class LlmNodeDetail(BaseModel):
     output_text: str | None = None
 
 
+class SystemPromptSection(BaseModel):
+    """运行时实际组装并持久化的有序系统提示词段落。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    section_id: str = Field(min_length=1)
+    content: str
+
+
+class SystemPromptNodeDetail(BaseModel):
+    """仅通过独立详情端点返回的历史系统提示词正文。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    template_version: str = Field(min_length=1)
+    fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    char_count: int = Field(ge=0)
+    sections: list[SystemPromptSection] = Field(min_length=1)
+
+
+class SystemPromptSnapshot(SystemPromptNodeDetail):
+    """持久化格式校验；版本号不接受布尔值或字符串隐式转换。"""
+
+    schema_version: int = Field(ge=1, le=1)
+
+
 class TrajectoryNodeDetailResponse(BaseModel):
-    """P3 Tool/LLM Node Detail 的统一稳定响应信封。"""
+    """轨迹节点详情的统一稳定响应信封。"""
 
     model_config = ConfigDict(extra="forbid")
 
     status: Literal["available", "pending", "not_recorded", "degraded"]
-    node_type: Literal["tool", "llm"] = "tool"
-    available_sections: list[Literal["summary", "payload", "result", "timing", "schema", "thinking", "output"]] = Field(
-        default_factory=list
-    )
-    detail: ToolNodeDetail | LlmNodeDetail | None = None
+    node_type: Literal["tool", "llm", "system_prompt"] = "tool"
+    available_sections: list[
+        Literal["summary", "payload", "result", "timing", "schema", "thinking", "output", "prompt"]
+    ] = Field(default_factory=list)
+    detail: ToolNodeDetail | LlmNodeDetail | SystemPromptNodeDetail | None = None
     redacted_fields: list[str] = Field(default_factory=list)
     truncated_fields: list[str] = Field(default_factory=list)
     reason: str | None = None
