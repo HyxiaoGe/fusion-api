@@ -299,7 +299,7 @@ class TrajectoryApiTests(unittest.TestCase):
 
     def test_system_prompt_detail_returns_persisted_body_only_to_exact_owner(self):
         """正文端点必须有普通用户信封、完整归属校验，且列表和快照不携带正文。"""
-        from app.db.models import AgentEvent, AgentSession
+        from app.db.models import AgentEvent, AgentSession, AgentSystemPromptSnapshot
 
         self._add_run("run-prompt")
         self._add_run("run-prompt-old")
@@ -312,20 +312,40 @@ class TrajectoryApiTests(unittest.TestCase):
             "char_count": 13,
             "sections": [{"section_id": "app_identity", "content": "只属于当前 Run 的正文"}],
         }
-        self.db.get(AgentSession, "run-prompt").run_config = {"system_prompt_snapshot": snapshot}
-        self.db.get(AgentSession, "run-prompt-other").run_config = {"system_prompt_snapshot": snapshot}
-        self.db.get(AgentSession, "run-prompt-inconsistent").run_config = {"system_prompt_snapshot": snapshot}
-        self.db.add(
-            AgentEvent(
-                conversation_id="conv-1",
-                message_id="msg-run-prompt",
-                run_id="run-prompt",
-                sequence=3,
-                event_type="system_prompt_prepared",
-                schema_version=1,
-                event_ts=self.now,
-                payload={"status": "ready", "detail_status": "available", "fingerprint": snapshot["fingerprint"]},
-            )
+        self.db.get(AgentSession, "run-prompt").run_config = {"unrelated_config": "内部配置"}
+        self.db.get(AgentSession, "run-prompt-other").run_config = {"unrelated_config": "内部配置"}
+        self.db.get(AgentSession, "run-prompt-inconsistent").run_config = {"unrelated_config": "内部配置"}
+        self.db.add_all(
+            [
+                AgentSystemPromptSnapshot(
+                    run_id="run-prompt",
+                    conversation_id="conv-1",
+                    user_id="user-1",
+                    snapshot=snapshot,
+                ),
+                AgentSystemPromptSnapshot(
+                    run_id="run-prompt-other",
+                    conversation_id="conv-2",
+                    user_id="user-2",
+                    snapshot=snapshot,
+                ),
+                AgentSystemPromptSnapshot(
+                    run_id="run-prompt-inconsistent",
+                    conversation_id="conv-1",
+                    user_id="user-2",
+                    snapshot=snapshot,
+                ),
+                AgentEvent(
+                    conversation_id="conv-1",
+                    message_id="msg-run-prompt",
+                    run_id="run-prompt",
+                    sequence=3,
+                    event_type="system_prompt_prepared",
+                    schema_version=1,
+                    event_ts=self.now,
+                    payload={"status": "ready", "detail_status": "available", "fingerprint": snapshot["fingerprint"]},
+                ),
+            ]
         )
         self.db.commit()
         self.db.close()

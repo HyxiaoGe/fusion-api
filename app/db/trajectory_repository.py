@@ -11,6 +11,7 @@ from app.db.models import (
     AgentEvent,
     AgentLlmRoundDetail,
     AgentSession,
+    AgentSystemPromptSnapshot,
     Conversation,
     RunTrajectoryMeta,
     ToolCallLog,
@@ -222,10 +223,14 @@ class TrajectoryRepository:
         ).scalar_one_or_none()
 
     def get_system_prompt_snapshot(self, conversation_id: str, run_id: str, user_id: str) -> object | None:
-        """独立详情读取只取快照子键，不加载运行配置的其他字段。"""
+        """只从独立私有表读取正文，并重新验证 Run 与当前用户的完整归属。"""
         return self._session.execute(
-            select(AgentSession.run_config["system_prompt_snapshot"])
+            select(AgentSystemPromptSnapshot.snapshot)
+            .join(AgentSession, AgentSession.id == AgentSystemPromptSnapshot.run_id)
             .join(Conversation, Conversation.id == AgentSession.conversation_id)
+            .where(AgentSystemPromptSnapshot.conversation_id == conversation_id)
+            .where(AgentSystemPromptSnapshot.user_id == user_id)
+            .where(AgentSystemPromptSnapshot.run_id == run_id)
             .where(Conversation.id == conversation_id)
             .where(Conversation.user_id == user_id)
             .where(AgentSession.id == run_id)

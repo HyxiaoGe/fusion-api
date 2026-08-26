@@ -15,7 +15,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.core.logger import app_logger as logger
 from app.db.database import SessionLocal
-from app.db.models import AgentSession, AgentStep, Conversation
+from app.db.models import AgentSession, AgentStep, AgentSystemPromptSnapshot, Conversation
 from app.utils.time import utc_now
 
 _ATTEMPT_ALLOCATION_RETRIES = 3
@@ -52,20 +52,31 @@ def _write_system_prompt_snapshot(run_id: str, conversation_id: str, user_id: st
     with SessionLocal() as session:
         # 与同 Run 恢复共享会话锁，避免配置重置与正文写入相互覆盖。
         _lock_conversation(session, conversation_id)
-        row = session.execute(
+        run = session.execute(
             select(AgentSession)
             .join(Conversation, Conversation.id == AgentSession.conversation_id)
             .where(AgentSession.id == run_id, AgentSession.conversation_id == conversation_id)
             .where(AgentSession.user_id == user_id, Conversation.user_id == user_id)
         ).scalar_one_or_none()
-        if row is None:
+        if run is None:
             raise ValueError("系统提示词所属运行不存在或无权访问")
-        config = dict(row.run_config or {})
-        if "system_prompt_snapshot" in config:
-            if config["system_prompt_snapshot"] != snapshot:
+        existing = session.get(AgentSystemPromptSnapshot, run_id)
+        if existing is not None:
+            if (
+                existing.conversation_id != conversation_id
+                or existing.user_id != user_id
+                or existing.snapshot != snapshot
+            ):
                 raise ValueError("该运行已保存不同的系统提示词快照")
             return
-        row.run_config = {**config, "system_prompt_snapshot": snapshot}
+        session.add(
+            AgentSystemPromptSnapshot(
+                run_id=run_id,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                snapshot=snapshot,
+            )
+        )
         session.commit()
 
 
@@ -373,14 +384,7 @@ def _reset_existing_session(
 
     existing.model_id = model_id
     existing.provider = provider
-    previous_config = existing.run_config if isinstance(existing.run_config, dict) else {}
-    if "system_prompt_snapshot" in previous_config:
-        existing.run_config = {
-            **(run_config or {}),
-            "system_prompt_snapshot": previous_config["system_prompt_snapshot"],
-        }
-    else:
-        existing.run_config = run_config
+    existing.run_config = run_config
     existing.status = "running"
     existing.terminal_at = None
     existing.limit_reason = None

@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
@@ -16,7 +16,7 @@ from sqlalchemy.pool import StaticPool
 os.environ.setdefault("DATABASE_URL", "sqlite:///./fusion-test.db")
 
 from app.db.database import Base  # noqa: E402
-from app.db.models import AgentSession, Conversation  # noqa: E402
+from app.db.models import AgentSession, AgentSystemPromptSnapshot, Conversation, User  # noqa: E402
 from app.services.agent.session_cache import (  # noqa: E402
     write_session_started,
     write_session_status,
@@ -27,6 +27,75 @@ from app.services.agent.session_cache import (  # noqa: E402
 
 
 class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_prompt_snapshot_is_deleted_with_its_run_or_conversation(self):
+        engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+
+        @event.listens_for(engine, "connect")
+        def enable_foreign_keys(dbapi_connection, _connection_record):
+            dbapi_connection.execute("PRAGMA foreign_keys=ON")
+
+        Base.metadata.create_all(engine)
+        factory = sessionmaker(bind=engine, expire_on_commit=False)
+        try:
+            with factory() as db:
+                db.add_all(
+                    [
+                        User(id="u1", username="run-owner", email="run-owner@example.com"),
+                        User(id="u2", username="conversation-owner", email="conversation-owner@example.com"),
+                    ]
+                )
+                db.commit()
+                db.add_all(
+                    [
+                        Conversation(id="c1", user_id="u1", title="Run 级联", model_id="m1"),
+                        Conversation(id="c2", user_id="u2", title="会话级联", model_id="m1"),
+                    ]
+                )
+                db.commit()
+                db.add_all(
+                    [
+                        AgentSession(
+                            id="r1",
+                            conversation_id="c1",
+                            user_id="u1",
+                            model_id="m1",
+                            provider="p1",
+                            status="running",
+                        ),
+                        AgentSession(
+                            id="r2",
+                            conversation_id="c2",
+                            user_id="u2",
+                            model_id="m1",
+                            provider="p1",
+                            status="running",
+                        ),
+                    ]
+                )
+                db.commit()
+                db.add_all(
+                    [
+                        AgentSystemPromptSnapshot(
+                            run_id="r1", conversation_id="c1", user_id="u1", snapshot={"sections": []}
+                        ),
+                        AgentSystemPromptSnapshot(
+                            run_id="r2", conversation_id="c2", user_id="u2", snapshot={"sections": []}
+                        ),
+                    ]
+                )
+                db.commit()
+
+                db.delete(db.get(AgentSession, "r1"))
+                db.commit()
+                self.assertIsNone(db.get(AgentSystemPromptSnapshot, "r1"))
+
+                db.delete(db.get(Conversation, "c2"))
+                db.commit()
+                self.assertIsNone(db.get(AgentSession, "r2"))
+                self.assertIsNone(db.get(AgentSystemPromptSnapshot, "r2"))
+        finally:
+            engine.dispose()
+
     async def test_prompt_snapshot_is_durable_scoped_and_not_overwritten_on_run_reentry(self):
         from app.db.trajectory_repository import TrajectoryRepository
         from app.services.agent import session_cache
@@ -99,9 +168,14 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
                     run_config={"max_steps": 8},
                 )
             with factory() as db:
-                saved = db.get(AgentSession, "r1").run_config
-                self.assertEqual(saved["system_prompt_snapshot"], snapshot)
-                self.assertEqual(saved["max_steps"], 8)
+                saved_run = db.get(AgentSession, "r1")
+                saved_snapshot = db.get(AgentSystemPromptSnapshot, "r1")
+                self.assertEqual(saved_run.run_config, {"max_steps": 8})
+                self.assertNotIn("system_prompt_snapshot", saved_run.run_config)
+                self.assertIsNotNone(saved_snapshot)
+                self.assertEqual(saved_snapshot.snapshot, snapshot)
+                self.assertEqual(saved_snapshot.conversation_id, "c1")
+                self.assertEqual(saved_snapshot.user_id, "u1")
                 service = TrajectoryQueryService(
                     TrajectoryRepository(db), max_events_per_run=10, max_runs_per_conversation=10
                 )
@@ -109,6 +183,18 @@ class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(detail.status, "available")
                 self.assertEqual(detail.detail.sections[0].content, "原文\n保持换行")
                 self.assertEqual(detail.detail.fingerprint, snapshot["fingerprint"])
+            with factory() as db:
+                db.get(AgentSession, "r1").run_config = {"legacy_writer": True}
+                db.commit()
+            with factory() as db:
+                saved_snapshot = db.get(AgentSystemPromptSnapshot, "r1")
+                self.assertEqual(saved_snapshot.snapshot, snapshot)
+                service = TrajectoryQueryService(
+                    TrajectoryRepository(db), max_events_per_run=10, max_runs_per_conversation=10
+                )
+                detail = service.get_user_system_prompt_node_detail("c1", "r1", "u1")
+                self.assertEqual(detail.status, "available")
+                self.assertEqual(detail.detail.sections[0].content, "原文\n保持换行")
         finally:
             engine.dispose()
 

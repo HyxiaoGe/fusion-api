@@ -46,8 +46,8 @@
 上一版仅实现元数据，未覆盖用户查看组装结果的预期；不能将其技术检查记录等同于正文展示验收。本次保留全部展示与安全要求，不以速度为由削减范围。
 
 - 从组装器当次输出复制有序段落，与运行中后续变更的消息隔离；不重新执行模板来重建历史。
-- 复用 `agent_sessions.config.system_prompt_snapshot`，包含 `schema_version: 1`、模板版本、组装指纹、字符数及有序 `sections[{section_id, content}]`。这个独立命名空间是不可变诊断快照，不参与执行配置恢复，不需要数据库迁移。
-- 保存与 Run 恢复共用会话锁；同一快照重复写入幂等，不同快照不能覆盖。保存异常只记录错误类型，正文详情降级，模型生成继续。
+- 使用独立的 `agent_system_prompt_snapshots` 表，以 `run_id` 为主键保存 `schema_version: 1`、模板版本、组装指纹、字符数及有序 `sections[{section_id, content}]`。正文不进入 `agent_sessions.config`，因此滚动部署或应用回滚期间，旧实例既不会通过普通会话响应投影正文，也不会在同一 Run 重入时覆盖正文。
+- 保存与 Run 恢复共用会话锁；同一快照重复写入幂等，不同快照不能覆盖。数据库迁移先扩表再切换 API 实例，应用回滚保留该表；保存异常只记录错误类型，正文详情降级，模型生成继续。
 - 通用会话摘要过滤快照字段；SSE 与 `agent_events` 只携带状态和元数据。前端不把正文写入 Redux 或 Dexie。
 - `GET /api/conversations/{conversation_id}/runs/{run_id}/node-detail/system-prompt` 沿用 Node Detail 信封，`node_type: system_prompt`。只有当前用户拥有会话且 Run 归属一致才可读取，其他情况统一 404。客户端使用 `cache: no-store`，成功响应使用 `Cache-Control: private, no-store`。
 - 读取验证结构、段落顺序、字符数与真实指纹，并核对事件已提供的模板版本、段落标识及字符数；损坏的数据降级，不返回误导性正文。旧 Run 无快照返回 `not_recorded`，组装失败及保存失败返回明确的 `degraded` 原因。

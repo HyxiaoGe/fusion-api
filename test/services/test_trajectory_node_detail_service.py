@@ -19,6 +19,7 @@ from app.db.models import (
     AgentEvent,
     AgentLlmRoundDetail,
     AgentSession,
+    AgentSystemPromptSnapshot,
     Conversation,
     RunTrajectoryMeta,
     ToolCallLog,
@@ -162,7 +163,15 @@ class TrajectoryNodeDetailServiceTests(unittest.TestCase):
             run = db.get(AgentSession, run_id)
             assert run is not None
             if snapshot is not None:
-                run.run_config = {"system_prompt_snapshot": snapshot, "unrelated_config": "内部配置"}
+                run.run_config = {"unrelated_config": "内部配置"}
+                db.add(
+                    AgentSystemPromptSnapshot(
+                        run_id=run_id,
+                        conversation_id=run.conversation_id,
+                        user_id=run.user_id,
+                        snapshot=snapshot,
+                    )
+                )
             if metadata is not None:
                 db.add(
                     AgentEvent(
@@ -179,7 +188,7 @@ class TrajectoryNodeDetailServiceTests(unittest.TestCase):
             db.commit()
 
     def test_system_prompt_detail_reads_exact_persisted_body_after_session_refresh_and_template_changes(self):
-        """若重新执行当前模板、截断正文或只依赖写入会话，历史正文读取必须失败。"""
+        """若重新执行当前模板、截断正文或读取会话配置，历史正文读取必须失败。"""
         self._run("run-system-prompt")
         snapshot = self._system_prompt_snapshot()
         self._system_prompt(
@@ -393,6 +402,7 @@ class TrajectoryNodeDetailServiceTests(unittest.TestCase):
         self.assertIsNone(llm)
         self.assertTrue(statements)
         self.assertNotIn("agent_sessions.config", "\n".join(statements))
+        self.assertNotIn("agent_system_prompt_snapshots.snapshot", "\n".join(statements))
         self.assertNotIn("完整规则", listing.model_dump_json() + snapshot.model_dump_json() + tool.model_dump_json())
 
     def _llm_round(
