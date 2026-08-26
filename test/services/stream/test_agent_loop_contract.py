@@ -11,6 +11,7 @@ from app.schemas.chat import SearchBlock
 from app.services.stream import StreamHandler
 from app.services.stream.tool_execution_result import ToolExecutionRecord
 from app.services.tool_handlers.base import ToolResult
+from app.utils.prompt_fingerprint import fingerprint_system_messages
 
 
 @dataclass
@@ -1002,6 +1003,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             result.event_types,
             [
                 "run_started",
+                "system_prompt_prepared",
                 "step_started",
                 "context_status_updated",
                 "llm_round_started",
@@ -1010,6 +1012,16 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 "step_completed",
                 "run_completed",
             ],
+        )
+        prompt_event = result.events[1]
+        self.assertEqual(prompt_event["status"], "ready")
+        self.assertIsNone(prompt_event["step_id"])
+        self.assertIn("current_date", prompt_event["section_ids"])
+        self.assertIn("app_identity", prompt_event["section_ids"])
+        round_started = next(event for event in result.events if event["type"] == "llm_round_started")
+        self.assertEqual(
+            round_started["system_prompt_fingerprint"],
+            fingerprint_system_messages(result.llm_calls[0]["messages"]),
         )
         context_events = [event for event in result.events if event["type"] == "context_status_updated"]
         self.assertEqual(

@@ -221,6 +221,8 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         self.mock_db = MagicMock()
         persistence_query = self.mock_db.query.return_value
         persistence_query.populate_existing.return_value = persistence_query
+        # 用户偏好通过 filter 查询；与 filter_by 一样显式返回无记录，避免生成 MagicMock 偏好。
+        persistence_query.filter.return_value = persistence_query
         persistence_query.filter_by.return_value = persistence_query
         persistence_query.with_for_update.return_value = persistence_query
         persistence_query.first.return_value = None
@@ -347,6 +349,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
             types,
             [
                 "run_started",
+                "system_prompt_prepared",
                 "step_started",
                 "context_status_updated",
                 "llm_round_started",
@@ -356,6 +359,17 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                 "run_completed",
             ],
         )
+        prompt_event = events[1]
+        self.assertEqual(prompt_event["status"], "ready")
+        self.assertEqual(prompt_event["source"], "code")
+        self.assertIsNone(prompt_event["step_id"])
+        self.assertEqual(
+            prompt_event["section_ids"],
+            ["current_date", "app_identity", "no_tool_network_boundary"],
+        )
+        self.assertRegex(prompt_event["fingerprint"], r"^[0-9a-f]{64}$")
+        self.assertGreater(prompt_event["char_count"], 0)
+        self.assertGreaterEqual(prompt_event["duration_ms"], 0)
         context_events = [event for event in events if event["type"] == "context_status_updated"]
         self.assertEqual([event["phase"] for event in context_events], ["estimated", "final"])
         self.assertEqual([event["round_index"] for event in context_events], [1, 1])
@@ -822,6 +836,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
             types,
             [
                 "run_started",
+                "system_prompt_prepared",
                 "step_started",
                 "context_status_updated",
                 "llm_round_started",

@@ -68,6 +68,7 @@
 - 迁移前已核对 dev 生效模板；收尾摘要差异保留现有解析路径，其他 PromptHub 消费者不变。
 - 独立审查发现并修复空文本加非图片附件回归；API 22文件目标集合 `416 passed + 121 subtests`，ruff、架构及 diff 检查通过。
 - 前端 27 文件 376 测试及隔离构建通过；37 个既有类型错误与干净同 SHA 基线逐字一致，无新增。跨仓独立审查通过，无未解决 P0/P1。
+- 草稿 PR：API [#60](https://github.com/HyxiaoGe/fusion-api/pull/60)、UI [#48](https://github.com/HyxiaoGe/fusion-ui/pull/48)。UI 首轮 CI 全量 2350 测试及容器构建通过；API 首轮 CI 暴露两份旧集成测试的查询夹具/事件顺序不匹配，修正后主代理以 unittest 重跑 46 测试通过，生产代码未因此改动。最新分支 CI 结果以 PR Checks 为准。
 - 本条记录本地实现、代码验证与独立审查；分支 CI 以配套 PR 为准，未合并部署，未完成新版本真实浏览器/模型验收。协议和范围见 [一期契约](superpowers/specs/2026-08-26-system-prompt-assembly.md)。
 
 ## 最近发布记录
