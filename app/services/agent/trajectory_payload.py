@@ -101,6 +101,7 @@ _EVENT_FIELDS: dict[str, frozenset[str]] = {
             "source",
             "template_version",
             "section_ids",
+            "detail_status",
             "fingerprint",
             "char_count",
             "duration_ms",

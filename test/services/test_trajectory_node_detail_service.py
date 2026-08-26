@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from app.core.config import settings
@@ -17,6 +19,7 @@ from app.db.models import (
     AgentEvent,
     AgentLlmRoundDetail,
     AgentSession,
+    AgentSystemPromptSnapshot,
     Conversation,
     RunTrajectoryMeta,
     ToolCallLog,
@@ -135,6 +138,272 @@ class TrajectoryNodeDetailServiceTests(unittest.TestCase):
                 )
             )
             db.commit()
+
+    @staticmethod
+    def _system_prompt_snapshot() -> dict:
+        return {
+            "schema_version": 1,
+            "template_version": "2026-08-26.1",
+            "fingerprint": "ea74d6bfa2a7c788583abe258af4d4ded20982b8907b8b1ece9cb46ad05aee90",
+            "char_count": 1438,
+            "sections": [
+                {"section_id": "current_date", "content": "历史日期：2026-08-26（Asia/Shanghai）"},
+                {"section_id": "user_preferences", "content": "保持详细回答。\n" + "完整规则" * 350},
+            ],
+        }
+
+    def _system_prompt(
+        self,
+        run_id: str,
+        *,
+        snapshot: object | None = None,
+        metadata: dict | None = None,
+    ) -> None:
+        with self.Session() as db:
+            run = db.get(AgentSession, run_id)
+            assert run is not None
+            if snapshot is not None:
+                run.run_config = {"unrelated_config": "内部配置"}
+                db.add(
+                    AgentSystemPromptSnapshot(
+                        run_id=run_id,
+                        conversation_id=run.conversation_id,
+                        user_id=run.user_id,
+                        snapshot=snapshot,
+                    )
+                )
+            if metadata is not None:
+                db.add(
+                    AgentEvent(
+                        conversation_id=run.conversation_id,
+                        message_id=run.message_id,
+                        run_id=run_id,
+                        sequence=0,
+                        event_type="system_prompt_prepared",
+                        schema_version=1,
+                        event_ts=self.now,
+                        payload=metadata,
+                    )
+                )
+            db.commit()
+
+    def test_system_prompt_detail_reads_exact_persisted_body_after_session_refresh_and_template_changes(self):
+        """若重新执行当前模板、截断正文或读取会话配置，历史正文读取必须失败。"""
+        self._run("run-system-prompt")
+        snapshot = self._system_prompt_snapshot()
+        self._system_prompt(
+            "run-system-prompt",
+            snapshot=snapshot,
+            metadata={"status": "ready", "detail_status": "available", "fingerprint": snapshot["fingerprint"]},
+        )
+
+        first = self._service().get_user_system_prompt_node_detail("conv-1", "run-system-prompt", "user-1")
+        with (
+            patch("app.ai.prompts.system_prompt.TEMPLATE_VERSION", "2099-new-template"),
+            patch("app.ai.prompts.system_prompt.build_base_sections", side_effect=AssertionError("不能重建历史提示词")),
+        ):
+            refreshed = self._service().get_user_system_prompt_node_detail("conv-1", "run-system-prompt", "user-1")
+
+        assert first is not None and refreshed is not None
+        self.assertEqual(first.model_dump(), refreshed.model_dump())
+        self.assertEqual(first.status, "available")
+        self.assertEqual(first.node_type, "system_prompt")
+        self.assertEqual(first.available_sections, ["summary", "prompt"])
+        expected_detail = {key: value for key, value in snapshot.items() if key != "schema_version"}
+        self.assertEqual(first.detail.model_dump(), expected_detail)
+        self.assertEqual(first.redacted_fields, [])
+        self.assertEqual(first.truncated_fields, [])
+        self.assertIsNone(first.reason)
+        self.assertNotIn("内部配置", first.model_dump_json())
+
+    def test_system_prompt_detail_requires_exact_conversation_run_and_user_ownership(self):
+        """若省略任一归属条件，其他 Run 或不一致用户的持久正文会泄漏。"""
+        self._run("run-owned")
+        self._run("run-foreign", conversation_id="conv-2", user_id="user-2")
+        self._run("run-inconsistent", user_id="user-2")
+        for run_id in ("run-owned", "run-foreign", "run-inconsistent"):
+            self._system_prompt(run_id, snapshot=self._system_prompt_snapshot())
+
+        service = self._service()
+        for conversation_id, run_id, user_id in (
+            ("conv-2", "run-foreign", "user-1"),
+            ("conv-1", "run-foreign", "user-1"),
+            ("conv-2", "run-owned", "user-2"),
+            ("conv-1", "run-owned", "user-2"),
+            ("conv-1", "run-inconsistent", "user-1"),
+            ("conv-1", "run-inconsistent", "user-2"),
+            ("conv-1", "missing-run", "user-1"),
+        ):
+            with self.subTest(conversation_id=conversation_id, run_id=run_id, user_id=user_id):
+                self.assertIsNone(service.get_user_system_prompt_node_detail(conversation_id, run_id, user_id))
+        own = service.get_user_system_prompt_node_detail("conv-1", "run-owned", "user-1")
+        assert own is not None
+        self.assertEqual(own.status, "available")
+
+    def test_system_prompt_detail_distinguishes_unrecorded_assembly_failure_and_missing_snapshot(self):
+        """旧 Run 不伪造正文，新记录缺失与实际组装失败必须明确降级。"""
+        cases = (
+            (None, "not_recorded", "system_prompt_not_recorded"),
+            ({"status": "ready"}, "not_recorded", "system_prompt_not_recorded"),
+            ({"status": "failed"}, "degraded", "system_prompt_assembly_failed"),
+            ({"status": "ready", "detail_status": "available"}, "degraded", "system_prompt_detail_missing"),
+            ({"status": "ready", "detail_status": "degraded"}, "degraded", "system_prompt_detail_missing"),
+        )
+        for index, (metadata, status, reason) in enumerate(cases):
+            with self.subTest(metadata=metadata):
+                run_id = f"run-system-status-{index}"
+                self._run(run_id)
+                self._system_prompt(run_id, metadata=metadata)
+                response = self._service().get_user_system_prompt_node_detail("conv-1", run_id, "user-1")
+                assert response is not None
+                self.assertEqual(response.status, status)
+                self.assertEqual(response.node_type, "system_prompt")
+                self.assertEqual(response.reason, reason)
+                self.assertIsNone(response.detail)
+                self.assertEqual(response.available_sections, [])
+
+    def test_system_prompt_detail_waits_for_async_ledger_before_classifying_an_old_run(self):
+        """SSE 先于账本落库时，应短暂等待；终态过宽限且无记录才视为旧 Run。"""
+        cases = (
+            ("running", None, "pending", "system_prompt_detail_settling"),
+            ("completed", self.now - timedelta(seconds=5), "pending", "system_prompt_detail_settling"),
+            ("completed", self.now - timedelta(seconds=6), "not_recorded", "system_prompt_not_recorded"),
+        )
+        for index, (run_status, terminal_at, expected_status, reason) in enumerate(cases):
+            with self.subTest(run_status=run_status, terminal_at=terminal_at):
+                run_id = f"run-system-ledger-lag-{index}"
+                self._run(run_id, status=run_status, terminal_at=terminal_at)
+                response = self._service().get_user_system_prompt_node_detail("conv-1", run_id, "user-1")
+                assert response is not None
+                self.assertEqual(response.status, expected_status)
+                self.assertEqual(response.reason, reason)
+                self.assertIsNone(response.detail)
+                self.assertEqual(response.available_sections, [])
+
+                if expected_status == "pending":
+                    self._system_prompt(run_id, metadata={"status": "ready", "detail_status": "degraded"})
+                    settled = self._service().get_user_system_prompt_node_detail("conv-1", run_id, "user-1")
+                    assert settled is not None
+                    self.assertEqual(settled.status, "degraded")
+                    self.assertEqual(settled.reason, "system_prompt_detail_missing")
+
+    def test_system_prompt_snapshot_is_available_before_event_and_failed_event_never_exposes_body(self):
+        """写入与事件间隙可读快照，但失败事件不能被偶存正文覆盖为成功。"""
+        self._run("run-before-event")
+        self._run("run-failed-event")
+        snapshot = self._system_prompt_snapshot()
+        self._system_prompt("run-before-event", snapshot=snapshot)
+        self._system_prompt("run-failed-event", snapshot=snapshot, metadata={"status": "failed"})
+
+        before_event = self._service().get_user_system_prompt_node_detail("conv-1", "run-before-event", "user-1")
+        failed = self._service().get_user_system_prompt_node_detail("conv-1", "run-failed-event", "user-1")
+
+        assert before_event is not None and failed is not None
+        self.assertEqual(before_event.status, "available")
+        self.assertEqual(failed.status, "degraded")
+        self.assertEqual(failed.reason, "system_prompt_assembly_failed")
+        self.assertIsNone(failed.detail)
+
+    def test_system_prompt_detail_rejects_corrupt_schema_sections_hash_and_character_count(self):
+        """若直接信任持久字典、事件 hash 或字符数，损坏正文会被当成可用历史。"""
+        valid = self._system_prompt_snapshot()
+        invalid_values = [
+            [],
+            {**valid, "schema_version": 2},
+            {**valid, "schema_version": True},
+            {**valid, "template_version": 123},
+            {**valid, "char_count": str(valid["char_count"])},
+            {**valid, "char_count": valid["char_count"] + 1},
+            {**valid, "sections": []},
+            {**valid, "sections": list(reversed(valid["sections"]))},
+            {**valid, "fingerprint": "0" * 64},
+            {**valid, "unexpected_body": "不得放行的字段"},
+        ]
+        duplicate = deepcopy(valid)
+        duplicate["sections"][1]["section_id"] = duplicate["sections"][0]["section_id"]
+        invalid_values.append(duplicate)
+        malformed = deepcopy(valid)
+        malformed["sections"][0]["content"] = ["内容不是文本"]
+        invalid_values.append(malformed)
+        empty_id = deepcopy(valid)
+        empty_id["sections"][0]["section_id"] = ""
+        invalid_values.append(empty_id)
+        for index, snapshot in enumerate(invalid_values):
+            with self.subTest(index=index):
+                run_id = f"run-system-invalid-{index}"
+                self._run(run_id)
+                self._system_prompt(
+                    run_id,
+                    snapshot=snapshot,
+                    metadata={
+                        "status": "ready",
+                        "detail_status": "available",
+                        "fingerprint": snapshot.get("fingerprint") if isinstance(snapshot, dict) else None,
+                    },
+                )
+                response = self._service().get_user_system_prompt_node_detail("conv-1", run_id, "user-1")
+                assert response is not None
+                self.assertEqual(response.status, "degraded")
+                self.assertEqual(response.reason, "system_prompt_detail_invalid")
+                self.assertIsNone(response.detail)
+                self.assertEqual(response.available_sections, [])
+
+    def test_system_prompt_detail_rejects_event_metadata_mismatch(self):
+        """快照内容虽自洽，但若与组装事件的正文或版本信息不同，不能当作事件正文。"""
+        snapshot = self._system_prompt_snapshot()
+        mismatches = {
+            "fingerprint": "f" * 64,
+            "section_ids": ["other", "user_preferences"],
+            "template_version": "other-version",
+            "char_count": 0,
+        }
+        for field, value in mismatches.items():
+            with self.subTest(field=field):
+                run_id = f"run-system-mismatch-{field}"
+                self._run(run_id)
+                self._system_prompt(
+                    run_id,
+                    snapshot=snapshot,
+                    metadata={
+                        "status": "ready",
+                        "detail_status": "available",
+                        "fingerprint": snapshot["fingerprint"],
+                        field: value,
+                    },
+                )
+
+                response = self._service().get_user_system_prompt_node_detail("conv-1", run_id, "user-1")
+
+                assert response is not None
+                self.assertEqual(response.status, "degraded")
+                self.assertEqual(response.reason, "system_prompt_detail_invalid")
+                self.assertIsNone(response.detail)
+
+    def test_general_trajectory_and_other_node_details_do_not_read_system_prompt_body(self):
+        """若共用 Run 查询增加 config 或触发全列懒加载，普通读取会无故加载完整正文。"""
+        self._run("run-system-private")
+        self._system_prompt("run-system-private", snapshot=self._system_prompt_snapshot())
+        statements = []
+
+        def capture_sql(connection, cursor, statement, parameters, context, executemany):
+            statements.append(statement)
+
+        event.listen(self.engine, "before_cursor_execute", capture_sql)
+        try:
+            service = self._service()
+            listing = service.list_runs("conv-1", "user-1")
+            snapshot = service.get_user_snapshot("conv-1", "run-system-private", "user-1")
+            tool = service.get_user_tool_node_detail("conv-1", "run-system-private", "absent-tool", "user-1")
+            llm = service.get_user_llm_node_detail("conv-1", "run-system-private", "absent-round", "user-1")
+        finally:
+            event.remove(self.engine, "before_cursor_execute", capture_sql)
+
+        assert listing is not None and snapshot is not None and tool is not None
+        self.assertIsNone(llm)
+        self.assertTrue(statements)
+        self.assertNotIn("agent_sessions.config", "\n".join(statements))
+        self.assertNotIn("agent_system_prompt_snapshots.snapshot", "\n".join(statements))
+        self.assertNotIn("完整规则", listing.model_dump_json() + snapshot.model_dump_json() + tool.model_dump_json())
 
     def _llm_round(
         self,

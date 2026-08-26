@@ -433,6 +433,21 @@ def _assert_text_and_lists_are_bounded_and_secret_like_error_text_is_redacted():
 
 
 class TrajectoryPayloadTests(unittest.TestCase):
+    def test_prompt_detail_status_is_durable_but_full_text_is_never_ledger_payload(self):
+        payload = build_trajectory_payload(
+            {
+                **COMMON,
+                "type": "system_prompt_prepared",
+                **EVENT_FIELDS["system_prompt_prepared"],
+                "detail_status": "degraded",
+                "system_prompt_snapshot": {"content": "PRIVATE 正文"},
+                "sections": [{"section_id": "user_preferences", "content": "PRIVATE 偏好"}],
+            }
+        )
+        self.assertEqual(payload["detail_status"], "degraded")
+        self.assertNotIn("PRIVATE", str(payload))
+        self.assertNotIn("sections", payload)
+
     def test_every_event_type_uses_an_explicit_top_level_allowlist(self):
         for event_type in sorted(EVENT_FIELDS):
             with self.subTest(event_type=event_type):

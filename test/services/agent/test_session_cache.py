@@ -6,16 +6,17 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 # 防御层：万一 unittest discover 没把 test/ 当 package，这里兜底
 os.environ.setdefault("DATABASE_URL", "sqlite:///./fusion-test.db")
 
 from app.db.database import Base  # noqa: E402
-from app.db.models import AgentSession, Conversation  # noqa: E402
+from app.db.models import AgentSession, AgentSystemPromptSnapshot, Conversation, User  # noqa: E402
 from app.services.agent.session_cache import (  # noqa: E402
     write_session_started,
     write_session_status,
@@ -26,6 +27,177 @@ from app.services.agent.session_cache import (  # noqa: E402
 
 
 class SessionCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_prompt_snapshot_is_deleted_with_its_run_or_conversation(self):
+        engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+
+        @event.listens_for(engine, "connect")
+        def enable_foreign_keys(dbapi_connection, _connection_record):
+            dbapi_connection.execute("PRAGMA foreign_keys=ON")
+
+        Base.metadata.create_all(engine)
+        factory = sessionmaker(bind=engine, expire_on_commit=False)
+        try:
+            with factory() as db:
+                db.add_all(
+                    [
+                        User(id="u1", username="run-owner", email="run-owner@example.com"),
+                        User(id="u2", username="conversation-owner", email="conversation-owner@example.com"),
+                    ]
+                )
+                db.commit()
+                db.add_all(
+                    [
+                        Conversation(id="c1", user_id="u1", title="Run 级联", model_id="m1"),
+                        Conversation(id="c2", user_id="u2", title="会话级联", model_id="m1"),
+                    ]
+                )
+                db.commit()
+                db.add_all(
+                    [
+                        AgentSession(
+                            id="r1",
+                            conversation_id="c1",
+                            user_id="u1",
+                            model_id="m1",
+                            provider="p1",
+                            status="running",
+                        ),
+                        AgentSession(
+                            id="r2",
+                            conversation_id="c2",
+                            user_id="u2",
+                            model_id="m1",
+                            provider="p1",
+                            status="running",
+                        ),
+                    ]
+                )
+                db.commit()
+                db.add_all(
+                    [
+                        AgentSystemPromptSnapshot(
+                            run_id="r1", conversation_id="c1", user_id="u1", snapshot={"sections": []}
+                        ),
+                        AgentSystemPromptSnapshot(
+                            run_id="r2", conversation_id="c2", user_id="u2", snapshot={"sections": []}
+                        ),
+                    ]
+                )
+                db.commit()
+
+                db.delete(db.get(AgentSession, "r1"))
+                db.commit()
+                self.assertIsNone(db.get(AgentSystemPromptSnapshot, "r1"))
+
+                db.delete(db.get(Conversation, "c2"))
+                db.commit()
+                self.assertIsNone(db.get(AgentSession, "r2"))
+                self.assertIsNone(db.get(AgentSystemPromptSnapshot, "r2"))
+        finally:
+            engine.dispose()
+
+    async def test_prompt_snapshot_is_durable_scoped_and_not_overwritten_on_run_reentry(self):
+        from app.db.trajectory_repository import TrajectoryRepository
+        from app.services.agent import session_cache
+        from app.services.trajectory_query_service import TrajectoryQueryService
+
+        engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+        Base.metadata.create_all(engine)
+        factory = sessionmaker(bind=engine, expire_on_commit=False)
+        snapshot = {
+            "schema_version": 1,
+            "template_version": "test.1",
+            "fingerprint": "a45b3127dea09221b17f29ba070f505393118249e0bfdb59899439b3f78677cd",
+            "char_count": 7,
+            "sections": [{"section_id": "identity", "content": "原文\n保持换行"}],
+        }
+        try:
+            with factory() as db:
+                db.add(Conversation(id="c1", user_id="u1", title="测试", model_id="m1"))
+                db.add(
+                    AgentSession(
+                        id="r1",
+                        conversation_id="c1",
+                        user_id="u1",
+                        message_id="m1",
+                        turn_message_id="t1",
+                        model_id="m1",
+                        provider="p1",
+                        status="running",
+                        run_config={"max_steps": 3},
+                    )
+                )
+                db.commit()
+            with patch("app.services.agent.session_cache.SessionLocal", factory):
+                for conversation_id, user_id in [("wrong", "u1"), ("c1", "wrong")]:
+                    with self.assertRaises(ValueError):
+                        await session_cache.write_system_prompt_snapshot(
+                            run_id="r1",
+                            conversation_id=conversation_id,
+                            user_id=user_id,
+                            snapshot=snapshot,
+                        )
+                await session_cache.write_system_prompt_snapshot(
+                    run_id="r1",
+                    conversation_id="c1",
+                    user_id="u1",
+                    snapshot=snapshot,
+                )
+                await session_cache.write_system_prompt_snapshot(
+                    run_id="r1",
+                    conversation_id="c1",
+                    user_id="u1",
+                    snapshot=snapshot,
+                )
+                with self.assertRaises(ValueError):
+                    await session_cache.write_system_prompt_snapshot(
+                        run_id="r1",
+                        conversation_id="c1",
+                        user_id="u1",
+                        snapshot={"sections": []},
+                    )
+                await write_session_status(run_id="r1", status="completed", total_steps=1, total_tool_calls=0)
+                await write_session_started(
+                    run_id="r1",
+                    conversation_id="c1",
+                    user_id="u1",
+                    model_id="m1",
+                    provider="p1",
+                    message_id="m1",
+                    turn_message_id="t1",
+                    run_config={"max_steps": 8},
+                )
+            with factory() as db:
+                saved_run = db.get(AgentSession, "r1")
+                saved_snapshot = db.get(AgentSystemPromptSnapshot, "r1")
+                self.assertEqual(saved_run.run_config, {"max_steps": 8})
+                self.assertNotIn("system_prompt_snapshot", saved_run.run_config)
+                self.assertIsNotNone(saved_snapshot)
+                self.assertEqual(saved_snapshot.snapshot, snapshot)
+                self.assertEqual(saved_snapshot.conversation_id, "c1")
+                self.assertEqual(saved_snapshot.user_id, "u1")
+                service = TrajectoryQueryService(
+                    TrajectoryRepository(db), max_events_per_run=10, max_runs_per_conversation=10
+                )
+                detail = service.get_user_system_prompt_node_detail("c1", "r1", "u1")
+                self.assertEqual(detail.status, "available")
+                self.assertEqual(detail.detail.sections[0].content, "原文\n保持换行")
+                self.assertEqual(detail.detail.fingerprint, snapshot["fingerprint"])
+            with factory() as db:
+                db.get(AgentSession, "r1").run_config = {"legacy_writer": True}
+                db.commit()
+            with factory() as db:
+                saved_snapshot = db.get(AgentSystemPromptSnapshot, "r1")
+                self.assertEqual(saved_snapshot.snapshot, snapshot)
+                service = TrajectoryQueryService(
+                    TrajectoryRepository(db), max_events_per_run=10, max_runs_per_conversation=10
+                )
+                detail = service.get_user_system_prompt_node_detail("c1", "r1", "u1")
+                self.assertEqual(detail.status, "available")
+                self.assertEqual(detail.detail.sections[0].content, "原文\n保持换行")
+        finally:
+            engine.dispose()
+
     @staticmethod
     def _configure_new_run(session, *, conversation_id="c1", max_attempt=None):
         lock_result = MagicMock()

@@ -78,15 +78,34 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 emitted.append(payload)
 
         assembly = assemble_system_prompt(user_system_prompt="不能进入事件的规则原文")
+        saved = []
+        snapshot = {
+            "schema_version": 1,
+            "template_version": assembly.metadata["template_version"],
+            "fingerprint": assembly.metadata["fingerprint"],
+            "char_count": assembly.metadata["char_count"],
+            "sections": [
+                {"section_id": key, "content": message["content"]}
+                for key, message in zip(assembly.metadata["section_ids"], assembly.messages, strict=True)
+            ],
+        }
         prepared = SimpleNamespace(
             messages=assembly.messages,
             initial_content_blocks=[],
             final_tool_names=[],
             prompt_assembly=assembly.metadata,
+            prompt_snapshot=snapshot,
         )
+
+        async def save_snapshot(**kwargs):
+            self.assertEqual(kwargs["run_id"], "run-life")
+            self.assertEqual(kwargs["conversation_id"], "conv-life")
+            self.assertEqual(kwargs["user_id"], "user-life")
+            saved.append(kwargs["snapshot"])
 
         async def run_loop(**_kwargs):
             self.assertEqual([event["type"] for event in emitted].count("system_prompt_prepared"), 1)
+            self.assertEqual(saved, [snapshot])
             return AgentLoopOutcome(exit=AgentLoopExit.COMPLETED)
 
         await run_agent_loop_lifecycle(
@@ -96,12 +115,55 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 start_agent_run_fn=_start_event_run,
                 prepare_messages_fn=AsyncMock(return_value=prepared),
                 run_agent_loop_fn=run_loop,
+                write_system_prompt_snapshot_fn=save_snapshot,
             ),
         )
         prompt_events = [event for event in emitted if event["type"] == "system_prompt_prepared"]
         self.assertEqual(len(prompt_events), 1)
         self.assertEqual(prompt_events[0]["fingerprint"], assembly.metadata["fingerprint"])
+        self.assertEqual(prompt_events[0]["detail_status"], "available")
         self.assertNotIn("不能进入事件的规则原文", str(emitted))
+
+    async def test_prompt_snapshot_write_failure_keeps_run_running_and_reports_degraded_without_body(self):
+        from app.ai.prompts.system_prompt import assemble_system_prompt
+
+        emitted, warnings = [], []
+
+        class CaptureWriter:
+            async def append_chunk(self, _conversation_id, _task_id, _chunk_type, payload):
+                emitted.append(payload)
+
+        assembly = assemble_system_prompt()
+        prepared = SimpleNamespace(
+            messages=assembly.messages,
+            initial_content_blocks=[],
+            final_tool_names=[],
+            prompt_assembly=assembly.metadata,
+            prompt_snapshot={"sections": []},
+        )
+        driver_calls = []
+
+        async def run_loop(**kwargs):
+            driver_calls.append(kwargs["messages"])
+            return AgentLoopOutcome(exit=AgentLoopExit.COMPLETED)
+
+        await run_agent_loop_lifecycle(
+            request=self._request(),
+            execution=self._execution(redis_writer=CaptureWriter()),
+            dependencies=self._dependencies(
+                start_agent_run_fn=_start_event_run,
+                prepare_messages_fn=AsyncMock(return_value=prepared),
+                run_agent_loop_fn=run_loop,
+                write_system_prompt_snapshot_fn=AsyncMock(side_effect=RuntimeError("PRIVATE 正文")),
+                warning_fn=warnings.append,
+            ),
+        )
+        event = next(event for event in emitted if event["type"] == "system_prompt_prepared")
+        self.assertEqual(event["status"], "ready")
+        self.assertEqual(event["detail_status"], "degraded")
+        self.assertEqual(len(driver_calls), 1)
+        self.assertTrue(warnings)
+        self.assertNotIn("PRIVATE", str(emitted) + str(warnings))
 
     async def test_only_actual_assembly_error_emits_failed_prompt_result(self):
         from app.ai.prompts.system_prompt import SystemPromptAssemblyError

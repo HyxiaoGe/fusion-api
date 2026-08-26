@@ -313,6 +313,7 @@ class SystemPromptPrepared(AgentEventBase):
     section_ids: list[str] = Field(max_length=50)
     fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     char_count: int | None = Field(default=None, ge=0)
+    detail_status: Literal["available", "degraded"] | None = None
     duration_ms: int = Field(ge=0)
     error_code: str | None = None
     message: str | None = Field(default=None, max_length=120)

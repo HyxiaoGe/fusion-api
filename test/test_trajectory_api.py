@@ -297,6 +297,97 @@ class TrajectoryApiTests(unittest.TestCase):
             self.assertEqual(response.status_code, 404)
             self.assertEqual(response.json()["message"], "会话或轨迹不存在，或无权访问")
 
+    def test_system_prompt_detail_returns_persisted_body_only_to_exact_owner(self):
+        """正文端点必须有普通用户信封、完整归属校验，且列表和快照不携带正文。"""
+        from app.db.models import AgentEvent, AgentSession, AgentSystemPromptSnapshot
+
+        self._add_run("run-prompt")
+        self._add_run("run-prompt-old")
+        self._add_run("run-prompt-other", conversation_id="conv-2", user_id="user-2")
+        self._add_run("run-prompt-inconsistent", user_id="user-2")
+        snapshot = {
+            "schema_version": 1,
+            "template_version": "2026-08-26.1",
+            "fingerprint": "b62d9881a561f21dc1dc33e8b8e288ea71d1ed13744258ef986c6cea86b73d39",
+            "char_count": 13,
+            "sections": [{"section_id": "app_identity", "content": "只属于当前 Run 的正文"}],
+        }
+        self.db.get(AgentSession, "run-prompt").run_config = {"unrelated_config": "内部配置"}
+        self.db.get(AgentSession, "run-prompt-other").run_config = {"unrelated_config": "内部配置"}
+        self.db.get(AgentSession, "run-prompt-inconsistent").run_config = {"unrelated_config": "内部配置"}
+        self.db.add_all(
+            [
+                AgentSystemPromptSnapshot(
+                    run_id="run-prompt",
+                    conversation_id="conv-1",
+                    user_id="user-1",
+                    snapshot=snapshot,
+                ),
+                AgentSystemPromptSnapshot(
+                    run_id="run-prompt-other",
+                    conversation_id="conv-2",
+                    user_id="user-2",
+                    snapshot=snapshot,
+                ),
+                AgentSystemPromptSnapshot(
+                    run_id="run-prompt-inconsistent",
+                    conversation_id="conv-1",
+                    user_id="user-2",
+                    snapshot=snapshot,
+                ),
+                AgentEvent(
+                    conversation_id="conv-1",
+                    message_id="msg-run-prompt",
+                    run_id="run-prompt",
+                    sequence=3,
+                    event_type="system_prompt_prepared",
+                    schema_version=1,
+                    event_ts=self.now,
+                    payload={"status": "ready", "detail_status": "available", "fingerprint": snapshot["fingerprint"]},
+                ),
+            ]
+        )
+        self.db.commit()
+        self.db.close()
+        self.db = self.Session()
+
+        exact = self.client.get("/api/conversations/conv-1/runs/run-prompt/node-detail/system-prompt")
+
+        self.assertEqual(exact.status_code, 200)
+        self.assertEqual(exact.headers.get("cache-control"), "private, no-store")
+        self.assertEqual(exact.json()["code"], "SUCCESS")
+        self.assertTrue(exact.json()["request_id"])
+        data = exact.json()["data"]
+        self.assertEqual(data["node_type"], "system_prompt")
+        self.assertEqual(data["status"], "available")
+        self.assertEqual(data["available_sections"], ["summary", "prompt"])
+        self.assertEqual(data["detail"], {key: value for key, value in snapshot.items() if key != "schema_version"})
+        self.assertEqual(data["redacted_fields"], [])
+        self.assertEqual(data["truncated_fields"], [])
+        for path in (
+            "/api/conversations/conv-2/runs/run-prompt-other/node-detail/system-prompt",
+            "/api/conversations/conv-1/runs/run-prompt-other/node-detail/system-prompt",
+            "/api/conversations/conv-2/runs/run-prompt/node-detail/system-prompt",
+            "/api/conversations/conv-1/runs/run-prompt-inconsistent/node-detail/system-prompt",
+            "/api/conversations/conv-1/runs/missing-run/node-detail/system-prompt",
+        ):
+            with self.subTest(path=path):
+                response = self.client.get(path)
+                self.assertEqual(response.status_code, 404)
+                self.assertEqual(response.json()["code"], "NOT_FOUND")
+                self.assertEqual(response.json()["message"], "会话或轨迹不存在，或无权访问")
+                self.assertNotIn("只属于当前 Run 的正文", response.text)
+        old = self.client.get("/api/conversations/conv-1/runs/run-prompt-old/node-detail/system-prompt")
+        self.assertEqual(old.status_code, 200)
+        self.assertEqual(old.headers.get("cache-control"), "private, no-store")
+        self.assertEqual(old.json()["data"]["status"], "not_recorded")
+        self.assertEqual(old.json()["data"]["reason"], "system_prompt_not_recorded")
+        for path in ("/api/conversations/conv-1/runs", "/api/conversations/conv-1/runs/run-prompt/trajectory"):
+            response = self.client.get(path)
+            self.assertEqual(response.status_code, 200)
+            self.assertNotIn("只属于当前 Run 的正文", response.text)
+            self.assertNotIn("system_prompt_snapshot", response.text)
+
 
 if __name__ == "__main__":
     unittest.main()

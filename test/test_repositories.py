@@ -274,7 +274,12 @@ class MessageRepositoryTests(unittest.TestCase):
                 user_id="user-1",
                 model_id="deepseek-chat",
                 provider="deepseek",
-                run_config={"max_steps": 3, "max_tool_calls": 5, "timeout_s": 60},
+                run_config={
+                    "max_steps": 3,
+                    "max_tool_calls": 5,
+                    "timeout_s": 60,
+                    "system_prompt_snapshot": {"sections": [{"content": "不能进入会话摘要的提示词"}]},
+                },
                 total_steps=3,
                 total_tool_calls=5,
                 status="limit_reached",
@@ -291,6 +296,8 @@ class MessageRepositoryTests(unittest.TestCase):
             self.assertEqual(result.messages[0].agent_run.status, "limit_reached")
             self.assertEqual(result.messages[0].agent_run.limit_reason, "max_steps")
             self.assertEqual(result.messages[0].agent_run.config["max_steps"], 3)
+            self.assertNotIn("system_prompt_snapshot", result.messages[0].agent_run.config)
+            self.assertNotIn("不能进入会话摘要", result.model_dump_json())
         finally:
             db.close()
             engine.dispose()

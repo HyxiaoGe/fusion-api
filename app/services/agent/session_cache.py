@@ -6,6 +6,8 @@ emitter 不碰 DB；本模块由 stream_handler (Task 9) 在 emit 调用点平�
 
 from __future__ import annotations
 
+import asyncio
+from copy import deepcopy
 from typing import Literal, TypeAlias
 
 from sqlalchemy import and_, func, or_, select
@@ -13,7 +15,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.core.logger import app_logger as logger
 from app.db.database import SessionLocal
-from app.db.models import AgentSession, AgentStep, Conversation
+from app.db.models import AgentSession, AgentStep, AgentSystemPromptSnapshot, Conversation
 from app.utils.time import utc_now
 
 _ATTEMPT_ALLOCATION_RETRIES = 3
@@ -33,6 +35,49 @@ class InvalidPreviousRunError(ValueError):
 
 class StalePreviousRunError(InvalidPreviousRunError):
     """previous run 合法但已不是当前 turn 的最新 attempt。"""
+
+
+async def write_system_prompt_snapshot(
+    *,
+    run_id: str,
+    conversation_id: str,
+    user_id: str,
+    snapshot: dict,
+) -> None:
+    """独立事务保存当次组装正文，不阻塞事件循环，不覆盖已记录的快照。"""
+    await asyncio.to_thread(_write_system_prompt_snapshot, run_id, conversation_id, user_id, deepcopy(snapshot))
+
+
+def _write_system_prompt_snapshot(run_id: str, conversation_id: str, user_id: str, snapshot: dict) -> None:
+    with SessionLocal() as session:
+        # 与同 Run 恢复共享会话锁，避免配置重置与正文写入相互覆盖。
+        _lock_conversation(session, conversation_id)
+        run = session.execute(
+            select(AgentSession)
+            .join(Conversation, Conversation.id == AgentSession.conversation_id)
+            .where(AgentSession.id == run_id, AgentSession.conversation_id == conversation_id)
+            .where(AgentSession.user_id == user_id, Conversation.user_id == user_id)
+        ).scalar_one_or_none()
+        if run is None:
+            raise ValueError("系统提示词所属运行不存在或无权访问")
+        existing = session.get(AgentSystemPromptSnapshot, run_id)
+        if existing is not None:
+            if (
+                existing.conversation_id != conversation_id
+                or existing.user_id != user_id
+                or existing.snapshot != snapshot
+            ):
+                raise ValueError("该运行已保存不同的系统提示词快照")
+            return
+        session.add(
+            AgentSystemPromptSnapshot(
+                run_id=run_id,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                snapshot=snapshot,
+            )
+        )
+        session.commit()
 
 
 async def write_session_started(

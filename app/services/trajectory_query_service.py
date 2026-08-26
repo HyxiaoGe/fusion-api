@@ -6,11 +6,15 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from pydantic import ValidationError
+
 from app.db.models import AgentEvent, AgentSession
 from app.db.trajectory_repository import TrajectoryRepository
 from app.schemas.admin_trajectory import AdminTrajectorySnapshot, AdminTrajectoryToolCall
 from app.schemas.trajectory import (
     LlmNodeDetail,
+    SystemPromptNodeDetail,
+    SystemPromptSnapshot,
     ToolNodeDetail,
     TrajectoryCompleteness,
     TrajectoryEventRecord,
@@ -29,6 +33,7 @@ from app.services.agent.trajectory_reconciliation import (
 )
 from app.services.mcp.amap_product_tools import AMAP_PRODUCT_TOOL_NAMES
 from app.services.mcp.flyai_travel_tools import FLYAI_TRAVEL_TOOL_NAMES
+from app.utils.prompt_fingerprint import fingerprint_system_messages
 from app.utils.time import as_utc, utc_now
 
 _USER_WEB_SEARCH_ARGUMENT_FIELDS = ("query", "count", "domains", "recency_days", "intent")
@@ -142,6 +147,76 @@ class TrajectoryQueryService:
         llm_round_id: str,
     ) -> TrajectoryNodeDetailResponse | None:
         return self._get_llm_node_detail(conversation_id, run_id, llm_round_id, user_id=None)
+
+    def get_user_system_prompt_node_detail(
+        self,
+        conversation_id: str,
+        run_id: str,
+        user_id: str,
+    ) -> TrajectoryNodeDetailResponse | None:
+        """正文仅来自同一 Run 的持久快照，不执行当前提示词模板。"""
+        run = self._repository.get_detail_run(conversation_id, run_id, user_id)
+        if run is None:
+            return None
+        event = self._repository.get_system_prompt_prepared_event(conversation_id, run_id)
+        if event is not None and not isinstance(event.payload, dict):
+            return self._unavailable_system_prompt_detail("degraded", "system_prompt_detail_invalid")
+        metadata = event.payload if event is not None else None
+        if metadata is not None and metadata.get("status") == "failed":
+            return self._unavailable_system_prompt_detail("degraded", "system_prompt_assembly_failed")
+
+        snapshot = self._repository.get_system_prompt_snapshot(conversation_id, run_id, user_id)
+        if snapshot is None:
+            if metadata is None:
+                awaiting_ledger = run.status == "running" or (
+                    run.terminal_at is not None
+                    and as_utc(self._now_provider()) - as_utc(run.terminal_at) <= self._detail_settle_grace
+                )
+                if awaiting_ledger:
+                    return self._unavailable_system_prompt_detail("pending", "system_prompt_detail_settling")
+            if metadata is not None and metadata.get("detail_status") in {"available", "degraded"}:
+                return self._unavailable_system_prompt_detail("degraded", "system_prompt_detail_missing")
+            return self._unavailable_system_prompt_detail("not_recorded", "system_prompt_not_recorded")
+
+        try:
+            persisted = SystemPromptSnapshot.model_validate(snapshot)
+            messages = [{"role": "system", "content": section.content} for section in persisted.sections]
+            valid = (
+                len({section.section_id for section in persisted.sections}) == len(persisted.sections)
+                and persisted.fingerprint == fingerprint_system_messages(messages)
+                and persisted.char_count == sum(len(section.content) for section in persisted.sections)
+                and (metadata is None or metadata.get("fingerprint") == persisted.fingerprint)
+                and (
+                    metadata is None
+                    or all(
+                        metadata[key] == value
+                        for key, value in {
+                            "section_ids": [section.section_id for section in persisted.sections],
+                            "template_version": persisted.template_version,
+                            "char_count": persisted.char_count,
+                        }.items()
+                        if key in metadata
+                    )
+                )
+            )
+        except (ValidationError, UnicodeError):
+            valid = False
+        if not valid:
+            return self._unavailable_system_prompt_detail("degraded", "system_prompt_detail_invalid")
+
+        return TrajectoryNodeDetailResponse(
+            status="available",
+            node_type="system_prompt",
+            available_sections=["summary", "prompt"],
+            detail=SystemPromptNodeDetail(
+                template_version=persisted.template_version,
+                fingerprint=persisted.fingerprint,
+                char_count=persisted.char_count,
+                sections=persisted.sections,
+            ),
+            redacted_fields=[],
+            truncated_fields=[],
+        )
 
     def _get_llm_node_detail(
         self,
@@ -353,6 +428,18 @@ class TrajectoryQueryService:
         return TrajectoryNodeDetailResponse(
             status=status,
             node_type="llm",
+            available_sections=[],
+            detail=None,
+            redacted_fields=[],
+            truncated_fields=[],
+            reason=reason,
+        )
+
+    @staticmethod
+    def _unavailable_system_prompt_detail(status: str, reason: str) -> TrajectoryNodeDetailResponse:
+        return TrajectoryNodeDetailResponse(
+            status=status,
+            node_type="system_prompt",
             available_sections=[],
             detail=None,
             redacted_fields=[],
