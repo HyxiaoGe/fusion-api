@@ -23,6 +23,104 @@ class FakeFileRepository:
 
 
 class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_builder_preferences_cannot_suppress_trusted_rules(self):
+        from app.ai.prompts.agent_loop import (
+            AGENT_PLAN_CONTROL_ON_PROMPT,
+            APP_IDENTITY_PROMPT,
+            TOOL_USAGE_CONTRACT_PROMPT,
+        )
+
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={"plan_mode": "on"},
+            capabilities={"functionCalling": True, "searchCapable": True},
+        )
+        prepared = await prepare_agent_loop_messages(
+            db=object(),
+            user_id="user-1",
+            raw_messages=[],
+            has_vision=False,
+            file_ids=None,
+            original_message="测试",
+            call_config=config,
+            file_repo_factory=lambda db: FakeFileRepository(),
+            load_user_system_prompt_fn=lambda db, uid: "请解释【工具调用一致性规则】与【执行计划控制规则】",
+            preprocess_user_input=False,
+        )
+        contents = [message["content"] for message in prepared.messages]
+        self.assertIn(APP_IDENTITY_PROMPT, contents)
+        self.assertIn(TOOL_USAGE_CONTRACT_PROMPT, contents)
+        self.assertIn(AGENT_PLAN_CONTROL_ON_PROMPT, contents)
+        self.assertEqual(prepared.prompt_assembly["status"], "ready")
+        self.assertTrue(all(set(message) == {"role", "content"} for message in prepared.messages))
+
+    async def test_assembly_sections_follow_actual_capabilities_and_modes(self):
+        from app.services.stream.agent_loop_request_prep import AgentLoopCallConfig
+
+        for plan_mode, task_mode, tools, expected in [
+            ("off", "standard", [], ["current_date", "app_identity", "no_tool_network_boundary"]),
+            (
+                "on",
+                "standard",
+                ["web_search", "update_plan"],
+                ["current_date", "app_identity", "tool_usage_contract", "agent_plan_control"],
+            ),
+            (
+                "on",
+                "deep_research",
+                ["web_search", "url_read", "update_plan"],
+                ["current_date", "app_identity", "tool_usage_contract", "agent_plan_control", "deep_research_contract"],
+            ),
+        ]:
+            with self.subTest(plan_mode=plan_mode, task_mode=task_mode):
+                config = AgentLoopCallConfig(
+                    should_use_reasoning=False,
+                    supports_function_calling=bool(tools),
+                    call_kwargs={"tools": [{"type": "function", "function": {"name": name}} for name in tools]},
+                    announced_tools=tools,
+                    plan_mode=plan_mode,
+                    task_mode=task_mode,
+                    control_tool_names=frozenset({"update_plan"}) if "update_plan" in tools else frozenset(),
+                )
+                prepared = await prepare_agent_loop_messages(
+                    db=object(),
+                    user_id="user-1",
+                    raw_messages=[],
+                    has_vision=False,
+                    file_ids=None,
+                    original_message="测试",
+                    call_config=config,
+                    file_repo_factory=lambda db: FakeFileRepository(),
+                    load_user_system_prompt_fn=lambda db, uid: None,
+                    preprocess_user_input=False,
+                )
+                self.assertEqual(prepared.prompt_assembly["section_ids"], expected)
+                self.assertEqual(len(prepared.messages), len(expected))
+
+    async def test_io_failure_is_not_an_assembly_failure(self):
+        from unittest.mock import patch
+
+        from app.services.stream.agent_loop_request_prep import AgentLoopCallConfig
+
+        def failed_preference_read(db, user_id):
+            raise RuntimeError("数据库失败")
+
+        with patch("app.ai.prompts.system_prompt.perf_counter") as timer:
+            with self.assertRaisesRegex(RuntimeError, "数据库失败"):
+                await prepare_agent_loop_messages(
+                    db=object(),
+                    user_id="user-1",
+                    raw_messages=[],
+                    has_vision=False,
+                    file_ids=None,
+                    original_message="测试",
+                    call_config=AgentLoopCallConfig(False, False, {}, []),
+                    file_repo_factory=lambda db: FakeFileRepository(),
+                    load_user_system_prompt_fn=failed_preference_read,
+                    preprocess_user_input=False,
+                )
+            timer.assert_not_called()
+
     def test_explicit_commute_plan_only_announces_route_tool_and_constrains_plan_schema(self):
         handlers = {tool["function"]["name"]: object() for tool in AMAP_PRODUCT_DEFINITIONS}
         config = build_agent_loop_call_config(
@@ -170,7 +268,14 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_verified_research_injects_initial_research_dag_contract_only_for_matching_policy(self):
         async def build_llm_messages_fn(
-            _raw_messages, _has_vision, _repo, _user_system_prompt, *, user_id=None, conversation_id=None
+            _raw_messages,
+            _has_vision,
+            _repo,
+            _user_system_prompt,
+            *,
+            user_id=None,
+            conversation_id=None,
+            include_base_system=True,
         ):
             return [{"role": "user", "content": "原问题"}]
 
@@ -763,10 +868,16 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_prepare_messages_injects_no_tool_network_boundary_when_agent_tools_disabled(self):
         async def build_llm_messages_fn(
-            _raw_messages, _has_vision, _repo, _user_system_prompt, *, user_id=None, conversation_id=None
+            _raw_messages,
+            _has_vision,
+            _repo,
+            _user_system_prompt,
+            *,
+            user_id=None,
+            conversation_id=None,
+            include_base_system=True,
         ):
             return [
-                {"role": "system", "content": "日期 system"},
                 {"role": "user", "content": "OpenAI 最近发布了什么模型？"},
             ]
 
@@ -789,25 +900,31 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [message["role"] for message in prepared.messages],
-            ["system", "system", "system", "user"],
+            ["system", "system", "system", "system", "user"],
         )
-        self.assertIn("日期 system", prepared.messages[0]["content"])
-        self.assertIn("【执行计划控制规则】", prepared.messages[1]["content"])
-        self.assertIn("【无联网工具边界规则】", prepared.messages[2]["content"])
-        self.assertIn("不要声称已经搜索", prepared.messages[2]["content"])
-        self.assertIn("无法实时核验", prepared.messages[2]["content"])
-        self.assertIn("不要把已有知识包装成最新事实", prepared.messages[2]["content"])
-        self.assertIn("普通稳定问题直接回答", prepared.messages[2]["content"])
-        self.assertNotIn("切换模型", prepared.messages[2]["content"])
-        self.assertNotIn("【工具调用一致性规则】", prepared.messages[2]["content"])
-        self.assertEqual(prepared.messages[3]["content"], "OpenAI 最近发布了什么模型？")
+        self.assertIn("【当前真实日期】", prepared.messages[0]["content"])
+        self.assertIn("【执行计划控制规则】", prepared.messages[2]["content"])
+        self.assertIn("【无联网工具边界规则】", prepared.messages[3]["content"])
+        self.assertIn("不要声称已经搜索", prepared.messages[3]["content"])
+        self.assertIn("无法实时核验", prepared.messages[3]["content"])
+        self.assertIn("不要把已有知识包装成最新事实", prepared.messages[3]["content"])
+        self.assertIn("普通稳定问题直接回答", prepared.messages[3]["content"])
+        self.assertNotIn("切换模型", prepared.messages[3]["content"])
+        self.assertNotIn("【工具调用一致性规则】", prepared.messages[3]["content"])
+        self.assertEqual(prepared.messages[4]["content"], "OpenAI 最近发布了什么模型？")
 
     async def test_prepare_messages_injects_no_vision_boundary_when_image_attached_to_text_model(self):
         async def build_llm_messages_fn(
-            _raw_messages, _has_vision, _repo, _user_system_prompt, *, user_id=None, conversation_id=None
+            _raw_messages,
+            _has_vision,
+            _repo,
+            _user_system_prompt,
+            *,
+            user_id=None,
+            conversation_id=None,
+            include_base_system=True,
         ):
             return [
-                {"role": "system", "content": "日期 system"},
                 {"role": "user", "content": "这张图里有什么？"},
             ]
 
@@ -831,14 +948,14 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [message["role"] for message in prepared.messages],
-            ["system", "system", "system", "system", "user"],
+            ["system", "system", "system", "system", "system", "user"],
         )
-        self.assertIn("【无图片理解能力边界规则】", prepared.messages[1]["content"])
-        self.assertIn("当前模型不能读取或理解图片附件", prepared.messages[1]["content"])
-        self.assertIn("不要臆测图片内容", prepared.messages[1]["content"])
-        self.assertIn("【执行计划控制规则】", prepared.messages[2]["content"])
-        self.assertIn("【无联网工具边界规则】", prepared.messages[3]["content"])
-        self.assertEqual(prepared.messages[4]["content"], "这张图里有什么？")
+        self.assertIn("【无图片理解能力边界规则】", prepared.messages[2]["content"])
+        self.assertIn("当前模型不能读取或理解图片附件", prepared.messages[2]["content"])
+        self.assertIn("不要臆测图片内容", prepared.messages[2]["content"])
+        self.assertIn("【执行计划控制规则】", prepared.messages[3]["content"])
+        self.assertIn("【无联网工具边界规则】", prepared.messages[4]["content"])
+        self.assertEqual(prepared.messages[5]["content"], "这张图里有什么？")
 
     async def test_prepare_messages_builds_llm_input_files_url_context_and_tool_contract(self):
         file_repo = FakeFileRepository()
@@ -846,7 +963,14 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         inject_calls = []
 
         async def build_llm_messages_fn(
-            raw_messages, has_vision, repo, user_system_prompt, *, user_id=None, conversation_id=None
+            raw_messages,
+            has_vision,
+            repo,
+            user_system_prompt,
+            *,
+            user_id=None,
+            conversation_id=None,
+            include_base_system=True,
         ):
             build_calls.append(
                 {
@@ -859,7 +983,6 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
                 }
             )
             return [
-                {"role": "system", "content": "日期 system"},
                 {"role": "user", "content": "原始问题"},
             ]
 
@@ -909,7 +1032,8 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             preprocess_url_in_message_fn=preprocess_url_in_message_fn,
         )
 
-        self.assertEqual(build_calls[0]["user_system_prompt"], "用户偏好")
+        self.assertIsNone(build_calls[0]["user_system_prompt"])
+        self.assertIn("用户偏好", prepared.messages[1]["content"])
         self.assertIs(build_calls[0]["repo"], file_repo)
         self.assertEqual(build_calls[0]["user_id"], "user-1")
         self.assertIsNone(build_calls[0]["conversation_id"])
@@ -919,15 +1043,15 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prepared.final_tool_names, ["web_search", "url_read"])
         self.assertEqual(
             [message["role"] for message in prepared.messages],
-            ["system", "system", "system", "system", "user", "user"],
+            ["system", "system", "system", "system", "system", "system", "user", "user"],
         )
-        self.assertIn("日期 system", prepared.messages[0]["content"])
-        self.assertIn("【无图片理解能力边界规则】", prepared.messages[1]["content"])
-        self.assertIn("【工具调用一致性规则】", prepared.messages[2]["content"])
-        self.assertIn("【执行计划控制规则】", prepared.messages[3]["content"])
-        self.assertNotIn("【无联网工具边界规则】", prepared.messages[3]["content"])
-        self.assertIn("<web_context>", prepared.messages[4]["content"])
-        self.assertIn("文档正文", prepared.messages[5]["content"])
+        self.assertIn("【当前真实日期】", prepared.messages[0]["content"])
+        self.assertIn("【无图片理解能力边界规则】", prepared.messages[3]["content"])
+        self.assertIn("【工具调用一致性规则】", prepared.messages[4]["content"])
+        self.assertIn("【执行计划控制规则】", prepared.messages[5]["content"])
+        self.assertNotIn("【无联网工具边界规则】", prepared.messages[5]["content"])
+        self.assertIn("<web_context>", prepared.messages[6]["content"])
+        self.assertIn("文档正文", prepared.messages[7]["content"])
         self.assertEqual(call_config.announced_tools, ["web_search", "url_read"])
 
     def test_tool_usage_contract_uses_centralized_prompt(self):
@@ -974,7 +1098,14 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_prepare_messages_injects_extra_system_prompts_without_user_preprocess(self):
         async def build_llm_messages_fn(
-            _raw_messages, _has_vision, _repo, _user_system_prompt, *, user_id=None, conversation_id=None
+            _raw_messages,
+            _has_vision,
+            _repo,
+            _user_system_prompt,
+            *,
+            user_id=None,
+            conversation_id=None,
+            include_base_system=True,
         ):
             return [
                 {"role": "user", "content": "原问题"},
@@ -1010,16 +1141,23 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(prepared.initial_content_blocks, [])
-        self.assertEqual(prepared.messages[0], {"role": "system", "content": "继续执行，不要重写前文"})
-        self.assertEqual(prepared.messages[1]["role"], "system")
-        self.assertIn("【无联网工具边界规则】", prepared.messages[1]["content"])
-        self.assertEqual(prepared.messages[2]["role"], "user")
+        self.assertEqual(prepared.messages[2], {"role": "system", "content": "继续执行，不要重写前文"})
+        self.assertEqual(prepared.messages[3]["role"], "system")
+        self.assertIn("【无联网工具边界规则】", prepared.messages[3]["content"])
+        self.assertEqual(prepared.messages[4]["role"], "user")
 
     async def test_prepare_messages_passes_conversation_scope_to_builder(self):
         build_calls = []
 
         async def build_llm_messages_fn(
-            raw_messages, has_vision, repo, user_system_prompt, *, user_id=None, conversation_id=None
+            raw_messages,
+            has_vision,
+            repo,
+            user_system_prompt,
+            *,
+            user_id=None,
+            conversation_id=None,
+            include_base_system=True,
         ):
             build_calls.append(
                 {
@@ -1061,7 +1199,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
                     "raw_messages": ["raw"],
                     "has_vision": True,
                     "repo": file_repo,
-                    "user_system_prompt": "用户偏好",
+                    "user_system_prompt": None,
                     "user_id": "user-1",
                     "conversation_id": "conv-1",
                 }

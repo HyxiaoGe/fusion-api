@@ -10,7 +10,7 @@ LLM 消息构建模块
 import base64
 from typing import Dict, List, Optional
 
-from app.ai.prompts.agent_loop import build_current_date_system_prompt, get_app_identity_prompt
+from app.ai.prompts.system_prompt import build_base_sections
 from app.core.logger import app_logger as logger
 from app.db.repositories import FileRepository
 from app.services.file_service import is_image_mime
@@ -66,6 +66,7 @@ async def build_llm_messages(
     *,
     user_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
+    include_base_system: bool = True,
 ) -> List[dict]:
     """
     将 content blocks 消息列表转为 LLM 可消费的 dict 格式。
@@ -79,23 +80,11 @@ async def build_llm_messages(
     """
     result = []
 
-    # 注入当前日期（始终注入，对所有对话生效）
-    result.append({"role": "system", "content": build_current_date_system_prompt()})
-
-    # 注入用户自定义个性化 prompt
-    if user_system_prompt and user_system_prompt.strip():
-        result.append(
-            {
-                "role": "system",
-                "content": (
-                    "以下是用户的个性化偏好设置，请在回答中自然遵守，但不要主动提及这些设置本身：\n\n"
-                    f"{user_system_prompt.strip()}"
-                ),
-            }
+    # 主聊天由纯组装器统一注入；其他调用保持基础规则保证。
+    if include_base_system:
+        result.extend(
+            {"role": "system", "content": section.content} for section in build_base_sections(user_system_prompt)
         )
-
-    # 注入产品身份约束（始终注入，并放在用户偏好之后，避免被个性化设置覆盖）
-    result.append({"role": "system", "content": get_app_identity_prompt()})
 
     # 计算最近 N 轮用户消息的起始索引，用于控制图片注入范围
     vision_cutoff_idx = 0

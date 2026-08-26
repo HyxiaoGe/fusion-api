@@ -14,6 +14,7 @@ from app.ai.prompts.agent_loop import (
     get_no_vision_file_boundary_prompt,
     get_tool_usage_contract_prompt,
 )
+from app.ai.prompts.system_prompt import SystemPromptSection, assemble_system_prompt
 from app.ai.tools import build_url_read_tool, build_web_search_tool
 from app.db.repositories import FileRepository
 from app.services.agent.plan_coordinator import PlanMode
@@ -128,6 +129,7 @@ class AgentLoopPreparedMessages:
     messages: list[dict]
     initial_content_blocks: list[Any] = field(default_factory=list)
     final_tool_names: list[str] = field(default_factory=list)
+    prompt_assembly: dict[str, Any] | None = None
 
 
 def announced_tool_names_from_call_kwargs(call_kwargs: dict) -> list[str]:
@@ -338,11 +340,11 @@ async def prepare_agent_loop_messages(
         raw_messages,
         has_vision,
         file_repo,
-        user_system_prompt,
+        None,
+        include_base_system=False,
         user_id=user_id,
         conversation_id=conversation_id,
     )
-    messages = inject_extra_system_prompts(messages, extra_system_prompts or [])
 
     if preprocess_user_input:
         has_image_attachment = _has_image_file(
@@ -372,18 +374,31 @@ async def prepare_agent_loop_messages(
         initial_content_blocks = []
         has_image_attachment = False
 
-    if has_image_attachment and not has_vision:
-        messages = inject_no_vision_file_boundary(messages)
-    messages = inject_tool_usage_contract(messages, call_config.call_kwargs)
-    messages = inject_amap_fact_boundary(messages, call_config.call_kwargs)
-    messages = inject_flyai_travel_fact_boundary(messages, call_config.call_kwargs)
-    messages = inject_plan_control_contract(messages, call_config)
-    messages = inject_verified_research_plan_contract(messages, call_config)
-    messages = inject_deep_research_contract(messages, call_config)
-    messages = inject_no_tool_network_boundary(messages, call_config.call_kwargs)
+    def selected_sections():
+        # 只在空消息集上选择可信模板，用户文本不会影响段落是否存在。
+        if has_image_attachment and not has_vision:
+            yield SystemPromptSection("no_vision_file_boundary", get_no_vision_file_boundary_prompt())
+        selectors = [
+            ("tool_usage_contract", inject_tool_usage_contract, call_config.call_kwargs),
+            ("amap_fact_boundary", inject_amap_fact_boundary, call_config.call_kwargs),
+            ("flyai_travel_fact_boundary", inject_flyai_travel_fact_boundary, call_config.call_kwargs),
+            ("agent_plan_control", inject_plan_control_contract, call_config),
+            ("verified_research_plan", inject_verified_research_plan_contract, call_config),
+            ("deep_research_contract", inject_deep_research_contract, call_config),
+            ("no_tool_network_boundary", inject_no_tool_network_boundary, call_config.call_kwargs),
+        ]
+        for index, prompt in enumerate(extra_system_prompts or []):
+            yield SystemPromptSection(f"extra_system_{index}", prompt)
+        for section_id, selector, config in selectors:
+            for message in selector([], config):
+                yield SystemPromptSection(section_id, message["content"])
+
+    assembly = assemble_system_prompt(user_system_prompt=user_system_prompt, sections=selected_sections)
+    messages = [*assembly.messages, *messages]
     return AgentLoopPreparedMessages(
         messages=messages,
         initial_content_blocks=initial_content_blocks,
+        prompt_assembly=assembly.metadata,
         final_tool_names=[
             name
             for name in announced_tool_names_from_call_kwargs(call_config.call_kwargs)
@@ -460,7 +475,7 @@ def inject_tool_usage_contract(messages: list[dict], call_kwargs: dict) -> list[
     """工具模式下补一条 system 约束，避免 reasoning 口头承诺搜索但不发 tool_call。"""
     if "web_search" not in set(announced_tool_names_from_call_kwargs(call_kwargs)):
         return messages
-    if any(msg.get("role") == "system" and "【工具调用一致性规则】" in str(msg.get("content", "")) for msg in messages):
+    if any(msg.get("role") == "system" and msg.get("content") == get_tool_usage_contract_prompt() for msg in messages):
         return messages
 
     insert_at = 0
@@ -475,9 +490,7 @@ def inject_amap_fact_boundary(messages: list[dict], call_kwargs: dict) -> list[d
     announced_tools = set(announced_tool_names_from_call_kwargs(call_kwargs))
     if not AMAP_PRODUCT_TOOL_NAMES.intersection(announced_tools):
         return messages
-    if any(
-        msg.get("role") == "system" and "【地点与路线事实边界规则】" in str(msg.get("content", "")) for msg in messages
-    ):
+    if any(msg.get("role") == "system" and msg.get("content") == AMAP_FACT_BOUNDARY_SYSTEM_PROMPT for msg in messages):
         return messages
 
     insert_at = 0
@@ -494,7 +507,8 @@ def inject_flyai_travel_fact_boundary(messages: list[dict], call_kwargs: dict) -
     if not FLYAI_TRAVEL_TOOL_NAMES.intersection(announced_tools):
         return messages
     if any(
-        msg.get("role") == "system" and "【航班与高铁事实边界规则】" in str(msg.get("content", "")) for msg in messages
+        msg.get("role") == "system" and msg.get("content") == FLYAI_TRAVEL_FACT_BOUNDARY_SYSTEM_PROMPT
+        for msg in messages
     ):
         return messages
 
@@ -513,7 +527,10 @@ def inject_plan_control_contract(
 
     if "update_plan" not in getattr(call_config, "control_tool_names", frozenset()):
         return messages
-    if any(msg.get("role") == "system" and "【执行计划控制规则】" in str(msg.get("content", "")) for msg in messages):
+    if any(
+        msg.get("role") == "system" and msg.get("content") == get_agent_plan_control_prompt(call_config.plan_mode)
+        for msg in messages
+    ):
         return messages
 
     insert_at = 0
@@ -536,7 +553,7 @@ def inject_verified_research_plan_contract(
     if "verified_research_request" not in policy_reasons:
         return messages
     if any(
-        message.get("role") == "system" and "【可核验证据计划规则】" in str(message.get("content", ""))
+        message.get("role") == "system" and message.get("content") == VERIFIED_RESEARCH_PLAN_CONTRACT_PROMPT
         for message in messages
     ):
         return messages
@@ -557,7 +574,7 @@ def inject_deep_research_contract(
     if getattr(call_config, "task_mode", "standard") != "deep_research":
         return messages
     if any(
-        message.get("role") == "system" and "【深度研究执行约束】" in str(message.get("content", ""))
+        message.get("role") == "system" and message.get("content") == DEEP_RESEARCH_CONTRACT_PROMPT
         for message in messages
     ):
         return messages
@@ -582,7 +599,9 @@ def inject_no_tool_network_boundary(messages: list[dict], call_kwargs: dict) -> 
         or any(name.startswith("mcp_") for name in announced_tools)
     ):
         return messages
-    if any(msg.get("role") == "system" and "【无联网工具边界规则】" in str(msg.get("content", "")) for msg in messages):
+    if any(
+        msg.get("role") == "system" and msg.get("content") == get_no_tool_network_boundary_prompt() for msg in messages
+    ):
         return messages
 
     insert_at = 0
@@ -595,7 +614,7 @@ def inject_no_tool_network_boundary(messages: list[dict], call_kwargs: dict) -> 
 def inject_no_vision_file_boundary(messages: list[dict]) -> list[dict]:
     """图片已附加但当前模型无 vision 时，给 LLM 明确能力边界，避免臆测图片内容。"""
     if any(
-        msg.get("role") == "system" and "【无图片理解能力边界规则】" in str(msg.get("content", "")) for msg in messages
+        msg.get("role") == "system" and msg.get("content") == get_no_vision_file_boundary_prompt() for msg in messages
     ):
         return messages
 

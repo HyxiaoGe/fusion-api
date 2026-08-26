@@ -9,6 +9,12 @@ from app.services.chat.message_builder import build_llm_messages
 
 
 class MessageBuilderTests(unittest.IsolatedAsyncioTestCase):
+    def test_current_date_keeps_historical_queries_and_converts_timezone(self):
+        prompt = build_current_date_system_prompt(datetime(2026, 7, 16, 20, 0, tzinfo=timezone.utc))
+        self.assertTrue(prompt.startswith("【当前真实日期】2026年7月17日"))
+        self.assertIn("历史", prompt)
+        self.assertNotIn("严禁使用", prompt)
+
     def test_current_date_prompt_includes_relative_date_anchors(self):
         prompt = build_current_date_system_prompt(datetime(2026, 7, 16, 9, 0, tzinfo=timezone(timedelta(hours=8))))
 

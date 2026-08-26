@@ -15,18 +15,28 @@ class PromptRuntimeTemplatesTests(unittest.TestCase):
 
         self.assertEqual(prompt, "标题：Redis")
 
-    def test_agent_loop_prompt_getter_uses_runtime_template_override(self):
+    def test_agent_loop_prompt_getter_uses_code_template(self):
         from app.ai.prompts import agent_loop
 
-        with patch.object(
-            agent_loop,
-            "get_runtime_prompt_template",
-            return_value="覆盖后的工具规则",
-            create=True,
-        ):
-            prompt = agent_loop.get_tool_usage_contract_prompt()
+        with patch.object(agent_loop, "get_runtime_prompt_template", side_effect=AssertionError("不应读取运行时模板")):
+            self.assertEqual(agent_loop.get_app_identity_prompt(), agent_loop.APP_IDENTITY_PROMPT)
+            self.assertEqual(agent_loop.get_tool_usage_contract_prompt(), agent_loop.TOOL_USAGE_CONTRACT_PROMPT)
+            self.assertEqual(
+                agent_loop.get_no_tool_network_boundary_prompt(), agent_loop.NO_TOOL_NETWORK_BOUNDARY_PROMPT
+            )
+            self.assertEqual(agent_loop.get_no_vision_file_boundary_prompt(), agent_loop.NO_VISION_FILE_BOUNDARY_PROMPT)
+            self.assertEqual(agent_loop.get_agent_plan_control_prompt("on"), agent_loop.AGENT_PLAN_CONTROL_ON_PROMPT)
+            self.assertEqual(
+                agent_loop.get_agent_plan_control_prompt("auto"), agent_loop.AGENT_PLAN_CONTROL_AUTO_PROMPT
+            )
+            self.assertEqual(agent_loop.get_continuation_system_prompt(), agent_loop.CONTINUATION_SYSTEM_PROMPT)
 
-        self.assertEqual(prompt, "覆盖后的工具规则")
+    def test_summary_and_url_description_keep_runtime_resolution(self):
+        from app.ai.prompts import agent_loop
+
+        with patch.object(agent_loop, "get_runtime_prompt_template", return_value="保留运行时模板"):
+            self.assertEqual(agent_loop.get_limit_summary_prompt(), "保留运行时模板")
+            self.assertEqual(agent_loop.get_url_read_tool_description(), "保留运行时模板")
 
     def test_build_url_read_tool_uses_runtime_description(self):
         from app.ai import tools
@@ -40,11 +50,12 @@ class PromptRuntimeTemplatesTests(unittest.TestCase):
 
         self.assertEqual(tool["function"]["description"], "动态读取网页说明")
 
-    def test_message_builder_injects_runtime_app_identity_prompt(self):
+    def test_message_builder_uses_shared_base_template(self):
+        from app.ai.prompts import system_prompt
         from app.services.chat import message_builder
 
         with patch.object(
-            message_builder,
+            system_prompt,
             "get_app_identity_prompt",
             return_value="运行时 Fusion 身份规则",
             create=True,
