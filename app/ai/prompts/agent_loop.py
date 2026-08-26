@@ -1,6 +1,6 @@
 """Agent loop 提示词常量。
 
-当前先以代码常量维护，待搜索/深读策略稳定后迁移到 PromptHub。
+主聊天规则以代码维护；摘要和工具说明保留现有解析路径。
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ CHINA_TZ = timezone(timedelta(hours=8))
 def build_current_date_system_prompt(now: datetime | None = None) -> str:
     """为 LLM 注入当前真实日期，避免模型凭训练 cutoff 猜年份。"""
     current = now or datetime.now(CHINA_TZ)
+    current = current.replace(tzinfo=CHINA_TZ) if current.tzinfo is None else current.astimezone(CHINA_TZ)
     weekday_cn = ["一", "二", "三", "四", "五", "六", "日"][current.weekday()]
     tomorrow = current.date() + timedelta(days=1)
     week_start = current.date() - timedelta(days=current.weekday())
@@ -23,7 +24,6 @@ def build_current_date_system_prompt(now: datetime | None = None) -> str:
     this_sunday = week_start + timedelta(days=6)
     next_saturday = this_saturday + timedelta(days=7)
     next_sunday = this_sunday + timedelta(days=7)
-    forbidden_years = ", ".join(str(y) for y in range(current.year - 3, current.year))
     return (
         f"【当前真实日期】{current.year}年{current.month}月{current.day}日（星期{weekday_cn}），"
         f"北京时间 {current.strftime('%H:%M')}。\n\n"
@@ -35,8 +35,7 @@ def build_current_date_system_prompt(now: datetime | None = None) -> str:
         f"下周日是 {_format_date_with_weekday(next_sunday)}。\n\n"
         f"硬性规则：\n"
         f"1. 涉及『最新』『当前』『目前』等时效性问题，必须基于上述日期作答。\n"
-        f"2. **生成搜索关键词时，年份必须使用 {current.year} 或更晚，"
-        f"严禁使用 {forbidden_years} 等过去年份**。\n"
+        f"2. 搜索年份应匹配用户问题；历史事件或指定年份查询应保留对应历史年份，不得强制改为当前年份。\n"
         f"3. 不要相信训练数据中的『当前年份』印象——你的训练 cutoff 早于现在。\n"
         f"4. 用户使用『今天』『明天』『本周末』『下周末』等相对日期时，"
         f"必须先按上述锚点换算；搜索词与最终答案中的日期、星期必须一致。"
@@ -262,25 +261,25 @@ def get_runtime_prompt_template(name: str, fallback: str) -> str:
 
 
 def get_app_identity_prompt() -> str:
-    return get_runtime_prompt_template("app_identity", APP_IDENTITY_PROMPT)
+    return APP_IDENTITY_PROMPT
 
 
 def get_tool_usage_contract_prompt() -> str:
-    return get_runtime_prompt_template("tool_usage_contract", TOOL_USAGE_CONTRACT_PROMPT)
+    return TOOL_USAGE_CONTRACT_PROMPT
 
 
 def get_no_tool_network_boundary_prompt() -> str:
-    return get_runtime_prompt_template("no_tool_network_boundary", NO_TOOL_NETWORK_BOUNDARY_PROMPT)
+    return NO_TOOL_NETWORK_BOUNDARY_PROMPT
 
 
 def get_agent_plan_control_prompt(plan_mode: str) -> str:
     if plan_mode == "on":
-        return get_runtime_prompt_template("agent_plan_control_on", AGENT_PLAN_CONTROL_ON_PROMPT)
-    return get_runtime_prompt_template("agent_plan_control_auto", AGENT_PLAN_CONTROL_AUTO_PROMPT)
+        return AGENT_PLAN_CONTROL_ON_PROMPT
+    return AGENT_PLAN_CONTROL_AUTO_PROMPT
 
 
 def get_no_vision_file_boundary_prompt() -> str:
-    return get_runtime_prompt_template("no_vision_file_boundary", NO_VISION_FILE_BOUNDARY_PROMPT)
+    return NO_VISION_FILE_BOUNDARY_PROMPT
 
 
 def get_url_read_tool_description() -> str:
@@ -292,4 +291,4 @@ def get_limit_summary_prompt() -> str:
 
 
 def get_continuation_system_prompt() -> str:
-    return get_runtime_prompt_template("continuation_system", CONTINUATION_SYSTEM_PROMPT)
+    return CONTINUATION_SYSTEM_PROMPT

@@ -36,7 +36,7 @@ _EVENT_FIELDS: dict[str, frozenset[str]] = {
     "run_interrupted": frozenset({"reason"}),
     "run_failed": frozenset({"error_code", "message"}),
     "run_completed": frozenset({"total_steps", "total_tool_calls", "finish_reason"}),
-    "llm_round_started": frozenset({"llm_round_id", "round_index", "model", "provider"}),
+    "llm_round_started": frozenset({"llm_round_id", "round_index", "model", "provider", "system_prompt_fingerprint"}),
     "llm_round_first_output_delta": frozenset({"llm_round_id", "delta_kind", "ttft_ms"}),
     "llm_round_completed": frozenset(
         {
@@ -94,6 +94,20 @@ _EVENT_FIELDS: dict[str, frozenset[str]] = {
     # 完整 content block 不属于 P0 脱敏账本，只保留事件存在性与协议版本。
     "content_block_upserted": frozenset({"protocol_version"}),
     "content_block_discarded": frozenset({"protocol_version", "block_id"}),
+    "system_prompt_prepared": frozenset(
+        {
+            "protocol_version",
+            "status",
+            "source",
+            "template_version",
+            "section_ids",
+            "fingerprint",
+            "char_count",
+            "duration_ms",
+            "error_code",
+            "message",
+        }
+    ),
     "context_status_updated": frozenset(
         {
             "protocol_version",
@@ -146,7 +160,7 @@ _EVIDENCE_FIELDS = frozenset(
         "citation_index",
     }
 )
-_LIST_FIELDS = frozenset({"tools", "key_findings", "source_refs"})
+_LIST_FIELDS = frozenset({"tools", "key_findings", "source_refs", "section_ids"})
 _SECRET_PATTERN = re.compile(
     r"(?i)\b(api[_-]?key|authorization|access[_-]?token|token|password|secret)\s*[:=]\s*"
     r"(?:bearer\s+)?[^\s,;]+"

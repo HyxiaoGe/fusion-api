@@ -271,6 +271,7 @@ class AgentEventEmitter:
         model: str,
         provider: str,
         parent_step_id: str | None = None,
+        system_prompt_fingerprint: str | None = None,
     ) -> None:
         await self._emit(
             ev.LLMRoundStarted(
@@ -279,6 +280,7 @@ class AgentEventEmitter:
                 round_index=round_index,
                 model=model,
                 provider=provider,
+                system_prompt_fingerprint=system_prompt_fingerprint,
                 **self._envelope(parent_step_id=parent_step_id),
             )
         )
@@ -633,6 +635,40 @@ class AgentEventEmitter:
                 protocol_version=2,
                 block_id=block_id,
                 **self._envelope(),
+            )
+        )
+
+    async def system_prompt_prepared(
+        self,
+        *,
+        status: str,
+        source: str,
+        template_version: str,
+        section_ids: list[str],
+        duration_ms: int,
+        fingerprint: str | None = None,
+        char_count: int | None = None,
+        error_code: str | None = None,
+        message: str | None = None,
+    ) -> None:
+        if self._message_id is None:
+            raise RuntimeError("system_prompt_prepared 必须在 run_started 之后发送")
+        # 错误原文可能含偏好或模板内容；事件只发送固定文案。
+        safe_error = "assembly_failed" if status == "failed" else None
+        await self._emit(
+            ev.SystemPromptPrepared(
+                type="system_prompt_prepared",
+                protocol_version=2,
+                status=status,
+                source=source,
+                template_version=template_version,
+                section_ids=section_ids,
+                fingerprint=fingerprint,
+                char_count=char_count,
+                duration_ms=duration_ms,
+                error_code=safe_error,
+                message="系统提示词组装失败，请稍后重试。" if safe_error else None,
+                **self._envelope(step_id=None),
             )
         )
 

@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -359,6 +361,7 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
                     emitter.llm_round_cancelled.assert_not_awaited()
 
     async def test_run_agent_round_finalizes_language_contract_before_budget_and_model_call(self):
+        emitter = AsyncMock()
         step_context = AgentStepContext(
             step_id="step-language",
             step_number=1,
@@ -420,9 +423,15 @@ class AgentRoundTests(unittest.IsolatedAsyncioTestCase):
                 llm_call_fn=llm_call_fn,
                 stream_round_fn=stream_round_fn,
                 log_round_summary_fn=lambda **_kwargs: None,
+                emitter=emitter,
             )
 
         self.assertEqual(sent_messages, prepared_messages)
+        system_messages = [message for message in sent_messages if message["role"] == "system"]
+        expected_fingerprint = hashlib.sha256(
+            json.dumps(system_messages, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(emitter.llm_round_started.await_args.kwargs["system_prompt_fingerprint"], expected_fingerprint)
         self.assertTrue(sent_messages[-1]["content"].endswith(VISIBLE_RESPONSE_LANGUAGE_PROMPT))
         self.assertEqual(
             sum(str(item.get("content") or "").count(VISIBLE_RESPONSE_LANGUAGE_PROMPT) for item in sent_messages),

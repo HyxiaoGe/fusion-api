@@ -57,11 +57,87 @@ async def _unused_async(**_kwargs):
     raise AssertionError("不应调用这个依赖")
 
 
+async def _start_event_run(**kwargs):
+    await kwargs["emitter"].run_started(
+        message_id=kwargs["message_id"], model=kwargs["model_id"], tools=kwargs["tools"], config=kwargs["config"]
+    )
+
+
 def _unused_sync(*_args, **_kwargs):
     raise AssertionError("不应调用这个依赖")
 
 
 class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_system_prompt_ready_is_emitted_once_before_driver(self):
+        from app.ai.prompts.system_prompt import assemble_system_prompt
+
+        emitted = []
+
+        class CaptureWriter:
+            async def append_chunk(self, _conversation_id, _task_id, _chunk_type, payload):
+                emitted.append(payload)
+
+        assembly = assemble_system_prompt(user_system_prompt="不能进入事件的规则原文")
+        prepared = SimpleNamespace(
+            messages=assembly.messages,
+            initial_content_blocks=[],
+            final_tool_names=[],
+            prompt_assembly=assembly.metadata,
+        )
+
+        async def run_loop(**_kwargs):
+            self.assertEqual([event["type"] for event in emitted].count("system_prompt_prepared"), 1)
+            return AgentLoopOutcome(exit=AgentLoopExit.COMPLETED)
+
+        await run_agent_loop_lifecycle(
+            request=self._request(),
+            execution=self._execution(redis_writer=CaptureWriter()),
+            dependencies=self._dependencies(
+                start_agent_run_fn=_start_event_run,
+                prepare_messages_fn=AsyncMock(return_value=prepared),
+                run_agent_loop_fn=run_loop,
+            ),
+        )
+        prompt_events = [event for event in emitted if event["type"] == "system_prompt_prepared"]
+        self.assertEqual(len(prompt_events), 1)
+        self.assertEqual(prompt_events[0]["fingerprint"], assembly.metadata["fingerprint"])
+        self.assertNotIn("不能进入事件的规则原文", str(emitted))
+
+    async def test_only_actual_assembly_error_emits_failed_prompt_result(self):
+        from app.ai.prompts.system_prompt import SystemPromptAssemblyError
+
+        metadata = {
+            "status": "failed",
+            "source": "code",
+            "template_version": "1",
+            "section_ids": [],
+            "duration_ms": 0,
+            "error_code": "assembly_failed",
+            "message": "不应披露的偏好内容",
+        }
+        for error, expected_count in [(SystemPromptAssemblyError(metadata), 1), (RuntimeError("附件读取失败"), 0)]:
+            with self.subTest(error_type=type(error).__name__):
+                emitted = []
+
+                class CaptureWriter:
+                    async def append_chunk(self, _conversation_id, _task_id, _chunk_type, payload):
+                        emitted.append(payload)
+
+                with self.assertRaises(type(error)):
+                    await run_agent_loop_lifecycle(
+                        request=self._request(),
+                        execution=self._execution(redis_writer=CaptureWriter()),
+                        dependencies=self._dependencies(
+                            start_agent_run_fn=_start_event_run, prepare_messages_fn=AsyncMock(side_effect=error)
+                        ),
+                    )
+                prompt_events = [event for event in emitted if event["type"] == "system_prompt_prepared"]
+                self.assertEqual(len(prompt_events), expected_count)
+                if prompt_events:
+                    self.assertEqual(prompt_events[0]["status"], "failed")
+                    self.assertEqual(prompt_events[0]["error_code"], "assembly_failed")
+                self.assertNotIn("不应披露的偏好内容", str(emitted))
+
     async def test_knowledge_retrieval_emits_started_and_completed_around_real_call(self):
         emitted = []
 
@@ -169,6 +245,7 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaises(asyncio.CancelledError):
                 await _prepare_knowledge_grounding(request=request, execution=execution)
+
     def test_deep_research_with_files_still_requires_network_gate(self):
         execution = self._execution(
             call_config=SimpleNamespace(
@@ -898,9 +975,7 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
                         session = db.get(AgentSession, "run-life")
                         ledger_events = list(
                             db.scalars(
-                                select(AgentEvent)
-                                .where(AgentEvent.run_id == "run-life")
-                                .order_by(AgentEvent.sequence)
+                                select(AgentEvent).where(AgentEvent.run_id == "run-life").order_by(AgentEvent.sequence)
                             )
                         )
                         event_types = [event.event_type for event in ledger_events]
@@ -918,22 +993,14 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
                             self.assertIsNone(meta.degraded_reason)
                             self.assertIsNotNone(meta.finalized_at)
 
-                    expected_events = (
-                        ["run_started", "run_interrupted"]
-                        if scenario == "accepted"
-                        else ["run_started"]
-                    )
+                    expected_events = ["run_started", "run_interrupted"] if scenario == "accepted" else ["run_started"]
                     self.assertEqual(event_types, expected_events)
                     if scenario == "accepted":
                         self.assertEqual(ledger_events[-1].payload["reason"], "superseded")
                     required_event_types = [event["type"] for event in redis_writer.events]
                     self.assertEqual(
                         required_event_types,
-                        (
-                            ["run_started", "run_interrupted"]
-                            if writer_error is None
-                            else ["run_started"]
-                        ),
+                        (["run_started", "run_interrupted"] if writer_error is None else ["run_started"]),
                     )
                     self.assertEqual(execution.state.terminal_emitted, terminal_emitted)
                     fallback_status.assert_not_awaited()
@@ -981,9 +1048,7 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 async def finalize(expected_last_sequence):
                     calls.append(("finalize", expected_last_sequence))
 
-                execution.emitter.seal_and_get_last_sequence = AsyncMock(
-                    side_effect=seal_and_get_last_sequence
-                )
+                execution.emitter.seal_and_get_last_sequence = AsyncMock(side_effect=seal_and_get_last_sequence)
                 execution.trajectory_recorder.finalize = AsyncMock(side_effect=finalize)
                 dependencies = self._dependencies(
                     run_agent_loop_fn=run_agent_loop_fn,
@@ -1043,9 +1108,7 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
             calls.append("finalize")
 
         execution.emitter.suggested_questions_pending = AsyncMock(side_effect=pending_event)
-        execution.emitter.seal_and_get_last_sequence = AsyncMock(
-            side_effect=seal_and_get_last_sequence
-        )
+        execution.emitter.seal_and_get_last_sequence = AsyncMock(side_effect=seal_and_get_last_sequence)
         execution.trajectory_recorder.finalize = AsyncMock(side_effect=finalize)
 
         await run_agent_loop_lifecycle(
@@ -1082,9 +1145,7 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         async def finalize(expected_last_sequence):
             calls.append(("finalize", expected_last_sequence))
 
-        execution.emitter.seal_and_get_last_sequence = AsyncMock(
-            side_effect=seal_and_get_last_sequence
-        )
+        execution.emitter.seal_and_get_last_sequence = AsyncMock(side_effect=seal_and_get_last_sequence)
         execution.trajectory_recorder.finalize = AsyncMock(side_effect=finalize)
 
         with self.assertRaisesRegex(RuntimeError, "start unavailable"):
@@ -1105,9 +1166,7 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
             raise primary_error
 
         execution.emitter.seal_and_get_last_sequence = AsyncMock(return_value=2)
-        execution.trajectory_recorder.finalize = AsyncMock(
-            side_effect=ValueError("barrier failure")
-        )
+        execution.trajectory_recorder.finalize = AsyncMock(side_effect=ValueError("barrier failure"))
 
         with self.assertRaises(RuntimeError) as raised:
             await run_agent_loop_lifecycle(

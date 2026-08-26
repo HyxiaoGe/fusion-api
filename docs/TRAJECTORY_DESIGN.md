@@ -124,8 +124,11 @@ schema_version: int   # 协议版本，本次定 1
 | Annotation | `evidence_item_upserted` | 证据区段 |
 | Annotation | `content_block_upserted / content_block_discarded` | 消息组装块 |
 | Annotation | `context_status_updated` | 上下文管理区段（含 `removed_turns/removed_messages/removed_tool_transactions`——即 compaction 数据） |
+| Annotation | `system_prompt_prepared` | 每 Run 的本地提示词组装结果，仅 ready/failed；不带正文，不创建准备中状态 |
 | Annotation | `context_required / context_result` | 上下文握手 |
 | Annotation | `suggested_questions_pending` | run 后异步辅助事件；计入账本 sequence 完整性范围（见 §5.2） |
+
+系统提示词组装事件复用既有 SSE 与 `agent_events`，字段、失败与历史兼容边界见 [一期契约](superpowers/specs/2026-08-26-system-prompt-assembly.md)。组装指纹描述初始规则，模型请求指纹在最终语言规则与上下文准备后计算，二者可能不同；两者都不包含用户消息、工具结果或工具 schema。
 
 ### 3.3 新增生命周期事件的完整 Schema（P0 可实施定义）
 
@@ -140,6 +143,7 @@ llm_round_started:
   model: str                 # 模型 id（已脱敏，如 deepseek/deepseek-chat）
   provider: str
   parent_step_id: str | null
+  system_prompt_fingerprint: str | null  # 新 Run 可选：有效 system 消息的 SHA-256，缺失不推断
 
 llm_round_first_output_delta:
   llm_round_id: str

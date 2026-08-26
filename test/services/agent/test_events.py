@@ -108,6 +108,20 @@ class AgentEventModelTests(unittest.TestCase):
         self.assertEqual(d["sequence"], 0)
         self.assertEqual(d["run_id"], "r1")
 
+    def test_system_prompt_result_rejects_loading_and_full_prompt_payload(self):
+        adapter = TypeAdapter(AnyAgentEvent)
+        payload = {
+            **self._common(), "type": "system_prompt_prepared", "protocol_version": 2,
+            "status": "ready", "source": "code", "template_version": "1", "section_ids": ["app_identity"],
+            "fingerprint": "a" * 64, "char_count": 200, "duration_ms": 0,
+        }
+        self.assertEqual(adapter.validate_python(payload).status, "ready")
+        self.assertEqual(adapter.validate_python({**payload, "status": "failed"}).status, "failed")
+        with self.assertRaises(ValidationError):
+            adapter.validate_python({**payload, "status": "loading"})
+        with self.assertRaises(ValidationError):
+            adapter.validate_python({**payload, "prompt": "不能暴露的规则"})
+
     def test_existing_event_defaults_to_schema_version_1(self):
         event = StepStarted(type="step_started", step_number=1, **self._common())
 

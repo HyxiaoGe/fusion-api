@@ -52,8 +52,8 @@ class ContextManagerTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
         with (
-            patch("app.services.chat.message_builder.build_current_date_system_prompt", return_value="固定日期"),
-            patch("app.services.chat.message_builder.get_app_identity_prompt", return_value="固定身份"),
+            patch("app.ai.prompts.system_prompt.build_current_date_system_prompt", return_value="固定日期"),
+            patch("app.ai.prompts.system_prompt.get_app_identity_prompt", return_value="固定身份"),
         ):
             canonical = await build_llm_messages(history)
 

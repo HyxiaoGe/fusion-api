@@ -37,6 +37,7 @@ from app.services.stream.research_evidence import (
     validate_research_completion,
 )
 from app.services.stream_state_service import StreamWriteTerminalError, append_chunk
+from app.utils.prompt_fingerprint import fingerprint_system_messages
 
 LIMIT_SUMMARY_PROMPT = _LIMIT_SUMMARY_PROMPT
 
@@ -331,6 +332,7 @@ async def call_limit_summary_round(
         run_id=request.run_id,
         message_id=request.assistant_message_id,
         detail_scheduler=request.llm_round_detail_scheduler,
+        system_prompt_fingerprint=fingerprint_system_messages(effective_messages),
     )
     observation.start()
     detail_partial_output = partial_output if partial_output is not None else {}

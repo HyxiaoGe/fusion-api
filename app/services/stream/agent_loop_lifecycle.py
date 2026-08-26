@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.ai.prompts.system_prompt import SystemPromptAssemblyError
 from app.core.logger import app_logger as logger
 from app.core.prompt_bundle import get_active_prompt_bundle_revision
 from app.schemas.chat import TextBlock
@@ -134,10 +135,7 @@ async def commit_trajectory_barrier(
         barrier_task.add_done_callback(_consume_trajectory_barrier_result)
         warning_fn(f"轨迹完整性提交屏障超时: run_id={execution.run_id}")
     elif error is not None:
-        warning_fn(
-            "轨迹完整性提交屏障失败: "
-            f"run_id={execution.run_id}, error_type={type(error).__name__}"
-        )
+        warning_fn(f"轨迹完整性提交屏障失败: run_id={execution.run_id}, error_type={type(error).__name__}")
     return cancelled
 
 
@@ -326,18 +324,30 @@ async def _prepare_messages(
     execution: AgentLoopExecutionContext,
     dependencies: AgentLoopLifecycleDependencies,
 ) -> Any:
-    return await dependencies.prepare_messages_fn(
-        db=execution.completion_context.db,
-        user_id=execution.runtime.user_id,
-        conversation_id=execution.completion_context.conversation_id,
-        raw_messages=request.raw_messages,
-        has_vision=request.has_vision,
-        file_ids=request.file_ids,
-        original_message=request.original_message,
-        call_config=request.call_config,
-        extra_system_prompts=request.extra_system_prompts,
-        preprocess_user_input=request.preprocess_user_input,
-    )
+    try:
+        prepared = await dependencies.prepare_messages_fn(
+            db=execution.completion_context.db,
+            user_id=execution.runtime.user_id,
+            conversation_id=execution.completion_context.conversation_id,
+            raw_messages=request.raw_messages,
+            has_vision=request.has_vision,
+            file_ids=request.file_ids,
+            original_message=request.original_message,
+            call_config=request.call_config,
+            extra_system_prompts=request.extra_system_prompts,
+            preprocess_user_input=request.preprocess_user_input,
+        )
+    except SystemPromptAssemblyError as error:
+        try:
+            await execution.emitter.system_prompt_prepared(**error.metadata)
+        except Exception:
+            # 保留组装原始失败，不让诊断写入异常覆盖主错误。
+            dependencies.warning_fn("系统提示词失败事件写入失败")
+        raise
+    metadata = getattr(prepared, "prompt_assembly", None)
+    if metadata is not None:
+        await execution.emitter.system_prompt_prepared(**metadata)
+    return prepared
 
 
 async def _prepare_knowledge_grounding(
