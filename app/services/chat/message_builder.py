@@ -157,11 +157,12 @@ def inject_file_content(
     file_contents: Dict[str, str],
 ) -> List[dict]:
     """将非图片文件的解析内容注入到最后一条用户消息的文本中"""
-    if not messages:
-        return messages
-
     combined = "\n\n".join(f"文件内容 ({i + 1}):\n{content}" for i, content in enumerate(file_contents.values()))
     enhanced = f"{original_message}\n\n以下是相关文件内容，请结合这些内容回答：\n{combined}"
+
+    # 仅附件的新会话没有文字消息，仍须将解析正文作为用户输入。
+    if not messages:
+        return [{"role": "user", "content": enhanced}]
 
     result = messages.copy()
     result[-1] = {"role": "user", "content": enhanced}

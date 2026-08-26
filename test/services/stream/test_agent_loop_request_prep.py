@@ -23,6 +23,41 @@ class FakeFileRepository:
 
 
 class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_builder_preserves_parsed_attachment_without_text_in_new_conversation(self):
+        from app.ai.prompts.agent_loop import APP_IDENTITY_PROMPT
+        from app.schemas.chat import FileBlock, Message
+        from app.services.stream.agent_loop_request_prep import AgentLoopCallConfig
+
+        file_repo = FakeFileRepository()
+        prepared = await prepare_agent_loop_messages(
+            db=object(),
+            user_id="user-1",
+            conversation_id="new-conversation",
+            raw_messages=[
+                Message(
+                    role="user",
+                    content=[
+                        TextBlock(type="text", text=""),
+                        FileBlock(type="file", file_id="doc-1", filename="note.txt", mime_type="text/plain"),
+                    ],
+                )
+            ],
+            has_vision=False,
+            file_ids=["doc-1"],
+            original_message="",
+            call_config=AgentLoopCallConfig(False, False, {}, []),
+            file_repo_factory=lambda db: file_repo,
+            load_user_system_prompt_fn=lambda db, uid: None,
+            is_image_file_fn=lambda file_id, repo: False,
+        )
+        user_messages = [message for message in prepared.messages if message["role"] == "user"]
+        self.assertEqual(len(user_messages), 1)
+        self.assertIn("文档正文", user_messages[0]["content"])
+        self.assertIn("文件内容 (1)", user_messages[0]["content"])
+        self.assertIn({"role": "system", "content": APP_IDENTITY_PROMPT}, prepared.messages)
+        self.assertEqual(prepared.prompt_assembly["status"], "ready")
+        self.assertEqual(file_repo.requested_content_ids, [["doc-1"]])
+
     async def test_real_builder_preferences_cannot_suppress_trusted_rules(self):
         from app.ai.prompts.agent_loop import (
             AGENT_PLAN_CONTROL_ON_PROMPT,
