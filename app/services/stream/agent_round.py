@@ -17,6 +17,7 @@ from app.services.chat.context_manager import ContextManagementError, ContextPla
 from app.services.chat.model_call_language_policy import finalize_model_call_language_policy
 from app.services.stream.context_status import build_context_usage, emit_context_status
 from app.services.stream.llm_round_lifecycle import LLMRoundLifecycle, accumulate_token_usage
+from app.utils.prompt_fingerprint import fingerprint_system_messages
 
 
 @dataclass(frozen=True)
@@ -289,6 +290,7 @@ async def run_agent_round(
         run_id=run_id,
         message_id=assistant_message_id,
         detail_scheduler=llm_round_detail_scheduler,
+        system_prompt_fingerprint=fingerprint_system_messages(effective_messages),
     )
     observation.start()
     partial_output: dict[str, str] = {}

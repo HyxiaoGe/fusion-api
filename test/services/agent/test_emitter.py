@@ -11,6 +11,46 @@ from app.services.agent.events import StepStarted
 
 
 class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_system_prompt_result_and_request_fingerprint_share_run_envelope(self):
+        emitted = []
+
+        class CaptureWriter:
+            async def append_chunk(self, _conversation_id, _task_id, _chunk_type, payload):
+                emitted.append(payload)
+
+        em = AgentEventEmitter(
+            run_id="r1", trace_id="r1", conversation_id="c1", task_id="t1", redis_writer=CaptureWriter()
+        )
+        await em.run_started(message_id="m1", model="gpt", tools=[], config={})
+        await em.system_prompt_prepared(
+            status="ready",
+            source="code",
+            template_version="1",
+            section_ids=["core", "current_date"],
+            fingerprint="a" * 64,
+            char_count=100,
+            duration_ms=0,
+        )
+        await em.llm_round_started(
+            llm_round_id="q1",
+            round_index=1,
+            model="gpt",
+            provider="openai",
+            system_prompt_fingerprint="b" * 64,
+        )
+
+        self.assertEqual(
+            [event["type"] for event in emitted], ["run_started", "system_prompt_prepared", "llm_round_started"]
+        )
+        self.assertEqual(emitted[1]["protocol_version"], 2)
+        self.assertEqual(emitted[1]["status"], "ready")
+        self.assertEqual(emitted[1]["section_ids"], ["core", "current_date"])
+        self.assertEqual(emitted[1]["sequence"], 1)
+        self.assertIsNone(emitted[1]["step_id"])
+        self.assertEqual(emitted[2]["system_prompt_fingerprint"], "b" * 64)
+        self.assertEqual(emitted[2]["run_id"], "r1")
+        self.assertEqual(emitted[2]["llm_round_id"], "q1")
+
     async def test_run_started_envelope(self):
         writer = AsyncMock()
         em = AgentEventEmitter(run_id="r1", trace_id="r1", conversation_id="c1", task_id="task-1", redis_writer=writer)
@@ -459,7 +499,11 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
         parent_step_id = await em.step_started(step_number=1)
 
         await em.llm_round_started(
-            llm_round_id="llm-1", round_index=1, model="deepseek/deepseek-chat", provider="deepseek", parent_step_id=parent_step_id
+            llm_round_id="llm-1",
+            round_index=1,
+            model="deepseek/deepseek-chat",
+            provider="deepseek",
+            parent_step_id=parent_step_id,
         )
         await em.llm_round_failed(
             llm_round_id="llm-1",
@@ -473,7 +517,11 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
             parent_step_id=parent_step_id,
         )
         await em.tool_attempt_started(
-            tool_attempt_id="attempt-1", tool_call_id="tool-1", tool_name="web_search", attempt_index=1, parent_step_id=parent_step_id
+            tool_attempt_id="attempt-1",
+            tool_call_id="tool-1",
+            tool_name="web_search",
+            attempt_index=1,
+            parent_step_id=parent_step_id,
         )
 
         payloads = [call.args[3] for call in writer.append_chunk.call_args_list[-4:]]
@@ -507,8 +555,15 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
 
         await em.llm_round_first_output_delta(llm_round_id="llm-1", delta_kind="tool_call", ttft_ms=10)
         await em.llm_round_completed(
-            llm_round_id="llm-1", finish_reason="stop", input_tokens=1, output_tokens=2, total_tokens=3,
-            cache_read_tokens=0, cache_write_tokens=None, ttft_ms=10, duration_ms=20,
+            llm_round_id="llm-1",
+            finish_reason="stop",
+            input_tokens=1,
+            output_tokens=2,
+            total_tokens=3,
+            cache_read_tokens=0,
+            cache_write_tokens=None,
+            ttft_ms=10,
+            duration_ms=20,
         )
         await em.llm_round_cancelled(llm_round_id="llm-2", reason="superseded")
         await em.retrieval_completed(retrieval_id="ret-1", document_count=2, duration_ms=20)
@@ -522,8 +577,13 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [payload["type"] for payload in payloads],
             [
-                "llm_round_first_output_delta", "llm_round_completed", "llm_round_cancelled",
-                "retrieval_completed", "retrieval_failed", "retrieval_cancelled", "tool_attempt_completed",
+                "llm_round_first_output_delta",
+                "llm_round_completed",
+                "llm_round_cancelled",
+                "retrieval_completed",
+                "retrieval_failed",
+                "retrieval_cancelled",
+                "tool_attempt_completed",
             ],
         )
         self.assertEqual(payloads[0]["delta_kind"], "tool_call")

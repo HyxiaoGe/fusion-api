@@ -101,6 +101,7 @@ class LLMRoundStarted(AgentEventBase):
     round_index: int = Field(ge=1)
     model: str
     provider: str
+    system_prompt_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class LLMRoundFirstOutputDelta(AgentEventBase):
@@ -301,6 +302,22 @@ class ContentBlockDiscarded(AgentEventBase):
     block_id: str = Field(min_length=1, max_length=128)
 
 
+class SystemPromptPrepared(AgentEventBase):
+    """本地系统提示词组装的终态元数据，不携带提示词或用户偏好正文。"""
+
+    type: Literal["system_prompt_prepared"]
+    protocol_version: Literal[2]
+    status: Literal["ready", "failed"]
+    source: Literal["code"]
+    template_version: str = Field(min_length=1, max_length=64)
+    section_ids: list[str] = Field(max_length=50)
+    fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    char_count: int | None = Field(default=None, ge=0)
+    duration_ms: int = Field(ge=0)
+    error_code: str | None = None
+    message: str | None = Field(default=None, max_length=120)
+
+
 class ContextStatusUpdated(AgentEventBase):
     """单轮 LLM 上下文状态；字段严格白名单，不携带 prompt 或内部来源。"""
 
@@ -371,6 +388,7 @@ AnyAgentEvent = Annotated[
     | EvidenceItemUpserted
     | ContentBlockUpserted
     | ContentBlockDiscarded
+    | SystemPromptPrepared
     | ContextStatusUpdated
     | ContextRequired
     | ContextResult,

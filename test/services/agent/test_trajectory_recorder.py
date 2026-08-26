@@ -87,6 +87,49 @@ class FailingSubmitExecutor(concurrent.futures.Executor):
 
 
 class RecorderDatabaseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_prompt_metadata_and_effective_request_fingerprint_survive_database_reload(self):
+        recorder = self._recorder()
+        await recorder.record_chunk(
+            "conv-1",
+            "agent_event",
+            _event(
+                0,
+                "system_prompt_prepared",
+                protocol_version=2,
+                status="ready",
+                source="code",
+                template_version="1",
+                section_ids=["app_identity", "user_preferences"],
+                fingerprint="a" * 64,
+                char_count=200,
+                duration_ms=0,
+                prompt="不能落库的模板",
+                user_preferences="不能落库的偏好",
+            ),
+        )
+        await recorder.record_chunk(
+            "conv-1",
+            "agent_event",
+            _event(
+                1,
+                "llm_round_started",
+                llm_round_id="round-1",
+                round_index=1,
+                model="gpt-4",
+                provider="openai",
+                system_prompt_fingerprint="b" * 64,
+            ),
+        )
+
+        with self.Session() as db:
+            rows = db.query(AgentEvent).filter_by(run_id="run-1").order_by(AgentEvent.sequence).all()
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0].payload["section_ids"], ["app_identity", "user_preferences"])
+            self.assertEqual(rows[0].payload["fingerprint"], "a" * 64)
+            self.assertEqual(rows[1].payload["system_prompt_fingerprint"], "b" * 64)
+            self.assertEqual(rows[1].payload["llm_round_id"], "round-1")
+            self.assertNotIn("不能落库", str([row.payload for row in rows]))
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         database_path = Path(self.temp_dir.name) / "trajectory.sqlite3"

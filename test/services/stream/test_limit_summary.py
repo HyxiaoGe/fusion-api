@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import unittest
 from dataclasses import replace
 from functools import partial
@@ -1900,6 +1902,7 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(emitter.context_status_updated.await_args_list[-1].kwargs["phase"], "final")
 
     async def test_limit_summary_uses_real_budgeted_snapshot_and_keeps_tail_system_prompt(self):
+        emitter = AsyncMock()
         messages = [
             {"role": "user", "content": "a" * 100},
             {"role": "assistant", "content": "b" * 100},
@@ -1954,7 +1957,7 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
             content_blocks=[],
             call_kwargs={},
             accumulated_usage=Usage(input_tokens=0, output_tokens=0),
-            emitter=object(),
+            emitter=emitter,
             session_cache=object(),
             total_timeout_s=300,
             run_start=100.0,
@@ -1990,6 +1993,12 @@ class LimitSummaryStepTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(messages), 4)
         self.assertEqual(messages[-1]["content"], LIMIT_SUMMARY_PROMPT)
+
+        system_messages = [message for message in sent_messages if message["role"] == "system"]
+        expected_fingerprint = hashlib.sha256(
+            json.dumps(system_messages, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(emitter.llm_round_started.await_args.kwargs["system_prompt_fingerprint"], expected_fingerprint)
 
     async def test_limit_summary_records_independent_round_observation(self):
         messages = []
