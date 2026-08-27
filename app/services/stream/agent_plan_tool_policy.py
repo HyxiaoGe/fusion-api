@@ -421,14 +421,36 @@ def _endpoint_slot_tier(value: str) -> _EndpointSlotTier:
     if not value or len(value) > 60:
         return _EndpointSlotTier.INVALID
     if (
-        value in INTERCITY_LOCATION_NAMES
-        or value in _KNOWN_PHYSICAL_LOCATION_NAMES
+        _is_intercity_location_slot(value)
+        or _is_known_physical_location_slot(value)
         or value.endswith(_SAFE_LOCATION_SLOT_SUFFIXES)
     ):
         return _EndpointSlotTier.DEFAULT_ROUTE_LOCATION
     if value.endswith(_INSTITUTION_LOCATION_SLOT_SUFFIXES) or _TRANSPORT_INSTITUTION_SLOT_RE.search(value):
         return _EndpointSlotTier.CONFIRMED_LOCATION
     return _EndpointSlotTier.BOUNDED
+
+
+def _is_intercity_location_slot(value: str) -> bool:
+    """接受常见城市名及其“市”行政区写法。"""
+
+    return value in INTERCITY_LOCATION_NAMES or (
+        value.endswith("市") and value.removesuffix("市") in INTERCITY_LOCATION_NAMES
+    )
+
+
+def _is_known_physical_location_slot(value: str) -> bool:
+    """允许可信地标携带城市或行政区前缀，避免等价地名表达漏召回。"""
+
+    for landmark in _KNOWN_PHYSICAL_LOCATION_NAMES:
+        if value == landmark:
+            return True
+        if not value.endswith(landmark):
+            continue
+        prefix = value[: -len(landmark)]
+        if prefix in INTERCITY_LOCATION_NAMES or prefix.endswith(("省", "市", "区", "县", "镇", "乡")):
+            return True
+    return False
 
 
 def _resolve_mobility_intent_strength(

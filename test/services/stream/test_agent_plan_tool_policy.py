@@ -104,6 +104,21 @@ class AgentPlanToolPolicyTests(unittest.TestCase):
                 self.assertTrue(signals.explicit_route)
                 self.assertTrue(signals.intercity_mobility)
 
+    def test_explicit_mobility_accepts_city_suffixes_and_prefixed_landmarks(self):
+        for message in (
+            "从上海市人民广场到上海市外滩怎么坐公共交通？",
+            "从北京市到上海市怎么去？",
+        ):
+            with self.subTest(message=message):
+                signals = resolve_product_capability_signals(
+                    original_message=message,
+                    task_context_messages=None,
+                )
+
+                self.assertTrue(signals.endpoint_relation)
+                self.assertTrue(signals.explicit_route)
+                self.assertTrue(signals.intercity_mobility)
+
     def test_abstract_process_and_career_paths_are_not_mobility_signals(self):
         for message in (
             "从亏损到盈利怎么走？",
