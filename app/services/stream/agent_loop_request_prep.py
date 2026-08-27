@@ -23,11 +23,8 @@ from app.services.chat.message_builder import (
     inject_file_content,
     is_image_file,
 )
-from app.services.mcp.amap_product_tools import AMAP_FACT_BOUNDARY_SYSTEM_PROMPT, AMAP_PRODUCT_TOOL_NAMES
-from app.services.mcp.flyai_travel_tools import (
-    FLYAI_TRAVEL_FACT_BOUNDARY_SYSTEM_PROMPT,
-    FLYAI_TRAVEL_TOOL_NAMES,
-)
+from app.services.mcp.amap_product_tools import AMAP_PRODUCT_TOOL_NAMES
+from app.services.mcp.flyai_travel_tools import FLYAI_TRAVEL_TOOL_NAMES
 from app.services.stream.agent_plan_tool_policy import AgentPlanToolPolicy, resolve_agent_plan_tool_policy
 from app.services.stream.agent_task_policy import resolve_agent_task_policy
 from app.services.stream.persistence import preprocess_url_in_message
@@ -381,8 +378,6 @@ async def prepare_agent_loop_messages(
             yield SystemPromptSection("no_vision_file_boundary", get_no_vision_file_boundary_prompt())
         selectors = [
             ("tool_usage_contract", inject_tool_usage_contract, call_config.call_kwargs),
-            ("amap_fact_boundary", inject_amap_fact_boundary, call_config.call_kwargs),
-            ("flyai_travel_fact_boundary", inject_flyai_travel_fact_boundary, call_config.call_kwargs),
             ("agent_plan_control", inject_plan_control_contract, call_config),
             ("verified_research_plan", inject_verified_research_plan_contract, call_config),
             ("deep_research_contract", inject_deep_research_contract, call_config),
@@ -494,40 +489,6 @@ def inject_tool_usage_contract(messages: list[dict], call_kwargs: dict) -> list[
         insert_at += 1
     contract_msg = {"role": "system", "content": get_tool_usage_contract_prompt()}
     return [*messages[:insert_at], contract_msg, *messages[insert_at:]]
-
-
-def inject_amap_fact_boundary(messages: list[dict], call_kwargs: dict) -> list[dict]:
-    """地点与路线产品工具启用时前置通用事实边界，不提升任何外部结果为 system 内容。"""
-    announced_tools = set(announced_tool_names_from_call_kwargs(call_kwargs))
-    if not AMAP_PRODUCT_TOOL_NAMES.intersection(announced_tools):
-        return messages
-    if any(msg.get("role") == "system" and msg.get("content") == AMAP_FACT_BOUNDARY_SYSTEM_PROMPT for msg in messages):
-        return messages
-
-    insert_at = 0
-    while insert_at < len(messages) and messages[insert_at].get("role") == "system":
-        insert_at += 1
-    boundary_msg = {"role": "system", "content": AMAP_FACT_BOUNDARY_SYSTEM_PROMPT}
-    return [*messages[:insert_at], boundary_msg, *messages[insert_at:]]
-
-
-def inject_flyai_travel_fact_boundary(messages: list[dict], call_kwargs: dict) -> list[dict]:
-    """航班或高铁产品工具启用时注入供应商中性的事实边界。"""
-
-    announced_tools = set(announced_tool_names_from_call_kwargs(call_kwargs))
-    if not FLYAI_TRAVEL_TOOL_NAMES.intersection(announced_tools):
-        return messages
-    if any(
-        msg.get("role") == "system" and msg.get("content") == FLYAI_TRAVEL_FACT_BOUNDARY_SYSTEM_PROMPT
-        for msg in messages
-    ):
-        return messages
-
-    insert_at = 0
-    while insert_at < len(messages) and messages[insert_at].get("role") == "system":
-        insert_at += 1
-    boundary_msg = {"role": "system", "content": FLYAI_TRAVEL_FACT_BOUNDARY_SYSTEM_PROMPT}
-    return [*messages[:insert_at], boundary_msg, *messages[insert_at:]]
 
 
 def inject_plan_control_contract(

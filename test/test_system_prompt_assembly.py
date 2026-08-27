@@ -12,7 +12,7 @@ class SystemPromptAssemblyTests(unittest.TestCase):
             user_system_prompt="请解释工具规则",
             sections=lambda: [SystemPromptSection("tool", "工具规则正文"), SystemPromptSection("tool", "重复规则")],
         )
-        self.assertEqual(result.metadata["section_ids"], ["current_date", "user_preferences", "app_identity", "tool"])
+        self.assertEqual(result.metadata["section_ids"], ["app_identity", "tool", "current_date", "user_preferences"])
         self.assertEqual(result.metadata["status"], "ready")
         self.assertEqual(result.metadata["source"], "code")
         self.assertEqual(len(result.metadata["fingerprint"]), 64)
@@ -39,7 +39,7 @@ class SystemPromptAssemblyTests(unittest.TestCase):
 
         with patch("app.ai.prompts.system_prompt.perf_counter", side_effect=[10, 10.0255]):
             result = assemble_system_prompt()
-        self.assertEqual(result.metadata["section_ids"], ["current_date", "app_identity"])
+        self.assertEqual(result.metadata["section_ids"], ["app_identity", "current_date"])
         self.assertIsInstance(result.metadata["duration_ms"], int)
         self.assertEqual(result.metadata["duration_ms"], 25)
-        self.assertIn("Fusion AI", result.messages[1]["content"])
+        self.assertIn("Fusion AI", result.messages[0]["content"])

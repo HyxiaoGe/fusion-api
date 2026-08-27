@@ -10,7 +10,7 @@ from typing import Any
 from app.ai.prompts.agent_loop import build_current_date_system_prompt, get_app_identity_prompt
 from app.utils.prompt_fingerprint import fingerprint_system_messages
 
-TEMPLATE_VERSION = "2026-08-26.1"
+TEMPLATE_VERSION = "2026-08-27.1"
 
 
 @dataclass(frozen=True)
@@ -33,7 +33,11 @@ class SystemPromptAssemblyError(Exception):
         self.metadata = metadata
 
 
-def build_base_sections(user_system_prompt: str | None = None) -> list[SystemPromptSection]:
+def build_stable_base_sections() -> list[SystemPromptSection]:
+    return [SystemPromptSection("app_identity", get_app_identity_prompt())]
+
+
+def build_dynamic_sections(user_system_prompt: str | None = None) -> list[SystemPromptSection]:
     sections = [SystemPromptSection("current_date", build_current_date_system_prompt())]
     if user_system_prompt and user_system_prompt.strip():
         sections.append(
@@ -43,8 +47,11 @@ def build_base_sections(user_system_prompt: str | None = None) -> list[SystemPro
                 + user_system_prompt.strip(),
             )
         )
-    sections.append(SystemPromptSection("app_identity", get_app_identity_prompt()))
     return sections
+
+
+def build_base_sections(user_system_prompt: str | None = None) -> list[SystemPromptSection]:
+    return [*build_stable_base_sections(), *build_dynamic_sections(user_system_prompt)]
 
 
 def assemble_system_prompt(
@@ -64,9 +71,10 @@ def assemble_system_prompt(
         "char_count": None,
     }
     try:
-        selected = build_base_sections(user_system_prompt)
+        selected = build_stable_base_sections()
         if sections is not None:
             selected.extend(sections())
+        selected.extend(build_dynamic_sections(user_system_prompt))
         messages = []
         for section in selected:
             if section.section_id in section_ids:

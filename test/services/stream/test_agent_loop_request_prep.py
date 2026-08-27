@@ -3,9 +3,9 @@ import unittest
 from app.schemas.chat import TextBlock
 from app.services.agent.plan_coordinator import PlanCoordinator
 from app.services.mcp.amap_product_tools import AMAP_PRODUCT_DEFINITIONS
+from app.services.mcp.flyai_travel_tools import FLYAI_TRAVEL_DEFINITIONS
 from app.services.stream.agent_loop_request_prep import (
     build_agent_loop_call_config,
-    inject_amap_fact_boundary,
     inject_deep_research_contract,
     inject_no_tool_network_boundary,
     inject_plan_control_contract,
@@ -104,18 +104,18 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         from app.services.stream.agent_loop_request_prep import AgentLoopCallConfig
 
         for plan_mode, task_mode, tools, expected in [
-            ("off", "standard", [], ["current_date", "app_identity", "no_tool_network_boundary"]),
+            ("off", "standard", [], ["app_identity", "no_tool_network_boundary", "current_date"]),
             (
                 "on",
                 "standard",
                 ["web_search", "update_plan"],
-                ["current_date", "app_identity", "tool_usage_contract", "agent_plan_control"],
+                ["app_identity", "tool_usage_contract", "agent_plan_control", "current_date"],
             ),
             (
                 "on",
                 "deep_research",
                 ["web_search", "url_read", "update_plan"],
-                ["current_date", "app_identity", "tool_usage_contract", "agent_plan_control", "deep_research_contract"],
+                ["app_identity", "tool_usage_contract", "agent_plan_control", "deep_research_contract", "current_date"],
             ),
         ]:
             with self.subTest(plan_mode=plan_mode, task_mode=task_mode):
@@ -144,6 +144,54 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(prepared.messages), len(expected))
                 self.assertEqual([s["section_id"] for s in prepared.prompt_snapshot["sections"]], expected)
                 self.assertTrue(all(s["content"] for s in prepared.prompt_snapshot["sections"]))
+
+    async def test_product_tool_visibility_does_not_load_full_domain_prompts(self):
+        tools = [*AMAP_PRODUCT_DEFINITIONS, *FLYAI_TRAVEL_DEFINITIONS]
+        tool_names = [tool["function"]["name"] for tool in tools]
+        config = build_agent_loop_call_config(
+            provider="deepseek",
+            options={},
+            capabilities={"functionCalling": True, "searchCapable": True, "agentTools": True},
+            additional_tools=tools,
+            dynamic_tool_handlers={name: object() for name in tool_names},
+            original_message="你好",
+        )
+
+        prepared = await prepare_agent_loop_messages(
+            db=object(),
+            user_id="user-1",
+            raw_messages=[],
+            has_vision=False,
+            file_ids=None,
+            original_message="你好",
+            call_config=config,
+            file_repo_factory=lambda db: FakeFileRepository(),
+            load_user_system_prompt_fn=lambda db, uid: None,
+            preprocess_user_input=False,
+        )
+
+        self.assertEqual(prepared.final_tool_names, ["web_search", "url_read", *tool_names])
+        self.assertEqual(
+            prepared.prompt_assembly["section_ids"],
+            ["app_identity", "tool_usage_contract", "agent_plan_control", "current_date"],
+        )
+        self.assertNotIn("amap_fact_boundary", prepared.prompt_assembly["section_ids"])
+        self.assertNotIn("flyai_travel_fact_boundary", prepared.prompt_assembly["section_ids"])
+
+    def test_low_confidence_route_paraphrase_keeps_authorized_route_tool_visible(self):
+        handlers = {tool["function"]["name"]: object() for tool in AMAP_PRODUCT_DEFINITIONS}
+
+        config = build_agent_loop_call_config(
+            provider="deepseek",
+            options={},
+            capabilities={"functionCalling": True, "searchCapable": True, "agentTools": True},
+            additional_tools=AMAP_PRODUCT_DEFINITIONS,
+            dynamic_tool_handlers=handlers,
+            original_message="我现在在北京，我想去上海，你可以帮我吗",
+        )
+
+        self.assertIn("route_compare", config.announced_tools)
+        self.assertIsNone(config.plan_tool_policy_reason)
 
     async def test_io_failure_is_not_an_assembly_failure(self):
         from unittest.mock import patch
@@ -530,126 +578,6 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(inject_plan_control_contract(messages, config), messages)
 
-    def test_amap_fact_boundary_is_generic_system_prompt_and_preserves_multi_tool_message_order(self):
-        messages = [
-            {"role": "system", "content": "基础系统提示"},
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {"id": "tc-place", "type": "function", "function": {"name": "local_place_search"}},
-                    {"id": "tc-route", "type": "function", "function": {"name": "route_compare"}},
-                    {"id": "tc-search", "type": "function", "function": {"name": "web_search"}},
-                ],
-            },
-            {"role": "tool", "tool_call_id": "tc-place", "content": "民治星巴克地点原始数据"},
-            {"role": "tool", "tool_call_id": "tc-route", "content": "深圳北站路线原始数据"},
-            {"role": "tool", "tool_call_id": "tc-search", "content": "普通搜索上下文"},
-        ]
-        call_kwargs = {
-            "tools": [
-                {"type": "function", "function": {"name": "local_place_search"}},
-                {"type": "function", "function": {"name": "route_compare"}},
-                {"type": "function", "function": {"name": "weather_forecast"}},
-                {"type": "function", "function": {"name": "web_search"}},
-            ]
-        }
-
-        prepared = inject_amap_fact_boundary(messages, call_kwargs)
-
-        self.assertEqual(
-            [message["role"] for message in prepared],
-            ["system", "system", "assistant", "tool", "tool", "tool"],
-        )
-        self.assertEqual(
-            [message["tool_call_id"] for message in prepared[3:]],
-            ["tc-place", "tc-route", "tc-search"],
-        )
-        boundary = prepared[1]["content"]
-        self.assertIn("【地点与路线工具选择规则】", boundary)
-        self.assertIn("【组合行程必填信息规则】", boundary)
-        self.assertIn("存在多个合理的具体出发日期", boundary)
-        self.assertIn("必须先向用户确认具体日期", boundary)
-        self.assertIn(
-            "不得选择任一候选日期调用 search_flights、search_trains、weather_forecast 或 route_compare", boundary
-        )
-        self.assertIn("两个自然语言起终点", boundary)
-        self.assertIn("直接调用 route_compare", boundary)
-        self.assertIn("不要先调用 web_search 或 local_place_search", boundary)
-        self.assertIn("当前位置", boundary)
-        self.assertIn("source=current_location", boundary)
-        self.assertIn("【地点与路线事实边界规则】", boundary)
-        self.assertIn("工具失败、不可用或未取得可用结果", boundary)
-        self.assertIn("不得用训练知识补充具体地点、线路、时间、距离、费用或路况", boundary)
-        self.assertIn("不得仅根据地址片区或同村", boundary)
-        self.assertIn("步行可达", boundary)
-        self.assertIn("隔壁片区", boundary)
-        self.assertIn("本次返回候选中", boundary)
-        self.assertIn("距离或就近作为选择条件", boundary)
-        self.assertIn("只能来自对应 result.places 或 result.routes 中实际返回的字段", boundary)
-        self.assertIn("禁止使用常识、品牌印象、店名词义或训练知识", boundary)
-        self.assertIn("环境、安静度、座位、出品、通常营业时间、公园步道", boundary)
-        self.assertIn("rating 只能称为评分或综合评分", boundary)
-        self.assertIn("不得解释为环境、安静度或服务评分", boundary)
-        self.assertIn("不得根据品牌、店名或综合评分", boundary)
-        self.assertIn("适合聊天、适合三人、品牌稳定或出品稳定", boundary)
-        self.assertIn("不得在正文或括号中补充估计", boundary)
-        self.assertIn("结果为 0 条时，不得根据常识推荐任何有名称的地点", boundary)
-        self.assertIn("reference_cost_yuan", boundary)
-        self.assertIn("只能原样称为参考消费", boundary)
-        self.assertIn("不得评价为便宜、实惠或性价比高", boundary)
-        self.assertIn("允许依据实际返回的 rating 或 open_hours 做有限排序或说明", boundary)
-        self.assertIn("必须明确所依据的字段", boundary)
-        self.assertIn("不得把排序或说明改写成未返回属性", boundary)
-        self.assertIn("不得推断实时排队、预约、空位", boundary)
-        self.assertIn("地点之间的时间或距离", boundary)
-        self.assertIn("路线选择或比较只能基于实际返回的 duration_s、distance_m、transfers 等字段", boundary)
-        self.assertIn("允许说明最快、最慢、换乘次数或距离远近", boundary)
-        self.assertIn("必须明确依据的返回字段", boundary)
-        self.assertIn("停车位、停车难度、停车费、公交票价或成本", boundary)
-        self.assertIn(
-            "当前路况、周六路况、进出站或换乘等待时间、出行灵活性、舒适度、环保或免费",
-            boundary,
-        )
-        self.assertIn("不得声称路线耗时包含或不包含停车及其他未返回构成", boundary)
-        self.assertIn("未返回的路线属性只能说明无法从本次查询结果确认", boundary)
-        self.assertIn("【天气事实边界规则】", boundary)
-        self.assertIn("组合行程", boundary)
-        self.assertIn("必须调用 weather_forecast", boundary)
-        self.assertIn("不得用 web_search 或 url_read 替代", boundary)
-        self.assertIn("目的地市内接驳", boundary)
-        self.assertIn("先完成航班或高铁查询", boundary)
-        self.assertIn("只调用一次 route_compare", boundary)
-        self.assertIn("不得猜测机场或车站", boundary)
-        self.assertIn("必须把班次结果中的 city", boundary)
-        self.assertIn("origin_city 和 destination_city", boundary)
-        self.assertIn("实时温度、湿度、空气质量、降雨概率", boundary)
-        self.assertIn("不得声称代表具体建筑物、街道或园区的精确天气", boundary)
-        self.assertNotIn("民治星巴克", boundary)
-        self.assertNotIn("深圳北站", boundary)
-
-    def test_amap_fact_boundary_is_deduplicated(self):
-        call_kwargs = {"tools": [{"type": "function", "function": {"name": "local_place_search"}}]}
-
-        prepared = inject_amap_fact_boundary([{"role": "user", "content": "找咖啡店"}], call_kwargs)
-        prepared = inject_amap_fact_boundary(prepared, call_kwargs)
-
-        boundaries = [
-            message
-            for message in prepared
-            if message.get("role") == "system" and "【地点与路线事实边界规则】" in str(message.get("content", ""))
-        ]
-        self.assertEqual(len(boundaries), 1)
-
-    def test_non_amap_tools_do_not_inject_amap_fact_boundary(self):
-        messages = [{"role": "user", "content": "深圳天气"}]
-        call_kwargs = {"tools": [{"type": "function", "function": {"name": "web_search"}}]}
-
-        prepared = inject_amap_fact_boundary(messages, call_kwargs)
-
-        self.assertIs(prepared, messages)
-        self.assertFalse(any("【地点与路线事实边界规则】" in str(message.get("content", "")) for message in prepared))
-
     def test_build_call_config_applies_controlled_max_tokens(self):
         for raw_value, expected in ((1, 1), (1024, 1024), (9999, 4096)):
             with self.subTest(raw_value=raw_value):
@@ -950,15 +878,16 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             [message["role"] for message in prepared.messages],
             ["system", "system", "system", "system", "user"],
         )
-        self.assertIn("【当前真实日期】", prepared.messages[0]["content"])
-        self.assertIn("【执行计划控制规则】", prepared.messages[2]["content"])
-        self.assertIn("【无联网工具边界规则】", prepared.messages[3]["content"])
-        self.assertIn("不要声称已经搜索", prepared.messages[3]["content"])
-        self.assertIn("无法实时核验", prepared.messages[3]["content"])
-        self.assertIn("不要把已有知识包装成最新事实", prepared.messages[3]["content"])
-        self.assertIn("普通稳定问题直接回答", prepared.messages[3]["content"])
-        self.assertNotIn("切换模型", prepared.messages[3]["content"])
-        self.assertNotIn("【工具调用一致性规则】", prepared.messages[3]["content"])
+        self.assertIn("【Fusion 身份一致性规则】", prepared.messages[0]["content"])
+        self.assertIn("【执行计划控制规则】", prepared.messages[1]["content"])
+        self.assertIn("【无联网工具边界规则】", prepared.messages[2]["content"])
+        self.assertIn("不要声称已经搜索", prepared.messages[2]["content"])
+        self.assertIn("无法实时核验", prepared.messages[2]["content"])
+        self.assertIn("不要把已有知识包装成最新事实", prepared.messages[2]["content"])
+        self.assertIn("普通稳定问题直接回答", prepared.messages[2]["content"])
+        self.assertNotIn("切换模型", prepared.messages[2]["content"])
+        self.assertNotIn("【工具调用一致性规则】", prepared.messages[2]["content"])
+        self.assertIn("【当前真实日期】", prepared.messages[3]["content"])
         self.assertEqual(prepared.messages[4]["content"], "OpenAI 最近发布了什么模型？")
 
     async def test_prepare_messages_injects_no_vision_boundary_when_image_attached_to_text_model(self):
@@ -998,11 +927,12 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             [message["role"] for message in prepared.messages],
             ["system", "system", "system", "system", "system", "user"],
         )
-        self.assertIn("【无图片理解能力边界规则】", prepared.messages[2]["content"])
-        self.assertIn("当前模型不能读取或理解图片附件", prepared.messages[2]["content"])
-        self.assertIn("不要臆测图片内容", prepared.messages[2]["content"])
-        self.assertIn("【执行计划控制规则】", prepared.messages[3]["content"])
-        self.assertIn("【无联网工具边界规则】", prepared.messages[4]["content"])
+        self.assertIn("【无图片理解能力边界规则】", prepared.messages[1]["content"])
+        self.assertIn("当前模型不能读取或理解图片附件", prepared.messages[1]["content"])
+        self.assertIn("不要臆测图片内容", prepared.messages[1]["content"])
+        self.assertIn("【执行计划控制规则】", prepared.messages[2]["content"])
+        self.assertIn("【无联网工具边界规则】", prepared.messages[3]["content"])
+        self.assertIn("【当前真实日期】", prepared.messages[4]["content"])
         self.assertEqual(prepared.messages[5]["content"], "这张图里有什么？")
 
     async def test_prepare_messages_builds_llm_input_files_url_context_and_tool_contract(self):
@@ -1081,7 +1011,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNone(build_calls[0]["user_system_prompt"])
-        self.assertIn("用户偏好", prepared.messages[1]["content"])
+        self.assertIn("用户偏好", prepared.messages[5]["content"])
         self.assertIs(build_calls[0]["repo"], file_repo)
         self.assertEqual(build_calls[0]["user_id"], "user-1")
         self.assertIsNone(build_calls[0]["conversation_id"])
@@ -1093,11 +1023,12 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             [message["role"] for message in prepared.messages],
             ["system", "system", "system", "system", "system", "system", "user", "user"],
         )
-        self.assertIn("【当前真实日期】", prepared.messages[0]["content"])
-        self.assertIn("【无图片理解能力边界规则】", prepared.messages[3]["content"])
-        self.assertIn("【工具调用一致性规则】", prepared.messages[4]["content"])
-        self.assertIn("【执行计划控制规则】", prepared.messages[5]["content"])
-        self.assertNotIn("【无联网工具边界规则】", prepared.messages[5]["content"])
+        self.assertIn("【Fusion 身份一致性规则】", prepared.messages[0]["content"])
+        self.assertIn("【无图片理解能力边界规则】", prepared.messages[1]["content"])
+        self.assertIn("【工具调用一致性规则】", prepared.messages[2]["content"])
+        self.assertIn("【执行计划控制规则】", prepared.messages[3]["content"])
+        self.assertNotIn("【无联网工具边界规则】", prepared.messages[3]["content"])
+        self.assertIn("【当前真实日期】", prepared.messages[4]["content"])
         self.assertIn("<web_context>", prepared.messages[6]["content"])
         self.assertIn("文档正文", prepared.messages[7]["content"])
         self.assertEqual(call_config.announced_tools, ["web_search", "url_read"])
@@ -1189,9 +1120,10 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(prepared.initial_content_blocks, [])
-        self.assertEqual(prepared.messages[2], {"role": "system", "content": "继续执行，不要重写前文"})
-        self.assertEqual(prepared.messages[3]["role"], "system")
-        self.assertIn("【无联网工具边界规则】", prepared.messages[3]["content"])
+        self.assertEqual(prepared.messages[1], {"role": "system", "content": "继续执行，不要重写前文"})
+        self.assertEqual(prepared.messages[2]["role"], "system")
+        self.assertIn("【无联网工具边界规则】", prepared.messages[2]["content"])
+        self.assertIn("【当前真实日期】", prepared.messages[3]["content"])
         self.assertEqual(prepared.messages[4]["role"], "user")
 
     async def test_prepare_messages_passes_conversation_scope_to_builder(self):

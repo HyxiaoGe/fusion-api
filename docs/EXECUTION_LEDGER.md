@@ -71,6 +71,15 @@
 - 草稿 PR：API [#60](https://github.com/HyxiaoGe/fusion-api/pull/60)、UI [#48](https://github.com/HyxiaoGe/fusion-ui/pull/48)。UI 首轮 CI 全量 2350 测试及容器构建通过；API 首轮 CI 暴露两份旧集成测试的查询夹具/事件顺序不匹配，修正后主代理以 unittest 重跑 46 测试通过，生产代码未因此改动。最新分支 CI 结果以 PR Checks 为准。
 - 本条记录本地实现、代码验证与独立审查；分支 CI 以配套 PR 为准，未合并部署，未完成新版本真实浏览器/模型验收。协议和范围见 [一期契约](superpowers/specs/2026-08-26-system-prompt-assembly.md)。
 
+## 2026-08-27 主聊天 Prompt Runtime v2（仅本地开发与静态验证）
+
+- Run 初始 Prompt 改为 `app_identity → 固定运行规则 → current_date → user_preferences`，模板版本更新为 `2026-08-27.1`；稳定前缀不再被动态日期和偏好截断。
+- 默认 Web、高德、FlyAI、Plan 工具仍向主 LLM 公告 schema，但 Run 初始 Prompt 不再因工具可用而注入整段高德/FlyAI 领域 Prompt；自然表达“我现在在北京，我想去上海，你可以帮我吗”仍保留 `route_compare`。
+- 工具调用前规则下沉到 description/schema 和后端校验；高德事实约束继续随实际结果进入 ToolMessage，FlyAI 实际结果新增完整事实边界及单班次接驳后续规则。旧高德整段 Prompt 常量和两条初始注入 helper 已删除。
+- Trajectory 节点明确显示“Run 初始系统提示词”，正文说明后续 Round 可追加语言、修复、研究或总结规则；LLM 请求指纹改标“当轮实际系统消息指纹”。
+- 本地证据：API 全量 `2918 passed, 2 skipped, 828 subtests`，Ruff check/format 通过；UI 全量 `2371 passed`，目标 ESLint 和 production build 通过；两仓 `git diff --check` 通过。
+- 本条没有提交、推送、PR、CI、部署、本地服务或真实模型/浏览器验收。协议见 [v2 规格](superpowers/specs/2026-08-27-prompt-runtime-v2.md)。
+
 ## 最近发布记录
 
 | 日期 | 仓库 | commit | 内容 | 验证 |
