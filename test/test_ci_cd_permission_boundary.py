@@ -379,6 +379,11 @@ class CICDPermissionBoundaryTests(unittest.TestCase):
         self.assertIn("Start-Service -Name $serviceName", script)
         self.assertIn("Docker Desktop.exe", script)
         self.assertIn("Start-Process -FilePath $desktopPath", script)
+        self.assertIn('$env:RUNNER_TRACKING_ID = ""', script)
+        self.assertLess(
+            script.index('$env:RUNNER_TRACKING_ID = ""'),
+            script.index("Start-Process -FilePath $desktopPath"),
+        )
         self.assertIn("Start-Sleep -Seconds (10 * $attempt)", script)
         self.assertIn("Docker daemon ready", script)
         self.assertIn("Docker daemon did not become ready", script)
