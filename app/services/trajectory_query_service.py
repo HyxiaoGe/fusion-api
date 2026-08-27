@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -16,6 +16,7 @@ from app.schemas.trajectory import (
     SystemPromptNodeDetail,
     SystemPromptSnapshot,
     ToolNodeDetail,
+    TrajectoryCapabilityResolution,
     TrajectoryCompleteness,
     TrajectoryEventRecord,
     TrajectoryLlmRoundSummary,
@@ -540,7 +541,18 @@ class TrajectoryQueryService:
             ended_at=run.terminal_at,
             llm_detail_schema_version=llm_detail_schema_version,
             llm_round_count=llm_round_count,
+            capability_resolution=TrajectoryQueryService._capability_resolution(run.run_config),
         )
+
+    @staticmethod
+    def _capability_resolution(run_config: object) -> TrajectoryCapabilityResolution | None:
+        if not isinstance(run_config, Mapping):
+            return None
+        raw_resolution = run_config.get("capability_resolution")
+        try:
+            return TrajectoryCapabilityResolution.model_validate(raw_resolution)
+        except ValidationError:
+            return None
 
     @staticmethod
     def _event_record(event: AgentEvent) -> TrajectoryEventRecord:

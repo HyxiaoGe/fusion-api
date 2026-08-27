@@ -33,6 +33,20 @@ from app.services.agent.events import (
     ToolResultDigest,
 )
 
+CAPABILITY_RESOLUTION = {
+    "schema_version": 1,
+    "router_version": "2026-08-27.1",
+    "package_id": "fresh_web",
+    "confidence": "high",
+    "resolution_mode": "routed",
+    "reason_codes": ["fresh_external_fact"],
+    "external_tool_names": ["web_search"],
+    "effective_plan_mode": "off",
+    "include_current_date": True,
+    "network_boundary_required": False,
+    "bundle_fingerprint": "sha256:" + "a" * 64,
+}
+
 
 class AgentEventModelTests(unittest.TestCase):
     def _common(self):
@@ -51,12 +65,56 @@ class AgentEventModelTests(unittest.TestCase):
             model="gpt",
             tools=["web_search"],
             config={"max_steps": 8, "max_tool_calls": 20, "timeout_s": 300},
+            capability_resolution=CAPABILITY_RESOLUTION,
             **self._common(),
         )
         self.assertEqual(ev.type, "run_started")
         self.assertEqual(ev.tools, ["web_search"])
         self.assertEqual(ev.message_id, "msg-1")
         self.assertEqual(ev.task_id, "task-1")
+        self.assertEqual(ev.capability_resolution.model_dump(), CAPABILITY_RESOLUTION)
+
+    def test_run_started_rejects_unsafe_or_invalid_capability_resolution(self):
+        base = {
+            "type": "run_started",
+            "conversation_id": "c1",
+            "message_id": "msg-1",
+            "task_id": "task-1",
+            "model": "gpt",
+            "tools": ["web_search"],
+            "config": {},
+            **self._common(),
+        }
+        with self.assertRaises(ValidationError):
+            RunStarted(
+                **base,
+                capability_resolution={
+                    **CAPABILITY_RESOLUTION,
+                    "original_message": "用户原文禁止进入事件协议",
+                },
+            )
+        with self.assertRaises(ValidationError):
+            RunStarted(
+                **base,
+                capability_resolution={
+                    **CAPABILITY_RESOLUTION,
+                    "bundle_fingerprint": "a" * 64,
+                },
+            )
+
+    def test_run_started_tools_must_match_external_resolution_without_update_plan(self):
+        with self.assertRaises(ValidationError):
+            RunStarted(
+                type="run_started",
+                conversation_id="c1",
+                message_id="msg-1",
+                task_id="task-1",
+                model="gpt",
+                tools=["web_search", "update_plan"],
+                config={"capability_resolution": CAPABILITY_RESOLUTION},
+                capability_resolution=CAPABILITY_RESOLUTION,
+                **self._common(),
+            )
 
     def test_run_started_message_id_required(self):
         """RunStarted 缺 message_id 必须抛 ValidationError"""

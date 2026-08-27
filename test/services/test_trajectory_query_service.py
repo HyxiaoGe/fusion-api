@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import create_engine, event
@@ -24,6 +25,20 @@ from app.db.models import (
 )
 from app.db.trajectory_repository import TrajectoryRepository
 from app.services.trajectory_query_service import TrajectoryQueryService
+
+CAPABILITY_RESOLUTION = {
+    "schema_version": 1,
+    "router_version": "2026-08-27.1",
+    "package_id": "fresh_web",
+    "confidence": "high",
+    "resolution_mode": "routed",
+    "reason_codes": ["fresh_external_fact"],
+    "external_tool_names": ["web_search"],
+    "effective_plan_mode": "off",
+    "include_current_date": True,
+    "network_boundary_required": False,
+    "bundle_fingerprint": "sha256:" + "a" * 64,
+}
 
 
 class TrajectoryQueryServiceTests(unittest.TestCase):
@@ -68,6 +83,7 @@ class TrajectoryQueryServiceTests(unittest.TestCase):
         created_at: datetime | None = None,
         turn_message_id: str | None = "turn-1",
         attempt_index: int | None = 1,
+        run_config: dict | None = None,
     ) -> None:
         with self.Session() as db:
             db.add(
@@ -84,6 +100,7 @@ class TrajectoryQueryServiceTests(unittest.TestCase):
                     total_steps=7,
                     total_tool_calls=11,
                     total_duration_ms=345,
+                    run_config=run_config,
                     created_at=created_at or self.now,
                     terminal_at=created_at or self.now,
                 )
@@ -195,6 +212,55 @@ class TrajectoryQueryServiceTests(unittest.TestCase):
         self.assertEqual(snapshot.completeness.expected_last_sequence, 2)
         self.assertEqual(snapshot.completeness.loaded_event_count, 2)
         self.assertEqual((snapshot.completeness.first_sequence, snapshot.completeness.last_sequence), (0, 1))
+
+    def test_refresh_reads_safe_capability_resolution_from_run_config_without_rerouting(self):
+        self._run(
+            "run-resolution",
+            run_config={
+                "capability_resolution": CAPABILITY_RESOLUTION,
+                "authorization": "Bearer hidden",
+                "system_prompt_snapshot": {"content": "PRIVATE 正文"},
+            },
+        )
+        self._meta("run-resolution")
+
+        with patch(
+            "app.services.stream.run_capability_router.resolve_run_capability_route",
+            side_effect=AssertionError("刷新不得重新调用 router"),
+        ) as router:
+            service = self._service(max_events=10)
+            run_list = service.list_runs("conv-1", "user-1")
+            snapshot = service.get_user_snapshot("conv-1", "run-resolution", "user-1")
+
+        router.assert_not_called()
+        self.assertIsNotNone(run_list)
+        self.assertIsNotNone(snapshot)
+        assert run_list is not None
+        assert snapshot is not None
+        self.assertEqual(run_list.items[0].capability_resolution.model_dump(), CAPABILITY_RESOLUTION)
+        self.assertEqual(snapshot.run.capability_resolution.model_dump(), CAPABILITY_RESOLUTION)
+        self.assertNotIn("authorization", run_list.model_dump_json())
+        self.assertNotIn("PRIVATE", snapshot.model_dump_json())
+
+    def test_legacy_or_invalid_capability_resolution_returns_none(self):
+        invalid_values = (
+            None,
+            "not-a-dict",
+            {**CAPABILITY_RESOLUTION, "original_message": "用户原文"},
+            {**CAPABILITY_RESOLUTION, "bundle_fingerprint": "not-a-sha256"},
+            {**CAPABILITY_RESOLUTION, "reason_codes": ["private_match_text"]},
+            {**CAPABILITY_RESOLUTION, "include_current_date": "true"},
+        )
+        for index, invalid in enumerate(invalid_values):
+            run_id = f"run-invalid-{index}"
+            run_config = {} if invalid is None else {"capability_resolution": invalid}
+            self._run(run_id, turn_message_id=f"turn-invalid-{index}", run_config=run_config)
+            result = self._service().get_user_snapshot("conv-1", run_id, "user-1")
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertIsNone(result.run.capability_resolution)
+            self.assertNotIn("用户原文", result.model_dump_json())
 
     def test_snapshot_batches_llm_previews_and_run_list_counts_distinct_rounds(self):
         self._run("run-llm")

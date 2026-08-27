@@ -140,6 +140,7 @@ class AgentEventEmitter:
                 model=model,
                 tools=tools,
                 config=config,
+                capability_resolution=config.get("capability_resolution"),
                 **self._envelope(step_id=None),
             )
         )

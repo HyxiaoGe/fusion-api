@@ -9,6 +9,20 @@ from pydantic import ValidationError
 from app.services.agent.emitter import AgentEventEmitter
 from app.services.agent.events import StepStarted
 
+CAPABILITY_RESOLUTION = {
+    "schema_version": 1,
+    "router_version": "2026-08-27.1",
+    "package_id": "fresh_web",
+    "confidence": "high",
+    "resolution_mode": "routed",
+    "reason_codes": ["fresh_external_fact"],
+    "external_tool_names": ["web_search"],
+    "effective_plan_mode": "off",
+    "include_current_date": True,
+    "network_boundary_required": False,
+    "bundle_fingerprint": "sha256:" + "a" * 64,
+}
+
 
 class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
     async def test_system_prompt_result_and_request_fingerprint_share_run_envelope(self):
@@ -54,7 +68,12 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_started_envelope(self):
         writer = AsyncMock()
         em = AgentEventEmitter(run_id="r1", trace_id="r1", conversation_id="c1", task_id="task-1", redis_writer=writer)
-        await em.run_started(message_id="m1", model="gpt", tools=["web_search"], config={"max_steps": 8})
+        await em.run_started(
+            message_id="m1",
+            model="gpt",
+            tools=["web_search"],
+            config={"max_steps": 8, "capability_resolution": CAPABILITY_RESOLUTION},
+        )
         writer.append_chunk.assert_awaited_once()
         args, kwargs = writer.append_chunk.call_args
         self.assertEqual(args[0], "c1")
@@ -66,6 +85,9 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args[3]["trace_id"], "r1")
         self.assertEqual(args[3]["message_id"], "m1")
         self.assertEqual(args[3]["task_id"], "task-1")
+        self.assertEqual(args[3]["capability_resolution"], CAPABILITY_RESOLUTION)
+        self.assertEqual(args[3]["tools"], args[3]["capability_resolution"]["external_tool_names"])
+        self.assertNotIn("update_plan", args[3]["tools"])
 
     async def test_step_started_returns_step_id_and_persists_context(self):
         writer = AsyncMock()

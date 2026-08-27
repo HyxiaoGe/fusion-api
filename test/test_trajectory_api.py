@@ -21,6 +21,20 @@ os.environ["AUTH_SERVICE_BASE_URL"] = "http://auth.example:8100"
 os.environ["AUTH_SERVICE_CLIENT_ID"] = "fusion-client"
 os.environ["AUTH_SERVICE_JWKS_URL"] = "http://auth.example:8100/.well-known/jwks.json"
 
+CAPABILITY_RESOLUTION = {
+    "schema_version": 1,
+    "router_version": "2026-08-27.1",
+    "package_id": "fresh_web",
+    "confidence": "high",
+    "resolution_mode": "routed",
+    "reason_codes": ["fresh_external_fact"],
+    "external_tool_names": ["web_search"],
+    "effective_plan_mode": "off",
+    "include_current_date": True,
+    "network_boundary_required": False,
+    "bundle_fingerprint": "sha256:" + "a" * 64,
+}
+
 
 class TrajectoryApiTests(unittest.TestCase):
     @classmethod
@@ -87,6 +101,7 @@ class TrajectoryApiTests(unittest.TestCase):
         user_id: str = "user-1",
         trajectory_status: str = "complete",
         terminal_intent_reason: str | None = None,
+        run_config: dict | None = None,
     ) -> None:
         from app.db.models import AgentEvent, AgentSession, RunTrajectoryMeta, ToolCallLog
 
@@ -104,6 +119,7 @@ class TrajectoryApiTests(unittest.TestCase):
                 total_steps=2,
                 total_tool_calls=3,
                 total_duration_ms=123,
+                run_config=run_config,
                 created_at=self.now,
                 terminal_at=self.now,
             )
@@ -178,6 +194,50 @@ class TrajectoryApiTests(unittest.TestCase):
         self.assertNotIn("input_params", snapshot.text)
         self.assertNotIn("output_data", snapshot.text)
         self.assertNotIn("terminal_intent", snapshot.text)
+
+    def test_run_list_and_snapshot_expose_only_persisted_safe_capability_resolution(self):
+        self._add_run(
+            "run-resolution",
+            run_config={
+                "capability_resolution": CAPABILITY_RESOLUTION,
+                "authorization": "Bearer hidden",
+                "system_prompt_snapshot": {"content": "PRIVATE 正文"},
+            },
+        )
+
+        listing = self.client.get("/api/conversations/conv-1/runs")
+        snapshot = self.client.get("/api/conversations/conv-1/runs/run-resolution/trajectory")
+
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual(snapshot.status_code, 200)
+        self.assertEqual(listing.json()["data"]["items"][0]["capability_resolution"], CAPABILITY_RESOLUTION)
+        self.assertEqual(snapshot.json()["data"]["run"]["capability_resolution"], CAPABILITY_RESOLUTION)
+        for response in (listing, snapshot):
+            self.assertNotIn("Bearer hidden", response.text)
+            self.assertNotIn("authorization", response.text)
+            self.assertNotIn("PRIVATE 正文", response.text)
+            self.assertNotIn("system_prompt_snapshot", response.text)
+
+    def test_legacy_and_invalid_run_capability_resolution_are_null(self):
+        self._add_run("run-legacy", run_config={"max_steps": 8})
+        self._add_run(
+            "run-invalid",
+            run_config={
+                "capability_resolution": {
+                    **CAPABILITY_RESOLUTION,
+                    "original_message": "用户原文禁止返回",
+                }
+            },
+        )
+
+        legacy = self.client.get("/api/conversations/conv-1/runs/run-legacy/trajectory")
+        invalid = self.client.get("/api/conversations/conv-1/runs/run-invalid/trajectory")
+
+        self.assertEqual(legacy.status_code, 200)
+        self.assertEqual(invalid.status_code, 200)
+        self.assertIsNone(legacy.json()["data"]["run"]["capability_resolution"])
+        self.assertIsNone(invalid.json()["data"]["run"]["capability_resolution"])
+        self.assertNotIn("用户原文禁止返回", invalid.text)
 
     def test_unauthorized_conversation_and_cross_conversation_run_are_uniformly_not_found(self):
         """若 handler 在 service 之外泄漏资源归属，404 契约会被破坏。"""

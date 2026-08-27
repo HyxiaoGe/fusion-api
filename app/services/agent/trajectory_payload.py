@@ -7,6 +7,10 @@ from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from pydantic import ValidationError
+
+from app.schemas.trajectory import TrajectoryCapabilityResolution
+
 MAX_LEDGER_TEXT_LENGTH = 512
 MAX_LEDGER_LIST_ITEMS = 50
 
@@ -26,7 +30,7 @@ _COMMON_FIELDS = frozenset(
 )
 
 _EVENT_FIELDS: dict[str, frozenset[str]] = {
-    "run_started": frozenset({"conversation_id", "message_id", "task_id", "model", "tools"}),
+    "run_started": frozenset({"conversation_id", "message_id", "task_id", "model", "tools", "capability_resolution"}),
     "step_started": frozenset({"step_number"}),
     "tool_call_started": frozenset({"tool_name", "plan_item_id"}),
     "tool_call_delta": frozenset({"tool_name"}),
@@ -228,6 +232,31 @@ def _sanitize_evidence(value: Any) -> dict[str, Any]:
     return evidence
 
 
+_CAPABILITY_RESOLUTION_FIELDS = (
+    "schema_version",
+    "router_version",
+    "package_id",
+    "confidence",
+    "resolution_mode",
+    "reason_codes",
+    "external_tool_names",
+    "effective_plan_mode",
+    "include_current_date",
+    "network_boundary_required",
+    "bundle_fingerprint",
+)
+
+
+def _sanitize_capability_resolution(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    candidate = {field: value[field] for field in _CAPABILITY_RESOLUTION_FIELDS if field in value}
+    try:
+        return TrajectoryCapabilityResolution.model_validate(candidate).model_dump()
+    except ValidationError:
+        return None
+
+
 def _sanitize_scalar(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, float)):
         return value
@@ -238,6 +267,7 @@ _SPECIAL_SANITIZERS: dict[str, Callable[[Any], Any]] = {
     "items": _sanitize_plan_items,
     "item": _sanitize_plan_item,
     "evidence": _sanitize_evidence,
+    "capability_resolution": _sanitize_capability_resolution,
 }
 
 

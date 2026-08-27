@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.ai.prompts.system_prompt import SystemPromptAssemblyError
+from app.ai.prompts.system_prompt import TEMPLATE_VERSION, SystemPromptAssemblyError
 from app.core.logger import app_logger as logger
 from app.core.prompt_bundle import get_active_prompt_bundle_revision
 from app.schemas.chat import TextBlock
 from app.schemas.response import ApiException
+from app.schemas.trajectory import TrajectoryCapabilityResolution
 from app.services.agent.session_cache import write_system_prompt_snapshot
 from app.services.agent_strategy_config import get_agent_strategy_config
 from app.services.knowledge.chat_grounding import (
@@ -28,6 +31,7 @@ from app.services.stream.agent_loop_outcome import AgentLoopExit
 from app.services.stream.agent_loop_policy import AgentLoopLimits, map_run_terminal_state
 from app.services.stream.agent_loop_request_prep import AgentLoopCallConfig
 from app.services.stream.research_evidence import assign_missing_source_reference_metadata
+from app.services.stream.run_capability_router import serialize_capability_resolution
 from app.services.stream_state_service import StreamOwnershipLostError
 
 AsyncFn = Callable[..., Awaitable[Any]]
@@ -572,4 +576,27 @@ def _run_config(limits: AgentLoopLimits, call_config: AgentLoopCallConfig | None
             bindings.append(safe_binding)
     if bindings:
         config["mcp_tool_bindings"] = bindings
+    resolution = getattr(call_config, "capability_resolution", None)
+    if resolution is not None:
+        resolution_payload = serialize_capability_resolution(resolution)
+        announced_tools = list(getattr(call_config, "announced_tools", []) or [])
+        if resolution_payload["external_tool_names"] != announced_tools:
+            raise ValueError("能力路由工具与 Run 公告工具不一致")
+        fingerprint_input = {
+            "router_version": resolution_payload["router_version"],
+            "prompt_template_version": TEMPLATE_VERSION,
+            "package_id": resolution_payload["package_id"],
+            "external_tool_names": announced_tools,
+            "effective_plan_mode": resolution_payload["effective_plan_mode"],
+            "task_mode": config["task_mode"],
+            "evidence_policy": config["evidence_policy"],
+        }
+        serialized_fingerprint_input = json.dumps(
+            fingerprint_input,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        resolution_payload["bundle_fingerprint"] = "sha256:" + hashlib.sha256(serialized_fingerprint_input).hexdigest()
+        config["capability_resolution"] = TrajectoryCapabilityResolution.model_validate(resolution_payload).model_dump()
     return config
