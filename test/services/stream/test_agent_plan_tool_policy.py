@@ -1,10 +1,23 @@
 import unittest
 from types import SimpleNamespace
 
-from app.services.stream.agent_plan_tool_policy import resolve_agent_plan_tool_policy
+from app.services.stream.agent_plan_tool_policy import (
+    resolve_agent_plan_tool_policy,
+    resolve_product_capability_signals,
+)
 
 
 class AgentPlanToolPolicyTests(unittest.TestCase):
+    def test_product_signal_resolver_is_reusable_by_run_router(self):
+        signals = resolve_product_capability_signals(
+            original_message="我住在南景新村，公司在双子塔，请比较地铁和驾车通勤路线。",
+            task_context_messages=None,
+        )
+
+        self.assertTrue(signals.explicit_route)
+        self.assertFalse(signals.adjacent_route_followup)
+        self.assertFalse(signals.weather)
+
     def test_verified_research_requires_search_and_two_independent_reads(self):
         messages = [
             "帮我调研一下韩国股市近几年的起伏，重点说说主要原因和争议。",

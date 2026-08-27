@@ -21,6 +21,7 @@ _ROUTE_ACTION_RE = re.compile(r"路线|怎么走|如何去|如何到|导航|到�
 _ROUTE_MODE_RE = re.compile(r"驾车|开车|自驾|公交|公共交通|地铁|轨道交通|骑行|步行|摩托")
 _ROUTE_ENDPOINT_RE = re.compile(
     r"(?:从.{1,80}?(?:到|去|前往).{1,80})|"
+    r"(?:(?:我)?(?:现在)?在.{1,80}?(?:想|要|准备)?(?:到|去|前往).{1,80})|"
     r"(?:(?:住在|起点|出发地).{1,80}?(?:公司在|学校在|终点|目的地|到|去|前往).{1,80})"
 )
 _ROUTE_FOLLOWUP_RE = re.compile(r"哪个|哪种|推荐|更合适|怎么选|如何选|选择|优先|日常通勤")
@@ -59,6 +60,41 @@ class AgentPlanToolPolicy:
     reason: str | None = None
 
 
+@dataclass(frozen=True)
+class ProductCapabilitySignals:
+    """产品能力路由与计划策略共用的代码固定信号。"""
+
+    explicit_route: bool
+    adjacent_route_followup: bool
+    endpoint_relation: bool
+    weather: bool
+    flight: bool
+    train: bool
+    place: bool
+
+
+def resolve_product_capability_signals(
+    *,
+    original_message: str | None,
+    task_context_messages: list[object] | None,
+) -> ProductCapabilitySignals:
+    """集中解析产品意图，避免 Run 路由和计划策略维护两套正则。"""
+
+    message = _normalize_message(original_message)
+    adjacent_route_followup = _has_adjacent_route_result_context(
+        task_context_messages
+    ) and _is_route_followup(message)
+    return ProductCapabilitySignals(
+        explicit_route=_is_explicit_route_task(message),
+        adjacent_route_followup=adjacent_route_followup,
+        endpoint_relation=bool(_ROUTE_ENDPOINT_RE.search(message)),
+        weather=bool(_WEATHER_RE.search(message)),
+        flight=bool(_FLIGHT_RE.search(message)),
+        train=bool(_TRAIN_RE.search(message)),
+        place=bool(_PLACE_RE.search(message)),
+    )
+
+
 def resolve_agent_plan_tool_policy(
     *,
     original_message: str | None,
@@ -74,7 +110,11 @@ def resolve_agent_plan_tool_policy(
     is_verified_research = _VERIFIED_RESEARCH_TOOL_NAMES.issubset(announced) and _is_verified_research_request(
         message
     )
-    is_explicit_route = AMAP_ROUTE_COMPARE in announced and _is_explicit_route_task(message)
+    product_signals = resolve_product_capability_signals(
+        original_message=message,
+        task_context_messages=task_context_messages,
+    )
+    is_explicit_route = AMAP_ROUTE_COMPARE in announced and product_signals.explicit_route
     if is_verified_research:
         required_counts = {"web_search": 1, "url_read": 2}
         reason = "verified_research_request"
@@ -87,23 +127,22 @@ def resolve_agent_plan_tool_policy(
         )
     if AMAP_ROUTE_COMPARE not in announced:
         return AgentPlanToolPolicy()
-    has_adjacent_route_context = _has_adjacent_route_result_context(task_context_messages)
-    if has_adjacent_route_context and _is_route_followup(message):
+    if product_signals.adjacent_route_followup:
         return AgentPlanToolPolicy(
             allowed_tool_names=frozenset({AMAP_ROUTE_COMPARE}),
             reason="adjacent_route_followup",
         )
-    if not _is_explicit_route_task(message):
+    if not product_signals.explicit_route:
         return AgentPlanToolPolicy()
 
     allowed = {AMAP_ROUTE_COMPARE}
-    if AMAP_WEATHER_FORECAST in announced and _WEATHER_RE.search(message):
+    if AMAP_WEATHER_FORECAST in announced and product_signals.weather:
         allowed.add(AMAP_WEATHER_FORECAST)
-    if FLYAI_SEARCH_FLIGHTS in announced and _FLIGHT_RE.search(message):
+    if FLYAI_SEARCH_FLIGHTS in announced and product_signals.flight:
         allowed.add(FLYAI_SEARCH_FLIGHTS)
-    if FLYAI_SEARCH_TRAINS in announced and _TRAIN_RE.search(message):
+    if FLYAI_SEARCH_TRAINS in announced and product_signals.train:
         allowed.add(FLYAI_SEARCH_TRAINS)
-    if AMAP_LOCAL_PLACE_SEARCH in announced and _PLACE_RE.search(message):
+    if AMAP_LOCAL_PLACE_SEARCH in announced and product_signals.place:
         allowed.add(AMAP_LOCAL_PLACE_SEARCH)
     return AgentPlanToolPolicy(
         required_initial_tool_counts={AMAP_ROUTE_COMPARE: 1},
