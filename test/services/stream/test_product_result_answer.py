@@ -330,6 +330,28 @@ class ProductResultAnswerTests(unittest.TestCase):
         for unsupported in ("湿度", "空气质量", "降雨概率", "预警"):
             self.assertNotIn(unsupported, answer)
 
+    def test_weather_fallback_answers_requested_activity_condition_without_inference(self):
+        block = _weather_result("weather-activity")
+        messages = [
+            {
+                "role": "user",
+                "content": "2026年8月2日上海天气怎么样，适合上午骑行吗？",
+            }
+        ]
+
+        answer = build_grounded_product_answer([block], messages=messages)
+
+        self.assertIn("8月2日（周日）白天阵雨", answer)
+        self.assertNotIn("8月1日", answer)
+        self.assertNotIn("8月3日", answer)
+        self.assertIn("只有白天和夜间粒度，无法确认上午这一细分时段", answer)
+        self.assertIn("如果你的条件是上午骑行时避开降水", answer)
+        self.assertIn("不满足这一条件", answer)
+        self.assertNotIn("建议", answer)
+        self.assertNotIn("适合骑行", answer)
+        validation = validate_product_answer(answer, [block], messages=messages)
+        self.assertTrue(validation.is_valid, validation.reason_code)
+
     def test_geolocation_failure_answer_is_product_neutral(self):
         answer = build_product_tool_failure_answer(
             [
