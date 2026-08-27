@@ -507,6 +507,53 @@ def test_explicit_mobility_accepts_arbitrary_bounded_endpoint_slots(message):
 @pytest.mark.parametrize(
     "message",
     [
+        "从需求评审到正式上线怎么走流程？",
+        "从初级工程师到架构师怎么走？",
+        "从初级工程师到架构师怎么走职业路径？",
+    ],
+)
+def test_abstract_process_and_career_paths_do_not_expose_mobility_tools(message):
+    route = _resolve(message)
+
+    assert route.package_id == "clarification_only"
+    assert route.external_tool_names == ()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "请给我从故宫到颐和园的路线",
+        "请给出从故宫到颐和园的路线",
+        "请规划从故宫到颐和园的路线",
+        "请推荐从故宫到颐和园的路线",
+    ],
+)
+def test_plain_route_request_structure_exposes_route_compare(message):
+    route = _resolve(message)
+
+    assert route.package_id == "mobility_route"
+    assert route.external_tool_names == ("route_compare",)
+    assert route.reason_codes == ("explicit_route_task",)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "请给我从前端团队到后端团队的技术路线",
+        "请规划从初创团队到成熟团队的发展路线",
+        "请推荐从销售线索到正式签约的业务路线",
+    ],
+)
+def test_plain_route_request_structure_rejects_abstract_route_types(message):
+    route = _resolve(message)
+
+    assert route.package_id == "clarification_only"
+    assert route.external_tool_names == ()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
         "从 到颐和园怎么走？",
         f"从故宫到{'颐' * 61}怎么走？",
     ],

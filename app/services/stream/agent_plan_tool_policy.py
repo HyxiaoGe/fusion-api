@@ -24,6 +24,24 @@ _EXPLICIT_MOBILITY_ACTION_RE = re.compile(
 _EXPLICIT_ROUTE_CHOICE_RE = re.compile(
     r"(?:哪个|哪条|哪种)\s*路线(?:\s*(?:更快|更短|更合适|更方便))?"
 )
+_PLAIN_ROUTE_REQUEST_RE = re.compile(
+    r"(?:请\s*)?(?:给我|给出|规划|推荐)\s*从\s*"
+    r"(?P<origin>[^，,。；;？?]{1,40}?)(?:到|去|前往)\s*"
+    r"(?P<destination>[^，,。；;？?]{1,60}?)的路线"
+    r"(?=$|[，,。；;？?])"
+)
+_ABSTRACT_ROUTE_CONTEXT_RE = re.compile(
+    r"怎么走(?:个)?(?:流程|程序|步骤)|"
+    r"(?:职业|晋升|成长)(?:发展)?(?:路径|路线)|"
+    r"(?:技术|发展|业务)路线"
+)
+_CAREER_ENDPOINT_RE = re.compile(
+    r"(?:工程师|架构师|设计师|分析师|科学家|经理|主管|总监|专家|顾问|"
+    r"开发者|程序员|岗位|职位|职级)$"
+)
+_PROCESS_STAGE_ENDPOINT_RE = re.compile(
+    r"(?:需求|评审|立项|开发|联调|测试|验收|发布|上线|部署|交付)$"
+)
 INTERCITY_LOCATION_NAMES = (
     "北京",
     "上海",
@@ -172,6 +190,7 @@ class _EndpointRelation:
     origin: str
     destination: str
     structured: bool
+    plain_route_request: bool = False
 
 
 def resolve_product_capability_signals(
@@ -188,6 +207,7 @@ def resolve_product_capability_signals(
     endpoint = _parse_endpoint_relation(message)
     endpoint_relation = endpoint is not None
     mobility_intent = _resolve_mobility_intent_strength(message, endpoint)
+    abstract_relation = _is_abstract_endpoint_relation(message, endpoint)
     endpoint_tiers = (
         (
             _endpoint_slot_tier(endpoint.origin),
@@ -206,6 +226,7 @@ def resolve_product_capability_signals(
         endpoint
         and endpoint.structured
         and endpoints_are_bounded
+        and not abstract_relation
         and mobility_intent == _MobilityIntentStrength.EXPLICIT
     )
     return ProductCapabilitySignals(
@@ -214,6 +235,7 @@ def resolve_product_capability_signals(
         endpoint_relation=endpoint_relation,
         intercity_mobility=(
             bool(endpoint)
+            and not abstract_relation
             and (
                 explicit_route
                 or (
@@ -352,6 +374,16 @@ def _content_has_block_type(content: object, block_type: str) -> bool:
 
 
 def _parse_endpoint_relation(message: str) -> _EndpointRelation | None:
+    plain_route_match = _PLAIN_ROUTE_REQUEST_RE.search(message)
+    if plain_route_match is not None:
+        return _EndpointRelation(
+            origin=_normalize_endpoint_slot(plain_route_match.group("origin")),
+            destination=_normalize_endpoint_slot(
+                plain_route_match.group("destination")
+            ),
+            structured=True,
+            plain_route_request=True,
+        )
     for pattern in _STRUCTURED_ROUTE_ENDPOINT_RES:
         match = pattern.search(message)
         if match is not None:
@@ -390,6 +422,8 @@ def _resolve_mobility_intent_strength(
     message: str,
     endpoint: _EndpointRelation | None = None,
 ) -> _MobilityIntentStrength:
+    if endpoint is not None and endpoint.plain_route_request:
+        return _MobilityIntentStrength.EXPLICIT
     intent_message = _without_endpoint_slots(message, endpoint)
     if _EXPLICIT_MOBILITY_ACTION_RE.search(intent_message) or _EXPLICIT_ROUTE_CHOICE_RE.search(
         intent_message
@@ -398,6 +432,20 @@ def _resolve_mobility_intent_strength(
     if _RELATED_MOBILITY_RE.search(intent_message):
         return _MobilityIntentStrength.RELATED
     return _MobilityIntentStrength.NONE
+
+
+def _is_abstract_endpoint_relation(
+    message: str,
+    endpoint: _EndpointRelation | None,
+) -> bool:
+    if endpoint is None:
+        return False
+    if _ABSTRACT_ROUTE_CONTEXT_RE.search(message):
+        return True
+    slots = (endpoint.origin, endpoint.destination)
+    return all(_CAREER_ENDPOINT_RE.search(slot) for slot in slots) or all(
+        _PROCESS_STAGE_ENDPOINT_RE.search(slot) for slot in slots
+    )
 
 
 def _without_endpoint_slots(

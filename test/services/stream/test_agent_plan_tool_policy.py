@@ -104,6 +104,55 @@ class AgentPlanToolPolicyTests(unittest.TestCase):
                 self.assertTrue(signals.explicit_route)
                 self.assertTrue(signals.intercity_mobility)
 
+    def test_abstract_process_and_career_paths_are_not_mobility_signals(self):
+        for message in (
+            "从需求评审到正式上线怎么走流程？",
+            "从初级工程师到架构师怎么走？",
+            "从初级工程师到架构师怎么走职业路径？",
+        ):
+            with self.subTest(message=message):
+                signals = resolve_product_capability_signals(
+                    original_message=message,
+                    task_context_messages=None,
+                )
+
+                self.assertTrue(signals.endpoint_relation)
+                self.assertFalse(signals.explicit_route)
+                self.assertFalse(signals.intercity_mobility)
+
+    def test_plain_route_request_structure_is_an_explicit_mobility_signal(self):
+        for message in (
+            "请给我从故宫到颐和园的路线",
+            "请给出从故宫到颐和园的路线",
+            "请规划从故宫到颐和园的路线",
+            "请推荐从故宫到颐和园的路线",
+        ):
+            with self.subTest(message=message):
+                signals = resolve_product_capability_signals(
+                    original_message=message,
+                    task_context_messages=None,
+                )
+
+                self.assertTrue(signals.endpoint_relation)
+                self.assertTrue(signals.explicit_route)
+                self.assertTrue(signals.intercity_mobility)
+
+    def test_plain_route_request_structure_rejects_abstract_route_types(self):
+        for message in (
+            "请给我从前端团队到后端团队的技术路线",
+            "请规划从初创团队到成熟团队的发展路线",
+            "请推荐从销售线索到正式签约的业务路线",
+        ):
+            with self.subTest(message=message):
+                signals = resolve_product_capability_signals(
+                    original_message=message,
+                    task_context_messages=None,
+                )
+
+                self.assertTrue(signals.endpoint_relation)
+                self.assertFalse(signals.explicit_route)
+                self.assertFalse(signals.intercity_mobility)
+
     def test_explicit_mobility_rejects_empty_or_overlong_endpoint_slots(self):
         for message in (
             "从 到颐和园怎么走？",
