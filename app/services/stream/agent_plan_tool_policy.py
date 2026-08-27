@@ -19,16 +19,21 @@ from app.services.search_budget import infer_search_intent
 _COMMUTE_RE = re.compile(r"通勤")
 _ROUTE_ACTION_RE = re.compile(r"路线|怎么走|如何去|如何到|导航|到达")
 _ROUTE_MODE_RE = re.compile(r"驾车|开车|自驾|公交|公共交通|地铁|轨道交通|骑行|步行|摩托")
-_ROUTE_ENDPOINT_RE = re.compile(
+_STRUCTURED_ROUTE_ENDPOINT_RE = re.compile(
     r"(?:从.{1,80}?(?:到|去|前往).{1,80})|"
     r"(?:(?:我)?(?:现在)?在.{1,80}?(?:想|要|准备)?(?:到|去|前往).{1,80})|"
-    r"(?:(?:住在|起点|出发地).{1,80}?(?:公司在|学校在|终点|目的地|到|去|前往).{1,80})|"
-    r"(?:^(?:[^，,。；;]{1,40})到(?:[^，,。；;]{1,40}))"
+    r"(?:(?:住在|起点|出发地).{1,80}?(?:公司在|学校在|终点|目的地|到|去|前往).{1,80})"
 )
+_BARE_ROUTE_ENDPOINT_RE = re.compile(r"^(?:[^，,。；;]{1,40})到(?:[^，,。；;]{1,40})")
 _ROUTE_FOLLOWUP_RE = re.compile(r"哪个|哪种|推荐|更合适|怎么选|如何选|选择|优先|日常通勤")
-_INTERCITY_MOBILITY_RE = re.compile(
+_BARE_INTERCITY_MOBILITY_RE = re.compile(
     r"想去|要去|准备去|前往|出发|哪种方式|什么方式|哪种交通|交通方式|"
-    r"怎么去|如何去|怎么到|如何到|怎么走|路线|出行|行程|通勤"
+    r"怎么去|如何去|怎么到|如何到|怎么走|出行|行程|通勤"
+)
+_NON_TRAVEL_ENDPOINT_RE = re.compile(
+    r"大学.{0,24}(?:申请|选择|哪个)|"
+    r"公司.{0,24}(?:发展|哪家|业务)|"
+    r"文章|写作|技术路线|发展路线|业务路线"
 )
 _WEATHER_RE = re.compile(r"天气|气温|温度|降雨|下雨|下雪|风力")
 _FLIGHT_RE = re.compile(r"航班|飞机|机场|机票")
@@ -90,12 +95,22 @@ def resolve_product_capability_signals(
     adjacent_route_followup = _has_adjacent_route_result_context(
         task_context_messages
     ) and _is_route_followup(message)
-    endpoint_relation = bool(_ROUTE_ENDPOINT_RE.search(message))
+    structured_endpoint = bool(_STRUCTURED_ROUTE_ENDPOINT_RE.search(message))
+    bare_endpoint = bool(_BARE_ROUTE_ENDPOINT_RE.search(message))
+    endpoint_relation = structured_endpoint or bare_endpoint
+    non_travel_context = bool(_NON_TRAVEL_ENDPOINT_RE.search(message))
     return ProductCapabilitySignals(
         explicit_route=_is_explicit_route_task(message),
         adjacent_route_followup=adjacent_route_followup,
         endpoint_relation=endpoint_relation,
-        intercity_mobility=endpoint_relation and bool(_INTERCITY_MOBILITY_RE.search(message)),
+        intercity_mobility=(
+            endpoint_relation
+            and not non_travel_context
+            and (
+                structured_endpoint
+                or (bare_endpoint and bool(_BARE_INTERCITY_MOBILITY_RE.search(message)))
+            )
+        ),
         weather=bool(_WEATHER_RE.search(message)),
         flight=bool(_FLIGHT_RE.search(message)),
         train=bool(_TRAIN_RE.search(message)),
@@ -225,8 +240,9 @@ def _content_has_block_type(content: object, block_type: str) -> bool:
 def _is_explicit_route_task(message: str) -> bool:
     has_route_goal = bool(_COMMUTE_RE.search(message) or _ROUTE_ACTION_RE.search(message))
     has_route_mode = bool(_ROUTE_MODE_RE.search(message))
-    has_endpoint_relation = bool(_ROUTE_ENDPOINT_RE.search(message))
-    return has_endpoint_relation and (has_route_goal or has_route_mode)
+    has_structured_endpoint = bool(_STRUCTURED_ROUTE_ENDPOINT_RE.search(message))
+    is_non_travel_context = bool(_NON_TRAVEL_ENDPOINT_RE.search(message))
+    return has_structured_endpoint and not is_non_travel_context and (has_route_goal or has_route_mode)
 
 
 def _is_route_followup(message: str) -> bool:

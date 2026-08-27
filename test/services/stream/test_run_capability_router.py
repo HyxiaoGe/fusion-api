@@ -422,6 +422,29 @@ def test_bare_intercity_relation_with_transport_choice_is_routed():
 @pytest.mark.parametrize(
     "message",
     [
+        "从北京到上海",
+        "从北京去上海",
+        "住在北京，公司在上海",
+    ],
+)
+def test_structured_intercity_relation_is_itself_a_mobility_signal(message):
+    route = _resolve(message)
+
+    assert route.package_id == "mobility_intercity"
+    assert route.external_tool_names == (
+        "route_compare",
+        "search_flights",
+        "search_trains",
+    )
+    assert route.reason_codes == (
+        "origin_destination_relation",
+        "intercity_locations",
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
         "从北京大学到上海交通大学申请哪个更适合我？",
         "从北京公司到上海公司比较哪家发展更好？",
         "比较从北京到上海两篇文章的写作风格",
@@ -429,6 +452,13 @@ def test_bare_intercity_relation_with_transport_choice_is_routed():
 )
 def test_city_names_in_non_travel_context_do_not_expose_intercity_tools(message):
     route = _resolve(message)
+
+    assert route.package_id == "clarification_only"
+    assert route.external_tool_names == ()
+
+
+def test_business_development_route_does_not_expose_mobility_tools():
+    route = _resolve("比较北京到上海两家公司的发展路线")
 
     assert route.package_id == "clarification_only"
     assert route.external_tool_names == ()
