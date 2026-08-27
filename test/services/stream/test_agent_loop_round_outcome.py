@@ -2030,6 +2030,88 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(warnings), 1)
         self.assertIn("天气活动条件使用确定性回答", warnings[0])
 
+    async def test_deferred_mixed_travel_answer_is_always_deterministic(self):
+        state = AgentLoopState()
+        state.mark_current_step("step-mixed-travel-answer")
+        state.content_blocks.extend(
+            [
+                {
+                    "type": "flight_results",
+                    "id": "flight-out",
+                    "origin": "北京",
+                    "destination": "上海",
+                    "departure_date": "2026-08-29",
+                    "flights": [
+                        {
+                            "id": "flight-1",
+                            "flight_no": "MU5101",
+                            "duration_s": 8100,
+                            "price": {"currency": "CNY", "amount_minor": 76000},
+                            "departure": {"station_name": "北京首都国际机场", "scheduled_at": "2026-08-29T07:00:00"},
+                            "arrival": {"station_name": "上海浦东国际机场", "scheduled_at": "2026-08-29T09:15:00"},
+                        }
+                    ],
+                    "limitations": ["班次与参考价格仅代表本次查询时刻"],
+                },
+                {
+                    "type": "train_results",
+                    "id": "train-out",
+                    "origin": "北京",
+                    "destination": "上海",
+                    "departure_date": "2026-08-29",
+                    "trains": [
+                        {
+                            "id": "train-1",
+                            "train_no": "G1",
+                            "duration_s": 17640,
+                            "price": {"currency": "CNY", "amount_minor": 66100},
+                            "departure": {"station_name": "北京南站", "scheduled_at": "2026-08-29T06:30:00"},
+                            "arrival": {"station_name": "上海虹桥站", "scheduled_at": "2026-08-29T11:24:00"},
+                        }
+                    ],
+                    "limitations": ["本次结果不包含余票或准点率"],
+                },
+            ]
+        )
+        model_answer = (
+            "航班都优于高铁。若希望落地更接近市区，可选虹桥机场。"
+            "G1 是兼顾早到与耗时的选择。"
+        )
+        append_chunk = AsyncMock()
+        warnings: list[str] = []
+
+        with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
+            outcome = await handle_agent_round_outcome(
+                request=AgentRoundOutcomeRequest(
+                    db="db",
+                    messages=[{"role": "user", "content": "北京到上海，高铁和飞机都查，比较最省钱和最快方案"}],
+                    state=state,
+                    runtime=_runtime(complete_step_fn=AsyncMock(), warning_fn=warnings.append),
+                    step_number=3,
+                    step_context=_step_context("step-mixed-travel-answer"),
+                    round_result=AgentRoundResult(
+                        reasoning_buf="",
+                        content_buf=model_answer,
+                        tool_calls=[],
+                        finish_reason="stop",
+                        accumulated_usage=Usage(input_tokens=2, output_tokens=30),
+                        output_deferred=True,
+                    ),
+                )
+            )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        emitted_answer = append_chunk.await_args.args[2]
+        self.assertIn("同时返回北京到上海", emitted_answer)
+        self.assertIn("MU5101", emitted_answer)
+        self.assertIn("G1", emitted_answer)
+        self.assertNotIn("都优于", emitted_answer)
+        self.assertNotIn("更接近市区", emitted_answer)
+        self.assertNotIn("兼顾早到", emitted_answer)
+        self.assertEqual(state.content_blocks[-1].text, emitted_answer)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("混合出行比较使用确定性回答", warnings[0])
+
     async def test_final_answer_evidence_does_not_swallow_stream_write_unavailable(self):
         from app.services.stream_state_service import StreamWriteUnavailableError
 

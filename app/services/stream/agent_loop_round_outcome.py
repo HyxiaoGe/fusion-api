@@ -23,6 +23,7 @@ from app.services.stream.product_answer_validator import (
     validate_product_answer,
 )
 from app.services.stream.product_result_answer import (
+    build_grounded_mixed_travel_answer,
     build_grounded_product_answer,
     build_grounded_weather_activity_answer,
     build_product_tool_failure_answer,
@@ -487,6 +488,23 @@ async def _commit_deferred_product_answer(
         )
         answer = neutralize_product_provider_mentions(
             weather_activity_answer,
+            request.state.content_blocks,
+        )
+        await _append_committed_answer(request, answer, model_output_visible=False)
+        return _with_replaced_answer(request, answer)
+
+    mixed_travel_answer = build_grounded_mixed_travel_answer(
+        request.state.content_blocks,
+        messages=request.messages,
+    )
+    if mixed_travel_answer:
+        request.runtime.warning_fn(
+            "产品混合出行比较使用确定性回答: "
+            f"conv_id={request.runtime.conversation_id} run_id={request.runtime.run_id} "
+            f"step={request.step_number}"
+        )
+        answer = neutralize_product_provider_mentions(
+            mixed_travel_answer,
             request.state.content_blocks,
         )
         await _append_committed_answer(request, answer, model_output_visible=False)
