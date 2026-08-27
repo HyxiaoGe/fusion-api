@@ -55,9 +55,68 @@ jobs:
         env:
           MAINTENANCE_OPERATION: ${{ github.event.inputs.maintenance_operation }}
         run: |
-          $ErrorActionPreference = "Stop"
+          $ErrorActionPreference = "Continue"
+          $serviceNames = @('docker', 'com.docker.service')
+          $dockerDesktopStarted = $false
+          $desktopPaths = @(
+            "$env:ProgramFiles\Docker\Docker\Docker Desktop.exe",
+            "${env:ProgramFiles(x86)}\Docker\Docker\Docker Desktop.exe"
+          )
+
+          for ($attempt = 1; $attempt -le 6; $attempt++) {
+            Write-Host "Checking Docker access, attempt $attempt/6..."
+            docker version
+            if ($LASTEXITCODE -eq 0) {
+              docker ps
+              if ($LASTEXITCODE -eq 0) {
+                Write-Host "Docker daemon ready"
+                break
+              }
+            }
+
+            foreach ($serviceName in $serviceNames) {
+              $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+              if ($null -ne $service -and $service.Status -ne "Running") {
+                Write-Host "Starting Docker service: $serviceName"
+                try {
+                  Start-Service -Name $serviceName -ErrorAction Stop
+                } catch {
+                  Write-Host "Docker service start failed for ${serviceName}: $($_.Exception.Message)"
+                }
+              } elseif ($null -ne $service) {
+                Write-Host "Docker service ${serviceName} status: $($service.Status)"
+              }
+            }
+
+            if (-not $dockerDesktopStarted) {
+              foreach ($desktopPath in $desktopPaths) {
+                if ($desktopPath -and (Test-Path $desktopPath)) {
+                  Write-Host "Starting persistent Docker Desktop: $desktopPath"
+                  try {
+                    $originalTrackingId = $env:RUNNER_TRACKING_ID
+                    $env:RUNNER_TRACKING_ID = ""
+                    Start-Process -FilePath $desktopPath -WindowStyle Minimized
+                    $env:RUNNER_TRACKING_ID = $originalTrackingId
+                    $dockerDesktopStarted = $true
+                    break
+                  } catch {
+                    $env:RUNNER_TRACKING_ID = $originalTrackingId
+                    Write-Host "Docker Desktop start failed: $($_.Exception.Message)"
+                  }
+                }
+              }
+            }
+
+            if ($attempt -lt 6) {
+              Start-Sleep -Seconds (10 * $attempt)
+            }
+          }
+
           docker version
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($LASTEXITCODE -ne 0) {
+            throw "Docker daemon did not become ready"
+          }
+          $ErrorActionPreference = "Stop"
 
           Write-Host "Windows containers:"
           docker ps -a --format "{{.Names}}|{{.Image}}|{{.Status}}"
