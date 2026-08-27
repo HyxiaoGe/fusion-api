@@ -49,6 +49,12 @@ _TRAVEL_PROVIDER_ATTRIBUTION_REPLACEMENTS = (
     (re.compile(r"(?:FlyAI|飞猪(?:旅行)?)(?:本次)?(?:未能|没有|未)返回"), "本次查询未能返回"),
 )
 _TRAVEL_PROVIDER_NAME_RE = re.compile(r"FlyAI|飞猪(?:旅行)?", re.IGNORECASE)
+_WEATHER_ACTIVITY_PATTERN = r"(?:骑行|骑车|自行车|跑步|慢跑|徒步|登山|爬山|露营|运动|出游|游玩)"
+_WEATHER_ACTIVITY_REQUEST_RE = re.compile(
+    rf"(?:适合|适宜|能否|能不能|可以|可不可以|宜不宜).{{0,16}}(?P<after>{_WEATHER_ACTIVITY_PATTERN})|"
+    rf"(?P<before>{_WEATHER_ACTIVITY_PATTERN}).{{0,16}}(?:适合|适宜|能否|能不能|可以|可不可以|宜不宜)"
+)
+_WEATHER_FINE_PERIOD_RE = re.compile(r"上午|早上|清晨|中午|下午")
 
 
 def neutralize_product_provider_mentions(answer: str, content_blocks: list[Any] | None = None) -> str:
@@ -112,9 +118,14 @@ def has_product_result_blocks(content_blocks: list[Any]) -> bool:
     return any(_value(block, "type") in _PRODUCT_RESULT_TYPES for block in content_blocks)
 
 
-def build_grounded_product_answer(content_blocks: list[Any]) -> str:
+def build_grounded_product_answer(
+    content_blocks: list[Any],
+    *,
+    messages: list[dict[str, Any]] | None = None,
+) -> str:
     """只读取产品结果块的已校验字段，不复用模型生成的自由文本。"""
     product_blocks = [block for block in content_blocks if _value(block, "type") in _PRODUCT_RESULT_TYPES]
+    user_text = _latest_user_text(messages or [])
     itinerary = next(
         (block for block in reversed(product_blocks) if _value(block, "type") == "itinerary_results"),
         None,
@@ -164,7 +175,7 @@ def build_grounded_product_answer(content_blocks: list[Any]) -> str:
         elif block_type == "route_results":
             paragraph = _build_route_answer(block)
         elif block_type == "weather_results":
-            paragraph = _build_weather_answer(block)
+            paragraph = _build_weather_answer(block, user_text=user_text)
         elif block_type == "flight_results":
             paragraph = _build_flight_answer(block)
         elif block_type == "train_results":
@@ -439,6 +450,13 @@ def _has_unavailable_geolocation_context(messages: list[dict[str, Any]]) -> bool
     return False
 
 
+def _latest_user_text(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") == "user" and isinstance(message.get("content"), str):
+            return message["content"]
+    return ""
+
+
 def _build_place_answer(block: Any) -> str:
     places = [item for item in (_value(block, "places") or []) if _value(item, "name")]
     query = _value(block, "query") or "地点搜索"
@@ -468,64 +486,31 @@ def _build_route_answer(block: Any) -> str:
     return f"{lead}{recommendation}{limitations}"
 
 
-def _build_weather_answer(block: Any) -> str:
+def _build_weather_answer(block: Any, *, user_text: str = "") -> str:
     days = [item for item in (_value(block, "forecast_days") or []) if _value(item, "date")][:4]
     if not days:
         return ""
     location = _value(block, "resolved_location") or "该行政区"
+    activity_answer = _build_weather_activity_condition_answer(
+        block,
+        days,
+        location=str(location),
+        user_text=user_text,
+    )
+    if activity_answer:
+        return activity_answer
     summaries: list[str] = []
     has_precipitation = False
     has_strong_wind = False
-    weekday_labels = ("一", "二", "三", "四", "五", "六", "日")
     for day in days:
-        raw_date = _value(day, "date")
-        if hasattr(raw_date, "strftime"):
-            date_label = f"{raw_date.month}月{raw_date.day}日"
-        else:
-            try:
-                parsed_date = datetime.strptime(str(raw_date), "%Y-%m-%d")
-                date_label = f"{parsed_date.month}月{parsed_date.day}日"
-            except ValueError:
-                continue
-        weekday = _value(day, "weekday")
-        weekday_label = (
-            f"周{weekday_labels[weekday - 1]}"
-            if isinstance(weekday, int) and not isinstance(weekday, bool) and 1 <= weekday <= 7
-            else ""
-        )
+        detail = _format_weather_day_summary(day)
+        if not detail:
+            continue
+        summaries.append(detail)
         day_weather = _value(day, "day_weather")
         night_weather = _value(day, "night_weather")
-        high_c = _value(day, "high_c")
-        low_c = _value(day, "low_c")
-        if not all(
-            (
-                isinstance(day_weather, str) and day_weather,
-                isinstance(night_weather, str) and night_weather,
-                isinstance(high_c, (int, float)) and not isinstance(high_c, bool),
-                isinstance(low_c, (int, float)) and not isinstance(low_c, bool),
-            )
-        ):
-            continue
-        detail = (
-            f"{date_label}{f'（{weekday_label}）' if weekday_label else ''}"
-            f"白天{day_weather}、夜间{night_weather}，{_format_temperature(low_c)}–{_format_temperature(high_c)}℃"
-        )
-        wind_parts: list[str] = []
-        for direction_key, power_key, period in (
-            ("day_wind_direction", "day_wind_power", "白天"),
-            ("night_wind_direction", "night_wind_power", "夜间"),
-        ):
-            direction = _value(day, direction_key)
-            power = _value(day, power_key)
-            if isinstance(direction, str) and direction and isinstance(power, str) and power:
-                wind_parts.append(f"{period}{direction}风{power}级")
-        if wind_parts:
-            detail += f"，{'、'.join(wind_parts)}"
-        summaries.append(detail)
         has_precipitation = has_precipitation or bool(re.search(r"雨|雪|雷", f"{day_weather}{night_weather}"))
-        has_strong_wind = has_strong_wind or bool(
-            re.search(r"大风|台风", f"{day_weather}{night_weather}{''.join(wind_parts)}")
-        )
+        has_strong_wind = has_strong_wind or bool(re.search(r"大风|台风", f"{day_weather}{night_weather}{detail}"))
     if not summaries:
         return ""
     lead = f"{location}天气预报：{'；'.join(summaries)}。"
@@ -536,6 +521,104 @@ def _build_weather_answer(block: Any) -> str:
     else:
         advice = ""
     return f"{lead}{advice}{_limitations_sentence(block)}"
+
+
+def _build_weather_activity_condition_answer(
+    block: Any,
+    days: list[Any],
+    *,
+    location: str,
+    user_text: str,
+) -> str:
+    activity_match = _WEATHER_ACTIVITY_REQUEST_RE.search(user_text)
+    requested_day = _requested_weather_day(days, user_text)
+    if activity_match is None or requested_day is None:
+        return ""
+    activity = activity_match.group("after") or activity_match.group("before")
+    detail = _format_weather_day_summary(requested_day)
+    if not detail:
+        return ""
+    fine_period_match = _WEATHER_FINE_PERIOD_RE.search(user_text)
+    fine_period = fine_period_match.group(0) if fine_period_match else ""
+    period_weather = str(_value(requested_day, "day_weather") or "")
+    if not period_weather:
+        return ""
+    has_precipitation = bool(re.search(r"雨|雪|雷", period_weather))
+    condition_status = "不满足" if has_precipitation else "满足"
+    granularity = f"本次预报只有白天和夜间粒度，无法确认{fine_period}这一细分时段。" if fine_period else ""
+    condition_period = fine_period or "白天"
+    condition = (
+        f"如果你的条件是{condition_period}{activity}时避开降水，"
+        f"本次返回的白天{period_weather}预报{condition_status}这一条件。"
+    )
+    return f"{location}天气预报：{detail}。{granularity}{condition}{_limitations_sentence(block)}"
+
+
+def _requested_weather_day(days: list[Any], user_text: str) -> Any | None:
+    iso_match = re.search(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)", user_text)
+    requested_iso = iso_match.group(1) if iso_match else ""
+    calendar_match = re.search(r"(?:(\d{4})年)?(\d{1,2})月(\d{1,2})日", user_text)
+    for day in days:
+        raw_date = _value(day, "date")
+        try:
+            parsed_date = raw_date if hasattr(raw_date, "year") else datetime.strptime(str(raw_date), "%Y-%m-%d")
+        except ValueError:
+            continue
+        if requested_iso and parsed_date.strftime("%Y-%m-%d") == requested_iso:
+            return day
+        if calendar_match is None:
+            continue
+        year_text, month_text, day_text = calendar_match.groups()
+        if year_text and parsed_date.year != int(year_text):
+            continue
+        if parsed_date.month == int(month_text) and parsed_date.day == int(day_text):
+            return day
+    return None
+
+
+def _format_weather_day_summary(day: Any) -> str:
+    raw_date = _value(day, "date")
+    if hasattr(raw_date, "strftime"):
+        parsed_date = raw_date
+    else:
+        try:
+            parsed_date = datetime.strptime(str(raw_date), "%Y-%m-%d")
+        except ValueError:
+            return ""
+    weekday = _value(day, "weekday")
+    weekday_labels = ("一", "二", "三", "四", "五", "六", "日")
+    weekday_label = (
+        f"周{weekday_labels[weekday - 1]}"
+        if isinstance(weekday, int) and not isinstance(weekday, bool) and 1 <= weekday <= 7
+        else ""
+    )
+    day_weather = _value(day, "day_weather")
+    night_weather = _value(day, "night_weather")
+    high_c = _value(day, "high_c")
+    low_c = _value(day, "low_c")
+    if not all(
+        (
+            isinstance(day_weather, str) and day_weather,
+            isinstance(night_weather, str) and night_weather,
+            isinstance(high_c, (int, float)) and not isinstance(high_c, bool),
+            isinstance(low_c, (int, float)) and not isinstance(low_c, bool),
+        )
+    ):
+        return ""
+    detail = (
+        f"{parsed_date.month}月{parsed_date.day}日{f'（{weekday_label}）' if weekday_label else ''}"
+        f"白天{day_weather}、夜间{night_weather}，{_format_temperature(low_c)}–{_format_temperature(high_c)}℃"
+    )
+    wind_parts: list[str] = []
+    for direction_key, power_key, period in (
+        ("day_wind_direction", "day_wind_power", "白天"),
+        ("night_wind_direction", "night_wind_power", "夜间"),
+    ):
+        direction = _value(day, direction_key)
+        power = _value(day, power_key)
+        if isinstance(direction, str) and direction and isinstance(power, str) and power:
+            wind_parts.append(f"{period}{direction}风{power}级")
+    return f"{detail}，{'、'.join(wind_parts)}" if wind_parts else detail
 
 
 def _format_temperature(value: int | float) -> str:

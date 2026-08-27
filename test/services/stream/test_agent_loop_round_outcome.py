@@ -1963,7 +1963,7 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(warnings), 1)
         self.assertIn("已安全修整", warnings[0])
 
-    async def test_deferred_weather_answer_removes_activity_inference_and_keeps_condition(self):
+    async def test_deferred_weather_fallback_answers_activity_condition_after_unrepairable_model_output(self):
         state = AgentLoopState()
         state.mark_current_step("step-weather-activity-repair")
         state.content_blocks.append(
@@ -1989,13 +1989,7 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
                 limitations=["天气预报按行政区提供，不代表具体建筑物"],
             )
         )
-        model_answer = (
-            "7月24日（周五）南山区白天预报有雷阵雨，如果你的条件是希望上午骑行时避开降雨，"
-            "本次预报不满足这一条件。"
-            "当天最高气温31°C、最低26°C，夜间多云。"
-            "户外骑行大概率会淋雨，建议优先考虑室内骑行或改期。"
-            "本次预报只有昼夜两个粒度，无法确认上午与下午的细分差异。"
-        )
+        model_answer = "7月24日上午晴，适合骑行。"
         append_chunk = AsyncMock()
         warnings: list[str] = []
 
@@ -2021,14 +2015,14 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
         emitted_answer = append_chunk.await_args.args[2]
-        self.assertIn("本次预报不满足这一条件", emitted_answer)
-        self.assertIn("无法确认上午与下午的细分差异", emitted_answer)
-        self.assertNotIn("大概率会淋雨", emitted_answer)
-        self.assertNotIn("室内骑行", emitted_answer)
-        self.assertNotIn("改期", emitted_answer)
+        self.assertIn("不满足这一条件", emitted_answer)
+        self.assertIn("只有白天和夜间粒度，无法确认上午这一细分时段", emitted_answer)
+        self.assertNotIn("上午晴", emitted_answer)
+        self.assertNotIn("适合骑行", emitted_answer)
         self.assertEqual(state.content_blocks[-1].text, emitted_answer)
         self.assertEqual(len(warnings), 1)
-        self.assertIn("已安全修整", warnings[0])
+        self.assertIn("使用确定性兜底", warnings[0])
+        self.assertIn("reason_code=unsupported_claim", warnings[0])
 
     async def test_final_answer_evidence_does_not_swallow_stream_write_unavailable(self):
         from app.services.stream_state_service import StreamWriteUnavailableError

@@ -426,7 +426,10 @@ async def _commit_deferred_answer(
 
     clarification = build_tool_repair_clarification(request.state.pending_tool_repairs)
     if clarification:
-        grounded_answer = build_grounded_product_answer(request.state.content_blocks)
+        grounded_answer = build_grounded_product_answer(
+            request.state.content_blocks,
+            messages=request.messages,
+        )
         answer = "\n\n".join(part for part in (grounded_answer, clarification) if part)
         await _append_committed_answer(request, answer)
         return _with_replaced_answer(request, answer)
@@ -504,7 +507,10 @@ async def _commit_deferred_product_answer(
                 f"step={request.step_number} reason_code={validation.reason_code} "
                 f"repair_reason_code={repair_reason_code}"
             )
-            answer = build_grounded_product_answer(request.state.content_blocks)
+            answer = build_grounded_product_answer(
+                request.state.content_blocks,
+                messages=request.messages,
+            )
             if answer:
                 completed_answer, _ = repair_unsupported_product_answer(
                     answer,
