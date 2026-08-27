@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 
 from app.db.models import AgentEvent, AgentSession
-from app.db.trajectory_repository import TrajectoryRepository
+from app.db.trajectory_repository import RunWithMeta, TrajectoryRepository
 from app.schemas.admin_trajectory import AdminTrajectorySnapshot, AdminTrajectoryToolCall
 from app.schemas.trajectory import (
     LlmNodeDetail,
@@ -85,12 +85,13 @@ class TrajectoryQueryService:
         watermark = self._ledger_watermark()
         items = [
             self._run_summary(
-                run,
-                resolve_user_trajectory_status_from_rows(run.created_at, meta, watermark).trajectory_status,
-                llm_detail_schema_version=meta.llm_detail_schema_version if meta is not None else None,
-                llm_round_count=meta.llm_round_count if meta is not None else 0,
+                row.run,
+                resolve_user_trajectory_status_from_rows(row.run.created_at, row.meta, watermark).trajectory_status,
+                llm_detail_schema_version=(row.meta.llm_detail_schema_version if row.meta is not None else None),
+                llm_round_count=row.meta.llm_round_count if row.meta is not None else 0,
+                capability_resolution=row.capability_resolution,
             )
-            for run, meta in bounded_rows
+            for row in bounded_rows
         ]
         return TrajectoryRunListResponse(items=self._grouping_order(items), truncated=truncated)
 
@@ -469,9 +470,10 @@ class TrajectoryQueryService:
         self,
         conversation_id: str,
         run_id: str,
-        row: tuple[AgentSession, object | None],
+        row: RunWithMeta,
     ) -> TrajectorySnapshot:
-        run, meta = row
+        run = row.run
+        meta = row.meta
         event_rows = self._repository.list_events(conversation_id, run_id, self._max_events_per_run + 1)
         truncated = len(event_rows) > self._max_events_per_run
         loaded_events = event_rows[: self._max_events_per_run]
@@ -503,6 +505,7 @@ class TrajectoryQueryService:
                 assessment.trajectory_status,
                 llm_detail_schema_version=meta.llm_detail_schema_version if meta is not None else None,
                 llm_round_count=meta.llm_round_count if meta is not None else 0,
+                capability_resolution=row.capability_resolution,
             ),
             records=projection.records,
             spans=projection.spans,
@@ -526,6 +529,7 @@ class TrajectoryQueryService:
         *,
         llm_detail_schema_version: int | None = None,
         llm_round_count: int = 0,
+        capability_resolution: object | None = None,
     ) -> TrajectoryRunSummary:
         return TrajectoryRunSummary(
             run_id=run.id,
@@ -541,14 +545,11 @@ class TrajectoryQueryService:
             ended_at=run.terminal_at,
             llm_detail_schema_version=llm_detail_schema_version,
             llm_round_count=llm_round_count,
-            capability_resolution=TrajectoryQueryService._capability_resolution(run.run_config),
+            capability_resolution=TrajectoryQueryService._capability_resolution(capability_resolution),
         )
 
     @staticmethod
-    def _capability_resolution(run_config: object) -> TrajectoryCapabilityResolution | None:
-        if not isinstance(run_config, Mapping):
-            return None
-        raw_resolution = run_config.get("capability_resolution")
+    def _capability_resolution(raw_resolution: object) -> TrajectoryCapabilityResolution | None:
         try:
             return TrajectoryCapabilityResolution.model_validate(raw_resolution)
         except ValidationError:

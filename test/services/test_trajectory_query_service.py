@@ -9,7 +9,8 @@ from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, select
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
@@ -23,7 +24,7 @@ from app.db.models import (
     TrajectoryLedgerSettings,
     User,
 )
-from app.db.trajectory_repository import TrajectoryRepository
+from app.db.trajectory_repository import _CAPABILITY_RESOLUTION_PROJECTION, TrajectoryRepository
 from app.services.trajectory_query_service import TrajectoryQueryService
 
 CAPABILITY_RESOLUTION = {
@@ -223,24 +224,50 @@ class TrajectoryQueryServiceTests(unittest.TestCase):
             },
         )
         self._meta("run-resolution")
+        statements: list[str] = []
 
-        with patch(
-            "app.services.stream.run_capability_router.resolve_run_capability_route",
-            side_effect=AssertionError("刷新不得重新调用 router"),
-        ) as router:
-            service = self._service(max_events=10)
-            run_list = service.list_runs("conv-1", "user-1")
-            snapshot = service.get_user_snapshot("conv-1", "run-resolution", "user-1")
+        def capture_sql(_connection, _cursor, statement, _parameters, _context, _executemany):
+            statements.append(statement)
+
+        event.listen(self.engine, "before_cursor_execute", capture_sql)
+        try:
+            with patch(
+                "app.services.stream.run_capability_router.resolve_run_capability_route",
+                side_effect=AssertionError("刷新不得重新调用 router"),
+            ) as router:
+                service = self._service(max_events=10)
+                run_list = service.list_runs("conv-1", "user-1")
+                snapshot = service.get_user_snapshot("conv-1", "run-resolution", "user-1")
+                admin_snapshot = service.get_admin_snapshot("conv-1", "run-resolution")
+        finally:
+            event.remove(self.engine, "before_cursor_execute", capture_sql)
 
         router.assert_not_called()
         self.assertIsNotNone(run_list)
         self.assertIsNotNone(snapshot)
+        self.assertIsNotNone(admin_snapshot)
         assert run_list is not None
         assert snapshot is not None
+        assert admin_snapshot is not None
         self.assertEqual(run_list.items[0].capability_resolution.model_dump(), CAPABILITY_RESOLUTION)
         self.assertEqual(snapshot.run.capability_resolution.model_dump(), CAPABILITY_RESOLUTION)
+        self.assertEqual(admin_snapshot.snapshot.run.capability_resolution.model_dump(), CAPABILITY_RESOLUTION)
         self.assertNotIn("authorization", run_list.model_dump_json())
         self.assertNotIn("PRIVATE", snapshot.model_dump_json())
+        sql = "\n".join(statements)
+        self.assertNotRegex(sql, r"(?:SELECT|,)\s*agent_sessions\.config(?:\s+AS\s+\w+)?\s*(?:,|FROM)")
+        self.assertIn("JSON_EXTRACT(agent_sessions.config", sql)
+
+    def test_capability_resolution_projection_compiles_as_json_path_for_sqlite_and_postgres(self):
+        statement = select(_CAPABILITY_RESOLUTION_PROJECTION)
+
+        sqlite_sql = str(statement.compile(dialect=sqlite.dialect()))
+        postgres_sql = str(statement.compile(dialect=postgresql.dialect()))
+
+        self.assertIn("JSON_EXTRACT(agent_sessions.config", sqlite_sql)
+        self.assertRegex(postgres_sql, r"agent_sessions\.config\s*(?:->|\[)")
+        for sql in (sqlite_sql, postgres_sql):
+            self.assertNotRegex(sql, r"SELECT\s+agent_sessions\.config\s+(?:AS\s+\w+\s+)?FROM")
 
     def test_legacy_or_invalid_capability_resolution_returns_none(self):
         invalid_values = (
@@ -331,13 +358,25 @@ class TrajectoryQueryServiceTests(unittest.TestCase):
             self._run(run_id, turn_message_id=f"turn-invalid-{index}", run_config=run_config)
             run_ids.append(run_id)
 
-        service = self._service()
+        service = self._service(max_runs=len(run_ids))
+        run_list = service.list_runs("conv-1", "user-1")
+        self.assertIsNotNone(run_list)
+        assert run_list is not None
+        summaries_by_id = {summary.run_id: summary for summary in run_list.items}
+        self.assertEqual(set(summaries_by_id), set(run_ids))
         for run_id in run_ids:
             result = service.get_user_snapshot("conv-1", run_id, "user-1")
             self.assertIsNotNone(result)
             assert result is not None
             self.assertIsNone(result.run.capability_resolution)
+            self.assertIsNone(summaries_by_id[run_id].capability_resolution)
             self.assertNotIn("用户原文", result.model_dump_json())
+
+        for run_id in (run_ids[0], run_ids[-1]):
+            admin_snapshot = service.get_admin_snapshot("conv-1", run_id)
+            self.assertIsNotNone(admin_snapshot)
+            assert admin_snapshot is not None
+            self.assertIsNone(admin_snapshot.snapshot.run.capability_resolution)
 
     def test_snapshot_batches_llm_previews_and_run_list_counts_distinct_rounds(self):
         self._run("run-llm")

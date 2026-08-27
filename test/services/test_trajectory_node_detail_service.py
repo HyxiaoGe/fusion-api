@@ -401,7 +401,9 @@ class TrajectoryNodeDetailServiceTests(unittest.TestCase):
         assert listing is not None and snapshot is not None and tool is not None
         self.assertIsNone(llm)
         self.assertTrue(statements)
-        self.assertNotIn("agent_sessions.config", "\n".join(statements))
+        sql = "\n".join(statements)
+        self.assertNotRegex(sql, r"(?:SELECT|,)\s*agent_sessions\.config(?:\s+AS\s+\w+)?\s*(?:,|FROM)")
+        self.assertIn("JSON_EXTRACT(agent_sessions.config", sql)
         self.assertNotIn("agent_system_prompt_snapshots.snapshot", "\n".join(statements))
         self.assertNotIn("完整规则", listing.model_dump_json() + snapshot.model_dump_json() + tool.model_dump_json())
 

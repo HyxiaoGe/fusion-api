@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TypeAlias
+from dataclasses import dataclass
 
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session, load_only
@@ -19,7 +19,17 @@ from app.db.models import (
 )
 from app.schemas.trajectory import UserTrajectoryMetaRow
 
-RunWithMeta: TypeAlias = tuple[AgentSession, UserTrajectoryMetaRow | None]
+
+@dataclass(frozen=True)
+class RunWithMeta:
+    """通用 Run 读取结果，仅额外携带安全 JSON 子字段投影。"""
+
+    run: AgentSession
+    meta: UserTrajectoryMetaRow | None
+    capability_resolution: object | None
+
+
+_CAPABILITY_RESOLUTION_PROJECTION = AgentSession.run_config["capability_resolution"].label("capability_resolution")
 
 
 def _llm_round_count_subquery():
@@ -52,6 +62,7 @@ class TrajectoryRepository:
                 RunTrajectoryMeta.terminal_intent_pending_at,
                 RunTrajectoryMeta.llm_detail_schema_version,
                 _llm_round_count_subquery(),
+                _CAPABILITY_RESOLUTION_PROJECTION,
             )
             .select_from(Conversation)
             .options(
@@ -66,7 +77,6 @@ class TrajectoryRepository:
                     AgentSession.total_steps,
                     AgentSession.total_tool_calls,
                     AgentSession.total_duration_ms,
-                    AgentSession.run_config,
                     AgentSession.terminal_at,
                     AgentSession.created_at,
                 ),
@@ -83,7 +93,15 @@ class TrajectoryRepository:
         ).all()
         if not rows:
             return None
-        return [(row[1], self._user_meta_from_columns(row[2:])) for row in rows if row[1] is not None]
+        return [
+            RunWithMeta(
+                run=row[1],
+                meta=self._user_meta_from_columns(row[2:-1]),
+                capability_resolution=row[-1],
+            )
+            for row in rows
+            if row[1] is not None
+        ]
 
     def get_run(self, conversation_id: str, run_id: str, user_id: str) -> RunWithMeta | None:
         row = self._session.execute(
@@ -96,6 +114,7 @@ class TrajectoryRepository:
                 RunTrajectoryMeta.terminal_intent_pending_at,
                 RunTrajectoryMeta.llm_detail_schema_version,
                 _llm_round_count_subquery(),
+                _CAPABILITY_RESOLUTION_PROJECTION,
             )
             .options(
                 load_only(
@@ -109,7 +128,6 @@ class TrajectoryRepository:
                     AgentSession.total_steps,
                     AgentSession.total_tool_calls,
                     AgentSession.total_duration_ms,
-                    AgentSession.run_config,
                     AgentSession.terminal_at,
                     AgentSession.created_at,
                 ),
@@ -121,7 +139,13 @@ class TrajectoryRepository:
             .where(AgentSession.id == run_id)
             .where(AgentSession.user_id == user_id)
         ).one_or_none()
-        return None if row is None else (row[0], self._user_meta_from_columns(row[1:]))
+        if row is None:
+            return None
+        return RunWithMeta(
+            run=row[0],
+            meta=self._user_meta_from_columns(row[1:-1]),
+            capability_resolution=row[-1],
+        )
 
     def get_run_for_admin(self, conversation_id: str, run_id: str) -> RunWithMeta | None:
         """管理员读取仍严格验证 run 属于指定会话，但不附加普通用户归属条件。"""
@@ -135,6 +159,7 @@ class TrajectoryRepository:
                 RunTrajectoryMeta.terminal_intent_pending_at,
                 RunTrajectoryMeta.llm_detail_schema_version,
                 _llm_round_count_subquery(),
+                _CAPABILITY_RESOLUTION_PROJECTION,
             )
             .options(
                 load_only(
@@ -148,7 +173,6 @@ class TrajectoryRepository:
                     AgentSession.total_steps,
                     AgentSession.total_tool_calls,
                     AgentSession.total_duration_ms,
-                    AgentSession.run_config,
                     AgentSession.terminal_at,
                     AgentSession.created_at,
                 ),
@@ -158,7 +182,13 @@ class TrajectoryRepository:
             .where(Conversation.id == conversation_id)
             .where(AgentSession.id == run_id)
         ).one_or_none()
-        return None if row is None else (row[0], self._user_meta_from_columns(row[1:]))
+        if row is None:
+            return None
+        return RunWithMeta(
+            run=row[0],
+            meta=self._user_meta_from_columns(row[1:-1]),
+            capability_resolution=row[-1],
+        )
 
     def get_detail_run(
         self,
