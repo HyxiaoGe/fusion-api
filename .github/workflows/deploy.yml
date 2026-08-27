@@ -13,6 +13,15 @@ on:
         description: 手动回滚原因（填写 rollback_sha 时必填）
         required: false
         type: string
+      maintenance_operation:
+        description: 临时 Windows 依赖诊断；非 master 分支使用，不进入正式发布
+        required: false
+        default: none
+        type: choice
+        options:
+          - none
+          - inspect-milvus
+          - recover-milvus
 
 permissions:
   contents: read
@@ -29,6 +38,78 @@ env:
   FLYAI_ADAPTER_IMAGE_NAME: crpi-77w10wlykpqilmmb.cn-shenzhen.personal.cr.aliyuncs.com/seanfield/fusion-flyai-adapter
 
 jobs:
+  windows-maintenance:
+    name: Inspect or recover Windows Milvus
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref != 'refs/heads/master' &&
+      github.event.inputs.maintenance_operation != 'none'
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 8
+    defaults:
+      run:
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
+
+    steps:
+      - name: Inspect Milvus containers
+        env:
+          MAINTENANCE_OPERATION: ${{ github.event.inputs.maintenance_operation }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          docker version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          Write-Host "Windows containers:"
+          docker ps -a --format "{{.Names}}|{{.Image}}|{{.Status}}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $milvus = docker inspect fusion-knowledge-milvus | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $null -eq $milvus -or $milvus.Count -ne 1) {
+            throw "fusion-knowledge-milvus 容器不存在或状态不可读"
+          }
+
+          $container = $milvus[0]
+          $labels = $container.Config.Labels
+          $project = $labels.'com.docker.compose.project'
+          Write-Host "Milvus state=$($container.State.Status) health=$($container.State.Health.Status) restart=$($container.HostConfig.RestartPolicy.Name) project=$project"
+          Write-Host "Milvus compose service=$($labels.'com.docker.compose.service') working_dir=$($labels.'com.docker.compose.project.working_dir')"
+
+          if ($env:MAINTENANCE_OPERATION -eq "inspect-milvus") {
+            exit 0
+          }
+          if ($env:MAINTENANCE_OPERATION -ne "recover-milvus") {
+            throw "不支持的维护操作: $env:MAINTENANCE_OPERATION"
+          }
+          if ([string]::IsNullOrWhiteSpace($project)) {
+            throw "Milvus 容器缺少 Docker Compose project 标签，拒绝恢复"
+          }
+
+          foreach ($service in @("etcd", "minio", "standalone")) {
+            $ids = @(
+              docker ps -a -q `
+                --filter "label=com.docker.compose.project=$project" `
+                --filter "label=com.docker.compose.service=$service"
+            ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            if ($ids.Count -ne 1) {
+              throw "Compose 服务 $service 应且只能有一个容器，实际 $($ids.Count)"
+            }
+            docker start $ids[0]
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+          for ($attempt = 1; $attempt -le 60; $attempt++) {
+            $health = docker inspect fusion-knowledge-milvus --format "{{.State.Health.Status}}"
+            if ($health -eq "healthy") {
+              Write-Host "Milvus recovery completed"
+              exit 0
+            }
+            Write-Host "Waiting for Milvus health, attempt $attempt/60: $health"
+            Start-Sleep -Seconds 5
+          }
+
+          docker logs --tail 160 fusion-knowledge-milvus
+          throw "Milvus 未在 300 秒内恢复健康"
+
   prepare:
     name: Validate deployment request
     runs-on: ubuntu-latest
