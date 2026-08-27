@@ -2112,6 +2112,69 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(warnings), 1)
         self.assertIn("混合出行比较使用确定性回答", warnings[0])
 
+    async def test_deferred_single_train_comparison_is_always_deterministic(self):
+        state = AgentLoopState()
+        state.mark_current_step("step-single-train-comparison")
+        state.content_blocks.append(
+            {
+                "type": "train_results",
+                "id": "train-out",
+                "origin": "北京",
+                "destination": "上海",
+                "departure_date": "2026-08-29",
+                "trains": [
+                    {
+                        "train_no": "G737",
+                        "duration_s": 21900,
+                        "price": {"currency": "CNY", "amount_minor": 59800},
+                    },
+                    {
+                        "train_no": "G37",
+                        "duration_s": 16980,
+                        "price": {"currency": "CNY", "amount_minor": 66100},
+                    },
+                ],
+                "limitations": ["班次与参考价格仅代表本次查询时刻"],
+            }
+        )
+        append_chunk = AsyncMock()
+        warnings: list[str] = []
+
+        with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
+            outcome = await handle_agent_round_outcome(
+                request=AgentRoundOutcomeRequest(
+                    db="db",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": "请查询北京到上海的高铁，告诉我本次返回中最便宜和最快的车次。",
+                        }
+                    ],
+                    state=state,
+                    runtime=_runtime(complete_step_fn=AsyncMock(), warning_fn=warnings.append),
+                    step_number=2,
+                    step_context=_step_context("step-single-train-comparison"),
+                    round_result=AgentRoundResult(
+                        reasoning_buf="",
+                        content_buf="G737 最省事，G37 兼顾价格和时间。",
+                        tool_calls=[],
+                        finish_reason="stop",
+                        accumulated_usage=Usage(input_tokens=2, output_tokens=10),
+                        output_deferred=True,
+                    ),
+                )
+            )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        emitted_answer = append_chunk.await_args.args[2]
+        self.assertIn("参考价最低的是G737", emitted_answer)
+        self.assertIn("计划行程时长最短的是G37", emitted_answer)
+        self.assertNotIn("最省事", emitted_answer)
+        self.assertNotIn("兼顾", emitted_answer)
+        self.assertEqual(state.content_blocks[-1].text, emitted_answer)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("单一出行比较使用确定性回答", warnings[0])
+
     async def test_final_answer_evidence_does_not_swallow_stream_write_unavailable(self):
         from app.services.stream_state_service import StreamWriteUnavailableError
 

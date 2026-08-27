@@ -25,6 +25,7 @@ from app.services.stream.product_answer_validator import (
 from app.services.stream.product_result_answer import (
     build_grounded_mixed_travel_answer,
     build_grounded_product_answer,
+    build_grounded_single_travel_comparison_answer,
     build_grounded_weather_activity_answer,
     build_product_tool_failure_answer,
     build_tool_repair_clarification,
@@ -505,6 +506,23 @@ async def _commit_deferred_product_answer(
         )
         answer = neutralize_product_provider_mentions(
             mixed_travel_answer,
+            request.state.content_blocks,
+        )
+        await _append_committed_answer(request, answer, model_output_visible=False)
+        return _with_replaced_answer(request, answer)
+
+    single_travel_comparison_answer = build_grounded_single_travel_comparison_answer(
+        request.state.content_blocks,
+        messages=request.messages,
+    )
+    if single_travel_comparison_answer:
+        request.runtime.warning_fn(
+            "产品单一出行比较使用确定性回答: "
+            f"conv_id={request.runtime.conversation_id} run_id={request.runtime.run_id} "
+            f"step={request.step_number}"
+        )
+        answer = neutralize_product_provider_mentions(
+            single_travel_comparison_answer,
             request.state.content_blocks,
         )
         await _append_committed_answer(request, answer, model_output_visible=False)
