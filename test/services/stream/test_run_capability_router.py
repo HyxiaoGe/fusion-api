@@ -307,9 +307,9 @@ def test_tool_degradation_uses_network_boundary(message, kwargs, expected_reason
     assert route.reason_codes == (expected_reason,)
 
 
-def test_knowledge_grounded_has_highest_priority_without_network_boundary():
+def test_knowledge_grounded_marks_blocked_fresh_request_with_date_and_boundary():
     route = _resolve(
-        "查一下今天最新的 OpenAI 新闻",
+        "查一下最新的 OpenAI 新闻",
         knowledge_grounded=True,
         tools_disabled=True,
         requested_plan_mode="on",
@@ -319,8 +319,36 @@ def test_knowledge_grounded_has_highest_priority_without_network_boundary():
     assert route.external_tool_names == ()
     assert route.effective_plan_mode == "off"
     assert route.include_current_date is True
-    assert route.network_boundary_required is False
+    assert route.network_boundary_required is True
     assert route.reason_codes == ("knowledge_grounded_mode",)
+
+
+def test_knowledge_grounded_stable_question_does_not_add_network_boundary():
+    route = _resolve(
+        "为什么天空通常看起来是蓝色的？",
+        knowledge_grounded=True,
+    )
+
+    assert route.package_id == "knowledge_grounded"
+    assert route.include_current_date is False
+    assert route.network_boundary_required is False
+
+
+@pytest.mark.parametrize("available_tools", [["web_search"], ["url_read"]])
+def test_deep_research_requires_complete_search_and_read_tool_set(available_tools):
+    route = _resolve(
+        "深入研究 AI Agent 浏览器安全现状",
+        task_mode="deep_research",
+        available_tool_names=available_tools,
+    )
+
+    assert route.package_id == "tools_unavailable"
+    assert route.external_tool_names == ()
+    assert route.effective_plan_mode == "off"
+    assert route.include_current_date is True
+    assert route.network_boundary_required is True
+    assert route.resolution_mode == "degraded"
+    assert route.reason_codes == ("required_tools_unavailable",)
 
 
 def test_explicit_plan_mode_overrides_package_auto_policy():
@@ -376,6 +404,36 @@ def test_destination_without_origin_requests_clarification():
     assert route.resolution_mode == "clarification"
 
 
+def test_bare_intercity_relation_with_transport_choice_is_routed():
+    route = _resolve("北京到上海哪种方式好？")
+
+    assert route.package_id == "mobility_intercity"
+    assert route.external_tool_names == (
+        "route_compare",
+        "search_flights",
+        "search_trains",
+    )
+    assert route.reason_codes == (
+        "origin_destination_relation",
+        "intercity_locations",
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "从北京大学到上海交通大学申请哪个更适合我？",
+        "从北京公司到上海公司比较哪家发展更好？",
+        "比较从北京到上海两篇文章的写作风格",
+    ],
+)
+def test_city_names_in_non_travel_context_do_not_expose_intercity_tools(message):
+    route = _resolve(message)
+
+    assert route.package_id == "clarification_only"
+    assert route.external_tool_names == ()
+
+
 def test_greeting_prefix_does_not_turn_an_ambiguous_request_into_direct():
     route = _resolve("你好，帮我查一下这个")
 
@@ -405,6 +463,40 @@ def test_mixed_itinerary_keeps_only_three_travel_tools():
     )
     assert route.effective_plan_mode == "auto"
     assert route.reason_codes == ("mixed_itinerary_request",)
+
+
+def test_summary_of_provided_text_stays_transform():
+    route = _resolve("摘要以下内容：天空通常看起来是蓝色的。")
+
+    assert route.package_id == "transform"
+    assert route.external_tool_names == ()
+    assert route.include_current_date is False
+
+
+def test_summary_of_fresh_official_announcement_uses_verified_web():
+    route = _resolve("摘要 OpenAI 今天发布的官方公告")
+
+    assert route.package_id == "verified_web"
+    assert route.external_tool_names == ("web_search", "url_read")
+    assert route.effective_plan_mode == "auto"
+    assert route.include_current_date is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "请查证明天上海天气并给官方来源",
+        "请核验 2026-09-10 上海到北京航班并阅读官方原文",
+    ],
+)
+def test_verified_request_has_priority_over_product_keywords(message):
+    route = _resolve(message)
+
+    assert route.package_id == "verified_web"
+    assert route.external_tool_names == ("web_search", "url_read")
+    assert route.effective_plan_mode == "auto"
+    assert route.include_current_date is True
+    assert route.reason_codes == ("verified_source_request",)
 
 
 def test_exact_authorized_mcp_alias_can_select_only_that_tool():

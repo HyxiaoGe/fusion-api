@@ -18,6 +18,24 @@ class AgentPlanToolPolicyTests(unittest.TestCase):
         self.assertFalse(signals.adjacent_route_followup)
         self.assertFalse(signals.weather)
 
+    def test_product_signal_resolver_recognizes_bare_intercity_choice(self):
+        signals = resolve_product_capability_signals(
+            original_message="北京到上海哪种方式好？",
+            task_context_messages=None,
+        )
+
+        self.assertTrue(signals.endpoint_relation)
+        self.assertTrue(signals.intercity_mobility)
+
+    def test_product_signal_resolver_rejects_non_travel_city_relation(self):
+        signals = resolve_product_capability_signals(
+            original_message="从北京大学到上海交通大学申请哪个更适合我？",
+            task_context_messages=None,
+        )
+
+        self.assertTrue(signals.endpoint_relation)
+        self.assertFalse(signals.intercity_mobility)
+
     def test_verified_research_requires_search_and_two_independent_reads(self):
         messages = [
             "帮我调研一下韩国股市近几年的起伏，重点说说主要原因和争议。",

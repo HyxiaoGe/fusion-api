@@ -38,7 +38,11 @@ _CANONICAL_EXTERNAL_TOOL_ORDER = (
 )
 _CONTROL_TOOL_NAMES = frozenset({"update_plan"})
 
-_TRANSFORM_RE = re.compile(r"翻译|译成|改写|重写|润色|措辞|概括|摘要|总结(?:这|以下|上述|给定)")
+_TRANSFORM_RE = re.compile(
+    r"翻译|译成|改写|重写|润色|措辞|"
+    r"(?:概括|摘要|总结)(?:这|以下|上述|给定|已给|后面|内容|文本|[:：])|"
+    r"(?:对|将|把)(?:这|以下|上述|给定|已给|后面).{0,24}(?:概括|摘要|总结)"
+)
 _CURRENT_DATE_ONLY_RE = re.compile(
     r"^(?:请问|请告诉我|帮我看下|帮我看看)?(?:今天|现在)"
     r"(?:是)?(?:几月几日|几号|星期几|周几|日期|什么日子)"
@@ -198,17 +202,36 @@ def resolve_run_capability_route(
     search_capable = capabilities.get("searchCapable") is True
 
     if knowledge_grounded:
+        blocked_candidate = (
+            _CandidateRoute(
+                package_id="deep_research",
+                confidence="high",
+                reason_codes=("deep_research_mode",),
+                include_current_date=True,
+            )
+            if task_policy.task_mode == "deep_research"
+            else _classify_standard_request(
+                message=message,
+                task_context_messages=task_context_messages,
+                available_tool_names=available_tool_names,
+            )
+        )
+        blocked_tool_names = blocked_candidate.explicit_tool_names or _PACKAGE_TOOLS.get(
+            blocked_candidate.package_id,
+            (),
+        )
         return _resolution(
             candidate=_CandidateRoute(
                 package_id="knowledge_grounded",
                 confidence="high",
                 reason_codes=("knowledge_grounded_mode",),
-                include_current_date=_needs_current_date(message),
+                include_current_date=blocked_candidate.include_current_date,
             ),
             available_tool_names=available_tool_names,
             requested_plan_mode="off",
             function_calling=function_calling,
             tools_disabled=True,
+            network_boundary_required=bool(blocked_tool_names),
         )
 
     if task_policy.task_mode == "deep_research":
@@ -262,6 +285,23 @@ def resolve_run_capability_route(
         function_calling=function_calling,
         tools_disabled=tools_disabled,
     )
+    if candidate.package_id == "deep_research" and not frozenset(requested_tools).issubset(
+        resolution.external_tool_names
+    ):
+        return _resolution(
+            candidate=_CandidateRoute(
+                package_id="tools_unavailable",
+                confidence=candidate.confidence,
+                reason_codes=("required_tools_unavailable",),
+                include_current_date=candidate.include_current_date,
+                resolution_mode="degraded",
+            ),
+            available_tool_names=available_tool_names,
+            requested_plan_mode="off",
+            function_calling=function_calling,
+            tools_disabled=True,
+            network_boundary_required=True,
+        )
     if needs_external_capability and not resolution.external_tool_names:
         return _resolution(
             candidate=_CandidateRoute(
@@ -306,6 +346,23 @@ def _classify_standard_request(
         )
     if _CURRENT_DATE_ONLY_RE.search(message):
         return _CandidateRoute("date", "high", ("current_date_question",), True)
+
+    if _URL_RE.search(message) and _URL_READ_ACTION_RE.search(message):
+        return _CandidateRoute("url_read", "high", ("explicit_url_read",), False)
+    if _VERIFIED_SOURCE_RE.search(message):
+        return _CandidateRoute(
+            "verified_web",
+            "high",
+            ("verified_source_request",),
+            True,
+        )
+    if _FRESH_EXTERNAL_RE.search(message):
+        return _CandidateRoute(
+            "fresh_web",
+            "high",
+            ("fresh_external_fact",),
+            True,
+        )
 
     signals = resolve_product_capability_signals(
         original_message=message,
@@ -357,7 +414,11 @@ def _classify_standard_request(
             ("explicit_route_task",),
             include_current_date,
         )
-    if signals.endpoint_relation and _has_two_intercity_locations(message):
+    if (
+        signals.endpoint_relation
+        and signals.intercity_mobility
+        and _has_two_intercity_locations(message)
+    ):
         return _CandidateRoute(
             "mobility_intercity",
             "medium",
@@ -365,18 +426,7 @@ def _classify_standard_request(
             True,
         )
 
-    if _URL_RE.search(message) and _URL_READ_ACTION_RE.search(message):
-        return _CandidateRoute("url_read", "high", ("explicit_url_read",), False)
-    if _VERIFIED_SOURCE_RE.search(message):
-        return _CandidateRoute(
-            "verified_web",
-            "high",
-            ("verified_source_request",),
-            True,
-        )
-    if _FRESH_EXTERNAL_RE.search(message) or (
-        include_current_date and re.search(r"查|查询|多少|是否|吗[？?]?$", message)
-    ):
+    if include_current_date and re.search(r"查|查询|多少|是否|吗[？?]?$", message):
         return _CandidateRoute(
             "fresh_web",
             "high",

@@ -22,9 +22,14 @@ _ROUTE_MODE_RE = re.compile(r"驾车|开车|自驾|公交|公共交通|地铁|�
 _ROUTE_ENDPOINT_RE = re.compile(
     r"(?:从.{1,80}?(?:到|去|前往).{1,80})|"
     r"(?:(?:我)?(?:现在)?在.{1,80}?(?:想|要|准备)?(?:到|去|前往).{1,80})|"
-    r"(?:(?:住在|起点|出发地).{1,80}?(?:公司在|学校在|终点|目的地|到|去|前往).{1,80})"
+    r"(?:(?:住在|起点|出发地).{1,80}?(?:公司在|学校在|终点|目的地|到|去|前往).{1,80})|"
+    r"(?:^(?:[^，,。；;]{1,40})到(?:[^，,。；;]{1,40}))"
 )
 _ROUTE_FOLLOWUP_RE = re.compile(r"哪个|哪种|推荐|更合适|怎么选|如何选|选择|优先|日常通勤")
+_INTERCITY_MOBILITY_RE = re.compile(
+    r"想去|要去|准备去|前往|出发|哪种方式|什么方式|哪种交通|交通方式|"
+    r"怎么去|如何去|怎么到|如何到|怎么走|路线|出行|行程|通勤"
+)
 _WEATHER_RE = re.compile(r"天气|气温|温度|降雨|下雨|下雪|风力")
 _FLIGHT_RE = re.compile(r"航班|飞机|机场|机票")
 _TRAIN_RE = re.compile(r"高铁|动车|火车|列车|车次")
@@ -67,6 +72,7 @@ class ProductCapabilitySignals:
     explicit_route: bool
     adjacent_route_followup: bool
     endpoint_relation: bool
+    intercity_mobility: bool
     weather: bool
     flight: bool
     train: bool
@@ -84,10 +90,12 @@ def resolve_product_capability_signals(
     adjacent_route_followup = _has_adjacent_route_result_context(
         task_context_messages
     ) and _is_route_followup(message)
+    endpoint_relation = bool(_ROUTE_ENDPOINT_RE.search(message))
     return ProductCapabilitySignals(
         explicit_route=_is_explicit_route_task(message),
         adjacent_route_followup=adjacent_route_followup,
-        endpoint_relation=bool(_ROUTE_ENDPOINT_RE.search(message)),
+        endpoint_relation=endpoint_relation,
+        intercity_mobility=endpoint_relation and bool(_INTERCITY_MOBILITY_RE.search(message)),
         weather=bool(_WEATHER_RE.search(message)),
         flight=bool(_FLIGHT_RE.search(message)),
         train=bool(_TRAIN_RE.search(message)),
