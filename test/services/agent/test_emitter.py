@@ -113,6 +113,13 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
                 "external_tool_names": ["web_search"],
                 "include_current_date": False,
             },
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "deep_research",
+                "reason_codes": ["deep_research_mode"],
+                "external_tool_names": ["url_read", "web_search"],
+                "effective_plan_mode": "on",
+            },
         )
 
         for invalid_resolution in invalid_resolutions:

@@ -248,6 +248,16 @@ class TrajectoryApiTests(unittest.TestCase):
                     "include_current_date": False,
                 },
             ),
+            (
+                "run-invalid-order",
+                {
+                    **CAPABILITY_RESOLUTION,
+                    "package_id": "deep_research",
+                    "reason_codes": ["deep_research_mode"],
+                    "external_tool_names": ["url_read", "web_search"],
+                    "effective_plan_mode": "on",
+                },
+            ),
         )
         for run_id, resolution in invalid_resolutions:
             self._add_run(run_id, run_config={"capability_resolution": resolution})

@@ -579,6 +579,12 @@ def _run_config(limits: AgentLoopLimits, call_config: AgentLoopCallConfig | None
     resolution = getattr(call_config, "capability_resolution", None)
     if resolution is not None:
         resolution_payload = serialize_capability_resolution(resolution)
+        TrajectoryCapabilityResolution.model_validate(
+            {
+                **resolution_payload,
+                "bundle_fingerprint": "sha256:" + "0" * 64,
+            }
+        )
         announced_tools = list(getattr(call_config, "announced_tools", []) or [])
         if resolution_payload["external_tool_names"] != announced_tools:
             raise ValueError("能力路由工具与 Run 公告工具不一致")

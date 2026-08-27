@@ -563,6 +563,30 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValidationError):
             _run_config(self._limits(), call_config)
 
+    def test_run_config_rejects_reversed_tools_before_bundle_fingerprint_persistence(self):
+        call_config = self._call_config()
+        call_config.capability_resolution = replace(
+            call_config.capability_resolution,
+            package_id="deep_research",
+            reason_codes=("deep_research_mode",),
+            external_tool_names=("url_read", "web_search"),
+            effective_plan_mode="on",
+            include_current_date=True,
+        )
+        call_config.announced_tools = ["url_read", "web_search"]
+        call_config.plan_mode = "on"
+        call_config.task_mode = "deep_research"
+        call_config.network_profile = "deep_research"
+        call_config.evidence_policy = "deep_research_v1"
+
+        with (
+            patch("app.services.stream.agent_loop_lifecycle.hashlib.sha256", wraps=hashlib.sha256) as sha256,
+            self.assertRaises(ValidationError),
+        ):
+            _run_config(self._limits(), call_config)
+
+        sha256.assert_not_called()
+
     def _execution(self, *, call_config=None, limits=None, redis_writer=None):
         call_config = call_config or self._call_config()
         limits = limits or self._limits()

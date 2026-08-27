@@ -236,6 +236,70 @@ class AgentEventModelTests(unittest.TestCase):
 
         self.assertEqual(event.tools, ["mcp_docs_a1b2c3d4"])
 
+    def test_run_started_rejects_reversed_fixed_package_tool_order(self):
+        reversed_resolutions = (
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "deep_research",
+                "reason_codes": ["deep_research_mode"],
+                "external_tool_names": ["url_read", "web_search"],
+                "effective_plan_mode": "on",
+            },
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "travel_air_rail",
+                "reason_codes": ["air_rail_comparison"],
+                "external_tool_names": ["search_trains", "search_flights"],
+                "effective_plan_mode": "auto",
+            },
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "mobility_intercity",
+                "confidence": "medium",
+                "reason_codes": ["origin_destination_relation", "intercity_locations"],
+                "external_tool_names": ["search_trains", "route_compare"],
+                "effective_plan_mode": "auto",
+            },
+        )
+
+        for resolution in reversed_resolutions:
+            with self.subTest(resolution=resolution), self.assertRaises(ValidationError):
+                RunStarted(
+                    type="run_started",
+                    conversation_id="c1",
+                    message_id="msg-1",
+                    task_id="task-1",
+                    model="gpt",
+                    tools=resolution["external_tool_names"],
+                    config={"capability_resolution": resolution},
+                    capability_resolution=resolution,
+                    **self._common(),
+                )
+
+    def test_run_started_accepts_canonical_partial_fixed_package_tools(self):
+        resolution = {
+            **CAPABILITY_RESOLUTION,
+            "package_id": "mobility_intercity",
+            "confidence": "medium",
+            "reason_codes": ["origin_destination_relation", "intercity_locations"],
+            "external_tool_names": ["route_compare", "search_trains"],
+            "effective_plan_mode": "auto",
+        }
+
+        event = RunStarted(
+            type="run_started",
+            conversation_id="c1",
+            message_id="msg-1",
+            task_id="task-1",
+            model="gpt",
+            tools=resolution["external_tool_names"],
+            config={"capability_resolution": resolution},
+            capability_resolution=resolution,
+            **self._common(),
+        )
+
+        self.assertEqual(event.capability_resolution.external_tool_names, ["route_compare", "search_trains"])
+
     def test_run_started_message_id_required(self):
         """RunStarted 缺 message_id 必须抛 ValidationError"""
         with self.assertRaises(ValidationError):

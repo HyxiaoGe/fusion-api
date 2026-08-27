@@ -610,6 +610,16 @@ def test_tools_are_canonical_and_intersect_available_names():
     assert route.external_tool_names == ("search_flights", "search_trains")
 
 
+def test_three_tool_package_keeps_canonical_partial_subsequence():
+    route = _resolve(
+        "我现在在北京，我想去上海，你可以帮我吗",
+        available_tool_names=["search_trains", "route_compare"],
+    )
+
+    assert route.package_id == "mobility_intercity"
+    assert route.external_tool_names == ("route_compare", "search_trains")
+
+
 def test_mixed_itinerary_keeps_only_three_travel_tools():
     route = _resolve("从北京到上海，比较飞机和高铁，并规划落地后的市内接驳路线")
 

@@ -304,4 +304,10 @@ def build_trajectory_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             stored[field] = _bounded_list(payload[field])
         else:
             stored[field] = _sanitize_scalar(payload[field])
+    if (
+        event_type == "run_started"
+        and payload.get("capability_resolution") is not None
+        and stored.get("capability_resolution") is None
+    ):
+        stored["tools"] = []
     return stored

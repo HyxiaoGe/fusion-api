@@ -513,6 +513,48 @@ class TrajectoryPayloadTests(unittest.TestCase):
                 if "update_plan" in invalid_resolution["external_tool_names"]:
                     self.assertEqual(payload["tools"], [])
 
+    def test_run_started_drops_reversed_fixed_package_resolution_but_keeps_canonical_partial(self):
+        reversed_resolution = {
+            **CAPABILITY_RESOLUTION,
+            "package_id": "deep_research",
+            "reason_codes": ["deep_research_mode"],
+            "external_tool_names": ["url_read", "web_search"],
+            "effective_plan_mode": "on",
+        }
+        invalid_payload = build_trajectory_payload(
+            {
+                **COMMON,
+                "type": "run_started",
+                **EVENT_FIELDS["run_started"],
+                "tools": reversed_resolution["external_tool_names"],
+                "capability_resolution": reversed_resolution,
+            }
+        )
+
+        self.assertIsNone(invalid_payload["capability_resolution"])
+        self.assertEqual(invalid_payload["tools"], [])
+
+        canonical_partial = {
+            **CAPABILITY_RESOLUTION,
+            "package_id": "mobility_intercity",
+            "confidence": "medium",
+            "reason_codes": ["origin_destination_relation", "intercity_locations"],
+            "external_tool_names": ["route_compare", "search_trains"],
+            "effective_plan_mode": "auto",
+        }
+        valid_payload = build_trajectory_payload(
+            {
+                **COMMON,
+                "type": "run_started",
+                **EVENT_FIELDS["run_started"],
+                "tools": canonical_partial["external_tool_names"],
+                "capability_resolution": canonical_partial,
+            }
+        )
+
+        self.assertEqual(valid_payload["capability_resolution"], canonical_partial)
+        self.assertEqual(valid_payload["tools"], canonical_partial["external_tool_names"])
+
     def test_prompt_detail_status_is_durable_but_full_text_is_never_ledger_payload(self):
         payload = build_trajectory_payload(
             {

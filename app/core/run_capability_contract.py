@@ -171,6 +171,9 @@ def validate_capability_resolution_semantics(
             raise ValueError("外部工具能力包不得缺少全部工具")
         if not actual_tool_names.issubset(allowed_tool_name_set):
             raise ValueError("能力包公告了不属于该包的外部工具")
+        canonical_tool_names = tuple(name for name in allowed_tool_names if name in actual_tool_names)
+        if tool_names != canonical_tool_names:
+            raise ValueError("能力包外部工具必须使用 canonical order")
         if package_id == "deep_research" and actual_tool_names != allowed_tool_name_set:
             raise ValueError("Deep Research 必须公告完整搜索与读取工具集合")
 

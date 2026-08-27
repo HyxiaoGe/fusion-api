@@ -301,6 +301,28 @@ class TrajectoryQueryServiceTests(unittest.TestCase):
                 "effective_plan_mode": "auto",
             },
             {**CAPABILITY_RESOLUTION, "reason_codes": ["verified_source_request"]},
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "deep_research",
+                "reason_codes": ["deep_research_mode"],
+                "external_tool_names": ["url_read", "web_search"],
+                "effective_plan_mode": "on",
+            },
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "travel_air_rail",
+                "reason_codes": ["air_rail_comparison"],
+                "external_tool_names": ["search_trains", "search_flights"],
+                "effective_plan_mode": "auto",
+            },
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "mobility_intercity",
+                "confidence": "medium",
+                "reason_codes": ["origin_destination_relation", "intercity_locations"],
+                "external_tool_names": ["search_trains", "route_compare"],
+                "effective_plan_mode": "auto",
+            },
         )
         run_ids = []
         for index, invalid in enumerate(invalid_values):
