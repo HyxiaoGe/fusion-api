@@ -231,6 +231,41 @@ class AgentLoopWiringTests(unittest.TestCase):
         self.assertIs(lifecycle_call.dependencies.error_fn, error_fn)
         self.assertIs(lifecycle_call.dependencies.warning_fn, warning_fn)
 
+        alias_message = "请使用 mcp_docs_alias 查询 Microsoft Learn"
+        for options, capabilities in (
+            (
+                {"disable_tools": True},
+                {"functionCalling": True, "agentTools": True},
+            ),
+            (
+                {},
+                {"functionCalling": False, "agentTools": False},
+            ),
+        ):
+            with self.subTest(options=options, capabilities=capabilities):
+                captured.clear()
+                build_agent_loop_lifecycle_call(
+                    run_input=replace(
+                        run_input,
+                        raw_messages=[{"role": "user", "content": alias_message}],
+                        original_message=alias_message,
+                        options=options,
+                        capabilities=capabilities,
+                    ),
+                    db="db-wiring",
+                    limits=limits,
+                    dependencies=dependencies,
+                )
+
+                self.assertEqual(captured["dynamic_tools_db"], "db-wiring")
+                self.assertEqual(captured["call_config_kwargs"]["additional_tools"], [])
+                self.assertEqual(captured["call_config_kwargs"]["dynamic_tool_handlers"], {})
+                self.assertEqual(captured["call_config_kwargs"]["tool_bindings"], [])
+                self.assertEqual(
+                    captured["call_config_kwargs"]["authorized_tool_names"],
+                    ["mcp_docs_alias"],
+                )
+
         captured.pop("dynamic_tools_db")
         strict_call = build_agent_loop_lifecycle_call(
             run_input=replace(

@@ -732,6 +732,52 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(config.announced_tools, [])
 
+    def test_on_mode_without_external_tools_constrains_planned_tools_to_empty_arrays(self):
+        for message, expected_package in (
+            ("你好", "direct"),
+            ("帮我查一下这个", "clarification_only"),
+        ):
+            with self.subTest(message=message):
+                config = build_agent_loop_call_config(
+                    provider="openai",
+                    options={"plan_mode": "on"},
+                    capabilities={"functionCalling": True, "searchCapable": True},
+                    original_message=message,
+                )
+
+                update_plan = next(
+                    tool for tool in config.call_kwargs["tools"] if tool["function"]["name"] == "update_plan"
+                )
+                parameters = update_plan["function"]["parameters"]
+                planned_tools = parameters["properties"]["plan"]["items"]["properties"]["planned_tools"]
+                empty_plan = {
+                    "plan": [
+                        {"id": "step-1", "step": "理解请求", "status": "pending", "planned_tools": []},
+                        {"id": "step-2", "step": "直接回答", "status": "pending", "planned_tools": []},
+                    ]
+                }
+                invalid_plan = {
+                    "plan": [
+                        {
+                            "id": "step-1",
+                            "step": "错误调用未公告工具",
+                            "status": "pending",
+                            "planned_tools": ["web_search"],
+                        },
+                        {"id": "step-2", "step": "直接回答", "status": "pending", "planned_tools": []},
+                    ]
+                }
+
+                self.assertEqual(config.capability_resolution.package_id, expected_package)
+                self.assertEqual(config.announced_tools, [])
+                self.assertEqual(planned_tools["maxItems"], 0)
+                self.assertTrue(
+                    all(len(item["planned_tools"]) <= planned_tools["maxItems"] for item in empty_plan["plan"])
+                )
+                self.assertFalse(
+                    all(len(item["planned_tools"]) <= planned_tools["maxItems"] for item in invalid_plan["plan"])
+                )
+
     def test_requested_on_mode_defensively_disables_when_model_cannot_call_control_tool(self):
         config = build_agent_loop_call_config(
             provider="openai",
@@ -1043,6 +1089,94 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.dynamic_tool_handlers, {})
         self.assertEqual(config.tool_bindings, [])
         self.assertNotIn("tools", config.call_kwargs)
+
+    async def test_authorized_mcp_alias_degrades_atomically_when_execution_is_unavailable(self):
+        alias = "mcp_docs_a1b2c3d4"
+        mcp_tool = {
+            "type": "function",
+            "function": {
+                "name": alias,
+                "description": "搜索 Microsoft Learn 文档",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            },
+        }
+        handler = object()
+        binding = {"alias": alias, "server_id": "server-1"}
+        message = f"请使用 {alias} 查询 Microsoft Learn"
+
+        async def build_llm_messages_fn(
+            _raw_messages,
+            _has_vision,
+            _repo,
+            _user_system_prompt,
+            *,
+            user_id=None,
+            conversation_id=None,
+            include_base_system=True,
+        ):
+            return [{"role": "user", "content": message}]
+
+        for options, capabilities, expected_reason in (
+            (
+                {"disable_tools": True},
+                {"functionCalling": True, "searchCapable": True},
+                "tools_disabled",
+            ),
+            (
+                {},
+                {"functionCalling": False, "searchCapable": False},
+                "function_calling_unavailable",
+            ),
+        ):
+            with self.subTest(expected_reason=expected_reason):
+                config = build_agent_loop_call_config(
+                    provider="openai",
+                    options=options,
+                    capabilities=capabilities,
+                    additional_tools=[mcp_tool],
+                    dynamic_tool_handlers={alias: handler},
+                    tool_bindings=[binding],
+                    authorized_tool_names=[alias],
+                    original_message=message,
+                )
+                prepared = await prepare_agent_loop_messages(
+                    db=object(),
+                    user_id="user-1",
+                    raw_messages=[],
+                    has_vision=False,
+                    file_ids=None,
+                    original_message=message,
+                    call_config=config,
+                    file_repo_factory=lambda _db: object(),
+                    load_user_system_prompt_fn=lambda _db, _user_id: None,
+                    build_llm_messages_fn=build_llm_messages_fn,
+                    preprocess_user_input=False,
+                )
+
+                self.assertEqual(config.capability_resolution.package_id, "tools_unavailable")
+                self.assertEqual(config.capability_resolution.resolution_mode, "degraded")
+                self.assertEqual(config.capability_resolution.reason_codes, (expected_reason,))
+                self.assertTrue(config.capability_resolution.network_boundary_required)
+                self.assertEqual(config.capability_resolution.external_tool_names, ())
+                self.assertNotIn("tools", config.call_kwargs)
+                self.assertEqual(config.dynamic_tool_handlers, {})
+                self.assertEqual(config.tool_bindings, [])
+                self.assertEqual(config.announced_tools, [])
+                self.assertEqual(prepared.final_tool_names, [])
+                self.assertEqual(
+                    prepared.prompt_assembly["section_ids"],
+                    ["app_identity", "no_tool_network_boundary"],
+                )
+
+        unauthorized = build_agent_loop_call_config(
+            provider="openai",
+            options={"disable_tools": True},
+            capabilities={"functionCalling": True, "searchCapable": True},
+            authorized_tool_names=[alias],
+            original_message="请使用 mcp_unapproved_deadbeef 查询秘密资料",
+        )
+        self.assertEqual(unauthorized.capability_resolution.package_id, "clarification_only")
+        self.assertFalse(unauthorized.capability_resolution.network_boundary_required)
 
     def test_mcp_tool_prevents_false_no_network_boundary(self):
         messages = [{"role": "user", "content": "查一下 Microsoft Learn"}]

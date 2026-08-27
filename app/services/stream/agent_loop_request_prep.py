@@ -68,6 +68,12 @@ def build_update_plan_tool(allowed_tool_names: list[str] | None = None) -> dict[
     normalized_allowed_tool_names = list(dict.fromkeys(allowed_tool_names or []))
     if normalized_allowed_tool_names:
         planned_tool_schema["enum"] = normalized_allowed_tool_names
+    planned_tools_max_items = 1 if normalized_allowed_tool_names else 0
+    planned_tools_description = (
+        "执行步骤最多声明一个当前已提供的真实工具；多工具拆成独立步骤。"
+        if normalized_allowed_tool_names
+        else "本次没有外部工具，必须提交空数组。"
+    )
 
     return {
         "type": "function",
@@ -112,8 +118,8 @@ def build_update_plan_tool(allowed_tool_names: list[str] | None = None) -> dict[
                                 "planned_tools": {
                                     "type": "array",
                                     "items": planned_tool_schema,
-                                    "maxItems": 1,
-                                    "description": ("执行步骤最多声明一个当前已提供的真实工具；多工具拆成独立步骤。"),
+                                    "maxItems": planned_tools_max_items,
+                                    "description": planned_tools_description,
                                 },
                             },
                             "required": ["id", "step", "status", "planned_tools"],
@@ -212,6 +218,7 @@ def build_agent_loop_call_config(
     additional_tools: list[dict] | None = None,
     dynamic_tool_handlers: dict[str, Any] | None = None,
     tool_bindings: list[dict[str, Any]] | None = None,
+    authorized_tool_names: list[str] | None = None,
     original_message: str | None = None,
     task_context_messages: list[object] | None = None,
 ) -> AgentLoopCallConfig:
@@ -246,10 +253,18 @@ def build_agent_loop_call_config(
             tool for tool in (additional_tools or []) if _tool_definition_name(tool) in provided_handlers
         )
     available_tools_by_name = {name: tool for tool in available_tools if (name := _tool_definition_name(tool))}
+    route_tool_names = list(available_tools_by_name)
+    if tools_disabled or capabilities.get("functionCalling") is not True:
+        trusted_authorized_tool_names = [
+            name for name in (authorized_tool_names or []) if isinstance(name, str) and name
+        ]
+        route_tool_names.extend(
+            name for name in dict.fromkeys(trusted_authorized_tool_names) if name not in available_tools_by_name
+        )
     capability_resolution = resolve_run_capability_route(
         original_message=original_message,
         task_context_messages=task_context_messages,
-        available_tool_names=list(available_tools_by_name),
+        available_tool_names=route_tool_names,
         requested_plan_mode=requested_plan_mode,
         task_policy=task_policy,
         capabilities=capabilities,
