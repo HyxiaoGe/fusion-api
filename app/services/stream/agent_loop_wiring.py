@@ -131,6 +131,7 @@ class AgentLoopWiringDependencies:
     generate_suggested_questions_fn: Callable[..., Any] | None = None
     fail_suggested_questions_fn: Callable[..., Any] | None = None
     load_dynamic_tools_fn: Callable[..., Any] | None = None
+    load_authorized_tool_names_fn: Callable[..., list[str]] | None = None
     llm_round_detail_scheduler: Callable[[Any], Any] | None = None
 
     def to_execution_dependencies(self) -> AgentLoopDependencies:
@@ -201,25 +202,33 @@ def build_agent_loop_lifecycle_call(
         and dependencies.load_dynamic_tools_fn is not None
     )
     should_load_dynamic_tool_metadata = (
-        dependencies.load_dynamic_tools_fn is not None
+        dependencies.load_authorized_tool_names_fn is not None
         and options.get("knowledge_grounded") is not True
         and (options.get("disable_tools") is True or capabilities.get("functionCalling") is not True)
     )
     dynamic_tool_set = (
         _load_dynamic_tools(dependencies.load_dynamic_tools_fn, db=db, user_id=run_input.user_id)
-        if should_load_dynamic_tools or should_load_dynamic_tool_metadata
+        if should_load_dynamic_tools
         else None
     )
-    executable_dynamic_tool_set = dynamic_tool_set if should_load_dynamic_tools else None
+    authorized_tool_names = (
+        _load_dynamic_tools(
+            dependencies.load_authorized_tool_names_fn,
+            db=db,
+            user_id=run_input.user_id,
+        )
+        if should_load_dynamic_tool_metadata
+        else []
+    )
     call_config = dependencies.build_call_config_fn(
         provider=run_input.provider,
         options=options,
         capabilities=capabilities,
-        additional_tools=list(getattr(executable_dynamic_tool_set, "definitions", []) or []),
-        dynamic_tool_handlers=dict(getattr(executable_dynamic_tool_set, "handlers", {}) or {}),
-        tool_bindings=list(getattr(executable_dynamic_tool_set, "audit_bindings", []) or []),
+        additional_tools=list(getattr(dynamic_tool_set, "definitions", []) or []),
+        dynamic_tool_handlers=dict(getattr(dynamic_tool_set, "handlers", {}) or {}),
+        tool_bindings=list(getattr(dynamic_tool_set, "audit_bindings", []) or []),
         **(
-            {"authorized_tool_names": _authorized_tool_names(dynamic_tool_set)}
+            {"authorized_tool_names": authorized_tool_names}
             if should_load_dynamic_tool_metadata
             and _accepts_keyword(dependencies.build_call_config_fn, "authorized_tool_names")
             else {}
@@ -257,21 +266,6 @@ def _load_dynamic_tools(load_fn: Callable[..., Any], *, db: Any, user_id: str) -
     if supports_user_id:
         return load_fn(db, user_id=user_id)
     return load_fn(db)
-
-
-def _authorized_tool_names(dynamic_tool_set: Any) -> list[str]:
-    """仅从已授权 definition 与 handler 的交集提取路由元数据，不暴露 schema。"""
-
-    handlers = getattr(dynamic_tool_set, "handlers", {}) or {}
-    if not isinstance(handlers, dict):
-        return []
-    names: list[str] = []
-    for definition in getattr(dynamic_tool_set, "definitions", []) or []:
-        function = definition.get("function") if isinstance(definition, dict) else None
-        name = function.get("name") if isinstance(function, dict) else None
-        if isinstance(name, str) and name and name in handlers and name not in names:
-            names.append(name)
-    return names
 
 
 def _accepts_keyword(fn: Callable[..., Any], keyword: str) -> bool:
