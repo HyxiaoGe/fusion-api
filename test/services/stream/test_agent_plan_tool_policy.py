@@ -86,6 +86,79 @@ class AgentPlanToolPolicyTests(unittest.TestCase):
         self.assertTrue(signals.explicit_route)
         self.assertTrue(signals.intercity_mobility)
 
+    def test_explicit_mobility_accepts_arbitrary_bounded_endpoint_slots(self):
+        for message in (
+            "从故宫到颐和园怎么走？",
+            "从迪士尼到东方明珠如何去？",
+            "从奥体中心到市民中心坐地铁怎么走？",
+            "从故宫到颐和园哪条路线？",
+            "从北京公交集团到上海地铁公司怎么走？",
+        ):
+            with self.subTest(message=message):
+                signals = resolve_product_capability_signals(
+                    original_message=message,
+                    task_context_messages=None,
+                )
+
+                self.assertTrue(signals.endpoint_relation)
+                self.assertTrue(signals.explicit_route)
+                self.assertTrue(signals.intercity_mobility)
+
+    def test_explicit_mobility_rejects_empty_or_overlong_endpoint_slots(self):
+        for message in (
+            "从 到颐和园怎么走？",
+            f"从故宫到{'颐' * 61}怎么走？",
+        ):
+            with self.subTest(message=message):
+                signals = resolve_product_capability_signals(
+                    original_message=message,
+                    task_context_messages=None,
+                )
+
+                self.assertFalse(signals.explicit_route)
+                self.assertFalse(signals.intercity_mobility)
+
+    def test_ambiguous_organization_slots_need_explicit_mobility_intent(self):
+        for message in (
+            "从北京产品中心到上海研发中心，比较两边职责",
+            "从北京运营中心到上海研发中心的协作关系是什么？",
+            "从北京公交集团到上海地铁公司的职责如何划分？",
+        ):
+            with self.subTest(message=message):
+                signals = resolve_product_capability_signals(
+                    original_message=message,
+                    task_context_messages=None,
+                )
+
+                self.assertTrue(signals.endpoint_relation)
+                self.assertFalse(signals.explicit_route)
+                self.assertFalse(signals.intercity_mobility)
+
+    def test_abstract_route_terms_are_not_mobility_intent(self):
+        for message in (
+            "从前端团队到后端团队比较技术路线",
+            "从北京产品中心到上海研发中心比较发展路线",
+        ):
+            with self.subTest(message=message):
+                signals = resolve_product_capability_signals(
+                    original_message=message,
+                    task_context_messages=None,
+                )
+
+                self.assertTrue(signals.endpoint_relation)
+                self.assertFalse(signals.explicit_route)
+                self.assertFalse(signals.intercity_mobility)
+
+    def test_safe_natural_location_slots_keep_structured_intercity_signal(self):
+        signals = resolve_product_capability_signals(
+            original_message="从广州南站到深圳北站",
+            task_context_messages=None,
+        )
+
+        self.assertTrue(signals.endpoint_relation)
+        self.assertFalse(signals.explicit_route)
+        self.assertTrue(signals.intercity_mobility)
+
     def test_verified_research_requires_search_and_two_independent_reads(self):
         messages = [
             "帮我调研一下韩国股市近几年的起伏，重点说说主要原因和争议。",

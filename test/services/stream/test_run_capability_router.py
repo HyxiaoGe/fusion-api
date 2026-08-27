@@ -486,6 +486,66 @@ def test_institution_slots_are_valid_when_route_action_is_explicit():
     assert route.reason_codes == ("explicit_route_task",)
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "从故宫到颐和园怎么走？",
+        "从迪士尼到东方明珠如何去？",
+        "从奥体中心到市民中心坐地铁怎么走？",
+        "从故宫到颐和园哪条路线？",
+        "从北京公交集团到上海地铁公司怎么走？",
+    ],
+)
+def test_explicit_mobility_accepts_arbitrary_bounded_endpoint_slots(message):
+    route = _resolve(message)
+
+    assert route.package_id == "mobility_route"
+    assert route.external_tool_names == ("route_compare",)
+    assert route.reason_codes == ("explicit_route_task",)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "从 到颐和园怎么走？",
+        f"从故宫到{'颐' * 61}怎么走？",
+    ],
+)
+def test_explicit_mobility_rejects_empty_or_overlong_endpoint_slots(message):
+    route = _resolve(message)
+
+    assert route.package_id == "clarification_only"
+    assert route.external_tool_names == ()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "从北京产品中心到上海研发中心，比较两边职责",
+        "从北京运营中心到上海研发中心的协作关系是什么？",
+        "从北京公交集团到上海地铁公司的职责如何划分？",
+        "从前端团队到后端团队比较技术路线",
+        "从北京产品中心到上海研发中心比较发展路线",
+    ],
+)
+def test_ambiguous_organization_and_abstract_route_slots_do_not_expose_tools(message):
+    route = _resolve(message)
+
+    assert route.package_id == "clarification_only"
+    assert route.external_tool_names == ()
+
+
+def test_safe_natural_location_slots_keep_structured_intercity_package():
+    route = _resolve("从广州南站到深圳北站")
+
+    assert route.package_id == "mobility_intercity"
+    assert route.external_tool_names == (
+        "route_compare",
+        "search_flights",
+        "search_trains",
+    )
+
+
 def test_greeting_prefix_does_not_turn_an_ambiguous_request_into_direct():
     route = _resolve("你好，帮我查一下这个")
 
