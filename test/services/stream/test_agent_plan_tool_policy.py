@@ -86,7 +86,7 @@ class AgentPlanToolPolicyTests(unittest.TestCase):
         self.assertTrue(signals.explicit_route)
         self.assertTrue(signals.intercity_mobility)
 
-    def test_explicit_mobility_accepts_arbitrary_bounded_endpoint_slots(self):
+    def test_explicit_mobility_accepts_confirmed_physical_endpoint_slots(self):
         for message in (
             "从故宫到颐和园怎么走？",
             "从迪士尼到东方明珠如何去？",
@@ -106,6 +106,8 @@ class AgentPlanToolPolicyTests(unittest.TestCase):
 
     def test_abstract_process_and_career_paths_are_not_mobility_signals(self):
         for message in (
+            "从亏损到盈利怎么走？",
+            "请规划从冷启动到规模化的路线",
             "从需求评审到正式上线怎么走流程？",
             "从初级工程师到架构师怎么走？",
             "从初级工程师到架构师怎么走职业路径？",
@@ -262,10 +264,7 @@ class AgentPlanToolPolicyTests(unittest.TestCase):
 
     def test_verified_route_research_merges_route_and_evidence_requirements(self):
         policy = resolve_agent_plan_tool_policy(
-            original_message=(
-                "请联网调研从南景新村到双子塔的驾车和地铁路线，"
-                "核验争议说法并给出权威来源。"
-            ),
+            original_message=("请联网调研从南景新村到双子塔的驾车和地铁路线，核验争议说法并给出权威来源。"),
             announced_tool_names=["web_search", "url_read", "route_compare"],
         )
 

@@ -21,9 +21,7 @@ _EXPLICIT_MOBILITY_ACTION_RE = re.compile(
     r"怎么走|怎么去|如何去|怎么到|如何到|导航|"
     r"驾车|开车|自驾|公交|公共交通|地铁|轨道交通|骑行|步行|摩托|通勤|接驳"
 )
-_EXPLICIT_ROUTE_CHOICE_RE = re.compile(
-    r"(?:哪个|哪条|哪种)\s*路线(?:\s*(?:更快|更短|更合适|更方便))?"
-)
+_EXPLICIT_ROUTE_CHOICE_RE = re.compile(r"(?:哪个|哪条|哪种)\s*路线(?:\s*(?:更快|更短|更合适|更方便))?")
 _PLAIN_ROUTE_REQUEST_RE = re.compile(
     r"(?:请\s*)?(?:给我|给出|规划|推荐)\s*从\s*"
     r"(?P<origin>[^，,。；;？?]{1,40}?)(?:到|去|前往)\s*"
@@ -39,9 +37,7 @@ _CAREER_ENDPOINT_RE = re.compile(
     r"(?:工程师|架构师|设计师|分析师|科学家|经理|主管|总监|专家|顾问|"
     r"开发者|程序员|岗位|职位|职级)$"
 )
-_PROCESS_STAGE_ENDPOINT_RE = re.compile(
-    r"(?:需求|评审|立项|开发|联调|测试|验收|发布|上线|部署|交付)$"
-)
+_PROCESS_STAGE_ENDPOINT_RE = re.compile(r"(?:需求|评审|立项|开发|联调|测试|验收|发布|上线|部署|交付)$")
 INTERCITY_LOCATION_NAMES = (
     "北京",
     "上海",
@@ -69,6 +65,17 @@ INTERCITY_LOCATION_NAMES = (
     "无锡",
     "香港",
     "澳门",
+)
+_KNOWN_PHYSICAL_LOCATION_NAMES = frozenset(
+    {
+        "故宫",
+        "颐和园",
+        "迪士尼",
+        "东方明珠",
+        "奥体中心",
+        "市民中心",
+        "外滩",
+    }
 )
 _STRUCTURED_ROUTE_ENDPOINT_RES = (
     re.compile(
@@ -102,6 +109,7 @@ _RELATED_MOBILITY_RE = re.compile(
 _ENDPOINT_SUFFIX_RE = re.compile(
     r"(?:哪个|哪条|哪种)(?:路线|方式)|怎么(?:走|去|到|坐)|如何(?:走|去|到)|"
     r"(?:乘坐|坐)(?:公交|公共交通|地铁|轨道交通)|导航|"
+    r"的(?=(?:驾车|开车|自驾|公交|公共交通|地铁|轨道交通|骑行|步行|摩托|通勤|接驳))|"
     r"(?:驾车|开车|自驾|公交|公共交通|地铁|轨道交通|骑行|步行|摩托|通勤|接驳)"
     r"(?:路线)?$|更快|更短|更合适|申请|比较|的职责|的协作|的发展|两家"
 )
@@ -123,7 +131,16 @@ _SAFE_LOCATION_SLOT_SUFFIXES = (
     "路",
     "街",
     "桥",
+    "塔",
 )
+_INSTITUTION_LOCATION_SLOT_SUFFIXES = (
+    "大学",
+    "学院",
+    "医院",
+    "博物馆",
+    "体育馆",
+)
+_TRANSPORT_INSTITUTION_SLOT_RE = re.compile(r"(?:公交|地铁|轨道交通).*(?:集团|公司|中心)$")
 _WEATHER_RE = re.compile(r"天气|气温|温度|降雨|下雨|下雪|风力")
 _FLIGHT_RE = re.compile(r"航班|飞机|机场|机票")
 _TRAIN_RE = re.compile(r"高铁|动车|火车|列车|车次")
@@ -160,6 +177,7 @@ class _EndpointSlotTier(IntEnum):
     INVALID = 0
     BOUNDED = 1
     CONFIRMED_LOCATION = 2
+    DEFAULT_ROUTE_LOCATION = 3
 
 
 @dataclass(frozen=True)
@@ -201,9 +219,7 @@ def resolve_product_capability_signals(
     """集中解析产品意图，避免 Run 路由和计划策略维护两套正则。"""
 
     message = _normalize_message(original_message)
-    adjacent_route_followup = _has_adjacent_route_result_context(
-        task_context_messages
-    ) and _is_route_followup(message)
+    adjacent_route_followup = _has_adjacent_route_result_context(task_context_messages) and _is_route_followup(message)
     endpoint = _parse_endpoint_relation(message)
     endpoint_relation = endpoint is not None
     mobility_intent = _resolve_mobility_intent_strength(message, endpoint)
@@ -216,16 +232,14 @@ def resolve_product_capability_signals(
         if endpoint
         else (_EndpointSlotTier.INVALID, _EndpointSlotTier.INVALID)
     )
-    endpoints_are_bounded = all(
-        tier >= _EndpointSlotTier.BOUNDED for tier in endpoint_tiers
-    )
-    endpoints_are_confirmed_locations = all(
-        tier >= _EndpointSlotTier.CONFIRMED_LOCATION for tier in endpoint_tiers
+    endpoints_are_confirmed_locations = all(tier >= _EndpointSlotTier.CONFIRMED_LOCATION for tier in endpoint_tiers)
+    endpoints_are_default_route_locations = all(
+        tier >= _EndpointSlotTier.DEFAULT_ROUTE_LOCATION for tier in endpoint_tiers
     )
     explicit_route = bool(
         endpoint
         and endpoint.structured
-        and endpoints_are_bounded
+        and endpoints_are_confirmed_locations
         and not abstract_relation
         and mobility_intent == _MobilityIntentStrength.EXPLICIT
     )
@@ -239,11 +253,8 @@ def resolve_product_capability_signals(
             and (
                 explicit_route
                 or (
-                    endpoints_are_confirmed_locations
-                    and (
-                        endpoint.structured
-                        or mobility_intent >= _MobilityIntentStrength.RELATED
-                    )
+                    endpoints_are_default_route_locations
+                    and (endpoint.structured or mobility_intent >= _MobilityIntentStrength.RELATED)
                 )
             )
         ),
@@ -266,9 +277,7 @@ def resolve_agent_plan_tool_policy(
     announced = frozenset(name for name in announced_tool_names if name)
     if not message:
         return AgentPlanToolPolicy()
-    is_verified_research = _VERIFIED_RESEARCH_TOOL_NAMES.issubset(announced) and _is_verified_research_request(
-        message
-    )
+    is_verified_research = _VERIFIED_RESEARCH_TOOL_NAMES.issubset(announced) and _is_verified_research_request(message)
     product_signals = resolve_product_capability_signals(
         original_message=message,
         task_context_messages=task_context_messages,
@@ -325,9 +334,7 @@ def _is_verified_research_request(message: str) -> bool:
     explicit_research = bool(_RESEARCH_REQUEST_RE.search(message)) and search_intent != "quick_fact"
     if explicit_research:
         return True
-    return bool(
-        _VERIFIED_EVIDENCE_RE.search(message) or _CONTROVERSY_VERIFICATION_RE.search(message)
-    )
+    return bool(_VERIFIED_EVIDENCE_RE.search(message) or _CONTROVERSY_VERIFICATION_RE.search(message))
 
 
 def _has_adjacent_route_result_context(messages: list[object] | None) -> bool:
@@ -378,9 +385,7 @@ def _parse_endpoint_relation(message: str) -> _EndpointRelation | None:
     if plain_route_match is not None:
         return _EndpointRelation(
             origin=_normalize_endpoint_slot(plain_route_match.group("origin")),
-            destination=_normalize_endpoint_slot(
-                plain_route_match.group("destination")
-            ),
+            destination=_normalize_endpoint_slot(plain_route_match.group("destination")),
             structured=True,
             plain_route_request=True,
         )
@@ -413,7 +418,13 @@ def _normalize_endpoint_slot(value: str) -> str:
 def _endpoint_slot_tier(value: str) -> _EndpointSlotTier:
     if not value or len(value) > 60:
         return _EndpointSlotTier.INVALID
-    if value in INTERCITY_LOCATION_NAMES or value.endswith(_SAFE_LOCATION_SLOT_SUFFIXES):
+    if (
+        value in INTERCITY_LOCATION_NAMES
+        or value in _KNOWN_PHYSICAL_LOCATION_NAMES
+        or value.endswith(_SAFE_LOCATION_SLOT_SUFFIXES)
+    ):
+        return _EndpointSlotTier.DEFAULT_ROUTE_LOCATION
+    if value.endswith(_INSTITUTION_LOCATION_SLOT_SUFFIXES) or _TRANSPORT_INSTITUTION_SLOT_RE.search(value):
         return _EndpointSlotTier.CONFIRMED_LOCATION
     return _EndpointSlotTier.BOUNDED
 
@@ -425,9 +436,7 @@ def _resolve_mobility_intent_strength(
     if endpoint is not None and endpoint.plain_route_request:
         return _MobilityIntentStrength.EXPLICIT
     intent_message = _without_endpoint_slots(message, endpoint)
-    if _EXPLICIT_MOBILITY_ACTION_RE.search(intent_message) or _EXPLICIT_ROUTE_CHOICE_RE.search(
-        intent_message
-    ):
+    if _EXPLICIT_MOBILITY_ACTION_RE.search(intent_message) or _EXPLICIT_ROUTE_CHOICE_RE.search(intent_message):
         return _MobilityIntentStrength.EXPLICIT
     if _RELATED_MOBILITY_RE.search(intent_message):
         return _MobilityIntentStrength.RELATED
@@ -465,6 +474,5 @@ def _is_route_followup(message: str) -> bool:
     """已有结构化路线结果时，比较和推荐追问不强制重复查询。"""
 
     return bool(
-        _resolve_mobility_intent_strength(message) > _MobilityIntentStrength.NONE
-        or _ROUTE_FOLLOWUP_RE.search(message)
+        _resolve_mobility_intent_strength(message) > _MobilityIntentStrength.NONE or _ROUTE_FOLLOWUP_RE.search(message)
     )

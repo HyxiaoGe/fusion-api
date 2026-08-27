@@ -12,7 +12,10 @@ from app.services.chat.context_manager import (
     prepare_context,
 )
 from app.services.chat.message_builder import build_llm_messages
-from app.services.stream.agent_loop_request_prep import AgentLoopCallConfig, _prepare_url_context
+from app.services.stream.agent_loop_request_prep import (
+    _prepare_url_context,
+    build_agent_loop_call_config,
+)
 
 
 def _length_estimator(_model, messages, call_kwargs):
@@ -275,11 +278,11 @@ class ContextManagerTests(unittest.IsolatedAsyncioTestCase):
         prepared, _blocks = await _prepare_url_context(
             messages=messages,
             original_message="summarize it",
-            call_config=AgentLoopCallConfig(
-                should_use_reasoning=False,
-                supports_function_calling=True,
-                call_kwargs={},
-                announced_tools=[],
+            call_config=build_agent_loop_call_config(
+                provider="openai",
+                options={},
+                capabilities={"functionCalling": True, "searchCapable": True},
+                original_message="总结 https://example.com",
             ),
             preprocess_url_in_message_fn=preprocess_url,
         )

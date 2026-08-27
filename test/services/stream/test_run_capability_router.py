@@ -56,8 +56,7 @@ def _resolve(
         available_tool_names=available_tool_names or ALL_TOOLS,
         requested_plan_mode=requested_plan_mode,
         task_policy=_task_policy(task_mode=task_mode, plan_mode=requested_plan_mode),
-        capabilities=capabilities
-        or {"functionCalling": True, "searchCapable": True},
+        capabilities=capabilities or {"functionCalling": True, "searchCapable": True},
         tools_disabled=tools_disabled,
         knowledge_grounded=knowledge_grounded,
     )
@@ -496,7 +495,7 @@ def test_institution_slots_are_valid_when_route_action_is_explicit():
         "从北京公交集团到上海地铁公司怎么走？",
     ],
 )
-def test_explicit_mobility_accepts_arbitrary_bounded_endpoint_slots(message):
+def test_explicit_mobility_accepts_confirmed_physical_endpoint_slots(message):
     route = _resolve(message)
 
     assert route.package_id == "mobility_route"
@@ -507,6 +506,8 @@ def test_explicit_mobility_accepts_arbitrary_bounded_endpoint_slots(message):
 @pytest.mark.parametrize(
     "message",
     [
+        "从亏损到盈利怎么走？",
+        "请规划从冷启动到规模化的路线",
         "从需求评审到正式上线怎么走流程？",
         "从初级工程师到架构师怎么走？",
         "从初级工程师到架构师怎么走职业路径？",
@@ -610,9 +611,7 @@ def test_tools_are_canonical_and_intersect_available_names():
 
 
 def test_mixed_itinerary_keeps_only_three_travel_tools():
-    route = _resolve(
-        "从北京到上海，比较飞机和高铁，并规划落地后的市内接驳路线"
-    )
+    route = _resolve("从北京到上海，比较飞机和高铁，并规划落地后的市内接驳路线")
 
     assert route.package_id == "mixed_itinerary"
     assert route.external_tool_names == (

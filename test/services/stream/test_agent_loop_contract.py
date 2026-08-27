@@ -336,6 +336,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             fake_handler=None,
             dynamic_tool_set=dynamic_tool_set,
             capabilities={"functionCalling": True, "searchCapable": False},
+            user_message=f"请使用 {alias} 查询 MCP authorization",
         )
 
         run_started = next(event for event in result.events if event["type"] == "run_started")
@@ -345,12 +346,11 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request_tools[0]["function"]["name"], alias)
         request_parameters = request_tools[0]["function"]["parameters"]
         self.assertEqual(request_parameters["properties"]["query"], {"type": "string"})
-        self.assertIn("_plan_item_id", request_parameters["properties"])
-        self.assertNotIn("_plan_item_id", request_parameters["required"])
+        self.assertNotIn("_plan_item_id", request_parameters["properties"])
         self.assertNotIn("_plan_item_id", definition["function"]["parameters"]["properties"])
         self.assertEqual(
             [tool["function"]["name"] for tool in request_tools],
-            [alias, "update_plan"],
+            [alias],
         )
         self.assertNotIn("web_search", str(result.llm_calls[0]["call_kwargs"]))
         second_round_tool_messages = [
@@ -420,6 +420,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             use_real_tool_executor=True,
             dynamic_tool_set=dynamic_tool_set,
             capabilities={"functionCalling": True, "agentTools": True, "searchCapable": False},
+            user_message="找人民广场附近评分较高的咖啡店",
         )
 
         run_started = next(event for event in result.events if event["type"] == "run_started")
@@ -495,6 +496,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 audit_bindings=[],
             ),
             capabilities={"functionCalling": True, "agentTools": True, "searchCapable": False},
+            user_message="找人民广场附近评分较高的咖啡店",
         )
 
         self.assertEqual(len(result.llm_calls), 2)
@@ -620,7 +622,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             use_real_tool_executor=True,
             dynamic_tool_set=dynamic_tool_set,
             capabilities={"functionCalling": True, "agentTools": True, "searchCapable": False},
-            user_message="查询南山区资料",
+            user_message=f"请使用 {alias} 查询南山区资料",
         )
 
         self.assertEqual(len(handler.calls), 2)
@@ -721,7 +723,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 audit_bindings=[],
             ),
             capabilities={"functionCalling": True, "agentTools": True, "searchCapable": False},
-            user_message="查询上海浦东国际机场到外滩的路线",
+            user_message="从人民广场到外滩怎么走？",
         )
 
         self.assertEqual(len(handler.calls), 1)
@@ -831,7 +833,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 audit_bindings=[],
             ),
             capabilities={"functionCalling": True, "agentTools": True, "searchCapable": False},
-            user_message="查询上海浦东国际机场到外滩的路线",
+            user_message="从人民广场到外滩怎么走？",
         )
 
         self.assertEqual(handler.calls, [])
@@ -841,7 +843,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.session_status_calls[-1]["total_tool_calls"], 0)
 
-    async def test_exhausted_mcp_server_tools_are_hidden_from_next_llm_round(self):
+    async def test_exhausted_routed_mcp_tool_is_hidden_from_next_llm_round(self):
         class SharedServerBudget:
             def __init__(self, max_calls):
                 self.max_calls = max_calls
@@ -914,16 +916,17 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 audit_bindings=[],
             ),
             capabilities={"functionCalling": True, "searchCapable": True, "agentTools": True},
+            user_message=f"请使用 {exhausted_alias} 查询地图",
         )
 
         first_round_tool_names = {tool["function"]["name"] for tool in result.llm_calls[0]["call_kwargs"]["tools"]}
-        second_round_tool_names = {tool["function"]["name"] for tool in result.llm_calls[1]["call_kwargs"]["tools"]}
-        self.assertTrue({"web_search", exhausted_alias, sibling_alias, available_alias} <= first_round_tool_names)
-        self.assertEqual(
-            second_round_tool_names,
-            first_round_tool_names - {exhausted_alias, sibling_alias},
-        )
-        self.assertTrue({"web_search", available_alias} <= second_round_tool_names)
+        second_round_tool_names = {
+            tool["function"]["name"] for tool in result.llm_calls[1]["call_kwargs"].get("tools", [])
+        }
+        self.assertEqual(first_round_tool_names, {exhausted_alias})
+        self.assertEqual(second_round_tool_names, set())
+        self.assertNotIn(sibling_alias, first_round_tool_names)
+        self.assertNotIn(available_alias, first_round_tool_names)
         self.assertNotIn(
             "调用预算已用完",
             "\n".join(str(message.get("content") or "") for call in result.llm_calls for message in call["messages"]),
@@ -1060,6 +1063,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 audit_bindings=[],
             ),
             capabilities={"functionCalling": True, "searchCapable": True, "agentTools": True},
+            user_message="今天查询深圳聚餐趋势",
         )
 
         self.assertEqual(result.tool_execute_calls[0]["args"][0], [valid_search])
@@ -1107,7 +1111,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
         prompt_event = result.events[1]
         self.assertEqual(prompt_event["status"], "ready")
         self.assertIsNone(prompt_event["step_id"])
-        self.assertIn("current_date", prompt_event["section_ids"])
+        self.assertNotIn("current_date", prompt_event["section_ids"])
         self.assertIn("app_identity", prompt_event["section_ids"])
         round_started = next(event for event in result.events if event["type"] == "llm_round_started")
         self.assertEqual(
@@ -1175,7 +1179,8 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             use_real_tool_executor=True,
             fake_handler=FakeSearchHandler(),
             options={"use_reasoning": True},
-            capabilities={"functionCalling": True, "deepThinking": True},
+            capabilities={"functionCalling": True, "searchCapable": True, "deepThinking": True},
+            user_message="今天 OpenAI 发布了什么？",
         )
 
         self.assertEqual(result.event_types[0], "run_started")
@@ -1251,7 +1256,8 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             ],
             execute_tools_result=_execute_tools,
             options={"use_reasoning": True},
-            capabilities={"functionCalling": True, "deepThinking": True},
+            capabilities={"functionCalling": True, "searchCapable": True, "deepThinking": True},
+            user_message="OpenAI 今天发布了什么？阅读官方公告后总结",
         )
 
         self.assertFalse(any(event["type"] in {"plan_snapshot", "plan_step_updated"} for event in result.events))
@@ -1322,7 +1328,8 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             use_real_tool_executor=True,
             fake_handler=FakeSearchHandler(),
             options={"use_reasoning": True},
-            capabilities={"functionCalling": True, "deepThinking": True},
+            capabilities={"functionCalling": True, "searchCapable": True, "deepThinking": True},
+            user_message="今天 OpenAI 发布了什么？",
         )
 
         self.assertEqual(result.session_started_calls[0]["run_id"], "run-contract")

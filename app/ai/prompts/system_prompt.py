@@ -10,7 +10,7 @@ from typing import Any
 from app.ai.prompts.agent_loop import build_current_date_system_prompt, get_app_identity_prompt
 from app.utils.prompt_fingerprint import fingerprint_system_messages
 
-TEMPLATE_VERSION = "2026-08-27.1"
+TEMPLATE_VERSION = "2026-08-27.2"
 
 
 @dataclass(frozen=True)
@@ -37,8 +37,12 @@ def build_stable_base_sections() -> list[SystemPromptSection]:
     return [SystemPromptSection("app_identity", get_app_identity_prompt())]
 
 
-def build_dynamic_sections(user_system_prompt: str | None = None) -> list[SystemPromptSection]:
-    sections = [SystemPromptSection("current_date", build_current_date_system_prompt())]
+def build_dynamic_sections(
+    user_system_prompt: str | None = None,
+    *,
+    include_current_date: bool = True,
+) -> list[SystemPromptSection]:
+    sections = [SystemPromptSection("current_date", build_current_date_system_prompt())] if include_current_date else []
     if user_system_prompt and user_system_prompt.strip():
         sections.append(
             SystemPromptSection(
@@ -50,13 +54,24 @@ def build_dynamic_sections(user_system_prompt: str | None = None) -> list[System
     return sections
 
 
-def build_base_sections(user_system_prompt: str | None = None) -> list[SystemPromptSection]:
-    return [*build_stable_base_sections(), *build_dynamic_sections(user_system_prompt)]
+def build_base_sections(
+    user_system_prompt: str | None = None,
+    *,
+    include_current_date: bool = True,
+) -> list[SystemPromptSection]:
+    return [
+        *build_stable_base_sections(),
+        *build_dynamic_sections(
+            user_system_prompt,
+            include_current_date=include_current_date,
+        ),
+    ]
 
 
 def assemble_system_prompt(
     *,
     user_system_prompt: str | None = None,
+    include_current_date: bool = True,
     sections: Callable[[], Iterable[SystemPromptSection]] | None = None,
 ) -> SystemPromptAssembly:
     """回调只允许读取已准备的内存状态，段落内容不参与身份判定。"""
@@ -74,7 +89,12 @@ def assemble_system_prompt(
         selected = build_stable_base_sections()
         if sections is not None:
             selected.extend(sections())
-        selected.extend(build_dynamic_sections(user_system_prompt))
+        selected.extend(
+            build_dynamic_sections(
+                user_system_prompt,
+                include_current_date=include_current_date,
+            )
+        )
         messages = []
         for section in selected:
             if section.section_id in section_ids:
