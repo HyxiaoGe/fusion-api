@@ -224,6 +224,67 @@ class ProductResultAnswerTests(unittest.TestCase):
         self.assertIn("驾车约 40 分钟、21 公里", answer)
         self.assertTrue(validate_product_answer(answer, [*source_blocks, _itinerary_result()]).is_valid)
 
+    def test_itinerary_fallback_keeps_unreferenced_travel_type_returned_in_same_round(self):
+        flight = _travel_block(
+            block_type="flight_results",
+            block_id="flight-out",
+            origin="北京",
+            destination="上海",
+            departure_date="2026-08-29",
+            option_id="flight-out-1",
+            number="MU5101",
+            duration_s=8100,
+            price_minor=76000,
+        )
+        train = _travel_block(
+            block_type="train_results",
+            block_id="train-out",
+            origin="北京",
+            destination="上海",
+            departure_date="2026-08-29",
+            option_id="train-out-1",
+            number="G1",
+            duration_s=16200,
+            price_minor=55300,
+        )
+        itinerary = {
+            "type": "itinerary_results",
+            "id": "itinerary-one-way",
+            "status": "success",
+            "trip_type": "one_way",
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-08-29",
+            "end_date": None,
+            "plans": [
+                {
+                    "id": "fastest",
+                    "title": "最快方案",
+                    "status": "complete",
+                    "strategy": "fastest_known_duration",
+                    "known_cost": {"currency": "CNY", "amount_minor": 76000},
+                    "known_duration_s": 8100,
+                    "sections": [
+                        {
+                            "kind": "outbound_transport",
+                            "coverage": None,
+                            "result_refs": [{"block_id": "flight-out", "item_ids": ["flight-out-1"]}],
+                        }
+                    ],
+                }
+            ],
+            "limitations": [],
+        }
+        blocks = [flight, train, itinerary]
+
+        answer = build_grounded_product_answer(blocks)
+
+        self.assertIn("同时返回北京到上海", answer)
+        self.assertIn("MU5101", answer)
+        self.assertIn("G1", answer)
+        validation = validate_product_answer(answer, blocks)
+        self.assertTrue(validation.is_valid, validation.reason_code)
+
     def test_weather_fallback_uses_only_forecast_fields_and_safe_advice(self):
         block = WeatherResultsBlock(
             type="weather_results",
