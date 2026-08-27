@@ -60,6 +60,7 @@ _BOOKING_HOST = "a.feizhu.com"
 _ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _CABIN_CLASSES = ("经济舱", "超级经济舱", "公务舱", "商务舱", "头等舱")
 _SEAT_CLASSES = ("二等座", "一等座", "商务座", "特等座", "硬座", "软座", "硬卧", "软卧", "无座")
+_TRAIN_CATEGORIES = ("high_speed", "all")
 _SORT_VALUES = ("recommended", "price_asc", "duration_asc", "departure_asc")
 _PATH_BY_TOOL = {
     FLYAI_SEARCH_FLIGHTS: "/v1/search/flights",
@@ -78,9 +79,11 @@ _DIAGNOSTIC_ARGUMENT_FIELDS = frozenset(
         "limit",
         "cabin_class",
         "seat_class",
+        "train_category",
     }
 )
 _VALIDATION_TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_HIGH_SPEED_TRAIN_NO_RE = re.compile(r"^[GDC]\d", re.IGNORECASE)
 
 
 class _TravelSearchArgs(BaseModel):
@@ -136,6 +139,7 @@ class _FlightSearchArgs(_TravelSearchArgs):
 
 class _TrainSearchArgs(_TravelSearchArgs):
     seat_class: Literal["二等座", "一等座", "商务座", "特等座", "硬座", "软座", "硬卧", "软卧", "无座"] | None = None
+    train_category: Literal["high_speed", "all"] = "all"
 
 
 class _AdapterRequest(BaseModel):
@@ -256,6 +260,7 @@ FLYAI_TRAVEL_DEFINITIONS = [
                 "存在多个合理日期时必须先询问，不得替用户选择日期。不查询余票、退改签、"
                 "检票口或站台，也不执行购票。"
                 + _COMBINED_ITINERARY_CALL_GUARD
+                + "用户明确要求高铁或动车时必须传 train_category=high_speed；用户明确要求普通火车或全部列车时传 all。"
                 + "用户要求在某个整点前到达时，必须传 arrival_before_hour，结果会限定为出发日当天"
                 "该整点前到达的班次。"
             ),
@@ -266,6 +271,7 @@ FLYAI_TRAVEL_DEFINITIONS = [
                     "destination": {"type": "string", "minLength": 1, "maxLength": 80},
                     "departure_date": {"type": "string", "format": "date"},
                     "seat_class": {"type": "string", "enum": list(_SEAT_CLASSES)},
+                    "train_category": {"type": "string", "enum": list(_TRAIN_CATEGORIES)},
                     "max_price_yuan": {"type": "integer", "minimum": 0, "maximum": 1_000_000},
                     "departure_hour_start": {"type": "integer", "minimum": 0, "maximum": 23},
                     "departure_hour_end": {"type": "integer", "minimum": 0, "maximum": 23},
@@ -686,7 +692,11 @@ def _validate_args(tool_name: str, args: Any) -> dict[str, Any]:
 def _adapter_arguments(normalized: dict[str, Any], *, raw_args: Any) -> dict[str, Any]:
     """剥离仅由 Fusion 处理的筛选条件，保持私有 adapter 契约稳定。"""
 
-    arguments = {key: value for key, value in normalized.items() if key != "arrival_before_hour"}
+    arguments = {
+        key: value
+        for key, value in normalized.items()
+        if key not in {"arrival_before_hour", "train_category"}
+    }
     if normalized.get("arrival_before_hour") is not None and (
         not isinstance(raw_args, dict) or "sort_by" not in raw_args
     ):
@@ -722,6 +732,9 @@ def _project_result(
     arrival_before_hour = arguments.get("arrival_before_hour")
     departure_date = arguments["departure_date"]
     candidates = response.items
+    train_category = arguments.get("train_category")
+    if tool_name == FLYAI_SEARCH_TRAINS and train_category == "high_speed":
+        candidates = [item for item in candidates if _HIGH_SPEED_TRAIN_NO_RE.match(item.transport_no)]
     if isinstance(arrival_before_hour, int):
         candidates = [
             item
@@ -743,6 +756,8 @@ def _project_result(
     ]
     if isinstance(arrival_before_hour, int):
         limitations.append(f"结果已限定为出发日当天 {arrival_before_hour:02d}:00 前到达")
+    if tool_name == FLYAI_SEARCH_TRAINS and train_category == "high_speed":
+        limitations.append("结果已限定为 G、D、C 字头的高铁或动车班次")
 
     return {
         "origin": response.request.origin,

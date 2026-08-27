@@ -122,6 +122,10 @@ class FlyAiTravelToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("cabin_class", by_name[FLYAI_SEARCH_FLIGHTS]["properties"])
         self.assertNotIn("seat_class", by_name[FLYAI_SEARCH_FLIGHTS]["properties"])
         self.assertIn("seat_class", by_name[FLYAI_SEARCH_TRAINS]["properties"])
+        self.assertEqual(
+            by_name[FLYAI_SEARCH_TRAINS]["properties"]["train_category"]["enum"],
+            ["high_speed", "all"],
+        )
         self.assertNotIn("cabin_class", by_name[FLYAI_SEARCH_TRAINS]["properties"])
 
     async def test_arrival_deadline_is_filtered_locally_and_not_forwarded_to_adapter(self):
@@ -157,6 +161,38 @@ class FlyAiTravelToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("arrival_before_hour", captured["request"])
         self.assertEqual(captured["request"]["sort_by"], "departure_asc")
         self.assertEqual([item["transport_no"] for item in result.data["result"]["items"]], ["G100"])
+
+    async def test_high_speed_category_filters_regular_trains_and_is_not_forwarded_to_adapter(self):
+        captured: dict = {}
+
+        async def respond(request: httpx.Request) -> httpx.Response:
+            adapter_request = json.loads(request.content)
+            captured["request"] = adapter_request
+            payload = _adapter_payload(transport_no="G100", request=adapter_request)
+            d_train = json.loads(json.dumps(payload["items"][0]))
+            d_train["transport_no"] = "D200"
+            regular_train = json.loads(json.dumps(payload["items"][0]))
+            regular_train["transport_no"] = "1461"
+            regular_train["operator_name"] = "普快"
+            payload["items"] = [regular_train, d_train, payload["items"][0]]
+            return httpx.Response(200, json=payload)
+
+        handler = _handler(FLYAI_SEARCH_TRAINS, httpx.MockTransport(respond))
+        result = await handler.execute(
+            {
+                "origin": "深圳",
+                "destination": "上海",
+                "departure_date": "2026-08-01",
+                "train_category": "high_speed",
+            }
+        )
+
+        self.assertEqual(result.status, "success")
+        self.assertNotIn("train_category", captured["request"])
+        self.assertEqual(
+            [item["transport_no"] for item in result.data["result"]["items"]],
+            ["D200", "G100"],
+        )
 
     async def test_flight_success_projects_safe_fields_and_trusted_booking_action(self):
         captured: dict = {}
