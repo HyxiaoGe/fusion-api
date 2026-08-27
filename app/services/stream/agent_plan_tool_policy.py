@@ -23,7 +23,9 @@ _EXPLICIT_MOBILITY_ACTION_RE = re.compile(
 )
 _EXPLICIT_ROUTE_CHOICE_RE = re.compile(r"(?:哪个|哪条|哪种)\s*路线(?:\s*(?:更快|更短|更合适|更方便))?")
 _PLAIN_ROUTE_REQUEST_RE = re.compile(
-    r"(?:请\s*)?(?:给我|给出|规划|推荐)\s*从\s*"
+    r"(?:(?:请|麻烦)(?:帮我)?|帮我|我想|我要)?\s*"
+    r"(?:给我|给出|提供|规划|推荐|查询|查找|查|搜索|查看|获取|找)\s*"
+    r"(?:一下|下|一条|一条合适的)?\s*从\s*"
     r"(?P<origin>[^，,。；;？?]{1,40}?)(?:到|去|前往)\s*"
     r"(?P<destination>[^，,。；;？?]{1,60}?)的路线"
     r"(?=$|[，,。；;？?])"

@@ -31,7 +31,13 @@ CAPABILITY_PACKAGE_EXTERNAL_TOOL_NAMES = MappingProxyType(
         "train": ("search_trains",),
         "travel_air_rail": ("search_flights", "search_trains"),
         "mobility_intercity": ("route_compare", "search_flights", "search_trains"),
-        "mixed_itinerary": ("route_compare", "search_flights", "search_trains"),
+        "mixed_itinerary": (
+            "weather_forecast",
+            "local_place_search",
+            "route_compare",
+            "search_flights",
+            "search_trains",
+        ),
         "deep_research": ("web_search", "url_read"),
         "knowledge_grounded": (),
         "tools_unavailable": (),
@@ -155,6 +161,8 @@ def validate_capability_resolution_semantics(
     tool_names = tuple(external_tool_names)
     if CAPABILITY_CONTROL_TOOL_NAMES.intersection(tool_names):
         raise ValueError("能力路由外部工具不得包含内部控制工具")
+    if len(tool_names) > 3:
+        raise ValueError("能力路由最多三个外部工具")
 
     if package_id == "mcp_explicit":
         if len(tool_names) != 1 or not is_authorized_mcp_tool_alias(tool_names[0]):

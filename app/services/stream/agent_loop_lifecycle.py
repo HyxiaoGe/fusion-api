@@ -589,12 +589,12 @@ def _run_config(limits: AgentLoopLimits, call_config: AgentLoopCallConfig | None
         if resolution_payload["external_tool_names"] != announced_tools:
             raise ValueError("能力路由工具与 Run 公告工具不一致")
         fingerprint_input = {
-            "router_version": resolution_payload["router_version"],
             "prompt_template_version": TEMPLATE_VERSION,
-            "package_id": resolution_payload["package_id"],
-            "external_tool_names": announced_tools,
-            "effective_plan_mode": resolution_payload["effective_plan_mode"],
+            "capability_resolution": resolution_payload,
+            "announced_tools": announced_tools,
+            "mcp_tool_bindings": bindings,
             "task_mode": config["task_mode"],
+            "network_profile": config["network_profile"],
             "evidence_policy": config["evidence_policy"],
         }
         serialized_fingerprint_input = json.dumps(

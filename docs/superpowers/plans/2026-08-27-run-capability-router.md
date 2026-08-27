@@ -38,7 +38,7 @@
 
 - [ ] **Step 1: 写 RED 路由矩阵测试**
 
-参数化覆盖 direct、transform、date、fresh/verified web、URL、天气、地点、路线、航班、高铁、飞机高铁比较、自然跨城、clarification、Deep Research、禁用工具、无 FC、显式 plan on/off、紧邻路线追问和话题切换。每个 case 精确断言：
+参数化覆盖中英文 direct、transform、date、fresh/verified web、URL、天气、地点、路线、航班、高铁、飞机高铁比较、自然跨城、多能力并集、clarification、Deep Research、禁用工具、无 FC、显式 plan on/off、紧邻路线追问和话题切换。每个 case 精确断言：
 
 ```python
 assert route.package_id == expected_package
@@ -49,7 +49,7 @@ assert route.network_boundary_required is expected_network_boundary
 assert len(route.external_tool_names) <= 3 or route.package_id == "deep_research"
 ```
 
-另加反向样本：`把北京到上海翻译成英文` 不得触发出行，`帮我查一下这个` 不得公开 Web/MCP/产品工具。
+另加反向样本：`把北京到上海翻译成英文` 不得触发出行，`帮我查一下这个` 不得公开 Web/MCP/产品工具；机场/火车站路线不得被航班/铁路关键词抢占，明确 URL/联网搜索与外部公告翻译不得被本地 transform 或 clarification 截断。
 
 - [ ] **Step 2: 运行 RED 测试并保存失败证据**
 

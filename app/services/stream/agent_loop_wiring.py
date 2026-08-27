@@ -204,7 +204,7 @@ def build_agent_loop_lifecycle_call(
     should_load_dynamic_tool_metadata = (
         dependencies.load_authorized_tool_names_fn is not None
         and options.get("knowledge_grounded") is not True
-        and (options.get("disable_tools") is True or capabilities.get("functionCalling") is not True)
+        and not should_load_dynamic_tools
     )
     dynamic_tool_set = (
         _load_dynamic_tools(dependencies.load_dynamic_tools_fn, db=db, user_id=run_input.user_id)

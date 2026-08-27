@@ -129,3 +129,9 @@ Task 5 指定目标集：
 - 旧 stream fixture 只为真正需要工具的场景补充明确用户意图；普通直接回答保持空工具。
 - 全量暴露的共享 query projection 回归已由独立上游提交关闭；Task 5 提交不夹带该生产修复，也没有把首次失败改写成 Task 5 GREEN。
 - 本地测试未证明 CI、部署、多模型真实选择质量、实际 tool calls、UI 实时/刷新一致性或登录态浏览器体验。这些属于后续发布门禁，Task 5 没有伪造结论。
+
+## 最终发布审查补强
+
+最终多轮对抗审查在发布前继续拦截了显式内置/产品工具 deny 被自然语言重新放开、定义类稳定知识被 fresh/verified/product 词法抢占、定义尾部 `in ...` 吞掉真实新闻/价格查询、合法 URL query 被拆成公网搜索动作、未知交通方式回退全三工具、当前请求作用域和回指对象枚举不足、`never go online`/禁止访问网络等全局中英文联网禁用枚举不足、交通方式否定跨逗号/冒号/破折号子句、air pollution 误判以及产品子集筛选/否定疑问漏召回。修复保持 router version `2026-08-27.2`，以 hard deny、按名词类型区分的定义请求前置判定、URI/产品动作子句边界和未知方式 fail-closed 处理根因，不恢复低置信全工具包。
+
+最终 fixture 共 501 条行为样本，其中 491 条通过真实 `build_agent_loop_call_config()` 与 `prepare_agent_loop_messages()` 校验 package、definitions、handlers、bindings、announced/final tools、Prompt sections、plan/date/boundary 与最多三工具边界。最新目标集（含生产 wiring 与 lifecycle 指纹契约）为 `654 passed + 1065 subtests`，其中路由单测 `506 passed`、真实组装 fixture `491 subtests`。API 权威全量 `3489 passed, 2 skipped, 1895 subtests`，Ruff、任务改动文件 format check 与 diff check 通过；能力包指纹覆盖完整 resolution、announced tools、安全 MCP bindings、task/network/evidence policy 与模板版本，实际 Prompt 仍由独立 snapshot/fingerprint 证明。UI 全量 `2430 passed` 且 production build、ESLint 与 diff check 通过；最终替换式对抗审查结论为 CLEAN。CI、dev 部署和真实登录态页面仍属于发布门禁。

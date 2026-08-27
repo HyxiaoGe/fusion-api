@@ -238,17 +238,26 @@ class AgentLoopWiringTests(unittest.TestCase):
         self.assertIs(lifecycle_call.dependencies.warning_fn, warning_fn)
 
         alias_message = "请使用 mcp_docs_alias 查询 Microsoft Learn"
-        for options, capabilities in (
+        from app.services.stream.agent_loop_request_prep import build_agent_loop_call_config
+
+        for options, capabilities, expected_reason in (
             (
                 {"disable_tools": True},
                 {"functionCalling": True, "agentTools": True},
+                "tools_disabled",
             ),
             (
                 {},
                 {"functionCalling": False, "agentTools": False},
+                "function_calling_unavailable",
+            ),
+            (
+                {},
+                {"functionCalling": True, "searchCapable": True, "agentTools": False},
+                "required_tools_unavailable",
             ),
         ):
-            with self.subTest(options=options, capabilities=capabilities):
+            with self.subTest(options=options, capabilities=capabilities, expected_reason=expected_reason):
                 captured.clear()
                 build_agent_loop_lifecycle_call(
                     run_input=replace(
@@ -272,6 +281,14 @@ class AgentLoopWiringTests(unittest.TestCase):
                     captured["call_config_kwargs"]["authorized_tool_names"],
                     ["mcp_docs_alias"],
                 )
+                real_call_config = build_agent_loop_call_config(**captured["call_config_kwargs"])
+                self.assertEqual(real_call_config.capability_resolution.package_id, "tools_unavailable")
+                self.assertEqual(
+                    real_call_config.capability_resolution.reason_codes,
+                    (expected_reason,),
+                )
+                self.assertTrue(real_call_config.capability_resolution.network_boundary_required)
+                self.assertEqual(real_call_config.announced_tools, [])
 
         captured.clear()
         strict_call = build_agent_loop_lifecycle_call(

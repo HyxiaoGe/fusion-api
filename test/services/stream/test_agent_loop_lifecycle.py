@@ -513,12 +513,23 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         from app.ai.prompts.system_prompt import TEMPLATE_VERSION
 
         fingerprint_input = {
-            "router_version": "2026-08-27.1",
             "prompt_template_version": TEMPLATE_VERSION,
-            "package_id": "fresh_web",
-            "external_tool_names": ["web_search"],
-            "effective_plan_mode": "off",
+            "capability_resolution": {
+                "schema_version": 1,
+                "router_version": "2026-08-27.1",
+                "package_id": "fresh_web",
+                "confidence": "high",
+                "resolution_mode": "routed",
+                "reason_codes": ["fresh_external_fact"],
+                "external_tool_names": ["web_search"],
+                "effective_plan_mode": "off",
+                "include_current_date": True,
+                "network_boundary_required": False,
+            },
+            "announced_tools": ["web_search"],
+            "mcp_tool_bindings": [],
             "task_mode": "standard",
+            "network_profile": "standard",
             "evidence_policy": "standard",
         }
         bundle_fingerprint = (
@@ -586,6 +597,44 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
             _run_config(self._limits(), call_config)
 
         sha256.assert_not_called()
+
+    def test_bundle_fingerprint_covers_date_and_network_boundary_semantics(self):
+        base = self._call_config()
+        base.capability_resolution = RunCapabilityResolution(
+            schema_version=1,
+            router_version="2026-08-27.2",
+            package_id="knowledge_grounded",
+            confidence="high",
+            resolution_mode="routed",
+            reason_codes=("knowledge_grounded_mode",),
+            external_tool_names=(),
+            effective_plan_mode="off",
+            include_current_date=False,
+            network_boundary_required=False,
+        )
+        base.announced_tools = []
+
+        baseline = _run_config(self._limits(), base)["capability_resolution"]["bundle_fingerprint"]
+        with_date = _run_config(
+            self._limits(),
+            SimpleNamespace(
+                **{
+                    **base.__dict__,
+                    "capability_resolution": replace(base.capability_resolution, include_current_date=True),
+                }
+            ),
+        )["capability_resolution"]["bundle_fingerprint"]
+        with_boundary = _run_config(
+            self._limits(),
+            SimpleNamespace(
+                **{
+                    **base.__dict__,
+                    "capability_resolution": replace(base.capability_resolution, network_boundary_required=True),
+                }
+            ),
+        )["capability_resolution"]["bundle_fingerprint"]
+
+        self.assertEqual(len({baseline, with_date, with_boundary}), 3)
 
     def _execution(self, *, call_config=None, limits=None, redis_writer=None):
         call_config = call_config or self._call_config()

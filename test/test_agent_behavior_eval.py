@@ -650,7 +650,18 @@ class RunCapabilityBehaviorEvalIntegrationTests(unittest.IsolatedAsyncioTestCase
 
         samples = [sample for sample in load_samples(DEFAULT_SAMPLE_PATH) if sample["id"].startswith("run-route-")]
         self.assertGreaterEqual(len(samples), 29)
-        dynamic_tools = [*AMAP_PRODUCT_DEFINITIONS, *FLYAI_TRAVEL_DEFINITIONS]
+        dynamic_tools = [
+            *AMAP_PRODUCT_DEFINITIONS,
+            *FLYAI_TRAVEL_DEFINITIONS,
+            {
+                "type": "function",
+                "function": {
+                    "name": "mcp_unrelated_tool",
+                    "description": "行为评估专用 MCP 工具。",
+                    "parameters": {"type": "object", "additionalProperties": False},
+                },
+            },
+        ]
         dynamic_tool_names = [tool["function"]["name"] for tool in dynamic_tools]
         handlers = {name: object() for name in dynamic_tool_names}
         bindings = [

@@ -84,7 +84,7 @@ Deep Research 继续要求 function calling 与 search capability，并固定只
 | `train` | 明确高铁、动车、火车、车次 | `search_trains` | off | 是 |
 | `travel_air_rail` | 明确比较飞机和高铁 | `search_flights`, `search_trains` | auto | 是 |
 | `mobility_intercity` | 有跨城起终点但交通方式不明确 | `route_compare`, `search_flights`, `search_trains` | auto | 是 |
-| `mixed_itinerary` | 航旅比较并明确要求市内接驳 | `route_compare`, `search_flights`, `search_trains` | auto | 是 |
+| `mixed_itinerary` | 同一请求显式包含 2–3 个天气、地点、路线或航旅能力 | 按 canonical order 冻结最多 3 个已命中产品工具 | auto | 是 |
 | `deep_research` | `task_mode=deep_research` | `web_search`, `url_read` | on | 是 |
 | `knowledge_grounded` | 服务端知识库模式 | 无 | off | 按问题 |
 | `tools_unavailable` | 请求需要工具但工具被禁用或模型不支持 | 无 | off | 按问题 |
@@ -115,7 +115,7 @@ Deep Research 继续要求 function calling 与 search capability，并固定只
 ```json
 {
   "schema_version": 1,
-  "router_version": "2026-08-27.1",
+  "router_version": "2026-08-27.2",
   "package_id": "mobility_intercity",
   "confidence": "medium",
   "resolution_mode": "routed",
@@ -214,8 +214,8 @@ Deep Research 继续要求 function calling 与 search capability，并固定只
 ## Task 5 本地自动化证据（2026-08-27）
 
 - 行为评测协议在兼容既有 V1 字段的前提下，增加 package、公告工具、实际调用工具、Prompt section IDs、resolution mode、reason codes、effective plan mode 与 network boundary 的可选断言；样本声明了期望值但 observation 缺字段时明确失败。
-- 本地 fixture 共 40 条，其中 30 条为 Run 能力路由样本：24 条主矩阵、6 条对抗记录，覆盖 5 个对抗变体。每条路由样本都精确声明 package、按 canonical order 排列的外部工具和 Prompt section IDs。
+- Task 5 初始本地 fixture 共 40 条，其中 30 条为 Run 能力路由样本：24 条主矩阵、6 条对抗记录。发布前多轮对抗审查将其扩展为 501 条行为样本、491 条 Run 路由记录；新增边界覆盖英文能力、显式联网/自然 URL、URL query 与自然动作分隔、按名词类型区分的定义类稳定知识与时效查询、页面内搜索、交通端点与未知方式、跨城改写、多能力并集、有序及对象级权限、中英文显式/自然内置、产品与 MCP 工具 hard deny 及最终再授权、当前请求作用域、同对象中英文作用域、回指对象、离线及来源排除、`go online`/访问网络等全局中英文联网禁用、交通方式否定列表、逗号/冒号/破折号子句边界及实体内部短横线保留、子集筛选、否定疑问、领域/解释补语、天气地点补语和中英文时序连接词。每条路由样本都精确声明 package、按 canonical order 排列的外部工具和 Prompt section IDs。
 - 集成测试不复制路由判断：以真实高德/FlyAI definition、handler 与 binding 构造 `build_agent_loop_call_config()`，再进入 `prepare_agent_loop_messages()` 的现有 Prompt assembly，逐条核对 resolution、实际 definition、announced/final tools 与 section IDs。该夹具关闭用户输入预处理，只做纯本地组装，不访问网络或服务。
 - 旧 stream fixture 不再依赖“支持 function calling 就公布全部工具”：需要搜索或 URL 的下游执行测试改用明确用户意图和真实模型能力；普通直接回答只保留 `app_identity`。
-- Task 5 指定目标集：`182 passed, 126 subtests passed`；扩大集：`1239 passed, 570 subtests passed`；仓库权威全量：`3058 passed, 2 skipped, 972 subtests passed`。三组均只有既有依赖弃用 warning。
+- Task 5 最新指定目标集（含生产 wiring 与 lifecycle 指纹契约）：`654 passed, 1065 subtests passed`，其中路由单测 `506 passed`、真实组装 fixture `491 subtests`；API 仓库权威全量为 `3489 passed, 2 skipped, 1895 subtests passed`。Ruff check、任务改动文件 format check 与 diff check 通过；最终替换式对抗审查结论为 CLEAN，现有 warning 均为既有依赖弃用提示。
 - 以上证据只证明本地路由、Agent Loop 装配、Prompt 组装、stream fixture 与 API 相关回归；未运行 CI、部署、真实模型或浏览器验收，也未启动本地 Fusion 服务。

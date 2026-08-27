@@ -1178,6 +1178,23 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(unauthorized.capability_resolution.package_id, "clarification_only")
         self.assertFalse(unauthorized.capability_resolution.network_boundary_required)
 
+    def test_authorized_mcp_alias_degrades_when_agent_tools_are_unsupported(self):
+        alias = "mcp_docs_a1b2c3d4"
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={},
+            capabilities={"functionCalling": True, "searchCapable": True, "agentTools": False},
+            authorized_tool_names=[alias],
+            original_message=f"请调用 {alias} 查询 Microsoft Learn",
+        )
+
+        self.assertEqual(config.capability_resolution.package_id, "tools_unavailable")
+        self.assertEqual(config.capability_resolution.reason_codes, ("required_tools_unavailable",))
+        self.assertTrue(config.capability_resolution.network_boundary_required)
+        self.assertEqual(config.capability_resolution.external_tool_names, ())
+        self.assertEqual(config.announced_tools, [])
+        self.assertNotIn("tools", config.call_kwargs)
+
     def test_mcp_tool_prevents_false_no_network_boundary(self):
         messages = [{"role": "user", "content": "查一下 Microsoft Learn"}]
         call_kwargs = {

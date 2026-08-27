@@ -18,7 +18,7 @@
 
 Ruling: 低置信不采用旧 `legacy_fallback` 全量工具 — 新 spec 的 revised recommendation 是绑定合同 — 代价是未知普通 MCP 只能在精确 alias 命中时公开。
 
-Ruling: `bundle_fingerprint` 不包含随后才能得到的实际 Prompt section IDs — `_start_run` 之前必须冻结能力包，实际 Prompt 由独立 snapshot/fingerprint 证明 — 代价是验收需同时查看两个指纹。
+Ruling: `bundle_fingerprint` 在 `_start_run` 前覆盖完整 resolution、announced tools、安全 MCP bindings、task/network/evidence policy 与 Prompt 模板版本；随后得到的实际 Prompt section/body 继续由独立 snapshot/fingerprint 证明 — 验收需同时查看能力包与实际 Prompt 两个指纹。
 
 Ruling: continuation 每次创建新 Run 时按当前消息、当前授权和恢复的 task/plan policy 重新确定性路由；本期不恢复旧 route schema — spec 未要求 Skill/route 续跑冻结，且当前权限必须优先 — 代价是目录或 router 版本变化后新 continuation 可记录不同包，但旧 Run 不被改写。
 
@@ -53,5 +53,5 @@ Task 4: complete (UI commit c239fbd; target 69 passed; Trajectory regression 303
 Task 4: fix round 1/5 complete (2 Important addressed, 0 open; UI commits c239fbd..246430d; contract/panel target 141 passed; Trajectory regression 336 passed; ESLint/build/diff check green).
 Task 3: fix round 2/5 complete (1 Important addressed, 0 open; commits 58b9b82..b664a93; target 127 passed / 73 subtests; adjacent 186 passed / 42 subtests; Ruff/format/diff check green).
 Task 4: fix round 2/5 complete (1 Important addressed, 0 open; UI commits 246430d..5b603d5; target 151 passed; Trajectory regression 346 passed; ESLint/build/diff check green).
-Task 5: complete (START_BASE b664a93; COMMIT_BASE 7e49f5f after shared query-projection fix; behavior eval 23 passed / 98 subtests; exact stream migrations 7 passed; target 182 passed / 126 subtests; expanded 1239 passed / 570 subtests; authoritative full 3058 passed / 2 skipped / 972 subtests; Ruff/format/diff check green; no services, network, CI, deploy, or browser acceptance).
+Task 5: final local implementation complete, release pending (START_BASE b664a93; COMMIT_BASE 7e49f5f after shared query-projection fix; behavior fixture 501 total / 491 route records; latest target 654 passed / 1065 subtests including production wiring, route unit 506 passed and real assembly 491 subtests; fresh authoritative API full 3489 passed / 2 skipped / 1895 subtests and static gates green; UI full 2430 passed, production build, ESLint and diff check green; Prompt/Trajectory independent review and final replacement adversarial review CLEAN; no services, CI, deploy, or browser acceptance yet).
 Task 3: regression fix round 3/5 complete (1 authoritative full-regression failure addressed; commits b664a93..7e49f5f; failing test 1 passed; target 128 passed / 73 subtests; adjacent 186 passed / 42 subtests; qualified SQLite/Postgres JSON path compile checks and Ruff/format/diff green).

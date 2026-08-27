@@ -253,14 +253,12 @@ def build_agent_loop_call_config(
             tool for tool in (additional_tools or []) if _tool_definition_name(tool) in provided_handlers
         )
     available_tools_by_name = {name: tool for tool in available_tools if (name := _tool_definition_name(tool))}
+    trusted_authorized_tool_names = [name for name in (authorized_tool_names or []) if isinstance(name, str) and name]
     route_tool_names = list(available_tools_by_name)
-    if tools_disabled or capabilities.get("functionCalling") is not True:
-        trusted_authorized_tool_names = [
-            name for name in (authorized_tool_names or []) if isinstance(name, str) and name
-        ]
-        route_tool_names.extend(
-            name for name in dict.fromkeys(trusted_authorized_tool_names) if name not in available_tools_by_name
-        )
+    route_tool_names.extend(
+        name for name in dict.fromkeys(trusted_authorized_tool_names) if name not in available_tools_by_name
+    )
+    unavailable_tool_names = [name for name in trusted_authorized_tool_names if name not in available_tools_by_name]
     capability_resolution = resolve_run_capability_route(
         original_message=original_message,
         task_context_messages=task_context_messages,
@@ -270,6 +268,7 @@ def build_agent_loop_call_config(
         capabilities=capabilities,
         tools_disabled=tools_disabled,
         knowledge_grounded=knowledge_grounded,
+        unavailable_tool_names=unavailable_tool_names,
     )
     external_tool_names = list(capability_resolution.external_tool_names)
     tools = [available_tools_by_name[name] for name in external_tool_names]
