@@ -205,6 +205,10 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不得推断路况、安全性或舒适度", system_text)
         self.assertIn("上午或下午等更细时段", system_text)
         self.assertIn("条件化结论", system_text)
+        self.assertIn("不得评价温度或风力是否适合、可接受或舒适", system_text)
+        self.assertIn("不得声称天气会影响活动体验、路面状况或安全", system_text)
+        self.assertIn("不要直接使用“适合”“不适合”“建议”“不建议”评价活动", system_text)
+        self.assertIn("只说明返回事实、时间粒度边界和用户条件是否满足", system_text)
 
     async def test_mixed_flight_and_train_results_require_both_types_without_markdown_table(self):
         captured = []
@@ -250,6 +254,10 @@ class AgentLoopDriverTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("必须同时覆盖航班和高铁", system_text)
         self.assertIn("不得遗漏任一类型", system_text)
         self.assertIn("不使用 Markdown 表格", system_text)
+        self.assertIn("只比较参考价格和班次计划时长", system_text)
+        self.assertIn("不得比较总出行时间、接驳便利性、值机、安检或候车", system_text)
+        self.assertIn("行程卡片只展示航班，也不能省略高铁", system_text)
+        self.assertIn("正文固定包含总体结论、航班摘要、高铁摘要和事实边界", system_text)
 
     async def test_forced_plan_mode_only_exposes_control_tool_before_valid_plan(self):
         captured = []

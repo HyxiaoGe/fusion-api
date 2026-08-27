@@ -322,6 +322,21 @@ class ProductAnswerValidatorTests(unittest.TestCase):
             with self.subTest(answer=answer):
                 self.assertEqual(validate_product_answer(answer, [_weather_block()]).is_valid, expected)
 
+    def test_weather_activity_answer_accepts_grounded_condition_without_activity_inference(self):
+        answer = (
+            "7月24日（周五）白天雷阵雨、夜间多云，26–31℃。"
+            "本次预报只有白天和夜间粒度，无法确认上午这一细分时段。"
+            "如果你的条件是避雨，本次返回的白天雷阵雨预报不满足这一条件。"
+        )
+
+        validation = validate_product_answer(
+            answer,
+            [_weather_block()],
+            messages=[{"role": "user", "content": "7月24日上午适合骑行吗？"}],
+        )
+
+        self.assertTrue(validation.is_valid, validation.reason_code)
+
     def test_weather_forecast_coverage_limits_allow_unknown_dates_without_allowing_claims(self):
         cases = (
             ("当前预报只覆盖7月23日至7月24日，未覆盖8月2日至8月4日。", True, "ok"),

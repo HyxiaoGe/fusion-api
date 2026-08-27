@@ -119,7 +119,7 @@ def build_grounded_product_answer(content_blocks: list[Any]) -> str:
         (block for block in reversed(product_blocks) if _value(block, "type") == "itinerary_results"),
         None,
     )
-    if itinerary is not None:
+    if itinerary is not None and _itinerary_covers_available_travel_types(itinerary, product_blocks):
         itinerary_answer = _build_itinerary_answer(itinerary, product_blocks)
         if itinerary_answer:
             supplements = _build_itinerary_route_supplements(itinerary, product_blocks)
@@ -174,6 +174,33 @@ def build_grounded_product_answer(content_blocks: list[Any]) -> str:
         if paragraph:
             paragraphs.append(paragraph)
     return "\n\n".join(paragraphs)
+
+
+def _itinerary_covers_available_travel_types(itinerary: Any, content_blocks: list[Any]) -> bool:
+    """避免行程卡只引用一种交通方式时，兜底正文丢失同轮另一种结果。"""
+
+    source_by_id = {
+        str(block_id): block
+        for block in content_blocks
+        if (block_id := _value(block, "id")) and _value(block, "type") in {"flight_results", "train_results"}
+    }
+    available_types_by_group: dict[tuple[str, str, str], set[str]] = {}
+    for block in source_by_id.values():
+        available_types_by_group.setdefault(_travel_group(block), set()).add(str(_value(block, "type")))
+
+    referenced_types_by_group: dict[tuple[str, str, str], set[str]] = {}
+    for plan in _value(itinerary, "plans") or []:
+        for section in _value(plan, "sections") or []:
+            for result_ref in _value(section, "result_refs") or []:
+                source = source_by_id.get(str(_value(result_ref, "block_id") or ""))
+                if source is None:
+                    continue
+                referenced_types_by_group.setdefault(_travel_group(source), set()).add(str(_value(source, "type")))
+
+    return all(
+        available_types <= referenced_types_by_group.get(group, set())
+        for group, available_types in available_types_by_group.items()
+    )
 
 
 def _build_itinerary_answer(itinerary: Any, content_blocks: list[Any]) -> str:
