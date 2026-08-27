@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock
 from app.schemas.chat import WeatherResultsBlock
 from app.services.agent.context_broker import Geolocation
 from app.services.mcp.amap_product_tools import (
-    AMAP_FACT_BOUNDARY_SYSTEM_PROMPT,
     AMAP_PRODUCT_DEFINITIONS,
     AMAP_PRODUCT_REMOTE_DEPENDENCIES,
     AmapProductToolHandler,
@@ -167,13 +166,16 @@ class AmapProductDefinitionTests(unittest.TestCase):
         self.assertIn("不要先用网页搜索猜测城市", route_description)
         self.assertIn("用户指定日期或时间时必须传入", route_description)
         self.assertIn("未指定时必须省略", route_description)
-        self.assertIn("仅当用户明确指定日期", AMAP_FACT_BOUNDARY_SYSTEM_PROMPT)
-        self.assertIn("不得默认填写“现在”", AMAP_FACT_BOUNDARY_SYSTEM_PROMPT)
+        self.assertIn("组合行程到达后接驳", route_description)
+        self.assertIn("只为选中的一个班次调用一次", route_description)
+        self.assertIn("不得猜测机场或车站", route_description)
         self.assertEqual(set(weather_schema["properties"]), {"location", "location_source"})
         self.assertFalse(weather_schema["additionalProperties"])
         weather_description = definitions["weather_forecast"]["function"]["description"]
         self.assertIn("完整地点文本", weather_description)
         self.assertIn("不得自行补充用户未提供的城市", weather_description)
+        self.assertIn("组合行程同时要求目的地天气", weather_description)
+        self.assertIn("不得用 web_search 或 url_read 替代", weather_description)
         self.assertEqual(
             AMAP_PRODUCT_REMOTE_DEPENDENCIES["weather_forecast"],
             frozenset({"maps_geo", "maps_regeocode", "maps_weather"}),

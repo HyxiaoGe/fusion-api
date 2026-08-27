@@ -62,7 +62,7 @@ class PromptRuntimeTemplatesTests(unittest.TestCase):
         ):
             messages = self._run_async(message_builder.build_llm_messages([], has_vision=False, file_repo=None))
 
-        self.assertEqual(messages[1], {"role": "system", "content": "运行时 Fusion 身份规则"})
+        self.assertEqual(messages[0], {"role": "system", "content": "运行时 Fusion 身份规则"})
 
     def test_agent_loop_request_prep_injects_runtime_tool_contract_prompt(self):
         from app.services.stream import agent_loop_request_prep

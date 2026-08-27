@@ -16,13 +16,13 @@ from app.services.mcp.flyai_travel_tools import (
     FLYAI_SEARCH_FLIGHTS,
     FLYAI_SEARCH_TRAINS,
     FLYAI_TRAVEL_DEFINITIONS,
+    FLYAI_TRAVEL_FACT_BOUNDARY_SYSTEM_PROMPT,
     FlyAiTravelAdapterClient,
     FlyAiTravelRunControls,
     FlyAiTravelToolHandler,
     build_flyai_travel_binding,
     build_flyai_user_scope,
 )
-from app.services.stream.agent_loop_request_prep import inject_flyai_travel_fact_boundary
 from app.services.stream.agent_loop_wiring import _load_dynamic_tools
 from app.services.stream.product_answer_validator import (
     repair_unsupported_product_answer,
@@ -104,6 +104,10 @@ def _handler(
 class FlyAiTravelToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_tool_definitions_are_closed_bounded_and_use_confirmed_names(self):
         by_name = {item["function"]["name"]: item["function"]["parameters"] for item in FLYAI_TRAVEL_DEFINITIONS}
+        descriptions = [item["function"]["description"] for item in FLYAI_TRAVEL_DEFINITIONS]
+        for description in descriptions:
+            self.assertIn("组合行程", description)
+            self.assertIn("不得先调用任何出行、天气或接驳工具", description)
 
         self.assertEqual(set(by_name), {FLYAI_SEARCH_FLIGHTS, FLYAI_SEARCH_TRAINS})
         for parameters in by_name.values():
@@ -221,7 +225,23 @@ class FlyAiTravelToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(block, TrainResultsBlock)
         self.assertEqual(block.trains[0].train_no, "G100")
         self.assertEqual(block.trains[0].actions, [])
-        self.assertNotIn("evil.example", handler.format_llm_context(result))
+        context = handler.format_llm_context(result)
+        self.assertIn(FLYAI_TRAVEL_FACT_BOUNDARY_SYSTEM_PROMPT, context)
+        self.assertIn("如果用户还要求到达后的市内接驳", context)
+        self.assertIn("只调用一次 route_compare", context)
+        self.assertNotIn("evil.example", context)
+
+    def test_llm_context_budget_includes_trusted_result_wrapper(self):
+        handler = _handler(FLYAI_SEARCH_TRAINS, httpx.MockTransport(lambda _request: httpx.Response(500)))
+        result = SimpleNamespace(
+            status="success",
+            data={"result": {"items": [{"station_name": "超长站名" * 4_000}]}},
+        )
+
+        context = handler.format_llm_context(result)
+
+        self.assertLessEqual(len(context.encode("utf-8")), handler.max_llm_context_bytes)
+        self.assertIn(FLYAI_TRAVEL_FACT_BOUNDARY_SYSTEM_PROMPT, context)
 
     async def test_invalid_arguments_do_not_consume_budget_or_send_request(self):
         calls = 0
@@ -632,16 +652,7 @@ class FlyAiTravelToolTests(unittest.IsolatedAsyncioTestCase):
         failure = build_product_tool_failure_answer()
         self.assertIn("航班或高铁", failure)
 
-    async def test_agent_request_injects_travel_boundary_and_loader_receives_user_id(self):
-        call_kwargs = {"tools": [FLYAI_TRAVEL_DEFINITIONS[0]]}
-        messages = inject_flyai_travel_fact_boundary([{"role": "user", "content": "查航班"}], call_kwargs)
-
-        self.assertEqual(messages[0]["role"], "system")
-        self.assertIn("【航班与高铁事实边界规则】", messages[0]["content"])
-        self.assertIn("正文不使用表格重复卡片", messages[0]["content"])
-        self.assertNotIn("FlyAI", messages[0]["content"])
-        self.assertNotIn("飞猪", messages[0]["content"])
-
+    async def test_dynamic_tool_loader_receives_user_id(self):
         captured: dict = {}
 
         def new_loader(db, *, user_id):

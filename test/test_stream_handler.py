@@ -365,7 +365,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(prompt_event["step_id"])
         self.assertEqual(
             prompt_event["section_ids"],
-            ["current_date", "app_identity", "no_tool_network_boundary"],
+            ["app_identity", "no_tool_network_boundary", "current_date"],
         )
         self.assertRegex(prompt_event["fingerprint"], r"^[0-9a-f]{64}$")
         self.assertGreater(prompt_event["char_count"], 0)
