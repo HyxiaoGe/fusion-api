@@ -55,6 +55,8 @@ _WEATHER_ACTIVITY_REQUEST_RE = re.compile(
     rf"(?P<before>{_WEATHER_ACTIVITY_PATTERN}).{{0,16}}(?:适合|适宜|能否|能不能|可以|可不可以|宜不宜)"
 )
 _WEATHER_FINE_PERIOD_RE = re.compile(r"上午|早上|清晨|中午|下午")
+_TRAVEL_CHEAPEST_REQUEST_RE = re.compile(r"最便宜|最低价|最省钱|价格最低|预算最低")
+_TRAVEL_FASTEST_REQUEST_RE = re.compile(r"最快|用时最短|耗时最短|时间最短")
 
 
 def neutralize_product_provider_mentions(answer: str, content_blocks: list[Any] | None = None) -> str:
@@ -233,6 +235,75 @@ def build_grounded_mixed_travel_answer(
     if not flight_groups.intersection(train_groups):
         return ""
     return build_grounded_product_answer(content_blocks, messages=messages)
+
+
+def build_grounded_single_travel_comparison_answer(
+    content_blocks: list[Any],
+    *,
+    messages: list[dict[str, Any]] | None = None,
+) -> str:
+    """单一交通方式的价格或时长比较直接由结构化结果生成。"""
+
+    product_blocks = [block for block in content_blocks if _value(block, "type") in _PRODUCT_RESULT_TYPES]
+    if not product_blocks or any(
+        _value(block, "type") not in {"flight_results", "train_results", "itinerary_results"}
+        for block in product_blocks
+    ):
+        return ""
+    travel_blocks = [
+        block for block in product_blocks if _value(block, "type") in {"flight_results", "train_results"}
+    ]
+    travel_types = {_value(block, "type") for block in travel_blocks}
+    travel_groups = {_travel_group(block) for block in travel_blocks}
+    if len(travel_types) != 1 or len(travel_groups) != 1:
+        return ""
+
+    user_text = _latest_user_text(messages or [])
+    cheapest_requested = bool(_TRAVEL_CHEAPEST_REQUEST_RE.search(user_text))
+    fastest_requested = bool(_TRAVEL_FASTEST_REQUEST_RE.search(user_text))
+    if not cheapest_requested and not fastest_requested:
+        return ""
+
+    block_type = next(iter(travel_types))
+    number_key = "flight_no" if block_type == "flight_results" else "train_no"
+    collection_key = "flights" if block_type == "flight_results" else "trains"
+    kind_label = "直达航班" if block_type == "flight_results" else "直达车次"
+    options_by_number: dict[str, Any] = {}
+    for block in travel_blocks:
+        for option in _value(block, collection_key) or []:
+            number = _value(option, number_key)
+            if isinstance(number, str) and number:
+                options_by_number.setdefault(number, option)
+    options = list(options_by_number.values())
+    if not options:
+        return ""
+
+    comparison_sentences: list[str] = []
+    if cheapest_requested:
+        cheapest = _minimum_travel_option(options, "price")
+        if cheapest is None:
+            return ""
+        comparison_sentences.append(
+            f"本次返回中参考价最低的是{_compact_travel_option(cheapest, number_key)}。"
+        )
+    if fastest_requested:
+        fastest = _minimum_travel_option(options, "duration")
+        if fastest is None:
+            return ""
+        comparison_sentences.append(
+            f"本次返回中计划行程时长最短的是{_compact_travel_option(fastest, number_key)}。"
+        )
+
+    origin, destination, departure_date = next(iter(travel_groups))
+    paragraphs = [
+        f"本次查询返回{origin}到{destination}在{departure_date}的 {len(options)} 个{kind_label}。",
+        "".join(comparison_sentences),
+        "卡片中的时长是班次计划行程时长，不包含前后接驳、值机、安检或候车等额外时间。",
+    ]
+    limitations = _combined_limitations_sentence(*travel_blocks)
+    if limitations:
+        paragraphs.append(limitations)
+    return "\n\n".join(paragraphs)
 
 
 def _itinerary_covers_available_travel_types(itinerary: Any, content_blocks: list[Any]) -> bool:
