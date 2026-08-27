@@ -205,15 +205,20 @@ _WEATHER_UNSUPPORTED_IMPACT_RE = re.compile(
     r"(?:天气|雨天|有雨|下雨|会下雨|有雪|下雪|会下雪).{0,20}(?:建议|推荐|优先).{0,12}"
     r"(?:驾车|开车|自驾|公交|地铁|公共交通|步行|骑行)"
 )
-_WEATHER_ACTIVITY_PATTERN = r"(?:户外(?:活动|运动)?|骑行|骑车|自行车|跑步|慢跑|徒步|登山|爬山|露营|运动|出游|游玩)"
+_WEATHER_ACTIVITY_PATTERN = (
+    r"(?:户外(?:活动|运动)?|活动|骑行|骑车|自行车|跑步|慢跑|徒步|登山|爬山|露营|运动|出游|游玩)"
+)
 _WEATHER_ACTIVITY_INFERENCE_RE = re.compile(
     rf"{_WEATHER_ACTIVITY_PATTERN}.{{0,16}}"
     r"(?:适合|不适合|推荐|不推荐|建议|不建议|大概率|容易|可能).{0,8}"
     r"(?:淋雨|中暑|受凉|危险|安全|舒适|体验)?|"
     r"(?:适合|不适合|推荐|不推荐|建议|不建议|宜|不宜)"
     rf".{{0,16}}{_WEATHER_ACTIVITY_PATTERN}|"
-    r"(?:建议|推荐|优先|考虑|改期|取消|转为)"
-    rf".{{0,20}}(?:{_WEATHER_ACTIVITY_PATTERN}|室内|改期|取消)"
+    r"(?:建议|推荐|优先|考虑|改期|取消|转为|调整)"
+    rf".{{0,20}}(?:{_WEATHER_ACTIVITY_PATTERN}|室内|改期|取消)|"
+    r"(?:存在|有|可能|容易|大概率).{0,10}(?:被)?淋雨|"
+    r"(?:被)?淋雨.{0,10}(?:可能|风险)|"
+    r"天气条件.{0,10}(?:相对|更).{0,8}(?:宽松|合适|适合|友好)"
 )
 _WEATHER_DATE_TOKEN_PATTERN = r"(?:\d{4}-\d{2}-\d{2}|\d{1,2}月\d{1,2}日)"
 _WEATHER_DATE_RANGE_PATTERN = rf"{_WEATHER_DATE_TOKEN_PATTERN}(?:\s*(?:至|到|~|～|—)\s*{_WEATHER_DATE_TOKEN_PATTERN})?"

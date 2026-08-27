@@ -187,6 +187,35 @@ def build_grounded_product_answer(
     return "\n\n".join(paragraphs)
 
 
+def build_grounded_weather_activity_answer(
+    content_blocks: list[Any],
+    *,
+    messages: list[dict[str, Any]] | None = None,
+) -> str:
+    """纯天气活动条件问题使用确定性回答，避免模型追加体验或改期推断。"""
+
+    product_blocks = [block for block in content_blocks if _value(block, "type") in _PRODUCT_RESULT_TYPES]
+    if not product_blocks or any(_value(block, "type") != "weather_results" for block in product_blocks):
+        return ""
+    user_text = _latest_user_text(messages or [])
+    paragraphs: list[str] = []
+    for block in product_blocks:
+        days = [item for item in (_value(block, "forecast_days") or []) if _value(item, "date")][:4]
+        if not days:
+            return ""
+        location = str(_value(block, "resolved_location") or "该行政区")
+        paragraph = _build_weather_activity_condition_answer(
+            block,
+            days,
+            location=location,
+            user_text=user_text,
+        )
+        if not paragraph:
+            return ""
+        paragraphs.append(paragraph)
+    return "\n\n".join(paragraphs)
+
+
 def _itinerary_covers_available_travel_types(itinerary: Any, content_blocks: list[Any]) -> bool:
     """避免行程卡只引用一种交通方式时，兜底正文丢失同轮另一种结果。"""
 

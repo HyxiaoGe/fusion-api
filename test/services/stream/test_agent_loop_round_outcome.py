@@ -1963,7 +1963,7 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(warnings), 1)
         self.assertIn("已安全修整", warnings[0])
 
-    async def test_deferred_weather_fallback_answers_activity_condition_after_unrepairable_model_output(self):
+    async def test_deferred_weather_activity_answer_is_always_deterministic(self):
         state = AgentLoopState()
         state.mark_current_step("step-weather-activity-repair")
         state.content_blocks.append(
@@ -1989,7 +1989,13 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
                 limitations=["天气预报按行政区提供，不代表具体建筑物"],
             )
         )
-        model_answer = "7月24日上午晴，适合骑行。"
+        model_answer = (
+            "7月24日（周五）南山区白天雷阵雨、夜间多云，26–31℃。"
+            "如果你的条件是上午骑行时避开降雨，本次预报不满足这一条件。"
+            "本次预报只有白天和夜间粒度，无法确认上午这一细分时段。"
+            "从避雨角度看这一天的白天时段存在被淋雨的可能。"
+            "夜间转为多云，如果你计划调整到晚上活动，天气条件相对更宽松一些。"
+        )
         append_chunk = AsyncMock()
         warnings: list[str] = []
 
@@ -2017,12 +2023,12 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         emitted_answer = append_chunk.await_args.args[2]
         self.assertIn("不满足这一条件", emitted_answer)
         self.assertIn("只有白天和夜间粒度，无法确认上午这一细分时段", emitted_answer)
-        self.assertNotIn("上午晴", emitted_answer)
-        self.assertNotIn("适合骑行", emitted_answer)
+        self.assertNotIn("存在被淋雨的可能", emitted_answer)
+        self.assertNotIn("调整到晚上活动", emitted_answer)
+        self.assertNotIn("天气条件相对更宽松", emitted_answer)
         self.assertEqual(state.content_blocks[-1].text, emitted_answer)
         self.assertEqual(len(warnings), 1)
-        self.assertIn("使用确定性兜底", warnings[0])
-        self.assertIn("reason_code=unsupported_claim", warnings[0])
+        self.assertIn("天气活动条件使用确定性回答", warnings[0])
 
     async def test_final_answer_evidence_does_not_swallow_stream_write_unavailable(self):
         from app.services.stream_state_service import StreamWriteUnavailableError
