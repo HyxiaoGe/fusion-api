@@ -365,6 +365,24 @@ class CICDPermissionBoundaryTests(unittest.TestCase):
         self.assertEqual(publish_job.count("name: Publish master images on Windows runner"), 1)
         self.assertNotIn("name: Build on Windows runner", publish_job)
 
+    def test_windows_publish_recovers_docker_daemon_before_build(self) -> None:
+        publish_job = self.release_document["jobs"]["publish"]
+        verify_step = workflow_step(publish_job, "Verify Docker access")
+        script = verify_step["run"]
+
+        self.assertEqual(
+            verify_step["shell"],
+            'powershell -NoProfile -ExecutionPolicy Bypass -Command ". \'{0}\'"',
+        )
+        self.assertIn("for ($attempt = 1; $attempt -le 6; $attempt++)", script)
+        self.assertIn("$serviceNames = @('docker', 'com.docker.service')", script)
+        self.assertIn("Start-Service -Name $serviceName", script)
+        self.assertIn("Docker Desktop.exe", script)
+        self.assertIn("Start-Process -FilePath $desktopPath", script)
+        self.assertIn("Start-Sleep -Seconds (10 * $attempt)", script)
+        self.assertIn("Docker daemon ready", script)
+        self.assertIn("Docker daemon did not become ready", script)
+
     def test_release_runs_are_never_cancelled_mid_deployment(self) -> None:
         self.assertRegex(
             self.release_workflow,
