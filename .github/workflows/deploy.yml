@@ -65,7 +65,7 @@ jobs:
 
           $milvus = docker inspect fusion-knowledge-milvus | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0 -or $null -eq $milvus -or $milvus.Count -ne 1) {
-            throw "fusion-knowledge-milvus 容器不存在或状态不可读"
+            throw "fusion-knowledge-milvus container is missing or unreadable"
           }
 
           $container = $milvus[0]
@@ -78,10 +78,10 @@ jobs:
             exit 0
           }
           if ($env:MAINTENANCE_OPERATION -ne "recover-milvus") {
-            throw "不支持的维护操作: $env:MAINTENANCE_OPERATION"
+            throw "Unsupported maintenance operation: $env:MAINTENANCE_OPERATION"
           }
           if ([string]::IsNullOrWhiteSpace($project)) {
-            throw "Milvus 容器缺少 Docker Compose project 标签，拒绝恢复"
+            throw "Milvus container has no Docker Compose project label"
           }
 
           foreach ($service in @("etcd", "minio", "standalone")) {
@@ -91,7 +91,7 @@ jobs:
                 --filter "label=com.docker.compose.service=$service"
             ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
             if ($ids.Count -ne 1) {
-              throw "Compose 服务 $service 应且只能有一个容器，实际 $($ids.Count)"
+              throw "Compose service $service expected one container, got $($ids.Count)"
             }
             docker start $ids[0]
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -108,7 +108,7 @@ jobs:
           }
 
           docker logs --tail 160 fusion-knowledge-milvus
-          throw "Milvus 未在 300 秒内恢复健康"
+          throw "Milvus did not become healthy within 300 seconds"
 
   prepare:
     name: Validate deployment request
