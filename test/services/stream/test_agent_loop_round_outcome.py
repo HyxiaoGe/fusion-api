@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -13,6 +14,8 @@ from app.schemas.chat import (
     SearchSourceSummary,
     SourceReference,
     Usage,
+    WeatherForecastDay,
+    WeatherResultsBlock,
 )
 from app.services.agent.plan_coordinator import PlanCoordinator
 from app.services.stream.agent_loop_outcome import AgentLoopExit
@@ -1956,6 +1959,73 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("高峰期可能拥堵", emitted_answer)
         self.assertIn("本次查询结果无法确认", emitted_answer)
         self.assertNotIn("高德", emitted_answer)
+        self.assertEqual(state.content_blocks[-1].text, emitted_answer)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("已安全修整", warnings[0])
+
+    async def test_deferred_weather_answer_removes_activity_inference_and_keeps_condition(self):
+        state = AgentLoopState()
+        state.mark_current_step("step-weather-activity-repair")
+        state.content_blocks.append(
+            WeatherResultsBlock(
+                type="weather_results",
+                schema_version=1,
+                provider="amap",
+                status="degraded",
+                query="南山区",
+                resolved_location="南山区",
+                day_count=1,
+                forecast_days=[
+                    WeatherForecastDay(
+                        date=date(2026, 7, 24),
+                        weekday=5,
+                        day_weather="雷阵雨",
+                        night_weather="多云",
+                        high_c=31,
+                        low_c=26,
+                    )
+                ],
+                fetched_at=datetime(2026, 7, 23, 8, tzinfo=timezone.utc),
+                limitations=["天气预报按行政区提供，不代表具体建筑物"],
+            )
+        )
+        model_answer = (
+            "7月24日（周五）南山区白天预报有雷阵雨，如果你的条件是希望上午骑行时避开降雨，"
+            "本次预报不满足这一条件。"
+            "当天最高气温31°C、最低26°C，夜间多云。"
+            "户外骑行大概率会淋雨，建议优先考虑室内骑行或改期。"
+            "本次预报只有昼夜两个粒度，无法确认上午与下午的细分差异。"
+        )
+        append_chunk = AsyncMock()
+        warnings: list[str] = []
+
+        with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
+            outcome = await handle_agent_round_outcome(
+                request=AgentRoundOutcomeRequest(
+                    db="db",
+                    messages=[{"role": "user", "content": "7月24日南山区天气怎么样，适合上午骑行吗？"}],
+                    state=state,
+                    runtime=_runtime(complete_step_fn=AsyncMock(), warning_fn=warnings.append),
+                    step_number=2,
+                    step_context=_step_context("step-weather-activity-repair"),
+                    round_result=AgentRoundResult(
+                        reasoning_buf="",
+                        content_buf=model_answer,
+                        tool_calls=[],
+                        finish_reason="stop",
+                        accumulated_usage=Usage(input_tokens=2, output_tokens=30),
+                        output_deferred=True,
+                    ),
+                )
+            )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        emitted_answer = append_chunk.await_args.args[2]
+        self.assertIn("本次预报不满足这一条件", emitted_answer)
+        self.assertIn("无法确认上午与下午的细分差异", emitted_answer)
+        self.assertNotIn("大概率会淋雨", emitted_answer)
+        self.assertNotIn("室内骑行", emitted_answer)
+        self.assertNotIn("改期", emitted_answer)
         self.assertEqual(state.content_blocks[-1].text, emitted_answer)
         self.assertEqual(len(warnings), 1)
         self.assertIn("已安全修整", warnings[0])
