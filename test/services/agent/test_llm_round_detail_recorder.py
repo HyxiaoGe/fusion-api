@@ -8,7 +8,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
-from app.db.models import AgentLlmRoundDetail, AgentSession
+from app.db.models import AgentLlmRoundDetail, AgentSession, Message
 from app.services.agent import llm_round_detail_recorder as recorder_module
 from app.services.agent.llm_round_detail_recorder import (
     LLM_DETAIL_PREVIEW_MAX_CHARS,
@@ -73,6 +73,7 @@ class LlmRoundDetailRecorderTests(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(len(row.output_preview), LLM_DETAIL_PREVIEW_MAX_CHARS)
             self.assertEqual(row.redacted_fields, ["reasoning_text"])
             self.assertEqual(row.truncated_fields, [])
+            self.assertIsNone(row.message_id)
 
     async def test_duplicate_round_is_idempotent_and_first_write_wins(self):
         first = schedule_llm_round_detail(self._draft(content_text="第一次"), session_factory=self.Session)
@@ -84,6 +85,21 @@ class LlmRoundDetailRecorderTests(unittest.IsolatedAsyncioTestCase):
             rows = db.scalars(select(AgentLlmRoundDetail)).all()
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0].content_text, "第一次")
+
+    async def test_existing_message_id_is_preserved(self):
+        with self.Session() as db:
+            db.add(Message(id="msg-existing", conversation_id="conv-1", role="assistant", content=[]))
+            db.commit()
+
+        task = schedule_llm_round_detail(
+            self._draft(message_id="msg-existing"),
+            session_factory=self.Session,
+        )
+        await task
+
+        with self.Session() as db:
+            row = db.scalar(select(AgentLlmRoundDetail))
+            self.assertEqual(row.message_id, "msg-existing")
 
     async def test_completed_task_is_released_from_controlled_task_set(self):
         task = schedule_llm_round_detail(self._draft(), session_factory=self.Session)

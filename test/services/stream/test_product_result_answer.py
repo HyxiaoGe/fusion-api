@@ -13,6 +13,7 @@ from app.schemas.chat import (
 )
 from app.services.stream.product_answer_validator import validate_product_answer
 from app.services.stream.product_result_answer import (
+    build_grounded_mixed_travel_answer,
     build_grounded_product_answer,
     build_product_tool_failure_answer,
     build_tool_repair_clarification,
@@ -22,6 +23,41 @@ from app.services.stream.product_result_answer import (
 
 
 class ProductResultAnswerTests(unittest.TestCase):
+    def test_mixed_travel_deterministic_answer_requires_same_route_and_date(self):
+        flight = _travel_block(
+            block_type="flight_results",
+            block_id="flight-out",
+            origin="北京",
+            destination="上海",
+            departure_date="2026-08-29",
+            option_id="flight-out-1",
+            number="MU5101",
+            duration_s=8100,
+            price_minor=76000,
+        )
+        same_day_train = _travel_block(
+            block_type="train_results",
+            block_id="train-out",
+            origin="北京",
+            destination="上海",
+            departure_date="2026-08-29",
+            option_id="train-out-1",
+            number="G1",
+            duration_s=17640,
+            price_minor=66100,
+        )
+        other_day_train = {
+            **same_day_train,
+            "departure_date": "2026-08-30",
+        }
+
+        answer = build_grounded_mixed_travel_answer([flight, same_day_train])
+
+        self.assertIn("同时返回北京到上海", answer)
+        self.assertIn("MU5101", answer)
+        self.assertIn("G1", answer)
+        self.assertEqual(build_grounded_mixed_travel_answer([flight, other_day_train]), "")
+
     def test_fallback_keeps_both_directions_when_more_than_four_product_blocks_exist(self):
         blocks = [
             _travel_block(

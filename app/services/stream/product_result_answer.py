@@ -216,6 +216,25 @@ def build_grounded_weather_activity_answer(
     return "\n\n".join(paragraphs)
 
 
+def build_grounded_mixed_travel_answer(
+    content_blocks: list[Any],
+    *,
+    messages: list[dict[str, Any]] | None = None,
+) -> str:
+    """同组航班和火车结果使用确定性比较，避免自由文本产生跨类型推断。"""
+
+    product_blocks = [block for block in content_blocks if _value(block, "type") in _PRODUCT_RESULT_TYPES]
+    flight_groups = {
+        _travel_group(block) for block in product_blocks if _value(block, "type") == "flight_results"
+    }
+    train_groups = {
+        _travel_group(block) for block in product_blocks if _value(block, "type") == "train_results"
+    }
+    if not flight_groups.intersection(train_groups):
+        return ""
+    return build_grounded_product_answer(content_blocks, messages=messages)
+
+
 def _itinerary_covers_available_travel_types(itinerary: Any, content_blocks: list[Any]) -> bool:
     """避免行程卡只引用一种交通方式时，兜底正文丢失同轮另一种结果。"""
 
