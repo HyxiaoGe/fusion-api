@@ -85,6 +85,10 @@ class AgentLoopWiringTests(unittest.TestCase):
             captured["dynamic_tools_db"] = db
             return dynamic_tool_set
 
+        def load_authorized_tool_names_fn(db):
+            captured["authorized_tool_names_db"] = db
+            return ["mcp_docs_alias"]
+
         def build_execution_fn(**kwargs):
             captured["execution_kwargs"] = kwargs
             return fake_execution
@@ -158,6 +162,7 @@ class AgentLoopWiringTests(unittest.TestCase):
             error_fn=error_fn,
             warning_fn=warning_fn,
             load_dynamic_tools_fn=load_dynamic_tools_fn,
+            load_authorized_tool_names_fn=load_authorized_tool_names_fn,
         )
         lifecycle_call = build_agent_loop_lifecycle_call(
             run_input=run_input,
@@ -180,6 +185,7 @@ class AgentLoopWiringTests(unittest.TestCase):
             },
         )
         self.assertEqual(captured["dynamic_tools_db"], "db-wiring")
+        self.assertNotIn("authorized_tool_names_db", captured)
         self.assertTrue(captured["redis_writer_factory_called"])
         execution_request = captured["execution_kwargs"]["request"]
         execution_dependencies = captured["execution_kwargs"]["dependencies"]
@@ -231,7 +237,60 @@ class AgentLoopWiringTests(unittest.TestCase):
         self.assertIs(lifecycle_call.dependencies.error_fn, error_fn)
         self.assertIs(lifecycle_call.dependencies.warning_fn, warning_fn)
 
-        captured.pop("dynamic_tools_db")
+        alias_message = "请使用 mcp_docs_alias 查询 Microsoft Learn"
+        from app.services.stream.agent_loop_request_prep import build_agent_loop_call_config
+
+        for options, capabilities, expected_reason in (
+            (
+                {"disable_tools": True},
+                {"functionCalling": True, "agentTools": True},
+                "tools_disabled",
+            ),
+            (
+                {},
+                {"functionCalling": False, "agentTools": False},
+                "function_calling_unavailable",
+            ),
+            (
+                {},
+                {"functionCalling": True, "searchCapable": True, "agentTools": False},
+                "required_tools_unavailable",
+            ),
+        ):
+            with self.subTest(options=options, capabilities=capabilities, expected_reason=expected_reason):
+                captured.clear()
+                build_agent_loop_lifecycle_call(
+                    run_input=replace(
+                        run_input,
+                        raw_messages=[{"role": "user", "content": alias_message}],
+                        original_message=alias_message,
+                        options=options,
+                        capabilities=capabilities,
+                    ),
+                    db="db-wiring",
+                    limits=limits,
+                    dependencies=dependencies,
+                )
+
+                self.assertNotIn("dynamic_tools_db", captured)
+                self.assertEqual(captured["authorized_tool_names_db"], "db-wiring")
+                self.assertEqual(captured["call_config_kwargs"]["additional_tools"], [])
+                self.assertEqual(captured["call_config_kwargs"]["dynamic_tool_handlers"], {})
+                self.assertEqual(captured["call_config_kwargs"]["tool_bindings"], [])
+                self.assertEqual(
+                    captured["call_config_kwargs"]["authorized_tool_names"],
+                    ["mcp_docs_alias"],
+                )
+                real_call_config = build_agent_loop_call_config(**captured["call_config_kwargs"])
+                self.assertEqual(real_call_config.capability_resolution.package_id, "tools_unavailable")
+                self.assertEqual(
+                    real_call_config.capability_resolution.reason_codes,
+                    (expected_reason,),
+                )
+                self.assertTrue(real_call_config.capability_resolution.network_boundary_required)
+                self.assertEqual(real_call_config.announced_tools, [])
+
+        captured.clear()
         strict_call = build_agent_loop_lifecycle_call(
             run_input=replace(
                 run_input,
@@ -244,6 +303,7 @@ class AgentLoopWiringTests(unittest.TestCase):
             dependencies=dependencies,
         )
         self.assertNotIn("dynamic_tools_db", captured)
+        self.assertNotIn("authorized_tool_names_db", captured)
         self.assertEqual(captured["call_config_kwargs"]["additional_tools"], [])
         self.assertEqual(strict_call.request.knowledge_base_ids, ["kb-1"])
 

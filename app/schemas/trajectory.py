@@ -2,11 +2,111 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from app.utils.run_capability_contract import validate_capability_resolution_semantics
+
+CapabilityPackageId = Literal[
+    "direct",
+    "transform",
+    "date",
+    "fresh_web",
+    "verified_web",
+    "url_read",
+    "weather",
+    "place_discovery",
+    "mobility_route",
+    "flight",
+    "train",
+    "travel_air_rail",
+    "mobility_intercity",
+    "mixed_itinerary",
+    "deep_research",
+    "knowledge_grounded",
+    "tools_unavailable",
+    "clarification_only",
+    "mcp_explicit",
+]
+CapabilityReasonCode = Literal[
+    "direct_greeting",
+    "assistant_identity_question",
+    "stable_knowledge_question",
+    "simple_calculation",
+    "text_transform_request",
+    "current_date_question",
+    "fresh_external_fact",
+    "verified_source_request",
+    "explicit_url_read",
+    "explicit_weather_request",
+    "explicit_place_discovery",
+    "explicit_route_task",
+    "explicit_flight_request",
+    "explicit_train_request",
+    "air_rail_comparison",
+    "mixed_itinerary_request",
+    "origin_destination_relation",
+    "intercity_locations",
+    "adjacent_route_followup",
+    "deep_research_mode",
+    "knowledge_grounded_mode",
+    "tools_disabled",
+    "function_calling_unavailable",
+    "search_capability_unavailable",
+    "required_tools_unavailable",
+    "explicit_authorized_tool_alias",
+    "insufficient_capability_signal",
+]
+
+
+class TrajectoryCapabilityResolution(BaseModel):
+    """Run 级能力路由在实时与历史协议中的显式安全 DTO。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal[1]
+    router_version: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}\.\d+$", max_length=32)
+    package_id: CapabilityPackageId
+    confidence: Literal["high", "medium", "low"]
+    resolution_mode: Literal["routed", "degraded", "clarification"]
+    reason_codes: list[CapabilityReasonCode] = Field(min_length=1, max_length=4)
+    external_tool_names: list[str] = Field(max_length=3)
+    effective_plan_mode: Literal["auto", "on", "off"]
+    include_current_date: bool
+    network_boundary_required: bool
+    bundle_fingerprint: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+    @field_validator("reason_codes", "external_tool_names")
+    @classmethod
+    def _require_unique_items(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("能力路由列表字段不得重复")
+        return value
+
+    @field_validator("external_tool_names")
+    @classmethod
+    def _validate_tool_names(cls, value: list[str]) -> list[str]:
+        if any(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,127}", name) is None for name in value):
+            raise ValueError("能力路由工具名格式非法")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_package_semantics(self) -> TrajectoryCapabilityResolution:
+        validate_capability_resolution_semantics(
+            package_id=self.package_id,
+            confidence=self.confidence,
+            resolution_mode=self.resolution_mode,
+            reason_codes=self.reason_codes,
+            external_tool_names=self.external_tool_names,
+            effective_plan_mode=self.effective_plan_mode,
+            include_current_date=self.include_current_date,
+            network_boundary_required=self.network_boundary_required,
+        )
+        return self
 
 
 @dataclass(frozen=True)
@@ -104,6 +204,7 @@ class TrajectoryRunSummary(BaseModel):
     ended_at: datetime | None = None
     llm_detail_schema_version: int | None = None
     llm_round_count: int = 0
+    capability_resolution: TrajectoryCapabilityResolution | None = None
 
 
 class TrajectoryRunListResponse(BaseModel):

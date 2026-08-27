@@ -21,6 +21,20 @@ COMMON = {
 
 COMMON_KEYS = set(COMMON) | {"type"}
 
+CAPABILITY_RESOLUTION = {
+    "schema_version": 1,
+    "router_version": "2026-08-27.1",
+    "package_id": "fresh_web",
+    "confidence": "high",
+    "resolution_mode": "routed",
+    "reason_codes": ["fresh_external_fact"],
+    "external_tool_names": ["web_search"],
+    "effective_plan_mode": "off",
+    "include_current_date": True,
+    "network_boundary_required": False,
+    "bundle_fingerprint": "sha256:" + "a" * 64,
+}
+
 EVENT_FIELDS = {
     "run_started": {
         "conversation_id": "conv-1",
@@ -29,6 +43,14 @@ EVENT_FIELDS = {
         "model": "gpt-4",
         "tools": ["web_search"],
         "config": {"prompt": "禁止落库"},
+        "capability_resolution": {
+            **CAPABILITY_RESOLUTION,
+            "original_message": "用户原文禁止落库",
+            "system_prompt": "完整提示词禁止落库",
+            "tool_schema": {"api_key": "secret"},
+            "credentials": "Bearer secret",
+            "endpoint": "https://private.example/token",
+        },
     },
     "step_started": {"step_number": 1},
     "tool_call_started": {
@@ -244,7 +266,7 @@ EVENT_FIELDS = {
 }
 
 EVENT_ALLOWED_FIELDS = {
-    "run_started": {"conversation_id", "message_id", "task_id", "model", "tools"},
+    "run_started": {"conversation_id", "message_id", "task_id", "model", "tools", "capability_resolution"},
     "step_started": {"step_number"},
     "tool_call_started": {"tool_name", "plan_item_id"},
     "tool_call_delta": {"tool_name"},
@@ -433,6 +455,106 @@ def _assert_text_and_lists_are_bounded_and_secret_like_error_text_is_redacted():
 
 
 class TrajectoryPayloadTests(unittest.TestCase):
+    def test_run_started_persists_only_explicit_safe_capability_resolution(self):
+        payload = build_trajectory_payload(
+            {
+                **COMMON,
+                "type": "run_started",
+                **EVENT_FIELDS["run_started"],
+                "user_preferences": "不要泄漏",
+            }
+        )
+
+        self.assertEqual(payload["capability_resolution"], CAPABILITY_RESOLUTION)
+        self.assertEqual(payload["tools"], CAPABILITY_RESOLUTION["external_tool_names"])
+        self.assertNotIn("config", payload)
+        for forbidden in (
+            "original_message",
+            "system_prompt",
+            "tool_schema",
+            "credentials",
+            "endpoint",
+            "user_preferences",
+            "secret",
+        ):
+            self.assertNotIn(forbidden, str(payload))
+
+    def test_run_started_drops_control_tool_and_package_mismatch_resolution(self):
+        invalid_resolutions = (
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "mcp_explicit",
+                "reason_codes": ["explicit_authorized_tool_alias"],
+                "external_tool_names": ["update_plan"],
+                "include_current_date": False,
+            },
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "direct",
+                "reason_codes": ["direct_greeting"],
+                "external_tool_names": ["web_search"],
+                "include_current_date": False,
+            },
+        )
+
+        for invalid_resolution in invalid_resolutions:
+            with self.subTest(invalid_resolution=invalid_resolution):
+                payload = build_trajectory_payload(
+                    {
+                        **COMMON,
+                        "type": "run_started",
+                        **EVENT_FIELDS["run_started"],
+                        "tools": invalid_resolution["external_tool_names"],
+                        "capability_resolution": invalid_resolution,
+                    }
+                )
+
+                self.assertIsNone(payload["capability_resolution"])
+                if "update_plan" in invalid_resolution["external_tool_names"]:
+                    self.assertEqual(payload["tools"], [])
+
+    def test_run_started_drops_reversed_fixed_package_resolution_but_keeps_canonical_partial(self):
+        reversed_resolution = {
+            **CAPABILITY_RESOLUTION,
+            "package_id": "deep_research",
+            "reason_codes": ["deep_research_mode"],
+            "external_tool_names": ["url_read", "web_search"],
+            "effective_plan_mode": "on",
+        }
+        invalid_payload = build_trajectory_payload(
+            {
+                **COMMON,
+                "type": "run_started",
+                **EVENT_FIELDS["run_started"],
+                "tools": reversed_resolution["external_tool_names"],
+                "capability_resolution": reversed_resolution,
+            }
+        )
+
+        self.assertIsNone(invalid_payload["capability_resolution"])
+        self.assertEqual(invalid_payload["tools"], [])
+
+        canonical_partial = {
+            **CAPABILITY_RESOLUTION,
+            "package_id": "mobility_intercity",
+            "confidence": "medium",
+            "reason_codes": ["origin_destination_relation", "intercity_locations"],
+            "external_tool_names": ["route_compare", "search_trains"],
+            "effective_plan_mode": "auto",
+        }
+        valid_payload = build_trajectory_payload(
+            {
+                **COMMON,
+                "type": "run_started",
+                **EVENT_FIELDS["run_started"],
+                "tools": canonical_partial["external_tool_names"],
+                "capability_resolution": canonical_partial,
+            }
+        )
+
+        self.assertEqual(valid_payload["capability_resolution"], canonical_partial)
+        self.assertEqual(valid_payload["tools"], canonical_partial["external_tool_names"])
+
     def test_prompt_detail_status_is_durable_but_full_text_is_never_ledger_payload(self):
         payload = build_trajectory_payload(
             {

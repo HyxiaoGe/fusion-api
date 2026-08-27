@@ -29,6 +29,10 @@ from app.services.stream.agent_plan_tool_policy import AgentPlanToolPolicy, reso
 from app.services.stream.agent_task_policy import resolve_agent_task_policy
 from app.services.stream.persistence import preprocess_url_in_message
 from app.services.stream.reasoning_policy import configure_reasoning_call_kwargs
+from app.services.stream.run_capability_router import (
+    RunCapabilityResolution,
+    resolve_run_capability_route,
+)
 
 VOLCENGINE_PROVIDERS = {"volcengine"}
 MAX_CONTROLLED_OUTPUT_TOKENS = 4096
@@ -44,6 +48,7 @@ class AgentLoopCallConfig:
     supports_function_calling: bool
     call_kwargs: dict
     announced_tools: list[str]
+    capability_resolution: RunCapabilityResolution
     supports_dynamic_tools: bool = False
     dynamic_tool_handlers: dict[str, Any] = field(default_factory=dict)
     tool_bindings: list[dict[str, Any]] = field(default_factory=list)
@@ -63,6 +68,12 @@ def build_update_plan_tool(allowed_tool_names: list[str] | None = None) -> dict[
     normalized_allowed_tool_names = list(dict.fromkeys(allowed_tool_names or []))
     if normalized_allowed_tool_names:
         planned_tool_schema["enum"] = normalized_allowed_tool_names
+    planned_tools_max_items = 1 if normalized_allowed_tool_names else 0
+    planned_tools_description = (
+        "执行步骤最多声明一个当前已提供的真实工具；多工具拆成独立步骤。"
+        if normalized_allowed_tool_names
+        else "本次没有外部工具，必须提交空数组。"
+    )
 
     return {
         "type": "function",
@@ -107,8 +118,8 @@ def build_update_plan_tool(allowed_tool_names: list[str] | None = None) -> dict[
                                 "planned_tools": {
                                     "type": "array",
                                     "items": planned_tool_schema,
-                                    "maxItems": 1,
-                                    "description": ("执行步骤最多声明一个当前已提供的真实工具；多工具拆成独立步骤。"),
+                                    "maxItems": planned_tools_max_items,
+                                    "description": planned_tools_description,
                                 },
                             },
                             "required": ["id", "step", "status", "planned_tools"],
@@ -207,6 +218,7 @@ def build_agent_loop_call_config(
     additional_tools: list[dict] | None = None,
     dynamic_tool_handlers: dict[str, Any] | None = None,
     tool_bindings: list[dict[str, Any]] | None = None,
+    authorized_tool_names: list[str] | None = None,
     original_message: str | None = None,
     task_context_messages: list[object] | None = None,
 ) -> AgentLoopCallConfig:
@@ -222,39 +234,66 @@ def build_agent_loop_call_config(
     task_policy = resolve_agent_task_policy(options=options, capabilities=capabilities)
     requested_plan_mode = "off" if knowledge_grounded else task_policy.plan_mode
     supports_function_calling = supports_search_tools(capabilities) and not tools_disabled
-    supports_control_tools = bool(capabilities.get("functionCalling", False)) and not tools_disabled
-    plan_mode: PlanMode = requested_plan_mode if supports_control_tools else "off"
     supports_dynamic_tools = supports_dynamic_agent_tools(capabilities) and not tools_disabled
     call_kwargs: dict = {}
     max_tokens = normalize_controlled_max_tokens(options.get("max_tokens"))
     if max_tokens is not None:
         call_kwargs["max_tokens"] = max_tokens
-    tools: list[dict] = []
+    available_tools: list[dict] = []
     if supports_function_calling:
-        tools.append(build_web_search_tool_fn())
-        if plan_mode != "off":
-            tools.append(build_url_read_tool_fn())
+        available_tools.extend(
+            [
+                build_web_search_tool_fn(),
+                build_url_read_tool_fn(),
+            ]
+        )
     provided_handlers = dynamic_tool_handlers or {}
     if supports_dynamic_tools:
-        tools.extend(tool for tool in (additional_tools or []) if _tool_definition_name(tool) in provided_handlers)
-    external_tool_names = [_tool_definition_name(tool) for tool in tools if _tool_definition_name(tool)]
-    if task_policy.task_mode == "deep_research":
+        available_tools.extend(
+            tool for tool in (additional_tools or []) if _tool_definition_name(tool) in provided_handlers
+        )
+    available_tools_by_name = {name: tool for tool in available_tools if (name := _tool_definition_name(tool))}
+    trusted_authorized_tool_names = [name for name in (authorized_tool_names or []) if isinstance(name, str) and name]
+    route_tool_names = list(available_tools_by_name)
+    route_tool_names.extend(
+        name for name in dict.fromkeys(trusted_authorized_tool_names) if name not in available_tools_by_name
+    )
+    unavailable_tool_names = [name for name in trusted_authorized_tool_names if name not in available_tools_by_name]
+    capability_resolution = resolve_run_capability_route(
+        original_message=original_message,
+        task_context_messages=task_context_messages,
+        available_tool_names=route_tool_names,
+        requested_plan_mode=requested_plan_mode,
+        task_policy=task_policy,
+        capabilities=capabilities,
+        tools_disabled=tools_disabled,
+        knowledge_grounded=knowledge_grounded,
+        unavailable_tool_names=unavailable_tool_names,
+    )
+    external_tool_names = list(capability_resolution.external_tool_names)
+    tools = [available_tools_by_name[name] for name in external_tool_names]
+    plan_mode = capability_resolution.effective_plan_mode
+    if capability_resolution.package_id == "deep_research":
         schedulable_names = frozenset({"web_search", "url_read"}).intersection(external_tool_names)
         plan_tool_policy = AgentPlanToolPolicy(
             allowed_tool_names=frozenset(schedulable_names),
             reason="deep_research_schedulable_tools",
         )
+    elif capability_resolution.package_id == "verified_web" and plan_mode != "off":
+        plan_tool_policy = AgentPlanToolPolicy(
+            required_initial_tool_counts={"web_search": 1, "url_read": 2},
+            reason="verified_research_request",
+        )
+    elif capability_resolution.package_id == "verified_web":
+        plan_tool_policy = AgentPlanToolPolicy()
     else:
         plan_tool_policy = resolve_agent_plan_tool_policy(
             original_message=original_message,
             announced_tool_names=external_tool_names,
             task_context_messages=task_context_messages,
         )
-    if requested_plan_mode != "off" and plan_tool_policy.allowed_tool_names is not None:
-        tools = [tool for tool in tools if _tool_definition_name(tool) in plan_tool_policy.allowed_tool_names]
-        external_tool_names = [_tool_definition_name(tool) for tool in tools if _tool_definition_name(tool)]
     control_tool_names: frozenset[str] = frozenset()
-    if supports_control_tools and plan_mode != "off":
+    if plan_mode != "off":
         tools.append(build_update_plan_tool(external_tool_names))
         control_tool_names = frozenset({"update_plan"})
         tools = [
@@ -273,19 +312,20 @@ def build_agent_loop_call_config(
         should_use_reasoning=should_use_reasoning,
     )
 
-    announced_tools = [
-        name for name in announced_tool_names_from_call_kwargs(call_kwargs) if name not in control_tool_names
-    ]
-    announced_tool_set = set(announced_tools)
-    active_handlers = {name: handler for name, handler in provided_handlers.items() if name in announced_tool_set}
-    active_bindings = [
-        binding for binding in (tool_bindings or []) if str(binding.get("alias", "")) in announced_tool_set
-    ]
+    announced_tools = list(external_tool_names)
+    active_handlers = {name: provided_handlers[name] for name in announced_tools if name in provided_handlers}
+    bindings_by_alias = {
+        str(binding.get("alias", "")): binding
+        for binding in (tool_bindings or [])
+        if isinstance(binding, dict) and binding.get("alias")
+    }
+    active_bindings = [bindings_by_alias[name] for name in announced_tools if name in bindings_by_alias]
     return AgentLoopCallConfig(
         should_use_reasoning=should_use_reasoning,
         supports_function_calling=supports_function_calling,
         call_kwargs=call_kwargs,
         announced_tools=announced_tools,
+        capability_resolution=capability_resolution,
         supports_dynamic_tools=bool(active_handlers),
         dynamic_tool_handlers=active_handlers,
         tool_bindings=active_bindings,
@@ -376,20 +416,34 @@ async def prepare_agent_loop_messages(
         # 只在空消息集上选择可信模板，用户文本不会影响段落是否存在。
         if has_image_attachment and not has_vision:
             yield SystemPromptSection("no_vision_file_boundary", get_no_vision_file_boundary_prompt())
-        selectors = [
-            ("tool_usage_contract", inject_tool_usage_contract, call_config.call_kwargs),
-            ("agent_plan_control", inject_plan_control_contract, call_config),
-            ("verified_research_plan", inject_verified_research_plan_contract, call_config),
-            ("deep_research_contract", inject_deep_research_contract, call_config),
-            ("no_tool_network_boundary", inject_no_tool_network_boundary, call_config.call_kwargs),
-        ]
         for index, prompt in enumerate(extra_system_prompts or []):
             yield SystemPromptSection(f"extra_system_{index}", prompt)
-        for section_id, selector, config in selectors:
-            for message in selector([], config):
-                yield SystemPromptSection(section_id, message["content"])
+        resolution = call_config.capability_resolution
+        if "web_search" in resolution.external_tool_names:
+            yield SystemPromptSection("tool_usage_contract", get_tool_usage_contract_prompt())
+        if resolution.effective_plan_mode != "off":
+            yield SystemPromptSection(
+                "agent_plan_control",
+                get_agent_plan_control_prompt(resolution.effective_plan_mode),
+            )
+        if resolution.package_id == "verified_web" and resolution.effective_plan_mode != "off":
+            yield SystemPromptSection(
+                "verified_research_plan",
+                VERIFIED_RESEARCH_PLAN_CONTRACT_PROMPT,
+            )
+        if resolution.package_id == "deep_research":
+            yield SystemPromptSection("deep_research_contract", DEEP_RESEARCH_CONTRACT_PROMPT)
+        if resolution.network_boundary_required:
+            yield SystemPromptSection(
+                "no_tool_network_boundary",
+                get_no_tool_network_boundary_prompt(),
+            )
 
-    assembly = assemble_system_prompt(user_system_prompt=user_system_prompt, sections=selected_sections)
+    assembly = assemble_system_prompt(
+        user_system_prompt=user_system_prompt,
+        include_current_date=call_config.capability_resolution.include_current_date,
+        sections=selected_sections,
+    )
     messages = [*assembly.messages, *messages]
     return AgentLoopPreparedMessages(
         messages=messages,
@@ -405,11 +459,7 @@ async def prepare_agent_loop_messages(
                 for section_id, message in zip(assembly.metadata["section_ids"], assembly.messages, strict=True)
             ],
         },
-        final_tool_names=[
-            name
-            for name in announced_tool_names_from_call_kwargs(call_config.call_kwargs)
-            if name not in getattr(call_config, "control_tool_names", frozenset())
-        ],
+        final_tool_names=list(call_config.capability_resolution.external_tool_names),
     )
 
 
@@ -464,6 +514,8 @@ async def _prepare_url_context(
     call_config: AgentLoopCallConfig,
     preprocess_url_in_message_fn: Callable[..., Awaitable[tuple[Any | None, dict | None, str | None]]],
 ) -> tuple[list[dict], list[Any]]:
+    if "url_read" not in call_config.capability_resolution.external_tool_names:
+        return messages, []
     initial_content_blocks = []
     url_read_block, url_context_msg, _auto_detected_url = await preprocess_url_in_message_fn(
         original_message,

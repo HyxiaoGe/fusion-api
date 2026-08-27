@@ -131,6 +131,7 @@ class AgentLoopWiringDependencies:
     generate_suggested_questions_fn: Callable[..., Any] | None = None
     fail_suggested_questions_fn: Callable[..., Any] | None = None
     load_dynamic_tools_fn: Callable[..., Any] | None = None
+    load_authorized_tool_names_fn: Callable[..., list[str]] | None = None
     llm_round_detail_scheduler: Callable[[Any], Any] | None = None
 
     def to_execution_dependencies(self) -> AgentLoopDependencies:
@@ -200,10 +201,24 @@ def build_agent_loop_lifecycle_call(
         and options.get("knowledge_grounded") is not True
         and dependencies.load_dynamic_tools_fn is not None
     )
+    should_load_dynamic_tool_metadata = (
+        dependencies.load_authorized_tool_names_fn is not None
+        and options.get("knowledge_grounded") is not True
+        and not should_load_dynamic_tools
+    )
     dynamic_tool_set = (
         _load_dynamic_tools(dependencies.load_dynamic_tools_fn, db=db, user_id=run_input.user_id)
         if should_load_dynamic_tools
         else None
+    )
+    authorized_tool_names = (
+        _load_dynamic_tools(
+            dependencies.load_authorized_tool_names_fn,
+            db=db,
+            user_id=run_input.user_id,
+        )
+        if should_load_dynamic_tool_metadata
+        else []
     )
     call_config = dependencies.build_call_config_fn(
         provider=run_input.provider,
@@ -212,6 +227,12 @@ def build_agent_loop_lifecycle_call(
         additional_tools=list(getattr(dynamic_tool_set, "definitions", []) or []),
         dynamic_tool_handlers=dict(getattr(dynamic_tool_set, "handlers", {}) or {}),
         tool_bindings=list(getattr(dynamic_tool_set, "audit_bindings", []) or []),
+        **(
+            {"authorized_tool_names": authorized_tool_names}
+            if should_load_dynamic_tool_metadata
+            and _accepts_keyword(dependencies.build_call_config_fn, "authorized_tool_names")
+            else {}
+        ),
         **(
             {"original_message": run_input.original_message}
             if _accepts_keyword(dependencies.build_call_config_fn, "original_message")

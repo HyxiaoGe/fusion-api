@@ -80,6 +80,14 @@
 - 本地证据：API 全量 `2918 passed, 2 skipped, 828 subtests`，Ruff check/format 通过；UI 全量 `2371 passed`，目标 ESLint 和 production build 通过；两仓 `git diff --check` 通过。
 - 本条没有提交、推送、PR、CI、部署、本地服务或真实模型/浏览器验收。协议见 [v2 规格](superpowers/specs/2026-08-27-prompt-runtime-v2.md)。
 
+## 2026-08-27 Run 级能力路由（本地实现与自动化回归）
+
+- API 在首个 LLM Round 前以 `RunCapabilityResolution` 冻结最小能力包；同一 resolution 原子派生外部 tool definitions、handlers、bindings、announced/final tools、`update_plan` schema 和条件 Prompt sections。服务端共享 capability contract 同时约束当前 Run、实时事件、durable ledger 与历史 DTO；`AgentSession.run_config.capability_resolution` 是刷新和历史事实源。
+- 权限边界默认收窄：普通 direct/transform/clarification 不公布工具；Deep Research 只开放完整 search/read；禁用工具、无 function calling、Knowledge Grounded 和未满足必需工具时不把 schema 发给模型。已授权 MCP alias 的只读元数据只参与禁用/无 FC 路由分类，不复用受执行预算裁剪的 ToolSet，也不授信未授权 alias。
+- 自动化行为 fixture 共 501 条，其中 491 条路由记录通过真实 `build_agent_loop_call_config()` 与 `prepare_agent_loop_messages()` 核对 package、definitions、handlers、bindings、最终工具与 Prompt sections，不使用静态 JSON 自洽替身。矩阵覆盖问候、身份、日期、联网、URL、地图、航班/铁路、混合行程、Deep Research、Knowledge Grounded、模糊意图、抽象流程、按名词类型区分的定义类稳定知识与时效查询、URL query/自然动作边界、页面内搜索、中英文显式/自然内置、产品与 MCP 工具 hard deny 及最终再授权、当前请求及同对象中英文作用域、回指对象、`go online`/访问网络等全局中英文联网禁用、未知交通方式 fail-closed、交通方式否定、逗号/冒号/破折号子句边界及实体内部短横线保留、产品子集筛选、否定疑问、领域/解释补语、天气地点补语和中英文时序连接词。
+- 本地证据：最新目标集（含生产 wiring 与 lifecycle 指纹契约）`654 passed + 1065 subtests`，其中路由单测 `506 passed`、真实组装 fixture `491 subtests`；API 权威全量 `3489 passed, 2 skipped, 1895 subtests`，Ruff、任务改动文件 format check 与 diff check 已通过。能力包指纹现覆盖完整 resolution、announced tools、安全 MCP bindings、task/network/evidence policy 与 Prompt 模板版本；实际 Prompt snapshot/fingerprint 继续单独证明 section/body。UI 全量 `2430 passed`、production build、目标 ESLint 与 diff check 已通过；最终替换式对抗审查结论为 CLEAN。全量首次发现 Trajectory 列表读取整个 `AgentSession.config`，共享路径以 `7e49f5f` 收窄为 capability resolution 轻量投影后，原失败单项与全量均通过。
+- 当前状态仅为 API/UI 分支本地实现和静态/单元回归；没有推送、PR、CI、部署、真实模型或登录态浏览器验收。协议见 [Run 级能力路由规格](superpowers/specs/2026-08-27-run-capability-router.md)。
+
 ## 最近发布记录
 
 | 日期 | 仓库 | commit | 内容 | 验证 |

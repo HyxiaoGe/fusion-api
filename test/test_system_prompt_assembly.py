@@ -43,3 +43,17 @@ class SystemPromptAssemblyTests(unittest.TestCase):
         self.assertIsInstance(result.metadata["duration_ms"], int)
         self.assertEqual(result.metadata["duration_ms"], 25)
         self.assertIn("Fusion AI", result.messages[0]["content"])
+
+    def test_current_date_can_be_omitted_without_changing_preference_order(self):
+        from app.ai.prompts.system_prompt import assemble_system_prompt
+
+        result = assemble_system_prompt(
+            user_system_prompt="请保持简洁",
+            include_current_date=False,
+        )
+
+        self.assertEqual(
+            result.metadata["section_ids"],
+            ["app_identity", "user_preferences"],
+        )
+        self.assertEqual(result.metadata["template_version"], "2026-08-27.2")

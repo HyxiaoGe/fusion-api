@@ -19,6 +19,7 @@ class CIContainerContractTest(unittest.TestCase):
         self.assertNotIn("fakeredis", production)
         self.assertNotIn("-r requirements.txt", ci)
         self.assertIn("fakeredis[lua]", ci)
+        self.assertIn("pytest==9.1.1", ci)
         self.assertIn("ruff==", ci)
 
     def test_auth_client_uses_fixed_pypi_release(self) -> None:
@@ -67,6 +68,10 @@ class CIContainerContractTest(unittest.TestCase):
             self.assertIn("python scripts/check_architecture.py", build_script)
             self.assertIn("ruff check .", build_script)
             self.assertIn("python -u -m unittest discover -s test -t . -v", build_script)
+            self.assertIn(
+                "python -m pytest -q test/services/stream/test_run_capability_router.py",
+                build_script,
+            )
 
         self.assertIn(
             '--mount "type=bind,source=${PWD}/README.md,target=/app/README.md,readonly"',

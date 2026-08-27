@@ -1,5 +1,7 @@
 import asyncio
 import concurrent.futures
+import hashlib
+import json
 import tempfile
 import threading
 import unittest
@@ -9,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from pydantic import ValidationError
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
@@ -37,6 +40,7 @@ from app.services.stream.agent_loop_lifecycle import (
     AgentLoopLifecycleDependencies,
     AgentLoopLifecycleRequest,
     _prepare_knowledge_grounding,
+    _run_config,
     commit_trajectory_barrier,
     configure_research_state,
     run_agent_loop_lifecycle,
@@ -48,6 +52,7 @@ from app.services.stream.agent_loop_run_completion import (
     write_fallback_run_error,
 )
 from app.services.stream.research_evidence import validate_research_completion
+from app.services.stream.run_capability_router import RunCapabilityResolution
 from app.services.stream.run_finalizer import interrupt_agent_run
 from app.services.stream.tool_executor import AgentEventCompositeWriter
 from app.services.stream_state_service import StreamOwnershipLostError, StreamWriteTerminalError
@@ -486,10 +491,150 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
             should_use_reasoning=False,
             call_kwargs={},
             announced_tools=["web_search"],
+            capability_resolution=RunCapabilityResolution(
+                schema_version=1,
+                router_version="2026-08-27.1",
+                package_id="fresh_web",
+                confidence="high",
+                resolution_mode="routed",
+                reason_codes=("fresh_external_fact",),
+                external_tool_names=("web_search",),
+                effective_plan_mode="off",
+                include_current_date=True,
+                network_boundary_required=False,
+            ),
+            plan_mode="off",
+            task_mode="standard",
+            network_profile="standard",
+            evidence_policy="standard",
         )
+
+    def _expected_capability_resolution(self):
+        from app.ai.prompts.system_prompt import TEMPLATE_VERSION
+
+        fingerprint_input = {
+            "prompt_template_version": TEMPLATE_VERSION,
+            "capability_resolution": {
+                "schema_version": 1,
+                "router_version": "2026-08-27.1",
+                "package_id": "fresh_web",
+                "confidence": "high",
+                "resolution_mode": "routed",
+                "reason_codes": ["fresh_external_fact"],
+                "external_tool_names": ["web_search"],
+                "effective_plan_mode": "off",
+                "include_current_date": True,
+                "network_boundary_required": False,
+            },
+            "announced_tools": ["web_search"],
+            "mcp_tool_bindings": [],
+            "task_mode": "standard",
+            "network_profile": "standard",
+            "evidence_policy": "standard",
+        }
+        bundle_fingerprint = (
+            "sha256:"
+            + hashlib.sha256(
+                json.dumps(
+                    fingerprint_input,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+        return {
+            "schema_version": 1,
+            "router_version": "2026-08-27.1",
+            "package_id": "fresh_web",
+            "confidence": "high",
+            "resolution_mode": "routed",
+            "reason_codes": ["fresh_external_fact"],
+            "external_tool_names": ["web_search"],
+            "effective_plan_mode": "off",
+            "include_current_date": True,
+            "network_boundary_required": False,
+            "bundle_fingerprint": bundle_fingerprint,
+        }
 
     def _limits(self):
         return AgentLoopLimits(max_steps=3, max_tool_calls=5, total_timeout_s=30)
+
+    def test_run_config_rejects_invalid_current_resolution_before_persistence(self):
+        call_config = self._call_config()
+        call_config.capability_resolution = replace(
+            call_config.capability_resolution,
+            package_id="mcp_explicit",
+            reason_codes=("explicit_authorized_tool_alias",),
+            external_tool_names=("update_plan",),
+            include_current_date=False,
+        )
+        call_config.announced_tools = ["update_plan"]
+
+        with self.assertRaises(ValidationError):
+            _run_config(self._limits(), call_config)
+
+    def test_run_config_rejects_reversed_tools_before_bundle_fingerprint_persistence(self):
+        call_config = self._call_config()
+        call_config.capability_resolution = replace(
+            call_config.capability_resolution,
+            package_id="deep_research",
+            reason_codes=("deep_research_mode",),
+            external_tool_names=("url_read", "web_search"),
+            effective_plan_mode="on",
+            include_current_date=True,
+        )
+        call_config.announced_tools = ["url_read", "web_search"]
+        call_config.plan_mode = "on"
+        call_config.task_mode = "deep_research"
+        call_config.network_profile = "deep_research"
+        call_config.evidence_policy = "deep_research_v1"
+
+        with (
+            patch("app.services.stream.agent_loop_lifecycle.hashlib.sha256", wraps=hashlib.sha256) as sha256,
+            self.assertRaises(ValidationError),
+        ):
+            _run_config(self._limits(), call_config)
+
+        sha256.assert_not_called()
+
+    def test_bundle_fingerprint_covers_date_and_network_boundary_semantics(self):
+        base = self._call_config()
+        base.capability_resolution = RunCapabilityResolution(
+            schema_version=1,
+            router_version="2026-08-27.2",
+            package_id="knowledge_grounded",
+            confidence="high",
+            resolution_mode="routed",
+            reason_codes=("knowledge_grounded_mode",),
+            external_tool_names=(),
+            effective_plan_mode="off",
+            include_current_date=False,
+            network_boundary_required=False,
+        )
+        base.announced_tools = []
+
+        baseline = _run_config(self._limits(), base)["capability_resolution"]["bundle_fingerprint"]
+        with_date = _run_config(
+            self._limits(),
+            SimpleNamespace(
+                **{
+                    **base.__dict__,
+                    "capability_resolution": replace(base.capability_resolution, include_current_date=True),
+                }
+            ),
+        )["capability_resolution"]["bundle_fingerprint"]
+        with_boundary = _run_config(
+            self._limits(),
+            SimpleNamespace(
+                **{
+                    **base.__dict__,
+                    "capability_resolution": replace(base.capability_resolution, network_boundary_required=True),
+                }
+            ),
+        )["capability_resolution"]["bundle_fingerprint"]
+
+        self.assertEqual(len({baseline, with_date, with_boundary}), 3)
 
     def _execution(self, *, call_config=None, limits=None, redis_writer=None):
         call_config = call_config or self._call_config()
@@ -679,15 +824,22 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 "max_steps": 3,
                 "max_tool_calls": 5,
                 "timeout_s": 30,
-                "plan_mode": "auto",
+                "plan_mode": "off",
                 "task_mode": "standard",
                 "network_profile": "standard",
                 "evidence_policy": "standard",
                 "runtime_config_versions": {
                     "agent_strategy/default": "code-default",
                 },
+                "capability_resolution": self._expected_capability_resolution(),
             },
         )
+        capability_resolution = call_order[1][6]["capability_resolution"]
+        self.assertEqual(capability_resolution["external_tool_names"], call_order[1][5])
+        self.assertNotIn("update_plan", call_order[1][5])
+        self.assertNotIn("section_ids", capability_resolution)
+        self.assertNotIn("prompt", capability_resolution)
+        self.assertNotIn("system_prompt_fingerprint", capability_resolution)
         self.assertIs(call_order[2][3], call_config)
         self.assertEqual(call_order[2][4], "user-life")
         self.assertEqual(call_order[2][5], "conv-life")
@@ -1609,13 +1761,14 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 "max_steps": 3,
                 "max_tool_calls": 5,
                 "timeout_s": 30,
-                "plan_mode": "auto",
+                "plan_mode": "off",
                 "task_mode": "standard",
                 "network_profile": "standard",
                 "evidence_policy": "standard",
                 "runtime_config_versions": {
                     "agent_strategy/default": "agent-strategy-v7",
                 },
+                "capability_resolution": self._expected_capability_resolution(),
             },
         )
 

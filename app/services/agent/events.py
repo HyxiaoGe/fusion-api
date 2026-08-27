@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.schemas.chat import ContextStatus, KnowledgeEvidenceBlock, ProductResultBlock
+from app.schemas.trajectory import TrajectoryCapabilityResolution
+from app.utils.run_capability_contract import CAPABILITY_CONTROL_TOOL_NAMES
 
 
 class AgentEventBase(BaseModel):
@@ -33,6 +35,15 @@ class RunStarted(AgentEventBase):
     model: str
     tools: list[str]
     config: dict[str, Any]
+    capability_resolution: TrajectoryCapabilityResolution | None = None
+
+    @model_validator(mode="after")
+    def _require_external_tools_match_resolution(self) -> RunStarted:
+        if CAPABILITY_CONTROL_TOOL_NAMES.intersection(self.tools):
+            raise ValueError("Run 公告工具不得包含内部控制工具")
+        if self.capability_resolution is not None and self.tools != self.capability_resolution.external_tool_names:
+            raise ValueError("Run 公告工具必须与能力路由外部工具一致")
+        return self
 
 
 class StepStarted(AgentEventBase):
