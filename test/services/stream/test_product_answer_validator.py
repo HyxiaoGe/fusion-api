@@ -344,6 +344,8 @@ class ProductAnswerValidatorTests(unittest.TestCase):
             "具体来看：当天白天天气为雷阵雨，最高气温31°C、最低26°C，夜间多云。"
             "由于降雨覆盖白天时段，户外骑行大概率会淋雨，建议优先考虑室内骑行或改期。"
             "本次预报只有昼夜两个粒度，无法确认上午与下午的细分差异。"
+            "不过白天整体为降雨天气，从避雨角度看这一天的白天时段存在被淋雨的可能。"
+            "夜间转为多云，如果你计划调整到晚上活动，天气条件相对更宽松一些。"
         )
         messages = [{"role": "user", "content": "7月24日南山区天气怎么样，适合上午骑行吗？"}]
 
@@ -363,6 +365,9 @@ class ProductAnswerValidatorTests(unittest.TestCase):
         self.assertNotIn("大概率会淋雨", repaired)
         self.assertNotIn("室内骑行", repaired)
         self.assertNotIn("改期", repaired)
+        self.assertNotIn("存在被淋雨的可能", repaired)
+        self.assertNotIn("调整到晚上活动", repaired)
+        self.assertNotIn("天气条件相对更宽松", repaired)
         self.assertTrue(validate_product_answer(repaired, [_weather_block()], messages=messages).is_valid)
 
     def test_weather_forecast_coverage_limits_allow_unknown_dates_without_allowing_claims(self):
