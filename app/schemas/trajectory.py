@@ -9,7 +9,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.core.run_capability_contract import validate_capability_resolution_semantics
+from app.utils.run_capability_contract import validate_capability_resolution_semantics
 
 CapabilityPackageId = Literal[
     "direct",

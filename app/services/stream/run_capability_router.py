@@ -6,7 +6,13 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Literal
 
-from app.core.run_capability_contract import (
+from app.services.agent.plan_coordinator import PlanMode
+from app.services.stream.agent_plan_tool_policy import (
+    INTERCITY_LOCATION_NAMES,
+    resolve_product_capability_signals,
+)
+from app.services.stream.agent_task_policy import AgentTaskPolicy
+from app.utils.run_capability_contract import (
     CAPABILITY_AUTO_PLAN_PACKAGES,
     CAPABILITY_CANONICAL_EXTERNAL_TOOL_ORDER,
     CAPABILITY_CONTROL_TOOL_NAMES,
@@ -15,12 +21,6 @@ from app.core.run_capability_contract import (
     is_authorized_mcp_tool_alias,
     validate_capability_resolution_semantics,
 )
-from app.services.agent.plan_coordinator import PlanMode
-from app.services.stream.agent_plan_tool_policy import (
-    INTERCITY_LOCATION_NAMES,
-    resolve_product_capability_signals,
-)
-from app.services.stream.agent_task_policy import AgentTaskPolicy
 
 Confidence = Literal["high", "medium", "low"]
 ResolutionMode = Literal["routed", "degraded", "clarification"]

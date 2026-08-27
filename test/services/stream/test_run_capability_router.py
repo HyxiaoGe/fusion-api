@@ -4,13 +4,13 @@ from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
-from app.core.run_capability_contract import validate_capability_resolution_semantics
 from app.services.stream.agent_task_policy import AgentTaskPolicy
 from app.services.stream.run_capability_router import (
     RunCapabilityResolution,
     resolve_run_capability_route,
     serialize_capability_resolution,
 )
+from app.utils.run_capability_contract import validate_capability_resolution_semantics
 
 ALL_TOOLS = [
     "mcp_unrelated_tool",

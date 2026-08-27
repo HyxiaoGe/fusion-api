@@ -6,9 +6,9 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from app.core.run_capability_contract import CAPABILITY_CONTROL_TOOL_NAMES
 from app.schemas.chat import ContextStatus, KnowledgeEvidenceBlock, ProductResultBlock
 from app.schemas.trajectory import TrajectoryCapabilityResolution
+from app.utils.run_capability_contract import CAPABILITY_CONTROL_TOOL_NAMES
 
 
 class AgentEventBase(BaseModel):

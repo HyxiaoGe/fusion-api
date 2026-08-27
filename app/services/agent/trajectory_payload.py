@@ -9,8 +9,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import ValidationError
 
-from app.core.run_capability_contract import CAPABILITY_CONTROL_TOOL_NAMES
 from app.schemas.trajectory import TrajectoryCapabilityResolution
+from app.utils.run_capability_contract import CAPABILITY_CONTROL_TOOL_NAMES
 
 MAX_LEDGER_TEXT_LENGTH = 512
 MAX_LEDGER_LIST_ITEMS = 50
