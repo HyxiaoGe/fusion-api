@@ -220,24 +220,47 @@ class TrajectoryApiTests(unittest.TestCase):
 
     def test_legacy_and_invalid_run_capability_resolution_are_null(self):
         self._add_run("run-legacy", run_config={"max_steps": 8})
-        self._add_run(
-            "run-invalid",
-            run_config={
-                "capability_resolution": {
+        invalid_resolutions = (
+            (
+                "run-invalid-extra",
+                {
                     **CAPABILITY_RESOLUTION,
                     "original_message": "用户原文禁止返回",
-                }
-            },
+                },
+            ),
+            (
+                "run-invalid-control",
+                {
+                    **CAPABILITY_RESOLUTION,
+                    "package_id": "mcp_explicit",
+                    "reason_codes": ["explicit_authorized_tool_alias"],
+                    "external_tool_names": ["update_plan"],
+                    "include_current_date": False,
+                },
+            ),
+            (
+                "run-invalid-package",
+                {
+                    **CAPABILITY_RESOLUTION,
+                    "package_id": "direct",
+                    "reason_codes": ["direct_greeting"],
+                    "external_tool_names": ["web_search"],
+                    "include_current_date": False,
+                },
+            ),
         )
+        for run_id, resolution in invalid_resolutions:
+            self._add_run(run_id, run_config={"capability_resolution": resolution})
 
         legacy = self.client.get("/api/conversations/conv-1/runs/run-legacy/trajectory")
-        invalid = self.client.get("/api/conversations/conv-1/runs/run-invalid/trajectory")
-
         self.assertEqual(legacy.status_code, 200)
-        self.assertEqual(invalid.status_code, 200)
         self.assertIsNone(legacy.json()["data"]["run"]["capability_resolution"])
-        self.assertIsNone(invalid.json()["data"]["run"]["capability_resolution"])
-        self.assertNotIn("用户原文禁止返回", invalid.text)
+        for run_id, _resolution in invalid_resolutions:
+            with self.subTest(run_id=run_id):
+                invalid = self.client.get(f"/api/conversations/conv-1/runs/{run_id}/trajectory")
+                self.assertEqual(invalid.status_code, 200)
+                self.assertIsNone(invalid.json()["data"]["run"]["capability_resolution"])
+                self.assertNotIn("用户原文禁止返回", invalid.text)
 
     def test_unauthorized_conversation_and_cross_conversation_run_are_uniformly_not_found(self):
         """若 handler 在 service 之外泄漏资源归属，404 契约会被破坏。"""

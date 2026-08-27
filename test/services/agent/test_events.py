@@ -116,6 +116,126 @@ class AgentEventModelTests(unittest.TestCase):
                 **self._common(),
             )
 
+    def test_run_started_rejects_control_tool_even_when_resolution_and_tools_match(self):
+        invalid_resolution = {
+            **CAPABILITY_RESOLUTION,
+            "package_id": "mcp_explicit",
+            "reason_codes": ["explicit_authorized_tool_alias"],
+            "external_tool_names": ["update_plan"],
+            "include_current_date": False,
+        }
+
+        with self.assertRaises(ValidationError):
+            RunStarted(
+                type="run_started",
+                conversation_id="c1",
+                message_id="msg-1",
+                task_id="task-1",
+                model="gpt",
+                tools=["update_plan"],
+                config={"capability_resolution": invalid_resolution},
+                capability_resolution=invalid_resolution,
+                **self._common(),
+            )
+
+        with self.assertRaises(ValidationError):
+            RunStarted(
+                type="run_started",
+                conversation_id="c1",
+                message_id="msg-1",
+                task_id="task-1",
+                model="gpt",
+                tools=["update_plan"],
+                config={},
+                capability_resolution=None,
+                **self._common(),
+            )
+
+    def test_run_started_rejects_package_tool_and_fixed_semantic_mismatches(self):
+        invalid_resolutions = (
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "direct",
+                "reason_codes": ["direct_greeting"],
+                "external_tool_names": ["web_search"],
+                "include_current_date": False,
+            },
+            {**CAPABILITY_RESOLUTION, "effective_plan_mode": "auto"},
+            {**CAPABILITY_RESOLUTION, "include_current_date": False},
+            {**CAPABILITY_RESOLUTION, "network_boundary_required": True},
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "mcp_explicit",
+                "reason_codes": ["explicit_authorized_tool_alias"],
+                "external_tool_names": ["authorized_but_not_mcp_alias"],
+                "include_current_date": False,
+            },
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "clarification_only",
+                "confidence": "high",
+                "resolution_mode": "clarification",
+                "reason_codes": ["insufficient_capability_signal"],
+                "external_tool_names": [],
+                "include_current_date": False,
+            },
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "tools_unavailable",
+                "resolution_mode": "routed",
+                "reason_codes": ["tools_disabled"],
+                "external_tool_names": [],
+                "effective_plan_mode": "off",
+                "network_boundary_required": True,
+            },
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "mobility_intercity",
+                "confidence": "high",
+                "reason_codes": ["origin_destination_relation", "intercity_locations"],
+                "external_tool_names": ["route_compare", "search_flights", "search_trains"],
+                "effective_plan_mode": "auto",
+            },
+            {**CAPABILITY_RESOLUTION, "reason_codes": ["verified_source_request"]},
+        )
+
+        for invalid_resolution in invalid_resolutions:
+            with self.subTest(invalid_resolution=invalid_resolution), self.assertRaises(ValidationError):
+                RunStarted(
+                    type="run_started",
+                    conversation_id="c1",
+                    message_id="msg-1",
+                    task_id="task-1",
+                    model="gpt",
+                    tools=invalid_resolution["external_tool_names"],
+                    config={"capability_resolution": invalid_resolution},
+                    capability_resolution=invalid_resolution,
+                    **self._common(),
+                )
+
+    def test_run_started_accepts_single_exact_mcp_alias(self):
+        resolution = {
+            **CAPABILITY_RESOLUTION,
+            "package_id": "mcp_explicit",
+            "reason_codes": ["explicit_authorized_tool_alias"],
+            "external_tool_names": ["mcp_docs_a1b2c3d4"],
+            "include_current_date": False,
+        }
+
+        event = RunStarted(
+            type="run_started",
+            conversation_id="c1",
+            message_id="msg-1",
+            task_id="task-1",
+            model="gpt",
+            tools=["mcp_docs_a1b2c3d4"],
+            config={"capability_resolution": resolution},
+            capability_resolution=resolution,
+            **self._common(),
+        )
+
+        self.assertEqual(event.tools, ["mcp_docs_a1b2c3d4"])
+
     def test_run_started_message_id_required(self):
         """RunStarted 缺 message_id 必须抛 ValidationError"""
         with self.assertRaises(ValidationError):

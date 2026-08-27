@@ -89,6 +89,43 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args[3]["tools"], args[3]["capability_resolution"]["external_tool_names"])
         self.assertNotIn("update_plan", args[3]["tools"])
 
+    async def test_invalid_current_run_resolution_is_not_emitted(self):
+        writer = AsyncMock()
+        em = AgentEventEmitter(
+            run_id="r1",
+            trace_id="r1",
+            conversation_id="c1",
+            task_id="task-1",
+            redis_writer=writer,
+        )
+        invalid_resolutions = (
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "mcp_explicit",
+                "reason_codes": ["explicit_authorized_tool_alias"],
+                "external_tool_names": ["update_plan"],
+                "include_current_date": False,
+            },
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "direct",
+                "reason_codes": ["direct_greeting"],
+                "external_tool_names": ["web_search"],
+                "include_current_date": False,
+            },
+        )
+
+        for invalid_resolution in invalid_resolutions:
+            with self.subTest(invalid_resolution=invalid_resolution), self.assertRaises(ValidationError):
+                await em.run_started(
+                    message_id="m1",
+                    model="gpt",
+                    tools=invalid_resolution["external_tool_names"],
+                    config={"capability_resolution": invalid_resolution},
+                )
+
+        writer.append_chunk.assert_not_awaited()
+
     async def test_step_started_returns_step_id_and_persists_context(self):
         writer = AsyncMock()
         em = AgentEventEmitter(run_id="r1", trace_id="r1", conversation_id="c1", task_id="task-1", redis_writer=writer)

@@ -250,13 +250,68 @@ class TrajectoryQueryServiceTests(unittest.TestCase):
             {**CAPABILITY_RESOLUTION, "bundle_fingerprint": "not-a-sha256"},
             {**CAPABILITY_RESOLUTION, "reason_codes": ["private_match_text"]},
             {**CAPABILITY_RESOLUTION, "include_current_date": "true"},
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "mcp_explicit",
+                "reason_codes": ["explicit_authorized_tool_alias"],
+                "external_tool_names": ["update_plan"],
+                "include_current_date": False,
+            },
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "direct",
+                "reason_codes": ["direct_greeting"],
+                "external_tool_names": ["web_search"],
+                "include_current_date": False,
+            },
+            {**CAPABILITY_RESOLUTION, "effective_plan_mode": "auto"},
+            {**CAPABILITY_RESOLUTION, "include_current_date": False},
+            {**CAPABILITY_RESOLUTION, "network_boundary_required": True},
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "mcp_explicit",
+                "reason_codes": ["explicit_authorized_tool_alias"],
+                "external_tool_names": ["authorized_but_not_mcp_alias"],
+                "include_current_date": False,
+            },
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "clarification_only",
+                "confidence": "high",
+                "resolution_mode": "clarification",
+                "reason_codes": ["insufficient_capability_signal"],
+                "external_tool_names": [],
+                "include_current_date": False,
+            },
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "tools_unavailable",
+                "resolution_mode": "routed",
+                "reason_codes": ["tools_disabled"],
+                "external_tool_names": [],
+                "effective_plan_mode": "off",
+                "network_boundary_required": True,
+            },
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "mobility_intercity",
+                "confidence": "high",
+                "reason_codes": ["origin_destination_relation", "intercity_locations"],
+                "external_tool_names": ["route_compare", "search_flights", "search_trains"],
+                "effective_plan_mode": "auto",
+            },
+            {**CAPABILITY_RESOLUTION, "reason_codes": ["verified_source_request"]},
         )
+        run_ids = []
         for index, invalid in enumerate(invalid_values):
             run_id = f"run-invalid-{index}"
             run_config = {} if invalid is None else {"capability_resolution": invalid}
             self._run(run_id, turn_message_id=f"turn-invalid-{index}", run_config=run_config)
-            result = self._service().get_user_snapshot("conv-1", run_id, "user-1")
+            run_ids.append(run_id)
 
+        service = self._service()
+        for run_id in run_ids:
+            result = service.get_user_snapshot("conv-1", run_id, "user-1")
             self.assertIsNotNone(result)
             assert result is not None
             self.assertIsNone(result.run.capability_resolution)

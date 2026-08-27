@@ -479,6 +479,40 @@ class TrajectoryPayloadTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, str(payload))
 
+    def test_run_started_drops_control_tool_and_package_mismatch_resolution(self):
+        invalid_resolutions = (
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "mcp_explicit",
+                "reason_codes": ["explicit_authorized_tool_alias"],
+                "external_tool_names": ["update_plan"],
+                "include_current_date": False,
+            },
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "direct",
+                "reason_codes": ["direct_greeting"],
+                "external_tool_names": ["web_search"],
+                "include_current_date": False,
+            },
+        )
+
+        for invalid_resolution in invalid_resolutions:
+            with self.subTest(invalid_resolution=invalid_resolution):
+                payload = build_trajectory_payload(
+                    {
+                        **COMMON,
+                        "type": "run_started",
+                        **EVENT_FIELDS["run_started"],
+                        "tools": invalid_resolution["external_tool_names"],
+                        "capability_resolution": invalid_resolution,
+                    }
+                )
+
+                self.assertIsNone(payload["capability_resolution"])
+                if "update_plan" in invalid_resolution["external_tool_names"]:
+                    self.assertEqual(payload["tools"], [])
+
     def test_prompt_detail_status_is_durable_but_full_text_is_never_ledger_payload(self):
         payload = build_trajectory_payload(
             {

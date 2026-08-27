@@ -9,6 +9,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import ValidationError
 
+from app.core.run_capability_contract import CAPABILITY_CONTROL_TOOL_NAMES
 from app.schemas.trajectory import TrajectoryCapabilityResolution
 
 MAX_LEDGER_TEXT_LENGTH = 512
@@ -257,6 +258,19 @@ def _sanitize_capability_resolution(value: Any) -> dict[str, Any] | None:
         return None
 
 
+def _sanitize_external_tool_names(value: Any) -> list[str]:
+    sanitized = []
+    for name in _bounded_list(value):
+        if (
+            name in CAPABILITY_CONTROL_TOOL_NAMES
+            or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,127}", name) is None
+            or name in sanitized
+        ):
+            continue
+        sanitized.append(name)
+    return sanitized[:3]
+
+
 def _sanitize_scalar(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, float)):
         return value
@@ -268,6 +282,7 @@ _SPECIAL_SANITIZERS: dict[str, Callable[[Any], Any]] = {
     "item": _sanitize_plan_item,
     "evidence": _sanitize_evidence,
     "capability_resolution": _sanitize_capability_resolution,
+    "tools": _sanitize_external_tool_names,
 }
 
 

@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from pydantic import ValidationError
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
@@ -39,6 +40,7 @@ from app.services.stream.agent_loop_lifecycle import (
     AgentLoopLifecycleDependencies,
     AgentLoopLifecycleRequest,
     _prepare_knowledge_grounding,
+    _run_config,
     commit_trajectory_barrier,
     configure_research_state,
     run_agent_loop_lifecycle,
@@ -546,6 +548,20 @@ class AgentLoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     def _limits(self):
         return AgentLoopLimits(max_steps=3, max_tool_calls=5, total_timeout_s=30)
+
+    def test_run_config_rejects_invalid_current_resolution_before_persistence(self):
+        call_config = self._call_config()
+        call_config.capability_resolution = replace(
+            call_config.capability_resolution,
+            package_id="mcp_explicit",
+            reason_codes=("explicit_authorized_tool_alias",),
+            external_tool_names=("update_plan",),
+            include_current_date=False,
+        )
+        call_config.announced_tools = ["update_plan"]
+
+        with self.assertRaises(ValidationError):
+            _run_config(self._limits(), call_config)
 
     def _execution(self, *, call_config=None, limits=None, redis_writer=None):
         call_config = call_config or self._call_config()

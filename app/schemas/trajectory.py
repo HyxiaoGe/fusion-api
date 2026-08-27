@@ -7,7 +7,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from app.core.run_capability_contract import validate_capability_resolution_semantics
 
 CapabilityPackageId = Literal[
     "direct",
@@ -91,6 +93,20 @@ class TrajectoryCapabilityResolution(BaseModel):
         if any(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,127}", name) is None for name in value):
             raise ValueError("能力路由工具名格式非法")
         return value
+
+    @model_validator(mode="after")
+    def _validate_package_semantics(self) -> TrajectoryCapabilityResolution:
+        validate_capability_resolution_semantics(
+            package_id=self.package_id,
+            confidence=self.confidence,
+            resolution_mode=self.resolution_mode,
+            reason_codes=self.reason_codes,
+            external_tool_names=self.external_tool_names,
+            effective_plan_mode=self.effective_plan_mode,
+            include_current_date=self.include_current_date,
+            network_boundary_required=self.network_boundary_required,
+        )
+        return self
 
 
 @dataclass(frozen=True)

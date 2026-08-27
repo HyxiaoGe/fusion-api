@@ -6,16 +6,16 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Literal
 
+from app.core.run_capability_contract import (
+    CAPABILITY_AUTO_PLAN_PACKAGES,
+    CAPABILITY_CANONICAL_EXTERNAL_TOOL_ORDER,
+    CAPABILITY_CONTROL_TOOL_NAMES,
+    CAPABILITY_PACKAGE_EXTERNAL_TOOL_NAMES,
+    CAPABILITY_REASON_CODES,
+    is_authorized_mcp_tool_alias,
+    validate_capability_resolution_semantics,
+)
 from app.services.agent.plan_coordinator import PlanMode
-from app.services.mcp.amap_product_tools import (
-    AMAP_LOCAL_PLACE_SEARCH,
-    AMAP_ROUTE_COMPARE,
-    AMAP_WEATHER_FORECAST,
-)
-from app.services.mcp.flyai_travel_tools import (
-    FLYAI_SEARCH_FLIGHTS,
-    FLYAI_SEARCH_TRAINS,
-)
 from app.services.stream.agent_plan_tool_policy import (
     INTERCITY_LOCATION_NAMES,
     resolve_product_capability_signals,
@@ -28,16 +28,8 @@ ResolutionMode = Literal["routed", "degraded", "clarification"]
 SCHEMA_VERSION = 1
 ROUTER_VERSION = "2026-08-27.1"
 
-_CANONICAL_EXTERNAL_TOOL_ORDER = (
-    "web_search",
-    "url_read",
-    AMAP_WEATHER_FORECAST,
-    AMAP_LOCAL_PLACE_SEARCH,
-    AMAP_ROUTE_COMPARE,
-    FLYAI_SEARCH_FLIGHTS,
-    FLYAI_SEARCH_TRAINS,
-)
-_CONTROL_TOOL_NAMES = frozenset({"update_plan"})
+_CANONICAL_EXTERNAL_TOOL_ORDER = CAPABILITY_CANONICAL_EXTERNAL_TOOL_ORDER
+_CONTROL_TOOL_NAMES = CAPABILITY_CONTROL_TOOL_NAMES
 
 _TRANSFORM_RE = re.compile(
     r"翻译|译成|改写|重写|润色|措辞|"
@@ -50,9 +42,7 @@ _CURRENT_DATE_ONLY_RE = re.compile(
     r"(?:[、，,和及](?:星期几|周几|几月几日|几号|日期))?[？?。！!]*$"
 )
 _RELATIVE_DATE_RE = re.compile(r"今天|今日|明天|后天|昨天|本周|下周|这个月|本月|下个月|当前|现在")
-_FRESH_EXTERNAL_RE = re.compile(
-    r"最新|新闻|开市|收盘|股价|汇率|比分|发布了什么|刚刚发布|公开发布|现任|目前的"
-)
+_FRESH_EXTERNAL_RE = re.compile(r"最新|新闻|开市|收盘|股价|汇率|比分|发布了什么|刚刚发布|公开发布|现任|目前的")
 _VERIFIED_SOURCE_RE = re.compile(
     r"官方(?:公告|原文|资料|来源)|一手来源|可靠来源|权威来源|"
     r"(?:查证|核验|验证|交叉验证)|只依据(?:该|这个)页面"
@@ -66,70 +56,13 @@ _GREETING_RE = re.compile(
 )
 _IDENTITY_RE = re.compile(r"你是谁|你叫什么|介绍一下你自己|你能做什么")
 _STABLE_KNOWLEDGE_RE = re.compile(r"^(?:为什么|为何|什么是|解释一下|介绍一下|讲讲|how\b|what\b)", re.IGNORECASE)
-_SIMPLE_CALC_RE = re.compile(r"^(?:请)?(?:计算|算一下|算算)?\s*[\d\s()+\-*/.%]+(?:等于多少|是多少)?[？?]?$", re.IGNORECASE)
+_SIMPLE_CALC_RE = re.compile(
+    r"^(?:请)?(?:计算|算一下|算算)?\s*[\d\s()+\-*/.%]+(?:等于多少|是多少)?[？?]?$", re.IGNORECASE
+)
 _ROUTE_TRANSFER_RE = re.compile(r"接驳|市内|机场到|车站到|落地后")
-_PACKAGE_TOOLS: dict[str, tuple[str, ...]] = {
-    "direct": (),
-    "transform": (),
-    "date": (),
-    "fresh_web": ("web_search",),
-    "verified_web": ("web_search", "url_read"),
-    "url_read": ("url_read",),
-    "weather": (AMAP_WEATHER_FORECAST,),
-    "place_discovery": (AMAP_LOCAL_PLACE_SEARCH,),
-    "mobility_route": (AMAP_ROUTE_COMPARE,),
-    "flight": (FLYAI_SEARCH_FLIGHTS,),
-    "train": (FLYAI_SEARCH_TRAINS,),
-    "travel_air_rail": (FLYAI_SEARCH_FLIGHTS, FLYAI_SEARCH_TRAINS),
-    "mobility_intercity": (
-        AMAP_ROUTE_COMPARE,
-        FLYAI_SEARCH_FLIGHTS,
-        FLYAI_SEARCH_TRAINS,
-    ),
-    "mixed_itinerary": (
-        AMAP_ROUTE_COMPARE,
-        FLYAI_SEARCH_FLIGHTS,
-        FLYAI_SEARCH_TRAINS,
-    ),
-    "deep_research": ("web_search", "url_read"),
-    "knowledge_grounded": (),
-    "tools_unavailable": (),
-    "clarification_only": (),
-}
-_AUTO_PLAN_PACKAGES = frozenset(
-    {"verified_web", "mobility_route", "travel_air_rail", "mobility_intercity", "mixed_itinerary"}
-)
-_REASON_CODES = frozenset(
-    {
-        "direct_greeting",
-        "assistant_identity_question",
-        "stable_knowledge_question",
-        "simple_calculation",
-        "text_transform_request",
-        "current_date_question",
-        "fresh_external_fact",
-        "verified_source_request",
-        "explicit_url_read",
-        "explicit_weather_request",
-        "explicit_place_discovery",
-        "explicit_route_task",
-        "explicit_flight_request",
-        "explicit_train_request",
-        "air_rail_comparison",
-        "mixed_itinerary_request",
-        "origin_destination_relation",
-        "intercity_locations",
-        "adjacent_route_followup",
-        "deep_research_mode",
-        "knowledge_grounded_mode",
-        "tools_disabled",
-        "function_calling_unavailable",
-        "search_capability_unavailable",
-        "required_tools_unavailable",
-        "explicit_authorized_tool_alias",
-        "insufficient_capability_signal",
-    }
-)
+_PACKAGE_TOOLS = CAPABILITY_PACKAGE_EXTERNAL_TOOL_NAMES
+_AUTO_PLAN_PACKAGES = CAPABILITY_AUTO_PLAN_PACKAGES
+_REASON_CODES = CAPABILITY_REASON_CODES
 
 
 @dataclass(frozen=True)
@@ -192,18 +125,20 @@ def resolve_run_capability_route(
             blocked_candidate.package_id,
             (),
         )
-        return _resolution(
-            candidate=_CandidateRoute(
-                package_id="knowledge_grounded",
-                confidence="high",
-                reason_codes=("knowledge_grounded_mode",),
-                include_current_date=blocked_candidate.include_current_date,
-            ),
-            available_tool_names=available_tool_names,
-            requested_plan_mode="off",
-            function_calling=function_calling,
-            tools_disabled=True,
-            network_boundary_required=bool(blocked_tool_names),
+        return _validated_resolution(
+            _resolution(
+                candidate=_CandidateRoute(
+                    package_id="knowledge_grounded",
+                    confidence="high",
+                    reason_codes=("knowledge_grounded_mode",),
+                    include_current_date=blocked_candidate.include_current_date,
+                ),
+                available_tool_names=available_tool_names,
+                requested_plan_mode="off",
+                function_calling=function_calling,
+                tools_disabled=True,
+                network_boundary_required=bool(blocked_tool_names),
+            )
         )
 
     if task_policy.task_mode == "deep_research":
@@ -235,19 +170,21 @@ def resolve_run_capability_route(
         degraded_reason = "search_capability_unavailable"
 
     if degraded_reason is not None:
-        return _resolution(
-            candidate=_CandidateRoute(
-                package_id="tools_unavailable",
-                confidence=candidate.confidence,
-                reason_codes=(degraded_reason,),
-                include_current_date=candidate.include_current_date,
-                resolution_mode="degraded",
-            ),
-            available_tool_names=available_tool_names,
-            requested_plan_mode="off",
-            function_calling=function_calling,
-            tools_disabled=True,
-            network_boundary_required=True,
+        return _validated_resolution(
+            _resolution(
+                candidate=_CandidateRoute(
+                    package_id="tools_unavailable",
+                    confidence=candidate.confidence,
+                    reason_codes=(degraded_reason,),
+                    include_current_date=candidate.include_current_date,
+                    resolution_mode="degraded",
+                ),
+                available_tool_names=available_tool_names,
+                requested_plan_mode="off",
+                function_calling=function_calling,
+                tools_disabled=True,
+                network_boundary_required=True,
+            )
         )
 
     resolution = _resolution(
@@ -260,36 +197,40 @@ def resolve_run_capability_route(
     if candidate.package_id == "deep_research" and not frozenset(requested_tools).issubset(
         resolution.external_tool_names
     ):
-        return _resolution(
-            candidate=_CandidateRoute(
-                package_id="tools_unavailable",
-                confidence=candidate.confidence,
-                reason_codes=("required_tools_unavailable",),
-                include_current_date=candidate.include_current_date,
-                resolution_mode="degraded",
-            ),
-            available_tool_names=available_tool_names,
-            requested_plan_mode="off",
-            function_calling=function_calling,
-            tools_disabled=True,
-            network_boundary_required=True,
+        return _validated_resolution(
+            _resolution(
+                candidate=_CandidateRoute(
+                    package_id="tools_unavailable",
+                    confidence=candidate.confidence,
+                    reason_codes=("required_tools_unavailable",),
+                    include_current_date=candidate.include_current_date,
+                    resolution_mode="degraded",
+                ),
+                available_tool_names=available_tool_names,
+                requested_plan_mode="off",
+                function_calling=function_calling,
+                tools_disabled=True,
+                network_boundary_required=True,
+            )
         )
     if needs_external_capability and not resolution.external_tool_names:
-        return _resolution(
-            candidate=_CandidateRoute(
-                package_id="tools_unavailable",
-                confidence=candidate.confidence,
-                reason_codes=("required_tools_unavailable",),
-                include_current_date=candidate.include_current_date,
-                resolution_mode="degraded",
-            ),
-            available_tool_names=available_tool_names,
-            requested_plan_mode="off",
-            function_calling=function_calling,
-            tools_disabled=True,
-            network_boundary_required=True,
+        return _validated_resolution(
+            _resolution(
+                candidate=_CandidateRoute(
+                    package_id="tools_unavailable",
+                    confidence=candidate.confidence,
+                    reason_codes=("required_tools_unavailable",),
+                    include_current_date=candidate.include_current_date,
+                    resolution_mode="degraded",
+                ),
+                available_tool_names=available_tool_names,
+                requested_plan_mode="off",
+                function_calling=function_calling,
+                tools_disabled=True,
+                network_boundary_required=True,
+            )
         )
-    return resolution
+    return _validated_resolution(resolution)
 
 
 def serialize_capability_resolution(resolution: RunCapabilityResolution) -> dict:
@@ -386,11 +327,7 @@ def _classify_standard_request(
             ("explicit_route_task",),
             include_current_date,
         )
-    if (
-        signals.endpoint_relation
-        and signals.intercity_mobility
-        and _has_two_intercity_locations(message)
-    ):
+    if signals.endpoint_relation and signals.intercity_mobility and _has_two_intercity_locations(message):
         return _CandidateRoute(
             "mobility_intercity",
             "medium",
@@ -481,6 +418,20 @@ def _resolution(
     )
 
 
+def _validated_resolution(resolution: RunCapabilityResolution) -> RunCapabilityResolution:
+    validate_capability_resolution_semantics(
+        package_id=resolution.package_id,
+        confidence=resolution.confidence,
+        resolution_mode=resolution.resolution_mode,
+        reason_codes=resolution.reason_codes,
+        external_tool_names=resolution.external_tool_names,
+        effective_plan_mode=resolution.effective_plan_mode,
+        include_current_date=resolution.include_current_date,
+        network_boundary_required=resolution.network_boundary_required,
+    )
+    return resolution
+
+
 def _effective_plan_mode(
     *,
     package_id: str,
@@ -508,17 +459,9 @@ def _resolve_explicit_authorized_alias(
 ) -> str | None:
     product_names = frozenset(_CANONICAL_EXTERNAL_TOOL_ORDER) | _CONTROL_TOOL_NAMES
     aliases = sorted(
-        {
-            name
-            for name in available_tool_names
-            if isinstance(name, str) and name and name not in product_names
-        }
+        {name for name in available_tool_names if is_authorized_mcp_tool_alias(name) and name not in product_names}
     )
-    matched = [
-        alias
-        for alias in aliases
-        if re.search(rf"(?<![\w]){re.escape(alias.lower())}(?![\w])", message)
-    ]
+    matched = [alias for alias in aliases if re.search(rf"(?<![\w]){re.escape(alias.lower())}(?![\w])", message)]
     return matched[0] if len(matched) == 1 else None
 
 

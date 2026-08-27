@@ -12,7 +12,7 @@ from app.services.stream.run_capability_router import (
 )
 
 ALL_TOOLS = [
-    "unrelated_mcp_tool",
+    "mcp_unrelated_tool",
     "search_trains",
     "web_search",
     "route_compare",
@@ -659,20 +659,30 @@ def test_verified_request_has_priority_over_product_keywords(message):
 
 def test_exact_authorized_mcp_alias_can_select_only_that_tool():
     route = _resolve(
-        "请调用 unrelated_mcp_tool 处理这份数据",
-        available_tool_names=["unrelated_mcp_tool", "web_search", "url_read"],
+        "请调用 mcp_unrelated_tool 处理这份数据",
+        available_tool_names=["mcp_unrelated_tool", "web_search", "url_read"],
     )
 
     assert route.package_id == "mcp_explicit"
-    assert route.external_tool_names == ("unrelated_mcp_tool",)
+    assert route.external_tool_names == ("mcp_unrelated_tool",)
     assert route.effective_plan_mode == "off"
     assert route.reason_codes == ("explicit_authorized_tool_alias",)
+
+
+def test_non_mcp_tool_name_cannot_be_treated_as_an_authorized_mcp_alias():
+    route = _resolve(
+        "请调用 unrelated_tool 处理这份数据",
+        available_tool_names=["unrelated_tool", "web_search", "url_read"],
+    )
+
+    assert route.package_id == "clarification_only"
+    assert route.external_tool_names == ()
 
 
 def test_unmentioned_authorized_mcp_alias_is_not_exposed():
     route = _resolve(
         "帮我处理这份数据",
-        available_tool_names=["unrelated_mcp_tool", "web_search", "url_read"],
+        available_tool_names=["mcp_unrelated_tool", "web_search", "url_read"],
     )
 
     assert route.package_id == "clarification_only"
