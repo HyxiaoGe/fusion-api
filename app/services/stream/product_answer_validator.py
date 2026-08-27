@@ -205,6 +205,16 @@ _WEATHER_UNSUPPORTED_IMPACT_RE = re.compile(
     r"(?:天气|雨天|有雨|下雨|会下雨|有雪|下雪|会下雪).{0,20}(?:建议|推荐|优先).{0,12}"
     r"(?:驾车|开车|自驾|公交|地铁|公共交通|步行|骑行)"
 )
+_WEATHER_ACTIVITY_PATTERN = r"(?:户外(?:活动|运动)?|骑行|骑车|自行车|跑步|慢跑|徒步|登山|爬山|露营|运动|出游|游玩)"
+_WEATHER_ACTIVITY_INFERENCE_RE = re.compile(
+    rf"{_WEATHER_ACTIVITY_PATTERN}.{{0,16}}"
+    r"(?:适合|不适合|推荐|不推荐|建议|不建议|大概率|容易|可能).{0,8}"
+    r"(?:淋雨|中暑|受凉|危险|安全|舒适|体验)?|"
+    r"(?:适合|不适合|推荐|不推荐|建议|不建议|宜|不宜)"
+    rf".{{0,16}}{_WEATHER_ACTIVITY_PATTERN}|"
+    r"(?:建议|推荐|优先|考虑|改期|取消|转为)"
+    rf".{{0,20}}(?:{_WEATHER_ACTIVITY_PATTERN}|室内|改期|取消)"
+)
 _WEATHER_DATE_TOKEN_PATTERN = r"(?:\d{4}-\d{2}-\d{2}|\d{1,2}月\d{1,2}日)"
 _WEATHER_DATE_RANGE_PATTERN = rf"{_WEATHER_DATE_TOKEN_PATTERN}(?:\s*(?:至|到|~|～|—)\s*{_WEATHER_DATE_TOKEN_PATTERN})?"
 _WEATHER_COVERAGE_RETRY_SUFFIX_PATTERN = (
@@ -470,6 +480,7 @@ def repair_unsupported_product_answer(
     kept_units: list[str] = []
     safe_text_length = 0
     caveat_codes: set[str] = set()
+    activity_inference_removed = False
     user_text = _latest_user_text(messages)
     if _needs_place_relation_caveat(user_text, facts) and not _PLACE_RELATION_CAVEAT_RE.search(answer):
         caveat_codes.add("relation")
@@ -486,6 +497,17 @@ def repair_unsupported_product_answer(
             continue
         weather_reason = _weather_claim_reason(unit, facts)
         if weather_reason is not None:
+            if weather_reason == "unsupported_claim" and _has_weather_activity_inference(unit):
+                activity_inference_removed = True
+                salvaged = _salvage_safe_subclauses(
+                    unit,
+                    content_blocks,
+                    facts,
+                    messages=messages,
+                )
+                kept_units.extend(salvaged)
+                safe_text_length += sum(len(re.sub(r"\s+", "", item)) for item in salvaged)
+                continue
             return None, weather_reason
         if validation.reason_code == "unsupported_claim":
             if format_rewritten:
@@ -534,7 +556,9 @@ def repair_unsupported_product_answer(
         if format_rewritten and validation.reason_code.startswith("unknown_travel_"):
             continue
         return None, validation.reason_code
-    if safe_text_length < 8 or (not caveat_codes and not label_rewritten and not format_rewritten):
+    if safe_text_length < 8 or (
+        not caveat_codes and not label_rewritten and not format_rewritten and not activity_inference_removed
+    ):
         return None, "not_repairable"
     repaired = "\n".join(_normalize_repaired_unit(unit) for unit in kept_units)
     repaired = _drop_empty_markdown_sections(repaired)
@@ -1006,6 +1030,8 @@ def _weather_claim_reason(answer: str, facts: _FactIndex) -> str | None:
                 return "unsupported_claim"
         if _WEATHER_UNSUPPORTED_IMPACT_RE.search(sentence):
             return "unsupported_claim"
+        if _has_weather_activity_inference(sentence):
+            return "unsupported_claim"
         coverage_validation = _validate_weather_coverage_sentence(sentence, facts.weather_days)
         if coverage_validation is False:
             return "weather_fact_mismatch"
@@ -1114,6 +1140,13 @@ def _weather_claim_reason(answer: str, facts: _FactIndex) -> str | None:
             if not supported:
                 return "unsupported_claim"
     return None
+
+
+def _has_weather_activity_inference(text: str) -> bool:
+    return any(
+        _WEATHER_ACTIVITY_INFERENCE_RE.search(clause) and not _LIMITATION_CUE_RE.search(clause)
+        for clause in _CLAUSE_SPLIT_RE.split(text)
+    )
 
 
 def _validate_weather_coverage_sentence(
