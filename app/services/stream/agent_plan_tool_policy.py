@@ -19,22 +19,88 @@ from app.services.search_budget import infer_search_intent
 _COMMUTE_RE = re.compile(r"通勤")
 _ROUTE_ACTION_RE = re.compile(r"路线|怎么走|如何去|如何到|导航|到达")
 _ROUTE_MODE_RE = re.compile(r"驾车|开车|自驾|公交|公共交通|地铁|轨道交通|骑行|步行|摩托")
-_STRUCTURED_ROUTE_ENDPOINT_RE = re.compile(
-    r"(?:从.{1,80}?(?:到|去|前往).{1,80})|"
-    r"(?:(?:我)?(?:现在)?在.{1,80}?(?:想|要|准备)?(?:到|去|前往).{1,80})|"
-    r"(?:(?:住在|起点|出发地).{1,80}?(?:公司在|学校在|终点|目的地|到|去|前往).{1,80})"
+INTERCITY_LOCATION_NAMES = (
+    "北京",
+    "上海",
+    "天津",
+    "重庆",
+    "广州",
+    "深圳",
+    "杭州",
+    "南京",
+    "苏州",
+    "成都",
+    "武汉",
+    "西安",
+    "长沙",
+    "郑州",
+    "青岛",
+    "厦门",
+    "福州",
+    "昆明",
+    "沈阳",
+    "大连",
+    "济南",
+    "合肥",
+    "宁波",
+    "无锡",
+    "香港",
+    "澳门",
 )
-_BARE_ROUTE_ENDPOINT_RE = re.compile(r"^(?:[^，,。；;]{1,40})到(?:[^，,。；;]{1,40})")
+_STRUCTURED_ROUTE_ENDPOINT_RES = (
+    re.compile(
+        r"从(?P<origin>[^，,。；;？?]{1,40}?)(?:到|去|前往)"
+        r"(?P<destination>[^，,。；;？?]{1,60})"
+    ),
+    re.compile(
+        r"(?:我)?(?:现在)?在(?P<origin>[^，,。；;？?]{1,40})[，,\s]*"
+        r"(?:我)?(?:想|要|准备)(?:到|去|前往)(?P<destination>[^，,。；;？?]{1,60})"
+    ),
+    re.compile(
+        r"住在(?P<origin>[^，,。；;？?]{1,40})[，,\s]*(?:公司|学校)在"
+        r"(?P<destination>[^，,。；;？?]{1,60})"
+    ),
+    re.compile(
+        r"(?:起点|出发地)(?:是|在)?(?P<origin>[^，,。；;？?]{1,40})[，,\s]*"
+        r"(?:终点|目的地)(?:是|在)?(?P<destination>[^，,。；;？?]{1,60})"
+    ),
+)
+_BARE_ROUTE_ENDPOINT_RE = re.compile(
+    r"^(?P<origin>[^，,。；;？?]{1,40}?)到(?P<destination>[^，,。；;？?]{1,60})"
+)
 _ROUTE_FOLLOWUP_RE = re.compile(r"哪个|哪种|推荐|更合适|怎么选|如何选|选择|优先|日常通勤")
 _BARE_INTERCITY_MOBILITY_RE = re.compile(
     r"想去|要去|准备去|前往|出发|哪种方式|什么方式|哪种交通|交通方式|"
     r"怎么去|如何去|怎么到|如何到|怎么走|出行|行程|通勤"
 )
-_NON_TRAVEL_ENDPOINT_RE = re.compile(
-    r"大学.{0,24}(?:申请|选择|哪个)|"
-    r"公司.{0,24}(?:发展|哪家|业务)|"
-    r"文章|写作|技术路线|发展路线|业务路线"
+_ENDPOINT_SUFFIX_RE = re.compile(
+    r"(?:哪个|哪条|哪种)(?:路线|方式)|怎么|如何|乘坐|坐|驾车|开车|公交|地铁|"
+    r"路线|导航|更快|更短|更合适|申请|比较|的职责|的协作|的发展|两家"
 )
+_CONFIRMED_PLACE_NAMES = frozenset({"外滩", "天安门"})
+_CONFIRMED_PLACE_SUFFIXES = (
+    "站",
+    "机场",
+    "码头",
+    "港口",
+    "小区",
+    "新村",
+    "村",
+    "广场",
+    "公园",
+    "景区",
+    "酒店",
+    "宾馆",
+    "大厦",
+    "商场",
+    "中心",
+    "塔",
+    "路",
+    "街",
+    "桥",
+    "馆",
+)
+_INSTITUTION_SUFFIXES = ("大学", "学院", "学校", "医院", "公司", "园区")
 _WEATHER_RE = re.compile(r"天气|气温|温度|降雨|下雨|下雪|风力")
 _FLIGHT_RE = re.compile(r"航班|飞机|机场|机票")
 _TRAIN_RE = re.compile(r"高铁|动车|火车|列车|车次")
@@ -84,6 +150,13 @@ class ProductCapabilitySignals:
     place: bool
 
 
+@dataclass(frozen=True)
+class _EndpointRelation:
+    origin: str
+    destination: str
+    structured: bool
+
+
 def resolve_product_capability_signals(
     *,
     original_message: str | None,
@@ -95,20 +168,36 @@ def resolve_product_capability_signals(
     adjacent_route_followup = _has_adjacent_route_result_context(
         task_context_messages
     ) and _is_route_followup(message)
-    structured_endpoint = bool(_STRUCTURED_ROUTE_ENDPOINT_RE.search(message))
-    bare_endpoint = bool(_BARE_ROUTE_ENDPOINT_RE.search(message))
-    endpoint_relation = structured_endpoint or bare_endpoint
-    non_travel_context = bool(_NON_TRAVEL_ENDPOINT_RE.search(message))
+    endpoint = _parse_endpoint_relation(message)
+    endpoint_relation = endpoint is not None
+    has_route_action = bool(
+        _COMMUTE_RE.search(message) or _ROUTE_ACTION_RE.search(message) or _ROUTE_MODE_RE.search(message)
+    )
+    endpoints_are_places = bool(
+        endpoint
+        and _is_confirmed_place_slot(endpoint.origin)
+        and _is_confirmed_place_slot(endpoint.destination)
+    )
+    endpoints_are_route_targets = bool(
+        endpoint
+        and _is_route_target_slot(endpoint.origin)
+        and _is_route_target_slot(endpoint.destination)
+    )
     return ProductCapabilitySignals(
-        explicit_route=_is_explicit_route_task(message),
+        explicit_route=bool(endpoint and endpoint.structured and has_route_action and endpoints_are_route_targets),
         adjacent_route_followup=adjacent_route_followup,
         endpoint_relation=endpoint_relation,
         intercity_mobility=(
-            endpoint_relation
-            and not non_travel_context
+            bool(endpoint)
             and (
-                structured_endpoint
-                or (bare_endpoint and bool(_BARE_INTERCITY_MOBILITY_RE.search(message)))
+                (has_route_action and endpoints_are_route_targets)
+                or (
+                    endpoints_are_places
+                    and (
+                        endpoint.structured
+                        or bool(_BARE_INTERCITY_MOBILITY_RE.search(message))
+                    )
+                )
             )
         ),
         weather=bool(_WEATHER_RE.search(message)),
@@ -237,12 +326,43 @@ def _content_has_block_type(content: object, block_type: str) -> bool:
     )
 
 
-def _is_explicit_route_task(message: str) -> bool:
-    has_route_goal = bool(_COMMUTE_RE.search(message) or _ROUTE_ACTION_RE.search(message))
-    has_route_mode = bool(_ROUTE_MODE_RE.search(message))
-    has_structured_endpoint = bool(_STRUCTURED_ROUTE_ENDPOINT_RE.search(message))
-    is_non_travel_context = bool(_NON_TRAVEL_ENDPOINT_RE.search(message))
-    return has_structured_endpoint and not is_non_travel_context and (has_route_goal or has_route_mode)
+def _parse_endpoint_relation(message: str) -> _EndpointRelation | None:
+    for pattern in _STRUCTURED_ROUTE_ENDPOINT_RES:
+        match = pattern.search(message)
+        if match is not None:
+            return _EndpointRelation(
+                origin=_normalize_endpoint_slot(match.group("origin")),
+                destination=_normalize_endpoint_slot(match.group("destination")),
+                structured=True,
+            )
+    bare_match = _BARE_ROUTE_ENDPOINT_RE.search(message)
+    if bare_match is None:
+        return None
+    return _EndpointRelation(
+        origin=_normalize_endpoint_slot(bare_match.group("origin")),
+        destination=_normalize_endpoint_slot(bare_match.group("destination")),
+        structured=False,
+    )
+
+
+def _normalize_endpoint_slot(value: str) -> str:
+    normalized = value.strip(" ，,。；;？！?的")
+    suffix = _ENDPOINT_SUFFIX_RE.search(normalized)
+    if suffix is not None:
+        normalized = normalized[: suffix.start()]
+    return normalized.strip(" ，,。；;？！?的")
+
+
+def _is_confirmed_place_slot(value: str) -> bool:
+    return (
+        value in INTERCITY_LOCATION_NAMES
+        or value in _CONFIRMED_PLACE_NAMES
+        or value.endswith(_CONFIRMED_PLACE_SUFFIXES)
+    )
+
+
+def _is_route_target_slot(value: str) -> bool:
+    return _is_confirmed_place_slot(value) or value.endswith(_INSTITUTION_SUFFIXES)
 
 
 def _is_route_followup(message: str) -> bool:

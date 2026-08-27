@@ -17,6 +17,7 @@ from app.services.mcp.flyai_travel_tools import (
     FLYAI_SEARCH_TRAINS,
 )
 from app.services.stream.agent_plan_tool_policy import (
+    INTERCITY_LOCATION_NAMES,
     resolve_product_capability_signals,
 )
 from app.services.stream.agent_task_policy import AgentTaskPolicy
@@ -67,35 +68,6 @@ _IDENTITY_RE = re.compile(r"你是谁|你叫什么|介绍一下你自己|你能�
 _STABLE_KNOWLEDGE_RE = re.compile(r"^(?:为什么|为何|什么是|解释一下|介绍一下|讲讲|how\b|what\b)", re.IGNORECASE)
 _SIMPLE_CALC_RE = re.compile(r"^(?:请)?(?:计算|算一下|算算)?\s*[\d\s()+\-*/.%]+(?:等于多少|是多少)?[？?]?$", re.IGNORECASE)
 _ROUTE_TRANSFER_RE = re.compile(r"接驳|市内|机场到|车站到|落地后")
-_INTERCITY_LOCATIONS = (
-    "北京",
-    "上海",
-    "天津",
-    "重庆",
-    "广州",
-    "深圳",
-    "杭州",
-    "南京",
-    "苏州",
-    "成都",
-    "武汉",
-    "西安",
-    "长沙",
-    "郑州",
-    "青岛",
-    "厦门",
-    "福州",
-    "昆明",
-    "沈阳",
-    "大连",
-    "济南",
-    "合肥",
-    "宁波",
-    "无锡",
-    "香港",
-    "澳门",
-)
-
 _PACKAGE_TOOLS: dict[str, tuple[str, ...]] = {
     "direct": (),
     "transform": (),
@@ -561,4 +533,4 @@ def _needs_current_date(message: str) -> bool:
 
 
 def _has_two_intercity_locations(message: str) -> bool:
-    return len({location for location in _INTERCITY_LOCATIONS if location in message}) >= 2
+    return len({location for location in INTERCITY_LOCATION_NAMES if location in message}) >= 2

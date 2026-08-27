@@ -464,6 +464,28 @@ def test_business_development_route_does_not_expose_mobility_tools():
     assert route.external_tool_names == ()
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "从北京团队到上海团队的职责如何划分？",
+        "从北京部门到上海部门的协作关系是什么？",
+    ],
+)
+def test_organization_slots_are_not_treated_as_places_without_route_action(message):
+    route = _resolve(message)
+
+    assert route.package_id == "clarification_only"
+    assert route.external_tool_names == ()
+
+
+def test_institution_slots_are_valid_when_route_action_is_explicit():
+    route = _resolve("从北京大学到上海交通大学哪个路线更快？")
+
+    assert route.package_id == "mobility_route"
+    assert route.external_tool_names == ("route_compare",)
+    assert route.reason_codes == ("explicit_route_task",)
+
+
 def test_greeting_prefix_does_not_turn_an_ambiguous_request_into_direct():
     route = _resolve("你好，帮我查一下这个")
 

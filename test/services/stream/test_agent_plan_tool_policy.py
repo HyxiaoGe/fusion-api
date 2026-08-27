@@ -61,6 +61,31 @@ class AgentPlanToolPolicyTests(unittest.TestCase):
         self.assertFalse(signals.explicit_route)
         self.assertFalse(signals.intercity_mobility)
 
+    def test_organization_endpoint_slots_are_not_places_without_route_action(self):
+        for message in (
+            "从北京团队到上海团队的职责如何划分？",
+            "从北京部门到上海部门的协作关系是什么？",
+        ):
+            with self.subTest(message=message):
+                signals = resolve_product_capability_signals(
+                    original_message=message,
+                    task_context_messages=None,
+                )
+
+                self.assertTrue(signals.endpoint_relation)
+                self.assertFalse(signals.explicit_route)
+                self.assertFalse(signals.intercity_mobility)
+
+    def test_institution_endpoint_slots_are_valid_with_explicit_route_action(self):
+        signals = resolve_product_capability_signals(
+            original_message="从北京大学到上海交通大学哪个路线更快？",
+            task_context_messages=None,
+        )
+
+        self.assertTrue(signals.endpoint_relation)
+        self.assertTrue(signals.explicit_route)
+        self.assertTrue(signals.intercity_mobility)
+
     def test_verified_research_requires_search_and_two_independent_reads(self):
         messages = [
             "帮我调研一下韩国股市近几年的起伏，重点说说主要原因和争议。",
