@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.schemas.chat import SearchBlock
+from app.schemas.chat import PlaceResult, PlaceResultsBlock, SearchBlock
 from app.services.stream import StreamHandler
 from app.services.stream.tool_execution_result import ToolExecutionRecord
 from app.services.tool_handlers.base import ToolResult
@@ -432,6 +432,97 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event["tool_name"] for event in tool_events], [alias, alias])
         self.assertEqual(result.session_status_calls[-1]["total_tool_calls"], 1)
         self.assertIn("不可信外部数据", str(result.llm_calls[1]["messages"]))
+
+    async def test_product_result_constraint_changes_only_the_post_tool_round_fingerprint(self):
+        alias = "local_place_search"
+        definition = {
+            "type": "function",
+            "function": {
+                "name": alias,
+                "description": "地点搜索",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            },
+        }
+
+        class FakeProductHandler:
+            tool_name = alias
+            supports_automatic_retry = False
+
+            async def execute(self, args):
+                return ToolResult(status="success", data={"query": args["query"]})
+
+            async def log(self, **_kwargs):
+                return None
+
+            def _build_result_summary(self, result):
+                return {"kind": "external_tool", "title": "地点搜索", "result_count": 1}
+
+            def format_llm_context(self, result, *, citation_numbers=None):
+                return "只可使用结构化地点结果。"
+
+            def build_content_block(self, result, block_id, log_id):
+                return PlaceResultsBlock(
+                    type="place_results",
+                    id=block_id,
+                    schema_version=1,
+                    provider="amap",
+                    query=result.data["query"],
+                    status="success",
+                    result_count=1,
+                    places=[PlaceResult(name="测试咖啡馆", address="测试路 1 号")],
+                    tool_call_log_id=log_id,
+                )
+
+        result = await self._run_agent_contract(
+            rounds=[
+                (
+                    "",
+                    "",
+                    [{"id": "tc-place", "name": alias, "arguments": '{"query":"咖啡"}'}],
+                    "tool_calls",
+                    None,
+                ),
+                ("", "本次查询返回测试咖啡馆。", [], "stop", None),
+            ],
+            use_real_tool_executor=True,
+            dynamic_tool_set=SimpleNamespace(
+                definitions=[definition],
+                handlers={alias: FakeProductHandler()},
+                audit_bindings=[],
+            ),
+            capabilities={"functionCalling": True, "agentTools": True, "searchCapable": False},
+        )
+
+        self.assertEqual(len(result.llm_calls), 2)
+        first_system_text = "\n".join(
+            message["content"] for message in result.llm_calls[0]["messages"] if message["role"] == "system"
+        )
+        second_system_text = "\n".join(
+            message["content"] for message in result.llm_calls[1]["messages"] if message["role"] == "system"
+        )
+        self.assertNotIn("【本轮产品结果综合约束】", first_system_text)
+        self.assertIn("【本轮产品结果综合约束】", second_system_text)
+
+        round_events = [event for event in result.events if event["type"] == "llm_round_started"]
+        self.assertEqual(len(round_events), 2)
+        self.assertEqual(
+            round_events[0]["system_prompt_fingerprint"],
+            fingerprint_system_messages(result.llm_calls[0]["messages"]),
+        )
+        self.assertEqual(
+            round_events[1]["system_prompt_fingerprint"],
+            fingerprint_system_messages(result.llm_calls[1]["messages"]),
+        )
+        self.assertNotEqual(
+            round_events[0]["system_prompt_fingerprint"],
+            round_events[1]["system_prompt_fingerprint"],
+        )
+        prompt_event = next(event for event in result.events if event["type"] == "system_prompt_prepared")
+        self.assertNotIn("product_result_round_constraint", prompt_event["section_ids"])
 
     async def test_argument_repair_uses_next_agent_round_without_backend_guessing(self):
         alias = "mcp_region_lookup"

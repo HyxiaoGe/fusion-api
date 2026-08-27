@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from inspect import Parameter, signature
 
+from app.ai.prompts.product_results import build_product_result_round_prompt
 from app.services.stream.agent_loop_outcome import AgentLoopExit, AgentLoopOutcome
 from app.services.stream.agent_loop_policy import check_agent_loop_limit
 from app.services.stream.agent_loop_round_outcome import AgentRoundOutcomeRequest, handle_agent_round_outcome
@@ -312,6 +313,10 @@ async def _run_round(
         plan_repair_tool=plan_repair_tool,
         active_plan_item_ids=active_plan_item_ids,
     )
+    effective_messages = _messages_with_product_result_constraint(
+        effective_messages,
+        content_blocks=state.content_blocks,
+    )
     run_round_kwargs = dict(
         conversation_id=runtime.conversation_id,
         task_id=runtime.task_id,
@@ -618,5 +623,25 @@ def _messages_with_research_workset(
         *([{"role": "system", "content": stage_prompt}] if stage_prompt else []),
         *([{"role": "system", "content": prompt}] if prompt else []),
         *untrusted_messages,
+        *messages[insert_at:],
+    ]
+
+
+def _messages_with_product_result_constraint(
+    messages: list[dict],
+    *,
+    content_blocks: list,
+) -> list[dict]:
+    """只为当前模型轮次添加静态约束，不修改 Run 的持久消息与初始提示词快照。"""
+
+    prompt = build_product_result_round_prompt(content_blocks)
+    if not prompt or any(message.get("role") == "system" and message.get("content") == prompt for message in messages):
+        return messages
+    insert_at = 0
+    while insert_at < len(messages) and messages[insert_at].get("role") == "system":
+        insert_at += 1
+    return [
+        *messages[:insert_at],
+        {"role": "system", "content": prompt},
         *messages[insert_at:],
     ]
