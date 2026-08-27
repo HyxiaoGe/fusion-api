@@ -180,12 +180,17 @@ jobs:
               foreach ($desktopPath in $desktopPaths) {
                 if ($desktopPath -and (Test-Path $desktopPath)) {
                   Write-Host "Starting Docker Desktop: $desktopPath"
+                  $runnerTrackingId = $env:RUNNER_TRACKING_ID
                   try {
+                    # Keep Docker Desktop alive after the self-hosted runner cleans up this job.
+                    $env:RUNNER_TRACKING_ID = ""
                     Start-Process -FilePath $desktopPath -WindowStyle Minimized
                     $dockerDesktopStarted = $true
                     break
                   } catch {
                     Write-Host "Docker Desktop start failed: $($_.Exception.Message)"
+                  } finally {
+                    $env:RUNNER_TRACKING_ID = $runnerTrackingId
                   }
                 }
               }
