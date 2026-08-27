@@ -39,6 +39,44 @@ class FutureRegisteredResultBlock(BaseModel):
     schema_version: Literal[1]
 
 
+class ExplicitTrainCategoryTests(unittest.TestCase):
+    def test_explicit_high_speed_request_overrides_model_arguments(self):
+        tool_calls = [
+            {
+                "id": "tc-train-price",
+                "name": "search_trains",
+                "arguments": '{"origin":"北京","destination":"上海","train_category":"all"}',
+            },
+            {
+                "id": "tc-train-duration",
+                "name": "search_trains",
+                "arguments": {"origin": "北京", "destination": "上海"},
+            },
+        ]
+
+        resolved = tool_round_module._apply_explicit_train_category(
+            tool_calls,
+            messages=[{"role": "user", "content": "请查北京到上海的高铁，比较最便宜和最快"}],
+        )
+
+        self.assertEqual(
+            resolved[0]["arguments"],
+            '{"origin":"北京","destination":"上海","train_category":"high_speed"}',
+        )
+        self.assertEqual(resolved[1]["arguments"]["train_category"], "high_speed")
+        self.assertEqual(tool_calls[0]["arguments"], '{"origin":"北京","destination":"上海","train_category":"all"}')
+
+    def test_broad_train_request_does_not_force_high_speed_category(self):
+        tool_calls = [{"id": "tc-train", "name": "search_trains", "arguments": {"origin": "北京"}}]
+
+        resolved = tool_round_module._apply_explicit_train_category(
+            tool_calls,
+            messages=[{"role": "user", "content": "高铁和普通火车都查一下"}],
+        )
+
+        self.assertEqual(resolved, tool_calls)
+
+
 class ToolRoundTests(unittest.IsolatedAsyncioTestCase):
     async def test_deferred_plan_control_round_persists_visible_reasoning_but_returns_raw_to_model(self):
         update_call = {

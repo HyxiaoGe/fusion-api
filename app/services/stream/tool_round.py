@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -54,6 +55,13 @@ logger = logging.getLogger(__name__)
 
 # 本地预校验不消耗真实工具额度，但仍限制单轮事件、日志与上下文放大。
 MAX_LOCAL_PREFLIGHT_ATTEMPTS_PER_ROUND = 4
+
+_EXPLICIT_HIGH_SPEED_RE = re.compile(r"高铁|动车")
+_BROAD_TRAIN_RE = re.compile(
+    r"(?:普通|普速|普快|所有|全部|任意).{0,4}(?:火车|列车|车次)|"
+    r"(?:高铁|动车).{0,4}(?:和|及|以及|或).{0,4}(?:普通火车|火车|普快|普速)|"
+    r"(?:普通火车|火车|普快|普速).{0,4}(?:和|及|以及|或).{0,4}(?:高铁|动车)"
+)
 
 
 @dataclass(frozen=True)
@@ -518,6 +526,10 @@ async def handle_tool_calls_round(*, request: ToolRoundRequest) -> ToolRoundOutc
     )
     unavailable_tool_calls = [*unavailable_tool_calls, *unavailable_external_calls]
     selected_tool_calls = _select_tool_calls_within_limit(request, announced_tool_calls)
+    selected_tool_calls = (
+        _apply_explicit_train_category(selected_tool_calls[0], messages=request.messages),
+        selected_tool_calls[1],
+    )
     context_resolution = ToolContextResolution(executable_calls=selected_tool_calls[0])
     if request.agent_state is not None and selected_tool_calls[0]:
         context_resolution = await request.resolve_tool_context_fn(
@@ -1440,3 +1452,53 @@ def _tool_arguments(tool_calls: list[dict]) -> list[dict]:
             continue
         arguments.append({})
     return arguments
+
+
+def _apply_explicit_train_category(
+    tool_calls: list[dict],
+    *,
+    messages: list[dict],
+) -> list[dict]:
+    """把用户明确的高铁约束写入工具参数，避免价格排序混入普速列车。"""
+
+    user_text = next(
+        (
+            str(message.get("content") or "")
+            for message in reversed(messages)
+            if isinstance(message, dict) and message.get("role") == "user"
+        ),
+        "",
+    )
+    if not _EXPLICIT_HIGH_SPEED_RE.search(user_text) or _BROAD_TRAIN_RE.search(user_text):
+        return tool_calls
+
+    resolved: list[dict] = []
+    for tool_call in tool_calls:
+        if tool_call.get("name") != "search_trains":
+            resolved.append(tool_call)
+            continue
+        raw_arguments = tool_call.get("arguments")
+        if isinstance(raw_arguments, dict):
+            arguments = dict(raw_arguments)
+            serialized = False
+        elif isinstance(raw_arguments, str):
+            try:
+                parsed = json.loads(raw_arguments)
+            except (TypeError, ValueError):
+                resolved.append(tool_call)
+                continue
+            if not isinstance(parsed, dict):
+                resolved.append(tool_call)
+                continue
+            arguments = parsed
+            serialized = True
+        else:
+            resolved.append(tool_call)
+            continue
+        arguments["train_category"] = "high_speed"
+        next_call = dict(tool_call)
+        next_call["arguments"] = (
+            json.dumps(arguments, ensure_ascii=False, separators=(",", ":")) if serialized else arguments
+        )
+        resolved.append(next_call)
+    return resolved
