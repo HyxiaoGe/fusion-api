@@ -3241,7 +3241,7 @@ def test_serialization_only_contains_safe_protocol_fields():
 
     assert payload == {
         "schema_version": 1,
-        "router_version": "2026-08-27.2",
+        "router_version": "2026-08-28.1",
         "package_id": "mobility_intercity",
         "confidence": "medium",
         "resolution_mode": "routed",

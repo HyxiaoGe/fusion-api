@@ -26,7 +26,7 @@ Confidence = Literal["high", "medium", "low"]
 ResolutionMode = Literal["routed", "degraded", "clarification"]
 
 SCHEMA_VERSION = 1
-ROUTER_VERSION = "2026-08-27.2"
+ROUTER_VERSION = "2026-08-28.1"
 
 _CANONICAL_EXTERNAL_TOOL_ORDER = CAPABILITY_CANONICAL_EXTERNAL_TOOL_ORDER
 _CONTROL_TOOL_NAMES = CAPABILITY_CONTROL_TOOL_NAMES
