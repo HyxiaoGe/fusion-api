@@ -1,6 +1,6 @@
 # Fusion 执行台账
 
-> 本文件是 Fusion 项目的执行事实源，用来避免重复提出已经实施过的方向。回答“下一步”“还能怎么优化”“接下来做什么”之前，必须先读本文件，再核对两个子仓的 `git log` 和相关 `docs/superpowers/specs` 记录。
+> 本文件是 Fusion 项目的执行事实源，用来避免重复提出已经实施过的方向。回答“下一步”“还能怎么优化”“接下来做什么”之前，必须先读本文件，再核对两个子仓的 `git log` 和相关 `docs/implementation-plans`、`docs/superpowers/specs` 记录。
 
 ## 使用规则
 
@@ -37,6 +37,7 @@
 | 管理员压测审计详情 | 已完成 v1.1 | `fusion-api` commit `64d3452`、`fusion-ui` commit `2e3d857`；列表与详情安全契约分离、存量脏数据安全降级、L1-L4/资源/清理结果结构化详情、按需请求、响应式布局和管理页 no-store；生产登录态 Chrome 验收通过 |
 | 管理员审计安全与身份展示 | 已完成 v1.2 | `fusion-api` commit `d036d89`、`fusion-ui` commit `9d1075d`；审计内容严格白名单投影、签名 URL/令牌脱敏、历史 schema 安全降级、用户昵称/用户名/ID 三元组、详情竞态隔离、Agent/tool 独立分页、压测指标语义与管理页 CSP 收紧；对抗式复审及生产登录态 Chrome 验收通过 |
 | 管理员用户详情与对话联动 | 已完成 v1.3 | `fusion-ui` commit `d2d473b`；用户详情改为当前视口立即可见的弹窗，统一 loading/错误/重试并隔离迟到请求；可从详情直接进入该用户对话，用户筛选仅作用于本次关联导航；生产登录态 Chrome 验收通过 |
+| Run 级 Skills 运行时 | 已完成 MVP | `fusion-api` merge commits `64049e5`（PR #76 引入 Run 级 Skills 运行时）、`3ba19f9`（PR #77 修正 skills CRLF 与 release hash）、`22f8625`（PR #79 修正 fresh release intent 路由）；Skill registry (`app/ai/skills/registry.py`)、`verified-research/1.0.0` skill、Run capability 路由、Trajectory API 与 skills 详情端点、agent loop wiring 与 previous run skill release，含配套测试 |
 | 管理员时间展示与返回路由 | 已完成 v1.4 | `fusion-ui` commit `402644d`；对话列表展示创建/更新时间；Tab、用户详情、用户对话筛选、对话详情与压测详情以 URL 为事实源，支持手势返回、刷新恢复、深链接、旧压测记录跨页加载与 403 净 URL；生产登录态 Chrome 验收通过 |
 | 管理员模型运营中心 | 已完成 v1 | `fusion-api` commits `5624241`, `1a2b456`、`fusion-ui` commit `3097c6b`；LiteLLM 当前目录与历史模型并集、健康/能力、持久化使用、Agent/压测摘要、模型到对话 URL 联动、目录降级和严格安全口径；`docs/acceptance/2026-07-12-admin-model-operations-v1.md` |
 
@@ -116,6 +117,6 @@
 2. 运行并阅读：
    - `git -C /Users/sean/code/fusion/fusion-api log --oneline -40`
    - `git -C /Users/sean/code/fusion/fusion-ui log --oneline -40`
-3. 用 `rg` 搜索相关关键词，至少覆盖 `docs/superpowers/specs` 和 `docs/MODEL_ACCEPTANCE_RUNBOOK.md`。
+3. 用 `rg` 搜索相关关键词，至少覆盖 `docs/implementation-plans`、`docs/superpowers/specs` 和 `docs/MODEL_ACCEPTANCE_RUNBOOK.md`。
 4. 先列“已完成事实”，再列“不能重复建议”，最后才给新的建议。
 5. 如果没有高置信下一步，直接说“当前不建议继续开基础设施优化坑”，不要硬凑方向。
