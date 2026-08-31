@@ -162,7 +162,7 @@ def _load_skill(
     raw = resolved_path.read_bytes()
     if len(raw) > MAX_SKILL_FILE_BYTES:
         raise ValueError("Skill 文件超过大小上限")
-    document = raw.decode("utf-8")
+    document = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
     parsed = _parse_skill_document(document)
     _validate_skill_metadata(
         parsed,
