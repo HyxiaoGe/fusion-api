@@ -225,7 +225,7 @@ Task 0 第 7 步判定为「仍活跃且影响运行态」的 Vercel / Railway �
 
 ## 不做什么
 
-- 不改任何业务代码。目录搬迁之外，`app/` 与 `src/` 下不产生 diff。
+- 不改任何业务代码。目录搬迁之外，`apps/api/app/` 与 `apps/ui/src/` 下的**业务模块**不产生 diff。**唯一例外**：`apps/ui/src/scripts/buildAndDeployWorkflow.test.ts` 属路径清单 B 类（CI 契约测试，需限定 `filesUnder()` 扫描范围），虽位于 `src/` 之下但必须修改。API 侧 5 个同类测试位于 `test/`，与 `app/` 平级，不涉及此例外。
 - 不引入 npm/pnpm workspace、Nx、Turborepo。当前两应用零共享代码，工具链只增复杂度。
 - 不在本轮做 OpenAPI 契约同步。`scripts/export_openapi.py` 已存在但 UI 未消费，合并后具备条件，另开 plan。
 - 不合并 `docker-compose.yml`。两边网络拓扑不同（api 侧有 `middleware`、`litellm_net`、`flyai` 三个网络），需单独评估。
