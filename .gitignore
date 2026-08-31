@@ -18,8 +18,7 @@ docs/*
 !docs/LITELLM_HEALTH.md
 !docs/TRAJECTORY_DESIGN.md
 !docs/superpowers/
-!docs/superpowers/plans/
-!docs/superpowers/plans/2026-08-22-trajectory-ledger-p0.md
+!docs/implementation-plans/
 
 .cursor
 

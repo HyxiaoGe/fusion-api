@@ -17,7 +17,8 @@ description: Use when the user asks Fusion “下一步”, “接下来做什�
    - `git -C /Users/sean/code/fusion/fusion-api log --oneline -40`
    - `git -C /Users/sean/code/fusion/fusion-ui log --oneline -40`
 4. 用 `rg` 搜索用户提到的关键词，范围至少包括：
-   - `docs/superpowers`
+   - `docs/implementation-plans`
+   - `docs/superpowers/specs`
    - `docs/MODEL_ACCEPTANCE_RUNBOOK.md`
    - 相关源码目录
 5. 回答必须包含：
