@@ -4,7 +4,7 @@
 > Base: `fusion-api@43cee73` / `fusion-ui@77b7fc2`（2026-08-31 复核基线）
 > Branch: `feat/monorepo-merge`
 > Target: 新建仓库 `HyxiaoGe/fusion`
-> Review: PR #83 第一轮评审已受理，修订记录见文末
+> Review: PR #83 第一轮（9 条）与第二轮（6 条）评审均已受理，修订记录见文末
 
 **目标：** 把 `fusion-api` 与 `fusion-ui` 合并为单一仓库 `fusion`，保留两边完整 git 历史，并把当前分散在两处、共约 3600 行的发布流水线收敛为一份参数化的可复用 workflow + 一组可本地执行的部署脚本。
 
@@ -28,7 +28,10 @@
 
 - **搬迁、切换与流水线重写必须分三阶段，不得合并。** 流水线操作真实 docker 重启、alembic 迁移与用户上传文件目录，混做会使发布故障无法二分定位。
 - **旧仓库在最终验收通过前保持完整发布与回滚能力。** 不得在切换完成前注销旧仓 runner、撤销旧仓 secrets 或归档旧仓。
-- **宿主机持久化状态与代码 checkout 路径必须分开处理。** 二者当前在 `~/project/fusion` 下混放，不得以同一次路径替换处理。
+- **宿主机持久化状态必须迁出仓库 checkout 树，而不只是换一个子目录。** 目标路径不得位于任何仓库 checkout 根之下（含新仓的 `~/project/fusion`）。持久化状态与代码 checkout 当前在 `~/project/fusion` 下混放。
+- **跨仓互斥必须由宿主机侧的锁承担。** GitHub concurrency group 只在单个 repository 内协调，无法阻止旧 `fusion-api`、旧 `fusion-ui` 与新 `fusion` 三方同时操作同一台 dev server。所有部署入口在宿主机获取同一把 `flock` 后才可操作 docker/systemd。
+- **cutover 必须以「运行态归属新仓」收尾。** 任何回退演练之后都要重新切回新仓并复验，验收不得停在"旧仓重新发布成功"这一步。
+- **secrets 不可从旧仓复制。** GitHub API 只能列出名称与元数据，不能读回值；一律从原始凭据源重新注入，找不到原始值的必须轮换，禁止从 workflow 日志或运行环境反向导出。
 - `paths:` **不得用作 event-level 过滤**（见 P0-4）。变更检测由 workflow 内首个 `changes` job 承担，且始终提供一个恒定存在的 required gate job。
 - 跨应用顺序由顶层 orchestrator 的 DAG 保证，concurrency 只负责防并发，不承担顺序语义。
 - 抽取 shell 到 `ops/deploy/` 时**逐字搬运**，不得顺手"优化"。行为差异必须为零，抽取与改写分属不同 Task。
@@ -76,17 +79,31 @@
 - `actions/setup-node` 的 `cache-dependency-path`
 - 7 份跨仓 plan 中的 `../fusion-ui/` 相对路径与文档绝对路径
 
-## Task 0：新仓基建与恢复点（新增）
+## Task 0：新仓基建、恢复点与外部绑定清点
 
-前置于一切代码搬迁。目的是让 Task 1 的验收在新仓可执行，同时保证旧仓不失能。
+前置于一切代码搬迁。目的是让后续 Task 的验收在新仓可执行，同时保证旧仓不失能。**本 Task 不改动旧仓任何配置，也不执行真实发布。**
 
 1. 创建 `HyxiaoGe/fusion`，默认分支 `master`。
-2. 为两个原仓库各打一份 `git bundle` 恢复点，异地留存。
-3. 复制 `dev` Environment 及其 protection rule、branch policy、branch protection；secrets/variables 按 repo 层与 Environment 层分别对应建立。
-4. **新增 runner 实例**（不迁移旧仓 runner），并为全部 runner 增加应用维度标签 `fusion-api` / `fusion-ui`；workflow 的 `runs-on` 同步改为带应用标签的组合。旧仓四个 runner 原样保留至 Task 5。
-5. 产出宿主机状态清单：`~/project/fusion` 下的目录、bind mount 源、`.env`、systemd unit 的实际 `WorkingDirectory`，逐项记录当前值。
+2. **恢复点（含未提交资产）**：
+   - 产出两仓的 dirty / untracked 精确清单（`git status --porcelain --untracked-files=all`）；
+   - 未提交文件另做独立可恢复归档并记录哈希 —— `git bundle` 只包含 refs 与可达 object，**不含未跟踪文件**；
+   - bundle 以完整 refs 创建（`--all`）并执行 `git bundle verify`；
+   - bundle 与未提交资产各在临时目录还原一次并校验；
+   - 迁移分支只从精确 HEAD 创建，不在旧仓 master 上执行目录下沉提交。
+3. 复制 `dev` Environment 及其 custom branch policy、branch protection。
+4. **secrets 重新注入（非复制）**：
+   - 通过 API 导出旧仓 secret **名称清单**（repo 层与 Environment 层分别导出）；
+   - 从密码管理器、部署主机安全配置或原始凭据源向新仓注入；
+   - 原始值不可得的 secret 一律轮换；
+   - webhook secret 与 deploy key 私钥同此处理；
+   - 新仓侧只验证存在性、权限边界与目标服务连通性，**禁止输出 secret 值**；
+   - 逐项登记「来源、注入位置、验证结果、是否轮换」。
+5. **新增 runner 实例**（不迁移旧仓 runner），并为全部 runner 增加应用维度标签 `fusion-api` / `fusion-ui`；workflow 的 `runs-on` 同步改为带应用标签的组合。旧仓四个 runner（`dev-server-fusion-api`、`windows-build-api-01`、`dev-server-fusion-ui`、`windows-build-01`）原样保留至 Task 5。
+6. **宿主机状态清单**：`~/project/fusion` 下的目录、bind mount 源、`.env`、三个 systemd unit 的实际 `WorkingDirectory`，逐项记录当前值、文件数、总字节数、权限与 owner。
+7. **外部平台使用状态清单**：逐个 Vercel / Railway 服务记录 —— 是否活跃、跟踪哪个 repo 与 branch、负责 dev 还是 production、是否自动部署。**据此判定每个绑定归属 Task 2 还是 Task 4**：凡仍活跃且影响运行态的，必须并入 Task 2 的同一次受控 cutover；只有不影响当前运行态的纯重构项才留到 Task 4。
+8. 在宿主机部署跨仓 `flock` 锁文件与获取脚本，供三个仓库的部署入口共用。
 
-**验收：** 新仓可跑通一个 hello-world workflow，分别命中 `fusion-api` 与 `fusion-ui` 标签的 runner；旧仓两条流水线仍可正常发布与回滚（各执行一次）；bundle 可在临时目录成功还原。
+**验收：** 新仓可跑通 hello-world workflow 并分别命中 `fusion-api` / `fusion-ui` 标签的 runner；bundle 与未提交资产归档均通过还原验证；secrets 清单逐项登记完毕且新仓连通性验证通过；平台清单产出且每个绑定已判定 Task 归属。旧仓侧**只做只读核验**：runner 在线、workflow 配置未变、最近一次成功发布记录存在。**不在本 Task 执行真实发布或回滚**（真实旧仓回退演练集中到 Task 2 的 cutover runbook 执行一次）。
 
 ## Task 1：历史合并与目录下沉
 
@@ -106,18 +123,39 @@
 
 ## Task 2：受控 cutover
 
-本 Task 是唯一改变生产行为的一步，独立执行、独立回退。
+本 Task 是唯一改变生产行为的一步，独立执行、独立回退。**必须按 runbook 顺序执行，不得跳步。**
 
-1. **宿主机状态迁移**（路径清单 A 类）：
-   - 先备份 `~/project/fusion/fusion-api/storage/files`；
-   - 确立与仓库布局解耦的稳定数据目录（例如 `~/project/fusion/data/api/storage/files`），bind mount 指向稳定目录；
-   - 代码 checkout 目录与数据目录分离，必要时以软链接兼容过渡期；
-   - 把 `cost-sync` unit 的 `WorkingDirectory` 与 `AssertPathExists` 收敛到 `%h/.local/share/fusion/*-current` 范式（与另两个 unit 一致），`systemctl --user daemon-reload` 后逐个验证启动；
-   - `${HOME}/project/fusion/.env` 的位置与读取方保持一致。
-2. 启用新仓顶层 orchestrator：`detect changes → deploy API → deploy UI`，只改一侧时跳过另一侧。环境级 concurrency 仅防并发。
-3. 首次切换选择低峰时段，切换后旧仓 workflow 置为 disabled 但不删除。
+### 2.1 宿主机状态迁移（路径清单 A 类）
 
-**验收：** 新仓完成一次真实 API 发布 + 回滚；一次真实 UI 发布 + 回滚；一次同时修改两边的提交，确认执行顺序为 API → UI；确认上传文件在切换前后可正常读取（切换前上传一个文件，切换后下载校验）；三个 systemd unit 均 active（`cost-sync` 需确认已脱离仓库 checkout 路径）；**旧仓回退演练一次**（重新 enable 旧 workflow 并成功发布）。任一项失败即回退到旧仓。
+持久化状态一律迁出仓库 checkout 树：
+
+| 内容 | 目标路径 |
+|---|---|
+| 上传文件 | `~/.local/share/fusion/api/storage/files` |
+| 运行时配置 | `~/.config/fusion/runtime.env` |
+| systemd release/current | `~/.local/share/fusion/*-current`（沿用既有范式） |
+
+- 迁移前全量备份，并记录文件数、总字节数、权限与 owner，对文件清单生成校验摘要；
+- bind mount 与 `.env` 读取方指向新路径；
+- 把 `cost-sync` unit 的 `WorkingDirectory` 与 `AssertPathExists` 收敛到 `%h/.local/share/fusion/*-current` 范式（与另两个 unit 一致），`daemon-reload` 后逐个验证启动；
+- 旧路径仅保留**有明确退役时间**的过渡软链接，退役时间写入本文件。
+
+### 2.2 Cutover Runbook
+
+1. 冻结三个仓库（旧 `fusion-api`、旧 `fusion-ui`、新 `fusion`）的 master 合并与手动发布；
+2. 在宿主机获取跨仓 `flock` 部署锁；
+3. disable 旧仓两条 workflow，再 enable 新仓 orchestrator（`detect changes → deploy API → deploy UI`）；
+4. 由新仓发布、验证，并记录部署所有权归新仓；
+5. **回退演练**：先 disable 新仓，再 enable 旧仓，由旧仓发布并验证成功；
+6. **回切收尾（不可省略）**：再次 disable 旧仓、enable 新仓，重新部署新仓当前 SHA，并验证最终镜像 ID、发布台账与部署所有权**全部归新仓**。
+
+第 6 步是本 Task 的终点。缺少它，验收会停在"旧仓重新发布成功"，而运行态实际停留在旧仓版本。
+
+### 2.3 外部平台绑定
+
+Task 0 第 7 步判定为「仍活跃且影响运行态」的 Vercel / Railway 绑定，在本 Task 的同一次 cutover 内完成切换，不得延后到 Task 4。
+
+**验收：** 新仓完成一次真实 API 发布 + 回滚；一次真实 UI 发布 + 回滚；一次同时修改两边的提交，确认执行顺序为 API → UI；上传文件迁移前后的**文件数、总字节数、权限/owner、校验摘要四项全部一致**，并另做一次单文件上传下载验证；三个 systemd unit 均 active 且 `cost-sync` 已脱离仓库 checkout 路径；runbook 第 5 步旧仓回退演练成功；runbook 第 6 步回切后镜像 ID、台账、发布所有权均指向新仓。任一项失败即回退到旧仓并停止推进。
 
 ## Task 3：抽取 shell 到 ops/deploy
 
@@ -136,7 +174,7 @@
 1. 以 UI 侧精简实现为基线，逐条比对 API 侧多出的检查，分类为「真实约束」与「重复防御」。真实约束做成可选 hook，重复防御合并。**分类结果登记在本文件，本 Task 内不删除任何检查。**
 2. 抽出 `_deploy-app.yml`，参数：应用名、镜像仓库、健康检查端点、迁移开关、依赖服务列表、回滚锚点校验策略。
 3. **保留各应用现有 ACR repository 与 `<sha>` tag**（`seanfield/fusion-api` 与 `seanfield/fusion-ui` 已天然区分应用，见 P1-6）。新增 per-app 发布台账/manifest，记录每个应用的 last deployed SHA，解决 path-filtered 发布后两应用 SHA 分叉导致的回滚目标定位问题。
-4. Vercel root directory 改为 `apps/ui`；Railway 两个服务的 root directory 分别指向 `apps/api` / `apps/ui`。
+4. 处理 Task 0 判定为「不影响当前运行态」的平台项（例如非活跃服务的 root directory 归位）。**影响运行态的绑定已在 Task 2 切换完毕，本 Task 不得留有此类项。**
 5. 分支保护、required checks 按新 workflow 的 job 名重建（gate job 为 required，应用 job 不是）。
 
 **验收：** 两应用各发布、各回滚一次；构造仅改 UI 的提交，确认 API 的 last deployed SHA 未变且回滚目标仍可唯一解析；平台绑定逐条在控制台勾选确认并各触发一次真实构建。
@@ -174,7 +212,18 @@
 | required check 因 path 跳过而永久 Pending | Task 1 | 恒定 gate job 始终产出结论，不使用 event-level `paths:` |
 | 跨应用发布顺序错误导致 SSE 契约不匹配 | Task 2 | orchestrator DAG 强制 API → UI；失败则整条流水线中止 |
 | shell 抽取引入行为差异 | Task 3 | 逐个抽取 + 单测，单个 revert 即可定位 |
-| 整体方案失败 | 任意 | Task 0 的 git bundle + 未归档的旧仓，可完整回到合并前状态 |
+| 三仓 workflow 同时操作 dev server | Task 2 | 宿主机 `flock` 跨仓互斥 + cutover 期间冻结三仓发布 |
+| 验收停在旧仓、运行态未归新仓 | Task 2 | runbook 第 6 步回切收尾为强制项，验镜像 ID / 台账 / 所有权三项 |
+| secret 原始值不可得 | Task 0 | 该项一律轮换，不从日志或运行环境反向导出 |
+| 未提交资产在迁移中丢失 | Task 0 | bundle 之外另做未跟踪文件归档 + 哈希 + 还原验证 |
+| 平台仍跟踪旧仓导致发布链未真正切换 | Task 2 | Task 0 产出平台使用状态清单，活跃绑定并入 Task 2 同一次 cutover |
+| 整体方案失败 | 任意 | Task 0 的 git bundle + 未提交资产归档 + 未归档的旧仓，可完整回到合并前状态 |
+
+## 关于本 PR 自身的合并边界
+
+`.github/workflows/deploy.yml` 的触发条件为 `on.push.branches: [master]`，**无 `paths` 过滤**。因此即便本 PR 只新增文档，合并到 master 仍会触发完整的 API 发布流水线：`publish`（Windows runner 构建并推 ACR）+ `deploy-dev`（alembic 迁移 + 容器重启）。
+
+本 PR 的合并**不是操作层面无副作用的文档合并**，应按一次正式发布处理：选择合适时间窗口，合并后单独记录 CI 结论、部署结果与运行态验证。
 
 ## 评审修订记录
 
@@ -192,4 +241,18 @@ PR #83 第一轮评审共 9 条，全部受理。逐条处理如下：
 | P1-8 | 每抽一个脚本就发布回滚成本过高 | **成立。** master 是发布通道，不适合作为单步搬运的测试环境 | 改为每脚本 fixture/dry-run/contract test，真实发布与回滚只在 Task 边界执行；Task 3 末尾保留一次完整 API → UI 验收 |
 | P1-9 | 缺少平台元数据迁移边界 | **成立。** 原计划未涉及 | Task 5 新增元数据边界章节，明确复制项、仅旧仓保留项、`#NN` 引用语义、旧仓退役时点 |
 
-**未独立核实的项：** P0-2 中关于 runner 为 repo-scoped、标签仅为通用值、`dev` Environment 仅允许 `master`、secrets 分布于 repo 与 Environment 两层的描述，来自仓库 owner 的评审陈述，本次未通过 API 独立验证。Task 0 第 5 步会在执行时逐项确认实际配置。
+**第一轮遗留的「未独立核实」项已由第二轮复核结清**，见下节。
+
+### 第二轮（PR #83，6 条）
+
+owner 已通过 GitHub API 独立复核第一轮标注为"未独立核实"的项，结论属实：runner 为 `dev-server-fusion-api` / `windows-build-api-01` / `dev-server-fusion-ui` / `windows-build-01`，均 repo-scoped 且标签仅通用值；两仓 `dev` Environment 均用 custom branch policy 且只允许 `master`；secrets 确实分布于 repo 层与 Environment 层。该标注已从文档中移除。
+
+| # | 评审意见 | 核实结果 | 处理 |
+|---|---|---|---|
+| P0-10 | 跨仓 cutover 缺互斥与最终状态闭环 | **成立。** GitHub concurrency group 只在单 repository 内协调，无法阻止三仓同时操作同一台 dev server | Global Constraints 增加宿主机 `flock` 跨仓互斥与"cutover 必须以运行态归属新仓收尾"两条；Task 2 新增 6 步 cutover runbook，第 6 步回切收尾为强制项；Task 0 增加锁文件部署 |
+| P0-11 | secrets 不能从旧仓直接复制 | **成立。** GitHub API 只能列出名称与元数据，不能读回值 | Global Constraints 增加禁止复制与禁止反向导出；Task 0 第 4 步改为名称清单导出 + 原始源重新注入 + 不可得则轮换 + 逐项登记来源/注入位置/验证结果/是否轮换 |
+| P0-12 | 持久化状态仍未脱离 checkout | **成立，原方案自相矛盾。** 初稿示例 `~/project/fusion/data/api/storage/files` 仍位于新仓 checkout 根 `~/project/fusion` 之下，与自身 Global Constraint 冲突 | 固定为仓库外路径：上传文件 `~/.local/share/fusion/api/storage/files`、运行时配置 `~/.config/fusion/runtime.env`；Global Constraint 改为"必须迁出 checkout 树，而不只是换子目录"；验收增加文件数、总字节数、权限/owner 与校验摘要四项比对 |
+| P0-13 | 平台 cutover 边界需前移判定 | **成立。** Task 2 切换 Actions 发布权但平台绑定留到 Task 4，会导致发布链未真正切换 | Task 0 新增第 7 步平台使用状态清单（活跃性、跟踪 repo/branch、dev 或 production、是否自动部署）并据此判定 Task 归属；活跃且影响运行态的并入 Task 2；Task 4 收窄为不影响运行态的项 |
+| P0-14 | git bundle 不保护未提交资产 | **原理成立，计数不适用于本仓库当前状态。** `git bundle` 只含 refs 与可达 object，确实不含未跟踪文件。但评审所述"9 个未跟踪 plan/spec 文件"在本会话 checkout（`a5ad5b5`）中不成立 —— `git status --porcelain --untracked-files=all` 返回 0 项，工作区干净。该状态应属 owner 本机工作区；由于迁移将从该工作区执行，防护仍然必要 | Task 0 第 2 步增加 dirty/untracked 精确清单、未提交文件独立归档与哈希、`--all` 创建 bundle 并 `git bundle verify`、两者各做还原验证、迁移分支只从精确 HEAD 创建 |
+| P1-15 | Task 0 不必重复真实发布与回滚 | **成立。** Task 0 不修改旧仓 runner/workflow，无改动发布的风险高于收益 | Task 0 验收改为只读核验（runner 在线、workflow 配置未变、最近成功记录存在）；真实旧仓回退演练集中到 Task 2 runbook 第 5 步执行一次 |
+| — | 本 PR 合并会触发 master 发布 | **成立。** 实测 `deploy.yml` 为 `on.push.branches: [master]` 且无 `paths` 过滤，合并将触发 `publish` + `deploy-dev`（含 alembic 迁移与容器重启） | 新增「关于本 PR 自身的合并边界」章节，明确按一次正式发布处理 |
