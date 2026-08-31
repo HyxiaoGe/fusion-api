@@ -50,9 +50,16 @@
 |---|---|---|
 | `deploy.yml` L587 / L658 / L1994 | `cd ~/project/fusion` | 宿主机工作目录，与仓库名耦合 |
 | `build-and-deploy.yml` L282 / L391 | `cd ~/project/fusion` | 同上，两应用共用同一目录 |
-| `deploy.yml` L1036/1042/1077/1206 | `./fusion-api/storage/files` bind mount | **用户上传文件持久化**，路径变更会挂载到空目录 |
+| `deploy.yml` L1036/1042/1077/1206 | `./fusion-api/storage/files` bind mount | 文件对象持久化，路径变更会挂载到空目录。**严重程度取决于生产实际后端**，见下方说明 |
 | `deploy.yml` L1819 | `${HOME}/project/fusion/.env` | 运行时环境变量来源 |
 | `ops/litellm/fusion-litellm-cost-sync.service` | `%h/project/fusion/fusion-api` ×3（L5/L6 `AssertPathExists`、L13 `WorkingDirectory`） | **唯一直接耦合仓库 checkout 的 unit**，路径错则 unit 启动失败 |
+
+**关于 `storage/files` 的严重程度（待 Task 0 判定）：** 存储后端有三种 —— `local` / `minio` / `oss`（`.env.example` 默认 `local`），由宿主机 `${HOME}/project/fusion/.env` 的 `STORAGE_BACKEND` 决定，**不在仓库内，本计划无法确认生产实际取值**。
+
+- 若为 `local`：`app/services/storage/local_storage.py` 的 `upload()` 直接写原始字节、`download()` 直接读回，该目录是**原件的唯一副本**；且 `app/db/models.py` 有两处 `storage_key = Column(String(600), nullable=False)` 与 `UniqueConstraint("storage_backend", "storage_key")` 硬引用，文件丢失会留下指向空对象的 DB 行，属数据不一致而非单纯缺文件。Task 2 的备份、四项校验与回退演练全部必要。
+- 若为 `minio` / `oss`：对象存于远端，本地目录重要性大幅下降，Task 2 可相应减负。
+
+注意 `deploy.yml` L1428 对 `/app/storage/files` 挂载的断言是**无条件**的，因此"挂载存在"不能证明后端为 `local`。另 L1036–1042 存在一段从容器内 `tar` 抢救文件的兼容路径，说明该数据历史上曾只存在于容器内并出过问题 —— 是这批数据值得谨慎对待的旁证。
 
 宿主机当前布局为 `~/project/fusion/fusion-api/…`，目录名直接镜像仓库名。**该布局与新仓库的 `apps/api` 结构不一致，且不能自动跟随。**
 
@@ -100,7 +107,7 @@
    - 新仓侧只验证存在性、权限边界与目标服务连通性，**禁止输出 secret 值**；
    - 逐项登记「来源、注入位置、验证结果、是否轮换」。
 5. **新增 runner 实例**（不迁移旧仓 runner），并为全部 runner 增加应用维度标签 `fusion-api` / `fusion-ui`；workflow 的 `runs-on` 同步改为带应用标签的组合。旧仓四个 runner（`dev-server-fusion-api`、`windows-build-api-01`、`dev-server-fusion-ui`、`windows-build-01`）原样保留至 Task 5。
-6. **宿主机状态清单**：`~/project/fusion` 下的目录、bind mount 源、`.env`、三个 systemd unit 的实际 `WorkingDirectory`，逐项记录当前值、文件数、总字节数、权限与 owner。
+6. **宿主机状态清单**：`~/project/fusion` 下的目录、bind mount 源、`.env`、三个 systemd unit 的实际 `WorkingDirectory`，逐项记录当前值、文件数、总字节数、权限与 owner。**其中必须先判定 `STORAGE_BACKEND` 的实际取值**（读宿主机 `${HOME}/project/fusion/.env`，取值为 `local` / `minio` / `oss` 之一），该结果决定 Task 2 中 `storage/files` 迁移的分量：`local` 时该目录为原件唯一副本，全套备份与校验必做；`minio` / `oss` 时可减负。判定结果记入本文件。
 7. **外部平台使用状态清单**：逐个 Vercel / Railway 服务记录 —— 是否活跃、跟踪哪个 repo 与 branch、负责 dev 还是 production、是否自动部署。**据此判定每个绑定归属 Task 2 还是 Task 4**：凡仍活跃且影响运行态的，必须并入 Task 2 的同一次受控 cutover；只有不影响当前运行态的纯重构项才留到 Task 4。
 8. 在宿主机部署跨仓 `flock` 锁文件与获取脚本，供三个仓库的部署入口共用。
 
@@ -144,7 +151,7 @@
 
 ### 2.1 宿主机状态迁移（路径清单 A 类）
 
-持久化状态一律迁出仓库 checkout 树：
+持久化状态一律迁出仓库 checkout 树。**执行前先取 Task 0 第 6 步判定的 `STORAGE_BACKEND` 结果**：非 `local` 时上传文件一项可按实际情况减负，其余不变。
 
 | 内容 | 目标路径 |
 |---|---|
