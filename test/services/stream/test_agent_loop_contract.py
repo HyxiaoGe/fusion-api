@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.schemas.chat import SearchBlock
+from app.schemas.chat import PlaceResult, PlaceResultsBlock, SearchBlock
 from app.services.stream import StreamHandler
 from app.services.stream.tool_execution_result import ToolExecutionRecord
 from app.services.tool_handlers.base import ToolResult
@@ -336,6 +336,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             fake_handler=None,
             dynamic_tool_set=dynamic_tool_set,
             capabilities={"functionCalling": True, "searchCapable": False},
+            user_message=f"请使用 {alias} 查询 MCP authorization",
         )
 
         run_started = next(event for event in result.events if event["type"] == "run_started")
@@ -345,12 +346,11 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request_tools[0]["function"]["name"], alias)
         request_parameters = request_tools[0]["function"]["parameters"]
         self.assertEqual(request_parameters["properties"]["query"], {"type": "string"})
-        self.assertIn("_plan_item_id", request_parameters["properties"])
-        self.assertNotIn("_plan_item_id", request_parameters["required"])
+        self.assertNotIn("_plan_item_id", request_parameters["properties"])
         self.assertNotIn("_plan_item_id", definition["function"]["parameters"]["properties"])
         self.assertEqual(
             [tool["function"]["name"] for tool in request_tools],
-            [alias, "update_plan"],
+            [alias],
         )
         self.assertNotIn("web_search", str(result.llm_calls[0]["call_kwargs"]))
         second_round_tool_messages = [
@@ -420,6 +420,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             use_real_tool_executor=True,
             dynamic_tool_set=dynamic_tool_set,
             capabilities={"functionCalling": True, "agentTools": True, "searchCapable": False},
+            user_message="找人民广场附近评分较高的咖啡店",
         )
 
         run_started = next(event for event in result.events if event["type"] == "run_started")
@@ -432,6 +433,98 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event["tool_name"] for event in tool_events], [alias, alias])
         self.assertEqual(result.session_status_calls[-1]["total_tool_calls"], 1)
         self.assertIn("不可信外部数据", str(result.llm_calls[1]["messages"]))
+
+    async def test_product_result_constraint_changes_only_the_post_tool_round_fingerprint(self):
+        alias = "local_place_search"
+        definition = {
+            "type": "function",
+            "function": {
+                "name": alias,
+                "description": "地点搜索",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            },
+        }
+
+        class FakeProductHandler:
+            tool_name = alias
+            supports_automatic_retry = False
+
+            async def execute(self, args):
+                return ToolResult(status="success", data={"query": args["query"]})
+
+            async def log(self, **_kwargs):
+                return None
+
+            def _build_result_summary(self, result):
+                return {"kind": "external_tool", "title": "地点搜索", "result_count": 1}
+
+            def format_llm_context(self, result, *, citation_numbers=None):
+                return "只可使用结构化地点结果。"
+
+            def build_content_block(self, result, block_id, log_id):
+                return PlaceResultsBlock(
+                    type="place_results",
+                    id=block_id,
+                    schema_version=1,
+                    provider="amap",
+                    query=result.data["query"],
+                    status="success",
+                    result_count=1,
+                    places=[PlaceResult(name="测试咖啡馆", address="测试路 1 号")],
+                    tool_call_log_id=log_id,
+                )
+
+        result = await self._run_agent_contract(
+            rounds=[
+                (
+                    "",
+                    "",
+                    [{"id": "tc-place", "name": alias, "arguments": '{"query":"咖啡"}'}],
+                    "tool_calls",
+                    None,
+                ),
+                ("", "本次查询返回测试咖啡馆。", [], "stop", None),
+            ],
+            use_real_tool_executor=True,
+            dynamic_tool_set=SimpleNamespace(
+                definitions=[definition],
+                handlers={alias: FakeProductHandler()},
+                audit_bindings=[],
+            ),
+            capabilities={"functionCalling": True, "agentTools": True, "searchCapable": False},
+            user_message="找人民广场附近评分较高的咖啡店",
+        )
+
+        self.assertEqual(len(result.llm_calls), 2)
+        first_system_text = "\n".join(
+            message["content"] for message in result.llm_calls[0]["messages"] if message["role"] == "system"
+        )
+        second_system_text = "\n".join(
+            message["content"] for message in result.llm_calls[1]["messages"] if message["role"] == "system"
+        )
+        self.assertNotIn("【本轮产品结果综合约束】", first_system_text)
+        self.assertIn("【本轮产品结果综合约束】", second_system_text)
+
+        round_events = [event for event in result.events if event["type"] == "llm_round_started"]
+        self.assertEqual(len(round_events), 2)
+        self.assertEqual(
+            round_events[0]["system_prompt_fingerprint"],
+            fingerprint_system_messages(result.llm_calls[0]["messages"]),
+        )
+        self.assertEqual(
+            round_events[1]["system_prompt_fingerprint"],
+            fingerprint_system_messages(result.llm_calls[1]["messages"]),
+        )
+        self.assertNotEqual(
+            round_events[0]["system_prompt_fingerprint"],
+            round_events[1]["system_prompt_fingerprint"],
+        )
+        prompt_event = next(event for event in result.events if event["type"] == "system_prompt_prepared")
+        self.assertNotIn("product_result_round_constraint", prompt_event["section_ids"])
 
     async def test_argument_repair_uses_next_agent_round_without_backend_guessing(self):
         alias = "mcp_region_lookup"
@@ -529,7 +622,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             use_real_tool_executor=True,
             dynamic_tool_set=dynamic_tool_set,
             capabilities={"functionCalling": True, "agentTools": True, "searchCapable": False},
-            user_message="查询南山区资料",
+            user_message=f"请使用 {alias} 查询南山区资料",
         )
 
         self.assertEqual(len(handler.calls), 2)
@@ -630,7 +723,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 audit_bindings=[],
             ),
             capabilities={"functionCalling": True, "agentTools": True, "searchCapable": False},
-            user_message="查询上海浦东国际机场到外滩的路线",
+            user_message="从人民广场到外滩怎么走？",
         )
 
         self.assertEqual(len(handler.calls), 1)
@@ -740,7 +833,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 audit_bindings=[],
             ),
             capabilities={"functionCalling": True, "agentTools": True, "searchCapable": False},
-            user_message="查询上海浦东国际机场到外滩的路线",
+            user_message="从人民广场到外滩怎么走？",
         )
 
         self.assertEqual(handler.calls, [])
@@ -750,7 +843,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.session_status_calls[-1]["total_tool_calls"], 0)
 
-    async def test_exhausted_mcp_server_tools_are_hidden_from_next_llm_round(self):
+    async def test_exhausted_routed_mcp_tool_is_hidden_from_next_llm_round(self):
         class SharedServerBudget:
             def __init__(self, max_calls):
                 self.max_calls = max_calls
@@ -823,16 +916,17 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 audit_bindings=[],
             ),
             capabilities={"functionCalling": True, "searchCapable": True, "agentTools": True},
+            user_message=f"请使用 {exhausted_alias} 查询地图",
         )
 
         first_round_tool_names = {tool["function"]["name"] for tool in result.llm_calls[0]["call_kwargs"]["tools"]}
-        second_round_tool_names = {tool["function"]["name"] for tool in result.llm_calls[1]["call_kwargs"]["tools"]}
-        self.assertTrue({"web_search", exhausted_alias, sibling_alias, available_alias} <= first_round_tool_names)
-        self.assertEqual(
-            second_round_tool_names,
-            first_round_tool_names - {exhausted_alias, sibling_alias},
-        )
-        self.assertTrue({"web_search", available_alias} <= second_round_tool_names)
+        second_round_tool_names = {
+            tool["function"]["name"] for tool in result.llm_calls[1]["call_kwargs"].get("tools", [])
+        }
+        self.assertEqual(first_round_tool_names, {exhausted_alias})
+        self.assertEqual(second_round_tool_names, set())
+        self.assertNotIn(sibling_alias, first_round_tool_names)
+        self.assertNotIn(available_alias, first_round_tool_names)
         self.assertNotIn(
             "调用预算已用完",
             "\n".join(str(message.get("content") or "") for call in result.llm_calls for message in call["messages"]),
@@ -969,6 +1063,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 audit_bindings=[],
             ),
             capabilities={"functionCalling": True, "searchCapable": True, "agentTools": True},
+            user_message="今天查询深圳聚餐趋势",
         )
 
         self.assertEqual(result.tool_execute_calls[0]["args"][0], [valid_search])
@@ -1003,6 +1098,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             result.event_types,
             [
                 "run_started",
+                "skills_resolved",
                 "system_prompt_prepared",
                 "step_started",
                 "context_status_updated",
@@ -1013,10 +1109,10 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 "run_completed",
             ],
         )
-        prompt_event = result.events[1]
+        prompt_event = next(event for event in result.events if event["type"] == "system_prompt_prepared")
         self.assertEqual(prompt_event["status"], "ready")
         self.assertIsNone(prompt_event["step_id"])
-        self.assertIn("current_date", prompt_event["section_ids"])
+        self.assertNotIn("current_date", prompt_event["section_ids"])
         self.assertIn("app_identity", prompt_event["section_ids"])
         round_started = next(event for event in result.events if event["type"] == "llm_round_started")
         self.assertEqual(
@@ -1084,7 +1180,8 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             use_real_tool_executor=True,
             fake_handler=FakeSearchHandler(),
             options={"use_reasoning": True},
-            capabilities={"functionCalling": True, "deepThinking": True},
+            capabilities={"functionCalling": True, "searchCapable": True, "deepThinking": True},
+            user_message="今天 OpenAI 发布了什么？",
         )
 
         self.assertEqual(result.event_types[0], "run_started")
@@ -1160,7 +1257,8 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             ],
             execute_tools_result=_execute_tools,
             options={"use_reasoning": True},
-            capabilities={"functionCalling": True, "deepThinking": True},
+            capabilities={"functionCalling": True, "searchCapable": True, "deepThinking": True},
+            user_message="OpenAI 今天发布了什么？阅读官方公告后总结",
         )
 
         self.assertFalse(any(event["type"] in {"plan_snapshot", "plan_step_updated"} for event in result.events))
@@ -1231,7 +1329,8 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             use_real_tool_executor=True,
             fake_handler=FakeSearchHandler(),
             options={"use_reasoning": True},
-            capabilities={"functionCalling": True, "deepThinking": True},
+            capabilities={"functionCalling": True, "searchCapable": True, "deepThinking": True},
+            user_message="今天 OpenAI 发布了什么？",
         )
 
         self.assertEqual(result.session_started_calls[0]["run_id"], "run-contract")

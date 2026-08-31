@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -13,6 +14,8 @@ from app.schemas.chat import (
     SearchSourceSummary,
     SourceReference,
     Usage,
+    WeatherForecastDay,
+    WeatherResultsBlock,
 )
 from app.services.agent.plan_coordinator import PlanCoordinator
 from app.services.stream.agent_loop_outcome import AgentLoopExit
@@ -1959,6 +1962,218 @@ class AgentLoopRoundOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.content_blocks[-1].text, emitted_answer)
         self.assertEqual(len(warnings), 1)
         self.assertIn("已安全修整", warnings[0])
+
+    async def test_deferred_weather_activity_answer_is_always_deterministic(self):
+        state = AgentLoopState()
+        state.mark_current_step("step-weather-activity-repair")
+        state.content_blocks.append(
+            WeatherResultsBlock(
+                type="weather_results",
+                schema_version=1,
+                provider="amap",
+                status="degraded",
+                query="南山区",
+                resolved_location="南山区",
+                day_count=1,
+                forecast_days=[
+                    WeatherForecastDay(
+                        date=date(2026, 7, 24),
+                        weekday=5,
+                        day_weather="雷阵雨",
+                        night_weather="多云",
+                        high_c=31,
+                        low_c=26,
+                    )
+                ],
+                fetched_at=datetime(2026, 7, 23, 8, tzinfo=timezone.utc),
+                limitations=["天气预报按行政区提供，不代表具体建筑物"],
+            )
+        )
+        model_answer = (
+            "7月24日（周五）南山区白天雷阵雨、夜间多云，26–31℃。"
+            "如果你的条件是上午骑行时避开降雨，本次预报不满足这一条件。"
+            "本次预报只有白天和夜间粒度，无法确认上午这一细分时段。"
+            "从避雨角度看这一天的白天时段存在被淋雨的可能。"
+            "夜间转为多云，如果你计划调整到晚上活动，天气条件相对更宽松一些。"
+        )
+        append_chunk = AsyncMock()
+        warnings: list[str] = []
+
+        with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
+            outcome = await handle_agent_round_outcome(
+                request=AgentRoundOutcomeRequest(
+                    db="db",
+                    messages=[{"role": "user", "content": "7月24日南山区天气怎么样，适合上午骑行吗？"}],
+                    state=state,
+                    runtime=_runtime(complete_step_fn=AsyncMock(), warning_fn=warnings.append),
+                    step_number=2,
+                    step_context=_step_context("step-weather-activity-repair"),
+                    round_result=AgentRoundResult(
+                        reasoning_buf="",
+                        content_buf=model_answer,
+                        tool_calls=[],
+                        finish_reason="stop",
+                        accumulated_usage=Usage(input_tokens=2, output_tokens=30),
+                        output_deferred=True,
+                    ),
+                )
+            )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        emitted_answer = append_chunk.await_args.args[2]
+        self.assertIn("不满足这一条件", emitted_answer)
+        self.assertIn("只有白天和夜间粒度，无法确认上午这一细分时段", emitted_answer)
+        self.assertNotIn("存在被淋雨的可能", emitted_answer)
+        self.assertNotIn("调整到晚上活动", emitted_answer)
+        self.assertNotIn("天气条件相对更宽松", emitted_answer)
+        self.assertEqual(state.content_blocks[-1].text, emitted_answer)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("天气活动条件使用确定性回答", warnings[0])
+
+    async def test_deferred_mixed_travel_answer_is_always_deterministic(self):
+        state = AgentLoopState()
+        state.mark_current_step("step-mixed-travel-answer")
+        state.content_blocks.extend(
+            [
+                {
+                    "type": "flight_results",
+                    "id": "flight-out",
+                    "origin": "北京",
+                    "destination": "上海",
+                    "departure_date": "2026-08-29",
+                    "flights": [
+                        {
+                            "id": "flight-1",
+                            "flight_no": "MU5101",
+                            "duration_s": 8100,
+                            "price": {"currency": "CNY", "amount_minor": 76000},
+                            "departure": {"station_name": "北京首都国际机场", "scheduled_at": "2026-08-29T07:00:00"},
+                            "arrival": {"station_name": "上海浦东国际机场", "scheduled_at": "2026-08-29T09:15:00"},
+                        }
+                    ],
+                    "limitations": ["班次与参考价格仅代表本次查询时刻"],
+                },
+                {
+                    "type": "train_results",
+                    "id": "train-out",
+                    "origin": "北京",
+                    "destination": "上海",
+                    "departure_date": "2026-08-29",
+                    "trains": [
+                        {
+                            "id": "train-1",
+                            "train_no": "G1",
+                            "duration_s": 17640,
+                            "price": {"currency": "CNY", "amount_minor": 66100},
+                            "departure": {"station_name": "北京南站", "scheduled_at": "2026-08-29T06:30:00"},
+                            "arrival": {"station_name": "上海虹桥站", "scheduled_at": "2026-08-29T11:24:00"},
+                        }
+                    ],
+                    "limitations": ["本次结果不包含余票或准点率"],
+                },
+            ]
+        )
+        model_answer = (
+            "航班都优于高铁。若希望落地更接近市区，可选虹桥机场。"
+            "G1 是兼顾早到与耗时的选择。"
+        )
+        append_chunk = AsyncMock()
+        warnings: list[str] = []
+
+        with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
+            outcome = await handle_agent_round_outcome(
+                request=AgentRoundOutcomeRequest(
+                    db="db",
+                    messages=[{"role": "user", "content": "北京到上海，高铁和飞机都查，比较最省钱和最快方案"}],
+                    state=state,
+                    runtime=_runtime(complete_step_fn=AsyncMock(), warning_fn=warnings.append),
+                    step_number=3,
+                    step_context=_step_context("step-mixed-travel-answer"),
+                    round_result=AgentRoundResult(
+                        reasoning_buf="",
+                        content_buf=model_answer,
+                        tool_calls=[],
+                        finish_reason="stop",
+                        accumulated_usage=Usage(input_tokens=2, output_tokens=30),
+                        output_deferred=True,
+                    ),
+                )
+            )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        emitted_answer = append_chunk.await_args.args[2]
+        self.assertIn("同时返回北京到上海", emitted_answer)
+        self.assertIn("MU5101", emitted_answer)
+        self.assertIn("G1", emitted_answer)
+        self.assertNotIn("都优于", emitted_answer)
+        self.assertNotIn("更接近市区", emitted_answer)
+        self.assertNotIn("兼顾早到", emitted_answer)
+        self.assertEqual(state.content_blocks[-1].text, emitted_answer)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("混合出行比较使用确定性回答", warnings[0])
+
+    async def test_deferred_single_train_comparison_is_always_deterministic(self):
+        state = AgentLoopState()
+        state.mark_current_step("step-single-train-comparison")
+        state.content_blocks.append(
+            {
+                "type": "train_results",
+                "id": "train-out",
+                "origin": "北京",
+                "destination": "上海",
+                "departure_date": "2026-08-29",
+                "trains": [
+                    {
+                        "train_no": "G737",
+                        "duration_s": 21900,
+                        "price": {"currency": "CNY", "amount_minor": 59800},
+                    },
+                    {
+                        "train_no": "G37",
+                        "duration_s": 16980,
+                        "price": {"currency": "CNY", "amount_minor": 66100},
+                    },
+                ],
+                "limitations": ["班次与参考价格仅代表本次查询时刻"],
+            }
+        )
+        append_chunk = AsyncMock()
+        warnings: list[str] = []
+
+        with patch("app.services.stream.agent_loop_round_outcome.append_chunk", append_chunk):
+            outcome = await handle_agent_round_outcome(
+                request=AgentRoundOutcomeRequest(
+                    db="db",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": "请查询北京到上海的高铁，告诉我本次返回中最便宜和最快的车次。",
+                        }
+                    ],
+                    state=state,
+                    runtime=_runtime(complete_step_fn=AsyncMock(), warning_fn=warnings.append),
+                    step_number=2,
+                    step_context=_step_context("step-single-train-comparison"),
+                    round_result=AgentRoundResult(
+                        reasoning_buf="",
+                        content_buf="G737 最省事，G37 兼顾价格和时间。",
+                        tool_calls=[],
+                        finish_reason="stop",
+                        accumulated_usage=Usage(input_tokens=2, output_tokens=10),
+                        output_deferred=True,
+                    ),
+                )
+            )
+
+        self.assertEqual(outcome.exit, AgentLoopExit.COMPLETED)
+        emitted_answer = append_chunk.await_args.args[2]
+        self.assertIn("参考价最低的是G737", emitted_answer)
+        self.assertIn("计划行程时长最短的是G37", emitted_answer)
+        self.assertNotIn("最省事", emitted_answer)
+        self.assertNotIn("兼顾", emitted_answer)
+        self.assertEqual(state.content_blocks[-1].text, emitted_answer)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("单一出行比较使用确定性回答", warnings[0])
 
     async def test_final_answer_evidence_does_not_swallow_stream_write_unavailable(self):
         from app.services.stream_state_service import StreamWriteUnavailableError

@@ -140,9 +140,19 @@ jobs:
           persist-credentials: false
 
       - name: Verify Docker access
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           docker version
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Docker Engine is unavailable on this runner."
+            exit $LASTEXITCODE
+          }
+
           docker ps
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "The runner cannot access Docker Engine."
+            exit $LASTEXITCODE
+          }
 
       - name: Test and build Docker image
         timeout-minutes: 15

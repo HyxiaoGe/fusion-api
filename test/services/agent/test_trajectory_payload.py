@@ -21,6 +21,38 @@ COMMON = {
 
 COMMON_KEYS = set(COMMON) | {"type"}
 
+CAPABILITY_RESOLUTION = {
+    "schema_version": 1,
+    "router_version": "2026-08-27.1",
+    "package_id": "fresh_web",
+    "confidence": "high",
+    "resolution_mode": "routed",
+    "reason_codes": ["fresh_external_fact"],
+    "external_tool_names": ["web_search"],
+    "effective_plan_mode": "off",
+    "include_current_date": True,
+    "network_boundary_required": False,
+    "bundle_fingerprint": "sha256:" + "a" * 64,
+}
+
+SKILL_METADATA = {
+    "skill_id": "verified-research",
+    "version": "1.0.0",
+    "content_sha256": "b" * 64,
+    "allowed_tool_names": ["web_search", "url_read"],
+    "section_id": "skill:verified-research@1.0.0",
+    "char_count": 354,
+}
+
+SKILL_RESOLUTION = {
+    "status": "loaded",
+    "activation_source": "capability_package",
+    "requested_skill_ids": ["verified-research"],
+    "skills": [SKILL_METADATA],
+    "duration_ms": 1,
+    "error_code": None,
+}
+
 EVENT_FIELDS = {
     "run_started": {
         "conversation_id": "conv-1",
@@ -29,6 +61,14 @@ EVENT_FIELDS = {
         "model": "gpt-4",
         "tools": ["web_search"],
         "config": {"prompt": "禁止落库"},
+        "capability_resolution": {
+            **CAPABILITY_RESOLUTION,
+            "original_message": "用户原文禁止落库",
+            "system_prompt": "完整提示词禁止落库",
+            "tool_schema": {"api_key": "secret"},
+            "credentials": "Bearer secret",
+            "endpoint": "https://private.example/token",
+        },
     },
     "step_started": {"step_number": 1},
     "tool_call_started": {
@@ -68,6 +108,11 @@ EVENT_FIELDS = {
         "duration_ms": 1,
         "error_code": None,
         "message": None,
+    },
+    "skills_resolved": {
+        "protocol_version": 2,
+        **SKILL_RESOLUTION,
+        "detail_status": "available",
     },
     "llm_round_first_output_delta": {
         "llm_round_id": "round-1",
@@ -244,7 +289,7 @@ EVENT_FIELDS = {
 }
 
 EVENT_ALLOWED_FIELDS = {
-    "run_started": {"conversation_id", "message_id", "task_id", "model", "tools"},
+    "run_started": {"conversation_id", "message_id", "task_id", "model", "tools", "capability_resolution"},
     "step_started": {"step_number"},
     "tool_call_started": {"tool_name", "plan_item_id"},
     "tool_call_delta": {"tool_name"},
@@ -266,6 +311,16 @@ EVENT_ALLOWED_FIELDS = {
         "duration_ms",
         "error_code",
         "message",
+    },
+    "skills_resolved": {
+        "protocol_version",
+        "status",
+        "activation_source",
+        "requested_skill_ids",
+        "skills",
+        "duration_ms",
+        "detail_status",
+        "error_code",
     },
     "llm_round_first_output_delta": {"llm_round_id", "delta_kind", "ttft_ms"},
     "llm_round_completed": {
@@ -433,6 +488,158 @@ def _assert_text_and_lists_are_bounded_and_secret_like_error_text_is_redacted():
 
 
 class TrajectoryPayloadTests(unittest.TestCase):
+    def test_run_started_persists_only_explicit_safe_capability_resolution(self):
+        payload = build_trajectory_payload(
+            {
+                **COMMON,
+                "type": "run_started",
+                **EVENT_FIELDS["run_started"],
+                "user_preferences": "不要泄漏",
+            }
+        )
+
+        self.assertEqual(payload["capability_resolution"], CAPABILITY_RESOLUTION)
+        self.assertEqual(payload["tools"], CAPABILITY_RESOLUTION["external_tool_names"])
+        self.assertNotIn("config", payload)
+        for forbidden in (
+            "original_message",
+            "system_prompt",
+            "tool_schema",
+            "credentials",
+            "endpoint",
+            "user_preferences",
+            "secret",
+        ):
+            self.assertNotIn(forbidden, str(payload))
+
+    def test_schema_v2_capability_and_skills_event_persist_only_safe_metadata(self):
+        resolution_v2 = {
+            **CAPABILITY_RESOLUTION,
+            "schema_version": 2,
+            "router_version": "2026-08-31.1",
+            "package_id": "verified_web",
+            "reason_codes": ["verified_source_request"],
+            "external_tool_names": ["web_search", "url_read"],
+            "effective_plan_mode": "on",
+            "skill_resolution": SKILL_RESOLUTION,
+        }
+        run_payload = build_trajectory_payload(
+            {
+                **COMMON,
+                "type": "run_started",
+                **EVENT_FIELDS["run_started"],
+                "tools": ["web_search", "url_read"],
+                "capability_resolution": resolution_v2,
+            }
+        )
+        skill_payload = build_trajectory_payload(
+            {
+                **COMMON,
+                "type": "skills_resolved",
+                **EVENT_FIELDS["skills_resolved"],
+                "skills": [{**SKILL_METADATA, "content": "完整 Skill 正文禁止进入账本", "path": "/private"}],
+                "raw_error": "SECRET",
+                "user_input": "用户原文",
+            }
+        )
+
+        self.assertEqual(run_payload["capability_resolution"]["skill_resolution"], SKILL_RESOLUTION)
+        self.assertEqual(skill_payload["skills"], [SKILL_METADATA])
+        encoded = str({"run": run_payload, "event": skill_payload})
+        for forbidden in ("完整 Skill 正文", "/private", "raw_error", "SECRET", "user_input", "用户原文"):
+            self.assertNotIn(forbidden, encoded)
+
+    def test_run_started_drops_control_tool_and_package_mismatch_resolution(self):
+        invalid_resolutions = (
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "mcp_explicit",
+                "reason_codes": ["explicit_authorized_tool_alias"],
+                "external_tool_names": ["update_plan"],
+                "include_current_date": False,
+            },
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "direct",
+                "reason_codes": ["direct_greeting"],
+                "external_tool_names": ["web_search"],
+                "include_current_date": False,
+            },
+        )
+
+        for invalid_resolution in invalid_resolutions:
+            with self.subTest(invalid_resolution=invalid_resolution):
+                payload = build_trajectory_payload(
+                    {
+                        **COMMON,
+                        "type": "run_started",
+                        **EVENT_FIELDS["run_started"],
+                        "tools": invalid_resolution["external_tool_names"],
+                        "capability_resolution": invalid_resolution,
+                    }
+                )
+
+                self.assertIsNone(payload["capability_resolution"])
+                if "update_plan" in invalid_resolution["external_tool_names"]:
+                    self.assertEqual(payload["tools"], [])
+
+    def test_run_started_drops_reversed_fixed_package_resolution_but_keeps_canonical_partial(self):
+        reversed_resolution = {
+            **CAPABILITY_RESOLUTION,
+            "package_id": "deep_research",
+            "reason_codes": ["deep_research_mode"],
+            "external_tool_names": ["url_read", "web_search"],
+            "effective_plan_mode": "on",
+        }
+        invalid_payload = build_trajectory_payload(
+            {
+                **COMMON,
+                "type": "run_started",
+                **EVENT_FIELDS["run_started"],
+                "tools": reversed_resolution["external_tool_names"],
+                "capability_resolution": reversed_resolution,
+            }
+        )
+
+        self.assertIsNone(invalid_payload["capability_resolution"])
+        self.assertEqual(invalid_payload["tools"], [])
+
+        canonical_partial = {
+            **CAPABILITY_RESOLUTION,
+            "package_id": "mobility_intercity",
+            "confidence": "medium",
+            "reason_codes": ["origin_destination_relation", "intercity_locations"],
+            "external_tool_names": ["route_compare", "search_trains"],
+            "effective_plan_mode": "auto",
+        }
+        valid_payload = build_trajectory_payload(
+            {
+                **COMMON,
+                "type": "run_started",
+                **EVENT_FIELDS["run_started"],
+                "tools": canonical_partial["external_tool_names"],
+                "capability_resolution": canonical_partial,
+            }
+        )
+
+        self.assertEqual(valid_payload["capability_resolution"], canonical_partial)
+        self.assertEqual(valid_payload["tools"], canonical_partial["external_tool_names"])
+
+    def test_prompt_detail_status_is_durable_but_full_text_is_never_ledger_payload(self):
+        payload = build_trajectory_payload(
+            {
+                **COMMON,
+                "type": "system_prompt_prepared",
+                **EVENT_FIELDS["system_prompt_prepared"],
+                "detail_status": "degraded",
+                "system_prompt_snapshot": {"content": "PRIVATE 正文"},
+                "sections": [{"section_id": "user_preferences", "content": "PRIVATE 偏好"}],
+            }
+        )
+        self.assertEqual(payload["detail_status"], "degraded")
+        self.assertNotIn("PRIVATE", str(payload))
+        self.assertNotIn("sections", payload)
+
     def test_every_event_type_uses_an_explicit_top_level_allowlist(self):
         for event_type in sorted(EVENT_FIELDS):
             with self.subTest(event_type=event_type):

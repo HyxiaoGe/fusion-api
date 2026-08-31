@@ -23,7 +23,10 @@ from app.services.stream.product_answer_validator import (
     validate_product_answer,
 )
 from app.services.stream.product_result_answer import (
+    build_grounded_mixed_travel_answer,
     build_grounded_product_answer,
+    build_grounded_single_travel_comparison_answer,
+    build_grounded_weather_activity_answer,
     build_product_tool_failure_answer,
     build_tool_repair_clarification,
     has_product_result_blocks,
@@ -426,7 +429,10 @@ async def _commit_deferred_answer(
 
     clarification = build_tool_repair_clarification(request.state.pending_tool_repairs)
     if clarification:
-        grounded_answer = build_grounded_product_answer(request.state.content_blocks)
+        grounded_answer = build_grounded_product_answer(
+            request.state.content_blocks,
+            messages=request.messages,
+        )
         answer = "\n\n".join(part for part in (grounded_answer, clarification) if part)
         await _append_committed_answer(request, answer)
         return _with_replaced_answer(request, answer)
@@ -471,6 +477,57 @@ async def _commit_deferred_knowledge_answer(
 async def _commit_deferred_product_answer(
     request: AgentRoundOutcomeRequest,
 ) -> AgentRoundOutcomeRequest:
+    weather_activity_answer = build_grounded_weather_activity_answer(
+        request.state.content_blocks,
+        messages=request.messages,
+    )
+    if weather_activity_answer:
+        request.runtime.warning_fn(
+            "产品天气活动条件使用确定性回答: "
+            f"conv_id={request.runtime.conversation_id} run_id={request.runtime.run_id} "
+            f"step={request.step_number}"
+        )
+        answer = neutralize_product_provider_mentions(
+            weather_activity_answer,
+            request.state.content_blocks,
+        )
+        await _append_committed_answer(request, answer, model_output_visible=False)
+        return _with_replaced_answer(request, answer)
+
+    mixed_travel_answer = build_grounded_mixed_travel_answer(
+        request.state.content_blocks,
+        messages=request.messages,
+    )
+    if mixed_travel_answer:
+        request.runtime.warning_fn(
+            "产品混合出行比较使用确定性回答: "
+            f"conv_id={request.runtime.conversation_id} run_id={request.runtime.run_id} "
+            f"step={request.step_number}"
+        )
+        answer = neutralize_product_provider_mentions(
+            mixed_travel_answer,
+            request.state.content_blocks,
+        )
+        await _append_committed_answer(request, answer, model_output_visible=False)
+        return _with_replaced_answer(request, answer)
+
+    single_travel_comparison_answer = build_grounded_single_travel_comparison_answer(
+        request.state.content_blocks,
+        messages=request.messages,
+    )
+    if single_travel_comparison_answer:
+        request.runtime.warning_fn(
+            "产品单一出行比较使用确定性回答: "
+            f"conv_id={request.runtime.conversation_id} run_id={request.runtime.run_id} "
+            f"step={request.step_number}"
+        )
+        answer = neutralize_product_provider_mentions(
+            single_travel_comparison_answer,
+            request.state.content_blocks,
+        )
+        await _append_committed_answer(request, answer, model_output_visible=False)
+        return _with_replaced_answer(request, answer)
+
     candidate = neutralize_product_provider_mentions(
         request.round_result.content_buf.strip(),
         request.state.content_blocks,
@@ -504,7 +561,10 @@ async def _commit_deferred_product_answer(
                 f"step={request.step_number} reason_code={validation.reason_code} "
                 f"repair_reason_code={repair_reason_code}"
             )
-            answer = build_grounded_product_answer(request.state.content_blocks)
+            answer = build_grounded_product_answer(
+                request.state.content_blocks,
+                messages=request.messages,
+            )
             if answer:
                 completed_answer, _ = repair_unsupported_product_answer(
                     answer,

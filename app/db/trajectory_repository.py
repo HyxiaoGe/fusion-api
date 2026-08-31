@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TypeAlias
+from dataclasses import dataclass
 
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session, load_only
@@ -11,6 +11,7 @@ from app.db.models import (
     AgentEvent,
     AgentLlmRoundDetail,
     AgentSession,
+    AgentSystemPromptSnapshot,
     Conversation,
     RunTrajectoryMeta,
     ToolCallLog,
@@ -18,7 +19,17 @@ from app.db.models import (
 )
 from app.schemas.trajectory import UserTrajectoryMetaRow
 
-RunWithMeta: TypeAlias = tuple[AgentSession, UserTrajectoryMetaRow | None]
+
+@dataclass(frozen=True)
+class RunWithMeta:
+    """通用 Run 读取结果，仅额外携带安全 JSON 子字段投影。"""
+
+    run: AgentSession
+    meta: UserTrajectoryMetaRow | None
+    capability_resolution: object | None
+
+
+_CAPABILITY_RESOLUTION_PROJECTION = AgentSession.run_config["capability_resolution"].label("capability_resolution")
 
 
 def _llm_round_count_subquery():
@@ -51,6 +62,7 @@ class TrajectoryRepository:
                 RunTrajectoryMeta.terminal_intent_pending_at,
                 RunTrajectoryMeta.llm_detail_schema_version,
                 _llm_round_count_subquery(),
+                _CAPABILITY_RESOLUTION_PROJECTION,
             )
             .select_from(Conversation)
             .options(
@@ -81,7 +93,15 @@ class TrajectoryRepository:
         ).all()
         if not rows:
             return None
-        return [(row[1], self._user_meta_from_columns(row[2:])) for row in rows if row[1] is not None]
+        return [
+            RunWithMeta(
+                run=row[1],
+                meta=self._user_meta_from_columns(row[2:-1]),
+                capability_resolution=row[-1],
+            )
+            for row in rows
+            if row[1] is not None
+        ]
 
     def get_run(self, conversation_id: str, run_id: str, user_id: str) -> RunWithMeta | None:
         row = self._session.execute(
@@ -94,6 +114,7 @@ class TrajectoryRepository:
                 RunTrajectoryMeta.terminal_intent_pending_at,
                 RunTrajectoryMeta.llm_detail_schema_version,
                 _llm_round_count_subquery(),
+                _CAPABILITY_RESOLUTION_PROJECTION,
             )
             .options(
                 load_only(
@@ -118,7 +139,13 @@ class TrajectoryRepository:
             .where(AgentSession.id == run_id)
             .where(AgentSession.user_id == user_id)
         ).one_or_none()
-        return None if row is None else (row[0], self._user_meta_from_columns(row[1:]))
+        if row is None:
+            return None
+        return RunWithMeta(
+            run=row[0],
+            meta=self._user_meta_from_columns(row[1:-1]),
+            capability_resolution=row[-1],
+        )
 
     def get_run_for_admin(self, conversation_id: str, run_id: str) -> RunWithMeta | None:
         """管理员读取仍严格验证 run 属于指定会话，但不附加普通用户归属条件。"""
@@ -132,6 +159,7 @@ class TrajectoryRepository:
                 RunTrajectoryMeta.terminal_intent_pending_at,
                 RunTrajectoryMeta.llm_detail_schema_version,
                 _llm_round_count_subquery(),
+                _CAPABILITY_RESOLUTION_PROJECTION,
             )
             .options(
                 load_only(
@@ -154,7 +182,13 @@ class TrajectoryRepository:
             .where(Conversation.id == conversation_id)
             .where(AgentSession.id == run_id)
         ).one_or_none()
-        return None if row is None else (row[0], self._user_meta_from_columns(row[1:]))
+        if row is None:
+            return None
+        return RunWithMeta(
+            run=row[0],
+            meta=self._user_meta_from_columns(row[1:-1]),
+            capability_resolution=row[-1],
+        )
 
     def get_detail_run(
         self,
@@ -219,6 +253,45 @@ class TrajectoryRepository:
             .where(ToolCallLog.user_id == user_id)
             .where(ToolCallLog.trace_id == run_id)
             .where(ToolCallLog.tool_call_id == tool_call_id)
+        ).scalar_one_or_none()
+
+    def get_system_prompt_snapshot(self, conversation_id: str, run_id: str, user_id: str) -> object | None:
+        """只从独立私有表读取正文，并重新验证 Run 与当前用户的完整归属。"""
+        return self._session.execute(
+            select(AgentSystemPromptSnapshot.snapshot)
+            .join(AgentSession, AgentSession.id == AgentSystemPromptSnapshot.run_id)
+            .join(Conversation, Conversation.id == AgentSession.conversation_id)
+            .where(AgentSystemPromptSnapshot.conversation_id == conversation_id)
+            .where(AgentSystemPromptSnapshot.user_id == user_id)
+            .where(AgentSystemPromptSnapshot.run_id == run_id)
+            .where(Conversation.id == conversation_id)
+            .where(Conversation.user_id == user_id)
+            .where(AgentSession.id == run_id)
+            .where(AgentSession.user_id == user_id)
+        ).scalar_one_or_none()
+
+    def get_system_prompt_prepared_event(self, conversation_id: str, run_id: str) -> AgentEvent | None:
+        """每个 Run 只有一次组装；读取对应终态元数据，不加载完整事件列。"""
+        return self._session.execute(
+            select(AgentEvent)
+            .options(load_only(AgentEvent.payload))
+            .where(AgentEvent.conversation_id == conversation_id)
+            .where(AgentEvent.run_id == run_id)
+            .where(AgentEvent.event_type == "system_prompt_prepared")
+            .order_by(AgentEvent.sequence.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+
+    def get_skills_resolved_event(self, conversation_id: str, run_id: str) -> AgentEvent | None:
+        """读取单个 Run 的 Skill 终态安全元数据，不加载其他事件列。"""
+        return self._session.execute(
+            select(AgentEvent)
+            .options(load_only(AgentEvent.payload))
+            .where(AgentEvent.conversation_id == conversation_id)
+            .where(AgentEvent.run_id == run_id)
+            .where(AgentEvent.event_type == "skills_resolved")
+            .order_by(AgentEvent.sequence.desc())
+            .limit(1)
         ).scalar_one_or_none()
 
     def get_detail_watermark(self):

@@ -1,6 +1,6 @@
 """普通用户的历史轨迹读取端点。"""
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, Response
 
 from app.api.deps import get_current_user, get_trajectory_query_service
 from app.db.models import User
@@ -66,4 +66,36 @@ def get_llm_node_detail(
     result = service.get_user_llm_node_detail(conversation_id, run_id, node_id, current_user.id)
     if result is None:
         raise ApiException.not_found(_NOT_FOUND_MESSAGE)
+    return success(data=result, request_id=request.state.request_id)
+
+
+@router.get("/conversations/{conversation_id}/runs/{run_id}/node-detail/system-prompt")
+def get_system_prompt_node_detail(
+    conversation_id: str,
+    run_id: str,
+    request: Request,
+    response: Response,
+    service: TrajectoryQueryService = Depends(get_trajectory_query_service),
+    current_user: User = Depends(get_current_user),
+):
+    result = service.get_user_system_prompt_node_detail(conversation_id, run_id, current_user.id)
+    if result is None:
+        raise ApiException.not_found(_NOT_FOUND_MESSAGE)
+    response.headers["Cache-Control"] = "private, no-store"
+    return success(data=result, request_id=request.state.request_id)
+
+
+@router.get("/conversations/{conversation_id}/runs/{run_id}/node-detail/skills")
+def get_skills_node_detail(
+    conversation_id: str,
+    run_id: str,
+    request: Request,
+    response: Response,
+    service: TrajectoryQueryService = Depends(get_trajectory_query_service),
+    current_user: User = Depends(get_current_user),
+):
+    result = service.get_user_skills_node_detail(conversation_id, run_id, current_user.id)
+    if result is None:
+        raise ApiException.not_found(_NOT_FOUND_MESSAGE)
+    response.headers["Cache-Control"] = "private, no-store"
     return success(data=result, request_id=request.state.request_id)

@@ -11,7 +11,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.logger import app_logger
 from app.db.database import SessionLocal
-from app.db.models import AgentLlmRoundDetail
+from app.db.models import AgentLlmRoundDetail, Message
 from app.utils.user_visible_content import sanitize_user_visible_reasoning
 
 LLM_DETAIL_PREVIEW_MAX_CHARS = 200
@@ -119,6 +119,11 @@ def _write_llm_round_detail(draft: LlmRoundDetailDraft, session_factory: Session
 
     session = session_factory()
     try:
+        values["message_id"] = (
+            draft.message_id
+            if draft.message_id is not None and session.get(Message, draft.message_id) is not None
+            else None
+        )
         dialect_name = session.get_bind().dialect.name
         if dialect_name == "postgresql":
             statement = postgresql_insert(AgentLlmRoundDetail).values(**values)

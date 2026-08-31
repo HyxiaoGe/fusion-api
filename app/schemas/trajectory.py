@@ -2,11 +2,202 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer, model_validator
+
+from app.utils.run_capability_contract import (
+    CAPABILITY_CANONICAL_EXTERNAL_TOOL_ORDER,
+    CAPABILITY_CONTROL_TOOL_NAMES,
+    validate_capability_resolution_semantics,
+)
+
+CapabilityPackageId = Literal[
+    "direct",
+    "transform",
+    "date",
+    "fresh_web",
+    "verified_web",
+    "url_read",
+    "weather",
+    "place_discovery",
+    "mobility_route",
+    "flight",
+    "train",
+    "travel_air_rail",
+    "mobility_intercity",
+    "mixed_itinerary",
+    "deep_research",
+    "knowledge_grounded",
+    "tools_unavailable",
+    "clarification_only",
+    "mcp_explicit",
+]
+CapabilityReasonCode = Literal[
+    "direct_greeting",
+    "assistant_identity_question",
+    "stable_knowledge_question",
+    "simple_calculation",
+    "text_transform_request",
+    "current_date_question",
+    "fresh_external_fact",
+    "verified_source_request",
+    "explicit_url_read",
+    "explicit_weather_request",
+    "explicit_place_discovery",
+    "explicit_route_task",
+    "explicit_flight_request",
+    "explicit_train_request",
+    "air_rail_comparison",
+    "mixed_itinerary_request",
+    "origin_destination_relation",
+    "intercity_locations",
+    "adjacent_route_followup",
+    "deep_research_mode",
+    "knowledge_grounded_mode",
+    "tools_disabled",
+    "function_calling_unavailable",
+    "search_capability_unavailable",
+    "required_tools_unavailable",
+    "required_skill_unavailable",
+    "explicit_authorized_tool_alias",
+    "insufficient_capability_signal",
+]
+
+
+class TrajectorySkillMetadata(BaseModel):
+    """可进入实时协议和账本的 Skill 安全元数据。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    skill_id: str = Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$", max_length=128)
+    version: str = Field(pattern=r"^\d+\.\d+\.\d+$", max_length=32)
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    allowed_tool_names: list[str] = Field(min_length=1, max_length=3)
+    section_id: str = Field(min_length=1, max_length=192)
+    char_count: int = Field(ge=1, le=32 * 1024)
+
+    @field_validator("allowed_tool_names")
+    @classmethod
+    def _validate_allowed_tools(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("Skill 允许工具不得重复")
+        if any(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,127}", name) is None for name in value):
+            raise ValueError("Skill 允许工具名格式非法")
+        if CAPABILITY_CONTROL_TOOL_NAMES.intersection(value):
+            raise ValueError("Skill 不得允许内部控制工具")
+        known_tools = frozenset(CAPABILITY_CANONICAL_EXTERNAL_TOOL_ORDER)
+        if not set(value).issubset(known_tools):
+            raise ValueError("Skill 允许工具包含未知工具")
+        canonical = [name for name in CAPABILITY_CANONICAL_EXTERNAL_TOOL_ORDER if name in value]
+        if value != canonical:
+            raise ValueError("Skill 允许工具必须使用 canonical order")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_section_id(self) -> TrajectorySkillMetadata:
+        if self.section_id != f"skill:{self.skill_id}@{self.version}":
+            raise ValueError("Skill section_id 必须与 ID 和版本一致")
+        return self
+
+
+class TrajectorySkillResolution(BaseModel):
+    """Run 级 Skill 选择终态；仅包含安全元数据。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    status: Literal["not_selected", "loaded", "load_failed"]
+    activation_source: Literal["capability_package"]
+    requested_skill_ids: list[str] = Field(max_length=1)
+    skills: list[TrajectorySkillMetadata] = Field(max_length=1)
+    duration_ms: int = Field(ge=0)
+    error_code: Literal["skill_load_failed"] | None = None
+
+    @field_validator("requested_skill_ids")
+    @classmethod
+    def _validate_requested_skill_ids(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("请求 Skill ID 不得重复")
+        if any(re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", skill_id) is None for skill_id in value):
+            raise ValueError("请求 Skill ID 格式非法")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_status_semantics(self) -> TrajectorySkillResolution:
+        skill_ids = [skill.skill_id for skill in self.skills]
+        if len(skill_ids) != len(set(skill_ids)):
+            raise ValueError("Skill 安全元数据不得重复")
+        if self.status == "not_selected":
+            valid = not self.requested_skill_ids and not self.skills and self.error_code is None
+        elif self.status == "loaded":
+            valid = bool(self.skills) and self.requested_skill_ids == skill_ids and self.error_code is None
+        else:
+            valid = bool(self.requested_skill_ids) and not self.skills and self.error_code == "skill_load_failed"
+        if not valid:
+            raise ValueError("Skill 选择状态与安全元数据不一致")
+        return self
+
+
+class TrajectoryCapabilityResolution(BaseModel):
+    """Run 级能力路由在实时与历史协议中的显式安全 DTO。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal[1, 2]
+    router_version: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}\.\d+$", max_length=32)
+    package_id: CapabilityPackageId
+    confidence: Literal["high", "medium", "low"]
+    resolution_mode: Literal["routed", "degraded", "clarification"]
+    reason_codes: list[CapabilityReasonCode] = Field(min_length=1, max_length=4)
+    external_tool_names: list[str] = Field(max_length=3)
+    effective_plan_mode: Literal["auto", "on", "off"]
+    include_current_date: bool
+    network_boundary_required: bool
+    bundle_fingerprint: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    skill_resolution: TrajectorySkillResolution | None = None
+
+    @field_validator("reason_codes", "external_tool_names")
+    @classmethod
+    def _require_unique_items(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("能力路由列表字段不得重复")
+        return value
+
+    @field_validator("external_tool_names")
+    @classmethod
+    def _validate_tool_names(cls, value: list[str]) -> list[str]:
+        if any(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,127}", name) is None for name in value):
+            raise ValueError("能力路由工具名格式非法")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_package_semantics(self) -> TrajectoryCapabilityResolution:
+        if self.schema_version == 1 and self.skill_resolution is not None:
+            raise ValueError("schema v1 不得携带 Skill 解析状态")
+        if self.schema_version == 2 and self.skill_resolution is None:
+            raise ValueError("schema v2 必须携带 Skill 解析状态")
+        validate_capability_resolution_semantics(
+            package_id=self.package_id,
+            confidence=self.confidence,
+            resolution_mode=self.resolution_mode,
+            reason_codes=self.reason_codes,
+            external_tool_names=self.external_tool_names,
+            effective_plan_mode=self.effective_plan_mode,
+            include_current_date=self.include_current_date,
+            network_boundary_required=self.network_boundary_required,
+            skill_resolution=self.skill_resolution,
+        )
+        return self
+
+    @model_serializer(mode="wrap")
+    def _serialize_versioned(self, handler):
+        serialized = handler(self)
+        if self.schema_version == 1:
+            serialized.pop("skill_resolution", None)
+        return serialized
 
 
 @dataclass(frozen=True)
@@ -104,6 +295,7 @@ class TrajectoryRunSummary(BaseModel):
     ended_at: datetime | None = None
     llm_detail_schema_version: int | None = None
     llm_round_count: int = 0
+    capability_resolution: TrajectoryCapabilityResolution | None = None
 
 
 class TrajectoryRunListResponse(BaseModel):
@@ -176,17 +368,65 @@ class LlmNodeDetail(BaseModel):
     output_text: str | None = None
 
 
+class SystemPromptSection(BaseModel):
+    """运行时实际组装并持久化的有序系统提示词段落。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    section_id: str = Field(min_length=1)
+    content: str
+
+
+class SystemPromptNodeDetail(BaseModel):
+    """仅通过独立详情端点返回的历史系统提示词正文。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    template_version: str = Field(min_length=1)
+    fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    char_count: int = Field(ge=0)
+    sections: list[SystemPromptSection] = Field(min_length=1)
+
+
+class SystemPromptSnapshot(SystemPromptNodeDetail):
+    """持久化格式校验；版本号不接受布尔值或字符串隐式转换。"""
+
+    schema_version: int = Field(ge=1, le=1)
+
+
+class SkillNodeDetailItem(TrajectorySkillMetadata):
+    """从当次 Prompt 快照提取并校验后的 Skill 正文。"""
+
+    content: str = Field(min_length=1, max_length=32 * 1024)
+
+
+class SkillsNodeDetail(BaseModel):
+    """Skills 聚合节点详情。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    status: Literal["not_selected", "loaded", "load_failed"]
+    activation_source: Literal["capability_package"]
+    skills: list[SkillNodeDetailItem] = Field(max_length=1)
+
+    @model_validator(mode="after")
+    def _validate_status_semantics(self) -> SkillsNodeDetail:
+        if (self.status == "loaded") is not bool(self.skills):
+            raise ValueError("Skills 详情正文必须与 loaded 状态一致")
+        return self
+
+
 class TrajectoryNodeDetailResponse(BaseModel):
-    """P3 Tool/LLM Node Detail 的统一稳定响应信封。"""
+    """轨迹节点详情的统一稳定响应信封。"""
 
     model_config = ConfigDict(extra="forbid")
 
     status: Literal["available", "pending", "not_recorded", "degraded"]
-    node_type: Literal["tool", "llm"] = "tool"
-    available_sections: list[Literal["summary", "payload", "result", "timing", "schema", "thinking", "output"]] = Field(
-        default_factory=list
-    )
-    detail: ToolNodeDetail | LlmNodeDetail | None = None
+    node_type: Literal["tool", "llm", "system_prompt", "skills"] = "tool"
+    available_sections: list[
+        Literal["summary", "payload", "result", "timing", "schema", "thinking", "output", "prompt"]
+    ] = Field(default_factory=list)
+    detail: ToolNodeDetail | LlmNodeDetail | SystemPromptNodeDetail | SkillsNodeDetail | None = None
     redacted_fields: list[str] = Field(default_factory=list)
     truncated_fields: list[str] = Field(default_factory=list)
     reason: str | None = None

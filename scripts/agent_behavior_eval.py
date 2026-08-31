@@ -1,5 +1,5 @@
 """
-Agent 行为评估集 V1。
+Agent 行为评估集（兼容 V1，并可断言 Run 能力路由）。
 
 默认 dry-run 只输出样本基线，不调用 LLM、搜索服务或浏览器。
 真实 Chrome 回归可以把观测结果转成 observation 后复用 score_observation()。
@@ -22,7 +22,11 @@ REQUIRED_SAMPLE_FIELDS = {"id", "category", "question", "expected_tool_policy", 
 VALID_TOOL_POLICIES = {"no_search", "search"}
 VALID_SURFACES = {"direct_answer", "evidence"}
 SEARCH_SURFACES = {"execution_process", "answer_evidence"}
-OPTIONAL_BOOL_FIELDS = {"requires_search_keywords", "requires_console_clean"}
+OPTIONAL_BOOL_FIELDS = {
+    "expected_network_boundary_required",
+    "requires_search_keywords",
+    "requires_console_clean",
+}
 OPTIONAL_NON_NEGATIVE_INT_FIELDS = {
     "max_duplicate_search_keywords",
     "max_provider_search_calls",
@@ -31,13 +35,50 @@ OPTIONAL_NON_NEGATIVE_INT_FIELDS = {
     "max_search_calls",
 }
 OPTIONAL_STRING_LIST_FIELDS = {
+    "expected_announced_tools",
+    "expected_called_tools",
+    "expected_prompt_section_ids",
     "expected_search_budgets",
     "expected_search_actions",
     "forbidden_read_domains",
     "forbidden_search_actions",
+    "required_capability_reason_codes",
     "required_decision_reason_codes",
     "required_search_actions",
 }
+RUN_CAPABILITY_EXPECTATION_FIELDS = (
+    "expected_package_id",
+    "expected_announced_tools",
+    "expected_called_tools",
+    "expected_prompt_section_ids",
+    "expected_resolution_mode",
+    "required_capability_reason_codes",
+    "expected_effective_plan_mode",
+    "expected_network_boundary_required",
+)
+VALID_RUN_CAPABILITY_PACKAGE_IDS = {
+    "clarification_only",
+    "date",
+    "deep_research",
+    "direct",
+    "flight",
+    "fresh_web",
+    "knowledge_grounded",
+    "mcp_explicit",
+    "mixed_itinerary",
+    "mobility_intercity",
+    "mobility_route",
+    "place_discovery",
+    "tools_unavailable",
+    "train",
+    "transform",
+    "travel_air_rail",
+    "url_read",
+    "verified_web",
+    "weather",
+}
+VALID_RESOLUTION_MODES = {"clarification", "degraded", "routed"}
+VALID_EFFECTIVE_PLAN_MODES = {"auto", "off", "on"}
 
 
 def load_samples(path: Path = DEFAULT_SAMPLE_PATH) -> list[dict]:
@@ -87,6 +128,33 @@ def load_samples(path: Path = DEFAULT_SAMPLE_PATH) -> list[dict]:
             if field in item and not _is_string_list(item[field]):
                 raise ValueError(f"{field} 必须是字符串数组: id={sample_id}")
 
+        package_id = item.get("expected_package_id")
+        if "expected_package_id" in item:
+            if not isinstance(package_id, str) or not package_id.strip():
+                raise ValueError(f"expected_package_id 必须是非空字符串: id={sample_id}")
+            if package_id not in VALID_RUN_CAPABILITY_PACKAGE_IDS:
+                raise ValueError(f"expected_package_id 非法: id={sample_id}, value={package_id}")
+
+        resolution_mode = item.get("expected_resolution_mode")
+        if "expected_resolution_mode" in item and resolution_mode not in VALID_RESOLUTION_MODES:
+            raise ValueError(f"expected_resolution_mode 非法: id={sample_id}, value={resolution_mode}")
+
+        plan_mode = item.get("expected_effective_plan_mode")
+        if "expected_effective_plan_mode" in item and plan_mode not in VALID_EFFECTIVE_PLAN_MODES:
+            raise ValueError(f"expected_effective_plan_mode 非法: id={sample_id}, value={plan_mode}")
+
+        if "required_capability_reason_codes" in item and not item["required_capability_reason_codes"]:
+            raise ValueError(f"required_capability_reason_codes 必须是非空字符串数组: id={sample_id}")
+
+        for field in (
+            "expected_announced_tools",
+            "expected_called_tools",
+            "expected_prompt_section_ids",
+            "required_capability_reason_codes",
+        ):
+            if field in item and len(item[field]) != len(set(item[field])):
+                raise ValueError(f"{field} 不得包含重复值: id={sample_id}")
+
         samples.append(item)
 
     return samples
@@ -107,6 +175,7 @@ def score_observation(sample: dict, observation: dict) -> dict:
     _check_tool_policy(sample, tool_calls, issues)
     _check_surface_policy(sample, surfaces, issues)
     _check_search_context(sample, observation, issues)
+    _check_run_capability_observation(sample, observation, issues)
     _check_forbidden_terms(sample, observation, output_text, issues)
 
     return {
@@ -120,6 +189,9 @@ def score_observation(sample: dict, observation: dict) -> dict:
 def write_dry_run(samples: list[dict], output: TextIO = sys.stdout) -> None:
     for sample in samples:
         score = score_observation(sample, {})
+        capability_expectations = {
+            field: sample[field] for field in RUN_CAPABILITY_EXPECTATION_FIELDS if field in sample
+        }
         output.write(
             json.dumps(
                 {
@@ -128,6 +200,7 @@ def write_dry_run(samples: list[dict], output: TextIO = sys.stdout) -> None:
                     "question": sample["question"],
                     "expected_tool_policy": sample["expected_tool_policy"],
                     "expected_surface": sample["expected_surface"],
+                    **capability_expectations,
                     "passed": score["passed"],
                     "issues": score["issues"],
                 },
@@ -251,6 +324,44 @@ def _check_search_context(sample: dict, observation: dict, issues: list[str]) ->
         missing_reason_codes = sorted(required_reason_codes - actual_reason_codes)
         if missing_reason_codes:
             issues.append(f"缺少必需决策原因: {', '.join(missing_reason_codes)}")
+
+
+def _check_run_capability_observation(sample: dict, observation: dict, issues: list[str]) -> None:
+    exact_fields = (
+        ("expected_package_id", "package_id", "能力包"),
+        ("expected_announced_tools", "announced_tools", "公告工具"),
+        ("expected_called_tools", "called_tools", "实际调用工具"),
+        ("expected_prompt_section_ids", "prompt_section_ids", "Prompt section IDs"),
+        ("expected_resolution_mode", "resolution_mode", "resolution mode"),
+        ("expected_effective_plan_mode", "effective_plan_mode", "effective plan mode"),
+        (
+            "expected_network_boundary_required",
+            "network_boundary_required",
+            "network boundary 标记",
+        ),
+    )
+    for expected_field, observed_field, label in exact_fields:
+        if expected_field not in sample:
+            continue
+        if observed_field not in observation:
+            issues.append(f"缺少必需观测字段: {observed_field}")
+            continue
+        actual = observation[observed_field]
+        expected = sample[expected_field]
+        matches = actual is expected if isinstance(expected, bool) else actual == expected
+        if not matches:
+            issues.append(f"{label}不符合预期: actual={actual} expected={expected}")
+
+    required_reason_codes = _string_list(sample.get("required_capability_reason_codes", []))
+    if not required_reason_codes:
+        return
+    if "capability_reason_codes" not in observation:
+        issues.append("缺少必需观测字段: capability_reason_codes")
+        return
+    actual_reason_codes = _string_list(observation.get("capability_reason_codes"))
+    missing_reason_codes = [code for code in required_reason_codes if code not in actual_reason_codes]
+    if missing_reason_codes:
+        issues.append(f"缺少必需能力原因码: {', '.join(missing_reason_codes)}")
 
 
 def _check_forbidden_terms(sample: dict, observation: dict, output_text: str, issues: list[str]) -> None:

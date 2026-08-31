@@ -801,6 +801,28 @@ class AgentSession(Base):
     )
 
 
+class AgentSystemPromptSnapshot(Base):
+    """与 Run 精确关联、不会被旧版会话投影或重入覆盖的提示词正文。"""
+
+    __tablename__ = "agent_system_prompt_snapshots"
+
+    run_id = Column(
+        String,
+        ForeignKey("agent_sessions.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    conversation_id = Column(
+        String,
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    user_id = Column(String, nullable=False)
+    snapshot = Column(JSONB, nullable=False)
+    recorded_at = Column(DateTime(timezone=True), nullable=False, default=utc_now, server_default=func.now())
+
+    __table_args__ = (Index("ix_agent_system_prompt_snapshots_conversation_run", "conversation_id", "run_id"),)
+
+
 class AgentEvent(Base):
     """用户安全的 Agent 事件追加账本。"""
 

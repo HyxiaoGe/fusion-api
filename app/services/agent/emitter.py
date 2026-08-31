@@ -140,6 +140,7 @@ class AgentEventEmitter:
                 model=model,
                 tools=tools,
                 config=config,
+                capability_resolution=config.get("capability_resolution"),
                 **self._envelope(step_id=None),
             )
         )
@@ -648,6 +649,7 @@ class AgentEventEmitter:
         duration_ms: int,
         fingerprint: str | None = None,
         char_count: int | None = None,
+        detail_status: str | None = None,
         error_code: str | None = None,
         message: str | None = None,
     ) -> None:
@@ -665,9 +667,40 @@ class AgentEventEmitter:
                 section_ids=section_ids,
                 fingerprint=fingerprint,
                 char_count=char_count,
+                detail_status=detail_status,
                 duration_ms=duration_ms,
                 error_code=safe_error,
                 message="系统提示词组装失败，请稍后重试。" if safe_error else None,
+                **self._envelope(step_id=None),
+            )
+        )
+
+    async def skills_resolved(
+        self,
+        *,
+        status: str,
+        activation_source: str,
+        requested_skill_ids: list[str],
+        skills: list[dict[str, Any]],
+        duration_ms: int,
+        detail_status: str | None,
+        error_code: str | None = None,
+    ) -> None:
+        if self._message_id is None:
+            raise RuntimeError("skills_resolved 必须在 run_started 之后发送")
+        # 只允许公开固定错误码，避免将文件路径或解析异常带入实时事件。
+        safe_error = "skill_load_failed" if status == "load_failed" else None
+        await self._emit(
+            ev.SkillsResolved(
+                type="skills_resolved",
+                protocol_version=2,
+                status=status,
+                activation_source=activation_source,
+                requested_skill_ids=requested_skill_ids,
+                skills=skills,
+                duration_ms=duration_ms,
+                detail_status=detail_status,
+                error_code=safe_error,
                 **self._envelope(step_id=None),
             )
         )

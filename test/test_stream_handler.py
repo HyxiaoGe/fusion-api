@@ -349,6 +349,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
             types,
             [
                 "run_started",
+                "skills_resolved",
                 "system_prompt_prepared",
                 "step_started",
                 "context_status_updated",
@@ -359,13 +360,13 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                 "run_completed",
             ],
         )
-        prompt_event = events[1]
+        prompt_event = next(event for event in events if event["type"] == "system_prompt_prepared")
         self.assertEqual(prompt_event["status"], "ready")
         self.assertEqual(prompt_event["source"], "code")
         self.assertIsNone(prompt_event["step_id"])
         self.assertEqual(
             prompt_event["section_ids"],
-            ["current_date", "app_identity", "no_tool_network_boundary"],
+            ["app_identity"],
         )
         self.assertRegex(prompt_event["fingerprint"], r"^[0-9a-f]{64}$")
         self.assertGreater(prompt_event["char_count"], 0)
@@ -385,7 +386,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.session_statuses[-1]["status"], "completed")
 
     async def test_run_started_declares_plan_mode_url_read_once_before_url_prep(self):
-        """普通计划模式初始即声明 url_read，URL 预处理不得重复回填。"""
+        """明确 URL 读取在 Run 初始只声明 url_read，预处理不得重复回填。"""
         from app.services.external.reader_client import UrlReadResult
 
         with patch(
@@ -404,13 +405,17 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                 stream_round_side_effect=[
                     ("", "Hello world", [], "stop", None),
                 ],
-                capabilities={"functionCalling": True, "deepThinking": True},
-                original_message="请看 https://example.com/a",
+                capabilities={
+                    "functionCalling": True,
+                    "searchCapable": True,
+                    "deepThinking": True,
+                },
+                original_message="请阅读 https://example.com/a",
             )
 
         run_started = self._agent_events()[0]
         self.assertEqual(run_started["type"], "run_started")
-        self.assertEqual(run_started["tools"], ["web_search", "url_read"])
+        self.assertEqual(run_started["tools"], ["url_read"])
 
     async def test_tool_mode_injects_web_search_contract_prompt(self):
         """工具模式：调用 LLM 前注入契约，避免 thinking 口头搜索但不发 tool_call。"""
@@ -424,7 +429,8 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
             stream_round_side_effect=[
                 ("", "Hello world", [], "stop", None),
             ],
-            capabilities={"functionCalling": True, "deepThinking": True},
+            capabilities={"functionCalling": True, "searchCapable": True, "deepThinking": True},
+            original_message="OpenAI 今天发布了什么？阅读官方公告后总结",
             patch_extra=[
                 patch(
                     "app.services.stream.runner.llm_call_with_retry",
@@ -487,6 +493,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ],
             capabilities={"functionCalling": True, "searchCapable": True},
+            original_message="请搜索 OpenAI 今天发布的最新消息",
         )
 
         events = self._agent_events()
@@ -553,6 +560,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ],
             capabilities={"functionCalling": True, "searchCapable": True},
+            original_message="请搜索 OpenAI 今天发布的最新消息",
         )
 
         self.assertGreaterEqual(len(order), 2)
@@ -585,6 +593,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                     )
                 ],
                 capabilities={"functionCalling": True, "searchCapable": True},
+                original_message="请搜索 OpenAI 今天发布的最新消息",
             )
 
         self.assertIn("content block boom", str(cm.exception))
@@ -631,8 +640,8 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                     AsyncMock(return_value=None),
                 ),
             ],
-            capabilities={"functionCalling": True},
-            original_message="请读取 https://example.com",
+            capabilities={"functionCalling": True, "searchCapable": True},
+            original_message="总结 https://example.com，只依据该页面",
         )
 
         self.assertGreaterEqual(len(captured_messages), 2)
@@ -836,6 +845,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
             types,
             [
                 "run_started",
+                "skills_resolved",
                 "system_prompt_prepared",
                 "step_started",
                 "context_status_updated",
@@ -937,6 +947,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 ],
                 capabilities={"functionCalling": True, "searchCapable": True},
+                original_message="请搜索 OpenAI 今天发布的最新消息",
             )
 
         events = self._agent_events()
@@ -1062,6 +1073,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 ],
                 capabilities={"functionCalling": True, "searchCapable": True},
+                original_message="请搜索 OpenAI 今天发布的最新消息",
             )
 
         events = self._agent_events()

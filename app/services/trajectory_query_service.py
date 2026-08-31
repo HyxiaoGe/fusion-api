@@ -2,22 +2,31 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from pydantic import ValidationError
+
 from app.db.models import AgentEvent, AgentSession
-from app.db.trajectory_repository import TrajectoryRepository
+from app.db.trajectory_repository import RunWithMeta, TrajectoryRepository
 from app.schemas.admin_trajectory import AdminTrajectorySnapshot, AdminTrajectoryToolCall
 from app.schemas.trajectory import (
     LlmNodeDetail,
+    SkillNodeDetailItem,
+    SkillsNodeDetail,
+    SystemPromptNodeDetail,
+    SystemPromptSnapshot,
     ToolNodeDetail,
+    TrajectoryCapabilityResolution,
     TrajectoryCompleteness,
     TrajectoryEventRecord,
     TrajectoryLlmRoundSummary,
     TrajectoryNodeDetailResponse,
     TrajectoryRunListResponse,
     TrajectoryRunSummary,
+    TrajectorySkillResolution,
     TrajectorySnapshot,
 )
 from app.services.admin_audit_sanitizer import sanitize_admin_value
@@ -29,6 +38,7 @@ from app.services.agent.trajectory_reconciliation import (
 )
 from app.services.mcp.amap_product_tools import AMAP_PRODUCT_TOOL_NAMES
 from app.services.mcp.flyai_travel_tools import FLYAI_TRAVEL_TOOL_NAMES
+from app.utils.prompt_fingerprint import fingerprint_system_messages
 from app.utils.time import as_utc, utc_now
 
 _USER_WEB_SEARCH_ARGUMENT_FIELDS = ("query", "count", "domains", "recency_days", "intent")
@@ -79,12 +89,13 @@ class TrajectoryQueryService:
         watermark = self._ledger_watermark()
         items = [
             self._run_summary(
-                run,
-                resolve_user_trajectory_status_from_rows(run.created_at, meta, watermark).trajectory_status,
-                llm_detail_schema_version=meta.llm_detail_schema_version if meta is not None else None,
-                llm_round_count=meta.llm_round_count if meta is not None else 0,
+                row.run,
+                resolve_user_trajectory_status_from_rows(row.run.created_at, row.meta, watermark).trajectory_status,
+                llm_detail_schema_version=(row.meta.llm_detail_schema_version if row.meta is not None else None),
+                llm_round_count=row.meta.llm_round_count if row.meta is not None else 0,
+                capability_resolution=row.capability_resolution,
             )
-            for run, meta in bounded_rows
+            for row in bounded_rows
         ]
         return TrajectoryRunListResponse(items=self._grouping_order(items), truncated=truncated)
 
@@ -142,6 +153,179 @@ class TrajectoryQueryService:
         llm_round_id: str,
     ) -> TrajectoryNodeDetailResponse | None:
         return self._get_llm_node_detail(conversation_id, run_id, llm_round_id, user_id=None)
+
+    def get_user_system_prompt_node_detail(
+        self,
+        conversation_id: str,
+        run_id: str,
+        user_id: str,
+    ) -> TrajectoryNodeDetailResponse | None:
+        """正文仅来自同一 Run 的持久快照，不执行当前提示词模板。"""
+        run = self._repository.get_detail_run(conversation_id, run_id, user_id)
+        if run is None:
+            return None
+        event = self._repository.get_system_prompt_prepared_event(conversation_id, run_id)
+        if event is not None and not isinstance(event.payload, dict):
+            return self._unavailable_system_prompt_detail("degraded", "system_prompt_detail_invalid")
+        metadata = event.payload if event is not None else None
+        if metadata is not None and metadata.get("status") == "failed":
+            return self._unavailable_system_prompt_detail("degraded", "system_prompt_assembly_failed")
+
+        snapshot = self._repository.get_system_prompt_snapshot(conversation_id, run_id, user_id)
+        if snapshot is None:
+            if metadata is None:
+                awaiting_ledger = run.status == "running" or (
+                    run.terminal_at is not None
+                    and as_utc(self._now_provider()) - as_utc(run.terminal_at) <= self._detail_settle_grace
+                )
+                if awaiting_ledger:
+                    return self._unavailable_system_prompt_detail("pending", "system_prompt_detail_settling")
+            if metadata is not None and metadata.get("detail_status") in {"available", "degraded"}:
+                return self._unavailable_system_prompt_detail("degraded", "system_prompt_detail_missing")
+            return self._unavailable_system_prompt_detail("not_recorded", "system_prompt_not_recorded")
+
+        try:
+            persisted = SystemPromptSnapshot.model_validate(snapshot)
+            messages = [{"role": "system", "content": section.content} for section in persisted.sections]
+            valid = (
+                len({section.section_id for section in persisted.sections}) == len(persisted.sections)
+                and persisted.fingerprint == fingerprint_system_messages(messages)
+                and persisted.char_count == sum(len(section.content) for section in persisted.sections)
+                and (metadata is None or metadata.get("fingerprint") == persisted.fingerprint)
+                and (
+                    metadata is None
+                    or all(
+                        metadata[key] == value
+                        for key, value in {
+                            "section_ids": [section.section_id for section in persisted.sections],
+                            "template_version": persisted.template_version,
+                            "char_count": persisted.char_count,
+                        }.items()
+                        if key in metadata
+                    )
+                )
+            )
+        except (ValidationError, UnicodeError):
+            valid = False
+        if not valid:
+            return self._unavailable_system_prompt_detail("degraded", "system_prompt_detail_invalid")
+
+        return TrajectoryNodeDetailResponse(
+            status="available",
+            node_type="system_prompt",
+            available_sections=["summary", "prompt"],
+            detail=SystemPromptNodeDetail(
+                template_version=persisted.template_version,
+                fingerprint=persisted.fingerprint,
+                char_count=persisted.char_count,
+                sections=persisted.sections,
+            ),
+            redacted_fields=[],
+            truncated_fields=[],
+        )
+
+    def get_user_skills_node_detail(
+        self,
+        conversation_id: str,
+        run_id: str,
+        user_id: str,
+    ) -> TrajectoryNodeDetailResponse | None:
+        """按 Skill 事件元数据从同一 Run 的 Prompt 快照提取冻结正文。"""
+        run = self._repository.get_detail_run(conversation_id, run_id, user_id)
+        if run is None:
+            return None
+        event = self._repository.get_skills_resolved_event(conversation_id, run_id)
+        if event is None:
+            awaiting_ledger = run.status == "running" or (
+                run.terminal_at is not None
+                and as_utc(self._now_provider()) - as_utc(run.terminal_at) <= self._detail_settle_grace
+            )
+            if awaiting_ledger:
+                return self._unavailable_skills_detail("pending", "skills_detail_settling")
+            return self._unavailable_skills_detail("not_recorded", "skills_not_recorded")
+        if not isinstance(event.payload, dict) or type(event.payload.get("protocol_version")) is not int:
+            return self._unavailable_skills_detail("degraded", "skills_detail_invalid")
+        if event.payload.get("protocol_version") != 2:
+            return self._unavailable_skills_detail("degraded", "skills_detail_invalid")
+        try:
+            resolution = TrajectorySkillResolution.model_validate(
+                {
+                    key: event.payload.get(key)
+                    for key in (
+                        "status",
+                        "activation_source",
+                        "requested_skill_ids",
+                        "skills",
+                        "duration_ms",
+                        "error_code",
+                    )
+                }
+            )
+        except ValidationError:
+            return self._unavailable_skills_detail("degraded", "skills_detail_invalid")
+
+        detail_status = event.payload.get("detail_status")
+        if detail_status not in {None, "available", "degraded"}:
+            return self._unavailable_skills_detail("degraded", "skills_detail_invalid")
+        if resolution.status != "loaded" and detail_status is not None:
+            return self._unavailable_skills_detail("degraded", "skills_detail_invalid")
+        if resolution.status == "not_selected":
+            return self._terminal_skills_detail(status="available", resolution=resolution)
+        if resolution.status == "load_failed":
+            return self._terminal_skills_detail(
+                status="degraded",
+                resolution=resolution,
+                reason="skills_load_failed",
+            )
+        if detail_status is None:
+            return self._unavailable_skills_detail("degraded", "skills_detail_invalid")
+        if detail_status == "degraded":
+            return self._unavailable_skills_detail("degraded", "skills_detail_missing")
+
+        snapshot = self._repository.get_system_prompt_snapshot(conversation_id, run_id, user_id)
+        if snapshot is None:
+            return self._unavailable_skills_detail("degraded", "skills_detail_missing")
+
+        try:
+            persisted = SystemPromptSnapshot.model_validate(snapshot)
+            messages = [{"role": "system", "content": section.content} for section in persisted.sections]
+            sections_by_id = {section.section_id: section.content for section in persisted.sections}
+            expected_section_ids = {skill.section_id for skill in resolution.skills}
+            valid = (
+                len(sections_by_id) == len(persisted.sections)
+                and persisted.fingerprint == fingerprint_system_messages(messages)
+                and persisted.char_count == sum(len(section.content) for section in persisted.sections)
+                and {section_id for section_id in sections_by_id if section_id.startswith("skill:")}
+                == expected_section_ids
+            )
+            skill_details = []
+            for skill in resolution.skills:
+                content = sections_by_id.get(skill.section_id)
+                if content is None or len(content) != skill.char_count:
+                    valid = False
+                    break
+                if hashlib.sha256(content.encode("utf-8")).hexdigest() != skill.content_sha256:
+                    valid = False
+                    break
+                skill_details.append(SkillNodeDetailItem(**skill.model_dump(), content=content))
+        except (ValidationError, UnicodeError):
+            valid = False
+            skill_details = []
+        if not valid:
+            return self._unavailable_skills_detail("degraded", "skills_detail_invalid")
+
+        return TrajectoryNodeDetailResponse(
+            status="available",
+            node_type="skills",
+            available_sections=["summary", "prompt"],
+            detail=SkillsNodeDetail(
+                status="loaded",
+                activation_source=resolution.activation_source,
+                skills=skill_details,
+            ),
+            redacted_fields=[],
+            truncated_fields=[],
+        )
 
     def _get_llm_node_detail(
         self,
@@ -361,6 +545,51 @@ class TrajectoryQueryService:
         )
 
     @staticmethod
+    def _unavailable_system_prompt_detail(status: str, reason: str) -> TrajectoryNodeDetailResponse:
+        return TrajectoryNodeDetailResponse(
+            status=status,
+            node_type="system_prompt",
+            available_sections=[],
+            detail=None,
+            redacted_fields=[],
+            truncated_fields=[],
+            reason=reason,
+        )
+
+    @staticmethod
+    def _unavailable_skills_detail(status: str, reason: str) -> TrajectoryNodeDetailResponse:
+        return TrajectoryNodeDetailResponse(
+            status=status,
+            node_type="skills",
+            available_sections=[],
+            detail=None,
+            redacted_fields=[],
+            truncated_fields=[],
+            reason=reason,
+        )
+
+    @staticmethod
+    def _terminal_skills_detail(
+        *,
+        status: str,
+        resolution: TrajectorySkillResolution,
+        reason: str | None = None,
+    ) -> TrajectoryNodeDetailResponse:
+        return TrajectoryNodeDetailResponse(
+            status=status,
+            node_type="skills",
+            available_sections=[],
+            detail=SkillsNodeDetail(
+                status=resolution.status,
+                activation_source=resolution.activation_source,
+                skills=[],
+            ),
+            redacted_fields=[],
+            truncated_fields=[],
+            reason=reason,
+        )
+
+    @staticmethod
     def _admin_tool_call(tool) -> AdminTrajectoryToolCall:
         item = {key: value for key, value in AdminAuditService._tool_item(tool).items() if key != "trace_id"}
         created_at = item.get("created_at")
@@ -381,9 +610,10 @@ class TrajectoryQueryService:
         self,
         conversation_id: str,
         run_id: str,
-        row: tuple[AgentSession, object | None],
+        row: RunWithMeta,
     ) -> TrajectorySnapshot:
-        run, meta = row
+        run = row.run
+        meta = row.meta
         event_rows = self._repository.list_events(conversation_id, run_id, self._max_events_per_run + 1)
         truncated = len(event_rows) > self._max_events_per_run
         loaded_events = event_rows[: self._max_events_per_run]
@@ -415,6 +645,7 @@ class TrajectoryQueryService:
                 assessment.trajectory_status,
                 llm_detail_schema_version=meta.llm_detail_schema_version if meta is not None else None,
                 llm_round_count=meta.llm_round_count if meta is not None else 0,
+                capability_resolution=row.capability_resolution,
             ),
             records=projection.records,
             spans=projection.spans,
@@ -438,6 +669,7 @@ class TrajectoryQueryService:
         *,
         llm_detail_schema_version: int | None = None,
         llm_round_count: int = 0,
+        capability_resolution: object | None = None,
     ) -> TrajectoryRunSummary:
         return TrajectoryRunSummary(
             run_id=run.id,
@@ -453,7 +685,15 @@ class TrajectoryQueryService:
             ended_at=run.terminal_at,
             llm_detail_schema_version=llm_detail_schema_version,
             llm_round_count=llm_round_count,
+            capability_resolution=TrajectoryQueryService._capability_resolution(capability_resolution),
         )
+
+    @staticmethod
+    def _capability_resolution(raw_resolution: object) -> TrajectoryCapabilityResolution | None:
+        try:
+            return TrajectoryCapabilityResolution.model_validate(raw_resolution)
+        except ValidationError:
+            return None
 
     @staticmethod
     def _event_record(event: AgentEvent) -> TrajectoryEventRecord:

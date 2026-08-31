@@ -7,6 +7,11 @@ from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from pydantic import ValidationError
+
+from app.schemas.trajectory import TrajectoryCapabilityResolution, TrajectorySkillMetadata
+from app.utils.run_capability_contract import CAPABILITY_CONTROL_TOOL_NAMES
+
 MAX_LEDGER_TEXT_LENGTH = 512
 MAX_LEDGER_LIST_ITEMS = 50
 
@@ -26,7 +31,7 @@ _COMMON_FIELDS = frozenset(
 )
 
 _EVENT_FIELDS: dict[str, frozenset[str]] = {
-    "run_started": frozenset({"conversation_id", "message_id", "task_id", "model", "tools"}),
+    "run_started": frozenset({"conversation_id", "message_id", "task_id", "model", "tools", "capability_resolution"}),
     "step_started": frozenset({"step_number"}),
     "tool_call_started": frozenset({"tool_name", "plan_item_id"}),
     "tool_call_delta": frozenset({"tool_name"}),
@@ -101,11 +106,24 @@ _EVENT_FIELDS: dict[str, frozenset[str]] = {
             "source",
             "template_version",
             "section_ids",
+            "detail_status",
             "fingerprint",
             "char_count",
             "duration_ms",
             "error_code",
             "message",
+        }
+    ),
+    "skills_resolved": frozenset(
+        {
+            "protocol_version",
+            "status",
+            "activation_source",
+            "requested_skill_ids",
+            "skills",
+            "duration_ms",
+            "detail_status",
+            "error_code",
         }
     ),
     "context_status_updated": frozenset(
@@ -160,7 +178,7 @@ _EVIDENCE_FIELDS = frozenset(
         "citation_index",
     }
 )
-_LIST_FIELDS = frozenset({"tools", "key_findings", "source_refs", "section_ids"})
+_LIST_FIELDS = frozenset({"tools", "key_findings", "source_refs", "section_ids", "requested_skill_ids"})
 _SECRET_PATTERN = re.compile(
     r"(?i)\b(api[_-]?key|authorization|access[_-]?token|token|password|secret)\s*[:=]\s*"
     r"(?:bearer\s+)?[^\s,;]+"
@@ -227,6 +245,76 @@ def _sanitize_evidence(value: Any) -> dict[str, Any]:
     return evidence
 
 
+_SKILL_METADATA_FIELDS = (
+    "skill_id",
+    "version",
+    "content_sha256",
+    "allowed_tool_names",
+    "section_id",
+    "char_count",
+)
+
+
+def _sanitize_skill_metadata(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    candidate = {field: value[field] for field in _SKILL_METADATA_FIELDS if field in value}
+    try:
+        return TrajectorySkillMetadata.model_validate(candidate).model_dump()
+    except ValidationError:
+        return None
+
+
+def _sanitize_skills(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    sanitized = [_sanitize_skill_metadata(item) for item in value[:1]]
+    return [item for item in sanitized if item is not None]
+
+
+def _sanitize_requested_skill_ids(value: Any) -> list[str]:
+    return _bounded_list(value)[:1]
+
+
+_CAPABILITY_RESOLUTION_FIELDS = (
+    "schema_version",
+    "router_version",
+    "package_id",
+    "confidence",
+    "resolution_mode",
+    "reason_codes",
+    "external_tool_names",
+    "effective_plan_mode",
+    "include_current_date",
+    "network_boundary_required",
+    "bundle_fingerprint",
+    "skill_resolution",
+)
+
+
+def _sanitize_capability_resolution(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    candidate = {field: value[field] for field in _CAPABILITY_RESOLUTION_FIELDS if field in value}
+    try:
+        return TrajectoryCapabilityResolution.model_validate(candidate).model_dump()
+    except ValidationError:
+        return None
+
+
+def _sanitize_external_tool_names(value: Any) -> list[str]:
+    sanitized = []
+    for name in _bounded_list(value):
+        if (
+            name in CAPABILITY_CONTROL_TOOL_NAMES
+            or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,127}", name) is None
+            or name in sanitized
+        ):
+            continue
+        sanitized.append(name)
+    return sanitized[:3]
+
+
 def _sanitize_scalar(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, float)):
         return value
@@ -237,6 +325,10 @@ _SPECIAL_SANITIZERS: dict[str, Callable[[Any], Any]] = {
     "items": _sanitize_plan_items,
     "item": _sanitize_plan_item,
     "evidence": _sanitize_evidence,
+    "skills": _sanitize_skills,
+    "requested_skill_ids": _sanitize_requested_skill_ids,
+    "capability_resolution": _sanitize_capability_resolution,
+    "tools": _sanitize_external_tool_names,
 }
 
 
@@ -258,4 +350,10 @@ def build_trajectory_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             stored[field] = _bounded_list(payload[field])
         else:
             stored[field] = _sanitize_scalar(payload[field])
+    if (
+        event_type == "run_started"
+        and payload.get("capability_resolution") is not None
+        and stored.get("capability_resolution") is None
+    ):
+        stored["tools"] = []
     return stored

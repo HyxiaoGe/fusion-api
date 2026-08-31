@@ -1,11 +1,13 @@
 import unittest
+from unittest.mock import patch
 
+from app.ai.skills.registry import SkillReleasePin
 from app.schemas.chat import TextBlock
 from app.services.agent.plan_coordinator import PlanCoordinator
 from app.services.mcp.amap_product_tools import AMAP_PRODUCT_DEFINITIONS
+from app.services.mcp.flyai_travel_tools import FLYAI_TRAVEL_DEFINITIONS
 from app.services.stream.agent_loop_request_prep import (
     build_agent_loop_call_config,
-    inject_amap_fact_boundary,
     inject_deep_research_contract,
     inject_no_tool_network_boundary,
     inject_plan_control_contract,
@@ -23,10 +25,71 @@ class FakeFileRepository:
 
 
 class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
+    def test_continuation_with_frozen_skill_fails_closed_when_current_route_drops_skill(self):
+        current = build_agent_loop_call_config(
+            provider="openai",
+            options={"plan_mode": "on"},
+            capabilities={"functionCalling": True, "searchCapable": True},
+            original_message="核验 OpenAI 最新公告，给出官方原文和交叉来源",
+        )
+        metadata = current.capability_resolution.skill_resolution.skills[0]
+
+        continued = build_agent_loop_call_config(
+            provider="openai",
+            options={"plan_mode": "on"},
+            capabilities={"functionCalling": True, "searchCapable": True},
+            original_message="继续",
+            skill_release_pins=(
+                SkillReleasePin(
+                    skill_id=metadata.skill_id,
+                    version=metadata.version,
+                    content_sha256=metadata.content_sha256,
+                ),
+            ),
+        )
+
+        self.assertEqual(continued.capability_resolution.package_id, "tools_unavailable")
+        self.assertEqual(continued.capability_resolution.reason_codes, ("required_skill_unavailable",))
+        self.assertEqual(continued.capability_resolution.skill_resolution.status, "load_failed")
+        self.assertEqual(continued.announced_tools, [])
+
+    async def test_prompt_uses_frozen_skill_snapshot_without_rereading_disk(self):
+        message = "核验 OpenAI 最新公告，给出官方原文和交叉来源"
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={"plan_mode": "on"},
+            capabilities={"functionCalling": True, "searchCapable": True},
+            original_message=message,
+        )
+        frozen = config.capability_resolution.loaded_skills[0]
+
+        with patch(
+            "app.ai.skills.registry.Path.read_bytes",
+            side_effect=AssertionError("Prompt 组装不得重新读取 Skill 文件"),
+        ):
+            prepared = await prepare_agent_loop_messages(
+                db=object(),
+                user_id="user-1",
+                raw_messages=[],
+                has_vision=False,
+                file_ids=None,
+                original_message=message,
+                call_config=config,
+                file_repo_factory=lambda _db: FakeFileRepository(),
+                load_user_system_prompt_fn=lambda _db, _uid: None,
+                preprocess_user_input=False,
+            )
+
+        skill_sections = [
+            section
+            for section in prepared.prompt_snapshot["sections"]
+            if section["section_id"] == frozen.metadata.section_id
+        ]
+        self.assertEqual(skill_sections, [{"section_id": frozen.metadata.section_id, "content": frozen.content}])
+
     async def test_real_builder_preserves_parsed_attachment_without_text_in_new_conversation(self):
         from app.ai.prompts.agent_loop import APP_IDENTITY_PROMPT
         from app.schemas.chat import FileBlock, Message
-        from app.services.stream.agent_loop_request_prep import AgentLoopCallConfig
 
         file_repo = FakeFileRepository()
         prepared = await prepare_agent_loop_messages(
@@ -45,7 +108,12 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             has_vision=False,
             file_ids=["doc-1"],
             original_message="",
-            call_config=AgentLoopCallConfig(False, False, {}, []),
+            call_config=build_agent_loop_call_config(
+                provider="openai",
+                options={},
+                capabilities={"functionCalling": False},
+                original_message="",
+            ),
             file_repo_factory=lambda db: file_repo,
             load_user_system_prompt_fn=lambda db, uid: None,
             is_image_file_fn=lambda file_id, repo: False,
@@ -69,6 +137,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             provider="openai",
             options={"plan_mode": "on"},
             capabilities={"functionCalling": True, "searchCapable": True},
+            original_message="OpenAI 今天发布了什么？阅读官方公告后总结",
         )
         prepared = await prepare_agent_loop_messages(
             db=object(),
@@ -76,7 +145,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             raw_messages=[],
             has_vision=False,
             file_ids=None,
-            original_message="测试",
+            original_message="OpenAI 今天发布了什么？阅读官方公告后总结",
             call_config=config,
             file_repo_factory=lambda db: FakeFileRepository(),
             load_user_system_prompt_fn=lambda db, uid: "请解释【工具调用一致性规则】与【执行计划控制规则】",
@@ -86,36 +155,45 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(APP_IDENTITY_PROMPT, contents)
         self.assertIn(TOOL_USAGE_CONTRACT_PROMPT, contents)
         self.assertIn(AGENT_PLAN_CONTROL_ON_PROMPT, contents)
+        self.assertEqual(config.capability_resolution.skill_resolution.status, "loaded")
+        self.assertIn("skill:verified-research@1.0.0", prepared.prompt_assembly["section_ids"])
+        skill_content = config.capability_resolution.loaded_skills[0].content
+        self.assertEqual(contents.count(skill_content), 1)
+        self.assertNotIn("verified_research_plan", prepared.prompt_assembly["section_ids"])
         self.assertEqual(prepared.prompt_assembly["status"], "ready")
         self.assertTrue(all(set(message) == {"role", "content"} for message in prepared.messages))
+        snapshot = prepared.prompt_snapshot
+        self.assertEqual(snapshot["fingerprint"], prepared.prompt_assembly["fingerprint"])
+        self.assertEqual(
+            [section["content"] for section in snapshot["sections"]],
+            contents[: len(prepared.prompt_assembly["section_ids"])],
+        )
+        self.assertIn(
+            "请解释", next(s["content"] for s in snapshot["sections"] if s["section_id"] == "user_preferences")
+        )
+        prepared.messages[0]["content"] = "运行中追加或改写的内容"
+        self.assertNotEqual(snapshot["sections"][0]["content"], "运行中追加或改写的内容")
 
     async def test_assembly_sections_follow_actual_capabilities_and_modes(self):
-        from app.services.stream.agent_loop_request_prep import AgentLoopCallConfig
-
-        for plan_mode, task_mode, tools, expected in [
-            ("off", "standard", [], ["current_date", "app_identity", "no_tool_network_boundary"]),
+        for message, options, expected in [
+            ("你好", {}, ["app_identity"]),
             (
-                "on",
-                "standard",
-                ["web_search", "update_plan"],
-                ["current_date", "app_identity", "tool_usage_contract", "agent_plan_control"],
+                "今天上海证券交易所开市吗？",
+                {"plan_mode": "on"},
+                ["app_identity", "tool_usage_contract", "agent_plan_control", "current_date"],
             ),
             (
-                "on",
-                "deep_research",
-                ["web_search", "url_read", "update_plan"],
-                ["current_date", "app_identity", "tool_usage_contract", "agent_plan_control", "deep_research_contract"],
+                "深入研究 2026 年 AI Agent 浏览器安全现状",
+                {"task_mode": "deep_research"},
+                ["app_identity", "tool_usage_contract", "agent_plan_control", "deep_research_contract", "current_date"],
             ),
         ]:
-            with self.subTest(plan_mode=plan_mode, task_mode=task_mode):
-                config = AgentLoopCallConfig(
-                    should_use_reasoning=False,
-                    supports_function_calling=bool(tools),
-                    call_kwargs={"tools": [{"type": "function", "function": {"name": name}} for name in tools]},
-                    announced_tools=tools,
-                    plan_mode=plan_mode,
-                    task_mode=task_mode,
-                    control_tool_names=frozenset({"update_plan"}) if "update_plan" in tools else frozenset(),
+            with self.subTest(message=message, options=options):
+                config = build_agent_loop_call_config(
+                    provider="openai",
+                    options=options,
+                    capabilities={"functionCalling": True, "searchCapable": True},
+                    original_message=message,
                 )
                 prepared = await prepare_agent_loop_messages(
                     db=object(),
@@ -123,7 +201,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
                     raw_messages=[],
                     has_vision=False,
                     file_ids=None,
-                    original_message="测试",
+                    original_message=message,
                     call_config=config,
                     file_repo_factory=lambda db: FakeFileRepository(),
                     load_user_system_prompt_fn=lambda db, uid: None,
@@ -131,11 +209,268 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(prepared.prompt_assembly["section_ids"], expected)
                 self.assertEqual(len(prepared.messages), len(expected))
+                self.assertEqual([s["section_id"] for s in prepared.prompt_snapshot["sections"]], expected)
+                self.assertTrue(all(s["content"] for s in prepared.prompt_snapshot["sections"]))
+
+    async def test_greeting_materializes_empty_capability_bundle(self):
+        tools = [*AMAP_PRODUCT_DEFINITIONS, *FLYAI_TRAVEL_DEFINITIONS]
+        tool_names = [tool["function"]["name"] for tool in tools]
+        bindings = [{"alias": name, "server_id": f"server-{index}"} for index, name in enumerate(tool_names)]
+        config = build_agent_loop_call_config(
+            provider="deepseek",
+            options={},
+            capabilities={"functionCalling": True, "searchCapable": True, "agentTools": True},
+            additional_tools=tools,
+            dynamic_tool_handlers={name: object() for name in tool_names},
+            tool_bindings=bindings,
+            original_message="你好",
+        )
+
+        prepared = await prepare_agent_loop_messages(
+            db=object(),
+            user_id="user-1",
+            raw_messages=[],
+            has_vision=False,
+            file_ids=None,
+            original_message="你好",
+            call_config=config,
+            file_repo_factory=lambda db: FakeFileRepository(),
+            load_user_system_prompt_fn=lambda db, uid: None,
+            preprocess_user_input=False,
+        )
+
+        self.assertNotIn("tools", config.call_kwargs)
+        self.assertEqual(config.dynamic_tool_handlers, {})
+        self.assertEqual(config.tool_bindings, [])
+        self.assertEqual(config.announced_tools, [])
+        self.assertEqual(prepared.final_tool_names, [])
+        self.assertEqual(prepared.prompt_assembly["section_ids"], ["app_identity"])
+        self.assertEqual(config.capability_resolution.package_id, "direct")
+
+    async def test_route_resolution_atomically_materializes_tools_and_prompt_sections(self):
+        tools = [*AMAP_PRODUCT_DEFINITIONS, *FLYAI_TRAVEL_DEFINITIONS]
+        tool_names = [tool["function"]["name"] for tool in tools]
+        handlers = {name: object() for name in tool_names}
+        bindings = [{"alias": name, "server_id": f"server-{index}"} for index, name in enumerate(tool_names)]
+
+        cases = [
+            (
+                "我现在在北京，我想去上海，你可以帮我吗",
+                {},
+                {"functionCalling": True, "searchCapable": True, "agentTools": True},
+                "mobility_intercity",
+                ["route_compare", "search_flights", "search_trains"],
+                ["app_identity", "agent_plan_control", "current_date"],
+            ),
+            (
+                "今天上海证券交易所开市吗？",
+                {},
+                {"functionCalling": True, "searchCapable": True, "agentTools": True},
+                "fresh_web",
+                ["web_search"],
+                ["app_identity", "tool_usage_contract", "current_date"],
+            ),
+            (
+                "总结 https://example.com/report，只依据该页面",
+                {},
+                {"functionCalling": True, "searchCapable": True, "agentTools": True},
+                "url_read",
+                ["url_read"],
+                ["app_identity"],
+            ),
+            (
+                "OpenAI 今天发布了什么？阅读官方公告后总结",
+                {"plan_mode": "off"},
+                {"functionCalling": True, "searchCapable": True, "agentTools": True},
+                "verified_web",
+                ["web_search", "url_read"],
+                [
+                    "app_identity",
+                    "tool_usage_contract",
+                    "skill:verified-research@1.0.0",
+                    "current_date",
+                ],
+            ),
+            (
+                "明天上海天气怎样？",
+                {},
+                {"functionCalling": True, "searchCapable": True, "agentTools": True},
+                "weather",
+                ["weather_forecast"],
+                ["app_identity", "current_date"],
+            ),
+            (
+                "你好",
+                {"plan_mode": "on"},
+                {"functionCalling": True, "searchCapable": True, "agentTools": True},
+                "direct",
+                [],
+                ["app_identity", "agent_plan_control"],
+            ),
+            (
+                "查一下今天最新的 OpenAI 新闻",
+                {"disable_tools": True},
+                {"functionCalling": True, "searchCapable": True, "agentTools": True},
+                "tools_unavailable",
+                [],
+                ["app_identity", "no_tool_network_boundary", "current_date"],
+            ),
+            (
+                "查今天上海天气",
+                {},
+                {"functionCalling": False, "searchCapable": True, "agentTools": True},
+                "tools_unavailable",
+                [],
+                ["app_identity", "no_tool_network_boundary", "current_date"],
+            ),
+        ]
+
+        async def build_messages(
+            _raw_messages,
+            _has_vision,
+            _repo,
+            _user_system_prompt,
+            *,
+            user_id=None,
+            conversation_id=None,
+            include_base_system=True,
+        ):
+            return [{"role": "user", "content": "原问题"}]
+
+        for message, options, capabilities, package_id, expected_external_tools, expected_sections in cases:
+            with self.subTest(message=message):
+                config = build_agent_loop_call_config(
+                    provider="openai",
+                    options=options,
+                    capabilities=capabilities,
+                    additional_tools=tools,
+                    dynamic_tool_handlers=handlers,
+                    tool_bindings=bindings,
+                    original_message=message,
+                )
+                prepared = await prepare_agent_loop_messages(
+                    db=object(),
+                    user_id="user-1",
+                    raw_messages=[],
+                    has_vision=False,
+                    file_ids=None,
+                    original_message=message,
+                    call_config=config,
+                    file_repo_factory=lambda _db: object(),
+                    load_user_system_prompt_fn=lambda _db, _user_id: None,
+                    build_llm_messages_fn=build_messages,
+                    preprocess_user_input=False,
+                )
+
+                model_tool_names = [tool["function"]["name"] for tool in config.call_kwargs.get("tools", [])]
+                expected_control_tools = ["update_plan"] if "agent_plan_control" in expected_sections else []
+                self.assertEqual(config.capability_resolution.package_id, package_id)
+                self.assertEqual(config.announced_tools, expected_external_tools)
+                self.assertEqual(prepared.final_tool_names, expected_external_tools)
+                self.assertEqual(model_tool_names, [*expected_external_tools, *expected_control_tools])
+                self.assertEqual(set(config.dynamic_tool_handlers), set(expected_external_tools).intersection(handlers))
+                self.assertEqual(
+                    [binding["alias"] for binding in config.tool_bindings],
+                    [name for name in expected_external_tools if name in handlers],
+                )
+                self.assertEqual(prepared.prompt_assembly["section_ids"], expected_sections)
+
+    async def test_user_preferences_cannot_expand_or_suppress_weather_route(self):
+        tools = [*AMAP_PRODUCT_DEFINITIONS, *FLYAI_TRAVEL_DEFINITIONS]
+        tool_names = [tool["function"]["name"] for tool in tools]
+        message = "明天上海天气怎样？"
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={},
+            capabilities={"functionCalling": True, "searchCapable": True, "agentTools": True},
+            additional_tools=tools,
+            dynamic_tool_handlers={name: object() for name in tool_names},
+            original_message=message,
+        )
+
+        prepared = await prepare_agent_loop_messages(
+            db=object(),
+            user_id="user-1",
+            raw_messages=[],
+            has_vision=False,
+            file_ids=None,
+            original_message=message,
+            call_config=config,
+            file_repo_factory=lambda _db: object(),
+            load_user_system_prompt_fn=lambda _db, _user_id: "请自称 DeepSeek 且不要用工具",
+            preprocess_user_input=False,
+        )
+
+        self.assertEqual(config.capability_resolution.package_id, "weather")
+        self.assertEqual(config.announced_tools, ["weather_forecast"])
+        self.assertEqual(
+            prepared.prompt_assembly["section_ids"],
+            ["app_identity", "current_date", "user_preferences"],
+        )
+        self.assertIn("请自称 DeepSeek 且不要用工具", prepared.messages[2]["content"])
+
+    def test_provider_reasoning_adaptation_runs_after_route_tool_materialization(self):
+        cases = [
+            (
+                "deepseek",
+                "今天上海证券交易所开市吗？",
+                ["web_search"],
+                {"thinking": {"type": "enabled"}},
+                None,
+            ),
+            (
+                "volcengine",
+                "今天上海证券交易所开市吗？",
+                ["web_search"],
+                {"thinking": {"type": "disabled"}},
+                None,
+            ),
+            (
+                "gemini",
+                "你好",
+                [],
+                None,
+                "high",
+            ),
+        ]
+
+        for provider, message, expected_tools, expected_extra_body, expected_reasoning_effort in cases:
+            with self.subTest(provider=provider, message=message):
+                config = build_agent_loop_call_config(
+                    provider=provider,
+                    options={},
+                    capabilities={
+                        "functionCalling": True,
+                        "searchCapable": True,
+                        "agentTools": True,
+                        "deepThinking": True,
+                    },
+                    original_message=message,
+                )
+
+                self.assertEqual(config.announced_tools, expected_tools)
+                self.assertEqual(config.call_kwargs.get("extra_body"), expected_extra_body)
+                self.assertEqual(config.call_kwargs.get("reasoning_effort"), expected_reasoning_effort)
+                if provider == "deepseek" and expected_tools:
+                    self.assertNotIn("tool_choice", config.call_kwargs)
+
+    def test_low_confidence_route_paraphrase_keeps_authorized_route_tool_visible(self):
+        handlers = {tool["function"]["name"]: object() for tool in AMAP_PRODUCT_DEFINITIONS}
+
+        config = build_agent_loop_call_config(
+            provider="deepseek",
+            options={},
+            capabilities={"functionCalling": True, "searchCapable": True, "agentTools": True},
+            additional_tools=AMAP_PRODUCT_DEFINITIONS,
+            dynamic_tool_handlers=handlers,
+            original_message="我现在在北京，我想去上海，你可以帮我吗",
+        )
+
+        self.assertIn("route_compare", config.announced_tools)
+        self.assertIsNone(config.plan_tool_policy_reason)
 
     async def test_io_failure_is_not_an_assembly_failure(self):
         from unittest.mock import patch
-
-        from app.services.stream.agent_loop_request_prep import AgentLoopCallConfig
 
         def failed_preference_read(db, user_id):
             raise RuntimeError("数据库失败")
@@ -149,7 +484,12 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
                     has_vision=False,
                     file_ids=None,
                     original_message="测试",
-                    call_config=AgentLoopCallConfig(False, False, {}, []),
+                    call_config=build_agent_loop_call_config(
+                        provider="openai",
+                        options={},
+                        capabilities={"functionCalling": False},
+                        original_message="测试",
+                    ),
                     file_repo_factory=lambda db: FakeFileRepository(),
                     load_user_system_prompt_fn=failed_preference_read,
                     preprocess_user_input=False,
@@ -267,6 +607,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             provider="openai",
             options={},
             capabilities={"functionCalling": True, "searchCapable": True},
+            original_message="OpenAI 今天发布了什么？阅读官方公告后总结",
         )
 
         model_tool_names = [tool["function"]["name"] for tool in config.call_kwargs["tools"]]
@@ -301,7 +642,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         ]["items"]
         self.assertEqual(planned_tools["enum"], ["web_search", "url_read"])
 
-    async def test_verified_research_injects_initial_research_dag_contract_only_for_matching_policy(self):
+    async def test_verified_research_loads_skill_body_only_for_matching_policy(self):
         async def build_llm_messages_fn(
             _raw_messages,
             _has_vision,
@@ -343,12 +684,11 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             str(message.get("content", "")) for message in simple.messages if message.get("role") == "system"
         )
 
-        self.assertIn("【可核验证据计划规则】", verified_system_text)
-        self.assertIn("至少 1 个 web_search", verified_system_text)
-        self.assertIn("至少 2 个独立的 url_read", verified_system_text)
-        self.assertIn("直接或间接依赖 web_search", verified_system_text)
-        self.assertIn("最终 answer 或 synthesis", verified_system_text)
-        self.assertNotIn("【可核验证据计划规则】", simple_system_text)
+        self.assertIn("# 可核验证据研究", verified_system_text)
+        self.assertIn("先搜索候选来源", verified_system_text)
+        self.assertIn("独立来源交叉核验", verified_system_text)
+        self.assertNotIn("【可核验证据计划规则】", verified_system_text)
+        self.assertNotIn("# 可核验证据研究", simple_system_text)
 
     def test_deep_research_forces_plan_mode_and_records_task_policy(self):
         config = build_agent_loop_call_config(
@@ -399,6 +739,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             provider="openai",
             options={"plan_mode": "off"},
             capabilities={"functionCalling": True, "searchCapable": True},
+            original_message="今天上海证券交易所开市吗？",
         )
 
         model_tool_names = [tool["function"]["name"] for tool in config.call_kwargs["tools"]]
@@ -413,6 +754,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             provider="openai",
             options={"plan_mode": "on"},
             capabilities={"functionCalling": True, "searchCapable": True},
+            original_message="今天上海证券交易所开市吗？",
         )
 
         tools = {tool["function"]["name"]: tool for tool in config.call_kwargs["tools"]}
@@ -441,6 +783,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             provider="openai",
             options={"plan_mode": "auto"},
             capabilities={"functionCalling": True, "searchCapable": True},
+            original_message="OpenAI 今天发布了什么？阅读官方公告后总结",
         )
 
         web_tool = next(tool for tool in config.call_kwargs["tools"] if tool["function"]["name"] == "web_search")
@@ -462,6 +805,52 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(config.announced_tools, [])
 
+    def test_on_mode_without_external_tools_constrains_planned_tools_to_empty_arrays(self):
+        for message, expected_package in (
+            ("你好", "direct"),
+            ("帮我查一下这个", "clarification_only"),
+        ):
+            with self.subTest(message=message):
+                config = build_agent_loop_call_config(
+                    provider="openai",
+                    options={"plan_mode": "on"},
+                    capabilities={"functionCalling": True, "searchCapable": True},
+                    original_message=message,
+                )
+
+                update_plan = next(
+                    tool for tool in config.call_kwargs["tools"] if tool["function"]["name"] == "update_plan"
+                )
+                parameters = update_plan["function"]["parameters"]
+                planned_tools = parameters["properties"]["plan"]["items"]["properties"]["planned_tools"]
+                empty_plan = {
+                    "plan": [
+                        {"id": "step-1", "step": "理解请求", "status": "pending", "planned_tools": []},
+                        {"id": "step-2", "step": "直接回答", "status": "pending", "planned_tools": []},
+                    ]
+                }
+                invalid_plan = {
+                    "plan": [
+                        {
+                            "id": "step-1",
+                            "step": "错误调用未公告工具",
+                            "status": "pending",
+                            "planned_tools": ["web_search"],
+                        },
+                        {"id": "step-2", "step": "直接回答", "status": "pending", "planned_tools": []},
+                    ]
+                }
+
+                self.assertEqual(config.capability_resolution.package_id, expected_package)
+                self.assertEqual(config.announced_tools, [])
+                self.assertEqual(planned_tools["maxItems"], 0)
+                self.assertTrue(
+                    all(len(item["planned_tools"]) <= planned_tools["maxItems"] for item in empty_plan["plan"])
+                )
+                self.assertFalse(
+                    all(len(item["planned_tools"]) <= planned_tools["maxItems"] for item in invalid_plan["plan"])
+                )
+
     def test_requested_on_mode_defensively_disables_when_model_cannot_call_control_tool(self):
         config = build_agent_loop_call_config(
             provider="openai",
@@ -478,6 +867,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             provider="openai",
             options={},
             capabilities={"functionCalling": True, "searchCapable": True},
+            original_message="OpenAI 今天发布了什么？阅读官方公告后总结",
         )
         messages = [{"role": "user", "content": "规划通勤路线"}]
 
@@ -517,126 +907,6 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(inject_plan_control_contract(messages, config), messages)
 
-    def test_amap_fact_boundary_is_generic_system_prompt_and_preserves_multi_tool_message_order(self):
-        messages = [
-            {"role": "system", "content": "基础系统提示"},
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {"id": "tc-place", "type": "function", "function": {"name": "local_place_search"}},
-                    {"id": "tc-route", "type": "function", "function": {"name": "route_compare"}},
-                    {"id": "tc-search", "type": "function", "function": {"name": "web_search"}},
-                ],
-            },
-            {"role": "tool", "tool_call_id": "tc-place", "content": "民治星巴克地点原始数据"},
-            {"role": "tool", "tool_call_id": "tc-route", "content": "深圳北站路线原始数据"},
-            {"role": "tool", "tool_call_id": "tc-search", "content": "普通搜索上下文"},
-        ]
-        call_kwargs = {
-            "tools": [
-                {"type": "function", "function": {"name": "local_place_search"}},
-                {"type": "function", "function": {"name": "route_compare"}},
-                {"type": "function", "function": {"name": "weather_forecast"}},
-                {"type": "function", "function": {"name": "web_search"}},
-            ]
-        }
-
-        prepared = inject_amap_fact_boundary(messages, call_kwargs)
-
-        self.assertEqual(
-            [message["role"] for message in prepared],
-            ["system", "system", "assistant", "tool", "tool", "tool"],
-        )
-        self.assertEqual(
-            [message["tool_call_id"] for message in prepared[3:]],
-            ["tc-place", "tc-route", "tc-search"],
-        )
-        boundary = prepared[1]["content"]
-        self.assertIn("【地点与路线工具选择规则】", boundary)
-        self.assertIn("【组合行程必填信息规则】", boundary)
-        self.assertIn("存在多个合理的具体出发日期", boundary)
-        self.assertIn("必须先向用户确认具体日期", boundary)
-        self.assertIn(
-            "不得选择任一候选日期调用 search_flights、search_trains、weather_forecast 或 route_compare", boundary
-        )
-        self.assertIn("两个自然语言起终点", boundary)
-        self.assertIn("直接调用 route_compare", boundary)
-        self.assertIn("不要先调用 web_search 或 local_place_search", boundary)
-        self.assertIn("当前位置", boundary)
-        self.assertIn("source=current_location", boundary)
-        self.assertIn("【地点与路线事实边界规则】", boundary)
-        self.assertIn("工具失败、不可用或未取得可用结果", boundary)
-        self.assertIn("不得用训练知识补充具体地点、线路、时间、距离、费用或路况", boundary)
-        self.assertIn("不得仅根据地址片区或同村", boundary)
-        self.assertIn("步行可达", boundary)
-        self.assertIn("隔壁片区", boundary)
-        self.assertIn("本次返回候选中", boundary)
-        self.assertIn("距离或就近作为选择条件", boundary)
-        self.assertIn("只能来自对应 result.places 或 result.routes 中实际返回的字段", boundary)
-        self.assertIn("禁止使用常识、品牌印象、店名词义或训练知识", boundary)
-        self.assertIn("环境、安静度、座位、出品、通常营业时间、公园步道", boundary)
-        self.assertIn("rating 只能称为评分或综合评分", boundary)
-        self.assertIn("不得解释为环境、安静度或服务评分", boundary)
-        self.assertIn("不得根据品牌、店名或综合评分", boundary)
-        self.assertIn("适合聊天、适合三人、品牌稳定或出品稳定", boundary)
-        self.assertIn("不得在正文或括号中补充估计", boundary)
-        self.assertIn("结果为 0 条时，不得根据常识推荐任何有名称的地点", boundary)
-        self.assertIn("reference_cost_yuan", boundary)
-        self.assertIn("只能原样称为参考消费", boundary)
-        self.assertIn("不得评价为便宜、实惠或性价比高", boundary)
-        self.assertIn("允许依据实际返回的 rating 或 open_hours 做有限排序或说明", boundary)
-        self.assertIn("必须明确所依据的字段", boundary)
-        self.assertIn("不得把排序或说明改写成未返回属性", boundary)
-        self.assertIn("不得推断实时排队、预约、空位", boundary)
-        self.assertIn("地点之间的时间或距离", boundary)
-        self.assertIn("路线选择或比较只能基于实际返回的 duration_s、distance_m、transfers 等字段", boundary)
-        self.assertIn("允许说明最快、最慢、换乘次数或距离远近", boundary)
-        self.assertIn("必须明确依据的返回字段", boundary)
-        self.assertIn("停车位、停车难度、停车费、公交票价或成本", boundary)
-        self.assertIn(
-            "当前路况、周六路况、进出站或换乘等待时间、出行灵活性、舒适度、环保或免费",
-            boundary,
-        )
-        self.assertIn("不得声称路线耗时包含或不包含停车及其他未返回构成", boundary)
-        self.assertIn("未返回的路线属性只能说明无法从本次查询结果确认", boundary)
-        self.assertIn("【天气事实边界规则】", boundary)
-        self.assertIn("组合行程", boundary)
-        self.assertIn("必须调用 weather_forecast", boundary)
-        self.assertIn("不得用 web_search 或 url_read 替代", boundary)
-        self.assertIn("目的地市内接驳", boundary)
-        self.assertIn("先完成航班或高铁查询", boundary)
-        self.assertIn("只调用一次 route_compare", boundary)
-        self.assertIn("不得猜测机场或车站", boundary)
-        self.assertIn("必须把班次结果中的 city", boundary)
-        self.assertIn("origin_city 和 destination_city", boundary)
-        self.assertIn("实时温度、湿度、空气质量、降雨概率", boundary)
-        self.assertIn("不得声称代表具体建筑物、街道或园区的精确天气", boundary)
-        self.assertNotIn("民治星巴克", boundary)
-        self.assertNotIn("深圳北站", boundary)
-
-    def test_amap_fact_boundary_is_deduplicated(self):
-        call_kwargs = {"tools": [{"type": "function", "function": {"name": "local_place_search"}}]}
-
-        prepared = inject_amap_fact_boundary([{"role": "user", "content": "找咖啡店"}], call_kwargs)
-        prepared = inject_amap_fact_boundary(prepared, call_kwargs)
-
-        boundaries = [
-            message
-            for message in prepared
-            if message.get("role") == "system" and "【地点与路线事实边界规则】" in str(message.get("content", ""))
-        ]
-        self.assertEqual(len(boundaries), 1)
-
-    def test_non_amap_tools_do_not_inject_amap_fact_boundary(self):
-        messages = [{"role": "user", "content": "深圳天气"}]
-        call_kwargs = {"tools": [{"type": "function", "function": {"name": "web_search"}}]}
-
-        prepared = inject_amap_fact_boundary(messages, call_kwargs)
-
-        self.assertIs(prepared, messages)
-        self.assertFalse(any("【地点与路线事实边界规则】" in str(message.get("content", "")) for message in prepared))
-
     def test_build_call_config_applies_controlled_max_tokens(self):
         for raw_value, expected in ((1, 1), (1024, 1024), (9999, 4096)):
             with self.subTest(raw_value=raw_value):
@@ -675,7 +945,8 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         config = build_agent_loop_call_config(
             provider="volcengine",
             options={"plan_mode": "off"},
-            capabilities={"functionCalling": True, "deepThinking": True},
+            capabilities={"functionCalling": True, "searchCapable": True, "deepThinking": True},
+            original_message="今天上海证券交易所开市吗？",
         )
 
         self.assertTrue(config.should_use_reasoning)
@@ -751,7 +1022,8 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         config = build_agent_loop_call_config(
             provider="volcengine",
             options={"use_reasoning": False},
-            capabilities={"functionCalling": True, "deepThinking": True},
+            capabilities={"functionCalling": True, "searchCapable": True, "deepThinking": True},
+            original_message="OpenAI 今天发布了什么？阅读官方公告后总结",
         )
 
         self.assertFalse(config.should_use_reasoning)
@@ -776,6 +1048,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             provider="openai",
             options={"plan_mode": "off"},
             capabilities={"functionCalling": True, "agentTools": False, "searchCapable": True},
+            original_message="今天上海证券交易所开市吗？",
         )
 
         self.assertTrue(config.supports_function_calling)
@@ -813,6 +1086,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             additional_tools=[mcp_tool],
             dynamic_tool_handlers={"mcp_microsoft_docs_a1b2c3d4": handler},
             tool_bindings=[binding],
+            original_message="请使用 mcp_microsoft_docs_a1b2c3d4 查询 Microsoft Learn",
         )
 
         self.assertFalse(config.supports_function_calling)
@@ -840,6 +1114,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             additional_tools=[product_tool],
             dynamic_tool_handlers={"local_place_search": handler},
             tool_bindings=[{"alias": "local_place_search", "server_id": "amap-1"}],
+            original_message="搜索民治附近的咖啡店",
         )
         messages = [{"role": "user", "content": "搜索民治附近的咖啡店"}]
 
@@ -888,6 +1163,111 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.tool_bindings, [])
         self.assertNotIn("tools", config.call_kwargs)
 
+    async def test_authorized_mcp_alias_degrades_atomically_when_execution_is_unavailable(self):
+        alias = "mcp_docs_a1b2c3d4"
+        mcp_tool = {
+            "type": "function",
+            "function": {
+                "name": alias,
+                "description": "搜索 Microsoft Learn 文档",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            },
+        }
+        handler = object()
+        binding = {"alias": alias, "server_id": "server-1"}
+        message = f"请使用 {alias} 查询 Microsoft Learn"
+
+        async def build_llm_messages_fn(
+            _raw_messages,
+            _has_vision,
+            _repo,
+            _user_system_prompt,
+            *,
+            user_id=None,
+            conversation_id=None,
+            include_base_system=True,
+        ):
+            return [{"role": "user", "content": message}]
+
+        for options, capabilities, expected_reason in (
+            (
+                {"disable_tools": True},
+                {"functionCalling": True, "searchCapable": True},
+                "tools_disabled",
+            ),
+            (
+                {},
+                {"functionCalling": False, "searchCapable": False},
+                "function_calling_unavailable",
+            ),
+        ):
+            with self.subTest(expected_reason=expected_reason):
+                config = build_agent_loop_call_config(
+                    provider="openai",
+                    options=options,
+                    capabilities=capabilities,
+                    additional_tools=[mcp_tool],
+                    dynamic_tool_handlers={alias: handler},
+                    tool_bindings=[binding],
+                    authorized_tool_names=[alias],
+                    original_message=message,
+                )
+                prepared = await prepare_agent_loop_messages(
+                    db=object(),
+                    user_id="user-1",
+                    raw_messages=[],
+                    has_vision=False,
+                    file_ids=None,
+                    original_message=message,
+                    call_config=config,
+                    file_repo_factory=lambda _db: object(),
+                    load_user_system_prompt_fn=lambda _db, _user_id: None,
+                    build_llm_messages_fn=build_llm_messages_fn,
+                    preprocess_user_input=False,
+                )
+
+                self.assertEqual(config.capability_resolution.package_id, "tools_unavailable")
+                self.assertEqual(config.capability_resolution.resolution_mode, "degraded")
+                self.assertEqual(config.capability_resolution.reason_codes, (expected_reason,))
+                self.assertTrue(config.capability_resolution.network_boundary_required)
+                self.assertEqual(config.capability_resolution.external_tool_names, ())
+                self.assertNotIn("tools", config.call_kwargs)
+                self.assertEqual(config.dynamic_tool_handlers, {})
+                self.assertEqual(config.tool_bindings, [])
+                self.assertEqual(config.announced_tools, [])
+                self.assertEqual(prepared.final_tool_names, [])
+                self.assertEqual(
+                    prepared.prompt_assembly["section_ids"],
+                    ["app_identity", "no_tool_network_boundary"],
+                )
+
+        unauthorized = build_agent_loop_call_config(
+            provider="openai",
+            options={"disable_tools": True},
+            capabilities={"functionCalling": True, "searchCapable": True},
+            authorized_tool_names=[alias],
+            original_message="请使用 mcp_unapproved_deadbeef 查询秘密资料",
+        )
+        self.assertEqual(unauthorized.capability_resolution.package_id, "clarification_only")
+        self.assertFalse(unauthorized.capability_resolution.network_boundary_required)
+
+    def test_authorized_mcp_alias_degrades_when_agent_tools_are_unsupported(self):
+        alias = "mcp_docs_a1b2c3d4"
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={},
+            capabilities={"functionCalling": True, "searchCapable": True, "agentTools": False},
+            authorized_tool_names=[alias],
+            original_message=f"请调用 {alias} 查询 Microsoft Learn",
+        )
+
+        self.assertEqual(config.capability_resolution.package_id, "tools_unavailable")
+        self.assertEqual(config.capability_resolution.reason_codes, ("required_tools_unavailable",))
+        self.assertTrue(config.capability_resolution.network_boundary_required)
+        self.assertEqual(config.capability_resolution.external_tool_names, ())
+        self.assertEqual(config.announced_tools, [])
+        self.assertNotIn("tools", config.call_kwargs)
+
     def test_mcp_tool_prevents_false_no_network_boundary(self):
         messages = [{"role": "user", "content": "查一下 Microsoft Learn"}]
         call_kwargs = {
@@ -927,6 +1307,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
                 provider="qwen",
                 options={},
                 capabilities={"functionCalling": True, "agentTools": False},
+                original_message="OpenAI 最近发布了什么模型？",
             ),
             file_repo_factory=lambda _db: object(),
             load_user_system_prompt_fn=lambda _db, _user_id: None,
@@ -935,18 +1316,18 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [message["role"] for message in prepared.messages],
-            ["system", "system", "system", "system", "user"],
+            ["system", "system", "system", "user"],
         )
-        self.assertIn("【当前真实日期】", prepared.messages[0]["content"])
-        self.assertIn("【执行计划控制规则】", prepared.messages[2]["content"])
-        self.assertIn("【无联网工具边界规则】", prepared.messages[3]["content"])
-        self.assertIn("不要声称已经搜索", prepared.messages[3]["content"])
-        self.assertIn("无法实时核验", prepared.messages[3]["content"])
-        self.assertIn("不要把已有知识包装成最新事实", prepared.messages[3]["content"])
-        self.assertIn("普通稳定问题直接回答", prepared.messages[3]["content"])
-        self.assertNotIn("切换模型", prepared.messages[3]["content"])
-        self.assertNotIn("【工具调用一致性规则】", prepared.messages[3]["content"])
-        self.assertEqual(prepared.messages[4]["content"], "OpenAI 最近发布了什么模型？")
+        self.assertIn("【Fusion 身份一致性规则】", prepared.messages[0]["content"])
+        self.assertIn("【无联网工具边界规则】", prepared.messages[1]["content"])
+        self.assertIn("不要声称已经搜索", prepared.messages[1]["content"])
+        self.assertIn("无法实时核验", prepared.messages[1]["content"])
+        self.assertIn("不要把已有知识包装成最新事实", prepared.messages[1]["content"])
+        self.assertIn("普通稳定问题直接回答", prepared.messages[1]["content"])
+        self.assertNotIn("切换模型", prepared.messages[1]["content"])
+        self.assertNotIn("【工具调用一致性规则】", prepared.messages[1]["content"])
+        self.assertIn("【当前真实日期】", prepared.messages[2]["content"])
+        self.assertEqual(prepared.messages[3]["content"], "OpenAI 最近发布了什么模型？")
 
     async def test_prepare_messages_injects_no_vision_boundary_when_image_attached_to_text_model(self):
         async def build_llm_messages_fn(
@@ -974,6 +1355,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
                 provider="qwen",
                 options={},
                 capabilities={"functionCalling": True, "agentTools": False, "vision": False},
+                original_message="这张图里有什么？",
             ),
             file_repo_factory=lambda _db: object(),
             load_user_system_prompt_fn=lambda _db, _user_id: None,
@@ -983,14 +1365,12 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [message["role"] for message in prepared.messages],
-            ["system", "system", "system", "system", "system", "user"],
+            ["system", "system", "user"],
         )
-        self.assertIn("【无图片理解能力边界规则】", prepared.messages[2]["content"])
-        self.assertIn("当前模型不能读取或理解图片附件", prepared.messages[2]["content"])
-        self.assertIn("不要臆测图片内容", prepared.messages[2]["content"])
-        self.assertIn("【执行计划控制规则】", prepared.messages[3]["content"])
-        self.assertIn("【无联网工具边界规则】", prepared.messages[4]["content"])
-        self.assertEqual(prepared.messages[5]["content"], "这张图里有什么？")
+        self.assertIn("【无图片理解能力边界规则】", prepared.messages[1]["content"])
+        self.assertIn("当前模型不能读取或理解图片附件", prepared.messages[1]["content"])
+        self.assertIn("不要臆测图片内容", prepared.messages[1]["content"])
+        self.assertEqual(prepared.messages[2]["content"], "这张图里有什么？")
 
     async def test_prepare_messages_builds_llm_input_files_url_context_and_tool_contract(self):
         file_repo = FakeFileRepository()
@@ -1034,11 +1414,12 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             return result
 
         async def preprocess_url_in_message_fn(original_message, supports_function_calling, call_kwargs):
-            self.assertEqual(original_message, "请看 https://example.com/a")
+            self.assertEqual(original_message, "请阅读 https://example.com/a")
             self.assertTrue(supports_function_calling)
-            self.assertEqual(call_kwargs["tools"][0]["function"]["name"], "web_search")
-            if not any(tool["function"]["name"] == "url_read" for tool in call_kwargs["tools"]):
-                call_kwargs["tools"].append({"type": "function", "function": {"name": "url_read"}})
+            self.assertEqual(
+                [tool["function"]["name"] for tool in call_kwargs["tools"]],
+                ["url_read"],
+            )
             return (
                 TextBlock(type="text", id="url-block", text="URL 摘要"),
                 {"role": "user", "content": "<web_context>网页正文</web_context>"},
@@ -1048,7 +1429,8 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         call_config = build_agent_loop_call_config(
             provider="openai",
             options={"use_reasoning": True},
-            capabilities={"functionCalling": True, "deepThinking": True},
+            capabilities={"functionCalling": True, "searchCapable": True, "deepThinking": True},
+            original_message="请阅读 https://example.com/a",
         )
 
         prepared = await prepare_agent_loop_messages(
@@ -1057,7 +1439,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             raw_messages=["raw"],
             has_vision=False,
             file_ids=["doc-1", "image-1"],
-            original_message="请看 https://example.com/a",
+            original_message="请阅读 https://example.com/a",
             call_config=call_config,
             file_repo_factory=lambda _db: file_repo,
             load_user_system_prompt_fn=lambda _db, _user_id: "用户偏好",
@@ -1068,26 +1450,23 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNone(build_calls[0]["user_system_prompt"])
-        self.assertIn("用户偏好", prepared.messages[1]["content"])
+        self.assertIn("用户偏好", prepared.messages[2]["content"])
         self.assertIs(build_calls[0]["repo"], file_repo)
         self.assertEqual(build_calls[0]["user_id"], "user-1")
         self.assertIsNone(build_calls[0]["conversation_id"])
         self.assertEqual(file_repo.requested_content_ids, [["doc-1"]])
         self.assertEqual(inject_calls[0]["file_contents"], {"doc-1": "文档正文"})
         self.assertEqual([block.id for block in prepared.initial_content_blocks], ["url-block"])
-        self.assertEqual(prepared.final_tool_names, ["web_search", "url_read"])
+        self.assertEqual(prepared.final_tool_names, ["url_read"])
         self.assertEqual(
             [message["role"] for message in prepared.messages],
-            ["system", "system", "system", "system", "system", "system", "user", "user"],
+            ["system", "system", "system", "user", "user"],
         )
-        self.assertIn("【当前真实日期】", prepared.messages[0]["content"])
-        self.assertIn("【无图片理解能力边界规则】", prepared.messages[3]["content"])
-        self.assertIn("【工具调用一致性规则】", prepared.messages[4]["content"])
-        self.assertIn("【执行计划控制规则】", prepared.messages[5]["content"])
-        self.assertNotIn("【无联网工具边界规则】", prepared.messages[5]["content"])
-        self.assertIn("<web_context>", prepared.messages[6]["content"])
-        self.assertIn("文档正文", prepared.messages[7]["content"])
-        self.assertEqual(call_config.announced_tools, ["web_search", "url_read"])
+        self.assertIn("【Fusion 身份一致性规则】", prepared.messages[0]["content"])
+        self.assertIn("【无图片理解能力边界规则】", prepared.messages[1]["content"])
+        self.assertIn("<web_context>", prepared.messages[3]["content"])
+        self.assertIn("文档正文", prepared.messages[4]["content"])
+        self.assertEqual(call_config.announced_tools, ["url_read"])
 
     def test_tool_usage_contract_uses_centralized_prompt(self):
         from app.ai.prompts.agent_loop import NETWORK_DECISION_PROMPT, TOOL_USAGE_CONTRACT_PROMPT
@@ -1164,6 +1543,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
                 provider="openai",
                 options={},
                 capabilities={"functionCalling": False},
+                original_message="https://example.com",
             ),
             file_repo_factory=lambda _db: object(),
             load_user_system_prompt_fn=lambda _db, _user_id: None,
@@ -1176,10 +1556,8 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(prepared.initial_content_blocks, [])
-        self.assertEqual(prepared.messages[2], {"role": "system", "content": "继续执行，不要重写前文"})
-        self.assertEqual(prepared.messages[3]["role"], "system")
-        self.assertIn("【无联网工具边界规则】", prepared.messages[3]["content"])
-        self.assertEqual(prepared.messages[4]["role"], "user")
+        self.assertEqual(prepared.messages[1], {"role": "system", "content": "继续执行，不要重写前文"})
+        self.assertEqual(prepared.messages[2]["role"], "user")
 
     async def test_prepare_messages_passes_conversation_scope_to_builder(self):
         build_calls = []

@@ -71,6 +71,23 @@
 - 草稿 PR：API [#60](https://github.com/HyxiaoGe/fusion-api/pull/60)、UI [#48](https://github.com/HyxiaoGe/fusion-ui/pull/48)。UI 首轮 CI 全量 2350 测试及容器构建通过；API 首轮 CI 暴露两份旧集成测试的查询夹具/事件顺序不匹配，修正后主代理以 unittest 重跑 46 测试通过，生产代码未因此改动。最新分支 CI 结果以 PR Checks 为准。
 - 本条记录本地实现、代码验证与独立审查；分支 CI 以配套 PR 为准，未合并部署，未完成新版本真实浏览器/模型验收。协议和范围见 [一期契约](superpowers/specs/2026-08-26-system-prompt-assembly.md)。
 
+## 2026-08-27 主聊天 Prompt Runtime v2（仅本地开发与静态验证）
+
+- Run 初始 Prompt 改为 `app_identity → 固定运行规则 → current_date → user_preferences`，模板版本更新为 `2026-08-27.1`；稳定前缀不再被动态日期和偏好截断。
+- 默认 Web、高德、FlyAI、Plan 工具仍向主 LLM 公告 schema，但 Run 初始 Prompt 不再因工具可用而注入整段高德/FlyAI 领域 Prompt；自然表达“我现在在北京，我想去上海，你可以帮我吗”仍保留 `route_compare`。
+- 工具调用前规则下沉到 description/schema 和后端校验；高德事实约束继续随实际结果进入 ToolMessage，FlyAI 实际结果新增完整事实边界及单班次接驳后续规则。旧高德整段 Prompt 常量和两条初始注入 helper 已删除。
+- Trajectory 节点明确显示“Run 初始系统提示词”，正文说明后续 Round 可追加语言、修复、研究或总结规则；LLM 请求指纹改标“当轮实际系统消息指纹”。
+- 本地证据：API 全量 `2918 passed, 2 skipped, 828 subtests`，Ruff check/format 通过；UI 全量 `2371 passed`，目标 ESLint 和 production build 通过；两仓 `git diff --check` 通过。
+- 本条没有提交、推送、PR、CI、部署、本地服务或真实模型/浏览器验收。协议见 [v2 规格](superpowers/specs/2026-08-27-prompt-runtime-v2.md)。
+
+## 2026-08-27 Run 级能力路由（本地实现与自动化回归）
+
+- API 在首个 LLM Round 前以 `RunCapabilityResolution` 冻结最小能力包；同一 resolution 原子派生外部 tool definitions、handlers、bindings、announced/final tools、`update_plan` schema 和条件 Prompt sections。服务端共享 capability contract 同时约束当前 Run、实时事件、durable ledger 与历史 DTO；`AgentSession.run_config.capability_resolution` 是刷新和历史事实源。
+- 权限边界默认收窄：普通 direct/transform/clarification 不公布工具；Deep Research 只开放完整 search/read；禁用工具、无 function calling、Knowledge Grounded 和未满足必需工具时不把 schema 发给模型。已授权 MCP alias 的只读元数据只参与禁用/无 FC 路由分类，不复用受执行预算裁剪的 ToolSet，也不授信未授权 alias。
+- 自动化行为 fixture 共 501 条，其中 491 条路由记录通过真实 `build_agent_loop_call_config()` 与 `prepare_agent_loop_messages()` 核对 package、definitions、handlers、bindings、最终工具与 Prompt sections，不使用静态 JSON 自洽替身。矩阵覆盖问候、身份、日期、联网、URL、地图、航班/铁路、混合行程、Deep Research、Knowledge Grounded、模糊意图、抽象流程、按名词类型区分的定义类稳定知识与时效查询、URL query/自然动作边界、页面内搜索、中英文显式/自然内置、产品与 MCP 工具 hard deny 及最终再授权、当前请求及同对象中英文作用域、回指对象、`go online`/访问网络等全局中英文联网禁用、未知交通方式 fail-closed、交通方式否定、逗号/冒号/破折号子句边界及实体内部短横线保留、产品子集筛选、否定疑问、领域/解释补语、天气地点补语和中英文时序连接词。
+- 本地证据：最新目标集（含生产 wiring 与 lifecycle 指纹契约）`654 passed + 1065 subtests`，其中路由单测 `506 passed`、真实组装 fixture `491 subtests`；API 权威全量 `3489 passed, 2 skipped, 1895 subtests`，Ruff、任务改动文件 format check 与 diff check 已通过。能力包指纹现覆盖完整 resolution、announced tools、安全 MCP bindings、task/network/evidence policy 与 Prompt 模板版本；实际 Prompt snapshot/fingerprint 继续单独证明 section/body。UI 全量 `2430 passed`、production build、目标 ESLint 与 diff check 已通过；最终替换式对抗审查结论为 CLEAN。全量首次发现 Trajectory 列表读取整个 `AgentSession.config`，共享路径以 `7e49f5f` 收窄为 capability resolution 轻量投影后，原失败单项与全量均通过。
+- 当前状态仅为 API/UI 分支本地实现和静态/单元回归；没有推送、PR、CI、部署、真实模型或登录态浏览器验收。协议见 [Run 级能力路由规格](superpowers/specs/2026-08-27-run-capability-router.md)。
+
 ## 最近发布记录
 
 | 日期 | 仓库 | commit | 内容 | 验证 |

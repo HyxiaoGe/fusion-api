@@ -365,6 +365,52 @@ class CICDPermissionBoundaryTests(unittest.TestCase):
         self.assertEqual(publish_job.count("name: Publish master images on Windows runner"), 1)
         self.assertNotIn("name: Build on Windows runner", publish_job)
 
+    def test_windows_publish_requires_preconfigured_docker_engine(self) -> None:
+        publish_job = self.release_document["jobs"]["publish"]
+        verify_step = workflow_step(publish_job, "Verify Docker access")
+        script = verify_step["run"]
+
+        self.assertEqual(
+            verify_step["shell"],
+            'powershell -NoProfile -ExecutionPolicy Bypass -Command ". \'{0}\'"',
+        )
+        self.assertEqual(script.count("docker version"), 1)
+        self.assertEqual(script.count("docker ps"), 1)
+        self.assertIn("if ($LASTEXITCODE -ne 0)", script)
+        self.assertIn("exit $LASTEXITCODE", script)
+
+        for forbidden_command in (
+            "Docker Desktop.exe",
+            "Start-Process",
+            "Start-Service",
+            "RUNNER_TRACKING_ID",
+            "Start-Sleep",
+        ):
+            with self.subTest(forbidden_command=forbidden_command):
+                self.assertNotIn(forbidden_command, script)
+
+    def test_windows_powershell_51_inline_docker_check_is_ascii_only(self) -> None:
+        publish_job = self.release_document["jobs"]["publish"]
+        verify_step = workflow_step(publish_job, "Verify Docker access")
+
+        self.assertTrue(
+            verify_step["run"].isascii(),
+            "Windows PowerShell 5.1 会错误解码 GitHub Actions 生成的无 BOM UTF-8 临时脚本",
+        )
+
+    def test_non_ascii_windows_powershell_files_have_utf8_bom(self) -> None:
+        for script_path in (BUILD_SCRIPT, CLEANUP_SCRIPT):
+            raw_script = script_path.read_bytes()
+            if raw_script.isascii():
+                continue
+
+            with self.subTest(script=script_path.name):
+                self.assertTrue(
+                    raw_script.startswith(b"\xef\xbb\xbf"),
+                    "含非 ASCII 字符的 Windows PowerShell 5.1 脚本必须使用 UTF-8 BOM",
+                )
+                raw_script.decode("utf-8-sig")
+
     def test_release_runs_are_never_cancelled_mid_deployment(self) -> None:
         self.assertRegex(
             self.release_workflow,

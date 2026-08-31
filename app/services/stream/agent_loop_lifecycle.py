@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.ai.prompts.system_prompt import SystemPromptAssemblyError
+from app.ai.prompts.system_prompt import TEMPLATE_VERSION, SystemPromptAssemblyError
 from app.core.logger import app_logger as logger
 from app.core.prompt_bundle import get_active_prompt_bundle_revision
 from app.schemas.chat import TextBlock
 from app.schemas.response import ApiException
+from app.schemas.trajectory import TrajectoryCapabilityResolution
+from app.services.agent.session_cache import write_system_prompt_snapshot
 from app.services.agent_strategy_config import get_agent_strategy_config
 from app.services.knowledge.chat_grounding import (
     KnowledgeGroundingStreamError,
@@ -27,6 +31,7 @@ from app.services.stream.agent_loop_outcome import AgentLoopExit
 from app.services.stream.agent_loop_policy import AgentLoopLimits, map_run_terminal_state
 from app.services.stream.agent_loop_request_prep import AgentLoopCallConfig
 from app.services.stream.research_evidence import assign_missing_source_reference_metadata
+from app.services.stream.run_capability_router import serialize_capability_resolution
 from app.services.stream_state_service import StreamOwnershipLostError
 
 AsyncFn = Callable[..., Awaitable[Any]]
@@ -72,6 +77,7 @@ class AgentLoopLifecycleDependencies:
     claim_suggested_questions_fn: Callable[..., Any] | None = None
     generate_suggested_questions_fn: Callable[..., Any] | None = None
     fail_suggested_questions_fn: Callable[..., Any] | None = None
+    write_system_prompt_snapshot_fn: AsyncFn = write_system_prompt_snapshot
 
 
 async def run_agent_loop_lifecycle(
@@ -183,6 +189,12 @@ async def _run_success_path(
     dependencies: AgentLoopLifecycleDependencies,
 ) -> None:
     await _start_run(request=request, execution=execution, dependencies=dependencies)
+    if request.call_config.capability_resolution.skill_resolution.status != "loaded":
+        await _emit_skills_resolved(
+            request=request,
+            execution=execution,
+            detail_status=None,
+        )
     grounding = await _prepare_knowledge_grounding(request=request, execution=execution)
     if grounding is not None:
         execution.state.content_blocks.append(grounding.evidence_block)
@@ -338,16 +350,86 @@ async def _prepare_messages(
             preprocess_user_input=request.preprocess_user_input,
         )
     except SystemPromptAssemblyError as error:
+        await _emit_loaded_skills_degraded(request=request, execution=execution)
         try:
             await execution.emitter.system_prompt_prepared(**error.metadata)
         except Exception:
             # 保留组装原始失败，不让诊断写入异常覆盖主错误。
             dependencies.warning_fn("系统提示词失败事件写入失败")
         raise
+    except Exception:
+        await _emit_loaded_skills_degraded(request=request, execution=execution)
+        raise
     metadata = getattr(prepared, "prompt_assembly", None)
+    skill_detail_status = "degraded"
     if metadata is not None:
+        metadata = dict(metadata)
+        snapshot = getattr(prepared, "prompt_snapshot", None)
+        if snapshot is not None:
+            try:
+                await dependencies.write_system_prompt_snapshot_fn(
+                    run_id=execution.run_id,
+                    conversation_id=execution.completion_context.conversation_id,
+                    user_id=execution.runtime.user_id,
+                    snapshot=snapshot,
+                )
+                metadata["detail_status"] = "available"
+                skill_detail_status = "available"
+            except Exception as error:
+                # 辅助正文失败不终止生成，也不将异常中的提示词写入日志。
+                metadata["detail_status"] = "degraded"
+                dependencies.warning_fn(f"系统提示词正文保存失败: error_type={type(error).__name__}")
+        else:
+            metadata["detail_status"] = "degraded"
+        await _emit_loaded_skills_resolved(
+            request=request,
+            execution=execution,
+            detail_status=skill_detail_status,
+        )
         await execution.emitter.system_prompt_prepared(**metadata)
+    else:
+        await _emit_loaded_skills_degraded(request=request, execution=execution)
     return prepared
+
+
+async def _emit_loaded_skills_degraded(
+    *,
+    request: AgentLoopLifecycleRequest,
+    execution: AgentLoopExecutionContext,
+) -> None:
+    await _emit_loaded_skills_resolved(
+        request=request,
+        execution=execution,
+        detail_status="degraded",
+    )
+
+
+async def _emit_loaded_skills_resolved(
+    *,
+    request: AgentLoopLifecycleRequest,
+    execution: AgentLoopExecutionContext,
+    detail_status: str,
+) -> None:
+    if request.call_config.capability_resolution.skill_resolution.status != "loaded":
+        return
+    await _emit_skills_resolved(
+        request=request,
+        execution=execution,
+        detail_status=detail_status,
+    )
+
+
+async def _emit_skills_resolved(
+    *,
+    request: AgentLoopLifecycleRequest,
+    execution: AgentLoopExecutionContext,
+    detail_status: str | None,
+) -> None:
+    skill_resolution = serialize_capability_resolution(request.call_config.capability_resolution)["skill_resolution"]
+    await execution.emitter.skills_resolved(
+        **skill_resolution,
+        detail_status=detail_status,
+    )
 
 
 async def _prepare_knowledge_grounding(
@@ -555,4 +637,39 @@ def _run_config(limits: AgentLoopLimits, call_config: AgentLoopCallConfig | None
             bindings.append(safe_binding)
     if bindings:
         config["mcp_tool_bindings"] = bindings
+    resolution = getattr(call_config, "capability_resolution", None)
+    if resolution is not None:
+        resolution_payload = serialize_capability_resolution(resolution)
+        TrajectoryCapabilityResolution.model_validate(
+            {
+                **resolution_payload,
+                "bundle_fingerprint": "sha256:" + "0" * 64,
+            }
+        )
+        announced_tools = list(getattr(call_config, "announced_tools", []) or [])
+        if resolution_payload["external_tool_names"] != announced_tools:
+            raise ValueError("能力路由工具与 Run 公告工具不一致")
+        fingerprint_resolution = {
+            **resolution_payload,
+            "skill_resolution": {
+                key: value for key, value in resolution_payload["skill_resolution"].items() if key != "duration_ms"
+            },
+        }
+        fingerprint_input = {
+            "prompt_template_version": TEMPLATE_VERSION,
+            "capability_resolution": fingerprint_resolution,
+            "announced_tools": announced_tools,
+            "mcp_tool_bindings": bindings,
+            "task_mode": config["task_mode"],
+            "network_profile": config["network_profile"],
+            "evidence_policy": config["evidence_policy"],
+        }
+        serialized_fingerprint_input = json.dumps(
+            fingerprint_input,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        resolution_payload["bundle_fingerprint"] = "sha256:" + hashlib.sha256(serialized_fingerprint_input).hexdigest()
+        config["capability_resolution"] = TrajectoryCapabilityResolution.model_validate(resolution_payload).model_dump()
     return config

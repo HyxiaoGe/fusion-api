@@ -9,8 +9,77 @@ from pydantic import ValidationError
 from app.services.agent.emitter import AgentEventEmitter
 from app.services.agent.events import StepStarted
 
+CAPABILITY_RESOLUTION = {
+    "schema_version": 1,
+    "router_version": "2026-08-27.1",
+    "package_id": "fresh_web",
+    "confidence": "high",
+    "resolution_mode": "routed",
+    "reason_codes": ["fresh_external_fact"],
+    "external_tool_names": ["web_search"],
+    "effective_plan_mode": "off",
+    "include_current_date": True,
+    "network_boundary_required": False,
+    "bundle_fingerprint": "sha256:" + "a" * 64,
+}
+
+SKILL_METADATA = {
+    "skill_id": "verified-research",
+    "version": "1.0.0",
+    "content_sha256": "b" * 64,
+    "allowed_tool_names": ["web_search", "url_read"],
+    "section_id": "skill:verified-research@1.0.0",
+    "char_count": 354,
+}
+
 
 class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_skills_resolved_is_safe_run_level_event_between_run_start_and_first_llm_round(self):
+        emitted = []
+
+        class CaptureWriter:
+            async def append_chunk(self, _conversation_id, _task_id, _chunk_type, payload):
+                emitted.append(payload)
+
+        em = AgentEventEmitter(
+            run_id="r1", trace_id="r1", conversation_id="c1", task_id="t1", redis_writer=CaptureWriter()
+        )
+        with self.assertRaisesRegex(RuntimeError, "run_started"):
+            await em.skills_resolved(
+                status="not_selected",
+                activation_source="capability_package",
+                requested_skill_ids=[],
+                skills=[],
+                duration_ms=0,
+                detail_status=None,
+                error_code=None,
+            )
+
+        await em.run_started(message_id="m1", model="gpt", tools=[], config={})
+        await em.skills_resolved(
+            status="loaded",
+            activation_source="capability_package",
+            requested_skill_ids=["verified-research"],
+            skills=[SKILL_METADATA],
+            duration_ms=1,
+            detail_status="available",
+            error_code=None,
+        )
+        await em.llm_round_started(
+            llm_round_id="round-1",
+            round_index=1,
+            model="gpt",
+            provider="openai",
+        )
+
+        self.assertEqual([event["type"] for event in emitted], ["run_started", "skills_resolved", "llm_round_started"])
+        skill_event = emitted[1]
+        self.assertEqual(skill_event["sequence"], 1)
+        self.assertIsNone(skill_event["step_id"])
+        self.assertEqual(skill_event["detail_status"], "available")
+        self.assertEqual(skill_event["skills"], [SKILL_METADATA])
+        self.assertNotIn("content", skill_event["skills"][0])
+
     async def test_system_prompt_result_and_request_fingerprint_share_run_envelope(self):
         emitted = []
 
@@ -54,7 +123,12 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_started_envelope(self):
         writer = AsyncMock()
         em = AgentEventEmitter(run_id="r1", trace_id="r1", conversation_id="c1", task_id="task-1", redis_writer=writer)
-        await em.run_started(message_id="m1", model="gpt", tools=["web_search"], config={"max_steps": 8})
+        await em.run_started(
+            message_id="m1",
+            model="gpt",
+            tools=["web_search"],
+            config={"max_steps": 8, "capability_resolution": CAPABILITY_RESOLUTION},
+        )
         writer.append_chunk.assert_awaited_once()
         args, kwargs = writer.append_chunk.call_args
         self.assertEqual(args[0], "c1")
@@ -66,6 +140,53 @@ class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args[3]["trace_id"], "r1")
         self.assertEqual(args[3]["message_id"], "m1")
         self.assertEqual(args[3]["task_id"], "task-1")
+        self.assertEqual(args[3]["capability_resolution"], CAPABILITY_RESOLUTION)
+        self.assertEqual(args[3]["tools"], args[3]["capability_resolution"]["external_tool_names"])
+        self.assertNotIn("update_plan", args[3]["tools"])
+
+    async def test_invalid_current_run_resolution_is_not_emitted(self):
+        writer = AsyncMock()
+        em = AgentEventEmitter(
+            run_id="r1",
+            trace_id="r1",
+            conversation_id="c1",
+            task_id="task-1",
+            redis_writer=writer,
+        )
+        invalid_resolutions = (
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "mcp_explicit",
+                "reason_codes": ["explicit_authorized_tool_alias"],
+                "external_tool_names": ["update_plan"],
+                "include_current_date": False,
+            },
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "direct",
+                "reason_codes": ["direct_greeting"],
+                "external_tool_names": ["web_search"],
+                "include_current_date": False,
+            },
+            {
+                **CAPABILITY_RESOLUTION,
+                "package_id": "deep_research",
+                "reason_codes": ["deep_research_mode"],
+                "external_tool_names": ["url_read", "web_search"],
+                "effective_plan_mode": "on",
+            },
+        )
+
+        for invalid_resolution in invalid_resolutions:
+            with self.subTest(invalid_resolution=invalid_resolution), self.assertRaises(ValidationError):
+                await em.run_started(
+                    message_id="m1",
+                    model="gpt",
+                    tools=invalid_resolution["external_tool_names"],
+                    config={"capability_resolution": invalid_resolution},
+                )
+
+        writer.append_chunk.assert_not_awaited()
 
     async def test_step_started_returns_step_id_and_persists_context(self):
         writer = AsyncMock()

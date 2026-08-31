@@ -4,9 +4,15 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.schemas.chat import ContextStatus, KnowledgeEvidenceBlock, ProductResultBlock
+from app.schemas.trajectory import (
+    TrajectoryCapabilityResolution,
+    TrajectorySkillMetadata,
+    TrajectorySkillResolution,
+)
+from app.utils.run_capability_contract import CAPABILITY_CONTROL_TOOL_NAMES
 
 
 class AgentEventBase(BaseModel):
@@ -33,6 +39,15 @@ class RunStarted(AgentEventBase):
     model: str
     tools: list[str]
     config: dict[str, Any]
+    capability_resolution: TrajectoryCapabilityResolution | None = None
+
+    @model_validator(mode="after")
+    def _require_external_tools_match_resolution(self) -> RunStarted:
+        if CAPABILITY_CONTROL_TOOL_NAMES.intersection(self.tools):
+            raise ValueError("Run 公告工具不得包含内部控制工具")
+        if self.capability_resolution is not None and self.tools != self.capability_resolution.external_tool_names:
+            raise ValueError("Run 公告工具必须与能力路由外部工具一致")
+        return self
 
 
 class StepStarted(AgentEventBase):
@@ -313,9 +328,40 @@ class SystemPromptPrepared(AgentEventBase):
     section_ids: list[str] = Field(max_length=50)
     fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     char_count: int | None = Field(default=None, ge=0)
+    detail_status: Literal["available", "degraded"] | None = None
     duration_ms: int = Field(ge=0)
     error_code: str | None = None
     message: str | None = Field(default=None, max_length=120)
+
+
+class SkillsResolved(AgentEventBase):
+    """Run 级 Skill 选择终态；不携带正文、路径或原始异常。"""
+
+    type: Literal["skills_resolved"]
+    protocol_version: Literal[2]
+    status: Literal["not_selected", "loaded", "load_failed"]
+    activation_source: Literal["capability_package"]
+    requested_skill_ids: list[str] = Field(max_length=1)
+    skills: list[TrajectorySkillMetadata] = Field(max_length=1)
+    duration_ms: int = Field(ge=0)
+    detail_status: Literal["available", "degraded"] | None = None
+    error_code: Literal["skill_load_failed"] | None = None
+
+    @model_validator(mode="after")
+    def _validate_resolution(self) -> SkillsResolved:
+        TrajectorySkillResolution(
+            status=self.status,
+            activation_source=self.activation_source,
+            requested_skill_ids=self.requested_skill_ids,
+            skills=self.skills,
+            duration_ms=self.duration_ms,
+            error_code=self.error_code,
+        )
+        if self.status == "loaded" and self.detail_status not in {"available", "degraded"}:
+            raise ValueError("已加载 Skill 必须公告正文详情终态")
+        if self.status != "loaded" and self.detail_status is not None:
+            raise ValueError("未加载 Skill 时不得公告正文详情状态")
+        return self
 
 
 class ContextStatusUpdated(AgentEventBase):
@@ -389,6 +435,7 @@ AnyAgentEvent = Annotated[
     | ContentBlockUpserted
     | ContentBlockDiscarded
     | SystemPromptPrepared
+    | SkillsResolved
     | ContextStatusUpdated
     | ContextRequired
     | ContextResult,

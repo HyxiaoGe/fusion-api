@@ -16,13 +16,13 @@ from app.services.mcp.flyai_travel_tools import (
     FLYAI_SEARCH_FLIGHTS,
     FLYAI_SEARCH_TRAINS,
     FLYAI_TRAVEL_DEFINITIONS,
+    FLYAI_TRAVEL_FACT_BOUNDARY_SYSTEM_PROMPT,
     FlyAiTravelAdapterClient,
     FlyAiTravelRunControls,
     FlyAiTravelToolHandler,
     build_flyai_travel_binding,
     build_flyai_user_scope,
 )
-from app.services.stream.agent_loop_request_prep import inject_flyai_travel_fact_boundary
 from app.services.stream.agent_loop_wiring import _load_dynamic_tools
 from app.services.stream.product_answer_validator import (
     repair_unsupported_product_answer,
@@ -104,6 +104,10 @@ def _handler(
 class FlyAiTravelToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_tool_definitions_are_closed_bounded_and_use_confirmed_names(self):
         by_name = {item["function"]["name"]: item["function"]["parameters"] for item in FLYAI_TRAVEL_DEFINITIONS}
+        descriptions = [item["function"]["description"] for item in FLYAI_TRAVEL_DEFINITIONS]
+        for description in descriptions:
+            self.assertIn("组合行程", description)
+            self.assertIn("不得先调用任何出行、天气或接驳工具", description)
 
         self.assertEqual(set(by_name), {FLYAI_SEARCH_FLIGHTS, FLYAI_SEARCH_TRAINS})
         for parameters in by_name.values():
@@ -118,6 +122,10 @@ class FlyAiTravelToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("cabin_class", by_name[FLYAI_SEARCH_FLIGHTS]["properties"])
         self.assertNotIn("seat_class", by_name[FLYAI_SEARCH_FLIGHTS]["properties"])
         self.assertIn("seat_class", by_name[FLYAI_SEARCH_TRAINS]["properties"])
+        self.assertEqual(
+            by_name[FLYAI_SEARCH_TRAINS]["properties"]["train_category"]["enum"],
+            ["high_speed", "all"],
+        )
         self.assertNotIn("cabin_class", by_name[FLYAI_SEARCH_TRAINS]["properties"])
 
     async def test_arrival_deadline_is_filtered_locally_and_not_forwarded_to_adapter(self):
@@ -153,6 +161,38 @@ class FlyAiTravelToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("arrival_before_hour", captured["request"])
         self.assertEqual(captured["request"]["sort_by"], "departure_asc")
         self.assertEqual([item["transport_no"] for item in result.data["result"]["items"]], ["G100"])
+
+    async def test_high_speed_category_filters_regular_trains_and_is_not_forwarded_to_adapter(self):
+        captured: dict = {}
+
+        async def respond(request: httpx.Request) -> httpx.Response:
+            adapter_request = json.loads(request.content)
+            captured["request"] = adapter_request
+            payload = _adapter_payload(transport_no="G100", request=adapter_request)
+            d_train = json.loads(json.dumps(payload["items"][0]))
+            d_train["transport_no"] = "D200"
+            regular_train = json.loads(json.dumps(payload["items"][0]))
+            regular_train["transport_no"] = "1461"
+            regular_train["operator_name"] = "普快"
+            payload["items"] = [regular_train, d_train, payload["items"][0]]
+            return httpx.Response(200, json=payload)
+
+        handler = _handler(FLYAI_SEARCH_TRAINS, httpx.MockTransport(respond))
+        result = await handler.execute(
+            {
+                "origin": "深圳",
+                "destination": "上海",
+                "departure_date": "2026-08-01",
+                "train_category": "high_speed",
+            }
+        )
+
+        self.assertEqual(result.status, "success")
+        self.assertNotIn("train_category", captured["request"])
+        self.assertEqual(
+            [item["transport_no"] for item in result.data["result"]["items"]],
+            ["D200", "G100"],
+        )
 
     async def test_flight_success_projects_safe_fields_and_trusted_booking_action(self):
         captured: dict = {}
@@ -221,7 +261,23 @@ class FlyAiTravelToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(block, TrainResultsBlock)
         self.assertEqual(block.trains[0].train_no, "G100")
         self.assertEqual(block.trains[0].actions, [])
-        self.assertNotIn("evil.example", handler.format_llm_context(result))
+        context = handler.format_llm_context(result)
+        self.assertIn(FLYAI_TRAVEL_FACT_BOUNDARY_SYSTEM_PROMPT, context)
+        self.assertIn("如果用户还要求到达后的市内接驳", context)
+        self.assertIn("只调用一次 route_compare", context)
+        self.assertNotIn("evil.example", context)
+
+    def test_llm_context_budget_includes_trusted_result_wrapper(self):
+        handler = _handler(FLYAI_SEARCH_TRAINS, httpx.MockTransport(lambda _request: httpx.Response(500)))
+        result = SimpleNamespace(
+            status="success",
+            data={"result": {"items": [{"station_name": "超长站名" * 4_000}]}},
+        )
+
+        context = handler.format_llm_context(result)
+
+        self.assertLessEqual(len(context.encode("utf-8")), handler.max_llm_context_bytes)
+        self.assertIn(FLYAI_TRAVEL_FACT_BOUNDARY_SYSTEM_PROMPT, context)
 
     async def test_invalid_arguments_do_not_consume_budget_or_send_request(self):
         calls = 0
@@ -632,16 +688,7 @@ class FlyAiTravelToolTests(unittest.IsolatedAsyncioTestCase):
         failure = build_product_tool_failure_answer()
         self.assertIn("航班或高铁", failure)
 
-    async def test_agent_request_injects_travel_boundary_and_loader_receives_user_id(self):
-        call_kwargs = {"tools": [FLYAI_TRAVEL_DEFINITIONS[0]]}
-        messages = inject_flyai_travel_fact_boundary([{"role": "user", "content": "查航班"}], call_kwargs)
-
-        self.assertEqual(messages[0]["role"], "system")
-        self.assertIn("【航班与高铁事实边界规则】", messages[0]["content"])
-        self.assertIn("正文不使用表格重复卡片", messages[0]["content"])
-        self.assertNotIn("FlyAI", messages[0]["content"])
-        self.assertNotIn("飞猪", messages[0]["content"])
-
+    async def test_dynamic_tool_loader_receives_user_id(self):
         captured: dict = {}
 
         def new_loader(db, *, user_id):

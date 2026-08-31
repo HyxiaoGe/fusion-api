@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import os
 import sys
@@ -20,6 +21,20 @@ os.environ["FRONTEND_URL"] = "http://dev.example:3004"
 os.environ["AUTH_SERVICE_BASE_URL"] = "http://auth.example:8100"
 os.environ["AUTH_SERVICE_CLIENT_ID"] = "fusion-client"
 os.environ["AUTH_SERVICE_JWKS_URL"] = "http://auth.example:8100/.well-known/jwks.json"
+
+CAPABILITY_RESOLUTION = {
+    "schema_version": 1,
+    "router_version": "2026-08-27.1",
+    "package_id": "fresh_web",
+    "confidence": "high",
+    "resolution_mode": "routed",
+    "reason_codes": ["fresh_external_fact"],
+    "external_tool_names": ["web_search"],
+    "effective_plan_mode": "off",
+    "include_current_date": True,
+    "network_boundary_required": False,
+    "bundle_fingerprint": "sha256:" + "a" * 64,
+}
 
 
 class TrajectoryApiTests(unittest.TestCase):
@@ -87,6 +102,7 @@ class TrajectoryApiTests(unittest.TestCase):
         user_id: str = "user-1",
         trajectory_status: str = "complete",
         terminal_intent_reason: str | None = None,
+        run_config: dict | None = None,
     ) -> None:
         from app.db.models import AgentEvent, AgentSession, RunTrajectoryMeta, ToolCallLog
 
@@ -104,6 +120,7 @@ class TrajectoryApiTests(unittest.TestCase):
                 total_steps=2,
                 total_tool_calls=3,
                 total_duration_ms=123,
+                run_config=run_config,
                 created_at=self.now,
                 terminal_at=self.now,
             )
@@ -178,6 +195,83 @@ class TrajectoryApiTests(unittest.TestCase):
         self.assertNotIn("input_params", snapshot.text)
         self.assertNotIn("output_data", snapshot.text)
         self.assertNotIn("terminal_intent", snapshot.text)
+
+    def test_run_list_and_snapshot_expose_only_persisted_safe_capability_resolution(self):
+        self._add_run(
+            "run-resolution",
+            run_config={
+                "capability_resolution": CAPABILITY_RESOLUTION,
+                "authorization": "Bearer hidden",
+                "system_prompt_snapshot": {"content": "PRIVATE 正文"},
+            },
+        )
+
+        listing = self.client.get("/api/conversations/conv-1/runs")
+        snapshot = self.client.get("/api/conversations/conv-1/runs/run-resolution/trajectory")
+
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual(snapshot.status_code, 200)
+        self.assertEqual(listing.json()["data"]["items"][0]["capability_resolution"], CAPABILITY_RESOLUTION)
+        self.assertEqual(snapshot.json()["data"]["run"]["capability_resolution"], CAPABILITY_RESOLUTION)
+        for response in (listing, snapshot):
+            self.assertNotIn("Bearer hidden", response.text)
+            self.assertNotIn("authorization", response.text)
+            self.assertNotIn("PRIVATE 正文", response.text)
+            self.assertNotIn("system_prompt_snapshot", response.text)
+
+    def test_legacy_and_invalid_run_capability_resolution_are_null(self):
+        self._add_run("run-legacy", run_config={"max_steps": 8})
+        invalid_resolutions = (
+            (
+                "run-invalid-extra",
+                {
+                    **CAPABILITY_RESOLUTION,
+                    "original_message": "用户原文禁止返回",
+                },
+            ),
+            (
+                "run-invalid-control",
+                {
+                    **CAPABILITY_RESOLUTION,
+                    "package_id": "mcp_explicit",
+                    "reason_codes": ["explicit_authorized_tool_alias"],
+                    "external_tool_names": ["update_plan"],
+                    "include_current_date": False,
+                },
+            ),
+            (
+                "run-invalid-package",
+                {
+                    **CAPABILITY_RESOLUTION,
+                    "package_id": "direct",
+                    "reason_codes": ["direct_greeting"],
+                    "external_tool_names": ["web_search"],
+                    "include_current_date": False,
+                },
+            ),
+            (
+                "run-invalid-order",
+                {
+                    **CAPABILITY_RESOLUTION,
+                    "package_id": "deep_research",
+                    "reason_codes": ["deep_research_mode"],
+                    "external_tool_names": ["url_read", "web_search"],
+                    "effective_plan_mode": "on",
+                },
+            ),
+        )
+        for run_id, resolution in invalid_resolutions:
+            self._add_run(run_id, run_config={"capability_resolution": resolution})
+
+        legacy = self.client.get("/api/conversations/conv-1/runs/run-legacy/trajectory")
+        self.assertEqual(legacy.status_code, 200)
+        self.assertIsNone(legacy.json()["data"]["run"]["capability_resolution"])
+        for run_id, _resolution in invalid_resolutions:
+            with self.subTest(run_id=run_id):
+                invalid = self.client.get(f"/api/conversations/conv-1/runs/{run_id}/trajectory")
+                self.assertEqual(invalid.status_code, 200)
+                self.assertIsNone(invalid.json()["data"]["run"]["capability_resolution"])
+                self.assertNotIn("用户原文禁止返回", invalid.text)
 
     def test_unauthorized_conversation_and_cross_conversation_run_are_uniformly_not_found(self):
         """若 handler 在 service 之外泄漏资源归属，404 契约会被破坏。"""
@@ -296,6 +390,184 @@ class TrajectoryApiTests(unittest.TestCase):
         for response in (wrong_node, cross_user):
             self.assertEqual(response.status_code, 404)
             self.assertEqual(response.json()["message"], "会话或轨迹不存在，或无权访问")
+
+    def test_system_prompt_detail_returns_persisted_body_only_to_exact_owner(self):
+        """正文端点必须有普通用户信封、完整归属校验，且列表和快照不携带正文。"""
+        from app.db.models import AgentEvent, AgentSession, AgentSystemPromptSnapshot
+
+        self._add_run("run-prompt")
+        self._add_run("run-prompt-old")
+        self._add_run("run-prompt-other", conversation_id="conv-2", user_id="user-2")
+        self._add_run("run-prompt-inconsistent", user_id="user-2")
+        snapshot = {
+            "schema_version": 1,
+            "template_version": "2026-08-26.1",
+            "fingerprint": "b62d9881a561f21dc1dc33e8b8e288ea71d1ed13744258ef986c6cea86b73d39",
+            "char_count": 13,
+            "sections": [{"section_id": "app_identity", "content": "只属于当前 Run 的正文"}],
+        }
+        self.db.get(AgentSession, "run-prompt").run_config = {"unrelated_config": "内部配置"}
+        self.db.get(AgentSession, "run-prompt-other").run_config = {"unrelated_config": "内部配置"}
+        self.db.get(AgentSession, "run-prompt-inconsistent").run_config = {"unrelated_config": "内部配置"}
+        self.db.add_all(
+            [
+                AgentSystemPromptSnapshot(
+                    run_id="run-prompt",
+                    conversation_id="conv-1",
+                    user_id="user-1",
+                    snapshot=snapshot,
+                ),
+                AgentSystemPromptSnapshot(
+                    run_id="run-prompt-other",
+                    conversation_id="conv-2",
+                    user_id="user-2",
+                    snapshot=snapshot,
+                ),
+                AgentSystemPromptSnapshot(
+                    run_id="run-prompt-inconsistent",
+                    conversation_id="conv-1",
+                    user_id="user-2",
+                    snapshot=snapshot,
+                ),
+                AgentEvent(
+                    conversation_id="conv-1",
+                    message_id="msg-run-prompt",
+                    run_id="run-prompt",
+                    sequence=3,
+                    event_type="system_prompt_prepared",
+                    schema_version=1,
+                    event_ts=self.now,
+                    payload={"status": "ready", "detail_status": "available", "fingerprint": snapshot["fingerprint"]},
+                ),
+            ]
+        )
+        self.db.commit()
+        self.db.close()
+        self.db = self.Session()
+
+        exact = self.client.get("/api/conversations/conv-1/runs/run-prompt/node-detail/system-prompt")
+
+        self.assertEqual(exact.status_code, 200)
+        self.assertEqual(exact.headers.get("cache-control"), "private, no-store")
+        self.assertEqual(exact.json()["code"], "SUCCESS")
+        self.assertTrue(exact.json()["request_id"])
+        data = exact.json()["data"]
+        self.assertEqual(data["node_type"], "system_prompt")
+        self.assertEqual(data["status"], "available")
+        self.assertEqual(data["available_sections"], ["summary", "prompt"])
+        self.assertEqual(data["detail"], {key: value for key, value in snapshot.items() if key != "schema_version"})
+        self.assertEqual(data["redacted_fields"], [])
+        self.assertEqual(data["truncated_fields"], [])
+        for path in (
+            "/api/conversations/conv-2/runs/run-prompt-other/node-detail/system-prompt",
+            "/api/conversations/conv-1/runs/run-prompt-other/node-detail/system-prompt",
+            "/api/conversations/conv-2/runs/run-prompt/node-detail/system-prompt",
+            "/api/conversations/conv-1/runs/run-prompt-inconsistent/node-detail/system-prompt",
+            "/api/conversations/conv-1/runs/missing-run/node-detail/system-prompt",
+        ):
+            with self.subTest(path=path):
+                response = self.client.get(path)
+                self.assertEqual(response.status_code, 404)
+                self.assertEqual(response.json()["code"], "NOT_FOUND")
+                self.assertEqual(response.json()["message"], "会话或轨迹不存在，或无权访问")
+                self.assertNotIn("只属于当前 Run 的正文", response.text)
+        old = self.client.get("/api/conversations/conv-1/runs/run-prompt-old/node-detail/system-prompt")
+        self.assertEqual(old.status_code, 200)
+        self.assertEqual(old.headers.get("cache-control"), "private, no-store")
+        self.assertEqual(old.json()["data"]["status"], "not_recorded")
+        self.assertEqual(old.json()["data"]["reason"], "system_prompt_not_recorded")
+        for path in ("/api/conversations/conv-1/runs", "/api/conversations/conv-1/runs/run-prompt/trajectory"):
+            response = self.client.get(path)
+            self.assertEqual(response.status_code, 200)
+            self.assertNotIn("只属于当前 Run 的正文", response.text)
+            self.assertNotIn("system_prompt_snapshot", response.text)
+
+    def test_skills_detail_endpoint_returns_frozen_body_with_no_store_and_keeps_old_run_distinct(self):
+        from app.db.models import AgentEvent, AgentSystemPromptSnapshot
+        from app.utils.prompt_fingerprint import fingerprint_system_messages
+
+        self._add_run("run-skills-api")
+        self._add_run("run-skills-old")
+        content = "API 返回的冻结 Skill 正文"
+        sections = [
+            {"section_id": "app_identity", "content": "Fusion 身份"},
+            {"section_id": "skill:verified-research@1.0.0", "content": content},
+        ]
+        snapshot = {
+            "schema_version": 1,
+            "template_version": "2026-08-31.1",
+            "fingerprint": fingerprint_system_messages(
+                [{"role": "system", "content": section["content"]} for section in sections]
+            ),
+            "char_count": sum(len(section["content"]) for section in sections),
+            "sections": sections,
+        }
+        metadata = {
+            "skill_id": "verified-research",
+            "version": "1.0.0",
+            "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "allowed_tool_names": ["web_search", "url_read"],
+            "section_id": "skill:verified-research@1.0.0",
+            "char_count": len(content),
+        }
+        self.db.add_all(
+            [
+                AgentSystemPromptSnapshot(
+                    run_id="run-skills-api",
+                    conversation_id="conv-1",
+                    user_id="user-1",
+                    snapshot=snapshot,
+                ),
+                AgentEvent(
+                    conversation_id="conv-1",
+                    message_id="msg-run-skills-api",
+                    run_id="run-skills-api",
+                    sequence=3,
+                    event_type="skills_resolved",
+                    schema_version=1,
+                    event_ts=self.now,
+                    payload={
+                        "protocol_version": 2,
+                        "status": "loaded",
+                        "activation_source": "capability_package",
+                        "requested_skill_ids": ["verified-research"],
+                        "skills": [metadata],
+                        "duration_ms": 1,
+                        "detail_status": "available",
+                        "error_code": None,
+                    },
+                ),
+            ]
+        )
+        self.db.commit()
+
+        exact = self.client.get("/api/conversations/conv-1/runs/run-skills-api/node-detail/skills")
+        old = self.client.get("/api/conversations/conv-1/runs/run-skills-old/node-detail/skills")
+
+        self.assertEqual(exact.status_code, 200)
+        self.assertEqual(exact.headers.get("cache-control"), "private, no-store")
+        data = exact.json()["data"]
+        self.assertEqual(data["status"], "available")
+        self.assertEqual(data["node_type"], "skills")
+        self.assertEqual(data["available_sections"], ["summary", "prompt"])
+        self.assertEqual(
+            data["detail"],
+            {
+                "status": "loaded",
+                "activation_source": "capability_package",
+                "skills": [{**metadata, "content": content}],
+            },
+        )
+        self.assertNotIn("Fusion 身份", exact.text)
+        self.assertEqual(old.status_code, 200)
+        self.assertEqual(old.headers.get("cache-control"), "private, no-store")
+        self.assertEqual(
+            (old.json()["data"]["status"], old.json()["data"]["reason"]), ("not_recorded", "skills_not_recorded")
+        )
+        for path in ("/api/conversations/conv-1/runs", "/api/conversations/conv-1/runs/run-skills-api/trajectory"):
+            response = self.client.get(path)
+            self.assertEqual(response.status_code, 200)
+            self.assertNotIn(content, response.text)
 
 
 if __name__ == "__main__":

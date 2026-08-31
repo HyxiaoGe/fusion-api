@@ -322,6 +322,54 @@ class ProductAnswerValidatorTests(unittest.TestCase):
             with self.subTest(answer=answer):
                 self.assertEqual(validate_product_answer(answer, [_weather_block()]).is_valid, expected)
 
+    def test_weather_activity_answer_accepts_grounded_condition_without_activity_inference(self):
+        answer = (
+            "7月24日（周五）白天雷阵雨、夜间多云，26–31℃。"
+            "本次预报只有白天和夜间粒度，无法确认上午这一细分时段。"
+            "如果你的条件是避雨，本次返回的白天雷阵雨预报不满足这一条件。"
+        )
+
+        validation = validate_product_answer(
+            answer,
+            [_weather_block()],
+            messages=[{"role": "user", "content": "7月24日上午适合骑行吗？"}],
+        )
+
+        self.assertTrue(validation.is_valid, validation.reason_code)
+
+    def test_weather_activity_inference_is_rejected_and_safe_condition_is_retained(self):
+        answer = (
+            "7月24日（周五）南山区白天预报有雷阵雨，如果你的条件是希望上午骑行时避开降雨，"
+            "本次预报不满足这一条件。"
+            "具体来看：当天白天天气为雷阵雨，最高气温31°C、最低26°C，夜间多云。"
+            "由于降雨覆盖白天时段，户外骑行大概率会淋雨，建议优先考虑室内骑行或改期。"
+            "本次预报只有昼夜两个粒度，无法确认上午与下午的细分差异。"
+            "不过白天整体为降雨天气，从避雨角度看这一天的白天时段存在被淋雨的可能。"
+            "夜间转为多云，如果你计划调整到晚上活动，天气条件相对更宽松一些。"
+        )
+        messages = [{"role": "user", "content": "7月24日南山区天气怎么样，适合上午骑行吗？"}]
+
+        validation = validate_product_answer(answer, [_weather_block()], messages=messages)
+        repaired, reason_code = repair_unsupported_product_answer(
+            answer,
+            [_weather_block()],
+            messages=messages,
+        )
+
+        self.assertFalse(validation.is_valid)
+        self.assertEqual(validation.reason_code, "unsupported_claim")
+        self.assertEqual(reason_code, "ok")
+        self.assertIsNotNone(repaired)
+        self.assertIn("本次预报不满足这一条件", repaired)
+        self.assertIn("无法确认上午与下午的细分差异", repaired)
+        self.assertNotIn("大概率会淋雨", repaired)
+        self.assertNotIn("室内骑行", repaired)
+        self.assertNotIn("改期", repaired)
+        self.assertNotIn("存在被淋雨的可能", repaired)
+        self.assertNotIn("调整到晚上活动", repaired)
+        self.assertNotIn("天气条件相对更宽松", repaired)
+        self.assertTrue(validate_product_answer(repaired, [_weather_block()], messages=messages).is_valid)
+
     def test_weather_forecast_coverage_limits_allow_unknown_dates_without_allowing_claims(self):
         cases = (
             ("当前预报只覆盖7月23日至7月24日，未覆盖8月2日至8月4日。", True, "ok"),

@@ -15,6 +15,7 @@ from app.ai.prompts.agent_loop import (
     get_tool_usage_contract_prompt,
 )
 from app.ai.prompts.system_prompt import SystemPromptSection, assemble_system_prompt
+from app.ai.skills.registry import RunSkillResolution, SkillReleasePin, load_skills_for_package
 from app.ai.tools import build_url_read_tool, build_web_search_tool
 from app.db.repositories import FileRepository
 from app.services.agent.plan_coordinator import PlanMode
@@ -23,22 +24,21 @@ from app.services.chat.message_builder import (
     inject_file_content,
     is_image_file,
 )
-from app.services.mcp.amap_product_tools import AMAP_FACT_BOUNDARY_SYSTEM_PROMPT, AMAP_PRODUCT_TOOL_NAMES
-from app.services.mcp.flyai_travel_tools import (
-    FLYAI_TRAVEL_FACT_BOUNDARY_SYSTEM_PROMPT,
-    FLYAI_TRAVEL_TOOL_NAMES,
-)
+from app.services.mcp.amap_product_tools import AMAP_PRODUCT_TOOL_NAMES
+from app.services.mcp.flyai_travel_tools import FLYAI_TRAVEL_TOOL_NAMES
 from app.services.stream.agent_plan_tool_policy import AgentPlanToolPolicy, resolve_agent_plan_tool_policy
 from app.services.stream.agent_task_policy import resolve_agent_task_policy
 from app.services.stream.persistence import preprocess_url_in_message
 from app.services.stream.reasoning_policy import configure_reasoning_call_kwargs
+from app.services.stream.run_capability_router import (
+    RunCapabilityResolution,
+    resolve_run_capability_route,
+)
 
 VOLCENGINE_PROVIDERS = {"volcengine"}
 MAX_CONTROLLED_OUTPUT_TOKENS = 4096
 PLAN_ITEM_ARGUMENT_NAME = "_plan_item_id"
 PLAN_ITEM_ID_PATTERN = "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
-VERIFIED_RESEARCH_PLAN_CONTRACT_PROMPT = """【可核验证据计划规则】
-当前请求需要建立可核验的证据链。首个 update_plan 必须包含至少 1 个 web_search 步骤和至少 2 个独立的 url_read 来源核验步骤。每个 url_read 步骤必须通过 depends_on 直接或间接依赖 web_search，不能作为首批可执行步骤。最终 answer 或 synthesis 步骤必须依赖全部读取步骤。先搜索候选来源，再读取原文，最后综合结论。"""
 
 
 @dataclass(frozen=True)
@@ -47,6 +47,7 @@ class AgentLoopCallConfig:
     supports_function_calling: bool
     call_kwargs: dict
     announced_tools: list[str]
+    capability_resolution: RunCapabilityResolution
     supports_dynamic_tools: bool = False
     dynamic_tool_handlers: dict[str, Any] = field(default_factory=dict)
     tool_bindings: list[dict[str, Any]] = field(default_factory=list)
@@ -66,6 +67,12 @@ def build_update_plan_tool(allowed_tool_names: list[str] | None = None) -> dict[
     normalized_allowed_tool_names = list(dict.fromkeys(allowed_tool_names or []))
     if normalized_allowed_tool_names:
         planned_tool_schema["enum"] = normalized_allowed_tool_names
+    planned_tools_max_items = 1 if normalized_allowed_tool_names else 0
+    planned_tools_description = (
+        "执行步骤最多声明一个当前已提供的真实工具；多工具拆成独立步骤。"
+        if normalized_allowed_tool_names
+        else "本次没有外部工具，必须提交空数组。"
+    )
 
     return {
         "type": "function",
@@ -110,8 +117,8 @@ def build_update_plan_tool(allowed_tool_names: list[str] | None = None) -> dict[
                                 "planned_tools": {
                                     "type": "array",
                                     "items": planned_tool_schema,
-                                    "maxItems": 1,
-                                    "description": ("执行步骤最多声明一个当前已提供的真实工具；多工具拆成独立步骤。"),
+                                    "maxItems": planned_tools_max_items,
+                                    "description": planned_tools_description,
                                 },
                             },
                             "required": ["id", "step", "status", "planned_tools"],
@@ -130,6 +137,7 @@ class AgentLoopPreparedMessages:
     initial_content_blocks: list[Any] = field(default_factory=list)
     final_tool_names: list[str] = field(default_factory=list)
     prompt_assembly: dict[str, Any] | None = None
+    prompt_snapshot: dict[str, Any] | None = None
 
 
 def announced_tool_names_from_call_kwargs(call_kwargs: dict) -> list[str]:
@@ -209,8 +217,10 @@ def build_agent_loop_call_config(
     additional_tools: list[dict] | None = None,
     dynamic_tool_handlers: dict[str, Any] | None = None,
     tool_bindings: list[dict[str, Any]] | None = None,
+    authorized_tool_names: list[str] | None = None,
     original_message: str | None = None,
     task_context_messages: list[object] | None = None,
+    skill_release_pins: tuple[SkillReleasePin, ...] | None = None,
 ) -> AgentLoopCallConfig:
     options = options or {}
     capabilities = capabilities or {}
@@ -224,39 +234,103 @@ def build_agent_loop_call_config(
     task_policy = resolve_agent_task_policy(options=options, capabilities=capabilities)
     requested_plan_mode = "off" if knowledge_grounded else task_policy.plan_mode
     supports_function_calling = supports_search_tools(capabilities) and not tools_disabled
-    supports_control_tools = bool(capabilities.get("functionCalling", False)) and not tools_disabled
-    plan_mode: PlanMode = requested_plan_mode if supports_control_tools else "off"
     supports_dynamic_tools = supports_dynamic_agent_tools(capabilities) and not tools_disabled
     call_kwargs: dict = {}
     max_tokens = normalize_controlled_max_tokens(options.get("max_tokens"))
     if max_tokens is not None:
         call_kwargs["max_tokens"] = max_tokens
-    tools: list[dict] = []
+    available_tools: list[dict] = []
     if supports_function_calling:
-        tools.append(build_web_search_tool_fn())
-        if plan_mode != "off":
-            tools.append(build_url_read_tool_fn())
+        available_tools.extend(
+            [
+                build_web_search_tool_fn(),
+                build_url_read_tool_fn(),
+            ]
+        )
     provided_handlers = dynamic_tool_handlers or {}
     if supports_dynamic_tools:
-        tools.extend(tool for tool in (additional_tools or []) if _tool_definition_name(tool) in provided_handlers)
-    external_tool_names = [_tool_definition_name(tool) for tool in tools if _tool_definition_name(tool)]
-    if task_policy.task_mode == "deep_research":
+        available_tools.extend(
+            tool for tool in (additional_tools or []) if _tool_definition_name(tool) in provided_handlers
+        )
+    available_tools_by_name = {name: tool for tool in available_tools if (name := _tool_definition_name(tool))}
+    trusted_authorized_tool_names = [name for name in (authorized_tool_names or []) if isinstance(name, str) and name]
+    route_tool_names = list(available_tools_by_name)
+    route_tool_names.extend(
+        name for name in dict.fromkeys(trusted_authorized_tool_names) if name not in available_tools_by_name
+    )
+    unavailable_tool_names = [name for name in trusted_authorized_tool_names if name not in available_tools_by_name]
+    skill_loader = None
+    if skill_release_pins is not None:
+
+        def skill_loader(package_id, routed_tool_names):
+            return load_skills_for_package(
+                package_id,
+                routed_tool_names,
+                release_pins=skill_release_pins,
+            )
+
+    capability_resolution = resolve_run_capability_route(
+        original_message=original_message,
+        task_context_messages=task_context_messages,
+        available_tool_names=route_tool_names,
+        requested_plan_mode=requested_plan_mode,
+        task_policy=task_policy,
+        capabilities=capabilities,
+        tools_disabled=tools_disabled,
+        knowledge_grounded=knowledge_grounded,
+        unavailable_tool_names=unavailable_tool_names,
+        load_skills_fn=skill_loader,
+    )
+    if (
+        skill_release_pins
+        and capability_resolution.skill_resolution is not None
+        and capability_resolution.skill_resolution.status == "not_selected"
+    ):
+        capability_resolution = RunCapabilityResolution(
+            schema_version=capability_resolution.schema_version,
+            router_version=capability_resolution.router_version,
+            package_id="tools_unavailable",
+            confidence=capability_resolution.confidence,
+            resolution_mode="degraded",
+            reason_codes=("required_skill_unavailable",),
+            external_tool_names=(),
+            effective_plan_mode="off",
+            include_current_date=capability_resolution.include_current_date,
+            network_boundary_required=True,
+            skill_resolution=RunSkillResolution(
+                status="load_failed",
+                activation_source="capability_package",
+                requested_skill_ids=tuple(pin.skill_id for pin in skill_release_pins),
+                skills=(),
+                duration_ms=0,
+                error_code="skill_load_failed",
+            ),
+            loaded_skills=(),
+        )
+    external_tool_names = list(capability_resolution.external_tool_names)
+    tools = [available_tools_by_name[name] for name in external_tool_names]
+    plan_mode = capability_resolution.effective_plan_mode
+    if capability_resolution.package_id == "deep_research":
         schedulable_names = frozenset({"web_search", "url_read"}).intersection(external_tool_names)
         plan_tool_policy = AgentPlanToolPolicy(
             allowed_tool_names=frozenset(schedulable_names),
             reason="deep_research_schedulable_tools",
         )
+    elif capability_resolution.package_id == "verified_web" and plan_mode != "off":
+        plan_tool_policy = AgentPlanToolPolicy(
+            required_initial_tool_counts={"web_search": 1, "url_read": 2},
+            reason="verified_research_request",
+        )
+    elif capability_resolution.package_id == "verified_web":
+        plan_tool_policy = AgentPlanToolPolicy()
     else:
         plan_tool_policy = resolve_agent_plan_tool_policy(
             original_message=original_message,
             announced_tool_names=external_tool_names,
             task_context_messages=task_context_messages,
         )
-    if requested_plan_mode != "off" and plan_tool_policy.allowed_tool_names is not None:
-        tools = [tool for tool in tools if _tool_definition_name(tool) in plan_tool_policy.allowed_tool_names]
-        external_tool_names = [_tool_definition_name(tool) for tool in tools if _tool_definition_name(tool)]
     control_tool_names: frozenset[str] = frozenset()
-    if supports_control_tools and plan_mode != "off":
+    if plan_mode != "off":
         tools.append(build_update_plan_tool(external_tool_names))
         control_tool_names = frozenset({"update_plan"})
         tools = [
@@ -275,19 +349,20 @@ def build_agent_loop_call_config(
         should_use_reasoning=should_use_reasoning,
     )
 
-    announced_tools = [
-        name for name in announced_tool_names_from_call_kwargs(call_kwargs) if name not in control_tool_names
-    ]
-    announced_tool_set = set(announced_tools)
-    active_handlers = {name: handler for name, handler in provided_handlers.items() if name in announced_tool_set}
-    active_bindings = [
-        binding for binding in (tool_bindings or []) if str(binding.get("alias", "")) in announced_tool_set
-    ]
+    announced_tools = list(external_tool_names)
+    active_handlers = {name: provided_handlers[name] for name in announced_tools if name in provided_handlers}
+    bindings_by_alias = {
+        str(binding.get("alias", "")): binding
+        for binding in (tool_bindings or [])
+        if isinstance(binding, dict) and binding.get("alias")
+    }
+    active_bindings = [bindings_by_alias[name] for name in announced_tools if name in bindings_by_alias]
     return AgentLoopCallConfig(
         should_use_reasoning=should_use_reasoning,
         supports_function_calling=supports_function_calling,
         call_kwargs=call_kwargs,
         announced_tools=announced_tools,
+        capability_resolution=capability_resolution,
         supports_dynamic_tools=bool(active_handlers),
         dynamic_tool_handlers=active_handlers,
         tool_bindings=active_bindings,
@@ -378,32 +453,47 @@ async def prepare_agent_loop_messages(
         # 只在空消息集上选择可信模板，用户文本不会影响段落是否存在。
         if has_image_attachment and not has_vision:
             yield SystemPromptSection("no_vision_file_boundary", get_no_vision_file_boundary_prompt())
-        selectors = [
-            ("tool_usage_contract", inject_tool_usage_contract, call_config.call_kwargs),
-            ("amap_fact_boundary", inject_amap_fact_boundary, call_config.call_kwargs),
-            ("flyai_travel_fact_boundary", inject_flyai_travel_fact_boundary, call_config.call_kwargs),
-            ("agent_plan_control", inject_plan_control_contract, call_config),
-            ("verified_research_plan", inject_verified_research_plan_contract, call_config),
-            ("deep_research_contract", inject_deep_research_contract, call_config),
-            ("no_tool_network_boundary", inject_no_tool_network_boundary, call_config.call_kwargs),
-        ]
         for index, prompt in enumerate(extra_system_prompts or []):
             yield SystemPromptSection(f"extra_system_{index}", prompt)
-        for section_id, selector, config in selectors:
-            for message in selector([], config):
-                yield SystemPromptSection(section_id, message["content"])
+        resolution = call_config.capability_resolution
+        if "web_search" in resolution.external_tool_names:
+            yield SystemPromptSection("tool_usage_contract", get_tool_usage_contract_prompt())
+        if resolution.effective_plan_mode != "off":
+            yield SystemPromptSection(
+                "agent_plan_control",
+                get_agent_plan_control_prompt(resolution.effective_plan_mode),
+            )
+        for skill in resolution.loaded_skills:
+            yield SystemPromptSection(skill.metadata.section_id, skill.content)
+        if resolution.package_id == "deep_research":
+            yield SystemPromptSection("deep_research_contract", DEEP_RESEARCH_CONTRACT_PROMPT)
+        if resolution.network_boundary_required:
+            yield SystemPromptSection(
+                "no_tool_network_boundary",
+                get_no_tool_network_boundary_prompt(),
+            )
 
-    assembly = assemble_system_prompt(user_system_prompt=user_system_prompt, sections=selected_sections)
+    assembly = assemble_system_prompt(
+        user_system_prompt=user_system_prompt,
+        include_current_date=call_config.capability_resolution.include_current_date,
+        sections=selected_sections,
+    )
     messages = [*assembly.messages, *messages]
     return AgentLoopPreparedMessages(
         messages=messages,
         initial_content_blocks=initial_content_blocks,
         prompt_assembly=assembly.metadata,
-        final_tool_names=[
-            name
-            for name in announced_tool_names_from_call_kwargs(call_config.call_kwargs)
-            if name not in getattr(call_config, "control_tool_names", frozenset())
-        ],
+        prompt_snapshot={
+            "schema_version": 1,
+            "template_version": assembly.metadata["template_version"],
+            "fingerprint": assembly.metadata["fingerprint"],
+            "char_count": assembly.metadata["char_count"],
+            "sections": [
+                {"section_id": section_id, "content": message["content"]}
+                for section_id, message in zip(assembly.metadata["section_ids"], assembly.messages, strict=True)
+            ],
+        },
+        final_tool_names=list(call_config.capability_resolution.external_tool_names),
     )
 
 
@@ -458,6 +548,8 @@ async def _prepare_url_context(
     call_config: AgentLoopCallConfig,
     preprocess_url_in_message_fn: Callable[..., Awaitable[tuple[Any | None, dict | None, str | None]]],
 ) -> tuple[list[dict], list[Any]]:
+    if "url_read" not in call_config.capability_resolution.external_tool_names:
+        return messages, []
     initial_content_blocks = []
     url_read_block, url_context_msg, _auto_detected_url = await preprocess_url_in_message_fn(
         original_message,
@@ -485,40 +577,6 @@ def inject_tool_usage_contract(messages: list[dict], call_kwargs: dict) -> list[
     return [*messages[:insert_at], contract_msg, *messages[insert_at:]]
 
 
-def inject_amap_fact_boundary(messages: list[dict], call_kwargs: dict) -> list[dict]:
-    """地点与路线产品工具启用时前置通用事实边界，不提升任何外部结果为 system 内容。"""
-    announced_tools = set(announced_tool_names_from_call_kwargs(call_kwargs))
-    if not AMAP_PRODUCT_TOOL_NAMES.intersection(announced_tools):
-        return messages
-    if any(msg.get("role") == "system" and msg.get("content") == AMAP_FACT_BOUNDARY_SYSTEM_PROMPT for msg in messages):
-        return messages
-
-    insert_at = 0
-    while insert_at < len(messages) and messages[insert_at].get("role") == "system":
-        insert_at += 1
-    boundary_msg = {"role": "system", "content": AMAP_FACT_BOUNDARY_SYSTEM_PROMPT}
-    return [*messages[:insert_at], boundary_msg, *messages[insert_at:]]
-
-
-def inject_flyai_travel_fact_boundary(messages: list[dict], call_kwargs: dict) -> list[dict]:
-    """航班或高铁产品工具启用时注入供应商中性的事实边界。"""
-
-    announced_tools = set(announced_tool_names_from_call_kwargs(call_kwargs))
-    if not FLYAI_TRAVEL_TOOL_NAMES.intersection(announced_tools):
-        return messages
-    if any(
-        msg.get("role") == "system" and msg.get("content") == FLYAI_TRAVEL_FACT_BOUNDARY_SYSTEM_PROMPT
-        for msg in messages
-    ):
-        return messages
-
-    insert_at = 0
-    while insert_at < len(messages) and messages[insert_at].get("role") == "system":
-        insert_at += 1
-    boundary_msg = {"role": "system", "content": FLYAI_TRAVEL_FACT_BOUNDARY_SYSTEM_PROMPT}
-    return [*messages[:insert_at], boundary_msg, *messages[insert_at:]]
-
-
 def inject_plan_control_contract(
     messages: list[dict],
     call_config: AgentLoopCallConfig,
@@ -541,30 +599,6 @@ def inject_plan_control_contract(
         "content": get_agent_plan_control_prompt(call_config.plan_mode),
     }
     return [*messages[:insert_at], contract_msg, *messages[insert_at:]]
-
-
-def inject_verified_research_plan_contract(
-    messages: list[dict],
-    call_config: AgentLoopCallConfig,
-) -> list[dict]:
-    """仅为高置信可核验研究请求前置首计划 DAG 约束。"""
-
-    policy_reasons = set((getattr(call_config, "plan_tool_policy_reason", "") or "").split("+"))
-    if "verified_research_request" not in policy_reasons:
-        return messages
-    if any(
-        message.get("role") == "system" and message.get("content") == VERIFIED_RESEARCH_PLAN_CONTRACT_PROMPT
-        for message in messages
-    ):
-        return messages
-    insert_at = 0
-    while insert_at < len(messages) and messages[insert_at].get("role") == "system":
-        insert_at += 1
-    return [
-        *messages[:insert_at],
-        {"role": "system", "content": VERIFIED_RESEARCH_PLAN_CONTRACT_PROMPT},
-        *messages[insert_at:],
-    ]
 
 
 def inject_deep_research_contract(

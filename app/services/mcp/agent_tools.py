@@ -47,6 +47,7 @@ from app.services.mcp.runtime import get_mcp_client_manager
 from app.services.mcp.server_service import MCP_TOOL_UNAVAILABLE_MESSAGE, McpServerService
 from app.services.mcp.tool_contract import (
     agent_tool_definition_sha256,
+    build_agent_tool_alias,
     build_agent_tool_definition,
     build_tool_label,
     canonical_json_bytes,
@@ -821,6 +822,21 @@ def _argument_field_is_missing(arguments: dict[str, Any], field: str) -> bool:
         if not current_values:
             return False
     return False
+
+
+def load_mcp_authorized_tool_aliases(
+    db: Any,
+    *,
+    repository_factory: Callable[[Any], McpServerRepository] = McpServerRepository,
+) -> list[str]:
+    """只读投影启用服务的合法授权别名，不构建可执行工具或模型 schema。"""
+
+    rows = sorted(repository_factory(db).list_enabled(), key=lambda row: str(row.id))
+    return [
+        build_agent_tool_alias(str(row.id), snapshot["name"])
+        for row in rows
+        for snapshot in _iter_authorized_snapshots(row)
+    ]
 
 
 def load_mcp_agent_tools(
