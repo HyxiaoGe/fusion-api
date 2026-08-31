@@ -140,6 +140,16 @@ def _resolve(
             ("fresh_external_fact",),
         ),
         (
+            "今天 OpenAI 有什么新发布？请简单说明。",
+            "fresh_web",
+            ("web_search",),
+            "off",
+            True,
+            False,
+            "high",
+            ("fresh_external_fact",),
+        ),
+        (
             "OpenAI 今天发布了什么？阅读官方公告后总结",
             "verified_web",
             ("web_search", "url_read"),
@@ -481,6 +491,59 @@ def test_route_matrix(
     assert route.confidence == expected_confidence
     assert route.reason_codes == expected_reason_codes
     assert len(route.external_tool_names) <= 3 or route.package_id == "deep_research"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "2020 年 OpenAI 有什么新发布？",
+        "Python 3.8 当年有何新更新？",
+        "今天是星期几？另外，2020 年 OpenAI 有什么新发布？",
+        "今天先解释二分查找。另一个问题：Python 3.8 当年有何新更新？",
+        "今天，OpenAI 2020 年有什么新发布？",
+        "今天，OpenAI 2020年有什么新发布？",
+        "现在回顾1998年微软有何新发布的产品？",
+        "今天先解释二分查找. 秦始皇有何新发布的法令？",
+        "今天先解释二分查找.秦始皇有何新发布的法令？",
+        "今天回顾1898年微软前身有何新发布的产品？",
+    ],
+)
+def test_historical_new_release_phrasing_does_not_force_fresh_web(message):
+    route = _resolve(message)
+
+    assert route.package_id == "clarification_only"
+    assert route.external_tool_names == ()
+    assert route.include_current_date is False
+
+
+def test_current_new_release_phrasing_keeps_verified_web_priority():
+    route = _resolve("今天 OpenAI 有什么新发布？请阅读官方原文并交叉核验")
+
+    assert route.package_id == "verified_web"
+    assert route.external_tool_names == ("web_search", "url_read")
+    assert route.include_current_date is True
+
+
+def test_current_new_release_phrasing_respects_network_denial():
+    route = _resolve("不要联网，告诉我今天 OpenAI 有什么新发布")
+
+    assert route.package_id == "clarification_only"
+    assert route.external_tool_names == ()
+
+
+def test_quoted_current_new_release_phrasing_remains_transform():
+    route = _resolve("把“今天 OpenAI 有什么新发布”翻译成英文")
+
+    assert route.package_id == "transform"
+    assert route.external_tool_names == ()
+
+
+def test_current_new_release_phrasing_degrades_when_tools_are_disabled():
+    route = _resolve("今天 OpenAI 有什么新发布？", tools_disabled=True)
+
+    assert route.package_id == "tools_unavailable"
+    assert route.external_tool_names == ()
+    assert route.network_boundary_required is True
 
 
 @pytest.mark.parametrize(
@@ -3245,7 +3308,7 @@ def test_serialization_only_contains_safe_protocol_fields():
 
     assert payload == {
         "schema_version": 2,
-        "router_version": "2026-08-31.1",
+        "router_version": "2026-08-31.2",
         "package_id": "mobility_intercity",
         "confidence": "medium",
         "resolution_mode": "routed",

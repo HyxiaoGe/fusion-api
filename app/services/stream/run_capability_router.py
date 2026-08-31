@@ -32,7 +32,7 @@ Confidence = Literal["high", "medium", "low"]
 ResolutionMode = Literal["routed", "degraded", "clarification"]
 
 SCHEMA_VERSION = 2
-ROUTER_VERSION = "2026-08-31.1"
+ROUTER_VERSION = "2026-08-31.2"
 
 _CANONICAL_EXTERNAL_TOOL_ORDER = CAPABILITY_CANONICAL_EXTERNAL_TOOL_ORDER
 _CONTROL_TOOL_NAMES = CAPABILITY_CONTROL_TOOL_NAMES
@@ -62,6 +62,20 @@ _FRESH_EXTERNAL_RE = re.compile(
     r"\b(?:latest|breaking news|most recent|"
     r"current (?:price|score|exchange rate|ceo|president|release|version))\b",
     re.IGNORECASE,
+)
+_CURRENT_RELEASE_UPDATE_RE = re.compile(
+    r"(?:有什么|有何)(?:新|最新)(?:发布|更新|动态)",
+    re.IGNORECASE,
+)
+_EXPLICIT_HISTORICAL_TIME_RE = re.compile(
+    r"(?:(?<![0-9])[0-9]{4}\s*年?(?![0-9])|当年|彼时|那时)",
+    re.IGNORECASE,
+)
+_SENTENCE_BOUNDARY_RE = re.compile(r"[。！？!?；;\r\n]+|\.(?=\D|$)")
+_CURRENT_EXTERNAL_QUERY_RE = re.compile(
+    r"(?:^|请|帮我|替我)(?:查|查询)|"
+    r"(?:今天|今日|明天|后天|昨天|当前|现在)(?:请|帮我|替我)?(?:查|查询)|"
+    r"多少|是否|吗[？?]?$"
 )
 _VERIFIED_SOURCE_RE = re.compile(
     r"官方(?:公告|原文|资料|来源)|一手来源|可靠来源|权威来源|"
@@ -730,7 +744,10 @@ def _classify_standard_request(
     independent_verified_web_request = verified_web_request and not _URL_LOCAL_SOURCE_ONLY_RE.search(
         external_signal_message
     )
-    fresh_web_request = bool(_FRESH_EXTERNAL_RE.search(external_signal_message))
+    fresh_web_request = bool(
+        _FRESH_EXTERNAL_RE.search(external_signal_message)
+        or _has_current_release_update_request(external_signal_message)
+    )
 
     if _is_definitional_knowledge_request(routing_message):
         return _CandidateRoute(
@@ -1063,7 +1080,7 @@ def _classify_standard_request(
             True,
         )
 
-    if not web_search_denied and include_current_date and re.search(r"查|查询|多少|是否|吗[？?]?$", routing_message):
+    if not web_search_denied and _has_current_external_query_request(routing_message):
         return _CandidateRoute(
             "fresh_web",
             "high",
@@ -1789,6 +1806,24 @@ def _is_definitional_knowledge_request(message: str) -> bool:
         or _POSITIVE_WEB_TOOL_NAME_RE.search(message)
         or _POSITIVE_URL_TOOL_NAME_RE.search(message)
     )
+
+
+def _has_current_release_update_request(message: str) -> bool:
+    for sentence in _SENTENCE_BOUNDARY_RE.split(message):
+        if _EXPLICIT_HISTORICAL_TIME_RE.search(sentence):
+            continue
+        if _RELATIVE_DATE_RE.search(sentence) and _CURRENT_RELEASE_UPDATE_RE.search(sentence):
+            return True
+    return False
+
+
+def _has_current_external_query_request(message: str) -> bool:
+    for sentence in _SENTENCE_BOUNDARY_RE.split(message):
+        if _EXPLICIT_HISTORICAL_TIME_RE.search(sentence):
+            continue
+        if _RELATIVE_DATE_RE.search(sentence) and _CURRENT_EXTERNAL_QUERY_RE.search(sentence):
+            return True
+    return False
 
 
 def _needs_current_date(message: str) -> bool:
