@@ -365,7 +365,7 @@ class CICDPermissionBoundaryTests(unittest.TestCase):
         self.assertEqual(publish_job.count("name: Publish master images on Windows runner"), 1)
         self.assertNotIn("name: Build on Windows runner", publish_job)
 
-    def test_windows_publish_recovers_docker_daemon_before_build(self) -> None:
+    def test_windows_publish_requires_preconfigured_docker_engine(self) -> None:
         publish_job = self.release_document["jobs"]["publish"]
         verify_step = workflow_step(publish_job, "Verify Docker access")
         script = verify_step["run"]
@@ -374,19 +374,20 @@ class CICDPermissionBoundaryTests(unittest.TestCase):
             verify_step["shell"],
             'powershell -NoProfile -ExecutionPolicy Bypass -Command ". \'{0}\'"',
         )
-        self.assertIn("for ($attempt = 1; $attempt -le 6; $attempt++)", script)
-        self.assertIn("$serviceNames = @('docker', 'com.docker.service')", script)
-        self.assertIn("Start-Service -Name $serviceName", script)
-        self.assertIn("Docker Desktop.exe", script)
-        self.assertIn("Start-Process -FilePath $desktopPath", script)
-        self.assertIn('$env:RUNNER_TRACKING_ID = ""', script)
-        self.assertLess(
-            script.index('$env:RUNNER_TRACKING_ID = ""'),
-            script.index("Start-Process -FilePath $desktopPath"),
-        )
-        self.assertIn("Start-Sleep -Seconds (10 * $attempt)", script)
-        self.assertIn("Docker daemon ready", script)
-        self.assertIn("Docker daemon did not become ready", script)
+        self.assertEqual(script.count("docker version"), 1)
+        self.assertEqual(script.count("docker ps"), 1)
+        self.assertIn("if ($LASTEXITCODE -ne 0)", script)
+        self.assertIn("exit $LASTEXITCODE", script)
+
+        for forbidden_command in (
+            "Docker Desktop.exe",
+            "Start-Process",
+            "Start-Service",
+            "RUNNER_TRACKING_ID",
+            "Start-Sleep",
+        ):
+            with self.subTest(forbidden_command=forbidden_command):
+                self.assertNotIn(forbidden_command, script)
 
     def test_release_runs_are_never_cancelled_mid_deployment(self) -> None:
         self.assertRegex(
