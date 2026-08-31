@@ -21,7 +21,7 @@
 - **发布流水线已被手工写了两遍。** 两边步骤名逐字相同的有 14 个（去重后），另有 3 对同职能不同名（`Capture current deployment` ↔ `…for rollback`、`Rollback previous deployment` ↔ `Roll back failed deployment`、`Smoke check candidate` ↔ `Verify health`）。抽象成可复用 workflow 有实证支撑。
 - **`deploy.yml` 的体量是内联 shell，不是 YAML 编排。** 全文 2563 行中 `deploy-dev` 单个 job 占 2339 行（L189–L2527），其中四个步骤合计 1757 行（占该 job 的 75%）：`Pull and restart fusion-api` 693、`Roll back failed deployment` 476、`Capture current deployment for rollback` 307、`Verify health` 281。该逻辑当前不可本地执行、不可单测，唯一验证方式是向 master 推送。
 - **同职能步骤两边体量差 10 倍。** Capture 307 vs 30 行，Rollback 476 vs 65 行。差额中一部分是 API 的真实约束（alembic 迁移、flyai-adapter 必须与 api 同 SHA、litellm governance 与 model management 两个 worker 的暂停/恢复），一部分是重复的防御性检查。分类结论见 Task 4，本计划不预判。
-- **双仓成本已有记录。** `docs/superpowers/plans/2026-06-28-agent-run-continuation.md` 明确写有"这份 spec 横跨 fusion-api 和 fusion-ui……实施时使用一个工作分支；最终按子仓分别提交，避免把半成品多次推送触发流水线"。
+- **双仓成本已有记录。** 原 `docs/superpowers/plans/2026-06-28-agent-run-continuation.md` 明确写有"这份 spec 横跨 fusion-api 和 fusion-ui……实施时使用一个工作分支；最终按子仓分别提交，避免把半成品多次推送触发流水线"。该文件已由 PR #84 随已弃用的 superpowers 插件文档一并清理，原文保留在 git 历史中（`git log --diff-filter=D --name-only -- 'docs/superpowers/plans/*'` 可定位）。**结论不受影响：跨仓协同需要一个工作分支、却只能按子仓分别提交，这一约束本身就是双仓成本的直接证据。**
 - **运行时已经耦合。** `fusion-ui/next.config.js` 通过 rewrites 把 `/api/*` 同源代理到 fusion-api，SSE 走此通道；两边共用同一组 self-hosted runner 类型、同一个阿里云 ACR、同一台 dev server，且**共用同一个宿主机工作目录 `~/project/fusion`**。
 
 ## Global Constraints
@@ -85,7 +85,7 @@
 - 两边 `.github/scripts/*` 的调用路径
 - Dockerfile build context（`.` → `apps/api` / `apps/ui`）
 - `actions/setup-node` 的 `cache-dependency-path`
-- 跨仓 plan 中的相对路径与文档绝对路径。**实测存量很小**：`docs/superpowers/` 下含 `../fusion-ui/` 的仅 `2026-06-30-search-read-planner-ledger.md` 一份（另一份是本计划自身）；提到 `fusion-ui` 但不含该相对路径模式的另有 6 份，只需按需核对
+- 文档中的跨仓相对路径与绝对路径。**PR #84 合并后存量归零**：此前唯一含 `../fusion-ui/` 的 `2026-06-30-search-read-planner-ledger.md` 已随 superpowers 遗留文档清理删除。本项在新树上只需对 `docs/implementation-plans/` 与 `docs/superpowers/specs/` 复查一次即可
 
 ## Task 0：新仓基建、恢复点与外部绑定清点
 
@@ -219,11 +219,14 @@ Task 0 第 7 步判定为「仍活跃且影响运行态」的 Vercel / Railway �
 ## Task 5：文档、台账与旧仓归档
 
 1. 合并两份 `EXECUTION_LEDGER.md`，补一条本次合并记录。
-2. 合并 `docs/superpowers/plans`（54 份）与 `specs`（23 份），修正 `2026-06-30-search-read-planner-ledger.md` 中的 `../fusion-ui/` 相对路径（实测存量仅此一份）。
+2. 合并两仓文档目录。**PR #84 合并后 `fusion-api` 侧已简化**：`docs/superpowers/plans/` 已清空并随已弃用插件一并移除，实施计划的落位改为与插件无关的 `docs/implementation-plans/`（本文件即在此），保留的 `docs/superpowers/specs/` 23 份中三份是被台账与 `TRAJECTORY_DESIGN.md` 引用的承重契约。
 
-   **同时做一次分诊，不要原样搬运。** 实测当前两套记录体系互不索引：台账 `EXECUTION_LEDGER.md` 按「领域 + commit SHA」追踪（71 处 SHA 引用），54 份 plan 中仅 **4 份**被台账点名；checkbox 追踪已基本废弃（25 份有 box 但 0 勾选、10 份无 box、仅 9 份全勾）。因此**单看一份 plan 无法判断它是活的还是已完成** —— 这正是 `AGENTS.md` 第 11 条要求"必须先读台账再查 git log"的原因。
+   因此本步只需：把 `fusion-api` 的 `docs/implementation-plans/` 与 `docs/superpowers/specs/` 迁入新仓，并对 `fusion-ui` 侧的 `docs/superpowers/` 做同一轮判定 —— **UI 侧尚未做过该清理**，需先按同样口径核查入边与插件遗留头，再决定删除或迁移，不要直接搬运。
 
-   迁移时至少做到：为每份 plan 标注「已完成 / 进行中 / 已废弃」，或按状态分目录（如 `plans/archive/`）。**否则等于把这个索引缺口原样搬进新仓。** 本步不要求补齐 checkbox，只要求可判定死活。
+   **迁移后 `specs/` 应脱离 `superpowers/` 这个已废弃插件的名字**（建议 `docs/specs/`），并同步更新台账、`TRAJECTORY_DESIGN.md` 与全部发现入口。
+
+   **落位与发现入口必须闭环。** 教训来自 PR #84 评审：若发现入口（`AGENTS.md` 第 11 条、执行台账开头与检查清单、`fusion-next-step` skill）扫描的目录与实施计划的实际落位不一致，新计划会落在无人扫描的位置。新仓的入口配置必须与实际目录一一对应，并在合并后的**最终树**上跑一次残留引用检查，而不是只查单个分支。
+
 3. 根 `CLAUDE.md` 改为导航，`apps/api/CLAUDE.md` 与 `apps/ui/CLAUDE.md` 承载应用级约定；`AGENTS.md` 同理。`.agents/skills/` 中 10 个 skill 合并去重（`fusion-next-step` 两边各有一份需统一）。
 4. **平台元数据边界**（见 P1-9）：git 历史合并不迁移 Issues、PR、Actions runs、releases、webhooks、deploy keys、Environment protection、branch rules。明确：
    - 复制：Environment protection、branch rules、secrets/variables、webhooks；
