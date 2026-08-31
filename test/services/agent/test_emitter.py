@@ -23,8 +23,63 @@ CAPABILITY_RESOLUTION = {
     "bundle_fingerprint": "sha256:" + "a" * 64,
 }
 
+SKILL_METADATA = {
+    "skill_id": "verified-research",
+    "version": "1.0.0",
+    "content_sha256": "b" * 64,
+    "allowed_tool_names": ["web_search", "url_read"],
+    "section_id": "skill:verified-research@1.0.0",
+    "char_count": 354,
+}
+
 
 class EmitterEnvelopeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_skills_resolved_is_safe_run_level_event_between_run_start_and_first_llm_round(self):
+        emitted = []
+
+        class CaptureWriter:
+            async def append_chunk(self, _conversation_id, _task_id, _chunk_type, payload):
+                emitted.append(payload)
+
+        em = AgentEventEmitter(
+            run_id="r1", trace_id="r1", conversation_id="c1", task_id="t1", redis_writer=CaptureWriter()
+        )
+        with self.assertRaisesRegex(RuntimeError, "run_started"):
+            await em.skills_resolved(
+                status="not_selected",
+                activation_source="capability_package",
+                requested_skill_ids=[],
+                skills=[],
+                duration_ms=0,
+                detail_status=None,
+                error_code=None,
+            )
+
+        await em.run_started(message_id="m1", model="gpt", tools=[], config={})
+        await em.skills_resolved(
+            status="loaded",
+            activation_source="capability_package",
+            requested_skill_ids=["verified-research"],
+            skills=[SKILL_METADATA],
+            duration_ms=1,
+            detail_status="available",
+            error_code=None,
+        )
+        await em.llm_round_started(
+            llm_round_id="round-1",
+            round_index=1,
+            model="gpt",
+            provider="openai",
+        )
+
+        self.assertEqual([event["type"] for event in emitted], ["run_started", "skills_resolved", "llm_round_started"])
+        skill_event = emitted[1]
+        self.assertEqual(skill_event["sequence"], 1)
+        self.assertIsNone(skill_event["step_id"])
+        self.assertEqual(skill_event["detail_status"], "available")
+        self.assertEqual(skill_event["skills"], [SKILL_METADATA])
+        self.assertNotIn("content", skill_event["skills"][0])
+
     async def test_system_prompt_result_and_request_fingerprint_share_run_envelope(self):
         emitted = []
 

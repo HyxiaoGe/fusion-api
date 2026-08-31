@@ -10,7 +10,7 @@ from typing import Any
 from app.ai.prompts.agent_loop import build_current_date_system_prompt, get_app_identity_prompt
 from app.utils.prompt_fingerprint import fingerprint_system_messages
 
-TEMPLATE_VERSION = "2026-08-27.2"
+TEMPLATE_VERSION = "2026-08-31.1"
 
 
 @dataclass(frozen=True)

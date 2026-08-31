@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import re
 from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
+from app.ai.skills.registry import RunSkillResolution, SkillLoadResult
 from app.services.stream.agent_task_policy import AgentTaskPolicy
 from app.services.stream.run_capability_router import (
     RunCapabilityResolution,
@@ -50,6 +52,7 @@ def _resolve(
     capabilities: dict | None = None,
     tools_disabled: bool = False,
     knowledge_grounded: bool = False,
+    load_skills_fn=None,
 ) -> RunCapabilityResolution:
     return resolve_run_capability_route(
         original_message=message,
@@ -60,6 +63,7 @@ def _resolve(
         capabilities=capabilities or {"functionCalling": True, "searchCapable": True},
         tools_disabled=tools_disabled,
         knowledge_grounded=knowledge_grounded,
+        load_skills_fn=load_skills_fn,
     )
 
 
@@ -3240,8 +3244,8 @@ def test_serialization_only_contains_safe_protocol_fields():
     payload = serialize_capability_resolution(route)
 
     assert payload == {
-        "schema_version": 1,
-        "router_version": "2026-08-28.1",
+        "schema_version": 2,
+        "router_version": "2026-08-31.1",
         "package_id": "mobility_intercity",
         "confidence": "medium",
         "resolution_mode": "routed",
@@ -3250,8 +3254,83 @@ def test_serialization_only_contains_safe_protocol_fields():
         "effective_plan_mode": "auto",
         "include_current_date": True,
         "network_boundary_required": False,
+        "skill_resolution": {
+            "status": "not_selected",
+            "activation_source": "capability_package",
+            "requested_skill_ids": [],
+            "skills": [],
+            "duration_ms": 0,
+            "error_code": None,
+        },
     }
     assert "original_message" not in payload
+    assert "loaded_skills" not in payload
+
+
+def test_verified_web_route_freezes_versioned_skill_before_run_start():
+    route = _resolve("OpenAI 今天发布了什么？请阅读官方原文并交叉核验")
+
+    assert route.schema_version == 2
+    assert route.package_id == "verified_web"
+    assert route.external_tool_names == ("web_search", "url_read")
+    assert route.skill_resolution.status == "loaded"
+    assert route.skill_resolution.requested_skill_ids == ("verified-research",)
+    assert len(route.skill_resolution.skills) == 1
+    metadata = route.skill_resolution.skills[0]
+    assert metadata.skill_id == "verified-research"
+    assert metadata.version == "1.0.0"
+    assert metadata.allowed_tool_names == ("web_search", "url_read")
+    assert metadata.section_id == "skill:verified-research@1.0.0"
+    assert re.fullmatch(r"[0-9a-f]{64}", metadata.content_sha256)
+    assert route.loaded_skills[0].metadata == metadata
+    assert route.loaded_skills[0].content.startswith("# 可核验证据研究")
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "你好",
+        "为什么天空通常看起来是蓝色的？",
+        "查一下今天 OpenAI 有什么更新",
+        "总结 https://example.com/report，只依据该页面",
+        "不用核验，简单查一下 OpenAI 的最新动态",
+    ],
+)
+def test_non_verified_research_requests_do_not_load_skill(message):
+    route = _resolve(message)
+
+    assert route.skill_resolution.status == "not_selected"
+    assert route.skill_resolution.skills == ()
+    assert route.loaded_skills == ()
+
+
+def test_verified_web_skill_load_failure_fails_closed_without_tools_or_body():
+    def fail_loader(_package_id, _routed_tool_names):
+        return SkillLoadResult(
+            resolution=RunSkillResolution(
+                status="load_failed",
+                activation_source="capability_package",
+                requested_skill_ids=("verified-research",),
+                skills=(),
+                duration_ms=1,
+                error_code="skill_load_failed",
+            ),
+            loaded_skills=(),
+        )
+
+    route = _resolve(
+        "核验 OpenAI 最新公告，给出官方原文和交叉来源",
+        load_skills_fn=fail_loader,
+    )
+
+    assert route.package_id == "tools_unavailable"
+    assert route.resolution_mode == "degraded"
+    assert route.reason_codes == ("required_skill_unavailable",)
+    assert route.external_tool_names == ()
+    assert route.effective_plan_mode == "off"
+    assert route.network_boundary_required is True
+    assert route.skill_resolution.status == "load_failed"
+    assert route.loaded_skills == ()
 
 
 def test_resolution_is_immutable():

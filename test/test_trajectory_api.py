@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import os
 import sys
@@ -480,6 +481,93 @@ class TrajectoryApiTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertNotIn("只属于当前 Run 的正文", response.text)
             self.assertNotIn("system_prompt_snapshot", response.text)
+
+    def test_skills_detail_endpoint_returns_frozen_body_with_no_store_and_keeps_old_run_distinct(self):
+        from app.db.models import AgentEvent, AgentSystemPromptSnapshot
+        from app.utils.prompt_fingerprint import fingerprint_system_messages
+
+        self._add_run("run-skills-api")
+        self._add_run("run-skills-old")
+        content = "API 返回的冻结 Skill 正文"
+        sections = [
+            {"section_id": "app_identity", "content": "Fusion 身份"},
+            {"section_id": "skill:verified-research@1.0.0", "content": content},
+        ]
+        snapshot = {
+            "schema_version": 1,
+            "template_version": "2026-08-31.1",
+            "fingerprint": fingerprint_system_messages(
+                [{"role": "system", "content": section["content"]} for section in sections]
+            ),
+            "char_count": sum(len(section["content"]) for section in sections),
+            "sections": sections,
+        }
+        metadata = {
+            "skill_id": "verified-research",
+            "version": "1.0.0",
+            "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "allowed_tool_names": ["web_search", "url_read"],
+            "section_id": "skill:verified-research@1.0.0",
+            "char_count": len(content),
+        }
+        self.db.add_all(
+            [
+                AgentSystemPromptSnapshot(
+                    run_id="run-skills-api",
+                    conversation_id="conv-1",
+                    user_id="user-1",
+                    snapshot=snapshot,
+                ),
+                AgentEvent(
+                    conversation_id="conv-1",
+                    message_id="msg-run-skills-api",
+                    run_id="run-skills-api",
+                    sequence=3,
+                    event_type="skills_resolved",
+                    schema_version=1,
+                    event_ts=self.now,
+                    payload={
+                        "protocol_version": 2,
+                        "status": "loaded",
+                        "activation_source": "capability_package",
+                        "requested_skill_ids": ["verified-research"],
+                        "skills": [metadata],
+                        "duration_ms": 1,
+                        "detail_status": "available",
+                        "error_code": None,
+                    },
+                ),
+            ]
+        )
+        self.db.commit()
+
+        exact = self.client.get("/api/conversations/conv-1/runs/run-skills-api/node-detail/skills")
+        old = self.client.get("/api/conversations/conv-1/runs/run-skills-old/node-detail/skills")
+
+        self.assertEqual(exact.status_code, 200)
+        self.assertEqual(exact.headers.get("cache-control"), "private, no-store")
+        data = exact.json()["data"]
+        self.assertEqual(data["status"], "available")
+        self.assertEqual(data["node_type"], "skills")
+        self.assertEqual(data["available_sections"], ["summary", "prompt"])
+        self.assertEqual(
+            data["detail"],
+            {
+                "status": "loaded",
+                "activation_source": "capability_package",
+                "skills": [{**metadata, "content": content}],
+            },
+        )
+        self.assertNotIn("Fusion 身份", exact.text)
+        self.assertEqual(old.status_code, 200)
+        self.assertEqual(old.headers.get("cache-control"), "private, no-store")
+        self.assertEqual(
+            (old.json()["data"]["status"], old.json()["data"]["reason"]), ("not_recorded", "skills_not_recorded")
+        )
+        for path in ("/api/conversations/conv-1/runs", "/api/conversations/conv-1/runs/run-skills-api/trajectory"):
+            response = self.client.get(path)
+            self.assertEqual(response.status_code, 200)
+            self.assertNotIn(content, response.text)
 
 
 if __name__ == "__main__":

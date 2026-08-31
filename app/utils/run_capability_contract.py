@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 
 CAPABILITY_CONTROL_TOOL_NAMES = frozenset({"update_plan"})
@@ -110,6 +110,7 @@ _PACKAGE_REASON_CODE_OPTIONS = MappingProxyType(
                 ("function_calling_unavailable",),
                 ("search_capability_unavailable",),
                 ("required_tools_unavailable",),
+                ("required_skill_unavailable",),
             }
         ),
         "clarification_only": frozenset({("insufficient_capability_signal",)}),
@@ -155,6 +156,7 @@ def validate_capability_resolution_semantics(
     effective_plan_mode: str,
     include_current_date: bool,
     network_boundary_required: bool,
+    skill_resolution: object | None = None,
 ) -> None:
     """拒绝无法由能力路由器产生的工具与固定包语义组合。"""
 
@@ -216,3 +218,54 @@ def validate_capability_resolution_semantics(
     expected_resolution_mode = _PACKAGE_RESOLUTION_MODE.get(package_id)
     if expected_resolution_mode is None or resolution_mode != expected_resolution_mode:
         raise ValueError("能力包与 resolution mode 不匹配")
+
+    if skill_resolution is None:
+        return
+    field = (
+        skill_resolution.get
+        if isinstance(skill_resolution, Mapping)
+        else lambda name, default=None: getattr(skill_resolution, name, default)
+    )
+    status = field("status")
+    activation_source = field("activation_source")
+    requested_skill_ids = tuple(field("requested_skill_ids", ()) or ())
+    skills = tuple(field("skills", ()) or ())
+    duration_ms = field("duration_ms")
+    error_code = field("error_code")
+    if status not in {"not_selected", "loaded", "load_failed"}:
+        raise ValueError("Skill 终态非法")
+    if activation_source != "capability_package":
+        raise ValueError("Skill 激活来源非法")
+    if isinstance(duration_ms, bool) or not isinstance(duration_ms, int) or duration_ms < 0:
+        raise ValueError("Skill 加载耗时非法")
+    if (status == "loaded") is not bool(skills):
+        raise ValueError("Skill loaded 状态必须与安全元数据一致")
+    if status == "loaded":
+        skill_ids = tuple(_skill_field(skill, "skill_id") for skill in skills)
+        allowed_tool_names = tuple(
+            tool_name for skill in skills for tool_name in tuple(_skill_field(skill, "allowed_tool_names", ()) or ())
+        )
+        if (
+            package_id != "verified_web"
+            or requested_skill_ids != skill_ids
+            or allowed_tool_names != tuple(external_tool_names)
+            or error_code is not None
+        ):
+            raise ValueError("已加载 Skill 必须与能力包和工具权限精确一致")
+    elif status == "load_failed":
+        if (
+            package_id != "tools_unavailable"
+            or tuple(reason_codes) != ("required_skill_unavailable",)
+            or bool(external_tool_names)
+            or not requested_skill_ids
+            or error_code != "skill_load_failed"
+        ):
+            raise ValueError("Skill 加载失败必须 fail closed")
+    elif package_id == "verified_web" or requested_skill_ids or skills or error_code is not None:
+        raise ValueError("未选择 Skill 时不得携带 Skill 元数据")
+
+
+def _skill_field(skill: object, name: str, default: object = None) -> object:
+    if isinstance(skill, Mapping):
+        return skill.get(name, default)
+    return getattr(skill, name, default)

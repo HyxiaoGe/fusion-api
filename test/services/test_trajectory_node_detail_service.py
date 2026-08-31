@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -28,6 +29,7 @@ from app.db.models import (
 )
 from app.db.trajectory_repository import TrajectoryRepository
 from app.services.trajectory_query_service import TrajectoryQueryService
+from app.utils.prompt_fingerprint import fingerprint_system_messages
 
 
 class TrajectoryNodeDetailServiceTests(unittest.TestCase):
@@ -186,6 +188,63 @@ class TrajectoryNodeDetailServiceTests(unittest.TestCase):
                     )
                 )
             db.commit()
+
+    @staticmethod
+    def _skill_metadata(content: str) -> dict:
+        return {
+            "skill_id": "verified-research",
+            "version": "1.0.0",
+            "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "allowed_tool_names": ["web_search", "url_read"],
+            "section_id": "skill:verified-research@1.0.0",
+            "char_count": len(content),
+        }
+
+    @classmethod
+    def _skill_prompt_snapshot(cls, content: str) -> dict:
+        sections = [
+            {"section_id": "app_identity", "content": "Fusion 历史身份正文"},
+            {"section_id": "skill:verified-research@1.0.0", "content": content},
+        ]
+        return {
+            "schema_version": 1,
+            "template_version": "2026-08-31.1",
+            "fingerprint": fingerprint_system_messages(
+                [{"role": "system", "content": section["content"]} for section in sections]
+            ),
+            "char_count": sum(len(section["content"]) for section in sections),
+            "sections": sections,
+        }
+
+    def _skills(self, run_id: str, payload: dict) -> None:
+        with self.Session() as db:
+            run = db.get(AgentSession, run_id)
+            assert run is not None
+            db.add(
+                AgentEvent(
+                    conversation_id=run.conversation_id,
+                    message_id=run.message_id,
+                    run_id=run_id,
+                    sequence=0,
+                    event_type="skills_resolved",
+                    schema_version=1,
+                    event_ts=self.now,
+                    payload=payload,
+                )
+            )
+            db.commit()
+
+    def _loaded_skill_event(self, content: str, *, detail_status: str = "available") -> dict:
+        return {
+            "protocol_version": 2,
+            "status": "loaded",
+            "activation_source": "capability_package",
+            "requested_skill_ids": ["verified-research"],
+            "skills": [self._skill_metadata(content)],
+            "duration_ms": 1,
+            "detail_status": detail_status,
+            "error_code": None,
+        }
 
     def test_system_prompt_detail_reads_exact_persisted_body_after_session_refresh_and_template_changes(self):
         """若重新执行当前模板、截断正文或读取会话配置，历史正文读取必须失败。"""
@@ -378,6 +437,146 @@ class TrajectoryNodeDetailServiceTests(unittest.TestCase):
                 self.assertEqual(response.status, "degraded")
                 self.assertEqual(response.reason, "system_prompt_detail_invalid")
                 self.assertIsNone(response.detail)
+
+    def test_skills_detail_reads_only_frozen_prompt_snapshot_and_survives_refresh(self):
+        content = "冻结的 Verified Research Skill 正文\n必须读取官方原文并交叉核验。"
+        self._run("run-skills", terminal_at=self.now - timedelta(minutes=1))
+        self._system_prompt("run-skills", snapshot=self._skill_prompt_snapshot(content))
+        self._skills("run-skills", self._loaded_skill_event(content))
+
+        first = self._service().get_user_skills_node_detail("conv-1", "run-skills", "user-1")
+        with patch(
+            "app.ai.skills.registry.load_skills_for_package",
+            side_effect=AssertionError("历史正文不得从当前 SKILL.md 重建"),
+        ):
+            refreshed = self._service().get_user_skills_node_detail("conv-1", "run-skills", "user-1")
+
+        assert first is not None and first.detail is not None and refreshed is not None
+        self.assertEqual(first.model_dump(), refreshed.model_dump())
+        self.assertEqual(first.status, "available")
+        self.assertEqual(first.node_type, "skills")
+        self.assertEqual(first.available_sections, ["summary", "prompt"])
+        self.assertEqual(first.detail.status, "loaded")
+        self.assertEqual(first.detail.activation_source, "capability_package")
+        self.assertEqual(first.detail.skills[0].content, content)
+        self.assertEqual(first.detail.skills[0].model_dump(exclude={"content"}), self._skill_metadata(content))
+        self.assertNotIn("Fusion 历史身份正文", first.model_dump_json())
+
+    def test_skills_detail_distinguishes_not_selected_load_failed_old_and_settling_runs(self):
+        terminal_payloads = {
+            "run-no-skill": {
+                "protocol_version": 2,
+                "status": "not_selected",
+                "activation_source": "capability_package",
+                "requested_skill_ids": [],
+                "skills": [],
+                "duration_ms": 0,
+                "detail_status": None,
+                "error_code": None,
+            },
+            "run-skill-failed": {
+                "protocol_version": 2,
+                "status": "load_failed",
+                "activation_source": "capability_package",
+                "requested_skill_ids": ["verified-research"],
+                "skills": [],
+                "duration_ms": 1,
+                "detail_status": None,
+                "error_code": "skill_load_failed",
+            },
+        }
+        for run_id, payload in terminal_payloads.items():
+            self._run(run_id, terminal_at=self.now - timedelta(minutes=1))
+            self._skills(run_id, payload)
+        self._run("run-skills-old", terminal_at=self.now - timedelta(minutes=1))
+        self._run("run-skills-settling", terminal_at=self.now - timedelta(seconds=5))
+
+        service = self._service()
+        not_selected = service.get_user_skills_node_detail("conv-1", "run-no-skill", "user-1")
+        load_failed = service.get_user_skills_node_detail("conv-1", "run-skill-failed", "user-1")
+        old = service.get_user_skills_node_detail("conv-1", "run-skills-old", "user-1")
+        settling = service.get_user_skills_node_detail("conv-1", "run-skills-settling", "user-1")
+
+        assert not_selected is not None and not_selected.detail is not None
+        assert load_failed is not None and load_failed.detail is not None
+        assert old is not None and settling is not None
+        self.assertEqual((not_selected.status, not_selected.detail.status), ("available", "not_selected"))
+        self.assertEqual((load_failed.status, load_failed.detail.status), ("degraded", "load_failed"))
+        self.assertEqual(load_failed.reason, "skills_load_failed")
+        self.assertEqual((old.status, old.reason), ("not_recorded", "skills_not_recorded"))
+        self.assertEqual((settling.status, settling.reason), ("pending", "skills_detail_settling"))
+        for response in (not_selected, load_failed, old, settling):
+            self.assertEqual(response.node_type, "skills")
+            self.assertEqual(response.available_sections, [])
+        self.assertIsNone(old.detail)
+        self.assertIsNone(settling.detail)
+
+    def test_skills_detail_rejects_missing_snapshot_and_skill_section_hash_or_char_count_mismatch(self):
+        content = "冻结的 Skill 正文"
+        self._run("run-skills-invalid-detail-status", terminal_at=self.now - timedelta(minutes=1))
+        self._system_prompt("run-skills-invalid-detail-status", snapshot=self._skill_prompt_snapshot(content))
+        invalid_detail_status = self._loaded_skill_event(content)
+        invalid_detail_status["detail_status"] = None
+        self._skills("run-skills-invalid-detail-status", invalid_detail_status)
+        invalid_status = self._service().get_user_skills_node_detail(
+            "conv-1", "run-skills-invalid-detail-status", "user-1"
+        )
+        assert invalid_status is not None
+        self.assertEqual((invalid_status.status, invalid_status.reason), ("degraded", "skills_detail_invalid"))
+
+        self._run("run-skills-missing", terminal_at=self.now - timedelta(minutes=1))
+        self._skills("run-skills-missing", self._loaded_skill_event(content))
+        missing = self._service().get_user_skills_node_detail("conv-1", "run-skills-missing", "user-1")
+        assert missing is not None
+        self.assertEqual((missing.status, missing.reason), ("degraded", "skills_detail_missing"))
+
+        corruptions = {
+            "hash": {"content_sha256": "0" * 64},
+            "char_count": {"char_count": len(content) + 1},
+            "section_id": {"section_id": "skill:other@1.0.0"},
+        }
+        for suffix, metadata_patch in corruptions.items():
+            with self.subTest(suffix=suffix):
+                run_id = f"run-skills-invalid-{suffix}"
+                self._run(run_id, terminal_at=self.now - timedelta(minutes=1))
+                self._system_prompt(run_id, snapshot=deepcopy(self._skill_prompt_snapshot(content)))
+                payload = self._loaded_skill_event(content)
+                payload["skills"] = [{**payload["skills"][0], **metadata_patch}]
+                self._skills(run_id, payload)
+
+                response = self._service().get_user_skills_node_detail("conv-1", run_id, "user-1")
+
+                assert response is not None
+                self.assertEqual((response.status, response.reason), ("degraded", "skills_detail_invalid"))
+                self.assertEqual(response.available_sections, [])
+                self.assertIsNone(response.detail)
+
+    def test_skills_detail_requires_exact_conversation_run_and_user_ownership(self):
+        content = "他人被冻结的 Skill 正文"
+        cases = (
+            ("run-skills-owned", "conv-1", "user-1"),
+            ("run-skills-other", "conv-2", "user-2"),
+            ("run-skills-inconsistent", "conv-1", "user-2"),
+        )
+        for run_id, conversation_id, user_id in cases:
+            self._run(
+                run_id,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                terminal_at=self.now - timedelta(minutes=1),
+            )
+            self._system_prompt(run_id, snapshot=self._skill_prompt_snapshot(content))
+            self._skills(run_id, self._loaded_skill_event(content))
+
+        service = self._service()
+        self.assertIsNotNone(service.get_user_skills_node_detail("conv-1", "run-skills-owned", "user-1"))
+        for conversation_id, run_id, user_id in (
+            ("conv-2", "run-skills-other", "user-1"),
+            ("conv-1", "run-skills-other", "user-1"),
+            ("conv-1", "run-skills-inconsistent", "user-1"),
+        ):
+            with self.subTest(conversation_id=conversation_id, run_id=run_id, user_id=user_id):
+                self.assertIsNone(service.get_user_skills_node_detail(conversation_id, run_id, user_id))
 
     def test_general_trajectory_and_other_node_details_do_not_read_system_prompt_body(self):
         """若共用 Run 查询增加 config 或触发全列懒加载，普通读取会无故加载完整正文。"""

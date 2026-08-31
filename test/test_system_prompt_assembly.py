@@ -56,4 +56,4 @@ class SystemPromptAssemblyTests(unittest.TestCase):
             result.metadata["section_ids"],
             ["app_identity", "user_preferences"],
         )
-        self.assertEqual(result.metadata["template_version"], "2026-08-27.2")
+        self.assertEqual(result.metadata["template_version"], "2026-08-31.1")

@@ -371,7 +371,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -1162,7 +1162,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -2058,7 +2058,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -2085,7 +2085,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -2665,7 +2665,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -3213,7 +3213,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -3240,7 +3240,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -3566,7 +3566,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -4122,7 +4122,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -4149,7 +4149,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -4176,7 +4176,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -4203,7 +4203,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -4318,7 +4318,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -4568,7 +4568,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -4595,7 +4595,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -5402,7 +5402,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -5429,7 +5429,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -5456,7 +5456,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -6597,7 +6597,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -6624,7 +6624,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -6651,7 +6651,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -7756,7 +7756,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -7783,7 +7783,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -7810,7 +7810,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -7837,7 +7837,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -8810,7 +8810,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
@@ -9125,7 +9125,7 @@
       "app_identity",
       "tool_usage_contract",
       "agent_plan_control",
-      "verified_research_plan",
+      "skill:verified-research@1.0.0",
       "current_date"
     ],
     "expected_resolution_mode": "routed",
