@@ -1,6 +1,6 @@
 # Fusion 执行台账
 
-> 本文件是 Fusion 项目的执行事实源，用来避免重复提出已经实施过的方向。回答“下一步”“还能怎么优化”“接下来做什么”之前，必须先读本文件，再核对两个子仓的 `git log` 和相关 `docs/superpowers` 记录。
+> 本文件是 Fusion 项目的执行事实源，用来避免重复提出已经实施过的方向。回答“下一步”“还能怎么优化”“接下来做什么”之前，必须先读本文件，再核对两个子仓的 `git log` 和相关 `docs/superpowers/specs` 记录。
 
 ## 使用规则
 
@@ -116,6 +116,6 @@
 2. 运行并阅读：
    - `git -C /Users/sean/code/fusion/fusion-api log --oneline -40`
    - `git -C /Users/sean/code/fusion/fusion-ui log --oneline -40`
-3. 用 `rg` 搜索相关关键词，至少覆盖 `docs/superpowers` 和 `docs/MODEL_ACCEPTANCE_RUNBOOK.md`。
+3. 用 `rg` 搜索相关关键词，至少覆盖 `docs/superpowers/specs` 和 `docs/MODEL_ACCEPTANCE_RUNBOOK.md`。
 4. 先列“已完成事实”，再列“不能重复建议”，最后才给新的建议。
 5. 如果没有高置信下一步，直接说“当前不建议继续开基础设施优化坑”，不要硬凑方向。
