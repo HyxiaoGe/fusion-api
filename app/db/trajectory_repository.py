@@ -282,6 +282,18 @@ class TrajectoryRepository:
             .limit(1)
         ).scalar_one_or_none()
 
+    def get_skills_resolved_event(self, conversation_id: str, run_id: str) -> AgentEvent | None:
+        """读取单个 Run 的 Skill 终态安全元数据，不加载其他事件列。"""
+        return self._session.execute(
+            select(AgentEvent)
+            .options(load_only(AgentEvent.payload))
+            .where(AgentEvent.conversation_id == conversation_id)
+            .where(AgentEvent.run_id == run_id)
+            .where(AgentEvent.event_type == "skills_resolved")
+            .order_by(AgentEvent.sequence.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+
     def get_detail_watermark(self):
         return self._session.execute(
             select(TrajectoryLedgerSettings.trajectory_detail_enabled_at).where(

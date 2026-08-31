@@ -349,6 +349,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
             types,
             [
                 "run_started",
+                "skills_resolved",
                 "system_prompt_prepared",
                 "step_started",
                 "context_status_updated",
@@ -359,7 +360,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
                 "run_completed",
             ],
         )
-        prompt_event = events[1]
+        prompt_event = next(event for event in events if event["type"] == "system_prompt_prepared")
         self.assertEqual(prompt_event["status"], "ready")
         self.assertEqual(prompt_event["source"], "code")
         self.assertIsNone(prompt_event["step_id"])
@@ -844,6 +845,7 @@ class AgentLoopFourPathsTests(unittest.IsolatedAsyncioTestCase):
             types,
             [
                 "run_started",
+                "skills_resolved",
                 "system_prompt_prepared",
                 "step_started",
                 "context_status_updated",

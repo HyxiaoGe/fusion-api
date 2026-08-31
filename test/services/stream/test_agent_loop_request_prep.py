@@ -1,5 +1,7 @@
 import unittest
+from unittest.mock import patch
 
+from app.ai.skills.registry import SkillReleasePin
 from app.schemas.chat import TextBlock
 from app.services.agent.plan_coordinator import PlanCoordinator
 from app.services.mcp.amap_product_tools import AMAP_PRODUCT_DEFINITIONS
@@ -23,6 +25,68 @@ class FakeFileRepository:
 
 
 class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
+    def test_continuation_with_frozen_skill_fails_closed_when_current_route_drops_skill(self):
+        current = build_agent_loop_call_config(
+            provider="openai",
+            options={"plan_mode": "on"},
+            capabilities={"functionCalling": True, "searchCapable": True},
+            original_message="核验 OpenAI 最新公告，给出官方原文和交叉来源",
+        )
+        metadata = current.capability_resolution.skill_resolution.skills[0]
+
+        continued = build_agent_loop_call_config(
+            provider="openai",
+            options={"plan_mode": "on"},
+            capabilities={"functionCalling": True, "searchCapable": True},
+            original_message="继续",
+            skill_release_pins=(
+                SkillReleasePin(
+                    skill_id=metadata.skill_id,
+                    version=metadata.version,
+                    content_sha256=metadata.content_sha256,
+                ),
+            ),
+        )
+
+        self.assertEqual(continued.capability_resolution.package_id, "tools_unavailable")
+        self.assertEqual(continued.capability_resolution.reason_codes, ("required_skill_unavailable",))
+        self.assertEqual(continued.capability_resolution.skill_resolution.status, "load_failed")
+        self.assertEqual(continued.announced_tools, [])
+
+    async def test_prompt_uses_frozen_skill_snapshot_without_rereading_disk(self):
+        message = "核验 OpenAI 最新公告，给出官方原文和交叉来源"
+        config = build_agent_loop_call_config(
+            provider="openai",
+            options={"plan_mode": "on"},
+            capabilities={"functionCalling": True, "searchCapable": True},
+            original_message=message,
+        )
+        frozen = config.capability_resolution.loaded_skills[0]
+
+        with patch(
+            "app.ai.skills.registry.Path.read_bytes",
+            side_effect=AssertionError("Prompt 组装不得重新读取 Skill 文件"),
+        ):
+            prepared = await prepare_agent_loop_messages(
+                db=object(),
+                user_id="user-1",
+                raw_messages=[],
+                has_vision=False,
+                file_ids=None,
+                original_message=message,
+                call_config=config,
+                file_repo_factory=lambda _db: FakeFileRepository(),
+                load_user_system_prompt_fn=lambda _db, _uid: None,
+                preprocess_user_input=False,
+            )
+
+        skill_sections = [
+            section
+            for section in prepared.prompt_snapshot["sections"]
+            if section["section_id"] == frozen.metadata.section_id
+        ]
+        self.assertEqual(skill_sections, [{"section_id": frozen.metadata.section_id, "content": frozen.content}])
+
     async def test_real_builder_preserves_parsed_attachment_without_text_in_new_conversation(self):
         from app.ai.prompts.agent_loop import APP_IDENTITY_PROMPT
         from app.schemas.chat import FileBlock, Message
@@ -91,6 +155,11 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(APP_IDENTITY_PROMPT, contents)
         self.assertIn(TOOL_USAGE_CONTRACT_PROMPT, contents)
         self.assertIn(AGENT_PLAN_CONTROL_ON_PROMPT, contents)
+        self.assertEqual(config.capability_resolution.skill_resolution.status, "loaded")
+        self.assertIn("skill:verified-research@1.0.0", prepared.prompt_assembly["section_ids"])
+        skill_content = config.capability_resolution.loaded_skills[0].content
+        self.assertEqual(contents.count(skill_content), 1)
+        self.assertNotIn("verified_research_plan", prepared.prompt_assembly["section_ids"])
         self.assertEqual(prepared.prompt_assembly["status"], "ready")
         self.assertTrue(all(set(message) == {"role", "content"} for message in prepared.messages))
         snapshot = prepared.prompt_snapshot
@@ -215,7 +284,12 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
                 {"functionCalling": True, "searchCapable": True, "agentTools": True},
                 "verified_web",
                 ["web_search", "url_read"],
-                ["app_identity", "tool_usage_contract", "current_date"],
+                [
+                    "app_identity",
+                    "tool_usage_contract",
+                    "skill:verified-research@1.0.0",
+                    "current_date",
+                ],
             ),
             (
                 "明天上海天气怎样？",
@@ -568,7 +642,7 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
         ]["items"]
         self.assertEqual(planned_tools["enum"], ["web_search", "url_read"])
 
-    async def test_verified_research_injects_initial_research_dag_contract_only_for_matching_policy(self):
+    async def test_verified_research_loads_skill_body_only_for_matching_policy(self):
         async def build_llm_messages_fn(
             _raw_messages,
             _has_vision,
@@ -610,12 +684,11 @@ class AgentLoopRequestPrepTests(unittest.IsolatedAsyncioTestCase):
             str(message.get("content", "")) for message in simple.messages if message.get("role") == "system"
         )
 
-        self.assertIn("【可核验证据计划规则】", verified_system_text)
-        self.assertIn("至少 1 个 web_search", verified_system_text)
-        self.assertIn("至少 2 个独立的 url_read", verified_system_text)
-        self.assertIn("直接或间接依赖 web_search", verified_system_text)
-        self.assertIn("最终 answer 或 synthesis", verified_system_text)
-        self.assertNotIn("【可核验证据计划规则】", simple_system_text)
+        self.assertIn("# 可核验证据研究", verified_system_text)
+        self.assertIn("先搜索候选来源", verified_system_text)
+        self.assertIn("独立来源交叉核验", verified_system_text)
+        self.assertNotIn("【可核验证据计划规则】", verified_system_text)
+        self.assertNotIn("# 可核验证据研究", simple_system_text)
 
     def test_deep_research_forces_plan_mode_and_records_task_policy(self):
         config = build_agent_loop_call_config(

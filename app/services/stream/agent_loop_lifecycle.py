@@ -189,6 +189,12 @@ async def _run_success_path(
     dependencies: AgentLoopLifecycleDependencies,
 ) -> None:
     await _start_run(request=request, execution=execution, dependencies=dependencies)
+    if request.call_config.capability_resolution.skill_resolution.status != "loaded":
+        await _emit_skills_resolved(
+            request=request,
+            execution=execution,
+            detail_status=None,
+        )
     grounding = await _prepare_knowledge_grounding(request=request, execution=execution)
     if grounding is not None:
         execution.state.content_blocks.append(grounding.evidence_block)
@@ -344,13 +350,18 @@ async def _prepare_messages(
             preprocess_user_input=request.preprocess_user_input,
         )
     except SystemPromptAssemblyError as error:
+        await _emit_loaded_skills_degraded(request=request, execution=execution)
         try:
             await execution.emitter.system_prompt_prepared(**error.metadata)
         except Exception:
             # 保留组装原始失败，不让诊断写入异常覆盖主错误。
             dependencies.warning_fn("系统提示词失败事件写入失败")
         raise
+    except Exception:
+        await _emit_loaded_skills_degraded(request=request, execution=execution)
+        raise
     metadata = getattr(prepared, "prompt_assembly", None)
+    skill_detail_status = "degraded"
     if metadata is not None:
         metadata = dict(metadata)
         snapshot = getattr(prepared, "prompt_snapshot", None)
@@ -363,12 +374,62 @@ async def _prepare_messages(
                     snapshot=snapshot,
                 )
                 metadata["detail_status"] = "available"
+                skill_detail_status = "available"
             except Exception as error:
                 # 辅助正文失败不终止生成，也不将异常中的提示词写入日志。
                 metadata["detail_status"] = "degraded"
                 dependencies.warning_fn(f"系统提示词正文保存失败: error_type={type(error).__name__}")
+        else:
+            metadata["detail_status"] = "degraded"
+        await _emit_loaded_skills_resolved(
+            request=request,
+            execution=execution,
+            detail_status=skill_detail_status,
+        )
         await execution.emitter.system_prompt_prepared(**metadata)
+    else:
+        await _emit_loaded_skills_degraded(request=request, execution=execution)
     return prepared
+
+
+async def _emit_loaded_skills_degraded(
+    *,
+    request: AgentLoopLifecycleRequest,
+    execution: AgentLoopExecutionContext,
+) -> None:
+    await _emit_loaded_skills_resolved(
+        request=request,
+        execution=execution,
+        detail_status="degraded",
+    )
+
+
+async def _emit_loaded_skills_resolved(
+    *,
+    request: AgentLoopLifecycleRequest,
+    execution: AgentLoopExecutionContext,
+    detail_status: str,
+) -> None:
+    if request.call_config.capability_resolution.skill_resolution.status != "loaded":
+        return
+    await _emit_skills_resolved(
+        request=request,
+        execution=execution,
+        detail_status=detail_status,
+    )
+
+
+async def _emit_skills_resolved(
+    *,
+    request: AgentLoopLifecycleRequest,
+    execution: AgentLoopExecutionContext,
+    detail_status: str | None,
+) -> None:
+    skill_resolution = serialize_capability_resolution(request.call_config.capability_resolution)["skill_resolution"]
+    await execution.emitter.skills_resolved(
+        **skill_resolution,
+        detail_status=detail_status,
+    )
 
 
 async def _prepare_knowledge_grounding(
@@ -588,9 +649,15 @@ def _run_config(limits: AgentLoopLimits, call_config: AgentLoopCallConfig | None
         announced_tools = list(getattr(call_config, "announced_tools", []) or [])
         if resolution_payload["external_tool_names"] != announced_tools:
             raise ValueError("能力路由工具与 Run 公告工具不一致")
+        fingerprint_resolution = {
+            **resolution_payload,
+            "skill_resolution": {
+                key: value for key, value in resolution_payload["skill_resolution"].items() if key != "duration_ms"
+            },
+        }
         fingerprint_input = {
             "prompt_template_version": TEMPLATE_VERSION,
-            "capability_resolution": resolution_payload,
+            "capability_resolution": fingerprint_resolution,
             "announced_tools": announced_tools,
             "mcp_tool_bindings": bindings,
             "task_mode": config["task_mode"],

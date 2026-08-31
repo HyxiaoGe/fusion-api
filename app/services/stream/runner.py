@@ -41,6 +41,7 @@ from app.services.stream.agent_round import run_agent_round
 from app.services.stream.limit_summary import run_limit_summary_step
 from app.services.stream.llm_stream import llm_call_with_retry, stream_round
 from app.services.stream.persistence import persist_message
+from app.services.stream.previous_run_skill_release import load_previous_run_skill_release_pins
 from app.services.stream.run_finalizer import (
     complete_agent_run,
     fail_agent_run,
@@ -135,6 +136,7 @@ def _agent_loop_wiring_dependencies() -> AgentLoopWiringDependencies:
         fail_suggested_questions_fn=fail_claimed_suggested_questions,
         load_dynamic_tools_fn=load_mcp_agent_tools,
         load_authorized_tool_names_fn=load_mcp_authorized_tool_aliases,
+        load_previous_skill_release_pins_fn=load_previous_run_skill_release_pins,
         llm_round_detail_scheduler=schedule_llm_round_detail,
     )
 

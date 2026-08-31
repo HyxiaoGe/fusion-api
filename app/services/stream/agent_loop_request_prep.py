@@ -15,6 +15,7 @@ from app.ai.prompts.agent_loop import (
     get_tool_usage_contract_prompt,
 )
 from app.ai.prompts.system_prompt import SystemPromptSection, assemble_system_prompt
+from app.ai.skills.registry import RunSkillResolution, SkillReleasePin, load_skills_for_package
 from app.ai.tools import build_url_read_tool, build_web_search_tool
 from app.db.repositories import FileRepository
 from app.services.agent.plan_coordinator import PlanMode
@@ -38,8 +39,6 @@ VOLCENGINE_PROVIDERS = {"volcengine"}
 MAX_CONTROLLED_OUTPUT_TOKENS = 4096
 PLAN_ITEM_ARGUMENT_NAME = "_plan_item_id"
 PLAN_ITEM_ID_PATTERN = "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
-VERIFIED_RESEARCH_PLAN_CONTRACT_PROMPT = """【可核验证据计划规则】
-当前请求需要建立可核验的证据链。首个 update_plan 必须包含至少 1 个 web_search 步骤和至少 2 个独立的 url_read 来源核验步骤。每个 url_read 步骤必须通过 depends_on 直接或间接依赖 web_search，不能作为首批可执行步骤。最终 answer 或 synthesis 步骤必须依赖全部读取步骤。先搜索候选来源，再读取原文，最后综合结论。"""
 
 
 @dataclass(frozen=True)
@@ -221,6 +220,7 @@ def build_agent_loop_call_config(
     authorized_tool_names: list[str] | None = None,
     original_message: str | None = None,
     task_context_messages: list[object] | None = None,
+    skill_release_pins: tuple[SkillReleasePin, ...] | None = None,
 ) -> AgentLoopCallConfig:
     options = options or {}
     capabilities = capabilities or {}
@@ -259,6 +259,16 @@ def build_agent_loop_call_config(
         name for name in dict.fromkeys(trusted_authorized_tool_names) if name not in available_tools_by_name
     )
     unavailable_tool_names = [name for name in trusted_authorized_tool_names if name not in available_tools_by_name]
+    skill_loader = None
+    if skill_release_pins is not None:
+
+        def skill_loader(package_id, routed_tool_names):
+            return load_skills_for_package(
+                package_id,
+                routed_tool_names,
+                release_pins=skill_release_pins,
+            )
+
     capability_resolution = resolve_run_capability_route(
         original_message=original_message,
         task_context_messages=task_context_messages,
@@ -269,7 +279,34 @@ def build_agent_loop_call_config(
         tools_disabled=tools_disabled,
         knowledge_grounded=knowledge_grounded,
         unavailable_tool_names=unavailable_tool_names,
+        load_skills_fn=skill_loader,
     )
+    if (
+        skill_release_pins
+        and capability_resolution.skill_resolution is not None
+        and capability_resolution.skill_resolution.status == "not_selected"
+    ):
+        capability_resolution = RunCapabilityResolution(
+            schema_version=capability_resolution.schema_version,
+            router_version=capability_resolution.router_version,
+            package_id="tools_unavailable",
+            confidence=capability_resolution.confidence,
+            resolution_mode="degraded",
+            reason_codes=("required_skill_unavailable",),
+            external_tool_names=(),
+            effective_plan_mode="off",
+            include_current_date=capability_resolution.include_current_date,
+            network_boundary_required=True,
+            skill_resolution=RunSkillResolution(
+                status="load_failed",
+                activation_source="capability_package",
+                requested_skill_ids=tuple(pin.skill_id for pin in skill_release_pins),
+                skills=(),
+                duration_ms=0,
+                error_code="skill_load_failed",
+            ),
+            loaded_skills=(),
+        )
     external_tool_names = list(capability_resolution.external_tool_names)
     tools = [available_tools_by_name[name] for name in external_tool_names]
     plan_mode = capability_resolution.effective_plan_mode
@@ -426,11 +463,8 @@ async def prepare_agent_loop_messages(
                 "agent_plan_control",
                 get_agent_plan_control_prompt(resolution.effective_plan_mode),
             )
-        if resolution.package_id == "verified_web" and resolution.effective_plan_mode != "off":
-            yield SystemPromptSection(
-                "verified_research_plan",
-                VERIFIED_RESEARCH_PLAN_CONTRACT_PROMPT,
-            )
+        for skill in resolution.loaded_skills:
+            yield SystemPromptSection(skill.metadata.section_id, skill.content)
         if resolution.package_id == "deep_research":
             yield SystemPromptSection("deep_research_contract", DEEP_RESEARCH_CONTRACT_PROMPT)
         if resolution.network_boundary_required:
@@ -565,30 +599,6 @@ def inject_plan_control_contract(
         "content": get_agent_plan_control_prompt(call_config.plan_mode),
     }
     return [*messages[:insert_at], contract_msg, *messages[insert_at:]]
-
-
-def inject_verified_research_plan_contract(
-    messages: list[dict],
-    call_config: AgentLoopCallConfig,
-) -> list[dict]:
-    """仅为高置信可核验研究请求前置首计划 DAG 约束。"""
-
-    policy_reasons = set((getattr(call_config, "plan_tool_policy_reason", "") or "").split("+"))
-    if "verified_research_request" not in policy_reasons:
-        return messages
-    if any(
-        message.get("role") == "system" and message.get("content") == VERIFIED_RESEARCH_PLAN_CONTRACT_PROMPT
-        for message in messages
-    ):
-        return messages
-    insert_at = 0
-    while insert_at < len(messages) and messages[insert_at].get("role") == "system":
-        insert_at += 1
-    return [
-        *messages[:insert_at],
-        {"role": "system", "content": VERIFIED_RESEARCH_PLAN_CONTRACT_PROMPT},
-        *messages[insert_at:],
-    ]
 
 
 def inject_deep_research_contract(

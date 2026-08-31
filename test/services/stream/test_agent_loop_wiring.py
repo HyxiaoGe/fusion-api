@@ -2,6 +2,7 @@ import unittest
 from dataclasses import replace
 from types import SimpleNamespace
 
+from app.ai.skills.registry import SkillReleasePin
 from app.services.stream.agent_loop_policy import AgentLoopLimits
 from app.services.stream.agent_loop_wiring import (
     AgentLoopRunInput,
@@ -89,6 +90,18 @@ class AgentLoopWiringTests(unittest.TestCase):
             captured["authorized_tool_names_db"] = db
             return ["mcp_docs_alias"]
 
+        continuation_pins = (
+            SkillReleasePin(
+                skill_id="verified-research",
+                version="0.9.0",
+                content_sha256="a" * 64,
+            ),
+        )
+
+        def load_previous_skill_release_pins_fn(db, *, conversation_id, user_id, previous_run_id):
+            captured["previous_skill_release"] = (db, conversation_id, user_id, previous_run_id)
+            return continuation_pins
+
         def build_execution_fn(**kwargs):
             captured["execution_kwargs"] = kwargs
             return fake_execution
@@ -163,6 +176,7 @@ class AgentLoopWiringTests(unittest.TestCase):
             warning_fn=warning_fn,
             load_dynamic_tools_fn=load_dynamic_tools_fn,
             load_authorized_tool_names_fn=load_authorized_tool_names_fn,
+            load_previous_skill_release_pins_fn=load_previous_skill_release_pins_fn,
         )
         lifecycle_call = build_agent_loop_lifecycle_call(
             run_input=run_input,
@@ -236,6 +250,23 @@ class AgentLoopWiringTests(unittest.TestCase):
         self.assertIs(lifecycle_call.dependencies.info_fn, info_fn)
         self.assertIs(lifecycle_call.dependencies.error_fn, error_fn)
         self.assertIs(lifecycle_call.dependencies.warning_fn, warning_fn)
+
+        captured.clear()
+        build_agent_loop_lifecycle_call(
+            run_input=replace(
+                run_input,
+                previous_run_id="run-previous",
+                run_attempt_kind="continue",
+            ),
+            db="db-wiring",
+            limits=limits,
+            dependencies=dependencies,
+        )
+        self.assertEqual(
+            captured["previous_skill_release"],
+            ("db-wiring", "conv-wiring", "user-wiring", "run-previous"),
+        )
+        self.assertEqual(captured["call_config_kwargs"]["skill_release_pins"], continuation_pins)
 
         alias_message = "请使用 mcp_docs_alias 查询 Microsoft Learn"
         from app.services.stream.agent_loop_request_prep import build_agent_loop_call_config

@@ -1098,6 +1098,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
             result.event_types,
             [
                 "run_started",
+                "skills_resolved",
                 "system_prompt_prepared",
                 "step_started",
                 "context_status_updated",
@@ -1108,7 +1109,7 @@ class AgentLoopContractTests(unittest.IsolatedAsyncioTestCase):
                 "run_completed",
             ],
         )
-        prompt_event = result.events[1]
+        prompt_event = next(event for event in result.events if event["type"] == "system_prompt_prepared")
         self.assertEqual(prompt_event["status"], "ready")
         self.assertIsNone(prompt_event["step_id"])
         self.assertNotIn("current_date", prompt_event["section_ids"])

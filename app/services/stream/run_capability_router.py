@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import re
-from dataclasses import asdict, dataclass
-from typing import Literal
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
+from typing import Any, Literal
 
+from app.ai.skills.registry import (
+    LoadedSkillSnapshot,
+    RunSkillResolution,
+    load_skills_for_package,
+)
 from app.services.agent.plan_coordinator import PlanMode
 from app.services.stream.agent_plan_tool_policy import (
     INTERCITY_LOCATION_NAMES,
@@ -25,8 +31,8 @@ from app.utils.run_capability_contract import (
 Confidence = Literal["high", "medium", "low"]
 ResolutionMode = Literal["routed", "degraded", "clarification"]
 
-SCHEMA_VERSION = 1
-ROUTER_VERSION = "2026-08-28.1"
+SCHEMA_VERSION = 2
+ROUTER_VERSION = "2026-08-31.1"
 
 _CANONICAL_EXTERNAL_TOOL_ORDER = CAPABILITY_CANONICAL_EXTERNAL_TOOL_ORDER
 _CONTROL_TOOL_NAMES = CAPABILITY_CONTROL_TOOL_NAMES
@@ -497,6 +503,8 @@ class RunCapabilityResolution:
     effective_plan_mode: PlanMode
     include_current_date: bool
     network_boundary_required: bool
+    skill_resolution: RunSkillResolution | None = None
+    loaded_skills: tuple[LoadedSkillSnapshot, ...] = field(default=(), repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -520,10 +528,12 @@ def resolve_run_capability_route(
     tools_disabled: bool,
     knowledge_grounded: bool,
     unavailable_tool_names: list[str] | None = None,
+    load_skills_fn: Callable[..., Any] | None = None,
 ) -> RunCapabilityResolution:
     """根据受信运行态与当前用户消息解析最小能力包。"""
 
     message = _normalize_message(original_message)
+    skill_loader = load_skills_fn or load_skills_for_package
     function_calling = capabilities.get("functionCalling") is True
     search_capable = capabilities.get("searchCapable") is True
 
@@ -559,7 +569,8 @@ def resolve_run_capability_route(
                 function_calling=function_calling,
                 tools_disabled=True,
                 network_boundary_required=bool(blocked_tool_names),
-            )
+            ),
+            load_skills_fn=skill_loader,
         )
 
     if task_policy.task_mode == "deep_research":
@@ -608,7 +619,8 @@ def resolve_run_capability_route(
                 function_calling=function_calling,
                 tools_disabled=True,
                 network_boundary_required=True,
-            )
+            ),
+            load_skills_fn=skill_loader,
         )
 
     resolution = _resolution(
@@ -635,7 +647,8 @@ def resolve_run_capability_route(
                 function_calling=function_calling,
                 tools_disabled=True,
                 network_boundary_required=True,
-            )
+            ),
+            load_skills_fn=skill_loader,
         )
     if needs_external_capability and not resolution.external_tool_names:
         return _validated_resolution(
@@ -652,18 +665,48 @@ def resolve_run_capability_route(
                 function_calling=function_calling,
                 tools_disabled=True,
                 network_boundary_required=True,
-            )
+            ),
+            load_skills_fn=skill_loader,
         )
-    return _validated_resolution(resolution)
+    return _validated_resolution(resolution, load_skills_fn=skill_loader)
 
 
 def serialize_capability_resolution(resolution: RunCapabilityResolution) -> dict:
     """转换为可持久化的安全协议，不包含原文或自由文本。"""
 
-    payload = asdict(resolution)
-    payload["reason_codes"] = list(resolution.reason_codes)
-    payload["external_tool_names"] = list(resolution.external_tool_names)
-    return payload
+    skill_resolution = resolution.skill_resolution
+    if skill_resolution is None:
+        raise ValueError("Run 能力包尚未冻结 Skill 终态")
+    return {
+        "schema_version": resolution.schema_version,
+        "router_version": resolution.router_version,
+        "package_id": resolution.package_id,
+        "confidence": resolution.confidence,
+        "resolution_mode": resolution.resolution_mode,
+        "reason_codes": list(resolution.reason_codes),
+        "external_tool_names": list(resolution.external_tool_names),
+        "effective_plan_mode": resolution.effective_plan_mode,
+        "include_current_date": resolution.include_current_date,
+        "network_boundary_required": resolution.network_boundary_required,
+        "skill_resolution": {
+            "status": skill_resolution.status,
+            "activation_source": skill_resolution.activation_source,
+            "requested_skill_ids": list(skill_resolution.requested_skill_ids),
+            "skills": [
+                {
+                    "skill_id": skill.skill_id,
+                    "version": skill.version,
+                    "content_sha256": skill.content_sha256,
+                    "allowed_tool_names": list(skill.allowed_tool_names),
+                    "section_id": skill.section_id,
+                    "char_count": skill.char_count,
+                }
+                for skill in skill_resolution.skills
+            ],
+            "duration_ms": skill_resolution.duration_ms,
+            "error_code": skill_resolution.error_code,
+        },
+    }
 
 
 def _classify_standard_request(
@@ -1105,7 +1148,37 @@ def _resolution(
     )
 
 
-def _validated_resolution(resolution: RunCapabilityResolution) -> RunCapabilityResolution:
+def _validated_resolution(
+    resolution: RunCapabilityResolution,
+    *,
+    load_skills_fn: Callable[..., Any],
+) -> RunCapabilityResolution:
+    skill_result = load_skills_fn(
+        resolution.package_id,
+        resolution.external_tool_names,
+    )
+    skill_resolution = skill_result.resolution
+    if skill_resolution.status == "load_failed":
+        resolution = RunCapabilityResolution(
+            schema_version=SCHEMA_VERSION,
+            router_version=ROUTER_VERSION,
+            package_id="tools_unavailable",
+            confidence=resolution.confidence,
+            resolution_mode="degraded",
+            reason_codes=("required_skill_unavailable",),
+            external_tool_names=(),
+            effective_plan_mode="off",
+            include_current_date=resolution.include_current_date,
+            network_boundary_required=True,
+            skill_resolution=skill_resolution,
+            loaded_skills=(),
+        )
+    else:
+        resolution = replace(
+            resolution,
+            skill_resolution=skill_resolution,
+            loaded_skills=tuple(skill_result.loaded_skills),
+        )
     validate_capability_resolution_semantics(
         package_id=resolution.package_id,
         confidence=resolution.confidence,
@@ -1115,6 +1188,7 @@ def _validated_resolution(resolution: RunCapabilityResolution) -> RunCapabilityR
         effective_plan_mode=resolution.effective_plan_mode,
         include_current_date=resolution.include_current_date,
         network_boundary_required=resolution.network_boundary_required,
+        skill_resolution=resolution.skill_resolution,
     )
     return resolution
 

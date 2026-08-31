@@ -132,6 +132,7 @@ class AgentLoopWiringDependencies:
     fail_suggested_questions_fn: Callable[..., Any] | None = None
     load_dynamic_tools_fn: Callable[..., Any] | None = None
     load_authorized_tool_names_fn: Callable[..., list[str]] | None = None
+    load_previous_skill_release_pins_fn: Callable[..., Any] | None = None
     llm_round_detail_scheduler: Callable[[Any], Any] | None = None
 
     def to_execution_dependencies(self) -> AgentLoopDependencies:
@@ -220,6 +221,18 @@ def build_agent_loop_lifecycle_call(
         if should_load_dynamic_tool_metadata
         else []
     )
+    skill_release_pins = None
+    if (
+        run_input.run_attempt_kind == "continue"
+        and run_input.previous_run_id is not None
+        and dependencies.load_previous_skill_release_pins_fn is not None
+    ):
+        skill_release_pins = dependencies.load_previous_skill_release_pins_fn(
+            db,
+            conversation_id=run_input.conversation_id,
+            user_id=run_input.user_id,
+            previous_run_id=run_input.previous_run_id,
+        )
     call_config = dependencies.build_call_config_fn(
         provider=run_input.provider,
         options=options,
@@ -241,6 +254,12 @@ def build_agent_loop_lifecycle_call(
         **(
             {"task_context_messages": run_input.raw_messages}
             if _accepts_keyword(dependencies.build_call_config_fn, "task_context_messages")
+            else {}
+        ),
+        **(
+            {"skill_release_pins": skill_release_pins}
+            if skill_release_pins is not None
+            and _accepts_keyword(dependencies.build_call_config_fn, "skill_release_pins")
             else {}
         ),
     )
