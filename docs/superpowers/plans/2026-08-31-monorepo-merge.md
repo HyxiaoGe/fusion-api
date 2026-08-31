@@ -4,7 +4,7 @@
 > Base: `fusion-api@43cee73` / `fusion-ui@77b7fc2`（2026-08-31 复核基线）
 > Branch: `feat/monorepo-merge`
 > Target: 新建仓库 `HyxiaoGe/fusion`
-> Review: PR #83 第一轮（9 条）与第二轮（6 条）评审均已受理，修订记录见文末
+> Review: PR #83 三轮评审（9 + 6 + 5 条）均已受理，修订记录见文末
 
 **目标：** 把 `fusion-api` 与 `fusion-ui` 合并为单一仓库 `fusion`，保留两边完整 git 历史，并把当前分散在两处、共约 3600 行的发布流水线收敛为一份参数化的可复用 workflow + 一组可本地执行的部署脚本。
 
@@ -29,7 +29,8 @@
 - **搬迁、切换与流水线重写必须分三阶段，不得合并。** 流水线操作真实 docker 重启、alembic 迁移与用户上传文件目录，混做会使发布故障无法二分定位。
 - **旧仓库在最终验收通过前保持完整发布与回滚能力。** 不得在切换完成前注销旧仓 runner、撤销旧仓 secrets 或归档旧仓。
 - **宿主机持久化状态必须迁出仓库 checkout 树，而不只是换一个子目录。** 目标路径不得位于任何仓库 checkout 根之下（含新仓的 `~/project/fusion`）。持久化状态与代码 checkout 当前在 `~/project/fusion` 下混放。
-- **跨仓互斥必须由宿主机侧的锁承担。** GitHub concurrency group 只在单个 repository 内协调，无法阻止旧 `fusion-api`、旧 `fusion-ui` 与新 `fusion` 三方同时操作同一台 dev server。所有部署入口在宿主机获取同一把 `flock` 后才可操作 docker/systemd。
+- **跨仓互斥由 drain 门禁承担，`flock` 只覆盖新仓与宿主机侧操作。** GitHub concurrency group 只在单个 repository 内协调。**实测两个旧仓 workflow 均无任何 `flock` 调用**（`grep -c flock` = 0），而本计划不改动旧仓配置，因此仅在宿主机放置锁文件不产生跨仓互斥 —— 旧 workflow 会直接绕过。故：新仓 orchestrator 与宿主机手工操作持同一把 `flock`；cutover 期间的三仓互斥由 Task 2 的 drain 门禁保证（见 2.2）。
+- **`disable` 不等于停止。** GitHub 的 disable 只阻止后续触发，不影响已 queued / in-progress 的 run。任何"冻结"步骤都必须配合对三个仓库在途 run 的查询、等待或取消，直至归零。
 - **cutover 必须以「运行态归属新仓」收尾。** 任何回退演练之后都要重新切回新仓并复验，验收不得停在"旧仓重新发布成功"这一步。
 - **secrets 不可从旧仓复制。** GitHub API 只能列出名称与元数据，不能读回值；一律从原始凭据源重新注入，找不到原始值的必须轮换，禁止从 workflow 日志或运行环境反向导出。
 - `paths:` **不得用作 event-level 过滤**（见 P0-4）。变更检测由 workflow 内首个 `changes` job 承担，且始终提供一个恒定存在的 required gate job。
@@ -90,7 +91,7 @@
    - bundle 以完整 refs 创建（`--all`）并执行 `git bundle verify`；
    - bundle 与未提交资产各在临时目录还原一次并校验；
    - 迁移分支只从精确 HEAD 创建，不在旧仓 master 上执行目录下沉提交。
-3. 复制 `dev` Environment 及其 custom branch policy、branch protection。
+3. 复制 `dev` Environment 及其 custom branch policy。**branch protection 分两步 bootstrap**（P1-18）：本 Task 只复制**非 check 类**保护规则；required status check 暂不设置 —— 两个旧仓当前的 required check 名为 `PR container validation`，而新仓此时尚未产生过该 check，且 GitHub 要求 required check 在目标仓库最近 7 天内成功运行过，直接复制会使新仓 PR 永久 Pending。gate 在新仓成功运行一次后（Task 1）再设为 required。
 4. **secrets 重新注入（非复制）**：
    - 通过 API 导出旧仓 secret **名称清单**（repo 层与 Environment 层分别导出）；
    - 从密码管理器、部署主机安全配置或原始凭据源向新仓注入；
@@ -117,9 +118,25 @@
    - `release-safety.yml` 拆为 `apps/api/release-safety.yml` 与 `apps/ui/release-safety.yml`，`release-safety-contract.sh` 改为接受契约文件路径参数；
    - 本地 composite action 路径、Dockerfile context、`cache-dependency-path` 逐一修正。
 4. PR CI 改造为：始终触发 → 首个 `changes` job 判定 `api` / `ui` / `shared` → 应用 job 用 `if` 跳过 → 末尾恒定 required gate job。明确 `.github/**`、`ops/**`、根配置、共享文档各触发哪一侧。
-5. 部署 workflow 原样复制两份进新仓但**保持 disabled**，不接管发布。
+5. **部署 workflow 改造为 `workflow_call` 外壳**（P0-16）。实测两边现有 workflow 均**不暴露 `workflow_call`**，普通 workflow 无法被 orchestrator 以 job-level `uses` + `needs` 调用，用 `workflow_dispatch` 触发子 workflow 也无法在同一 run 内形成可证明的依赖链 —— 若不在此处理，Task 2 的 orchestrator 无可调用对象。故生成两份**逻辑原样、尚未参数化合并**的 app-specific reusable workflow：
+   - `.github/workflows/_deploy-api.yml`，仅暴露 `workflow_call`；
+   - `.github/workflows/_deploy-ui.yml`，仅暴露 `workflow_call`。
 
-**验收：** 新仓 PR CI 全绿；`apps/api` 与 `apps/ui` 的单测与 lint 在新仓通过（含上述被改动的 6 个测试文件）；两个应用的镜像可在新仓成功构建（不推送、不部署）；只改一侧的 PR 不触发另一侧的应用 job，但 required gate 仍产出成功结论。
+   这**只改变调用外壳，不合并也不优化部署逻辑**，仍满足"搬迁与重写分离"。两份在本 Task 保持不被任何已启用的 workflow 调用。Task 4 再合并为参数化 `_deploy-app.yml`。
+6. **`changes` 与 required gate 行为契约**（P1-19）：
+   - `changes` 使用 checkout 后的**完整 Git diff**，不依赖 GitHub 的 300-file event 过滤；
+   - 分别定义 PR、push、首次 push、merge commit、`workflow_dispatch` 五种情形的 base / head；
+   - required gate 使用 `if: always()`；
+   - gate 必须验证「按 `changes` 结果**应当运行**的 app job 成功」，**不得**因 app job 为 `skipped` 就无条件通过；
+   - API 未变化而 UI 变化时，UI job **不得**因 `needs: deploy-api` 处于 `skipped` 而被级联跳过（用 `always()` + 显式结果判定，不用裸 `needs`）；
+   - 恒定 gate 的 display name 在本 Task 确定并记入文档，供 Task 0/4 的 branch protection 引用。
+7. **`workflow_dispatch` 回滚契约**（P0-16）：
+   - 目标应用参数 `api | ui | both`；
+   - API / UI **各自独立**的 rollback SHA，不假设两应用相同；
+   - 手动回滚时 `changes` **不得**按路径判定后跳过目标应用；
+   - 明确单应用与双应用回滚的执行顺序、失败中止行为与最终台账更新规则。
+
+**验收：** 新仓 PR CI 全绿；`apps/api` 与 `apps/ui` 的单测与 lint 在新仓通过（含上述被改动的 6 个测试文件）；两个应用的镜像可在新仓成功构建（不推送、不部署）；只改一侧的 PR 不触发另一侧的应用 job，但 required gate 仍产出成功结论；构造一次「API 未变、UI 变」的 PR，确认 UI job **未**被级联跳过且 gate 正确判定；构造一次「应运行的 app job 失败」，确认 gate **失败**而非放行；`_deploy-api.yml` / `_deploy-ui.yml` 通过 `workflow_call` 语法校验且未被任何已启用 workflow 调用。
 
 ## Task 2：受控 cutover
 
@@ -142,20 +159,22 @@
 
 ### 2.2 Cutover Runbook
 
-1. 冻结三个仓库（旧 `fusion-api`、旧 `fusion-ui`、新 `fusion`）的 master 合并与手动发布；
-2. 在宿主机获取跨仓 `flock` 部署锁；
-3. disable 旧仓两条 workflow，再 enable 新仓 orchestrator（`detect changes → deploy API → deploy UI`）；
-4. 由新仓发布、验证，并记录部署所有权归新仓；
-5. **回退演练**：先 disable 新仓，再 enable 旧仓，由旧仓发布并验证成功；
-6. **回切收尾（不可省略）**：再次 disable 旧仓、enable 新仓，重新部署新仓当前 SHA，并验证最终镜像 ID、发布台账与部署所有权**全部归新仓**。
+1. 冻结三个仓库（旧 `fusion-api`、旧 `fusion-ui`、新 `fusion`）的 master 合并与手动 dispatch；
+2. **Drain 门禁（显式，不可跳过）**：查询三个仓库全部 `queued` 与 `in_progress` 的 workflow run，等待其自然结束或安全取消，**直至三仓在途 run 归零**并二次确认。`disable` 只阻止后续触发，不影响已在途的 run，因此本步不能被"冻结"或"disable"替代；
+3. disable 旧仓两条 workflow，**再次确认无在途 run**，然后 enable 新仓 orchestrator（`detect changes → deploy API → deploy UI`）；
+4. 由新仓发布、验证，并记录部署所有权归新仓（新仓 orchestrator 与宿主机手工操作全程持 `flock`）；
+5. **回退演练**：先 disable 新仓 → drain → enable 旧仓，由旧仓发布并验证成功；
+6. **回切收尾（不可省略）**：disable 旧仓 → drain → enable 新仓，重新部署新仓当前 SHA，验证最终镜像 ID、发布台账与部署所有权**全部归新仓**。
 
-第 6 步是本 Task 的终点。缺少它，验收会停在"旧仓重新发布成功"，而运行态实际停留在旧仓版本。
+每次 enable / disable 切换之间都要重跑第 2 步的 drain，三仓不得在任一时刻同时处于 enabled。第 6 步是本 Task 的终点：缺少它，验收会停在"旧仓重新发布成功"，而运行态实际停留在旧仓版本。
+
+**关于跨仓锁的取舍：** 评审提出两个方案 —— (1) 先发独立 PR 给旧仓加同一把 `flock`；(2) 不宣称锁覆盖三仓，改用严格 drain。**本计划采用方案 2**，理由是方案 1 要在 cutover 前夕修改旧仓的部署 job，而旧仓正是失败时的唯一回退路径，动它会削弱兜底。配合 runbook 的 drain 门禁与"三仓不同时 enabled"纪律，风险窗口已被覆盖。若后续认为需要双保险，方案 1 可作为独立前置 PR 追加 —— 这是可推翻的决策。
 
 ### 2.3 外部平台绑定
 
 Task 0 第 7 步判定为「仍活跃且影响运行态」的 Vercel / Railway 绑定，在本 Task 的同一次 cutover 内完成切换，不得延后到 Task 4。
 
-**验收：** 新仓完成一次真实 API 发布 + 回滚；一次真实 UI 发布 + 回滚；一次同时修改两边的提交，确认执行顺序为 API → UI；上传文件迁移前后的**文件数、总字节数、权限/owner、校验摘要四项全部一致**，并另做一次单文件上传下载验证；三个 systemd unit 均 active 且 `cost-sync` 已脱离仓库 checkout 路径；runbook 第 5 步旧仓回退演练成功；runbook 第 6 步回切后镜像 ID、台账、发布所有权均指向新仓。任一项失败即回退到旧仓并停止推进。
+**验收：** 新仓完成一次真实 API 发布 + 回滚；一次真实 UI 发布 + 回滚；一次同时修改两边的提交，确认执行顺序为 API → UI；上传文件迁移前后的**文件数、总字节数、权限/owner、校验摘要四项全部一致**，并另做一次单文件上传下载验证；三个 systemd unit 均 active 且 `cost-sync` 已脱离仓库 checkout 路径；runbook 每次切换前的 drain 均确认三仓在途 run 为 0；第 5 步旧仓回退演练成功；第 6 步回切后镜像 ID、台账、发布所有权均指向新仓。任一项失败即回退到旧仓并停止推进。
 
 ## Task 3：抽取 shell 到 ops/deploy
 
@@ -173,9 +192,20 @@ Task 0 第 7 步判定为「仍活跃且影响运行态」的 Vercel / Railway �
 
 1. 以 UI 侧精简实现为基线，逐条比对 API 侧多出的检查，分类为「真实约束」与「重复防御」。真实约束做成可选 hook，重复防御合并。**分类结果登记在本文件，本 Task 内不删除任何检查。**
 2. 抽出 `_deploy-app.yml`，参数：应用名、镜像仓库、健康检查端点、迁移开关、依赖服务列表、回滚锚点校验策略。
-3. **保留各应用现有 ACR repository 与 `<sha>` tag**（`seanfield/fusion-api` 与 `seanfield/fusion-ui` 已天然区分应用，见 P1-6）。新增 per-app 发布台账/manifest，记录每个应用的 last deployed SHA，解决 path-filtered 发布后两应用 SHA 分叉导致的回滚目标定位问题。
+3. **保留各应用现有 ACR repository 与 `<sha>` tag**（`seanfield/fusion-api` 与 `seanfield/fusion-ui` 已天然区分应用，见 P1-6）。新增 per-app 发布台账解决两应用 last deployed SHA 分叉导致的回滚目标定位问题，其语义按下表固定（P1-20）：
+
+   | 项 | 约定 |
+   |---|---|
+   | 权威来源 | **运行容器的 immutable image ref + image ID**（`docker inspect` 可得），不是台账文件 |
+   | 台账定位 | 权威来源的**可恢复投影**，用于快速查询与审计，丢失可从运行态重建 |
+   | 存储位置 | 宿主机 checkout 树之外（`~/.local/share/fusion/<app>/release-ledger.json`） |
+   | 更新时机 | 发布验证通过后，在**同一把部署 `flock` 内原子替换**（写临时文件 + `rename`） |
+   | 失败与自动回滚 | 回滚完成后按回滚后的实际运行镜像重写台账，不保留失败中间态 |
+   | 手动回滚 | 按 `workflow_dispatch` 的目标应用与 SHA 更新对应条目，另一应用条目不变 |
+   | 宿主机丢失 | 从运行容器 image ref + ID 重建；容器也不存在则从 ACR tag 与部署记录人工恢复 |
+   | 禁止项 | **不得把部署时变化的 manifest commit 回 master** —— 会递归触发发布流水线 |
 4. 处理 Task 0 判定为「不影响当前运行态」的平台项（例如非活跃服务的 root directory 归位）。**影响运行态的绑定已在 Task 2 切换完毕，本 Task 不得留有此类项。**
-5. 分支保护、required checks 按新 workflow 的 job 名重建（gate job 为 required，应用 job 不是）。
+5. **required context 迁移**（P1-18）：仅在 gate 的 job display name 确实变化时迁移 required context，迁移后**验证旧 context 已从保护规则中移除**，避免残留一个永不再产生的 required check。应用 job 始终不设为 required。
 
 **验收：** 两应用各发布、各回滚一次；构造仅改 UI 的提交，确认 API 的 last deployed SHA 未变且回滚目标仍可唯一解析；平台绑定逐条在控制台勾选确认并各触发一次真实构建。
 
@@ -217,6 +247,11 @@ Task 0 第 7 步判定为「仍活跃且影响运行态」的 Vercel / Railway �
 | secret 原始值不可得 | Task 0 | 该项一律轮换，不从日志或运行环境反向导出 |
 | 未提交资产在迁移中丢失 | Task 0 | bundle 之外另做未跟踪文件归档 + 哈希 + 还原验证 |
 | 平台仍跟踪旧仓导致发布链未真正切换 | Task 2 | Task 0 产出平台使用状态清单，活跃绑定并入 Task 2 同一次 cutover |
+| orchestrator 无可调用的部署单元 | Task 2 | Task 1 先产出 `_deploy-api.yml` / `_deploy-ui.yml` 两份 `workflow_call` 外壳 |
+| 在途 run 绕过冻结继续操作 dev server | Task 2 | runbook 第 2 步 drain 门禁，每次 enable/disable 切换前重跑 |
+| 新仓 required check 从未运行导致 PR 永久 Pending | Task 0 | branch protection 分两步 bootstrap，gate 成功运行一次后再设 required |
+| gate 因 app job skipped 而误放行 | Task 1 | gate 用 `if: always()` 并验证「应运行的 job 成功」，含专门的反例验收 |
+| 台账与运行态不一致 | Task 4 | 权威来源为运行容器 image ref + ID，台账仅为可恢复投影，锁内原子替换 |
 | 整体方案失败 | 任意 | Task 0 的 git bundle + 未提交资产归档 + 未归档的旧仓，可完整回到合并前状态 |
 
 ## 关于本 PR 自身的合并边界
@@ -256,3 +291,13 @@ owner 已通过 GitHub API 独立复核第一轮标注为"未独立核实"的项
 | P0-14 | git bundle 不保护未提交资产 | **原理成立，计数不适用于本仓库当前状态。** `git bundle` 只含 refs 与可达 object，确实不含未跟踪文件。但评审所述"9 个未跟踪 plan/spec 文件"在本会话 checkout（`a5ad5b5`）中不成立 —— `git status --porcelain --untracked-files=all` 返回 0 项，工作区干净。该状态应属 owner 本机工作区；由于迁移将从该工作区执行，防护仍然必要 | Task 0 第 2 步增加 dirty/untracked 精确清单、未提交文件独立归档与哈希、`--all` 创建 bundle 并 `git bundle verify`、两者各做还原验证、迁移分支只从精确 HEAD 创建 |
 | P1-15 | Task 0 不必重复真实发布与回滚 | **成立。** Task 0 不修改旧仓 runner/workflow，无改动发布的风险高于收益 | Task 0 验收改为只读核验（runner 在线、workflow 配置未变、最近成功记录存在）；真实旧仓回退演练集中到 Task 2 runbook 第 5 步执行一次 |
 | — | 本 PR 合并会触发 master 发布 | **成立。** 实测 `deploy.yml` 为 `on.push.branches: [master]` 且无 `paths` 过滤，合并将触发 `publish` + `deploy-dev`（含 alembic 迁移与容器重启） | 新增「关于本 PR 自身的合并边界」章节，明确按一次正式发布处理 |
+
+### 第三轮（PR #83，5 条）
+
+| # | 评审意见 | 核实结果 | 处理 |
+|---|---|---|---|
+| P0-16 | Task 2 orchestrator 在 Task 4 前无可调用的部署单元 | **成立。** 实测两边 workflow 均不暴露 `workflow_call`（`grep workflow_call` 无命中）。普通 workflow 无法被 job-level `uses` + `needs` 调用，`workflow_dispatch` 也无法在同一 run 内形成可证明的依赖链 —— 原顺序下 Task 2 的 DAG 无对象可调 | Task 1 新增第 5 步：产出 `_deploy-api.yml` / `_deploy-ui.yml` 两份**逻辑原样、仅暴露 `workflow_call`** 的外壳，只改调用形式不动部署逻辑，仍满足搬迁与重写分离；Task 4 再合并为参数化 `_deploy-app.yml`。同时新增第 7 步 `workflow_dispatch` 回滚契约（目标应用 `api\|ui\|both`、双 SHA 独立、手动回滚不被 `changes` 跳过、顺序与中止规则） |
+| P0-17 | `flock` 未覆盖旧仓，disable 前缺 drain | **成立。** 实测两个旧仓 workflow 的 `flock` 调用数均为 **0**，而本计划声明不改动旧仓配置 —— 仅在宿主机放锁文件不产生互斥，旧 workflow 直接绕过。且 GitHub 的 disable 只阻止后续触发，不影响在途 run | Global Constraints 中 `flock` 范围诚实收窄为「新仓 orchestrator + 宿主机手工操作」，并新增「disable 不等于停止」一条；Task 2 runbook 第 2 步改为**显式 drain 门禁**（查询三仓 queued/in-progress → 等待或安全取消 → 归零并二次确认），每次 enable/disable 切换前重跑。**两方案中选择方案 2（严格 drain）**，理由与可推翻性写入 runbook |
+| P1-18 | 新仓 branch protection 需要 bootstrap 顺序 | **成立。** 实测两个旧仓的 required check 同名 `PR container validation`；新仓此时未产生过该 check，而 GitHub 要求 required check 近 7 天内在目标仓成功运行过 | Task 0 第 3 步改为只复制非 check 类保护，required check 暂不设置；Task 1 确定恒定 gate 的精确 display name 并在成功运行一次后设为 required；Task 4 仅在 job 名确实变化时迁移 required context 并验证旧 context 已移除 |
+| P1-19 | `changes` 与 gate 的行为契约需具体化 | **成立。** 原计划只写了结构，未定义语义 | Task 1 新增第 6 步契约：`changes` 用 checkout 后完整 Git diff 不依赖 300-file 过滤；分别定义五种触发情形的 base/head；gate 用 `if: always()`；gate 须验证「应运行的 app job 成功」而非 skipped 即放行；UI job 不得因 `needs: deploy-api` 的 skipped 被级联跳过。验收增加两个反例用例 |
+| P1-20 | per-app 台账缺权威存储与原子更新语义 | **成立。** 原计划只写"新增台账"四字 | Task 4 第 3 步新增语义表：权威来源为运行容器 immutable image ref + image ID，台账仅为可恢复投影；存于 checkout 树外；发布验证通过后在同一把 `flock` 内原子替换；定义失败/自动回滚、手动回滚、宿主机丢失三种恢复路径；明确禁止把部署时变化的 manifest commit 回 master 以免递归触发发布 |
