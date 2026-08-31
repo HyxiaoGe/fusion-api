@@ -1,10 +1,9 @@
 ---
 name: verified-research
-version: 1.0.0
 description: 对需要官方原文与交叉来源的请求建立可核验证据链
-allowed-tools:
-  - web_search
-  - url_read
+metadata:
+  version: "1.0.0"
+allowed-tools: web_search url_read
 ---
 # 可核验证据研究
 

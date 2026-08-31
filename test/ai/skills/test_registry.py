@@ -23,16 +23,23 @@ def _skill_document(
     allowed_tools: tuple[str, ...] | None = ("web_search", "url_read"),
     body: str = VALID_BODY,
     extra_frontmatter: str = "",
+    standard_layout: bool = False,
 ) -> bytes:
     lines = [
         "---",
         f"name: {name}",
-        f"version: {version}",
         f"description: {description}",
     ]
+    if standard_layout:
+        lines.extend(["metadata:", f'  version: "{version}"'])
+    else:
+        lines.append(f"version: {version}")
     if allowed_tools is not None:
-        lines.append("allowed-tools:")
-        lines.extend(f"  - {tool_name}" for tool_name in allowed_tools)
+        if standard_layout:
+            lines.append(f"allowed-tools: {' '.join(allowed_tools)}")
+        else:
+            lines.append("allowed-tools:")
+            lines.extend(f"  - {tool_name}" for tool_name in allowed_tools)
     if extra_frontmatter:
         lines.append(extra_frontmatter)
     lines.extend(["---", body])
@@ -48,6 +55,13 @@ def _write_skill(
     skill_path = root / "verified-research" / version_directory / "SKILL.md"
     skill_path.parent.mkdir(parents=True, exist_ok=True)
     skill_path.write_bytes(payload if payload is not None else _skill_document())
+    return skill_path
+
+
+def _write_standard_skill(root: Path, *, payload: bytes) -> Path:
+    skill_path = root / "verified-research" / "SKILL.md"
+    skill_path.parent.mkdir(parents=True, exist_ok=True)
+    skill_path.write_bytes(payload)
     return skill_path
 
 
@@ -85,12 +99,63 @@ def test_bundled_verified_research_skill_loads_as_frozen_snapshot() -> None:
     assert loaded.content not in serialized
 
 
+def test_standard_directory_layout_and_frontmatter_load_through_existing_run_contract(tmp_path: Path) -> None:
+    _write_standard_skill(
+        tmp_path,
+        payload=_skill_document(standard_layout=True),
+    )
+
+    result = load_skills_for_package(
+        "verified_web",
+        ("web_search", "url_read"),
+        skills_root=tmp_path,
+        release_pins=(
+            SkillReleasePin(
+                skill_id="verified-research",
+                version="1.0.0",
+                content_sha256=hashlib.sha256(VALID_BODY.encode("utf-8")).hexdigest(),
+            ),
+        ),
+    )
+
+    assert result.resolution.status == "loaded"
+    assert result.loaded_skills[0].metadata.version == "1.0.0"
+    assert result.loaded_skills[0].metadata.allowed_tool_names == ("web_search", "url_read")
+
+
+def test_standard_skill_without_version_or_allowed_tools_gets_content_pin_and_route_permissions(tmp_path: Path) -> None:
+    payload = _skill_document(version="ignored", allowed_tools=None, standard_layout=True).replace(
+        b'metadata:\n  version: "ignored"\n',
+        b"",
+    )
+    _write_standard_skill(tmp_path, payload=payload)
+    normalized = payload.decode("utf-8")
+    resolved_version = f"sha256-{hashlib.sha256(normalized.encode('utf-8')).hexdigest()[:16]}"
+
+    result = load_skills_for_package(
+        "verified_web",
+        ("web_search", "url_read"),
+        skills_root=tmp_path,
+        release_pins=(
+            SkillReleasePin(
+                skill_id="verified-research",
+                version=resolved_version,
+                content_sha256=hashlib.sha256(VALID_BODY.encode("utf-8")).hexdigest(),
+            ),
+        ),
+    )
+
+    assert result.resolution.status == "loaded"
+    assert result.resolution.skills[0].version == resolved_version
+    assert result.resolution.skills[0].allowed_tool_names == ("web_search", "url_read")
+
+
 @pytest.mark.parametrize("line_ending", (b"\r\n", b"\r"))
 def test_platform_line_endings_keep_published_body_digest_stable(
     tmp_path: Path,
     line_ending: bytes,
 ) -> None:
-    bundled_path = Path(__file__).parents[3] / "app/ai/skills/verified-research/1.0.0/SKILL.md"
+    bundled_path = Path(__file__).parents[3] / "app/ai/skills/verified-research/SKILL.md"
     bundled = bundled_path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
     _write_skill(tmp_path, payload=bundled.replace(b"\n", line_ending))
 
@@ -190,12 +255,6 @@ def test_unmapped_package_does_not_touch_skill_files(package_id: str, tmp_path: 
         ("invalid_utf8", b"---\nname: verified-research\n---\n\xff", "1.0.0", ("web_search", "url_read")),
         ("missing_frontmatter", b"# no frontmatter", "1.0.0", ("web_search", "url_read")),
         (
-            "unknown_frontmatter_field",
-            _skill_document(extra_frontmatter="license: proprietary"),
-            "1.0.0",
-            ("web_search", "url_read"),
-        ),
-        (
             "version_directory_mismatch",
             _skill_document(version="1.0.1"),
             "1.0.0",
@@ -204,12 +263,6 @@ def test_unmapped_package_does_not_touch_skill_files(package_id: str, tmp_path: 
         (
             "invalid_version",
             _skill_document(version="v1"),
-            "1.0.0",
-            ("web_search", "url_read"),
-        ),
-        (
-            "missing_allowed_tools",
-            _skill_document(allowed_tools=None),
             "1.0.0",
             ("web_search", "url_read"),
         ),

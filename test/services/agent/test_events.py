@@ -457,6 +457,22 @@ class AgentEventModelTests(unittest.TestCase):
         event = adapter.validate_python(loaded)
         self.assertIsInstance(event, SkillsResolved)
         self.assertEqual(event.skills[0].content_sha256, "b" * 64)
+
+        content_version = "sha256-0123456789abcdef"
+        content_pinned = adapter.validate_python(
+            {
+                **loaded,
+                "skills": [
+                    {
+                        **SKILL_METADATA,
+                        "version": content_version,
+                        "section_id": f"skill:verified-research@{content_version}",
+                    }
+                ],
+            }
+        )
+        self.assertEqual(content_pinned.skills[0].version, content_version)
+
         for payload in (
             {**loaded, "skills": [{**SKILL_METADATA, "content": "正文禁止进入事件"}]},
             {**loaded, "status": "not_selected"},

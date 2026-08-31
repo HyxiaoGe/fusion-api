@@ -74,7 +74,7 @@ class TrajectorySkillMetadata(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     skill_id: str = Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$", max_length=128)
-    version: str = Field(pattern=r"^\d+\.\d+\.\d+$", max_length=32)
+    version: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$", max_length=64)
     content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     allowed_tool_names: list[str] = Field(min_length=1, max_length=3)
     section_id: str = Field(min_length=1, max_length=192)

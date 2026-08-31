@@ -1,4 +1,4 @@
-"""从代码固定目录加载并冻结 Run 级 Skill 快照。"""
+"""将本地 Agent Skills 标准目录适配为 Run 级冻结快照。"""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Literal, Sequence
 
+from app.ai.skills.document import MAX_SKILL_FILE_BYTES, SkillDocument, parse_skill_document
 from app.utils.run_capability_contract import (
     CAPABILITY_CANONICAL_EXTERNAL_TOOL_ORDER,
     CAPABILITY_CONTROL_TOOL_NAMES,
@@ -18,7 +19,6 @@ SkillLoadStatus = Literal["not_selected", "loaded", "load_failed"]
 SkillActivationSource = Literal["capability_package"]
 SkillLoadErrorCode = Literal["skill_load_failed"]
 
-MAX_SKILL_FILE_BYTES = 32 * 1024
 _SKILLS_ROOT = Path(__file__).resolve().parent
 _PACKAGE_SKILLS: dict[str, tuple[tuple[str, str, str], ...]] = {
     "verified_web": (
@@ -29,10 +29,9 @@ _PACKAGE_SKILLS: dict[str, tuple[tuple[str, str, str], ...]] = {
         ),
     ),
 }
-_FRONTMATTER_FIELDS = frozenset({"name", "version", "description", "allowed-tools"})
 _KNOWN_TOOL_NAMES = frozenset(CAPABILITY_CANONICAL_EXTERNAL_TOOL_ORDER)
 _SKILL_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -75,15 +74,6 @@ class RunSkillResolution:
 class SkillLoadResult:
     resolution: RunSkillResolution
     loaded_skills: tuple[LoadedSkillSnapshot, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class _ParsedFrontmatter:
-    name: str
-    version: str
-    description: str
-    allowed_tool_names: tuple[str, ...]
-    body: str
 
 
 def load_skills_for_package(
@@ -152,35 +142,19 @@ def _load_skill(
     expected_content_sha256: str,
     routed_tool_names: tuple[str, ...],
 ) -> LoadedSkillSnapshot:
-    skill_path = root / skill_id / version / "SKILL.md"
-    resolved_path = skill_path.resolve(strict=True)
-    if not resolved_path.is_relative_to(root):
-        raise ValueError("Skill 路径越界")
-    if any(path.is_symlink() for path in (skill_path, skill_path.parent, skill_path.parent.parent)):
-        raise ValueError("Skill 路径不得使用符号链接")
-
-    raw = resolved_path.read_bytes()
-    if len(raw) > MAX_SKILL_FILE_BYTES:
-        raise ValueError("Skill 文件超过大小上限")
-    document = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
-    parsed = _parse_skill_document(document)
-    _validate_skill_metadata(
-        parsed,
-        expected_skill_id=skill_id,
-        expected_version=version,
-        routed_tool_names=routed_tool_names,
-    )
+    parsed = _read_selected_skill(root=root, skill_id=skill_id, version=version)
+    allowed_tool_names = _validate_skill_metadata(parsed, routed_tool_names=routed_tool_names)
     content_sha256 = hashlib.sha256(parsed.body.encode("utf-8")).hexdigest()
     if content_sha256 != expected_content_sha256:
         raise ValueError("Skill 正文摘要与发布版本不一致")
     metadata = SkillMetadata(
         skill_id=parsed.name,
-        version=parsed.version,
+        version=parsed.resolved_version,
         description=parsed.description,
         content_sha256=content_sha256,
-        allowed_tool_names=parsed.allowed_tool_names,
+        allowed_tool_names=allowed_tool_names,
         activation_source="capability_package",
-        section_id=f"skill:{parsed.name}@{parsed.version}",
+        section_id=f"skill:{parsed.name}@{parsed.resolved_version}",
         char_count=len(parsed.body),
     )
     return LoadedSkillSnapshot(metadata=metadata, content=parsed.body)
@@ -208,91 +182,53 @@ def _resolve_release_pins(
     return tuple(releases)
 
 
-def _parse_skill_document(document: str) -> _ParsedFrontmatter:
-    lines = document.splitlines(keepends=True)
-    if not lines or lines[0].rstrip("\r\n") != "---":
-        raise ValueError("Skill 缺少 frontmatter")
-    closing_index = next(
-        (index for index, line in enumerate(lines[1:], start=1) if line.rstrip("\r\n") == "---"),
-        None,
+def _read_selected_skill(*, root: Path, skill_id: str, version: str) -> SkillDocument:
+    candidates = (
+        root / skill_id / "SKILL.md",
+        root / skill_id / version / "SKILL.md",
     )
-    if closing_index is None:
-        raise ValueError("Skill frontmatter 未闭合")
-
-    metadata_lines = [line.rstrip("\r\n") for line in lines[1:closing_index]]
-    body = "".join(lines[closing_index + 1 :])
-    if not body.strip():
-        raise ValueError("Skill 正文不能为空")
-
-    scalars: dict[str, str] = {}
-    allowed_tools: list[str] | None = None
-    active_list: str | None = None
-    for line in metadata_lines:
-        if not line.strip():
+    found_version_mismatch = False
+    for skill_path in candidates:
+        if not skill_path.exists():
             continue
-        if line.startswith("  - "):
-            if active_list != "allowed-tools" or allowed_tools is None:
-                raise ValueError("Skill frontmatter 列表结构非法")
-            tool_name = line[4:].strip()
-            if not tool_name:
-                raise ValueError("Skill 工具名不能为空")
-            allowed_tools.append(tool_name)
-            continue
-        if line[:1].isspace() or ":" not in line:
-            raise ValueError("Skill frontmatter 结构非法")
-        field, value = line.split(":", 1)
-        field = field.strip()
-        value = value.strip()
-        if (
-            field not in _FRONTMATTER_FIELDS
-            or field in scalars
-            or (field == "allowed-tools" and allowed_tools is not None)
-        ):
-            raise ValueError("Skill frontmatter 字段非法")
-        active_list = None
-        if field == "allowed-tools":
-            if value:
-                raise ValueError("allowed-tools 必须使用受控列表格式")
-            allowed_tools = []
-            active_list = field
-        else:
-            if not value:
-                raise ValueError("Skill frontmatter 标量不能为空")
-            scalars[field] = value
+        resolved_path = skill_path.resolve(strict=True)
+        if not resolved_path.is_relative_to(root):
+            raise ValueError("Skill 路径越界")
+        current = skill_path
+        while current != root:
+            if current.is_symlink():
+                raise ValueError("Skill 路径不得使用符号链接")
+            current = current.parent
 
-    required_scalars = {"name", "version", "description"}
-    if set(scalars) != required_scalars or allowed_tools is None:
-        raise ValueError("Skill frontmatter 缺少必填字段")
-    return _ParsedFrontmatter(
-        name=scalars["name"],
-        version=scalars["version"],
-        description=scalars["description"],
-        allowed_tool_names=tuple(allowed_tools),
-        body=body,
-    )
+        raw = resolved_path.read_bytes()
+        if len(raw) > MAX_SKILL_FILE_BYTES:
+            raise ValueError("Skill 文件超过大小上限")
+        document = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+        parsed = parse_skill_document(document, expected_skill_id=skill_id)
+        if parsed.resolved_version != version:
+            found_version_mismatch = True
+            continue
+        return parsed
+    if found_version_mismatch:
+        raise ValueError("Skill version 与发布版本不一致")
+    raise FileNotFoundError("Skill 文件不存在")
 
 
 def _validate_skill_metadata(
-    parsed: _ParsedFrontmatter,
+    parsed: SkillDocument,
     *,
-    expected_skill_id: str,
-    expected_version: str,
     routed_tool_names: tuple[str, ...],
-) -> None:
-    if _SKILL_ID_RE.fullmatch(parsed.name) is None or parsed.name != expected_skill_id:
-        raise ValueError("Skill name 与受控目录不一致")
-    if _VERSION_RE.fullmatch(parsed.version) is None or parsed.version != expected_version:
-        raise ValueError("Skill version 与版本目录不一致")
-    if len(parsed.description) > 1024:
-        raise ValueError("Skill description 超过大小上限")
-    if not parsed.allowed_tool_names or len(parsed.allowed_tool_names) != len(set(parsed.allowed_tool_names)):
-        raise ValueError("Skill allowed-tools 不能为空或重复")
-    if CAPABILITY_CONTROL_TOOL_NAMES.intersection(parsed.allowed_tool_names):
+) -> tuple[str, ...]:
+    declared_tools = parsed.declared_allowed_tools
+    if not declared_tools:
+        return routed_tool_names
+    if CAPABILITY_CONTROL_TOOL_NAMES.intersection(declared_tools):
         raise ValueError("Skill 不得声明控制工具")
-    if not set(parsed.allowed_tool_names).issubset(_KNOWN_TOOL_NAMES):
+    if not set(declared_tools).issubset(_KNOWN_TOOL_NAMES):
         raise ValueError("Skill 声明了未知工具")
-    if parsed.allowed_tool_names != routed_tool_names:
+    if declared_tools != routed_tool_names:
         raise ValueError("Skill allowed-tools 与能力路由工具不一致")
+    return routed_tool_names
 
 
 def _validate_routed_tool_names(routed_tool_names: Sequence[str]) -> tuple[str, ...]:

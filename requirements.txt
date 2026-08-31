@@ -23,6 +23,7 @@ watchfiles==1.0.4
 authlib==1.3.2
 websockets==15.0
 python-dotenv==1.1.0
+PyYAML==6.0.2
 mcp==1.28.1
 # MCP 1.28.1 允许浮动到 sse-starlette 3.x，但 3.4+ 要求 Starlette >=0.49，
 # 与 FastAPI 0.115.12 的 Starlette <0.47 约束冲突，因此固定兼容版本。
