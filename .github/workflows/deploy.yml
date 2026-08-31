@@ -144,13 +144,13 @@ jobs:
         run: |
           docker version
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "当前 Runner 未提供可用的 Docker Engine；请先完成 Runner 预配置"
+            Write-Host "Docker Engine is unavailable on this runner."
             exit $LASTEXITCODE
           }
 
           docker ps
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "当前 Runner 无权访问 Docker Engine；请先修复 Runner 权限"
+            Write-Host "The runner cannot access Docker Engine."
             exit $LASTEXITCODE
           }
 
