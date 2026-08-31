@@ -142,69 +142,17 @@ jobs:
       - name: Verify Docker access
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
-          $ErrorActionPreference = "Continue"
-          $serviceNames = @('docker', 'com.docker.service')
-          $dockerDesktopStarted = $false
-          $desktopPaths = @(
-            "$env:ProgramFiles\Docker\Docker\Docker Desktop.exe",
-            "${env:ProgramFiles(x86)}\Docker\Docker\Docker Desktop.exe"
-          )
-
-          for ($attempt = 1; $attempt -le 6; $attempt++) {
-            Write-Host "Checking Docker access, attempt $attempt/6..."
-
-            docker version
-            if ($LASTEXITCODE -eq 0) {
-              docker ps
-              if ($LASTEXITCODE -eq 0) {
-                Write-Host "Docker daemon ready"
-                exit 0
-              }
-            }
-
-            foreach ($serviceName in $serviceNames) {
-              $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-              if ($null -ne $service -and $service.Status -ne "Running") {
-                Write-Host "Starting Docker service: $serviceName"
-                try {
-                  Start-Service -Name $serviceName -ErrorAction Stop
-                } catch {
-                  Write-Host "Docker service start failed for ${serviceName}: $($_.Exception.Message)"
-                }
-              } elseif ($null -ne $service) {
-                Write-Host "Docker service ${serviceName} status: $($service.Status)"
-              }
-            }
-
-            if (-not $dockerDesktopStarted) {
-              foreach ($desktopPath in $desktopPaths) {
-                if ($desktopPath -and (Test-Path $desktopPath)) {
-                  Write-Host "Starting Docker Desktop: $desktopPath"
-                  $runnerTrackingId = $env:RUNNER_TRACKING_ID
-                  try {
-                    # Keep Docker Desktop alive after the self-hosted runner cleans up this job.
-                    $env:RUNNER_TRACKING_ID = ""
-                    Start-Process -FilePath $desktopPath -WindowStyle Minimized
-                    $dockerDesktopStarted = $true
-                    break
-                  } catch {
-                    Write-Host "Docker Desktop start failed: $($_.Exception.Message)"
-                  } finally {
-                    $env:RUNNER_TRACKING_ID = $runnerTrackingId
-                  }
-                }
-              }
-            }
-
-            if ($attempt -lt 6) {
-              Start-Sleep -Seconds (10 * $attempt)
-            }
+          docker version
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "当前 Runner 未提供可用的 Docker Engine；请先完成 Runner 预配置"
+            exit $LASTEXITCODE
           }
 
-          Write-Host "Docker daemon did not become ready"
-          docker version
           docker ps
-          exit 1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "当前 Runner 无权访问 Docker Engine；请先修复 Runner 权限"
+            exit $LASTEXITCODE
+          }
 
       - name: Test and build Docker image
         timeout-minutes: 15
