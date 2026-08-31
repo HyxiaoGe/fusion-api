@@ -85,7 +85,7 @@
 - 两边 `.github/scripts/*` 的调用路径
 - Dockerfile build context（`.` → `apps/api` / `apps/ui`）
 - `actions/setup-node` 的 `cache-dependency-path`
-- 7 份跨仓 plan 中的 `../fusion-ui/` 相对路径与文档绝对路径
+- 跨仓 plan 中的相对路径与文档绝对路径。**实测存量很小**：`docs/superpowers/` 下含 `../fusion-ui/` 的仅 `2026-06-30-search-read-planner-ledger.md` 一份（另一份是本计划自身）；提到 `fusion-ui` 但不含该相对路径模式的另有 6 份，只需按需核对
 
 ## Task 0：新仓基建、恢复点与外部绑定清点
 
@@ -219,7 +219,11 @@ Task 0 第 7 步判定为「仍活跃且影响运行态」的 Vercel / Railway �
 ## Task 5：文档、台账与旧仓归档
 
 1. 合并两份 `EXECUTION_LEDGER.md`，补一条本次合并记录。
-2. 合并 `docs/superpowers/plans` 与 `specs`，修正 7 份跨仓 plan 中的 `../fusion-ui/` 相对路径。
+2. 合并 `docs/superpowers/plans`（54 份）与 `specs`（23 份），修正 `2026-06-30-search-read-planner-ledger.md` 中的 `../fusion-ui/` 相对路径（实测存量仅此一份）。
+
+   **同时做一次分诊，不要原样搬运。** 实测当前两套记录体系互不索引：台账 `EXECUTION_LEDGER.md` 按「领域 + commit SHA」追踪（71 处 SHA 引用），54 份 plan 中仅 **4 份**被台账点名；checkbox 追踪已基本废弃（25 份有 box 但 0 勾选、10 份无 box、仅 9 份全勾）。因此**单看一份 plan 无法判断它是活的还是已完成** —— 这正是 `AGENTS.md` 第 11 条要求"必须先读台账再查 git log"的原因。
+
+   迁移时至少做到：为每份 plan 标注「已完成 / 进行中 / 已废弃」，或按状态分目录（如 `plans/archive/`）。**否则等于把这个索引缺口原样搬进新仓。** 本步不要求补齐 checkbox，只要求可判定死活。
 3. 根 `CLAUDE.md` 改为导航，`apps/api/CLAUDE.md` 与 `apps/ui/CLAUDE.md` 承载应用级约定；`AGENTS.md` 同理。`.agents/skills/` 中 10 个 skill 合并去重（`fusion-next-step` 两边各有一份需统一）。
 4. **平台元数据边界**（见 P1-9）：git 历史合并不迁移 Issues、PR、Actions runs、releases、webhooks、deploy keys、Environment protection、branch rules。明确：
    - 复制：Environment protection、branch rules、secrets/variables、webhooks；
