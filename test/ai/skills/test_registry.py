@@ -85,6 +85,28 @@ def test_bundled_verified_research_skill_loads_as_frozen_snapshot() -> None:
     assert loaded.content not in serialized
 
 
+@pytest.mark.parametrize("line_ending", (b"\r\n", b"\r"))
+def test_platform_line_endings_keep_published_body_digest_stable(
+    tmp_path: Path,
+    line_ending: bytes,
+) -> None:
+    bundled_path = Path(__file__).parents[3] / "app/ai/skills/verified-research/1.0.0/SKILL.md"
+    bundled = bundled_path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    _write_skill(tmp_path, payload=bundled.replace(b"\n", line_ending))
+
+    result = load_skills_for_package(
+        "verified_web",
+        ("web_search", "url_read"),
+        skills_root=tmp_path,
+    )
+
+    assert result.resolution.status == "loaded"
+    assert result.resolution.skills[0].content_sha256 == (
+        "5c93abf51e64321ad42968ab8d01d3a9429bcd4ea90cb514b6fd0822c8842cdb"
+    )
+    assert "\r" not in result.loaded_skills[0].content
+
+
 def test_published_version_rejects_body_changed_without_version_bump(tmp_path: Path) -> None:
     _write_skill(tmp_path, payload=_skill_document(body="# 被原地修改\n\n这不应继续冒充 1.0.0。\n"))
 
