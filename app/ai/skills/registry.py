@@ -83,7 +83,7 @@ def load_skills_for_package(
     skills_root: Path | None = None,
     release_pins: Sequence[SkillReleasePin] | None = None,
 ) -> SkillLoadResult:
-    """加载代码固定 Skill；已选择 Skill 的任何异常都返回受控失败。"""
+    """加载能力包配置的标准目录 Skill；已选择 Skill 的异常均受控失败。"""
 
     started = perf_counter()
     configured_releases = _PACKAGE_SKILLS.get(package_id, ())
@@ -183,35 +183,24 @@ def _resolve_release_pins(
 
 
 def _read_selected_skill(*, root: Path, skill_id: str, version: str) -> SkillDocument:
-    candidates = (
-        root / skill_id / "SKILL.md",
-        root / skill_id / version / "SKILL.md",
-    )
-    found_version_mismatch = False
-    for skill_path in candidates:
-        if not skill_path.exists():
-            continue
-        resolved_path = skill_path.resolve(strict=True)
-        if not resolved_path.is_relative_to(root):
-            raise ValueError("Skill 路径越界")
-        current = skill_path
-        while current != root:
-            if current.is_symlink():
-                raise ValueError("Skill 路径不得使用符号链接")
-            current = current.parent
+    skill_path = root / skill_id / "SKILL.md"
+    resolved_path = skill_path.resolve(strict=True)
+    if not resolved_path.is_relative_to(root):
+        raise ValueError("Skill 路径越界")
+    current = skill_path
+    while current != root:
+        if current.is_symlink():
+            raise ValueError("Skill 路径不得使用符号链接")
+        current = current.parent
 
-        raw = resolved_path.read_bytes()
-        if len(raw) > MAX_SKILL_FILE_BYTES:
-            raise ValueError("Skill 文件超过大小上限")
-        document = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
-        parsed = parse_skill_document(document, expected_skill_id=skill_id)
-        if parsed.resolved_version != version:
-            found_version_mismatch = True
-            continue
-        return parsed
-    if found_version_mismatch:
+    raw = resolved_path.read_bytes()
+    if len(raw) > MAX_SKILL_FILE_BYTES:
+        raise ValueError("Skill 文件超过大小上限")
+    document = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    parsed = parse_skill_document(document, expected_skill_id=skill_id)
+    if parsed.resolved_version != version:
         raise ValueError("Skill version 与发布版本不一致")
-    raise FileNotFoundError("Skill 文件不存在")
+    return parsed
 
 
 def _validate_skill_metadata(

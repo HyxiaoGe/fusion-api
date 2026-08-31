@@ -25,16 +25,16 @@
 **Files:**
 - Create: `app/ai/skills/__init__.py`
 - Create: `app/ai/skills/registry.py`
-- Create: `app/ai/skills/verified-research/1.0.0/SKILL.md`
+- Create: `app/ai/skills/verified-research/SKILL.md`
 - Test: `test/ai/skills/test_registry.py`
 
 **Interfaces:**
 - Produces: `LoadedSkillSnapshot`、`RunSkillResolution`、`load_skills_for_package(package_id, routed_tool_names)`。
 - `LoadedSkillSnapshot` 含安全元数据和仅内存 `content`；`RunSkillResolution` 可序列化但不含正文。
 
-- [ ] 写失败测试：合法文件稳定解析；未选择不读取文件；非法 UTF-8/frontmatter/版本/allowed-tools/超限/路径逃逸返回 `load_failed`。
+- [ ] 写失败测试：标准目录合法文件稳定解析；版本子目录不得加载；未选择不读取文件；非法 UTF-8/frontmatter/版本/allowed-tools/超限/路径逃逸返回 `load_failed`。
 - [ ] 运行 `/Users/sean/code/fusion/fusion-api/.venv/bin/python -m pytest test/ai/skills/test_registry.py -q`，确认因模块或接口不存在失败。
-- [ ] 实现受控 frontmatter 解析、32 KiB 上限、SHA-256、版本目录校验、固定 package 映射和 fail-closed 结果。
+- [ ] 实现标准 frontmatter 解析、32 KiB 上限、SHA-256、单一标准目录、固定 package 映射和 fail-closed 结果。
 - [ ] 重跑单文件测试至通过，并运行目标 Ruff。
 
 ### Task 2: Run 能力包、工具权限与 Prompt 原子组装

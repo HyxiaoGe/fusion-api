@@ -49,19 +49,11 @@ def _skill_document(
 def _write_skill(
     root: Path,
     *,
-    version_directory: str = "1.0.0",
     payload: bytes | None = None,
 ) -> Path:
-    skill_path = root / "verified-research" / version_directory / "SKILL.md"
-    skill_path.parent.mkdir(parents=True, exist_ok=True)
-    skill_path.write_bytes(payload if payload is not None else _skill_document())
-    return skill_path
-
-
-def _write_standard_skill(root: Path, *, payload: bytes) -> Path:
     skill_path = root / "verified-research" / "SKILL.md"
     skill_path.parent.mkdir(parents=True, exist_ok=True)
-    skill_path.write_bytes(payload)
+    skill_path.write_bytes(payload if payload is not None else _skill_document())
     return skill_path
 
 
@@ -100,7 +92,7 @@ def test_bundled_verified_research_skill_loads_as_frozen_snapshot() -> None:
 
 
 def test_standard_directory_layout_and_frontmatter_load_through_existing_run_contract(tmp_path: Path) -> None:
-    _write_standard_skill(
+    _write_skill(
         tmp_path,
         payload=_skill_document(standard_layout=True),
     )
@@ -123,12 +115,34 @@ def test_standard_directory_layout_and_frontmatter_load_through_existing_run_con
     assert result.loaded_skills[0].metadata.allowed_tool_names == ("web_search", "url_read")
 
 
+def test_versioned_subdirectory_is_not_a_skill_source(tmp_path: Path) -> None:
+    legacy_path = tmp_path / "verified-research" / "1.0.0" / "SKILL.md"
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.write_bytes(_skill_document(standard_layout=True))
+
+    result = load_skills_for_package(
+        "verified_web",
+        ("web_search", "url_read"),
+        skills_root=tmp_path,
+        release_pins=(
+            SkillReleasePin(
+                skill_id="verified-research",
+                version="1.0.0",
+                content_sha256=hashlib.sha256(VALID_BODY.encode("utf-8")).hexdigest(),
+            ),
+        ),
+    )
+
+    assert result.resolution.status == "load_failed"
+    assert result.loaded_skills == ()
+
+
 def test_standard_skill_without_version_or_allowed_tools_gets_content_pin_and_route_permissions(tmp_path: Path) -> None:
     payload = _skill_document(version="ignored", allowed_tools=None, standard_layout=True).replace(
         b'metadata:\n  version: "ignored"\n',
         b"",
     )
-    _write_standard_skill(tmp_path, payload=payload)
+    _write_skill(tmp_path, payload=payload)
     normalized = payload.decode("utf-8")
     resolved_version = f"sha256-{hashlib.sha256(normalized.encode('utf-8')).hexdigest()[:16]}"
 
@@ -190,7 +204,6 @@ def test_continuation_release_pin_restores_exact_version_and_digest(tmp_path: Pa
     body = "# 旧版可核验研究\n\n继续同一业务尝试时必须恢复这份正文。\n"
     _write_skill(
         tmp_path,
-        version_directory="0.9.0",
         payload=_skill_document(version="0.9.0", body=body),
     )
     pin = SkillReleasePin(
@@ -250,62 +263,53 @@ def test_unmapped_package_does_not_touch_skill_files(package_id: str, tmp_path: 
 
 
 @pytest.mark.parametrize(
-    ("case_name", "payload", "version_directory", "routed_tool_names"),
+    ("case_name", "payload", "routed_tool_names"),
     [
-        ("invalid_utf8", b"---\nname: verified-research\n---\n\xff", "1.0.0", ("web_search", "url_read")),
-        ("missing_frontmatter", b"# no frontmatter", "1.0.0", ("web_search", "url_read")),
+        ("invalid_utf8", b"---\nname: verified-research\n---\n\xff", ("web_search", "url_read")),
+        ("missing_frontmatter", b"# no frontmatter", ("web_search", "url_read")),
         (
-            "version_directory_mismatch",
+            "declared_version_mismatch",
             _skill_document(version="1.0.1"),
-            "1.0.0",
             ("web_search", "url_read"),
         ),
         (
             "invalid_version",
             _skill_document(version="v1"),
-            "1.0.0",
             ("web_search", "url_read"),
         ),
         (
             "empty_allowed_tools",
             _skill_document(allowed_tools=()),
-            "1.0.0",
             ("web_search", "url_read"),
         ),
         (
             "duplicate_allowed_tool",
             _skill_document(allowed_tools=("web_search", "web_search")),
-            "1.0.0",
             ("web_search", "url_read"),
         ),
         (
             "control_tool",
             _skill_document(allowed_tools=("web_search", "url_read", "update_plan")),
-            "1.0.0",
             ("web_search", "url_read"),
         ),
         (
             "unknown_tool",
             _skill_document(allowed_tools=("web_search", "url_read", "shell_exec")),
-            "1.0.0",
             ("web_search", "url_read"),
         ),
         (
             "expands_routed_tools",
             _skill_document(),
-            "1.0.0",
             ("web_search",),
         ),
         (
             "missing_required_tool",
             _skill_document(allowed_tools=("web_search",)),
-            "1.0.0",
             ("web_search", "url_read"),
         ),
         (
             "oversized_file",
             _skill_document(body="x" * (32 * 1024)),
-            "1.0.0",
             ("web_search", "url_read"),
         ),
     ],
@@ -313,11 +317,10 @@ def test_unmapped_package_does_not_touch_skill_files(package_id: str, tmp_path: 
 def test_invalid_selected_skill_fails_closed(
     case_name: str,
     payload: bytes,
-    version_directory: str,
     routed_tool_names: tuple[str, ...],
     tmp_path: Path,
 ) -> None:
-    _write_skill(tmp_path, version_directory=version_directory, payload=payload)
+    _write_skill(tmp_path, payload=payload)
 
     result = load_skills_for_package(
         "verified_web",
@@ -350,7 +353,7 @@ def test_missing_selected_skill_fails_closed(tmp_path: Path) -> None:
 def test_selected_skill_symlink_cannot_escape_registry_root(tmp_path: Path) -> None:
     outside = tmp_path.parent / f"{tmp_path.name}-outside-skill.md"
     outside.write_bytes(_skill_document())
-    skill_path = tmp_path / "verified-research" / "1.0.0" / "SKILL.md"
+    skill_path = tmp_path / "verified-research" / "SKILL.md"
     skill_path.parent.mkdir(parents=True)
     skill_path.symlink_to(outside)
 

@@ -6,16 +6,16 @@
 
 ## DeerFlow 参考与取舍
 
-保留 DeerFlow 的 `SKILL.md` 包结构、frontmatter、版本、内容哈希、渐进加载、`allowed-tools`、fail closed 和历史可还原原则。Fusion 不复制 `skill_index → describe_skill → read_file`：现有路由已经能在首次 LLM 前高置信选择能力包，增加两轮模型工具调用会扩大延迟、竞态和权限面。
+保留 Agent Skills 的 `SKILL.md` 包结构、frontmatter、内容哈希、渐进加载、`allowed-tools` 和 fail closed 原则。Fusion 不复制 `skill_index → describe_skill → read_file`：现有路由已经能在首次 LLM 前高置信选择能力包，增加两轮模型工具调用会扩大延迟、竞态和权限面。
 
 不实现用户 Skill、在线编辑、SkillScan、脚本执行、Secret 注入、沙箱投影、热重载、Slash 激活或线程级 `skill_context`。这些能力达到明确产品需求后再单独设计。
 
-## 目录与版本
+## 标准目录与运行时版本
 
 首个 Skill 位于：
 
 ```text
-app/ai/skills/verified-research/1.0.0/SKILL.md
+app/ai/skills/verified-research/SKILL.md
 ```
 
 文件使用受控 frontmatter：
@@ -23,19 +23,19 @@ app/ai/skills/verified-research/1.0.0/SKILL.md
 ```yaml
 ---
 name: verified-research
-version: 1.0.0
 description: 对需要官方原文与交叉来源的请求建立可核验证据链
-allowed-tools:
-  - web_search
-  - url_read
+metadata:
+  version: "1.0.0"
+allowed-tools: web_search url_read
 ---
 ```
 
-- `allowed-tools` 必填；省略、空数组、重复、控制工具或未知工具均加载失败。
-- 版本目录与 frontmatter 必须一致。已发布版本不得原地修改；正文变化新建版本目录。
+- 只读取 `<skill-id>/SKILL.md`，不探测或兼容 `<skill-id>/<version>/SKILL.md`。
+- `allowed-tools` 按 Agent Skills 标准为可选字段；省略时沿用能力路由已授权工具，声明时只能与路由授权集合一致，不能扩权。
+- `metadata.version` 可选；省略或格式不适合账本时使用整份 `SKILL.md` 的 SHA-256 生成稳定运行时版本。
 - 能力包发布映射同时固定 `skill_id + version + content_sha256`；磁盘正文与固定摘要不一致时按加载失败处理。
 - 正文使用 UTF-8，包含 frontmatter 的完整文件不超过 32 KiB。
-- 不引入 PyYAML 运行时依赖；MVP 解析器只接受上述受控字段和结构。
+- 使用 PyYAML SafeLoader 解析标准 frontmatter，并拒绝危险标签、YAML 别名和重复键。
 
 ## Run 冻结与原子权限
 
@@ -78,7 +78,7 @@ content
 
 `verified-research` 接管现有 `verified_research_plan` 的研究方法、来源核验与输出规则；旧文本段落停止注入，避免两套规则和版本漂移。服务端的 `web_search × 1`、`url_read × 2`、计划依赖及证据校验继续作为确定性门禁，不迁入 Skill。
 
-每个 Run 重新选择 Skill。话题切换和重试不从上一 Run 隐式继承“当前活动 Skill”；continuation 按 owner-scoped previous Run 已持久化的 ID、版本和哈希精确恢复同一业务尝试，找不到原版本或当前路由无法继续承接时 fail closed。
+每个 Run 重新选择 Skill。话题切换和重试不从上一 Run 隐式继承“当前活动 Skill”；continuation 按 owner-scoped previous Run 已持久化的 ID、版本和哈希校验当前标准目录文件，文件已经更新或当前路由无法继续承接时 fail closed。历史详情始终读取当次 Prompt snapshot，不从磁盘重建。
 
 ## 协议与 Trajectory
 
